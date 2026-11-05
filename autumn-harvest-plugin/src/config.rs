@@ -58,6 +58,51 @@ pub struct HarvestReadinessConfig {
     pub require_shard_readiness: bool,
 }
 
+/// The processes that run the retention janitor (issue #2478).
+///
+/// `HarvestBuilder::retention` sets what retention deletes. This value sets
+/// where it runs. The TOML key is `[harvest.retention] run_on`. The
+/// environment variable is `AUTUMN_HARVEST_RETENTION__RUN_ON`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+#[non_exhaustive]
+pub enum RetentionRunOn {
+    /// Run retention where the resolved scheduler runs. This is the default.
+    /// A `web` role runs no scheduler, so it runs no retention.
+    #[default]
+    Scheduler,
+    /// Run retention on each process. This is the behaviour before issue
+    /// #2478. Row leases keep concurrent janitors correct.
+    All,
+}
+
+impl RetentionRunOn {
+    /// The config value, as an operator writes it.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Scheduler => "scheduler",
+            Self::All => "all",
+        }
+    }
+}
+
+impl std::fmt::Display for RetentionRunOn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// The `[harvest.retention]` section (issue #2478).
+///
+/// It holds the placement only. The policy is Rust-only, on
+/// `HarvestBuilder::retention`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct HarvestRetentionConfig {
+    /// The processes that run the retention janitor.
+    pub run_on: RetentionRunOn,
+}
+
 /// Highest accepted `harvest.redis.poll_interval_ms`.
 ///
 /// The value is the wait of one blocking read. The worker checks shutdown and
@@ -181,6 +226,8 @@ pub struct HarvestRuntimeConfig {
     pub readiness: HarvestReadinessConfig,
     pub startup: HarvestStartupConfig,
     pub redis: HarvestRedisConfig,
+    /// Where the retention janitor runs (issue #2478).
+    pub retention: HarvestRetentionConfig,
 }
 
 impl HarvestRuntimeConfig {
@@ -292,6 +339,9 @@ impl HarvestRuntimeConfig {
         if let Some(reconcile_batch) = partial.redis.reconcile_batch {
             self.redis.reconcile_batch = reconcile_batch;
         }
+        if let Some(run_on) = partial.retention.run_on {
+            self.retention.run_on = run_on;
+        }
     }
 
     fn apply_env_overrides(&mut self, env: &dyn Env) -> Result<(), ConfigError> {
@@ -398,6 +448,10 @@ impl HarvestRuntimeConfig {
         if let Ok(reconcile_batch) = env.var("AUTUMN_HARVEST_REDIS__RECONCILE_BATCH") {
             self.redis.reconcile_batch =
                 parse_usize("AUTUMN_HARVEST_REDIS__RECONCILE_BATCH", &reconcile_batch)?;
+        }
+        if let Ok(run_on) = env.var("AUTUMN_HARVEST_RETENTION__RUN_ON") {
+            self.retention.run_on =
+                parse_retention_run_on("AUTUMN_HARVEST_RETENTION__RUN_ON", &run_on)?;
         }
 
         Ok(())
@@ -609,6 +663,7 @@ impl Default for HarvestRuntimeConfig {
             readiness: HarvestReadinessConfig::default(),
             startup: HarvestStartupConfig::default(),
             redis: HarvestRedisConfig::default(),
+            retention: HarvestRetentionConfig::default(),
         }
     }
 }
@@ -687,6 +742,13 @@ struct PartialHarvestRuntimeConfig {
     redis: PartialHarvestRedisConfig,
     #[serde(default)]
     sqlite: PartialHarvestSqliteConfig,
+    #[serde(default)]
+    retention: PartialHarvestRetentionConfig,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PartialHarvestRetentionConfig {
+    run_on: Option<RetentionRunOn>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1020,6 +1082,21 @@ fn parse_orphan_startup_action(key: &str, value: &str) -> Result<OrphanStartupAc
         "fail" => Ok(OrphanStartupAction::Fail),
         _ => Err(ConfigError::Validation(format!(
             "invalid orphaned_workflows value for {key}: {value:?}; expected one of: off, warn, fail"
+        ))),
+    }
+}
+
+/// Parse a [`RetentionRunOn`] from an environment override (issue #2478).
+///
+/// The match ignores case, as for `orphaned_workflows`. A TOML value must be
+/// lowercase. An unknown value is an error, so a typo cannot turn retention
+/// off.
+fn parse_retention_run_on(key: &str, value: &str) -> Result<RetentionRunOn, ConfigError> {
+    match value.to_ascii_lowercase().as_str() {
+        "scheduler" => Ok(RetentionRunOn::Scheduler),
+        "all" => Ok(RetentionRunOn::All),
+        _ => Err(ConfigError::Validation(format!(
+            "invalid retention run_on value for {key}: {value:?}; expected one of: scheduler, all"
         ))),
     }
 }
@@ -2083,5 +2160,72 @@ orphaned_workflows = "fail"
     fn write_file(path: &Path, contents: &str) {
         fs::write(path, contents)
             .unwrap_or_else(|error| panic!("failed to write {}: {error}", path.display()));
+    }
+
+    /// Issue #2478: retention follows the scheduler by default.
+    #[test]
+    fn retention_run_on_defaults_to_the_scheduler() {
+        let config = HarvestRuntimeConfig::load_with_env(&MockEnv::new()).expect("loads");
+        assert_eq!(config.retention.run_on, RetentionRunOn::Scheduler);
+        assert_eq!(
+            HarvestRetentionConfig::default().run_on,
+            RetentionRunOn::Scheduler
+        );
+    }
+
+    /// `[harvest.retention] run_on` sets the placement. The env beats the file.
+    #[test]
+    fn retention_run_on_from_toml_and_env() {
+        let dir = unique_temp_dir("harvest-config-retention-run-on");
+        write_file(
+            &dir.join("autumn.toml"),
+            "[harvest.retention]\nrun_on = \"all\"\n",
+        );
+        let env = MockEnv::new().with("AUTUMN_MANIFEST_DIR", dir.to_string_lossy().as_ref());
+        let config = HarvestRuntimeConfig::load_with_env(&env).expect("loads");
+        assert_eq!(config.retention.run_on, RetentionRunOn::All);
+
+        let env = MockEnv::new()
+            .with("AUTUMN_MANIFEST_DIR", dir.to_string_lossy().as_ref())
+            .with("AUTUMN_HARVEST_RETENTION__RUN_ON", "scheduler");
+        let config = HarvestRuntimeConfig::load_with_env(&env).expect("loads");
+        assert_eq!(config.retention.run_on, RetentionRunOn::Scheduler);
+
+        for value in ["all", "ALL", "All"] {
+            let env = MockEnv::new().with("AUTUMN_HARVEST_RETENTION__RUN_ON", value);
+            let config = HarvestRuntimeConfig::load_with_env(&env).expect("loads");
+            assert_eq!(config.retention.run_on, RetentionRunOn::All, "{value}");
+        }
+    }
+
+    /// A typo must stop the boot. It must not turn retention off.
+    #[test]
+    fn retention_run_on_rejects_an_unknown_value() {
+        let env = MockEnv::new().with("AUTUMN_HARVEST_RETENTION__RUN_ON", "worker");
+        let error = HarvestRuntimeConfig::load_with_env(&env).expect_err("must refuse");
+        let message = error.to_string();
+        assert!(message.contains("run_on"), "{message}");
+        assert!(message.contains("scheduler, all"), "{message}");
+
+        let dir = unique_temp_dir("harvest-config-retention-run-on-reject");
+        write_file(
+            &dir.join("autumn.toml"),
+            "[harvest.retention]\nrun_on = \"everywhere\"\n",
+        );
+        let env = MockEnv::new().with("AUTUMN_MANIFEST_DIR", dir.to_string_lossy().as_ref());
+        let error = HarvestRuntimeConfig::load_with_env(&env).expect_err("must refuse");
+        let message = error.to_string();
+        assert!(
+            message.contains("everywhere") || message.contains("run_on"),
+            "{message}"
+        );
+    }
+
+    /// The labels are the config values, so a log line can be pasted back.
+    #[test]
+    fn retention_run_on_labels_are_the_config_values() {
+        assert_eq!(RetentionRunOn::Scheduler.as_str(), "scheduler");
+        assert_eq!(RetentionRunOn::All.as_str(), "all");
+        assert_eq!(RetentionRunOn::All.to_string(), "all");
     }
 }

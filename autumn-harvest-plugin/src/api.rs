@@ -163,6 +163,9 @@ pub struct HarvestRetentionRuntime {
     config: RetentionConfig,
     monitor: Option<RetentionMonitor>,
     trigger: Option<tokio::sync::mpsc::Sender<()>>,
+    /// Retention is on, but `run_on` places it on other processes (issue
+    /// #2478). `run-now` then names the fix.
+    placed_elsewhere: bool,
 }
 
 impl HarvestRetentionRuntime {
@@ -176,12 +179,25 @@ impl HarvestRetentionRuntime {
             config,
             monitor,
             trigger,
+            placed_elsewhere: false,
         }
     }
 
     #[must_use]
     pub const fn disabled(config: RetentionConfig) -> Self {
         Self::new(config, None, None)
+    }
+
+    /// Retention is on, but this process does not run it (issue #2478).
+    ///
+    /// `harvest.retention.run_on = "scheduler"` places the janitor on the
+    /// processes that run the scheduler. `run-now` then returns a 503 that
+    /// names `run_on = "all"`.
+    #[must_use]
+    pub const fn placed_elsewhere(config: RetentionConfig) -> Self {
+        let mut runtime = Self::new(config, None, None);
+        runtime.placed_elsewhere = true;
+        runtime
     }
 }
 
@@ -35864,6 +35880,12 @@ async fn retention_status(
     Ok(Json(status))
 }
 
+/// The 503 of `run-now` on a process with no placed janitor (issue #2478).
+const RETENTION_PLACED_ELSEWHERE_MESSAGE: &str = "retention run-now unavailable: \
+     harvest.retention.run_on = \"scheduler\" runs retention only on processes that run the \
+     scheduler, and this process runs none. Set harvest.retention.run_on = \"all\" to run \
+     retention here";
+
 async fn retention_run_now(
     Extension(api_state): Extension<HarvestApiState>,
     headers: axum::http::HeaderMap,
@@ -35873,6 +35895,17 @@ async fn retention_run_now(
 
     let runtime = api_state.runtime().map_err(map_error)?;
     let Some(trigger) = runtime.retention.trigger.as_ref() else {
+        let (summary, message) = if runtime.retention.placed_elsewhere {
+            (
+                "retention not placed on this process",
+                RETENTION_PLACED_ELSEWHERE_MESSAGE,
+            )
+        } else {
+            (
+                "no local retention runtime owner",
+                "retention run-now unavailable: no local retention runtime owner",
+            )
+        };
         if let Ok(pool) = api_state.storage_pool()
             && let Ok(mut conn) = acquire_conn(pool.default_pool()).await
         {
@@ -35885,15 +35918,13 @@ async fn retention_run_now(
                 request_id: request_id.as_deref(),
                 idempotency_key: None,
                 status: STATUS_FAILED,
-                error_summary: Some("no local retention runtime owner"),
+                error_summary: Some(summary),
                 shard_id: None,
                 source: &source,
             };
             let _ = audit::insert_audit(&mut conn, &ar).await;
         }
-        return Err(AutumnError::service_unavailable_msg(
-            "retention run-now unavailable: no local retention runtime owner",
-        ));
+        return Err(AutumnError::service_unavailable_msg(message));
     };
 
     let send_result = trigger.try_send(());
