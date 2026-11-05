@@ -40,6 +40,11 @@ Accepted (issue #2270, epic #2262).
 5. A single delegation, a gated one, or one to a durable peer runs inline,
    as before. A task with `parallel_children` 0 or 1 runs as before. A
    recorded task has no such field, so it replays as it ran.
+6. A delegation that runs alone under a bound of 2 or more names why
+   (issue #2483). Its `DelegationRecord::serial` holds a `SerialReason`.
+   A silent fallback hides the cause from the operator. The reason comes
+   from the recorded turn, the recorded roster and the task, so replay is
+   not affected.
 
 ```mermaid
 sequenceDiagram

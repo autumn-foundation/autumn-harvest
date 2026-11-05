@@ -237,6 +237,11 @@ pub struct AgentTask {
     /// (issue #2270). Each runs as a child `agent_loop` run. Zero or one runs
     /// them one after another, inline. The bound is
     /// [`MAX_PARALLEL_CHILDREN`].
+    ///
+    /// Only allowed `delegate` calls in a row, each to an inline peer, form a
+    /// batch. Each other delegation that runs alone names why in
+    /// [`DelegationRecord::serial`](crate::DelegationRecord::serial) (issue
+    /// #2483).
     #[serde(default, skip_serializing_if = "is_zero")]
     pub parallel_children: u32,
     /// The name of the harness model that runs this task (issue #2271).
