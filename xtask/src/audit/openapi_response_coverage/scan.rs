@@ -172,9 +172,9 @@ pub fn receiver_expression(block: &str, dot: usize) -> &str {
 /// Where the postfix expression that ends at the `.` of a method call at
 /// `dot` starts.
 ///
-/// It reads back over names, grouped `( .. )` and indexed `[ .. ]` parts, a
-/// call's own name with its turbofish, `?`, and the `.` or `::` that join
-/// them. So the expression is `(&body)` in `(&body).decode()`, and
+/// It reads back over names, and over grouped `( .. )` and indexed `[ .. ]`
+/// parts. It also reads back over a call's own name with its turbofish, `?`,
+/// and the `.` or `::` that join them. So the expression is `(&body)` in `(&body).decode()`, and
 /// `body.as_ref()` in `body.as_ref().decode()`. A prefix operator outside
 /// the group, as in `&body.decode()`, applies to the call, so it is not
 /// read.

@@ -42,14 +42,168 @@ pub fn entries<'a>(route: &'a Value, key: &str) -> Vec<&'a Value> {
     }
 }
 
+/// Whether Python can use a JSON value as a dict key or a set member.
+const fn hashable(value: &Value) -> bool {
+    !matches!(value, Value::Array(_) | Value::Object(_))
+}
+
+/// Whether a JSON value is falsy, as Python's `or` reads it.
+fn falsy(value: &Value) -> bool {
+    match value {
+        Value::Null => true,
+        Value::Bool(flag) => !flag,
+        Value::Number(number) => number.as_f64() == Some(0.0),
+        Value::String(text) => text.is_empty(),
+        Value::Array(items) => items.is_empty(),
+        Value::Object(map) => map.is_empty(),
+    }
+}
+
+/// Fails when Python could not iterate `value` as a list of entries.
+///
+/// An empty string or an empty object iterates to nothing. Any other
+/// non-list value raises in Python, or yields an item that is no dict.
+fn check_iterable(value: &Value, what: &str) -> Result<(), String> {
+    match value {
+        Value::Array(_) => Ok(()),
+        Value::String(text) if text.is_empty() => Ok(()),
+        Value::Object(map) if map.is_empty() => Ok(()),
+        _ => Err(format!("{what} is not a list")),
+    }
+}
+
+/// Fails when each entry of a list is not an object.
+fn check_objects(value: &Value, what: &str) -> Result<(), String> {
+    check_iterable(value, what)?;
+    if let Value::Array(items) = value
+        && items.iter().any(|item| !item.is_object())
+    {
+        return Err(format!("an entry of {what} is not an object"));
+    }
+    Ok(())
+}
+
+/// The contract routes, or the error that the Python original raised.
+///
+/// The original read the contract with plain indexing. So a contract with
+/// no `routes`, or a route with no `method` or `path`, stopped the audit.
+/// A gate that skips such a contract would pass on input it cannot read.
+/// The `params` of every route are read the same way, as
+/// `duplicate_params` reads them.
+pub fn contract_routes(contract: &Value) -> Result<Vec<&Value>, String> {
+    let routes = contract
+        .get("routes")
+        .ok_or_else(|| "KeyError: the contract has no `routes`".to_string())?;
+    check_objects(routes, "`routes`")?;
+    let routes = entries(contract, "routes");
+    for route in &routes {
+        for key in ["method", "path"] {
+            match route.get(key) {
+                None => return Err(format!("KeyError: a route has no `{key}`")),
+                Some(value) if !hashable(value) => {
+                    return Err(format!("TypeError: a route `{key}` is not a string"));
+                }
+                Some(_) => {}
+            }
+        }
+        if let Some(params) = route.get("params")
+            && !falsy(params)
+        {
+            check_objects(params, "a route's `params`")?;
+            for entry in entries(route, "params") {
+                if ["name", "in"]
+                    .iter()
+                    .any(|key| entry.get(*key).is_some_and(|value| !hashable(value)))
+                {
+                    return Err("TypeError: a param `name` or `in` is not a string".to_string());
+                }
+            }
+        }
+    }
+    Ok(routes)
+}
+
+/// Fails where the Python original raised on a served route's entry.
+///
+/// That is a route with no `success_response.status`, a response entry
+/// with no `status`, or a `request_body` or `fields` value that is no
+/// object or list.
+pub fn check_served_route(route: &Value) -> Result<(), String> {
+    let status = route
+        .get("success_response")
+        .filter(|response| response.is_object())
+        .and_then(|response| response.get("status"))
+        .ok_or_else(|| "KeyError: a route has no `success_response.status`".to_string())?;
+    if !hashable(status) {
+        return Err("TypeError: a `status` is not a number".to_string());
+    }
+    for key in ["additional_responses", "error_responses"] {
+        let Some(list) = route.get(key) else {
+            continue;
+        };
+        check_objects(list, key)?;
+        for entry in entries(route, key) {
+            match entry.get("status") {
+                None => return Err(format!("KeyError: an entry of `{key}` has no `status`")),
+                Some(value) if !hashable(value) => {
+                    return Err("TypeError: a `status` is not a number".to_string());
+                }
+                Some(_) => {}
+            }
+        }
+    }
+    let Some(body) = route.get("request_body").filter(|body| !falsy(body)) else {
+        return Ok(());
+    };
+    if !body.is_object() {
+        return Err("AttributeError: `request_body` is not an object".to_string());
+    }
+    if let Some(fields) = body.get("fields")
+        && !falsy(fields)
+    {
+        check_objects(fields, "`request_body.fields`")?;
+        for field in entries(body, "fields") {
+            if field.get("name").is_some_and(|name| !hashable(name)) {
+                return Err("TypeError: a field `name` is not a string".to_string());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A status as Python compares it with an `int`.
+///
+/// A whole float such as `404.0` equals `404`, and `true` equals `1`.
+fn status_number(value: &Value) -> Option<i64> {
+    match value {
+        Value::Bool(flag) => Some(i64::from(*flag)),
+        Value::Number(number) => number.as_i64().or_else(|| {
+            number
+                .as_f64()
+                .filter(|float| float.fract() == 0.0 && float.abs() < 1e15)
+                .map(|float| {
+                    #[allow(clippy::cast_possible_truncation)]
+                    let whole = float as i64;
+                    whole
+                })
+        }),
+        _ => None,
+    }
+}
+
 /// Check 6: each parameter's `(name, in)` pair is documented once.
 ///
 /// `OpenAPI` requires the pair to be unique. A second entry would otherwise
 /// collapse into the first before any check reads it, so it is reported.
 pub fn duplicate_params(method: &str, path: &str, route: &Value) -> Vec<String> {
+    // Python's `entry.get(..)` gives `None` for a missing key and for a JSON
+    // `null`. So both are one key here.
+    fn get<'v>(entry: &'v Value, key: &str) -> Option<&'v Value> {
+        entry.get(key).filter(|value| !value.is_null())
+    }
     let mut counts: Vec<((Option<&Value>, Option<&Value>), usize)> = Vec::new();
     for entry in entries(route, "params") {
-        let entry_key = (entry.get("name"), entry.get("in"));
+        let entry_key = (get(entry, "name"), get(entry, "in"));
         if let Some(found) = counts.iter_mut().find(|(known, _)| *known == entry_key) {
             found.1 += 1;
         } else {
@@ -82,8 +236,9 @@ pub fn duplicate_params(method: &str, path: &str, route: &Value) -> Vec<String> 
 /// The head of the type goes through `written_path`, so an import decides.
 /// It counts when it expands to one of `RAW_READER_PATHS`, after the
 /// `autumn_web::reexports::` prefix is cut. A bare name with no import
-/// counts, as a bare extractor name does, unless a local item shadows it or
-/// an untrusted glob may bring it, as `glob_unknowns` reads it. A reader
+/// counts, as a bare extractor name does. It does not count when a local
+/// item shadows it, or when an untrusted glob may bring it, as
+/// `glob_unknowns` reads it. A reader
 /// nested in a generic argument, as in `State<Request>`, or one from an
 /// untrusted path, does not count.
 pub fn raw_reader(written: &str, site: &Site) -> bool {
@@ -276,16 +431,73 @@ pub fn declared_statuses(route: &Value) -> BTreeSet<i64> {
     if let Some(status) = route
         .get("success_response")
         .and_then(|response| response.get("status"))
-        .and_then(Value::as_i64)
+        .and_then(status_number)
     {
         statuses.insert(status);
     }
     for key in ["additional_responses", "error_responses"] {
         for entry in entries(route, key) {
-            if let Some(status) = entry.get("status").and_then(Value::as_i64) {
+            if let Some(status) = entry.get("status").and_then(status_number) {
                 statuses.insert(status);
             }
         }
     }
     statuses
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn a_well_formed_contract_passes_the_checks() {
+        let contract = json!({ "routes": [{
+            "method": "GET",
+            "path": "/a",
+            "params": null,
+            "success_response": { "status": 200 },
+            "error_responses": [{ "status": 404 }],
+            "request_body": { "required": true, "fields": [{ "name": "x" }] },
+        }] });
+        let routes = contract_routes(&contract).expect("the contract reads");
+        assert_eq!(routes.len(), 1);
+        assert!(check_served_route(routes[0]).is_ok());
+        assert_eq!(declared_statuses(routes[0]), BTreeSet::from([200, 404]));
+    }
+
+    #[test]
+    fn a_contract_python_could_not_read_is_an_error() {
+        assert!(contract_routes(&json!({})).is_err());
+        assert!(contract_routes(&json!({ "routes": [{ "path": "/a" }] })).is_err());
+        assert!(contract_routes(&json!({ "routes": [["GET"]] })).is_err());
+        let bad_param = json!({ "routes": [{ "method": "GET", "path": "/a", "params": [1] }] });
+        assert!(contract_routes(&bad_param).is_err());
+        assert!(check_served_route(&json!({ "method": "GET", "path": "/a" })).is_err());
+        let no_status = json!({
+            "success_response": { "status": 200 },
+            "error_responses": [{ "description": "x" }],
+        });
+        assert!(check_served_route(&no_status).is_err());
+        let list_body = json!({ "success_response": { "status": 200 }, "request_body": ["x"] });
+        assert!(check_served_route(&list_body).is_err());
+    }
+
+    #[test]
+    fn a_whole_float_status_counts_as_its_integer() {
+        let route = json!({
+            "success_response": { "status": 200.0 },
+            "error_responses": [{ "status": "404" }, { "status": 409.5 }],
+        });
+        assert_eq!(declared_statuses(&route), BTreeSet::from([200]));
+    }
+
+    #[test]
+    fn a_missing_and_a_null_param_name_are_one_key() {
+        let route = json!({ "params": [{ "in": "query" }, { "in": "query", "name": null }] });
+        assert_eq!(
+            duplicate_params("GET", "/a", &route),
+            vec!["  GET /a: `None` is documented 2 times in query".to_string()]
+        );
+    }
 }

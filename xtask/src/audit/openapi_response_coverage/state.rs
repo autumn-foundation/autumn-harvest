@@ -7,7 +7,7 @@
 //!
 //! Each file text that a site can point into is interned. Two texts with the
 //! same content are then one allocation. So a cache or a place keyed by the
-//! allocation reads as the Python one keyed by content, and a pointer key is
+//! allocation reads as the Python one keyed by content. A pointer key is
 //! never reused while the intern table holds the text.
 
 use std::cell::RefCell;

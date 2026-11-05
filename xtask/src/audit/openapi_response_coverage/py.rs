@@ -6,9 +6,9 @@
 //! almost all ASCII, so a byte offset there is a character offset too.
 //!
 //! A regex runs on `fancy_regex`, since many patterns use a lookbehind or a
-//! lookahead. Python's `$` matches at the end or before a final newline, so
-//! each pattern compiles in two forms: one for a text that ends in `\n` and
-//! one for any other text. A leading negative lookbehind of one class is
+//! lookahead. Python's `$` matches at the end or before a final newline.
+//! So each pattern compiles in two forms: one for a text that ends in `\n`
+//! and one for any other text. A leading negative lookbehind of one class is
 //! checked by hand. The rest of the pattern then often runs on the plain
 //! `regex` engine, which is much faster.
 
@@ -863,6 +863,18 @@ pub fn lead_len(text: &str) -> usize {
     text.len() - text.trim_start().len()
 }
 
+/// A file text as Python's `Path.read_text()` returns it.
+///
+/// Python reads a file with universal newlines. So `\r\n` and a lone `\r`
+/// each become `\n`, and a line number counts the same on every platform.
+pub fn universal_newlines(text: String) -> String {
+    if text.contains('\r') {
+        text.replace("\r\n", "\n").replace('\r', "\n")
+    } else {
+        text
+    }
+}
+
 /// Python's `repr` of a string, as `str()` of a tuple prints it.
 pub fn repr(text: &str) -> String {
     let quote = if text.contains('\'') && !text.contains('"') {
@@ -949,6 +961,12 @@ mod tests {
     fn balanced_returns_the_whole_text_without_a_match() {
         assert_eq!(paren("(a(b)c)d"), "(a(b)c)");
         assert_eq!(paren("(a"), "(a");
+    }
+
+    #[test]
+    fn a_file_text_reads_with_universal_newlines() {
+        assert_eq!(universal_newlines("a\r\nb\rc\n".to_string()), "a\nb\nc\n");
+        assert_eq!(universal_newlines("a\nb".to_string()), "a\nb");
     }
 
     #[test]

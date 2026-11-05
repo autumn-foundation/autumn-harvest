@@ -78,8 +78,8 @@ pub fn guards(block: &str, position: usize, variable: &str) -> bool {
         }
     }
     // A `match` on the same test reads like the `if`. Its empty-body arm must
-    // let the request through, and the parse must be in the other arm, or
-    // after a `match` whose empty-body arm returns a success.
+    // let the request through. The parse must be in the other arm, or after
+    // a `match` whose empty-body arm returns a success.
     for (start, empty_arm, other_arm, end) in empty_matches(block, variable) {
         if start >= position || rejecting_exit(&empty_arm.2) {
             continue;
@@ -173,9 +173,9 @@ pub fn empty_matches(block: &str, variable: &str) -> Vec<EmptyMatch> {
 /// unless an earlier empty-body test rejects it, as `rejects_empty` reads
 /// it.
 ///
-/// A position in a closure that runs only where it is called, as
-/// `closure_calls` finds, is also read at each call when no guard in the
-/// closure applies. The strictest call decides.
+/// A position can be in a closure that runs only where it is called, as
+/// `closure_calls` finds. It is then also read at each call, when no guard
+/// in the closure applies. The strictest call decides.
 pub fn empty_allowed(block: B<'_>, position: usize, variable: &str, tolerant: bool) -> bool {
     if guards(&block, position, variable) {
         return true;
@@ -195,8 +195,8 @@ pub fn empty_allowed(block: B<'_>, position: usize, variable: &str, tolerant: bo
 /// The arm that runs for an empty body is the block of `if body.is_empty()`,
 /// or the `else` of `if !body.is_empty()`, when `condition_keeps` holds for
 /// the whole condition. It counts when that arm rejects, as
-/// `rejecting_exit` reads it, and the parse is in the other arm or after the
-/// whole `if` in the same scope.
+/// `rejecting_exit` reads it. The parse must then be in the other arm, or
+/// after the whole `if` in the same scope.
 pub fn rejects_empty(block: &str, position: usize, variable: &str) -> bool {
     let pattern = format!(r"\bif\s+(!\s*)?{}\.is_empty\(\)", py::esc(variable));
     for test in py::finditer(&pattern, py::upto(block, position)) {
@@ -251,11 +251,11 @@ pub fn rejects_empty(block: &str, position: usize, variable: &str) -> bool {
 /// Whether a `Result<Json<T>, _>` body is mandatory, since its error
 /// rejects.
 ///
-/// The body is mandatory when a method chain on it ends in `?`, or reaches
-/// `.unwrap()` or `.expect(..)`, before any call that turns the error into
-/// a value. It is also mandatory when an `if` on `.is_err()` or `.is_ok()`
-/// sends the error to a rejection, or when any `Err` or catch-all arm of a
-/// `match` on it rejects. So does an `if let Err(..) = body` block that
+/// The body is mandatory when a method chain on it ends in `?`. It is
+/// mandatory when the chain reaches `.unwrap()` or `.expect(..)` before any
+/// call that turns the error into a value. It is also mandatory when an `if`
+/// on `.is_err()` or `.is_ok()` sends the error to a rejection. So is a body
+/// where any `Err` or catch-all arm of a `match` on it rejects. So does an `if let Err(..) = body` block that
 /// rejects, and the `else` of a `let Ok(..) = body else` or an `if let
 /// Ok(..) = body` that rejects, as `rejecting_exit` reads it. It is
 /// mandatory too when the handler returns it, or a chain on it that keeps
@@ -270,9 +270,10 @@ pub fn rejects_result_body(params: &str, block: B<'_>) -> bool {
 ///
 /// It reads `Option<Json<T>>`, `Option<Bytes>` and `Result<Bytes, _>`.
 /// `error_rejects` reads each with its failure, `None` or `Err`. So the same
-/// forms decide: `ok_or(..)?`, `?`, `.unwrap()`, `.expect(..)`, a failure or
-/// catch-all arm that rejects, `if let` on the failure, a let-else on the
-/// success, and an `if` on an inspection such as `.is_none()`.
+/// forms decide. They are `ok_or(..)?`, `?`, `.unwrap()`, `.expect(..)`, and
+/// a failure or catch-all arm that rejects. They are also `if let` on the
+/// failure, a let-else on the success, and an `if` on an inspection such as
+/// `.is_none()`.
 /// `rejects_result_body` reads `Result<Json<T>, _>`.
 pub fn rejects_wrapped_body(params: &str, block: B<'_>) -> bool {
     let pattern = format!(r"\b([a-z_][a-z_0-9]*)\s*:\s*{OPTION}<\s*{JSON}<");
@@ -399,7 +400,7 @@ pub fn error_rejects_from(
         let (mut verdict, inspection, rest) = walk_chain(py::from(&block, found.end()), kind);
         let before = py::upto(&block, found.start());
         // A chain that still holds the error and is the value of the block
-        // hands that error to the caller, so it rejects like `?` does.
+        // hands that error to the caller. So it rejects like `?` does.
         if verdict == "open" && yields_block_value(before, rest) {
             verdict = "reject";
         }
@@ -660,10 +661,10 @@ pub fn binds_name(block: &str, start: usize, end: usize) -> bool {
 
 /// Whether an extractor use at `position` is a form `error_rejects` reads.
 ///
-/// `rest` is the text after the use and its method chain. The forms are the
-/// whole value of a `match`, an `if let` or a `while let`, a let-else, a
-/// move into another name, and a direct argument of a helper that the audit
-/// can find. Any other use, such as an argument of a macro or a method, or a
+/// `rest` is the text after the use and its method chain. One form is the
+/// whole value of a `match`, an `if let` or a `while let`. The others are a
+/// let-else, a move into another name, and a direct argument of a helper
+/// that the audit can find. Any other use, such as an argument of a macro or a method, or a
 /// field read, is not read. The audit treats it as strict and fails closed.
 pub fn read_elsewhere(block: B<'_>, position: usize, rest: &str) -> bool {
     let before = py::upto(&block, position);
@@ -764,8 +765,8 @@ pub fn rejecting_exit(block: &str) -> bool {
 /// It rejects as `rejecting_arm` reads it. It also rejects when it exits as
 /// `rejecting_exit` reads it, or when its value is a call to a free
 /// function. A call that hands the bound error to a helper is the one
-/// exception, since such a helper can recover the request, as the start
-/// route does (#808). The exception covers that call only. Any other exit of
+/// exception. Such a helper can recover the request, as the start route
+/// does (#808). The exception covers that call only. Any other exit of
 /// the arm that rejects still makes the arm reject. A type path such as
 /// `Gadget::default()` builds a value.
 pub fn arm_rejects(arm: &str, bound: Option<&str>) -> bool {
@@ -1068,7 +1069,7 @@ pub fn fallback_rejects(method: &str, arguments: &str, state: &str) -> bool {
 ///
 /// A value that `SUCCESS_EXIT` matches is a success. Any other value is a
 /// success only when it is a helper call that `builds_rejection` rejects as
-/// a rejection, such as a helper that returns a bare `Json<T>`. Every exit
+/// a rejection. An example is a helper that returns a bare `Json<T>`. Every exit
 /// is read through this one rule.
 pub fn success_value(value: &str) -> bool {
     let value = value.trim();
@@ -1243,8 +1244,7 @@ pub fn ends_expression(after: &str) -> bool {
 /// The struct a `from_slice` call yields, or `None` when it is unnamed.
 ///
 /// A typed `let` or a `Result<T, _>` return type names the call only when
-/// the call ends its expression, since a `.map(..)` after it yields another
-/// type.
+/// the call ends its expression. A `.map(..)` after it yields another type.
 pub fn parse_type(
     turbofish: Option<&str>,
     before: &str,

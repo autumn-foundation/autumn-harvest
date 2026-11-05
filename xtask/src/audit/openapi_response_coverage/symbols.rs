@@ -514,8 +514,8 @@ pub enum Item {
 /// a scanned module, such as `super::*`, brings that module's items. Any
 /// other glob may bind the name. So the result is `None`, and the caller
 /// fails closed. An empty list means no glob decides, so the name follows
-/// its bare rule. A name that no scanned item has is left to that rule too,
-/// since a glob can then bring only an item the audit cannot read.
+/// its bare rule. A name that no scanned item has is left to that rule too.
+/// A glob can then bring only an item the audit cannot read.
 pub fn glob_candidates(found: &[Cand], site: &Site, origin: &str) -> Option<Vec<Cand>> {
     let Some(at) = site.at else {
         return Some(Vec::new());
@@ -856,11 +856,16 @@ fn crate_files(crate_dir: &str) -> Vec<(PathBuf, PathBuf)> {
 }
 
 /// Reads a crate file, recording an error the audit reports.
+///
+/// The text has universal newlines, as `Path.read_text()` gives it.
 fn read_text(path: &Path) -> String {
-    std::fs::read_to_string(path).unwrap_or_else(|error| {
-        py::fail(format!("reading {}: {error}", path.display()));
-        String::new()
-    })
+    std::fs::read_to_string(path).map_or_else(
+        |error| {
+            py::fail(format!("reading {}: {error}", path.display()));
+            String::new()
+        },
+        py::universal_newlines,
+    )
 }
 
 /// Every struct in either crate, as `struct_index` reads it, by bare name.
@@ -889,7 +894,7 @@ pub fn defined_structs() -> Rc<StructIndex> {
 /// The attribute lines above a struct match, then its block.
 ///
 /// An attribute that rustfmt splits over several lines is read up to its
-/// opening `#[`, since its closing `)]` line alone does not start with `#[`.
+/// opening `#[`. Its closing `)]` line alone does not start with `#[`.
 pub fn struct_text(source: &str, start: usize, end: usize) -> String {
     let mut lines: Vec<&str> = py::upto(source, start).split('\n').collect();
     lines.pop();
@@ -1073,10 +1078,10 @@ pub struct Params {
 
 /// A parameter list with each parameter type in its `canonical_type` form.
 ///
-/// Each type is read at its own site in the audited source. A plainly named
-/// parameter whose type is no byte carrier is `possible` when its type has
-/// an alias the audit cannot read, or a head the audit does not know, as
-/// `known_non_bytes` reads it.
+/// Each type is read at its own site in the audited source. Take a plainly
+/// named parameter whose type is no byte carrier. It is `possible` when its
+/// type has an alias the audit cannot read. It is also `possible` when its
+/// type has a head the audit does not know, as `known_non_bytes` reads it.
 pub fn canonical_params(params: &str, opener: usize) -> Rc<Params> {
     state::cached(&CANONICAL_PARAMS, (params.to_string(), opener), || {
         let source = state::source();

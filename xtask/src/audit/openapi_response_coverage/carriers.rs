@@ -267,8 +267,8 @@ pub fn carrier_parses(
 /// `None`.
 ///
 /// A standard conversion is a call of a `std`, `core` or `alloc` path, or of
-/// a standard type such as `String::from_utf8`, with one argument that reads
-/// a live, whole carrier. A trailing success projection or `.map_err(..)`
+/// a standard type such as `String::from_utf8`. It has one argument that
+/// reads a live, whole carrier. A trailing success projection or `.map_err(..)`
 /// keeps it, so `std::str::from_utf8(&body)?` reads `body`. The argument may
 /// copy the carrier through `BYTE_PRESERVING`. So
 /// `String::from_utf8(body.to_vec())` reads `body` too. `handoffs` fails
@@ -519,8 +519,8 @@ pub fn moved_names(block: B<'_>, names: Carriers) -> Carriers {
         // A plain assignment `name = value;` moves a carrier as a `let`
         // does. One that gives a carrier name another value leaves it
         // partial from there. That fails closed, since a branch may skip
-        // it. That is decided only once no name moves, since a later pass
-        // can find a carrier in the value, as in a cycle of plain moves.
+        // it. That is decided only once no name moves. A later pass can
+        // find a carrier in the value, as in a cycle of plain moves.
         let mut rebinds: Vec<(String, usize)> = Vec::new();
         for (target, start, opener, value) in &assigned {
             let flows: Vec<Option<Way>> = found
@@ -579,11 +579,11 @@ pub fn moved_names(block: B<'_>, names: Carriers) -> Carriers {
 
 /// How a `let` value at `opener` holds a carrier that a helper returns.
 ///
-/// When the whole value is one call, with any trailing success projection,
-/// that `byte_call` reads, the result is `"whole"` when `returns_carrier`
+/// The value can be one call that `byte_call` reads, with any trailing
+/// success projection. Then the result is `"whole"` when `returns_carrier`
 /// proves that the helper returns the carrier, and `"partial"` otherwise.
-/// When such a call is anywhere else in the value, as in a branch, a block,
-/// a match arm or a group, the result is `"partial"`. The audit does not
+/// Such a call can also be anywhere else in the value, as in a branch, a
+/// block, a match arm or a group. Then the result is `"partial"`. The audit does not
 /// model which branch runs, so a later parse fails closed. A value that
 /// holds a carrier outside every call is read by `argument_passes`, the
 /// same partial rule. Any other value is `None`. It holds no carrier the
@@ -1203,7 +1203,7 @@ pub fn handoffs(
         return found;
     }
     // An assignment to a target the audit cannot read, such as `self.x` or
-    // `*p`, moves a live carrier out of its view, so it fails closed.
+    // `*p`, moves a live carrier out of its view. So it fails closed.
     for (target, start, opener, value) in assignments(&block).iter() {
         if py::full(r"[a-z_][a-z_0-9]*", target) || in_dead_closure(&block, *start) {
             continue;
@@ -1733,9 +1733,10 @@ pub fn in_dead_closure(block: &str, position: usize) -> bool {
 /// the name or an alias, as `live_binding` reads it, must run the body or
 /// move it to an alias. That is a direct call such as `run()` for a
 /// closure, or `fut.await` for an async block. The body then runs at those
-/// uses, so a guard or an early exit there applies. Any other use, such as
-/// a handoff to a helper, a combinator or a spawn, or an alias that is
-/// wrapped or given another value, may run where the audit cannot see. This
+/// uses, so a guard or an early exit there applies. Any other use may run
+/// where the audit cannot see. Examples are a handoff to a helper, a
+/// combinator or a spawn, or an alias that is wrapped or given another
+/// value. This
 /// is then empty, and the caller reads `position` itself.
 pub fn closure_calls(block: B<'_>, position: usize) -> Vec<usize> {
     // Each body, with the pattern that a use of its name must start with.

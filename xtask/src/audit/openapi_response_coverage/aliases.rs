@@ -294,8 +294,9 @@ pub fn shadow_bound(declared_type: &str, site: &Site) -> String {
 /// `code`.
 ///
 /// It reads `use .. as ..` for `Query`, `Json`, `Bytes` and each of
-/// `serde_json`'s `SERDE_PARSERS`, a module alias of `serde_json`, a plain or
-/// glob import of those parsers, and `type X<..> = Y<..>;`. An import or a
+/// `serde_json`'s `SERDE_PARSERS`. It also reads a module alias of
+/// `serde_json`, a plain or glob import of those parsers, and `type X<..> =
+/// Y<..>;`. An import or a
 /// local item that binds an extractor's name to something else shadows it
 /// in its scope. A type alias to one of those types with the same
 /// parameters is a rename. One with no parameters is replaced by its
@@ -440,8 +441,8 @@ fn alias_declarations_uncached(code: &Text) -> Vec<AliasDecl> {
 /// does not scan, may bring its own `Query`, `Request` or `Option`. A glob
 /// of a scanned module brings such a name only when that module binds it,
 /// as `module_binds` reads it. In the glob's scope, a bare use of such a
-/// name cannot be told apart, unless a plain import in the same scope binds
-/// it, since a plain import wins over a glob.
+/// name cannot be told apart. The exception is a plain import in the same
+/// scope that binds it, since a plain import wins over a glob.
 pub fn glob_unknowns(code: &Text) -> Rc<Vec<(usize, usize, String)>> {
     state::cached(&GLOB_UNKNOWNS, state::key(code), || {
         let globs: Vec<((usize, usize), GlobModule)> = glob_imports(code)

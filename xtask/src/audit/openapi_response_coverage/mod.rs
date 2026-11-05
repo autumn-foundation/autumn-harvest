@@ -58,7 +58,7 @@
 //! returns a byte type, when `returns_carrier` proves that it returns the
 //! body. Any other such result is a partial carrier, so a parse of it fails
 //! closed. So is a value that holds such a call inside a branch, a block, a
-//! match arm or a group, since the audit does not model which branch runs.
+//! match arm or a group. The audit does not model which branch runs.
 //! A copy through a call, such as `body.to_vec()`, is read only inside a
 //! standard conversion. A byte accessor such as `body.as_ref()` is no
 //! handoff. The exception is a local method of that name that may run on
@@ -154,10 +154,10 @@
 //! `KNOWN_DESERIALIZERS` models it. A new custom deserializer must be added
 //! to that table, or its field is a finding.
 //!
-//! Check 7 stops the audit from skipping what it cannot read. These are
-//! findings: a `from_slice` call it cannot read, a body type it cannot
-//! resolve, a `Json<..>` or `Query<..>` extractor it cannot read, and a
-//! struct it cannot find. A generic struct such as `struct Q<'a>` is one it
+//! Check 7 stops the audit from skipping what it cannot read. A
+//! `from_slice` call it cannot read is a finding. So is a body type it
+//! cannot resolve, a `Json<..>` or `Query<..>` extractor it cannot read, and
+//! a struct it cannot find. A generic struct such as `struct Q<'a>` is one it
 //! cannot find.
 //!
 //! A helper called by bare name is found as a free function. So an earlier
@@ -223,8 +223,8 @@ use self::aliases::{
 use self::carriers::{byte_parameters, raw_body_parses, wrapped_carriers};
 use self::mask::masked_source;
 use self::query::{
-    QueryStruct, declared_statuses, documented_query_findings, duplicate_params, entries,
-    query_params, query_struct_findings,
+    QueryStruct, check_served_route, contract_routes, declared_statuses, documented_query_findings,
+    duplicate_params, entries, query_params, query_struct_findings,
 };
 use self::rejects::{error_rejects, rejects_result_body, rejects_wrapped_body};
 use self::scan::{called_helpers, key_arms, overridden_by_with_status, router_routes};
@@ -380,7 +380,7 @@ fn audit_inner(original: &str, contract: &Value, finder: &Finder) -> Result<Foun
     });
     state::set_file_place(&code, location(&[&local.0, &local.1]));
     let globbed = aliases::glob_unknowns(&code);
-    let routes_list = entries(contract, "routes");
+    let routes_list = contract_routes(contract).map_err(|error| anyhow!(error))?;
     let mut by_route: HashMap<(String, String), &Value> = HashMap::new();
     for route in &routes_list {
         let method = route.get("method").and_then(Value::as_str).unwrap_or("");
@@ -399,6 +399,7 @@ fn audit_inner(original: &str, contract: &Value, finder: &Finder) -> Result<Foun
         let Some(route) = by_route.get(&(method.clone(), path.clone())) else {
             continue;
         };
+        check_served_route(route).map_err(|error| anyhow!(error))?;
         let declared = declared_statuses(route);
         let body = parts.block();
         let helpers = called_helpers(body, &parts.params.text);
@@ -746,7 +747,11 @@ fn audit_inner(original: &str, contract: &Value, finder: &Finder) -> Result<Foun
 /// The real run: the router and the handlers of `api.rs` against the
 /// contract.
 fn main() -> Result<ExitCode> {
-    let source = crate::util::read_repo_file("autumn-harvest-plugin/src/api.rs")?;
+    // Python read each file with universal newlines, so a CRLF checkout
+    // gives the same findings.
+    let source = py::universal_newlines(crate::util::read_repo_file(
+        "autumn-harvest-plugin/src/api.rs",
+    )?);
     let contract_text = crate::util::read_repo_file("docs/api-contract.json")?;
     let contract: Value =
         serde_json::from_str(&contract_text).context("parsing docs/api-contract.json")?;

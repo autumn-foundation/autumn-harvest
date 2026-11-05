@@ -181,8 +181,8 @@ pub fn unreadable_serde(block: &StructBlock) -> Vec<String> {
 ///
 /// A key passes when `FIELD_KEEPING` names it, and `rename` only in its
 /// `rename = ".."` form. `deserialize_with` passes only for a deserializer
-/// in `KNOWN_DESERIALIZERS`, when the field has the type that entry accepts
-/// and the audited file defines the function with an `Option<Option<T>>`
+/// in `KNOWN_DESERIALIZERS`. The field must have the type that entry accepts.
+/// The audited file must define the function with an `Option<Option<T>>`
 /// result.
 pub fn unreadable_field_serde(items: &[SerdeItem], declared_type: &str) -> HashSet<String> {
     let mut found = HashSet::new();
