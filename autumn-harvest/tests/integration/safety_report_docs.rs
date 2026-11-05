@@ -476,7 +476,7 @@ fn command_checks_catch_each_bad_command() {
          chaos_tests::oracle_flags_a_duplicate_terminal_event -- --nocapture",
         "cd formal/tla && java -cp \"$TLA2TOOLS_JAR\" tlc2.TLC -metadir /tmp/tlc \
          -config ActivityClaim.cfg ActivityClaim.tla",
-        "scripts/check-formal-models.sh",
+        "cargo xtask check formal-models",
     ];
     for command in ok {
         let problems = command_problems(command, &models, &root);
@@ -503,6 +503,9 @@ fn command_checks_catch_each_bad_command() {
         "cd formal/tla && java -cp x tlc2.TLC -config NoSuch.cfg ActivityClaim.tla",
         "cd formal/tla && java -cp x tlc2.TLC -config ActivityClaim.cfg NoSuch.tla",
         "scripts/no-such-script.sh",
+        "cargo xtask check no-such-check",
+        "cargo xtask no-such-group formal-models",
+        "cargo xtask check",
         "make test",
     ];
     for command in bad {
@@ -653,8 +656,27 @@ fn command_problems(command: &str, models: &str, root: &Path) -> Vec<String> {
             Some((spec, config)) => tlc_problems(&spec, &config, models, root),
         },
         [script, ..] if script.starts_with("scripts/") => script_problems(&root.join(script)),
+        ["cargo", "xtask", group, command, ..] => xtask_problems(group, command, root),
         _ => vec!["the guard knows no such command form".into()],
     }
+}
+
+/// An xtask command must have its module, `xtask/src/<group>/<command>.rs`.
+///
+/// The module name is the command with each `-` as `_`. A module can also be
+/// a directory with a `mod.rs`.
+fn xtask_problems(group: &str, command: &str, root: &Path) -> Vec<String> {
+    let dir = root.join("xtask/src").join(group);
+    let module = command.replace('-', "_");
+    let file = dir.join(format!("{module}.rs"));
+    let nested = dir.join(&module).join("mod.rs");
+    if command.starts_with('-') || !(file.is_file() || nested.is_file()) {
+        return vec![format!(
+            "`cargo xtask {group} {command}` has no module {}",
+            file.display()
+        )];
+    }
+    Vec::new()
 }
 
 /// A script must exist, and on Unix it must be executable.

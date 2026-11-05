@@ -6,7 +6,7 @@
 #   expect  `pass`, or `violation:<Invariant>`
 #
 # A `violation` row is a counter-example. TLC must fail on that invariant
-# and on no other. scripts/check-formal-models.sh runs every row.
+# and on no other. `cargo xtask check formal-models` runs every row.
 # formal_models_coverage.rs fails when a config has no row here.
 
 ActivityClaim      ActivityClaim.cfg                   pass
