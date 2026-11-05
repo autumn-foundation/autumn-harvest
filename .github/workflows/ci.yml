@@ -2767,18 +2767,22 @@ jobs:
       needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     # The models take about 2 minutes and the trace fixtures about 10 seconds.
-    # The runner image has Java and Python.
+    # The runner image has Java. The runners are `cargo xtask` commands.
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Model-check every manifest row with TLC
-        run: scripts/check-formal-models.sh
+        run: cargo xtask check formal-models
       # Issue #2003: TLC must accept each clean fixture trace and reject
       # each red one. The chaos traces are checked in chaos.yml.
       - name: Check the trace fixtures against the TLA+ specs
-        run: scripts/check-formal-traces.sh formal/tla/trace/fixtures
+        run: cargo xtask check formal-traces formal/tla/trace/fixtures
 
-  # Kani proofs of the pure kernels (issue #1819). The script fails when Kani
+  # Kani proofs of the pure kernels (issue #1819). The command fails when Kani
   # verifies fewer proofs than the source holds, or when a cover check fails.
   kani:
     name: Kani proofs
@@ -2800,9 +2804,9 @@ jobs:
           cargo install --locked kani-verifier --version 0.68.0
           cargo kani setup
       - name: Run Kani proofs
-        run: scripts/check-kani-proofs.sh
+        run: cargo xtask check kani-proofs
 
-  # Verus proofs of the integer kernels for every input. The script pins
+  # Verus proofs of the integer kernels for every input. The command pins
   # the Verus release by SHA-256 and installs its Rust toolchain. The guard
   # suite verus_proofs_coverage.rs checks that each proved copy matches the
   # engine source. See docs/testing/formal-methods.md.
@@ -2818,8 +2822,12 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Verify the Verus proofs
-        run: scripts/check-verus-proofs.sh
+        run: cargo xtask check verus-proofs
 
   # Dependency ledger harness (Ballast). Runs `cargo deny check` against
   # `deny.toml`: advisories (RUSTSEC, joined against the lockfile — every

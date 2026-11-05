@@ -9,7 +9,7 @@
 //! * The model holds no Harvest name, and the page tables match it.
 //! * The replay rule survives, and the submission status is recorded.
 //! * Each prose sentence and each YAML text has 25 words or fewer.
-//! * A pinned script runs the upstream Weaver policy checks on the model.
+//! * A pinned xtask check runs the upstream Weaver policy checks on the model.
 //!   A workflow runs it, and the page records its pin.
 //! * The filing follows the upstream process. Section 9 fits the issue form.
 //!   A project proposal fills the community template. Each link in the
@@ -32,7 +32,10 @@ const ADR: &str = "docs/adr/0001-otel-trace-contract.md";
 const TELEMETRY_RS: &str = "autumn-harvest/src/telemetry.rs";
 const TELEMETRY_PAGE: &str = "docs/telemetry.md";
 const FILTER: &str = "--test integration otel_workflow_semconv_docs::";
-const WEAVER_SCRIPT: &str = "scripts/check-otel-workflow-semconv.sh";
+/// The source of the Weaver check.
+const WEAVER_SCRIPT: &str = "xtask/src/check/otel_workflow_semconv.rs";
+/// The command that runs the Weaver check.
+const WEAVER_COMMAND: &str = "cargo xtask check otel-workflow-semconv";
 const WEAVER_WORKFLOW: &str = ".github/workflows/otel-semconv.yml";
 const MODEL_PATHS: &str = "docs/otel-workflow-semconv/**";
 const MAX_SENTENCE_WORDS: usize = 25;
@@ -82,7 +85,7 @@ const ISSUE_AREA: &str = "`area:new`";
 const ISSUE_FIELD: &str = "Propose new conventions";
 
 /// The sections of the community `project-template.md` that are not
-/// "Optional" or "Post-Approval". The script checks the proposal against
+/// "Optional" or "Post-Approval". The Weaver check checks the proposal against
 /// the template itself.
 const PROJECT_SECTIONS: &[&str] = &[
     "## Background and description",
@@ -117,57 +120,62 @@ const OWN_REPO: &str = "https://github.com/autumn-foundation/autumn-harvest/";
 /// The phrase that precedes each copy of the community pin in the docs.
 const COMMUNITY_PIN_PREFIX: &str = "community commit `";
 
-/// Code lines of the Weaver script that must appear exactly, with the reason.
+/// Code lines of the Weaver check that must appear exactly, with the reason.
+///
+/// A code line is a trimmed line of the source that is not a comment.
 const WEAVER_SCRIPT_LINES: &[(&str, &str)] = &[
-    ("set -euo pipefail", "a failed command must fail the script"),
     (
-        r#"*@sha256:*) image="${registry}/${image}" ;;"#,
-        "the script must refuse an image with no digest",
+        "Err(exit_of(status).into())",
+        "a failed command must fail the check",
     ),
-    (r#"place "${model}""#, "run 1 must check this model"),
-    (r#"place "${broken}""#, "run 2 must check the broken copy"),
     (
-        r#"if run_weaver >"${work}/broken.log" 2>&1; then"#,
+        r#"if !image.contains("@sha256:") {"#,
+        "the check must refuse an image with no digest",
+    ),
+    ("weaver.place(&model)?;", "run 1 must check this model"),
+    ("weaver.place(&broken)?;", "run 2 must check the broken copy"),
+    (
+        r#"return fail("error: the negative control passed, so run 1 proves nothing");"#,
         "the broken copy must fail, so a pass is not vacuous",
     ),
     (
-        r#"grep -qxE "[[:space:]]*${line}[[:space:]]*" "${form}" || {"#,
+        "lines(form).iter().any(|l| l.trim_matches(is_space) == line)",
         "the form must hold each line of section 9 as a whole line",
     ),
     (
-        r#"[ -r "${proposal}" ] || {"#,
-        "a missing proposal must fail the script",
+        "let Ok(proposal_bytes) = std::fs::read(&proposal) else {",
+        "a missing proposal must fail the check",
     ),
     (
-        r#"grep -vE '\((Optional|Post-Approval)\)$' || true)""#,
+        r#"let optional = regex::Regex::new(r"\((Optional|Post-Approval)\)$")?;"#,
         "a required section is a heading that is not Optional or Post-Approval",
     ),
     (
-        r#"grep -vxF -f <(printf '%s\n' "${clean}") <<<"${required}" || [ $? -eq 1 ]"#,
+        "let lacks = required.iter().filter(|r| !clean.contains(r)).cloned();",
         "each required heading must be a whole line of the proposal",
     ),
     (
-        r#"grep -xF -f <(printf '%s\n' "${guidance}") <<<"${clean}" || [ $? -eq 1 ]"#,
+        "let keeps = clean.iter().filter(|l| guidance.contains(l)).cloned();",
         "the proposal must replace the guidance text of the template",
     ),
     (
-        r#"missing="$(missing_sections "${proposal}")""#,
-        "the script must check this proposal",
+        "let missing = missing_sections(&clean, &required, &guidance);",
+        "the check must check this proposal",
     ),
     (
-        r#"if [ -z "$(missing_sections "${work}/proposal-broken.md")" ]; then"#,
+        "if missing_sections(&broken, &required, &guidance).is_empty() {",
         "a proposal without a required section must fail, so a pass is not vacuous",
     ),
 ];
 
-/// Text that some code line of the Weaver script must hold, with the reason.
+/// Text that some code line of the Weaver check must hold, with the reason.
 const WEAVER_SCRIPT_PARTS: &[(&str, &str)] = &[
     (
-        r#"clone_at "${semconv_repo}" "${semconv_commit}""#,
-        "the script must check the pinned upstream commit",
+        "clone_at(SEMCONV_REPO, &semconv_commit, &semconv)",
+        "the check must check the pinned upstream commit",
     ),
     (
-        r#"clone_at "${semconv_repo}" "refs/tags/${baseline_tag}""#,
+        r#"&format!("refs/tags/{baseline_tag}")"#,
         "the baseline must be the pinned release",
     ),
     (
@@ -175,16 +183,23 @@ const WEAVER_SCRIPT_PARTS: &[(&str, &str)] = &[
         "the Weaver image comes from the upstream pin",
     ),
     (
-        "^WEAVER_PACKAGES_REPO=",
+        "line.strip_prefix(PACKAGES_PREFIX)",
         "the policy packages come from the upstream pin",
     ),
     (
-        "=~ ^[0-9a-f]{40}$",
+        r#"const PACKAGES_PREFIX: &str = "WEAVER_PACKAGES_REPO=";"#,
+        "the policy packages come from the upstream pin",
+    ),
+    (
+        "if !is_commit(packages_ref) || packages_repo == packages {",
         "the policy packages must be pinned to a commit",
     ),
-    ("--network none", "the container must use local mounts only"),
     (
-        "registry check --v2",
+        r#""--network", "none""#,
+        "the container must use local mounts only",
+    ),
+    (
+        r#""registry", "check", "--v2""#,
         "the flags must match `make check-policies`",
     ),
     (
@@ -202,11 +217,11 @@ const WEAVER_SCRIPT_PARTS: &[(&str, &str)] = &[
         "upstream checks compatibility",
     ),
     (
-        r#"model="${root}/docs/otel-workflow-semconv/model/workflow""#,
-        "the script must check this model",
+        r#"const MODEL: &str = "docs/otel-workflow-semconv/model/workflow";"#,
+        "the check must check this model",
     ),
     (
-        r#"cp -R "$1" "${semconv}/model/workflow""#,
+        r#"let target = self.semconv.join("model/workflow");"#,
         "the model must sit at its upstream path",
     ),
     (
@@ -214,28 +229,28 @@ const WEAVER_SCRIPT_PARTS: &[(&str, &str)] = &[
         "run 1 must fail on a warning for the model",
     ),
     (
-        "grep -qF 'naming_convention_attribute_namespace_collision'",
+        r#"const COLLISION: &str = "naming_convention_attribute_namespace_collision";"#,
         "the broken copy must fail on a package policy, not another error",
     ),
     (
-        r#"clone_at "${community_repo}" "${community_commit}""#,
-        "the script must read the pinned community tree",
+        "clone_at(COMMUNITY_REPO, &community_commit",
+        "the check must read the pinned community tree",
     ),
     (
-        r#"community_commit="$(git ls-remote "${community_repo}" refs/heads/main"#,
+        "main_commit(COMMUNITY_REPO)?",
         "`SEMCONV_LATEST=1` must also read community `main`",
     ),
     (
-        r#"proposal="${root}/docs/otel-workflow-semconv/project-proposal.md""#,
-        "the script must check this proposal",
+        r#"const PROPOSAL: &str = "docs/otel-workflow-semconv/project-proposal.md";"#,
+        "the check must check this proposal",
     ),
     (
         ".github/ISSUE_TEMPLATE/new-conventions.yaml",
         "section 9 follows this upstream form",
     ),
-    ("- area:new", "the form must offer the area of section 9"),
+    ("\"- area:new\"", "the form must offer the area of section 9"),
     (
-        "label: Propose new conventions",
+        "\"label: Propose new conventions\"",
         "the form must have the field of section 9",
     ),
     (
@@ -525,22 +540,22 @@ fn is_upstream_item(text: &str) -> bool {
         })
 }
 
-/// The value of the shell assignment `name="value"` at the start of a line.
-fn pin<'a>(script: &'a str, name: &str) -> Option<&'a str> {
-    script.lines().find_map(|line| {
-        line.strip_prefix(name)?
-            .strip_prefix("=\"")?
-            .split('"')
-            .next()
-    })
+/// The value of the constant `const NAME: &str = "value";` at the start of a
+/// line. `name` is the name in lower case, so `semconv_commit` reads
+/// `SEMCONV_COMMIT`.
+fn pin<'a>(source: &'a str, name: &str) -> Option<&'a str> {
+    let prefix = format!("const {}: &str = \"", name.to_uppercase());
+    source
+        .lines()
+        .find_map(|line| line.strip_prefix(prefix.as_str())?.split('"').next())
 }
 
-/// The full upstream commit SHA that the Weaver script pins.
+/// The full upstream commit SHA that the Weaver check pins.
 fn pinned_commit(script: &str) -> Option<&str> {
     pinned_sha(script, "semconv_commit")
 }
 
-/// The full commit SHA that the script assigns to `name`.
+/// The full commit SHA that the check assigns to the constant `name`.
 fn pinned_sha<'a>(script: &'a str, name: &str) -> Option<&'a str> {
     pin(script, name).filter(|sha| {
         sha.len() == 40
@@ -640,12 +655,15 @@ fn is_separator(cell: &str) -> bool {
     !cell.is_empty() && cell.chars().all(|c| matches!(c, '-' | ':'))
 }
 
-/// The trimmed lines of a shell script that are not comments.
+/// The trimmed lines of a source file that are not comments.
+///
+/// A line that starts with `//` is a comment. So is a shell line that starts
+/// with `#`, and the attribute lines of Rust go with them.
 fn code_lines(script: &str) -> Vec<&str> {
     script
         .lines()
         .map(str::trim)
-        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .filter(|line| !line.is_empty() && !line.starts_with('#') && !line.starts_with("//"))
         .collect()
 }
 
@@ -1092,15 +1110,15 @@ fn the_weaver_check_script_mirrors_upstream() {
     let script = read(WEAVER_SCRIPT);
     assert!(
         pinned_commit(&script).is_some(),
-        "{WEAVER_SCRIPT} must pin `semconv_commit=\"<40-hex SHA>\"`, not a branch"
+        "{WEAVER_SCRIPT} must pin `const SEMCONV_COMMIT: &str = \"<40-hex SHA>\";`, not a branch"
     );
     assert!(
         pin(&script, "baseline_tag").is_some_and(|tag| tag.starts_with('v')),
-        "{WEAVER_SCRIPT} must pin `baseline_tag=\"v<release>\"`"
+        "{WEAVER_SCRIPT} must pin `const BASELINE_TAG: &str = \"v<release>\";`"
     );
     assert!(
         pinned_sha(&script, "community_commit").is_some(),
-        "{WEAVER_SCRIPT} must pin `community_commit=\"<40-hex SHA>\"`, not a branch"
+        "{WEAVER_SCRIPT} must pin `const COMMUNITY_COMMIT: &str = \"<40-hex SHA>\";`, not a branch"
     );
     let code = code_lines(&script);
     let missing: Vec<String> = WEAVER_SCRIPT_LINES
@@ -1120,11 +1138,11 @@ fn the_weaver_check_script_mirrors_upstream() {
     );
 }
 
-/// The steps of `job` that run the Weaver script.
+/// The steps of `job` that run the Weaver check.
 fn script_steps(job: &Value) -> Vec<Value> {
     sequence(job, "steps")
         .into_iter()
-        .filter(|step| str_field(step, "run").is_some_and(|run| run.trim() == WEAVER_SCRIPT))
+        .filter(|step| str_field(step, "run").is_some_and(|run| run.trim() == WEAVER_COMMAND))
         .collect()
 }
 
@@ -1173,17 +1191,17 @@ fn the_weaver_check_runs_when_the_model_changes() {
     let steps = script_steps(pinned);
     assert!(
         !steps.is_empty(),
-        "the `pinned` job must run `{WEAVER_SCRIPT}`"
+        "the `pinned` job must run `{WEAVER_COMMAND}`"
     );
     assert!(
         pinned.get("continue-on-error").is_none(),
-        "the `pinned` job must fail when the script fails"
+        "the `pinned` job must fail when the check fails"
     );
     for step in &steps {
         for key in ["if", "continue-on-error", "env"] {
             assert!(
                 step.get(key).is_none(),
-                "the `pinned` step that runs the script must have no `{key}`"
+                "the `pinned` step that runs the check must have no `{key}`"
             );
         }
     }
@@ -1195,7 +1213,7 @@ fn the_weaver_check_runs_when_the_model_changes() {
         script_steps(latest)
             .iter()
             .any(|step| step["env"]["SEMCONV_LATEST"].as_str() == Some("1")),
-        "the `latest` job must run `{WEAVER_SCRIPT}` with `SEMCONV_LATEST: \"1\"`"
+        "the `latest` job must run `{WEAVER_COMMAND}` with `SEMCONV_LATEST: \"1\"`"
     );
 }
 
@@ -1224,7 +1242,7 @@ fn the_page_records_the_weaver_check() {
     let submission = page_section(&page, SUBMISSION_SECTION);
     let link = format!("../../{WEAVER_SCRIPT}");
     for (text, what) in [
-        (link.as_str(), "the script link"),
+        (link.as_str(), "the link to the check"),
         (short.as_str(), "the pinned commit"),
         (&format!("`{baseline}`"), "the pinned baseline"),
         (community.as_str(), "the pinned community commit"),
@@ -1236,7 +1254,7 @@ fn the_page_records_the_weaver_check() {
     }
     let steps = numbered_items(submission);
     let step = |needle: &str| steps.iter().position(|step| step.contains(needle));
-    let check = step("check-otel-workflow-semconv.sh");
+    let check = step(WEAVER_COMMAND);
     let filing = step("file the text");
     assert!(
         check.is_some() && filing.is_some() && check < filing,
@@ -1451,7 +1469,7 @@ fn the_submission_steps_follow_the_upstream_process() {
             _ => panic!("{SUBMISSION_SECTION} needs exactly one step that holds {needles:?}"),
         }
     };
-    let check = step(&["Run the script", "check-otel-workflow-semconv.sh"]);
+    let check = step(&["Run the check", WEAVER_COMMAND]);
     let issue = step(&["file the text", ISSUE_FORM]);
     let status = step(&["`submitted`"]);
     let project = step(&["open-telemetry/community", "(project-proposal.md)"]);
@@ -1534,28 +1552,34 @@ fn helpers_parse_their_inputs() {
     ));
     let sha = "331541c4057c53d133c32efadaa7b656636eda77";
     assert_eq!(
-        pinned_commit(&format!("x\nsemconv_commit=\"{sha}\"\n")),
+        pinned_commit(&format!("x\nconst SEMCONV_COMMIT: &str = \"{sha}\";\n")),
         Some(sha)
     );
-    assert_eq!(pinned_commit("semconv_commit=\"main\""), None);
+    assert_eq!(pinned_commit("const SEMCONV_COMMIT: &str = \"main\";"), None);
     assert_eq!(
-        pinned_commit(&format!("semconv_commit=\"{}\"", sha.to_uppercase())),
+        pinned_commit(&format!(
+            "const SEMCONV_COMMIT: &str = \"{}\";",
+            sha.to_uppercase()
+        )),
         None
     );
     assert_eq!(pinned_commit("no pin"), None);
     assert_eq!(
         pinned_commit(&format!(
-            "# semconv_commit=\"{sha}\"\nsemconv_commit=\"main\"\n"
+            "// const SEMCONV_COMMIT: &str = \"{sha}\";\nconst SEMCONV_COMMIT: &str = \"main\";\n"
         )),
         None
     );
     assert_eq!(
-        pin("a=\"1\"\nbaseline_tag=\"v1.2.0\"\n", "baseline_tag"),
+        pin(
+            "const A: &str = \"1\";\nconst BASELINE_TAG: &str = \"v1.2.0\";\n",
+            "baseline_tag"
+        ),
         Some("v1.2.0")
     );
     assert_eq!(
-        code_lines("#!/bin/sh\n  # note\n\n  run x  \n"),
-        vec!["run x"]
+        code_lines("#!/bin/sh\n  # note\n\n  run x  \n  // note\n  /// doc\n  let y = 1;\n"),
+        vec!["run x", "let y = 1;"]
     );
     let doc: Value = serde_yaml::from_str("p: [a, 1, b]").expect("valid YAML");
     assert_eq!(strings(&doc, "p"), vec!["a".to_owned(), "b".to_owned()]);
@@ -1567,7 +1591,10 @@ fn helpers_parse_their_inputs() {
 fn link_and_heading_helpers_parse_their_inputs() {
     let sha = "331541c4057c53d133c32efadaa7b656636eda77";
     assert_eq!(
-        pinned_sha(&format!("community_commit=\"{sha}\""), "community_commit"),
+        pinned_sha(
+            &format!("const COMMUNITY_COMMIT: &str = \"{sha}\";"),
+            "community_commit"
+        ),
         Some(sha)
     );
     assert_eq!(

@@ -335,14 +335,18 @@ fn owner_lease_model_has_a_red_config_per_defect_and_a_witness() {
     }
 }
 
-/// The Kani script must run every proof and check the verified count.
+/// The Kani runner must run every proof and check the verified count.
+///
+/// `xtask/src/check/kani_proofs.rs` holds the Kani command line as a string
+/// constant, on a line of its own.
 #[test]
 fn kani_script_runs_every_proof_and_checks_the_count() {
-    let script = read("scripts/check-kani-proofs.sh");
+    let script = read("xtask/src/check/kani_proofs.rs");
     let run = script
         .lines()
-        .find(|l| l.starts_with("cargo kani -p autumn-harvest"))
-        .expect("the script runs `cargo kani -p autumn-harvest`");
+        .map(str::trim)
+        .find(|l| l.starts_with("\"cargo kani -p autumn-harvest"))
+        .expect("the runner runs `cargo kani -p autumn-harvest`");
     for flag in ["--features chaos", "-Z stubbing"] {
         assert!(run.contains(flag), "the Kani run needs `{flag}`");
     }
@@ -354,7 +358,7 @@ fn kani_script_runs_every_proof_and_checks_the_count() {
 
 #[test]
 fn model_runner_reads_the_manifest_and_pins_tlc() {
-    let script = read("scripts/check-formal-models.sh");
+    let script = read("xtask/src/check/formal_models.rs");
     assert!(script.contains("formal/tla/models.txt"));
     assert!(
         script.contains("sha256sum"),
@@ -405,8 +409,8 @@ pub fn formal_job_defect(doc: &Value, job: &str, command: &str) -> Option<String
 fn ci_runs_the_model_checker_and_kani() {
     let ci = parse_workflow(".github/workflows/ci.yml");
     let jobs = [
-        ("formal-models", "scripts/check-formal-models.sh"),
-        ("kani", "scripts/check-kani-proofs.sh"),
+        ("formal-models", "cargo xtask check formal-models"),
+        ("kani", "cargo xtask check kani-proofs"),
     ];
     for (job, command) in jobs {
         if let Some(defect) = formal_job_defect(&ci, job, command) {

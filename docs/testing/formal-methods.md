@@ -27,10 +27,10 @@ and Shuttle, which check in-process concurrency.
 The runner needs Java 11 or later.
 
 ```bash
-scripts/check-formal-models.sh
+cargo xtask check formal-models
 ```
 
-The script downloads `tla2tools.jar` 1.7.4 and checks its SHA-256. To use a
+The command downloads `tla2tools.jar` 1.7.4 and checks its SHA-256. To use a
 local jar, set `TLA2TOOLS_JAR=/path/to/tla2tools.jar`. A full run takes about
 3 minutes on 4 cores. The `OwnerLease` design config takes about 2 minutes
 of it.
@@ -45,7 +45,7 @@ java -cp "$TLA2TOOLS_JAR" tlc2.TLC -metadir /tmp/tlc \
 
 `-metadir` keeps TLC's `states/` directory out of the tree.
 
-The `formal-models` job in `.github/workflows/ci.yml` runs the script. Like
+The `formal-models` job in `.github/workflows/ci.yml` runs the command. Like
 `msrv`, it skips draft PRs and docs-only changes.
 
 ### The manifest
@@ -560,12 +560,12 @@ Issue #2003 checks that the running engine follows `ActivityClaim` and
 history of a task row is a behavior of the spec.
 
 ```bash
-scripts/check-formal-traces.sh formal/tla/trace/fixtures
+cargo xtask check formal-traces formal/tla/trace/fixtures
 ```
 
-`scripts/check-formal-traces.sh` needs Java 11 or later and Python 3. It
-pins the same `tla2tools.jar` as `scripts/check-formal-models.sh`, and it
-reads `TLA2TOOLS_JAR` in the same way. The fixtures take about 10 seconds.
+`cargo xtask check formal-traces` needs Java 11 or later. It uses the
+`tla2tools.jar` pin of `cargo xtask check formal-models`, and it reads
+`TLA2TOOLS_JAR` in the same way. The fixtures take about 10 seconds.
 
 ### Record a trace
 
@@ -622,7 +622,7 @@ its pooled connections serve many claims.
 
 ### Check a trace
 
-`scripts/formal_traces.py` writes a TLA+ module for each check. The module
+`xtask/src/dev/formal_traces.rs` writes a TLA+ module for each check. The module
 holds the trace as the constant `Log`. TLC then checks `ActivityClaimTrace`
 or `WorkflowTaskClaimTrace`, in `formal/tla/trace/`. Each extends its model
 with a line cursor:
@@ -680,7 +680,7 @@ The sources are:
 ### In CI
 
 `chaos.yml` sets `HARVEST_TLA_TRACE_DIR`. After the chaos suite, it runs
-`scripts/check-formal-traces.sh "$HARVEST_TLA_TRACE_DIR"`. The runner checks
+`cargo xtask check formal-traces "$HARVEST_TLA_TRACE_DIR"`. The runner checks
 every trace from the reproducers, the convergence sweep and the
 infrastructure faults. TLC must reject each red trace.
 
@@ -697,7 +697,7 @@ export HARVEST_TLA_TRACE_DIR=/tmp/harvest-traces
 rm -rf "$HARVEST_TLA_TRACE_DIR"
 cargo test -p autumn-harvest --features chaos --test integration chaos_tests:: \
   -- --test-threads=1
-scripts/check-formal-traces.sh "$HARVEST_TLA_TRACE_DIR"
+cargo xtask check formal-traces "$HARVEST_TLA_TRACE_DIR"
 ```
 
 `formal_trace_coverage.rs` fails in these cases:
@@ -705,7 +705,7 @@ scripts/check-formal-traces.sh "$HARVEST_TLA_TRACE_DIR"
 - A fixture is malformed.
 - A spec has no clean fixture, or no red fixture that only the fence rejects.
 - A trace spec does not extend its model.
-- The two runners pin different TLC releases.
+- The trace runner pins its own TLC release.
 - `ci.yml` or `chaos.yml` does not run the runner.
 - The chaos suite does not install the recorder or export its traces.
 - This page does not name a part of the trace check.
@@ -743,21 +743,21 @@ cargo kani setup
 Run every proof:
 
 ```bash
-scripts/check-kani-proofs.sh
+cargo xtask check kani-proofs
 ```
 
-The script runs
+The command runs
 `cargo kani -p autumn-harvest --no-default-features --features chaos -Z stubbing`.
 `chaos` turns on the chaos controller, which holds a proof. `-Z stubbing`
 enables `#[kani::stub]`.
 
 `cargo kani` exits 0 when it finds no proof, and when a `kani::cover!` is
-unsatisfiable. The script fails in both cases. It also fails when Kani
+unsatisfiable. The command fails in both cases. It also fails when Kani
 verifies fewer proofs than the source holds.
 
 To run one proof, call `cargo kani` with the same flags and
 `--harness <name>`. The `kani` job in `.github/workflows/ci.yml` runs the
-script. It skips draft PRs and docs-only changes, like `msrv`. The compile
+command. It skips draft PRs and docs-only changes, like `msrv`. The compile
 takes most of the time. The proofs take about 1 minute together.
 
 ### The proofs
@@ -838,7 +838,7 @@ Three kernels have no Kani proof. Issue #1819 names the first two:
 3. Add `#[kani::unwind(N)]` to a proof with a loop. Kani reports an
    unwinding failure when `N` is too small.
 4. Add `kani::cover!` for an interesting case. A proof whose assumptions
-   exclude every input passes for the wrong reason. The script fails on an
+   exclude every input passes for the wrong reason. The command fails on an
    unsatisfied cover.
 5. Run the proof alone. Keep it under one minute. A slow proof usually
    relates a multiply to a divide, or builds a `Vec` or a `String`. Stub or
@@ -855,18 +855,18 @@ integer kernels that make CBMC time out: a 64-bit multiply, a 128-bit
 product, and a mixer that must be shown to be one to one.
 
 ```bash
-scripts/check-verus-proofs.sh
+cargo xtask check verus-proofs
 ```
 
-The script downloads the pinned Verus release and checks its SHA-256. The pin
+The command downloads the pinned Verus release and checks its SHA-256. The pin
 is a weekly release, because Verus deletes the assets of older rolling builds. To
 use a local binary, set `VERUS=/path/to/verus`. The release names the Rust
-toolchain that it links against, and the script installs that toolchain
+toolchain that it links against, and the command installs that toolchain
 with rustup. The proofs take about 2 seconds. The `verus` job in
-`.github/workflows/ci.yml` runs the script. It skips draft PRs and
+`.github/workflows/ci.yml` runs the command. It skips draft PRs and
 docs-only changes, like `msrv`.
 
-The script fails when Verus reports an error, or when it verifies nothing.
+The command fails when Verus reports an error, or when it verifies nothing.
 
 ### Mirrors
 
@@ -909,7 +909,7 @@ The guard suite fails in these cases:
 - A Verus file sits below `formal/verus/src`, or a proof file loads
   another file with `mod <name>;` or `include!`. No guard would read that
   file.
-- `ci.yml` does not run the script on every PR.
+- `ci.yml` does not run the command on every PR.
 - This page does not name a Verus file or a mirrored function.
 
 A Verus loop states its `invariant`, `invariant_except_break`, `ensures`
@@ -922,7 +922,7 @@ cannot hide code behind it. An engine body that holds a clause keyword
 fails the guard, so the drop changes only the Verus copy.
 
 A change to a mirrored function therefore fails the no-DB suite until the
-copy matches. Port the change, then run the script.
+copy matches. Port the change, then run `cargo xtask check verus-proofs`.
 
 ### The proofs
 
@@ -999,7 +999,7 @@ that no step overflows. The unit test
 3. Write the property as an `ensures` clause. Put proof hints in
    `proof { }` blocks, or in separate lemmas.
 4. Name the Verus file in a comment on the engine function.
-5. Run the script, then the guard suite.
+5. Run `cargo xtask check verus-proofs`, then the guard suite.
 6. Add a row to the table above.
 
 ## Not modelled yet

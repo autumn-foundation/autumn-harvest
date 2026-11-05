@@ -17,7 +17,7 @@ The model files use the upstream Weaver format:
   proposal that the community process needs.
 
 The `otel_workflow_semconv_docs` guard suite keeps this page, the model and
-ADR 0001 in agreement. A script runs the upstream Weaver policy checks on
+ADR 0001 in agreement. An xtask check runs the upstream Weaver policy checks on
 the model, and it checks the draft against the upstream process files.
 Section 10 gives the result.
 
@@ -327,8 +327,9 @@ The steps to submit:
 1. Review this draft, the model and the project proposal.
 2. Sign the CNCF Contributor License Agreement. The community and the
    upstream pull requests need it.
-3. Move the pins in `check-otel-workflow-semconv.sh` to upstream `main`,
-   the latest release and community `main`. Run the script. Then update
+3. Move the pins in `otel_workflow_semconv.rs` to upstream `main`,
+   the latest release and community `main`. Run the check with
+   `cargo xtask check otel-workflow-semconv`. Then update
    each pinned commit and the release in sections 9 and 10.
 4. Check each row of the facts table below again. Update its date. Keep
    the namespace aligned with `open-telemetry/semantic-conventions#1688`.
@@ -359,24 +360,24 @@ Upstream can also ask for a separate OpenTelemetry repository, as it did
 for the GenAI conventions.
 
 The guard suite checks the model shape and the names.
-[`check-otel-workflow-semconv.sh`](../../scripts/check-otel-workflow-semconv.sh)
+[`cargo xtask check otel-workflow-semconv`](../../xtask/src/check/otel_workflow_semconv.rs)
 runs the upstream Weaver policies. It mirrors the `make check-policies`
 recipe at upstream commit `331541c`, with the `v1.44.0` baseline. It uses
 the Weaver image that upstream pins at that commit. The model passes, and
 Weaver reports no warning for it. A copy with a namespace collision fails
 on the upstream naming policy.
 
-The script also checks the process files. At upstream commit `331541c`,
+The check also checks the process files. At upstream commit `331541c`,
 the issue form must offer `area:new` and the "Propose new conventions"
 field. At community commit `9c30b48`, the project proposal must have each
 required section of `project-template.md`. It must keep none of the
 guidance text of the template. A copy without one section must fail.
 
-The `otel-semconv.yml` workflow runs the script on a ready pull request
+The `otel-semconv.yml` workflow runs the check on a ready pull request
 that changes the draft. A weekly job runs it against upstream `main`, the
 latest release and community `main`.
 
-The script runs only the policy checks and the process checks above. The
+The check runs only the policy checks and the process checks above. The
 upstream pull request that follows the project approval needs more files,
 and upstream CI checks each one:
 
@@ -391,7 +392,7 @@ and upstream CI checks each one:
 ### Facts checked
 
 Each row records an external fact that this page or the project proposal
-cites. Each link in section 9 and in the proposal needs a row. The script
+cites. Each link in section 9 and in the proposal needs a row. The check
 checks the issue form and the template, so they have no row.
 
 | Source | Fact | Checked |
