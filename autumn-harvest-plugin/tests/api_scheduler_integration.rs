@@ -4006,11 +4006,19 @@ async fn a_worker_polls_only_the_queues_that_config_names() {
     let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
         .await
         .expect("connect");
-    let registered: Vec<Value> = harvest_workers::table
-        .select(harvest_workers::queues)
-        .load(&mut conn)
-        .await
-        .expect("load workers");
+    // The worker registers its row after `start` returns, so wait for it.
+    let mut registered: Vec<Value> = Vec::new();
+    for _ in 0..100 {
+        registered = harvest_workers::table
+            .select(harvest_workers::queues)
+            .load(&mut conn)
+            .await
+            .expect("load workers");
+        if !registered.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
     assert_eq!(registered, vec![json!(["priority"])]);
 
     let mut runs = Vec::new();
