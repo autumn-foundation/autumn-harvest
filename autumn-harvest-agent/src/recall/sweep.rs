@@ -140,7 +140,8 @@ fn run_nonce() -> String {
 ///
 /// With an overlay store, the profile is the op profile: the bare profile
 /// with the active overlay applied (issue #2556). An overlay can change the
-/// prompt and the model, so the models come from that profile too. An
+/// prompt and the model, so the op model comes from that profile. The pass
+/// model comes from the bare profile, as the episode pass reads it. An
 /// overlay that does not apply gives an error, as it does for an op.
 async fn agent_name(
     harness: &AgentHarness,
@@ -151,6 +152,13 @@ async fn agent_name(
     let bare = harness
         .agent_profile(config)
         .ok_or_else(|| format!("the harness has no profile {config:?}"))?;
+    // The episode pass reads the bare profile, so its model falls back to
+    // the bare profile model and not to the overlay model.
+    let pass = bare
+        .episodes
+        .as_ref()
+        .and_then(|settings| settings.model.clone())
+        .or_else(|| bare.model.clone());
     let profile = if harness.overlays().is_some() {
         let request = OverlayRead {
             kind: config.to_owned(),
@@ -160,14 +168,8 @@ async fn agent_name(
     } else {
         bare
     };
-    // A pass with no model of its own runs on the profile model.
-    let pass = profile
-        .episodes
-        .as_ref()
-        .and_then(|settings| settings.model.as_deref())
-        .or(profile.model.as_deref());
     let mut models = Vec::new();
-    for name in [profile.model.as_deref(), pass] {
+    for name in [profile.model.as_deref(), pass.as_deref()] {
         let identity = harness
             .model(name)?
             .model_id()

@@ -549,3 +549,55 @@ async fn an_overlay_that_does_not_apply_fails_its_item() {
     assert!(failed(&report, WINDOW, OP1_ITEM));
     assert_eq!(model.calls(), 0);
 }
+
+/// The episode pass runs on the bare profile model, not on the overlay
+/// model. A new bare pass model therefore gets new agents, also while an
+/// overlay names another model.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_new_pass_model_runs_again_under_a_model_overlay() {
+    let (_dir, db) = fresh_db();
+    let store = overlay_store();
+    let policy = RefinePolicy {
+        ceilings: PolicyCeilings {
+            models: Some(PolicyModels::new(BTreeSet::from(["alt".to_owned()])).expect("models")),
+            ..PolicyCeilings::default()
+        },
+        ..RefinePolicy::default()
+    };
+    store
+        .set_policy(EPISODES, &policy, None, Provenance::operator("ops"))
+        .await
+        .expect("policy");
+    let overlay = ProfileOverlay {
+        model: Some("alt".to_owned()),
+        ..ProfileOverlay::default()
+    };
+    let version = store
+        .put(EPISODES, &overlay, Provenance::operator("ops"))
+        .await
+        .expect("put");
+    store
+        .activate(EPISODES, version, None, Provenance::operator("ops"))
+        .await
+        .expect("activate");
+    let sweep_pass = |id: &'static str, pass: &Arc<ReaderModel>| {
+        let harness = harness(Arc::new(Named(id, pass.clone())), WINDOW_SIZE)
+            .model_named("alt", Arc::new(Named("alt", ReaderModel::new())))
+            .overlay_store(store.clone());
+        let harness = Arc::new(harness);
+        let db = db.clone();
+        async move {
+            let mut rt = SqliteRuntime::open(&db).expect("the database opens");
+            sqlite::register(&mut rt, Arc::clone(&harness));
+            let configs = [EPISODES.to_owned()];
+            recall::sweep(&mut rt, &harness, &only(OP1_ITEM), &configs).await
+        }
+    };
+    let first = ReaderModel::new();
+    sweep_pass("pass-a", &first).await;
+    assert!(first.calls() > 0, "the pass runs on the bare model");
+
+    let second = ReaderModel::new();
+    sweep_pass("pass-b", &second).await;
+    assert!(second.calls() > 0, "a new pass model runs its own agents");
+}
