@@ -407,14 +407,16 @@ serde_yaml = "0.9"
 # (`tests/loom_models.rs`) never uses testcontainers, so gate it to non-loom
 # builds; the Docker-backed integration tests that DO use it always run under a
 # normal build where `cfg(not(loom))` is true, so this is transparent to them.
+# The light test path (`harvest_light`, below) also skips it.
 [target.'cfg(not(any(loom, harvest_light)))'.dev-dependencies]
 testcontainers = { workspace = true }
 testcontainers-modules = { workspace = true }
 
-# The light test path (issue #2487) sets `--cfg harvest_light`. It skips the
-# heavy dev-dependencies below, so `cargo sandbox-test` builds no Docker client,
-# no benchmark harness and no model checker. Run `cargo sandbox-test` for it.
-# The `tests/`, `benches/` and `examples/` targets need the full set.
+# The light test path (issue #2487) sets `--cfg harvest_light`. The `sandbox-test`
+# alias sets it. The cfg skips the heavy dev-dependencies, so the build has no
+# Docker client, no benchmark harness and no model checker. Each heavy
+# dev-dependency sits in a table that excludes `harvest_light`. The `tests/`,
+# `benches/` and `examples/` targets need the full set.
 [target.'cfg(not(harvest_light))'.dev-dependencies]
 criterion = { version = "0.8", features = ["html_reports", "async_tokio"] }
 

@@ -538,9 +538,12 @@ executor. Other tests run fake `firecracker` and `jailer` scripts, and a fake
 API server.
 
 The first command is the light path. It builds no Diesel, no Docker client and
-no benchmark harness. Its largest compile step stays under 4 GiB, so it fits
-an 8 GiB machine. A `RUSTFLAGS` variable overrides the flag that the alias
-sets, so unset it first.
+no benchmark harness. The largest compile step peaked at 3.3 GiB when we
+measured it, so the build fits an 8 GiB machine.
+
+Cargo drops the flag of the alias when `RUSTFLAGS`, `CARGO_ENCODED_RUSTFLAGS`
+or a `rustflags` entry for the target triple is set. The build then compiles
+the heavy crates again. Unset these settings before you run the alias.
 
 ```sh
 cargo sandbox-test
