@@ -35,6 +35,17 @@ proof fn lemma_apply_all_is_the_union(floor: int, above: Set < int >, applied: S
 pub proof fn theorem_each_number_applies_once(seqs: Seq < int >, i: int) requires forall | j: int | 0 <= j < seqs.len() ==> 1 <= #[trigger] seqs [j], 0 <= i < seqs.len(), ensures ({ let before = apply_all(0, Set::empty(), seqs.take(i)); spec_is_new(before.0, seqs [i], before.1.contains(seqs [i])) ==! seqs.take(i).contains(seqs [i],) }), encodes(apply_all(0, Set::empty(), seqs).0, apply_all(0, Set::empty(), seqs).1, seqs.to_set(),),
 pub proof fn theorem_the_bound_makes_no_false_duplicate(floor: int, above: Set < int >, applied: Set < int >, seq: int, forgot: int,) requires sound(floor, above, applied), 1 <= seq, ensures ! spec_is_new(floor, seq, above.contains(seq)) ==> applied.contains(seq), sound(apply(floor, above, seq).0, apply(floor, above, seq).1, applied.insert(seq)), sound(floor, above.remove(forgot), applied),
 
+## formal/verus/src/agent_dispatch.rs
+pub const MAX_DISPATCH_PASSES: u32 = 256;
+pub open spec fn cap(max: int) -> int { if max == 0 { 1 } else if max > 256 { 256 } else { max } }
+pub open spec fn started(due: int, max: int) -> int { if due < cap(max) { due } else { cap(max) } }
+pub fn dispatch_passes(due: u64, max: u32) -> (r: u64) ensures r == started(due as int, max as int),
+pub proof fn theorem_a_firing_keeps_its_bound(due: int, max: int) requires 0 <= due, 0 <= max, ensures 1 <= cap(max) <= 256, 0 <= started(due, max) <= cap(max), started(due, max) <= due,
+pub proof fn theorem_a_due_agent_makes_progress(due: int, max: int) requires 0 < due, 0 <= max, ensures 1 <= started(due, max),
+pub proof fn theorem_agents_in_the_bound_never_wait(due: int, max: int) requires 0 <= due <= cap(max), 0 <= max, ensures started(due, max) == due,
+pub open spec fn left(due: int, max: int, n: nat) -> int decreases n, { if n == 0 { due } else { left(due - started(due, max), max, (n - 1) as nat) } }
+pub proof fn theorem_the_queue_drains(due: int, max: int, n: nat) requires 0 <= due, 0 <= max, due <= n * cap(max), ensures left(due, max, n) == 0, decreases n,
+
 ## formal/verus/src/agent_episodes.rs
 pub open spec fn bound(max: int) -> int { if max == 0 { 1 } else { max } }
 pub open spec fn evicted(len: int, max: int) -> int { if len < bound(max) { 0 } else { len - bound(max) + 1 } }

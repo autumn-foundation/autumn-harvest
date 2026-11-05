@@ -24,8 +24,8 @@ use autumn_harvest_agent::consolidate_all::{
 use autumn_harvest_agent::episode::{EpisodeSettings, EpisodeStore, InMemoryEpisodeStore};
 use autumn_harvest_agent::{
     AgentError, AgentHarness, AgentId, AgentMemory, AgentOp, AgentProfile, ChatRequest,
-    ChatResponse, ChatRole, ContentPart, ErrorKind, InMemoryMemoryStore, MemoryScope, MemoryStore,
-    StopReason, TokenUsage, sqlite,
+    ChatResponse, ChatRole, ContentPart, ErrorKind, InMemoryMemoryStore, Mandate, MemoryScope,
+    MemoryStore, StopReason, TokenUsage, sqlite,
 };
 use autumn_harvest_sqlite::{ExecutionFilter, RunState, ScheduleTrigger, SqliteRuntime};
 use common::{Reply, TryFnModel, runtime};
@@ -310,6 +310,15 @@ async fn one_firing_starts_at_most_max_passes_and_the_rest_wait() {
     for name in ["d3", "d1", "d2"] {
         say(&mut rt, &desk(name), name).await;
     }
+    let mut times = Vec::new();
+    for name in ["d3", "d1", "d2"] {
+        let log = episodes
+            .load(&consolidate::episode_scope(&desk(name)))
+            .await
+            .unwrap();
+        times.push(log.pending(1)[0].at_ms);
+    }
+    assert!(times[0] < times[1] && times[1] < times[2], "{times:?}");
     let two = ConsolidateAll::new().max_passes(2);
 
     let first = fire(&mut rt, &two).await;
@@ -324,6 +333,42 @@ async fn one_firing_starts_at_most_max_passes_and_the_rest_wait() {
     assert_eq!(started(&second), ["desk/d2"], "{second:?}");
     assert_eq!(second.waiting, 0);
     assert_eq!(second.idle, 2);
+    assert_eq!(pending(&episodes, &desk("d2")).await, 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stuck_agent_does_not_starve_the_others() {
+    let (_dir, db) = fresh_db();
+    let episodes = Arc::new(InMemoryEpisodeStore::default());
+    let memory = Arc::new(InMemoryMemoryStore::new());
+    // A pass over the episode `stuck` never parses, so it marks nothing and
+    // its episode stays the oldest.
+    let model = TryFnModel::new(|request| -> Reply {
+        if is_pass(request) && user_text(request).contains("stuck") {
+            return Ok(text_reply("no facts here"));
+        }
+        Ok(answer(request))
+    });
+    let mut rt = runtime(&db, harness(&db, model, &episodes, &memory));
+    say(&mut rt, &desk("d1"), "stuck").await;
+    say(&mut rt, &desk("d2"), "fine").await;
+    let one = ConsolidateAll::new().max_passes(1);
+
+    let first = fire(&mut rt, &one).await;
+    assert_eq!(
+        started(&first),
+        ["desk/d1"],
+        "the oldest episode goes first"
+    );
+    assert_eq!(first.passes[0].stop, Some(ConsolidationStop::InvalidReply));
+    let second = fire(&mut rt, &one).await;
+    assert_eq!(
+        started(&second),
+        ["desk/d2"],
+        "the stuck agent waits its turn"
+    );
+    let third = fire(&mut rt, &one).await;
+    assert_eq!(started(&third), ["desk/d1"], "{third:?}");
     assert_eq!(pending(&episodes, &desk("d2")).await, 0);
 }
 
@@ -399,6 +444,30 @@ async fn a_dispatcher_with_no_directory_fails_with_a_named_error() {
     };
     // SQLite keeps the message of the named error. It names the fix.
     assert!(error.contains("call AgentHarness::directory"), "{error}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_kind_whose_mandate_forbids_the_pass_model_is_not_served() {
+    let (_dir, db) = fresh_db();
+    let episodes = Arc::new(InMemoryEpisodeStore::default());
+    let memory = Arc::new(InMemoryMemoryStore::new());
+    let model = echo_model();
+    let forbidden = AgentProfile::new("locked")
+        .memory(AgentMemory::Store)
+        .episodes(EpisodeSettings::default().model("cheap"))
+        .mandate(Mandate::new("locked").models(["main"]));
+    let harness = harness(&db, model.clone(), &episodes, &memory)
+        .model_named("cheap", model.clone())
+        .model_named("main", model.clone())
+        .agent(forbidden);
+    let mut rt = runtime(&db, harness);
+    let locked = AgentId::new("locked", "l1").unwrap();
+    say(&mut rt, &locked, "one").await;
+    say(&mut rt, &desk("d1"), "two").await;
+
+    let report = fire(&mut rt, &ConsolidateAll::default()).await;
+    assert_eq!(report.listed, 1, "{report:?}");
+    assert_eq!(started(&report), ["desk/d1"]);
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -260,7 +260,7 @@ fn the_engine_registration_builds() {
         .activities(activities())
         .state(AgentHarness::new(ScriptedModel::new(Vec::new())))
         .build();
-    assert_eq!(built.workflow_count(), 6);
+    assert_eq!(built.workflow_count(), 7);
     assert!(built.state::<AgentHarness>().is_some());
     let names: Vec<&str> = activities().iter().map(|a| a.name).collect();
     assert_eq!(
@@ -286,6 +286,7 @@ fn the_engine_registration_builds() {
             "agent_consolidate_read",
             "agent_consolidate_turn",
             "agent_consolidate_write",
+            "agent_consolidate_due",
             "agent_episode_append",
             "agent_episode_reset",
         ]
@@ -300,6 +301,7 @@ fn the_engine_registration_builds() {
             autumn_harvest_agent::sampling::DRAWS_WORKFLOW_NAME,
             autumn_harvest_agent::sampling::SAMPLE_WORKFLOW_NAME,
             autumn_harvest_agent::CONSOLIDATE_WORKFLOW_NAME,
+            autumn_harvest_agent::CONSOLIDATE_ALL_WORKFLOW_NAME,
         ]
     );
 }

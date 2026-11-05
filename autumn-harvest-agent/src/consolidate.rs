@@ -35,7 +35,7 @@ use autumn_harvest::policy::{RetryPolicy, Schedule, WorkflowSchedule};
 use autumn_harvest::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use crate::agent::AgentId;
+use crate::agent::{AgentId, AgentMemory, AgentProfile};
 use crate::consolidate_all::{CONSOLIDATE_ALL_WORKFLOW_NAME, ConsolidateAll};
 use crate::episode::{Appended, Episode, EpisodeReset, EpisodeSettings, PassMark, fact_hash};
 use crate::error::ErrorKind;
@@ -65,8 +65,10 @@ pub const MAX_REFUSAL_BYTES: usize = 256;
 /// The output cap of the model call of a pass.
 pub const PASS_OUTPUT_TOKENS: u32 = 2_048;
 
-/// The input of [`agent_consolidate`].
+/// The input of [`agent_consolidate`]. Build it with [`ConsolidateTask::new`]
+/// or [`ConsolidateTask::dispatched`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ConsolidateTask {
     /// The agent whose episodes the pass reads.
     pub agent: AgentId,
@@ -689,6 +691,39 @@ pub(crate) async fn run_turn<'a>(
     (Ok(facts), vec![call])
 }
 
+/// The model of a pass of a kind with `profile`. `None` is the default
+/// model.
+fn pass_model(profile: &AgentProfile) -> Option<String> {
+    profile
+        .episodes
+        .as_ref()
+        .and_then(|settings| settings.model.clone())
+        .or_else(|| profile.model.clone())
+}
+
+/// Why no pass of a kind with `profile` can run, or `None` when one can.
+///
+/// The kind needs episodes and `AgentMemory::Store`. A pass runs for the
+/// agent, so it takes the model rule of its mandate, as each op does.
+pub(crate) fn pass_disabled(profile: &AgentProfile) -> Option<String> {
+    if profile.episodes.is_none() {
+        return Some("the kind keeps no episodes".to_owned());
+    }
+    if profile.memory != AgentMemory::Store {
+        return Some("episodes need AgentMemory::Store".to_owned());
+    }
+    let model = pass_model(profile);
+    if let Some(mandate) = &profile.mandate
+        && !mandate.allows_model(model.as_deref())
+    {
+        return Some(format!(
+            "the mandate forbids the pass model {:?}",
+            model.as_deref().unwrap_or(crate::DEFAULT_MODEL)
+        ));
+    }
+    None
+}
+
 /// Read the setting and the unconsolidated episodes of a pass.
 pub(crate) async fn read_pass(
     harness: &AgentHarness,
@@ -700,25 +735,15 @@ pub(crate) async fn read_pass(
             agent.kind()
         )));
     };
-    let Some(settings) = profile.episodes.clone() else {
+    if let Some(reason) = pass_disabled(&profile) {
+        return Ok(ConsolidateRead::disabled(reason));
+    }
+    let (Some(settings), Some(memory_scope)) =
+        (profile.episodes.clone(), profile.memory_scope(agent))
+    else {
         return Ok(ConsolidateRead::disabled("the kind keeps no episodes"));
     };
-    let Some(memory_scope) = profile.memory_scope(agent) else {
-        return Ok(ConsolidateRead::disabled(
-            "episodes need AgentMemory::Store",
-        ));
-    };
-    // A pass runs for the agent, so it takes the model rule of its mandate,
-    // as each op does.
-    let model = settings.model.clone().or_else(|| profile.model.clone());
-    if let Some(mandate) = &profile.mandate
-        && !mandate.allows_model(model.as_deref())
-    {
-        return Ok(ConsolidateRead::disabled(format!(
-            "the mandate forbids the pass model {:?}",
-            model.as_deref().unwrap_or(crate::DEFAULT_MODEL)
-        )));
-    }
+    let model = pass_model(&profile);
     let store = harness.episode_store()?;
     let scope = episode_scope(agent);
     let log = harness

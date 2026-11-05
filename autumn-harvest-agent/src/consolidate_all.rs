@@ -12,9 +12,14 @@
 //! 2. It loads the episode log of each agent. An agent with no pending
 //!    episode is idle and gets no pass. An agent whose pass still runs gets
 //!    no second pass.
-//! 3. It sorts the other agents by their oldest pending episode, then by
-//!    agent id. [`dispatch_passes`] gives how many passes start. The rest
-//!    wait for the next firing.
+//! 3. It sorts the other agents in turn order: the agent whose last pass
+//!    started first, then the oldest pending episode, then the agent id. An
+//!    agent with no pass yet goes first. [`dispatch_passes`] gives how many
+//!    passes start. The rest wait for the next firing.
+//!
+//! The turn order is round robin. A pass that ends without a mark, for
+//! example on a spent budget, sends its agent to the back. So a stuck agent
+//! never holds a slot of the bound on each firing.
 //! 4. The workflow starts one child pass for each picked agent, and waits
 //!    for each one.
 //!
@@ -26,15 +31,16 @@ use std::time::Duration;
 use autumn_harvest::failure::{ActivityFailure, IntoActivityErrorString};
 use autumn_harvest::policy::RetryPolicy;
 use autumn_harvest::prelude::*;
+use futures::StreamExt as _;
 use serde::{Deserialize, Serialize};
 
 use crate::agent::{AgentId, AgentProfile};
 use crate::bounds::dispatch_passes;
 use crate::consolidate::{
     CONSOLIDATE_WORKFLOW_NAME, ConsolidateTask, ConsolidationReport, ConsolidationStop,
-    episode_scope,
+    MAX_REFUSAL_BYTES, episode_scope, pass_disabled,
 };
-use crate::episode::ConsolidationTrigger;
+use crate::episode::{ConsolidationTrigger, EpisodeStore};
 use crate::error::AgentError;
 use crate::harness::AgentHarness;
 use crate::model::BoxFuture;
@@ -58,14 +64,41 @@ pub trait AgentDirectory: Send + Sync + std::fmt::Debug {
     /// Returns an error when the directory cannot read.
     fn agents<'a>(&'a self, kind: &'a str) -> BoxFuture<'a, Result<Vec<AgentId>, AgentError>>;
 
-    /// Whether a pass of `agent` still runs, by the search attribute
-    /// `agent_consolidation_of`.
+    /// The last pass of `agent`, by the search attribute
+    /// `agent_consolidation_of`. A pass that still runs comes first. `None`
+    /// when the agent has no such pass.
     ///
     /// # Errors
     ///
     /// Returns an error when the directory cannot read.
-    fn pass_runs<'a>(&'a self, agent: &'a AgentId) -> BoxFuture<'a, Result<bool, AgentError>>;
+    fn last_pass<'a>(
+        &'a self,
+        agent: &'a AgentId,
+    ) -> BoxFuture<'a, Result<Option<LastPass>, AgentError>>;
 }
+
+/// The last pass of an agent, as an [`AgentDirectory`] reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LastPass {
+    /// The pass still runs.
+    pub running: bool,
+    /// When the pass started, in epoch milliseconds.
+    pub started_ms: i64,
+}
+
+/// One due agent of a firing, with its turn order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DueAgent {
+    /// The agent.
+    pub agent: AgentId,
+    /// When its last pass started. `None` when it had no pass.
+    pub last_pass_ms: Option<i64>,
+    /// When its oldest pending episode was recorded.
+    pub oldest_ms: i64,
+}
+
+/// The most agents that one read reads at the same time.
+pub const READ_CONCURRENCY: usize = 8;
 
 /// The input of [`agent_consolidate_all`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -73,7 +106,7 @@ pub trait AgentDirectory: Send + Sync + std::fmt::Debug {
 #[non_exhaustive]
 pub struct ConsolidateAll {
     /// The most passes of one firing. 0 counts as 1. The cap is
-    /// [`MAX_DISPATCH_PASSES`].
+    /// [`MAX_DISPATCH_PASSES`](crate::bounds::MAX_DISPATCH_PASSES).
     pub max_passes: u32,
 }
 
@@ -115,6 +148,8 @@ pub struct DueRead {
     pub running: u64,
     /// The agents with pending episodes and no running pass.
     pub due: u64,
+    /// The agents whose read failed. They wait for the next firing.
+    pub unreadable: u64,
 }
 
 /// The end of one pass of a firing.
@@ -144,6 +179,8 @@ pub struct DispatchReport {
     pub running: u64,
     /// The agents with pending episodes and no running pass.
     pub due: u64,
+    /// The agents whose read failed. They wait for the next firing.
+    pub unreadable: u64,
     /// The passes that this firing started.
     pub started: u64,
     /// The due agents that wait for the next firing.
@@ -183,6 +220,7 @@ pub async fn agent_consolidate_all(
         idle: read.idle,
         running: read.running,
         due: read.due,
+        unreadable: read.unreadable,
         started: agents.len() as u64,
         waiting: read.due.saturating_sub(agents.len() as u64),
         ..DispatchReport::default()
@@ -214,7 +252,7 @@ pub async fn agent_consolidate_all(
                 DispatchedPass {
                     agent,
                     stop: None,
-                    error: Some(err),
+                    error: Some(crate::agent::cut(&err, MAX_REFUSAL_BYTES)),
                 }
             }
         };
@@ -226,6 +264,10 @@ pub async fn agent_consolidate_all(
 /// The kinds that the dispatcher serves: each profile with `episodes` set
 /// and the trigger `Schedule`. When two profiles share a kind, the later
 /// one wins, as in `AgentHarness::agent_profile`.
+///
+/// A kind whose pass can never run is not served, for example when its
+/// mandate forbids the pass model. Its agents would hold a slot of the
+/// bound on each firing and pay for a child run with no model call.
 fn scheduled_kinds(profiles: &[AgentProfile]) -> Vec<String> {
     let mut seen = BTreeSet::new();
     let mut kinds = Vec::new();
@@ -236,7 +278,8 @@ fn scheduled_kinds(profiles: &[AgentProfile]) -> Vec<String> {
         let scheduled = profile
             .episodes
             .as_ref()
-            .is_some_and(|settings| settings.trigger == ConsolidationTrigger::Schedule);
+            .is_some_and(|settings| settings.trigger == ConsolidationTrigger::Schedule)
+            && pass_disabled(profile).is_none();
         if scheduled {
             kinds.push(profile.kind.clone());
         }
@@ -245,27 +288,77 @@ fn scheduled_kinds(profiles: &[AgentProfile]) -> Vec<String> {
     kinds
 }
 
-/// The agents of one firing, oldest pending episode first.
+/// The agents of one firing, in turn order.
 ///
-/// `candidates` holds each due agent and the time of its oldest pending
-/// episode. A tie goes to the lower agent id. The result holds at most
-/// [`dispatch_passes`] agents.
+/// An agent with no pass goes first. Then the agent whose last pass started
+/// first, then the oldest pending episode, then the lower agent id. The
+/// result holds at most [`dispatch_passes`] agents.
 #[must_use]
-pub fn pick_due(mut candidates: Vec<(AgentId, i64)>, max_passes: u32) -> Vec<AgentId> {
-    candidates.sort_by(|(a, at_a), (b, at_b)| at_a.cmp(at_b).then_with(|| a.cmp(b)));
+pub fn pick_due(mut candidates: Vec<DueAgent>, max_passes: u32) -> Vec<AgentId> {
+    candidates.sort_by(|a, b| {
+        a.last_pass_ms
+            .cmp(&b.last_pass_ms)
+            .then_with(|| a.oldest_ms.cmp(&b.oldest_ms))
+            .then_with(|| a.agent.cmp(&b.agent))
+    });
     let bound = dispatch_passes(candidates.len() as u64, max_passes);
     candidates
         .into_iter()
         .take(usize::try_from(bound).unwrap_or(usize::MAX))
-        .map(|(agent, _at)| agent)
+        .map(|due| due.agent)
         .collect()
+}
+
+/// What the read finds for one agent.
+enum Found {
+    /// No pending episode.
+    Idle,
+    /// A pass still runs.
+    Running,
+    /// A pass is due.
+    Due(DueAgent),
+    /// The read failed.
+    Unreadable,
+}
+
+/// Read one agent: its episode log, then its last pass.
+async fn read_agent(
+    harness: &AgentHarness,
+    directory: &dyn AgentDirectory,
+    store: &dyn EpisodeStore,
+    agent: AgentId,
+) -> Found {
+    let read = async {
+        let log = harness
+            .hooked("the episode store", store.load(&episode_scope(&agent)))
+            .await?;
+        let Some(oldest) = log.pending(1).into_iter().next() else {
+            return Ok(Found::Idle);
+        };
+        let last = harness
+            .hooked("the agent directory", directory.last_pass(&agent))
+            .await?;
+        if last.is_some_and(|pass| pass.running) {
+            return Ok(Found::Running);
+        }
+        Ok::<_, String>(Found::Due(DueAgent {
+            agent: agent.clone(),
+            last_pass_ms: last.map(|pass| pass.started_ms),
+            oldest_ms: oldest.at_ms,
+        }))
+    };
+    read.await.unwrap_or_else(|err| {
+        tracing::warn!(agent = %agent, error = %err, "the consolidation read of an agent failed");
+        Found::Unreadable
+    })
 }
 
 /// Read the due agents of one firing.
 ///
 /// A harness with no scheduled kind returns an empty read and needs no
-/// directory. Each directory or store error fails the read, so the
-/// activity retries.
+/// directory. A failed list of a kind fails the read, so the activity
+/// retries. A failed read of one agent counts as `unreadable`, so one bad
+/// agent never stops the passes of the others.
 pub(crate) async fn read_due(
     harness: &AgentHarness,
     task: &ConsolidateAll,
@@ -276,34 +369,34 @@ pub(crate) async fn read_due(
     }
     let directory = harness.agent_directory()?;
     let store = harness.episode_store()?;
-    let mut read = DueRead::default();
-    let mut candidates = Vec::new();
+    let mut listed = Vec::new();
     for kind in &kinds {
         let mut agents = harness
             .hooked("the agent directory", directory.agents(kind))
             .await?;
-        agents.sort();
-        agents.dedup();
         // A directory may return an agent of another kind. Its own kind
         // decides its trigger, so skip it here.
         agents.retain(|agent| agent.kind() == kind);
-        for agent in agents {
-            read.listed = read.listed.saturating_add(1);
-            let log = harness
-                .hooked("the episode store", store.load(&episode_scope(&agent)))
-                .await?;
-            let Some(oldest) = log.pending(1).into_iter().next() else {
-                read.idle = read.idle.saturating_add(1);
-                continue;
-            };
-            let runs = harness
-                .hooked("the agent directory", directory.pass_runs(&agent))
-                .await?;
-            if runs {
-                read.running = read.running.saturating_add(1);
-                continue;
-            }
-            candidates.push((agent, oldest.at_ms));
+        listed.extend(agents);
+    }
+    listed.sort();
+    listed.dedup();
+    let mut read = DueRead {
+        listed: listed.len() as u64,
+        ..DueRead::default()
+    };
+    let found: Vec<Found> = futures::stream::iter(listed)
+        .map(|agent| read_agent(harness, directory.as_ref(), store.as_ref(), agent))
+        .buffered(READ_CONCURRENCY)
+        .collect()
+        .await;
+    let mut candidates = Vec::new();
+    for item in found {
+        match item {
+            Found::Idle => read.idle = read.idle.saturating_add(1),
+            Found::Running => read.running = read.running.saturating_add(1),
+            Found::Unreadable => read.unreadable = read.unreadable.saturating_add(1),
+            Found::Due(due) => candidates.push(due),
         }
     }
     read.due = candidates.len() as u64;
@@ -327,7 +420,7 @@ pub(crate) fn directory_missing() -> String {
 /// Returns `AgentDirectoryMissing` or `EpisodeStoreMissing` when a scheduled
 /// kind exists, or a directory or store error.
 #[activity(
-    start_to_close = "5m",
+    start_to_close = "15m",
     retry = RetryPolicy::exponential(3, Duration::from_secs(1))
 )]
 pub async fn agent_consolidate_due(
@@ -358,15 +451,71 @@ mod tests {
         assert!(failure.non_retryable);
     }
 
+    fn due(name: &str, last_pass_ms: Option<i64>, oldest_ms: i64) -> DueAgent {
+        DueAgent {
+            agent: id(name),
+            last_pass_ms,
+            oldest_ms,
+        }
+    }
+
     #[test]
     fn the_oldest_pending_episode_goes_first() {
-        let picked = pick_due(vec![(id("b"), 5), (id("c"), 1), (id("a"), 5)], 16);
+        let picked = pick_due(
+            vec![due("b", None, 5), due("c", None, 1), due("a", None, 5)],
+            16,
+        );
         assert_eq!(picked, [id("c"), id("a"), id("b")]);
     }
 
     #[test]
+    fn the_least_recent_pass_goes_first() {
+        // `stuck` has the oldest episode, but its pass ran last.
+        let picked = pick_due(
+            vec![
+                due("stuck", Some(30), 1),
+                due("late", Some(10), 9),
+                due("new", None, 20),
+            ],
+            2,
+        );
+        assert_eq!(picked, [id("new"), id("late")]);
+    }
+
+    proptest::proptest! {
+        /// A due agent gets a pass within `ceil(due / bound)` firings, when
+        /// each started pass becomes the newest pass and no agent joins.
+        #[test]
+        fn round_robin_serves_each_due_agent(
+            lasts in proptest::collection::vec(proptest::option::of(0_i64..50), 1..40),
+            max in 1_u32..8,
+        ) {
+            let mut queue: Vec<DueAgent> = lasts
+                .iter()
+                .enumerate()
+                .map(|(n, last)| due(&format!("a{n:02}"), *last, 0))
+                .collect();
+            let firings = queue.len().div_ceil(max as usize);
+            let mut served = BTreeSet::new();
+            for firing in 0..firings {
+                let picked = pick_due(queue.clone(), max);
+                for agent in &picked {
+                    let now = 1_000 + i64::try_from(firing).unwrap();
+                    if let Some(item) = queue.iter_mut().find(|item| &item.agent == agent) {
+                        item.last_pass_ms = Some(now);
+                    }
+                    served.insert(agent.clone());
+                }
+            }
+            proptest::prop_assert_eq!(served.len(), queue.len());
+        }
+    }
+
+    #[test]
     fn a_pick_keeps_its_bound() {
-        let many: Vec<(AgentId, i64)> = (0..300).map(|n| (id(&format!("a{n:03}")), n)).collect();
+        let many: Vec<DueAgent> = (0..300)
+            .map(|n| due(&format!("a{n:03}"), None, n))
+            .collect();
         assert_eq!(pick_due(many.clone(), 2).len(), 2);
         assert_eq!(pick_due(many.clone(), 0).len(), 1);
         assert_eq!(pick_due(many, u32::MAX).len(), MAX_DISPATCH_PASSES as usize);
@@ -383,6 +532,10 @@ mod tests {
             stored("off"),
             // The later profile of `b` keeps no episodes.
             stored("b"),
+            AgentProfile::new("state").episodes(EpisodeSettings::default()),
+            stored("locked")
+                .episodes(EpisodeSettings::default().model("cheap"))
+                .mandate(crate::Mandate::new("locked").models(["main"])),
         ];
         assert_eq!(scheduled_kinds(&profiles), ["a"]);
     }

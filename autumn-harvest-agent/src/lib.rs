@@ -159,7 +159,7 @@ pub use consolidate::{
     agent_consolidate, agent_consolidate_info,
 };
 pub use consolidate_all::{
-    AgentDirectory, CONSOLIDATE_ALL_WORKFLOW_NAME, ConsolidateAll, DispatchReport,
+    AgentDirectory, CONSOLIDATE_ALL_WORKFLOW_NAME, ConsolidateAll, DispatchReport, LastPass,
     agent_consolidate_all, agent_consolidate_all_info,
 };
 pub use context_reset::{ContextReset, ProgressNotes};

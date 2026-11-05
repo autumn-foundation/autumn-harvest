@@ -38,8 +38,8 @@ use crate::consolidate::{
     agent_episode_append_info, agent_episode_reset_info,
 };
 use crate::consolidate_all::{
-    AgentDirectory, CONSOLIDATE_ALL_WORKFLOW_NAME, ConsolidateAll, agent_consolidate_all_info,
-    agent_consolidate_due_info,
+    AgentDirectory, CONSOLIDATE_ALL_WORKFLOW_NAME, ConsolidateAll, LastPass,
+    agent_consolidate_all_info, agent_consolidate_due_info,
 };
 use crate::error::{AgentError, ErrorKind};
 use crate::harness::{AgentHarness, CacheTenant};
@@ -573,6 +573,34 @@ impl Directory {
         }
         Ok(ids)
     }
+
+    /// The last pass of `agent`. A running pass comes first. Each list
+    /// reads one row, newest first.
+    fn read_last_pass(&self, agent: &AgentId) -> SqliteResult<Option<LastPass>> {
+        let reader = SqliteReader::open(&self.path)?;
+        let mut filter = ExecutionFilter::new()
+            .workflow_name(CONSOLIDATE_WORKFLOW_NAME)
+            .search_attribute(CONSOLIDATION_ATTR, serde_json::json!(agent.as_str()));
+        filter.limit = Some(1);
+        let newest = |filter: &ExecutionFilter| -> SqliteResult<Option<i64>> {
+            let page = reader.list_executions(filter)?;
+            Ok(page
+                .executions
+                .first()
+                .and_then(|summary| summary.started_at.value())
+                .map(DateTime::timestamp_millis))
+        };
+        if let Some(started_ms) = newest(&filter.clone().state("RUNNING"))? {
+            return Ok(Some(LastPass {
+                running: true,
+                started_ms,
+            }));
+        }
+        Ok(newest(&filter)?.map(|started_ms| LastPass {
+            running: false,
+            started_ms,
+        }))
+    }
 }
 
 /// A SQLite read error as a retryable agent error.
@@ -582,29 +610,23 @@ fn transport(err: &autumn_harvest_sqlite::SqliteError) -> AgentError {
 
 impl AgentDirectory for Directory {
     fn agents<'a>(&'a self, kind: &'a str) -> BoxFuture<'a, Result<Vec<AgentId>, AgentError>> {
-        let filter = ExecutionFilter::new()
-            .workflow_name(AGENT_WORKFLOW_NAME)
-            .search_attribute("agent_kind", serde_json::json!(kind));
-        let read = self
-            .running(&filter)
-            .map_err(|err| transport(&err))
-            .map(|ids| {
-                ids.iter()
-                    .filter_map(|id| AgentId::parse(id).ok())
-                    .collect()
-            });
-        Box::pin(std::future::ready(read))
+        Box::pin(async move {
+            let filter = ExecutionFilter::new()
+                .workflow_name(AGENT_WORKFLOW_NAME)
+                .search_attribute("agent_kind", serde_json::json!(kind));
+            let ids = self.running(&filter).map_err(|err| transport(&err))?;
+            Ok(ids
+                .iter()
+                .filter_map(|id| AgentId::parse(id).ok())
+                .collect())
+        })
     }
 
-    fn pass_runs<'a>(&'a self, agent: &'a AgentId) -> BoxFuture<'a, Result<bool, AgentError>> {
-        let filter = ExecutionFilter::new()
-            .workflow_name(CONSOLIDATE_WORKFLOW_NAME)
-            .search_attribute(CONSOLIDATION_ATTR, serde_json::json!(agent.as_str()));
-        let read = self
-            .running(&filter)
-            .map(|ids| !ids.is_empty())
-            .map_err(|err| transport(&err));
-        Box::pin(std::future::ready(read))
+    fn last_pass<'a>(
+        &'a self,
+        agent: &'a AgentId,
+    ) -> BoxFuture<'a, Result<Option<LastPass>, AgentError>> {
+        Box::pin(async move { self.read_last_pass(agent).map_err(|err| transport(&err)) })
     }
 }
 

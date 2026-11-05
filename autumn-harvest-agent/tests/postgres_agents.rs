@@ -43,8 +43,8 @@ use autumn_harvest_agent::mesh_control::MeshSpend;
 use autumn_harvest_agent::postgres::{self, Directory, LedgerSpend, PostgresAgents, RunState};
 use autumn_harvest_agent::{
     AgentError, AgentHarness, AgentId, AgentMemory, AgentModel, AgentOp, AgentProfile, AgentReport,
-    AgentState, AgentStatus, AgentTask, Approval, ChatRequest, ContentPart, ErrorKind,
-    InMemoryMemoryStore, Rule, ToolEffect, ToolRules,
+    AgentState, AgentStatus, AgentTask, Approval, BoxFuture, ChatRequest, ChatResponse, ChatRole,
+    ContentPart, InMemoryMemoryStore, Rule, ToolEffect, ToolRules,
 };
 use common::{Recorder, Reply, ScriptedModel, TryFnModel, answer, calls, recorded_tool};
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
@@ -455,11 +455,12 @@ async fn a_heartbeat_tick_runs_and_reports() {
     assert_eq!(model.calls(), 1);
 }
 
-/// The text of every message of `request`.
-fn request_text(request: &ChatRequest) -> String {
+/// The text of the user messages of `request`.
+fn user_text(request: &ChatRequest) -> String {
     request
         .messages
         .iter()
+        .filter(|message| message.role == ChatRole::User)
         .flat_map(|message| message.content.iter())
         .filter_map(|part| match part {
             ContentPart::Text(text) => Some(text.as_str()),
@@ -471,7 +472,52 @@ fn request_text(request: &ChatRequest) -> String {
 
 /// Whether `request` is the model call of a consolidation pass.
 fn is_pass(request: &ChatRequest) -> bool {
-    request_text(request).contains("<episode id=\"")
+    user_text(request).contains("<episode id=\"")
+}
+
+/// The op text whose pass waits at the gate.
+const HELD: &str = "held-7f3a";
+
+/// A model for consolidation passes. Each op answers with its user text, so
+/// the episode holds it. A pass over the episode [`HELD`] waits until the
+/// gate opens. The wait is async, so no worker thread blocks.
+#[derive(Debug, Default)]
+struct GateModel {
+    closed: std::sync::atomic::AtomicBool,
+    passes: std::sync::atomic::AtomicUsize,
+}
+
+impl GateModel {
+    fn set_closed(&self, closed: bool) {
+        self.closed
+            .store(closed, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn passes(&self) -> usize {
+        self.passes.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl AgentModel for GateModel {
+    fn chat<'a>(
+        &'a self,
+        request: &'a ChatRequest,
+    ) -> BoxFuture<'a, Result<ChatResponse, AgentError>> {
+        Box::pin(async move {
+            let text = user_text(request);
+            if !is_pass(request) {
+                return answer(&format!("re: {text}"), 2);
+            }
+            if text.contains(HELD) {
+                while self.closed.load(std::sync::atomic::Ordering::SeqCst) {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }
+            self.passes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            answer(r#"{"facts":[]}"#, 2)
+        })
+    }
 }
 
 /// Run one dispatcher firing to its end.
@@ -488,32 +534,11 @@ async fn one_consolidation_firing_serves_each_agent_of_a_scheduled_kind() {
     let (url, _container) = database().await;
     let queue = unique("pg-consolidate");
     let kind = unique("desk");
-    // A pass over the episode `hold` fails with a retryable error until the
-    // test opens the gate. Its retry waits, so the pass still runs.
-    let open = Arc::new(std::sync::atomic::AtomicBool::new(true));
-    let gate = Arc::clone(&open);
-    let passes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let counted = Arc::clone(&passes);
-    let model = TryFnModel::new(move |request: &ChatRequest| -> Reply {
-        let text = request_text(request);
-        if !is_pass(request) {
-            let hold = if text.contains("hold") {
-                "hold"
-            } else {
-                "noted"
-            };
-            return answer(hold, 2);
-        }
-        if text.contains("hold") && !gate.load(std::sync::atomic::Ordering::SeqCst) {
-            return Err(AgentError::new(ErrorKind::Unavailable, "busy"));
-        }
-        counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        answer(r#"{"facts":[]}"#, 2)
-    });
+    let model = Arc::new(GateModel::default());
     let pg = PostgresAgents::single(pool(&url)).with_queue(&queue);
     let episodes = Arc::new(InMemoryEpisodeStore::default());
     let directory = Directory::new(pg.clone());
-    let harness = AgentHarness::new(model)
+    let harness = AgentHarness::new(model.clone())
         .memory(Arc::new(InMemoryMemoryStore::new()))
         .episodes(episodes.clone())
         .directory(Arc::new(directory.clone()))
@@ -537,6 +562,7 @@ async fn one_consolidation_firing_serves_each_agent_of_a_scheduled_kind() {
         directory.agents(&kind).await.unwrap(),
         [a.clone(), b.clone()]
     );
+    assert_eq!(directory.last_pass(&a).await.unwrap(), None);
 
     // Both agents get a pass on one firing.
     let first = fire(&pg, &ConsolidateAll::default()).await;
@@ -544,24 +570,31 @@ async fn one_consolidation_firing_serves_each_agent_of_a_scheduled_kind() {
     for pass in &first.passes {
         assert_eq!(pass.stop, Some(ConsolidationStop::Completed), "{pass:?}");
     }
-    assert_eq!(passes.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert_eq!(model.passes(), 2);
+    let last = directory.last_pass(&a).await.unwrap().unwrap();
+    assert!(!last.running, "{last:?}");
 
     // Both are idle now: no pass and no model call.
     let idle = fire(&pg, &ConsolidateAll::default()).await;
     assert_eq!((idle.idle, idle.started), (2, 0), "{idle:?}");
-    assert_eq!(passes.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert_eq!(model.passes(), 2);
 
     // A pass of `a` still runs, so `a` gets no second pass.
-    for (id, text) in [(&a, "hold"), (&b, "again")] {
+    for (id, text) in [(&a, HELD), (&b, "again")] {
         postgres::send(&pg, id, &AgentOp::message_with_id(text, "m-2"), Some("m-2"))
             .await
             .unwrap();
         settled(&pg, id, |state| state.segments >= 2).await;
     }
-    open.store(false, std::sync::atomic::Ordering::SeqCst);
+    model.set_closed(true);
     let held = postgres::consolidate(&pg, &a).await.unwrap();
     let deadline = std::time::Instant::now() + LIMIT;
-    while !directory.pass_runs(&a).await.unwrap() {
+    while !directory
+        .last_pass(&a)
+        .await
+        .unwrap()
+        .is_some_and(|pass| pass.running)
+    {
         assert!(
             std::time::Instant::now() < deadline,
             "the pass never published"
@@ -569,12 +602,13 @@ async fn one_consolidation_firing_serves_each_agent_of_a_scheduled_kind() {
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
     let busy = fire(&pg, &ConsolidateAll::default()).await;
+    model.set_closed(false);
     assert_eq!(busy.running, 1, "{busy:?}");
     assert_eq!(busy.passes.len(), 1);
     assert_eq!(busy.passes[0].agent, b);
-    open.store(true, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(busy.passes[0].stop, Some(ConsolidationStop::Completed));
     let RunState::Completed(_) = postgres::wait_run(&pg, held, LIMIT).await.unwrap() else {
-        panic!("the held pass should complete after its retry");
+        panic!("the held pass should complete");
     };
     let scope = autumn_harvest_agent::consolidate::episode_scope(&a);
     assert_eq!(episodes.load(&scope).await.unwrap().pending(10).len(), 0);
