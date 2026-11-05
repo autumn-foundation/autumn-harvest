@@ -8,9 +8,10 @@ silent. Now the configured limit governs every delegation answer.
   delegation answer. The default stays 8 000 characters.
 - `Peer::answer_limit(chars)` overrides the harness limit for one peer.
 - The rule covers an inline child, a fan-out child and a durable peer.
-- A delegation answer is also cut to a sixth of the request cap, as a tool
-  result is under its result cap. So a large limit cannot drop a whole
-  answer and end the run as `transcript_full`.
+- The encoded delegation result is also cut to a sixth of the request cap,
+  as a tool result is under its result cap. The size counts each JSON
+  escape. So a large limit cannot drop a whole answer and end the run as
+  `transcript_full`.
 - The delegation result JSON has `"truncated": true` or `false`. A cut sets
   `DelegationRecord::answer_truncated` in the report and logs a warning.
 - `Peer` gains a public field. A struct literal needs `..Peer::new(..)`.

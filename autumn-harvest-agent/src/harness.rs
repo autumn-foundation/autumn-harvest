@@ -107,7 +107,7 @@ pub const DEFAULT_BUDGET_TIMEOUT: Duration = Duration::from_secs(10);
 const OUTCOME_ENVELOPE_BYTES: u64 = 64;
 
 /// The mark at the end of a cut result.
-const TRUNCATED: &str = "…[truncated]";
+pub(crate) const TRUNCATED: &str = "…[truncated]";
 
 /// The model, the tools, and the policy behind the two agent activities.
 ///

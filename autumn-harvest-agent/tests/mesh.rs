@@ -2046,9 +2046,44 @@ async fn a_large_limit_still_cuts_to_the_byte_share() {
     );
     let result: Value =
         serde_json::from_str(&last_tool_results(&model.requests()[2].messages)[0]).unwrap();
+    // The whole delegation result fits the share, as a tool result does.
+    let content = &last_tool_results(&model.requests()[2].messages)[0];
+    assert!(content.len() <= 10_000, "{}", content.len());
     let answer = result["answer"].as_str().unwrap();
-    assert_eq!(answer.len(), 10_000, "{}", &answer[answer.len() - 20..]);
+    assert!(answer.len() > 9_900, "{}", answer.len());
     assert!(answer.ends_with("…[truncated]"));
+    assert_eq!(result["truncated"], true);
+    assert!(report.delegations[0].answer_truncated);
+}
+
+// Issue #2481: a control character takes six bytes in the delegation JSON,
+// and seven in the request. The cut measures the encoded result, so the
+// answer is still cut, not dropped.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_escaped_answer_still_cuts_to_the_byte_share() {
+    let (_dir, db) = fresh_db();
+    let model = ScriptedModel::new(vec![
+        delegate("d1", "researcher", "dig", 1),
+        answer(&"\0".repeat(12_000), 1),
+        answer("done", 1),
+    ]);
+    let harness = AgentHarness::new(model.clone())
+        .peer(researcher())
+        .tool_output_limit(20_000);
+    let mut rt = runtime(&db, harness);
+    let task = planner(&["researcher"]).max_request_bytes(60_064);
+    let exec = sqlite::start(&mut rt, &task).unwrap();
+    let report = report(rt.run_until_blocked(exec).await.unwrap());
+
+    assert_eq!(
+        report.stop,
+        AgentStop::Completed,
+        "the answer is cut, not dropped"
+    );
+    let content = &last_tool_results(&model.requests()[2].messages)[0];
+    assert!(content.len() <= 10_000, "{}", content.len());
+    let result: Value = serde_json::from_str(content).unwrap();
+    assert!(result["answer"].as_str().unwrap().ends_with("…[truncated]"));
     assert_eq!(result["truncated"], true);
     assert!(report.delegations[0].answer_truncated);
 }

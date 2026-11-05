@@ -44,7 +44,8 @@ The chosen option is in bold.
 | A run recorded before the change replays with a new JSON shape. Strict replay then diverges on the next model-turn input. | A recorded `Peer` with no `answer_limit` keeps the old cut and the old shape. |
 | An old activity worker answers a new workflow worker in a rolling deploy. | Its peers have no `answer_limit`. The run keeps the old behaviour. It does not fail. |
 | The `truncated` flag compares the shown text with the answer. An answer that already ends with the mark then reads as complete. | The flag comes from the character count, not from a text compare. |
-| A large limit lets one answer pass the request cap. The round budget then drops the whole answer, and the run ends as `transcript_full`. | The answer is also cut to `max_tool_result_bytes(request_cap)`, a sixth of the cap. That cut sets the flags too. |
+| A large limit lets one answer pass the request cap. The round budget then drops the whole answer, and the run ends as `transcript_full`. | The encoded delegation result is also cut to `max_tool_result_bytes(request_cap)`, a sixth of the cap. That cut sets the flags too. |
+| An answer of control characters grows sevenfold: six bytes in the delegation JSON, then one more in the request. A cut of the raw answer then still passes the cap. | The cut measures the encoded result, with each escape. The request escape then stays inside the share, as for a tool result. |
 | A large answer fits the byte cap but not the context window of the model. | The request cap bounds bytes, not tokens. The operator sets both limits. The mesh guide says so. |
 | An older worker replays a history that a new worker wrote. It ignores `answer_limit` and builds the old shape. | The older worker decodes the history and finishes the run. Its next window differs, so the transcript delta sends the whole window once. A strict replay of a history from both versions can report a divergence. |
 | A durable agent keeps no delegation records, so the operator misses its cuts. | Each cut logs a warning through `ctx.log_warn`, which replay does not repeat. |
@@ -81,8 +82,9 @@ The chosen option is in bold.
 3. Each delegation path cuts with the limit of its `Peer`. The JSON gets
    `"truncated": true` or `false`. A cut sets
    `DelegationRecord::answer_truncated`.
-4. Each answer is also cut to `max_tool_result_bytes(request_cap)` bytes.
-   That cut sets the same flags.
+4. The encoded delegation result is also cut to
+   `max_tool_result_bytes(request_cap)` bytes. The size counts each JSON
+   escape. That cut sets the same flags.
 5. Each cut logs a warning with the peer, the length and the limits.
 6. A recorded `Peer` with no limit cuts at `LEGACY_ANSWER_LIMIT`, 8 000
    characters. Its JSON has no `truncated` key, and no byte cut applies.
@@ -99,7 +101,7 @@ The chosen option is in bold.
 | A nested cut flags the record of its own peer. | `mesh.rs::a_nested_cut_flags_its_own_record` |
 | `Peer::answer_limit` overrides the harness for one peer. | `mesh.rs::a_peer_limit_overrides_the_harness_limit` |
 | The lookup resolves and records the limit. | `mesh.rs::discovery_resolves_the_answer_limit`, `mesh.rs::a_new_history_records_the_limit_and_replays` |
-| A large limit cuts to the byte share. It does not drop the answer. | `mesh.rs::a_large_limit_still_cuts_to_the_byte_share`, `workflow.rs::a_resolved_lookup_cuts_to_the_byte_share` |
+| A large limit cuts to the byte share. It does not drop the answer. | `mesh.rs::a_large_limit_still_cuts_to_the_byte_share`, `mesh.rs::an_escaped_answer_still_cuts_to_the_byte_share`, `workflow.rs::each_encoded_result_fits_its_share`, `workflow.rs::the_escape_length_matches_serde_json` |
 | A history from before the change replays strictly, with the old cut and shape. | `mesh.rs::a_history_from_before_the_answer_limit_replays` (fixture from `trunk-dev`), `workflow.rs::a_legacy_lookup_keeps_the_old_cut_and_shape` |
 | The cut flag is true exactly when the cut drops a character. | `harness.rs::the_cut_flag_matches_the_character_count` (property test), `harness.rs::a_text_that_ends_with_the_mark_still_reads_as_cut` |
 | The docs name the knob. | `docs/agent-mesh.md` §2 and §3, `docs/agent-adapter.md` §4 |

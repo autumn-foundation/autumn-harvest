@@ -40,7 +40,7 @@ use crate::draw::Draw;
 use crate::flow::Released;
 use crate::followup::{self, FOLLOWUP_TOOL, Planned};
 use crate::harness::{
-    AgentHarness, CacheTenant, cut_bytes, max_tool_result_bytes, truncate, truncate_flagged,
+    AgentHarness, CacheTenant, TRUNCATED, max_tool_result_bytes, truncate, truncate_flagged,
 };
 use crate::heartbeat::{HeartbeatTask, agent_heartbeat_info};
 use crate::loop_guard::{LoopTracker, LoopVerdict, warning_note};
@@ -2177,9 +2177,13 @@ impl<'a> AnswerRoom<'a> {
 
 /// Put the answer of `peer` into a delegation result (issue #2481).
 ///
-/// It cuts the answer to the character limit of the peer and to
-/// `max_bytes`. The `truncated` key tells the parent model whether text
-/// dropped. It returns `true` on a cut.
+/// It cuts the answer to the character limit of the peer. It also cuts the
+/// encoded result to `max_bytes`, as a tool result is cut. The encoded size
+/// counts each escape, so the request escape stays inside the share. The
+/// `truncated` key tells the parent model whether text dropped. It returns
+/// `true` on a cut.
+///
+/// Put every other key into `result` first, so the cut measures them.
 ///
 /// A peer lookup from before issue #2481 has no limit. Then the result
 /// keeps the old cut and the old shape, and the function returns `false`.
@@ -2189,12 +2193,50 @@ fn put_answer(result: &mut serde_json::Value, peer: &Peer, answer: &str, max_byt
         result["answer"] = truncate(answer, LEGACY_ANSWER_LIMIT).into();
         return false;
     };
-    let (shown, chars_cut) = truncate_flagged(answer, limit);
-    let bytes_cut = shown.len() > max_bytes;
-    let cut = chars_cut || bytes_cut;
-    result["answer"] = cut_bytes(shown, max_bytes).into();
+    // `false` is the longer flag, so the frame holds for either value.
+    result["answer"] = "".into();
+    result["truncated"] = false.into();
+    let frame = result.to_string().len();
+    let (shown, mut cut) = truncate_flagged(answer, limit);
+    let shown = if frame.saturating_add(escaped_len(&shown)) <= max_bytes {
+        shown
+    } else {
+        cut = true;
+        let room = max_bytes
+            .saturating_sub(frame)
+            .saturating_sub(escaped_len(TRUNCATED));
+        format!("{}{TRUNCATED}", escaped_prefix(answer, limit, room))
+    };
+    result["answer"] = shown.into();
     result["truncated"] = cut.into();
     cut
+}
+
+/// The longest prefix of the first `limit` characters of `text` whose JSON
+/// escape fits `room` bytes.
+fn escaped_prefix(text: &str, limit: usize, room: usize) -> &str {
+    let mut used = 0_usize;
+    for (taken, (index, c)) in text.char_indices().enumerate() {
+        used = used.saturating_add(escaped_char_len(c));
+        if taken >= limit || used > room {
+            return &text[..index];
+        }
+    }
+    text
+}
+
+/// The bytes of `text` inside a JSON string, without the quotes.
+fn escaped_len(text: &str) -> usize {
+    text.chars().map(escaped_char_len).sum()
+}
+
+/// The bytes of `c` inside a JSON string, as `serde_json` writes it.
+const fn escaped_char_len(c: char) -> usize {
+    match c {
+        '"' | '\\' | '\u{8}' | '\t' | '\n' | '\u{c}' | '\r' => 2,
+        '\0'..='\u{1f}' => 6,
+        _ => c.len_utf8(),
+    }
 }
 
 /// Record a refused delegation and answer the model.
@@ -2555,12 +2597,15 @@ fn peer_outcome(
             } else {
                 // The keys keep their old order, also under the
                 // `preserve_order` feature of `serde_json`.
+                // The answer key comes first, then `error`, so the cut
+                // measures the error too.
                 let mut content = serde_json::json!({
                     "agent": peer.name,
                     "stop": reply.stop,
                 });
-                room.put(tree, peer, &mut content, &reply.answer);
+                content["answer"] = "".into();
                 content["error"] = serde_json::json!(reply.error);
+                room.put(tree, peer, &mut content, &reply.answer);
                 let content = content.to_string();
                 ToolOutcome {
                     content,
@@ -3079,15 +3124,84 @@ mod tests {
     #[test]
     fn a_resolved_lookup_cuts_to_the_byte_share() {
         let peer = Peer::new("researcher", "R.").answer_limit(usize::MAX);
-        let mut result = serde_json::json!({"agent": "researcher"});
-        // "…[truncated]" is 14 bytes, so 3 bytes stay. "é" is 2 bytes.
-        assert!(put_answer(&mut result, &peer, &"é".repeat(20), 17));
+        let mut result = serde_json::json!({"agent": "a"});
+        // The frame `{"agent":"a","answer":"","truncated":false}` is 43
+        // bytes. One "é" (2 bytes) and the mark (14 bytes) fill 59 bytes.
+        assert!(put_answer(&mut result, &peer, &"é".repeat(20), 59));
         assert_eq!(result["answer"], "é…[truncated]");
         assert_eq!(result["truncated"], true);
-        let mut result = serde_json::json!({"agent": "researcher"});
-        assert!(!put_answer(&mut result, &peer, "éééé", 8));
+        assert!(result.to_string().len() <= 59);
+        let mut result = serde_json::json!({"agent": "a"});
+        assert!(!put_answer(&mut result, &peer, "éééé", 100));
         assert_eq!(result["answer"], "éééé");
         assert_eq!(result["truncated"], false);
+    }
+
+    // Issue #2481: the cut measures the encoded result, so an escaped
+    // character counts with its escape.
+    #[test]
+    fn an_escaped_answer_cuts_to_the_encoded_size() {
+        let peer = Peer::new("researcher", "R.").answer_limit(usize::MAX);
+        let mut result = serde_json::json!({"agent": "a"});
+        assert!(put_answer(&mut result, &peer, &"\0".repeat(100), 100));
+        assert!(result.to_string().len() <= 100, "{result}");
+        assert!(result["answer"].as_str().unwrap().ends_with("…[truncated]"));
+    }
+
+    // The escape length matches `serde_json` for each ASCII character and a
+    // few wider ones.
+    #[test]
+    fn the_escape_length_matches_serde_json() {
+        let wide = ['é', '漢', '🎉', '\u{7f}', '\u{2028}'];
+        for c in (0_u8..=0x7f).map(char::from).chain(wide) {
+            let encoded = serde_json::to_string(&c.to_string()).unwrap();
+            assert_eq!(escaped_char_len(c), encoded.len() - 2, "{c:?}");
+        }
+    }
+
+    // A fixed list of answers with each kind of escape, for the bound below.
+    fn escape_cases() -> Vec<String> {
+        let all: String = (0_u8..=0x7f).map(char::from).collect();
+        vec![
+            all.repeat(3),
+            "\"\\\n\t\0é漢🎉".repeat(20),
+            "plain text ".repeat(40),
+            String::new(),
+        ]
+    }
+
+    // Issue #2481: each encoded result fits a share that can hold the frame
+    // and the mark. A kept answer is a prefix of the original.
+    #[test]
+    fn each_encoded_result_fits_its_share() {
+        let peer = Peer::new("researcher", "R.").answer_limit(usize::MAX);
+        // The frame `{"agent":"a","answer":"","stop":"completed","truncated":false}`
+        // is 62 bytes. The mark adds 14.
+        for answer in escape_cases() {
+            for max_bytes in [76, 77, 81, 100, 257, 1_000] {
+                let mut result = serde_json::json!({"agent": "a", "stop": "completed"});
+                let cut = put_answer(&mut result, &peer, &answer, max_bytes);
+                assert!(
+                    result.to_string().len() <= max_bytes,
+                    "{max_bytes}: {result}"
+                );
+                let shown = result["answer"].as_str().unwrap();
+                let kept = shown.strip_suffix("…[truncated]").unwrap_or(shown);
+                assert!(answer.starts_with(kept), "{max_bytes}");
+                assert_eq!(cut, kept.len() < answer.len(), "{max_bytes}");
+            }
+        }
+    }
+
+    // A share too small for the frame and the mark keeps the mark only. The
+    // parent model still sees the cut.
+    #[test]
+    fn a_tiny_share_keeps_the_mark_only() {
+        let peer = Peer::new("researcher", "R.").answer_limit(usize::MAX);
+        let mut result = serde_json::json!({"agent": "a"});
+        assert!(put_answer(&mut result, &peer, "abc", 10));
+        assert_eq!(result["answer"], "…[truncated]");
+        assert_eq!(result["truncated"], true);
     }
 
     #[test]
