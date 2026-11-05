@@ -553,7 +553,9 @@ pub(crate) async fn drive(
             Err(error) => return Err(error),
         };
         let mut report = progress.report(stop, &tree);
-        if task.deliver {
+        // A probe sends no report (issue #2378). Its answer is for the
+        // operator, not for a person.
+        if task.deliver && task.probe.is_none() {
             let source = if woken {
                 ReportSource::Followup
             } else {
@@ -1877,6 +1879,7 @@ async fn run_tool(
         workspace: progress.workspace.clone(),
         skill: None,
         allowed_effects: task.allowed_effects.clone(),
+        probe_effects: task.probe.map(crate::types::Probe::effects),
     };
     if wants_skill {
         request.skill = Some(skill::lookup(
@@ -2383,7 +2386,8 @@ async fn durable_peer(
     };
     // A durable peer runs its own op with its own effects. A mandate cannot
     // carry an effect set, so a narrowed run never asks one (issue #2439).
-    if run.task.allowed_effects.is_some() {
+    // A probe never asks one for the same reason (issue #2378).
+    if run.task.allowed_effects.is_some() || run.task.probe.is_some() {
         return Ok(refuse(agent, tree, Refusal::NotPermitted, &peer.name));
     }
     let target_id = target.as_str();
@@ -2621,6 +2625,8 @@ fn child_task(
         // A child is part of the draw of its parent, so its requests keep
         // the draw id. It has its own run id, so it drops the root.
         draw: task.draw.as_ref().map(Draw::inherited),
+        // A child of a probe is a probe with the same effects (issue #2378).
+        probe: task.probe,
     }
 }
 

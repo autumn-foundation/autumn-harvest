@@ -2598,6 +2598,8 @@ jobs:
         run: cargo clippy -p autumn-harvest-agent --all-targets --features sandbox --no-deps -- -D warnings
       - name: Clippy autumn-harvest-agent (postgres and sqlite features, issue #2371)
         run: cargo clippy -p autumn-harvest-agent --all-targets --features postgres,sqlite --no-deps -- -D warnings
+      - name: Clippy autumn-harvest-agent (postgres and eval features, issue #2378)
+        run: cargo clippy -p autumn-harvest-agent --all-targets --features postgres,eval --no-deps -- -D warnings
       # Same issue #962 rule: a new workspace member needs its own step.
       # `--no-deps` for the reason of the redis step below.
       - name: Clippy autumn-harvest-sandbox-guest

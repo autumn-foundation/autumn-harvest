@@ -199,6 +199,14 @@ name = "score_postgres"
 required-features = ["postgres"]
 
 [[test]]
+name = "live_probe"
+required-features = ["eval", "sqlite"]
+
+[[test]]
+name = "live_probe_postgres"
+required-features = ["eval", "postgres"]
+
+[[test]]
 name = "sample"
 required-features = ["sqlite"]
 

@@ -207,7 +207,7 @@ pub use tool::{FnTool, Tool, ToolContext, ToolEffect};
 pub use transcript::{InMemoryTranscriptStore, PrefixRef, TranscriptStore};
 pub use types::{
     AgentReport, AgentStop, AgentTask, MAX_PARALLEL_CHILDREN, ModelTurn, ModelTurnRequest,
-    RunIdSource, ToolCallRequest, ToolOutcome,
+    PROBE_EFFECT_REFUSED, Probe, RunIdSource, ToolCallRequest, ToolOutcome,
 };
 pub use workflow::{
     WORKFLOW_NAME, activities, agent_deliver, agent_deliver_info, agent_discover_peers,
