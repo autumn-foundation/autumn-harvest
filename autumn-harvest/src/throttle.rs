@@ -1257,6 +1257,9 @@ async fn fire_claimed_throttle_row(
     // same handler) never does.
     let is_scheduled_fire = opts.origin.as_deref() == Some(crate::execution::ORIGIN_SCHEDULED);
 
+    // The stored JSON can mark a schedule policy. Keep that source (issue #2409).
+    let (retry_policy, retry_source) =
+        crate::workflow_retry::decode_optional(opts.workflow_retry_policy.as_ref());
     let params = crate::execution::StartWorkflowParams {
         execution_timeout,
         memo: opts.memo,
@@ -1286,9 +1289,8 @@ async fn fire_claimed_throttle_row(
         // the schedule exactly as an immediate fire would be.
         schedule_id: opts.schedule_id,
         scheduled_for: opts.scheduled_for,
-        workflow_retry_policy: opts
-            .workflow_retry_policy
-            .and_then(|v| serde_json::from_value(v).ok()),
+        workflow_retry_policy: retry_policy,
+        workflow_retry_source: retry_source,
         max_workflow_attempts_ceiling: opts.max_workflow_attempts_ceiling,
         origin: opts.origin.as_deref(),
         completion_callbacks: opts.completion_callbacks,

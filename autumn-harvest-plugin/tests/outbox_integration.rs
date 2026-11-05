@@ -126,6 +126,7 @@ async fn framework_outbox_start_takes_the_run_default_override() {
             chain_execution_timeout: Some(std::time::Duration::from_mins(15)),
             concurrency_limit: None,
             quota: autumn_harvest::quota::QuotaLimits::default(),
+            retry: autumn_harvest::workflow_retry::RetryLimits::default(),
         },
     );
     state.insert_extension(registry);

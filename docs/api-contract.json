@@ -6946,7 +6946,7 @@
       "path": "/admin/overrides",
       "category": "admin",
       "read_only": true,
-      "description": "List every operator override (issue #2388). schedule_overrides holds each DAG and workflow schedule override (issues #2385 and #2386), read from every shard pool: kind, name, fields (the stored override fields by their PATCH names), reason, updated_by, created_at, updated_at and shard_ids. run_default_overrides holds each run-default override (issues #2387, #2406, #2407 and #2408) from the default shard: workflow_name, sla_secs, execution_timeout_secs, chain_execution_timeout_secs, concurrency_limit, quota_max_active_executions, quota_max_history_bytes, quota_max_dead_letters, reason, updated_by and updated_at. unavailable_shards names each shard that could not be read; its overrides are absent from the list.",
+      "description": "List every operator override (issue #2388). schedule_overrides holds each DAG and workflow schedule override (issues #2385 and #2386), read from every shard pool: kind, name, fields (the stored override fields by their PATCH names), reason, updated_by, created_at, updated_at and shard_ids. run_default_overrides holds each run-default override (issues #2387, #2406, #2407, #2408 and #2409) from the default shard: workflow_name, sla_secs, execution_timeout_secs, chain_execution_timeout_secs, concurrency_limit, quota_max_active_executions, quota_max_history_bytes, quota_max_dead_letters, retry_max_attempts, retry_initial_interval_ms, retry_max_interval_ms, reason, updated_by and updated_at. unavailable_shards names each shard that could not be read; its overrides are absent from the list.",
       "params": [],
       "request_body": null,
       "success_response": {
@@ -7151,7 +7151,7 @@
       "path": "/admin/workflow-types/{workflow_name}/run-defaults",
       "category": "admin",
       "read_only": true,
-      "description": "Read the run defaults of one workflow type (issues #2387, #2406, #2407 and #2408). code holds the sla_secs, execution_timeout_secs, chain_execution_timeout_secs, concurrency_limit, quota_max_active_executions, quota_max_history_bytes and quota_max_dead_letters declared in code. override holds the stored operator override (the same seven fields, reason, updated_by, updated_at), or null. effective holds the values a new run takes: the override, then code. The start clamps still apply after it: sla is clamped to execution_timeout, the fleet ceiling caps execution_timeout, and the fleet chain ceiling caps chain_execution_timeout. A latest-wins type keeps its code concurrency_limit. A type with no quota admission cap keeps its code quota caps.",
+      "description": "Read the run defaults of one workflow type (issues #2387, #2406, #2407, #2408 and #2409). code holds the sla_secs, execution_timeout_secs, chain_execution_timeout_secs, concurrency_limit, quota_max_active_executions, quota_max_history_bytes, quota_max_dead_letters, retry_max_attempts, retry_initial_interval_ms and retry_max_interval_ms declared in code. override holds the stored operator override (the same ten fields, reason, updated_by, updated_at), or null. effective holds the values a new run takes: the override, then code. The start clamps still apply after it: sla is clamped to execution_timeout, the fleet ceiling caps execution_timeout, and the fleet chain ceiling caps chain_execution_timeout. A latest-wins type keeps its code concurrency_limit. A type with no quota admission cap keeps its code quota caps. The retry fields are those of the next failure of a run that stores the code retry_policy, before the fleet ceiling clamps retry_max_attempts.",
       "params": [
         {
           "name": "workflow_name",
@@ -7187,7 +7187,7 @@
       "path": "/admin/workflow-types/{workflow_name}/run-defaults",
       "category": "admin",
       "read_only": false,
-      "description": "Set, change or clear the run-default override of one workflow type (issues #2387, #2406, #2407 and #2408). The override wins over the code value for every new run and survives a restart. It reaches this process at once and every other process within its refresh period (about 5 seconds). Each duration is tri-state: absent keeps the stored override, null returns the field to its code value, a value sets it. A merge that sets no field deletes the override. With recompute_in_flight, the SLA deadline of each RUNNING, SUSPENDED or PAUSED run of the type that has not breached moves to the new effective SLA, on every shard, and the response gains recompute (moved_runs, unavailable_shards, superseded). A recompute stops when a newer change to the type replaces its SLA, and then reports superseded true. A hard deadline_at never changes. A chain_deadline_at never changes either: a chain in flight keeps its stored cap, and the override applies to the next chain that starts. A DAG declares no chain cap, so chain_execution_timeout_secs on a DAG is a 400. concurrency_limit applies to the next start and never lowers the cap of a run in flight. A PATCH that names concurrency_limit or clear_override, for a type with a concurrency policy, also raises the stored cap of each PENDING or RUNNING workflow task row of the type to the new effective limit, on every shard, and the response gains concurrency_raise (raised_tasks, unavailable_shards, superseded). Further raises run 10 seconds, 1 minute and 5 minutes later, for the starts that a process with a stale cache stored. No raise lowers a stored cap. Each quota_max_* field applies to the next admission of a key in every process: a lower cap refuses new work for a tenant over it with the 429 of issue #946, and never ends a run in flight. A parent whose child spawn a lower cap refuses waits with a backoff, and its own execution_timeout still applies. No row stores a quota cap, so no pass runs. The response has the same shape as GET.",
+      "description": "Set, change or clear the run-default override of one workflow type (issues #2387, #2406, #2407, #2408 and #2409). The override wins over the code value for every new run and survives a restart. It reaches this process at once and every other process within its refresh period (about 5 seconds). Each duration is tri-state: absent keeps the stored override, null returns the field to its code value, a value sets it. A merge that sets no field deletes the override. With recompute_in_flight, the SLA deadline of each RUNNING, SUSPENDED or PAUSED run of the type that has not breached moves to the new effective SLA, on every shard, and the response gains recompute (moved_runs, unavailable_shards, superseded). A recompute stops when a newer change to the type replaces its SLA, and then reports superseded true. A hard deadline_at never changes. A chain_deadline_at never changes either: a chain in flight keeps its stored cap, and the override applies to the next chain that starts. A DAG declares no chain cap, so chain_execution_timeout_secs on a DAG is a 400. concurrency_limit applies to the next start and never lowers the cap of a run in flight. A PATCH that names concurrency_limit or clear_override, for a type with a concurrency policy, also raises the stored cap of each PENDING or RUNNING workflow task row of the type to the new effective limit, on every shard, and the response gains concurrency_raise (raised_tasks, unavailable_shards, superseded). Further raises run 10 seconds, 1 minute and 5 minutes later, for the starts that a process with a stale cache stored. No raise lowers a stored cap. Each quota_max_* field applies to the next admission of a key in every process: a lower cap refuses new work for a tenant over it with the 429 of issue #946, and never ends a run in flight. A parent whose child spawn a lower cap refuses waits with a backoff, and its own execution_timeout still applies. No row stores a quota cap, so no pass runs. Each retry_* field applies to the next failure of any run of the type, in flight or new, in every process. It replaces that field of the policy that the failed run stores. A retry attempt that already started keeps its row and its fire time. The declared backoff coefficient and jitter still apply, and the effective max_interval never falls below the effective initial_interval. A schedule's own retry_policy wins for the runs that the schedule starts. No row changes, so no pass runs. The response has the same shape as GET.",
       "idempotency": "Idempotent: applying the same override twice is a no-op.",
       "params": [
         {
@@ -7238,6 +7238,21 @@
             "description": "Override the quota cap on the dead letters of one key, from 1 to 4294967295. null returns to code and is accepted on any type. A value is refused for a type with no quota admission cap, a DAG included."
           },
           {
+            "name": "retry_max_attempts",
+            "required": false,
+            "description": "Override the workflow retry max_attempts of the next failure, the first attempt included, from 1 to 2147483647 and at most the fleet ceiling. 1 stops the retries. null returns to code and is accepted on any type. A value is refused for a type with no retry_policy, a DAG included."
+          },
+          {
+            "name": "retry_initial_interval_ms",
+            "required": false,
+            "description": "Override the base delay before the first retry in whole milliseconds, from 1 to 31536000000 (365 days). The effective max_interval rises to it when it is lower. null returns to code and is accepted on any type. A value is refused for a type with no retry_policy, a DAG included."
+          },
+          {
+            "name": "retry_max_interval_ms",
+            "required": false,
+            "description": "Override the upper bound on the delay between retries in whole milliseconds, from 1 to 31536000000 (365 days). When both interval fields are set, at least retry_initial_interval_ms. A cap below the first delay rises to it. null returns to code and is accepted on any type. A value is refused for a type with no retry_policy, a DAG included."
+          },
+          {
             "name": "clear_override",
             "required": false,
             "description": "true deletes the stored override before the other fields merge."
@@ -7266,7 +7281,7 @@
       "error_responses": [
         {
           "status": 400,
-          "description": "Empty patch, unknown field, a duration of zero or past 100 years, chain_execution_timeout_secs for a DAG, a concurrency_limit of zero, past 2147483647, for a type with no policy, or for a latest-wins type, or a quota_max_* cap of zero, past its bound, or for a type with no quota admission cap."
+          "description": "Empty patch, unknown field, a duration of zero or past 100 years, chain_execution_timeout_secs for a DAG, a concurrency_limit of zero, past 2147483647, for a type with no policy, or for a latest-wins type, or a quota_max_* cap of zero, past its bound, or for a type with no quota admission cap, or a retry_* value for a type with no retry_policy, a retry_max_attempts of zero, past 2147483647 or above the fleet ceiling, a retry interval of zero or past 365 days, or a merged retry_max_interval_ms below retry_initial_interval_ms."
         },
         {
           "status": 404,

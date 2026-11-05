@@ -465,6 +465,9 @@ diesel::table! {
         quota_max_active_executions -> Nullable<Int8>,
         quota_max_history_bytes -> Nullable<Int8>,
         quota_max_dead_letters -> Nullable<Int8>,
+        retry_max_attempts -> Nullable<Int4>,
+        retry_initial_interval_ms -> Nullable<Int8>,
+        retry_max_interval_ms -> Nullable<Int8>,
     }
 }
 

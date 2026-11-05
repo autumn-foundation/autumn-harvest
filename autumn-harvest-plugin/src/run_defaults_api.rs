@@ -1,5 +1,5 @@
 //! `GET` and `PATCH /admin/workflow-types/{workflow_name}/run-defaults`
-//! (issues #2387, #2406, #2407 and #2408).
+//! (issues #2387, #2406, #2407, #2408 and #2409).
 //!
 //! The routes read and change the operator override of one workflow type.
 //! It holds the `sla`, the `execution_timeout`, the
@@ -26,6 +26,11 @@
 //! within its refresh period. Each admission reads the caps again, so no row
 //! changes and no run ends. The route refuses a quota cap for a type with no
 //! quota admission cap, because its starts lock no key.
+//!
+//! A change to a retry field applies to the next failure of any run of the
+//! type, in every process within its refresh period. A schedule policy wins.
+//! The route refuses a retry field for a type with no code `retry_policy`,
+//! and a `retry_max_attempts` above the fleet ceiling.
 
 use std::time::Duration;
 
@@ -35,12 +40,14 @@ use autumn_harvest::audit::{
 use autumn_harvest::concurrency::ConcurrencyPolicy;
 use autumn_harvest::error::HarvestError;
 use autumn_harvest::models::NewAuditRecord;
+use autumn_harvest::policy::RetryPolicy;
 use autumn_harvest::quota::{QuotaLimits, QuotaLimitsPatch, QuotaPolicy};
 use autumn_harvest::run_defaults::{
     RUN_DEFAULTS_TTL, RunDefaultChange, RunDefaultFields, RunDefaultOverride, RunDefaultPatch,
     get_run_default_override, raise_waiting_concurrency_caps, recompute_in_flight_sla,
     update_run_default_override,
 };
+use autumn_harvest::workflow_retry::{RetryLimits, RetryLimitsPatch, RetryPolicySource};
 use autumn_web::AutumnError;
 use autumn_web::reexports::axum;
 use axum::extract::{Extension, Json, Path};
@@ -73,6 +80,17 @@ pub struct RunDefaultSecs {
     pub quota_max_history_bytes: Option<u64>,
     /// The quota cap on the dead letters of one key (issue #2408).
     pub quota_max_dead_letters: Option<u32>,
+    /// The workflow retry `max_attempts` (issue #2409).
+    pub retry_max_attempts: Option<u32>,
+    /// The workflow retry `initial_interval`, in milliseconds (issue #2409).
+    pub retry_initial_interval_ms: Option<u64>,
+    /// The workflow retry `max_interval`, in milliseconds (issue #2409).
+    pub retry_max_interval_ms: Option<u64>,
+}
+
+/// A duration in whole milliseconds.
+fn millis(value: Duration) -> u64 {
+    u64::try_from(value.as_millis()).unwrap_or(u64::MAX)
 }
 
 impl From<RunDefaultFields> for RunDefaultSecs {
@@ -85,6 +103,9 @@ impl From<RunDefaultFields> for RunDefaultSecs {
             quota_max_active_executions: fields.quota.max_active_executions,
             quota_max_history_bytes: fields.quota.max_history_bytes,
             quota_max_dead_letters: fields.quota.max_dead_letters,
+            retry_max_attempts: fields.retry.max_attempts,
+            retry_initial_interval_ms: fields.retry.initial_interval.map(millis),
+            retry_max_interval_ms: fields.retry.max_interval.map(millis),
         }
     }
 }
@@ -109,6 +130,14 @@ pub struct RunDefaultOverrideView {
     /// The quota cap on dead letters that the override sets, if any (issue
     /// #2408).
     pub quota_max_dead_letters: Option<u32>,
+    /// The retry `max_attempts` that the override sets, if any (issue #2409).
+    pub retry_max_attempts: Option<u32>,
+    /// The retry `initial_interval` that the override sets, in milliseconds
+    /// (issue #2409).
+    pub retry_initial_interval_ms: Option<u64>,
+    /// The retry `max_interval` that the override sets, in milliseconds
+    /// (issue #2409).
+    pub retry_max_interval_ms: Option<u64>,
     /// The operator's stated reason.
     pub reason: Option<String>,
     /// The actor that last changed the override.
@@ -128,6 +157,9 @@ impl From<RunDefaultOverride> for RunDefaultOverrideView {
             quota_max_active_executions: secs.quota_max_active_executions,
             quota_max_history_bytes: secs.quota_max_history_bytes,
             quota_max_dead_letters: secs.quota_max_dead_letters,
+            retry_max_attempts: secs.retry_max_attempts,
+            retry_initial_interval_ms: secs.retry_initial_interval_ms,
+            retry_max_interval_ms: secs.retry_max_interval_ms,
             reason: stored.reason,
             updated_by: stored.updated_by,
             updated_at: stored.updated_at,
@@ -206,6 +238,12 @@ pub struct RunDefaultsPatchRequest {
     quota_max_history_bytes: Option<Option<u64>>,
     #[serde(default, deserialize_with = "deserialize_tristate")]
     quota_max_dead_letters: Option<Option<u32>>,
+    #[serde(default, deserialize_with = "deserialize_tristate")]
+    retry_max_attempts: Option<Option<u32>>,
+    #[serde(default, deserialize_with = "deserialize_tristate")]
+    retry_initial_interval_ms: Option<Option<u64>>,
+    #[serde(default, deserialize_with = "deserialize_tristate")]
+    retry_max_interval_ms: Option<Option<u64>>,
     #[serde(default)]
     clear_override: bool,
     reason: Option<String>,
@@ -222,6 +260,17 @@ impl RunDefaultsPatchRequest {
             chain_execution_timeout: to_duration(self.chain_execution_timeout_secs),
             concurrency_limit: self.concurrency_limit,
             quota: self.quota_patch(),
+            retry: self.retry_patch(),
+        }
+    }
+
+    /// The retry part of the patch (issue #2409).
+    fn retry_patch(&self) -> RetryLimitsPatch {
+        let to_duration = |value: Option<Option<u64>>| value.map(|v| v.map(Duration::from_millis));
+        RetryLimitsPatch {
+            max_attempts: self.retry_max_attempts,
+            initial_interval: to_duration(self.retry_initial_interval_ms),
+            max_interval: to_duration(self.retry_max_interval_ms),
         }
     }
 
@@ -240,6 +289,9 @@ impl RunDefaultsPatchRequest {
             && self.chain_execution_timeout_secs.is_none()
             && self.concurrency_limit.is_none()
             && self.quota_patch().is_empty()
+            && self.retry_max_attempts.is_none()
+            && self.retry_initial_interval_ms.is_none()
+            && self.retry_max_interval_ms.is_none()
             && !self.clear_override
             && !self.recompute_in_flight
     }
@@ -277,6 +329,11 @@ fn code_fields(runtime: &HarvestApiRuntime, workflow_name: &str) -> Option<RunDe
                 .quota
                 .map(|policy| QuotaLimits::of(&policy))
                 .unwrap_or_default(),
+            retry: info
+                .retry_policy
+                .as_ref()
+                .map(RetryLimits::of)
+                .unwrap_or_default(),
         }),
         None if runtime.is_registered_dag(workflow_name) => Some(RunDefaultFields::default()),
         None => None,
@@ -301,11 +358,21 @@ fn code_quota(runtime: &HarvestApiRuntime, workflow_name: &str) -> Option<QuotaP
         .and_then(|info| info.quota)
 }
 
+/// The code retry policy of a type (issue #2409). A DAG declares none.
+fn code_retry(runtime: &HarvestApiRuntime, workflow_name: &str) -> Option<RetryPolicy> {
+    runtime
+        .registry()
+        .workflows
+        .get(workflow_name)
+        .and_then(|info| info.retry_policy.clone())
+}
+
 /// The code policies that an override applies to.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct CodePolicies {
     concurrency: Option<ConcurrencyPolicy>,
     quota: Option<QuotaPolicy>,
+    retry: Option<RetryPolicy>,
 }
 
 impl CodePolicies {
@@ -313,6 +380,7 @@ impl CodePolicies {
         Self {
             concurrency: code_policy(runtime, workflow_name),
             quota: code_quota(runtime, workflow_name),
+            retry: code_retry(runtime, workflow_name),
         }
     }
 }
@@ -321,9 +389,11 @@ impl CodePolicies {
 ///
 /// A latest-wins concurrency policy keeps its code limit, as at start. A
 /// quota policy with no admission cap keeps its code caps, as at admission.
+/// The retry fields are those of the next failure of a run that stores the
+/// code policy, before the fleet ceiling.
 fn effective_fields(
     code: RunDefaultFields,
-    policies: CodePolicies,
+    policies: &CodePolicies,
     stored: Option<&RunDefaultOverride>,
 ) -> RunDefaultFields {
     let Some(stored) = stored else {
@@ -343,6 +413,17 @@ fn effective_fields(
             .apply_quota(policies.quota)
             .map(|policy| QuotaLimits::of(&policy))
             .unwrap_or_default(),
+        retry: policies
+            .retry
+            .clone()
+            .map(|policy| {
+                RetryLimits::of(
+                    &stored
+                        .fields
+                        .apply_retry(policy, RetryPolicySource::Type, None),
+                )
+            })
+            .unwrap_or_default(),
     }
 }
 
@@ -356,7 +437,7 @@ struct Reports {
 fn view(
     workflow_name: &str,
     code: RunDefaultFields,
-    policies: CodePolicies,
+    policies: &CodePolicies,
     stored: Option<RunDefaultOverride>,
     reports: Reports,
 ) -> RunDefaultsView {
@@ -392,7 +473,7 @@ pub async fn get_run_defaults(
     Ok(Json(view(
         &workflow_name,
         code,
-        policies,
+        &policies,
         stored,
         Reports::default(),
     )))
@@ -643,6 +724,73 @@ fn refuse_quota_caps(
     )
 }
 
+/// The reason to refuse the retry fields of a request, if any (issue #2409).
+///
+/// A run of a type with no code policy stores none, so a retry field has no
+/// policy to apply to. `ceiling` is the fleet ceiling on `max_attempts`. A
+/// start clamps a code value to it, so an override value above it is
+/// refused. A `null` sets no field, so it is never refused.
+fn refuse_retry_fields(
+    request: &RunDefaultsPatchRequest,
+    policy: Option<&RetryPolicy>,
+    ceiling: Option<u32>,
+) -> Option<String> {
+    let retry = request.retry_patch();
+    if !retry.sets_any() {
+        return None;
+    }
+    if policy.is_none() {
+        return Some(
+            "the type declares no retry_policy, so retry_max_attempts, \
+             retry_initial_interval_ms and retry_max_interval_ms are refused"
+                .to_string(),
+        );
+    }
+    match (retry.max_attempts.flatten(), ceiling) {
+        (Some(n), Some(ceiling)) if n > ceiling => Some(format!(
+            "retry_max_attempts must be at most the fleet ceiling ({ceiling})"
+        )),
+        _ => None,
+    }
+}
+
+/// The fleet ceiling on `max_attempts` of this process (issue #2409).
+///
+/// The API start path and the registry each hold one. The lower one wins.
+fn attempts_ceiling(api_state: &HarvestApiState, runtime: &HarvestApiRuntime) -> Option<u32> {
+    match (
+        api_state.max_workflow_attempts(),
+        runtime.registry().max_workflow_attempts_ceiling,
+    ) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
+}
+
+/// The reason to refuse a request for a registered type, if any.
+fn refusal(
+    request: &RunDefaultsPatchRequest,
+    api_state: &HarvestApiState,
+    runtime: &HarvestApiRuntime,
+    workflow_name: &str,
+    policies: &CodePolicies,
+) -> Option<String> {
+    if request.sets_chain_cap() && runtime.is_registered_dag(workflow_name) {
+        return Some(
+            "a DAG declares no chain cap, so chain_execution_timeout_secs is refused".to_string(),
+        );
+    }
+    refuse_concurrency_limit(request, policies.concurrency)
+        .or_else(|| refuse_quota_caps(request, policies.quota))
+        .or_else(|| {
+            refuse_retry_fields(
+                request,
+                policies.retry.as_ref(),
+                attempts_ceiling(api_state, runtime),
+            )
+        })
+}
+
 /// `PATCH /admin/workflow-types/{workflow_name}/run-defaults`.
 pub async fn patch_run_defaults(
     Extension(api_state): Extension<HarvestApiState>,
@@ -663,7 +811,9 @@ pub async fn patch_run_defaults(
             "empty patch: set sla_secs, execution_timeout_secs, \
              chain_execution_timeout_secs, concurrency_limit, \
              quota_max_active_executions, quota_max_history_bytes, \
-             quota_max_dead_letters, clear_override or recompute_in_flight",
+             quota_max_dead_letters, retry_max_attempts, \
+             retry_initial_interval_ms, retry_max_interval_ms, clear_override \
+             or recompute_in_flight",
         )),
         Ok(Json(request)) => Ok(request),
         Err(rejection) => Err(format!("invalid request body: {}", rejection.body_text())),
@@ -685,15 +835,8 @@ pub async fn patch_run_defaults(
         .await?;
         return Err(not_registered(&workflow_name));
     };
-    if request.sets_chain_cap() && runtime.is_registered_dag(&workflow_name) {
-        let summary = "a DAG declares no chain cap, so chain_execution_timeout_secs is refused";
-        audit_patch(&mut conn, ctx, &workflow_name, Some(summary)).await?;
-        return Err(AutumnError::bad_request_msg(summary));
-    }
     let policies = CodePolicies::of(&runtime, &workflow_name);
-    let refusal = refuse_concurrency_limit(&request, policies.concurrency)
-        .or_else(|| refuse_quota_caps(&request, policies.quota));
-    if let Some(summary) = refusal {
+    if let Some(summary) = refusal(&request, &api_state, &runtime, &workflow_name, &policies) {
         audit_patch(&mut conn, ctx, &workflow_name, Some(&summary)).await?;
         return Err(AutumnError::bad_request_msg(summary));
     }
@@ -729,30 +872,63 @@ pub async fn patch_run_defaults(
     // Holding this one would starve a small pool.
     drop(conn);
 
-    let effective = effective_fields(code, policies, stored.as_ref());
-    let recompute = if request.recompute_in_flight {
-        let job = ShardJob::Recompute {
-            code_sla: code.sla,
-            sla: effective.sla,
+    let effective = effective_fields(code, &policies, stored.as_ref());
+    let reports = PassInput {
+        api_state: &api_state,
+        pool: &pool,
+        workflow_name: &workflow_name,
+        request: &request,
+    }
+    .run(code, &policies, effective)
+    .await?;
+    Ok(Json(view(&workflow_name, code, &policies, stored, reports)))
+}
+
+/// What the shard passes of a `PATCH` read.
+struct PassInput<'a> {
+    api_state: &'a HarvestApiState,
+    pool: &'a HarvestDbPool,
+    workflow_name: &'a str,
+    request: &'a RunDefaultsPatchRequest,
+}
+
+impl PassInput<'_> {
+    /// Run the passes that the request asks for after its write commits.
+    ///
+    /// The SLA recompute runs when the request asks for it. The concurrency
+    /// raise runs when the request can change the limit of a type with a
+    /// policy. A retry or quota change needs no pass, because no row stores
+    /// the override.
+    async fn run(
+        self,
+        code: RunDefaultFields,
+        policies: &CodePolicies,
+        effective: RunDefaultFields,
+    ) -> Result<Reports, AutumnError> {
+        let recompute = if self.request.recompute_in_flight {
+            let job = ShardJob::Recompute {
+                code_sla: code.sla,
+                sla: effective.sla,
+            };
+            let pass = on_every_shard(self.pool, self.workflow_name, job).await;
+            Some(RecomputeReport {
+                moved_runs: pass.changed,
+                unavailable_shards: pass.unavailable_shards,
+                superseded: pass.superseded,
+            })
+        } else {
+            None
         };
-        let pass = on_every_shard(&pool, &workflow_name, job).await;
-        Some(RecomputeReport {
-            moved_runs: pass.changed,
-            unavailable_shards: pass.unavailable_shards,
-            superseded: pass.superseded,
+        let concurrency_raise = match (policies.concurrency, effective.concurrency_limit) {
+            (Some(policy), Some(limit)) if self.request.touches_concurrency_limit() => Some(
+                raise_on_every_shard(self.api_state, self.pool, self.workflow_name, policy, limit)
+                    .await?,
+            ),
+            _ => None,
+        };
+        Ok(Reports {
+            recompute,
+            concurrency_raise,
         })
-    } else {
-        None
-    };
-    let concurrency_raise = match (policies.concurrency, effective.concurrency_limit) {
-        (Some(policy), Some(limit)) if request.touches_concurrency_limit() => {
-            Some(raise_on_every_shard(&api_state, &pool, &workflow_name, policy, limit).await?)
-        }
-        _ => None,
-    };
-    let reports = Reports {
-        recompute,
-        concurrency_raise,
-    };
-    Ok(Json(view(&workflow_name, code, policies, stored, reports)))
+    }
 }

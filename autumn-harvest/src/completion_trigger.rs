@@ -4108,6 +4108,7 @@ mod tests {
                 chain_execution_timeout: Some(std::time::Duration::from_mins(15)),
                 concurrency_limit: None,
                 quota: crate::quota::QuotaLimits::default(),
+                retry: crate::workflow_retry::RetryLimits::default(),
             },
         );
         let got = resolve_target_run_defaults(

@@ -60,7 +60,7 @@ Declared with `#[workflow(...)]` and registered with `WorkerBuilder`.
 | `WorkflowInfo.input_schema` | no | Schema, generated from code. | deploy-only |
 | `WorkflowInfo.output_schema` | no | Schema, generated from code. | deploy-only |
 | `WorkflowInfo.error_schema` | no | Schema, generated from code. | deploy-only |
-| `WorkflowInfo.retry_policy` | no | Read when a run fails, to start the next attempt. A change applies to the next failure of any run. | override (#2409) |
+| `WorkflowInfo.retry_policy` | yes, `max_attempts`, `initial_interval` and `max_interval` only, run-defaults route (#2409). | Read when a run fails, to start the next attempt. A change applies to the next failure of any run. A schedule's own policy wins. The backoff coefficient, the jitter and `non_retryable_errors` stay deploy-only. | override (#2409), three fields only |
 | `WorkflowInfo.mcp` | no | Exposure of the type as a tool. A security boundary, so it changes with code review. | deploy-only |
 | `WorkflowInfo.declared_activities` | no | Static reachability metadata. | deploy-only |
 | `WorkflowInfo.declared_children` | no | Static reachability metadata. | deploy-only |

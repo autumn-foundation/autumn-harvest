@@ -131,6 +131,22 @@ ignore = [
     # anymore; `cargo tree --workspace --all-features` has zero h2 0.3.x
     # or 0.4.x-below-0.4.16 instances.
 
+    # RUSTSEC-2026-0440 — astral-tokio-tar 0.6.4 is unmaintained (not a
+    # vulnerability). Pulled only by testcontainers, a dev dependency, and
+    # by the opt-in `test-utils` feature of autumn-harvest-redis. No shipped
+    # binary links it. "No safe upgrade is available" per the advisory.
+    # Revisit: when testcontainers moves to a maintained tar crate.
+    { id = "RUSTSEC-2026-0440", reason = "unmaintained, no safe upgrade exists; reached only through testcontainers (dev dependency and the opt-in test-utils feature), never shipped. Revisit: testcontainers moves to a maintained tar crate." },
+
+    # RUSTSEC-2026-0441 — pin-utils 0.1.1 is unmaintained (not a
+    # vulnerability). The upstream repository was archived on 2026-10-01.
+    # Pulled only by third-party crates: the aws-smithy runtime of the AWS
+    # SDK, loom and wasmtimer. No crate in this repo uses it directly.
+    # "No safe upgrade is available" per the advisory.
+    # Revisit: when aws-smithy, loom and wasmtimer move to
+    # `core::pin::pin!` or pin-project-lite.
+    { id = "RUSTSEC-2026-0441", reason = "unmaintained, no safe upgrade exists; reached only through aws-smithy, loom and wasmtimer, never used directly here. Revisit: those crates move to core::pin::pin! or pin-project-lite." },
+
     # RUSTSEC-2026-0173 — proc-macro-error2 2.0.1 is unmaintained (not a
     # vulnerability). Pulled by validator_derive -> validator -> autumn-web;
     # no direct use in this repo. "No safe upgrade is available" per the

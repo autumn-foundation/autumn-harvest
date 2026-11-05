@@ -175,6 +175,12 @@ pub struct StartWorkflowParams<'a> {
     /// Precedence: per-start override > schedule-default > workflow-type default, then clamped
     /// by `max_workflow_attempts_ceiling`. `None` = no auto-retry for this execution.
     pub workflow_retry_policy: Option<crate::policy::RetryPolicy>,
+    /// Who chose [`Self::workflow_retry_policy`] (issue #2409).
+    ///
+    /// A schedule path sets `Schedule` when the schedule declares its own
+    /// policy. A retry successor copies the source of its run. An operator
+    /// override applies only to a `Type` policy.
+    pub workflow_retry_source: crate::workflow_retry::RetryPolicySource,
     /// ID of the prior failed execution this run retries (issue #523). `None` for first attempt.
     pub retry_of_exec_id: Option<uuid::Uuid>,
     /// Server-side ceiling on `retry_policy.max_attempts` (issue #523).
@@ -340,6 +346,7 @@ impl<'a> StartWorkflowParams<'a> {
             scheduled_for: None,
             workflow_attempt: 1,
             workflow_retry_policy: None,
+            workflow_retry_source: crate::workflow_retry::RetryPolicySource::Type,
             retry_of_exec_id: None,
             max_workflow_attempts_ceiling: None,
             origin: None,
@@ -786,6 +793,7 @@ mod start_params_new_tests {
             scheduled_for,
             workflow_attempt,
             workflow_retry_policy,
+            workflow_retry_source,
             retry_of_exec_id,
             max_workflow_attempts_ceiling,
             origin,
@@ -831,6 +839,10 @@ mod start_params_new_tests {
         assert!(scheduled_for.is_none());
         assert_eq!(workflow_attempt, 1, "zero would grant an extra retry");
         assert!(workflow_retry_policy.is_none());
+        assert_eq!(
+            workflow_retry_source,
+            crate::workflow_retry::RetryPolicySource::Type
+        );
         assert!(retry_of_exec_id.is_none());
         assert!(max_workflow_attempts_ceiling.is_none());
         assert!(origin.is_none());
@@ -1758,7 +1770,8 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
             if let Some(ceiling) = request.max_workflow_attempts_ceiling {
                 p.max_attempts = p.max_attempts.min(ceiling);
             }
-            serde_json::to_value(&p).unwrap_or(serde_json::Value::Null)
+            // A schedule policy carries its source (issue #2409).
+            crate::workflow_retry::encode_stored(&p, request.workflow_retry_source)
         }),
         retry_of_exec_id: request.retry_of_exec_id,
         origin: request.origin,
@@ -7409,8 +7422,13 @@ macro_rules! with_start_params {
             workflow_attempt: 1,
             workflow_retry_policy: $request
                 .workflow_retry_policy
-                .clone()
-                .and_then(|v| serde_json::from_value(v).ok()),
+                .as_ref()
+                .and_then(crate::workflow_retry::decode_stored)
+                .map(|(policy, _)| policy),
+            workflow_retry_source: $request.workflow_retry_policy.as_ref().map_or(
+                crate::workflow_retry::RetryPolicySource::Type,
+                crate::workflow_retry::stored_source,
+            ),
             retry_of_exec_id: None,
             max_workflow_attempts_ceiling: $request.max_workflow_attempts_ceiling,
             origin: None,
@@ -8654,15 +8672,20 @@ pub async fn rerun_workflow_execution_with_codecs(
                     },
                 )?),
             };
-            let rerun_retry_policy = match source.workflow_retry_policy.clone() {
-                None => None,
-                Some(v) => Some(serde_json::from_value(v).map_err(|e| {
-                    HarvestError::Config(format!(
-                        "source execution {source_exec_id} has an unparseable stored \
-                         `workflow_retry_policy` value ({e}); re-run cannot faithfully \
-                         clone it"
-                    ))
-                })?),
+            // A re-run keeps the source of the stored policy too (issue #2409).
+            let (rerun_retry_policy, rerun_retry_source) = match &source.workflow_retry_policy {
+                None => (None, crate::workflow_retry::RetryPolicySource::Type),
+                Some(v) => {
+                    let (policy, source_of_policy) = crate::workflow_retry::decode_stored(v)
+                        .ok_or_else(|| {
+                            HarvestError::Config(format!(
+                                "source execution {source_exec_id} has an unparseable stored \
+                                 `workflow_retry_policy` value; re-run cannot faithfully \
+                                 clone it"
+                            ))
+                        })?;
+                    (Some(policy), source_of_policy)
+                }
             };
 
             let params = StartWorkflowParams {
@@ -8717,6 +8740,7 @@ pub async fn rerun_workflow_execution_with_codecs(
                 // A fresh retry chain.
                 workflow_attempt: 1,
                 workflow_retry_policy: rerun_retry_policy,
+                workflow_retry_source: rerun_retry_source,
                 retry_of_exec_id: None,
                 max_workflow_attempts_ceiling: request.max_workflow_attempts_ceiling,
                 completion_callbacks: source.completion_callbacks.clone(),

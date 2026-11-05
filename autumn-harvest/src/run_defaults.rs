@@ -1,5 +1,5 @@
-//! Operator overrides for per-type run defaults (issues #2387, #2406, #2407
-//! and #2408).
+//! Operator overrides for per-type run defaults (issues #2387, #2406, #2407,
+//! #2408 and #2409).
 //!
 //! [`WorkflowInfo::sla`](crate::info::WorkflowInfo::sla),
 //! [`WorkflowInfo::execution_timeout`](crate::info::WorkflowInfo::execution_timeout),
@@ -7,6 +7,8 @@
 //! the `limit` of
 //! [`WorkflowInfo::concurrency`](crate::info::WorkflowInfo::concurrency) and
 //! the admission caps of [`WorkflowInfo::quota`](crate::info::WorkflowInfo::quota)
+//! and three fields of
+//! [`WorkflowInfo::retry_policy`](crate::info::WorkflowInfo::retry_policy)
 //! are declared in code. A DAG lowers to a shadow workflow type of the same
 //! name, so its `DagInfo` values arrive here too. Each start path resolves the
 //! deadlines of a new run from them, so a change needed a restart.
@@ -72,6 +74,17 @@
 //! A process that admits starts with no registry, or with no refresh loop,
 //! admits under the code caps.
 //!
+//! ## Retry policy
+//!
+//! An override of the workflow retry policy (issue #2409) sets
+//! `max_attempts`, `initial_interval` and `max_interval`. Each start stores
+//! the policy of its run. The failure path applies the override
+//! over that stored policy through [`current_retry_policy`]. So a change
+//! applies to the next failure of any run, in flight or new. A retry
+//! successor copies the stored policy, not the effective one. So a clear
+//! restores the code value. A
+//! schedule's own policy wins. See [`crate::workflow_retry`].
+//!
 //! ## Failure mode
 //!
 //! A refresh that fails keeps the last snapshot, and the next tick retries.
@@ -87,7 +100,9 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, Utc};
 
 use crate::concurrency::ConcurrencyPolicy;
+use crate::policy::RetryPolicy;
 use crate::quota::{QuotaLimits, QuotaLimitsPatch, QuotaPolicy};
+use crate::workflow_retry::{RetryLimits, RetryLimitsPatch, RetryPolicySource};
 
 /// The maximum age of a loaded snapshot before a refresh loop reloads it.
 pub const RUN_DEFAULTS_TTL: Duration = Duration::from_secs(5);
@@ -110,6 +125,18 @@ pub const MAX_CONCURRENCY_LIMIT: u32 = i32::MAX.unsigned_abs();
 /// The override column is a `BIGINT`, so a larger value does not fit.
 pub const MAX_QUOTA_HISTORY_BYTES: u64 = i64::MAX.unsigned_abs();
 
+/// The longest retry delay that an override can set (issue #2409).
+///
+/// A retry successor starts with a delay. The start refuses a delay above
+/// 365 days when the request sets no `max_workflow_start_delay`, and the
+/// retry sets none. So a longer interval would end the chain, not slow it.
+pub const MAX_RETRY_INTERVAL: Duration = Duration::from_hours(8_760);
+
+/// The largest `max_attempts` that a retry override can set (issue #2409).
+///
+/// The override column is an `INTEGER`, so a larger value does not fit.
+pub const MAX_RETRY_ATTEMPTS: u32 = i32::MAX.unsigned_abs();
+
 /// The run-default fields that an override can set.
 ///
 /// `None` inherits the code value.
@@ -125,6 +152,8 @@ pub struct RunDefaultFields {
     pub concurrency_limit: Option<u32>,
     /// The quota admission caps of a new admission (issue #2408).
     pub quota: QuotaLimits,
+    /// The workflow retry fields of the next failure (issue #2409).
+    pub retry: RetryLimits,
 }
 
 impl RunDefaultFields {
@@ -136,6 +165,30 @@ impl RunDefaultFields {
             && self.chain_execution_timeout.is_none()
             && self.concurrency_limit.is_none()
             && self.quota.is_empty()
+            && self.retry.is_empty()
+    }
+
+    /// Apply this override to the stored retry policy of a failed run (issue
+    /// #2409).
+    ///
+    /// A schedule policy wins, so this returns `policy` unchanged. `ceiling` is the
+    /// fleet ceiling on `max_attempts`. It clamps an override value, as a
+    /// start clamps a code value.
+    #[must_use]
+    pub fn apply_retry(
+        &self,
+        policy: RetryPolicy,
+        source: RetryPolicySource,
+        ceiling: Option<u32>,
+    ) -> RetryPolicy {
+        if source == RetryPolicySource::Schedule {
+            return policy;
+        }
+        let mut limits = self.retry;
+        if let (Some(n), Some(ceiling)) = (limits.max_attempts, ceiling) {
+            limits.max_attempts = Some(n.min(ceiling));
+        }
+        limits.apply(policy)
     }
 
     /// Apply this override to the code quota policy of one type (issue
@@ -209,6 +262,8 @@ pub struct RunDefaultPatch {
     pub concurrency_limit: Option<Option<u32>>,
     /// The quota admission caps (issue #2408).
     pub quota: QuotaLimitsPatch,
+    /// The workflow retry fields (issue #2409).
+    pub retry: RetryLimitsPatch,
 }
 
 impl RunDefaultPatch {
@@ -223,6 +278,7 @@ impl RunDefaultPatch {
                 .unwrap_or(stored.chain_execution_timeout),
             concurrency_limit: self.concurrency_limit.unwrap_or(stored.concurrency_limit),
             quota: self.quota.merge(stored.quota),
+            retry: self.retry.merge(stored.retry),
         }
     }
 }
@@ -347,6 +403,27 @@ impl RunDefaultsCache {
             .map_or(policy, |fields| fields.apply_quota(policy))
     }
 
+    /// The effective retry policy of a failed run of one type (issue #2409).
+    ///
+    /// `policy` is the stored policy of the run. A poisoned lock returns it
+    /// unchanged. See [`RunDefaultFields::apply_retry`].
+    #[must_use]
+    pub fn apply_retry(
+        &self,
+        workflow_name: &str,
+        policy: RetryPolicy,
+        source: RetryPolicySource,
+        ceiling: Option<u32>,
+    ) -> RetryPolicy {
+        let Ok(snapshot) = self.snapshot.read() else {
+            return policy;
+        };
+        match snapshot.overrides.get(workflow_name) {
+            Some(fields) => fields.apply_retry(policy, source, ceiling),
+            None => policy,
+        }
+    }
+
     /// The override of one type in the current snapshot, if any.
     #[must_use]
     pub fn get(&self, workflow_name: &str) -> Option<RunDefaultFields> {
@@ -404,9 +481,10 @@ pub use db::*;
 #[cfg(feature = "db")]
 mod db {
     use super::{
-        ConcurrencyPolicy, MAX_CONCURRENCY_LIMIT, MAX_QUOTA_HISTORY_BYTES, MAX_RUN_DEFAULT,
-        QuotaLimits, QuotaLimitsPatch, QuotaPolicy, RUN_DEFAULTS_TTL, RunDefaultFields,
-        RunDefaultOverride, RunDefaultPatch, RunDefaultsCache,
+        ConcurrencyPolicy, MAX_CONCURRENCY_LIMIT, MAX_QUOTA_HISTORY_BYTES, MAX_RETRY_ATTEMPTS,
+        MAX_RETRY_INTERVAL, MAX_RUN_DEFAULT, QuotaLimits, QuotaLimitsPatch, QuotaPolicy,
+        RUN_DEFAULTS_TTL, RetryLimits, RetryLimitsPatch, RetryPolicy, RetryPolicySource,
+        RunDefaultFields, RunDefaultOverride, RunDefaultPatch, RunDefaultsCache,
     };
     use std::time::Duration;
 
@@ -434,6 +512,9 @@ mod db {
         quota_max_active_executions: Option<i64>,
         quota_max_history_bytes: Option<i64>,
         quota_max_dead_letters: Option<i64>,
+        retry_max_attempts: Option<i32>,
+        retry_initial_interval_ms: Option<i64>,
+        retry_max_interval_ms: Option<i64>,
         reason: Option<String>,
         updated_by: String,
         created_at: DateTime<Utc>,
@@ -467,6 +548,17 @@ mod db {
                         u32::try_from(n)
                             .ok()
                             .filter(|n| *n > 0)
+                            .ok_or_else(|| unreadable(field, n))
+                    })
+                    .transpose()
+            };
+            let millis = |field: &str, value: Option<i64>| -> HarvestResult<Option<Duration>> {
+                value
+                    .map(|n| {
+                        u64::try_from(n)
+                            .ok()
+                            .map(Duration::from_millis)
+                            .filter(|d| !d.is_zero() && *d <= MAX_RETRY_INTERVAL)
                             .ok_or_else(|| unreadable(field, n))
                     })
                     .transpose()
@@ -507,6 +599,22 @@ mod db {
                     })
                     .transpose()?,
                 quota,
+                retry: RetryLimits {
+                    max_attempts: self
+                        .retry_max_attempts
+                        .map(|n| {
+                            u32::try_from(n)
+                                .ok()
+                                .filter(|n| *n > 0)
+                                .ok_or_else(|| unreadable("retry_max_attempts", i64::from(n)))
+                        })
+                        .transpose()?,
+                    initial_interval: millis(
+                        "retry_initial_interval_ms",
+                        self.retry_initial_interval_ms,
+                    )?,
+                    max_interval: millis("retry_max_interval_ms", self.retry_max_interval_ms)?,
+                },
             };
             Ok(RunDefaultOverride {
                 workflow_name: self.workflow_name,
@@ -521,6 +629,10 @@ mod db {
 
     fn to_secs(value: Duration) -> i64 {
         i64::try_from(value.as_secs()).unwrap_or(i64::MAX)
+    }
+
+    fn to_millis(value: Duration) -> i64 {
+        i64::try_from(value.as_millis()).unwrap_or(i64::MAX)
     }
 
     /// Load every override. Call it on the default shard.
@@ -595,6 +707,8 @@ mod db {
     /// A zero duration is rejected, because a zero SLA breaches at once and a
     /// zero timeout ends the run or the chain at once. The write also refuses
     /// a zero concurrency limit or quota cap, because no start can then run.
+    /// It refuses zero retry attempts, a zero retry delay, and a merged retry
+    /// cap below the first delay.
     /// A merge that sets no field deletes the row. Returns the stored override
     /// after the change.
     ///
@@ -643,6 +757,13 @@ mod db {
                 .max_history_bytes
                 .map(|n| i64::try_from(n).unwrap_or(i64::MAX));
             let quota_max_dead_letters = merged.quota.max_dead_letters.map(i64::from);
+            check_retry_limits(merged.retry)?;
+            let retry_max_attempts = merged
+                .retry
+                .max_attempts
+                .map(|n| i32::try_from(n).unwrap_or(i32::MAX));
+            let retry_initial_interval_ms = merged.retry.initial_interval.map(to_millis);
+            let retry_max_interval_ms = merged.retry.max_interval.map(to_millis);
             diesel::insert_into(dsl::harvest_run_default_overrides)
                 .values((
                     dsl::workflow_name.eq(change.workflow_name),
@@ -653,6 +774,9 @@ mod db {
                     dsl::quota_max_active_executions.eq(quota_max_active_executions),
                     dsl::quota_max_history_bytes.eq(quota_max_history_bytes),
                     dsl::quota_max_dead_letters.eq(quota_max_dead_letters),
+                    dsl::retry_max_attempts.eq(retry_max_attempts),
+                    dsl::retry_initial_interval_ms.eq(retry_initial_interval_ms),
+                    dsl::retry_max_interval_ms.eq(retry_max_interval_ms),
                     dsl::reason.eq(change.reason),
                     dsl::updated_by.eq(change.actor),
                     dsl::created_at.eq(now),
@@ -668,6 +792,9 @@ mod db {
                     dsl::quota_max_active_executions.eq(quota_max_active_executions),
                     dsl::quota_max_history_bytes.eq(quota_max_history_bytes),
                     dsl::quota_max_dead_letters.eq(quota_max_dead_letters),
+                    dsl::retry_max_attempts.eq(retry_max_attempts),
+                    dsl::retry_initial_interval_ms.eq(retry_initial_interval_ms),
+                    dsl::retry_max_interval_ms.eq(retry_max_interval_ms),
                     dsl::reason.eq(change.reason),
                     dsl::updated_by.eq(change.actor),
                     dsl::updated_at.eq(now),
@@ -716,7 +843,63 @@ mod db {
             }
             _ => {}
         }
-        check_quota_patch(&patch.quota)
+        check_quota_patch(&patch.quota)?;
+        check_retry_patch(&patch.retry)
+    }
+
+    /// Refuse a retry value that no failure can use (issue #2409).
+    ///
+    /// The first attempt has already run when the override applies, so zero
+    /// attempts has no meaning. Use `1` to stop the retries. The write refuses
+    /// a zero delay, as it refuses every other zero duration. The column holds
+    /// whole milliseconds, so the write also refuses a delay under 1 ms. A
+    /// delay above [`MAX_RETRY_INTERVAL`] would make the retry start fail.
+    fn check_retry_patch(retry: &RetryLimitsPatch) -> HarvestResult<()> {
+        match retry.max_attempts.flatten() {
+            Some(0) => {
+                return Err(HarvestError::Config(
+                    "retry_max_attempts must be at least 1".to_string(),
+                ));
+            }
+            Some(n) if n > MAX_RETRY_ATTEMPTS => {
+                return Err(HarvestError::Config(format!(
+                    "retry_max_attempts must be at most {MAX_RETRY_ATTEMPTS}"
+                )));
+            }
+            _ => {}
+        }
+        for (field, value) in [
+            ("retry_initial_interval_ms", retry.initial_interval),
+            ("retry_max_interval_ms", retry.max_interval),
+        ] {
+            if value.flatten().is_some_and(|d| d.as_millis() == 0) {
+                return Err(HarvestError::Config(format!("{field} must be at least 1")));
+            }
+            if value.flatten().is_some_and(|d| d > MAX_RETRY_INTERVAL) {
+                return Err(HarvestError::Config(format!(
+                    "{field} must be at most {} (365 days)",
+                    MAX_RETRY_INTERVAL.as_millis()
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Refuse merged retry limits whose cap is below the first delay (issue
+    /// #2409).
+    ///
+    /// `max_interval` caps each delay, so such a cap hides the first delay.
+    /// The check runs on the merged row, because a patch can set one field
+    /// and keep the stored value of the other.
+    fn check_retry_limits(retry: RetryLimits) -> HarvestResult<()> {
+        if let (Some(initial), Some(max)) = (retry.initial_interval, retry.max_interval)
+            && max < initial
+        {
+            return Err(HarvestError::Config(
+                "retry_max_interval_ms must be at least retry_initial_interval_ms".to_string(),
+            ));
+        }
+        Ok(())
     }
 
     /// Refuse a quota cap of zero, or one past its column (issue #2408).
@@ -768,6 +951,35 @@ mod db {
         cache
             .and_then(|cache| cache.apply_quota(workflow_name, Some(policy)))
             .unwrap_or(policy)
+    }
+
+    /// The effective retry policy of a failed run, from the process cache
+    /// (issue #2409).
+    ///
+    /// `policy` and `source` are the stored policy of the run and its source.
+    /// A schedule policy wins. Otherwise the cached override of the type
+    /// applies. The fleet ceiling clamps its `max_attempts`. The cache is
+    /// [`GLOBAL_RUN_DEFAULTS`](crate::completion_trigger::GLOBAL_RUN_DEFAULTS),
+    /// because the failure path has no registry. With no cache, `policy`
+    /// comes back unchanged.
+    #[must_use]
+    pub fn current_retry_policy(
+        workflow_name: &str,
+        policy: RetryPolicy,
+        source: RetryPolicySource,
+    ) -> RetryPolicy {
+        let cache = crate::completion_trigger::GLOBAL_RUN_DEFAULTS
+            .read()
+            .ok()
+            .and_then(|guard| guard.clone());
+        let ceiling = crate::completion_trigger::GLOBAL_MAX_WORKFLOW_ATTEMPTS_CEILING
+            .read()
+            .ok()
+            .and_then(|guard| *guard);
+        match cache {
+            Some(cache) => cache.apply_retry(workflow_name, policy, source, ceiling),
+            None => policy,
+        }
     }
 
     impl RunDefaultsCache {
@@ -1196,6 +1408,7 @@ mod tests {
             chain_execution_timeout: Some(mins(600)),
             concurrency_limit: None,
             quota: QuotaLimits::default(),
+            retry: RetryLimits::default(),
         };
         let clear_sla = RunDefaultPatch {
             sla: Some(None),
@@ -1393,6 +1606,150 @@ mod tests {
                 ..base
             }
         );
+    }
+
+    fn code_retry() -> RetryPolicy {
+        RetryPolicy {
+            max_attempts: 5,
+            initial_interval: Duration::from_millis(200),
+            backoff_coefficient: 2.0,
+            max_interval: Duration::from_secs(10),
+            non_retryable_errors: vec![],
+            jitter: crate::policy::JitterPolicy::None,
+        }
+    }
+
+    fn retry_only(limits: RetryLimits) -> RunDefaultFields {
+        RunDefaultFields {
+            retry: limits,
+            ..RunDefaultFields::default()
+        }
+    }
+
+    const STOP: RetryLimits = RetryLimits {
+        max_attempts: Some(1),
+        initial_interval: None,
+        max_interval: None,
+    };
+
+    #[test]
+    fn a_retry_override_replaces_the_stored_fields_of_a_type_policy() {
+        let cache = RunDefaultsCache::new();
+        cache.replace([stored(
+            "etl",
+            retry_only(RetryLimits {
+                max_attempts: Some(2),
+                initial_interval: Some(mins(1)),
+                max_interval: None,
+            }),
+        )]);
+        let effective = cache.apply_retry("etl", code_retry(), RetryPolicySource::Type, None);
+        assert_eq!(effective.max_attempts, 2);
+        assert_eq!(effective.initial_interval, mins(1));
+        assert_eq!(
+            effective.max_interval,
+            mins(1),
+            "the cap rises to the first delay"
+        );
+        let other = cache.apply_retry("other", code_retry(), RetryPolicySource::Type, None);
+        assert_eq!(
+            other.max_attempts, 5,
+            "another type keeps its stored policy"
+        );
+    }
+
+    #[test]
+    fn a_schedule_policy_wins_over_a_retry_override() {
+        let cache = RunDefaultsCache::new();
+        cache.write_through("etl", retry_only(STOP));
+        let effective = cache.apply_retry("etl", code_retry(), RetryPolicySource::Schedule, None);
+        assert_eq!(effective.max_attempts, 5);
+    }
+
+    #[test]
+    fn the_fleet_ceiling_clamps_an_override_max_attempts() {
+        let fields = retry_only(RetryLimits {
+            max_attempts: Some(50),
+            ..RetryLimits::default()
+        });
+        let clamped = fields.apply_retry(code_retry(), RetryPolicySource::Type, Some(7));
+        assert_eq!(clamped.max_attempts, 7);
+        let free = fields.apply_retry(code_retry(), RetryPolicySource::Type, None);
+        assert_eq!(free.max_attempts, 50);
+        let below = retry_only(STOP).apply_retry(code_retry(), RetryPolicySource::Type, Some(7));
+        assert_eq!(below.max_attempts, 1);
+    }
+
+    #[test]
+    fn the_ceiling_never_clamps_a_stored_value_with_no_override() {
+        let fields = RunDefaultFields::default();
+        let policy = fields.apply_retry(code_retry(), RetryPolicySource::Type, Some(2));
+        assert_eq!(
+            policy.max_attempts, 5,
+            "the start already clamped the stored value"
+        );
+    }
+
+    #[test]
+    fn a_never_loaded_cache_returns_the_stored_retry_policy() {
+        let cache = RunDefaultsCache::new();
+        let policy = cache.apply_retry("etl", code_retry(), RetryPolicySource::Type, None);
+        assert_eq!(policy.max_attempts, 5);
+    }
+
+    #[test]
+    fn a_retry_only_override_is_not_empty_and_leaves_the_other_fields() {
+        let fields = retry_only(STOP);
+        assert!(!fields.is_empty());
+        let cache = RunDefaultsCache::new();
+        cache.write_through("etl", fields);
+        assert_eq!(cache.get("etl"), Some(fields));
+        assert_eq!(
+            cache.apply("etl", Some(mins(30)), Some(mins(10))),
+            (Some(mins(30)), Some(mins(10)))
+        );
+        assert_eq!(cache.apply_quota("etl", Some(QUOTA)), Some(QUOTA));
+    }
+
+    #[test]
+    fn patch_merge_keeps_the_retry_fields_it_does_not_name() {
+        let base = RunDefaultFields {
+            sla: Some(mins(5)),
+            ..retry_only(STOP)
+        };
+        let clear_sla = RunDefaultPatch {
+            sla: Some(None),
+            ..RunDefaultPatch::default()
+        };
+        assert_eq!(clear_sla.merge(base).retry, STOP);
+        let clear_retry = RunDefaultPatch {
+            retry: RetryLimitsPatch {
+                max_attempts: Some(None),
+                ..RetryLimitsPatch::default()
+            },
+            ..RunDefaultPatch::default()
+        };
+        assert_eq!(
+            clear_retry.merge(base),
+            RunDefaultFields {
+                retry: RetryLimits::default(),
+                ..base
+            }
+        );
+    }
+
+    #[test]
+    fn the_retry_interval_bound_is_the_default_start_delay_limit() {
+        assert_eq!(
+            MAX_RETRY_INTERVAL,
+            crate::builder::DEFAULT_MAX_WORKFLOW_START_DELAY
+        );
+        assert_eq!(MAX_RETRY_INTERVAL, Duration::from_hours(365 * 24));
+    }
+
+    #[test]
+    fn the_attempts_bound_fits_the_integer_column() {
+        assert_eq!(i64::from(MAX_RETRY_ATTEMPTS), i64::from(i32::MAX));
     }
 
     #[test]

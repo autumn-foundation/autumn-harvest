@@ -330,6 +330,7 @@ async fn manual_start_has_no_scheduled_time() {
             scheduled_for: None,
             workflow_attempt: 1,
             workflow_retry_policy: None,
+            workflow_retry_source: autumn_harvest::workflow_retry::RetryPolicySource::Type,
             retry_of_exec_id: None,
             max_workflow_attempts_ceiling: None,
             origin: None,
