@@ -1005,6 +1005,17 @@ jobs:
       - name: Turn off kache executable caching (macOS)
         if: runner.os == 'macOS'
         run: echo "KACHE_CACHE_EXECUTABLES=0" >> "$GITHUB_ENV"
+      # On Windows, the kache store on C: filled up during the manifest
+      # compile. The paging file then could not grow, and rustc failed with
+      # os error 1455 (issue #2380). Debug info is most of each rlib, PDB and
+      # test binary. `run-suites.sh archive` turns it off for the same reason.
+      # A panic still reports its file and line.
+      - name: Turn off debug info (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          echo "CARGO_PROFILE_DEV_DEBUG=0" >> "$GITHUB_ENV"
+          echo "CARGO_PROFILE_TEST_DEBUG=0" >> "$GITHUB_ENV"
       - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
         with:
           version: v2.0.0
