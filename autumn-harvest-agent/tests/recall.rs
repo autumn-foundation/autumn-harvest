@@ -378,3 +378,82 @@ async fn a_rerun_with_another_window_runs_again() {
     assert!(wide.calls() > 0, "the wide window runs its own agents");
     assert_eq!(report.score(WINDOW, OP1_ITEM), Some(1.0));
 }
+
+/// A validator that accepts each overlay.
+struct AcceptAll;
+
+impl autumn_harvest_agent::OverlayValidator for AcceptAll {
+    fn validate(
+        &self,
+        _kind: &str,
+        _overlay: &autumn_harvest_agent::ProfileOverlay,
+        _policy: &autumn_harvest_agent::RefinePolicy,
+    ) -> Result<(), autumn_harvest_agent::OverlayStoreError> {
+        Ok(())
+    }
+}
+
+/// Put an overlay with the system prompt `system` on `kind`, and activate it.
+async fn activate_system(store: &Arc<autumn_harvest_agent::InMemoryOverlayStore>, system: &str) {
+    use autumn_harvest_agent::{ProfileOverlay, ProfileOverlayStore, Provenance};
+
+    let overlay = ProfileOverlay {
+        system: Some(system.to_owned()),
+        ..ProfileOverlay::default()
+    };
+    let who = || Provenance::operator("ops");
+    let active = store.active(WINDOW).await.expect("active");
+    let version = store.put(WINDOW, &overlay, who()).await.expect("put");
+    let expected = active.map(|stored| stored.version());
+    store
+        .activate(WINDOW, version, expected, who())
+        .await
+        .expect("activate");
+}
+
+/// Run the window config on `db` with `store` as the overlay store.
+async fn sweep_with_overlays(
+    db: &Path,
+    store: &Arc<autumn_harvest_agent::InMemoryOverlayStore>,
+    model: &Arc<ReaderModel>,
+) -> RecallReport {
+    let harness = Arc::new(harness(model.clone(), WINDOW_SIZE).overlay_store(store.clone()));
+    let mut rt = SqliteRuntime::open(db).expect("the database opens");
+    sqlite::register(&mut rt, Arc::clone(&harness));
+    let configs = [WINDOW.to_owned()];
+    recall::sweep(&mut rt, &harness, &only(OP1_ITEM), &configs).await
+}
+
+/// Issue #2556: an activation that changes the prompt gets new agents, so a
+/// rerun never reports the scores of the old overlay.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rerun_after_an_activation_runs_again() {
+    let (_dir, db) = fresh_db();
+    let store = Arc::new(autumn_harvest_agent::InMemoryOverlayStore::new(Arc::new(
+        AcceptAll,
+    )));
+    activate_system(&store, "Answer briefly.").await;
+    let first = ReaderModel::new();
+    sweep_with_overlays(&db, &store, &first).await;
+    assert!(first.calls() > 0, "the first sweep calls the model");
+
+    activate_system(&store, "Answer in full.").await;
+    let second = ReaderModel::new();
+    sweep_with_overlays(&db, &store, &second).await;
+    assert!(second.calls() > 0, "the new overlay runs its own agents");
+}
+
+/// Issue #2556: a rerun with the same active overlay reuses the agents.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rerun_with_no_activation_calls_no_model() {
+    let (_dir, db) = fresh_db();
+    let store = Arc::new(autumn_harvest_agent::InMemoryOverlayStore::new(Arc::new(
+        AcceptAll,
+    )));
+    activate_system(&store, "Answer briefly.").await;
+    sweep_with_overlays(&db, &store, &ReaderModel::new()).await;
+
+    let again = ReaderModel::new();
+    sweep_with_overlays(&db, &store, &again).await;
+    assert_eq!(again.calls(), 0);
+}
