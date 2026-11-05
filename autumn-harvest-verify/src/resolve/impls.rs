@@ -1307,12 +1307,24 @@ mod tests {
         index.absorb_syn(
             "#[cfg(test)] mod t { proptest! { #[test] fn p(s in any::<String>(), id: CandidateId) {\n\
              prop_assert_eq!(s, s); prop_assert!(id == id); } } }\n\
-             prop_compose! { fn pair()(a in 0u8.., b in 0u8..) -> Pair { Pair(a, b) } }\n",
+             prop_compose! { fn pair()(a in 0u8.., b in 0u8..) -> Pair { Pair(a, b) } }\n\
+             fn f() { prop_assume!(x == Foo); prop_assert_ne!(a, Baz);\n\
+             prop_assert_eq!(a, Qux); prop_assert!(a == Quux);\n\
+             let s = prop_oneof![Just(Bar)]; }\n",
             &[],
         );
         index.expand_macros();
         let opaque = |ty: &str| index.type_fields.get(ty).is_some_and(|f| f.opaque);
-        for ty in ["String", "CandidateId", "Pair"] {
+        for ty in [
+            "String",
+            "CandidateId",
+            "Pair",
+            "Foo",
+            "Baz",
+            "Qux",
+            "Quux",
+            "Bar",
+        ] {
             assert!(!opaque(ty), "{ty}: {index:?}");
         }
     }
