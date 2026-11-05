@@ -8,21 +8,32 @@ Config can now narrow the queues that the worker of one process polls.
   `AUTUMN_HARVEST__WORKER__QUEUES`, comma-separated. An empty list means
   "not set". `[harvest.worker]` refuses an unknown key.
 - An undeclared queue stops the boot. The error names it and the declared
-  queues. The check runs before any I/O.
+  queues. The check runs before the boot gates load and before a worker
+  starts. `AUTUMN_HARVEST_WORKER__QUEUES`, the sibling form, stops the boot
+  and names the right variable.
 - With no explicit list, the `pin` of a named Autumn role narrows the
   worker. Autumn job queues share the pin, so Harvest ignores a name that
-  it does not declare. A pin that names no declared queue changes nothing
-  and logs one `warn!`. An explicit list always wins.
+  it does not declare. A pin that names no declared queue changes nothing.
+  A process that runs the worker then logs one `warn!`. An explicit list
+  always wins. Harvest does not read `jobs.pin`.
 - The worker polls in code order. The management API keeps the declared
-  list, so the default start queue does not move. A weight of a queue that
-  the worker does not poll is dropped.
+  list, so the default start queue does not move. The runner drops the
+  weight of each queue that the worker does not poll.
 - Startup logs the declared queues, the polled queues and the source.
 - `GET /admin/config` adds `worker.declared_queues` and
   `worker.queue_source`. `worker.queues` is now the polled list.
 - `GET /admin/queue-coverage` adds `unpolled_declared_queues`: each
-  declared queue with no live worker on an inspected shard. It does not
-  change `uncovered`. `harvest queue coverage --strict` exits `2` when the
-  list is not empty.
+  declared queue with no live worker on a writable shard. It does not
+  change `uncovered`. `null` means "unknown": no runtime, or a writable
+  shard gave no answer. An idle shard whose worker read fails stays
+  `inspected`, as before.
+- `harvest queue coverage --strict` exits `2` when the list is not empty,
+  `null` or missing, so it fails closed against an older server.
+- Each Harvest route is in the `autumn-web` route group `harvest`. A
+  `[roles.<name>] mount` list must name it.
+- Harvest follows only the `base` of a preset role. A preset that turns
+  off `job_workers` (`pin = []` included), `scheduler` or `retention` logs
+  one `warn!`. Issue #2480 maps each capability.
 - `HarvestEmbedding` applies `[harvest.worker]` and the variable over the
   code value, as it does for `[harvest.startup]`.
 - The SQLite backend refuses a list. Its one driver runs each queue.
@@ -32,7 +43,10 @@ Config can now narrow the queues that the worker of one process polls.
   tracks it.
 
 **Compatibility: `autumn-web` 0.10.** `autumn-harvest-plugin` now depends
-on `autumn-web` 0.10, which adds named roles (autumn#3543). An app with its
+on `autumn-web` 0.10, which adds named roles (autumn#3543). Its public API
+holds `autumn-web` types, so ship this in a minor release, `0.10.0`, not
+in a `0.9.x` patch. A patch would give a `0.9` app two `autumn-web`
+copies on `cargo update`. An app with its
 own `autumn-web` entry must bump it to `"0.10"`. A leftover `"0.9"` builds
 two copies, and `HarvestPlugin` does not match the app's `AppBuilder`.
 `cargo tree -i autumn-web` must show one version. The plugin follows two

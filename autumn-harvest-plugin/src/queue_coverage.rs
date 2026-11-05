@@ -203,14 +203,19 @@ pub struct QueueCoverageReport {
     /// reported uncovered the moment it is unpaused without gaining a live
     /// poller. Empty when nothing pending is both paused and pollerless.
     pub excluded_paused_queues: Vec<String>,
-    /// Declared queues that no live worker polls on an inspected shard
+    /// Declared queues that no live worker polls on a writable shard
     /// (issue #2479). Sorted and deduped across shards.
     ///
     /// The declared list is the code list of the process that serves this
     /// request. Config or the role pin can narrow each worker to a subset. A
-    /// name here has no worker tier, so a run on it waits. Unlike `items`,
-    /// this needs no pending task. It does not change `uncovered`.
-    pub unpolled_declared_queues: Vec<String>,
+    /// name here has no worker tier, so a new run on it waits. Unlike
+    /// `items`, this needs no pending task. It does not change `uncovered`.
+    ///
+    /// Only writable shards count, because a drained shard takes no new run.
+    /// `items` still reports pending work on a drained shard. `None` means
+    /// "unknown": no runtime is installed, or a writable shard gave no
+    /// answer. An empty list means that each declared queue has a poller.
+    pub unpolled_declared_queues: Option<Vec<String>>,
 }
 
 /// One queue with pending work and zero live pollers, aggregated across
@@ -330,18 +335,30 @@ pub async fn build_queue_coverage_report(
     let expected_shards = shard_fanout::expected_shards(api_state, &pools);
 
     let filter = query.queue_name.clone();
-    let declared = declared_queues(api_state, filter.as_deref());
+    let runtime = api_state.runtime().ok();
+    let declared = runtime
+        .as_ref()
+        .map(|runtime| declared_queues(runtime.queues(), filter.as_deref()));
+    let writable: BTreeSet<i32> = runtime.as_ref().map_or_else(BTreeSet::new, |runtime| {
+        runtime
+            .router()
+            .writable_shards()
+            .iter()
+            .map(|shard| shard.as_i32())
+            .collect()
+    });
 
     let futures = expected_shards
         .iter()
         .map(|shard_id| {
             let pool = pools.get(shard_id).cloned();
+            let checked = declared_for_shard(declared.as_deref(), &writable, *shard_id);
             observe_shard(
                 *shard_id,
                 pool,
                 filter.clone(),
                 worker_stale_threshold,
-                &declared,
+                checked,
             )
         })
         .collect::<Vec<_>>();
@@ -350,30 +367,48 @@ pub async fn build_queue_coverage_report(
     let mut paused_uncovered_sets = Vec::with_capacity(results.len());
     let mut unpolled_sets = Vec::with_capacity(results.len());
     for shard in results {
+        if writable.contains(&shard.observation.shard_id) {
+            unpolled_sets.push(shard.unpolled_declared);
+        }
         observations.push(shard.observation);
         paused_uncovered_sets.push(shard.paused_uncovered);
-        unpolled_sets.push(shard.unpolled_declared);
     }
 
     let mut report = build_report_from_observations(observed_at, filter, observations);
     report.excluded_paused_queues = merge_queue_name_sets(paused_uncovered_sets);
-    report.unpolled_declared_queues = merge_queue_name_sets(unpolled_sets);
+    report.unpolled_declared_queues = declared
+        .is_some()
+        .then(|| unpolled_sets.into_iter().collect::<Option<Vec<_>>>())
+        .flatten()
+        .map(merge_queue_name_sets);
     report
+}
+
+/// The declared queues that `shard_id` must poll (issue #2479).
+///
+/// A shard that is not writable takes no new run, so it needs no poller.
+/// `items` still reports pending work on it.
+fn declared_for_shard<'a>(
+    declared: Option<&'a [String]>,
+    writable: &BTreeSet<i32>,
+    shard_id: i32,
+) -> &'a [String] {
+    match declared {
+        Some(declared) if writable.contains(&shard_id) => declared,
+        _ => &[],
+    }
 }
 
 /// The declared queues that the report checks (issue #2479).
 ///
 /// The list is the code list of the installed runtime. A `queue_name`
-/// filter narrows it to that one queue. With no runtime, the list is empty.
-fn declared_queues(api_state: &HarvestApiState, filter: Option<&str>) -> Vec<String> {
-    let declared = api_state
-        .runtime()
-        .map(|runtime| runtime.queues().to_vec())
-        .unwrap_or_default();
-    match filter {
-        Some(name) => declared.into_iter().filter(|queue| queue == name).collect(),
-        None => declared,
-    }
+/// filter narrows it to that one queue.
+fn declared_queues(declared: &[String], filter: Option<&str>) -> Vec<String> {
+    declared
+        .iter()
+        .filter(|queue| filter.is_none_or(|name| *queue == name))
+        .cloned()
+        .collect()
 }
 
 /// The declared queues that no live worker in `workers` polls on
@@ -396,15 +431,17 @@ fn unpolled_declared(
 
 /// What one shard reports.
 ///
-/// On an error path both sets are empty, as `rows` is. Coverage cannot be
-/// determined without a read, so nothing is asserted either way.
+/// On an error path, `rows` and the paused set are empty and the unpolled
+/// set is `None`. Coverage cannot be determined without a read, so nothing
+/// is asserted either way.
 struct ShardCoverage {
     observation: ShardObservation<UncoveredQueueDemand>,
     /// Queue names excluded only because they are paused. See
     /// [`merge_queue_name_sets`].
     paused_uncovered: BTreeSet<String>,
-    /// Declared queues that no live worker polls on this shard.
-    unpolled_declared: BTreeSet<String>,
+    /// Declared queues that no live worker polls on this shard. `None` when
+    /// the worker read failed.
+    unpolled_declared: Option<BTreeSet<String>>,
 }
 
 impl ShardCoverage {
@@ -416,7 +453,20 @@ impl ShardCoverage {
                 error: Some(error),
             },
             paused_uncovered: BTreeSet::new(),
-            unpolled_declared: BTreeSet::new(),
+            unpolled_declared: None,
+        }
+    }
+
+    /// An inspected shard with no uncovered demand.
+    const fn idle(shard_id: i32, unpolled_declared: Option<BTreeSet<String>>) -> Self {
+        Self {
+            observation: ShardObservation {
+                shard_id,
+                rows: Vec::new(),
+                error: None,
+            },
+            paused_uncovered: BTreeSet::new(),
+            unpolled_declared,
         }
     }
 }
@@ -557,7 +607,7 @@ async fn observe_shard(
             return ShardCoverage {
                 observation,
                 paused_uncovered: BTreeSet::new(),
-                unpolled_declared: BTreeSet::new(),
+                unpolled_declared: None,
             };
         }
     };
@@ -570,32 +620,19 @@ async fn observe_shard(
     // Nothing pending and no declared queue to check: skip the worker and
     // pause reads entirely. There is nothing to report.
     if pending.is_empty() && declared.is_empty() {
-        return ShardCoverage {
-            observation: ShardObservation {
-                shard_id,
-                rows: Vec::new(),
-                error: None,
-            },
-            paused_uncovered: BTreeSet::new(),
-            unpolled_declared: BTreeSet::new(),
-        };
+        return ShardCoverage::idle(shard_id, Some(BTreeSet::new()));
     }
 
     let workers = match fetch_potentially_live_workers(&mut conn, worker_stale_threshold).await {
         Ok(workers) => workers,
+        // With nothing pending, the read only served the unpolled check. The
+        // shard stays inspected, as before issue #2479. The check is unknown.
+        Err(_) if pending.is_empty() => return ShardCoverage::idle(shard_id, None),
         Err(error) => return ShardCoverage::failed(shard_id, error.to_string()),
     };
-    let unpolled_declared = unpolled_declared(declared, &workers, shard_id);
+    let unpolled_declared = Some(unpolled_declared(declared, &workers, shard_id));
     if pending.is_empty() {
-        return ShardCoverage {
-            observation: ShardObservation {
-                shard_id,
-                rows: Vec::new(),
-                error: None,
-            },
-            paused_uncovered: BTreeSet::new(),
-            unpolled_declared,
-        };
+        return ShardCoverage::idle(shard_id, unpolled_declared);
     }
 
     let paused: BTreeSet<String> = match queue_pause::paused_queue_names(&mut conn).await {
@@ -793,7 +830,7 @@ fn build_report_from_observations(
         items,
         shards,
         excluded_paused_queues: Vec::new(),
-        unpolled_declared_queues: Vec::new(),
+        unpolled_declared_queues: None,
     }
 }
 
@@ -1122,7 +1159,37 @@ mod tests {
             unpolled.into_iter().collect::<Vec<_>>(),
             vec!["default".to_owned(), "priority".to_owned()]
         );
-        assert!(unpolled_declared(&[], &workers, 0).is_empty());
+        assert_eq!(unpolled_declared(&[], &workers, 0), BTreeSet::new());
+    }
+
+    /// Issue #2479: only a writable shard must poll the declared queues.
+    #[test]
+    fn only_a_writable_shard_checks_the_declared_queues() {
+        let declared = vec!["default".to_owned()];
+        let writable = BTreeSet::from([0]);
+        assert_eq!(
+            declared_for_shard(Some(&declared), &writable, 0),
+            declared.as_slice()
+        );
+        assert_eq!(
+            declared_for_shard(Some(&declared), &writable, 1),
+            [] as [String; 0]
+        );
+        assert_eq!(declared_for_shard(None, &writable, 0), [] as [String; 0]);
+        assert_eq!(
+            declared_queues(&["a".to_owned(), "b".to_owned()], Some("b")),
+            vec!["b".to_owned()]
+        );
+    }
+
+    /// Issue #2479: with no runtime, the list is unknown, not empty. An
+    /// empty list would read as "each queue has a poller".
+    #[tokio::test]
+    async fn no_runtime_reports_unpolled_as_unknown() {
+        let report =
+            build_queue_coverage_report(&HarvestApiState::new(), QueueCoverageQuery::default())
+                .await;
+        assert_eq!(report.unpolled_declared_queues, None);
     }
 
     #[test]

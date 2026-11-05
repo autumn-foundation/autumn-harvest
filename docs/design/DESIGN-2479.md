@@ -14,7 +14,7 @@ with `jobs.pin`. Harvest does not take part.
 - `HarvestRunner::start` builds the `Worker` from
   `WorkerRuntimeConfig::queues`. The API runtime reads the same list. A
   start with no queue goes to the first queue of that list.
-- `Worker::validate` refuses an empty queue list. It warns about a weight
+- `WorkerRuntimeConfig::validate` refuses an empty queue list. It warns about a weight
   of a queue that it does not poll.
 - Each worker writes its queues to `harvest_workers.queues`.
   `GET /admin/queue-coverage` reads that column across the fleet.
@@ -55,6 +55,10 @@ The chosen option is in bold.
 | A typo such as `priorty` makes a tier that polls nothing. | An undeclared name stops the boot. The error names it and the declared list. |
 | `queue = [...]` narrows nothing in silence. | `[harvest.worker]` refuses an unknown key. |
 | A narrowed web tier moves the default start queue. | The API keeps the declared list. Only the worker polls the subset. |
+| A `mount` preset drops the Harvest routes, the readiness probe included. | The route group is `harvest`, not the Rust type path. The guide names it. |
+| A preset turns off `job_workers` or `scheduler`, but Harvest still runs. | One `warn!` names the preset and the fix. Issue #2480 maps capabilities. |
+| A new CLI calls an older server, and `--strict` passes. | A missing or `null` list fails the gate. |
+| A drained shard reports every queue unpolled. | Only writable shards count. |
 | A jobs-only role pin turns the Harvest worker off. | A pin that names no declared queue changes nothing. One `warn!` names the pin and the fix. |
 | A role pin overrides an operator choice. | An explicit list always wins. Verus proves it. |
 | No tier polls a declared queue. Its runs wait forever. | `/admin/queue-coverage` lists `unpolled_declared_queues`. `/admin/config` lists both lists and the source. |
@@ -94,7 +98,12 @@ The chosen option is in bold.
 - `HarvestRunnerResources::role_pin` reads `Role::pin()` of the app state.
 - `GET /admin/config` adds `worker.declared_queues` and
   `worker.queue_source`. `worker.queues` is the polled list.
-- `GET /admin/queue-coverage` adds `unpolled_declared_queues`.
+- `GET /admin/queue-coverage` adds `unpolled_declared_queues`. It checks
+  writable shards only. `null` means "unknown". `--strict` fails closed.
+- `HarvestPlugin::route_group` is `harvest`, so a `mount` list can name
+  the Harvest routes.
+- Harvest follows only the `base` of a preset. A preset that turns off a
+  capability logs one `warn!`. Issue #2480 maps each capability.
 - `HarvestEmbedding` applies the operator `[harvest.worker]` section.
 - The SQLite backend refuses a list.
 - `autumn-web` moves to 0.10.
@@ -104,5 +113,5 @@ The chosen option is in bold.
 | AC | Evidence |
 |---|---|
 | `AUTUMN_HARVEST__WORKER__QUEUES=priority` polls only `priority`. An undeclared queue fails the boot with its name. | Config test `worker_queues_from_toml_profile_and_env`. DB tests `a_worker_polls_only_the_queues_that_config_names` and `an_undeclared_worker_queue_fails_the_boot_with_its_name`. Module tests in `worker_queues.rs`. |
-| A role queue list applies with no explicit config. | Module test `a_named_role_pin_reaches_the_worker` resolves a `[roles.priority]` preset with `autumn-web` 0.10. Module tests `a_role_pin_narrows_with_no_explicit_list`, `an_explicit_list_wins_over_the_role_pin` and `a_pin_of_job_queues_only_keeps_the_code_set_and_warns`. Runner test `the_resources_give_the_pin_of_their_role`. Verus `theorem_the_role_applies_only_below_config`. |
+| A role queue list applies with no explicit config. | Module test `a_named_role_pin_reaches_the_worker` resolves a `[roles.priority]` preset with `autumn-web` 0.10. Module tests `a_role_pin_narrows_with_no_explicit_list`, `an_explicit_list_wins_over_the_role_pin` and `a_pin_of_job_queues_only_keeps_the_code_set_and_warns`. Runner test `the_resources_give_the_pin_of_their_role` (a built-in role gives no pin). Verus `theorem_the_role_applies_only_below_config`. |
 | Queue coverage is visible to Autumn doctor. | Partly. `/admin/config` and `/admin/queue-coverage` report the lists, and `harvest queue coverage --strict` gates on them. The `autumn doctor` hook waits for autumn#3545 and issue #2480. |

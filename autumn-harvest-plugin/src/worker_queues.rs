@@ -7,9 +7,9 @@
 //!    name must be declared. An undeclared name stops the boot, so a typo
 //!    cannot make a tier that polls nothing.
 //! 2. The `pin` of the Autumn role. It applies only when no explicit list is
-//!    set. Autumn job queues share the pin, so a name that Harvest does not
-//!    declare is ignored. A pin that names no declared queue changes nothing,
-//!    and logs one `warn!`.
+//!    set. Autumn job queues share the pin, so Harvest ignores a name that it
+//!    does not declare. A pin that names no declared queue changes nothing.
+//!    A process that runs the worker then logs one `warn!`.
 //!
 //! The worker polls the declared queues that the source selects, in the
 //! declared order. The management API keeps the declared list, so a start
@@ -18,7 +18,7 @@
 
 use std::collections::BTreeSet;
 
-/// The config key and the environment variable, as an operator writes them.
+/// The config key, as an operator writes it.
 pub const WORKER_QUEUES_KEY: &str = "harvest.worker.queues";
 
 /// The environment variable that sets [`WORKER_QUEUES_KEY`].
@@ -177,7 +177,8 @@ impl WorkerQueues {
     /// Log the resolved queues once at startup.
     ///
     /// One `info!` names the declared and the polled queues and the source.
-    /// A role pin that names no declared queue adds one `warn!`.
+    /// A role pin that names no declared queue adds one `warn!`, but only
+    /// when the worker runs.
     pub fn log(&self, worker_enabled: bool) {
         let polled: &[String] = if worker_enabled { &self.polled } else { &[] };
         tracing::info!(
@@ -187,7 +188,7 @@ impl WorkerQueues {
             source = %self.source,
             "harvest worker queues resolved"
         );
-        if self.pin_misses() {
+        if worker_enabled && self.pin_misses() {
             tracing::warn!(
                 "the Autumn role pin names no Harvest queue ({}), so the Harvest worker polls \
                  each declared queue ({}). To narrow it, set {WORKER_QUEUES_ENV} or \
@@ -224,8 +225,8 @@ pub(crate) const fn pin_misses(explicit: bool, pin_set: bool, pin_hits: bool) ->
 
 /// Parse `AUTUMN_HARVEST__WORKER__QUEUES`: comma-separated names.
 ///
-/// Each name is trimmed. An empty item is skipped, as for
-/// `AUTUMN_JOBS__PIN`. A repeated name is kept once.
+/// The parser trims each name, skips an empty item and keeps a repeated
+/// name once. It skips an empty item as `AUTUMN_JOBS__PIN` does.
 #[must_use]
 pub fn parse_env_list(value: &str) -> Vec<String> {
     dedupe(
@@ -271,7 +272,7 @@ mod tests {
         assert_eq!(queues.polled(), declared.as_slice());
         assert_eq!(queues.declared(), declared.as_slice());
         assert_eq!(queues.source(), QueueSource::Code);
-        assert!(queues.unpolled().is_empty());
+        assert_eq!(queues.unpolled(), Vec::<String>::new());
         assert!(!queues.pin_misses());
     }
 
@@ -301,7 +302,7 @@ mod tests {
             error,
             UndeclaredQueues {
                 undeclared: names(&["priorty"]),
-                declared: declared.clone(),
+                declared,
             }
         );
         let message = error.to_string();
@@ -354,6 +355,10 @@ mod tests {
         assert!(logs.contains("emails"), "{logs}");
         assert!(logs.contains("default, priority"), "{logs}");
         assert!(logs.contains("AUTUMN_HARVEST__WORKER__QUEUES"), "{logs}");
+
+        // A process with no worker polls nothing, so the warning is false.
+        let logs = crate::process_role::capture_logs(tracing::Level::WARN, || queues.log(false));
+        assert!(!logs.contains("WARN"), "{logs}");
     }
 
     #[test]
@@ -395,8 +400,8 @@ mod tests {
             parse_env_list(" priority , bulk,,priority ,"),
             names(&["priority", "bulk"])
         );
-        assert!(parse_env_list("").is_empty());
-        assert!(parse_env_list(" , ").is_empty());
+        assert_eq!(parse_env_list(""), Vec::<String>::new());
+        assert_eq!(parse_env_list(" , "), Vec::<String>::new());
     }
 
     /// Resolve the role that `toml` selects.
@@ -500,7 +505,7 @@ mod tests {
                 .map(|(name, _)| name.clone())
                 .collect();
             let queues = WorkerQueues::resolve(&declared, &explicit, None).unwrap();
-            let expected = if explicit.is_empty() { declared.clone() } else { explicit };
+            let expected = if explicit.is_empty() { declared } else { explicit };
             prop_assert_eq!(queues.polled(), expected.as_slice());
         }
     }

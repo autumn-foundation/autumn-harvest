@@ -257,6 +257,12 @@ impl HarvestEmbedding {
         api_state.set_workflow_result_notification_database_urls(urls);
         api_state.set_payload_codecs(built.payload_codecs().clone());
 
+        // Issue #2479: a queue typo stops the boot before the first I/O.
+        crate::runner::resolve_worker_queues(
+            &built.worker_config().queues,
+            &config,
+            resources.role_pin().as_deref(),
+        )?;
         boot::load_boot_admission_gates(&api_state, &default_pool).await;
         run_startup_orphan_gate(config.startup.orphaned_workflows, &built, &resources).await?;
         // The mirror sets a process global, so it runs after the last refusal

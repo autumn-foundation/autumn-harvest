@@ -1643,6 +1643,9 @@ const fn mcp_tools_unprotected(mcp_tools_enabled: bool, has_tool_middleware: boo
     mcp_tools_enabled && !has_tool_middleware
 }
 
+/// The route group of each Harvest route, for `[roles.<name>] mount`.
+pub const HARVEST_ROUTE_GROUP: &str = "harvest";
+
 /// The `autumn-web` series this crate supports.
 ///
 /// It must equal the `autumn-web` requirement in this crate's `Cargo.toml`.
@@ -1667,6 +1670,17 @@ impl Plugin for HarvestPlugin {
     /// outside this range. `autumn plugin-check` fails a plugin with no range.
     fn contract(&self) -> Option<PluginContract> {
         Some(harvest_plugin_contract())
+    }
+
+    /// Puts each Harvest route in the group [`HARVEST_ROUTE_GROUP`].
+    ///
+    /// `autumn-web` 0.10 uses this name in `[roles.<name>] mount = [...]`.
+    /// The default is the Rust type path, which an operator cannot guess and
+    /// which a module rename changes. A role that mounts groups must name
+    /// `harvest`, or it serves no Harvest route, the readiness probe
+    /// included.
+    fn route_group(&self) -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed(HARVEST_ROUTE_GROUP)
     }
 
     fn build(self, app: AppBuilder) -> AppBuilder {
@@ -2488,6 +2502,12 @@ async fn start_harvest_runtime(
     let mut built = builder
         .try_build()
         .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?;
+    // Issue #2479: a queue typo stops the boot before the gate load below.
+    crate::runner::resolve_worker_queues(
+        &built.worker_config().queues,
+        &harvest_config,
+        crate::worker_queues::role_pin(state.role()).as_deref(),
+    )?;
 
     // Issue #944: capture what the connector consumer loops need before
     // `built` is moved into the runner. `metrics` is Arc-identical to the
@@ -3462,6 +3482,14 @@ mod tests {
             .expect("the builder keeps the limiter");
         assert_eq!(kept.mutating(), BucketRate::per_second(10));
         assert_eq!(kept.read(), BucketRate::per_second(50));
+    }
+
+    /// A `mount` list names Harvest routes by a stable group, not by the
+    /// Rust type path.
+    #[test]
+    fn harvest_routes_have_a_stable_group() {
+        assert_eq!(HarvestPlugin::new().route_group(), "harvest");
+        assert_eq!(HARVEST_ROUTE_GROUP, "harvest");
     }
 
     /// The range excludes the previous and the next `autumn-web` series.

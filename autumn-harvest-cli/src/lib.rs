@@ -4291,13 +4291,10 @@ pub async fn run_cli(cli: Cli) -> Result<(), CliError> {
             context: "uncovered queue or incomplete shard report".to_string(),
         });
     }
-    if queue_coverage_is_strict(&cli) && !queue_coverage_unpolled(&response).is_empty() {
-        return Err(CliError::QueueCoverageGate {
-            context: format!(
-                "declared queues with no live poller: {}",
-                queue_coverage_unpolled(&response).join(", ")
-            ),
-        });
+    if queue_coverage_is_strict(&cli)
+        && let Some(context) = queue_coverage_strict_failure(&response)
+    {
+        return Err(CliError::QueueCoverageGate { context });
     }
     if queue_mutation_should_gate(&cli) && queue_mutation_exit_code(&response) != 0 {
         let detail = response
@@ -10183,6 +10180,32 @@ const fn queue_coverage_is_strict(cli: &Cli) -> bool {
     )
 }
 
+/// Why `queue coverage --strict` fails, or `None` when it passes (issue
+/// #2479).
+///
+/// A missing or `null` list fails. An older server omits the field, and a
+/// server with no runtime reports `null`. A gate must not pass on an
+/// answer that it cannot check.
+fn queue_coverage_strict_failure(value: &Value) -> Option<String> {
+    if !value
+        .get("unpolled_declared_queues")
+        .is_some_and(Value::is_array)
+    {
+        return Some(
+            "the server does not report unpolled_declared_queues: upgrade it, or retry once \
+             its runtime has started"
+                .to_string(),
+        );
+    }
+    let unpolled = queue_coverage_unpolled(value);
+    (!unpolled.is_empty()).then(|| {
+        format!(
+            "declared queues with no live poller: {}",
+            unpolled.join(", ")
+        )
+    })
+}
+
 /// The declared queues with no live poller (issue #2479).
 fn queue_coverage_unpolled(value: &Value) -> Vec<&str> {
     value
@@ -15006,8 +15029,27 @@ mod reuse_policy_tests {
         assert_eq!(queue_coverage_unpolled(&value), vec!["bulk", "priority"]);
 
         let covered = json!({ "unpolled_declared_queues": [] });
-        assert!(queue_coverage_unpolled_note(&covered).is_empty());
-        assert!(queue_coverage_unpolled(&json!({})).is_empty());
+        assert_eq!(queue_coverage_unpolled_note(&covered), "");
+        assert_eq!(queue_coverage_unpolled(&json!({})), Vec::<&str>::new());
+    }
+
+    /// Issue #2479: `--strict` fails on a gap, and on a list that it cannot
+    /// read. It passes only on an empty list.
+    #[test]
+    fn queue_coverage_strict_fails_closed() {
+        let gap = queue_coverage_strict_failure(&json!({
+            "unpolled_declared_queues": ["bulk"]
+        }))
+        .expect("a gap fails");
+        assert!(gap.contains("bulk"), "{gap}");
+        for unknown in [json!({}), json!({ "unpolled_declared_queues": null })] {
+            let failure = queue_coverage_strict_failure(&unknown).expect("unknown fails");
+            assert!(failure.contains("does not report"), "{failure}");
+        }
+        assert_eq!(
+            queue_coverage_strict_failure(&json!({ "unpolled_declared_queues": [] })),
+            None
+        );
     }
 
     /// Issue #2479: only `--strict` gates on an unpolled declared queue.

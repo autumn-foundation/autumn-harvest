@@ -111,7 +111,9 @@ pub struct HarvestRetentionConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct HarvestWorkerConfig {
     /// The queues that this process polls. Each name must be declared in
-    /// code. Empty: the role pin applies, else each declared queue.
+    /// code. An empty list means "not set". The role pin then applies, if it
+    /// names a declared queue. Otherwise the worker polls each declared
+    /// queue.
     pub queues: Vec<String>,
 }
 
@@ -133,7 +135,7 @@ impl HarvestWorkerConfig {
                 self.apply_partial(worker);
             }
         }
-        self.apply_env_overrides(env);
+        self.apply_env_overrides(env)?;
         self.validate()?;
         Ok(self)
     }
@@ -145,10 +147,23 @@ impl HarvestWorkerConfig {
     }
 
     /// An empty value clears the list, as for `AUTUMN_JOBS__PIN`.
-    fn apply_env_overrides(&mut self, env: &dyn Env) {
+    ///
+    /// The name follows the Autumn form `AUTUMN_<section>__<key>`. The other
+    /// Harvest sections use `AUTUMN_HARVEST_<SECTION>__<KEY>`, so an operator
+    /// can write that form by mistake. Nothing would read it, so it stops
+    /// the boot and names the right variable.
+    fn apply_env_overrides(&mut self, env: &dyn Env) -> Result<(), ConfigError> {
+        if env.var("AUTUMN_HARVEST_WORKER__QUEUES").is_ok() {
+            return Err(ConfigError::Validation(
+                "AUTUMN_HARVEST_WORKER__QUEUES is not a Harvest variable; set \
+                 AUTUMN_HARVEST__WORKER__QUEUES instead"
+                    .to_owned(),
+            ));
+        }
         if let Ok(queues) = env.var("AUTUMN_HARVEST__WORKER__QUEUES") {
             self.queues = crate::worker_queues::parse_env_list(&queues);
         }
+        Ok(())
     }
 
     fn validate(&self) -> Result<(), ConfigError> {
@@ -515,7 +530,7 @@ impl HarvestRuntimeConfig {
             self.retention.run_on =
                 parse_retention_run_on("AUTUMN_HARVEST_RETENTION__RUN_ON", &run_on)?;
         }
-        self.worker.apply_env_overrides(env);
+        self.worker.apply_env_overrides(env)?;
 
         Ok(())
     }
@@ -813,8 +828,9 @@ struct PartialHarvestRuntimeConfig {
     worker: PartialHarvestWorkerConfig,
 }
 
-/// A new section, so an unknown key stops the boot. `queue = [...]` must
-/// not narrow nothing in silence.
+/// `[harvest.worker]` is a new section, so it refuses an unknown key. A typo
+/// such as `queue = [...]` must stop the boot. It must not leave the worker
+/// unnarrowed in silence.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PartialHarvestWorkerConfig {
@@ -2338,11 +2354,32 @@ orphaned_workflows = "fail"
         list.iter().map(|name| (*name).to_owned()).collect()
     }
 
+    /// The sibling form of the variable stops the boot and names the right
+    /// one, so a typo cannot leave the worker unnarrowed.
+    #[test]
+    fn worker_queues_refuse_the_sibling_variable_form() {
+        let env = MockEnv::new().with("AUTUMN_HARVEST_WORKER__QUEUES", "priority");
+        let error = HarvestRuntimeConfig::load_with_env(&env).expect_err("must refuse");
+        assert!(
+            error
+                .to_string()
+                .contains("set AUTUMN_HARVEST__WORKER__QUEUES"),
+            "{error}"
+        );
+        let error = HarvestWorkerConfig::default()
+            .with_operator_overrides(&env)
+            .expect_err("must refuse");
+        assert!(
+            error.to_string().contains("AUTUMN_HARVEST_WORKER__QUEUES"),
+            "{error}"
+        );
+    }
+
     /// Issue #2479: no setting narrows the worker by default.
     #[test]
     fn worker_queues_default_to_unset() {
         let config = HarvestRuntimeConfig::load_with_env(&MockEnv::new()).expect("loads");
-        assert!(config.worker.queues.is_empty());
+        assert_eq!(config.worker.queues, Vec::<String>::new());
         assert_eq!(HarvestWorkerConfig::default().queues, Vec::<String>::new());
     }
 
@@ -2394,7 +2431,7 @@ orphaned_workflows = "fail"
             .with("AUTUMN_MANIFEST_DIR", dir.to_string_lossy().as_ref())
             .with("AUTUMN_HARVEST__WORKER__QUEUES", "");
         let config = HarvestRuntimeConfig::load_with_env(&env).expect("loads");
-        assert!(config.worker.queues.is_empty());
+        assert_eq!(config.worker.queues, Vec::<String>::new());
     }
 
     /// A blank name or an unknown key in `[harvest.worker]` stops the boot.

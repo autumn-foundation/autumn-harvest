@@ -117,11 +117,19 @@ comma. The variable wins over the file.
   declared queues. A name matches exactly, so `Priority` is not
   `priority`. A typo cannot make a tier that polls nothing.
 - **An empty list means "not set"**, as for `AUTUMN_JOBS__PIN`. An empty
-  variable clears a list from the file.
+  variable clears a list from the file. An empty list in a profile file
+  clears a list from `autumn.toml`.
 - **The worker polls in code order**, not in config order.
 - **The management API keeps the declared list.** A start with no queue
   goes to the first declared queue on each tier.
 - `[harvest.worker]` refuses an unknown key. `queue = [...]` stops the boot.
+- The variable follows the Autumn form `AUTUMN_<section>__<key>`. It does
+  not follow the form of other Harvest sections, such as
+  `AUTUMN_HARVEST_RETENTION__RUN_ON`. `AUTUMN_HARVEST_WORKER__QUEUES` stops the boot and names the
+  right variable.
+- **Deploy order.** Set the list only after each process runs a release
+  with issue #2479. An older process ignores `[harvest.worker]` and polls
+  each queue.
 
 ### The role pin
 
@@ -137,8 +145,32 @@ pin = ["priority", "emails"]
 Autumn job queues and Harvest queues share the pin. Harvest polls each
 declared queue that the pin names, and ignores the other names. A pin that
 names no declared queue changes nothing. Harvest then polls each declared
-queue and logs one `warn!`. The warning names the pin and the fix. An
-explicit list always wins over the pin.
+queue. A process that runs the worker logs one `warn!`, which names the
+pin and the fix. An explicit list always wins over the pin.
+
+Harvest reads the `pin` of a `[roles.<name>]` preset only. It does not
+read `jobs.pin` or `AUTUMN_JOBS__PIN`. A built-in role has no pin.
+
+Harvest follows only the `base` of a preset, as for issue #2477. A preset
+that turns off `job_workers`, `scheduler` or `retention` does not stop the
+Harvest worker, the scheduler or the janitor. `pin = []` turns off
+`job_workers`, so it does not stop the Harvest worker either. Harvest logs
+one `warn!` for such a preset. Set `harvest.worker_enabled` and
+`harvest.scheduler_enabled` to match. Issue #2480 maps each capability.
+
+### Route groups
+
+`autumn-web` 0.10 serves only the route groups that a preset names in
+`mount`. Each Harvest route is in the group `harvest`: the management API,
+the UI, the webhook receivers and the MCP routes. A preset that mounts
+groups must name `harvest`. Otherwise its replicas serve no Harvest route,
+and the Harvest readiness probe returns 404.
+
+```toml
+[roles.site]
+base = "web"
+mount = ["app", "harvest"]
+```
 
 | Explicit list | Role pin | The worker polls |
 |---|---|---|
@@ -147,7 +179,8 @@ explicit list always wins over the pin.
 | not set | names no declared queue | each declared queue, with a `warn!` |
 | not set | none | each declared queue |
 
-`formal/verus/src/worker_queues.rs` proves this table.
+`formal/verus/src/worker_queues.rs` proves the source of each row. The
+proptests in `worker_queues.rs` check the polled list.
 
 ### Coverage
 
@@ -158,18 +191,26 @@ Each queue needs a tier that polls it. Otherwise a run on it waits.
 - `GET /admin/config` reports `worker.queues` (polled),
   `worker.declared_queues` and `worker.queue_source`.
 - `GET /admin/queue-coverage` lists `unpolled_declared_queues`: each
-  declared queue with no live worker on an inspected shard.
-  `harvest queue coverage --strict` exits `2` when that list is not empty.
+  declared queue with no live worker on a writable shard. A drained shard
+  takes no new run, so it does not count. `null` means "unknown": no
+  runtime is installed, or a writable shard gave no answer.
+- `harvest queue coverage --strict` exits `2` when that list is not empty,
+  `null` or missing. An older server omits it, so the gate fails closed.
 - The `autumn doctor --strict` hook waits for autumn#3545. Issue #2480
   tracks it.
 
 With the `webhooks` feature, the built-in `webhooks` queue is a declared
 queue too. Narrow it out only when another tier polls it.
 
-The SQLite backend refuses a list. Its one driver runs each queue. A
-standalone `HarvestEmbedding` reads `[harvest.worker]` and the variable. A
-plain `HarvestRunner::start` reads only the `HarvestRuntimeConfig` that its
-caller passes.
+The SQLite backend refuses a list. Its one driver runs each queue. With a
+SQLite profile in development and a Postgres profile in production, put
+the list in the Postgres profile file or in the variable. Do not put it in
+an `autumn.toml` that the SQLite profile also reads. On SQLite, a role pin
+narrows nothing, and Harvest logs one `info!`.
+
+A standalone `HarvestEmbedding` reads `[harvest.worker]` and the variable.
+A plain `HarvestRunner::start` reads the `HarvestRuntimeConfig` that its
+caller passes, and the role pin of an app state in its resources.
 
 ## Fly.io
 

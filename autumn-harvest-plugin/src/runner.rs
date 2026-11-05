@@ -1012,6 +1012,24 @@ impl PreparedHarvestRuntime {
     }
 }
 
+/// Resolve the queues that the worker polls (issue #2479).
+///
+/// It reads no database and sets no global. The plugin and
+/// `HarvestEmbedding` call it before their first I/O, so a typo stops the
+/// boot first. `HarvestRunner::start` calls it again for a direct caller.
+///
+/// # Errors
+///
+/// Returns a 503 error that names each undeclared queue.
+pub(crate) fn resolve_worker_queues(
+    declared: &[String],
+    config: &HarvestRuntimeConfig,
+    pin: Option<&[String]>,
+) -> autumn_web::AutumnResult<WorkerQueues> {
+    WorkerQueues::resolve(declared, &config.worker.queues, pin)
+        .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))
+}
+
 impl PreparedHarvestRuntime {
     /// Point the worker at the resolved queues (issue #2479).
     ///
@@ -1238,12 +1256,11 @@ impl HarvestRunner {
         // Issue #2479: config and the role pin narrow the declared queues.
         // This is pure validation too, so an undeclared queue stops the boot
         // before any I/O.
-        let worker_queues = WorkerQueues::resolve(
+        let worker_queues = resolve_worker_queues(
             &built.worker_config().queues,
-            &config.worker.queues,
+            config,
             resources.role_pin().as_deref(),
-        )
-        .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?;
+        )?;
 
         // Issue #1128: the boot-time orphaned-workflow-type gate, on the
         // STANDALONE path. It runs HERE — the first act of `start`, before
@@ -1266,6 +1283,9 @@ impl HarvestRunner {
         // runner with no app state has no role and keeps both switches on.
         let switches = config.process_switches(resources.process_role());
         switches.log();
+        if let Some(state) = resources.app_state.as_ref() {
+            crate::process_role::warn_preset_overrides(state.role());
+        }
         let plan = SpawnPlan::new(
             switches,
             config.retention.run_on,

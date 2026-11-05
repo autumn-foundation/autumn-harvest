@@ -597,6 +597,12 @@ async fn start(
     }
     apply_driver_check(runtime_config.worker_enabled, state.role().base())?;
     refuse_worker_queues(&runtime_config.worker.queues)?;
+    if let Some(pin) = crate::worker_queues::role_pin(state.role()) {
+        tracing::info!(
+            pin = ?pin,
+            "the Harvest SQLite driver runs each queue; the Autumn role pin does not narrow it"
+        );
+    }
     let sqlite_config = HarvestSqliteConfig::load()
         .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?;
     let app_config = state.config();

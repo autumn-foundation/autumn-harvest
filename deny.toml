@@ -157,8 +157,9 @@ ignore = [
     # multiplication. The effect depends on the compiler and the CPU. The fix
     # is in 0.7.6, and the advisory covers every lower version.
     #
-    # No fix is possible from this repo. Since autumn-web 0.10.0, one path
-    # holds crypto-bigint 0.5.5. autumn-web turns on the `rust_crypto`
+    # Since autumn-web 0.10.0, one path holds crypto-bigint 0.5.5. A host app
+    # on the autumn-web defaults keeps it, so this repo cannot drop it. A
+    # build with no `jwt` feature and no `oidc` feature would drop it. autumn-web turns on the `rust_crypto`
     # feature of jsonwebtoken 11.1.0 through its default `jwt` feature.
     # jsonwebtoken pins p256 and p384 0.13 (jsonwebtoken-11.1.0/Cargo.toml:53-57).
     # p256 0.13 needs elliptic-curve 0.13.8, which requires crypto-bigint
