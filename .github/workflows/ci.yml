@@ -1003,26 +1003,37 @@ jobs:
             /usr/local/share/boost /usr/lib/jvm "$AGENT_TOOLSDIRECTORY" || true
           sudo docker image prune --all --force > /dev/null 2>&1 || true
           df -h /
-      # Windows keeps the Cargo registry on C:, which is the small drive. A
-      # leg that unpacks the AWS SDK filled it (os error 112, PR #2582). C:
-      # also holds the kache store, which reached 27 GB (PR #2581). The
-      # preinstalled Android SDK is the largest unused tree there. This job
-      # uses none of the toolchains below. Rust, MSVC and kache stay.
+      # Windows keeps the Cargo registry and the kache store on C:, which is
+      # the small drive. A leg that unpacks the AWS SDK filled it (os error
+      # 112, PR #2582). Freeing unused toolchains left 31 GB, and the kache
+      # store still filled that (PR #2581). The workspace drive has over
+      # 200 GB free. So this step points both directories at it with a
+      # junction. Each tool keeps its own path, and the bytes go to that
+      # drive. It runs before kache starts, so the store is empty here. It
+      # also frees the two largest unused trees on C:.
       - name: Free runner disk before heavy plugin link (Windows)
         if: runner.os == 'Windows' && needs.changes.outputs.code == 'true'
         shell: pwsh
         run: |
-          $paths = @(
-            'C:\Android',
-            'C:\hostedtoolcache\windows\CodeQL',
-            'C:\hostedtoolcache\windows\go',
-            'C:\hostedtoolcache\windows\Ruby',
-            'C:\hostedtoolcache\windows\PyPy',
-            'C:\hostedtoolcache\windows\Java_Temurin-Hotspot_jdk'
-          )
           # `rmdir /s /q` removes a large tree much faster than Remove-Item.
-          foreach ($path in $paths) {
+          foreach ($path in @('C:\Android', 'C:\hostedtoolcache\windows\CodeQL')) {
             if (Test-Path $path) { cmd /c rmdir /s /q "$path" }
+          }
+          # A tree that fails to delete only costs space. The step wrapper
+          # exits with the last native exit code, so clear it here.
+          $global:LASTEXITCODE = 0
+          $drive = Split-Path $env:GITHUB_WORKSPACE -Qualifier
+          $cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $env:USERPROFILE '.cargo' }
+          $links = @{
+            (Join-Path $env:LOCALAPPDATA 'kache') = (Join-Path $drive 'kache-store')
+            (Join-Path $cargoHome 'registry') = (Join-Path $drive 'cargo-registry')
+          }
+          foreach ($link in $links.GetEnumerator()) {
+            New-Item -ItemType Directory -Force -Path $link.Value | Out-Null
+            if (Test-Path $link.Key) { cmd /c rmdir /s /q "$($link.Key)" }
+            New-Item -ItemType Directory -Force -Path (Split-Path $link.Key) | Out-Null
+            New-Item -ItemType Junction -Path $link.Key -Target $link.Value | Out-Null
+            Get-Item $link.Key | Format-List FullName, LinkType, Target
           }
           Get-PSDrive -PSProvider FileSystem | Format-Table -AutoSize
       # kache executable caching broke uplifted binaries on macOS:
