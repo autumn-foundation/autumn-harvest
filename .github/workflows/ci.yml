@@ -1038,6 +1038,19 @@ jobs:
           SEMAPHORE_SHARD_COUNT: "4"
           SEMAPHORE_SHARD_INDEX: ${{ matrix.shard }}
         run: bash .github/ci/run-suites.sh run allos
+      # The manifest suites fill the D: drive of the Windows runner. Later
+      # steps then fail with os error 112, or SQLite reports a full disk
+      # (issue #2380). The suites already ran, so this step deletes their
+      # test executables and PDB files. Rlibs and proc-macro DLLs stay, so no
+      # crate builds again. A later step only links its own binaries again.
+      - name: Free runner disk after the manifest suites (Windows)
+        if: runner.os == 'Windows' && needs.changes.outputs.code == 'true'
+        shell: bash
+        run: |
+          df -h .
+          find target/debug/deps -maxdepth 1 -type f \
+            \( -name '*.exe' -o -name '*.pdb' \) -delete
+          df -h .
       # ── Individual crate/example steps carried over from `test`, one shard
       # each, balanced by measured time (see the job comment above) ─────────
       # The lib test target needs about 8 GB to compile, and `integration`
