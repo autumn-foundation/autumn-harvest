@@ -140,7 +140,8 @@ pub struct Peer {
     /// `None` uses [`AgentHarness::tool_output_limit`](crate::AgentHarness::tool_output_limit).
     /// The peer lookup writes that value here, so history records it. A
     /// lookup recorded before issue #2481 has `None`. Its run keeps the old
-    /// cut of 8 000 characters.
+    /// cut of 8 000 characters. A byte share of the request cap of the
+    /// caller also cuts the answer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub answer_limit: Option<usize>,
 }
@@ -766,8 +767,7 @@ pub struct DelegationRecord {
     /// The context resets of the child itself (issue #2453).
     #[serde(default, skip_serializing_if = "crate::types::is_zero")]
     pub resets: u32,
-    /// The answer of the child was cut to the limit of its peer (issue
-    /// #2481).
+    /// `true` when the harness cuts the answer of the child (issue #2481).
     #[serde(default, skip_serializing_if = "is_false")]
     pub answer_truncated: bool,
 }
@@ -780,6 +780,17 @@ mod tests {
 
     fn set(names: &[&str]) -> BTreeSet<String> {
         names.iter().map(|name| (*name).to_owned()).collect()
+    }
+
+    // Issue #2481: a lookup records the limit, and a large limit survives
+    // the round trip through history.
+    #[test]
+    fn an_answer_limit_round_trips_and_none_is_left_out() {
+        let peer = Peer::new("a", "b").answer_limit(usize::MAX);
+        let value = serde_json::to_value(&peer).unwrap();
+        assert_eq!(serde_json::from_value::<Peer>(value).unwrap(), peer);
+        let plain = serde_json::to_value(Peer::new("a", "b")).unwrap();
+        assert!(plain.get("answer_limit").is_none());
     }
 
     #[test]

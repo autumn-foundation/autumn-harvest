@@ -39,7 +39,9 @@ use crate::delivery::{Report, ReportSource, report_text};
 use crate::draw::Draw;
 use crate::flow::Released;
 use crate::followup::{self, FOLLOWUP_TOOL, Planned};
-use crate::harness::{AgentHarness, CacheTenant, truncate, truncate_flagged};
+use crate::harness::{
+    AgentHarness, CacheTenant, cut_bytes, max_tool_result_bytes, truncate, truncate_flagged,
+};
 use crate::heartbeat::{HeartbeatTask, agent_heartbeat_info};
 use crate::loop_guard::{LoopTracker, LoopVerdict, warning_note};
 use crate::memory::{
@@ -2121,7 +2123,7 @@ async fn delegate(
         "agent": peer.name,
         "stop": stop,
     });
-    mark_cut(tree, put_answer(&mut outcome, peer, &child.last_text));
+    AnswerRoom::of(ctx, task).put(tree, peer, &mut outcome, &child.last_text);
     let outcome = outcome.to_string();
     Ok(ToolOutcome {
         content: outcome,
@@ -2130,28 +2132,69 @@ async fn delegate(
     })
 }
 
+/// The room for one delegation answer in the next request of the parent
+/// (issue #2481).
+#[derive(Clone, Copy)]
+struct AnswerRoom<'a> {
+    ctx: &'a WorkflowContext,
+    /// The byte share of one result under the request cap of the parent.
+    max_bytes: usize,
+}
+
+impl<'a> AnswerRoom<'a> {
+    /// The room under the request cap of `task`.
+    ///
+    /// A tool result gets the same share of its result cap. Without this
+    /// cut, an answer over the cap drops whole, and the run ends as
+    /// `transcript_full`.
+    fn of(ctx: &'a WorkflowContext, task: &AgentTask) -> Self {
+        Self {
+            ctx,
+            max_bytes: max_tool_result_bytes(task.request_cap()),
+        }
+    }
+
+    /// Put the answer of `peer` into `result`, and report a cut.
+    ///
+    /// A cut sets `answer_truncated` on the last record of `tree`, which
+    /// is the record of this delegation. The operator also gets a warning.
+    fn put(self, tree: &mut Tree, peer: &Peer, result: &mut serde_json::Value, answer: &str) {
+        if !put_answer(result, peer, answer, self.max_bytes) {
+            return;
+        }
+        if let Some(record) = tree.records.last_mut() {
+            record.answer_truncated = true;
+        }
+        self.ctx.log_warn(&format!(
+            "the answer of the peer {:?} is cut: it has {} characters, and the limit is {} characters or {} bytes",
+            peer.name,
+            answer.chars().count(),
+            peer.answer_limit.unwrap_or(usize::MAX),
+            self.max_bytes,
+        ));
+    }
+}
+
 /// Put the answer of `peer` into a delegation result (issue #2481).
 ///
-/// The answer is cut to the limit of the peer, and `truncated` tells the
-/// parent model whether text dropped. Returns `true` on a cut. A peer
-/// lookup from before issue #2481 has no limit. That run keeps the old cut
-/// and the old shape, and returns `false`, so it replays as it ran.
-fn put_answer(result: &mut serde_json::Value, peer: &Peer, answer: &str) -> bool {
+/// It cuts the answer to the character limit of the peer and to
+/// `max_bytes`. The `truncated` key tells the parent model whether text
+/// dropped. It returns `true` on a cut.
+///
+/// A peer lookup from before issue #2481 has no limit. Then the result
+/// keeps the old cut and the old shape, and the function returns `false`.
+/// So that run replays as it ran.
+fn put_answer(result: &mut serde_json::Value, peer: &Peer, answer: &str, max_bytes: usize) -> bool {
     let Some(limit) = peer.answer_limit else {
         result["answer"] = truncate(answer, LEGACY_ANSWER_LIMIT).into();
         return false;
     };
-    let (shown, cut) = truncate_flagged(answer, limit);
-    result["answer"] = shown.into();
+    let (shown, chars_cut) = truncate_flagged(answer, limit);
+    let bytes_cut = shown.len() > max_bytes;
+    let cut = chars_cut || bytes_cut;
+    result["answer"] = cut_bytes(shown, max_bytes).into();
     result["truncated"] = cut.into();
     cut
-}
-
-/// Mark the last delegation record of `tree` when its answer was cut.
-fn mark_cut(tree: &mut Tree, cut: bool) {
-    if let Some(record) = tree.records.last_mut() {
-        record.answer_truncated = cut;
-    }
 }
 
 /// Record a refused delegation and answer the model.
@@ -2293,8 +2336,9 @@ async fn fan_out(
     // Each sibling ended, so every report joins the parent. The first
     // failure in input order fails the batch.
     let mut failed = None;
+    let room = AnswerRoom::of(ctx, task);
     for ((position, peer, child), output) in children.into_iter().zip(ended) {
-        match merge_ended(progress, tree, peer, child, output) {
+        match merge_ended(room, progress, tree, peer, child, output) {
             Ok(outcome) => outcomes[position] = Some(outcome),
             Err(err) => {
                 failed.get_or_insert(err);
@@ -2315,6 +2359,7 @@ async fn fan_out(
 /// A child that reported its failure still joins the parent. Then it counts
 /// as a failure like any other (issue #2328).
 fn merge_ended(
+    room: AnswerRoom<'_>,
     progress: &mut Progress,
     tree: &mut Tree,
     peer: &Peer,
@@ -2324,7 +2369,7 @@ fn merge_ended(
     let report = output.and_then(|value| {
         serde_json::from_value::<AgentReport>(value).map_err(|err| err.to_string())
     })?;
-    let outcome = merge_child(progress, tree, peer, child, &report);
+    let outcome = merge_child(room, progress, tree, peer, child, &report);
     if report.stop == AgentStop::Failed {
         return Err(report
             .error
@@ -2348,6 +2393,7 @@ fn sibling<'a>(agent: &'a Member, used: u32, name: &str) -> Result<(Mandate, &'a
 
 /// Add the report of one child run to the parent, and answer the model.
 fn merge_child(
+    room: AnswerRoom<'_>,
     progress: &mut Progress,
     tree: &mut Tree,
     peer: &Peer,
@@ -2388,7 +2434,7 @@ fn merge_child(
         "agent": peer.name,
         "stop": report.stop,
     });
-    mark_cut(tree, put_answer(&mut outcome, peer, &report.text));
+    room.put(tree, peer, &mut outcome, &report.text);
     let outcome = outcome.to_string();
     ToolOutcome {
         content: outcome,
@@ -2476,11 +2522,13 @@ async fn durable_peer(
     if chain.last().is_none_or(|last| *last != peer.name) {
         chain.push(peer.name.clone());
     }
-    Ok(peer_outcome(tree, peer, target_id, chain, outcome))
+    let room = AnswerRoom::of(ctx, run.task);
+    Ok(peer_outcome(room, tree, peer, target_id, chain, outcome))
 }
 
 /// Record one exchange with a durable peer and answer the model.
 fn peer_outcome(
+    room: AnswerRoom<'_>,
     tree: &mut Tree,
     peer: &Peer,
     target_id: &str,
@@ -2505,12 +2553,14 @@ fn peer_outcome(
             if let Some(refusal) = reply.refusal {
                 refused(refusal, &peer.name)
             } else {
+                // The keys keep their old order, also under the
+                // `preserve_order` feature of `serde_json`.
                 let mut content = serde_json::json!({
                     "agent": peer.name,
                     "stop": reply.stop,
-                    "error": reply.error,
                 });
-                mark_cut(tree, put_answer(&mut content, peer, &reply.answer));
+                room.put(tree, peer, &mut content, &reply.answer);
+                content["error"] = serde_json::json!(reply.error);
                 let content = content.to_string();
                 ToolOutcome {
                     content,
@@ -3001,7 +3051,7 @@ mod tests {
         assert_eq!(peer.answer_limit, None);
         assert_eq!(LEGACY_ANSWER_LIMIT, 8_000, "old histories pin this value");
         let mut result = serde_json::json!({"agent": "researcher", "stop": "completed"});
-        let cut = put_answer(&mut result, &peer, &"x".repeat(8_050));
+        let cut = put_answer(&mut result, &peer, &"x".repeat(8_050), 10);
         assert!(!cut, "a legacy run sets no record flag");
         let want = serde_json::json!({
             "agent": "researcher",
@@ -3016,12 +3066,27 @@ mod tests {
     fn a_resolved_lookup_marks_the_cut() {
         let peer = Peer::new("researcher", "R.").answer_limit(3);
         let mut result = serde_json::json!({"agent": "researcher"});
-        assert!(put_answer(&mut result, &peer, "abcd"));
+        assert!(put_answer(&mut result, &peer, "abcd", usize::MAX));
         assert_eq!(result["answer"], "abc…[truncated]");
         assert_eq!(result["truncated"], true);
         let mut result = serde_json::json!({"agent": "researcher"});
-        assert!(!put_answer(&mut result, &peer, "abc"));
+        assert!(!put_answer(&mut result, &peer, "abc", usize::MAX));
         assert_eq!(result["answer"], "abc");
+        assert_eq!(result["truncated"], false);
+    }
+
+    // Issue #2481: the byte share also cuts, on a char boundary.
+    #[test]
+    fn a_resolved_lookup_cuts_to_the_byte_share() {
+        let peer = Peer::new("researcher", "R.").answer_limit(usize::MAX);
+        let mut result = serde_json::json!({"agent": "researcher"});
+        // "…[truncated]" is 14 bytes, so 3 bytes stay. "é" is 2 bytes.
+        assert!(put_answer(&mut result, &peer, &"é".repeat(20), 17));
+        assert_eq!(result["answer"], "é…[truncated]");
+        assert_eq!(result["truncated"], true);
+        let mut result = serde_json::json!({"agent": "researcher"});
+        assert!(!put_answer(&mut result, &peer, "éééé", 8));
+        assert_eq!(result["answer"], "éééé");
         assert_eq!(result["truncated"], false);
     }
 

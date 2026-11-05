@@ -960,6 +960,7 @@ async fn the_harness_limit_governs_a_fan_out_answer() {
         );
         assert_eq!(result["truncated"], false);
     }
+    assert_eq!(report.delegations.len(), 3);
     assert!(report.delegations.iter().all(|r| !r.answer_truncated));
 }
 

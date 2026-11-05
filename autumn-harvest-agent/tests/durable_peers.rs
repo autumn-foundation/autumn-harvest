@@ -24,7 +24,7 @@ use autumn_harvest_agent::{
     TokenUsage, ToolEffect, sqlite,
 };
 use autumn_harvest_sqlite::{RunState, SqliteRuntime};
-use common::{Recorder, ScriptedModel, TryFnModel, recorded_tool, runtime};
+use common::{Recorder, ScriptedModel, TryFnModel, recorded_tool, report, runtime};
 use serde_json::{Value, json};
 
 fn fresh_db() -> (tempfile::TempDir, PathBuf) {
@@ -1348,11 +1348,10 @@ fn long_answer() -> String {
     format!("{}TAIL", "x".repeat(8_996))
 }
 
-/// Triage asks the durable researcher once. The researcher answers with
-/// [`long_answer`]. Returns the delegation result that triage read.
-async fn ask_with_limit(limit: usize) -> Value {
-    let (_dir, db) = fresh_db();
-    let model = FnModel::new(|request| {
+/// Triage asks the durable researcher once, and the researcher answers
+/// with [`long_answer`].
+fn long_mesh_model() -> Arc<FnModel> {
+    FnModel::new(|request| {
         if from_peer(request) {
             return text(&long_answer());
         }
@@ -1365,7 +1364,14 @@ async fn ask_with_limit(limit: usize) -> Value {
         } else {
             text("done")
         }
-    });
+    })
+}
+
+/// Run [`long_mesh_model`] with the durable triage agent. Returns the
+/// delegation result that triage read.
+async fn ask_with_limit(limit: usize) -> Value {
+    let (_dir, db) = fresh_db();
+    let model = long_mesh_model();
     let harness = mesh_harness(model.clone()).tool_output_limit(limit);
     let mut rt = runtime(&db, harness);
     start(&mut rt, &research()).await;
@@ -1401,4 +1407,24 @@ async fn a_cut_durable_answer_is_marked() {
     let result = ask_with_limit(100).await;
     assert_eq!(result["answer"], format!("{}…[truncated]", "x".repeat(100)));
     assert_eq!(result["truncated"], true);
+}
+
+// Issue #2481: an `agent_loop` run that asks a durable peer flags a cut in
+// its report. A durable sender keeps no records, so this run shows it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_one_shot_run_flags_a_cut_durable_answer() {
+    for (limit, cut) in [(100, true), (20_000, false)] {
+        let (_dir, db) = fresh_db();
+        let model = long_mesh_model();
+        let mut rt = runtime(&db, mesh_harness(model.clone()).tool_output_limit(limit));
+        start(&mut rt, &research()).await;
+        let task = AgentTask::new("go").mandate(Mandate::new("triage").peers(["researcher"]));
+        let exec = sqlite::start(&mut rt, &task).unwrap();
+        rt.run_until_blocked(exec).await.unwrap();
+        sqlite::drive(&mut rt, &research()).await.unwrap();
+        let ended = report(rt.run_until_blocked(exec).await.unwrap());
+
+        assert_eq!(ended.delegations.len(), 1, "limit {limit}");
+        assert_eq!(ended.delegations[0].answer_truncated, cut, "limit {limit}");
+    }
 }

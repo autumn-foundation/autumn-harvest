@@ -227,7 +227,8 @@ impl AgentHarness {
     /// characters.
     ///
     /// [`Peer::answer_limit`] overrides it for one peer. The delegation
-    /// result marks a cut answer with `"truncated": true` (issue #2481).
+    /// result marks a cut answer with `"truncated": true` (issue #2481). A
+    /// byte share of the request cap also cuts a delegation answer.
     #[must_use]
     pub const fn tool_output_limit(mut self, limit: usize) -> Self {
         self.tool_output_limit = limit;
