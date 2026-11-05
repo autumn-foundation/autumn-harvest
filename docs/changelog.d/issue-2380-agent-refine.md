@@ -49,7 +49,9 @@ anonymised pool of #2376, the evidence bundle of #2377, the live probe of
   decode a `ProposeRequest` with a `sample` above 1, so start a refine
   run only after every worker runs this release.
 - **Backends.** `sqlite::Sources` and `postgres::Sources` read the source
-  runs. Only Postgres runs a live re-probe. It waits through approval
+  runs. Only Postgres runs a live re-probe, with the new
+  `eval::live_probe_with` under the policy ceilings of the run, as the
+  stages and the replay probe use. It waits through approval
   waits, and it cancels a fork that does not end in 60 minutes or whose
   wait fails. SQLite records `live re-probe skipped: SQLite has no fork`
   in the stage notes.

@@ -1200,12 +1200,13 @@ impl crate::refine::RefineSources for Sources {
         use crate::refine::{LiveEnd, LiveProbeError};
         Box::pin(async move {
             let effects: Vec<_> = request.effects.iter().copied().collect();
-            let probe = crate::eval::live_probe(
+            let probe = crate::eval::live_probe_with(
                 &self.pg,
                 request.harness,
                 request.source,
                 request.overlay,
                 &effects,
+                Some(request.ceilings),
             )
             .await
             .map_err(|err| LiveProbeError::Failed(err.to_string()))?;

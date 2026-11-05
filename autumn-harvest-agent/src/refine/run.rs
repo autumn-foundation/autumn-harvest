@@ -565,6 +565,7 @@ pub(crate) async fn run_probe(
                 source: request.source,
                 overlay: &request.overlay,
                 effects: &request.effects,
+                ceilings: &request.ceilings,
             })
             .await;
         match ran {

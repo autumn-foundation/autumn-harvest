@@ -2351,7 +2351,8 @@ On Postgres, install `postgres::Sources::new(pg)` and start the workflow
   base of the next step.
 - **Probe.** `eval::evaluate` against the recorded source, so the base
   rollout costs nothing. A probe that stubs a tool call asks for a live
-  re-probe with `probe_effects`. SQLite has no fork, so the probe records
+  re-probe with `probe_effects`. The fork applies the overlay under the
+  policy ceilings, as the stages do. SQLite has no fork, so the probe records
   `live re-probe skipped: SQLite has no fork` in the stage notes.
 - **Compose and select.** An `OverlayComposer` reads the probes under
   opaque ids, with the anonymised pool of issue #2376. With a workspace

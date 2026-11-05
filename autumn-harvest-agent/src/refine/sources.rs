@@ -10,7 +10,7 @@ use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::types::ExecutionId;
 use serde::{Deserialize, Serialize};
 
-use crate::agent::overlay::ProfileOverlay;
+use crate::agent::overlay::{Ceilings, ProfileOverlay};
 use crate::error::AgentError;
 use crate::harness::AgentHarness;
 use crate::message::TokenUsage;
@@ -41,6 +41,9 @@ pub struct LiveRequest<'a> {
     pub overlay: &'a ProfileOverlay,
     /// The tool effects that the probe may run.
     pub effects: &'a BTreeSet<ToolEffect>,
+    /// The ceilings of the run. The fork applies the overlay under them, as
+    /// the stages and the replay probe do.
+    pub ceilings: &'a Ceilings,
 }
 
 /// How a live re-probe ended.

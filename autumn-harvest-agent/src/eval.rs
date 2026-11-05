@@ -132,6 +132,7 @@ mod probe;
 
 pub use probe::{
     LiveProbe, LiveProbeHost, PROBE_APPROVAL_TIMEOUT_SECS, ProbeFork, SourceRun, live_probe,
+    live_probe_with,
 };
 #[cfg(feature = "postgres")]
 pub(crate) use probe::{PROBE_FORK_OPERATOR, PROBE_FORK_REASON};
