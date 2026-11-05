@@ -144,6 +144,11 @@ pub struct AgentHarness {
     workspace: Option<WorkspaceStore>,
     proposer: Option<Arc<dyn OverlayProposer>>,
     proposer_timeout: Duration,
+    refine_sources: Option<Arc<dyn crate::refine::RefineSources>>,
+    #[cfg(feature = "eval")]
+    composer: Option<Arc<dyn crate::refine::OverlayComposer>>,
+    #[cfg(feature = "eval")]
+    selector: Option<Arc<dyn crate::refine::OverlaySelector>>,
     sampling: Option<Arc<dyn SamplingPolicyStore>>,
     scorers: BTreeMap<String, Arc<dyn Scorer>>,
     score_timeout: Duration,
@@ -164,6 +169,11 @@ impl AgentHarness {
             workspace: None,
             proposer: None,
             proposer_timeout: DEFAULT_PROPOSER_TIMEOUT,
+            refine_sources: None,
+            #[cfg(feature = "eval")]
+            composer: None,
+            #[cfg(feature = "eval")]
+            selector: None,
             sampling: None,
             scorers: BTreeMap::new(),
             score_timeout: DEFAULT_SCORE_TIMEOUT,
@@ -259,6 +269,48 @@ impl AgentHarness {
     pub fn proposer(mut self, proposer: Arc<dyn OverlayProposer>) -> Self {
         self.proposer = Some(proposer);
         self
+    }
+
+    /// Read the source runs of a refine run from `sources` (issue #2380).
+    #[must_use]
+    pub fn refine_sources(mut self, sources: Arc<dyn crate::refine::RefineSources>) -> Self {
+        self.refine_sources = Some(sources);
+        self
+    }
+
+    /// The source reader of a refine run, if one is installed.
+    #[cfg(feature = "eval")]
+    pub(crate) fn sources(&self) -> Option<&Arc<dyn crate::refine::RefineSources>> {
+        self.refine_sources.as_ref()
+    }
+
+    /// Set the overlay composer of a refine run (issue #2380).
+    #[cfg(feature = "eval")]
+    #[must_use]
+    pub fn composer(mut self, composer: Arc<dyn crate::refine::OverlayComposer>) -> Self {
+        self.composer = Some(composer);
+        self
+    }
+
+    /// The overlay composer, if one is installed.
+    #[cfg(feature = "eval")]
+    pub(crate) fn overlay_composer(&self) -> Option<&Arc<dyn crate::refine::OverlayComposer>> {
+        self.composer.as_ref()
+    }
+
+    /// Set the selector of a refine run (issue #2380). With none, the run
+    /// picks by the probe results and asks no model.
+    #[cfg(feature = "eval")]
+    #[must_use]
+    pub fn selector(mut self, selector: Arc<dyn crate::refine::OverlaySelector>) -> Self {
+        self.selector = Some(selector);
+        self
+    }
+
+    /// The selector, if one is installed.
+    #[cfg(feature = "eval")]
+    pub(crate) fn overlay_selector(&self) -> Option<&Arc<dyn crate::refine::OverlaySelector>> {
+        self.selector.as_ref()
     }
 
     /// Set the time budget of one proposer call.
@@ -1469,6 +1521,12 @@ impl AgentHarness {
                 )),
             },
         )
+    }
+
+    /// The workspace store, if one is installed.
+    #[cfg(feature = "eval")]
+    pub(crate) const fn workspace_store_opt(&self) -> Option<&WorkspaceStore> {
+        self.workspace.as_ref()
     }
 
     /// The workspace store, or a non-retryable error.

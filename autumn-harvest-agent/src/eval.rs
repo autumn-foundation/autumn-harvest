@@ -165,6 +165,7 @@ use crate::types::{
 };
 mod anonymise;
 
+pub(crate) use anonymise::recorded_pool;
 pub use anonymise::{
     AnonymisedEvaluation, AnonymisedPool, AnonymisedReport, CandidateRef, compare_anonymised,
 };
@@ -744,6 +745,25 @@ pub struct Evaluation {
     /// the tokens of that score. See [`compare`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scorer_usage: Option<TokenUsage>,
+    /// The tokens of the candidate model turns (issue #2380). A cache hit
+    /// adds none. A refine run counts them in its budget.
+    #[serde(default, skip_serializing_if = "is_no_usage")]
+    pub candidate_usage: TokenUsage,
+    /// The cost of the candidate model turns, in millionths of a US dollar
+    /// (issue #2380). An unpriced turn adds none.
+    #[serde(default, skip_serializing_if = "is_zero_cost")]
+    pub candidate_cost_usd_micros: u64,
+}
+
+/// Whether `usage` is empty, so an evaluation leaves it out.
+fn is_no_usage(usage: &TokenUsage) -> bool {
+    *usage == TokenUsage::default()
+}
+
+/// Whether `cost` is zero, so an evaluation leaves it out.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+const fn is_zero_cost(cost: &u64) -> bool {
+    *cost == 0
 }
 
 impl Evaluation {
@@ -1004,6 +1024,15 @@ async fn run_with_routes(
     let outcome = env.run(agent_loop_info().handler, input).await;
 
     let candidate_turns = model_turns(outcome.events())?;
+    let (candidate_usage, candidate_cost_usd_micros) =
+        candidate_turns
+            .iter()
+            .fold((TokenUsage::default(), 0_u64), |(usage, cost), turn| {
+                (
+                    usage.saturating_add(turn.usage),
+                    cost.saturating_add(turn.cost_usd_micros.unwrap_or(0)),
+                )
+            });
     let (replayed, stubbed, cap_reached, root, mut routes) = {
         let mut session = lock(&session);
         let root = session.root.clone();
@@ -1039,6 +1068,8 @@ async fn run_with_routes(
         recorded_verdict: verdicts.recorded,
         candidate_verdict: verdicts.candidate,
         scorer_usage: verdicts.usage,
+        candidate_usage,
+        candidate_cost_usd_micros,
     };
     Ok((evaluation, routes))
 }
@@ -1296,6 +1327,25 @@ struct RecordedTool {
     outcome: Result<ToolOutcome, String>,
     /// A recorded outcome answers one candidate call at most.
     used: bool,
+}
+
+/// How the recorded run of `history` ended (issue #2380).
+///
+/// # Errors
+///
+/// The errors of [`evaluate`] that the history alone gives.
+pub(crate) fn recorded_end(history: &[WorkflowEvent]) -> Result<RunEnd, EvalError> {
+    Recording::read(history).map(|recording| recording.end)
+}
+
+/// Check that an evaluation can read `history` (issue #2380). A refine run
+/// calls it before any model call.
+///
+/// # Errors
+///
+/// The errors of [`evaluate`] that the history alone gives.
+pub(crate) fn check_source(history: &[WorkflowEvent]) -> Result<(), EvalError> {
+    Recording::read(history).map(|_| ())
 }
 
 impl Recording {

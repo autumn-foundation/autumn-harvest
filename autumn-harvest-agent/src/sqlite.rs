@@ -47,7 +47,7 @@ use crate::heartbeat::{HEARTBEAT_WORKFLOW_NAME, HeartbeatTask, agent_heartbeat_i
 use crate::mesh_control::{MESH_ATTR, MeshPause, MeshSpend, Spend};
 use crate::model::BoxFuture;
 use crate::refine::agent_refine_propose_info;
-use crate::refine::propose::run_stage;
+use crate::refine::propose::run_stage_metered;
 use crate::sampling::{
     DRAWS_WORKFLOW_NAME, DrawsInput, SAMPLE_WORKFLOW_NAME, SampleInput, agent_draws_info,
     agent_sample_info, agent_sampling_policy_info,
@@ -156,12 +156,14 @@ fn register_refine(rt: &mut SqliteRuntime, harness: &Arc<AgentHarness>) {
         })
     });
     let h = Arc::clone(harness);
-    rt.register_activity_with_body(&agent_refine_propose_info(), move |input| {
-        call(input, |request| {
+    rt.register_activity_with_ledger(&agent_refine_propose_info(), move |input, _at| {
+        call_with_ledger(input, |request| {
             let h = Arc::clone(&h);
-            async move { run_stage(&h, request).await }
+            async move { run_stage_metered(&h, request).await }
         })
     });
+    #[cfg(feature = "eval")]
+    register_refine_run(rt, harness);
     let h = Arc::clone(harness);
     rt.register_activity_with_ledger(&agent_score_info(), move |input, _at| {
         call_with_ledger(input, |request| {
@@ -186,6 +188,128 @@ fn register_refine(rt: &mut SqliteRuntime, harness: &Arc<AgentHarness>) {
             }
         })
     });
+}
+
+/// Register the refine run and its steps (issue #2380). Each step that
+/// spends returns its cost ledger calls with its result.
+#[cfg(feature = "eval")]
+fn register_refine_run(rt: &mut SqliteRuntime, harness: &Arc<AgentHarness>) {
+    use crate::refine::compose::{run_compose, run_select};
+    use crate::refine::run::{probe_calls, run_probe, run_start};
+    use crate::refine::{
+        agent_refine_compose_info, agent_refine_info, agent_refine_probe_info,
+        agent_refine_select_info, agent_refine_start_info,
+    };
+
+    rt.register_workflow(&agent_refine_info());
+    let h = Arc::clone(harness);
+    rt.register_activity_with_body(&agent_refine_start_info(), move |input| {
+        call(input, |input| {
+            let h = Arc::clone(&h);
+            async move { run_start(&h, input).await }
+        })
+    });
+    let h = Arc::clone(harness);
+    rt.register_activity_with_ledger(&agent_refine_probe_info(), move |input, _at| {
+        call_with_ledger(input, |request| {
+            let h = Arc::clone(&h);
+            async move {
+                let result = run_probe(&h, request).await?;
+                let calls = probe_calls(&result);
+                Ok((result, calls))
+            }
+        })
+    });
+    let h = Arc::clone(harness);
+    rt.register_activity_with_ledger(&agent_refine_compose_info(), move |input, _at| {
+        call_with_ledger(input, |request| {
+            let h = Arc::clone(&h);
+            async move { run_compose(&h, request).await }
+        })
+    });
+    let h = Arc::clone(harness);
+    rt.register_activity_with_ledger(&agent_refine_select_info(), move |input, _at| {
+        call_with_ledger(input, |request| {
+            let h = Arc::clone(&h);
+            async move { run_select(&h, request).await }
+        })
+    });
+}
+
+/// Start one refine run (issue #2380). Returns its execution id. Drive it
+/// with `SqliteRuntime::run_until_blocked`. Install a [`Sources`] on the
+/// harness first.
+///
+/// # Errors
+///
+/// Returns an error when the runtime cannot record the start.
+#[cfg(feature = "eval")]
+pub fn start_refine(
+    rt: &mut SqliteRuntime,
+    input: &crate::refine::RefineInput,
+) -> SqliteResult<ExecutionId> {
+    rt.start_workflow(
+        crate::refine::REFINE_WORKFLOW_NAME,
+        serde_json::to_value(input)?,
+    )
+}
+
+/// The source runs of a refine run, from a SQLite file (issue #2380).
+///
+/// Each read opens its own read-only handle, so it sees what the runtime
+/// committed. SQLite has no fork, so a live re-probe returns
+/// [`LiveProbeError::Unsupported`](crate::refine::LiveProbeError::Unsupported).
+/// Install it with `AgentHarness::refine_sources`.
+#[derive(Debug, Clone)]
+pub struct Sources {
+    path: std::path::PathBuf,
+}
+
+impl Sources {
+    /// Read the runs of the database file at `path`.
+    #[must_use]
+    pub fn open(path: impl AsRef<std::path::Path>) -> Self {
+        Self {
+            path: path.as_ref().to_owned(),
+        }
+    }
+
+    fn read(&self, run: ExecutionId) -> SqliteResult<Option<crate::refine::SourceRecord>> {
+        let reader = SqliteReader::open(&self.path)?;
+        let description = match reader.describe(run) {
+            Ok(description) => description,
+            Err(autumn_harvest_sqlite::SqliteError::ExecutionNotFound(_)) => return Ok(None),
+            Err(err) => return Err(err),
+        };
+        let summary = description.summary;
+        let text = |value: Option<&String>| value.cloned().unwrap_or_default();
+        let state = text(summary.state.value());
+        Ok(Some(crate::refine::SourceRecord {
+            workflow_name: text(summary.workflow_name.value()),
+            workflow_id: text(summary.workflow_id.value()),
+            ended: !state.is_empty() && state != "RUNNING",
+            events: reader.load_history(run)?,
+        }))
+    }
+}
+
+impl crate::refine::RefineSources for Sources {
+    fn source(
+        &self,
+        run: ExecutionId,
+    ) -> BoxFuture<'_, Result<Option<crate::refine::SourceRecord>, AgentError>> {
+        let read = self.read(run).map_err(|err| transport(&err));
+        Box::pin(std::future::ready(read))
+    }
+
+    fn live_probe<'a>(
+        &'a self,
+        _request: crate::refine::LiveRequest<'a>,
+    ) -> BoxFuture<'a, Result<crate::refine::LiveEnd, crate::refine::LiveProbeError>> {
+        Box::pin(std::future::ready(Err(
+            crate::refine::LiveProbeError::Unsupported("SQLite"),
+        )))
+    }
 }
 
 /// Register the activities that retain, floor and reset a workspace.

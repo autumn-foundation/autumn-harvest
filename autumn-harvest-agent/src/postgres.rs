@@ -1086,6 +1086,159 @@ impl crate::eval::LiveProbeHost for PostgresAgents {
     }
 }
 
+/// How long a live re-probe of a refine run waits for its fork (issue
+/// #2380). The probe activity has a 2-hour budget, so the replay probe and
+/// the wait both fit in one attempt.
+pub const LIVE_REPROBE_WAIT: Duration = Duration::from_mins(60);
+
+/// The source runs of a refine run, from Postgres (issue #2380).
+///
+/// The read uses the codecs and the offloader of the target. With the
+/// `eval` feature, a live re-probe forks the source with
+/// `eval::live_probe` and waits up to [`LIVE_REPROBE_WAIT`] for its end. A
+/// worker of the queue must run the fork. Install it with
+/// `AgentHarness::refine_sources`.
+#[derive(Debug, Clone)]
+pub struct Sources {
+    pg: PostgresAgents,
+}
+
+impl Sources {
+    /// Read the runs of `pg`.
+    #[must_use]
+    pub const fn new(pg: PostgresAgents) -> Self {
+        Self { pg }
+    }
+
+    async fn read(&self, run: ExecutionId) -> HarvestResult<Option<crate::refine::SourceRecord>> {
+        let shard = match self.pg.shard_of(run).await {
+            Ok(shard) => shard,
+            Err(HarvestError::NotFound(_)) => return Ok(None),
+            Err(err) => return Err(err),
+        };
+        let mut conn = self.pg.conn(shard).await?;
+        let execution = match load_execution(&mut conn, run).await {
+            Ok(execution) => execution,
+            Err(HarvestError::NotFound(_)) => return Ok(None),
+            Err(err) => return Err(err),
+        };
+        let history = autumn_harvest::store::load_history_inflated(
+            &mut conn,
+            run,
+            &self.pg.codecs,
+            self.pg.offloader.as_deref(),
+        )
+        .await?;
+        Ok(Some(crate::refine::SourceRecord {
+            ended: WorkflowResultState::from_execution_state(&execution.state).is_terminal(),
+            workflow_name: execution.workflow_name,
+            workflow_id: execution.workflow_id,
+            events: history.events,
+        }))
+    }
+}
+
+impl Sources {
+    /// Cancel the fork `exec`. A failed cancel logs a warning.
+    #[cfg(feature = "eval")]
+    async fn cancel(&self, exec: ExecutionId) {
+        let cancelled = async {
+            let mut conn = self.pg.conn(self.pg.shard_of(exec).await?).await?;
+            autumn_harvest::cancel_workflow_execution(
+                &mut conn,
+                exec,
+                "the live re-probe did not end in time",
+                &autumn_harvest::telemetry::NoOpMetrics,
+            )
+            .await
+        };
+        if let Err(err) = cancelled.await {
+            tracing::warn!(error = %err, exec = %exec, "a live re-probe fork was not cancelled");
+        }
+    }
+}
+
+impl crate::refine::RefineSources for Sources {
+    fn source(
+        &self,
+        run: ExecutionId,
+    ) -> BoxFuture<'_, Result<Option<crate::refine::SourceRecord>, AgentError>> {
+        Box::pin(async move {
+            self.read(run)
+                .await
+                .map_err(|err| AgentError::new(ErrorKind::Transport, err.to_string()))
+        })
+    }
+
+    #[cfg(feature = "eval")]
+    fn live_probe<'a>(
+        &'a self,
+        request: crate::refine::LiveRequest<'a>,
+    ) -> BoxFuture<'a, Result<crate::refine::LiveEnd, crate::refine::LiveProbeError>> {
+        use crate::refine::{LiveEnd, LiveProbeError};
+        Box::pin(async move {
+            let effects: Vec<_> = request.effects.iter().copied().collect();
+            let probe = crate::eval::live_probe(
+                &self.pg,
+                request.harness,
+                request.source,
+                request.overlay,
+                &effects,
+            )
+            .await
+            .map_err(|err| LiveProbeError::Failed(err.to_string()))?;
+            let state = wait_run(&self.pg, probe.exec_id, LIVE_REPROBE_WAIT)
+                .await
+                .map_err(|err| LiveProbeError::Failed(err.to_string()))?;
+            let exec_id = probe.exec_id.to_string();
+            let end = match state {
+                RunState::Completed(output) => {
+                    // The report holds the spend of the fork, so the refine
+                    // ledger can count it.
+                    let report: Option<crate::types::AgentReport> =
+                        serde_json::from_value(output).ok();
+                    LiveEnd {
+                        exec_id,
+                        completed: true,
+                        error: None,
+                        usage: report.as_ref().map(|r| r.usage).unwrap_or_default(),
+                        cost_usd_micros: report.map_or(0, |r| r.cost_usd_micros),
+                    }
+                }
+                RunState::Failed(error) => LiveEnd {
+                    exec_id,
+                    completed: false,
+                    error: Some(crate::harness::truncate(&error, 500)),
+                    usage: crate::message::TokenUsage::default(),
+                    cost_usd_micros: 0,
+                },
+                RunState::Ended { state, error } => LiveEnd {
+                    exec_id,
+                    completed: false,
+                    error: Some(crate::harness::truncate(&error.unwrap_or(state), 500)),
+                    usage: crate::message::TokenUsage::default(),
+                    cost_usd_micros: 0,
+                },
+                RunState::WaitingSignal(_) | RunState::Running => {
+                    // A fork that does not end in time stops, so it spends
+                    // no more.
+                    self.cancel(probe.exec_id).await;
+                    LiveEnd {
+                        exec_id,
+                        completed: false,
+                        error: Some(
+                            "the fork did not end in time, and the probe cancelled it".to_owned(),
+                        ),
+                        usage: crate::message::TokenUsage::default(),
+                        cost_usd_micros: 0,
+                    }
+                }
+            };
+            Ok(end)
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -124,6 +124,7 @@ fn request() -> ProposeRequest {
         profile,
         current: ProfileOverlay::default(),
         attempts: ProposalAttempts::default(),
+        sample: 1,
     }
 }
 

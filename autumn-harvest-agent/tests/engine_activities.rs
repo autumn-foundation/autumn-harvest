@@ -261,11 +261,21 @@ fn the_engine_registration_builds() {
         .activities(activities())
         .state(AgentHarness::new(ScriptedModel::new(Vec::new())))
         .build();
-    assert_eq!(built.workflow_count(), 7);
+    // The `eval` feature adds the refine run `agent_refine` (issue #2380).
+    let refine = usize::from(cfg!(feature = "eval"));
+    assert_eq!(built.workflow_count(), 7 + refine);
     assert!(built.state::<AgentHarness>().is_some());
     let names: Vec<&str> = activities().iter().map(|a| a.name).collect();
+    let refine_steps = [
+        "agent_refine_start",
+        "agent_refine_probe",
+        "agent_refine_compose",
+        "agent_refine_select",
+    ];
+    let (core, steps) = names.split_at(names.len() - 4 * refine);
+    assert_eq!(steps, &refine_steps[..4 * refine]);
     assert_eq!(
-        names,
+        core,
         [
             "agent_model_turn",
             "agent_tool_call",
@@ -293,8 +303,10 @@ fn the_engine_registration_builds() {
         ]
     );
     let flows: Vec<&str> = workflows().iter().map(|w| w.name).collect();
+    let (core, refine_flow) = flows.split_at(flows.len() - refine);
+    assert_eq!(refine_flow, &["agent_refine"][..refine]);
     assert_eq!(
-        flows,
+        core,
         [
             autumn_harvest_agent::WORKFLOW_NAME,
             autumn_harvest_agent::heartbeat::HEARTBEAT_WORKFLOW_NAME,
