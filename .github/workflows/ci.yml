@@ -972,6 +972,12 @@ jobs:
     # pushes, so every OS x shard leg still spins up and reports a conclusion;
     # `needs.changes.outputs.code` gates the actual work per step.
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    env:
+      # Line tables only. A leg runs many serial builds with different
+      # feature sets, and full debug info filled the runner disk on Linux
+      # and Windows (ENOSPC, PR #2582). Backtraces keep file and line.
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
     strategy:
       fail-fast: false
       matrix:
