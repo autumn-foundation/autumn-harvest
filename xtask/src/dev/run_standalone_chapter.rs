@@ -43,6 +43,7 @@ use std::time::Duration;
 
 use smop::prelude::*;
 
+use crate::interrupt;
 use crate::util::repo_root;
 
 /// The chapter, relative to the repository root.
@@ -198,6 +199,10 @@ pub fn run(args: Args) -> Result<ExitCode> {
         .ok()
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| DEFAULT_HEALTH_TIMEOUT_SECS.to_string());
+    // The serve block runs in its own session, so Ctrl-C does not reach it.
+    // The guard keeps this process alive after an interrupt. So the cleanup
+    // still stops the server, as the `EXIT` trap of the old script did.
+    let _guard = interrupt::install();
     let mut session = Session {
         work: smop::fs::temp_dir()?,
         serve: None,
@@ -205,6 +210,9 @@ pub fn run(args: Args) -> Result<ExitCode> {
     };
     let outcome = session.run_blocks();
     session.cleanup(matches!(outcome, Ok(true)));
+    if interrupt::requested() {
+        return Ok(ExitCode::from(interrupt::EXIT_CODE));
+    }
     Ok(crate::util::gate_exit(outcome?))
 }
 
@@ -236,6 +244,9 @@ impl Session {
         }
 
         for (index, block) in blocks.iter().enumerate() {
+            if stopped() {
+                return Ok(false);
+            }
             let path = self.work.path().join(format!("{:02}", index + 1));
             std::fs::write(&path, &block.body)
                 .with_context(|| format!("cannot write {}", path.display()))?;
@@ -253,6 +264,10 @@ impl Session {
         // Press Ctrl-C, as the chapter tells the reader to. Then wait for the drain.
         signal_group("-INT", serve.id());
         for _ in 0..STOP_WAIT_SECS {
+            if stopped() {
+                self.serve = Some(serve);
+                return Ok(false);
+            }
             if serve
                 .try_wait()
                 .context("cannot poll the server")?
@@ -353,6 +368,9 @@ impl Session {
             0
         });
         for second in 1..=probes {
+            if stopped() {
+                return Ok(false);
+            }
             if curl(&["-sf", "-o", "/dev/null", HEALTH_URL]) {
                 println!("healthy after {second}s");
                 return Ok(true);
@@ -389,6 +407,15 @@ impl Session {
             }
         }
     }
+}
+
+/// Reports an interrupt once the guard has deferred one.
+fn stopped() -> bool {
+    let stopped = interrupt::requested();
+    if stopped {
+        eprintln!("run-standalone-chapter: interrupted; stopping the server");
+    }
+    stopped
 }
 
 /// Runs `curl` with `args` and reports whether it exited 0.

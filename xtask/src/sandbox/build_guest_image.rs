@@ -156,6 +156,10 @@ pub fn run(args: Args) -> Result<ExitCode> {
         eprintln!("usage: cargo xtask sandbox build-guest-image OUT_DIR");
         return Ok(ExitCode::FAILURE);
     };
+    // The container and the stage directory are removed on drop. The guard
+    // keeps this process alive after an interrupt, so those drops still run,
+    // as the `EXIT` trap of the old script did.
+    let _guard = crate::interrupt::install();
     match build(&out) {
         Ok(()) => Ok(ExitCode::SUCCESS),
         Err(err) => {
@@ -423,7 +427,10 @@ fn pipe_into(from: &mut Command, into: &mut Command) -> Result<()> {
 }
 
 /// Starts `command`. A missing program fails with 127, as in a shell.
+///
+/// After an interrupt, it starts nothing and fails with 130.
 fn spawn(command: &mut Command) -> Result<std::process::Child> {
+    stop_on_interrupt()?;
     command.spawn().map_err(|err| {
         let program = command.get_program().to_string_lossy().into_owned();
         if err.kind() == std::io::ErrorKind::NotFound {
@@ -436,8 +443,20 @@ fn spawn(command: &mut Command) -> Result<std::process::Child> {
     })
 }
 
+/// Fails with 130 once an interrupt has arrived.
+fn stop_on_interrupt() -> Result<()> {
+    if crate::interrupt::requested() {
+        eprintln!("build-guest-image: interrupted");
+        return Err(StepFailed(crate::interrupt::EXIT_CODE).into());
+    }
+    Ok(())
+}
+
 /// Maps a failed status to its exit code, as a shell reports it.
+///
+/// After an interrupt, it fails with 130 whatever the status.
 fn check(status: ExitStatus) -> Result<()> {
+    stop_on_interrupt()?;
     if status.success() {
         return Ok(());
     }

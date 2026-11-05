@@ -14,6 +14,7 @@ mod bench;
 mod check;
 mod ci;
 mod dev;
+mod interrupt;
 mod perf;
 mod sandbox;
 mod util;
