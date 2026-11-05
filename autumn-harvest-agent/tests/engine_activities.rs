@@ -176,6 +176,7 @@ async fn the_tool_handler_runs_the_named_tool_with_its_context() {
             arguments: json!({"k": 1}),
         },
         workspace: None,
+        probe_effects: None,
     };
 
     let info = agent_tool_call_info();
@@ -260,7 +261,7 @@ fn the_engine_registration_builds() {
         .activities(activities())
         .state(AgentHarness::new(ScriptedModel::new(Vec::new())))
         .build();
-    assert_eq!(built.workflow_count(), 6);
+    assert_eq!(built.workflow_count(), 7);
     assert!(built.state::<AgentHarness>().is_some());
     let names: Vec<&str> = activities().iter().map(|a| a.name).collect();
     assert_eq!(
@@ -286,6 +287,7 @@ fn the_engine_registration_builds() {
             "agent_consolidate_read",
             "agent_consolidate_turn",
             "agent_consolidate_write",
+            "agent_consolidate_due",
             "agent_episode_append",
             "agent_episode_reset",
         ]
@@ -300,6 +302,7 @@ fn the_engine_registration_builds() {
             autumn_harvest_agent::sampling::DRAWS_WORKFLOW_NAME,
             autumn_harvest_agent::sampling::SAMPLE_WORKFLOW_NAME,
             autumn_harvest_agent::CONSOLIDATE_WORKFLOW_NAME,
+            autumn_harvest_agent::CONSOLIDATE_ALL_WORKFLOW_NAME,
         ]
     );
 }
@@ -411,6 +414,7 @@ async fn a_huge_tool_error_still_fits_the_result_cap() {
                 arguments: json!({}),
             },
             workspace: None,
+            probe_effects: None,
         })
         .await
         .unwrap();
@@ -642,6 +646,7 @@ async fn a_read_only_call_refuses_a_write_tool_at_run_time() {
                 arguments: json!({}),
             },
             workspace: None,
+            probe_effects: None,
         })
         .await
         .unwrap();
@@ -776,6 +781,7 @@ async fn a_zero_result_cap_leaves_a_big_reply_and_a_big_tool_result_alone() {
                 arguments: json!({}),
             },
             workspace: None,
+            probe_effects: None,
         })
         .await
         .unwrap();

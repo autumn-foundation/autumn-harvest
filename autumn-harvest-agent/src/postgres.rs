@@ -26,7 +26,7 @@ use autumn_harvest::entity_state::ProjectedSnapshot;
 use autumn_harvest::error::{HarvestError, HarvestResult};
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::execution::{
-    SignalWithStartOutcome, SignalWithStartParams, StartWorkflowParams,
+    SignalWithStartOutcome, SignalWithStartParams, StartWorkflowParams, latest_with_search_attrs,
     list_running_with_search_attrs, load_execution, resolve_execution_id_by_workflow_id,
     signal_with_start_workflow_execution_with_metrics_and_codecs,
     start_or_load_workflow_execution_with_codecs,
@@ -46,6 +46,10 @@ use serde_json::Value;
 use crate::agent::{AGENT_WORKFLOW_NAME, Agent, AgentId, AgentOp, AgentState, Control, agent_info};
 use crate::agent::{INTERRUPT_SIGNAL, Interrupt};
 use crate::approval::{Approval, approval_call_id};
+use crate::consolidate::{CONSOLIDATE_WORKFLOW_NAME, CONSOLIDATION_ATTR, ConsolidateTask};
+use crate::consolidate_all::{
+    AgentDirectory, CONSOLIDATE_ALL_WORKFLOW_NAME, ConsolidateAll, LastPass,
+};
 use crate::error::{AgentError, ErrorKind};
 use crate::harness::AgentHarness;
 use crate::heartbeat::{HEARTBEAT_WORKFLOW_NAME, HeartbeatTask};
@@ -66,8 +70,8 @@ const SIGNAL_TIMEOUT_PREFIX: &str = "__signal_timeout:";
 /// How often [`wait_for`] and [`wait_run`] read the database again.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
-/// The page size of the mesh scan in [`pause_mesh`].
-const MESH_PAGE: u32 = 500;
+/// The page size of a search attribute scan, as in [`pause_mesh`].
+const SCAN_PAGE: u32 = 500;
 
 /// The Postgres target of the agent functions.
 ///
@@ -85,6 +89,8 @@ pub struct PostgresAgents {
     sharded: Option<ShardedDbPool>,
     router: ShardRouter,
     codecs: PayloadCodecs,
+    /// The payload offloader of the workers, if any (issue #2378).
+    offloader: Option<std::sync::Arc<autumn_harvest::payload_store::PayloadOffloader>>,
     queue: String,
 }
 
@@ -116,6 +122,7 @@ impl PostgresAgents {
             sharded: None,
             router: ShardRouter::single(),
             codecs: PayloadCodecs::default(),
+            offloader: None,
             queue: DEFAULT_QUEUE.to_owned(),
         }
     }
@@ -138,6 +145,7 @@ impl PostgresAgents {
             sharded: Some(pools.clone()),
             router,
             codecs: PayloadCodecs::default(),
+            offloader: None,
             queue: DEFAULT_QUEUE.to_owned(),
         }
     }
@@ -147,6 +155,18 @@ impl PostgresAgents {
     #[must_use]
     pub fn with_codecs(mut self, codecs: PayloadCodecs) -> Self {
         self.codecs = codecs;
+        self
+    }
+
+    /// Read and write offloaded payloads with `offloader` (issue #2378). Pass
+    /// the offloader of the workers. A live probe then reads a source whose
+    /// input the store holds, and offloads a large probe input.
+    #[must_use]
+    pub fn with_payload_offloader(
+        mut self,
+        offloader: std::sync::Arc<autumn_harvest::payload_store::PayloadOffloader>,
+    ) -> Self {
+        self.offloader = Some(offloader);
         self
     }
 
@@ -237,6 +257,37 @@ pub async fn start_heartbeat(
     task: &HeartbeatTask,
 ) -> HarvestResult<ExecutionId> {
     start_named(pg, HEARTBEAT_WORKFLOW_NAME, serde_json::to_value(task)?).await
+}
+
+/// Start one consolidation pass of the agent `id` (issue #2454). Returns
+/// its execution id. The Postgres form of `sqlite::consolidate`.
+///
+/// # Errors
+///
+/// Returns an error when the start cannot be recorded.
+pub async fn consolidate(pg: &PostgresAgents, id: &AgentId) -> HarvestResult<ExecutionId> {
+    let task = ConsolidateTask::new(id.clone());
+    start_named(pg, CONSOLIDATE_WORKFLOW_NAME, serde_json::to_value(task)?).await
+}
+
+/// Start one firing of the dispatcher `agent_consolidate_all` (issue
+/// #2540). Returns its execution id. The Postgres form of
+/// `sqlite::consolidate_all`. A deployment registers
+/// `consolidate::schedule` instead.
+///
+/// # Errors
+///
+/// Returns an error when the start cannot be recorded.
+pub async fn consolidate_all(
+    pg: &PostgresAgents,
+    task: &ConsolidateAll,
+) -> HarvestResult<ExecutionId> {
+    start_named(
+        pg,
+        CONSOLIDATE_ALL_WORKFLOW_NAME,
+        serde_json::to_value(task)?,
+    )
+    .await
 }
 
 /// Start the workflow `name` with `input`, under a fresh workflow id.
@@ -738,6 +789,114 @@ impl MeshSpend for LedgerSpend {
     }
 }
 
+/// The agent directory of the databases of a target (issue #2540).
+///
+/// It lists the running agents of a kind and the running passes of an
+/// agent by their search attributes. It reads each physical database once.
+/// The Postgres form of `sqlite::Directory`. Install it with
+/// `AgentHarness::directory`.
+#[derive(Debug, Clone)]
+pub struct Directory {
+    pg: PostgresAgents,
+}
+
+impl Directory {
+    /// Read the runs of the databases of `pg`.
+    #[must_use]
+    pub const fn new(pg: PostgresAgents) -> Self {
+        Self { pg }
+    }
+
+    /// The workflow ids of the running runs of `workflow_name` that carry
+    /// `attrs`, on each database.
+    async fn running(&self, workflow_name: &str, attrs: &Value) -> HarvestResult<Vec<String>> {
+        let mut ids = Vec::new();
+        for shard in self.pg.group_shards() {
+            let mut conn = self.pg.conn(shard).await?;
+            let mut after = None;
+            loop {
+                let page = list_running_with_search_attrs(
+                    &mut conn,
+                    workflow_name,
+                    attrs,
+                    after,
+                    SCAN_PAGE,
+                )
+                .await?;
+                let full = page.len() >= SCAN_PAGE as usize;
+                after = page.last().map(|(exec, _id)| *exec);
+                ids.extend(page.into_iter().map(|(_exec, id)| id));
+                if !full {
+                    break;
+                }
+            }
+        }
+        Ok(ids)
+    }
+
+    /// The last run of `workflow_name` that carries `attrs`, over each
+    /// database. A running run comes first. Each database returns one row.
+    async fn last_run(
+        &self,
+        workflow_name: &str,
+        attrs: &Value,
+    ) -> HarvestResult<Option<LastPass>> {
+        let mut last: Option<LastPass> = None;
+        for shard in self.pg.group_shards() {
+            let mut conn = self.pg.conn(shard).await?;
+            let Some((state, started_at)) =
+                latest_with_search_attrs(&mut conn, workflow_name, attrs).await?
+            else {
+                continue;
+            };
+            let found = LastPass {
+                running: state == "RUNNING",
+                started_ms: started_at.timestamp_millis(),
+            };
+            last = Some(match last {
+                Some(seen)
+                    if (seen.running, seen.started_ms) >= (found.running, found.started_ms) =>
+                {
+                    seen
+                }
+                _ => found,
+            });
+        }
+        Ok(last)
+    }
+}
+
+impl AgentDirectory for Directory {
+    fn agents<'a>(&'a self, kind: &'a str) -> BoxFuture<'a, Result<Vec<AgentId>, AgentError>> {
+        Box::pin(async move {
+            let attrs = serde_json::json!({ "agent_kind": kind });
+            let ids = self
+                .running(AGENT_WORKFLOW_NAME, &attrs)
+                .await
+                .map_err(|err| AgentError::new(ErrorKind::Transport, err.to_string()))?;
+            let mut agents: Vec<AgentId> = ids
+                .iter()
+                .filter_map(|id| AgentId::parse(id).ok())
+                .collect();
+            agents.sort();
+            agents.dedup();
+            Ok(agents)
+        })
+    }
+
+    fn last_pass<'a>(
+        &'a self,
+        agent: &'a AgentId,
+    ) -> BoxFuture<'a, Result<Option<LastPass>, AgentError>> {
+        Box::pin(async move {
+            let attrs = serde_json::json!({ CONSOLIDATION_ATTR: agent.as_str() });
+            self.last_run(CONSOLIDATE_WORKFLOW_NAME, &attrs)
+                .await
+                .map_err(|err| AgentError::new(ErrorKind::Transport, err.to_string()))
+        })
+    }
+}
+
 /// Pause every running agent of `mesh`, and return the audit record (issue
 /// #2272).
 ///
@@ -763,10 +922,10 @@ pub async fn pause_mesh(pg: &PostgresAgents, mesh: &str, reason: &str) -> Harves
                 AGENT_WORKFLOW_NAME,
                 &attrs,
                 after,
-                MESH_PAGE,
+                SCAN_PAGE,
             )
             .await?;
-            let full = page.len() >= MESH_PAGE as usize;
+            let full = page.len() >= SCAN_PAGE as usize;
             after = page.last().map(|(exec, _id)| *exec);
             targets.extend(
                 page.into_iter()
@@ -853,6 +1012,78 @@ async fn signal_live(
     Err(HarvestError::Config(format!(
         "the signal {name} to {id} raced {SUCCESSOR_ATTEMPTS} continue-as-new seals"
     )))
+}
+
+/// A live probe forks on Postgres with quiet live effects (issue #2378).
+///
+/// The read and the fork use the codecs and the offloader of the target. The fork commits in
+/// one transaction and only inserts rows, so the source stays unchanged.
+#[cfg(feature = "eval")]
+impl crate::eval::LiveProbeHost for PostgresAgents {
+    fn source_run(
+        &self,
+        source: ExecutionId,
+    ) -> BoxFuture<'_, Result<crate::eval::SourceRun, crate::eval::EvalError>> {
+        Box::pin(async move {
+            let host = |err: HarvestError| crate::eval::EvalError::Fork(err.to_string());
+            let mut conn = self
+                .conn(self.shard_of(source).await.map_err(host)?)
+                .await
+                .map_err(host)?;
+            let run = load_execution(&mut conn, source).await.map_err(host)?;
+            let history = autumn_harvest::store::load_history_inflated(
+                &mut conn,
+                source,
+                &self.codecs,
+                self.offloader.as_deref(),
+            )
+            .await
+            .map_err(host)?;
+            Ok(crate::eval::SourceRun {
+                workflow_name: run.workflow_name,
+                events: history.events,
+            })
+        })
+    }
+
+    fn fork_live(
+        &self,
+        source: ExecutionId,
+        input: Value,
+    ) -> BoxFuture<'_, Result<crate::eval::ProbeFork, crate::eval::EvalError>> {
+        use autumn_harvest::fork::{ForkEffects, WorkflowForkError, WorkflowForkRequest};
+        Box::pin(async move {
+            let host = |err: HarvestError| crate::eval::EvalError::Fork(err.to_string());
+            let mut conn = self
+                .conn(self.shard_of(source).await.map_err(host)?)
+                .await
+                .map_err(host)?;
+            let request = WorkflowForkRequest {
+                reason: crate::eval::PROBE_FORK_REASON.to_owned(),
+                operator_id: crate::eval::PROBE_FORK_OPERATOR.to_owned(),
+                effects: ForkEffects::LiveQuiet,
+                input: Some(input),
+                ..WorkflowForkRequest::default()
+            };
+            let fork = autumn_harvest::fork::fork_workflow_execution_with_codecs(
+                &mut conn,
+                source,
+                request,
+                &self.codecs,
+                self.offloader.as_deref(),
+            )
+            .await
+            .map_err(|err| match err {
+                WorkflowForkError::ErasedSource { .. } => crate::eval::EvalError::ErasedSource,
+                other => crate::eval::EvalError::Fork(other.to_string()),
+            })?;
+            Ok(crate::eval::ProbeFork {
+                exec_id: fork.new_exec_id,
+                workflow_id: fork.workflow_id,
+                forked_from_exec_id: fork.forked_from_exec_id,
+            })
+        })
+    }
 }
 
 #[cfg(test)]

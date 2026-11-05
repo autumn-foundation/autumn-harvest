@@ -7169,6 +7169,41 @@ pub async fn list_running_with_search_attrs(
         .collect())
 }
 
+/// The state and start time of the newest execution of `workflow_name`
+/// whose search attributes contain `attrs`, on ONE shard (issue #2540).
+///
+/// A running execution comes first, so the state reads `RUNNING` when any
+/// match still runs. Else the newest start wins. The test is JSON
+/// containment, as in [`list_running_with_search_attrs`]. The agent crate
+/// reads the last consolidation pass of an agent with it.
+///
+/// # Errors
+///
+/// Returns [`HarvestError::Database`] when the query fails.
+pub async fn latest_with_search_attrs(
+    conn: &mut AsyncPgConnection,
+    workflow_name: &str,
+    attrs: &serde_json::Value,
+) -> HarvestResult<Option<(String, chrono::DateTime<Utc>)>> {
+    use diesel::PgJsonbExpressionMethods as _;
+
+    harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::workflow_name.eq(workflow_name))
+        .filter(harvest_workflow_executions::search_attrs.contains(attrs.clone()))
+        .order((
+            harvest_workflow_executions::state.eq("RUNNING").desc(),
+            harvest_workflow_executions::started_at.desc(),
+        ))
+        .select((
+            harvest_workflow_executions::state,
+            harvest_workflow_executions::started_at,
+        ))
+        .first::<(String, chrono::DateTime<Utc>)>(conn)
+        .await
+        .optional()
+        .map_err(database_error)
+}
+
 /// Returns `true` when `err` reports that a target resolved by
 /// [`resolve_execution_id_by_workflow_id`] raced to `CONTINUED_AS_NEW`
 /// between resolution and a delivery/cancel attempt on it (issue #751).

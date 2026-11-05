@@ -6,6 +6,12 @@
 //! explicit value runs no worker and no scheduler. No role keeps the old
 //! default, `true`. An explicit value always wins. The startup warning fires
 //! exactly when the resolved value differs from the role default.
+//!
+//! Issue #2478 adds the retention placement. With `run_on = "scheduler"`,
+//! retention runs exactly where the resolved scheduler runs. So a `web` role
+//! with no explicit value runs no retention. With `run_on = "all"`, retention
+//! runs on each process, as before issue #2478. Retention that is off never
+//! runs.
 
 use vstd::prelude::*;
 
@@ -141,6 +147,125 @@ pub proof fn theorem_a_warning_marks_each_override(
             spec_role_default(role),
         ) != spec_role_default(role)),
         role.is_none() ==> !spec_contradicts(explicit, role),
+{
+}
+
+/// `crate::config::RetentionRunOn`.
+pub enum RetentionRunOn {
+    Scheduler,
+    All,
+}
+
+impl Clone for RetentionRunOn {
+    fn clone(&self) -> (r: Self)
+        ensures
+            r == *self,
+    {
+        *self
+    }
+}
+
+impl Copy for RetentionRunOn {}
+
+/// `retention_placed` as a spec.
+pub open spec fn spec_retention_placed(run_on: RetentionRunOn, scheduler: bool) -> bool {
+    match run_on {
+        RetentionRunOn::Scheduler => scheduler,
+        RetentionRunOn::All => true,
+    }
+}
+
+/// `runs_retention` as a spec.
+pub open spec fn spec_runs_retention(
+    enabled: bool,
+    run_on: RetentionRunOn,
+    scheduler: bool,
+) -> bool {
+    enabled && spec_retention_placed(run_on, scheduler)
+}
+
+// mirror: autumn-harvest-plugin/src/process_role.rs retention_placed
+pub fn retention_placed(run_on: RetentionRunOn, scheduler: bool) -> (r: bool)
+    ensures
+        r == spec_retention_placed(run_on, scheduler),
+{
+    match run_on {
+        RetentionRunOn::Scheduler => scheduler,
+        RetentionRunOn::All => true,
+    }
+}
+
+// mirror: autumn-harvest-plugin/src/process_role.rs runs_retention
+pub fn runs_retention(enabled: bool, run_on: RetentionRunOn, scheduler: bool) -> (r: bool)
+    ensures
+        r == spec_runs_retention(enabled, run_on, scheduler),
+{
+    enabled && retention_placed(run_on, scheduler)
+}
+
+/// With `run_on = "scheduler"`, retention runs exactly where the scheduler
+/// runs.
+pub proof fn theorem_retention_follows_the_scheduler(enabled: bool, scheduler: bool)
+    ensures
+        spec_runs_retention(enabled, RetentionRunOn::Scheduler, scheduler) == (enabled
+            && scheduler),
+{
+}
+
+/// A `web` role with no explicit scheduler value and the default
+/// placement runs no retention.
+pub proof fn theorem_a_web_role_runs_no_retention_by_default(enabled: bool)
+    ensures
+        !spec_runs_retention(
+            enabled,
+            RetentionRunOn::Scheduler,
+            spec_switch_value(None, spec_role_default(Some(ProcessRole::Web))),
+        ),
+{
+}
+
+/// A `worker` or `combined` role, or no role, runs enabled retention with
+/// no explicit scheduler value and the default placement.
+pub proof fn theorem_other_roles_run_retention_by_default(role: Option<ProcessRole>)
+    requires
+        role != Some(ProcessRole::Web),
+    ensures
+        spec_runs_retention(
+            true,
+            RetentionRunOn::Scheduler,
+            spec_switch_value(None, spec_role_default(role)),
+        ),
+{
+}
+
+/// An explicit scheduler value wins over the role, and retention follows
+/// it. So `scheduler_enabled = true` on a `web` role runs retention.
+pub proof fn theorem_an_explicit_scheduler_moves_retention(
+    enabled: bool,
+    scheduler: bool,
+    role: Option<ProcessRole>,
+)
+    ensures
+        spec_runs_retention(
+            enabled,
+            RetentionRunOn::Scheduler,
+            spec_switch_value(Some(scheduler), spec_role_default(role)),
+        ) == (enabled && scheduler),
+{
+}
+
+/// `run_on = "all"` runs enabled retention on each process, whatever the
+/// scheduler does. That is the behaviour before issue #2478.
+pub proof fn theorem_run_on_all_runs_retention_everywhere(enabled: bool, scheduler: bool)
+    ensures
+        spec_runs_retention(enabled, RetentionRunOn::All, scheduler) == enabled,
+{
+}
+
+/// Retention that is off never runs, on any placement.
+pub proof fn theorem_disabled_retention_never_runs(run_on: RetentionRunOn, scheduler: bool)
+    ensures
+        !spec_runs_retention(false, run_on, scheduler),
 {
 }
 

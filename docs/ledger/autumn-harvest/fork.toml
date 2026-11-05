@@ -32,14 +32,6 @@ tables = ["harvest_dead_letters", "harvest_events", "harvest_workflow_executions
 measured = "unmeasured"
 plan = "docs/ledger/plans/autumn-harvest/fork.md"
 
-["is_recorded_fork"]
-driver = "per_request"
-backend = ["postgres"]
-kind = ["read"]
-tables = ["harvest_events"]
-measured = "unmeasured"
-plan = "docs/ledger/plans/autumn-harvest/fork.md"
-
 ["load_fork_source"]
 driver = "per_request"
 backend = ["postgres"]
@@ -62,6 +54,14 @@ backend = ["postgres"]
 kind = ["write"]
 tables = ["harvest_task_queue"]
 measured = "docs/performance-fork-scheduled-occurrence.md"
+plan = "docs/ledger/plans/autumn-harvest/fork.md"
+
+["stored_fork_effects"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_events"]
+measured = "unmeasured"
 plan = "docs/ledger/plans/autumn-harvest/fork.md"
 
 ["workflow_id_in_use"]

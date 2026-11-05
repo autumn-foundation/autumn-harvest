@@ -15,8 +15,9 @@
 //! [`ResponseCache`] serves an identical model call across runs. The
 //! [`draw`] module gives each sample of a run its own identity, so the cache
 //! keeps the samples apart. The [`episode`] log records each op, and
-//! [`consolidate`] turns the episodes into facts (issue #2454). The
-//! [`recall`] module measures what an agent forgets across ops (issue
+//! [`consolidate`] turns the episodes into facts (issue #2454).
+//! [`consolidate_all`] starts the passes of many agents from one schedule
+//! (issue #2540). The [`recall`] module measures what an agent forgets across ops (issue
 //! #2455). The `eval` feature adds the `eval` module. That module re-drives
 //! a recorded run with a candidate model or prompt. The
 //! `sandbox` feature adds the `sandbox` module. Its `SandboxTool` runs agent
@@ -91,6 +92,7 @@ pub mod agent;
 pub mod approval;
 pub mod bounds;
 pub mod consolidate;
+pub mod consolidate_all;
 pub mod context_reset;
 pub mod delivery;
 pub mod draw;
@@ -98,6 +100,7 @@ pub mod episode;
 pub mod error;
 #[cfg(feature = "eval")]
 pub mod eval;
+mod fan_out_plan;
 pub mod flow;
 pub mod followup;
 pub mod harness;
@@ -156,6 +159,10 @@ pub use consolidate::{
     CONSOLIDATE_WORKFLOW_NAME, ConsolidateTask, ConsolidationReport, ConsolidationStop,
     agent_consolidate, agent_consolidate_info,
 };
+pub use consolidate_all::{
+    AgentDirectory, CONSOLIDATE_ALL_WORKFLOW_NAME, ConsolidateAll, DispatchReport, LastPass,
+    agent_consolidate_all, agent_consolidate_all_info,
+};
 pub use context_reset::{ContextReset, ProgressNotes};
 pub use delivery::{Delivery, LogDelivery, Report, ReportSource};
 pub use draw::{Draw, DrawId, run_draws};
@@ -174,7 +181,7 @@ pub use heartbeat::{
 pub use live::{LiveEvent, LiveSink, TurnText};
 pub use loop_guard::LoopGuard;
 pub use memory::{EditKey, InMemoryMemoryStore, MemoryBlock, MemoryScope, MemoryStore};
-pub use mesh::{DelegationRecord, MANDATE_META_KEY, Mandate, Peer, Refusal};
+pub use mesh::{DelegationRecord, MANDATE_META_KEY, Mandate, Peer, Refusal, SerialReason};
 pub use mesh_control::{BudgetPeriod, MeshBudget, MeshPause, MeshSpend, Spend};
 pub use message::{
     ChatMessage, ChatRole, ContentPart, RunId, SessionId, StopReason, TokenUsage, ToolCall,
@@ -207,7 +214,7 @@ pub use tool::{FnTool, Tool, ToolContext, ToolEffect};
 pub use transcript::{InMemoryTranscriptStore, PrefixRef, TranscriptStore};
 pub use types::{
     AgentReport, AgentStop, AgentTask, MAX_PARALLEL_CHILDREN, ModelTurn, ModelTurnRequest,
-    RunIdSource, ToolCallRequest, ToolOutcome,
+    PROBE_EFFECT_REFUSED, Probe, RunIdSource, ToolCallRequest, ToolOutcome,
 };
 pub use workflow::{
     WORKFLOW_NAME, activities, agent_deliver, agent_deliver_info, agent_discover_peers,

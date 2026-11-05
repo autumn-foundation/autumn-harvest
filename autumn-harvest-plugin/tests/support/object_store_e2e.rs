@@ -122,6 +122,10 @@ pub async fn retention_archive_reads_back_through_api_and_vantage<B: ObjectBacke
             readiness: autumn_harvest_plugin::HarvestReadinessConfig::default(),
             startup: autumn_harvest_plugin::HarvestStartupConfig::default(),
             redis: autumn_harvest_plugin::HarvestRedisConfig::default(),
+            // Both switches are off, so retention needs `all` (issue #2478).
+            retention: autumn_harvest_plugin::HarvestRetentionConfig {
+                run_on: autumn_harvest_plugin::RetentionRunOn::All,
+            },
         },
         HarvestRunnerResources::new(pool),
     )

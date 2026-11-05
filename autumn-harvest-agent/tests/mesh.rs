@@ -561,6 +561,7 @@ async fn the_tool_call_activity_checks_the_mandate_again() {
             labels: None,
             flow_labels: std::collections::BTreeSet::new(),
             workspace: None,
+            probe_effects: None,
         })
         .await
         .unwrap();
@@ -2127,6 +2128,7 @@ async fn the_tool_call_activity_refuses_a_tool_whose_labels_grew() {
         labels: Some(labels.iter().map(|label| (*label).to_owned()).collect()),
         flow_labels: std::collections::BTreeSet::new(),
         workspace: None,
+        probe_effects: None,
     };
     // The deciding worker saw a read-only tool.
     let grown = harness

@@ -14,6 +14,7 @@ use tracing::Instrument;
 use crate::agent::AgentProfile;
 use crate::agent::overlay_store::ProfileOverlayStore;
 use crate::bounds::{exceeds_bytes, json_len};
+use crate::consolidate_all::AgentDirectory;
 use crate::delivery::{Delivery, LogDelivery, Report};
 use crate::episode::EpisodeStore;
 use crate::error::{AgentError, ErrorKind};
@@ -130,6 +131,7 @@ pub struct AgentHarness {
     budget_timeout: Duration,
     memory: Option<Arc<dyn MemoryStore>>,
     episodes: Option<Arc<dyn EpisodeStore>>,
+    directory: Option<Arc<dyn AgentDirectory>>,
     delivery: Arc<dyn Delivery>,
     precheck: Option<Arc<dyn Precheck>>,
     cache: Option<ResponseCache>,
@@ -180,6 +182,7 @@ impl AgentHarness {
             budget_timeout: DEFAULT_BUDGET_TIMEOUT,
             memory: None,
             episodes: None,
+            directory: None,
             delivery: Arc::new(LogDelivery),
             precheck: None,
             cache: None,
@@ -433,6 +436,22 @@ impl AgentHarness {
     pub fn episodes(mut self, store: Arc<dyn EpisodeStore>) -> Self {
         self.episodes = Some(store);
         self
+    }
+
+    /// Set the agent directory (issue #2540). The dispatcher
+    /// `agent_consolidate_all` lists the agents of each scheduled kind with
+    /// it.
+    #[must_use]
+    pub fn directory(mut self, directory: Arc<dyn AgentDirectory>) -> Self {
+        self.directory = Some(directory);
+        self
+    }
+
+    /// The agent directory, or a non-retryable error that names the fix.
+    pub(crate) fn agent_directory(&self) -> Result<&Arc<dyn AgentDirectory>, String> {
+        self.directory
+            .as_ref()
+            .ok_or_else(crate::consolidate_all::directory_missing)
     }
 
     /// The memory store, or a non-retryable error that names the fix.
@@ -725,6 +744,11 @@ impl AgentHarness {
             .rev()
             .find(|profile| profile.kind == kind)
             .cloned()
+    }
+
+    /// Every profile, in the order of [`agent`](Self::agent).
+    pub(crate) fn agent_profiles(&self) -> &[AgentProfile] {
+        &self.profiles
     }
 
     /// Install flow rules. They gate each tool call against the labels that
@@ -1379,6 +1403,16 @@ impl AgentHarness {
         else {
             return Ok(self.error_outcome(&format!("unknown tool {:?}", call.name)));
         };
+        // A live probe runs only its effects (issue #2378). The check is in
+        // the activity, so no policy decision can change it.
+        if let Some(effects) = &request.probe_effects
+            && (!effects.contains(&tool.effect()) || tool.name() == MEMORY_TOOL)
+        {
+            // The memory of the scope belongs to the source. A note would
+            // show in the prompt of each later run, so a probe never writes
+            // one, as for the workspace head.
+            return Ok(ToolOutcome::probe_refused(tool.effect()));
+        }
         // A second check of the read-only rule. The decision and the call can
         // run on workers with different tool lists, for example in a deploy.
         if request.read_only && tool.effect() >= ToolEffect::Write {
@@ -1402,8 +1436,10 @@ impl AgentHarness {
         if let Some(lookup) = request.skill.filter(|_| tool.name() == LOAD_SKILL_TOOL) {
             return Ok(self.skill_outcome(lookup, &call.arguments));
         }
-        // A read-only run can read the files but never moves the head.
-        let keep_files = !request.read_only;
+        // A read-only run can read the files but never moves the head. A
+        // probe never moves it either, because the head belongs to the
+        // source scope (issue #2378).
+        let keep_files = !request.read_only && request.probe_effects.is_none();
         // Only a tool that opts in loads the workspace (issue #2274).
         let mount = request.workspace.filter(|_| tool.uses_workspace());
         let handle = match &mount {

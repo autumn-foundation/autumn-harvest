@@ -33,10 +33,13 @@ use crate::agent::{
     agent_workspace_floor_info, agent_workspace_reset_info, agent_workspace_retain_info,
 };
 use crate::approval::{Approval, Decision, approval_signal, await_decision, decode_decision};
-use crate::bounds::{RoundBudget, json_len, reaches_percent, reset_due, sibling_cap};
+use crate::bounds::{
+    RoundBudget, full_round_resets, json_len, reaches_percent, reset_due, sibling_cap,
+};
 use crate::context_reset::{self, ProgressNotes, SAVE_PROGRESS_TOOL};
 use crate::delivery::{Report, ReportSource, report_text};
 use crate::draw::Draw;
+use crate::fan_out_plan::{Fit, Step, fan_out_plan};
 use crate::flow::Released;
 use crate::followup::{self, FOLLOWUP_TOOL, Planned};
 use crate::harness::{
@@ -50,7 +53,7 @@ use crate::memory::{
 };
 use crate::mesh::{
     DELEGATE_TOOL, DelegateArgs, DelegationRecord, INVALID_NAME, Mandate, Peer, Refusal,
-    delegate_definition, valid_name,
+    SerialReason, delegate_definition, valid_name,
 };
 use crate::mesh_control::{MESH_ATTR, MESH_BUDGET_EXCEEDED, MeshBudgetExceeded};
 use crate::message::{
@@ -81,6 +84,12 @@ const CHILD_FAILURE_REPORT_PATCH: &str = "agent_child_failure_report";
 /// replays with this cut and with no `truncated` key. A new lookup always
 /// holds a limit, so a new run never reads this value.
 const LEGACY_ANSWER_LIMIT: usize = 8_000;
+
+/// The gate of the rules for a tool round over the cap (issue #2461). The
+/// loop asks it only where a new rule changes the branch: a round that
+/// resets, and a stopped save round. A history recorded before the gate
+/// holds no marker there, so it replays as it ran.
+const RESET_ON_FULL_PATCH: &str = "agent_reset_on_full_round";
 
 /// The registered workflow name.
 pub const WORKFLOW_NAME: &str = "agent_loop";
@@ -159,6 +168,10 @@ pub(crate) struct ResetState {
     /// The booking that woke this segment, with its result. Each reset of
     /// the segment keeps it, because the wake message points at it.
     pub(crate) woken_by: Option<[ChatMessage; 2]>,
+    /// The tool round over the cap that made the next reset due, with its
+    /// answers (issue #2461). The reset window keeps it, so the model sees
+    /// which calls ran. The reset clears it.
+    pub(crate) kept: Option<[ChatMessage; 2]>,
 }
 
 /// The steer messages of a durable agent (issue #2265).
@@ -562,7 +575,9 @@ pub(crate) async fn drive(
             Err(error) => return Err(error),
         };
         let mut report = progress.report(stop, &tree);
-        if task.deliver {
+        // A probe sends no report (issue #2378). Its answer is for the
+        // operator, not for a person.
+        if task.deliver && task.probe.is_none() {
             let source = if woken {
                 ReportSource::Followup
             } else {
@@ -700,6 +715,7 @@ async fn open_segment(
     progress.steers.clear();
     // A save turn that ended its segment has no reset to run.
     progress.reset.pending = false;
+    progress.reset.kept = None;
     if progress
         .sent
         .as_ref()
@@ -845,13 +861,10 @@ pub(crate) async fn run_segment(
 
         match Box::pin(run_round(ctx, run, progress, tree, slot, &turn, calls)).await? {
             RoundEnd::Continue => {}
-            // The reset of a save round runs next, with the notes it has.
-            RoundEnd::Full if progress.reset.pending => {}
-            RoundEnd::Full => {
-                // Not every call ran, so the text of the turn is no answer.
-                // It can claim work that never ran.
-                progress.last_text = narration;
-                return Ok(AgentStop::TranscriptFull);
+            RoundEnd::Full { stopped } => {
+                if !full_round_goes_on(ctx, run, progress, tree, input, stopped, narration) {
+                    return Ok(AgentStop::TranscriptFull);
+                }
             }
             RoundEnd::Loop => return Ok(AgentStop::LoopDetected),
             RoundEnd::Interrupted => {
@@ -879,6 +892,81 @@ fn answer_stop(turn: &ModelTurn, over_budget: bool) -> AgentStop {
 /// before the next request. A bound that ends the run still ends it.
 fn save_reply(progress: &Progress, turn: &ModelTurn, over_budget: bool) -> bool {
     progress.reset.pending && !over_budget && turn.stop != StopReason::MaxTokens
+}
+
+/// Whether a segment goes on after a tool round over the cap.
+///
+/// The reset of a save round runs next, with the notes it has. Any other
+/// round goes on only when [`reset_on_full_round`] resets it. A round that
+/// the loop guard or an interrupt also stopped never goes on, so the stop
+/// holds. A save round before that rule went on, so the gate keeps that
+/// history (issue #2461).
+///
+/// Not every call ran, so the text of the turn is no answer. It can claim
+/// work that never ran. So `narration`, the text before the turn, comes back
+/// unless the save round goes on.
+fn full_round_goes_on(
+    ctx: &WorkflowContext,
+    run: Run<'_>,
+    progress: &mut Progress,
+    tree: &Tree,
+    input: &str,
+    stopped: bool,
+    narration: String,
+) -> bool {
+    let save_round = progress.reset.pending;
+    if save_round && !(stopped && ctx.patched(RESET_ON_FULL_PATCH)) {
+        return true;
+    }
+    progress.last_text = narration;
+    !save_round && !stopped && reset_on_full_round(ctx, run, progress, tree, input)
+}
+
+/// Whether a tool round over the cap resets, and does not end the run
+/// (issue #2461).
+///
+/// The reset keeps the round with its answers. A call that ran shows its
+/// result or `DROPPED_FULL`, and a call that did not run shows
+/// `NOT_RUN_FULL`. So the model does not run a call with an effect again.
+///
+/// The round resets when a reset is left and the window after the reset,
+/// with the notes of that time, falls under the threshold. Then the next
+/// request takes the reset, with a save turn first when one fits. The check
+/// reads only recorded data, so replay takes the same branch.
+fn reset_on_full_round(
+    ctx: &WorkflowContext,
+    run: Run<'_>,
+    progress: &mut Progress,
+    tree: &Tree,
+    input: &str,
+) -> bool {
+    let Some(setting) = run.task.context_reset else {
+        return false;
+    };
+    // The round pushed its assistant turn, then its tool message.
+    let [.., call, answers] = progress.messages.as_slice() else {
+        return false;
+    };
+    progress.reset.kept = Some([call.clone(), answers.clone()]);
+    let after = reset_window(run.task, progress, input);
+    let after_len = json_len(&next_request(
+        run,
+        progress,
+        tree,
+        &run.extra_tools(),
+        after,
+    ));
+    let resets = full_round_resets(
+        progress.reset.count,
+        setting.max_resets,
+        after_len,
+        run.task.request_cap(),
+        setting.reset_at_percent,
+    ) && ctx.patched(RESET_ON_FULL_PATCH);
+    if !resets {
+        progress.reset.kept = None;
+    }
+    resets
 }
 
 /// The next request and its size, after a context reset when one is due
@@ -921,6 +1009,9 @@ fn sized_request(
 /// Without room, the reset runs at once. A reset whose window, with the
 /// notes of that time, still reaches the threshold frees no room. So it does
 /// not run, because it would only spend the next reset.
+///
+/// A round over the cap that kept its answers makes the reset due at once
+/// (issue #2461). [`reset_on_full_round`] already checked its room.
 fn plan_reset(
     run: Run<'_>,
     progress: &mut Progress,
@@ -934,19 +1025,21 @@ fn plan_reset(
     if std::mem::take(&mut progress.reset.pending) {
         return Some(reset_now(run.task, progress, input));
     }
-    if !reset_due(
-        progress.reset.count,
-        setting.max_resets,
-        len,
-        cap,
-        setting.reset_at_percent,
-    ) {
-        return None;
-    }
-    let after = reset_window(run.task, progress, input);
-    let after_len = json_len(&next_request(run, progress, tree, extra_tools, after));
-    if reaches_percent(after_len, cap, setting.reset_at_percent) {
-        return None;
+    if progress.reset.kept.is_none() {
+        if !reset_due(
+            progress.reset.count,
+            setting.max_resets,
+            len,
+            cap,
+            setting.reset_at_percent,
+        ) {
+            return None;
+        }
+        let after = reset_window(run.task, progress, input);
+        let after_len = json_len(&next_request(run, progress, tree, extra_tools, after));
+        if reaches_percent(after_len, cap, setting.reset_at_percent) {
+            return None;
+        }
     }
     let mut noticed = progress.messages.clone();
     noticed.push(ChatMessage::text(
@@ -972,7 +1065,10 @@ fn plan_reset(
 fn reset_now(task: &AgentTask, progress: &mut Progress, input: &str) -> Vec<ChatMessage> {
     progress.reset.count = progress.reset.count.saturating_add(1);
     progress.sent = None;
-    reset_window(task, progress, input)
+    let window = reset_window(task, progress, input);
+    // A later reset drops the kept round like any other turn.
+    progress.reset.kept = None;
+    window
 }
 
 /// The window after a reset (issue #2453).
@@ -980,7 +1076,11 @@ fn reset_now(task: &AgentTask, progress: &mut Progress, input: &str) -> Vec<Chat
 /// It holds the system prompt and the task. In a segment that a follow-up
 /// woke, the booking that woke it follows. The wake message points at that
 /// booking, so the wake message comes next. The booking that this segment
-/// made follows that. Then the notes follow, and last the steers.
+/// made follows that. A kept round over the cap follows (issue #2461). Then
+/// the notes follow, and last the steers.
+///
+/// The kept round can hold the booking of the segment. Then the booking
+/// shows only in the round, so no call id comes twice.
 fn reset_window(task: &AgentTask, progress: &Progress, input: &str) -> Vec<ChatMessage> {
     let messages = &progress.messages;
     let mut window = Vec::with_capacity(10 + progress.steers.len());
@@ -1005,9 +1105,13 @@ fn reset_window(task: &AgentTask, progress: &Progress, input: &str) -> Vec<ChatM
     if input != task.input {
         window.push(ChatMessage::text(ChatRole::User, input));
     }
+    let kept = progress.reset.kept.as_ref();
     if progress.followup.is_some() {
-        window.extend(booking(&messages[start..]).into_iter().flatten());
+        let own = booking(&messages[start..])
+            .filter(|[call, _]| !kept.is_some_and(|[round, _]| holds_calls_of(round, call)));
+        window.extend(own.into_iter().flatten());
     }
+    window.extend(kept.into_iter().flatten().cloned());
     if let Some(notes) = &progress.reset.notes {
         window.extend(context_reset::restored(&notes.text));
     }
@@ -1044,6 +1148,14 @@ fn booking(messages: &[ChatMessage]) -> Option<[ChatMessage; 2]> {
             content: vec![result.clone()],
         },
     ])
+}
+
+/// Whether `message` holds every call part of `calls`.
+fn holds_calls_of(message: &ChatMessage, calls: &ChatMessage) -> bool {
+    calls
+        .content
+        .iter()
+        .all(|part| message.content.contains(part))
 }
 
 /// The result part of the call `id` in `messages`.
@@ -1274,8 +1386,9 @@ async fn system_prompt(
 enum RoundEnd {
     /// Every call has an answer. Ask the model again.
     Continue,
-    /// The next request would exceed the request cap.
-    Full,
+    /// The next request would exceed the request cap. `stopped` is true when
+    /// the loop guard or an interrupt also stopped the round.
+    Full { stopped: bool },
     /// The loop guard stopped the run.
     Loop,
     /// An interrupt ended the round (issue #2265).
@@ -1386,9 +1499,11 @@ fn flow_after(tree: &Tree, turn: &ModelTurn) -> (BTreeSet<String>, Released) {
 /// each call does not fit, no call runs. The model could not read a result.
 ///
 /// The round drops a result that does not fit, and runs no more calls. The
-/// run then ends, so the model never reads a later result. No more calls run
-/// after the loop guard stops the run either. Each call still gets an answer,
-/// so the transcript stays valid and shows what ran.
+/// run then ends, so the model never reads a later result. With a reset left
+/// and room in the reset window, the run resets instead (issue #2461). A
+/// round that the loop guard or an interrupt also stopped never resets. No
+/// more calls run after the loop guard stops the run either. Each call still
+/// gets an answer, so the transcript stays valid and shows what ran.
 async fn run_round(
     ctx: &WorkflowContext,
     run: Run<'_>,
@@ -1400,7 +1515,7 @@ async fn run_round(
 ) -> Result<RoundEnd, String> {
     let task = run.task;
     let mut budget = round_budget(run, progress, tree, turn, &calls);
-    let batches = fan_out_batches(&calls, &turn.decisions, run.agent, task.parallel_children);
+    let plan = round_plan(&calls, &turn.decisions, run.agent, task.parallel_children);
     let mut results = Vec::with_capacity(calls.len());
     let mut full = false;
     let mut looped = false;
@@ -1447,10 +1562,10 @@ async fn run_round(
             *guard.full = true;
             ToolOutcome::error(NOT_RUN_FULL).content
         } else {
-            let batch = batches
-                .iter()
-                .find(|(start, _)| *start == position)
-                .map(|&(start, len)| start..start + len);
+            let batch = match plan.get(position) {
+                Some(&Step::Lead(len)) => Some(position..position + len),
+                _ => None,
+            };
             let span = batch.clone().unwrap_or(position..position + 1);
             // With flow rules, the turn decided each call against the labels
             // before the round. A delegation can add the labels of its child.
@@ -1461,10 +1576,14 @@ async fn run_round(
                     .cloned()
                     .collect::<BTreeSet<_>>()
             });
+            let before = tree.records.len();
             let (outcome, rest) = act(
                 ctx, run, progress, tree, slot, turn, &calls, position, batch,
             )
             .await?;
+            if let Some(&Step::Alone(reason)) = plan.get(position) {
+                note_serial(ctx, tree, before, call, reason);
+            }
             fanned = rest;
             stale = expected.is_some_and(|expected| !tree.exercised.is_subset(&expected));
             let mut guard = Settle {
@@ -1485,7 +1604,9 @@ async fn run_round(
         content: results,
     });
     Ok(if full {
-        RoundEnd::Full
+        RoundEnd::Full {
+            stopped: looped || progress.interrupted,
+        }
     } else if looped {
         RoundEnd::Loop
     } else if progress.interrupted {
@@ -1592,50 +1713,85 @@ impl Settle<'_, '_> {
     }
 }
 
-/// The fan-out batches of one round (issue #2270). Returns `(start, len)`
-/// pairs.
+/// The fan-out plan of one round (issues #2270 and #2483).
 ///
 /// A batch is two or more calls in a row. The policy allows each call, and
 /// each call delegates to an inline peer. A batch holds at most `bound`
-/// calls.
-///
-/// A gated delegation, or one to a durable peer, runs alone, as before.
-fn fan_out_batches(
+/// calls. A gated delegation, or one to a durable peer, runs alone, as
+/// before. The step of each delegation that runs alone names why.
+fn round_plan(
     calls: &[ToolCall],
     decisions: &[ToolDecision],
     agent: Option<&Member>,
     bound: u32,
-) -> Vec<(usize, usize)> {
+) -> Vec<Step> {
     let bound = usize::try_from(bound.min(MAX_PARALLEL_CHILDREN)).unwrap_or(1);
-    // A bound under 2 never extends a batch past one call.
     let Some(agent) = agent else {
-        return Vec::new();
+        return vec![Step::Skip; calls.len()];
     };
-    let batchable = |position: usize| {
-        let call = &calls[position];
-        call.name == DELEGATE_TOOL
-            && matches!(decisions.get(position), Some(ToolDecision::Allow))
-            && delegate_args(&call.arguments)
-                .and_then(|args| agent.peers.iter().find(|peer| peer.name == args.agent))
-                .is_some_and(|peer| peer.agent.is_none())
-    };
-    let mut batches = Vec::new();
-    let mut start = 0;
-    while start < calls.len() {
-        if !batchable(start) {
-            start += 1;
-            continue;
-        }
-        let mut end = start + 1;
-        while end < calls.len() && end - start < bound && batchable(end) {
-            end += 1;
-        }
-        if end - start >= 2 {
-            batches.push((start, end - start));
-        }
-        start = end;
+    let fits: Vec<Fit> = calls
+        .iter()
+        .enumerate()
+        .map(|(position, call)| fit(call, decisions.get(position), agent))
+        .collect();
+    fan_out_plan(&fits, bound)
+}
+
+/// What one call is to a fan-out. A call to a peer that the roster does not
+/// name is refused, so the plan does not touch it. A person can edit the
+/// target of a gated call, so a gated call is `Gated` whatever peer it names.
+fn fit(call: &ToolCall, decision: Option<&ToolDecision>, agent: &Member) -> Fit {
+    if call.name != DELEGATE_TOOL {
+        return Fit::Other;
     }
-    batches
+    match decision {
+        None | Some(ToolDecision::Deny { .. }) => return Fit::Other,
+        Some(ToolDecision::RequireApproval { .. }) => return Fit::Gated,
+        Some(ToolDecision::Allow) => {}
+    }
+    let Some(peer) = delegate_args(&call.arguments)
+        .and_then(|args| agent.peers.iter().find(|peer| peer.name == args.agent))
+    else {
+        return Fit::Other;
+    };
+    if peer.agent.is_some() {
+        Fit::Durable
+    } else {
+        Fit::Batchable
+    }
+}
+
+/// Write `reason` on the record of a delegation that ran alone (issue
+/// #2483).
+///
+/// The call pushes its own record last, after the records of its subtree.
+/// A refused delegation did not run, so its record keeps no reason. This
+/// includes a durable peer that refuses the message. A person can also
+/// reject a gated call. It then pushes no record.
+fn note_serial(
+    ctx: &WorkflowContext,
+    tree: &mut Tree,
+    before: usize,
+    call: &ToolCall,
+    reason: SerialReason,
+) {
+    let Some(record) = tree.records.get_mut(before..).and_then(<[_]>::last_mut) else {
+        return;
+    };
+    if record.refusal.is_some() {
+        return;
+    }
+    record.serial = Some(reason);
+    // Replay runs this code again. The record is the durable trace, so the
+    // log line fires only once.
+    if !ctx.is_replaying() {
+        tracing::debug!(
+            call_id = %call.id,
+            chain = ?record.chain,
+            reason = reason.code(),
+            "a delegation ran alone"
+        );
+    }
 }
 
 /// The longest answer that the round writes for a call with no result.
@@ -1886,6 +2042,7 @@ async fn run_tool(
         workspace: progress.workspace.clone(),
         skill: None,
         allowed_effects: task.allowed_effects.clone(),
+        probe_effects: task.probe.map(crate::types::Probe::effects),
     };
     if wants_skill {
         request.skill = Some(skill::lookup(
@@ -2118,6 +2275,7 @@ async fn delegate(
         tool_calls,
         resets: child.reset.count,
         answer_truncated: false,
+        serial: None,
     });
     let mut outcome = serde_json::json!({
         "agent": peer.name,
@@ -2260,6 +2418,7 @@ fn refuse_delegation(agent: &Member, tree: &mut Tree, refusal: Refusal, name: &s
         tool_calls: 0,
         resets: 0,
         answer_truncated: false,
+        serial: None,
     });
     refused(refusal, name)
 }
@@ -2471,6 +2630,7 @@ fn merge_child(
         tool_calls: report.tool_calls,
         resets: report.resets,
         answer_truncated: false,
+        serial: None,
     });
     let mut outcome = serde_json::json!({
         "agent": peer.name,
@@ -2505,7 +2665,8 @@ async fn durable_peer(
     };
     // A durable peer runs its own op with its own effects. A mandate cannot
     // carry an effect set, so a narrowed run never asks one (issue #2439).
-    if run.task.allowed_effects.is_some() {
+    // A probe never asks one for the same reason (issue #2378).
+    if run.task.allowed_effects.is_some() || run.task.probe.is_some() {
         return Ok(refuse(agent, tree, Refusal::NotPermitted, &peer.name));
     }
     let target_id = target.as_str();
@@ -2591,6 +2752,7 @@ fn peer_outcome(
                 tool_calls: 0,
                 resets: 0,
                 answer_truncated: false,
+                serial: None,
             });
             if let Some(refusal) = reply.refusal {
                 refused(refusal, &peer.name)
@@ -2625,6 +2787,7 @@ fn peer_outcome(
                 tool_calls: 0,
                 resets: 0,
                 answer_truncated: false,
+                serial: None,
             });
             ToolOutcome::error(&format!(
                 "the durable agent {:?} gave no answer: {error}",
@@ -2690,6 +2853,7 @@ fn refuse(agent: &Member, tree: &mut Tree, refusal: Refusal, name: &str) -> Tool
         tool_calls: 0,
         resets: 0,
         answer_truncated: false,
+        serial: None,
     });
     refused(refusal, name)
 }
@@ -2753,6 +2917,8 @@ fn child_task(
         // A child is part of the draw of its parent, so its requests keep
         // the draw id. It has its own run id, so it drops the root.
         draw: task.draw.as_ref().map(Draw::inherited),
+        // A child of a probe is a probe with the same effects (issue #2378).
+        probe: task.probe,
     }
 }
 
@@ -3047,6 +3213,7 @@ pub fn workflows() -> Vec<WorkflowInfo> {
         crate::sampling::agent_draws_info(),
         crate::sampling::agent_sample_info(),
         crate::consolidate::agent_consolidate_info(),
+        crate::consolidate_all::agent_consolidate_all_info(),
     ]
 }
 
@@ -3074,6 +3241,7 @@ pub fn activities() -> Vec<ActivityInfo> {
         crate::consolidate::agent_consolidate_read_info(),
         crate::consolidate::agent_consolidate_turn_info(),
         crate::consolidate::agent_consolidate_write_info(),
+        crate::consolidate_all::agent_consolidate_due_info(),
         crate::consolidate::agent_episode_append_info(),
         crate::consolidate::agent_episode_reset_info(),
     ]
@@ -3082,6 +3250,114 @@ pub fn activities() -> Vec<ActivityInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+    use serde_json::json;
+
+    /// The batching of one round before issue #2483, at the `ToolCall`
+    /// level. Returns `(start, len)` pairs.
+    fn old_batches(
+        calls: &[ToolCall],
+        decisions: &[ToolDecision],
+        agent: Option<&Member>,
+        bound: u32,
+    ) -> Vec<(usize, usize)> {
+        let bound = usize::try_from(bound.min(MAX_PARALLEL_CHILDREN)).unwrap_or(1);
+        let Some(agent) = agent else {
+            return Vec::new();
+        };
+        let batchable = |position: usize| {
+            let call = &calls[position];
+            call.name == DELEGATE_TOOL
+                && matches!(decisions.get(position), Some(ToolDecision::Allow))
+                && delegate_args(&call.arguments)
+                    .and_then(|args| agent.peers.iter().find(|peer| peer.name == args.agent))
+                    .is_some_and(|peer| peer.agent.is_none())
+        };
+        let mut batches = Vec::new();
+        let mut start = 0;
+        while start < calls.len() {
+            if !batchable(start) {
+                start += 1;
+                continue;
+            }
+            let mut end = start + 1;
+            while end < calls.len() && end - start < bound && batchable(end) {
+                end += 1;
+            }
+            if end - start >= 2 {
+                batches.push((start, end - start));
+            }
+            start = end;
+        }
+        batches
+    }
+
+    /// A call of a round: a delegation to an inline, a durable or an
+    /// unknown peer, a delegation with bad arguments, or another tool.
+    fn call() -> impl Strategy<Value = ToolCall> {
+        let delegate = |agent: &str| ToolCall {
+            id: "c".into(),
+            name: DELEGATE_TOOL.into(),
+            arguments: json!({"agent": agent, "task": "t"}),
+        };
+        prop_oneof![
+            Just(delegate("inline")),
+            Just(delegate("durable")),
+            Just(delegate("unknown")),
+            Just(ToolCall {
+                id: "c".into(),
+                name: DELEGATE_TOOL.into(),
+                arguments: json!({"agent": "inline"}),
+            }),
+            Just(ToolCall {
+                id: "c".into(),
+                name: "note".into(),
+                arguments: json!({}),
+            }),
+        ]
+    }
+
+    fn decision() -> impl Strategy<Value = ToolDecision> {
+        prop_oneof![
+            Just(ToolDecision::Allow),
+            Just(ToolDecision::RequireApproval { reason: "r".into() }),
+            Just(ToolDecision::Deny { reason: "d".into() }),
+        ]
+    }
+
+    proptest! {
+        /// The plan batches each round exactly as the code before issue
+        /// #2483 did, so a recorded run replays the same. A round may hold
+        /// fewer decisions than calls.
+        #[test]
+        fn a_round_plan_batches_as_before(
+            calls in prop::collection::vec(call(), 0..12),
+            decisions in prop::collection::vec(decision(), 0..12),
+            bound in 0u32..20,
+            mandated in any::<bool>(),
+        ) {
+            let id = crate::agent::AgentId::new("peer", "p1").unwrap();
+            let agent = Member {
+                mandate: Mandate::new("root"),
+                peers: vec![
+                    Peer::new("inline", "Inline."),
+                    Peer::agent("durable", "Durable.", &id),
+                ],
+            };
+            let agent = mandated.then_some(&agent);
+            let plan = round_plan(&calls, &decisions, agent, bound);
+            let leads: Vec<(usize, usize)> = plan
+                .iter()
+                .enumerate()
+                .filter_map(|(at, step)| match step {
+                    Step::Lead(len) => Some((at, *len)),
+                    _ => None,
+                })
+                .collect();
+            prop_assert_eq!(plan.len(), calls.len());
+            prop_assert_eq!(leads, old_batches(&calls, &decisions, agent, bound));
+        }
+    }
 
     // Issue #2481: a peer lookup recorded before the limit has no
     // `answer_limit`. Its run replays with the old cut and the old shape.
@@ -3383,6 +3659,68 @@ mod tests {
         progress.reset.count = 1;
         assert!(plan(&task, &mut progress, len).is_none(), "no reset left");
         assert!(!progress.reset.pending);
+    }
+
+    #[test]
+    fn a_kept_round_makes_the_reset_due_under_the_threshold() {
+        let (mut task, mut progress, len) = reset_fixture();
+        task.max_request_bytes = Some(len * 3);
+        let round = [
+            assistant(vec![followup_call("h1")]),
+            tool(vec![result("h1", "dropped")]),
+        ];
+        progress.reset.kept = Some(round.clone());
+        let noticed = plan(&task, &mut progress, len).expect("a save turn");
+        assert!(
+            progress.reset.pending,
+            "under 50 %, the kept round asks a save turn"
+        );
+        assert_eq!(noticed.len(), progress.messages.len() + 1);
+        let window = plan(&task, &mut progress, len).expect("the reset");
+        assert_eq!(progress.reset.count, 1);
+        assert!(progress.reset.kept.is_none(), "the reset clears the round");
+        let mut expected = vec![ChatMessage::text(ChatRole::User, "audit")];
+        expected.extend(round);
+        assert_eq!(window, expected);
+    }
+
+    #[test]
+    fn a_booking_in_the_kept_round_shows_once() {
+        let booked = r#"{"in_minutes":1,"scheduled":true}"#;
+        let task = AgentTask::new("audit");
+        let round = [
+            assistant(vec![followup_call("f1"), followup_call("h1")]),
+            tool(vec![result("f1", booked), result("h1", "dropped")]),
+        ];
+        let mut messages = vec![ChatMessage::text(ChatRole::User, "audit")];
+        messages.extend(round.clone());
+        let mut progress = Progress::new("r".into(), messages);
+        progress.followup = Some(Planned { delay_secs: 60 });
+        progress.reset.kept = Some(round.clone());
+        let window = reset_window(&task, &progress, "audit");
+        let mut expected = vec![ChatMessage::text(ChatRole::User, "audit")];
+        expected.extend(round);
+        assert_eq!(window, expected);
+        // A round with no booking keeps the booking of the segment apart.
+        progress.reset.kept = Some([
+            assistant(vec![followup_call("h2")]),
+            tool(vec![result("h2", "dropped")]),
+        ]);
+        let ids: Vec<String> = reset_window(&task, &progress, "audit")
+            .iter()
+            .map(|message| match &message.content[0] {
+                ContentPart::Text(text) => text.clone(),
+                ContentPart::ToolCall { id, .. }
+                | ContentPart::ToolResult {
+                    tool_call_id: id, ..
+                } => id.clone(),
+            })
+            .collect();
+        assert_eq!(
+            ids,
+            ["audit", "f1", "f1", "h2", "h2"],
+            "the booking comes first"
+        );
     }
 
     fn followup_call(id: &str) -> ContentPart {

@@ -513,9 +513,37 @@ let task = AgentTask::new("plan the trip")
     .parallel_children(3);
 ```
 
+The default is 0, so the fan-out is off until you set `n`. A call joins a
+batch only when each of these is true. Otherwise it runs inline, one after
+another, as with no bound.
+
+1. `n` is 2 or more. `MAX_PARALLEL_CHILDREN` caps it.
+2. The call is a `delegate` call.
+3. The policy allows the call. A gated call waits for a person.
+4. The peer is inline. A durable peer runs on its own worker.
+5. The call is next to another call that meets 2 to 4.
+
+A run of such calls splits into batches of at most `n`, in call order. A
+call left over at the end runs alone.
+
+A delegation that runs alone names why. Its `DelegationRecord::serial`
+holds the reason (issue #2483). A `debug` event logs it once, with the
+message `a delegation ran alone` and the fields `call_id`, `chain` and
+`reason`. A bound under 2 names no reason. A refused delegation names its
+refusal instead. A call that the policy denies, or that a person rejects,
+does not run, so it has no record.
+
+| `serial` | Why the call ran alone |
+|---|---|
+| `single_call` | No other call of the turn meets 2 to 4. |
+| `not_consecutive` | Another call meets 2 to 4, but no neighbour does. |
+| `gated` | The policy gated the call. A person can edit its target, so the peer does not count. |
+| `durable_peer` | The policy allowed a call to a durable peer. |
+| `bound_reached` | The call is the last of a run. The batch before it is full. |
+
 | Rule | What happens |
 |---|---|
-| Batch | Two or more `delegate` calls in a row, each allowed by the policy, each to an inline peer. At most `n` calls, and at most `MAX_PARALLEL_CHILDREN`. |
+| Batch | See the list above. |
 | Child | Each call of a batch runs as a child `agent_loop` run, with its own history. |
 | Tokens | The siblings split the token remainder of the tree with `sibling_cap`. The caps of a batch sum to the remainder. |
 | Delegations | The siblings split the delegation remainder. Each child run counts its own delegations from zero. |
@@ -533,7 +561,7 @@ let task = AgentTask::new("plan the trip")
 - A child run starts with no released flow rules.
 - A durable agent takes an interrupt only after the batch ends.
 - A single delegation, a gated one, or one to a durable peer runs inline,
-  as before.
+  as before. Its record names why.
 - `eval::evaluate` answers each child run with the recorded report of the
   child with the same delegation chain and task text. With no match, the
   candidate fails.

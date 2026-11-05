@@ -9,15 +9,19 @@
 
 mod common;
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use autumn_harvest_agent::recall::{
     self, EPISODES, MEMORY, NOTES, ReaderModel, RecallFixture, RecallOutcome, RecallReport, WINDOW,
 };
+use autumn_harvest_agent::refine::policy::PolicyModels;
 use autumn_harvest_agent::{
     AgentError, AgentHarness, AgentModel, AgentProfile, BoxFuture, ChatRequest, ChatResponse,
-    ChatRole, ContentPart, ErrorKind, sqlite,
+    ChatRole, ContentPart, ErrorKind, InMemoryOverlayStore, OverlayStoreError, OverlayValidator,
+    OverlayVersion, PolicyCeilings, ProfileOverlay, ProfileOverlayStore, Provenance, RefinePolicy,
+    sqlite,
 };
 use autumn_harvest_sqlite::SqliteRuntime;
 use common::ScriptedModel;
@@ -377,4 +381,223 @@ async fn a_rerun_with_another_window_runs_again() {
     let report = sweep_on(&db, wide.clone(), 8, &fixture, &[WINDOW]).await;
     assert!(wide.calls() > 0, "the wide window runs its own agents");
     assert_eq!(report.score(WINDOW, OP1_ITEM), Some(1.0));
+}
+
+/// A validator that accepts each overlay.
+struct AcceptAll;
+
+impl OverlayValidator for AcceptAll {
+    fn validate(
+        &self,
+        _kind: &str,
+        _overlay: &ProfileOverlay,
+        _policy: &RefinePolicy,
+    ) -> Result<(), OverlayStoreError> {
+        Ok(())
+    }
+}
+
+/// An empty overlay store that accepts each overlay.
+fn overlay_store() -> Arc<InMemoryOverlayStore> {
+    Arc::new(InMemoryOverlayStore::new(Arc::new(AcceptAll)))
+}
+
+/// Put `overlay` on the window config, and return its version.
+async fn put_overlay(store: &InMemoryOverlayStore, overlay: ProfileOverlay) -> OverlayVersion {
+    store
+        .put(WINDOW, &overlay, Provenance::operator("ops"))
+        .await
+        .expect("put")
+}
+
+/// Make `version` the active version of the window config.
+async fn activate(store: &InMemoryOverlayStore, version: OverlayVersion) {
+    let active = store.active(WINDOW).await.expect("active");
+    let expected = active.map(|stored| stored.version());
+    store
+        .activate(WINDOW, version, expected, Provenance::operator("ops"))
+        .await
+        .expect("activate");
+}
+
+/// Put an overlay with the system prompt `system`, and activate it.
+async fn activate_system(store: &InMemoryOverlayStore, system: &str) -> OverlayVersion {
+    let overlay = ProfileOverlay {
+        system: Some(system.to_owned()),
+        ..ProfileOverlay::default()
+    };
+    let version = put_overlay(store, overlay).await;
+    activate(store, version).await;
+    version
+}
+
+/// Sweep the window config on `harness` over the one item `OP1_ITEM`.
+async fn sweep_harness(db: &Path, harness: AgentHarness) -> RecallReport {
+    let harness = Arc::new(harness);
+    let mut rt = SqliteRuntime::open(db).expect("the database opens");
+    sqlite::register(&mut rt, Arc::clone(&harness));
+    let configs = [WINDOW.to_owned()];
+    recall::sweep(&mut rt, &harness, &only(OP1_ITEM), &configs).await
+}
+
+/// Run the window config on `db` with `store` as the overlay store.
+async fn sweep_with_overlays(
+    db: &Path,
+    store: &Arc<InMemoryOverlayStore>,
+    model: &Arc<ReaderModel>,
+) -> RecallReport {
+    let harness = harness(model.clone(), WINDOW_SIZE).overlay_store(store.clone());
+    sweep_harness(db, harness).await
+}
+
+/// Issue #2556: an activation that changes the prompt gets new agents, so a
+/// rerun never reports the scores of the old overlay.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rerun_after_an_activation_runs_again() {
+    let (_dir, db) = fresh_db();
+    let store = overlay_store();
+    activate_system(&store, "Answer briefly.").await;
+    let first = ReaderModel::new();
+    sweep_with_overlays(&db, &store, &first).await;
+    assert!(first.calls() > 0, "the first sweep calls the model");
+
+    activate_system(&store, "Answer in full.").await;
+    let second = ReaderModel::new();
+    sweep_with_overlays(&db, &store, &second).await;
+    assert!(second.calls() > 0, "the new overlay runs its own agents");
+}
+
+/// Issue #2556: a rerun with the same active overlay reuses the agents.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rerun_with_no_activation_calls_no_model() {
+    let (_dir, db) = fresh_db();
+    let store = overlay_store();
+    activate_system(&store, "Answer briefly.").await;
+    sweep_with_overlays(&db, &store, &ReaderModel::new()).await;
+
+    let again = ReaderModel::new();
+    sweep_with_overlays(&db, &store, &again).await;
+    assert_eq!(again.calls(), 0);
+}
+
+/// The fingerprint reads the content of the overlay, not its version. A
+/// rollback to the first version reuses the agents of the first sweep.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rollback_reuses_the_agents_of_the_old_overlay() {
+    let (_dir, db) = fresh_db();
+    let store = overlay_store();
+    let first = activate_system(&store, "Answer briefly.").await;
+    sweep_with_overlays(&db, &store, &ReaderModel::new()).await;
+    activate_system(&store, "Answer in full.").await;
+    sweep_with_overlays(&db, &store, &ReaderModel::new()).await;
+
+    activate(&store, first).await;
+    let again = ReaderModel::new();
+    sweep_with_overlays(&db, &store, &again).await;
+    assert_eq!(again.calls(), 0);
+}
+
+/// An overlay that changes only the model gets new agents.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_activation_that_changes_the_model_runs_again() {
+    let (_dir, db) = fresh_db();
+    let store = overlay_store();
+    let (first, second) = (ReaderModel::new(), ReaderModel::new());
+    let on = |id: &'static str, model: &Arc<ReaderModel>| {
+        harness(ReaderModel::new(), WINDOW_SIZE)
+            .model_named("alt", Arc::new(Named(id, model.clone())))
+            .overlay_store(store.clone())
+    };
+    let overlay = || ProfileOverlay {
+        model: Some("alt".to_owned()),
+        ..ProfileOverlay::default()
+    };
+    let models = BTreeSet::from(["alt".to_owned()]);
+    let policy = RefinePolicy {
+        ceilings: PolicyCeilings {
+            models: Some(PolicyModels::new(models).expect("a model list")),
+            ..PolicyCeilings::default()
+        },
+        ..RefinePolicy::default()
+    };
+    store
+        .set_policy(WINDOW, &policy, None, Provenance::operator("ops"))
+        .await
+        .expect("policy");
+    let version = put_overlay(&store, overlay()).await;
+    activate(&store, version).await;
+    sweep_harness(&db, on("alt-a", &first)).await;
+    assert!(first.calls() > 0, "the overlay model runs the ops");
+
+    sweep_harness(&db, on("alt-b", &second)).await;
+    assert!(second.calls() > 0, "a new model id runs its own agents");
+}
+
+/// An overlay that does not apply fails its item, as it fails an op.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_overlay_that_does_not_apply_fails_its_item() {
+    let (_dir, db) = fresh_db();
+    let store = overlay_store();
+    let overlay = ProfileOverlay {
+        model: Some("missing".to_owned()),
+        ..ProfileOverlay::default()
+    };
+    let version = put_overlay(&store, overlay).await;
+    activate(&store, version).await;
+    let model = ReaderModel::new();
+    let report = sweep_with_overlays(&db, &store, &model).await;
+    assert!(failed(&report, WINDOW, OP1_ITEM));
+    assert_eq!(model.calls(), 0);
+}
+
+/// The episode pass runs on the bare profile model, not on the overlay
+/// model. A new bare pass model therefore gets new agents, also while an
+/// overlay names another model.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_new_pass_model_runs_again_under_a_model_overlay() {
+    let (_dir, db) = fresh_db();
+    let store = overlay_store();
+    let policy = RefinePolicy {
+        ceilings: PolicyCeilings {
+            models: Some(PolicyModels::new(BTreeSet::from(["alt".to_owned()])).expect("models")),
+            ..PolicyCeilings::default()
+        },
+        ..RefinePolicy::default()
+    };
+    store
+        .set_policy(EPISODES, &policy, None, Provenance::operator("ops"))
+        .await
+        .expect("policy");
+    let overlay = ProfileOverlay {
+        model: Some("alt".to_owned()),
+        ..ProfileOverlay::default()
+    };
+    let version = store
+        .put(EPISODES, &overlay, Provenance::operator("ops"))
+        .await
+        .expect("put");
+    store
+        .activate(EPISODES, version, None, Provenance::operator("ops"))
+        .await
+        .expect("activate");
+    let sweep_pass = |id: &'static str, pass: &Arc<ReaderModel>| {
+        let harness = harness(Arc::new(Named(id, pass.clone())), WINDOW_SIZE)
+            .model_named("alt", Arc::new(Named("alt", ReaderModel::new())))
+            .overlay_store(store.clone());
+        let harness = Arc::new(harness);
+        let db = db.clone();
+        async move {
+            let mut rt = SqliteRuntime::open(&db).expect("the database opens");
+            sqlite::register(&mut rt, Arc::clone(&harness));
+            let configs = [EPISODES.to_owned()];
+            recall::sweep(&mut rt, &harness, &only(OP1_ITEM), &configs).await
+        }
+    };
+    let first = ReaderModel::new();
+    sweep_pass("pass-a", &first).await;
+    assert!(first.calls() > 0, "the pass runs on the bare model");
+
+    let second = ReaderModel::new();
+    sweep_pass("pass-b", &second).await;
+    assert!(second.calls() > 0, "a new pass model runs its own agents");
 }

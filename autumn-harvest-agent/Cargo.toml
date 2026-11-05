@@ -123,6 +123,10 @@ name = "fan_out"
 required-features = ["sqlite"]
 
 [[test]]
+name = "fan_out_trace"
+required-features = ["sqlite"]
+
+[[test]]
 name = "draws"
 required-features = ["sqlite"]
 
@@ -199,6 +203,14 @@ name = "score_postgres"
 required-features = ["postgres"]
 
 [[test]]
+name = "live_probe"
+required-features = ["eval", "sqlite"]
+
+[[test]]
+name = "live_probe_postgres"
+required-features = ["eval", "postgres"]
+
+[[test]]
 name = "sample"
 required-features = ["sqlite"]
 
@@ -218,6 +230,10 @@ required-features = ["postgres"]
 
 [[test]]
 name = "episodes"
+required-features = ["sqlite"]
+
+[[test]]
+name = "consolidate_all"
 required-features = ["sqlite"]
 
 [[test]]
