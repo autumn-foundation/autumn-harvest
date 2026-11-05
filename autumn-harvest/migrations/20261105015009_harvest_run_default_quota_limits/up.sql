@@ -14,13 +14,16 @@
 -- lock timeout still bounds the wait for its brief exclusive lock.
 SET LOCAL lock_timeout = '5s';
 
+-- A count cap is a `u32` in the engine. The upper bound keeps a row that
+-- the engine cannot read out of the table, because one such row would fail
+-- the load of every override.
 ALTER TABLE harvest_run_default_overrides
     ADD COLUMN quota_max_active_executions BIGINT
-        CHECK (quota_max_active_executions > 0),
+        CHECK (quota_max_active_executions BETWEEN 1 AND 4294967295),
     ADD COLUMN quota_max_history_bytes BIGINT
         CHECK (quota_max_history_bytes > 0),
     ADD COLUMN quota_max_dead_letters BIGINT
-        CHECK (quota_max_dead_letters > 0);
+        CHECK (quota_max_dead_letters BETWEEN 1 AND 4294967295);
 
 ALTER TABLE harvest_run_default_overrides
     DROP CONSTRAINT harvest_run_default_overrides_check;

@@ -150,6 +150,32 @@ fn registry() -> Arc<HandlerRegistry> {
     ))
 }
 
+/// A DAG. It declares no quota policy.
+const DAG: &str = "tenant_rollup";
+
+fn dag_catalog() -> DagCatalog {
+    autumn_harvest::compile_dag_catalog(vec![autumn_harvest::info::DagInfo {
+        name: DAG,
+        module: "quota_override_integration",
+        schedule: Some(autumn_harvest::policy::Schedule::Manual),
+        catchup: false,
+        max_active_runs: 1,
+        default_queue: None,
+        builder: |_dag| {},
+        workflow_handler: Some(|_ctx, input| Box::pin(async move { Ok(input) })),
+        jitter: std::time::Duration::ZERO,
+        overlap_policy: autumn_harvest::OverlapPolicy::Skip,
+        buffer_all_max: 100,
+        owner: None,
+        runbook_url: None,
+        severity: None,
+        mcp: false,
+        execution_timeout: None,
+        sla: None,
+    }])
+    .expect("dag compiles")
+}
+
 fn build_app(pool: &DbPool) -> axum::Router {
     let api_state = HarvestApiState::new();
     // Issue #1802: set the opt-out. This test exercises the handler, not auth.
@@ -158,7 +184,7 @@ fn build_app(pool: &DbPool) -> axum::Router {
     api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
     api_state.install(HarvestApiRuntime::new(
         registry(),
-        Arc::new(DagCatalog::default()),
+        Arc::new(dag_catalog()),
         Arc::new(Vec::new()),
         Some(BUILD.to_string()),
         vec!["default".to_string()],
@@ -259,6 +285,23 @@ async fn task_states(url: &str, exec_id: Uuid) -> Vec<String> {
             .await
             .expect("read task rows");
     rows.into_iter().map(|row| row.state).collect()
+}
+
+/// The `error_summary` of each failed run-defaults audit row, oldest first.
+async fn audit_failures(url: &str) -> Vec<String> {
+    use harvest_audit_log::dsl;
+    let mut conn = connect(url).await;
+    harvest_audit_log::table
+        .filter(dsl::operation.eq("workflow_type.run_defaults"))
+        .filter(dsl::status.eq("failed"))
+        .order(dsl::occurred_at.asc())
+        .select(dsl::error_summary)
+        .load::<Option<String>>(&mut conn)
+        .await
+        .expect("audit rows")
+        .into_iter()
+        .map(Option::unwrap_or_default)
+        .collect()
 }
 
 async fn audit_statuses(url: &str) -> Vec<String> {
@@ -404,11 +447,13 @@ async fn admin_quotas_reports_the_effective_limit_and_names_the_override() {
         assert_eq!(named["max_dead_letters"], 4);
         assert_eq!(named["max_history_bytes"], Value::Null);
         assert_eq!(named["reason"], "INC-7");
+        assert_eq!(named["applies"], true);
         assert!(named["updated_by"].is_string());
         assert!(named["updated_at"].is_string());
     }
     let usage = usage_entry(&body, QUOTA_WF, "acme");
     assert_eq!(usage["usage"]["active_executions"], 1);
+    assert_eq!(body["override_source"], "table", "read from the stored row");
 }
 
 /// AC3: clearing the override restores the code value. Every change is
@@ -486,38 +531,67 @@ async fn a_null_returns_one_cap_to_code() {
     assert_eq!(listed["quota_max_active_executions"], Value::Null);
 }
 
-/// The route refuses a cap that cannot apply, and audits each refusal.
+/// The route refuses a cap that cannot apply, and audits each refusal with
+/// its reason.
 #[tokio::test]
 async fn a_cap_that_cannot_apply_is_refused_and_audited() {
     let _serial = serial().await;
     let (url, _guard) = setup_database().await;
     let app = build_app(&build_pool(&url));
+    let no_cap = "declares no quota admission cap";
     let refused = [
-        (PLAIN_WF, json!({ "quota_max_dead_letters": 1 })),
-        (CAPLESS_WF, json!({ "quota_max_active_executions": 1 })),
-        (QUOTA_WF, json!({ "quota_max_active_executions": 0 })),
-        (QUOTA_WF, json!({ "quota_max_history_bytes": 0 })),
+        (PLAIN_WF, json!({ "quota_max_dead_letters": 1 }), no_cap),
+        (
+            CAPLESS_WF,
+            json!({ "quota_max_active_executions": 1 }),
+            no_cap,
+        ),
+        (DAG, json!({ "quota_max_history_bytes": 1 }), no_cap),
+        (
+            QUOTA_WF,
+            json!({ "quota_max_active_executions": 0 }),
+            "quota_max_active_executions must be at least 1",
+        ),
+        (
+            QUOTA_WF,
+            json!({ "quota_max_history_bytes": 0 }),
+            "quota_max_history_bytes must be at least 1",
+        ),
         (
             QUOTA_WF,
             json!({ "quota_max_history_bytes": 9_223_372_036_854_775_808_u64 }),
+            "quota_max_history_bytes must be at most 9223372036854775807",
         ),
         (
             QUOTA_WF,
             json!({ "quota_max_dead_letters": 4_294_967_296_u64 }),
+            "invalid request body",
+        ),
+        (
+            QUOTA_WF,
+            json!({ "quota_max_active_executions": -1 }),
+            "invalid request body",
         ),
     ];
-    for (name, body) in &refused {
+    for (name, body, _) in &refused {
         let (status, reply) = patch(&app, name, body.clone()).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{name} {body}: {reply}");
     }
-    assert_eq!(audit_statuses(&url).await.len(), refused.len());
+    let failures = audit_failures(&url).await;
+    assert_eq!(failures.len(), refused.len(), "one audit row per refusal");
+    for ((name, body, reason), summary) in refused.iter().zip(&failures) {
+        assert!(
+            summary.contains(reason),
+            "{name} {body}: {summary:?} names {reason:?}"
+        );
+    }
     assert!(
         audit_statuses(&url)
             .await
             .iter()
             .all(|status| status == "failed")
     );
-    // A null on a type with no cap sets nothing, so it is not refused.
+    // A null sets no cap, so it is not refused, even on a type with no cap.
     let (status, body) = patch(&app, PLAIN_WF, json!({ "quota_max_dead_letters": null })).await;
     assert_eq!(status, StatusCode::OK, "{body}");
 }

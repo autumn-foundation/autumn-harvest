@@ -27,7 +27,8 @@ for a release.
 - `has_any_cap()` of the code policy opens several gates: the key lock of a
   child spawn, the supersede credit and the lock-order scanner.
 - The run-default cache of #2387 holds one `RunDefaultFields` per type. A
-  process reloads it within about 6 seconds. `GLOBAL_RUN_DEFAULTS` mirrors
+  process reloads it within about 6 seconds: the 5-second TTL plus one
+  loop period. `GLOBAL_RUN_DEFAULTS` mirrors
   it for code that has no registry.
 - The LLM caps of #1997 are not admission caps. The issue names only the
   three admission caps. `key_expr` stays deploy-only.
@@ -63,10 +64,11 @@ Option 8 is out of scope: the issue keys the override by type.
 | A path compares usage to the code cap and skips the override. | `enforce_quota_admission` applies the override. A source guard fails on a `check_quota` call outside it, and on a cap read outside the allowed lines. |
 | A fork checks its history against the code `max_history_bytes`. | The fork applies the override before its admission and its stored-history check. |
 | A cross-shard child ships the code caps in its spec. | The target process applies its own override by type name in `enforce_quota_admission`. |
-| A lower cap ends a run in flight. | Only admission reads a cap. A retry stays exempt. A refused child spawn defers its parent. A DB test lowers the cap under live runs and checks that each run stays `RUNNING`. |
+| A lower cap ends a run in flight. | Only admission reads a cap. A retry stays exempt. A refused child spawn defers its parent, and its own `execution_timeout` still applies. A DB test drives a worker: a lower cap defers a child spawn, the parent stays `RUNNING`, and a clear lets it complete. |
 | An override adds a cap to a type with no key gate. | The route refuses each quota field for a type with no admission cap. The resolver also ignores an override for such a type. |
-| A cap of zero or past the column range. | The write refuses zero, a count past `u32::MAX` and a byte cap past `i64::MAX`. The table `CHECK` refuses zero. |
-| `GET /admin/quotas` shows a stale override. | It reads the stored override from the default shard. Only when that read fails does it read the process cache. |
+| A cap of zero or past the column range. | The route refuses a count past `u32::MAX` when it reads the body. The write refuses zero and a byte cap past `i64::MAX`. The table `CHECK` refuses zero and a count past `u32::MAX`, so no row can fail the load of every override. |
+| `GET /admin/quotas` shows a stale override. | It reads the stored override from the default shard. Only when that read fails does it read the process cache, and `override_source` then says `cache`. |
+| A process admits with no registry, or before its first refresh. | It admits under the code caps. The operations guide says so, and each failed refresh logs a warning. |
 | An older process reads a row with quota caps only. | It selects only its own columns, so it sees an empty override and keeps the code values. |
 | Clearing the override drops the other fields. | The tri-state merge keeps each field that the patch does not name. |
 | A change is not audited. | Each `PATCH` writes one audit row, refused or not. |
@@ -101,12 +103,14 @@ Option 8 is out of scope: the issue keys the override by type.
 - `run_defaults::current_quota_policy` applies `GLOBAL_RUN_DEFAULTS`.
   `enforce_quota_admission` and the fork call it.
 - Migration `20261105015009_harvest_run_default_quota_limits` adds three
-  `BIGINT CHECK (> 0)` columns and widens the row `CHECK` to seven columns.
+  `BIGINT` columns. Each refuses zero, and each count refuses a value past
+  `u32::MAX`. The row `CHECK` widens to seven columns.
 - `PATCH /admin/workflow-types/{workflow_name}/run-defaults` takes
   `quota_max_active_executions`, `quota_max_history_bytes` and
   `quota_max_dead_letters`. `code`, `override` and `effective` report them.
 - `GET /admin/quotas` reports `limits` as the effective caps, and adds
-  `code_limits` and `override` to each entry. A new top-level
+  `code_limits` and `override` to each entry. `override.applies` says whether
+  the override changes anything. `override_source` names the read. A new top-level
   `workflow_types` list holds the same three objects for each registered
   type with an admission cap.
 

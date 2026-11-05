@@ -63,15 +63,22 @@
 //! through [`current_quota_policy`], inside `enforce_quota_admission`. So a
 //! lower cap refuses the next admission over it, and a higher cap admits the
 //! next one. Only admission reads a cap, so a cap never ends a run in flight.
-//! A type with no admission cap keeps its code policy. See
-//! [`QuotaLimits::apply`].
+//! A parent whose child spawn a cap refuses waits with a backoff, and its own
+//! `execution_timeout` still applies. A type with no admission cap keeps its
+//! code policy. See [`QuotaLimits::apply`].
+//!
+//! Admission has no registry, so it reads the cache through
+//! `GLOBAL_RUN_DEFAULTS`. The last `HandlerRegistry` built sets that global.
+//! A process that admits starts with no registry, or with no refresh loop,
+//! admits under the code caps.
 //!
 //! ## Failure mode
 //!
 //! A refresh that fails keeps the last snapshot, and the next tick retries.
-//! A process that never loaded the table uses the code values. This is the
-//! same posture as a missed SLA: an SLA only reports a breach, and it never
-//! ends a run.
+//! A process that never loaded the table uses the code values. For an SLA
+//! this is harmless, because an SLA only reports a breach. For a concurrency
+//! limit or a quota cap, such a process admits under the code value until a
+//! refresh succeeds. Each failed refresh logs a warning.
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};

@@ -76,10 +76,6 @@ curl https://<host>/api/harvest/admin/workflow-types/nightly_etl/run-defaults
 Both routes need the admin role. Each `PATCH` writes one
 `workflow_type.run_defaults` audit row, a refused request included.
 
-The quota caps follow the same rule. An older process refuses each
-`quota_max_*` field with a 400, and it admits under the code caps. An older
-process reads a row with quota caps only as an override that sets nothing.
-
 ## Fields
 
 | Field | Meaning |
@@ -95,8 +91,9 @@ process reads a row with quota caps only as an override that sets nothing.
 | `reason` | Free text stored with the override. |
 | `recompute_in_flight` | `true` moves the SLA deadline of the runs in flight. Default `false`. |
 
-The route refuses each `quota_max_*` field for a type with no quota admission
-cap, a DAG included. Such a type stamps and locks no key for a cap.
+The route refuses a value in a `quota_max_*` field for a type with no quota
+admission cap, a DAG included. Such a type stamps and locks no key for a cap.
+A `null` sets no cap, so the route accepts it on any type.
 
 Each duration, `concurrency_limit` and each `quota_max_*` field is tri-state:
 
@@ -245,7 +242,9 @@ Each admission reads the quota caps again. No row stores a cap. So:
   of issue #946. Admission is the only place where a cap applies. A run in
   flight continues, and no run ends. A workflow retry is still exempt. A
   continue-as-new successor has no quota check. A child spawn that the cap
-  refuses defers its parent with a backoff, as before.
+  refuses defers its parent with a backoff, as before. The parent waits, and
+  its own `execution_timeout` still applies. So a lower cap that stays in
+  place for a long time can time out a parent that waits for a child.
 - **A higher cap** admits the next admission under it. No pass is needed.
 - **A cap that code leaves unset** can be set, on a type with at least one
   admission cap. `null` returns it to uncapped.
@@ -264,11 +263,23 @@ shard-local, as in `docs/sharding.md`.
 | `code_limits` | The caps declared in code. |
 | `override` | The stored caps with `reason`, `updated_by` and `updated_at`, or `null`. |
 
-Each usage entry carries the three fields. `workflow_types` lists them for
-each registered type with an admission cap, so an override shows before its
-type has usage. The route reads the stored override from the default shard.
-If that read fails, it shows the cache of the serving process, with no
-reason, actor or time.
+Each usage entry carries the three fields. `override.applies` is `false` when
+the type has no admission cap, for example after a deploy removed the caps.
+`workflow_types` lists the fields for each registered type with an admission
+cap, so an override shows before its type has usage.
+
+The route reads the stored override from the default shard, and then reports
+`override_source: "table"`. If that read fails, it shows the cache of the
+serving process, with no reason, actor or time, and reports
+`override_source: "cache"`.
+
+Admission reads the overrides through the cache of the last
+`HandlerRegistry` that the process built. Each worker and API node refreshes
+it. A process that starts runs with a bare `HarvestClient` and no registry
+admits under the code caps. A process that never loaded the table, for
+example because the default shard was down at boot, also admits under the
+code caps until a refresh succeeds. Watch for the refresh warning in the
+log.
 
 ## Mixed versions
 
@@ -277,6 +288,17 @@ refuses `concurrency_limit` with a 400, and it starts runs with the code
 limit. Do not send a `PATCH` to an older process once a limit is stored. If
 it clears the last other field of the row, it deletes the row, the limit
 included.
+
+The quota caps follow the same rule. An older process refuses each
+`quota_max_*` field with a 400, and it admits under the code caps. An older
+process reads a row with quota caps only as an override that sets nothing.
+An older process that serves `clear_override` with another field writes only
+its own columns, so the stored quota caps stay in force. Its response does
+not show them.
+
+To roll back, deploy the older release first. Then run the down migration of
+`20261105015009_harvest_run_default_quota_limits`. This release reads the
+quota columns, so it fails each refresh once they are gone.
 
 ## Grants
 

@@ -10,7 +10,8 @@ the other run-default fields. `GET` shows them in `code`, `override` and
 **Semantics.** No row stores a quota cap, and each admission reads the caps
 again. So a lower cap refuses the next admission of a key over it, with the
 `429` of issue #946. A run in flight continues: admission is the only place
-where a cap applies. A higher cap admits the next admission. Clearing the
+where a cap applies. A parent whose child spawn a lower cap refuses waits
+with a backoff, and its own `execution_timeout` still applies. A higher cap admits the next admission. Clearing the
 override restores the code caps. An override can set a cap that code leaves
 unset, on a type with at least one admission cap. The route refuses each
 field for a type with no admission cap, and a cap of zero or past its
@@ -24,12 +25,15 @@ outside `enforce_quota_admission`, and on a read of a code cap.
 
 **`GET /admin/quotas`.** `limits` now holds the effective caps. Each entry
 adds `code_limits` and `override`, which names the stored caps with
-`reason`, `updated_by` and `updated_at`. The new `workflow_types` list holds
-the same fields for each type with an admission cap.
+`reason`, `updated_by`, `updated_at` and `applies`. The new `workflow_types`
+list holds the same fields for each type with an admission cap. The new
+`override_source` says whether the overrides come from the table or, when
+the default shard is down, from the process cache.
 
 **Migration.** `20261105015009_harvest_run_default_quota_limits` adds three
 nullable `BIGINT` columns to `harvest_run_default_overrides`, and widens the
-row check to seven columns. No `WorkflowEvent` variant and no replay impact.
+row check to seven columns. Each count column also refuses a value past
+`u32::MAX`, so no row can fail the load of every override. No `WorkflowEvent` variant and no replay impact.
 Design: `docs/design/DESIGN-2408.md`.
 
 **Upgrade guide (for the next release).** Run the migration. During a roll,
@@ -38,6 +42,7 @@ code caps. So set a cap only after every process runs the new release. See
 the migration row in `docs/upgrading/0.5.0.md`.
 
 **Tests.** Unit tests on `QuotaLimits`, the fields, the merge and the cache.
-DB tests on the store, the table check and the admission. HTTP tests for
+DB tests on the store, the table check, the admission and a worker-driven
+child spawn that a lower cap defers. HTTP tests for
 each acceptance criterion and each refusal. A source guard over the cap
 reads.

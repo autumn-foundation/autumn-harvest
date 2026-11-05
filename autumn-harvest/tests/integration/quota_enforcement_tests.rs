@@ -1015,7 +1015,7 @@ fn phase_two<'a>(
     Box::pin(async move { Ok(serde_json::json!({"ran": "phase_two", "input": input})) })
 }
 
-fn wf_info(name: &'static str, handler: WorkflowHandlerFn) -> WorkflowInfo {
+pub fn wf_info(name: &'static str, handler: WorkflowHandlerFn) -> WorkflowInfo {
     WorkflowInfo {
         quota: None,
         declared_activities: None,
@@ -1070,11 +1070,14 @@ fn act_info(name: &'static str, handler: ActivityHandlerFn) -> ActivityInfo {
     }
 }
 
-fn registry(infos: Vec<WorkflowInfo>) -> Arc<HandlerRegistry> {
+pub fn registry(infos: Vec<WorkflowInfo>) -> Arc<HandlerRegistry> {
     Arc::new(HandlerRegistry::new(infos, vec![]))
 }
 
-async fn load_execution(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> WorkflowExecution {
+pub async fn load_execution(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+) -> WorkflowExecution {
     harvest_workflow_executions::table
         .find(exec_id.as_uuid())
         .select(WorkflowExecution::as_select())
@@ -1119,7 +1122,7 @@ async fn drive_transition(
 /// Start a root execution through the real start path (not the direct
 /// `try_start`/`params` helpers above, since the worker needs a genuinely
 /// dispatchable task -- `quota_key` resolution is identical either way).
-async fn start_root(
+pub async fn start_root(
     conn: &mut AsyncPgConnection,
     workflow_name: &str,
     workflow_id: &str,
@@ -1286,7 +1289,7 @@ async fn continue_as_new_cross_type_to_no_quota_workflow_clears_quota_key() {
 // type's tenant-quota footprint is an orthogonal concern this exercises.
 // ---------------------------------------------------------------------------
 
-fn detached_quota_parent<'a>(
+pub fn detached_quota_parent<'a>(
     ctx: &'a WorkflowContext,
     input: serde_json::Value,
 ) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
@@ -1309,7 +1312,7 @@ fn detached_quota_parent<'a>(
     })
 }
 
-fn detached_quota_child<'a>(
+pub fn detached_quota_child<'a>(
     _ctx: &'a WorkflowContext,
     _input: serde_json::Value,
 ) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {

@@ -8,6 +8,11 @@
 //! new comparison against a code cap skips the override. This guard fails on
 //! a `check_quota` call outside `enforce_quota_admission`, and on a read of a
 //! cap field outside the allowed files and lines.
+//!
+//! The scan is textual. It does not see a destructuring pattern such as
+//! `QuotaPolicy { max_dead_letters, .. }`. It also drops a line after its
+//! first `//`, so a URL in a string hides the rest of that line. A reviewer
+//! must catch those forms.
 
 use std::path::{Path, PathBuf};
 

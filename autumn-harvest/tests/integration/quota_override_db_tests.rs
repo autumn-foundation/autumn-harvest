@@ -26,10 +26,14 @@ use autumn_harvest::types::ExecutionId;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use uuid::Uuid;
 
-use crate::integration_e2e::setup_test_database_url_or_env;
+use crate::integration_e2e::{
+    build_runtime_worker, build_test_pool, setup_test_database_url_or_env, spawn_test_worker,
+    wait_for_execution_state,
+};
 use crate::quota_enforcement_tests::{
-    MetadataGuard, active_count, assert_quota_exceeded, connect, leaked, mark_terminal, params,
-    row_state, serial, start_ok, try_start,
+    MetadataGuard, active_count, assert_quota_exceeded, connect, count_rows, detached_quota_child,
+    detached_quota_parent, leaked, load_execution, mark_terminal, params, registry, row_state,
+    serial, start_ok, start_root, try_start, wf_info,
 };
 
 /// The code policy of the enforcement tests: three active runs per tenant.
@@ -224,7 +228,7 @@ async fn a_zero_or_oversized_quota_cap_is_refused() {
 }
 
 #[tokio::test]
-async fn the_table_check_refuses_a_zero_quota_cap() {
+async fn the_table_check_refuses_a_cap_that_the_engine_cannot_read() {
     let _serial = serial().await;
     let (url, _c) = setup_test_database_url_or_env().await;
     let mut conn = connect(&url).await;
@@ -244,6 +248,19 @@ async fn the_table_check_refuses_a_zero_quota_cap() {
             .execute(&mut conn)
             .await;
         assert!(refused.is_err(), "{column} = 0 is refused");
+        if column != "quota_max_history_bytes" {
+            // A count past `u32::MAX` would fail the load of every override.
+            let sql = format!(
+                "INSERT INTO harvest_run_default_overrides \
+                 (workflow_name, {column}, updated_by, created_at, updated_at) \
+                 VALUES ($1, 4294967296, 'ops', NOW(), NOW())"
+            );
+            let refused = diesel::sql_query(sql)
+                .bind::<diesel::sql_types::Text, _>(name)
+                .execute(&mut conn)
+                .await;
+            assert!(refused.is_err(), "{column} past u32::MAX is refused");
+        }
         let sql = format!(
             "INSERT INTO harvest_run_default_overrides \
              (workflow_name, {column}, updated_by, created_at, updated_at) \
@@ -347,6 +364,84 @@ async fn a_lower_limit_never_refuses_a_workflow_retry() {
         .expect("a retry continuation is exempt");
 }
 
+/// A run in flight reaches admission only when it spawns a child. A lower
+/// cap on the child type defers the parent with a backoff. It does not fail
+/// the parent. A clear restores the code cap, and the parent completes.
+#[tokio::test]
+async fn a_lower_limit_defers_a_child_spawn_and_never_fails_the_parent() {
+    let _serial = serial().await;
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let mut conn = connect(&url).await;
+    let parent_wf = leaked("quota_ovr_parent");
+    let child_wf = leaked("quota_ovr_child");
+    let code = QuotaPolicy::new("tenant_id").with_max_active_executions(2);
+    let mut child_info = wf_info(child_wf, detached_quota_child);
+    child_info.quota = Some(code);
+    let reg = registry(vec![wf_info(parent_wf, detached_quota_parent), child_info]);
+
+    // One live child of the tenant fits the code cap of 2. Its task row goes,
+    // so the worker never ends it.
+    let meta = MetadataGuard::install_one(child_wf, code);
+    let blocker = start_root(&mut conn, child_wf, &wid(), tenant("acme")).await;
+    drop(meta);
+    diesel::sql_query("DELETE FROM harvest_task_queue WHERE workflow_exec_id = $1")
+        .bind::<diesel::sql_types::Uuid, _>(blocker.as_uuid())
+        .execute(&mut conn)
+        .await
+        .expect("delete the blocker task row");
+
+    // The override lowers the cap to 1. It is stored, so a cache reload of
+    // the worker keeps it.
+    let lower = QuotaLimitsPatch {
+        max_active_executions: Some(Some(1)),
+        ..QuotaLimitsPatch::default()
+    };
+    let stored = change(&mut conn, child_wf, quota_patch(lower), false)
+        .await
+        .expect("store the override")
+        .expect("a row");
+    reg.run_defaults().write_through(child_wf, stored);
+
+    let parent = start_root(
+        &mut conn,
+        parent_wf,
+        &wid(),
+        serde_json::json!({ "child_type": child_wf }),
+    )
+    .await;
+    let worker = build_runtime_worker("w-2408-child-quota", 2, 1, Arc::clone(&reg));
+    let handle = spawn_test_worker(Arc::clone(&worker), build_test_pool(&url));
+    tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+
+    let children =
+        "SELECT COUNT(*)::BIGINT AS n FROM harvest_workflow_executions WHERE workflow_name = $1";
+    assert_eq!(
+        load_execution(&mut conn, parent).await.state,
+        "RUNNING",
+        "the lower cap defers the parent and never fails it"
+    );
+    assert_eq!(
+        count_rows(&mut conn, children, &[child_wf]).await,
+        1,
+        "the lower cap refuses the child spawn"
+    );
+    assert_eq!(row_state(&mut conn, blocker).await, "RUNNING");
+
+    change(&mut conn, child_wf, RunDefaultPatch::default(), true)
+        .await
+        .expect("clear the override");
+    reg.run_defaults()
+        .write_through(child_wf, RunDefaultFields::default());
+    wait_for_execution_state(&url, parent, "COMPLETED").await;
+    worker.shutdown();
+    handle.await.expect("worker join");
+    assert_eq!(
+        count_rows(&mut conn, children, &[child_wf]).await,
+        2,
+        "the code cap admits the child after the clear"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // A higher limit and a clear
 // ---------------------------------------------------------------------------
@@ -437,10 +532,13 @@ async fn an_override_can_add_a_dead_letter_cap() {
     });
 }
 
-/// A type with no admission cap stamps and locks no key. An override never
-/// adds a cap to it.
+/// A type with no admission cap admits each start, with an override stored.
+/// `enforce_quota_admission` returns before it reads the override, and
+/// `QuotaLimits::apply` ignores one too. The unit test
+/// `quota_limits_never_apply_to_a_policy_with_no_admission_cap` covers the
+/// second guard.
 #[tokio::test]
-async fn an_override_never_caps_a_type_with_no_admission_cap() {
+async fn a_type_with_no_admission_cap_admits_with_an_override_stored() {
     let _serial = serial().await;
     let (url, _c) = setup_test_database_url_or_env().await;
     let mut conn = connect(&url).await;

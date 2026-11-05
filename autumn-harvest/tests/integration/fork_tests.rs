@@ -1852,6 +1852,9 @@ async fn a_fork_is_admitted_under_the_tenant_quota() {
 /// lower cap refuses it, and a clear restores the code cap.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_fork_takes_the_quota_override() {
+    // The override reaches admission through a process global. The lock keeps
+    // the other quota tests from replacing it.
+    let _serial = crate::quota_enforcement_tests::serial().await;
     let (url, _container) = setup_test_database_url_or_env().await;
     let queue = unique("quota-ovr");
     let mut conn = connect(&url).await;
