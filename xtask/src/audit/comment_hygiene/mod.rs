@@ -200,6 +200,7 @@ mod markdown;
 mod markers;
 mod patterns;
 mod pyre;
+mod pysem;
 mod ratchet;
 mod rules;
 mod runs;
@@ -277,7 +278,12 @@ fn rule_hint(rule: &str) -> &'static str {
 
 /// Arguments of `cargo xtask audit comment-hygiene`.
 #[derive(Debug, Args)]
-#[command(about = "Folio corpus harness: comment hygiene across the Rust sources.")]
+// Python `argparse` accepts a unique prefix of a long flag, such as
+// `--tier`. So this command accepts one too.
+#[command(
+    about = "Folio corpus harness: comment hygiene across the Rust sources.",
+    infer_long_args = true
+)]
 pub struct Args {
     /// Emit the findings as JSON.
     #[arg(long)]
@@ -547,7 +553,10 @@ fn scan(root: &Path, paths: Option<&[String]>) -> Result<Vec<Finding>> {
     for (rel, found) in sources.iter().zip(per_file) {
         match found {
             Some(Ok(found)) => findings.extend(found),
-            Some(Err(error)) => eprintln!("comment-hygiene: cannot read {rel}: {error}"),
+            Some(Err(error)) => eprintln!(
+                "comment-hygiene: cannot read {rel}: {}",
+                os_error(&error, &root.join(rel))
+            ),
             None => bail!("the scan skipped {rel}"),
         }
     }
@@ -555,6 +564,25 @@ fn scan(root: &Path, paths: Option<&[String]>) -> Result<Vec<Finding>> {
         (left.rule, &left.path, left.line).cmp(&(right.rule, &right.path, right.line))
     });
     Ok(findings)
+}
+
+/// The text of a read error, as Python prints an `OSError`.
+///
+/// Python prints `[Errno 2] No such file or directory: '/path'`. Rust
+/// prints the same reason with ` (os error 2)` after it and no path. An
+/// error with no OS code keeps the Rust text.
+fn os_error(error: &std::io::Error, path: &Path) -> String {
+    let Some(code) = error.raw_os_error() else {
+        return error.to_string();
+    };
+    let text = error.to_string();
+    let reason = text
+        .strip_suffix(&format!(" (os error {code})"))
+        .unwrap_or(&text);
+    format!(
+        "[Errno {code}] {reason}: {}",
+        pyre::repr(&path.to_string_lossy())
+    )
 }
 
 /// Prints the text report. Returns the exit status.
@@ -673,6 +701,17 @@ mod tests {
             relpath(Path::new("/x/b.rs"), Path::new("/r")),
             PathBuf::from("../x/b.rs")
         );
+    }
+
+    #[test]
+    fn a_read_error_reads_as_python_prints_it() {
+        let error = std::io::Error::from_raw_os_error(2);
+        assert_eq!(
+            os_error(&error, Path::new("/r/a.rs")),
+            "[Errno 2] No such file or directory: '/r/a.rs'"
+        );
+        let other = std::io::Error::other("odd");
+        assert_eq!(os_error(&other, Path::new("/r/a.rs")), "odd");
     }
 
     #[test]

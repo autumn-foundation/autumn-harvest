@@ -5,9 +5,16 @@
 //! span is blanked, not deleted, so each later offset still points at the
 //! same column.
 //!
-//! Blanking fills each byte of a span, not each character. That keeps byte
-//! offsets in the blanked copy equal to the offsets in the source text. A
-//! sentence boundary found in a masked copy can then cut the real text.
+//! A blank and a mask fill a span in two different ways, on purpose.
+//!
+//! A blank fills each character with one space, as the Python original did.
+//! The block layer reads the blanked copy again, and it counts columns in
+//! characters. So a span of "`\u{e9}`" must leave three columns, not four.
+//! Otherwise a container after the span moves, and CH001 misses a line.
+//!
+//! A mask fills each byte with one `x`. A sentence boundary found in the
+//! masked copy then cuts the real text at the same byte offset. A run of
+//! `x` is one word whatever its length, so the count of words is the same.
 
 use super::patterns::{BLANK_LINE_RE, CODE_CLOSE_RE, CODE_OPEN_RE};
 
@@ -105,12 +112,20 @@ pub fn code_span_ranges(text: &str) -> Vec<(usize, usize)> {
     ranges
 }
 
-/// `text` with each character in `ranges` replaced by `filler`.
+/// How a fill replaces one character of a span.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Fill {
+    /// One space for each character, so each column still lines up.
+    Blank,
+    /// One `x` for each byte, so each byte offset still lines up.
+    Mask,
+}
+
+/// `text` with each character in `ranges` replaced by filler.
 ///
 /// Newlines survive, so a text with several lines splits back into the
-/// same lines. Each byte of a character becomes one filler byte, so the
-/// byte offsets do not move.
-fn fill_ranges(text: &str, ranges: &[(usize, usize)], filler: char) -> String {
+/// same lines.
+fn fill_ranges(text: &str, ranges: &[(usize, usize)], fill: Fill) -> String {
     if ranges.is_empty() {
         return text.to_string();
     }
@@ -122,8 +137,9 @@ fn fill_ranges(text: &str, ranges: &[(usize, usize)], filler: char) -> String {
         }
         let inside = next < ranges.len() && ranges[next].0 <= index && index < ranges[next].1;
         if inside && c != '\n' {
-            for _ in 0..c.len_utf8() {
-                out.push(filler);
+            match fill {
+                Fill::Blank => out.push(' '),
+                Fill::Mask => out.extend(std::iter::repeat_n('x', c.len_utf8())),
             }
         } else {
             out.push(c);
@@ -133,10 +149,10 @@ fn fill_ranges(text: &str, ranges: &[(usize, usize)], filler: char) -> String {
 }
 
 /// `text` with each code span replaced by `filler`.
-fn replace_spans(text: &str, filler: char) -> String {
+fn replace_spans(text: &str, fill: Fill) -> String {
     let mut ranges = code_span_ranges(text);
     ranges.sort_unstable();
-    fill_ranges(text, &ranges, filler)
+    fill_ranges(text, &ranges, fill)
 }
 
 /// Where the inline `<code>` elements of `text` are.
@@ -210,11 +226,11 @@ pub fn inline_code_ranges(text: &str) -> Vec<(usize, usize)> {
 }
 
 /// `text` with each inline `<code>` element replaced by `filler`.
-fn replace_inline_code(text: &str, filler: char) -> String {
+fn replace_inline_code(text: &str, fill: Fill) -> String {
     let mut ranges = inline_code_ranges(text);
     ranges.sort_unstable();
     merge_overlaps(&mut ranges);
-    fill_ranges(text, &ranges, filler)
+    fill_ranges(text, &ranges, fill)
 }
 
 /// Joins ranges that overlap, so the fill walks them in one pass.
@@ -234,7 +250,7 @@ fn merge_overlaps(ranges: &mut Vec<(usize, usize)>) {
 
 /// `text` with each inline `<code>` element replaced by spaces.
 pub fn blank_inline_code(text: &str) -> String {
-    replace_inline_code(text, ' ')
+    replace_inline_code(text, Fill::Blank)
 }
 
 /// `text` with each inline `<code>` element replaced by filler.
@@ -244,12 +260,12 @@ pub fn blank_inline_code(text: &str) -> String {
 /// not a sentence end. A split there left a fragment that the narrative
 /// rule read as deliberation.
 pub fn mask_inline_code(text: &str) -> String {
-    replace_inline_code(text, 'x')
+    replace_inline_code(text, Fill::Mask)
 }
 
 /// `text` with each inline code span replaced by spaces of equal width.
 pub fn blank_code_spans(text: &str) -> String {
-    replace_spans(text, ' ')
+    replace_spans(text, Fill::Blank)
 }
 
 /// `text` with each code span replaced by filler of the same width.
@@ -259,7 +275,7 @@ pub fn blank_code_spans(text: &str) -> String {
 /// a sentence that opens with a code span loses it, and it reports one word
 /// short with the span missing from its text.
 pub fn mask_code_spans(text: &str) -> String {
-    replace_spans(text, 'x')
+    replace_spans(text, Fill::Mask)
 }
 
 /// `lines` with code spans blanked, including spans that wrap.
@@ -276,9 +292,14 @@ pub fn blank_spans_across(lines: &[String]) -> Vec<String> {
 }
 
 /// `text` with code spans blanked inside each cell, never across two.
+///
+/// A blank can be shorter than its cell in bytes. So the cells are blanked
+/// from the right, and each earlier offset still points into `text`.
 pub fn blank_cells(text: &str, spans: &[(usize, usize)]) -> String {
     let mut out = text.to_string();
-    for &(start, end) in spans {
+    let mut ordered = spans.to_vec();
+    ordered.sort_unstable();
+    for &(start, end) in ordered.iter().rev() {
         if start >= end || end > text.len() {
             continue;
         }
@@ -323,6 +344,19 @@ mod tests {
     fn the_mask_keeps_byte_offsets() {
         let text = "x `\u{e9}` y";
         assert_eq!(mask_code_spans(text).len(), text.len());
+    }
+
+    #[test]
+    fn the_blank_keeps_columns() {
+        let text = "x `\u{e9}` y";
+        assert_eq!(blank_code_spans(text), "x     y");
+        assert_eq!(blank_code_spans(text).chars().count(), text.chars().count());
+    }
+
+    #[test]
+    fn cells_blank_from_the_right() {
+        let text = "| `\u{e9}` | `b` |";
+        assert_eq!(blank_cells(text, &[(1, 7), (8, 13)]), "|     |     |");
     }
 
     #[test]

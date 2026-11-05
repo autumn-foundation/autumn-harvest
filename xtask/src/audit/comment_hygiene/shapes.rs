@@ -127,7 +127,7 @@ pub fn sentence_splits(text: &str) -> Vec<(usize, usize)> {
         }
         let space: usize = text[cursor..]
             .chars()
-            .take_while(|c| c.is_whitespace())
+            .take_while(|&c| super::pyre::py_isspace(c))
             .map(char::len_utf8)
             .sum();
         if space == 0 {
@@ -216,7 +216,7 @@ mod tests {
     #[test]
     fn sentence_splits_match_the_pattern() {
         let re = &*SENTENCE_SPLIT_RE;
-        for text in strings(&['.', '?', ' ', '*', 'e', 'g', '\u{a0}'], 6) {
+        for text in strings(&['.', '?', ' ', '*', 'e', 'g', '\u{a0}', '\u{1c}'], 6) {
             let mut want = Vec::new();
             let mut pos = 0;
             while let Some(found) = re.find_from(&text, pos) {

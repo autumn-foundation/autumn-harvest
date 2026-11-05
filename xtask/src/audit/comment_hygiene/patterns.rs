@@ -1170,9 +1170,9 @@ pub static RAW_OPEN_RE: LazyLock<Re> = LazyLock::new(|| Re::new(r#"^(?:b|c|br|cr
 pub static CHAR_LIT_RE: LazyLock<Re> =
     LazyLock::new(|| Re::new(r"^'(?:\\(?:x[0-9a-fA-F]{2}|u\{[0-9a-fA-F]{1,6}\}|[^\n])|[^\\'\n])'"));
 
-/// Compiles each pattern and returns the first error.
-pub fn check_all() -> Result<(), String> {
-    let all: [&LazyLock<Re>; 23] = [
+/// Each pattern that the scan runs.
+fn all() -> [&'static LazyLock<Re>; 23] {
+    [
         &COMMENTED_CODE_RE,
         &TODO_RE,
         &TODO_REF_RE,
@@ -1196,6 +1196,24 @@ pub fn check_all() -> Result<(), String> {
         &HTML_VERBATIM_RE,
         &RAW_OPEN_RE,
         &CHAR_LIT_RE,
-    ];
-    all.iter().try_for_each(|re| re.check())
+    ]
+}
+
+/// Compiles each pattern and returns the first error.
+pub fn check_all() -> Result<(), String> {
+    all().iter().try_for_each(|re| re.check())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn each_pattern_has_an_exact_python_reading() {
+        assert_eq!(check_all(), Ok(()));
+        for re in all() {
+            let python = super::super::pysem::python_semantics(re.source());
+            assert!(!python.unsupported, "{}", re.source());
+        }
+    }
 }

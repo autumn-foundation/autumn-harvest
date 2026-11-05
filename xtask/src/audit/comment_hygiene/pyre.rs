@@ -213,21 +213,43 @@ impl Caps {
 /// back-references. A prefilter, when set, is a plain regex that every
 /// match must also contain. It only skips texts that cannot match, so it
 /// never changes a result.
+///
+/// Python and Rust read a few constructs differently on a few characters.
+/// `pysem` lists them. So a pattern that uses one of them compiles twice.
+/// The second copy spells out the Python meaning. A text with one of those
+/// characters
+/// runs on that copy. All other text runs on the first copy, which is
+/// faster and gives the same answer there. A pattern with none of them
+/// has no second copy and needs no check. Some of those patterns search a
+/// whole block many times, and a check of the block each time is slow.
 pub struct Re {
     inner: Result<fancy_regex::Regex, String>,
+    exact: Option<Result<fancy_regex::Regex, String>>,
+    /// The exact copy differs in `\s`, `\w` or `\b`.
+    classes: bool,
+    /// The exact copy differs in a case-insensitive `i`.
+    folds: bool,
     prefilter: Option<regex::Regex>,
     pattern: String,
+}
+
+/// Compiles `pattern` with no limit on backtracking.
+fn compile(pattern: &str) -> Result<fancy_regex::Regex, String> {
+    fancy_regex::RegexBuilder::new(pattern)
+        .backtrack_limit(usize::MAX)
+        .build()
+        .map_err(|error| error.to_string())
 }
 
 impl Re {
     /// Compiles `pattern`. A compile error is kept and reported by `check`.
     pub fn new(pattern: &str) -> Self {
-        let inner = fancy_regex::RegexBuilder::new(pattern)
-            .backtrack_limit(usize::MAX)
-            .build()
-            .map_err(|error| error.to_string());
+        let python = super::pysem::python_semantics(pattern);
         Self {
-            inner,
+            inner: compile(pattern),
+            exact: (python.pattern != pattern).then(|| compile(&python.pattern)),
+            classes: python.classes,
+            folds: python.folds,
             prefilter: None,
             pattern: pattern.to_string(),
         }
@@ -243,15 +265,36 @@ impl Re {
         re
     }
 
+    /// The pattern text, as it was written.
+    #[cfg(test)]
+    pub fn source(&self) -> &str {
+        &self.pattern
+    }
+
     /// The compile error, if there is one.
     pub fn check(&self) -> Result<(), String> {
+        let exact = self
+            .exact
+            .as_ref()
+            .map_or(Ok(()), |exact| exact.as_ref().map(|_| ()));
         self.inner
             .as_ref()
             .map(|_| ())
+            .and(exact)
             .map_err(|error| format!("{error}: {}", self.pattern))
     }
 
+    /// The engine for `text`, or `None` when `text` cannot match.
+    ///
+    /// The prefilter uses the Rust classes. So it only applies to a text on
+    /// which the two sets of classes agree.
     fn engine(&self, text: &str) -> Option<&fancy_regex::Regex> {
+        if let Some(exact) = &self.exact
+            && ((self.classes && super::pysem::diverges_on_classes(text))
+                || (self.folds && super::pysem::diverges_on_folds(text)))
+        {
+            return exact.as_ref().ok();
+        }
         let engine = self.inner.as_ref().ok()?;
         if let Some(filter) = &self.prefilter
             && !filter.is_match(text)
