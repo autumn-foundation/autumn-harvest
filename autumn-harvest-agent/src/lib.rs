@@ -232,8 +232,8 @@ pub use workspace::{
 /// A fence that drifts from the public API fails `cargo test --doc`. Each
 /// fence must compile, so a reader can copy it as written. The guard suite
 /// `tests/guide_snippets.rs` refuses a fence that rustdoc skips. A failure
-/// names a line in this file, not in the markdown. The `doc-snippets` job in
-/// CI runs these doctests, also on a docs-only change.
+/// names the guide and the line of the fence. The `doc-snippets` job in CI
+/// runs these doctests, also on a docs-only change.
 #[cfg(all(
     doctest,
     feature = "sqlite",

@@ -10,9 +10,9 @@ They work on Postgres and on SQLite. The research behind them is in
 [`rnd/2026-10-13-agent-mesh-primitives.md`](rnd/2026-10-13-agent-mesh-primitives.md).
 The plan is in [`docs/design/DESIGN-agent-mesh.md`](design/DESIGN-agent-mesh.md).
 
-Each Rust example compiles as written. A function parameter names the type
-of each value that the example does not build. CI compiles each example
-(issue #2482).
+Each Rust example compiles as written, and CI checks this (issue #2482). An
+example takes each value from your app as a function parameter. The type of
+the parameter shows what to pass.
 
 ## 1. The primitives
 
@@ -57,8 +57,8 @@ fn planner(
 }
 ```
 
-A harness takes each tool as an `Arc<dyn Tool>`. `FnTool::shared` makes one
-from an async function, as in section 7.
+A harness takes each tool as an `Arc<dyn Tool>`. `FnTool::new` wraps an async
+function, and `shared` returns it as an `Arc<dyn Tool>`. Section 7 shows both.
 
 The planner sees one more tool, `delegate`. Its input is `agent`, one of the
 peer names, and `task`, the text for the peer. The tool description lists

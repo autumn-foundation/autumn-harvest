@@ -14,9 +14,9 @@ The crate owns its agent primitives: `AgentModel`, `Tool`, `ToolPolicy`,
 depends on the core engine only, with no default features.
 [ADR 0006](adr/0006-agent-adapter-framework.md) records why.
 
-Each Rust example compiles as written. A function parameter names the type
-of each value that the example does not build. CI compiles each example
-(issue #2482).
+Each Rust example compiles as written, and CI checks this (issue #2482). An
+example takes each value from your app as a function parameter. The type of
+the parameter shows what to pass.
 
 ## 1. The mapping
 
@@ -59,7 +59,7 @@ answer: The note is saved.
 model calls: 1 before the restart, 1 after it
 ```
 
-The core of it. `model` is the `AgentModel` of your provider:
+The core of the example follows. `model` is the `AgentModel` of your provider:
 
 ```rust
 use std::sync::Arc;
@@ -70,12 +70,15 @@ use autumn_harvest_sqlite::{RunState, SqliteRuntime};
 use serde_json::{Value, json};
 
 async fn save_a_note(model: Arc<dyn AgentModel>) -> Result<RunState, Box<dyn std::error::Error>> {
-    // A harness takes each tool as an `Arc<dyn Tool>`. `shared` wraps the tool.
+    // A harness takes each tool as an `Arc<dyn Tool>`. `shared` returns that type.
     let write_note = FnTool::new(
         "write_note",
         "Replace the note.",
         json!({"type": "object", "properties": {"text": {"type": "string"}}}),
-        |_input: Value| async { Ok(json!({"saved": true})) },
+        |input: Value| async move {
+            println!("  write_note ran with {input}");
+            Ok(json!({"saved": true}))
+        },
     )
     .effect(ToolEffect::Write)
     .shared();
@@ -124,7 +127,7 @@ fn worker(client: Arc<dyn AgentModel>, lookup: Arc<dyn Tool>) -> BuiltHarvest {
 }
 ```
 
-`lookup` is an `Arc<dyn Tool>`, as `FnTool::shared` makes in section 2.
+Section 2 shows how `FnTool::shared` makes a tool such as `lookup`.
 
 `workflows()` returns `agent_loop`, `agent_heartbeat` and the durable
 `agent` (section 15). `activities()` returns `agent_model_turn`,
@@ -179,6 +182,7 @@ fn worker(harness: AgentHarness) -> HarvestBuilder {
 
 // In the app:
 async fn save_a_note(pool: DbPool) -> Result<RunState, Box<dyn std::error::Error>> {
+    // `wait_run` returns `Running` when `limit` passes first.
     let limit = Duration::from_secs(60);
     let pg = PostgresAgents::single(pool);
     let exec = postgres::start(&pg, &AgentTask::new("Save a note.")).await?;
@@ -500,7 +504,9 @@ fn worker(harness: AgentHarness) -> BuiltHarvest {
         .build()
 }
 
-let task = AgentTask::new("Summarise the ticket.").tenant("acme");
+fn task() -> AgentTask {
+    AgentTask::new("Summarise the ticket.").tenant("acme")
+}
 ```
 
 Register `agent_loop` with its policy on every worker that runs
@@ -984,22 +990,20 @@ decisions of the two runs diverge. Turn on the `eval` feature.
 
 ```rust
 use std::sync::Arc;
-use autumn_harvest::ExecutionId;
+use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest_agent::eval::{Candidate, evaluate};
 use autumn_harvest_agent::{AgentHarness, AgentModel, Tool};
-use autumn_harvest_sqlite::SqliteRuntime;
 
+// `history` holds the events of a finished run, for example from
+// `SqliteRuntime::load_history`.
 async fn try_model(
-    rt: &SqliteRuntime,
-    exec: ExecutionId,
+    history: &[WorkflowEvent],
     new_model: Arc<dyn AgentModel>,
     tools: Vec<Arc<dyn Tool>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // The source history: the events of a finished run.
-    let history = rt.load_history(exec)?;
     let candidate = Candidate::new(AgentHarness::new(new_model).tools(tools))
         .system_prompt("Answer in one sentence.");
-    let evaluation = evaluate(&history, &candidate).await?;
+    let evaluation = evaluate(history, &candidate).await?;
     if let Some(turn) = evaluation.first_divergence {
         println!("{:?}", evaluation.turns[turn]);
     }
@@ -1188,8 +1192,10 @@ use autumn_harvest_agent::{AgentHarness, ProfileOverlay};
 
 async fn compare_overlays(
     history: &[WorkflowEvent],
-    (harness_a, terse): (AgentHarness, ProfileOverlay),
-    (harness_b, guided): (AgentHarness, ProfileOverlay),
+    harness_a: AgentHarness,
+    terse: ProfileOverlay,
+    harness_b: AgentHarness,
+    guided: ProfileOverlay,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let first = Candidate::new(harness_a).overlay(terse);
     let second = Candidate::new(harness_b).overlay(guided);
@@ -1269,9 +1275,11 @@ use autumn_harvest_agent::eval::anon::AnonId;
 use autumn_harvest_agent::eval::{Candidate, compare_anonymised};
 use autumn_harvest_agent::{AgentHarness, ProfileOverlay};
 
-fn pool(
-    (harness_a, v7): (AgentHarness, ProfileOverlay),
-    (harness_b, v8): (AgentHarness, ProfileOverlay),
+fn candidate_pool(
+    harness_a: AgentHarness,
+    v7: ProfileOverlay,
+    harness_b: AgentHarness,
+    v8: ProfileOverlay,
 ) -> [Candidate; 2] {
     [
         Candidate::new(harness_a).overlay(v7).label("triage@v7"),
@@ -1326,9 +1334,11 @@ use autumn_harvest_agent::{Evidence, ProfileOverlay, WorkspaceStore};
 async fn evidence(
     store: &WorkspaceStore,
     history: &[WorkflowEvent],
-    [first, second]: [Evaluation; 2],
+    first: Evaluation,
+    second: Evaluation,
     current: &ProfileOverlay,
-    (random_seed, version_id): (u64, &str),
+    random_seed: u64,
+    version_id: &str,
 ) -> Result<(Evidence, Bundle), Box<dyn std::error::Error>> {
     let workspace = EvidenceWorkspace::new(store.clone(), "evidence:run-7", random_seed)
         .hide("fast-model")
@@ -1463,6 +1473,7 @@ async fn support(
     pool: DbPool,
     id: &AgentId,
 ) -> Result<Option<AgentState>, Box<dyn std::error::Error>> {
+    // `wait_for` returns `None` when `limit` passes first.
     let limit = Duration::from_secs(60);
     let pg = PostgresAgents::single(pool);
     let op = AgentOp::message_with_id("Where is my order?", "m-1");
@@ -1713,7 +1724,8 @@ use autumn_harvest_agent::{
 };
 
 fn support(
-    (model, cheap_model): (Arc<dyn AgentModel>, Arc<dyn AgentModel>),
+    model: Arc<dyn AgentModel>,
+    cheap_model: Arc<dyn AgentModel>,
     memory_store: Arc<dyn MemoryStore>,
     episode_store: Arc<dyn EpisodeStore>,
 ) -> AgentHarness {

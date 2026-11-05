@@ -2724,6 +2724,7 @@ jobs:
     name: Doc snippets compile
     runs-on: ubuntu-latest
     # Each script pins a docs snippet and compiles it with `cargo check`.
+    # The issue #2482 steps run `cargo test` on the agent guide doctests.
     # Plain `cargo check` shares no workspace build with clippy, so these
     # steps gain nothing from a clippy job and run on their own.
     # Draft-skip, as in `lint`. Not gated on `changes`: a docs-only PR
