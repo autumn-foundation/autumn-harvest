@@ -87,4 +87,4 @@ The chosen option is in bold.
 | Tests for each role with no knob set, and for an explicit override on each role, with the warning | `process_role.rs` unit tests |
 | The mixed-version smoke and the standalone runner still pass. The runner keeps `true`. | `standalone-runner` test of the resolved switches |
 | The deployment guide shows a split Fly and Kubernetes setup with only `AUTUMN_ROLE` | `docs/operations/process-roles.md` |
-| A changelog fragment that calls out the new `web` default | `docs/changelog.d/issue-2477-process-role-defaults.md` |
+| A changelog fragment that calls out the new `web` default | `docs/shipped-work.md` (collated from the fragment `issue-2477-process-role-defaults.md`) and `CHANGELOG.md` `[0.10.0]` |

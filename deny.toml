@@ -385,6 +385,13 @@ ignore = true
 # this manifest; treating every one as a hard failure would block CI on
 # constraints this repo can't resolve unilaterally.
 #
+# Update (0.10.0 release): PR #2523 moved the direct pin to `croner = "4.0"`.
+# The 2.2 pin that the record below defends is gone. The 0.10.0 upgrade
+# guide, section 1.6, lists the cron changes that operators see. autumn-web
+# is now 0.10.0. The duplicates are 3.0.1 (tokio-cron-scheduler, through
+# autumn-web) and 4.0.2 (ours and autumn-web's direct use). The record
+# below stays as the history of the 2.2 pin.
+#
 # `croner` is the one duplicate where our own side is in reach: the direct
 # `croner = "2.2"` pin in autumn-harvest/Cargo.toml. It stays pinned there,
 # proven by a rehearsal, not by inertia.
