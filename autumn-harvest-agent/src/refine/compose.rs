@@ -444,10 +444,15 @@ impl<'a> SelectContext<'a> {
 
 /// A selector of one composition.
 ///
-/// It returns the id of the pick. The rule of [`SelectedBy::Rule`] picks in
-/// its place in four cases: no selector is installed, the selector names an
-/// id outside the pool, it fails with a kind that a retry cannot fix, or it
-/// does not answer in time. A retryable error retries the step.
+/// It returns the id of the pick. In four cases, the rule of
+/// [`SelectedBy::Rule`] picks in its place:
+///
+/// - no selector is installed;
+/// - the selector names an id outside the pool;
+/// - it fails with a kind that a retry cannot fix;
+/// - it does not answer in time.
+///
+/// A retryable error retries the step.
 pub trait OverlaySelector: Send + Sync + fmt::Debug {
     /// Pick one id of `context.candidates`.
     fn select<'a>(
