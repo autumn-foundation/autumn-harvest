@@ -7,7 +7,8 @@
 //! A bound under 2 turns the fan-out off, so no step names a reason. With a
 //! bound of 2 or more, no delegation that can run falls back in silence. Each
 //! reason is true of the turn. A batch holds from 2 to `bound` calls that can
-//! join, and each of its members follows its lead.
+//! join, and each of its members follows its lead. A batch stops short of
+//! `bound` only at the end of a run, so `BoundReached` follows a full batch.
 
 use vstd::prelude::*;
 
@@ -82,6 +83,11 @@ pub open spec fn right(fits: Seq<Fit>, i: int) -> bool {
     i + 1 < fits.len() && joins(fits[i + 1])
 }
 
+/// The `bound` calls just before call `i` form one full batch.
+pub open spec fn full_before(steps: Seq<Step>, bound: int, i: int) -> bool {
+    bound <= i && steps[i - bound] is Lead && steps[i - bound]->Lead_0 == bound
+}
+
 /// Each reason is true of the turn.
 pub open spec fn reason_ok(fits: Seq<Fit>, i: int, reason: SerialReason) -> bool {
     match reason {
@@ -101,12 +107,15 @@ pub open spec fn step_ok(fits: Seq<Fit>, bound: int, steps: Seq<Step>, i: int) -
     } else {
         match steps[i] {
             Step::Skip => fits[i] is Other,
-            Step::Lead(n) => 2 <= n <= bound && i + n <= steps.len() && (forall|j: int|
+            Step::Lead(n) => 2 <= n <= bound && i + n <= steps.len()
+                && (n < bound ==> !right(fits, i + n - 1))
+                && (left(fits, i) ==> full_before(steps, bound, i)) && (forall|j: int|
                 i <= j < i + n ==> #[trigger] joins(fits[j])) && (forall|j: int|
                 i < j < i + n ==> #[trigger] steps[j] is Member),
             Step::Member => joins(fits[i]) && exists|k: int|
                 0 <= k < i && #[trigger] steps[k] is Lead && i < k + steps[k]->Lead_0,
-            Step::Alone(reason) => reason_ok(fits, i, reason),
+            Step::Alone(reason) => reason_ok(fits, i, reason)
+                && (reason is BoundReached ==> full_before(steps, bound, i)),
         }
     }
 }
@@ -224,6 +233,9 @@ proof fn lemma_push(fits: Seq<Fit>, bound: int, steps: Seq<Step>, step: Step, n:
     assert forall|i: int| 0 <= i < n implies #[trigger] step_ok(fits, bound, after, i) by {
         assert(after[i] == steps[i]);
         assert(step_ok(fits, bound, steps, i));
+        if bound >= 2 && bound <= i {
+            assert(after[i - bound] == steps[i - bound]);
+        }
         if bound >= 2 {
             match steps[i] {
                 Step::Lead(len) => {
@@ -338,6 +350,8 @@ pub fn fan_out_plan(fits: &[Fit], bound: usize) -> (steps: Vec<Step>)
             steps.len() == at,
             joining == count(fits@, fits.len() as int),
             prefix_ok(fits@, bound as int, steps@, at as int),
+            0 < at < fits.len() && joins(fits@[at - 1]) && joins(fits@[at as int])
+                ==> full_before(steps@, bound as int, at as int),
         decreases fits.len() - at,
     {
         match fits[at] {
@@ -345,6 +359,7 @@ pub fn fan_out_plan(fits: &[Fit], bound: usize) -> (steps: Vec<Step>)
                 let mut end = at + 1;
                 while end < fits.len() && end - at < bound && can_join(&fits[end])
                     invariant
+                        2 <= bound,
                         at < end <= fits.len(),
                         end - at <= bound,
                         forall|j: int| at <= j < end ==> #[trigger] joins(fits@[j]),
@@ -356,6 +371,9 @@ pub fn fan_out_plan(fits: &[Fit], bound: usize) -> (steps: Vec<Step>)
                     proof {
                         let lead = Step::Lead((end - at) as usize);
                         lemma_push(fits@, bound as int, steps@, lead, at as int);
+                        if at >= bound {
+                            assert(steps@.push(lead)[at - bound] == steps@[at - bound]);
+                        }
                     }
                     steps.push(Step::Lead(end - at));
                     let mut k = at + 1;
@@ -371,11 +389,16 @@ pub fn fan_out_plan(fits: &[Fit], bound: usize) -> (steps: Vec<Step>)
                             forall|j: int| at < j < k ==> #[trigger] steps@[j] is Member,
                             forall|j: int|
                                 at < j < k ==> #[trigger] step_ok(fits@, bound as int, steps@, j),
+                            end - at < bound ==> !right(fits@, end - 1),
+                            left(fits@, at as int) ==> full_before(steps@, bound as int, at as int),
                         decreases end - k,
                     {
                         proof {
                             let len = (end - at) as usize;
                             lemma_push_member(fits@, bound as int, steps@, at as int, len);
+                            if at >= bound {
+                                assert(steps@.push(Step::Member)[at - bound] == steps@[at - bound]);
+                            }
                         }
                         steps.push(Step::Member);
                         k += 1;
@@ -394,6 +417,9 @@ pub fn fan_out_plan(fits: &[Fit], bound: usize) -> (steps: Vec<Step>)
                     proof {
                         lemma_the_count_names_the_others(fits@, at as int);
                         lemma_push(fits@, bound as int, steps@, step, at as int);
+                        if at >= bound {
+                            assert(steps@.push(step)[at - bound] == steps@[at - bound]);
+                        }
                         assert(end == at + 1);
                         assert(!right(fits@, at as int));
                     }

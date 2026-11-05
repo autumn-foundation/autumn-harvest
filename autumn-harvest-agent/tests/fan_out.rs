@@ -945,13 +945,123 @@ fn note() -> Arc<dyn autumn_harvest_agent::Tool> {
 async fn the_call_past_the_bound_names_why_it_ran_alone() {
     let (_dir, db) = fresh_db();
     let mut rt = runtime(&db, trip_harness(trip_model()));
-    let (_exec, report) = run(&mut rt, &trip_task(2)).await;
+    let (exec, report) = run(&mut rt, &trip_task(2)).await;
 
     // The batch ends first, then the visas child runs inline.
     assert_eq!(
         serials(&report),
         [None, None, Some(SerialReason::BoundReached)]
     );
+    assert_eq!(report.delegations[2].chain, ["planner", "visas"]);
+    assert_eq!(children_started(&rt, exec).len(), 2, "one batch of two");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lone_call_after_a_batch_and_another_call_is_not_consecutive() {
+    let (_dir, db) = fresh_db();
+    let model = root_calls(vec![
+        delegate("d1", "flights", "find flights"),
+        delegate("d2", "hotels", "find hotels"),
+        ("n1", "note", json!({})),
+        delegate("d3", "visas", "check visas"),
+    ]);
+    let mut rt = runtime(&db, trip_harness(model).tool(note()));
+    let (exec, report) = run(&mut rt, &trip_task(3)).await;
+
+    assert_eq!(children_started(&rt, exec).len(), 2);
+    assert_eq!(
+        serials(&report),
+        [None, None, Some(SerialReason::NotConsecutive)]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bound_of_one_names_no_reason() {
+    let (_dir, db) = fresh_db();
+    let mut rt = runtime(&db, trip_harness(trip_model()));
+    let (exec, report) = run(&mut rt, &trip_task(1)).await;
+
+    assert!(children_started(&rt, exec).is_empty(), "each ran inline");
+    assert_eq!(serials(&report), [None, None, None]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_lone_delegation_keeps_no_reason() {
+    // The mandate allows one delegation. The second call is refused, so it
+    // did not run, and its record names the refusal only.
+    let (_dir, db) = fresh_db();
+    let model = root_calls(vec![
+        delegate("d1", "flights", "find flights"),
+        ("n1", "note", json!({})),
+        delegate("d2", "hotels", "find hotels"),
+    ]);
+    let mut rt = runtime(&db, trip_harness(model).tool(note()));
+    let task = AgentTask::new(ROOT_INPUT)
+        .mandate(
+            Mandate::new("planner")
+                .peers(["flights", "hotels", "visas"])
+                .max_delegations(1),
+        )
+        .parallel_children(3);
+    let (_exec, report) = run(&mut rt, &task).await;
+
+    assert_eq!(
+        report.delegations[1].refusal,
+        Some(autumn_harvest_agent::Refusal::FanOutExhausted)
+    );
+    assert_eq!(serials(&report), [Some(SerialReason::NotConsecutive), None]);
+}
+
+/// A policy that gates each delegation to one peer and allows each other
+/// call.
+#[derive(Debug)]
+struct GateOne(&'static str);
+
+impl autumn_harvest_agent::ToolPolicy for GateOne {
+    fn decide<'a>(
+        &'a self,
+        call: &'a autumn_harvest_agent::ToolCall,
+        _tool: Option<&'a dyn autumn_harvest_agent::Tool>,
+        _info: &'a autumn_harvest_agent::RunInfo,
+    ) -> BoxFuture<'a, ToolDecision> {
+        let gated = call.name == DELEGATE_TOOL && call.arguments["agent"] == self.0;
+        Box::pin(async move {
+            if gated {
+                ToolDecision::RequireApproval {
+                    reason: "check".into(),
+                }
+            } else {
+                ToolDecision::Allow
+            }
+        })
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rejected_gated_call_leaves_the_earlier_record_alone() {
+    use autumn_harvest_agent::Approval;
+    use autumn_harvest_sqlite::RunState;
+
+    let (_dir, db) = fresh_db();
+    let model = root_calls(vec![
+        delegate("d1", "flights", "find flights"),
+        delegate("d2", "hotels", "find hotels"),
+    ]);
+    let harness = trip_harness(model).policy(Arc::new(GateOne("hotels")));
+    let mut rt = runtime(&db, harness);
+    let exec = sqlite::start(&mut rt, &trip_task(3)).unwrap();
+    let RunState::WaitingSignal(signal) = rt.run_until_blocked(exec).await.unwrap() else {
+        panic!("the hotels call waits for a person");
+    };
+    let reject = Approval::Reject {
+        reason: "no".into(),
+    };
+    sqlite::decide(&mut rt, exec, &signal, &reject).unwrap();
+    let report = report(rt.run_until_blocked(exec).await.unwrap());
+
+    assert_eq!(report.delegations.len(), 1, "a rejected call has no record");
+    assert_eq!(report.delegations[0].chain, ["planner", "flights"]);
+    assert_eq!(serials(&report), [Some(SerialReason::SingleCall)]);
 }
 
 #[tokio::test(flavor = "multi_thread")]

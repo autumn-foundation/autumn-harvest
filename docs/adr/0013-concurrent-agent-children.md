@@ -43,7 +43,8 @@ Accepted (issue #2270, epic #2262).
 6. A delegation that runs alone under a bound of 2 or more names why
    (issue #2483). Its `DelegationRecord::serial` holds a `SerialReason`.
    A silent fallback hides the cause from the operator. The reason comes
-   from the recorded turn only, so replay is not affected.
+   from the recorded turn, the recorded roster and the task, so replay is
+   not affected.
 
 ```mermaid
 sequenceDiagram

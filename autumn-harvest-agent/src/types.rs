@@ -162,7 +162,7 @@ pub struct AgentTask {
     /// [`MAX_PARALLEL_CHILDREN`].
     ///
     /// Only allowed `delegate` calls in a row, each to an inline peer, form a
-    /// batch. Each other delegation runs alone. Its record names why in
+    /// batch. Each other delegation that runs alone names why in
     /// [`DelegationRecord::serial`](crate::DelegationRecord::serial) (issue
     /// #2483).
     #[serde(default, skip_serializing_if = "is_zero")]

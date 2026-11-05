@@ -1363,3 +1363,34 @@ async fn a_delegation_to_a_durable_peer_names_why_it_ran_alone() {
         [Some(autumn_harvest_agent::SerialReason::DurablePeer)]
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_gated_delegation_to_a_durable_peer_names_the_durable_peer() {
+    // Issue #2483: a durable peer never joins a batch, gated or not. The
+    // reason names the peer kind first.
+    use autumn_harvest_agent::{Approval, Rule, ToolRules};
+
+    let (_dir, db) = fresh_db();
+    let harness = mesh_harness(mesh_model())
+        .policy(Arc::new(ToolRules::new().tool(DELEGATE_TOOL, Rule::Ask)));
+    let mut rt = runtime(&db, harness);
+    start(&mut rt, &research()).await;
+    let task = AgentTask::new("what is it?")
+        .mandate(Mandate::new("triage").peers(["researcher"]))
+        .parallel_children(2);
+    let exec = sqlite::start(&mut rt, &task).unwrap();
+    let RunState::WaitingSignal(signal) = rt.run_until_blocked(exec).await.unwrap() else {
+        panic!("the delegation waits for a person");
+    };
+    sqlite::decide(&mut rt, exec, &signal, &Approval::Approve).unwrap();
+    rt.run_until_blocked(exec).await.unwrap();
+    sqlite::drive(&mut rt, &research()).await.unwrap();
+    let report = common::report(rt.run_until_blocked(exec).await.unwrap());
+
+    assert!(report.text.contains("The answer is 42."), "{}", report.text);
+    let serials: Vec<_> = report.delegations.iter().map(|r| r.serial).collect();
+    assert_eq!(
+        serials,
+        [Some(autumn_harvest_agent::SerialReason::DurablePeer)]
+    );
+}

@@ -509,24 +509,27 @@ another, as with no bound.
 4. The peer is inline. A durable peer runs on its own worker.
 5. The call is next to another call that meets 2 to 4.
 
-A run of such calls splits into batches of `n`, in call order. A last
-batch of one call runs alone.
+A run of such calls splits into batches of at most `n`, in call order. A
+call left over at the end runs alone.
 
 A delegation that runs alone names why. Its `DelegationRecord::serial`
-holds the reason, and a `debug` event logs it (issue #2483). A bound
-under 2 names no reason. A refused delegation names its refusal instead.
+holds the reason (issue #2483). A `debug` event logs it once, with the
+message `a delegation ran alone` and the fields `call_id`, `chain` and
+`reason`. A bound under 2 names no reason. A refused delegation names its
+refusal instead. A call that the policy denies, or that a person rejects,
+does not run, so it has no record.
 
 | `serial` | Why the call ran alone |
 |---|---|
 | `single_call` | No other call of the turn meets 2 to 4. |
 | `not_consecutive` | Another call meets 2 to 4, but no neighbour does. |
-| `gated` | The policy gated the call. |
-| `durable_peer` | The peer is durable. |
-| `bound_reached` | The call is the last of a run. The batch before it holds `n` calls. |
+| `gated` | The policy gated a call to an inline peer. |
+| `durable_peer` | The peer is durable, gated or not. |
+| `bound_reached` | The call is the last of a run. The batch before it is full. |
 
 | Rule | What happens |
 |---|---|
-| Batch | Two or more `delegate` calls in a row, each allowed by the policy, each to an inline peer. At most `n` calls, and at most `MAX_PARALLEL_CHILDREN`. |
+| Batch | See the list above. |
 | Child | Each call of a batch runs as a child `agent_loop` run, with its own history. |
 | Tokens | The siblings split the token remainder of the tree with `sibling_cap`. The caps of a batch sum to the remainder. |
 | Delegations | The siblings split the delegation remainder. Each child run counts its own delegations from zero. |

@@ -123,6 +123,10 @@ name = "fan_out"
 required-features = ["sqlite"]
 
 [[test]]
+name = "fan_out_trace"
+required-features = ["sqlite"]
+
+[[test]]
 name = "draws"
 required-features = ["sqlite"]
 

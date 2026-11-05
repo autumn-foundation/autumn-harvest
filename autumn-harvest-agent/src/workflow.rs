@@ -37,7 +37,7 @@ use crate::bounds::{RoundBudget, json_len, reaches_percent, reset_due, sibling_c
 use crate::context_reset::{self, ProgressNotes, SAVE_PROGRESS_TOOL};
 use crate::delivery::{Report, ReportSource, report_text};
 use crate::draw::Draw;
-use crate::fan_out_plan::{Fit, SerialReason, Step, fan_out_plan};
+use crate::fan_out_plan::{Fit, Step, fan_out_plan};
 use crate::flow::Released;
 use crate::followup::{self, FOLLOWUP_TOOL, Planned};
 use crate::harness::{AgentHarness, CacheTenant, DEFAULT_TOOL_OUTPUT_LIMIT, truncate};
@@ -49,7 +49,7 @@ use crate::memory::{
 };
 use crate::mesh::{
     DELEGATE_TOOL, DelegateArgs, DelegationRecord, INVALID_NAME, Mandate, Peer, Refusal,
-    delegate_definition, valid_name,
+    SerialReason, delegate_definition, valid_name,
 };
 use crate::mesh_control::{MESH_ATTR, MESH_BUDGET_EXCEEDED, MeshBudgetExceeded};
 use crate::message::{
@@ -1613,7 +1613,8 @@ fn round_plan(
 }
 
 /// What one call is to a fan-out. A call to a peer that the roster does not
-/// name is refused, so the plan does not touch it.
+/// name is refused, so the plan does not touch it. A durable peer comes
+/// before the decision, so a gated call to it is `Durable`.
 fn fit(call: &ToolCall, decision: Option<&ToolDecision>, agent: &Member) -> Fit {
     if call.name != DELEGATE_TOOL {
         return Fit::Other;
@@ -1635,8 +1636,9 @@ fn fit(call: &ToolCall, decision: Option<&ToolDecision>, agent: &Member) -> Fit 
 /// #2483).
 ///
 /// The call pushes its own record last, after the records of its subtree.
-/// A refused delegation did not run, so its record keeps no reason. A
-/// person can also reject a gated call. It then pushes no record.
+/// A refused delegation did not run, so its record keeps no reason. This
+/// includes a durable peer that refuses the message. A person can also
+/// reject a gated call. It then pushes no record.
 fn note_serial(
     ctx: &WorkflowContext,
     tree: &mut Tree,
@@ -2990,6 +2992,114 @@ pub fn activities() -> Vec<ActivityInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+    use serde_json::json;
+
+    /// The batching of one round before issue #2483, at the `ToolCall`
+    /// level. Returns `(start, len)` pairs.
+    fn old_batches(
+        calls: &[ToolCall],
+        decisions: &[ToolDecision],
+        agent: Option<&Member>,
+        bound: u32,
+    ) -> Vec<(usize, usize)> {
+        let bound = usize::try_from(bound.min(MAX_PARALLEL_CHILDREN)).unwrap_or(1);
+        let Some(agent) = agent else {
+            return Vec::new();
+        };
+        let batchable = |position: usize| {
+            let call = &calls[position];
+            call.name == DELEGATE_TOOL
+                && matches!(decisions.get(position), Some(ToolDecision::Allow))
+                && delegate_args(&call.arguments)
+                    .and_then(|args| agent.peers.iter().find(|peer| peer.name == args.agent))
+                    .is_some_and(|peer| peer.agent.is_none())
+        };
+        let mut batches = Vec::new();
+        let mut start = 0;
+        while start < calls.len() {
+            if !batchable(start) {
+                start += 1;
+                continue;
+            }
+            let mut end = start + 1;
+            while end < calls.len() && end - start < bound && batchable(end) {
+                end += 1;
+            }
+            if end - start >= 2 {
+                batches.push((start, end - start));
+            }
+            start = end;
+        }
+        batches
+    }
+
+    /// A call of a round: a delegation to an inline, a durable or an
+    /// unknown peer, a delegation with bad arguments, or another tool.
+    fn call() -> impl Strategy<Value = ToolCall> {
+        let delegate = |agent: &str| ToolCall {
+            id: "c".into(),
+            name: DELEGATE_TOOL.into(),
+            arguments: json!({"agent": agent, "task": "t"}),
+        };
+        prop_oneof![
+            Just(delegate("inline")),
+            Just(delegate("durable")),
+            Just(delegate("unknown")),
+            Just(ToolCall {
+                id: "c".into(),
+                name: DELEGATE_TOOL.into(),
+                arguments: json!({"agent": "inline"}),
+            }),
+            Just(ToolCall {
+                id: "c".into(),
+                name: "note".into(),
+                arguments: json!({}),
+            }),
+        ]
+    }
+
+    fn decision() -> impl Strategy<Value = ToolDecision> {
+        prop_oneof![
+            Just(ToolDecision::Allow),
+            Just(ToolDecision::RequireApproval { reason: "r".into() }),
+            Just(ToolDecision::Deny { reason: "d".into() }),
+        ]
+    }
+
+    proptest! {
+        /// The plan batches each round exactly as the code before issue
+        /// #2483 did, so a recorded run replays the same. A round may hold
+        /// fewer decisions than calls.
+        #[test]
+        fn a_round_plan_batches_as_before(
+            calls in prop::collection::vec(call(), 0..12),
+            decisions in prop::collection::vec(decision(), 0..12),
+            bound in 0u32..20,
+            mandated in any::<bool>(),
+        ) {
+            let id = crate::agent::AgentId::new("peer", "p1").unwrap();
+            let agent = Member {
+                mandate: Mandate::new("root"),
+                peers: vec![
+                    Peer::new("inline", "Inline."),
+                    Peer::agent("durable", "Durable.", &id),
+                ],
+            };
+            let agent = mandated.then_some(&agent);
+            let plan = round_plan(&calls, &decisions, agent, bound);
+            let leads: Vec<(usize, usize)> = plan
+                .iter()
+                .enumerate()
+                .filter_map(|(at, step)| match step {
+                    Step::Lead(len) => Some((at, *len)),
+                    _ => None,
+                })
+                .collect();
+            prop_assert_eq!(plan.len(), calls.len());
+            prop_assert_eq!(leads, old_batches(&calls, &decisions, agent, bound));
+        }
+    }
 
     #[test]
     fn the_flow_state_after_a_turn_skips_denied_calls() {

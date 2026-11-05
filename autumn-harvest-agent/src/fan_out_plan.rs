@@ -1,11 +1,12 @@
 //! The fan-out plan of one model turn (issue #2483).
 //!
 //! The plan gives each call a [`Step`]. A batch of delegations runs at the
-//! same time. Any other delegation runs alone, and its step names why, so a
-//! fan-out never falls back in silence. `formal/verus/src/agent_fan_out.rs`
+//! same time. With a bound of 2 or more, each other allowed or gated
+//! delegation to a known peer runs alone. Its step names why, so a fan-out
+//! never falls back in silence. `formal/verus/src/agent_fan_out.rs`
 //! proves the plan for every turn and every bound.
 
-pub use crate::mesh::SerialReason;
+use crate::mesh::SerialReason;
 
 /// What one call is to a fan-out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,8 +34,8 @@ pub enum Step {
     Skip,
 }
 
-/// Can the call join a batch? It takes a reference, because the Verus copy
-/// cannot copy an enum. `formal/verus/src/agent_fan_out.rs` proves it.
+/// `true` when the call can join a batch. It takes a reference, because the
+/// Verus copy cannot copy an enum. `formal/verus/src/agent_fan_out.rs` proves it.
 #[allow(clippy::trivially_copy_pass_by_ref)]
 pub const fn can_join(fit: &Fit) -> bool {
     matches!(fit, Fit::Batchable)
@@ -124,6 +125,8 @@ mod tests {
         let left = i > 0 && joins(i - 1);
         let right = joins(i + 1);
         let others = (0..fits.len()).any(|j| j != i && joins(j));
+        // The `bound` calls just before call `i` form one full batch.
+        let full_before = bound <= i && steps[i - bound] == Step::Lead(bound);
         if bound < 2 {
             return steps[i] == Step::Skip;
         }
@@ -132,6 +135,8 @@ mod tests {
             Step::Lead(n) => {
                 (2..=bound).contains(&n)
                     && i + n <= steps.len()
+                    && (n == bound || !joins(i + n))
+                    && (!left || full_before)
                     && (i..i + n).all(joins)
                     && (i + 1..i + n).all(|j| steps[j] == Step::Member)
             }
@@ -141,7 +146,7 @@ mod tests {
             Step::Alone(reason) => match reason {
                 SerialReason::Gated => fits[i] == Fit::Gated,
                 SerialReason::DurablePeer => fits[i] == Fit::Durable,
-                SerialReason::BoundReached => joins(i) && left && !right,
+                SerialReason::BoundReached => joins(i) && left && !right && full_before,
                 SerialReason::NotConsecutive => joins(i) && !left && !right && others,
                 SerialReason::SingleCall => joins(i) && !others,
             },
