@@ -2641,15 +2641,37 @@ runs of one kind. It needs the `eval` feature. It never runs on a live op.
 The design is in [`DESIGN-2380.md`](design/DESIGN-2380.md).
 
 ```rust
-let harness = AgentHarness::new(model)
-    .agent(profile)
-    .overlay_store(store)
-    .proposer(proposer)
-    .composer(composer)
-    .refine_sources(Arc::new(sqlite::Sources::open(&db)));
-let input = RefineInput::new("support", vec![run], 2, RefineMode::Parallel, seed)
-    .budget(MeshBudget::daily("refine").max_tokens(200_000));
-let exec = sqlite::start_refine(&mut rt, &input)?;
+use std::path::Path;
+use std::sync::Arc;
+use autumn_harvest_agent::refine::{OverlayComposer, RefineInput, RefineMode};
+use autumn_harvest_agent::{
+    AgentHarness, AgentModel, AgentProfile, MeshBudget, OverlayProposer, ProfileOverlayStore,
+    sqlite,
+};
+use autumn_harvest_sqlite::{ExecutionId, SqliteRuntime};
+
+fn refine(
+    model: Arc<dyn AgentModel>,
+    profile: AgentProfile,
+    store: Arc<dyn ProfileOverlayStore>,
+    proposer: Arc<dyn OverlayProposer>,
+    composer: Arc<dyn OverlayComposer>,
+    db: &Path,
+    run: ExecutionId,
+    seed: u64,
+) -> Result<ExecutionId, Box<dyn std::error::Error>> {
+    let harness = AgentHarness::new(model)
+        .agent(profile)
+        .overlay_store(store)
+        .proposer(proposer)
+        .composer(composer)
+        .refine_sources(Arc::new(sqlite::Sources::open(db)));
+    let mut rt = SqliteRuntime::open(db)?;
+    sqlite::register(&mut rt, Arc::new(harness));
+    let input = RefineInput::new("support", vec![run], 2, RefineMode::Parallel, seed)
+        .budget(MeshBudget::daily("refine").max_tokens(200_000));
+    Ok(sqlite::start_refine(&mut rt, &input)?)
+}
 ```
 
 On Postgres, install `postgres::Sources::new(pg)` and start the workflow
