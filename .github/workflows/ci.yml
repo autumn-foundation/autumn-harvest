@@ -620,7 +620,9 @@ jobs:
       # Issue #1614: the standalone getting-started chapter shows the files of
       # examples/standalone-quickstart byte for byte, and keeps the markers
       # that the `standalone-chapter` job runs.
-      - name: Standalone chapter sync (cargo xtask audit standalone-chapter-sync)
+      # The step name names the module, not the command. The audit then finds
+      # its own wiring on a run line only, so a commented-out run fails it.
+      - name: Standalone chapter sync (xtask/src/audit/standalone_chapter_sync.rs)
         run: |
           cargo xtask audit standalone-chapter-sync --self-test
           cargo xtask audit standalone-chapter-sync

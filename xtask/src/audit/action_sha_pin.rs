@@ -74,31 +74,43 @@ static TAG: LazyLock<Regex> = LazyLock::new(|| pattern(r"^v?\d[\w.+-]*(?:\s|$)")
 static DOCKER: LazyLock<Regex> =
     LazyLock::new(|| pattern(r"^docker://[^@\s]+@sha256:[0-9a-f]{64}$"));
 
+/// The tree of a file holds an alias cycle, so the walk has no end.
+///
+/// Python recursed until `RecursionError` stopped the script with exit 1. The
+/// port stops the run with exit 1 as well, so the gate still fails.
+#[derive(Debug, PartialEq, Eq)]
+struct Recursive;
+
+/// The composed graph, and the (line number, value node) of each `uses` key.
+type UsesNodes = (Graph, Vec<(usize, usize)>);
+
 /// Returns (line number, node) for each `uses` key in the YAML tree.
 ///
 /// A `uses` key directly under `with:` is an action input, not an action
 /// reference, so the walk skips it.
-fn uses_nodes(text: &str) -> Result<(Graph, Vec<(usize, usize)>), pyyaml::YamlError> {
+fn uses_nodes(text: &str) -> Result<Result<UsesNodes, Recursive>, pyyaml::YamlError> {
     let (graph, roots) = pyyaml::compose_all(text)?;
     let mut out = Vec::new();
     for root in roots {
         let mut path = HashSet::new();
-        walk(&graph, root, None, &mut path, &mut out);
+        if walk(&graph, root, None, &mut path, &mut out).is_err() {
+            return Ok(Err(Recursive));
+        }
     }
-    Ok((graph, out))
+    Ok(Ok((graph, out)))
 }
 
-/// Walks one node. `path` holds the nodes above it, so an alias cycle ends the
-/// walk instead of recursing forever.
+/// Walks one node. `path` holds the nodes above it, so the walk detects an
+/// alias cycle instead of recursing forever.
 fn walk<'g>(
     graph: &'g Graph,
     node: usize,
     parent_key: Option<&'g str>,
     path: &mut HashSet<usize>,
     out: &mut Vec<(usize, usize)>,
-) {
+) -> Result<(), Recursive> {
     if !path.insert(node) {
-        return;
+        return Err(Recursive);
     }
     match &graph.nodes[node].kind {
         Kind::Mapping(pairs) => {
@@ -110,17 +122,18 @@ fn walk<'g>(
                 if name == Some("uses") && parent_key != Some("with") {
                     out.push((graph.nodes[key].start.line + 1, value));
                 }
-                walk(graph, value, name, path, out);
+                walk(graph, value, name, path, out)?;
             }
         }
         Kind::Sequence(items) => {
             for &item in items {
-                walk(graph, item, parent_key, path, out);
+                walk(graph, item, parent_key, path, out)?;
             }
         }
         Kind::Scalar(_) => {}
     }
     path.remove(&node);
+    Ok(())
 }
 
 /// Returns a finding message for one plain `uses:` line, or `None`.
@@ -153,11 +166,14 @@ fn check_pin(value: &str, comment: Option<&str>) -> Option<String> {
 }
 
 /// Returns (line number, message) for each finding in `text`.
-fn scan_text(text: &str) -> Vec<(usize, String)> {
+fn scan_text(text: &str) -> Result<Vec<(usize, String)>, Recursive> {
     let (graph, nodes) = match uses_nodes(text) {
-        Ok(found) => found,
+        Ok(found) => found?,
         Err(error) => {
-            return vec![(0, format!("does not parse as YAML: {}", error.render(text)))];
+            return Ok(vec![(
+                0,
+                format!("does not parse as YAML: {}", error.render(text)),
+            )]);
         }
     };
     let lines = pytext::splitlines(text);
@@ -187,7 +203,7 @@ fn scan_text(text: &str) -> Vec<(usize, String)> {
             out.push((number, message));
         }
     }
-    out
+    Ok(out)
 }
 
 /// Returns the files to scan under `root`, in the order of the Python script.
@@ -371,7 +387,7 @@ fn self_test() -> (Vec<String>, usize) {
     let mut lines = Vec::new();
     let mut bad = 0;
     for (text, expected) in &fixtures {
-        let got = scan_text(text);
+        let got = scan_text(text).unwrap_or_default();
         if got.len() != *expected {
             lines.push(format!(
                 "self-test: expected {expected} finding(s), got {}:\n{text}",
@@ -387,16 +403,32 @@ fn self_test() -> (Vec<String>, usize) {
     (lines, bad)
 }
 
-/// Scans each file under `root`. Returns the output lines and the count of
-/// findings.
-fn audit(root: &Path) -> Result<(Vec<String>, usize)> {
+/// The result of a scan of the repository files.
+struct Audit {
+    /// The finding lines, then the summary line when the scan ends.
+    lines: Vec<String>,
+    total: usize,
+    /// The file whose alias cycle stopped the scan, if any.
+    recursive: Option<String>,
+}
+
+/// Scans each file under `root`. A file with an alias cycle stops the scan
+/// with no summary line, as the Python traceback did.
+fn audit(root: &Path) -> Result<Audit> {
     let paths = files(root)?;
     let mut lines = Vec::new();
     let mut total = 0;
     for path in &paths {
         let text = pytext::read_text(path)?.unwrap_or_default();
         let rel = path.strip_prefix(root).unwrap_or(path).display();
-        for (number, message) in scan_text(&text) {
+        let Ok(findings) = scan_text(&text) else {
+            return Ok(Audit {
+                lines,
+                total,
+                recursive: Some(rel.to_string()),
+            });
+        };
+        for (number, message) in findings {
             lines.push(format!("{rel}:{number}: {message}"));
             total += 1;
         }
@@ -405,18 +437,28 @@ fn audit(root: &Path) -> Result<(Vec<String>, usize)> {
         "action-sha-pin: {} files, {total} unpinned",
         paths.len()
     ));
-    Ok((lines, total))
+    Ok(Audit {
+        lines,
+        total,
+        recursive: None,
+    })
 }
 
 /// Runs `cargo xtask audit action-sha-pin`.
 pub fn run(args: Args) -> Result<ExitCode> {
-    let (lines, bad) = if args.self_test {
-        self_test()
+    let (lines, bad, recursive) = if args.self_test {
+        let (lines, bad) = self_test();
+        (lines, bad, None)
     } else {
-        audit(&util::repo_root())?
+        let audit = audit(&util::repo_root())?;
+        (audit.lines, audit.total, audit.recursive)
     };
     for line in lines {
         println!("{line}");
+    }
+    if let Some(rel) = recursive {
+        eprintln!("action-sha-pin: {rel}: an alias cycle makes the YAML tree infinite");
+        return Ok(ExitCode::FAILURE);
     }
     Ok(util::gate_exit(bad == 0))
 }
@@ -439,7 +481,7 @@ mod tests {
     fn a_tag_pin_names_its_line() {
         let text = step("      - uses: actions/checkout@v4");
         assert_eq!(
-            scan_text(&text),
+            scan_text(&text).unwrap_or_default(),
             [(
                 4,
                 "`actions/checkout@v4` must pin a 40-hex commit SHA, not a tag or branch"
@@ -450,7 +492,7 @@ mod tests {
 
     #[test]
     fn an_unparsable_file_is_one_finding_on_line_zero() {
-        let found = scan_text("jobs: [unclosed\n");
+        let found = scan_text("jobs: [unclosed\n").unwrap_or_default();
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].0, 0);
         assert!(
@@ -461,8 +503,13 @@ mod tests {
     }
 
     #[test]
-    fn an_alias_cycle_ends_the_walk() {
-        assert_eq!(scan_text("a: &x [*x]\n"), Vec::new());
+    fn an_alias_cycle_stops_the_scan() {
+        assert_eq!(scan_text("a: &x [*x]\n"), Err(Recursive));
+        // A shared alias that is not a cycle is walked twice, as in Python.
+        let text = format!("x: &s\n  uses: a/b@{SHA_A} # v1\njobs: [*s, *s]\n");
+        assert_eq!(scan_text(&text).map(|found| found.len()), Ok(0));
+        let text = "x: &s {uses: a/b@v1}\njobs: [*s, *s]\n";
+        assert_eq!(scan_text(text).map(|found| found.len()), Ok(3));
     }
 
     #[test]
@@ -474,7 +521,8 @@ mod tests {
 
     #[test]
     fn the_real_workflows_are_pinned() {
-        let (lines, total) = audit(&util::repo_root()).unwrap_or_default();
-        assert_eq!(total, 0, "{lines:#?}");
+        let audit = audit(&util::repo_root()).unwrap_or_else(|error| panic!("{error:#}"));
+        assert_eq!(audit.total, 0, "{:#?}", audit.lines);
+        assert_eq!(audit.recursive, None);
     }
 }

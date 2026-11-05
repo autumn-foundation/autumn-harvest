@@ -313,11 +313,27 @@ fn http_path(probe: Option<&Value>) -> Option<&str> {
     Value::or_get(Value::or_get(probe, "httpGet"), "path").and_then(Value::as_str)
 }
 
+/// A Python exception that stopped the script, such as a `KeyError` on a
+/// rendered manifest or a `YAMLError` from a loaded file.
+///
+/// Python exits 1 after an uncaught exception, so the port exits 1 for it as
+/// well. Exit 2 stays the code for a missing `helm`.
+#[derive(Debug)]
+struct Crash(String);
+
+impl std::fmt::Display for Crash {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Crash {}
+
 /// Ports `value[key]`. A missing key is an error, as the `KeyError` was.
 fn index<'a>(value: &'a Value, key: &str) -> Result<&'a Value> {
     value
         .get(key)
-        .with_context(|| format!("{CHART}: the rendered manifest has no `{key}` key"))
+        .ok_or_else(|| Crash(format!("{CHART}: the rendered manifest has no `{key}` key")).into())
 }
 
 /// Ports `list(value or [])`: the items of a list, or the characters of a
@@ -330,7 +346,9 @@ fn py_list(value: Option<&Value>) -> Result<Vec<Value>> {
         Value::List(items) | Value::Set(items) => items.clone(),
         Value::Str(text) => text.chars().map(|c| Value::Str(c.to_string())).collect(),
         Value::Dict(pairs) => pairs.iter().map(|(key, _)| key.clone()).collect(),
-        other => bail!("{CHART}: `{}` is not iterable", other.py_repr()),
+        other => {
+            return Err(Crash(format!("{CHART}: `{}` is not iterable", other.py_repr())).into());
+        }
     })
 }
 
@@ -339,7 +357,7 @@ fn first(value: Option<&Value>, what: &str) -> Result<Value> {
     py_list(value)?
         .into_iter()
         .next()
-        .with_context(|| format!("{CHART}: the rendered {what} list is empty"))
+        .ok_or_else(|| Crash(format!("{CHART}: the rendered {what} list is empty")).into())
 }
 
 /// Returns the findings for the rendered worker Deployment.
@@ -374,13 +392,22 @@ fn check_deployment(docs: &[Value]) -> Result<Vec<String>> {
             }
         };
     let grace = pod.get("terminationGracePeriodSeconds");
-    let floor = seconds + DRAIN_SECONDS + MARGIN_SECONDS;
+    // A huge `seconds` saturates instead of overflowing. The message still
+    // shows the exact sum, as the Python `int` does.
+    let floor = seconds
+        .saturating_add(DRAIN_SECONDS)
+        .saturating_add(MARGIN_SECONDS);
+    let floor_shown = if seconds == i128::MAX {
+        add_decimal(&seconds_shown, DRAIN_SECONDS + MARGIN_SECONDS)
+    } else {
+        floor.to_string()
+    };
     if grace
         .and_then(Value::as_int)
         .is_none_or(|grace| grace < floor)
     {
         found.push(format!(
-            "{CHART}: terminationGracePeriodSeconds {} is below {floor} (preStop {seconds_shown} + drain {DRAIN_SECONDS} + margin {MARGIN_SECONDS})",
+            "{CHART}: terminationGracePeriodSeconds {} is below {floor_shown} (preStop {seconds_shown} + drain {DRAIN_SECONDS} + margin {MARGIN_SECONDS})",
             grace.unwrap_or(&Value::None).py_str()
         ));
     }
@@ -396,6 +423,22 @@ fn check_deployment(docs: &[Value]) -> Result<Vec<String>> {
         found.push(format!("{CHART}: the worker root filesystem is writable"));
     }
     Ok(found)
+}
+
+/// Adds a small `addend` to a non-negative decimal string of any length.
+fn add_decimal(digits: &str, addend: i128) -> String {
+    let mut carry = u32::try_from(addend).unwrap_or(0);
+    let mut out: Vec<char> = Vec::with_capacity(digits.len() + 1);
+    for ch in digits.chars().rev() {
+        let total = ch.to_digit(10).unwrap_or(0) + carry;
+        out.push(char::from_digit(total % 10, 10).unwrap_or('0'));
+        carry = total / 10;
+    }
+    while carry > 0 {
+        out.push(char::from_digit(carry % 10, 10).unwrap_or('0'));
+        carry /= 10;
+    }
+    out.iter().rev().collect()
 }
 
 /// Returns true when a Job runs as a pre-install and pre-upgrade hook.
@@ -467,10 +510,13 @@ fn render(helm: &Path, root: &Path, extra: &[&str]) -> Result<(i32, String, Stri
         .arg(root.join(CHART))
         .args(extra)
         .output_raw()?;
+    // Python read both streams in text mode, which translates each line end
+    // to `\n`.
+    let text = |bytes: &[u8]| pytext::universal_newlines(&String::from_utf8_lossy(bytes));
     Ok((
         output.status.code().unwrap_or(-1),
-        String::from_utf8_lossy(&output.stdout).into_owned(),
-        String::from_utf8_lossy(&output.stderr).into_owned(),
+        text(&output.stdout),
+        text(&output.stderr),
     ))
 }
 
@@ -486,7 +532,12 @@ fn check_render(helm: &Path, root: &Path) -> Result<Vec<String>> {
         )]);
     }
     let docs: Vec<Value> = pyyaml::safe_load_all(&out)
-        .map_err(|error| anyhow!("{CHART}: the rendered chart: {}", error.render(&out)))?
+        .map_err(|error| {
+            Crash(format!(
+                "{CHART}: the rendered chart: {}",
+                error.render(&out)
+            ))
+        })?
         .into_iter()
         .filter(Value::truthy)
         .collect();
@@ -513,7 +564,7 @@ fn load(root: &Path, rel: &str) -> Result<Option<Value>> {
     };
     pyyaml::safe_load(&text)
         .map(Some)
-        .map_err(|error| anyhow!("{rel}: {}", error.render(&text)))
+        .map_err(|error| Crash(format!("{rel}: {}", error.render(&text))).into())
 }
 
 /// Runs every check under `root` with the `helm` at `helm`. Returns the
@@ -912,7 +963,16 @@ pub fn run(args: Args) -> Result<ExitCode> {
             eprintln!("worker-image-contract: helm is required (set HELM)");
             return Ok(ExitCode::from(2));
         };
-        let findings = audit(&util::repo_root(), &helm)?;
+        let findings = match audit(&util::repo_root(), &helm) {
+            Ok(findings) => findings,
+            Err(error) => {
+                let Some(crash) = error.downcast_ref::<Crash>() else {
+                    return Err(error);
+                };
+                eprintln!("worker-image-contract: {crash}");
+                return Ok(ExitCode::FAILURE);
+            }
+        };
         let count = findings.len();
         let mut lines = findings;
         lines.push(format!("worker-image-contract: {count} findings"));

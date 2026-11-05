@@ -18,9 +18,13 @@
 //! compiles its parser in, so it cannot skip.
 //!
 //! The submodules hold the Python semantics that the audits of this unit
-//! share. [`pyyaml`] reads YAML as `PyYAML` does, and [`pytext`] reads text as
-//! Python does.
+//! share. [`pyscan`] and [`pyparse`] port the pure Python scanner and parser
+//! of `PyYAML`. [`pyyaml`] composes and constructs values on top of them. So
+//! each audit accepts, rejects and words a YAML error as its script did.
+//! [`pytext`] reads text as Python does.
 
+pub mod pyparse;
+pub mod pyscan;
 pub mod pytext;
 pub mod pyyaml;
 

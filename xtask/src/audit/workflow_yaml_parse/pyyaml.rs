@@ -10,23 +10,21 @@
 //!   source line of each `uses` key.
 //! - `serde_yaml` rejects a repeated mapping key in every file. `PyYAML` keeps
 //!   the last value, and only `workflow-yaml-parse` asks for the rejection.
+//! - libyaml, under `serde_yaml`, accepts and rejects other documents than the
+//!   pure Python scanner. It also words each error in its own way.
 //!
-//! So this module parses with libyaml, through `unsafe-libyaml`. `PyYAML` is a
-//! port of libyaml, so both accept and reject the same documents.
-//! `serde_yaml` uses the same crate, so it adds no package to `Cargo.lock`.
-//! The module then composes nodes as `yaml.composer` does. It resolves tags
-//! and constructs values as `yaml.constructor.SafeConstructor` does. An
-//! error renders in the layout of a `PyYAML` `MarkedYAMLError`.
+//! So [`super::pyscan`] and [`super::pyparse`] port the pure Python reader,
+//! scanner and parser. This module composes nodes as `yaml.composer` does. It
+//! resolves tags and constructs values as `yaml.constructor.SafeConstructor`
+//! does. An error renders in the layout of a `PyYAML` `MarkedYAMLError`.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::ffi::CStr;
 use std::fmt::Write as _;
-use std::mem::MaybeUninit;
 use std::sync::LazyLock;
 
 use regex::Regex;
-use unsafe_libyaml as unsafe_sys;
 
+use super::pyparse::{Event, Parser};
 use super::pytext::repr_str;
 
 pub const NULL: &str = "tag:yaml.org,2002:null";
@@ -43,14 +41,16 @@ pub const SEQ: &str = "tag:yaml.org,2002:seq";
 pub const MAP: &str = "tag:yaml.org,2002:map";
 pub const MERGE: &str = "tag:yaml.org,2002:merge";
 pub const VALUE: &str = "tag:yaml.org,2002:value";
+/// The tag of the resolver that `PyYAML` registers for `!`, `&` and `*`.
+pub const YAML: &str = "tag:yaml.org,2002:yaml";
 
 /// The name that `PyYAML` gives a stream read from a Python `str`.
 const STREAM_NAME: &str = "<unicode string>";
 
 // ── Errors ──────────────────────────────────────────────────────────────────
 
-/// A position in the input. `index` counts bytes. `line` and `column` count
-/// from zero, as in `PyYAML`.
+/// A position in the input. `index` counts characters, as the pointer of a
+/// `PyYAML` mark does. `line` and `column` count from zero.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Mark {
     pub index: usize,
@@ -59,15 +59,6 @@ pub struct Mark {
 }
 
 impl Mark {
-    fn from_sys(mark: unsafe_sys::yaml_mark_t) -> Self {
-        let size = |value: u64| usize::try_from(value).unwrap_or(usize::MAX);
-        Self {
-            index: size(mark.index),
-            line: size(mark.line),
-            column: size(mark.column),
-        }
-    }
-
     /// Renders the mark as `PyYAML` `Mark.__str__`, with its source snippet.
     fn render(&self, text: &str) -> String {
         let mut out = format!(
@@ -89,9 +80,7 @@ impl Mark {
         let is_break =
             |c: char| matches!(c, '\0' | '\r' | '\n' | '\u{85}' | '\u{2028}' | '\u{2029}');
         let buffer: Vec<char> = text.chars().chain(std::iter::once('\0')).collect();
-        let pointer = text
-            .get(..self.index.min(text.len()))
-            .map_or(0, |head| head.chars().count());
+        let pointer = self.index.min(buffer.len());
         let mut head = "";
         let mut start = pointer;
         while start > 0 && !is_break(buffer[start - 1]) {
@@ -134,12 +123,12 @@ struct ErrorParts {
     context_mark: Option<Mark>,
     problem: String,
     problem_mark: Option<Mark>,
-    /// A reader error names a character and a byte offset, and has no mark.
-    reader: Option<(i32, usize)>,
+    /// A `ReaderError` names a character and its position, and has no mark.
+    reader: Option<(u32, usize)>,
 }
 
 impl YamlError {
-    fn new(
+    pub(super) fn new(
         context: Option<String>,
         context_mark: Option<Mark>,
         problem: impl Into<String>,
@@ -152,6 +141,14 @@ impl YamlError {
             problem_mark,
             reader: None,
         }))
+    }
+
+    /// Builds the `ReaderError` of a special character at a character
+    /// position.
+    pub(super) fn reader(character: u32, position: usize) -> Self {
+        let mut error = Self::new(None, None, "special characters are not allowed", None);
+        error.0.reader = Some((character, position));
+        error
     }
 
     fn at(problem: impl Into<String>, mark: Mark) -> Self {
@@ -172,13 +169,10 @@ impl YamlError {
     /// `text` is the parsed input. Each mark quotes its line from it.
     pub fn render(&self, text: &str) -> String {
         let parts = &*self.0;
-        if let Some((value, offset)) = parts.reader {
-            // PyYAML `ReaderError` counts characters, and libyaml counts bytes.
-            let position = text
-                .get(..offset)
-                .map_or(offset, |head| head.chars().count());
+        if let Some((value, position)) = parts.reader {
             return format!(
-                "unacceptable character #x{value:04x}: special characters are not allowed\n  in \"{STREAM_NAME}\", position {position}"
+                "unacceptable character #x{value:04x}: {}\n  in \"{STREAM_NAME}\", position {position}",
+                parts.problem
             );
         }
         let mut lines = Vec::new();
@@ -198,189 +192,6 @@ impl YamlError {
             lines.push(problem_mark.render(text));
         }
         lines.join("\n")
-    }
-}
-
-// ── libyaml events ──────────────────────────────────────────────────────────
-
-/// One parser event, copied out of libyaml.
-#[derive(Debug)]
-enum Event {
-    StreamStart,
-    StreamEnd,
-    DocumentStart,
-    DocumentEnd,
-    Alias(String),
-    Scalar {
-        anchor: Option<String>,
-        tag: Option<String>,
-        value: String,
-        plain_implicit: bool,
-    },
-    SequenceStart {
-        anchor: Option<String>,
-        tag: Option<String>,
-    },
-    SequenceEnd,
-    MappingStart {
-        anchor: Option<String>,
-        tag: Option<String>,
-    },
-    MappingEnd,
-}
-
-/// An owned libyaml parser over an owned copy of the input.
-struct Parser {
-    /// The libyaml state. It sits in a box, so it never moves after
-    /// `yaml_parser_initialize`.
-    sys: Box<unsafe_sys::yaml_parser_t>,
-    /// The input bytes. libyaml keeps a pointer into them until `drop`.
-    _input: Box<[u8]>,
-}
-
-impl Parser {
-    fn new(text: &str) -> Result<Self, YamlError> {
-        let input: Box<[u8]> = text.as_bytes().into();
-        let mut raw: Box<MaybeUninit<unsafe_sys::yaml_parser_t>> = Box::new(MaybeUninit::uninit());
-        let parser = raw.as_mut_ptr();
-        // SAFETY: `parser` points to writable memory of the right layout, and
-        // `yaml_parser_initialize` initializes all of it. The input box lives
-        // in `Self`, so the pointer that libyaml keeps stays valid until drop.
-        let sys = unsafe {
-            if unsafe_sys::yaml_parser_initialize(parser).fail {
-                return Err(YamlError::new(None, None, "libyaml: out of memory", None));
-            }
-            unsafe_sys::yaml_parser_set_encoding(parser, unsafe_sys::YAML_UTF8_ENCODING);
-            unsafe_sys::yaml_parser_set_input_string(parser, input.as_ptr(), input.len() as u64);
-            raw.assume_init()
-        };
-        Ok(Self { sys, _input: input })
-    }
-
-    /// Returns the next event and its start mark.
-    fn next(&mut self) -> Result<(Event, Mark), YamlError> {
-        let parser: *mut unsafe_sys::yaml_parser_t = &raw mut *self.sys;
-        let mut event = MaybeUninit::<unsafe_sys::yaml_event_t>::uninit();
-        // SAFETY: `parser` is initialized and owned by `self`. A successful
-        // `yaml_parser_parse` initializes `event`, and `yaml_event_delete`
-        // frees it after `convert` copies each field out.
-        unsafe {
-            if (**parser).error != unsafe_sys::YAML_NO_ERROR {
-                return Err(parser_error(parser));
-            }
-            if unsafe_sys::yaml_parser_parse(parser, event.as_mut_ptr()).fail {
-                return Err(parser_error(parser));
-            }
-            let event = event.as_mut_ptr();
-            let converted = convert(&*event);
-            let mark = Mark::from_sys((*event).start_mark);
-            unsafe_sys::yaml_event_delete(event);
-            Ok((converted?, mark))
-        }
-    }
-}
-
-impl Drop for Parser {
-    fn drop(&mut self) {
-        // SAFETY: `self.sys` was initialized in `new`, and nothing uses it
-        // after this call.
-        unsafe { unsafe_sys::yaml_parser_delete(&raw mut *self.sys) }
-    }
-}
-
-/// Copies a NUL-terminated libyaml string, or returns `None` for null.
-///
-/// # Safety
-///
-/// `ptr` is null or points to a NUL-terminated string.
-unsafe fn owned(ptr: *const u8) -> Option<String> {
-    if ptr.is_null() {
-        return None;
-    }
-    // SAFETY: the caller guarantees a NUL-terminated string.
-    let text = unsafe { CStr::from_ptr(ptr.cast()) };
-    Some(text.to_string_lossy().into_owned())
-}
-
-/// Builds the error of a failed parser call.
-///
-/// # Safety
-///
-/// `parser` points to an initialized parser.
-unsafe fn parser_error(parser: *const unsafe_sys::yaml_parser_t) -> YamlError {
-    // SAFETY: the caller guarantees an initialized parser. Its error fields
-    // are plain data, and its strings are static or NUL-terminated.
-    unsafe {
-        let state = &**parser;
-        let problem = owned(state.problem.cast())
-            .unwrap_or_else(|| "libyaml parser failed but there is no error".to_owned());
-        if state.error == unsafe_sys::YAML_READER_ERROR {
-            let offset = usize::try_from(state.problem_offset).unwrap_or(usize::MAX);
-            let mut error = YamlError::new(None, None, problem, None);
-            error.0.reader = Some((state.problem_value, offset));
-            return error;
-        }
-        let context = owned(state.context.cast());
-        let context_mark = context.as_ref().map(|_| Mark::from_sys(state.context_mark));
-        YamlError::new(
-            context,
-            context_mark,
-            problem,
-            Some(Mark::from_sys(state.problem_mark)),
-        )
-    }
-}
-
-/// Copies one libyaml event into an owned [`Event`].
-///
-/// # Safety
-///
-/// `event` was filled by a successful `yaml_parser_parse`.
-unsafe fn convert(event: &unsafe_sys::yaml_event_t) -> Result<Event, YamlError> {
-    // SAFETY: the event type names the union field that libyaml filled.
-    unsafe {
-        Ok(match event.type_ {
-            unsafe_sys::YAML_STREAM_START_EVENT => Event::StreamStart,
-            unsafe_sys::YAML_STREAM_END_EVENT => Event::StreamEnd,
-            unsafe_sys::YAML_DOCUMENT_START_EVENT => Event::DocumentStart,
-            unsafe_sys::YAML_DOCUMENT_END_EVENT => Event::DocumentEnd,
-            unsafe_sys::YAML_ALIAS_EVENT => {
-                Event::Alias(owned(event.data.alias.anchor).unwrap_or_default())
-            }
-            unsafe_sys::YAML_SCALAR_EVENT => {
-                let scalar = event.data.scalar;
-                let length = usize::try_from(scalar.length).unwrap_or(0);
-                let bytes = if scalar.value.is_null() || length == 0 {
-                    &[][..]
-                } else {
-                    std::slice::from_raw_parts(scalar.value, length)
-                };
-                Event::Scalar {
-                    anchor: owned(scalar.anchor),
-                    tag: owned(scalar.tag),
-                    value: String::from_utf8_lossy(bytes).into_owned(),
-                    plain_implicit: scalar.plain_implicit,
-                }
-            }
-            unsafe_sys::YAML_SEQUENCE_START_EVENT => Event::SequenceStart {
-                anchor: owned(event.data.sequence_start.anchor),
-                tag: owned(event.data.sequence_start.tag),
-            },
-            unsafe_sys::YAML_SEQUENCE_END_EVENT => Event::SequenceEnd,
-            unsafe_sys::YAML_MAPPING_START_EVENT => Event::MappingStart {
-                anchor: owned(event.data.mapping_start.anchor),
-                tag: owned(event.data.mapping_start.tag),
-            },
-            unsafe_sys::YAML_MAPPING_END_EVENT => Event::MappingEnd,
-            _ => {
-                return Err(YamlError::new(
-                    None,
-                    None,
-                    "libyaml: unexpected event",
-                    None,
-                ));
-            }
-        })
     }
 }
 
@@ -441,10 +252,18 @@ static IMPLICIT: LazyLock<Vec<(&'static str, Regex)>> = LazyLock::new(|| {
             r"^(?:[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]|[0-9][0-9][0-9][0-9]-[0-9][0-9]?-[0-9][0-9]?(?:[Tt]|[ \t]+)[0-9][0-9]?:[0-9][0-9]:[0-9][0-9](?:\.[0-9]*)?(?:[ \t]*(?:Z|[-+][0-9][0-9]?(?::[0-9][0-9])?))?)$",
         ),
         (VALUE, r"^(?:=)$"),
+        // `PyYAML` registers this rule for documentation only. A plain scalar
+        // cannot start with these characters, but a scalar tagged `!` can.
+        (YAML, r"^(?:!|&|\*)$"),
     ];
+    // A Python `$` also matches before a final line break. Only a quoted
+    // scalar tagged `!` can end in one.
     rules
         .into_iter()
-        .filter_map(|(tag, pattern)| Regex::new(pattern).ok().map(|re| (tag, re)))
+        .filter_map(|(tag, pattern)| {
+            let pattern = format!("{}\\n?$", pattern.strip_suffix('$').unwrap_or(pattern));
+            Regex::new(&pattern).ok().map(|re| (tag, re))
+        })
         .collect()
 });
 
@@ -456,7 +275,7 @@ fn resolve_scalar(value: &str, plain_implicit: bool) -> &'static str {
     STR
 }
 
-/// Composes nodes from libyaml events, as `yaml.composer.Composer` does.
+/// Composes nodes from parser events, as `yaml.composer.Composer` does.
 struct Composer {
     parser: Parser,
     peeked: Option<(Event, Mark)>,
@@ -481,7 +300,7 @@ impl Composer {
         self.peeked
             .as_ref()
             .map(|(event, _)| event)
-            .ok_or_else(|| YamlError::new(None, None, "libyaml: no event", None))
+            .ok_or_else(|| YamlError::new(None, None, "no event", None))
     }
 
     fn next(&mut self) -> Result<(Event, Mark), YamlError> {
@@ -597,10 +416,7 @@ impl Composer {
                 self.graph.nodes[id].kind = Kind::Mapping(pairs);
                 Ok(id)
             }
-            other => Err(YamlError::at(
-                format!("libyaml: unexpected event {other:?}"),
-                mark,
-            )),
+            other => Err(YamlError::at(format!("unexpected event {other:?}"), mark)),
         }
     }
 }
@@ -657,6 +473,8 @@ pub enum Value {
     None,
     Bool(bool),
     Int(i128),
+    /// An integer outside the range of `i128`, as its decimal digits.
+    BigInt(String),
     Float(f64),
     Str(String),
     Other(String),
@@ -913,27 +731,80 @@ impl<'g> Constructor<'g> {
     ///
     /// It compares the spelling of each key, not the resolved value. YAML 1.1
     /// turns both `on` and `true` into `True`, but GitHub keeps them distinct.
-    fn check_unique_keys(&self, node: usize) -> Result<(), YamlError> {
-        let Kind::Mapping(pairs) = &self.graph.nodes[node].kind else {
+    fn check_unique_keys(&mut self, node: usize) -> Result<(), YamlError> {
+        let Kind::Mapping(pairs) = self.graph.nodes[node].kind.clone() else {
             return Ok(());
         };
         let mut seen = HashSet::new();
-        for &(key, _) in pairs {
-            let key_node = &self.graph.nodes[key];
-            let spelling = match &key_node.kind {
-                Kind::Scalar(value) => value.clone(),
-                // Python compares `repr` of a constructed collection key. Such a
-                // key fails as unhashable anyway, so a node dump suffices here.
-                other => format!("{other:?}"),
+        for (key, _) in pairs {
+            // Python compares `repr` of a collection key that it constructs in
+            // full. A spelling and a `repr` share one set, as in Python.
+            let spelling = if let Kind::Scalar(value) = &self.graph.nodes[key].kind {
+                value.clone()
+            } else {
+                let slot = self.construct_deep(key)?;
+                self.slot_repr(slot, &mut Vec::new())
             };
             if !seen.insert(spelling.clone()) {
                 return Err(YamlError::at(
                     format!("duplicate mapping key {}", repr_str(&spelling)),
-                    key_node.start,
+                    self.graph.nodes[key].start,
                 ));
             }
         }
         Ok(())
+    }
+
+    /// Ports `construct_object(node, deep=True)`.
+    ///
+    /// A deep construction runs each generator at once, depth first. So its
+    /// fills leave the queue and run before this call returns.
+    fn construct_deep(&mut self, node: usize) -> Result<usize, YamlError> {
+        let before = self.queue.len();
+        let slot = self.construct_object(node)?;
+        let mut pending = self.queue.split_off(before);
+        while let Some((node, slot)) = pending.pop_front() {
+            let before = self.queue.len();
+            self.fill(node, slot)?;
+            for item in self.queue.split_off(before).into_iter().rev() {
+                pending.push_front(item);
+            }
+        }
+        Ok(slot)
+    }
+
+    /// Ports `repr` of a constructed value. A collection that contains itself
+    /// renders as `[...]` or `{...}`, as in Python.
+    fn slot_repr(&self, slot: usize, stack: &mut Vec<usize>) -> String {
+        let recursive = stack.contains(&slot);
+        let join = |items: Vec<String>| items.join(", ");
+        stack.push(slot);
+        let out = match &self.slots[slot] {
+            Slot::Scalar(value) => value.py_repr(),
+            Slot::List(_) if recursive => "[...]".to_owned(),
+            Slot::Dict(_) | Slot::Set(_) if recursive => "{...}".to_owned(),
+            Slot::List(items) => {
+                let items = items.iter().map(|&item| self.slot_repr(item, stack));
+                format!("[{}]", join(items.collect()))
+            }
+            Slot::Set(items) if items.is_empty() => "set()".to_owned(),
+            Slot::Set(items) => {
+                let items = items.iter().map(|&item| self.slot_repr(item, stack));
+                format!("{{{}}}", join(items.collect()))
+            }
+            Slot::Dict(pairs) => {
+                let pairs = pairs.iter().map(|&(key, value)| {
+                    format!(
+                        "{}: {}",
+                        self.slot_repr(key, stack),
+                        self.slot_repr(value, stack)
+                    )
+                });
+                format!("{{{}}}", join(pairs.collect()))
+            }
+        };
+        stack.pop();
+        out
     }
 
     /// Ports `SafeConstructor.construct_mapping` and the base version.
@@ -1065,7 +936,9 @@ fn py_key_eq(a: &Value, b: &Value) -> bool {
     };
     match (a, b) {
         (Value::Int(a), Value::Int(b)) => a == b,
-        (Value::Str(a), Value::Str(b)) | (Value::Other(a), Value::Other(b)) => a == b,
+        (Value::Str(a), Value::Str(b))
+        | (Value::Other(a), Value::Other(b))
+        | (Value::BigInt(a), Value::BigInt(b)) => a == b,
         (Value::None, Value::None) => true,
         _ => match (number(a), number(b)) {
             (Some(a), Some(b)) => a == b,
@@ -1096,7 +969,7 @@ fn construct_scalar(tag: &str, text: &str, mark: Mark) -> Result<Value, YamlErro
             "no" | "false" | "off" => Value::Bool(false),
             _ => return Err(invalid()),
         },
-        INT => Value::Int(construct_int(text).ok_or_else(invalid)?),
+        INT => construct_int(text).ok_or_else(invalid)?,
         FLOAT => Value::Float(construct_float(text).ok_or_else(invalid)?),
         BINARY | TIMESTAMP => Value::Other(text.to_owned()),
         _ => Value::Str(text.to_owned()),
@@ -1111,32 +984,112 @@ fn split_sign(value: &str) -> (i8, &str) {
     )
 }
 
+/// A non-negative integer of any size, in limbs of base 10^9, least
+/// significant first. A Python `int` has no size limit, so a long digit
+/// string in a workflow is still an integer.
+#[derive(Clone, Debug, Default)]
+struct BigUint(Vec<u32>);
+
+impl BigUint {
+    const BASE: u64 = 1_000_000_000;
+
+    /// Sets the value to `self * factor + addend`.
+    fn mul_add(&mut self, factor: u32, addend: u32) {
+        let mut carry = u64::from(addend);
+        for limb in &mut self.0 {
+            let total = u64::from(*limb) * u64::from(factor) + carry;
+            *limb = u32::try_from(total % Self::BASE).unwrap_or(0);
+            carry = total / Self::BASE;
+        }
+        while carry > 0 {
+            self.0.push(u32::try_from(carry % Self::BASE).unwrap_or(0));
+            carry /= Self::BASE;
+        }
+    }
+
+    /// Sets the value to `self + other`.
+    fn add(&mut self, other: &Self) {
+        let mut carry = 0;
+        for index in 0..self.0.len().max(other.0.len()) {
+            if index == self.0.len() {
+                self.0.push(0);
+            }
+            let total = u64::from(self.0[index])
+                + u64::from(other.0.get(index).copied().unwrap_or(0))
+                + carry;
+            self.0[index] = u32::try_from(total % Self::BASE).unwrap_or(0);
+            carry = total / Self::BASE;
+        }
+        if carry > 0 {
+            self.0.push(u32::try_from(carry).unwrap_or(0));
+        }
+    }
+
+    /// Ports `int(digits, radix)` for ASCII digits. Python strips the
+    /// surrounding whitespace first.
+    fn parse(digits: &str, radix: u32) -> Option<Self> {
+        let digits = super::pytext::strip(digits);
+        if digits.is_empty() {
+            return None;
+        }
+        let mut value = Self::default();
+        for ch in digits.chars() {
+            value.mul_add(radix, ch.to_digit(radix)?);
+        }
+        Some(value)
+    }
+
+    fn to_decimal(&self) -> String {
+        let mut limbs = self.0.iter().rev().skip_while(|limb| **limb == 0);
+        let Some(first) = limbs.next() else {
+            return "0".to_owned();
+        };
+        let mut out = first.to_string();
+        for limb in limbs {
+            let _ = write!(out, "{limb:09}");
+        }
+        out
+    }
+}
+
+/// Builds an `Int`, or a `BigInt` when the value does not fit `i128`.
+fn int_value(negative: bool, magnitude: &BigUint) -> Value {
+    let decimal = magnitude.to_decimal();
+    let signed = if negative && decimal != "0" {
+        format!("-{decimal}")
+    } else {
+        decimal
+    };
+    signed
+        .parse::<i128>()
+        .map_or(Value::BigInt(signed), Value::Int)
+}
+
 /// Ports `construct_yaml_int`: binary, hex, octal, base 60 and decimal.
-fn construct_int(text: &str) -> Option<i128> {
+fn construct_int(text: &str) -> Option<Value> {
     let value = text.replace('_', "");
     let (sign, value) = split_sign(&value);
-    let sign = i128::from(sign);
+    let negative = sign < 0;
     if value == "0" {
-        return Some(0);
+        return Some(Value::Int(0));
     }
     let magnitude = if let Some(digits) = value.strip_prefix("0b") {
-        i128::from_str_radix(digits, 2).ok()?
+        BigUint::parse(digits, 2)?
     } else if let Some(digits) = value.strip_prefix("0x") {
-        i128::from_str_radix(digits, 16).ok()?
+        BigUint::parse(digits, 16)?
     } else if value.starts_with('0') {
-        i128::from_str_radix(value, 8).ok()?
+        BigUint::parse(value, 8)?
     } else if value.contains(':') {
-        let mut total: i128 = 0;
+        let mut total = BigUint::default();
         for part in value.split(':') {
-            total = total
-                .checked_mul(60)?
-                .checked_add(part.parse::<i128>().ok()?)?;
+            total.mul_add(60, 0);
+            total.add(&BigUint::parse(part, 10)?);
         }
         total
     } else {
-        value.parse::<i128>().ok()?
+        BigUint::parse(value, 10)?
     };
-    magnitude.checked_mul(sign)
+    Some(int_value(negative, &magnitude))
 }
 
 /// Ports `construct_yaml_float`: `.inf`, `.nan`, base 60 and decimal.
@@ -1225,9 +1178,14 @@ impl Value {
     }
 
     /// Ports `isinstance(value, int)`, which is true for a `bool` as well.
+    ///
+    /// A `BigInt` saturates at the bound of `i128`. It still compares as
+    /// Python compares it with a small number.
     pub fn as_int(&self) -> Option<i128> {
         match self {
             Self::Int(int) => Some(*int),
+            Self::BigInt(digits) if digits.starts_with('-') => Some(i128::MIN),
+            Self::BigInt(_) => Some(i128::MAX),
             Self::Bool(flag) => Some(i128::from(*flag)),
             _ => None,
         }
@@ -1239,6 +1197,7 @@ impl Value {
             Self::None => false,
             Self::Bool(flag) => *flag,
             Self::Int(int) => *int != 0,
+            Self::BigInt(_) => true,
             Self::Float(float) => *float != 0.0,
             Self::Str(text) | Self::Other(text) => !text.is_empty(),
             Self::List(items) | Self::Set(items) => !items.is_empty(),
@@ -1268,6 +1227,7 @@ impl Value {
             Self::Bool(true) => "True".to_owned(),
             Self::Bool(false) => "False".to_owned(),
             Self::Int(int) => int.to_string(),
+            Self::BigInt(digits) => digits.clone(),
             Self::Float(float) => float_repr(*float),
             Self::Str(text) => repr_str(text),
             Self::Other(text) => text.clone(),
@@ -1486,6 +1446,46 @@ mod tests {
         assert_eq!(float_repr(1.5e-5), "1.5e-05");
         assert_eq!(float_repr(0.0001), "0.0001");
         assert_eq!(float_repr(123_456.0), "123456.0");
+    }
+
+    /// Each expected text is the output of `PyYAML` 6 with the
+    /// `UniqueKeyLoader` of `workflow-yaml-parse`. libyaml decides each of
+    /// these inputs in another way.
+    #[test]
+    fn the_pure_python_rules_decide_as_pyyaml_does() {
+        let value = |text: &str| match load(text, true).and_then(Document::into_value) {
+            Ok(value) => value.py_repr(),
+            Err(error) => error.render(text),
+        };
+        assert_eq!(
+            value("a: b\tc\n"),
+            "while scanning for the next token\nfound character '\\t' that cannot start any token\n  in \"<unicode string>\", line 1, column 5:\n    a: b\tc\n        ^"
+        );
+        assert_eq!(value("a:\n  b: |\n     \tx\n"), "{'a': {'b': '\\tx\\n'}}");
+        assert_eq!(
+            value("%FOO bar\n--- {jobs: {a: 1}}\n"),
+            "{'jobs': {'a': 1}}"
+        );
+        assert_eq!(value("a: 1\n\u{feff}b: 2\n"), "{'a': 1, '\\ufeffb': 2}");
+        assert_eq!(
+            value("a: 123456789012345678901234567890123456789012345\n"),
+            "{'a': 123456789012345678901234567890123456789012345}"
+        );
+        assert_eq!(
+            value("a: -0x123456789abcdef0123456789abcdef0123456789\n"),
+            "{'a': -1662864085140938409743844499106522448980869474185}"
+        );
+        assert_eq!(
+            value("? [a]\n: 1\n? [a]\n: 2\n"),
+            "duplicate mapping key \"['a']\"\n  in \"<unicode string>\", line 3, column 3:\n    ? [a]\n      ^"
+        );
+        assert_eq!(value("a: [x:y]\n"), "{'a': ['x:y']}");
+        assert_eq!(value("a:\n- b\n  - c\n"), "{'a': ['b - c']}");
+        assert_eq!(
+            value("{a: 1, a: 2}\n"),
+            "duplicate mapping key 'a'\n  in \"<unicode string>\", line 1, column 8:\n    {a: 1, a: 2}\n           ^"
+        );
+        assert_eq!(value("x: 'a\n\n  b'\n"), "{'x': 'a\\nb'}");
     }
 
     #[test]

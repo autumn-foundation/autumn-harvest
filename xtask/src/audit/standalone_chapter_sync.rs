@@ -678,6 +678,32 @@ mod tests {
         );
     }
 
+    /// The wiring check reads any uncommented line. A step name that held the
+    /// needle would satisfy it with every run line commented out.
+    #[test]
+    fn only_a_ci_run_line_holds_a_wiring_needle() {
+        let ci = util::read_repo_file(CI).unwrap_or_else(|error| panic!("{error:#}"));
+        for (_, needle) in REQUIRED_WIRING.iter().filter(|(path, _)| *path == CI) {
+            let holders: Vec<&str> = ci
+                .lines()
+                .map(str::trim)
+                .filter(|line| line.contains(needle) && !line.starts_with('#'))
+                .collect();
+            assert!(
+                holders.iter().all(|line| !line.starts_with("- name:")),
+                "a step name holds {needle:?}: {holders:?}"
+            );
+        }
+        let commented = ci.replace(
+            "          cargo xtask audit standalone-chapter-sync",
+            "          # cargo xtask audit standalone-chapter-sync",
+        );
+        assert!(!wiring_present(
+            &commented,
+            "cargo xtask audit standalone-chapter-sync"
+        ));
+    }
+
     #[test]
     fn a_bad_marker_is_quoted_as_python_repr() {
         let errors = check_run_markers("<!-- chapter-run: it's -->\n");

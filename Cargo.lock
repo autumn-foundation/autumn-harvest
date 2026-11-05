@@ -9486,7 +9486,6 @@ dependencies = [
  "serde_yaml",
  "smop",
  "toml 1.1.8+spec-1.1.0",
- "unsafe-libyaml",
  "walkdir",
 ]
 
