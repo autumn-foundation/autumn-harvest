@@ -14,6 +14,11 @@
 //! The reset reads only recorded data, so replay takes the same reset.
 //! `docs/design/DESIGN-2453.md` records the design.
 //!
+//! A tool round can pass the cap first. With a reset left, that round makes
+//! a reset due, and the new window keeps the round with its answers. So the
+//! model sees which calls ran (issue #2461). `docs/design/DESIGN-2461.md`
+//! records that rule.
+//!
 //! The model wrote the notes, maybe under the influence of a tool result.
 //! So the notes never go into a user message. The window shows them as the
 //! model's own `save_progress` call, with a fixed result that the app

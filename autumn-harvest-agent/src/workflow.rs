@@ -33,7 +33,9 @@ use crate::agent::{
     agent_workspace_floor_info, agent_workspace_reset_info, agent_workspace_retain_info,
 };
 use crate::approval::{Approval, Decision, approval_signal, await_decision, decode_decision};
-use crate::bounds::{RoundBudget, json_len, reaches_percent, reset_due, sibling_cap};
+use crate::bounds::{
+    RoundBudget, full_round_resets, json_len, reaches_percent, reset_due, sibling_cap,
+};
 use crate::context_reset::{self, ProgressNotes, SAVE_PROGRESS_TOOL};
 use crate::delivery::{Report, ReportSource, report_text};
 use crate::draw::Draw;
@@ -72,6 +74,11 @@ const FINAL_TURN_PATCH: &str = "agent_final_turn_rules";
 /// part of the recorded child input. A history from before the gate replays
 /// with the old input.
 const CHILD_FAILURE_REPORT_PATCH: &str = "agent_child_failure_report";
+
+/// The gate of a reset after a tool round over the cap (issue #2461). The
+/// loop asks it only where the new branch would run. A history recorded
+/// before the gate holds no marker there, so it ends the run as it ran.
+const RESET_ON_FULL_PATCH: &str = "agent_reset_on_full_round";
 
 /// The registered workflow name.
 pub const WORKFLOW_NAME: &str = "agent_loop";
@@ -150,6 +157,10 @@ pub(crate) struct ResetState {
     /// The booking that woke this segment, with its result. Each reset of
     /// the segment keeps it, because the wake message points at it.
     pub(crate) woken_by: Option<[ChatMessage; 2]>,
+    /// The tool round over the cap that made the next reset due, with its
+    /// answers (issue #2461). The reset window keeps it, so the model sees
+    /// which calls ran. The reset clears it.
+    pub(crate) kept: Option<[ChatMessage; 2]>,
 }
 
 /// The steer messages of a durable agent (issue #2265).
@@ -691,6 +702,7 @@ async fn open_segment(
     progress.steers.clear();
     // A save turn that ended its segment has no reset to run.
     progress.reset.pending = false;
+    progress.reset.kept = None;
     if progress
         .sent
         .as_ref()
@@ -842,7 +854,9 @@ pub(crate) async fn run_segment(
                 // Not every call ran, so the text of the turn is no answer.
                 // It can claim work that never ran.
                 progress.last_text = narration;
-                return Ok(AgentStop::TranscriptFull);
+                if !reset_on_full_round(ctx, run, progress, tree, &extra_tools, input) {
+                    return Ok(AgentStop::TranscriptFull);
+                }
             }
             RoundEnd::Loop => return Ok(AgentStop::LoopDetected),
             RoundEnd::Interrupted => {
@@ -870,6 +884,48 @@ fn answer_stop(turn: &ModelTurn, over_budget: bool) -> AgentStop {
 /// before the next request. A bound that ends the run still ends it.
 fn save_reply(progress: &Progress, turn: &ModelTurn, over_budget: bool) -> bool {
     progress.reset.pending && !over_budget && turn.stop != StopReason::MaxTokens
+}
+
+/// Whether a tool round over the cap resets, and does not end the run
+/// (issue #2461).
+///
+/// The reset keeps the round with its answers. A call that ran shows its
+/// result or `DROPPED_FULL`, and a call that did not run shows
+/// `NOT_RUN_FULL`. So the model does not run a call with an effect again.
+///
+/// The round resets when a reset is left and the window after the reset
+/// falls under the threshold. Then the next request takes the reset, with a
+/// save turn first when one fits. The check reads only recorded data, so
+/// replay takes the same branch.
+fn reset_on_full_round(
+    ctx: &WorkflowContext,
+    run: Run<'_>,
+    progress: &mut Progress,
+    tree: &Tree,
+    extra_tools: &[ToolDefinition],
+    input: &str,
+) -> bool {
+    let Some(setting) = run.task.context_reset else {
+        return false;
+    };
+    // The round pushed its assistant turn, then its tool message.
+    let [.., call, answers] = progress.messages.as_slice() else {
+        return false;
+    };
+    progress.reset.kept = Some([call.clone(), answers.clone()]);
+    let after = reset_window(run.task, progress, input);
+    let after_len = json_len(&next_request(run, progress, tree, extra_tools, after));
+    let resets = full_round_resets(
+        progress.reset.count,
+        setting.max_resets,
+        after_len,
+        run.task.request_cap(),
+        setting.reset_at_percent,
+    ) && ctx.patched(RESET_ON_FULL_PATCH);
+    if !resets {
+        progress.reset.kept = None;
+    }
+    resets
 }
 
 /// The next request and its size, after a context reset when one is due
@@ -912,6 +968,9 @@ fn sized_request(
 /// Without room, the reset runs at once. A reset whose window, with the
 /// notes of that time, still reaches the threshold frees no room. So it does
 /// not run, because it would only spend the next reset.
+///
+/// A round over the cap that kept its answers makes the reset due at once
+/// (issue #2461). [`reset_on_full_round`] already checked its room.
 fn plan_reset(
     run: Run<'_>,
     progress: &mut Progress,
@@ -925,19 +984,21 @@ fn plan_reset(
     if std::mem::take(&mut progress.reset.pending) {
         return Some(reset_now(run.task, progress, input));
     }
-    if !reset_due(
-        progress.reset.count,
-        setting.max_resets,
-        len,
-        cap,
-        setting.reset_at_percent,
-    ) {
-        return None;
-    }
-    let after = reset_window(run.task, progress, input);
-    let after_len = json_len(&next_request(run, progress, tree, extra_tools, after));
-    if reaches_percent(after_len, cap, setting.reset_at_percent) {
-        return None;
+    if progress.reset.kept.is_none() {
+        if !reset_due(
+            progress.reset.count,
+            setting.max_resets,
+            len,
+            cap,
+            setting.reset_at_percent,
+        ) {
+            return None;
+        }
+        let after = reset_window(run.task, progress, input);
+        let after_len = json_len(&next_request(run, progress, tree, extra_tools, after));
+        if reaches_percent(after_len, cap, setting.reset_at_percent) {
+            return None;
+        }
     }
     let mut noticed = progress.messages.clone();
     noticed.push(ChatMessage::text(
@@ -963,7 +1024,10 @@ fn plan_reset(
 fn reset_now(task: &AgentTask, progress: &mut Progress, input: &str) -> Vec<ChatMessage> {
     progress.reset.count = progress.reset.count.saturating_add(1);
     progress.sent = None;
-    reset_window(task, progress, input)
+    let window = reset_window(task, progress, input);
+    // A later reset drops the kept round like any other turn.
+    progress.reset.kept = None;
+    window
 }
 
 /// The window after a reset (issue #2453).
@@ -971,7 +1035,11 @@ fn reset_now(task: &AgentTask, progress: &mut Progress, input: &str) -> Vec<Chat
 /// It holds the system prompt and the task. In a segment that a follow-up
 /// woke, the booking that woke it follows. The wake message points at that
 /// booking, so the wake message comes next. The booking that this segment
-/// made follows that. Then the notes follow, and last the steers.
+/// made follows that. A kept round over the cap follows (issue #2461). Then
+/// the notes follow, and last the steers.
+///
+/// The kept round can hold the booking of the segment. Then the booking
+/// shows only in the round, so no call id comes twice.
 fn reset_window(task: &AgentTask, progress: &Progress, input: &str) -> Vec<ChatMessage> {
     let messages = &progress.messages;
     let mut window = Vec::with_capacity(10 + progress.steers.len());
@@ -996,9 +1064,13 @@ fn reset_window(task: &AgentTask, progress: &Progress, input: &str) -> Vec<ChatM
     if input != task.input {
         window.push(ChatMessage::text(ChatRole::User, input));
     }
+    let kept = progress.reset.kept.as_ref();
     if progress.followup.is_some() {
-        window.extend(booking(&messages[start..]).into_iter().flatten());
+        let own = booking(&messages[start..])
+            .filter(|[call, _]| !kept.is_some_and(|[round, _]| holds_calls_of(round, call)));
+        window.extend(own.into_iter().flatten());
     }
+    window.extend(kept.into_iter().flatten().cloned());
     if let Some(notes) = &progress.reset.notes {
         window.extend(context_reset::restored(&notes.text));
     }
@@ -1035,6 +1107,14 @@ fn booking(messages: &[ChatMessage]) -> Option<[ChatMessage; 2]> {
             content: vec![result.clone()],
         },
     ])
+}
+
+/// Whether `message` holds every call part of `calls`.
+fn holds_calls_of(message: &ChatMessage, calls: &ChatMessage) -> bool {
+    calls
+        .content
+        .iter()
+        .all(|part| message.content.contains(part))
 }
 
 /// The result part of the call `id` in `messages`.
@@ -1377,9 +1457,10 @@ fn flow_after(tree: &Tree, turn: &ModelTurn) -> (BTreeSet<String>, Released) {
 /// each call does not fit, no call runs. The model could not read a result.
 ///
 /// The round drops a result that does not fit, and runs no more calls. The
-/// run then ends, so the model never reads a later result. No more calls run
-/// after the loop guard stops the run either. Each call still gets an answer,
-/// so the transcript stays valid and shows what ran.
+/// run then ends, so the model never reads a later result. With a context
+/// reset left, the run resets instead (issue #2461). No more calls run after
+/// the loop guard stops the run either. Each call still gets an answer, so
+/// the transcript stays valid and shows what ran.
 async fn run_round(
     ctx: &WorkflowContext,
     run: Run<'_>,
@@ -3130,6 +3211,54 @@ mod tests {
         progress.reset.count = 1;
         assert!(plan(&task, &mut progress, len).is_none(), "no reset left");
         assert!(!progress.reset.pending);
+    }
+
+    #[test]
+    fn a_kept_round_makes_the_reset_due_under_the_threshold() {
+        let (mut task, mut progress, len) = reset_fixture();
+        task.max_request_bytes = Some(len * 3);
+        let round = [
+            assistant(vec![followup_call("h1")]),
+            tool(vec![result("h1", "dropped")]),
+        ];
+        progress.reset.kept = Some(round.clone());
+        let noticed = plan(&task, &mut progress, len).expect("a save turn");
+        assert!(
+            progress.reset.pending,
+            "under 50 %, the kept round asks a save turn"
+        );
+        assert_eq!(noticed.len(), progress.messages.len() + 1);
+        let window = plan(&task, &mut progress, len).expect("the reset");
+        assert_eq!(progress.reset.count, 1);
+        assert!(progress.reset.kept.is_none(), "the reset clears the round");
+        let mut expected = vec![ChatMessage::text(ChatRole::User, "audit")];
+        expected.extend(round);
+        assert_eq!(window, expected);
+    }
+
+    #[test]
+    fn a_booking_in_the_kept_round_shows_once() {
+        let booked = r#"{"in_minutes":1,"scheduled":true}"#;
+        let task = AgentTask::new("audit");
+        let round = [
+            assistant(vec![followup_call("f1"), followup_call("h1")]),
+            tool(vec![result("f1", booked), result("h1", "dropped")]),
+        ];
+        let mut messages = vec![ChatMessage::text(ChatRole::User, "audit")];
+        messages.extend(round.clone());
+        let mut progress = Progress::new("r".into(), messages);
+        progress.followup = Some(Planned { delay_secs: 60 });
+        progress.reset.kept = Some(round.clone());
+        let window = reset_window(&task, &progress, "audit");
+        let mut expected = vec![ChatMessage::text(ChatRole::User, "audit")];
+        expected.extend(round);
+        assert_eq!(window, expected);
+        // A round with no booking keeps the booking of the segment apart.
+        progress.reset.kept = Some([
+            assistant(vec![followup_call("h2")]),
+            tool(vec![result("h2", "dropped")]),
+        ]);
+        assert_eq!(reset_window(&task, &progress, "audit").len(), 5);
     }
 
     fn followup_call(id: &str) -> ContentPart {

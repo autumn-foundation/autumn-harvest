@@ -146,11 +146,31 @@ pub const fn reaches_percent(len: u64, cap: u64, percent: u8) -> bool {
 ///
 /// It is due when the run used fewer than `max_resets` resets and the
 /// request reaches `percent` of `cap`. A request over the cap always
-/// reaches it. A tool round can still pass the cap first and end the run.
+/// reaches it. A tool round can pass the cap first. [`full_round_resets`]
+/// decides that case.
 /// `formal/verus/src/agent_reset.rs` proves it for every input.
 #[must_use]
 pub const fn reset_due(resets: u32, max_resets: u32, len: u64, cap: u64, percent: u8) -> bool {
     resets < max_resets && reaches_percent(len, cap, percent)
+}
+
+/// Does a tool round over the cap reset, and not end the run (issue
+/// #2461)?
+///
+/// `after_len` is the size of the request after the reset, with the round
+/// kept. The round resets when a reset is left and that request falls under
+/// `percent` of `cap`. So the request after the reset fits the cap. A
+/// `cap` of zero is no cap, so no round passes it.
+/// `formal/verus/src/agent_reset.rs` proves it for every input.
+#[must_use]
+pub const fn full_round_resets(
+    resets: u32,
+    max_resets: u32,
+    after_len: u64,
+    cap: u64,
+    percent: u8,
+) -> bool {
+    resets < max_resets && cap > 0 && !reaches_percent(after_len, cap, percent)
 }
 
 /// The episodes that one append evicts from a log of `len` episodes
@@ -244,7 +264,34 @@ mod tests {
         assert!(!reset_due(0, 1, 40, 100, 50));
     }
 
+    #[test]
+    fn a_full_round_resets_only_with_room_and_a_reset_left() {
+        assert!(full_round_resets(0, 1, 40, 100, 50));
+        assert!(!full_round_resets(0, 1, 50, 100, 50), "at the threshold");
+        assert!(!full_round_resets(1, 1, 40, 100, 50), "no reset left");
+        assert!(!full_round_resets(0, 0, 0, 100, 50));
+        assert!(!full_round_resets(0, 9, 0, 0, 50), "a zero cap is no cap");
+        // 0 counts as 1, so only an empty window fits.
+        assert!(full_round_resets(0, 1, 0, 100, 0));
+        assert!(!full_round_resets(0, 1, 1, 100, 0));
+    }
+
     proptest::proptest! {
+        #[test]
+        fn a_full_round_reset_leaves_a_window_that_fits(
+            resets in 0_u32..8,
+            max_resets in 0_u32..8,
+            after_len in 0_u64..u64::MAX,
+            cap in 0_u64..u64::MAX,
+            percent in 0_u8..=255,
+        ) {
+            if full_round_resets(resets, max_resets, after_len, cap, percent) {
+                proptest::prop_assert!(after_len < cap);
+                proptest::prop_assert!(resets < max_resets);
+                proptest::prop_assert!(!reset_due(resets, max_resets, after_len, cap, percent));
+            }
+        }
+
         #[test]
         fn a_request_over_the_cap_always_reaches_the_threshold(
             cap in 1_u64..u64::MAX,
