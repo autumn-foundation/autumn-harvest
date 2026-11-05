@@ -21,7 +21,7 @@ use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
 
 use super::driver::{
-    Command, KeyedSignal, MAX_CHAIN_HOPS, MAX_RETRY_HOPS, RoutedSignal, RoutedUpdate,
+    Command, KeyedSignal, MAX_CHAIN_HOPS, MAX_RETRY_HOPS, Retention, RoutedSignal, RoutedUpdate,
     SignalWithStartParams, Started, StopAck,
 };
 
@@ -111,6 +111,8 @@ struct Inner {
     catalog: Arc<Catalog>,
     /// The fleet tenant of this Harvest. `None` for the control Harvest.
     tenant: Option<FleetDbKey>,
+    /// The retention of this file, which its driver runs (issue #2471).
+    retention: Arc<Retention>,
 }
 
 impl std::fmt::Debug for HarvestSqlite {
@@ -128,6 +130,7 @@ impl HarvestSqlite {
         reader: SqliteReader,
         path: PathBuf,
         catalog: Arc<Catalog>,
+        retention: Arc<Retention>,
     ) -> Self {
         let mut workflows: Vec<String> = catalog
             .workflows
@@ -150,6 +153,7 @@ impl HarvestSqlite {
                 infos,
                 catalog,
                 tenant: None,
+                retention,
             }),
             lease: None,
         }
@@ -243,6 +247,25 @@ impl HarvestSqlite {
         &self.inner.catalog
     }
 
+    /// The retention of this file (issue #2471).
+    pub(crate) fn retention(&self) -> &Arc<Retention> {
+        &self.inner.retention
+    }
+
+    /// Run `job` on the driver task, in turn with every other write (issue
+    /// #2471). The admin routes change schedules through it.
+    pub(crate) async fn run<T: Send + 'static>(
+        &self,
+        job: impl FnOnce(&mut autumn_harvest_sqlite::SqliteRuntime) -> T + Send + 'static,
+    ) -> Result<T, HarvestSqliteError> {
+        self.call(|reply| {
+            Command::Run(Box::new(move |runtime| {
+                let _ = reply.send(job(runtime));
+            }))
+        })
+        .await
+    }
+
     /// Run `read` on the read-only connection, off the async runtime.
     pub(crate) async fn read<T: Send + 'static>(
         &self,
@@ -318,6 +341,29 @@ impl HarvestSqlite {
                 reply,
             })
             .await??)
+    }
+
+    /// Return the newest run of the key in `options`, in any state, or else
+    /// start one. The outbox relay starts each row with this (issue #2470).
+    ///
+    /// The runtime checks the input schema of a fresh run only. A row whose
+    /// run already exists is marked delivered, whatever its input.
+    pub(crate) async fn start_once(
+        &self,
+        workflow_name: &str,
+        input: Value,
+        options: StartOptions,
+    ) -> Result<StartOutcome, HarvestSqliteError> {
+        let workflow_name = workflow_name.to_owned();
+        Self::lift(
+            self.call(|reply| Command::StartOnce {
+                workflow_name,
+                input,
+                options,
+                reply,
+            })
+            .await?,
+        )
     }
 
     /// Start a run and signal it, or signal the run that exists, in one
@@ -736,6 +782,9 @@ pub struct Catalog {
     pub queries: Vec<autumn_harvest::QueryHandlerInfo>,
     /// The declarative `#[update]` handlers.
     pub updates: Vec<autumn_harvest::UpdateHandlerInfo>,
+    /// The workflow names of the code schedules (issue #2471). A `PATCH`
+    /// of one sets an override. A `PATCH` of another schedule edits it.
+    pub code_schedules: std::collections::BTreeSet<String>,
     /// The app state of a replay.
     ///
     /// The state holds `AppState`, and `AppState` holds this handle. A weak
@@ -763,6 +812,11 @@ impl Catalog {
             signals: registry.signals.clone(),
             queries: registry.queries.clone(),
             updates: registry.updates.clone(),
+            code_schedules: registry
+                .schedules
+                .iter()
+                .map(|schedule| schedule.workflow_name.clone())
+                .collect(),
             state: Arc::downgrade(&registry.state),
         }
     }

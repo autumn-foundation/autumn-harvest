@@ -119,6 +119,7 @@ fn agent_loop_history(filler: Filler) -> Vec<WorkflowEvent> {
             queue: "agent".into(),
         });
         let reply = ModelTurn {
+            cost_usd_micros: None,
             content: vec![
                 ContentPart::Text(words(filler, 200 + turn as u64, 30)),
                 ContentPart::ToolCall {

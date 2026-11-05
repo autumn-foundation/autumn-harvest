@@ -2,7 +2,7 @@
 
 use crate::schema::{harvest_schedules_ext, harvest_workflow_executions_ext};
 use crate::table_split::SetExt;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -220,7 +220,9 @@ pub fn plan_backfill_timestamps(
             // Find the first cron occurrence at or after `from` by searching from 1 ms before
             // it (cron fires on whole-second boundaries; 1 ms is a safe undercut).
             let reference = from - chrono::Duration::milliseconds(1);
-            let Some(mut cursor) = next_run_after(schedule, reference) else {
+            let walker = slot_walker(schedule);
+            let next_slot = |at| walker.as_ref().and_then(|w| w.next_after(at));
+            let Some(mut cursor) = next_slot(reference) else {
                 return Ok(vec![]);
             };
             let mut timestamps = Vec::new();
@@ -232,7 +234,7 @@ pub fn plan_backfill_timestamps(
                     return Err(BackfillPlanError::LimitExceeded { limit: max_count });
                 }
                 timestamps.push(cursor);
-                let Some(next) = next_run_after(schedule, cursor) else {
+                let Some(next) = next_slot(cursor) else {
                     break;
                 };
                 cursor = next;
@@ -1046,16 +1048,24 @@ pub async fn register_workflow_schedules_for_shard_with_codecs(
     backoff: &ScheduleRegistrationBackoff,
     codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<ShardFiringDecision> {
-    register_workflow_schedules_fenced(conn, schedules, router, shard, backoff, codecs, None).await
+    register_workflow_schedules_fenced(conn, schedules, router, shard, &[], backoff, codecs, None)
+        .await
 }
 
 /// [`register_workflow_schedules_for_shard_with_codecs`] under the override
 /// fence of one scheduler pass (issue #2386).
+///
+/// `pool_peers` are the other shards on the pool of `shard` (issue #2405).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each argument is one input of the pass"
+)]
 async fn register_workflow_schedules_fenced(
     conn: &mut AsyncPgConnection,
     schedules: &[WorkflowSchedule],
     router: &ShardRouter,
     shard: ShardId,
+    pool_peers: &[ShardId],
     backoff: &ScheduleRegistrationBackoff,
     codecs: &crate::payload_codec::PayloadCodecs,
     fence: Option<&str>,
@@ -1085,7 +1095,7 @@ async fn register_workflow_schedules_fenced(
                 outcome,
                 now,
             );
-        } else if ws.dag_name.is_some() {
+        } else if ws.dag_name.is_some() && !pool_peer_owns(ws, router, pool_peers) {
             // Deliberately *not* backoff-gated, unlike the upsert above, and
             // deliberately not collected into one either. A failed collection
             // leaves a due row on a shard that no longer owns it, so unlike a
@@ -1104,6 +1114,66 @@ async fn register_workflow_schedules_fenced(
         }
     }
     Ok(decision)
+}
+
+/// Whether a shard on the same pool owns `schedule` (issue #2405).
+///
+/// Shards on one pool share one `harvest_schedules` table. The row of the
+/// owner is then also in this shard's table. It is not stale, so this shard
+/// must not delete it. Otherwise the row is gone at the end of the pass, or
+/// the owner inserts it again on each tick with a new `next_run_at`. The
+/// firing pass of this shard skips the row too. See [`peer_owned_dags`].
+fn pool_peer_owns(
+    schedule: &WorkflowSchedule,
+    router: &ShardRouter,
+    pool_peers: &[ShardId],
+) -> bool {
+    pool_peers
+        .iter()
+        .any(|&peer| schedule_targets_shard(schedule, router, peer))
+}
+
+/// The DAGs that a pool peer owns and `shard` does not (issue #2405).
+///
+/// Their rows are in the shared table of `shard`. The firing pass of `shard`
+/// skips them, so the owner fires each one with its own shard id.
+///
+/// The catalog is also read. A DAG with no schedule can still have a due row
+/// until its owner registers it again.
+fn peer_owned_dags(
+    schedules: &[WorkflowSchedule],
+    dags: &DagCatalog,
+    router: &ShardRouter,
+    shard: ShardId,
+    pool_peers: &[ShardId],
+) -> BTreeSet<String> {
+    let from_schedules = schedules
+        .iter()
+        .filter(|ws| {
+            !schedule_targets_shard(ws, router, shard) && pool_peer_owns(ws, router, pool_peers)
+        })
+        .filter_map(|ws| ws.dag_name.clone());
+    let from_catalog = dags
+        .keys()
+        .filter(|name| {
+            let owner = router.pick_for_dag(name);
+            owner != shard && pool_peers.contains(&owner)
+        })
+        .cloned();
+    from_schedules.chain(from_catalog).collect()
+}
+
+/// Whether the firing pass skips a row of `dag_name` (issue #2405).
+fn fired_by_a_peer(dag_name: Option<&String>, peer_dags: &BTreeSet<String>) -> bool {
+    dag_name.is_some_and(|name| peer_dags.contains(name))
+}
+
+/// The other shards on the pool of `shard` (issue #2405).
+fn pool_peers(pool: &ShardedDbPool, shard: ShardId) -> Vec<ShardId> {
+    pool.shard_ids()
+        .into_iter()
+        .filter(|&peer| peer != shard && pool.same_physical_pool(peer, shard))
+        .collect()
 }
 
 /// The rows a non-owning shard considers stale for `ws`.
@@ -1533,6 +1603,7 @@ pub async fn tick_once_sharded_with_backoff(
         let Some(fence) = scheduler_fence(shard_pool, shard, single_pool).await else {
             continue;
         };
+        let peers = pool_peers(&pool, shard);
 
         // The whole pass runs under the barrier. A lost barrier stops it.
         let pass = async {
@@ -1543,6 +1614,7 @@ pub async fn tick_once_sharded_with_backoff(
             let pass = register_shard_pass(
                 &mut conn,
                 shard,
+                &peers,
                 dags.as_ref(),
                 workflow_schedules.as_ref(),
                 &router,
@@ -1555,6 +1627,7 @@ pub async fn tick_once_sharded_with_backoff(
                     &mut conn,
                     shard,
                     dags.as_ref(),
+                    &pass.peer_dags,
                     registry.as_ref(),
                     &metrics,
                     &active_gates,
@@ -1587,6 +1660,8 @@ struct ShardPass<'a> {
     dags: Option<std::borrow::Cow<'a, DagCatalog>>,
     /// The DAG overrides that this shard holds for another shard (issue #2389).
     misplaced: Vec<String>,
+    /// The DAGs that a pool peer fires (issue #2405).
+    peer_dags: BTreeSet<String>,
 }
 
 impl ShardPass<'_> {
@@ -1594,6 +1669,7 @@ impl ShardPass<'_> {
         Self {
             dags: None,
             misplaced: Vec::new(),
+            peer_dags: BTreeSet::new(),
         }
     }
 }
@@ -1653,9 +1729,16 @@ async fn carry_misplaced_overrides(
 }
 
 /// Register the schedules of one shard for one pass.
+///
+/// `pool_peers` are the other shards on the pool of `shard` (issue #2405).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each argument is one input of the pass"
+)]
 async fn register_shard_pass<'a>(
     conn: &mut AsyncPgConnection,
     shard: ShardId,
+    pool_peers: &[ShardId],
     dags: &'a DagCatalog,
     workflow_schedules: &[WorkflowSchedule],
     router: &ShardRouter,
@@ -1689,6 +1772,7 @@ async fn register_shard_pass<'a>(
         workflow_schedules.as_ref(),
         router,
         shard,
+        pool_peers,
         backoff,
         registry.payload_codecs(),
         fence,
@@ -1710,11 +1794,20 @@ async fn register_shard_pass<'a>(
         return Ok(ShardPass {
             dags: None,
             misplaced,
+            peer_dags: BTreeSet::new(),
         });
     }
+    let peer_dags = peer_owned_dags(
+        workflow_schedules.as_ref(),
+        dags.as_ref(),
+        router,
+        shard,
+        pool_peers,
+    );
     Ok(ShardPass {
         dags: Some(dags),
         misplaced,
+        peer_dags,
     })
 }
 
@@ -1756,6 +1849,7 @@ async fn fire_shard_schedules(
     conn: &mut AsyncPgConnection,
     shard: ShardId,
     dags: &DagCatalog,
+    peer_dags: &BTreeSet<String>,
     registry: &HandlerRegistry,
     metrics: &Arc<dyn crate::telemetry::MetricsRecorder>,
     active_gates: &[crate::admission_gate::AdmissionGate],
@@ -1764,8 +1858,16 @@ async fn fire_shard_schedules(
     // capacity freed by a just-completed run is consumed by the oldest
     // pending slot first, not by the freshest next_run_at firing.
     #[cfg(feature = "db")]
-    if let Err(error) =
-        drain_buffered_schedule_runs(conn, shard, dags, registry, metrics, active_gates).await
+    if let Err(error) = drain_buffered_schedule_runs(
+        conn,
+        shard,
+        dags,
+        peer_dags,
+        registry,
+        metrics,
+        active_gates,
+    )
+    .await
     {
         tracing::warn!(
             error = %error,
@@ -1774,8 +1876,16 @@ async fn fire_shard_schedules(
         );
     }
 
-    if let Err(error) =
-        tick_workflow_schedules(conn, shard, dags, registry, metrics, active_gates).await
+    if let Err(error) = tick_workflow_schedules(
+        conn,
+        shard,
+        dags,
+        peer_dags,
+        registry,
+        metrics,
+        active_gates,
+    )
+    .await
     {
         tracing::warn!(
             error = %error,
@@ -3788,6 +3898,7 @@ async fn tick_workflow_schedules(
     conn: &mut AsyncPgConnection,
     current_shard: ShardId,
     registered_dags: &DagCatalog,
+    peer_dags: &BTreeSet<String>,
     registry: &crate::worker::HandlerRegistry,
     metrics: &Arc<dyn crate::telemetry::MetricsRecorder>,
     active_gates: &[crate::admission_gate::AdmissionGate],
@@ -3802,6 +3913,9 @@ async fn tick_workflow_schedules(
         let Some(ref wf_name) = schedule.workflow_name else {
             continue;
         };
+        if fired_by_a_peer(schedule.dag_name.as_ref(), peer_dags) {
+            continue;
+        }
 
         if let Some(ref dag_name) = schedule.dag_name
             && !registered_dags.contains_key(dag_name)
@@ -5171,8 +5285,9 @@ async fn tick_one_workflow_schedule(
             None => serde_json::Value::Null,
         };
         let wf_info = registry.workflows.get(wf_name);
+        // Issue #2407: an operator override wins over the declared limit.
         let (concurrency_key, concurrency_limit, concurrency_on_conflict) =
-            wf_info.and_then(|info| info.concurrency.as_ref()).map_or(
+            registry.concurrency_policy(wf_name).map_or(
                 (None, None, crate::concurrency::ConcurrencyOnConflict::Defer),
                 |policy| {
                     let key = crate::concurrency::resolve_concurrency_key(policy.key_expr, &input);
@@ -5674,6 +5789,11 @@ fn schedule_expr(schedule: Option<&Schedule>) -> Option<String> {
         Some(Schedule::Manual) => Some("manual".to_string()),
         None => None,
     }
+}
+
+/// Prepare `schedule` for a walk of many slots. `None` never fires.
+fn slot_walker(schedule: Option<&Schedule>) -> Option<crate::schedule_plan::SlotWalker> {
+    schedule.map(crate::schedule_plan::SlotWalker::new)
 }
 
 fn next_run_after(schedule: Option<&Schedule>, reference: DateTime<Utc>) -> Option<DateTime<Utc>> {
@@ -6421,13 +6541,14 @@ fn due_run_plan(
 
     let mut created = Vec::with_capacity(1);
     let mut cursor = first_due;
+    let walker = slot_walker(schedule);
 
     loop {
         if cursor > now {
             return (created, Some(cursor));
         }
         created.push(cursor);
-        let Some(next) = next_run_after(schedule, cursor) else {
+        let Some(next) = walker.as_ref().and_then(|w| w.next_after(cursor)) else {
             return (created, None);
         };
         cursor = next;
@@ -6621,6 +6742,7 @@ fn eligible_slot_summary(
     let mut cursor = first_due;
     let mut count: u64 = 0;
     let mut last_eligible = None;
+    let walker = slot_walker(schedule);
     loop {
         if cursor > now {
             return EligibleSummary {
@@ -6633,7 +6755,7 @@ fn eligible_slot_summary(
             count += 1;
             last_eligible = Some(cursor);
         }
-        let Some(next) = next_run_after(schedule, cursor) else {
+        let Some(next) = walker.as_ref().and_then(|w| w.next_after(cursor)) else {
             return EligibleSummary {
                 eligible_count: count,
                 last_eligible,
@@ -6686,8 +6808,12 @@ fn window_eligible_slots(
     // Codex #3069); the in-window set itself is bounded by the operator-chosen
     // window, so collecting it is intentional. Using `cutoff - 1ns` makes the
     // jump inclusive of an occurrence landing exactly on the cutoff.
+    let walker = slot_walker(schedule);
     let mut cursor = if cutoff > first_due {
-        next_run_after(schedule, cutoff - chrono::Duration::nanoseconds(1)).unwrap_or(first_due)
+        walker
+            .as_ref()
+            .and_then(|w| w.next_after(cutoff - chrono::Duration::nanoseconds(1)))
+            .unwrap_or(first_due)
     } else {
         first_due
     };
@@ -6699,7 +6825,7 @@ fn window_eligible_slots(
         if cursor >= cutoff && end_at.is_none_or(|e| cursor < e) {
             slots.push(cursor);
         }
-        let Some(next) = next_run_after(schedule, cursor) else {
+        let Some(next) = walker.as_ref().and_then(|w| w.next_after(cursor)) else {
             return slots;
         };
         cursor = next;
@@ -6819,6 +6945,7 @@ async fn drain_buffered_schedule_runs(
     conn: &mut AsyncPgConnection,
     current_shard: ShardId,
     registered_dags: &DagCatalog,
+    peer_dags: &BTreeSet<String>,
     registry: &crate::worker::HandlerRegistry,
     metrics: &Arc<dyn crate::telemetry::MetricsRecorder>,
     active_gates: &[crate::admission_gate::AdmissionGate],
@@ -6848,6 +6975,9 @@ async fn drain_buffered_schedule_runs(
         let Some(ref wf_name) = snapshot.workflow_name else {
             continue;
         };
+        if fired_by_a_peer(snapshot.dag_name.as_ref(), peer_dags) {
+            continue;
+        }
 
         // Skip DAG-backed schedules whose DAG is no longer registered so that
         // removing a DAG does not cause its stale buffered slots to be dispatched.
@@ -7138,8 +7268,9 @@ async fn drain_claimed_buffered_schedule(
             None => serde_json::Value::Null,
         };
         let wf_info = registry.workflows.get(wf_name);
+        // Issue #2407: an operator override wins over the declared limit.
         let (concurrency_key, concurrency_limit, concurrency_on_conflict) =
-            wf_info.and_then(|info| info.concurrency.as_ref()).map_or(
+            registry.concurrency_policy(wf_name).map_or(
                 (None, None, crate::concurrency::ConcurrencyOnConflict::Defer),
                 |policy| {
                     let key = crate::concurrency::resolve_concurrency_key(policy.key_expr, &input);
@@ -9712,6 +9843,91 @@ mod tests {
             !schedule_targets_shard(&canary, &router, s2),
             "a read-only shard is not a fire target"
         );
+    }
+
+    // ── Shards on one pool (issue #2405) ──────────────────────────────────
+
+    fn dag_schedule(name: &str) -> WorkflowSchedule {
+        let mut ws = WorkflowSchedule::new(name, Schedule::Interval(Duration::from_secs(60)));
+        ws.dag_name = Some(name.to_string());
+        ws
+    }
+
+    #[test]
+    fn pool_peer_owns_finds_an_owner_on_the_same_pool() {
+        let (s0, s1) = (ShardId::new(0), ShardId::new(1));
+        let router = ShardRouter::new(vec![s0, s1], vec![s0], s0);
+        let ws = dag_schedule("nightly");
+        assert!(pool_peer_owns(&ws, &router, &[s0]), "s0 owns the DAG");
+        assert!(!pool_peer_owns(&ws, &router, &[s1]), "s1 does not own it");
+    }
+
+    #[test]
+    fn pool_peer_owns_is_false_with_no_peers() {
+        let s0 = ShardId::new(0);
+        let router = ShardRouter::new(vec![s0], vec![s0], s0);
+        assert!(!pool_peer_owns(&dag_schedule("nightly"), &router, &[]));
+    }
+
+    #[test]
+    fn pool_peer_owns_covers_a_schedule_on_every_writable_shard() {
+        let (s0, s1, s2) = (ShardId::new(0), ShardId::new(1), ShardId::new(2));
+        let router = ShardRouter::new(vec![s0, s1, s2], vec![s0, s1], s0);
+        let ws = dag_schedule("probe").with_all_writable_shards();
+        assert!(pool_peer_owns(&ws, &router, &[s1]), "s1 is writable");
+        assert!(!pool_peer_owns(&ws, &router, &[s2]), "s2 is read-only");
+    }
+
+    #[test]
+    fn pool_peers_lists_only_the_other_shards_on_the_pool() {
+        let (s0, s1, s2) = (ShardId::new(0), ShardId::new(1), ShardId::new(2));
+        let pool = ShardedDbPool::from_dsns(
+            [
+                (s0, "postgres://unused/a".to_string()),
+                (s1, "postgres://unused/a".to_string()),
+                (s2, "postgres://unused/b".to_string()),
+            ],
+            s0,
+            1,
+        )
+        .expect("a pool builds without a connection");
+        assert_eq!(pool_peers(&pool, s0), vec![s1]);
+        assert_eq!(pool_peers(&pool, s1), vec![s0]);
+        assert!(pool_peers(&pool, s2).is_empty(), "s2 has its own pool");
+    }
+
+    #[test]
+    fn peer_owned_dags_lists_only_the_dags_that_a_peer_owns() {
+        let (s0, s1) = (ShardId::new(0), ShardId::new(1));
+        let router = ShardRouter::new(vec![s0, s1], vec![s0], s0);
+        let schedules = vec![
+            dag_schedule("nightly"),
+            WorkflowSchedule::new("report", Schedule::Interval(Duration::from_secs(60))),
+        ];
+        let none = DagCatalog::new();
+        let on_s1 = peer_owned_dags(&schedules, &none, &router, s1, &[s0]);
+        assert_eq!(on_s1, BTreeSet::from(["nightly".to_string()]));
+        assert!(peer_owned_dags(&schedules, &none, &router, s0, &[s1]).is_empty());
+        assert!(peer_owned_dags(&schedules, &none, &router, s1, &[]).is_empty());
+    }
+
+    #[test]
+    fn peer_owned_dags_reads_a_catalog_dag_with_no_schedule() {
+        let (s0, s1) = (ShardId::new(0), ShardId::new(1));
+        let router = ShardRouter::new(vec![s0, s1], vec![s0], s0);
+        let mut dags = DagCatalog::new();
+        dags.insert("manual".to_string(), dag_with_schedule("manual", None));
+        let on_s1 = peer_owned_dags(&[], &dags, &router, s1, &[s0]);
+        assert_eq!(on_s1, BTreeSet::from(["manual".to_string()]));
+        assert!(peer_owned_dags(&[], &dags, &router, s0, &[s1]).is_empty());
+    }
+
+    #[test]
+    fn fired_by_a_peer_skips_only_a_peer_dag() {
+        let peer_dags = BTreeSet::from(["nightly".to_string()]);
+        assert!(fired_by_a_peer(Some(&"nightly".to_string()), &peer_dags));
+        assert!(!fired_by_a_peer(Some(&"weekly".to_string()), &peer_dags));
+        assert!(!fired_by_a_peer(None, &peer_dags));
     }
 
     #[test]

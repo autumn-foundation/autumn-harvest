@@ -22,7 +22,7 @@ Options for each open question. The chosen option is in bold.
 | What the task asks for | nothing, the cap is the policy value · **`retries`, at most the policy cap** |
 | How the check is admitted | in workflow code over a policy read · **one recorded activity, `agent_answer_check`, before the first model call** |
 | Where the scorer runs | in workflow code · **in the recorded `agent_score` activity** |
-| How a judge model is held to the policy | trust the `ScorerRef` · **a `JudgeLimit` in each score request, which `ScoreContext::chat` enforces** |
+| How a judge model is held to the policy | trust the `ScorerRef` · **the `admitted_judges` of each score request (#2443), which `ScoreContext::chat` enforces** |
 | What the scorer reads | the answer only · **a `ScoreInput`: the task input, the answer and the tool results** |
 | How the model learns the reason | a system note · **a user message after the rejected answer** |
 | How the run ends at the cap | `completed` with a flag · **a new stop, `answer_rejected`** |
@@ -40,7 +40,7 @@ gives a rule.
 | A task puts `max_answer_retries` at its top level. | The decode refuses each name in `SAMPLING_POLICY_FIELDS`, as before. The ask is `answer_check.retries`. |
 | A task asks for 100 retries. | `sampling::answer_retry_cap` refuses an ask over the policy cap or over `MAX_ANSWER_RETRIES`. The run fails with `too_many_answer_retries` before any model call. |
 | A task names a judge with an expensive model. | `sampling::admit_answer_check` checks the scorer and the judge model against the policy. |
-| A scorer calls a judge model that the check did not name. | Each score request holds a `JudgeLimit`. `ScoreContext::chat` refuses any other model, and the score fails as `JudgeNotAllowed`. |
+| A scorer calls a judge model that the check did not name. | Each score request holds the admitted judge model. `ScoreContext::chat` refuses any other model before the call. |
 | A task names a kind of another tenant to borrow its policy. | The kind needs a profile. A profile with a tenant admits only a run of that tenant. On Postgres, the run tenant of the engine applies, not the task field. |
 | A task names a scorer that the harness does not have. | The admission refuses it as `unknown_scorer`. No model call runs. |
 | A crash between the answer and the verdict calls the model again. | The model turn and the verdict are recorded activities. Replay reads both. |
@@ -90,9 +90,9 @@ pub struct AnswerCheck {
 ```
 
 `AgentTask::answer_check: Option<AnswerCheck>` is `None` by default. The
-encoder skips it when it is `None`. `ScoreRequest::judge:
-Option<JudgeLimit>` holds the admitted judge model. `None` keeps the
-behavior of #2441.
+encoder skips it when it is `None`. Each score request sets
+`ScoreRequest::admitted_judges` (#2443) to the judge model of the check, or
+to no model.
 
 ### The kernel
 

@@ -732,6 +732,57 @@ fn target_run_defaults(workflow_name: &str) -> TargetRunDefaults {
     resolve_target_run_defaults(workflow_name, declared, cache.as_deref(), ceilings)
 }
 
+/// Apply the concurrency limit override to the declared policy of a target
+/// (issue #2407). A missing cache returns the declared policy.
+#[cfg(feature = "db")]
+fn apply_concurrency_override(
+    workflow_name: &str,
+    declared: Option<crate::concurrency::ConcurrencyPolicy>,
+    cache: Option<&crate::run_defaults::RunDefaultsCache>,
+) -> Option<crate::concurrency::ConcurrencyPolicy> {
+    cache.map_or(declared, |c| c.apply_concurrency(workflow_name, declared))
+}
+
+/// The concurrency limit that a deferred start takes when it fires (issue
+/// #2407).
+///
+/// `stored` is the limit that the deferred start stored when it was admitted.
+/// The current limit of the type replaces it, so the start takes the operator
+/// override that holds when it fires. A start that stored no limit keeps
+/// none. A process with no registered type keeps `stored`.
+#[cfg(feature = "db")]
+pub(crate) fn fire_time_concurrency_limit(workflow_name: &str, stored: Option<u32>) -> Option<u32> {
+    current_concurrency_limit(stored, target_concurrency(workflow_name))
+}
+
+/// `stored`, replaced by the limit of `current` when both are present.
+#[cfg(feature = "db")]
+fn current_concurrency_limit(
+    stored: Option<u32>,
+    current: Option<crate::concurrency::ConcurrencyPolicy>,
+) -> Option<u32> {
+    let stored = stored?;
+    Some(current.map_or(stored, |policy| policy.limit))
+}
+
+/// The effective concurrency policy of a target type, read from the process
+/// globals at start time (issue #2407).
+///
+/// This path has no registry handle, as for [`target_run_defaults`]. So a
+/// deferred start reads the override when it fires.
+#[cfg(feature = "db")]
+fn target_concurrency(workflow_name: &str) -> Option<crate::concurrency::ConcurrencyPolicy> {
+    let cache = GLOBAL_RUN_DEFAULTS.read().ok().and_then(|g| g.clone());
+    apply_concurrency_override(
+        workflow_name,
+        GLOBAL_WORKFLOW_METADATA
+            .read()
+            .ok()
+            .and_then(|guard| guard.as_ref()?.get(workflow_name)?.concurrency),
+        cache.as_deref(),
+    )
+}
+
 #[cfg(feature = "db")]
 pub static GLOBAL_MAX_WORKFLOW_INPUT_BYTES: std::sync::RwLock<u64> =
     std::sync::RwLock::new(crate::builder::DEFAULT_MAX_WORKFLOW_INPUT_BYTES);
@@ -2064,17 +2115,13 @@ pub fn evaluate_triggers_for_execution_collecting_with_codecs<'a>(
             }
 
             // Resolve target concurrency parameters
-            let (concurrency_key, concurrency_limit, concurrency_on_conflict) = {
-                let lock = GLOBAL_WORKFLOW_METADATA.read().ok();
-                lock.as_ref()
-                    .and_then(|guard| guard.as_ref())
-                    .and_then(|meta_map| meta_map.get(&trigger_db.target_workflow_name))
-                    .and_then(|meta| meta.concurrency.as_ref())
+            // Issue #2407: an operator override wins over the declared limit.
+            let (concurrency_key, concurrency_limit, concurrency_on_conflict) =
+                target_concurrency(&trigger_db.target_workflow_name)
                     .map_or((None, None, crate::concurrency::ConcurrencyOnConflict::Defer), |policy| {
                         let key = crate::concurrency::resolve_concurrency_key(policy.key_expr, &target_input);
                         (key, Some(policy.limit), policy.on_conflict)
-                    })
-            };
+                    });
 
             // Resolve target input caps
             let max_workflow_input_bytes = {
@@ -2753,20 +2800,20 @@ pub async fn enforce_completion_triggers_outbox_with_codecs(
             .ok()
             .and_then(|g| *g);
 
-        // Latest-wins overflow strategy (issue #811) is re-resolved from the
-        // registered workflow metadata at relay time rather than persisted on the
-        // outbox row -- the row already carries the resolved key + limit, and
-        // adding a column would need a migration that AC5 rules out.
-        let relay_concurrency_on_conflict = {
-            let lock = GLOBAL_WORKFLOW_METADATA.read().ok();
-            lock.as_ref()
-                .and_then(|guard| guard.as_ref())
-                .and_then(|meta_map| meta_map.get(&task.target_workflow_name))
-                .and_then(|meta| meta.concurrency.as_ref())
-                .map_or(crate::concurrency::ConcurrencyOnConflict::Defer, |policy| {
-                    policy.on_conflict
-                })
-        };
+        // The relay resolves `on_conflict` (issue #811) and the limit (issue
+        // #2407) again from the registered metadata. The row stores the key
+        // and the limit of the first evaluation only. So a deferred start
+        // takes the operator override that holds when it fires. A row that
+        // stores no limit keeps none.
+        let relay_concurrency_on_conflict = target_concurrency(&task.target_workflow_name)
+            .map_or(crate::concurrency::ConcurrencyOnConflict::Defer, |policy| {
+                policy.on_conflict
+            });
+        let relay_concurrency_limit = fire_time_concurrency_limit(
+            &task.target_workflow_name,
+            task.concurrency_limit
+                .map(|l| u32::try_from(l).unwrap_or(0)),
+        );
 
         // Provenance ref is the triggering (source) execution id (#740).
         let source_exec_id_str = task.source_exec_id.to_string();
@@ -2776,9 +2823,7 @@ pub async fn enforce_completion_triggers_outbox_with_codecs(
         let source_tenant = task.tenant.clone();
         let params = crate::execution::StartWorkflowParams {
             concurrency_key: task.concurrency_key,
-            concurrency_limit: task
-                .concurrency_limit
-                .map(|l| u32::try_from(l).unwrap_or(0)),
+            concurrency_limit: relay_concurrency_limit,
             concurrency_on_conflict: relay_concurrency_on_conflict,
             priority,
             max_workflow_input_bytes: u64::try_from(task.max_workflow_input_bytes).unwrap_or(0),
@@ -4061,6 +4106,7 @@ mod tests {
                 execution_timeout: Some(std::time::Duration::from_secs(90)),
                 sla: Some(std::time::Duration::from_secs(45)),
                 chain_execution_timeout: Some(std::time::Duration::from_mins(15)),
+                concurrency_limit: None,
             },
         );
         let got = resolve_target_run_defaults(
@@ -4083,6 +4129,41 @@ mod tests {
             Some(secs(600)),
             "another type"
         );
+    }
+
+    /// A target start takes the concurrency limit override (issue #2407).
+    #[cfg(feature = "db")]
+    #[test]
+    fn a_target_takes_the_concurrency_limit_override() {
+        let declared = Some(crate::concurrency::ConcurrencyPolicy::new("input.k", 4));
+        let cache = crate::run_defaults::RunDefaultsCache::new();
+        cache.write_through(
+            "wf",
+            crate::run_defaults::RunDefaultFields {
+                concurrency_limit: Some(9),
+                ..crate::run_defaults::RunDefaultFields::default()
+            },
+        );
+        let got = apply_concurrency_override("wf", declared, Some(&cache)).expect("policy");
+        assert_eq!(got.limit, 9);
+        assert_eq!(got.key_expr, "input.k");
+        assert_eq!(
+            apply_concurrency_override("other", declared, Some(&cache)),
+            declared
+        );
+        assert_eq!(apply_concurrency_override("wf", declared, None), declared);
+        assert_eq!(apply_concurrency_override("wf", None, Some(&cache)), None);
+    }
+
+    /// A deferred start takes the limit of the type when it fires, and a
+    /// start that stored no limit keeps none (issue #2407).
+    #[cfg(feature = "db")]
+    #[test]
+    fn a_deferred_start_takes_the_current_limit_when_it_fires() {
+        let current = Some(crate::concurrency::ConcurrencyPolicy::new("input.k", 7));
+        assert_eq!(current_concurrency_limit(Some(2), current), Some(7));
+        assert_eq!(current_concurrency_limit(Some(2), None), Some(2));
+        assert_eq!(current_concurrency_limit(None, current), None);
     }
 
     /// The result carries both fleet ceilings, so the start can cap the

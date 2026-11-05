@@ -46,9 +46,10 @@ use crate::model::BoxFuture;
 use crate::refine::agent_refine_propose_info;
 use crate::refine::propose::run_stage;
 use crate::sampling::{
-    DRAWS_WORKFLOW_NAME, DrawsInput, agent_draws_info, agent_sampling_policy_info,
+    DRAWS_WORKFLOW_NAME, DrawsInput, SAMPLE_WORKFLOW_NAME, SampleInput, agent_draws_info,
+    agent_sample_info, agent_sampling_policy_info,
 };
-use crate::score::{agent_score_info, run_score};
+use crate::score::{SampleScore, agent_sample_score_info, agent_score_info, run_score};
 use crate::types::{AgentTask, ModelTurnRequest};
 use crate::workflow::{
     WORKFLOW_NAME, agent_deliver_info, agent_discover_peers_info, agent_loop_info,
@@ -130,6 +131,7 @@ pub fn register(rt: &mut SqliteRuntime, harness: Arc<AgentHarness>) {
 /// Register the strategy run and its policy read (issue #2439).
 fn register_sampling(rt: &mut SqliteRuntime, harness: &Arc<AgentHarness>) {
     rt.register_workflow(&agent_draws_info());
+    rt.register_workflow(&agent_sample_info());
     let h = Arc::clone(harness);
     rt.register_activity_with_body(&agent_sampling_policy_info(), move |input| {
         call(input, |kind: String| {
@@ -148,7 +150,7 @@ fn register_sampling(rt: &mut SqliteRuntime, harness: &Arc<AgentHarness>) {
 }
 
 /// Register the refine and score activities against `harness` (issues
-/// #2379, #2394 and #2441).
+/// #2379, #2394, #2441 and #2443).
 fn register_refine(rt: &mut SqliteRuntime, harness: &Arc<AgentHarness>) {
     let h = Arc::clone(harness);
     rt.register_activity_with_body(&crate::refine::agent_refine_policy_info(), move |input| {
@@ -173,6 +175,18 @@ fn register_refine(rt: &mut SqliteRuntime, harness: &Arc<AgentHarness>) {
                 let pass = Box::new(|| Box::pin(async { Ok(()) }) as BoxFuture<'_, _>);
                 let (verdict, calls) = run_score(&h, request, pass).await;
                 verdict.map(|verdict| (verdict, calls))
+            }
+        })
+    });
+    let h = Arc::clone(harness);
+    rt.register_activity_with_ledger(&agent_sample_score_info(), move |input, _at| {
+        call_with_ledger(input, |request| {
+            let h = Arc::clone(&h);
+            async move {
+                // SQLite has no run budget, so a judge call passes the check.
+                let pass = Box::new(|| Box::pin(async { Ok(()) }) as BoxFuture<'_, _>);
+                let (verdict, calls) = run_score(&h, request, pass).await;
+                verdict.map(|verdict| (SampleScore::new(verdict, &calls), calls))
             }
         })
     });
@@ -277,6 +291,15 @@ pub fn start(rt: &mut SqliteRuntime, task: &AgentTask) -> SqliteResult<Execution
 /// Returns an error when the runtime cannot record the start.
 pub fn start_draws(rt: &mut SqliteRuntime, input: &DrawsInput) -> SqliteResult<ExecutionId> {
     rt.start_workflow(DRAWS_WORKFLOW_NAME, serde_json::to_value(input)?)
+}
+
+/// Start one `agent_sample` run (issue #2443). Returns its execution id.
+///
+/// # Errors
+///
+/// Returns an error when the runtime cannot record the start.
+pub fn start_sample(rt: &mut SqliteRuntime, input: &SampleInput) -> SqliteResult<ExecutionId> {
+    rt.start_workflow(SAMPLE_WORKFLOW_NAME, serde_json::to_value(input)?)
 }
 
 /// Start one heartbeat tick. Returns its execution id.

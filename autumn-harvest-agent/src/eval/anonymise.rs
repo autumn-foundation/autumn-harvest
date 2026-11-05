@@ -28,7 +28,9 @@
 //! as the model of a recorded peer. An identity is a label,
 //! a digest, a route or a model id. Only a whole name is replaced. A name
 //! ends at a character that is not a letter, a digit, `-` or `_`. So a
-//! short route, such as `a`, also replaces that word.
+//! short route, such as `a`, also replaces that word. The same rule redacts
+//! each reject reason of a scorer (issue #2447). Each judge route of a
+//! scorer counts as a route, with the model id behind it.
 //!
 //! # Limits
 //!
@@ -37,6 +39,11 @@
 //! family. A harness setting, such as a policy timeout, can show in a policy
 //! reason. Keep the seed from the reader, because the seed and the digests
 //! give the ids.
+//!
+//! Two candidates with the same scorer and harness share one source verdict
+//! (issue #2447). Only the first of them in pool order holds its tokens. So
+//! the source verdicts and the scorer usage can show which ids share a
+//! scorer or a harness.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{self, Write as _};
@@ -46,9 +53,11 @@ use serde::{Deserialize, Serialize};
 
 use super::anon::{self, AnonId, CandidateKey};
 use super::{
-    Candidate, Divergence, EvalError, Evaluation, Recording, RunEnd, Side, TurnDecision, TurnDiff,
-    Verdict, run_with_routes,
+    Candidate, Divergence, EvalError, Evaluation, Recording, RunEnd, Side, SourceScores,
+    TurnDecision, TurnDiff, Verdict, run_with_routes,
 };
+use crate::message::TokenUsage;
+use crate::score;
 
 /// The text that replaces an identity in a failure text.
 pub const REDACTED: &str = "[redacted]";
@@ -89,6 +98,17 @@ pub struct AnonymisedEvaluation {
     pub stubbed_tool_calls: u32,
     /// `true` when the turn cap stopped the candidate run.
     pub turn_cap_reached: bool,
+    /// The rule of [`Evaluation::recorded_verdict`], with each reject
+    /// reason redacted (issue #2447).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recorded_verdict: Option<score::Verdict>,
+    /// The rule of [`Evaluation::candidate_verdict`], with each reject
+    /// reason redacted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_verdict: Option<score::Verdict>,
+    /// The rule of [`Evaluation::scorer_usage`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scorer_usage: Option<TokenUsage>,
 }
 
 /// The candidates of one source, in pool order, with no identity.
@@ -139,8 +159,9 @@ impl AnonymisedReport {
 ///
 /// Each overlay passes [`overlay::apply`](crate::agent::overlay::apply)
 /// before the first model call. The pool also checks the ids for a
-/// duplicate first. The candidates then run one after the other, in pool
-/// order. An empty slice gives an empty pool.
+/// duplicate first. With a [`Candidate::scorer`], the pool then scores the
+/// source, in pool order (issue #2447). The candidates then run one after the
+/// other, in pool order. An empty slice gives an empty pool.
 ///
 /// # Errors
 ///
@@ -168,10 +189,17 @@ pub async fn compare_anonymised(
         .enumerate()
         .collect();
     jobs.sort_by_key(|(_, (_, (rank, _)))| *rank);
+    // Each source score comes before the first model call. Pool order keeps
+    // the input order out of the usage of each entry.
+    let mut sources = SourceScores::default();
+    let mut scored = Vec::with_capacity(jobs.len());
+    for (_, ((candidate, _), _)) in &jobs {
+        scored.push(sources.of(&recording, candidate).await?);
+    }
     let mut runs = Vec::with_capacity(jobs.len());
     let mut asked = BTreeSet::new();
-    for (index, ((candidate, task), (_, id))) in jobs {
-        let (evaluation, routes) = run_with_routes(&recording, task, candidate).await?;
+    for ((index, ((candidate, task), (_, id))), source) in jobs.into_iter().zip(scored) {
+        let (evaluation, routes) = run_with_routes(&recording, task, candidate, source).await?;
         asked.extend(routes);
         runs.push((index, candidate, id, evaluation));
     }
@@ -253,6 +281,9 @@ fn anonymise(evaluation: Evaluation, id: AnonId, scrub: &Scrub) -> AnonymisedEva
         turn_cap_reached,
         // The identity of the candidate.
         overlay_digest: _,
+        recorded_verdict,
+        candidate_verdict,
+        scorer_usage,
     } = evaluation;
     AnonymisedEvaluation {
         id,
@@ -263,6 +294,22 @@ fn anonymise(evaluation: Evaluation, id: AnonId, scrub: &Scrub) -> AnonymisedEva
         replayed_tool_calls,
         stubbed_tool_calls,
         turn_cap_reached,
+        recorded_verdict: recorded_verdict.map(|verdict| scrub_verdict(verdict, scrub)),
+        candidate_verdict: candidate_verdict.map(|verdict| scrub_verdict(verdict, scrub)),
+        scorer_usage,
+    }
+}
+
+/// `verdict` with each identity of `scrub` replaced in its reject reason.
+/// A judge reason can name a model.
+fn scrub_verdict(verdict: score::Verdict, scrub: &Scrub) -> score::Verdict {
+    match verdict {
+        // Redact the whole reason first, then cut it. A cut then never
+        // splits a name, and a longer reason still fits the cap.
+        score::Verdict::Reject(reason) => {
+            score::Verdict::reject(redact(&reason, &scrub.identities))
+        }
+        verdict @ score::Verdict::Score(_) => verdict,
     }
 }
 
@@ -380,6 +427,12 @@ fn render_entry(out: &mut String, entry: &AnonymisedEvaluation) -> fmt::Result {
     writeln!(out, "- Tool calls replayed: {}", entry.replayed_tool_calls)?;
     writeln!(out, "- Tool calls stubbed: {}", entry.stubbed_tool_calls)?;
     writeln!(out, "- End: {}", end_text(&entry.end))?;
+    if let Some(verdict) = &entry.recorded_verdict {
+        writeln!(out, "- Source verdict: {}", score_text(verdict))?;
+    }
+    if let Some(verdict) = &entry.candidate_verdict {
+        writeln!(out, "- Candidate verdict: {}", score_text(verdict))?;
+    }
     for turn in &entry.turns {
         writeln!(out, "- Turn {}: {}", turn.turn, verdict_text(turn.verdict))?;
         writeln!(out, "  - Source: {}", decision_text(turn.recorded.as_ref()))?;
@@ -412,6 +465,15 @@ fn verdict_text(verdict: Verdict) -> String {
         Divergence::Missing(Side::Candidate) => "the candidate has no such turn",
     };
     format!("diverged ({kind})")
+}
+
+/// One scorer verdict in words. A reason is JSON, so a newline in it cannot
+/// break the layout.
+fn score_text(verdict: &score::Verdict) -> String {
+    match verdict {
+        score::Verdict::Score(value) => format!("score {value}"),
+        score::Verdict::Reject(reason) => format!("reject, reason {}", json(reason)),
+    }
 }
 
 /// One turn decision as compact JSON, or `none`.

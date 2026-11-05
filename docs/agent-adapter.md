@@ -355,7 +355,7 @@ A bound is a normal end, not an error. `AgentReport.stop` names it:
 | `budget_exceeded` | A run or tenant LLM budget refused the next model call. The call was not sent. See [LLM budgets](#llm-budgets-issue-1997). |
 | `loop_detected` | The loop guard saw the same call, with the same result, too many times. |
 | `failed` | The run failed. `AgentReport.error` holds the error. Only a fan-out child ends so, because a parent keeps its usage and labels (issue #2328). |
-| `answer_rejected` | The answer check rejected more answers than its cap allows. `AgentReport.answer_rejections` holds each reason. See [Answer check](#20-answer-check-issue-2442). |
+| `answer_rejected` | The answer check rejected more answers than its cap allows. `AgentReport.answer_rejections` holds each reason. See [Answer check](#21-answer-check-issue-2442). |
 
 A turn that ends the run before its tool calls run is left out of
 `AgentReport.messages`. Its text is not the answer either. A round that ends
@@ -1035,6 +1035,38 @@ let comparison = compare(&history, &first, &second).await?;
 assert_ne!(comparison.first.overlay_digest, comparison.second.overlay_digest);
 ```
 
+### Score a comparison
+
+Divergence is not quality. `Candidate::scorer` adds a `score::Scorer`
+(issues #2441 and #2447). The report then holds a verdict for each run end.
+
+```rust,ignore
+use autumn_harvest_agent::eval::{Candidate, compare};
+use autumn_harvest_agent::score::{ExactMatch, Scorer, Verdict};
+
+let scorer: Arc<dyn Scorer> = Arc::new(ExactMatch::new("42"));
+let harness = Arc::new(AgentHarness::new(fallback).model_named("a", a).model_named("b", b));
+let first = Candidate::shared(Arc::clone(&harness)).model("a").scorer(Arc::clone(&scorer));
+let second = Candidate::shared(harness).model("b").scorer(scorer);
+let comparison = compare(&history, &first, &second).await?;
+// The source answered "41", the first candidate "42", the second "40".
+assert!(comparison.first.recorded_verdict.as_ref().is_some_and(Verdict::is_reject));
+assert_eq!(comparison.first_verdict(), Some(&Verdict::score(1.0)?));
+assert!(comparison.second_verdict().is_some_and(Verdict::is_reject));
+```
+
+| Part | In a scored evaluation |
+|---|---|
+| `recorded_verdict` | The verdict on the source end. The source run had no scorer, so the harness scores the recorded report. It does not read a verdict from history. |
+| `candidate_verdict` | The verdict on the candidate end. |
+| A failed end | No verdict. The scorer never sees it. |
+| `scorer_usage` | The tokens of the judge calls. They are not in the candidate usage. It is zero for a scorer that calls no judge. |
+| A judge | A live call to a model of the candidate harness, through `ScoreContext::chat`, as the candidate model is. The evaluation writes no ledger row. |
+| The order | The harness scores the source before the first candidate model call. So a scorer that fails on the source costs no candidate call. A scorer that fails only on the candidate end fails after the candidate run. |
+| A scorer error | `EvalError::Scorer` with the side: `Recorded` for the source end, `Candidate` for the candidate end. Its `usage` holds the tokens of each judge call before the error. The report of the candidate run is lost. An error is not a reject. `AgentHarness::score_timeout` bounds each score. |
+| `compare` | Each evaluation holds both verdicts. `Comparison::first_verdict` and `second_verdict` give the verdict of each candidate. Two candidates with the same scorer and harness share one source verdict. The first evaluation holds its tokens. |
+| No scorer | Each field is `None`, and the JSON has no new key. |
+
 Each candidate turn is a live model call. `Candidate::max_turns` caps them.
 The default cap is the recorded turn count plus `DEFAULT_EXTRA_TURNS`. The
 report sets `turn_cap_reached` when the cap stops the candidate. Each engine
@@ -1072,13 +1104,14 @@ let chosen = &pool[report.resolve(&pick).ok_or("not in the pool")?.index];
 |---|---|
 | `AnonId` | `eval::anon::assign` gives the ids, as for an evidence bundle. The key of a candidate is `Candidate::digest`. An id is `c-` and a hex prefix of `SHA-256(seed, source run id, Candidate::digest)`. The prefix has at least 12 digits. It grows until no two ids are equal. `formal/verus/src/agent_anonymise.rs` proves the width rule. |
 | The order | The pool lists the ids in order. The input order changes no id and no text. The candidates also run in pool order. |
-| `text` | `AnonymisedPool::render`: the source end, then per id the counts, the end, each turn verdict, and each turn decision as JSON. It holds no model name, overlay digest, label or input index. |
+| `text` | `AnonymisedPool::render`: the source end, then per id the counts, the end, each scorer verdict, each turn verdict, and each turn decision as JSON. It holds no model name, overlay digest, label or input index. |
 | `pool` | The same content as JSON. Each `AnonymisedEvaluation` keeps every field of `Evaluation` except `overlay_digest`. The recorded end is in the pool once. |
 | `key` | Each id with its `CandidateRef`: the input index, the candidate digest, the overlay digest and the label. Keep it from the reader. `AnonymisedReport` does not implement `Serialize`, and its `Debug` form hides the key. |
-| A failure text | Each run end error and report error replaces each label, digest, route and model id of the pool with `[redacted]`. The source end gets the same treatment. Each route that a run asks for counts, with the model id behind it in each harness. So a route that a candidate keeps from the source, such as the model of a recorded peer, counts too. Only a whole name is replaced, so a short route such as `a` also replaces that word. |
+| A failure text | Each run end error, report error and scorer reject reason replaces each label, digest, route and model id of the pool with `[redacted]`. A judge route of a scorer counts as a route. The source end gets the same treatment. Each route that a run asks for counts, with the model id behind it in each harness. So a route that a candidate keeps from the source, such as the model of a recorded peer, counts too. Only a whole name is replaced, so a short route such as `a` also replaces that word. |
 | `Candidate::label` | An operator name, such as an overlay version id. It enters the digest, never the text. |
 | `Candidate::digest` | The SHA-256 of the overlay digest, the label, the routes, the admitted models, the ceilings and the turn cap. It cannot read the harness. |
-| Equal digests | `EvalError::DuplicateCandidate` with both input indices, before any model call. Give each candidate a label. |
+| Equal digests | `EvalError::DuplicateCandidate` with both input indices, before any model call. Give each candidate a label. The scorer is not in the digest, so two candidates that differ only in the scorer need labels too. |
+| Scores | Each entry keeps its verdicts and `scorer_usage`. Each reject reason is redacted. Two candidates with the same scorer and harness share one source verdict, and only the first in pool order holds its tokens. So the scores can show which ids share a scorer or a harness. |
 
 The text renders each model reply as written, so a reply can name its own
 model. The pool keeps the token usage, and a tokenizer can show a model
@@ -1317,7 +1350,7 @@ so a list of the agents due to wake reads only those agents.
 **Profile overlays (issue #2374).** The `profile` commands use the routes
 of the overlay store. Install the store with
 `HarvestPlugin::agent_overlay_store`. Without it, each route is `404`. The
-SQLite plugin does not serve these routes yet (#2471).
+SQLite plugin does not serve these routes yet (epic #2466).
 
 - `list` shows each version with its provenance and created time. The
   active version has `active: true`.
@@ -1505,6 +1538,21 @@ let harness = AgentHarness::new(model)
 The crate ships `InMemoryEpisodeStore`. A durable store implements
 `EpisodeStore` and calls the methods of `EpisodeLog`, so the rules are the
 same in every store.
+
+### Recall eval (issue #2455)
+
+The module `recall` measures what an agent forgets across ops. Each item
+of a fixture states a fact in an early op and asks for it in its last op.
+`recall::sweep` runs each item on its own agent of the config kind, one op
+per session, and scores the last answer with `ExactMatch`. The report has
+one row for each config and item. A failed item reads `error`, and the
+other rows keep their scores.
+
+`recall::profiles` gives four configs: `window`, `notes`, `memory` and
+`episodes`.
+`ReaderModel` answers only from its request, so CI proves that the eval sees
+a loss. The `recall-eval` example runs the eval on Claude. The results are
+in [`performance-agent-recall.md`](performance-agent-recall.md).
 
 ### Workspaces (issue #2274)
 
@@ -1953,7 +2001,7 @@ is the safe value.
 | `draw_effects` | The `ToolEffect`s that a draw may run | `[read_only]` |
 | `scorers` | The scorer ids that the kind may use: `deterministic`, or `{"only": [ids]}` | `deterministic`: each scorer that calls no model |
 | `judge_models` | The models that a judge scorer may call | none |
-| `max_answer_retries` | The cap of the answer check (section 20). 0 to 16. | 0 |
+| `max_answer_retries` | The cap of the answer check (section 21). 0 to 16. | 0 |
 
 An unknown key fails the decode. So an older worker never drops a setting
 that a newer worker recorded. The run of that older worker fails closed,
@@ -2020,9 +2068,7 @@ wider effects than a single run of its kind.
   id `n`, so N draws are N samples, not one cached answer.
 
 `agent_draws` returns each draw report. An engine failure of a draw fails
-the run. The score (section 17) and the selection (#2443) build on it.
-The request says whether a scorer is a judge. A `Scorer` does not say it,
-so #2443 must check the model of each judge call against `judge_models`.
+the run. `agent_sample` (section 20) scores the draws and selects one.
 
 ### Upgrade every worker first
 
@@ -2041,7 +2087,91 @@ policy.
 
 The design is in [`DESIGN-2439.md`](design/DESIGN-2439.md).
 
-## 20. Answer check (issue #2442)
+## 20. Best-of-N and rejection sampling (issue #2443)
+
+`agent_sample` runs a task many times, scores each draw and keeps the
+best. Each draw is a child `agent_loop` run with the run id `{root}:s{n}`.
+History records the end of each draw and each verdict. So a crash costs
+only the draws in flight, and replay never calls a scorer again.
+
+```rust
+use autumn_harvest_agent::ExactMatch;
+use autumn_harvest_agent::sampling::{SampleInput, SampleStrategy, ScorerRef};
+
+// The policy of `researcher` must list `best_of_n`, with `max_draws >= 3`.
+
+let input = SampleInput::new(
+    "researcher",
+    "Name a prime.",
+    SampleStrategy::best_of_n(3),
+    ScorerRef::deterministic(ExactMatch::ID).unwrap(),
+)
+.max_total_tokens(20_000);
+// SQLite: autumn_harvest_agent::sqlite::start_sample(&mut rt, &input)
+```
+
+| Strategy | What it does |
+|---|---|
+| `best_of_n { n }` | Runs `n` draws, scores each, and selects with `select` (section 17). A tie goes to the lowest draw id. |
+| `rejection { max_attempts, threshold }` | Runs draws until one scores at or above `threshold`, up to `max_attempts` draws. It runs one draw at a time unless the input asks for more. It stops after the wave that holds the pass. |
+
+The run reads the profile and the sampling policy of the kind once each,
+as `agent_draws` does (section 19). The policy admits the strategy, the
+draw count (`n` or `max_attempts`), the concurrency and the scorer. Each
+draw gets `draw_effects`, so with the default `[read_only]` a draw that
+calls a `write` tool gets a refusal, and the tool body never runs.
+
+### The budget
+
+The draws share one token budget: the `max_total_tokens` of the profile,
+narrowed by the `max_total_tokens` of the input. The run starts each wave
+with the tokens that are left. `sample_step` keeps a wave no wider than
+the tokens left, and draw `i` gets the cap `sibling_cap(left, width, i)`.
+The spend of each draw and of its judge calls counts.
+
+The run starts no more draws when no token is left, when a draw ends
+`budget_exceeded`, or when the LLM budget refuses a judge call. It then
+selects among the draws that it has, and sets `stopped` to
+`budget_exceeded`. The loop checks a token cap between model calls. So
+each draw of the last wave can pass its share by one call.
+
+A failed score does not fail the run. The draw gets a reject that names
+the error, the run starts no more draws, and `stopped` is
+`score_failed`.
+
+### Scores and judges
+
+The `agent_sample_score` activity scores each draw. It is `agent_score`,
+but it also returns the tokens and the cost of the judge calls. A draw
+that failed, or that a budget stopped, gets a reject and no score call.
+The run cuts each tool result of a score input to 16 KiB.
+
+A judge call may name only the judge model of the input `ScorerRef`,
+which the policy admitted. So the scorer must name that model, and `None`
+fails. A call to any other model fails with `ErrorKind::Config`, and the
+model is not called.
+
+### The report
+
+`SampleReport` holds:
+
+- `outcome`: `selected { draw }`, or `no_accepted_draw` when no draw
+  passed;
+- `selected`: the `AgentReport` of the selected draw;
+- `stopped`: `completed`, `accepted` (a rejection run found a pass),
+  `budget_exceeded` or `score_failed`;
+- `attempts`: the draws that ran;
+- `draws`: for each draw, its stop, verdict, usage and cost. The usage and
+  the cost include the judge calls of the draw;
+- `usage` and `cost_usd_micros`: the totals. They equal the cost ledger
+  rows of the run tree.
+
+Each `ModelTurn` carries the cost that the ledger recorded for it, and
+`AgentReport::cost_usd_micros` sums it, as `usage` sums the tokens.
+
+The design is in [`DESIGN-2443.md`](design/DESIGN-2443.md).
+
+## 21. Answer check (issue #2442)
 
 An `AnswerCheck` scores each final answer of a run in the same run. A bad
 answer does not need a second run, so the run does not pay for its
@@ -2117,10 +2247,10 @@ A judge call goes to the cost ledger and the LLM budget (section 17).
 `max_total_tokens` and `AgentReport.usage` do not count judge tokens. A
 judge call that the LLM budget refuses ends the run as `budget_exceeded`.
 
-The admitted judge model is in each score request. `ScoreContext::chat`
-refuses a call to any other model. With no judge model, it refuses each
-call. The score then fails as `JudgeNotAllowed`, also when the scorer
-handles the error.
+A judge call may name only the judge model of the `ScorerRef`, which the
+policy admitted, as in section 20. So the scorer must name that model, and
+`None` fails. With no judge model, each judge call fails. A failed call
+returns `ErrorKind::Config`, and the model is not called.
 
 ### What the report and the delivery hold
 

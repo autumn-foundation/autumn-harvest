@@ -22,7 +22,7 @@ use crate::harness::AgentHarness;
 use crate::mesh::valid_name;
 use crate::message::{ChatMessage, ChatRole};
 use crate::sampling::{Refusal, ScorerRef, admit_answer_check, retry_after_reject};
-use crate::score::{JudgeLimit, ScoreInput, ScoreRequest, Verdict, agent_score_info, tool_records};
+use crate::score::{ScoreInput, ScoreRequest, Verdict, agent_score_info, tool_records};
 use crate::types::{AgentStop, AgentTask};
 use crate::workflow::Progress;
 
@@ -70,12 +70,10 @@ impl AnswerCheck {
         self
     }
 
-    /// The judge calls that a score of this check may make.
-    fn judge_limit(&self) -> JudgeLimit {
-        self.scorer
-            .judge_model
-            .clone()
-            .map_or(JudgeLimit::NoCall, JudgeLimit::Model)
+    /// The judge models that a score of this check may call: the judge
+    /// model of the scorer, or none.
+    fn admitted_judges(&self) -> Vec<String> {
+        self.scorer.judge_model.iter().cloned().collect()
     }
 }
 
@@ -192,8 +190,8 @@ pub async fn agent_answer_check(
 pub(crate) struct ActiveCheck {
     /// The scorer id.
     scorer: String,
-    /// The judge calls of each score.
-    judge: JudgeLimit,
+    /// The judge models that each score may call.
+    judges: Vec<String>,
     /// The retry cap of the run.
     cap: u32,
 }
@@ -224,7 +222,7 @@ pub(crate) async fn admit(
     match admission {
         CheckAdmission::Admitted { cap, .. } => Ok(Some(ActiveCheck {
             scorer: check.scorer.id.as_str().to_owned(),
-            judge: check.judge_limit(),
+            judges: check.admitted_judges(),
             cap,
         })),
         CheckAdmission::Refused { refusal } => Err(refusal.error_text()),
@@ -298,7 +296,8 @@ fn score_request(
 ) -> Option<ScoreRequest> {
     let mut input = ScoreInput::new(task.input.clone(), answer, AgentStop::Completed);
     input.tools = tool_records(&progress.messages);
-    let mut request = ScoreRequest::new(active.scorer.clone(), input).judge(active.judge.clone());
+    let mut request =
+        ScoreRequest::new(active.scorer.clone(), input).admitted_judges(active.judges.clone());
     let cap = task.request_cap();
     let fits = |request: &ScoreRequest| cap == 0 || json_len(request) <= cap;
     if !fits(&request) {
@@ -339,23 +338,11 @@ mod tests {
     }
 
     #[test]
-    fn a_deterministic_check_allows_no_judge_call() {
+    fn a_check_admits_only_the_judge_model_of_its_scorer() {
         let exact = AnswerCheck::new("k", ScorerRef::deterministic("s").unwrap());
-        assert_eq!(exact.judge_limit(), JudgeLimit::NoCall);
+        assert_eq!(exact.admitted_judges(), Vec::<String>::new());
         let judge = AnswerCheck::new("k", ScorerRef::judge("j", "big").unwrap());
-        assert_eq!(judge.judge_limit(), JudgeLimit::Model("big".to_owned()));
-    }
-
-    #[test]
-    fn a_judge_limit_allows_only_its_model() {
-        let cheap = JudgeLimit::Model("cheap".to_owned());
-        assert!(cheap.allows(Some("cheap")));
-        assert!(!cheap.allows(Some("big")));
-        assert!(!cheap.allows(None), "the default model is another model");
-        let default = JudgeLimit::Model(crate::DEFAULT_MODEL.to_owned());
-        assert!(default.allows(None), "None is the default model");
-        assert!(default.allows(Some(crate::DEFAULT_MODEL)));
-        assert!(!JudgeLimit::NoCall.allows(None));
+        assert_eq!(judge.admitted_judges(), ["big"]);
     }
 
     #[test]

@@ -831,3 +831,9 @@ harness = false
 [[bench]]
 name = "schema_contract_diff_profile"
 harness = false
+
+# Deterministic instruction/allocation harness for `schedule_plan::next_fire_after`
+# over a catch-up walk. Drive it under `valgrind --tool=callgrind` / `--tool=dhat`.
+[[bench]]
+name = "schedule_slot_walk_profile"
+harness = false

@@ -140,6 +140,9 @@ pub open spec fn spec_wave_end(draws: int, concurrency: int, start: int) -> int 
 pub fn wave_end(draws: u32, concurrency: u32, start: u32) -> (r: u32) ensures r == spec_wave_end(draws as int, concurrency as int, start as int), start < draws ==> start < r <= draws, start < draws && concurrency > 0 ==> r - start <= concurrency, start < draws && concurrency == 0 ==> r == start + 1, start >= draws ==> r == draws,
 pub open spec fn covered(draws: int, concurrency: int, start: int) -> int decreases draws - start, { if start >= draws || start < 0 { 0 } else { let end = spec_wave_end(draws, concurrency, start); if end <= start { 0 } else { (end - start) + covered(draws, concurrency, end) } } }
 pub proof fn theorem_the_waves_cover_each_draw_once(draws: int, concurrency: int, start: int) requires 0 <= start <= draws, concurrency >= 0, ensures covered(draws, concurrency, start) == draws - start, decreases draws - start,
+pub enum SampleStep { Wave { width: u32 }, Done, BudgetExceeded, }
+pub fn sample_step(draws: u32, started: u32, concurrency: u32, budgeted: bool, tokens_left: u32) -> (r: SampleStep) ensures r is Done <==> started >= draws, r is BudgetExceeded <==> (started < draws && budgeted && tokens_left == 0), r is Wave ==> 1 <= r -> Wave_width, r is Wave ==> started + r -> Wave_width <= draws, r is Wave && concurrency > 0 ==> r -> Wave_width <= concurrency, r is Wave && concurrency == 0 ==> r -> Wave_width == 1, r is Wave && budgeted ==> r -> Wave_width <= tokens_left,
+pub proof fn theorem_each_draw_of_a_wave_gets_a_token(left: int, width: int, index: int) requires 1 <= width <= left, ensures crate::agent_siblings::share(left, width, index) >= 1, crate::agent_siblings::total(left, width, width) == left,
 pub open spec fn spec_next_policy_revision(current: u64) -> Option < u64 > { if current < u64::MAX { Some((current + 1) as u64) } else { None } }
 pub fn next_policy_revision(current: u64) -> (r: Option < u64 >) ensures r == spec_next_policy_revision(current), r.is_some() ==> r.unwrap() == current + 1, r.is_some() ==> r.unwrap() >= 1, r.is_none() ==> current == u64::MAX,
 pub fn answer_retry_cap(policy_max: u32, asked: u32) -> (r: Option < u32 >) ensures r.is_some() ==> r.unwrap() == asked, r.is_some() ==> asked <= policy_max && asked <= MAX_ANSWER_RETRIES, r.is_none() ==> asked > policy_max || asked > MAX_ANSWER_RETRIES,
@@ -323,6 +326,26 @@ pub proof fn theorem_a_batch_is_one_acquisition_per_locked_row(epochs: Seq < int
 pub proof fn theorem_a_batch_fences_only_its_locked_rows(epochs: Seq < int >, locked: Set < int >, p: int, holder_matches: bool,) requires 0 <= p < epochs.len(), ensures locked.contains(p) ==>! (holder_matches && epochs [p] == batch(epochs, locked) [p]), ! locked.contains(p) ==> epochs [p] == batch(epochs, locked) [p],
 pub open spec fn skip_locked(wanted: Set < int >, takeable: Set < int >, busy: Set < int >) -> Set < int > { wanted.intersect(takeable).difference(busy) }
 pub proof fn theorem_a_batch_keeps_each_epoch_under_a_commit(epochs: Seq < int >, wanted: Set < int >, takeable: Set < int >, busy: Set < int >, p: int, pinned: int, holder_matches: bool,) requires 0 <= p < epochs.len(), ensures busy.contains(p) ==> batch(epochs, skip_locked(wanted, takeable, busy)) [p] == epochs [p], busy.contains(p) && holder_matches && pinned == epochs [p] ==> (holder_matches && pinned == batch(epochs, skip_locked(wanted, takeable, busy)) [p]), batch(epochs, skip_locked(wanted, takeable, busy)) [p] != epochs [p] ==> (wanted.contains(p) && takeable.contains(p) &&! busy.contains(p)),
+
+## formal/verus/src/process_role.rs
+pub enum ProcessRole { Combined, Web, Worker, }
+impl Clone for ProcessRole {
+fn clone(& self) -> (r: Self) ensures r ==* self,
+}
+impl Copy for ProcessRole {
+}
+pub open spec fn spec_role_default(role: Option < ProcessRole >) -> bool { match role { Some(ProcessRole::Web) => false, _ => true, } }
+pub open spec fn spec_switch_value(explicit: Option < bool >, default: bool) -> bool { match explicit { Some(value) => value, None => default, } }
+pub open spec fn spec_contradicts(explicit: Option < bool >, role: Option < ProcessRole >) -> bool { match explicit { Some(value) => role.is_some() && value != spec_role_default(role), None => false, } }
+pub fn role_default(role: Option < ProcessRole >) -> (r: bool) ensures r == spec_role_default(role),
+pub fn switch_value(explicit: Option < bool >, default: bool) -> (r: bool) ensures r == spec_switch_value(explicit, default),
+pub fn contradicts_role(explicit: Option < bool >, role: Option < ProcessRole >) -> (r: bool) ensures r == spec_contradicts(explicit, role),
+pub fn resolve_switch(explicit: Option < bool >, role: Option < ProcessRole >) -> (r: (bool, bool)) ensures r.0 == spec_switch_value(explicit, spec_role_default(role)), r.1 == spec_contradicts(explicit, role),
+pub proof fn theorem_a_web_role_runs_nothing_by_default() ensures ! spec_switch_value(None, spec_role_default(Some(ProcessRole::Web))),
+pub proof fn theorem_a_worker_or_combined_role_runs_both_by_default(role: ProcessRole) requires role != ProcessRole::Web, ensures spec_switch_value(None, spec_role_default(Some(role))),
+pub proof fn theorem_no_role_keeps_the_old_default() ensures spec_switch_value(None, spec_role_default(None)),
+pub proof fn theorem_an_explicit_value_wins(value: bool, role: Option < ProcessRole >) ensures spec_switch_value(Some(value), spec_role_default(role)) == value,
+pub proof fn theorem_a_warning_marks_each_override(explicit: Option < bool >, role: Option < ProcessRole >,) ensures role.is_some() ==> (spec_contradicts(explicit, role) <==> spec_switch_value(explicit, spec_role_default(role),) != spec_role_default(role)), role.is_none() ==>! spec_contradicts(explicit, role),
 
 ## formal/verus/src/refine_policy.rs
 pub enum AdoptDecision { Adopt, Unchanged, NeedsApproval, CapReached, }

@@ -4,6 +4,7 @@ use autumn_harvest_plugin::api::{HarvestApiState, StandaloneAdminAuth, harvest_a
 use autumn_harvest_plugin::harvest_ui_router;
 use autumn_harvest_plugin::metrics_scrape::HarvestMetricsRecorder;
 use autumn_harvest_plugin::prelude::HarvestMode;
+use autumn_harvest_plugin::process_role::SwitchSource;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::json;
@@ -19,9 +20,20 @@ fn runtime_config_uses_external_runner_mode_without_outbox() {
     let config = standalone_runtime_config("postgres://runner:runner@localhost/runner".to_owned());
 
     assert_eq!(config.mode, HarvestMode::External);
-    assert!(config.worker_enabled);
-    assert!(config.scheduler_enabled);
     assert!(!config.outbox.enabled);
+}
+
+/// The runner gives `HarvestRunner::start` no app state, so it has no Autumn
+/// role. Both switches keep their old default, `true` (issue #2477).
+#[test]
+fn runtime_config_keeps_the_worker_and_scheduler_with_no_role() {
+    let config = standalone_runtime_config("postgres://runner:runner@localhost/runner".to_owned());
+    let switches = config.process_switches(None);
+
+    assert!(switches.worker.enabled);
+    assert!(switches.scheduler.enabled);
+    assert_eq!(switches.worker.source, SwitchSource::Default);
+    assert_eq!(switches.scheduler.source, SwitchSource::Default);
 }
 
 #[test]

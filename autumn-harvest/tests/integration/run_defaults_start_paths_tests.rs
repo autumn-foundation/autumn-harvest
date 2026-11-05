@@ -179,6 +179,7 @@ async fn an_inline_target_start_takes_the_overrides() {
             execution_timeout: Some(3 * HOUR),
             sla: Some(30 * MINUTE),
             chain_execution_timeout: Some(4 * HOUR),
+            concurrency_limit: None,
         }),
         (None, None),
     )
@@ -219,6 +220,7 @@ async fn the_fleet_ceilings_cap_an_inline_target_start() {
             execution_timeout: Some(10 * HOUR),
             sla: None,
             chain_execution_timeout: Some(20 * HOUR),
+            concurrency_limit: None,
         }),
         (Some(HOUR), Some(2 * HOUR)),
     )
@@ -251,6 +253,7 @@ async fn the_outbox_sweep_start_takes_the_overrides_and_the_ceiling() {
             execution_timeout: Some(3 * HOUR),
             sla: None,
             chain_execution_timeout: Some(20 * HOUR),
+            concurrency_limit: None,
         }),
         (None, Some(5 * HOUR)),
     )
@@ -371,6 +374,7 @@ async fn update_with_start_takes_the_overrides() {
             execution_timeout: Some(3 * HOUR),
             sla: Some(10 * MINUTE),
             chain_execution_timeout: Some(4 * HOUR),
+            concurrency_limit: None,
         },
     );
     let row = run_uws(&url, &client_with(&url, cache, None)).await;

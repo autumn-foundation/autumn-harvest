@@ -18,8 +18,9 @@ again, within a cap.
   under the new stop `AgentStop::AnswerRejected` (`answer_rejected`).
   `AgentReport::answer_rejections` holds each reason. The delivery sends
   only the notice of that stop.
-- `ScoreRequest::judge` holds a `JudgeLimit`. `ScoreContext::chat` refuses
-  a judge model outside it, and the score fails as `JudgeNotAllowed`.
+- Each score request admits only the judge model of the check, through
+  `ScoreRequest::admitted_judges` (#2443). `ScoreContext::chat` refuses
+  any other model before the call.
 - A retry counts against `max_total_tokens` and the LLM budgets. A judge
   call that the budget refuses ends the run as `budget_exceeded`.
 - `sampling::answer_retry_cap` and `sampling::retry_after_reject` hold the

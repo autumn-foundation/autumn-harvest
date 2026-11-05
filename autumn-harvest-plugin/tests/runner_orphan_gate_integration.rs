@@ -330,8 +330,8 @@ async fn insert_claimable_task(database_url: &str, exec_id: ExecutionId) -> uuid
 
 fn runtime_config(action: OrphanStartupAction, worker_enabled: bool) -> HarvestRuntimeConfig {
     HarvestRuntimeConfig {
-        worker_enabled,
-        scheduler_enabled: false,
+        worker_enabled: Some(worker_enabled),
+        scheduler_enabled: Some(false),
         startup: HarvestStartupConfig {
             orphaned_workflows: action,
         },

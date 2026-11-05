@@ -42,6 +42,39 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # Compiler cache: kache (kunobi-ninja/kache-action) replaces
+  # Swatinem/rust-cache in every job that builds the root workspace.
+  # kache caches each rustc invocation by content, workspace crates and test
+  # binaries included, so an untouched crate is a cache hit on an empty target.
+  # Four jobs keep rust-cache: kani, fuzz-smoke and both harvest-verify jobs.
+  # They cache files that are not rustc outputs (MIR, `cargo install`, `fuzz/`).
+  # The action installs kache into the runner tool cache. A job that frees
+  # disk with `rm -rf "$AGENT_TOOLSDIRECTORY"` must run that step first.
+  #
+  # Backend: an S3 bucket, when the repository has `KACHE_S3_BUCKET` (as a
+  # variable or a secret) and the `KACHE_S3_ACCESS_KEY_ID` secret. The same
+  # goes for `KACHE_S3_REGION` and `KACHE_S3_ENDPOINT`. kache writes to it only
+  # from a push to a protected branch, so trunk-dev must have a ruleset. Pull
+  # requests read what trunk-dev published, so every PR shares one store.
+  # Each entry is written on its own, so the store follows trunk-dev.
+  # `manifest-key` names each job and leg, so prefetch stays per workload.
+  # `docs/rnd/2026-11-04-kache-compile-cache.md` lists the setup.
+  #
+  # No fallback: without the bucket, a job builds from an empty local store
+  # and saves nothing. The GitHub Actions cache is off (`github-cache: false`).
+  # One run saved 0.4 to 0.5 GB per job leg there, over 35 legs. That passed
+  # the repository quota, so GitHub evicted the oldest kache stores in the
+  # same run, and the rust-cache entries of other branches.
+  #
+  # rust-cache used to set CARGO_INCREMENTAL=0 itself. kache does not, and an
+  # incremental build gives path crates another codegen-units value, so the
+  # cache keys would differ between jobs and runs.
+  CARGO_INCREMENTAL: 0
+  # kache turns off free-space recovery in CI by default. The store reflinks
+  # each output, and it keeps the blocks after cargo replaces that file.
+  # A macOS no-db shard grew its store to 48 GiB of a 96 GiB disk, and cargo
+  # then hit a disk I/O error. Below this floor, kache evicts store entries.
+  KACHE_AUTO_RECOVER_MIN_FREE_BYTES: 20GiB
 
 jobs:
   # Detects whether any non-docs file changed, so the build/test jobs below can
@@ -162,7 +195,18 @@ jobs:
         with:
           toolchain: stable
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
+        with:
+          version: v2.0.0
+          github-cache: false
+          cache-executables: true
+          pr-comment: false
+          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && (vars.KACHE_S3_BUCKET || secrets.KACHE_S3_BUCKET) || '' }}
+          s3-region: ${{ vars.KACHE_S3_REGION || secrets.KACHE_S3_REGION }}
+          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT || secrets.KACHE_S3_ENDPOINT }}
+          s3-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY_ID }}
+          s3-secret-access-key: ${{ secrets.KACHE_S3_SECRET_ACCESS_KEY }}
+          manifest-key: ${{ github.job }}-${{ strategy.job-index }}
       - name: Check default-run for multi-binary packages
         # Guards the defect class that silently broke `cargo run -p
         # quickstart` and `cargo run -p autumn-harvest-cli -- ...` (the
@@ -817,7 +861,26 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      # kache executable caching broke uplifted binaries on macOS:
+      # `target/debug/harvest` and a build-script copy failed with "cannot
+      # execute binary file". Test binaries in `deps/` ran. The CLI caches
+      # executables by default on macOS, so this turns it off before the
+      # action can start the daemon.
+      - name: Turn off kache executable caching (macOS)
+        if: runner.os == 'macOS'
+        run: echo "KACHE_CACHE_EXECUTABLES=0" >> "$GITHUB_ENV"
+      - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
+        with:
+          version: v2.0.0
+          github-cache: false
+          cache-executables: ${{ runner.os != 'macOS' }}
+          pr-comment: false
+          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && (vars.KACHE_S3_BUCKET || secrets.KACHE_S3_BUCKET) || '' }}
+          s3-region: ${{ vars.KACHE_S3_REGION || secrets.KACHE_S3_REGION }}
+          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT || secrets.KACHE_S3_ENDPOINT }}
+          s3-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY_ID }}
+          s3-secret-access-key: ${{ secrets.KACHE_S3_SECRET_ACCESS_KEY }}
+          manifest-key: ${{ github.job }}-${{ strategy.job-index }}
       - name: Run no-db tests
         if: needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest --no-default-features
@@ -875,10 +938,19 @@ jobs:
   #     manifest rows. See run-suites.sh's header comment for why a filtered,
   #     already-sorted row list still batches correctly.
   #   * The ~30 individual steps carried over from `test` have no such
-  #     mechanism (each is its own crate/example, not a manifest row), so they
-  #     are round-robin assigned to one shard each via `matrix.shard == N` --
-  #     by COUNT, not by measured per-step time (no such measurement exists for
-  #     macOS/Windows), so the four shards are approximately, not exactly, even.
+  #     mechanism (each is its own crate/example, not a manifest row). Each
+  #     one runs on one shard, through `matrix.shard == N`.
+  #     The assignment balances the measured step times of trunk-dev run
+  #     41757040952 and PR run 41909196917 on all three OSes. Windows weighs
+  #     most, because it was the long pole at 110 minutes.
+  #     The manifest steps above set a different base load on each shard, so
+  #     balance the totals, not the step counts.
+  #     Shard 0 also runs `Compile db-backed tests`. That step and the
+  #     manifest compile vary by 5-12 minutes between runs, so keep shard 0
+  #     lighter than the others.
+  #     Two steps share a shard on purpose. `Run all-features lib tests` runs
+  #     on shard 0 after `Compile db-backed tests`, which builds the same lib
+  #     test binary. On another shard, it builds that binary again.
   #
   # A SEPARATE job, not a matrix dimension added to `test`, for the same reason
   # `test-db-linux` is one: `test`'s three legs are branch-protection required
@@ -914,13 +986,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-        with:
-          # Shared across a given OS's 4 shards (they build the same
-          # Cargo.lock), so a shard needing a binary another shard already
-          # built doesn't start cold -- same reasoning as `test-db-linux`'s
-          # `shared-key`, but per-OS since these three OSes don't share a cache.
-          shared-key: test-nodb-${{ matrix.os }}
       # Same disk-pressure guard as the pre-split `test` job carried
       # immediately before this step; every shard on Linux gets its own runner,
       # so it's cheap (a few seconds) to run per shard rather than build a
@@ -932,6 +997,26 @@ jobs:
             /usr/local/share/boost /usr/lib/jvm "$AGENT_TOOLSDIRECTORY" || true
           sudo docker image prune --all --force > /dev/null 2>&1 || true
           df -h /
+      # kache executable caching broke uplifted binaries on macOS:
+      # `target/debug/harvest` and a build-script copy failed with "cannot
+      # execute binary file". Test binaries in `deps/` ran. The CLI caches
+      # executables by default on macOS, so this turns it off before the
+      # action can start the daemon.
+      - name: Turn off kache executable caching (macOS)
+        if: runner.os == 'macOS'
+        run: echo "KACHE_CACHE_EXECUTABLES=0" >> "$GITHUB_ENV"
+      - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
+        with:
+          version: v2.0.0
+          github-cache: false
+          cache-executables: ${{ runner.os != 'macOS' }}
+          pr-comment: false
+          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && (vars.KACHE_S3_BUCKET || secrets.KACHE_S3_BUCKET) || '' }}
+          s3-region: ${{ vars.KACHE_S3_REGION || secrets.KACHE_S3_REGION }}
+          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT || secrets.KACHE_S3_ENDPOINT }}
+          s3-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY_ID }}
+          s3-secret-access-key: ${{ secrets.KACHE_S3_SECRET_ACCESS_KEY }}
+          manifest-key: ${{ github.job }}-${{ strategy.job-index }}
       # ── Manifest-driven, self-sharded (every shard runs both, each on its
       # own slice of the matching rows) ───────────────────────────────────
       - name: Compile plugin integration test suites (manifest, all OSes)
@@ -953,8 +1038,8 @@ jobs:
           SEMAPHORE_SHARD_COUNT: "4"
           SEMAPHORE_SHARD_INDEX: ${{ matrix.shard }}
         run: bash .github/ci/run-suites.sh run allos
-      # ── Individual crate/example steps carried over from `test`, round-robin
-      # assigned one shard each (see the job comment above) ─────────────────
+      # ── Individual crate/example steps carried over from `test`, one shard
+      # each, balanced by measured time (see the job comment above) ─────────
       # The lib test target needs about 8 GB to compile, and `integration`
       # needs about 11 GB. One `--tests` build compiles both at the same time.
       # That fills the 16 GB runner, and the runner shuts down (issue #2259).
@@ -1011,11 +1096,15 @@ jobs:
       # here is that the bench still compiles, not that it runs. No
       # `--features`: `autumn-harvest-plugin` unconditionally depends on
       # `autumn-harvest` with `db`/`testing` already enabled.
+      # One shard is enough for a compile check. With no shard condition, all
+      # four Linux shards built it, at about 11 minutes each.
       - name: Compile diagnose benchmark (issue #1194)
-        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
+        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true' && matrix.shard == 3
         run: cargo bench -p autumn-harvest-plugin --bench diagnose_bench --no-run
+      # Shard 0, after `Compile db-backed tests`: that step already built this
+      # lib test binary, so this step only runs it.
       - name: Run all-features lib tests
-        if: needs.changes.outputs.code == 'true' && matrix.shard == 3
+        if: needs.changes.outputs.code == 'true' && matrix.shard == 0
         run: cargo test -p autumn-harvest --all-features --lib
       - name: Run plugin lib tests
         if: needs.changes.outputs.code == 'true' && matrix.shard == 0
@@ -1023,9 +1112,32 @@ jobs:
       - name: Run plugin lib tests (webhooks feature, issue #618 outbound-delegate gating)
         if: needs.changes.outputs.code == 'true' && matrix.shard == 1
         run: cargo test -p autumn-harvest-plugin --features webhooks --lib
-      - name: Run plugin connector tests (issue #944)
-        if: needs.changes.outputs.code == 'true' && matrix.shard == 2
-        run: cargo test -p autumn-harvest-plugin --features connectors --lib connector
+      # Five feature-gated lib suites, each picked by a name filter, in one
+      # build. One step per feature rebuilt the plugin crate five times. Each
+      # rebuild took 3-5 minutes on Windows and ran seconds of tests.
+      # The features are additive, and no test that a filter selects is gated
+      # off by another feature in the list. So the one build runs every test
+      # that the five steps ran.
+      # - `connector` (issue #944): the connector unit tests. The doc example
+      #   check in `scripts/check-broker-connector-cutover-example.sh` relies
+      #   on this filter.
+      # - `aws_kms` (issue #1825): the AWS KMS binding of the AEAD codec key
+      #   provider, against a local fake KMS endpoint. It needs no AWS account.
+      # - `object_store` (issue #1983): the S3 and GCS adapters, against an
+      #   in-memory backend and a local fake GCS server. They need no cloud
+      #   account and no Docker.
+      # - `vault_transit` (issue #1981): the Vault Transit binding runs the
+      #   KMS conformance suite of AWS, against a local fake Vault server.
+      # - `oidc` (issue #1978): the OIDC unit tests and the `api_with_oidc`
+      #   builder test compile only with the feature. The MCP tool gate test
+      #   also needs `mcp`. The round-trip suite runs from the manifest
+      #   (`oidc_login`).
+      - name: Run plugin feature lib tests (connectors, KMS, object store, OIDC; issues 944, 1825, 1983, 1981, 1978)
+        if: needs.changes.outputs.code == 'true' && matrix.shard == 1
+        run: >-
+          cargo test -p autumn-harvest-plugin
+          --features connectors,aws-kms,s3,gcs,vault-transit,oidc,mcp,unified-dag-execution
+          --lib -- connector aws_kms object_store vault_transit oidc
       # Issue #1287 review: the manifest's `dev_runtime_tests` row (features
       # `dev-runtime`) and `dev_runtime_managed` row (`compileonly`, so
       # `--no-run` only) never exercise this crate's `--lib` target, so the
@@ -1045,27 +1157,6 @@ jobs:
       - name: Run plugin lib tests (redis feature, issue #1312)
         if: needs.changes.outputs.code == 'true' && matrix.shard == 3
         run: cargo test -p autumn-harvest-plugin --features redis --lib
-      # Issue #1825. The AWS KMS binding for the AEAD codec key provider runs
-      # against a local fake KMS endpoint, so it needs no AWS account.
-      - name: Run plugin lib tests (aws-kms feature, issue #1825)
-        if: needs.changes.outputs.code == 'true' && matrix.shard == 3
-        run: cargo test -p autumn-harvest-plugin --features aws-kms --lib aws_kms
-      # Issue #1983. The adapter unit tests use an in-memory backend and a
-      # local fake GCS server, so they need no cloud account and no Docker.
-      - name: Run plugin lib tests (s3 and gcs features, issue #1983)
-        if: needs.changes.outputs.code == 'true' && matrix.shard == 1
-        run: cargo test -p autumn-harvest-plugin --features s3,gcs --lib object_store
-      # Issue #1981. The Vault Transit binding runs the same KMS conformance
-      # suite as AWS, against a local fake Vault server.
-      - name: Run plugin lib tests (vault-transit feature, issue #1981)
-        if: needs.changes.outputs.code == 'true' && matrix.shard == 3
-        run: cargo test -p autumn-harvest-plugin --features vault-transit --lib vault_transit
-      # Issue #1978. The OIDC unit tests and the `api_with_oidc` builder test
-      # compile only with the feature. The MCP tool gate test also needs
-      # `mcp`. The round-trip suite runs from the manifest (`oidc_login`).
-      - name: Run plugin lib tests (oidc and mcp features, issue #1978)
-        if: needs.changes.outputs.code == 'true' && matrix.shard == 2
-        run: cargo test -p autumn-harvest-plugin --features oidc,mcp,unified-dag-execution --lib oidc
       # No CI step ran the plugin's doctests, so a broken `///` example landed
       # silently (issue #944 review found exactly that). These are compile-only
       # (`no_run`), so they cost seconds and need no database.
@@ -1078,8 +1169,10 @@ jobs:
       - name: Run plugin metrics scrape tests (issue #355)
         if: needs.changes.outputs.code == 'true' && matrix.shard == 1
         run: cargo test -p autumn-harvest-plugin --features metrics --lib --test metrics_scrape_http_tests
+      # Shard 1, beside the metrics scrape tests: both build the plugin with
+      # `metrics`, so the example reuses most of that build.
       - name: Compile plugin metrics scrape example
-        if: needs.changes.outputs.code == 'true' && matrix.shard == 2
+        if: needs.changes.outputs.code == 'true' && matrix.shard == 1
         run: cargo build -p autumn-harvest-plugin --example metrics_scrape_quickstart --features metrics
       # `aws-sdk-sqs` is pure Rust, so the SQS example builds on every OS.
       - name: Compile plugin SQS connector example (issue #944)
@@ -1089,7 +1182,7 @@ jobs:
       # (see tests/connector_example_budget.rs), so it must keep compiling.
       # Linux-only for the same librdkafka reason as the broker suite.
       - name: Compile plugin Kafka connector example (issue #944, Linux)
-        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true' && matrix.shard == 0
+        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true' && matrix.shard == 2
         run: |
           (sudo apt-get update || echo "::warning::apt-get update failed for a mirror; installing from the lists it fetched") && sudo apt-get install -y libcurl4-openssl-dev
           cargo build -p autumn-harvest-plugin --example kafka_connector_quickstart --features kafka
@@ -1097,7 +1190,7 @@ jobs:
         if: needs.changes.outputs.code == 'true' && matrix.shard == 1
         run: cargo test -p autumn-harvest-macros
       - name: Run CLI tests (issue #753)
-        if: needs.changes.outputs.code == 'true' && matrix.shard == 2
+        if: needs.changes.outputs.code == 'true' && matrix.shard == 1
         run: cargo test -p autumn-harvest-cli
       - name: Run autumn-harvest-sqlite tests (issue #1068)
         if: needs.changes.outputs.code == 'true' && matrix.shard == 3
@@ -1144,7 +1237,7 @@ jobs:
       # none of which touch the crates' own assertions. None need a live
       # database, so they run here rather than on `test-db-linux`.
       - name: Run saga-choreography example tests
-        if: needs.changes.outputs.code == 'true' && matrix.shard == 0
+        if: needs.changes.outputs.code == 'true' && matrix.shard == 1
         run: cargo test -p saga-choreography
       - name: Run billing-autumn-web example tests
         if: needs.changes.outputs.code == 'true' && matrix.shard == 1
@@ -1164,6 +1257,11 @@ jobs:
       - name: "Run agent-loop-hit-rate example tests (issue #2007)"
         if: needs.changes.outputs.code == 'true' && matrix.shard == 2
         run: cargo test -p agent-loop-hit-rate --bins
+      # Issue #2455. `--bins` runs the scripted sweep. A real-model run costs
+      # money and runs by hand (see the crate README).
+      - name: "Run recall-eval example tests (issue #2455)"
+        if: needs.changes.outputs.code == 'true' && matrix.shard == 2
+        run: cargo test -p recall-eval --bins
       # Issue #2257. The unit tests and the SQLite tests run offline. The
       # Postgres target runs from its `linux` manifest row, and the
       # measurement runs by hand (see the crate README).
@@ -1277,7 +1375,7 @@ jobs:
       # which drags in wasmtime — a multi-minute build not worth paying on three
       # legs, and the macOS/Windows legs never build core examples at all.
       - name: Run wasm_activity example (issue #965)
-        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true' && matrix.shard == 0
+        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true' && matrix.shard == 1
         run: cargo run -p autumn-harvest --features wasm-activities --example wasm_activity
       # Issue #794: the schema-contract gate, end to end. Generates the
       # currently-published schemas from the example registry, then diffs them
@@ -1359,11 +1457,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-        with:
-          # Its own key. The archive builds without debug info, so it shares
-          # no artifact with the jobs that build with it.
-          shared-key: test-db-archive
       - name: Free runner disk before heavy plugin link (Linux)
         if: needs.changes.outputs.code == 'true'
         run: |
@@ -1371,6 +1464,18 @@ jobs:
             /usr/local/share/boost /usr/lib/jvm "$AGENT_TOOLSDIRECTORY" || true
           sudo docker image prune --all --force > /dev/null 2>&1 || true
           df -h /
+      - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
+        with:
+          version: v2.0.0
+          github-cache: false
+          cache-executables: true
+          pr-comment: false
+          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && (vars.KACHE_S3_BUCKET || secrets.KACHE_S3_BUCKET) || '' }}
+          s3-region: ${{ vars.KACHE_S3_REGION || secrets.KACHE_S3_REGION }}
+          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT || secrets.KACHE_S3_ENDPOINT }}
+          s3-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY_ID }}
+          s3-secret-access-key: ${{ secrets.KACHE_S3_SECRET_ACCESS_KEY }}
+          manifest-key: ${{ github.job }}-${{ strategy.job-index }}
       # The shards install the same version. The archive format is internal
       # to nextest, so the two ends must agree.
       - uses: taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68 # v2.88.1
@@ -1712,7 +1817,18 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
+        with:
+          version: v2.0.0
+          github-cache: false
+          cache-executables: true
+          pr-comment: false
+          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && (vars.KACHE_S3_BUCKET || secrets.KACHE_S3_BUCKET) || '' }}
+          s3-region: ${{ vars.KACHE_S3_REGION || secrets.KACHE_S3_REGION }}
+          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT || secrets.KACHE_S3_ENDPOINT }}
+          s3-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY_ID }}
+          s3-secret-access-key: ${{ secrets.KACHE_S3_SECRET_ACCESS_KEY }}
+          manifest-key: ${{ github.job }}-${{ strategy.job-index }}
       - name: Build quickstart
         run: cargo build -p quickstart
       - name: Run the exact README quickstart command and assert a workflow reaches COMPLETED
@@ -1869,7 +1985,18 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
+        with:
+          version: v2.0.0
+          github-cache: false
+          cache-executables: true
+          pr-comment: false
+          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && (vars.KACHE_S3_BUCKET || secrets.KACHE_S3_BUCKET) || '' }}
+          s3-region: ${{ vars.KACHE_S3_REGION || secrets.KACHE_S3_REGION }}
+          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT || secrets.KACHE_S3_ENDPOINT }}
+          s3-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY_ID }}
+          s3-secret-access-key: ${{ secrets.KACHE_S3_SECRET_ACCESS_KEY }}
+          manifest-key: ${{ github.job }}-${{ strategy.job-index }}
       # One package per command. The chapter runs each with `cargo run -p`,
       # and a joint build resolves other features, so it would not be reused.
       - name: Build the chapter's crate and the CLI
@@ -1920,7 +2047,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       # Two trees build here, so free the disk as the `test` job does.
       - name: Free runner disk before two builds
         run: |
@@ -1928,6 +2054,18 @@ jobs:
             /usr/local/share/boost /usr/lib/jvm "$AGENT_TOOLSDIRECTORY" || true
           sudo docker image prune --all --force > /dev/null 2>&1 || true
           df -h /
+      - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
+        with:
+          version: v2.0.0
+          github-cache: false
+          cache-executables: true
+          pr-comment: false
+          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && (vars.KACHE_S3_BUCKET || secrets.KACHE_S3_BUCKET) || '' }}
+          s3-region: ${{ vars.KACHE_S3_REGION || secrets.KACHE_S3_REGION }}
+          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT || secrets.KACHE_S3_ENDPOINT }}
+          s3-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY_ID }}
+          s3-secret-access-key: ${{ secrets.KACHE_S3_SECRET_ACCESS_KEY }}
+          manifest-key: ${{ github.job }}-${{ strategy.job-index }}
       # See docs/upgrading/README.md, "How CI proves the contract".
       - name: Run the previous release and this tree on one database
         env:
@@ -1969,7 +2107,18 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
+        with:
+          version: v2.0.0
+          github-cache: false
+          cache-executables: true
+          pr-comment: false
+          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && (vars.KACHE_S3_BUCKET || secrets.KACHE_S3_BUCKET) || '' }}
+          s3-region: ${{ vars.KACHE_S3_REGION || secrets.KACHE_S3_REGION }}
+          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT || secrets.KACHE_S3_ENDPOINT }}
+          s3-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY_ID }}
+          s3-secret-access-key: ${{ secrets.KACHE_S3_SECRET_ACCESS_KEY }}
+          manifest-key: ${{ github.job }}-${{ strategy.job-index }}
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "22"
@@ -2078,7 +2227,18 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
+        with:
+          version: v2.0.0
+          github-cache: false
+          cache-executables: true
+          pr-comment: false
+          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && (vars.KACHE_S3_BUCKET || secrets.KACHE_S3_BUCKET) || '' }}
+          s3-region: ${{ vars.KACHE_S3_REGION || secrets.KACHE_S3_REGION }}
+          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT || secrets.KACHE_S3_ENDPOINT }}
+          s3-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY_ID }}
+          s3-secret-access-key: ${{ secrets.KACHE_S3_SECRET_ACCESS_KEY }}
+          manifest-key: ${{ github.job }}-${{ strategy.job-index }}
       - name: Scaffold a project with `harvest new`
         run: cargo run -p autumn-harvest-cli --bin harvest -- new demo_app --path "${RUNNER_TEMP}/scaffold"
       - name: Build the scaffolded project against the release candidates
@@ -2159,11 +2319,18 @@ jobs:
         with:
           toolchain: stable
           components: clippy
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
         with:
-          # A red step still leaves a useful dependency cache. Without this,
-          # one failure throws away the whole cold build.
-          cache-on-failure: true
+          version: v2.0.0
+          github-cache: false
+          cache-executables: true
+          pr-comment: false
+          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && (vars.KACHE_S3_BUCKET || secrets.KACHE_S3_BUCKET) || '' }}
+          s3-region: ${{ vars.KACHE_S3_REGION || secrets.KACHE_S3_REGION }}
+          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT || secrets.KACHE_S3_ENDPOINT }}
+          s3-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY_ID }}
+          s3-secret-access-key: ${{ secrets.KACHE_S3_SECRET_ACCESS_KEY }}
+          manifest-key: ${{ github.job }}-${{ strategy.job-index }}
       - name: Clippy autumn-harvest
         run: cargo clippy -p autumn-harvest --all-features --tests -- -D warnings
       # The deterministic profiles of the 0.8.0 fork, owner and entity paths.
@@ -2189,11 +2356,18 @@ jobs:
         with:
           toolchain: stable
           components: clippy
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
         with:
-          # A red step still leaves a useful dependency cache. Without this,
-          # one failure throws away the whole cold build.
-          cache-on-failure: true
+          version: v2.0.0
+          github-cache: false
+          cache-executables: true
+          pr-comment: false
+          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && (vars.KACHE_S3_BUCKET || secrets.KACHE_S3_BUCKET) || '' }}
+          s3-region: ${{ vars.KACHE_S3_REGION || secrets.KACHE_S3_REGION }}
+          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT || secrets.KACHE_S3_ENDPOINT }}
+          s3-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY_ID }}
+          s3-secret-access-key: ${{ secrets.KACHE_S3_SECRET_ACCESS_KEY }}
+          manifest-key: ${{ github.job }}-${{ strategy.job-index }}
       - name: Clippy autumn-harvest-plugin
         run: cargo clippy -p autumn-harvest-plugin --all-targets -- -D warnings
       - name: Clippy autumn-harvest-plugin (mcp feature)
@@ -2221,11 +2395,18 @@ jobs:
         with:
           toolchain: stable
           components: clippy
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
         with:
-          # A red step still leaves a useful dependency cache. Without this,
-          # one failure throws away the whole cold build.
-          cache-on-failure: true
+          version: v2.0.0
+          github-cache: false
+          cache-executables: true
+          pr-comment: false
+          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && (vars.KACHE_S3_BUCKET || secrets.KACHE_S3_BUCKET) || '' }}
+          s3-region: ${{ vars.KACHE_S3_REGION || secrets.KACHE_S3_REGION }}
+          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT || secrets.KACHE_S3_ENDPOINT }}
+          s3-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY_ID }}
+          s3-secret-access-key: ${{ secrets.KACHE_S3_SECRET_ACCESS_KEY }}
+          manifest-key: ${{ github.job }}-${{ strategy.job-index }}
       # issue #525. Both tiers are linted: `dev-runtime-managed` compiles the
       # archive-download path, which `dev-runtime` alone `cfg`s out entirely.
       - name: Clippy autumn-harvest-plugin (dev-runtime feature)
@@ -2259,11 +2440,18 @@ jobs:
         with:
           toolchain: stable
           components: clippy
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
         with:
-          # A red step still leaves a useful dependency cache. Without this,
-          # one failure throws away the whole cold build.
-          cache-on-failure: true
+          version: v2.0.0
+          github-cache: false
+          cache-executables: true
+          pr-comment: false
+          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && (vars.KACHE_S3_BUCKET || secrets.KACHE_S3_BUCKET) || '' }}
+          s3-region: ${{ vars.KACHE_S3_REGION || secrets.KACHE_S3_REGION }}
+          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT || secrets.KACHE_S3_ENDPOINT }}
+          s3-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY_ID }}
+          s3-secret-access-key: ${{ secrets.KACHE_S3_SECRET_ACCESS_KEY }}
+          manifest-key: ${{ github.job }}-${{ strategy.job-index }}
       - name: Clippy autumn-harvest-plugin (sqs feature)
         run: cargo clippy -p autumn-harvest-plugin --all-targets --features sqs -- -D warnings
       - name: Clippy autumn-harvest-plugin (aws-kms feature, issue #1825)
@@ -2291,29 +2479,41 @@ jobs:
         with:
           toolchain: stable
           components: clippy
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
         with:
-          cache-on-failure: true
+          version: v2.0.0
+          github-cache: false
+          cache-executables: true
+          pr-comment: false
+          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && (vars.KACHE_S3_BUCKET || secrets.KACHE_S3_BUCKET) || '' }}
+          s3-region: ${{ vars.KACHE_S3_REGION || secrets.KACHE_S3_REGION }}
+          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT || secrets.KACHE_S3_ENDPOINT }}
+          s3-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY_ID }}
+          s3-secret-access-key: ${{ secrets.KACHE_S3_SECRET_ACCESS_KEY }}
+          manifest-key: ${{ github.job }}-${{ strategy.job-index }}
       # The `sqlite` feature flips `autumn-web` to SQLite for the whole build.
       # The Postgres test binaries of this crate need a Postgres app pool, so
       # the lane builds the library and the SQLite suite only. No Postgres and
       # no Docker run here.
       #
       # `oidc` is on so the suite also runs the shared OIDC checks on a
-      # SQLite app (issue #2469). Each step uses the same features, so the
-      # lane builds the crate once.
+      # SQLite app (issue #2469). `mcp`, `webhooks` and `connectors` are on
+      # so the suite runs the MCP, webhook and connector checks (issue
+      # #2471). Each step uses the same features, so the lane builds the
+      # crate once.
       - name: Clippy autumn-harvest-plugin (sqlite feature)
-        run: cargo clippy -p autumn-harvest-plugin --features sqlite,oidc --lib --test sqlite_plugin --test sqlite_plugin_fleet --test sqlite_plugin_split -- -D warnings
-      # The same targets with no `oidc`, for the code that `oidc` turns off.
-      - name: Clippy autumn-harvest-plugin (sqlite feature, no oidc)
+        run: cargo clippy -p autumn-harvest-plugin --features sqlite,oidc,mcp,webhooks,connectors --lib --test sqlite_plugin --test sqlite_plugin_fleet --test sqlite_plugin_split -- -D warnings
+      # The same targets with no `oidc` and no trigger features, for the
+      # code that those features turn off.
+      - name: Clippy autumn-harvest-plugin (sqlite feature only)
         run: cargo clippy -p autumn-harvest-plugin --features sqlite --lib --test sqlite_plugin -- -D warnings
       - name: SQLite plugin unit tests
-        run: "cargo test -p autumn-harvest-plugin --features sqlite,oidc --lib -- sqlite:: sqlite_split_tests state::tests"
+        run: "cargo test -p autumn-harvest-plugin --features sqlite,oidc,mcp,webhooks,connectors --lib -- sqlite:: sqlite_split_tests state::tests"
       - name: SQLite plugin end-to-end suite
-        run: cargo test -p autumn-harvest-plugin --features sqlite,oidc --test sqlite_plugin
+        run: cargo test -p autumn-harvest-plugin --features sqlite,oidc,mcp,webhooks,connectors --test sqlite_plugin
       # Per-tenant Harvest in a SQLite fleet (issue #2472). No Docker.
       - name: SQLite plugin fleet suite
-        run: cargo test -p autumn-harvest-plugin --features sqlite,oidc --test sqlite_plugin_fleet
+        run: cargo test -p autumn-harvest-plugin --features sqlite,oidc,mcp,webhooks,connectors --test sqlite_plugin_fleet
 
   sqlite-plugin-split:
     name: SQLite HarvestPlugin, split mode (issue #2472)
@@ -2329,9 +2529,18 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
         with:
-          cache-on-failure: true
+          version: v2.0.0
+          github-cache: false
+          cache-executables: true
+          pr-comment: false
+          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && (vars.KACHE_S3_BUCKET || secrets.KACHE_S3_BUCKET) || '' }}
+          s3-region: ${{ vars.KACHE_S3_REGION || secrets.KACHE_S3_REGION }}
+          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT || secrets.KACHE_S3_ENDPOINT }}
+          s3-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY_ID }}
+          s3-secret-access-key: ${{ secrets.KACHE_S3_SECRET_ACCESS_KEY }}
+          manifest-key: ${{ github.job }}-${{ strategy.job-index }}
       # `testcontainers` retries no pull, so a registry blip would fail the
       # suite. The script retries it.
       - name: Pre-pull the Postgres image
@@ -2353,11 +2562,18 @@ jobs:
         with:
           toolchain: stable
           components: clippy
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
         with:
-          # A red step still leaves a useful dependency cache. Without this,
-          # one failure throws away the whole cold build.
-          cache-on-failure: true
+          version: v2.0.0
+          github-cache: false
+          cache-executables: true
+          pr-comment: false
+          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && (vars.KACHE_S3_BUCKET || secrets.KACHE_S3_BUCKET) || '' }}
+          s3-region: ${{ vars.KACHE_S3_REGION || secrets.KACHE_S3_REGION }}
+          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT || secrets.KACHE_S3_ENDPOINT }}
+          s3-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY_ID }}
+          s3-secret-access-key: ${{ secrets.KACHE_S3_SECRET_ACCESS_KEY }}
+          manifest-key: ${{ github.job }}-${{ strategy.job-index }}
       - name: Clippy autumn-harvest-macros
         run: cargo clippy -p autumn-harvest-macros -- -D warnings
       - name: Clippy autumn-harvest-cli
@@ -2421,9 +2637,18 @@ jobs:
         with:
           toolchain: stable
           components: clippy
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
         with:
-          cache-on-failure: true
+          version: v2.0.0
+          github-cache: false
+          cache-executables: true
+          pr-comment: false
+          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && (vars.KACHE_S3_BUCKET || secrets.KACHE_S3_BUCKET) || '' }}
+          s3-region: ${{ vars.KACHE_S3_REGION || secrets.KACHE_S3_REGION }}
+          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT || secrets.KACHE_S3_ENDPOINT }}
+          s3-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY_ID }}
+          s3-secret-access-key: ${{ secrets.KACHE_S3_SECRET_ACCESS_KEY }}
+          manifest-key: ${{ github.job }}-${{ strategy.job-index }}
       - name: Clippy --workspace (same command as release.yml validate)
         run: cargo clippy --workspace --all-targets -- -D warnings
 
@@ -2439,11 +2664,18 @@ jobs:
         with:
           toolchain: stable
           components: clippy
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
         with:
-          # A red step still leaves a useful dependency cache. Without this,
-          # one failure throws away the whole cold build.
-          cache-on-failure: true
+          version: v2.0.0
+          github-cache: false
+          cache-executables: true
+          pr-comment: false
+          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && (vars.KACHE_S3_BUCKET || secrets.KACHE_S3_BUCKET) || '' }}
+          s3-region: ${{ vars.KACHE_S3_REGION || secrets.KACHE_S3_REGION }}
+          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT || secrets.KACHE_S3_ENDPOINT }}
+          s3-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY_ID }}
+          s3-secret-access-key: ${{ secrets.KACHE_S3_SECRET_ACCESS_KEY }}
+          manifest-key: ${{ github.job }}-${{ strategy.job-index }}
       # Same issue #962 rule as every other crate on this page: a workspace
       # member gets NO clippy coverage without its own step, and these three
       # standalone example crates (each its own `examples/*/Cargo.toml`
@@ -2477,6 +2709,10 @@ jobs:
       # daemon above: it uses `autumn-harvest` with no default features.
       - name: Clippy autoresearch example
         run: cargo clippy -p autoresearch --all-targets --no-deps -- -D warnings
+      # The recall eval (issue #2455). `--no-deps` for the same reason as
+      # autoresearch, which it depends on.
+      - name: "Clippy recall-eval example (issue #2455)"
+        run: cargo clippy -p recall-eval --all-targets --no-deps -- -D warnings
       # The agent-mesh capstone (issue #2276). `--no-deps` for the same
       # reason as the autoresearch step.
       - name: "Clippy agent-mesh example (issue #2276)"
@@ -2497,11 +2733,18 @@ jobs:
         with:
           toolchain: stable
           components: rustfmt
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
         with:
-          # A red step still leaves a useful dependency cache. Without this,
-          # one failure throws away the whole cold build.
-          cache-on-failure: true
+          version: v2.0.0
+          github-cache: false
+          cache-executables: true
+          pr-comment: false
+          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && (vars.KACHE_S3_BUCKET || secrets.KACHE_S3_BUCKET) || '' }}
+          s3-region: ${{ vars.KACHE_S3_REGION || secrets.KACHE_S3_REGION }}
+          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT || secrets.KACHE_S3_ENDPOINT }}
+          s3-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY_ID }}
+          s3-secret-access-key: ${{ secrets.KACHE_S3_SECRET_ACCESS_KEY }}
+          manifest-key: ${{ github.job }}-${{ strategy.job-index }}
       - name: Check signals chapter's clean await_condition example
         # Guards two real, reproduced-live compile failures an Onramp
         # clean-room pass found in chapter 4's "Clean Declarative
@@ -2674,7 +2917,18 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: "1.97.0"
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
+        with:
+          version: v2.0.0
+          github-cache: false
+          cache-executables: true
+          pr-comment: false
+          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && (vars.KACHE_S3_BUCKET || secrets.KACHE_S3_BUCKET) || '' }}
+          s3-region: ${{ vars.KACHE_S3_REGION || secrets.KACHE_S3_REGION }}
+          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT || secrets.KACHE_S3_ENDPOINT }}
+          s3-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY_ID }}
+          s3-secret-access-key: ${{ secrets.KACHE_S3_SECRET_ACCESS_KEY }}
+          manifest-key: ${{ github.job }}-${{ strategy.job-index }}
       - name: Check MSRV compiles
         run: cargo check --workspace
       # `cargo check --workspace` builds default features only, so the
@@ -2719,7 +2973,18 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
+        with:
+          version: v2.0.0
+          github-cache: false
+          cache-executables: true
+          pr-comment: false
+          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && (vars.KACHE_S3_BUCKET || secrets.KACHE_S3_BUCKET) || '' }}
+          s3-region: ${{ vars.KACHE_S3_REGION || secrets.KACHE_S3_REGION }}
+          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT || secrets.KACHE_S3_ENDPOINT }}
+          s3-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY_ID }}
+          s3-secret-access-key: ${{ secrets.KACHE_S3_SECRET_ACCESS_KEY }}
+          manifest-key: ${{ github.job }}-${{ strategy.job-index }}
       - name: Run loom models
         run: cargo test -p autumn-harvest --no-default-features --test loom_models --release
 
@@ -2741,7 +3006,18 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
+        with:
+          version: v2.0.0
+          github-cache: false
+          cache-executables: true
+          pr-comment: false
+          s3-bucket: ${{ secrets.KACHE_S3_ACCESS_KEY_ID != '' && (vars.KACHE_S3_BUCKET || secrets.KACHE_S3_BUCKET) || '' }}
+          s3-region: ${{ vars.KACHE_S3_REGION || secrets.KACHE_S3_REGION }}
+          s3-endpoint: ${{ vars.KACHE_S3_ENDPOINT || secrets.KACHE_S3_ENDPOINT }}
+          s3-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY_ID }}
+          s3-secret-access-key: ${{ secrets.KACHE_S3_SECRET_ACCESS_KEY }}
+          manifest-key: ${{ github.job }}-${{ strategy.job-index }}
       - name: Run Shuttle models (random and PCT schedulers)
         run: cargo test -p autumn-harvest --no-default-features --test shuttle_models --release
 

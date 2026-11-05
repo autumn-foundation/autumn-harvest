@@ -155,8 +155,9 @@ async fn worker(url: String) -> Result<(), BoxError> {
     let pool = Pool::builder(manager).max_size(8).build()?;
     let config = HarvestRuntimeConfig {
         mode: HarvestMode::External,
-        worker_enabled: true,
-        scheduler_enabled: true,
+        // The switches stay at their default. That is `true` before issue
+        // #2477 and "no role, so `true`" after it, so one source builds on
+        // both trees.
         database: HarvestDatabaseConfig { url: Some(url) },
         outbox: HarvestOutboxConfig {
             enabled: false,

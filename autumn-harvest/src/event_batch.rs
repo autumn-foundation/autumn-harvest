@@ -366,7 +366,11 @@ pub async fn admit_batched_start_with_codecs(
                         chain_execution_timeout,
                         max_workflow_chain_timeout_ceiling,
                         concurrency_key: opts.concurrency_key,
-                        concurrency_limit: opts.concurrency_limit,
+                        // Issue #2407: the limit of the type when the start fires.
+                        concurrency_limit: crate::completion_trigger::fire_time_concurrency_limit(
+                            &row.workflow_name,
+                            opts.concurrency_limit,
+                        ),
                         concurrency_on_conflict: opts.concurrency_on_conflict.unwrap_or_default(),
                         priority,
                         max_workflow_input_bytes: opts.max_workflow_input_bytes.unwrap_or(u64::MAX),
@@ -770,7 +774,11 @@ async fn fire_claimed_batch_row(
         chain_execution_timeout,
         max_workflow_chain_timeout_ceiling,
         concurrency_key: opts.concurrency_key,
-        concurrency_limit: opts.concurrency_limit,
+        // Issue #2407: the limit of the type when the start fires.
+        concurrency_limit: crate::completion_trigger::fire_time_concurrency_limit(
+            &workflow_name,
+            opts.concurrency_limit,
+        ),
         concurrency_on_conflict: opts.concurrency_on_conflict.unwrap_or_default(),
         priority,
         max_workflow_input_bytes: opts.max_workflow_input_bytes.unwrap_or(u64::MAX),

@@ -93,8 +93,8 @@ fn builder() -> HarvestBuilder {
 fn config(database_url: &str) -> HarvestRuntimeConfig {
     HarvestRuntimeConfig {
         mode: HarvestMode::External,
-        worker_enabled: true,
-        scheduler_enabled: false,
+        worker_enabled: Some(true),
+        scheduler_enabled: Some(false),
         database: HarvestDatabaseConfig {
             url: Some(database_url.to_owned()),
         },
@@ -705,7 +705,7 @@ fn two_shard_resources(shard0: &str, shard1: &str) -> HarvestRunnerResources {
 
 fn api_only(database_url: &str) -> HarvestRuntimeConfig {
     HarvestRuntimeConfig {
-        worker_enabled: false,
+        worker_enabled: Some(false),
         ..config(database_url)
     }
 }

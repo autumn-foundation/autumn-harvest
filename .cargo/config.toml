@@ -28,3 +28,8 @@ dev = [
     "--bin", "harvest-dev",
     "--",
 ]
+
+# Workspace automation. Every CI gate, doc guard and perf evidence generator
+# runs through it, for example `cargo xtask audit comment-hygiene`.
+# `cargo xtask --help` lists the groups, and `docs/xtask.md` lists each command.
+xtask = ["run", "--quiet", "--package", "xtask", "--"]

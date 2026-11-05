@@ -17,9 +17,10 @@
 # `cutover-example-end` markers in
 # `cutover_example_from_getting_started_ch13_type_checks`, an ordinary test
 # in autumn-harvest-plugin/src/connector/binding.rs. That test is compiled
-# and run by CI's `connector` lib-test job (`cargo test -p
-# autumn-harvest-plugin --features connectors --lib connector`), so a real
-# compile enforces the example's correctness. This script's only job is to
+# and run by CI's plugin feature lib-test step, whose `connector` filter
+# selects it (`cargo test -p autumn-harvest-plugin --features
+# connectors,... --lib -- connector ...`), so a real compile enforces the
+# example's correctness. This script's only job is to
 # catch the doc and the compiled copy drifting apart.
 #
 # Usage: ./scripts/check-broker-connector-cutover-example.sh

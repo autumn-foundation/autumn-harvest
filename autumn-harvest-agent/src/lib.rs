@@ -15,9 +15,10 @@
 //! [`ResponseCache`] serves an identical model call across runs. The
 //! [`draw`] module gives each sample of a run its own identity, so the cache
 //! keeps the samples apart. The [`episode`] log records each op, and
-//! [`consolidate`] turns the episodes into facts (issue #2454). The `eval`
-//! feature adds the `eval` module. That
-//! module re-drives a recorded run with a candidate model or prompt. The
+//! [`consolidate`] turns the episodes into facts (issue #2454). The
+//! [`recall`] module measures what an agent forgets across ops (issue
+//! #2455). The `eval` feature adds the `eval` module. That module re-drives
+//! a recorded run with a candidate model or prompt. The
 //! `sandbox` feature adds the `sandbox` module. Its `SandboxTool` runs agent
 //! code in a sandbox.
 //!
@@ -30,7 +31,8 @@
 //!
 //! The [`sampling`] module holds the operator sampling policy of each kind
 //! (issue #2439). [`sampling::agent_draws`] reads it once, then runs the
-//! draws of a strategy.
+//! draws of a strategy. [`sampling::agent_sample`] also scores the draws
+//! and selects one (issue #2443).
 //!
 //! The [`mesh`] module lets a run delegate a task to a [`Peer`]. A
 //! [`Mandate`] bounds the delegation tree. The [`flow`] module gates a
@@ -111,6 +113,7 @@ pub mod model;
 pub mod policy;
 #[cfg(feature = "postgres")]
 pub mod postgres;
+pub mod recall;
 pub mod refine;
 pub mod response_cache;
 pub mod sampling;
@@ -199,9 +202,9 @@ pub use response_cache::{
     CacheIndex, CacheKey, CacheScope, InMemoryCacheIndex, KeyTenant, ResponseCache,
 };
 pub use score::{
-    ExactMatch, FiniteF64, JsonSchema, JudgeLimit, MAX_REJECT_REASON_BYTES, NonFinite,
-    ScoreContext, ScoreInput, ScoreRequest, Scorer, ToolRecord, Verdict, agent_score,
-    agent_score_info, select,
+    ExactMatch, FiniteF64, JsonSchema, MAX_REJECT_REASON_BYTES, NonFinite, SampleScore,
+    ScoreContext, ScoreInput, ScoreRequest, Scorer, ToolRecord, Verdict, agent_sample_score,
+    agent_sample_score_info, agent_score, agent_score_info, select,
 };
 pub use skill::{LOAD_SKILL_TOOL, SkillText};
 pub use tool::{FnTool, Tool, ToolContext, ToolEffect};

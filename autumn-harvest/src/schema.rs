@@ -461,6 +461,7 @@ diesel::table! {
         created_at -> Timestamptz,
         updated_at -> Timestamptz,
         chain_execution_timeout_secs -> Nullable<Int8>,
+        concurrency_limit -> Nullable<Int4>,
     }
 }
 

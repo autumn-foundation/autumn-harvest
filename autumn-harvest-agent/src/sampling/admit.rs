@@ -280,6 +280,49 @@ pub fn admit_answer_check(policy: &SamplingPolicy, check: &AnswerCheck) -> Resul
     Ok(cap)
 }
 
+/// The next step of a sample run (issue #2443). See [`sample_step`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SampleStep {
+    /// Start the next `width` draws at the same time.
+    Wave {
+        /// The draws of the wave.
+        width: u32,
+    },
+    /// Each planned draw started.
+    Done,
+    /// Draws are left, but the token budget is spent.
+    BudgetExceeded,
+}
+
+/// The next step of a sample run that started `started` of `draws` draws.
+///
+/// `budgeted` says whether the run has a token budget, and `tokens_left`
+/// holds the rest of it. A wave holds at most `concurrency` draws, the
+/// draws left and the tokens left. So each draw of a wave gets a share of
+/// at least 1 token from `sibling_cap`. A `concurrency` of 0 counts as 1.
+///
+/// `formal/verus/src/agent_sampling.rs` proves it.
+#[must_use]
+pub const fn sample_step(
+    draws: u32,
+    started: u32,
+    concurrency: u32,
+    budgeted: bool,
+    tokens_left: u32,
+) -> SampleStep {
+    if started >= draws {
+        return SampleStep::Done;
+    }
+    if budgeted && tokens_left == 0 {
+        return SampleStep::BudgetExceeded;
+    }
+    let mut width = wave_end(draws, concurrency, started) - started;
+    if budgeted && width > tokens_left {
+        width = tokens_left;
+    }
+    SampleStep::Wave { width }
+}
+
 /// Compare `ask` with `policy`.
 ///
 /// The checks go in order: the strategy, the draw count, the concurrency,
@@ -548,6 +591,55 @@ mod tests {
             text,
             "sampling refused (too_many_answer_retries): the run asks for 4 answer retries; the policy allows 3"
         );
+    }
+
+    #[test]
+    fn a_sample_step_of_four_draws_and_ten_tokens() {
+        assert_eq!(
+            sample_step(4, 0, 2, true, 10),
+            SampleStep::Wave { width: 2 }
+        );
+        assert_eq!(sample_step(4, 2, 2, true, 1), SampleStep::Wave { width: 1 });
+        assert_eq!(sample_step(4, 2, 2, true, 0), SampleStep::BudgetExceeded);
+        assert_eq!(sample_step(4, 4, 2, true, 0), SampleStep::Done);
+        assert_eq!(
+            sample_step(4, 3, 2, false, 0),
+            SampleStep::Wave { width: 1 }
+        );
+        assert_eq!(
+            sample_step(4, 0, 0, false, 0),
+            SampleStep::Wave { width: 1 }
+        );
+    }
+
+    proptest! {
+        #[test]
+        fn a_sample_step_never_passes_a_bound(
+            draws in 0_u32..=40,
+            started in 0_u32..=44,
+            concurrency in 0_u32..=20,
+            budgeted: bool,
+            tokens_left in 0_u32..=50,
+        ) {
+            match sample_step(draws, started, concurrency, budgeted, tokens_left) {
+                SampleStep::Done => prop_assert!(started >= draws),
+                SampleStep::BudgetExceeded => {
+                    prop_assert!(started < draws && budgeted && tokens_left == 0);
+                }
+                SampleStep::Wave { width } => {
+                    prop_assert!(width >= 1);
+                    prop_assert!(started + width <= draws);
+                    prop_assert!(width <= concurrency.max(1));
+                    if budgeted {
+                        prop_assert!(width <= tokens_left);
+                        // Each draw of the wave gets at least 1 token.
+                        for index in 0..width {
+                            prop_assert!(crate::bounds::sibling_cap(tokens_left, width, index) >= 1);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     proptest! {

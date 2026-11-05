@@ -430,6 +430,7 @@ fn sim_turn(content: Vec<ContentPart>, stop: StopReason) -> ModelTurn {
         .map(|_| ToolDecision::Allow)
         .collect();
     ModelTurn {
+        cost_usd_micros: None,
         content,
         stop,
         usage: TokenUsage::new(1, 1),
@@ -448,6 +449,7 @@ fn child_report(input: &Value) -> Value {
     let mut labels = BTreeSet::new();
     labels.insert(task.input.replace(' ', "_"));
     json!(AgentReport {
+        cost_usd_micros: 0,
         stop: AgentStop::Completed,
         text: format!("done: {}", task.input),
         steps_used: 1,

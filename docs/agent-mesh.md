@@ -189,7 +189,8 @@ order each ended:
 | `usage` | Tokens of the child and of every agent under it |
 | `steps_used`, `tool_calls` | The rounds and calls of the child and of every agent under it |
 
-`AgentReport::usage`, `steps_used` and `tool_calls` cover the whole tree.
+`AgentReport::usage`, `cost_usd_micros`, `steps_used` and `tool_calls`
+cover the whole tree.
 Each agent still has its own step bound, so a child round never counts
 against the `max_steps` of its parent.
 

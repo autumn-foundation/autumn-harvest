@@ -1154,6 +1154,39 @@ impl HandlerRegistry {
         self.run_defaults.apply_chain(workflow_name, declared)
     }
 
+    /// The effective concurrency policy of a registered workflow type
+    /// (issue #2407).
+    ///
+    /// An operator override of the limit wins over the declared limit. The
+    /// key and `on_conflict` stay as declared. A start path that holds the
+    /// registry resolves its policy here, or through
+    /// [`Self::apply_concurrency_run_default`]. The call reads memory only.
+    #[must_use]
+    pub fn concurrency_policy(
+        &self,
+        workflow_name: &str,
+    ) -> Option<crate::concurrency::ConcurrencyPolicy> {
+        self.apply_concurrency_run_default(
+            workflow_name,
+            self.workflows
+                .get(workflow_name)
+                .and_then(|info| info.concurrency),
+        )
+    }
+
+    /// Apply the concurrency limit override to a declared policy
+    /// (issue #2407).
+    ///
+    /// A start path that already holds the declared policy calls this.
+    #[must_use]
+    pub fn apply_concurrency_run_default(
+        &self,
+        workflow_name: &str,
+        declared: Option<crate::concurrency::ConcurrencyPolicy>,
+    ) -> Option<crate::concurrency::ConcurrencyPolicy> {
+        self.run_defaults.apply_concurrency(workflow_name, declared)
+    }
+
     /// Attach the large-payload offloader (issue #524).
     #[must_use]
     pub fn with_payload_offloader(
@@ -1966,6 +1999,56 @@ mod resolve_dispatch_deadline_tests {
             .run_defaults()
             .write_through("wf", crate::run_defaults::RunDefaultFields::default());
         assert_eq!(registry.chain_execution_timeout("wf"), Some(hour));
+    }
+
+    /// Issue #2407: the operator override of the concurrency limit reaches a
+    /// worker-side enqueue, such as a child spawn. The key stays declared.
+    #[test]
+    fn the_concurrency_override_reaches_a_worker_enqueue() {
+        let mut declared = deadline_info_fixture("wf", None, None);
+        declared.concurrency = Some(crate::concurrency::ConcurrencyPolicy::new(
+            "input.tenant",
+            2,
+        ));
+        let registry = HandlerRegistry::new(
+            vec![declared, deadline_info_fixture("plain", None, None)],
+            vec![],
+        );
+        let input = serde_json::json!({ "tenant": "acme" });
+        assert_eq!(
+            resolve_workflow_concurrency(&registry, "wf", &input),
+            (Some("acme".to_string()), Some(2))
+        );
+
+        let fields = crate::run_defaults::RunDefaultFields {
+            concurrency_limit: Some(7),
+            ..crate::run_defaults::RunDefaultFields::default()
+        };
+        registry.run_defaults().write_through("wf", fields);
+        registry.run_defaults().write_through("plain", fields);
+        assert_eq!(
+            resolve_workflow_concurrency(&registry, "wf", &input),
+            (Some("acme".to_string()), Some(7))
+        );
+        assert_eq!(registry.concurrency_policy("wf").map(|p| p.limit), Some(7));
+        assert_eq!(
+            resolve_workflow_concurrency(&registry, "plain", &input),
+            (None, None),
+            "an override needs a declared policy"
+        );
+        assert_eq!(registry.concurrency_policy("unregistered"), None);
+    }
+
+    /// Issue #2407: a same-type successor or a retry keeps its stored cap,
+    /// and takes a raise, never a drop.
+    #[test]
+    fn a_carried_cap_takes_a_raise_and_never_a_drop() {
+        let policy = |limit| Some(crate::concurrency::ConcurrencyPolicy::new("input.k", limit));
+        assert_eq!(carried_concurrency_cap(Some(2), policy(5)), Some(5));
+        assert_eq!(carried_concurrency_cap(Some(5), policy(2)), Some(5));
+        assert_eq!(carried_concurrency_cap(Some(3), None), Some(3));
+        assert_eq!(carried_concurrency_cap(None, policy(5)), None);
+        assert_eq!(carried_concurrency_cap(Some(-1), policy(5)), None);
     }
 
     /// Issue #2406 AC2: the fleet chain ceiling caps the chain cap of a child,
@@ -9832,6 +9915,20 @@ async fn clear_nd_block(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> H
     Ok(())
 }
 
+/// The cap that a same-type successor or a retry carries over from its task
+/// row (issue #2407).
+///
+/// The new row is the same run in flight, so it keeps the stored cap. A
+/// current limit above that cap replaces it, so a raise reaches a long chain.
+/// A lower limit never tightens a run in flight. A row with no cap keeps none.
+fn carried_concurrency_cap(
+    stored: Option<i32>,
+    current: Option<crate::concurrency::ConcurrencyPolicy>,
+) -> Option<u32> {
+    let stored = stored.and_then(|cap| u32::try_from(cap).ok())?;
+    Some(current.map_or(stored, |policy| stored.max(policy.limit)))
+}
+
 /// Resolve `(concurrency_key, limit)` for a worker-side enqueue.
 ///
 /// Deliberately does NOT surface [`crate::concurrency::ConcurrencyOnConflict`]
@@ -9847,9 +9944,7 @@ fn resolve_workflow_concurrency(
     input: &serde_json::Value,
 ) -> (Option<String>, Option<u32>) {
     registry
-        .workflows
-        .get(workflow_name)
-        .and_then(|info| info.concurrency.as_ref())
+        .concurrency_policy(workflow_name)
         .map_or((None, None), |policy| {
             let key = crate::concurrency::resolve_concurrency_key(policy.key_expr, input);
             (key, Some(policy.limit))
@@ -24797,10 +24892,10 @@ async fn persist_workflow_continue_as_new_with_verdict(
             || {
                 (
                     persistence.task.concurrency_key.clone(),
-                    persistence
-                        .task
-                        .concurrency_cap
-                        .and_then(|cap| u32::try_from(cap).ok()),
+                    carried_concurrency_cap(
+                        persistence.task.concurrency_cap,
+                        registry.concurrency_policy(&execution.workflow_name),
+                    ),
                 )
             },
             |target| resolve_workflow_concurrency(registry, target, &input),
@@ -25159,10 +25254,10 @@ async fn persist_workflow_outcome(
                 Some(execution),
                 Some(registry.telemetry().metrics.as_ref()),
                 persistence.task.concurrency_key.clone(),
-                persistence
-                    .task
-                    .concurrency_cap
-                    .and_then(|c| u32::try_from(c).ok()),
+                carried_concurrency_cap(
+                    persistence.task.concurrency_cap,
+                    registry.concurrency_policy(&execution.workflow_name),
+                ),
                 crate::types::Priority::from_i32(persistence.task.priority).unwrap_or_default(),
                 persistence.task.fairness_key.clone(),
                 registry.payload_codecs(),

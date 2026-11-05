@@ -1,0 +1,64 @@
+{
+  "items": [
+    {
+      "id": "vault-code",
+      "ops": [
+        "Remember: the vault code is 7319.",
+        "Name one bird that cannot fly.",
+        "What is the vault code?"
+      ],
+      "expected": "7319"
+    },
+    {
+      "id": "badge-number",
+      "ops": [
+        "Remember: the badge number is 5082.",
+        "Name a river in Europe.",
+        "Name a prime number below ten.",
+        "What is the badge number?"
+      ],
+      "expected": "5082"
+    },
+    {
+      "id": "server-port",
+      "ops": [
+        "Remember: the server port is 8443.",
+        "Remember: the backup slot is 23.",
+        "Name a planet with rings.",
+        "What is the server port?"
+      ],
+      "expected": "8443"
+    },
+    {
+      "id": "meeting-room",
+      "ops": [
+        "Name a colour of the rainbow.",
+        "Name a month with thirty days.",
+        "Remember: the meeting room is 412.",
+        "Name a metal that rusts.",
+        "What is the meeting room?"
+      ],
+      "expected": "412"
+    },
+    {
+      "id": "parcel-number",
+      "ops": [
+        "Name a sea creature with eight arms.",
+        "Remember: the parcel number is 4471.",
+        "What is the parcel number?"
+      ],
+      "expected": "4471"
+    },
+    {
+      "id": "wifi-pin",
+      "ops": [
+        "Remember: the wifi pin is 2291.",
+        "Name a fruit that is yellow.",
+        "Remember: the wifi pin is 6604.",
+        "Name an animal with stripes.",
+        "What is the wifi pin?"
+      ],
+      "expected": "6604"
+    }
+  ]
+}

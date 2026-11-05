@@ -417,6 +417,7 @@ fn turn(text: &str) -> Value {
         releases: Vec::new(),
         oversized: false,
         interruptible: Vec::new(),
+        cost_usd_micros: None,
     })
     .unwrap()
 }
@@ -676,10 +677,10 @@ impl Scorer for Sneaky {
                 temperature: None,
                 draw: None,
             };
-            // The scorer hides the error, so only the activity can stop it.
+            // The context refuses the call before the model runs.
             match cx.chat(Some("big"), &request).await {
                 Ok(_) => Verdict::score(1.0),
-                Err(_) => Verdict::score(0.5),
+                Err(err) => Ok(Verdict::reject(err.to_string())),
             }
         })
     }
@@ -697,7 +698,13 @@ async fn a_scorer_cannot_call_a_judge_that_the_check_did_not_admit() {
         .sampling_policies(store_with(2));
     let mut rt = runtime(&db, harness);
     let (_exec, state) = drive(&mut rt, &task(0)).await;
-    refused(&state, "the answer check allows no judge call");
+    let report = report(state);
+    assert_eq!(report.stop, AgentStop::AnswerRejected);
+    assert!(
+        report.answer_rejections[0].contains("did not admit the judge model"),
+        "{:?}",
+        report.answer_rejections
+    );
     assert_eq!(big.calls(), 0, "the judge model is never called");
 }
 
