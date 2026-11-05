@@ -1994,7 +1994,7 @@ cargo bench -p autumn-harvest --features testing --no-default-features --bench r
 cargo test -p autumn-harvest-macros
 
 # Docs corpus audits (link check, orphan scan; wired into CI's lint job)
-python3 docs/audits/corpus-link-check.py
+cargo xtask audit corpus-link-check
 ```
 
 See [`docs/audits/README.md`](audits/README.md) for what each docs audit script checks.
