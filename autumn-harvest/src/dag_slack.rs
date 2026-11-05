@@ -208,7 +208,7 @@ mod tests {
     fn empty_dag_has_no_tasks_and_zero_total() {
         let report = SlackAnalyzer::new(DagBuilder::new().build().unwrap()).analyze();
         assert_eq!(report.total_duration, Duration::ZERO);
-        assert!(report.tasks.is_empty());
+        assert_eq!(report.tasks.len(), 0);
     }
 
     #[test]
