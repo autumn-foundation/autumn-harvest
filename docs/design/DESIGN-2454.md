@@ -146,10 +146,9 @@ that lands between the check and one write can still keep that one fact.
 The memory reset runs after the episode reset, so it removes such a fact
 when the write lands first.
 
-**Known limit.** The engine keys a schedule by its workflow name, so
-`consolidate::schedule` serves one agent per deployment. For many agents,
-use `every(n)` or start each pass from the app. Issue #2540 tracks a
-dispatcher.
+**Superseded limit.** The engine keys a schedule by its workflow name.
+Issue #2540 replaced the per-agent schedule with one dispatcher schedule.
+See `docs/design/DESIGN-2540.md`.
 
 **Known limit.** SQLite has no run budget, so its pass always passes the
 check. The budget test runs the engine check in a unit test and the

@@ -4235,6 +4235,7 @@ mod tests {
                 // start reaching for a database it has no access to.
                 startup: crate::config::HarvestStartupConfig::default(),
                 redis: crate::config::HarvestRedisConfig::default(),
+                retention: crate::config::HarvestRetentionConfig::default(),
             },
             HarvestRunnerResources::new(pool),
         )
@@ -4356,6 +4357,7 @@ mod tests {
             readiness: crate::config::HarvestReadinessConfig::default(),
             startup: crate::config::HarvestStartupConfig::default(),
             redis: crate::config::HarvestRedisConfig::default(),
+            retention: crate::config::HarvestRetentionConfig::default(),
         };
 
         let harvest_pool = resolve_harvest_pool(&state, &config)

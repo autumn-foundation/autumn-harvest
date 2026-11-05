@@ -18,6 +18,8 @@
 //! - Completion callbacks and completion triggers do not fire.
 //!
 //! [`ForkEffects::Live`] runs effects for real. The caller must ask for it.
+//! [`ForkEffects::LiveQuiet`] runs effects for real too, but its terminal path
+//! sends no completion callback and fires no completion trigger (issue #2378).
 
 use crate::schema::harvest_workflow_executions_ext;
 use std::collections::{HashMap, HashSet};
@@ -265,7 +267,34 @@ pub async fn fork_workflow_execution(
     // buffering scope holds the hint until the transaction commits.
     crate::dispatch::buffered_settled(Box::pin(
         conn.transaction::<ForkResult, WorkflowForkError, _>(async |conn| {
-            fork_in_transaction(conn, source_id, &request, registry, codecs).await
+            let offloader = registry.and_then(HandlerRegistry::payload_offloader);
+            fork_in_transaction(conn, source_id, &request, registry, codecs, offloader).await
+        }),
+    ))
+    .await
+}
+
+/// [`fork_workflow_execution`], with `codecs`, an optional `offloader` and no
+/// handler registry (issue #2378).
+///
+/// A caller with no registry passes the payload codecs and the offloader of
+/// its workers. With no registry, the fork does not check that the workflow
+/// type is registered, as for [`fork_workflow_execution`] with `None`.
+///
+/// # Errors
+///
+/// As [`fork_workflow_execution`].
+pub async fn fork_workflow_execution_with_codecs(
+    conn: &mut AsyncPgConnection,
+    source_id: ExecutionId,
+    request: WorkflowForkRequest,
+    codecs: &PayloadCodecs,
+    offloader: Option<&crate::payload_store::PayloadOffloader>,
+) -> Result<ForkResult, WorkflowForkError> {
+    let request = request.normalized();
+    crate::dispatch::buffered_settled(Box::pin(
+        conn.transaction::<ForkResult, WorkflowForkError, _>(async |conn| {
+            fork_in_transaction(conn, source_id, &request, None, codecs, offloader).await
         }),
     ))
     .await
@@ -296,7 +325,9 @@ pub async fn fork_workflow_execution_audited(
     });
     crate::dispatch::buffered_settled(Box::pin(
         conn.transaction::<ForkResult, WorkflowForkError, _>(async |conn| {
-            let result = fork_in_transaction(conn, source_id, &request, registry, codecs).await?;
+            let offloader = registry.and_then(HandlerRegistry::payload_offloader);
+            let result =
+                fork_in_transaction(conn, source_id, &request, registry, codecs, offloader).await?;
             crate::audit::insert_audit(conn, audit).await?;
             Ok(result)
         }),
@@ -310,6 +341,7 @@ async fn fork_in_transaction(
     request: &WorkflowForkRequest,
     registry: Option<&HandlerRegistry>,
     codecs: &PayloadCodecs,
+    offloader: Option<&crate::payload_store::PayloadOffloader>,
 ) -> Result<ForkResult, WorkflowForkError> {
     let source = load_fork_source(conn, source_id, request, registry).await?;
 
@@ -351,15 +383,7 @@ async fn fork_in_transaction(
     };
 
     let start_input = match &request.input {
-        Some(input) => Some(
-            stored_start_input(
-                &events,
-                input,
-                codecs,
-                registry.and_then(HandlerRegistry::payload_offloader),
-            )
-            .await?,
-        ),
+        Some(input) => Some(stored_start_input(&events, input, codecs, offloader).await?),
         None => None,
     };
     let copied = copy_prefix(
@@ -390,7 +414,7 @@ async fn fork_in_transaction(
         new_exec_id,
         &tail,
         tail_start,
-        registry.and_then(HandlerRegistry::payload_offloader),
+        offloader,
         codecs,
     )
     .await?;
@@ -1647,8 +1671,38 @@ pub async fn is_recorded_fork(
     conn: &mut AsyncPgConnection,
     execution: &WorkflowExecution,
 ) -> HarvestResult<bool> {
+    Ok(stored_fork_effects(conn, execution)
+        .await?
+        .is_some_and(|effects| effects == ForkEffects::Recorded))
+}
+
+/// Whether the terminal path of `execution` skips its completion callbacks
+/// and completion triggers (issues #2000 and #2378).
+///
+/// A recorded fork and a quiet live fork skip them. Another run sends them.
+///
+/// # Errors
+///
+/// Returns [`HarvestError`] when the read fails.
+pub async fn skips_completion_effects(
+    conn: &mut AsyncPgConnection,
+    execution: &WorkflowExecution,
+) -> HarvestResult<bool> {
+    Ok(stored_fork_effects(conn, execution)
+        .await?
+        .is_some_and(|effects| !effects.notifies_completion()))
+}
+
+/// The effects mode of the fork `execution`, or `None` for a run that is not
+/// a fork. A fork with no readable marker fails safe, as recorded.
+///
+/// It reads the marker only for a fork, so another run costs no query.
+async fn stored_fork_effects(
+    conn: &mut AsyncPgConnection,
+    execution: &WorkflowExecution,
+) -> HarvestResult<Option<ForkEffects>> {
     if !is_fork(execution) {
-        return Ok(false);
+        return Ok(None);
     }
     let marker: Option<Value> = harvest_events::table
         .filter(harvest_events::workflow_exec_id.eq(execution.id))
@@ -1660,10 +1714,12 @@ pub async fn is_recorded_fork(
         .optional()
         .map_err(database_error)?;
     // A fork row with no readable marker fails safe, as recorded.
-    Ok(marker
-        .and_then(|value| serde_json::from_value::<WorkflowEvent>(value).ok())
-        .and_then(|event| fork_marker(std::slice::from_ref(&event)))
-        .is_none_or(|(_, effects)| effects == ForkEffects::Recorded))
+    Ok(Some(
+        marker
+            .and_then(|value| serde_json::from_value::<WorkflowEvent>(value).ok())
+            .and_then(|event| fork_marker(std::slice::from_ref(&event)))
+            .map_or(ForkEffects::Recorded, |(_, effects)| effects),
+    ))
 }
 
 /// What a fork does with one activity that it just scheduled.
@@ -1707,7 +1763,7 @@ pub fn resolve_activity(
         });
     }
     let effects = fork_marker(fork_events).map_or(ForkEffects::Recorded, |(_, effects)| effects);
-    if effects == ForkEffects::Live {
+    if effects.is_live() {
         return ForkResolution::Run;
     }
     match recorded_terminal(source_events, name, occurrence, input) {
@@ -2524,15 +2580,40 @@ mod tests {
     fn a_live_fork_serves_nothing() {
         let (source, _, _) = source();
         let id = ActivityExecId::new();
-        let fork = vec![
-            started(json!({})),
-            marker(ForkEffects::Live),
-            scheduled(id, "charge", json!({ "n": 1 })),
+        // A quiet live fork runs each activity too (issue #2378).
+        for effects in [ForkEffects::Live, ForkEffects::LiveQuiet] {
+            let fork = vec![
+                started(json!({})),
+                marker(effects),
+                scheduled(id, "charge", json!({ "n": 1 })),
+            ];
+            assert!(matches!(
+                resolve_activity(&fork, &source, id),
+                ForkResolution::Run
+            ));
+            let mut row = crate::reset::tests::execution_in_state("RUNNING");
+            row.start_source = Some("fork".to_string());
+            assert!(!history_is_recorded_fork(&row, &fork), "{effects:?}");
+        }
+    }
+
+    #[test]
+    fn only_a_plain_live_fork_notifies_its_completion() {
+        let modes = [
+            (ForkEffects::Recorded, false, false, "recorded"),
+            (ForkEffects::Live, true, true, "live"),
+            (ForkEffects::LiveQuiet, true, false, "live_quiet"),
         ];
-        assert!(matches!(
-            resolve_activity(&fork, &source, id),
-            ForkResolution::Run
-        ));
+        for (effects, live, notifies, wire) in modes {
+            assert_eq!(effects.is_live(), live, "{effects:?}");
+            assert_eq!(effects.notifies_completion(), notifies, "{effects:?}");
+            assert_eq!(effects.as_str(), wire);
+            assert_eq!(serde_json::to_value(effects).unwrap(), json!(wire));
+            assert_eq!(
+                serde_json::from_value::<ForkEffects>(json!(wire)).unwrap(),
+                effects
+            );
+        }
     }
 
     #[test]

@@ -528,6 +528,10 @@ task-queue janitor. They change nothing here.
   always `null`.
 - **`POST /admin/retention/run-now`** queues a pass, as on Postgres. The
   driver runs it on its next turn.
+- **Every role.** The driver runs the pass on every process role. It
+  ignores `[harvest.retention] run_on`, which places the Postgres janitor
+  (#2478). The app process is the only writer, so no other process runs
+  the pass.
 - Each tenant file runs the same policy, with its own status.
 
 ## MCP, webhooks and connectors

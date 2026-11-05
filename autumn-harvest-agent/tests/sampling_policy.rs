@@ -526,6 +526,7 @@ async fn the_tool_call_activity_checks_the_effect_set_again() {
         workspace: None,
         skill: None,
         allowed_effects: Some(effects),
+        probe_effects: None,
     };
     // A decision recorded on a worker with other rules still cannot run it.
     let refused = harness

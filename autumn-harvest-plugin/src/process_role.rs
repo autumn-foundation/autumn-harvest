@@ -15,6 +15,8 @@
 
 use autumn_web::config::ProcessRole;
 
+use crate::config::RetentionRunOn;
+
 /// Where a resolved switch value comes from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -161,6 +163,28 @@ pub(crate) const fn contradicts_role(explicit: Option<bool>, role: Option<Proces
 const fn resolve_switch(explicit: Option<bool>, role: Option<ProcessRole>) -> (bool, bool) {
     let enabled = switch_value(explicit, role_default(role));
     (enabled, contradicts_role(explicit, role))
+}
+
+/// True when `run_on` places retention on a process whose resolved
+/// scheduler switch is `scheduler` (issue #2478).
+///
+/// `formal/verus/src/process_role.rs` proves the function for every input.
+#[must_use]
+pub(crate) const fn retention_placed(run_on: RetentionRunOn, scheduler: bool) -> bool {
+    match run_on {
+        RetentionRunOn::Scheduler => scheduler,
+        RetentionRunOn::All => true,
+    }
+}
+
+/// True when this process runs the retention janitor (issue #2478).
+///
+/// `enabled` is `RetentionConfig::enabled`. Retention that is off never
+/// runs. `formal/verus/src/process_role.rs` proves the function for every
+/// input.
+#[must_use]
+pub(crate) const fn runs_retention(enabled: bool, run_on: RetentionRunOn, scheduler: bool) -> bool {
+    enabled && retention_placed(run_on, scheduler)
 }
 
 /// Run `f` and return its log output at `level` and above.
@@ -438,5 +462,28 @@ mod tests {
         let default = HarvestRuntimeConfig::default();
         assert_eq!(default.worker_enabled, None);
         assert_eq!(default.scheduler_enabled, None);
+    }
+
+    /// Issue #2478: the placement kernel for each input.
+    #[test]
+    fn retention_runs_where_the_scheduler_runs_unless_run_on_is_all() {
+        use super::{retention_placed, runs_retention};
+        use crate::config::RetentionRunOn;
+
+        for scheduler in [true, false] {
+            assert_eq!(
+                retention_placed(RetentionRunOn::Scheduler, scheduler),
+                scheduler
+            );
+            assert!(retention_placed(RetentionRunOn::All, scheduler));
+            for run_on in [RetentionRunOn::Scheduler, RetentionRunOn::All] {
+                assert!(!runs_retention(false, run_on, scheduler), "{run_on:?}");
+                assert_eq!(
+                    runs_retention(true, run_on, scheduler),
+                    retention_placed(run_on, scheduler),
+                    "{run_on:?}"
+                );
+            }
+        }
     }
 }

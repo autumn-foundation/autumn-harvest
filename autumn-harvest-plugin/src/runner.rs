@@ -757,23 +757,61 @@ impl DeferredAuditExportInstall {
     }
 }
 
+/// The startup line of a process with retention on but not placed (issue
+/// #2478).
+const RETENTION_NOT_PLACED_LOG: &str = "harvest retention janitor not started on this runtime: \
+     harvest.retention.run_on = \"scheduler\" and this process runs no scheduler. Set run_on = \
+     \"all\" to run it here";
+
 /// The background tasks that one runtime spawns (issue #2477).
 ///
 /// `HarvestRunner::start` reads every spawn decision from here, so a test of
-/// the plan covers the wiring of the switches.
+/// the plan covers the wiring of the switches. The test
+/// `each_role_places_each_runtime` pins the table of each runtime on each
+/// role (issue #2478).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SpawnPlan {
     /// The local worker and its poll loops.
     worker: bool,
     /// The local scheduler.
     scheduler: bool,
+    /// Where the retention janitor runs (issue #2478).
+    retention: RetentionSpawn,
+}
+
+/// The retention janitor of one process (issue #2478).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetentionSpawn {
+    /// Retention is off in `RetentionConfig`.
+    Off,
+    /// This process runs the janitor.
+    Here,
+    /// Retention is on, but `run_on` places it on other processes.
+    Elsewhere,
 }
 
 impl SpawnPlan {
-    const fn for_switches(switches: crate::process_role::ProcessSwitches) -> Self {
+    /// The plan of one process. `retention_enabled` is
+    /// `RetentionConfig::enabled`.
+    const fn new(
+        switches: crate::process_role::ProcessSwitches,
+        run_on: crate::config::RetentionRunOn,
+        retention_enabled: bool,
+    ) -> Self {
         Self {
             worker: switches.worker.enabled,
             scheduler: switches.scheduler.enabled,
+            retention: if crate::process_role::runs_retention(
+                retention_enabled,
+                run_on,
+                switches.scheduler.enabled,
+            ) {
+                RetentionSpawn::Here
+            } else if retention_enabled {
+                RetentionSpawn::Elsewhere
+            } else {
+                RetentionSpawn::Off
+            },
         }
     }
 
@@ -787,6 +825,35 @@ impl SpawnPlan {
     /// checker, so only a process with no worker needs this loop.
     const fn codec_refresh(self) -> bool {
         !self.worker
+    }
+
+    /// The dispatch-metrics sampler. A `Worker` runs its own copy, so only a
+    /// process with no worker runs this one. Two copies would emit each
+    /// gauge twice.
+    const fn dispatch_metrics_sampler(self) -> bool {
+        !self.worker
+    }
+
+    /// Retention is on, but `run_on` places it on other processes (issue
+    /// #2478). The API then reports `placed_elsewhere`, and `run-now`
+    /// names the fix.
+    const fn retention_placed_elsewhere(self) -> bool {
+        matches!(self.retention, RetentionSpawn::Elsewhere)
+    }
+
+    /// The retention janitor runs on this process (issue #2478).
+    const fn retention(self) -> bool {
+        matches!(self.retention, RetentionSpawn::Here)
+    }
+
+    /// The post-commit notify sender of each storage pool (issue #1796).
+    ///
+    /// Each process runs it, an API-only process included. That process
+    /// writes rows too, so it must send the notifications that wake the
+    /// waiters.
+    const fn notify_sender(self) -> bool {
+        let _ = self;
+        true
     }
 }
 
@@ -1158,7 +1225,11 @@ impl HarvestRunner {
         // runner with no app state has no role and keeps both switches on.
         let switches = config.process_switches(resources.process_role());
         switches.log();
-        let plan = SpawnPlan::for_switches(switches);
+        let plan = SpawnPlan::new(
+            switches,
+            config.retention.run_on,
+            built.retention().enabled(),
+        );
         let worker_enabled = plan.worker;
         let scheduler_enabled = plan.scheduler;
 
@@ -1173,8 +1244,10 @@ impl HarvestRunner {
         autumn_harvest::shard::install_global_router(shard_router.clone());
         // Start the post-commit notify sender for each storage pool (issue
         // #1796). An API-only process has no `Worker` to do it.
-        for (_, shard_pool) in prepared.storage_pool.iter_shards() {
-            autumn_harvest::notify::register_pool(shard_pool);
+        if plan.notify_sender() {
+            for (_, shard_pool) in prepared.storage_pool.iter_shards() {
+                autumn_harvest::notify::register_pool(shard_pool);
+            }
         }
 
         if !worker_enabled && !scheduler_enabled {
@@ -1392,7 +1465,7 @@ impl HarvestRunner {
         // API-only process writes through the pools registered above, so it
         // sends notifications and needs them too.
         // Only spawn when there is no `Worker` to double up with.
-        let dispatch_metrics_sampler = if worker.is_none() {
+        let dispatch_metrics_sampler = if plan.dispatch_metrics_sampler() {
             let cancel = CancellationToken::new();
             let handle = spawn_dispatch_metrics_sampler(
                 cancel.clone(),
@@ -1431,7 +1504,9 @@ impl HarvestRunner {
         // The API reads archived history back through the same archiver
         // (issue #1983).
         let api_history_archiver = prepared.history_archiver.clone();
-        let retention = if prepared.retention_config.enabled() {
+        // Issue #2478: retention runs where the scheduler runs, unless
+        // `run_on = "all"`. So a `web` replica runs no delete sweep.
+        let retention = if plan.retention() {
             RetentionRuntime::spawn_with_hooks(
                 prepared.storage_pool.sharded_pool().clone(),
                 prepared.retention_config.clone(),
@@ -1441,6 +1516,26 @@ impl HarvestRunner {
                     .with_offloader(registry.payload_offloader_arc())
                     .with_partition_archiver(prepared.partition_archiver),
             )
+        } else if plan.retention_placed_elsewhere() {
+            // A `web` role expects this. With no role, an operator turned the
+            // scheduler off by hand, so retention may run nowhere. Warn then.
+            if switches.role.is_some() {
+                tracing::info!(
+                    mode = ?config.mode,
+                    run_on = %config.retention.run_on,
+                    scheduler_enabled,
+                    "{RETENTION_NOT_PLACED_LOG}"
+                );
+            } else {
+                tracing::warn!(
+                    mode = ?config.mode,
+                    run_on = %config.retention.run_on,
+                    scheduler_enabled,
+                    "{RETENTION_NOT_PLACED_LOG}. This runner has no process role, so make sure \
+                     another process runs the scheduler"
+                );
+            }
+            None
         } else {
             tracing::info!(
                 mode = ?config.mode,
@@ -1486,11 +1581,15 @@ impl HarvestRunner {
             worker_id,
             queues,
             scheduler_monitor,
-            HarvestRetentionRuntime::new(
-                prepared.retention_config,
-                retention_monitor,
-                retention_trigger,
-            ),
+            if plan.retention_placed_elsewhere() {
+                HarvestRetentionRuntime::placed_elsewhere(prepared.retention_config)
+            } else {
+                HarvestRetentionRuntime::new(
+                    prepared.retention_config,
+                    retention_monitor,
+                    retention_trigger,
+                )
+            },
             shard_router,
         )
         .with_registered_dag_names(prepared.registered_dag_names.iter().cloned())
@@ -3058,11 +3157,13 @@ mod tests {
         use autumn_web::config::ProcessRole;
 
         use super::SpawnPlan;
+        use crate::config::RetentionRunOn;
         use crate::process_role::ProcessSwitches;
 
         // (worker, scheduler, batch, codec refresh) for each input.
         let plan = |worker, scheduler, role| {
-            let plan = SpawnPlan::for_switches(ProcessSwitches::resolve(worker, scheduler, role));
+            let switches = ProcessSwitches::resolve(worker, scheduler, role);
+            let plan = SpawnPlan::new(switches, RetentionRunOn::Scheduler, true);
             (
                 plan.worker,
                 plan.scheduler,
@@ -3084,6 +3185,133 @@ mod tests {
             plan(Some(false), Some(true), Some(ProcessRole::Worker)),
             (false, true, false, true)
         );
+    }
+
+    /// Issue #2478: the table of each runtime on each role.
+    ///
+    /// Retention is on in each row, and no switch is set. Read a row as
+    /// "this role runs these runtimes". The notify sender and the
+    /// dispatch-metrics sampler run on a `web` replica on purpose:
+    ///
+    /// - An API-only process writes rows, so it must send the post-commit
+    ///   notifications that wake the waiters.
+    /// - A `Worker` samples dispatch metrics itself. Only a process with no
+    ///   `Worker` runs the sampler, so no process emits a gauge twice.
+    #[test]
+    fn each_role_places_each_runtime() {
+        use autumn_web::config::ProcessRole;
+
+        use super::SpawnPlan;
+        use crate::config::RetentionRunOn;
+        use crate::process_role::ProcessSwitches;
+
+        #[derive(Debug, PartialEq, Eq)]
+        #[allow(
+            clippy::struct_excessive_bools,
+            reason = "one column per runtime reads as the table in the docs"
+        )]
+        struct Row {
+            worker: bool,
+            scheduler: bool,
+            batch: bool,
+            retention: bool,
+            retention_placed_elsewhere: bool,
+            dispatch_metrics_sampler: bool,
+            notify_sender: bool,
+            codec_refresh: bool,
+        }
+        let row = |role, run_on| {
+            let switches = ProcessSwitches::resolve(None, None, role);
+            let plan = SpawnPlan::new(switches, run_on, true);
+            Row {
+                worker: plan.worker,
+                scheduler: plan.scheduler,
+                batch: plan.batch(),
+                retention: plan.retention(),
+                retention_placed_elsewhere: plan.retention_placed_elsewhere(),
+                dispatch_metrics_sampler: plan.dispatch_metrics_sampler(),
+                notify_sender: plan.notify_sender(),
+                codec_refresh: plan.codec_refresh(),
+            }
+        };
+        let web = Row {
+            worker: false,
+            scheduler: false,
+            batch: false,
+            retention: false,
+            retention_placed_elsewhere: true,
+            dispatch_metrics_sampler: true,
+            notify_sender: true,
+            codec_refresh: true,
+        };
+        let full = Row {
+            worker: true,
+            scheduler: true,
+            batch: true,
+            retention: true,
+            retention_placed_elsewhere: false,
+            dispatch_metrics_sampler: false,
+            notify_sender: true,
+            codec_refresh: false,
+        };
+        let scheduler = RetentionRunOn::Scheduler;
+        assert_eq!(row(Some(ProcessRole::Web), scheduler), web);
+        assert_eq!(row(Some(ProcessRole::Worker), scheduler), full);
+        assert_eq!(row(Some(ProcessRole::Combined), scheduler), full);
+        assert_eq!(row(None, scheduler), full, "a standalone runner");
+
+        // `run_on = "all"` keeps the behaviour before issue #2478.
+        let all = RetentionRunOn::All;
+        assert_eq!(
+            row(Some(ProcessRole::Web), all),
+            Row {
+                retention: true,
+                retention_placed_elsewhere: false,
+                ..web
+            }
+        );
+        for role in [Some(ProcessRole::Worker), Some(ProcessRole::Combined), None] {
+            assert_eq!(row(role, all), full, "{role:?}");
+        }
+    }
+
+    /// Issue #2478: retention follows the resolved scheduler switch, so an
+    /// explicit scheduler value moves it. Retention that is off never runs.
+    #[test]
+    fn retention_follows_the_resolved_scheduler() {
+        use autumn_web::config::ProcessRole;
+
+        use super::SpawnPlan;
+        use crate::config::RetentionRunOn;
+        use crate::process_role::ProcessSwitches;
+
+        let retention = |scheduler, role, run_on, enabled| {
+            let switches = ProcessSwitches::resolve(None, scheduler, role);
+            SpawnPlan::new(switches, run_on, enabled).retention()
+        };
+        let web = Some(ProcessRole::Web);
+        let worker = Some(ProcessRole::Worker);
+        assert!(retention(Some(true), web, RetentionRunOn::Scheduler, true));
+        assert!(!retention(
+            Some(false),
+            worker,
+            RetentionRunOn::Scheduler,
+            true
+        ));
+        assert!(retention(Some(false), worker, RetentionRunOn::All, true));
+        for role in [web, worker, Some(ProcessRole::Combined), None] {
+            for run_on in [RetentionRunOn::Scheduler, RetentionRunOn::All] {
+                for scheduler in [None, Some(true), Some(false)] {
+                    assert!(
+                        !retention(scheduler, role, run_on, false),
+                        "{role:?} {run_on:?} {scheduler:?}"
+                    );
+                    let switches = ProcessSwitches::resolve(None, scheduler, role);
+                    let plan = SpawnPlan::new(switches, run_on, false);
+                    assert!(!plan.retention_placed_elsewhere(), "off is not elsewhere");
+                }
+            }
+        }
     }
 
     /// Issue #2477: the runner reads the role from its app state. With no

@@ -21,6 +21,13 @@
 //! #2376). It gives each one an opaque [`anon::AnonId`] in a seeded order. Its
 //! text names no model, overlay or label. See [`AnonymisedReport`].
 //!
+//! # A live probe
+//!
+//! [`live_probe`] runs a candidate on a Postgres fork with real tools (issue
+//! #2378). It runs only the tool effects that the operator allows. See
+//! [`LiveProbe`]. The rest of this page is about [`evaluate`], which runs no
+//! tool.
+//!
 //! # How it runs
 //!
 //! The harness runs the real `agent_loop` body in the in-memory test engine.
@@ -121,6 +128,13 @@
 
 pub mod anon;
 pub mod evidence;
+mod probe;
+
+pub use probe::{
+    LiveProbe, LiveProbeHost, PROBE_APPROVAL_TIMEOUT_SECS, ProbeFork, SourceRun, live_probe,
+};
+#[cfg(feature = "postgres")]
+pub(crate) use probe::{PROBE_FORK_OPERATOR, PROBE_FORK_REASON};
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -145,6 +159,7 @@ use crate::mesh::Peer;
 use crate::message::{ContentPart, StopReason, TokenUsage, ToolCall};
 use crate::policy::ToolDecision;
 use crate::score::{self, ScoreContext, ScoreInput, Scorer};
+pub use crate::types::PROBE_EFFECT_REFUSED;
 use crate::types::{
     AgentReport, AgentTask, ModelTurn, ModelTurnRequest, ToolCallRequest, ToolOutcome,
 };
@@ -416,13 +431,12 @@ impl Candidate {
     ///
     /// Returns the refusal of [`overlay::apply`].
     fn task_under_overlay(&self, task: &AgentTask) -> Result<AgentTask, OverlayError> {
-        let source = source_profile(task);
         let mut ceilings = self
             .ceilings
             .clone()
-            .unwrap_or_else(|| Ceilings::from_profile(&source));
+            .unwrap_or_else(|| Ceilings::from_profile(&source_profile(task)));
         ceilings.models.extend(self.admitted.iter().cloned());
-        let profile = overlay::apply(&source, &self.overlay, &ceilings, self.harness.as_ref())?;
+        let task = task_with_overlay(task, &self.overlay, &ceilings, self.harness.as_ref())?;
         // A route to a missing model would fail the run with an error that
         // names the model. So it is refused first, as an overlay model is.
         if let Some(model) = self
@@ -434,22 +448,40 @@ impl Candidate {
                 model: model.clone(),
             });
         }
-        let mut task = task.clone();
-        task.system = profile.system;
-        task.max_steps = profile.max_steps;
-        task.max_total_tokens = profile.max_total_tokens;
-        task.max_output_tokens = profile.max_output_tokens;
-        task.read_only = profile.read_only;
-        task.model = profile.model;
-        task.tool_guidance = profile.tool_guidance;
-        task.skills = profile.skills;
         Ok(task)
     }
 }
 
+/// `task` under `overlay` and `ceilings`.
+///
+/// The source profile holds the fields of `task` that an overlay can set,
+/// and the mandate. The result writes each such field back.
+///
+/// # Errors
+///
+/// Returns the refusal of [`overlay::apply`].
+pub(crate) fn task_with_overlay(
+    task: &AgentTask,
+    overlay: &ProfileOverlay,
+    ceilings: &Ceilings,
+    harness: &AgentHarness,
+) -> Result<AgentTask, OverlayError> {
+    let profile = overlay::apply(&source_profile(task), overlay, ceilings, harness)?;
+    let mut task = task.clone();
+    task.system = profile.system;
+    task.max_steps = profile.max_steps;
+    task.max_total_tokens = profile.max_total_tokens;
+    task.max_output_tokens = profile.max_output_tokens;
+    task.read_only = profile.read_only;
+    task.model = profile.model;
+    task.tool_guidance = profile.tool_guidance;
+    task.skills = profile.skills;
+    Ok(task)
+}
+
 /// The source profile of a recorded `task`: each field that an overlay can
 /// set, and the mandate, which bounds an overlay model.
-fn source_profile(task: &AgentTask) -> AgentProfile {
+pub(crate) fn source_profile(task: &AgentTask) -> AgentProfile {
     let mut profile = AgentProfile::new("eval").max_steps(task.max_steps);
     profile.system.clone_from(&task.system);
     profile.max_total_tokens = task.max_total_tokens;
@@ -501,6 +533,14 @@ pub enum EvalError {
         /// The input index of the second candidate.
         second: usize,
     },
+    /// The backend cannot run a live probe (issue #2378). SQLite has no
+    /// fork. The text names the backend.
+    #[error("a live probe is not supported on {0}")]
+    Unsupported(&'static str),
+    /// The probe host could not read the source or commit the fork (issue
+    /// #2378). The source stays unchanged.
+    #[error("the live probe fork failed: {0}")]
+    Fork(String),
     /// The scorer failed, or did not end within
     /// [`AgentHarness::score_timeout`] (issue #2447). A scorer error is not
     /// a reject, so the evaluation fails. [`Side::Recorded`] is the source
@@ -2274,6 +2314,7 @@ mod tests {
             steps_used: 0,
             tool_calls: 0,
             resets: 0,
+            serial: None,
         };
         report.delegations = vec![child("e1:d1"), child("e10"), child("x")];
         rebase_run_ids(&mut report, "e1", "r1");

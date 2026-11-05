@@ -95,7 +95,8 @@ pub fn fact_hash(text: &str) -> String {
 #[serde(tag = "type", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum ConsolidationTrigger {
-    /// An engine schedule starts each pass. The agent starts none. See
+    /// An engine schedule starts each pass. The agent starts none. One
+    /// schedule serves every agent of each such kind (issue #2540). See
     /// [`consolidate::schedule`](crate::consolidate::schedule).
     #[default]
     Schedule,

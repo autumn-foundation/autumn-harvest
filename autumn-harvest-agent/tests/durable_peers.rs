@@ -1341,3 +1341,53 @@ async fn a_read_only_receiver_keeps_the_next_durable_hop_read_only() {
     });
     assert!(refused, "the critic reads the refusal");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_delegation_to_a_durable_peer_names_why_it_ran_alone() {
+    // Issue #2483: a durable peer never joins a batch. The record says so.
+    let (_dir, db) = fresh_db();
+    let mut rt = runtime(&db, mesh_harness(mesh_model()));
+    start(&mut rt, &research()).await;
+    let task = AgentTask::new("what is it?")
+        .mandate(Mandate::new("triage").peers(["researcher"]))
+        .parallel_children(2);
+    let exec = sqlite::start(&mut rt, &task).unwrap();
+    rt.run_until_blocked(exec).await.unwrap();
+    sqlite::drive(&mut rt, &research()).await.unwrap();
+    let report = common::report(rt.run_until_blocked(exec).await.unwrap());
+
+    assert!(report.text.contains("The answer is 42."), "{}", report.text);
+    let serials: Vec<_> = report.delegations.iter().map(|r| r.serial).collect();
+    assert_eq!(
+        serials,
+        [Some(autumn_harvest_agent::SerialReason::DurablePeer)]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_gated_delegation_to_a_durable_peer_names_gated() {
+    // Issue #2483: a person can edit the target of a gated call, so the
+    // reason names the gate, not the peer.
+    use autumn_harvest_agent::{Approval, Rule, ToolRules};
+
+    let (_dir, db) = fresh_db();
+    let harness = mesh_harness(mesh_model())
+        .policy(Arc::new(ToolRules::new().tool(DELEGATE_TOOL, Rule::Ask)));
+    let mut rt = runtime(&db, harness);
+    start(&mut rt, &research()).await;
+    let task = AgentTask::new("what is it?")
+        .mandate(Mandate::new("triage").peers(["researcher"]))
+        .parallel_children(2);
+    let exec = sqlite::start(&mut rt, &task).unwrap();
+    let RunState::WaitingSignal(signal) = rt.run_until_blocked(exec).await.unwrap() else {
+        panic!("the delegation waits for a person");
+    };
+    sqlite::decide(&mut rt, exec, &signal, &Approval::Approve).unwrap();
+    rt.run_until_blocked(exec).await.unwrap();
+    sqlite::drive(&mut rt, &research()).await.unwrap();
+    let report = common::report(rt.run_until_blocked(exec).await.unwrap());
+
+    assert!(report.text.contains("The answer is 42."), "{}", report.text);
+    let serials: Vec<_> = report.delegations.iter().map(|r| r.serial).collect();
+    assert_eq!(serials, [Some(autumn_harvest_agent::SerialReason::Gated)]);
+}

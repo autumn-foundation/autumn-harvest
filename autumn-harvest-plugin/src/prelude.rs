@@ -7,7 +7,7 @@
 pub use crate::api::{HarvestApiRuntime, HarvestApiState, harvest_api_router};
 pub use crate::config::{
     HarvestDatabaseConfig, HarvestMode, HarvestOutboxConfig, HarvestReadinessConfig,
-    HarvestRedisConfig, HarvestRuntimeConfig,
+    HarvestRedisConfig, HarvestRetentionConfig, HarvestRuntimeConfig, RetentionRunOn,
 };
 pub use crate::embedding::{HarvestEmbedding, HarvestEmbeddingRuntime};
 pub use crate::outbox::{

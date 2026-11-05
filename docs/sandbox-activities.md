@@ -537,8 +537,19 @@ vsock `CONNECT` handshake, and it runs the real guest code and the real
 executor. Other tests run fake `firecracker` and `jailer` scripts, and a fake
 API server.
 
+The first command is the light path. It builds no Diesel, no Docker client and
+no benchmark harness. The largest compile step peaked at 3.3 GiB when we
+measured it, so the build fits an 8 GiB machine.
+
+Cargo drops the flag of the alias when `RUSTFLAGS`, `CARGO_ENCODED_RUSTFLAGS`
+or a `rustflags` entry for the target triple is set. The build then compiles
+the heavy crates again. Unset these settings before you run the alias.
+
+The alias uses its own flag set, so it shares no build cache with `cargo test`.
+Pass a test filter after `--`, for example `cargo sandbox-test -- exec`.
+
 ```sh
-cargo test -p autumn-harvest --no-default-features --features sandbox-activities --lib sandbox
+cargo sandbox-test
 cargo test -p autumn-harvest-sandbox-guest
 cargo test -p autumn-harvest-agent --features sqlite,eval,sandbox
 ```

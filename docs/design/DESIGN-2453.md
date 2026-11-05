@@ -47,6 +47,7 @@ Options for each open question. The chosen option is in bold.
 | A window that is still over the threshold after a reset resets on every turn. | A reset runs only when its window falls under the threshold. `max_resets` bounds the run. |
 | A durable agent shows two copies of its notes. | The agent strips the restored pair before `trim_window`. Each op adds one fresh pair. |
 | The save round does not fit the cap, so the run ends with a reset left. | The save turn reserves `max_notes_bytes`. A save round that still does not fit resets with the earlier notes. |
+| Another round does not fit the cap, so the run ends with a reset left. | That round makes a reset due, and the reset keeps it (issue #2461). |
 | The model answers the notice in text, and that reply becomes the answer. | A text reply to the notice ends no segment. The reset runs next. |
 | A read-only durable op resets, drops the history and keeps no summary. | Only a segment that may write memory gets the reset. |
 | The reset window keeps a refused booking, not the one that woke the segment. | The segment records the booking that woke it when it opens. A refused call books nothing, so it never counts. |
@@ -114,9 +115,10 @@ pub struct ContextReset {
 A zero cap is no cap, so it never resets. A `reset_at_percent` of 0 counts as
 1, and a value over 100 counts as 100.
 
-**Known limit.** A tool round that passes the cap in one step still ends as
-`transcript_full`. The reset runs only before a request. Issue #2461 tracks
-this limit.
+**A tool round over the cap (issue #2461).** A tool round can pass the cap
+in one step. With a reset left and room in the new window, that round
+makes a reset due, and the run goes on. The new window keeps the round with its answers, so the model sees
+which calls ran. `docs/design/DESIGN-2461.md` records the rule.
 
 ## 6. Acceptance criteria and their tests
 

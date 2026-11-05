@@ -16,7 +16,8 @@ use autumn_harvest::scheduler::{
     register_workflow_schedules, tick_once, tick_once_sharded,
 };
 use autumn_harvest::schema::{
-    harvest_dead_letters, harvest_schedules, harvest_task_queue, harvest_workflow_executions,
+    harvest_audit_log, harvest_dead_letters, harvest_schedules, harvest_task_queue,
+    harvest_workflow_executions,
 };
 use autumn_harvest::shard::{ShardRouter, ShardedDbPool};
 use autumn_harvest::store;
@@ -31,7 +32,8 @@ use autumn_harvest_plugin::api::{
     HarvestApiRuntime, HarvestApiState, HarvestRetentionRuntime, harvest_api_router,
 };
 use autumn_harvest_plugin::{
-    HarvestMode, HarvestRunner, HarvestRunnerResources, HarvestRuntimeConfig,
+    HarvestMode, HarvestRetentionConfig, HarvestRunner, HarvestRunnerResources,
+    HarvestRuntimeConfig, RetentionRunOn,
 };
 use autumn_web::reexports::axum;
 use axum::body::Body;
@@ -3052,6 +3054,7 @@ async fn external_runner_processes_workflows_started_via_management_api() {
             readiness: autumn_harvest_plugin::HarvestReadinessConfig::default(),
             startup: autumn_harvest_plugin::HarvestStartupConfig::default(),
             redis: autumn_harvest_plugin::HarvestRedisConfig::default(),
+            retention: autumn_harvest_plugin::HarvestRetentionConfig::default(),
         },
         HarvestRunnerResources::new(pool.clone()),
     )
@@ -3100,6 +3103,7 @@ async fn external_runner_processes_workflows_started_via_management_api() {
             readiness: autumn_harvest_plugin::HarvestReadinessConfig::default(),
             startup: autumn_harvest_plugin::HarvestStartupConfig::default(),
             redis: autumn_harvest_plugin::HarvestRedisConfig::default(),
+            retention: autumn_harvest_plugin::HarvestRetentionConfig::default(),
         },
         HarvestRunnerResources::new(pool.clone()),
     )
@@ -3760,6 +3764,10 @@ async fn retention_janitor_deletes_only_rows_older_than_max_age_and_cascades_chi
             readiness: autumn_harvest_plugin::HarvestReadinessConfig::default(),
             startup: autumn_harvest_plugin::HarvestStartupConfig::default(),
             redis: autumn_harvest_plugin::HarvestRedisConfig::default(),
+            // Both switches are off, so retention needs `all` (issue #2478).
+            retention: autumn_harvest_plugin::HarvestRetentionConfig {
+                run_on: autumn_harvest_plugin::RetentionRunOn::All,
+            },
         },
         HarvestRunnerResources::new(pool.clone()),
     )
@@ -3800,6 +3808,148 @@ async fn retention_janitor_deletes_only_rows_older_than_max_age_and_cascades_chi
     )
     .await;
 
+    runner.stop().await;
+}
+
+/// The resolved switches of one placement (issue #2478).
+///
+/// `AUTUMN_ROLE=web` resolves both switches to `false`, and
+/// `AUTUMN_ROLE=worker` resolves both to `true`. `process_role.rs` proves
+/// that. A test `AppState` cannot carry a role, so the test sets the values.
+fn placement_config(
+    database_url: &str,
+    switches: bool,
+    run_on: RetentionRunOn,
+) -> HarvestRuntimeConfig {
+    HarvestRuntimeConfig {
+        mode: HarvestMode::External,
+        worker_enabled: Some(switches),
+        scheduler_enabled: Some(switches),
+        database: autumn_harvest_plugin::HarvestDatabaseConfig {
+            url: Some(database_url.to_owned()),
+        },
+        retention: HarvestRetentionConfig { run_on },
+        ..HarvestRuntimeConfig::default()
+    }
+}
+
+/// Wait up to 15 s for retention to delete `exec_id`.
+async fn wait_for_sweep(database_url: &str, exec_id: uuid::Uuid) -> bool {
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
+        .await
+        .expect("connect");
+    for _ in 0..150 {
+        if count_execution_rows(&mut conn, exec_id).await == 0 {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    false
+}
+
+/// Issue #2478: retention runs where the scheduler runs. A `web` placement
+/// runs no sweep, and `run-now` names the fix. A `combined` role sweeps.
+/// `run_on = "all"` sweeps on a `web` placement, as before the change.
+#[tokio::test]
+async fn retention_follows_the_scheduler_placement() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let pool = build_test_pool(&database_url);
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
+        .await
+        .expect("connect");
+    let start = async |config: HarvestRuntimeConfig, resources: HarvestRunnerResources| {
+        let built = autumn_harvest::HarvestBuilder::new()
+            .retention(RetentionConfig {
+                max_age_secs: Some(7 * 24 * 60 * 60),
+                tick_interval_secs: 1,
+                ..Default::default()
+            })
+            .build();
+        HarvestRunner::start(built, &config, resources).await
+    };
+    let resources = || HarvestRunnerResources::new(pool.clone());
+    let expired = || "NOW() - INTERVAL '10 days'";
+
+    // A `web` placement. Retention is on, but no sweep runs.
+    let web_exec = uuid::Uuid::new_v4();
+    insert_retention_fixture_execution(&mut conn, web_exec, "placed-web", "COMPLETED", expired())
+        .await;
+    let runner = start(
+        placement_config(&database_url, false, RetentionRunOn::Scheduler),
+        resources(),
+    )
+    .await
+    .expect("web placement starts");
+    let api_state = HarvestApiState::new();
+    api_state.set_admin_auth_boundary(true);
+    api_state.install_storage_pool(runner.storage_pool());
+    api_state.install(runner.api_runtime());
+    let app = harvest_api_router(api_state);
+    let (status, body) = post_json(&app, "/admin/retention/run-now", json!({})).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert!(
+        body.to_string()
+            .contains(r#"Set harvest.retention.run_on = \"all\" to run retention here"#),
+        "the 503 names the fix: {body}"
+    );
+    let summary: Option<String> = harvest_audit_log::table
+        .filter(harvest_audit_log::operation.eq("retention.run_now"))
+        .select(harvest_audit_log::error_summary)
+        .order(harvest_audit_log::id.desc())
+        .first(&mut conn)
+        .await
+        .expect("run-now writes an audit row");
+    assert_eq!(
+        summary.as_deref(),
+        Some("retention not placed on this process")
+    );
+    let (_, retention) = get_json(&app, "/admin/retention").await;
+    assert_eq!(retention["per_shard"], json!([]), "{retention}");
+    assert_eq!(retention["placed_elsewhere"], json!(true), "{retention}");
+    // A back-up check. The 503 and the status above decide the test.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(count_execution_rows(&mut conn, web_exec).await, 1);
+    runner.stop().await;
+
+    // A `combined` role with no switch set sweeps the row on its own tick.
+    // This goes through the role resolve of the runner.
+    let runner = start(
+        HarvestRuntimeConfig {
+            worker_enabled: None,
+            scheduler_enabled: None,
+            ..placement_config(&database_url, true, RetentionRunOn::Scheduler)
+        },
+        resources().with_app_state(autumn_web::AppState::for_test()),
+    )
+    .await
+    .expect("combined role starts");
+    let api_state = HarvestApiState::new();
+    api_state.set_admin_auth_boundary(true);
+    api_state.install_storage_pool(runner.storage_pool());
+    api_state.install(runner.api_runtime());
+    let app = harvest_api_router(api_state);
+    let (_, retention) = get_json(&app, "/admin/retention").await;
+    assert_eq!(retention.get("placed_elsewhere"), None, "{retention}");
+    assert!(
+        wait_for_sweep(&database_url, web_exec).await,
+        "a combined role must sweep"
+    );
+    runner.stop().await;
+
+    // `run_on = "all"` restores the sweep on a `web` placement.
+    let all_exec = uuid::Uuid::new_v4();
+    insert_retention_fixture_execution(&mut conn, all_exec, "placed-all", "COMPLETED", expired())
+        .await;
+    let runner = start(
+        placement_config(&database_url, false, RetentionRunOn::All),
+        resources(),
+    )
+    .await
+    .expect("web placement with run_on = all starts");
+    assert!(
+        wait_for_sweep(&database_url, all_exec).await,
+        "run_on = all must sweep on a web placement"
+    );
     runner.stop().await;
 }
 
