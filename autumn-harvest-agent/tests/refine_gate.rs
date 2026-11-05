@@ -585,3 +585,27 @@ async fn a_restart_keeps_the_wait_and_its_deadline() {
     let events = f.rt.load_history(exec).unwrap();
     replay(f.harness.clone(), events, exec).await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn approve_expects_the_version_active_at_refine_start() {
+    let mut f = fixture();
+    let base = ProfileOverlay {
+        system: Some("Operator base.".to_owned()),
+        ..ProfileOverlay::default()
+    };
+    let ops = || Provenance::operator("ops");
+    let first = f.store.put(KIND, &base, ops()).await.unwrap();
+    f.store.activate(KIND, first, None, ops()).await.unwrap();
+    let exec = f.waiting().await;
+    let chosen = stored_versions(&f.store).await[1].0;
+    assert_eq!(active(&f.store).await, Some(first));
+    f.decide(exec, &RefineDecision::Approve);
+    let report = report_of(f.drive(exec).await);
+    assert_eq!(report.status, RefineStatus::Adopted, "{report:?}");
+    let gate = report.gate.expect("a gate record");
+    assert_eq!(gate.expected, Some(first));
+    assert_eq!(gate.adopted, Some(chosen));
+    assert_eq!(active(&f.store).await, Some(chosen));
+    let last = f.store.last_activation(KIND).await.unwrap().unwrap();
+    assert_eq!(last.from(), Some(first));
+}
