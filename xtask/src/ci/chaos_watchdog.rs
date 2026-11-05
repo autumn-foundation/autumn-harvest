@@ -343,6 +343,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn exit_code_passes_through_a_normal_status() {
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("exit 42")
+            .status()
+            .unwrap();
+        assert_eq!(exit_code(status), 42);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exit_code_maps_a_signal_to_128_plus_signal() {
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("kill -9 $$")
+            .status()
+            .unwrap();
+        assert_eq!(exit_code(status), 137);
+    }
+
+    #[test]
     fn since_is_48_hours_back_in_utc() {
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(3 * 86_400 + 3_661);
         assert_eq!(since_timestamp(now), "1970-01-02T01:01:01Z");

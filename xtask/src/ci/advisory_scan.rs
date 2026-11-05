@@ -399,6 +399,27 @@ fn finding_body(status: u8, run_url: &str, ids: &str, log: &[u8]) -> Vec<u8> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn exit_code_passes_through_a_normal_status() {
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("exit 42")
+            .status()
+            .unwrap();
+        assert_eq!(exit_code(status), 42);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exit_code_maps_a_signal_to_128_plus_signal() {
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("kill -9 $$")
+            .status()
+            .unwrap();
+        assert_eq!(exit_code(status), 137);
+    }
+
     const LISTING: &str = r#"[{"number":5,"title":"Other"}]
 [{"number":9,"title":"Advisory scan: cargo deny check advisories failed","pull_request":{}},
  {"number":31,"title":"Advisory scan: cargo deny check advisories failed"}]"#;
