@@ -997,6 +997,22 @@ jobs:
             /usr/local/share/boost /usr/lib/jvm "$AGENT_TOOLSDIRECTORY" || true
           sudo docker image prune --all --force > /dev/null 2>&1 || true
           df -h /
+      # Shard 3 ended with its agent-tests step still running and no later
+      # step ran. A dead runner skips the summary steps below, so they
+      # cannot show a disk that filled. Bash reads `BASH_ENV` at start, so
+      # each step prints free space when it exits. The line streams to the
+      # live log. The guard variable keeps child shells quiet.
+      - name: Print free disk at the end of every step (Linux)
+        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
+        shell: bash
+        run: |
+          cat > "$RUNNER_TEMP/disk-trap.sh" <<'TRAP'
+          if [ -z "${SEMAPHORE_DISK_TRAP:-}" ]; then
+            export SEMAPHORE_DISK_TRAP=1
+            trap 'echo "disk-free: $(df -h / | awk "NR==2{print \$4, \$5}")"' EXIT
+          fi
+          TRAP
+          echo "BASH_ENV=$RUNNER_TEMP/disk-trap.sh" >> "$GITHUB_ENV"
       # kache executable caching broke uplifted binaries on macOS:
       # `target/debug/harvest` and a build-script copy failed with "cannot
       # execute binary file". Test binaries in `deps/` ran. The CLI caches
@@ -1374,6 +1390,23 @@ jobs:
       # database. Linux-only: it is the one example gated on `wasm-activities`,
       # which drags in wasmtime — a multi-minute build not worth paying on three
       # legs, and the macOS/Windows legs never build core examples at all.
+      # Disk telemetry. One no-db leg failed with "No space left on device"
+      # while compiling, 45 minutes after `df` showed 111 GiB free. No step
+      # records where that space goes, so the cause is unmeasured. These two
+      # steps write free space and the size of `target/` and the kache store
+      # to the job summary: once before the heaviest step, once at the end,
+      # even on failure. Compare the two rows across legs to find the owner.
+      - name: Disk telemetry before the wasm and schema steps (Linux)
+        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
+        shell: bash
+        run: |
+          {
+            echo "### Disk telemetry: before wasm/schema steps (shard ${{ matrix.shard }})"
+            echo '```'
+            df -h /
+            du -sh target "$HOME/.cache/kache" "$HOME/.kache" "$HOME/.cargo" 2>/dev/null || true
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Run wasm_activity example (issue #965)
         if: runner.os == 'Linux' && needs.changes.outputs.code == 'true' && matrix.shard == 1
         run: cargo run -p autumn-harvest --features wasm-activities --example wasm_activity
@@ -1433,6 +1466,19 @@ jobs:
           else
             echo "no artifact at ${BASE_SHA} — first introduction, nothing to compare"
           fi
+
+      - name: Disk telemetry at job end (Linux)
+        if: always() && runner.os == 'Linux' && needs.changes.outputs.code == 'true'
+        shell: bash
+        run: |
+          {
+            echo "### Disk telemetry: job end (shard ${{ matrix.shard }})"
+            echo '```'
+            df -h /
+            du -sh target "$HOME/.cache/kache" "$HOME/.kache" "$HOME/.cargo" 2>/dev/null || true
+            du -sh target/debug/deps target/debug/incremental target/debug/build 2>/dev/null || true
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
 
   # Builds the test binaries of every `linux` and `linuxpart` manifest row once,
   # into one cargo-nextest archive. Each `test-db-linux` shard downloads it and
