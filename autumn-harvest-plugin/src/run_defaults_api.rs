@@ -1,12 +1,13 @@
 //! `GET` and `PATCH /admin/workflow-types/{workflow_name}/run-defaults`
 //! (issues #2387, #2406, #2407 and #2408).
 //!
-//! The routes read and change the operator override of the `sla`, the
-//! `execution_timeout`, the `chain_execution_timeout`, the concurrency
-//! `limit` and the three quota admission caps of one workflow type. A DAG
-//! uses its own name. A DAG declares no chain cap, so the route refuses a
-//! chain cap for a DAG. The override lives on the default shard. See [`autumn_harvest::run_defaults`] for the precedence
-//! and the cache.
+//! The routes read and change the operator override of one workflow type.
+//! It holds the `sla`, the `execution_timeout`, the
+//! `chain_execution_timeout`, the concurrency `limit` and the three quota
+//! admission caps. A DAG uses its own name. A DAG declares no chain cap, so
+//! the route refuses a chain cap for a DAG. The override lives on the default
+//! shard. See [`autumn_harvest::run_defaults`] for the precedence and the
+//! cache.
 //!
 //! A change reaches new starts in this process at once, through a write
 //! through to the cache. Other processes see it within their refresh period.

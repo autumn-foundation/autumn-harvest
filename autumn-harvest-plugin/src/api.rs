@@ -40828,9 +40828,9 @@ async fn load_quota_overrides(
 /// The `limits`, `code_limits` and `override` of one type (issues #946 and
 /// #2408).
 ///
-/// `limits` follows the same rule as admission: each cap of the override
-/// replaces the code cap, and a type with no admission cap keeps its code
-/// caps. A type with no quota policy reports null caps.
+/// `limits` follows the same rule as admission. Each cap of the override
+/// replaces the code cap. A type with no admission cap keeps its code caps.
+/// A type with no quota policy reports null caps.
 fn quota_limit_fields(
     policy: Option<::autumn_harvest::quota::QuotaPolicy>,
     stored: Option<&QuotaOverrideView>,
