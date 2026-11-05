@@ -12,9 +12,9 @@ use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest_agent::flow::labels;
 use autumn_harvest_agent::mesh::DELEGATE_TOOL;
 use autumn_harvest_agent::{
-    AgentHarness, AgentStop, AgentTask, Approval, ChatRole, ContentPart, FlowRules, FnTool,
-    Mandate, ModelTurn, ModelTurnRequest, Peer, Recheck, Refusal, Rule, TokenUsage, ToolCall,
-    ToolCallRequest, ToolDecision, ToolEffect, ToolRules, sqlite,
+    AgentHarness, AgentReport, AgentStop, AgentTask, Approval, ChatRole, ContentPart, FlowRules,
+    FnTool, Mandate, ModelTurn, ModelTurnRequest, Peer, Recheck, Refusal, Rule, TokenUsage,
+    ToolCall, ToolCallRequest, ToolDecision, ToolEffect, ToolRules, sqlite,
 };
 use autumn_harvest_sqlite::RunState;
 use common::{Recorder, Reply, ScriptedModel, answer, calls, recorded_tool, report, runtime};
@@ -1929,7 +1929,7 @@ async fn a_long_child_answer_is_cut() {
     ]);
     let mut rt = runtime(&db, AgentHarness::new(model.clone()).peer(researcher()));
     let exec = sqlite::start(&mut rt, &planner(&["researcher"])).unwrap();
-    report(rt.run_until_blocked(exec).await.unwrap());
+    let report = report(rt.run_until_blocked(exec).await.unwrap());
     let result: Value =
         serde_json::from_str(&last_tool_results(&model.requests()[2].messages)[0]).unwrap();
     let answer = result["answer"].as_str().unwrap();
@@ -1939,6 +1939,94 @@ async fn a_long_child_answer_is_cut() {
         &answer[answer.len() - 20..]
     );
     assert!(answer.chars().count() < 8_100);
+    // The parent model and the operator can see the cut (issue #2481).
+    assert_eq!(result["truncated"], true);
+    assert!(report.delegations[0].answer_truncated);
+}
+
+/// Run a planner whose researcher answers with `long`. Returns the
+/// delegation result that the planner reads, and the report.
+async fn delegate_once(harness: AgentHarness, model: &ScriptedModel) -> (Value, AgentReport) {
+    let (_dir, db) = fresh_db();
+    let mut rt = runtime(&db, harness);
+    let exec = sqlite::start(&mut rt, &planner(&["researcher"])).unwrap();
+    let report = report(rt.run_until_blocked(exec).await.unwrap());
+    let result =
+        serde_json::from_str(&last_tool_results(&model.requests()[2].messages)[0]).unwrap();
+    (result, report)
+}
+
+/// A researcher answer of 9 000 characters. It ends with a tail, so a cut
+/// shows.
+fn long_answer() -> String {
+    format!("{}TAIL", "x".repeat(8_996))
+}
+
+/// Assert that `result` holds the whole of [`long_answer`]. A failure shows
+/// the length, not 9 000 characters.
+fn assert_whole(result: &Value) {
+    let answer = result["answer"].as_str().unwrap_or_default();
+    assert!(
+        answer == long_answer(),
+        "{} characters, whole: {}",
+        answer.chars().count(),
+        answer.ends_with("TAIL")
+    );
+    assert_eq!(result["truncated"], false);
+}
+
+// Issue #2481: `tool_output_limit` governs an inline answer.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_harness_limit_governs_an_inline_answer() {
+    let model = ScriptedModel::new(vec![
+        delegate("d1", "researcher", "dig", 1),
+        answer(&long_answer(), 1),
+        answer("done", 1),
+    ]);
+    let harness = AgentHarness::new(model.clone())
+        .peer(researcher())
+        .tool_output_limit(20_000);
+    let (result, report) = delegate_once(harness, &model).await;
+    assert_whole(&result);
+    assert!(!report.delegations[0].answer_truncated);
+}
+
+// Issue #2481: `Peer::answer_limit` overrides the harness for one peer.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_peer_limit_overrides_the_harness_limit() {
+    let model = ScriptedModel::new(vec![
+        delegate("d1", "researcher", "dig", 1),
+        answer(&long_answer(), 1),
+        answer("done", 1),
+    ]);
+    let harness = AgentHarness::new(model.clone())
+        .peer(researcher().answer_limit(100))
+        .tool_output_limit(20_000);
+    let (result, report) = delegate_once(harness, &model).await;
+    assert_eq!(result["answer"], format!("{}…[truncated]", "x".repeat(100)));
+    assert_eq!(result["truncated"], true);
+    assert!(report.delegations[0].answer_truncated);
+
+    let model = ScriptedModel::new(vec![
+        delegate("d1", "researcher", "dig", 1),
+        answer(&long_answer(), 1),
+        answer("done", 1),
+    ]);
+    let harness = AgentHarness::new(model.clone()).peer(researcher().answer_limit(20_000));
+    let (result, _) = delegate_once(harness, &model).await;
+    assert_whole(&result);
+}
+
+// Issue #2481: the recorded lookup holds the resolved limit of each peer.
+#[test]
+fn discovery_resolves_the_answer_limit() {
+    let harness = AgentHarness::new(ScriptedModel::new(Vec::new()))
+        .peer(Peer::new("writer", "W.").answer_limit(7))
+        .peer(Peer::new("researcher", "R."))
+        .tool_output_limit(123);
+    let found = harness.discover_peers(&["researcher".to_owned(), "writer".to_owned()]);
+    let limits: Vec<Option<usize>> = found.iter().map(|peer| peer.answer_limit).collect();
+    assert_eq!(limits, vec![Some(123), Some(7)]);
 }
 
 // AC10: the tool-call worker refuses a tool whose labels grew after the

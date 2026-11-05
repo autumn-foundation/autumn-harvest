@@ -214,8 +214,9 @@ a worker. Otherwise the adapter ends a run that the store could carry.
 - `policy(policy)` — any `ToolPolicy`. The default is `AllowAll`.
   `ToolRules` gives per-tool and per-effect rules.
 - `temperature(t)` — the sampling temperature of each call.
-- `tool_output_limit(chars)` — the cap on one tool result. The default is
-  8 000 characters.
+- `tool_output_limit(chars)` — the cap on one tool result and on one
+  delegation answer. The default is 8 000 characters. `Peer::answer_limit`
+  overrides it for one peer.
 - `max_result_bytes(bytes)` — the activity-result cap of the workers. A
   larger tool result is cut to fit it. A model reply that does not fit ends
   the run as `reply_too_large`. The default is the engine default. Zero is

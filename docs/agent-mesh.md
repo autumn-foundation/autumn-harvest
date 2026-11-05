@@ -56,11 +56,12 @@ tool allowlist or flow rules.
 The result of a delegation is JSON:
 
 ```json
-{"agent": "researcher", "stop": "completed", "answer": "The ferry leaves at 9."}
+{"agent": "researcher", "answer": "The ferry leaves at 9.", "stop": "completed", "truncated": false}
 ```
 
-The `stop` field tells the parent model how the child ended. The parent
-model reads it and decides what to do.
+The `stop` field tells the parent model how the child ended. The
+`truncated` field is `true` when the answer was cut (section 3). The parent
+model reads both and decides what to do.
 
 ## 3. What the child gets
 
@@ -81,7 +82,14 @@ the task.
 | Memory, follow-ups, delivery | Off |
 | Session, tenant, output cap, unattended flag | As the parent |
 | Loop guard, approval timeout, request cap | As the parent |
-| Answer | Cut to 8 000 characters. `AgentHarness::tool_output_limit` does not apply. |
+| Answer | Cut to `Peer::answer_limit`, else to `AgentHarness::tool_output_limit` (default 8 000 characters). |
+
+The same limit applies to an inline child, a fan-out child (section 15) and
+a durable peer (section 13). A cut answer ends with `…[truncated]`. The
+result also has `"truncated": true`, and the report sets
+`DelegationRecord::answer_truncated`. The peer lookup records the limit, so
+replay cuts each answer as the live run did. A run recorded before issue
+#2481 keeps its old cut of 8 000 characters and has no `truncated` field.
 
 Tools key idempotency on `(run_id, step, call_id)`. A child has its own run
 id, so its keys never collide with the parent keys. A child of a run whose

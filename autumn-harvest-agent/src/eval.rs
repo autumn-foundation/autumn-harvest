@@ -2274,6 +2274,7 @@ mod tests {
             steps_used: 0,
             tool_calls: 0,
             resets: 0,
+            answer_truncated: false,
         };
         report.delegations = vec![child("e1:d1"), child("e10"), child("x")];
         rebase_run_ids(&mut report, "e1", "r1");

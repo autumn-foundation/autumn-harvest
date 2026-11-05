@@ -39,7 +39,7 @@ use crate::delivery::{Report, ReportSource, report_text};
 use crate::draw::Draw;
 use crate::flow::Released;
 use crate::followup::{self, FOLLOWUP_TOOL, Planned};
-use crate::harness::{AgentHarness, CacheTenant, DEFAULT_TOOL_OUTPUT_LIMIT, truncate};
+use crate::harness::{AgentHarness, CacheTenant, truncate, truncate_flagged};
 use crate::heartbeat::{HeartbeatTask, agent_heartbeat_info};
 use crate::loop_guard::{LoopTracker, LoopVerdict, warning_note};
 use crate::memory::{
@@ -72,6 +72,13 @@ const FINAL_TURN_PATCH: &str = "agent_final_turn_rules";
 /// part of the recorded child input. A history from before the gate replays
 /// with the old input.
 const CHILD_FAILURE_REPORT_PATCH: &str = "agent_child_failure_report";
+
+/// The cut of a delegation answer in a history from before issue #2481.
+///
+/// Such a history recorded its peer lookup with no `answer_limit`. Its run
+/// replays with this cut and with no `truncated` key. A new lookup always
+/// holds a limit, so a new run never reads this value.
+const LEGACY_ANSWER_LIMIT: usize = 8_000;
 
 /// The registered workflow name.
 pub const WORKFLOW_NAME: &str = "agent_loop";
@@ -2108,18 +2115,43 @@ async fn delegate(
         steps_used: steps,
         tool_calls,
         resets: child.reset.count,
+        answer_truncated: false,
     });
-    let outcome = serde_json::json!({
+    let mut outcome = serde_json::json!({
         "agent": peer.name,
         "stop": stop,
-        "answer": truncate(&child.last_text, DEFAULT_TOOL_OUTPUT_LIMIT),
-    })
-    .to_string();
+    });
+    mark_cut(tree, put_answer(&mut outcome, peer, &child.last_text));
+    let outcome = outcome.to_string();
     Ok(ToolOutcome {
         content: outcome,
         is_error: stop != AgentStop::Completed,
         workspace: None,
     })
+}
+
+/// Put the answer of `peer` into a delegation result (issue #2481).
+///
+/// The answer is cut to the limit of the peer, and `truncated` tells the
+/// parent model whether text dropped. Returns `true` on a cut. A peer
+/// lookup from before issue #2481 has no limit. That run keeps the old cut
+/// and the old shape, and returns `false`, so it replays as it ran.
+fn put_answer(result: &mut serde_json::Value, peer: &Peer, answer: &str) -> bool {
+    let Some(limit) = peer.answer_limit else {
+        result["answer"] = truncate(answer, LEGACY_ANSWER_LIMIT).into();
+        return false;
+    };
+    let (shown, cut) = truncate_flagged(answer, limit);
+    result["answer"] = shown.into();
+    result["truncated"] = cut.into();
+    cut
+}
+
+/// Mark the last delegation record of `tree` when its answer was cut.
+fn mark_cut(tree: &mut Tree, cut: bool) {
+    if let Some(record) = tree.records.last_mut() {
+        record.answer_truncated = cut;
+    }
 }
 
 /// Record a refused delegation and answer the model.
@@ -2142,6 +2174,7 @@ fn refuse_delegation(agent: &Member, tree: &mut Tree, refusal: Refusal, name: &s
         steps_used: 0,
         tool_calls: 0,
         resets: 0,
+        answer_truncated: false,
     });
     refused(refusal, name)
 }
@@ -2349,13 +2382,14 @@ fn merge_child(
         steps_used: report.steps_used,
         tool_calls: report.tool_calls,
         resets: report.resets,
+        answer_truncated: false,
     });
-    let outcome = serde_json::json!({
+    let mut outcome = serde_json::json!({
         "agent": peer.name,
         "stop": report.stop,
-        "answer": truncate(&report.text, DEFAULT_TOOL_OUTPUT_LIMIT),
-    })
-    .to_string();
+    });
+    mark_cut(tree, put_answer(&mut outcome, peer, &report.text));
+    let outcome = outcome.to_string();
     ToolOutcome {
         content: outcome,
         is_error: report.stop != AgentStop::Completed,
@@ -2466,17 +2500,18 @@ fn peer_outcome(
                 steps_used: 0,
                 tool_calls: 0,
                 resets: 0,
+                answer_truncated: false,
             });
             if let Some(refusal) = reply.refusal {
                 refused(refusal, &peer.name)
             } else {
-                let content = serde_json::json!({
+                let mut content = serde_json::json!({
                     "agent": peer.name,
                     "stop": reply.stop,
-                    "answer": truncate(&reply.answer, DEFAULT_TOOL_OUTPUT_LIMIT),
                     "error": reply.error,
-                })
-                .to_string();
+                });
+                mark_cut(tree, put_answer(&mut content, peer, &reply.answer));
+                let content = content.to_string();
                 ToolOutcome {
                     content,
                     is_error: reply.stop != Some(AgentStop::Completed),
@@ -2494,6 +2529,7 @@ fn peer_outcome(
                 steps_used: 0,
                 tool_calls: 0,
                 resets: 0,
+                answer_truncated: false,
             });
             ToolOutcome::error(&format!(
                 "the durable agent {:?} gave no answer: {error}",
@@ -2558,6 +2594,7 @@ fn refuse(agent: &Member, tree: &mut Tree, refusal: Refusal, name: &str) -> Tool
         steps_used: 0,
         tool_calls: 0,
         resets: 0,
+        answer_truncated: false,
     });
     refused(refusal, name)
 }
@@ -2950,6 +2987,43 @@ pub fn activities() -> Vec<ActivityInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Issue #2481: a peer lookup recorded before the limit has no
+    // `answer_limit`. Its run replays with the old cut and the old shape.
+    #[test]
+    fn a_legacy_lookup_keeps_the_old_cut_and_shape() {
+        let peer: Peer = serde_json::from_value(serde_json::json!({
+            "name": "researcher",
+            "description": "R.",
+            "max_steps": 8,
+        }))
+        .unwrap();
+        assert_eq!(peer.answer_limit, None);
+        assert_eq!(LEGACY_ANSWER_LIMIT, 8_000, "old histories pin this value");
+        let mut result = serde_json::json!({"agent": "researcher", "stop": "completed"});
+        let cut = put_answer(&mut result, &peer, &"x".repeat(8_050));
+        assert!(!cut, "a legacy run sets no record flag");
+        let want = serde_json::json!({
+            "agent": "researcher",
+            "stop": "completed",
+            "answer": format!("{}…[truncated]", "x".repeat(8_000)),
+        });
+        assert_eq!(result, want);
+    }
+
+    // Issue #2481: a resolved lookup cuts at its limit and marks the cut.
+    #[test]
+    fn a_resolved_lookup_marks_the_cut() {
+        let peer = Peer::new("researcher", "R.").answer_limit(3);
+        let mut result = serde_json::json!({"agent": "researcher"});
+        assert!(put_answer(&mut result, &peer, "abcd"));
+        assert_eq!(result["answer"], "abc…[truncated]");
+        assert_eq!(result["truncated"], true);
+        let mut result = serde_json::json!({"agent": "researcher"});
+        assert!(!put_answer(&mut result, &peer, "abc"));
+        assert_eq!(result["answer"], "abc");
+        assert_eq!(result["truncated"], false);
+    }
 
     #[test]
     fn the_flow_state_after_a_turn_skips_denied_calls() {
