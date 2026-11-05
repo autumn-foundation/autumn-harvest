@@ -838,6 +838,10 @@ fn run_rows(runner: &mut Runner, want: Option<&str>) -> Step {
 }
 
 /// Runs `cargo xtask ci run-suites`.
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "every command takes its `Args` by value, so each dispatch arm has one shape"
+)]
 pub fn run(args: Args) -> Result<ExitCode> {
     let mode = args.words.first().map_or("", String::as_str);
     let operand = args.words.get(1).map_or("", String::as_str);

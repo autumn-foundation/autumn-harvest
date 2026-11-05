@@ -111,7 +111,7 @@ pub fn run(_args: Args) -> Result<ExitCode> {
 
 /// Returns the shell exit code of a finished child, `128 + signal` for a signal.
 fn exit_code(status: std::process::ExitStatus) -> ExitCode {
-    crate::perf::broken_session_scan::support::exit_code(status)
+    crate::perf::support::exit_code(status)
 }
 
 #[cfg(test)]

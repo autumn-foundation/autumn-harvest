@@ -1,8 +1,7 @@
 //! Helpers that the perf evidence generators and the bench drivers share.
 //!
-//! `perf/mod.rs` belongs to the scaffold, so `broken_session_scan` declares
-//! this module with a `#[path]` attribute. The other perf commands and the
-//! bench commands reach it through that module.
+//! The perf commands reach it as `super::support`. The bench commands and
+//! `dev fuzz-smoke` reach it as `crate::perf::support`.
 //!
 //! The shell scripts that these commands replace ran under
 //! `set -euo pipefail`. Each helper here keeps one part of that contract. A

@@ -270,11 +270,6 @@ fn join_realpath(
     (base, true)
 }
 
-/// Returns the repository root as Python `Path(__file__).resolve()` gave it.
-pub fn resolved_root(root: &Path) -> PathBuf {
-    resolve(root)
-}
-
 /// Returns `path` relative to `root` as a POSIX string, as `str(p.relative_to(root))`.
 pub fn rel(path: &Path, root: &Path) -> String {
     let relative = path.strip_prefix(root).unwrap_or(path);

@@ -1858,6 +1858,10 @@ See `autumn-harvest/examples/schema_workflow.rs` for a full working demonstratio
 
 ## Development Commands
 
+Every CI gate, doc guard and perf evidence generator runs as
+`cargo xtask <group> <command>`. [`docs/xtask.md`](xtask.md) lists each
+command, its module and the script it replaced.
+
 ```bash
 # Build without DB (works on Windows, no OpenSSL required)
 cargo build -p autumn-harvest --no-default-features

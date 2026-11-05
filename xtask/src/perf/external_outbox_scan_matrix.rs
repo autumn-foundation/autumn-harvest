@@ -47,7 +47,7 @@ use std::process::{Command, ExitCode, ExitStatus, Stdio};
 use regex::Regex;
 use smop::prelude::*;
 
-use super::broken_session_scan::support::{self, Ctx};
+use super::support::{self, Ctx};
 
 /// Issue #1486's own fixture.
 ///

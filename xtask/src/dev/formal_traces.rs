@@ -57,6 +57,10 @@ pub struct Args {
 }
 
 /// Runs `cargo xtask dev formal-traces`.
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "every command takes its `Args` by value, so each dispatch arm has one shape"
+)]
 pub fn run(args: Args) -> Result<ExitCode> {
     check(
         Path::new(&args.jar),

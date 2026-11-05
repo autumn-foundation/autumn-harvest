@@ -32,7 +32,7 @@ use std::process::ExitCode;
 use regex::Regex;
 use smop::prelude::*;
 
-use super::default_run::support::{self, Report};
+use super::support::{self, Report};
 use crate::util;
 
 const MAIN_RS: &str = "examples/claude-agent-daemon/src/main.rs";

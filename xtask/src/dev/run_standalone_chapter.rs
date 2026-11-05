@@ -183,6 +183,10 @@ pub fn count_markers(doc: &str) -> usize {
 }
 
 /// Runs `cargo xtask dev run-standalone-chapter`.
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "every command takes its `Args` by value, so each dispatch arm has one shape"
+)]
 pub fn run(args: Args) -> Result<ExitCode> {
     let Args {} = args;
     std::env::set_current_dir(repo_root()).context("cannot enter the repository root")?;

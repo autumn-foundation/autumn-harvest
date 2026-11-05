@@ -38,7 +38,7 @@ use std::process::{Command, ExitCode, ExitStatus, Stdio};
 
 use smop::prelude::*;
 
-use super::broken_session_scan::support::{self, Ctx};
+use super::support::{self, Ctx};
 
 /// The `count(*) >= threshold` bound that both forms test.
 const THRESHOLD: u32 = 10000;

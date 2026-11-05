@@ -207,6 +207,10 @@ fn self_test() -> (Vec<String>, usize) {
 }
 
 /// Runs `cargo xtask audit mixed-version-contract`.
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "every command takes its `Args` by value, so each dispatch arm has one shape"
+)]
 pub fn run(args: Args) -> Result<ExitCode> {
     let (lines, bad) = if args.self_test {
         self_test()

@@ -250,6 +250,10 @@ fn step_cargo(repo: &Path, krate: &Path) -> Command {
 }
 
 /// Runs `cargo xtask dev clean-room-getting-started`.
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "every command takes its `Args` by value, so each dispatch arm has one shape"
+)]
 pub fn run(args: Args) -> Result<ExitCode> {
     let options = match parse(&args.rest) {
         Ok(options) => options,

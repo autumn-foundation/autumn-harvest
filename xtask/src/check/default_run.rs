@@ -15,9 +15,6 @@
 //! than 50 places, including the "Step 3 — Run preflight" step of the
 //! quickstart. On trunk-dev it failed with "could not determine which binary
 //! to run".
-//!
-//! This module also holds the helpers that every `check` guard shares, in
-//! [`support`].
 
 use std::process::ExitCode;
 
@@ -26,10 +23,7 @@ use smop::prelude::*;
 
 use crate::util;
 
-#[path = "support.rs"]
-pub(super) mod support;
-
-use support::Report;
+use super::support::Report;
 
 /// Arguments of `cargo xtask check default-run`.
 #[derive(Debug, Clone, Copy, Args)]

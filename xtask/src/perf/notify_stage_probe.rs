@@ -26,8 +26,8 @@ use std::process::ExitCode;
 
 use smop::prelude::*;
 
-use super::broken_session_scan::support::{self, Ctx};
 use super::pool_recycle_ping::{EchoPsql, bench_args, run_ranking};
+use super::support::{self, Ctx};
 
 /// The summary query: probe calls per workflow, and the share of all calls.
 const SUMMARY_SQL: &str = r#"

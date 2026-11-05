@@ -50,8 +50,9 @@ fn is_printable(ch: char) -> bool {
 pub enum DirectiveValue {
     /// A reserved directive. `PyYAML` skips it.
     None,
-    /// `%YAML major.minor`. A number too large for `u64` is `None`.
-    Yaml(Option<u64>, Option<u64>),
+    /// `%YAML major.minor`. The value is the major number, because the parser
+    /// reads only that number. A number too large for `u64` is `None`.
+    Yaml(Option<u64>),
     /// `%TAG handle prefix`.
     Tag(String, String),
 }
@@ -791,7 +792,7 @@ impl Scanner {
             ));
         }
         self.forward(1);
-        let minor = self.scan_yaml_directive_number(start)?;
+        self.scan_yaml_directive_number(start)?;
         if !is_in(self.peek(0), SPACEZ) {
             return Err(self.directive_error(
                 start,
@@ -801,7 +802,7 @@ impl Scanner {
                 ),
             ));
         }
-        Ok(DirectiveValue::Yaml(major, minor))
+        Ok(DirectiveValue::Yaml(major))
     }
 
     fn scan_yaml_directive_number(&mut self, start: Mark) -> Scan<Option<u64>> {

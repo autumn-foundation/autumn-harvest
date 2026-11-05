@@ -163,6 +163,10 @@ fn coverage(root: &Path, json: bool) -> Result<String> {
 }
 
 /// Runs `cargo xtask audit cli-flag-coverage`.
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "every command takes its `Args` by value, so each dispatch arm has one shape"
+)]
 pub fn run(args: Args) -> Result<ExitCode> {
     let root = pycompat::resolve(&util::repo_root());
     print!("{}", coverage(&root, args.json)?);

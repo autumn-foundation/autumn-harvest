@@ -133,7 +133,10 @@ const WEAVER_SCRIPT_LINES: &[(&str, &str)] = &[
         "the check must refuse an image with no digest",
     ),
     ("weaver.place(&model)?;", "run 1 must check this model"),
-    ("weaver.place(&broken)?;", "run 2 must check the broken copy"),
+    (
+        "weaver.place(&broken)?;",
+        "run 2 must check the broken copy",
+    ),
     (
         r#"return fail("error: the negative control passed, so run 1 proves nothing");"#,
         "the broken copy must fail, so a pass is not vacuous",
@@ -248,7 +251,10 @@ const WEAVER_SCRIPT_PARTS: &[(&str, &str)] = &[
         ".github/ISSUE_TEMPLATE/new-conventions.yaml",
         "section 9 follows this upstream form",
     ),
-    ("\"- area:new\"", "the form must offer the area of section 9"),
+    (
+        "\"- area:new\"",
+        "the form must offer the area of section 9",
+    ),
     (
         "\"label: Propose new conventions\"",
         "the form must have the field of section 9",
@@ -1555,7 +1561,10 @@ fn helpers_parse_their_inputs() {
         pinned_commit(&format!("x\nconst SEMCONV_COMMIT: &str = \"{sha}\";\n")),
         Some(sha)
     );
-    assert_eq!(pinned_commit("const SEMCONV_COMMIT: &str = \"main\";"), None);
+    assert_eq!(
+        pinned_commit("const SEMCONV_COMMIT: &str = \"main\";"),
+        None
+    );
     assert_eq!(
         pinned_commit(&format!(
             "const SEMCONV_COMMIT: &str = \"{}\";",

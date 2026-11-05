@@ -571,6 +571,10 @@ fn rel(path: &Path, root: &Path) -> String {
 type Hit = (PathBuf, &'static str, String);
 
 /// Runs `cargo xtask audit config-cli-drift`.
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "every command takes its `Args` by value, so each dispatch arm has one shape"
+)]
 pub fn run(args: Args) -> Result<ExitCode> {
     let root = pycompat::resolve(&util::repo_root());
     let (code, out) = drift(&root, args.json)?;

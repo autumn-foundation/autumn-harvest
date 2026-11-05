@@ -85,7 +85,7 @@ use std::process::ExitCode;
 
 use smop::prelude::*;
 
-use super::broken_session_scan::support::{self, Ctx, Toggle};
+use super::support::{self, Ctx, Toggle};
 
 /// The capture test and fix marker of this command.
 ///

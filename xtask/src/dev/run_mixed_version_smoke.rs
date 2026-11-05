@@ -135,6 +135,10 @@ pub fn codec_scenarios(previous: &str) -> &'static [&'static str] {
 }
 
 /// Runs `cargo xtask dev run-mixed-version-smoke`.
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "every command takes its `Args` by value, so each dispatch arm has one shape"
+)]
 pub fn run(args: Args) -> Result<ExitCode> {
     let Args {} = args;
     let root = repo_root();

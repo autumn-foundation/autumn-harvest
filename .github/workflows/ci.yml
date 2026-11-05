@@ -207,6 +207,11 @@ jobs:
           s3-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY_ID }}
           s3-secret-access-key: ${{ secrets.KACHE_S3_SECRET_ACCESS_KEY }}
           manifest-key: ${{ github.job }}-${{ strategy.job-index }}
+      # Every gate below runs through `cargo xtask`. Its unit tests hold the
+      # self-test fixtures and the parity cases of each port. So run them
+      # first, before any gate trusts the binary. They build only xtask.
+      - name: xtask unit tests (cargo test -p xtask)
+        run: cargo test --locked -p xtask
       - name: Check default-run for multi-binary packages
         # Guards the defect class that silently broke `cargo run -p
         # quickstart` and `cargo run -p autumn-harvest-cli -- ...` (the
@@ -1117,7 +1122,7 @@ jobs:
       # off by another feature in the list. So the one build runs every test
       # that the five steps ran.
       # - `connector` (issue #944): the connector unit tests. The doc example
-      #   check in `scripts/check-broker-connector-cutover-example.sh` relies
+      #   check in `cargo xtask check broker-connector-cutover-example` relies
       #   on this filter.
       # - `aws_kms` (issue #1825): the AWS KMS binding of the AEAD codec key
       #   provider, against a local fake KMS endpoint. It needs no AWS account.

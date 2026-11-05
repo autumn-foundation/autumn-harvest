@@ -35,7 +35,7 @@ use std::process::{Command, ExitCode};
 
 use smop::prelude::*;
 
-use super::broken_session_scan::support::{self, Ctx};
+use super::support::{self, Ctx};
 
 /// The example that prints both query texts.
 const DUMP_QUERIES_RS: &str = r#"fn main() {

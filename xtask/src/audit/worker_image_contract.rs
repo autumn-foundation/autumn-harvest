@@ -637,7 +637,7 @@ impl Default for Pod {
     }
 }
 
-fn pod(options: Pod) -> Value {
+fn pod(options: &Pod) -> Value {
     serde_json::json!({
         "kind": "Deployment",
         "spec": {"template": {"spec": {
@@ -832,45 +832,45 @@ fn self_test_cases() -> Result<Vec<Case>> {
             ),
             1,
         ),
-        Count(check_deployment(&[pod(Pod::default())])?, 0),
+        Count(check_deployment(&[pod(&Pod::default())])?, 0),
         Count(check_deployment(&[])?, 1),
         Count(
-            check_deployment(&[pod(Pod {
+            check_deployment(&[pod(&Pod {
                 live: READY,
                 ..Pod::default()
             })])?,
             1,
         ),
         Count(
-            check_deployment(&[pod(Pod {
+            check_deployment(&[pod(&Pod {
                 ready: "/api/harvest/health",
                 ..Pod::default()
             })])?,
             1,
         ),
         Count(
-            check_deployment(&[pod(Pod {
+            check_deployment(&[pod(&Pod {
                 sleep: 0,
                 ..Pod::default()
             })])?,
             1,
         ),
         Count(
-            check_deployment(&[pod(Pod {
+            check_deployment(&[pod(&Pod {
                 grace: 30,
                 ..Pod::default()
             })])?,
             1,
         ),
         Count(
-            check_deployment(&[pod(Pod {
+            check_deployment(&[pod(&Pod {
                 read_only: false,
                 ..Pod::default()
             })])?,
             1,
         ),
         Count(
-            check_deployment(&[pod(Pod {
+            check_deployment(&[pod(&Pod {
                 nonroot: false,
                 ..Pod::default()
             })])?,
@@ -955,6 +955,10 @@ fn self_test() -> Result<(Vec<String>, usize)> {
 }
 
 /// Runs `cargo xtask audit worker-image-contract`.
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "every command takes its `Args` by value, so each dispatch arm has one shape"
+)]
 pub fn run(args: Args) -> Result<ExitCode> {
     let (lines, bad) = if args.self_test {
         self_test()?

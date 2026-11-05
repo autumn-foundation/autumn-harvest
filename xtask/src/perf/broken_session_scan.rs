@@ -28,10 +28,7 @@ use std::process::ExitCode;
 
 use smop::prelude::*;
 
-#[path = "support.rs"]
-pub mod support;
-
-use support::Ctx;
+use super::support::{self, Ctx};
 
 /// The migration directory suffix that the "before" run moves aside.
 const MIGRATION_SUFFIX: &str = "_harvest_task_queue_session_active_index";

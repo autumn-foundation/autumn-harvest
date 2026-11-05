@@ -16,7 +16,7 @@ use std::process::ExitCode;
 use regex::Regex;
 use smop::prelude::*;
 
-use super::default_run::support::Report;
+use super::support::Report;
 use crate::util;
 
 /// Arguments of `cargo xtask check agent-adapter-deps`.

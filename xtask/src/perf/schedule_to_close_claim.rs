@@ -77,7 +77,7 @@ use std::process::ExitCode;
 
 use smop::prelude::*;
 
-use super::broken_session_scan::support::{self, Capture, Ctx, Verdict};
+use super::support::{self, Capture, Ctx, Verdict};
 
 /// The capture test that this command runs once.
 const CAPTURE: Capture = Capture {

@@ -2,8 +2,8 @@
 //!
 //! `scripts/formal_traces.py` parsed each line with `json.loads`. `CPython`
 //! 3.12 is the `python3` of the `ubuntu-24.04` runner that ran it. This
-//! decoder follows the C scanner of that release, so each trace gets the
-//! same verdict and each error names the same defect at the same place.
+//! decoder follows the C scanner of that release. So each trace gets the
+//! same verdict, and each error names the same defect at the same place.
 //!
 //! The decoder keeps these Python behaviors:
 //!

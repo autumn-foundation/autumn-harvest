@@ -40,7 +40,7 @@ use std::process::ExitCode;
 
 use smop::prelude::*;
 
-use super::default_run::support::{self, Report, ScratchExample};
+use super::support::{self, Report, ScratchExample};
 use crate::util;
 
 const EXAMPLE_NAME: &str = "_onramp_doc_check_continue_as_new_checkpoint";

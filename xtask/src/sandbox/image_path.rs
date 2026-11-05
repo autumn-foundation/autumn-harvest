@@ -37,6 +37,10 @@ pub struct Args {
 ///
 /// The group dispatcher fixes the `Result` return type.
 #[allow(clippy::unnecessary_wraps)]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "every command takes its `Args` by value, so each dispatch arm has one shape"
+)]
 pub fn run(args: Args) -> Result<ExitCode> {
     match resolve(&args.root, &args.path) {
         Ok(resolved) => {

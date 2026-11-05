@@ -24,7 +24,7 @@ use std::process::{Command, ExitCode, Stdio};
 
 use smop::prelude::*;
 
-use crate::perf::broken_session_scan::support::{self, Ctx};
+use crate::perf::support::{self, Ctx};
 
 /// The connection strings of the four shards in `docker-compose.yml`.
 pub const SHARD_URLS: &str = "postgres://postgres:postgres@127.0.0.1:55432/postgres,\

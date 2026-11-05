@@ -28,7 +28,7 @@ use std::process::ExitCode;
 
 use smop::prelude::*;
 
-use super::default_run::support::{self, Report};
+use super::support::{self, Report};
 use crate::util;
 
 const DOC: &str = "docs/getting-started/01-project-skeleton.md";

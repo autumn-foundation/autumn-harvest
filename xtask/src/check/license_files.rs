@@ -33,7 +33,7 @@ use std::process::ExitCode;
 use serde_json::Value;
 use smop::prelude::*;
 
-use super::default_run::support::{self, Report};
+use super::support::{self, Report};
 use crate::util;
 
 const LICENSE_FILES: [&str; 2] = ["LICENSE-MIT", "LICENSE-APACHE"];

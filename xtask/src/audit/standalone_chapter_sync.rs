@@ -52,7 +52,6 @@ pub struct Args {
 
 const CHAPTER: &str = "docs/getting-started/standalone-axum.md";
 const EMBEDDING: &str = "docs/embedding.md";
-const CRATE: &str = "examples/standalone-quickstart";
 const CHAPTER_2: &str = "docs/getting-started/02-first-workflow.md";
 const CHAPTER_2_FILE: &str = "examples/standalone-quickstart/src/workflows.rs";
 const COMPOSE: &str = "examples/standalone-quickstart/compose.yaml";
@@ -614,6 +613,10 @@ fn self_test_failures() -> Vec<&'static str> {
 /// No step can fail with an error, but each command keeps the signature that
 /// the dispatcher of `cargo xtask audit` calls.
 #[allow(clippy::unnecessary_wraps)]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "every command takes its `Args` by value, so each dispatch arm has one shape"
+)]
 pub fn run(args: Args) -> Result<ExitCode> {
     if args.self_test {
         let failed = self_test_failures();

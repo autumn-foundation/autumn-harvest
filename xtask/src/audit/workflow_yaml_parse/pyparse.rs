@@ -266,7 +266,7 @@ impl Parser {
                 continue;
             };
             match (name.as_str(), value) {
-                ("YAML", DirectiveValue::Yaml(major, _)) => {
+                ("YAML", DirectiveValue::Yaml(major)) => {
                     if yaml_version {
                         return Err(YamlError::new(
                             None,

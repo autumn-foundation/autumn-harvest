@@ -32,6 +32,10 @@ pub struct Args {
 }
 
 /// Runs `cargo xtask check formal-traces`.
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "every command takes its `Args` by value, so each dispatch arm has one shape"
+)]
 pub fn run(args: Args) -> Result<ExitCode> {
     if args.dirs.is_empty() {
         eprintln!("usage: cargo xtask check formal-traces <trace dir>...");

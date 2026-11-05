@@ -20,7 +20,7 @@ use std::process::ExitCode;
 
 use smop::prelude::*;
 
-use super::default_run::support::{self, Report, ScratchExample, SnippetCompile};
+use super::support::{self, Report, ScratchExample, SnippetCompile};
 use crate::util;
 
 const EXAMPLE_NAME: &str = "_onramp_doc_check_readme_front_door";

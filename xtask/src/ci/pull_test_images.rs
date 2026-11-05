@@ -199,6 +199,10 @@ fn images_to_pull(args: &[String]) -> Result<std::result::Result<Vec<String>, ()
 }
 
 /// Runs `cargo xtask ci pull-test-images`.
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "every command takes its `Args` by value, so each dispatch arm has one shape"
+)]
 pub fn run(args: Args) -> Result<ExitCode> {
     if let Ok(images) = images_to_pull(&args.images)? {
         return Ok(pull_all(&mut RealDocker, &images));

@@ -44,7 +44,7 @@ use std::process::ExitCode;
 
 use smop::prelude::*;
 
-use super::broken_session_scan::support::{self, Ctx};
+use super::support::{self, Ctx};
 
 /// The capture test of this command.
 const TEST_FILTER: &str = "deep_backlog_fixture_tests::zz_capture_deep_backlog_ledger_evidence";

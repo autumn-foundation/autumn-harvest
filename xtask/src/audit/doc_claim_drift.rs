@@ -217,7 +217,7 @@ fn fence_marker(line: &str) -> Option<(&str, &str)> {
 /// Finds the first whole run of exactly `run` backticks that starts at or after `from`.
 ///
 /// A run that starts before `from` is not whole from there, so it never counts.
-fn find_closer(chars: &[char], run: usize, from: usize) -> Option<(usize, usize)> {
+const fn find_closer(chars: &[char], run: usize, from: usize) -> Option<(usize, usize)> {
     let mut p = from;
     while p < chars.len() {
         if chars[p] != '`' || (p > 0 && chars[p - 1] == '`') {
@@ -630,6 +630,10 @@ fn findings(root: &Path) -> Result<Vec<String>> {
 }
 
 /// Runs `cargo xtask audit doc-claim-drift`.
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "every command takes its `Args` by value, so each dispatch arm has one shape"
+)]
 pub fn run(args: Args) -> Result<ExitCode> {
     if args.self_test {
         return Ok(match self_test() {

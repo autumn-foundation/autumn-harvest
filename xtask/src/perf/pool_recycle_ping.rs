@@ -30,7 +30,7 @@ use std::process::{Command, ExitCode, ExitStatus};
 
 use smop::prelude::*;
 
-use super::broken_session_scan::support::{self, Ctx, Tee};
+use super::support::{self, Ctx, Tee};
 
 /// The summary query: pings per claimed activity, and the share of all calls.
 const SUMMARY_SQL: &str = r"

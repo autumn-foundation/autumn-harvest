@@ -1,9 +1,5 @@
 //! Helpers that the `cargo xtask check` guards share.
 //!
-//! `check/mod.rs` does not declare this module. `default_run.rs` declares it
-//! with a `#[path]` attribute, and the other guards reach it through
-//! `super::default_run::support`.
-//!
 //! The helpers copy the exact behavior of the shell idioms that the old
 //! `scripts/check-*.sh` guards used. Each helper names the idiom that it
 //! replaces, so a reader can compare the port with the original script.

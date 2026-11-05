@@ -26,7 +26,7 @@ use std::process::{Command, ExitCode, Stdio};
 use smop::prelude::*;
 
 use super::run::{probe, report_path, utc_stamp};
-use crate::perf::broken_session_scan::support::{self, Ctx};
+use crate::perf::support::{self, Ctx};
 
 /// How many one-second readiness probes to try before the bench starts anyway.
 const READY_ATTEMPTS: u32 = 60;

@@ -60,7 +60,7 @@ use std::process::ExitCode;
 
 use smop::prelude::*;
 
-use super::broken_session_scan::support::{self, Ctx};
+use super::support::{self, Ctx};
 
 /// The `cargo test` arguments of the capture, as the script passed them to `exec`.
 const CAPTURE_ARGS: [&str; 11] = [

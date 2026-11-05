@@ -26,8 +26,8 @@ use std::process::ExitCode;
 use regex::Regex;
 use smop::prelude::*;
 
-use super::default_run::support::{self, Report};
 use super::readme_testing_dep_version::workspace_version;
+use super::support::{self, Report};
 use crate::util;
 
 /// Arguments of `cargo xtask check readme-upgrade-guide-current`.

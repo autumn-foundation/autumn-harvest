@@ -33,7 +33,7 @@ use std::process::ExitCode;
 
 use smop::prelude::*;
 
-use super::default_run::support::{self, Report, ScratchExample};
+use super::support::{self, Report, ScratchExample};
 use crate::util;
 
 const DOC: &str = "docs/getting-started/12-webhooks.md";

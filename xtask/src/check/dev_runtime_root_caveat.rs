@@ -26,7 +26,7 @@ use std::process::ExitCode;
 
 use smop::prelude::*;
 
-use super::default_run::support::{self, Report};
+use super::support::{self, Report};
 use crate::util;
 
 const DOCS: [&str; 2] = ["README.md", "docs/getting-started/01-project-skeleton.md"];

@@ -119,7 +119,7 @@ fn floors_of<'a>(baseline: &'a Value, path: &str) -> Result<&'a Value> {
 }
 
 /// A row of the summary with its branch percent replaced.
-fn with_branches_pct(row: FileRow, pct: f64) -> FileRow {
+const fn with_branches_pct(row: FileRow, pct: f64) -> FileRow {
     FileRow {
         branches_pct: Some(pct),
         ..row
