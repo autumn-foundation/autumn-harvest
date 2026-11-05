@@ -21,7 +21,10 @@ use crate::agent::overlay_store::{
 use crate::harness::truncate;
 use crate::mesh::MAX_NAME_LEN;
 
-/// The status of a refine run after its adoption step.
+/// The status of a refine run.
+///
+/// `agent_refine` ends as `Chosen`, `Unchanged` or `BudgetExhausted`
+/// (issue #2380). The adoption step gives the other values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
@@ -35,6 +38,12 @@ pub enum RefineStatus {
     /// The adoption gate waited for its whole timeout. See
     /// [`GateState::TimedOut`](super::policy::GateState::TimedOut).
     TimedOut,
+    /// The refine run chose an overlay that differs from the active one
+    /// (issue #2380). The adoption step comes next.
+    Chosen,
+    /// The refine run spent its budget before its plan ended (issue
+    /// #2380). It chose no overlay.
+    BudgetExhausted,
 }
 
 /// Why a candidate waits for a person.

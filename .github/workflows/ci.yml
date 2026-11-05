@@ -1034,6 +1034,7 @@ jobs:
         with:
           version: v2.0.0
           github-cache: false
+          cache-dir: ${{ runner.os == 'Windows' && format('{0}/kache', runner.temp) || '' }}
           cache-executables: ${{ runner.os != 'macOS' }}
           pr-comment: false
           warm: false
@@ -1221,6 +1222,19 @@ jobs:
       - name: Run autumn-harvest-sqlite tests (issue #1068)
         if: needs.changes.outputs.code == 'true' && matrix.shard == 3
         run: cargo test -p autumn-harvest-sqlite
+      # The agent suite links about 45 test binaries of some 180 MB each, and
+      # kache copies each one into its store. The test binaries of the earlier
+      # steps of this shard are no longer needed, so this step deletes them
+      # first. Their rlibs stay, so no crate builds again. Without it the
+      # runner ran out of disk in this step, and it died with no log (issue
+      # #2380).
+      - name: Free runner disk before the agent tests (Linux)
+        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true' && matrix.shard == 3
+        run: |
+          df -h /
+          find target/debug/deps -maxdepth 1 -type f -perm -u+x \
+            ! -name '*.so' ! -name '*.d' -delete
+          df -h /
       # Issue #1973. Offline: a scripted model, no API key, no network. The
       # crash test runs its own binary as a child process. Issue #2001 adds
       # the `eval` suite.

@@ -148,6 +148,29 @@ pub async fn live_probe<H: LiveProbeHost + ?Sized>(
     overlay: &ProfileOverlay,
     allowed: &[ToolEffect],
 ) -> Result<LiveProbe, EvalError> {
+    live_probe_with(host, harness, source, overlay, allowed, None).await
+}
+
+/// [`live_probe`] under `ceilings` in place of the source ceilings (issue
+/// #2380).
+///
+/// A refine run passes the policy ceilings that its stages and replay
+/// probes use. So an overlay that the policy allows to widen a bound or
+/// switch a model gets its live re-probe too. `None` uses the source
+/// ceilings, as [`live_probe`] does.
+///
+/// # Errors
+///
+/// The errors of [`live_probe`].
+#[allow(clippy::future_not_send)]
+pub async fn live_probe_with<H: LiveProbeHost + ?Sized>(
+    host: &H,
+    harness: &AgentHarness,
+    source: ExecutionId,
+    overlay: &ProfileOverlay,
+    allowed: &[ToolEffect],
+    ceilings: Option<&Ceilings>,
+) -> Result<LiveProbe, EvalError> {
     let run = host.source_run(source).await?;
     if run.workflow_name != WORKFLOW_NAME {
         return Err(EvalError::NotAnAgentRun(format!(
@@ -156,7 +179,7 @@ pub async fn live_probe<H: LiveProbeHost + ?Sized>(
         )));
     }
     let effects: BTreeSet<ToolEffect> = allowed.iter().copied().collect();
-    let task = probe_task(&task_of(&run.events)?, harness, overlay, &effects)?;
+    let task = probe_task(&task_of(&run.events)?, harness, overlay, &effects, ceilings)?;
     let input = serde_json::to_value(&task).map_err(|e| EvalError::Undecodable(e.to_string()))?;
     let fork = host.fork_live(source, input).await?;
     Ok(LiveProbe {
@@ -178,9 +201,11 @@ fn probe_task(
     harness: &AgentHarness,
     overlay: &ProfileOverlay,
     effects: &BTreeSet<ToolEffect>,
+    ceilings: Option<&Ceilings>,
 ) -> Result<AgentTask, EvalError> {
-    let ceilings = Ceilings::from_profile(&source_profile(task));
-    let mut task = task_with_overlay(task, overlay, &ceilings, harness)?;
+    let source = Ceilings::from_profile(&source_profile(task));
+    let ceilings = ceilings.unwrap_or(&source);
+    let mut task = task_with_overlay(task, overlay, ceilings, harness)?;
     task.probe = Some(Probe::new(effects.iter().copied()));
     task.followups = None;
     task.draw = None;
@@ -320,6 +345,34 @@ mod tests {
         assert_eq!(forked.parallel_children, 0, "each child runs inline");
         assert_eq!(forked.approval_timeout_secs, PROBE_APPROVAL_TIMEOUT_SECS);
         assert_eq!(forked.input, task.input);
+    }
+
+    #[tokio::test]
+    async fn given_ceilings_let_a_probe_switch_to_an_allowed_model() {
+        let host = FakeHost::new(serde_json::to_value(AgentTask::new("hi")).unwrap());
+        let harness = harness().model_named("other", Arc::new(NoModel));
+        let overlay = ProfileOverlay {
+            model: Some("other".to_owned()),
+            ..ProfileOverlay::default()
+        };
+        // The source ceilings hold only the source model.
+        let refused = live_probe(&host, &harness, ExecutionId::new(), &overlay, &[]).await;
+        assert!(matches!(refused, Err(EvalError::Overlay(_))), "{refused:?}");
+        // A refine run passes the policy ceilings, which allow the model.
+        let mut ceilings = Ceilings::from_profile(&crate::agent::AgentProfile::new("k"));
+        ceilings.models.insert("other".to_owned());
+        live_probe_with(
+            &host,
+            &harness,
+            ExecutionId::new(),
+            &overlay,
+            &[],
+            Some(&ceilings),
+        )
+        .await
+        .unwrap();
+        let [input] = host.forks().try_into().unwrap();
+        assert_eq!(input["model"], "other");
     }
 
     #[tokio::test]
