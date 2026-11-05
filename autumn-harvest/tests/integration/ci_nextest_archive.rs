@@ -91,7 +91,11 @@ mod runner {
             .env("DRY_RUN", "1")
             .env_remove("SEMAPHORE_SHARD_COUNT")
             .env_remove("SEMAPHORE_SHARD_INDEX")
-            .env_remove("SUITES_MANIFEST");
+            .env_remove("SUITES_MANIFEST")
+            // A CI job can set these for its own builds. The archive default
+            // is under test, so the job value must not leak in.
+            .env_remove("CARGO_PROFILE_DEV_DEBUG")
+            .env_remove("CARGO_PROFILE_TEST_DEBUG");
         for (key, value) in env {
             cmd.env(key, value);
         }

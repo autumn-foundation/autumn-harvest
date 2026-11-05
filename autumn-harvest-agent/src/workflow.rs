@@ -43,7 +43,9 @@ use crate::draw::Draw;
 use crate::fan_out_plan::{Fit, Step, fan_out_plan};
 use crate::flow::Released;
 use crate::followup::{self, FOLLOWUP_TOOL, Planned};
-use crate::harness::{AgentHarness, CacheTenant, DEFAULT_TOOL_OUTPUT_LIMIT, truncate};
+use crate::harness::{
+    AgentHarness, CacheTenant, TRUNCATED, max_tool_result_bytes, truncate, truncate_flagged,
+};
 use crate::heartbeat::{HeartbeatTask, agent_heartbeat_info};
 use crate::loop_guard::{LoopTracker, LoopVerdict, warning_note};
 use crate::memory::{
@@ -76,6 +78,13 @@ const FINAL_TURN_PATCH: &str = "agent_final_turn_rules";
 /// part of the recorded child input. A history from before the gate replays
 /// with the old input.
 const CHILD_FAILURE_REPORT_PATCH: &str = "agent_child_failure_report";
+
+/// The cut of a delegation answer in a history from before issue #2481.
+///
+/// Such a history recorded its peer lookup with no `answer_limit`. Its run
+/// replays with this cut and with no `truncated` key. A new lookup always
+/// holds a limit, so a new run never reads this value.
+const LEGACY_ANSWER_LIMIT: usize = 8_000;
 
 /// The gate of the rules for a tool round over the cap (issue #2461). The
 /// loop asks it only where a new rule changes the branch: a round that
@@ -2358,19 +2367,127 @@ async fn delegate(
         steps_used: steps,
         tool_calls,
         resets: child.reset.count,
+        answer_truncated: false,
         serial: None,
     });
-    let outcome = serde_json::json!({
+    let mut outcome = serde_json::json!({
         "agent": peer.name,
         "stop": stop,
-        "answer": truncate(&child.last_text, DEFAULT_TOOL_OUTPUT_LIMIT),
-    })
-    .to_string();
+    });
+    AnswerRoom::of(ctx, task).put(tree, peer, &mut outcome, &child.last_text);
+    let outcome = outcome.to_string();
     Ok(ToolOutcome {
         content: outcome,
         is_error: stop != AgentStop::Completed,
         workspace: None,
     })
+}
+
+/// The room for one delegation answer in the next request of the parent
+/// (issue #2481).
+#[derive(Clone, Copy)]
+struct AnswerRoom<'a> {
+    ctx: &'a WorkflowContext,
+    /// The byte share of one result under the request cap of the parent.
+    max_bytes: usize,
+}
+
+impl<'a> AnswerRoom<'a> {
+    /// The room under the request cap of `task`.
+    ///
+    /// A tool result gets the same share of its result cap. Without this
+    /// cut, an answer over the cap drops whole, and the run ends as
+    /// `transcript_full`.
+    fn of(ctx: &'a WorkflowContext, task: &AgentTask) -> Self {
+        Self {
+            ctx,
+            max_bytes: max_tool_result_bytes(task.request_cap()),
+        }
+    }
+
+    /// Put the answer of `peer` into `result`, and report a cut.
+    ///
+    /// A cut sets `answer_truncated` on the last record of `tree`, which
+    /// is the record of this delegation. The operator also gets a warning.
+    fn put(self, tree: &mut Tree, peer: &Peer, result: &mut serde_json::Value, answer: &str) {
+        if !put_answer(result, peer, answer, self.max_bytes) {
+            return;
+        }
+        if let Some(record) = tree.records.last_mut() {
+            record.answer_truncated = true;
+        }
+        self.ctx.log_warn(&format!(
+            "the answer of the peer {:?} is cut: it has {} characters, and the limit is {} characters or {} bytes",
+            peer.name,
+            answer.chars().count(),
+            peer.answer_limit.unwrap_or(usize::MAX),
+            self.max_bytes,
+        ));
+    }
+}
+
+/// Put the answer of `peer` into a delegation result (issue #2481).
+///
+/// It cuts the answer to the character limit of the peer. It also cuts the
+/// encoded result to `max_bytes`, as a tool result is cut. The encoded size
+/// counts each escape, so the request escape stays inside the share. The
+/// `truncated` key tells the parent model whether text dropped. It returns
+/// `true` on a cut.
+///
+/// Put every other key into `result` first, so the cut measures them.
+///
+/// A peer lookup from before issue #2481 has no limit. Then the result
+/// keeps the old cut and the old shape, and the function returns `false`.
+/// So that run replays as it ran.
+fn put_answer(result: &mut serde_json::Value, peer: &Peer, answer: &str, max_bytes: usize) -> bool {
+    let Some(limit) = peer.answer_limit else {
+        result["answer"] = truncate(answer, LEGACY_ANSWER_LIMIT).into();
+        return false;
+    };
+    // `false` is the longer flag, so the frame holds for either value.
+    result["answer"] = "".into();
+    result["truncated"] = false.into();
+    let frame = result.to_string().len();
+    let (shown, mut cut) = truncate_flagged(answer, limit);
+    let shown = if frame.saturating_add(escaped_len(&shown)) <= max_bytes {
+        shown
+    } else {
+        cut = true;
+        let room = max_bytes
+            .saturating_sub(frame)
+            .saturating_sub(escaped_len(TRUNCATED));
+        format!("{}{TRUNCATED}", escaped_prefix(answer, limit, room))
+    };
+    result["answer"] = shown.into();
+    result["truncated"] = cut.into();
+    cut
+}
+
+/// The longest prefix of the first `limit` characters of `text` whose JSON
+/// escape fits `room` bytes.
+fn escaped_prefix(text: &str, limit: usize, room: usize) -> &str {
+    let mut used = 0_usize;
+    for (taken, (index, c)) in text.char_indices().enumerate() {
+        used = used.saturating_add(escaped_char_len(c));
+        if taken >= limit || used > room {
+            return &text[..index];
+        }
+    }
+    text
+}
+
+/// The bytes of `text` inside a JSON string, without the quotes.
+fn escaped_len(text: &str) -> usize {
+    text.chars().map(escaped_char_len).sum()
+}
+
+/// The bytes of `c` inside a JSON string, as `serde_json` writes it.
+const fn escaped_char_len(c: char) -> usize {
+    match c {
+        '"' | '\\' | '\u{8}' | '\t' | '\n' | '\u{c}' | '\r' => 2,
+        '\0'..='\u{1f}' => 6,
+        _ => c.len_utf8(),
+    }
 }
 
 /// Record a refused delegation and answer the model.
@@ -2393,6 +2510,7 @@ fn refuse_delegation(agent: &Member, tree: &mut Tree, refusal: Refusal, name: &s
         steps_used: 0,
         tool_calls: 0,
         resets: 0,
+        answer_truncated: false,
         serial: None,
     });
     refused(refusal, name)
@@ -2512,8 +2630,9 @@ async fn fan_out(
     // Each sibling ended, so every report joins the parent. The first
     // failure in input order fails the batch.
     let mut failed = None;
+    let room = AnswerRoom::of(ctx, task);
     for ((position, peer, child), output) in children.into_iter().zip(ended) {
-        match merge_ended(progress, tree, peer, child, output) {
+        match merge_ended(room, progress, tree, peer, child, output) {
             Ok(outcome) => outcomes[position] = Some(outcome),
             Err(err) => {
                 failed.get_or_insert(err);
@@ -2534,6 +2653,7 @@ async fn fan_out(
 /// A child that reported its failure still joins the parent. Then it counts
 /// as a failure like any other (issue #2328).
 fn merge_ended(
+    room: AnswerRoom<'_>,
     progress: &mut Progress,
     tree: &mut Tree,
     peer: &Peer,
@@ -2543,7 +2663,7 @@ fn merge_ended(
     let report = output.and_then(|value| {
         serde_json::from_value::<AgentReport>(value).map_err(|err| err.to_string())
     })?;
-    let outcome = merge_child(progress, tree, peer, child, &report);
+    let outcome = merge_child(room, progress, tree, peer, child, &report);
     if report.stop == AgentStop::Failed {
         return Err(report
             .error
@@ -2567,6 +2687,7 @@ fn sibling<'a>(agent: &'a Member, used: u32, name: &str) -> Result<(Mandate, &'a
 
 /// Add the report of one child run to the parent, and answer the model.
 fn merge_child(
+    room: AnswerRoom<'_>,
     progress: &mut Progress,
     tree: &mut Tree,
     peer: &Peer,
@@ -2601,14 +2722,15 @@ fn merge_child(
         steps_used: report.steps_used,
         tool_calls: report.tool_calls,
         resets: report.resets,
+        answer_truncated: false,
         serial: None,
     });
-    let outcome = serde_json::json!({
+    let mut outcome = serde_json::json!({
         "agent": peer.name,
         "stop": report.stop,
-        "answer": truncate(&report.text, DEFAULT_TOOL_OUTPUT_LIMIT),
-    })
-    .to_string();
+    });
+    room.put(tree, peer, &mut outcome, &report.text);
+    let outcome = outcome.to_string();
     ToolOutcome {
         content: outcome,
         is_error: report.stop != AgentStop::Completed,
@@ -2696,11 +2818,13 @@ async fn durable_peer(
     if chain.last().is_none_or(|last| *last != peer.name) {
         chain.push(peer.name.clone());
     }
-    Ok(peer_outcome(tree, peer, target_id, chain, outcome))
+    let room = AnswerRoom::of(ctx, run.task);
+    Ok(peer_outcome(room, tree, peer, target_id, chain, outcome))
 }
 
 /// Record one exchange with a durable peer and answer the model.
 fn peer_outcome(
+    room: AnswerRoom<'_>,
     tree: &mut Tree,
     peer: &Peer,
     target_id: &str,
@@ -2720,18 +2844,24 @@ fn peer_outcome(
                 steps_used: 0,
                 tool_calls: 0,
                 resets: 0,
+                answer_truncated: false,
                 serial: None,
             });
             if let Some(refusal) = reply.refusal {
                 refused(refusal, &peer.name)
             } else {
-                let content = serde_json::json!({
+                // The keys keep their old order, also under the
+                // `preserve_order` feature of `serde_json`.
+                // The answer key comes first, then `error`, so the cut
+                // measures the error too.
+                let mut content = serde_json::json!({
                     "agent": peer.name,
                     "stop": reply.stop,
-                    "answer": truncate(&reply.answer, DEFAULT_TOOL_OUTPUT_LIMIT),
-                    "error": reply.error,
-                })
-                .to_string();
+                });
+                content["answer"] = "".into();
+                content["error"] = serde_json::json!(reply.error);
+                room.put(tree, peer, &mut content, &reply.answer);
+                let content = content.to_string();
                 ToolOutcome {
                     content,
                     is_error: reply.stop != Some(AgentStop::Completed),
@@ -2749,6 +2879,7 @@ fn peer_outcome(
                 steps_used: 0,
                 tool_calls: 0,
                 resets: 0,
+                answer_truncated: false,
                 serial: None,
             });
             ToolOutcome::error(&format!(
@@ -2814,6 +2945,7 @@ fn refuse(agent: &Member, tree: &mut Tree, refusal: Refusal, name: &str) -> Tool
         steps_used: 0,
         tool_calls: 0,
         resets: 0,
+        answer_truncated: false,
         serial: None,
     });
     refused(refusal, name)
@@ -3321,6 +3453,127 @@ mod tests {
             prop_assert_eq!(plan.len(), calls.len());
             prop_assert_eq!(leads, old_batches(&calls, &decisions, agent, bound));
         }
+    }
+
+    // Issue #2481: a peer lookup recorded before the limit has no
+    // `answer_limit`. Its run replays with the old cut and the old shape.
+    #[test]
+    fn a_legacy_lookup_keeps_the_old_cut_and_shape() {
+        let peer: Peer = serde_json::from_value(serde_json::json!({
+            "name": "researcher",
+            "description": "R.",
+            "max_steps": 8,
+        }))
+        .unwrap();
+        assert_eq!(peer.answer_limit, None);
+        assert_eq!(LEGACY_ANSWER_LIMIT, 8_000, "old histories pin this value");
+        let mut result = serde_json::json!({"agent": "researcher", "stop": "completed"});
+        let cut = put_answer(&mut result, &peer, &"x".repeat(8_050), 10);
+        assert!(!cut, "a legacy run sets no record flag");
+        let want = serde_json::json!({
+            "agent": "researcher",
+            "stop": "completed",
+            "answer": format!("{}…[truncated]", "x".repeat(8_000)),
+        });
+        assert_eq!(result, want);
+    }
+
+    // Issue #2481: a resolved lookup cuts at its limit and marks the cut.
+    #[test]
+    fn a_resolved_lookup_marks_the_cut() {
+        let peer = Peer::new("researcher", "R.").answer_limit(3);
+        let mut result = serde_json::json!({"agent": "researcher"});
+        assert!(put_answer(&mut result, &peer, "abcd", usize::MAX));
+        assert_eq!(result["answer"], "abc…[truncated]");
+        assert_eq!(result["truncated"], true);
+        let mut result = serde_json::json!({"agent": "researcher"});
+        assert!(!put_answer(&mut result, &peer, "abc", usize::MAX));
+        assert_eq!(result["answer"], "abc");
+        assert_eq!(result["truncated"], false);
+    }
+
+    // Issue #2481: the byte share also cuts, on a char boundary.
+    #[test]
+    fn a_resolved_lookup_cuts_to_the_byte_share() {
+        let peer = Peer::new("researcher", "R.").answer_limit(usize::MAX);
+        let mut result = serde_json::json!({"agent": "a"});
+        // The frame `{"agent":"a","answer":"","truncated":false}` is 43
+        // bytes. One "é" (2 bytes) and the mark (14 bytes) fill 59 bytes.
+        assert!(put_answer(&mut result, &peer, &"é".repeat(20), 59));
+        assert_eq!(result["answer"], "é…[truncated]");
+        assert_eq!(result["truncated"], true);
+        assert!(result.to_string().len() <= 59);
+        let mut result = serde_json::json!({"agent": "a"});
+        assert!(!put_answer(&mut result, &peer, "éééé", 100));
+        assert_eq!(result["answer"], "éééé");
+        assert_eq!(result["truncated"], false);
+    }
+
+    // Issue #2481: the cut measures the encoded result, so an escaped
+    // character counts with its escape.
+    #[test]
+    fn an_escaped_answer_cuts_to_the_encoded_size() {
+        let peer = Peer::new("researcher", "R.").answer_limit(usize::MAX);
+        let mut result = serde_json::json!({"agent": "a"});
+        assert!(put_answer(&mut result, &peer, &"\0".repeat(100), 100));
+        assert!(result.to_string().len() <= 100, "{result}");
+        assert!(result["answer"].as_str().unwrap().ends_with("…[truncated]"));
+    }
+
+    // The escape length matches `serde_json` for each ASCII character and a
+    // few wider ones.
+    #[test]
+    fn the_escape_length_matches_serde_json() {
+        let wide = ['é', '漢', '🎉', '\u{7f}', '\u{2028}'];
+        for c in (0_u8..=0x7f).map(char::from).chain(wide) {
+            let encoded = serde_json::to_string(&c.to_string()).unwrap();
+            assert_eq!(escaped_char_len(c), encoded.len() - 2, "{c:?}");
+        }
+    }
+
+    // A fixed list of answers with each kind of escape, for the bound below.
+    fn escape_cases() -> Vec<String> {
+        let all: String = (0_u8..=0x7f).map(char::from).collect();
+        vec![
+            all.repeat(3),
+            "\"\\\n\t\0é漢🎉".repeat(20),
+            "plain text ".repeat(40),
+            String::new(),
+        ]
+    }
+
+    // Issue #2481: each encoded result fits a share that can hold the frame
+    // and the mark. A kept answer is a prefix of the original.
+    #[test]
+    fn each_encoded_result_fits_its_share() {
+        let peer = Peer::new("researcher", "R.").answer_limit(usize::MAX);
+        // The frame `{"agent":"a","answer":"","stop":"completed","truncated":false}`
+        // is 62 bytes. The mark adds 14.
+        for answer in escape_cases() {
+            for max_bytes in [76, 77, 81, 100, 257, 1_000] {
+                let mut result = serde_json::json!({"agent": "a", "stop": "completed"});
+                let cut = put_answer(&mut result, &peer, &answer, max_bytes);
+                assert!(
+                    result.to_string().len() <= max_bytes,
+                    "{max_bytes}: {result}"
+                );
+                let shown = result["answer"].as_str().unwrap();
+                let kept = shown.strip_suffix("…[truncated]").unwrap_or(shown);
+                assert!(answer.starts_with(kept), "{max_bytes}");
+                assert_eq!(cut, kept.len() < answer.len(), "{max_bytes}");
+            }
+        }
+    }
+
+    // A share too small for the frame and the mark keeps the mark only. The
+    // parent model still sees the cut.
+    #[test]
+    fn a_tiny_share_keeps_the_mark_only() {
+        let peer = Peer::new("researcher", "R.").answer_limit(usize::MAX);
+        let mut result = serde_json::json!({"agent": "a"});
+        assert!(put_answer(&mut result, &peer, "abc", 10));
+        assert_eq!(result["answer"], "…[truncated]");
+        assert_eq!(result["truncated"], true);
     }
 
     #[test]

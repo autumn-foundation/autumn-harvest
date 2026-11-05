@@ -595,7 +595,14 @@ async fn start(
             runtime_config.mode
         )));
     }
-    apply_driver_check(runtime_config.worker_enabled, state.role())?;
+    apply_driver_check(runtime_config.worker_enabled, state.role().base())?;
+    refuse_worker_queues(&runtime_config.worker.queues)?;
+    if let Some(pin) = crate::worker_queues::role_pin(state.role()) {
+        tracing::info!(
+            pin = ?pin,
+            "the Harvest SQLite driver runs each queue; the Autumn role pin does not narrow it"
+        );
+    }
     let sqlite_config = HarvestSqliteConfig::load()
         .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?;
     let app_config = state.config();
@@ -924,6 +931,22 @@ fn apply_driver_check(
     }
 }
 
+/// Refuse `[harvest.worker] queues` on the SQLite backend (issue #2479).
+///
+/// The one driver runs each queue. A list would narrow nothing, so it stops
+/// the boot. The role pin does not apply either.
+fn refuse_worker_queues(queues: &[String]) -> autumn_web::AutumnResult<()> {
+    if queues.is_empty() {
+        return Ok(());
+    }
+    Err(AutumnError::service_unavailable_msg(format!(
+        "{} ({}) is not supported on the SQLite backend: its one driver runs each queue. \
+         Unset it",
+        crate::worker_queues::WORKER_QUEUES_KEY,
+        crate::worker_queues::WORKER_QUEUES_ENV,
+    )))
+}
+
 /// The SQLite backend always runs its driver.
 ///
 /// One process holds the writer lock. A process with no driver could not
@@ -988,6 +1011,17 @@ mod tests {
         assert!(!out.contains(" WARN "), "{out}");
         assert!(out.contains("worker_source=explicit"), "{out}");
         assert!(!run(None, ProcessRole::Worker).contains(" WARN "));
+    }
+
+    /// Issue #2479: a queue list would narrow nothing, so it stops the boot.
+    #[test]
+    fn the_sqlite_backend_refuses_a_worker_queue_list() {
+        assert!(refuse_worker_queues(&[]).is_ok());
+        let error = refuse_worker_queues(&["priority".to_owned()])
+            .expect_err("must refuse")
+            .to_string();
+        assert!(error.contains("harvest.worker.queues"), "{error}");
+        assert!(error.contains("AUTUMN_HARVEST__WORKER__QUEUES"), "{error}");
     }
 
     #[test]

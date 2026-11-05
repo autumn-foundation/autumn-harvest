@@ -24,7 +24,7 @@ use autumn_harvest_agent::{
     TokenUsage, ToolEffect, sqlite,
 };
 use autumn_harvest_sqlite::{RunState, SqliteRuntime};
-use common::{Recorder, ScriptedModel, TryFnModel, recorded_tool, runtime};
+use common::{Recorder, ScriptedModel, TryFnModel, recorded_tool, report, runtime};
 use serde_json::{Value, json};
 
 fn fresh_db() -> (tempfile::TempDir, PathBuf) {
@@ -1340,6 +1340,93 @@ async fn a_read_only_receiver_keeps_the_next_durable_hop_read_only() {
                 .any(|result| result.contains("only read"))
     });
     assert!(refused, "the critic reads the refusal");
+}
+
+/// A durable answer of 9 000 characters. It ends with a tail, so a cut
+/// shows.
+fn long_answer() -> String {
+    format!("{}TAIL", "x".repeat(8_996))
+}
+
+/// Triage asks the durable researcher once, and the researcher answers
+/// with [`long_answer`].
+fn long_mesh_model() -> Arc<FnModel> {
+    FnModel::new(|request| {
+        if from_peer(request) {
+            return text(&long_answer());
+        }
+        if tool_results(request).is_empty() {
+            call(
+                "d1",
+                DELEGATE_TOOL,
+                json!({"agent": "researcher", "task": "find the answer"}),
+            )
+        } else {
+            text("done")
+        }
+    })
+}
+
+/// Run [`long_mesh_model`] with the durable triage agent. Returns the
+/// delegation result that triage read.
+async fn ask_with_limit(limit: usize) -> Value {
+    let (_dir, db) = fresh_db();
+    let model = long_mesh_model();
+    let harness = mesh_harness(model.clone()).tool_output_limit(limit);
+    let mut rt = runtime(&db, harness);
+    start(&mut rt, &research()).await;
+    sqlite::send(&mut rt, &triage(), &AgentOp::message("ask"), None).unwrap();
+    sqlite::drive(&mut rt, &triage()).await.unwrap();
+    sqlite::drive(&mut rt, &research()).await.unwrap();
+    sqlite::drive(&mut rt, &triage()).await.unwrap();
+    let last = model
+        .requests()
+        .into_iter()
+        .rfind(|request| !from_peer(request) && !tool_results(request).is_empty())
+        .expect("triage read the reply");
+    serde_json::from_str(&tool_results(&last)[0]).unwrap()
+}
+
+// Issue #2481: `tool_output_limit` governs a durable answer.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_harness_limit_governs_a_durable_answer() {
+    let result = ask_with_limit(20_000).await;
+    let answer = result["answer"].as_str().unwrap_or_default();
+    assert!(
+        answer == long_answer(),
+        "{} characters, whole: {}",
+        answer.chars().count(),
+        answer.ends_with("TAIL")
+    );
+    assert_eq!(result["truncated"], false);
+}
+
+// Issue #2481: a cut durable answer is marked for the model.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cut_durable_answer_is_marked() {
+    let result = ask_with_limit(100).await;
+    assert_eq!(result["answer"], format!("{}…[truncated]", "x".repeat(100)));
+    assert_eq!(result["truncated"], true);
+}
+
+// Issue #2481: an `agent_loop` run that asks a durable peer flags a cut in
+// its report. A durable sender keeps no records, so this run shows it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_one_shot_run_flags_a_cut_durable_answer() {
+    for (limit, cut) in [(100, true), (20_000, false)] {
+        let (_dir, db) = fresh_db();
+        let model = long_mesh_model();
+        let mut rt = runtime(&db, mesh_harness(model.clone()).tool_output_limit(limit));
+        start(&mut rt, &research()).await;
+        let task = AgentTask::new("go").mandate(Mandate::new("triage").peers(["researcher"]));
+        let exec = sqlite::start(&mut rt, &task).unwrap();
+        rt.run_until_blocked(exec).await.unwrap();
+        sqlite::drive(&mut rt, &research()).await.unwrap();
+        let ended = report(rt.run_until_blocked(exec).await.unwrap());
+
+        assert_eq!(ended.delegations.len(), 1, "limit {limit}");
+        assert_eq!(ended.delegations[0].answer_truncated, cut, "limit {limit}");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -175,12 +175,21 @@ pub fn paste(ch1: &str, ch2: &str) -> Result<Pasted> {
 /// newer crates.io release over the checkout. So the command rewrites the
 /// two direct dependencies to paths. It also patches the macro crate that
 /// the engine pulls in.
-pub fn point_at_checkout(cargo_toml: &str, repo: &str) -> Result<String> {
+///
+/// The checkout can need a newer `autumn-web` than the release. So the
+/// `autumn-web` line takes `autumn_web`, the requirement of the checkout
+/// plugin. With `None`, the line stays as the chapter wrote it.
+pub fn point_at_checkout(cargo_toml: &str, repo: &str, autumn_web: Option<&str>) -> Result<String> {
     let mut text = cargo_toml.to_owned();
     for name in ["autumn-harvest", "autumn-harvest-plugin"] {
         let line = Regex::new(&format!(r#"(?m)^{} = "[^"\n]*""#, regex::escape(name)))?;
         let path = format!("{name} = {{ path = \"{repo}/{name}\" }}");
         text = line.replace_all(&text, NoExpand(&path)).into_owned();
+    }
+    if let Some(requirement) = autumn_web {
+        let line = Regex::new(r#"(?m)^autumn-web = "[^"\n]*""#)?;
+        let pinned = format!("autumn-web = \"{requirement}\"");
+        text = line.replace_all(&text, NoExpand(&pinned)).into_owned();
     }
     text.push_str("\n[patch.crates-io]\n");
     let _ = writeln!(
@@ -188,6 +197,14 @@ pub fn point_at_checkout(cargo_toml: &str, repo: &str) -> Result<String> {
         "autumn-harvest-macros = {{ path = \"{repo}/autumn-harvest-macros\" }}"
     );
     Ok(text)
+}
+
+/// Returns the version requirement of `name` in `manifest`, when the
+/// dependency is a plain `name = "requirement"` line. A table entry does not
+/// count, as the `sed` of the old script did not match it.
+pub fn plain_requirement(manifest: &str, name: &str) -> Option<String> {
+    let line = Regex::new(&format!(r#"(?m)^{} = "([^"\n]*)"$"#, regex::escape(name))).ok()?;
+    line.captures(manifest).map(|found| found[1].to_owned())
 }
 
 /// Returns the names of the packages of this repository that came from a
@@ -310,7 +327,10 @@ pub fn run(args: Args) -> Result<ExitCode> {
         let manifest = krate.join("Cargo.toml");
         let text =
             std::fs::read_to_string(&manifest).context("cannot read the pasted Cargo.toml")?;
-        let text = point_at_checkout(&text, &repo.display().to_string())?;
+        let plugin = std::fs::read_to_string(repo.join("autumn-harvest-plugin/Cargo.toml"))
+            .context("cannot read the checkout plugin manifest")?;
+        let autumn_web = plain_requirement(&plugin, "autumn-web");
+        let text = point_at_checkout(&text, &repo.display().to_string(), autumn_web.as_deref())?;
         std::fs::write(&manifest, text).context("cannot rewrite the pasted Cargo.toml")?;
     }
 
@@ -596,7 +616,7 @@ HarvestPlugin::new()
     #[test]
     fn a_checkout_run_rewrites_the_direct_dependencies() {
         let toml = "[dependencies]\nautumn-harvest = \"0.9\"\nautumn-harvest-plugin = \"0.9\" # x\nautumn-harvest-other = \"0.9\"\n";
-        let text = point_at_checkout(toml, "/repo").unwrap();
+        let text = point_at_checkout(toml, "/repo", None).unwrap();
         assert_eq!(
             text,
             "[dependencies]\n\
@@ -606,6 +626,20 @@ HarvestPlugin::new()
              \n[patch.crates-io]\n\
              autumn-harvest-macros = { path = \"/repo/autumn-harvest-macros\" }\n"
         );
+    }
+
+    #[test]
+    fn a_checkout_run_takes_the_autumn_web_requirement_of_the_plugin() {
+        let plugin = "[dependencies]\nautumn-web = \"0.10\"\n\n[dev-dependencies]\nautumn-web = { version = \"0.10\", features = [\"mcp\"] }\n";
+        let requirement = plain_requirement(plugin, "autumn-web");
+        assert_eq!(requirement.as_deref(), Some("0.10"));
+        let toml = "[dependencies]\nautumn-web = \"0.9\"\nautumn-harvest = \"0.9\"\n";
+        let text = point_at_checkout(toml, "/repo", requirement.as_deref()).unwrap();
+        assert!(
+            text.starts_with("[dependencies]\nautumn-web = \"0.10\"\n"),
+            "{text}"
+        );
+        assert!(plain_requirement("[dependencies]\nserde = \"1\"\n", "autumn-web").is_none());
     }
 
     #[test]

@@ -983,6 +983,8 @@ fn build_tool_route(
         // Generated API routes carry no SEO meta (since autumn-web 0.7): EMPTY is
         // what a route attribute without `seo(...)` produces.
         seo: autumn_web::SeoRouteDefaults::EMPTY,
+        // The group of the plugin that registers the route (since autumn-web 0.10).
+        group: None,
     }
 }
 

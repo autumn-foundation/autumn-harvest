@@ -126,6 +126,7 @@ pub async fn retention_archive_reads_back_through_api_and_vantage<B: ObjectBacke
             retention: autumn_harvest_plugin::HarvestRetentionConfig {
                 run_on: autumn_harvest_plugin::RetentionRunOn::All,
             },
+            worker: autumn_harvest_plugin::HarvestWorkerConfig::default(),
         },
         HarvestRunnerResources::new(pool),
     )

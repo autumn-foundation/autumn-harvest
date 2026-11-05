@@ -107,6 +107,7 @@ pub mod version_gate_retirement;
 pub mod version_usage;
 /// The `filter` grammar of `GET /workflows` (issue #1982).
 mod visibility_query;
+pub mod worker_queues;
 pub mod workflow_count;
 pub mod workflow_reachability;
 
@@ -158,7 +159,7 @@ pub use api::{
 pub use config::{
     HarvestBatchConfig, HarvestDatabaseConfig, HarvestMode, HarvestOutboxConfig,
     HarvestReadinessConfig, HarvestRedisConfig, HarvestRetentionConfig, HarvestRuntimeConfig,
-    HarvestStartupConfig, OrphanStartupAction, RetentionRunOn,
+    HarvestStartupConfig, HarvestWorkerConfig, OrphanStartupAction, RetentionRunOn,
 };
 pub use embedding::{HarvestEmbedding, HarvestEmbeddingRuntime};
 pub use outbox::{
