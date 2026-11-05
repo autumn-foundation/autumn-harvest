@@ -217,16 +217,7 @@ fn run_cargo_deny(log: &Path) -> Result<u8> {
 
 /// Maps a child exit status to an exit code, as a POSIX shell does.
 fn exit_code(status: ExitStatus) -> u8 {
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::ExitStatusExt;
-        if let Some(signal) = status.signal() {
-            return u8::try_from(128 + signal).unwrap_or(u8::MAX);
-        }
-    }
-    status.code().map_or(1, |code| {
-        u8::try_from(code.rem_euclid(256)).unwrap_or(u8::MAX)
-    })
+    crate::perf::support::status_code(status)
 }
 
 /// Runs `gh` with `args` and returns its stdout.
