@@ -408,7 +408,7 @@ fn resume_triage_and_legal_hold_do_not_document_a_pause_conflict() {
             .unwrap_or_else(|| {
                 panic!(
                     "{method} {path} must still declare a 409 (issue #1457): \
-                     docs/audits/openapi-response-coverage.py requires it, since \
+                     `cargo xtask audit openapi-response-coverage` requires it, since \
                      the handler routes through the generic conflict_from helper"
                 )
             });
@@ -477,8 +477,8 @@ fn multi_format_responses_declare_every_media_type() {
 /// A filter the query parser accepts reaches the document as a parameter.
 ///
 /// These routes take a `RawQuery` and parse the pairs by hand, so no struct
-/// field names them. `docs/audits/openapi-response-coverage.py` gates the whole
-/// set; this test pins the ones a client needs most.
+/// field names them. `cargo xtask audit openapi-response-coverage` gates the
+/// whole set; this test pins the ones a client needs most.
 #[test]
 fn hand_parsed_query_filters_are_published() {
     let doc = document();

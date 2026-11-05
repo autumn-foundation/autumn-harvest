@@ -4,13 +4,6 @@
 //! runs through this binary. The alias in `.cargo/config.toml` maps
 //! `cargo xtask <group> <command>` to `cargo run -p xtask -- <group> <command>`.
 //! `docs/xtask.md` lists each command and the script it replaced.
-// The stub modules trip these lints until each port lands.
-// The commit that wires the last port removes this attribute.
-#![allow(
-    dead_code,
-    clippy::needless_pass_by_value,
-    clippy::missing_const_for_fn
-)]
 
 use std::process::ExitCode;
 
