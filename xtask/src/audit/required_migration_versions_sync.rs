@@ -27,9 +27,10 @@ use std::sync::LazyLock;
 use regex::Regex;
 use smop::prelude::*;
 
-use super::libpq_keyword_sync::{UNSUPPORTED, file_name, find_fn, py_splitlines};
+use super::libpq_keyword_sync::{
+    UNSUPPORTED, file_name, find_fn, py_read_repo_file, py_splitlines,
+};
 use super::vantage_flash_live_region::compile;
-use crate::util::read_repo_file;
 
 /// Arguments of `cargo xtask audit required-migration-versions-sync`.
 #[derive(Debug, Clone, Copy, Args)]
@@ -110,7 +111,7 @@ fn findings(sources: &[(&str, String)]) -> Vec<String> {
 fn check() -> Result<ExitCode> {
     let mut sources = Vec::new();
     for rel in TARGETS {
-        sources.push((rel, read_repo_file(rel)?));
+        sources.push((rel, py_read_repo_file(rel)?));
     }
     let found = findings(&sources);
     for message in &found {

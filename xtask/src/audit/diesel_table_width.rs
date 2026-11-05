@@ -35,6 +35,7 @@ use regex::Regex;
 use smop::prelude::*;
 use walkdir::WalkDir;
 
+use super::libpq_keyword_sync::{py_read_text, py_universal_newlines};
 use super::vantage_flash_live_region::compile;
 use crate::util::repo_root;
 
@@ -206,7 +207,8 @@ fn check_tree(root: &Path) -> Result<Vec<String>> {
     for rel in walk(root, ".rs") {
         let bytes =
             std::fs::read(root.join(&rel)).with_context(|| format!("reading {}", rel.display()))?;
-        let source = String::from_utf8_lossy(&bytes);
+        // Python reads with `errors="replace"` in text mode.
+        let source = py_universal_newlines(String::from_utf8_lossy(&bytes).into_owned());
         for (name, count, line) in tables_in(&source) {
             found.push((name, count, format!("{}:{line}", rel.display())));
         }
@@ -218,7 +220,7 @@ fn check_tree(root: &Path) -> Result<Vec<String>> {
         if skipped {
             continue;
         }
-        let text = fs::read_string(root.join(&rel))?;
+        let text = py_read_text(&root.join(&rel))?;
         failures.extend(check_manifest(&text, &rel.display().to_string(), &wide));
     }
     Ok(failures)

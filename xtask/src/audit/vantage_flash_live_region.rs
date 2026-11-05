@@ -54,6 +54,7 @@ use std::sync::LazyLock;
 use regex::{Captures, Regex};
 use smop::prelude::*;
 
+use super::libpq_keyword_sync::py_read_text;
 use crate::util::repo_path;
 
 /// Arguments of `cargo xtask audit vantage-flash-live-region`.
@@ -320,7 +321,7 @@ pub(super) fn report(src: &str, path: &str, spec: &StatusSpec) -> (Vec<String>, 
 /// Runs one status-message audit over `ui.rs` and prints its report.
 pub(super) fn run_status_audit(spec: &StatusSpec) -> Result<ExitCode> {
     let path = ui_rs();
-    let src = fs::read_string(&path)?;
+    let src = py_read_text(&path)?;
     let (lines, passed) = report(&src, &path.display().to_string(), spec);
     for line in lines {
         println!("{line}");

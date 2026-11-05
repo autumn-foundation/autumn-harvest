@@ -140,6 +140,29 @@ pub(super) fn py_splitlines(text: &str) -> Vec<&str> {
     lines
 }
 
+/// Translates line endings the way Python's text mode reads a file.
+///
+/// Python's `read_text` turns each `\r\n` and each lone `\r` into `\n`.
+/// Without this, a file with CRLF endings breaks a pattern that ends on `\n`.
+/// So a gate would fail where the Python original passed.
+pub(super) fn py_universal_newlines(text: String) -> String {
+    if text.contains('\r') {
+        text.replace("\r\n", "\n").replace('\r', "\n")
+    } else {
+        text
+    }
+}
+
+/// Reads a file under the repository root as Python's `read_text` does.
+pub(super) fn py_read_repo_file(rel: &str) -> Result<String> {
+    Ok(py_universal_newlines(read_repo_file(rel)?))
+}
+
+/// Reads a file at `path` as Python's `read_text` does.
+pub(super) fn py_read_text(path: &std::path::Path) -> Result<String> {
+    Ok(py_universal_newlines(fs::read_string(path)?))
+}
+
 /// Collapses the one allowed difference so the rest compares exactly.
 fn normalize(body: &str) -> String {
     let body = body.replacen("pub(super) fn", "fn", 1);
@@ -209,7 +232,7 @@ fn findings(sources: &[(&str, String)]) -> Vec<String> {
 fn check() -> Result<ExitCode> {
     let mut sources = Vec::new();
     for rel in TARGETS {
-        sources.push((rel, read_repo_file(rel)?));
+        sources.push((rel, py_read_repo_file(rel)?));
     }
     let found = findings(&sources);
     for message in &found {
@@ -334,6 +357,20 @@ mod tests {
     #[test]
     fn the_self_test_passes() -> Result<()> {
         self_test()
+    }
+
+    #[test]
+    fn line_endings_translate_like_python() {
+        assert_eq!(
+            py_universal_newlines("a\r\nb\rc\n".to_string()),
+            "a\nb\nc\n"
+        );
+        assert_eq!(py_universal_newlines("plain\n".to_string()), "plain\n");
+        let crlf = "/// Sibling (#2521) of `dsn.rs`.\r\nfn is_connection_keyword(key: &str) -> bool {\r\n    true\r\n}\r\n";
+        let lf = py_universal_newlines(crlf.to_string());
+        let (start, body) = find_fn(&lf, &SIGNATURE).unwrap();
+        assert!(!body.contains('\r'));
+        assert!(has_sibling_comment(&lf, start, "dsn.rs"));
     }
 
     #[test]

@@ -37,6 +37,7 @@ use std::sync::LazyLock;
 use regex::Regex;
 use smop::prelude::*;
 
+use super::libpq_keyword_sync::py_read_text;
 use super::vantage_flash_live_region::{compile, search_unpreceded, ui_rs};
 
 /// Arguments of `cargo xtask audit vantage-dashboard-contrast`.
@@ -83,8 +84,9 @@ const fn is_hyphen(c: char) -> bool {
 
 /// Parses a 3-digit or 6-digit hex color into its RGB channels.
 ///
-/// The Python original slices the digits in pairs. A 4-digit or 5-digit
-/// color leaves a short or empty pair, so the parse fails there as well.
+/// The Python original slices the digits in pairs. A 4-digit color leaves an
+/// empty third pair, so the parse fails there as well. A 5-digit color leaves
+/// a 1-digit third pair, which both parse as one hex digit.
 fn hex_to_rgb(hex: &str) -> Result<[f64; 3]> {
     let digits = hex.trim_start_matches('#');
     let digits: String = if digits.chars().count() == 3 {
@@ -146,8 +148,21 @@ fn blend_toward(fg: &str, alpha: f64, backdrop: &str) -> Result<[f64; 3]> {
     Ok([0, 1, 2].map(|i| fg[i] * alpha + bd[i] * (1.0 - alpha)))
 }
 
-/// Formats a float the way Python's `str(float)` does for these values.
+/// Formats a float the way Python's `str(float)` does.
+///
+/// Both languages print the shortest digits that round-trip. Python uses the
+/// exponent form below 1e-4 and from 1e16 up, with at least two exponent
+/// digits. It prints an integral value with a trailing `.0`.
 fn py_float(value: f64) -> String {
+    let magnitude = value.abs();
+    if value.is_finite() && value != 0.0 && !(1e-4..1e16).contains(&magnitude) {
+        let text = format!("{value:e}");
+        let (mantissa, exponent) = text.split_once('e').unwrap_or((text.as_str(), "0"));
+        let (sign, digits) = exponent
+            .strip_prefix('-')
+            .map_or(("+", exponent), |rest| ("-", rest));
+        return format!("{mantissa}e{sign}{digits:0>2}");
+    }
     if value.is_finite() && value.fract() == 0.0 {
         format!("{value:.1}")
     } else {
@@ -382,7 +397,7 @@ fn report(src: &str, path: &str) -> Result<std::result::Result<(Vec<String>, boo
 pub fn run(args: Args) -> Result<ExitCode> {
     let Args {} = args;
     let path = ui_rs();
-    let src = fs::read_string(&path)?;
+    let src = py_read_text(&path)?;
     match report(&src, &path.display().to_string())? {
         Ok((lines, passed)) => {
             for line in lines {
@@ -459,6 +474,22 @@ mod tests {
         let rows = opacity_wrapped_badges(&src, &colors, BODY_BG)?;
         assert_eq!(rows[0].selector, "(opacity:0.5 wrapper) badge DONE");
         assert_eq!(rows[0].fg, "#dcfce7@0.5");
+        Ok(())
+    }
+
+    #[test]
+    fn floats_print_like_python() {
+        assert_eq!(py_float(0.0), "0.0");
+        assert_eq!(py_float(0.5), "0.5");
+        assert_eq!(py_float(0.0001), "0.0001");
+        assert_eq!(py_float(0.00001), "1e-05");
+        assert_eq!(py_float(0.000_012_5), "1.25e-05");
+        assert_eq!(py_float(1e-123), "1e-123");
+    }
+
+    #[test]
+    fn a_five_digit_color_parses_like_python() -> Result<()> {
+        assert_eq!(hex_to_rgb("#12345")?, [18.0, 52.0, 5.0]);
         Ok(())
     }
 

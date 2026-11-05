@@ -51,6 +51,7 @@ use std::sync::LazyLock;
 use regex::Regex;
 use smop::prelude::*;
 
+use super::libpq_keyword_sync::py_read_text;
 use super::vantage_flash_live_region::{
     captures_unpreceded, compile, is_word_dot_or_hyphen, is_word_or_hyphen, line_of,
     search_unpreceded, ui_rs,
@@ -300,7 +301,9 @@ fn find_block_end(src: &str, open: usize) -> Result<usize> {
         }
         i += 1;
     }
-    bail!("unbalanced braces starting at index {open}")
+    // Python indexes code points, so the message counts them too.
+    let index = src[..open].chars().count();
+    bail!("unbalanced braces starting at index {index}")
 }
 
 /// Blanks the `STYLE` block, or returns `None` when it is absent.
@@ -409,7 +412,7 @@ fn report(raw: &str, path: &str) -> Result<std::result::Result<(Vec<String>, boo
 pub fn run(args: Args) -> Result<ExitCode> {
     let Args {} = args;
     let path = ui_rs();
-    let raw = fs::read_string(&path)?;
+    let raw = py_read_text(&path)?;
     match report(&raw, &path.display().to_string())? {
         Ok((lines, passed)) => {
             for line in lines {

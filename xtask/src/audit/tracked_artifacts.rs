@@ -47,12 +47,13 @@ const ALLOWED: &[(&str, &str)] = &[(
 
 /// Returns one message for each rule that a tracked path breaks.
 ///
-/// `read_head` returns the first bytes of a path, or `None` to skip it.
+/// `read_head` returns the first bytes of a path, or `None` to skip it. An
+/// error from `read_head` stops the scan, as the Python traceback did.
 fn findings(
     paths: &[TrackedPath],
-    read_head: &dyn Fn(&TrackedPath) -> Option<Vec<u8>>,
+    read_head: &dyn Fn(&TrackedPath) -> Result<Option<Vec<u8>>>,
     allowed: &[&str],
-) -> Vec<String> {
+) -> Result<Vec<String>> {
     let mut found = Vec::new();
     for path in paths {
         if LEFTOVER_SUFFIXES.iter().any(|s| path.text.ends_with(s)) {
@@ -63,7 +64,7 @@ fn findings(
             continue;
         }
         let binary =
-            read_head(path).is_some_and(|head| head.iter().take(SNIFF_BYTES).any(|b| *b == 0));
+            read_head(path)?.is_some_and(|head| head.iter().take(SNIFF_BYTES).any(|b| *b == 0));
         if binary {
             found.push(format!("{}: binary file", path.text));
         }
@@ -75,28 +76,37 @@ fn findings(
             found.push(format!("{path}: in ALLOWED, but not tracked"));
         }
     }
-    found
+    Ok(found)
 }
 
 /// Returns the first bytes of a regular file, or `None` to skip it.
-fn read_head(path: &TrackedPath) -> Option<Vec<u8>> {
+///
+/// A path that cannot be examined, such as a file that the work tree lacks,
+/// is skipped, as Python's `islink` and `is_file` skip it. A regular file
+/// that cannot be read is an error. Python raised there, so the gate failed
+/// closed. A silent skip would pass a binary file that it never read.
+fn read_head(path: &TrackedPath) -> Result<Option<Vec<u8>>> {
     let full = repo_root().join(OsStr::from_bytes(&path.raw));
     // A symlink holds a path, and a gitlink is a directory.
-    let meta = std::fs::symlink_metadata(&full).ok()?;
+    let Ok(meta) = std::fs::symlink_metadata(&full) else {
+        return Ok(None);
+    };
     if meta.file_type().is_symlink() || !meta.is_file() {
-        return None;
+        return Ok(None);
     }
-    let file = std::fs::File::open(&full).ok()?;
+    let file = std::fs::File::open(&full).with_context(|| format!("opening {}", full.display()))?;
     let mut head = Vec::with_capacity(SNIFF_BYTES);
-    file.take(SNIFF_BYTES as u64).read_to_end(&mut head).ok()?;
-    Some(head)
+    file.take(SNIFF_BYTES as u64)
+        .read_to_end(&mut head)
+        .with_context(|| format!("reading {}", full.display()))?;
+    Ok(Some(head))
 }
 
 /// Checks the real tree and prints the findings.
 fn check() -> Result<ExitCode> {
     let paths = tracked_paths()?;
     let allowed: Vec<&str> = ALLOWED.iter().map(|(path, _)| *path).collect();
-    let found = findings(&paths, &read_head, &allowed);
+    let found = findings(&paths, &read_head, &allowed)?;
     for message in &found {
         println!("{message}");
     }
@@ -128,8 +138,8 @@ fn self_test() -> Result<()> {
         ("guest.wasm", Some(b"\0asm\x01\0\0\0".to_vec())),
         ("link", None),
     ]);
-    let lookup = |p: &TrackedPath| files.get(p.text.as_str()).cloned().flatten();
-    let check = |names: &[&str], allow: &[&str]| {
+    let lookup = |p: &TrackedPath| Ok(files.get(p.text.as_str()).cloned().flatten());
+    let check = |names: &[&str], allow: &[&str]| -> Result<Vec<String>> {
         let paths: Vec<TrackedPath> = names
             .iter()
             .map(|n| TrackedPath::from_bytes(n.as_bytes()))
@@ -137,34 +147,34 @@ fn self_test() -> Result<()> {
         findings(&paths, &lookup, allow)
     };
 
-    let found = check(&["src/lib.rs", "empty.txt", "late-nul.txt", "link"], &[]);
+    let found = check(&["src/lib.rs", "empty.txt", "late-nul.txt", "link"], &[])?;
     ensure!(found.is_empty(), "{found:?}");
-    let found = check(&["guest.wasm"], &["guest.wasm"]);
+    let found = check(&["guest.wasm"], &["guest.wasm"])?;
     ensure!(found.is_empty(), "{found:?}");
-    let found = check(&["guest.wasm"], &[]);
+    let found = check(&["guest.wasm"], &[])?;
     ensure!(
         found.first().is_some_and(|m| m.contains("binary")),
         "{found:?}"
     );
 
-    let found = check(&["src/lib.rs.orig", "fix.rej"], &[]);
+    let found = check(&["src/lib.rs.orig", "fix.rej"], &[])?;
     ensure!(found.len() == 2, "{found:?}");
     ensure!(
         found.iter().all(|m| m.contains("patch leftover")),
         "{found:?}"
     );
 
-    let found = check(&["test_debug"], &[]);
+    let found = check(&["test_debug"], &[])?;
     ensure!(found.len() == 1 && found[0].contains("binary"), "{found:?}");
 
-    let found = check(&["src/lib.rs"], &["gone.bin"]);
+    let found = check(&["src/lib.rs"], &["gone.bin"])?;
     ensure!(
         found.len() == 1 && found[0].contains("gone.bin"),
         "{found:?}"
     );
 
     // ALLOWED exempts a binary, never a patch leftover.
-    let found = check(&["src/lib.rs.orig"], &["src/lib.rs.orig"]);
+    let found = check(&["src/lib.rs.orig"], &["src/lib.rs.orig"])?;
     ensure!(
         found.len() == 1 && found[0].contains("patch leftover"),
         "{found:?}"
@@ -199,14 +209,23 @@ mod tests {
     }
 
     #[test]
+    fn a_read_error_fails_the_scan() {
+        let paths = [TrackedPath::from_text("unreadable.bin")];
+        let failing = |_: &TrackedPath| -> Result<Option<Vec<u8>>> { bail!("denied") };
+        assert!(findings(&paths, &failing, &[]).is_err());
+    }
+
+    #[test]
     fn the_head_reader_skips_a_missing_file() {
         let path = TrackedPath::from_text("no/such/file.bin");
-        assert_eq!(read_head(&path), None);
+        assert_eq!(read_head(&path).unwrap(), None);
     }
 
     #[test]
     fn the_head_reader_reads_a_real_file() {
-        let head = read_head(&TrackedPath::from_text("Cargo.toml")).unwrap();
+        let head = read_head(&TrackedPath::from_text("Cargo.toml"))
+            .unwrap()
+            .unwrap();
         assert!(!head.is_empty() && !head.contains(&0));
     }
 }

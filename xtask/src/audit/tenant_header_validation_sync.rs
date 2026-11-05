@@ -25,8 +25,8 @@ use std::process::ExitCode;
 
 use smop::prelude::*;
 
+use super::libpq_keyword_sync::py_read_repo_file;
 use super::vantage_flash_live_region::compile;
-use crate::util::read_repo_file;
 
 /// Arguments of `cargo xtask audit tenant-header-validation-sync`.
 #[derive(Debug, Clone, Copy, Args)]
@@ -86,7 +86,7 @@ fn normalize(body: &str, fn_name: &str, const_expr: &str) -> String {
 fn findings() -> Result<Vec<String>> {
     let mut bodies = Vec::new();
     for (rel_path, fn_name, const_expr) in TARGETS {
-        let source = read_repo_file(rel_path)?;
+        let source = py_read_repo_file(rel_path)?;
         let Some(body) = extract_fn_body(&source, fn_name) else {
             return Ok(vec![format!(
                 "{rel_path}: could not find fn {fn_name}(request: &Request) -> ..."
