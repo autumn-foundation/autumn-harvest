@@ -26,7 +26,7 @@
   },
   "auth_note": "Route authorization posture is classified in issue #174. This contract records the route surface and category; auth enforcement is separate. The optional API rate limiter (issue #1827) can answer 429 with a Retry-After header in whole seconds on any route that is not PublicSafe. Its body is {\"error\": \"rate limited\", \"route_class\", \"retry_after_secs\"}. See docs/security-posture.md#api-rate-limiting.",
   "audit_note": "Mutating routes (read_only: false) are covered by the audit trail (issue #158). The audit endpoint itself is read-only.",
-  "openapi_note": "Two OpenAPI 3.1 documents are generated from this file (issue #694): autumn-harvest-plugin/openapi.json, which the crate compiles in and serves, and docs/openapi.json, the pretty-printed copy. Run `scripts/regenerate-openapi.sh` whenever a route, parameter, request field or response field changes here; it writes both. Every parameter must declare `in` and `required`, and every request body must declare `required`. The transform rejects an entry that does not, and refuses a request body on a read method. See docs/openapi.md.",
+  "openapi_note": "Two OpenAPI 3.1 documents are generated from this file (issue #694): autumn-harvest-plugin/openapi.json, which the crate compiles in and serves, and docs/openapi.json, the pretty-printed copy. Run `cargo xtask dev regenerate-openapi` whenever a route, parameter, request field or response field changes here; it writes both. Every parameter must declare `in` and `required`, and every request body must declare `required`. The transform rejects an entry that does not, and refuses a request body on a read method. See docs/openapi.md.",
   "routes": [
     {
       "method": "GET",

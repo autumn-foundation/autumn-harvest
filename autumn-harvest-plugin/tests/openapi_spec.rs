@@ -665,7 +665,7 @@ fn document_is_structurally_valid_openapi_3_1() {
         doc["info"]["version"],
         env!("CARGO_PKG_VERSION"),
         "the document version tracks the crate version. Update `version` in \
-         docs/api-contract.json, then run scripts/regenerate-openapi.sh"
+         docs/api-contract.json, then run `cargo xtask dev regenerate-openapi`"
     );
 
     let mut ids = HashSet::new();
@@ -736,7 +736,7 @@ fn checked_in_artifacts_match_the_generated_document() {
     assert_eq!(
         compiled_in, generated,
         "autumn-harvest-plugin/openapi.json is stale. Regenerate both copies with:\n  \
-         scripts/regenerate-openapi.sh"
+         cargo xtask dev regenerate-openapi"
     );
     assert_eq!(
         served,
@@ -756,7 +756,7 @@ fn checked_in_artifacts_match_the_generated_document() {
             serde_json::to_string_pretty(&generated).expect("must serialize")
         ),
         "docs/openapi.json is stale. Regenerate both copies with:\n  \
-         scripts/regenerate-openapi.sh"
+         cargo xtask dev regenerate-openapi"
     );
 }
 
@@ -1005,8 +1005,8 @@ fn the_release_pipeline_builds_and_attaches_the_client() {
     let release = repo_file(".github/workflows/release.yml");
     let client = without_comments(job_block(&release, "client"));
     assert!(
-        client.contains("scripts/build-typescript-client.sh"),
-        "the client job must run scripts/build-typescript-client.sh"
+        client.contains("cargo xtask dev build-typescript-client"),
+        "the client job must run `cargo xtask dev build-typescript-client`"
     );
     assert!(
         client.contains("autumn-harvest-client-${version}.tgz"),
@@ -1043,7 +1043,7 @@ fn the_release_pipeline_builds_and_attaches_the_client() {
 fn ci_builds_the_client_package() {
     let ci = repo_file(".github/workflows/ci.yml");
     let job = without_comments(job_block(&ci, "typescript-client-package"));
-    assert!(job.contains("scripts/build-typescript-client.sh"));
+    assert!(job.contains("cargo xtask dev build-typescript-client"));
     assert!(
         !job.contains("services:"),
         "the client build must need no database or app"

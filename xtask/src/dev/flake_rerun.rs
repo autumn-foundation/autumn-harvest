@@ -1,21 +1,180 @@
-//! `cargo xtask dev flake-rerun`: the port of `scripts/flake-rerun.sh`.
+//! `cargo xtask dev flake-rerun`: the same-commit rerun protocol for one test
+//! binary (Semaphore, CI health).
+//!
+//! This is the port of the old `scripts/flake-rerun.sh`.
+//!
+//! Usage: `cargo xtask dev flake-rerun <test-binary> <test-name> <N>
+//! [cpu-spinners]`. Run it from the crate directory with
+//! `HARVEST_TEST_DATABASE_URL` set. `cargo xtask` keeps the current
+//! directory, so a relative binary path resolves from there.
+//!
+//! It runs `<test-binary> <test-name> --exact` N times. It prints the failure
+//! count, and the Postgres event order of each failure. Each CPU spinner is a
+//! busy thread that loads one core while the runs go on.
 
-use std::process::ExitCode;
+use std::process::{Command, ExitCode, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
 
+use regex::Regex;
 use smop::prelude::*;
 
 /// Arguments of `cargo xtask dev flake-rerun`.
 #[derive(Debug, Args)]
 pub struct Args {
-    /// Arguments that the port has not defined yet.
-    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-    pub rest: Vec<String>,
+    /// The test binary.
+    ///
+    /// The shell split it into words, so it can hold a program and its
+    /// leading arguments.
+    #[arg(value_name = "TEST_BINARY")]
+    pub bin: String,
+    /// The exact name of the test to run.
+    #[arg(value_name = "TEST_NAME")]
+    pub test: String,
+    /// The number of runs.
+    #[arg(value_name = "N")]
+    pub runs: u64,
+    /// The number of busy threads that load the CPU during the runs.
+    #[arg(value_name = "CPU_SPINNERS", default_value_t = 0)]
+    pub spinners: u32,
 }
 
 /// Runs `cargo xtask dev flake-rerun`.
 pub fn run(args: Args) -> Result<ExitCode> {
-    bail!(
-        "`cargo xtask dev flake-rerun` is not ported yet: {:?}",
-        args.rest
-    )
+    let Args {
+        bin,
+        test,
+        runs,
+        spinners,
+    } = args;
+    let mut words = bin.split_whitespace();
+    let program = words.next().unwrap_or_default().to_string();
+    let leading: Vec<String> = words.map(str::to_string).collect();
+    let pattern = Regex::new("postgres:.*(Activity|Signal)").context("the event pattern")?;
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let threads: Vec<_> = (0..spinners)
+        .map(|_| {
+            let stop = Arc::clone(&stop);
+            thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    std::hint::spin_loop();
+                }
+            })
+        })
+        .collect();
+
+    let mut failures = 0_u64;
+    for index in 1..=runs {
+        let (passed, output) = run_once(&program, &leading, &test)?;
+        if !passed {
+            failures += 1;
+            println!("run {index} FAIL: {}", event_order(&pattern, &output));
+        }
+    }
+
+    stop.store(true, Ordering::Relaxed);
+    for spinner in threads {
+        // A spinner never panics, so a join error has nothing to report.
+        let _ = spinner.join();
+    }
+    println!("RESULT {test}: {failures}/{runs} failed (spinners={spinners})");
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Runs the test once and returns whether it passed and its output.
+///
+/// The output holds stdout and stderr, interleaved, as `2>&1` gave them. A
+/// binary that cannot start is a failed run, as it was for the shell.
+fn run_once(program: &str, leading: &[String], test: &str) -> Result<(bool, String)> {
+    let scratch = fs::temp_dir()?;
+    let path = scratch.path().join("run.log");
+    let file =
+        std::fs::File::create(&path).with_context(|| format!("creating {}", path.display()))?;
+    let stderr = file.try_clone().context("opening the run log")?;
+    let status = Command::new(program)
+        .args(leading)
+        .args([test, "--exact"])
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::from(file))
+        .stderr(Stdio::from(stderr))
+        .status();
+    let output = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+    Ok(match status {
+        Ok(status) => (
+            status.success(),
+            String::from_utf8_lossy(&output).into_owned(),
+        ),
+        Err(error) => (false, format!("{program}: {error}")),
+    })
+}
+
+/// The Postgres activity and signal lines of `output`, joined by `|`.
+///
+/// Repeated spaces collapse to one, and each line ends with `|`. This is the
+/// shell pipeline `grep -E "postgres:.*(Activity|Signal)" | tr -s " " | tr
+/// "\n" "|"`.
+fn event_order(pattern: &Regex, output: &str) -> String {
+    let mut joined = String::new();
+    for line in output.trim_end_matches('\n').split('\n') {
+        if pattern.is_match(line) {
+            joined.push_str(&squeeze_spaces(line));
+            joined.push('|');
+        }
+    }
+    joined
+}
+
+/// Collapses each run of spaces in `line` to one space, as `tr -s " "` does.
+fn squeeze_spaces(line: &str) -> String {
+    let mut squeezed = String::with_capacity(line.len());
+    let mut previous_space = false;
+    for ch in line.chars() {
+        if ch == ' ' && previous_space {
+            continue;
+        }
+        previous_space = ch == ' ';
+        squeezed.push(ch);
+    }
+    squeezed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pattern() -> Regex {
+        Regex::new("postgres:.*(Activity|Signal)").unwrap()
+    }
+
+    #[test]
+    fn the_event_order_keeps_postgres_activity_and_signal_lines() {
+        let output = "running 1 test\n\
+                      postgres:   ActivityScheduled   a\n\
+                      other: Activity\n\
+                      postgres: SignalReceived  s\n\
+                      test failed\n\n";
+        assert_eq!(
+            event_order(&pattern(), output),
+            "postgres: ActivityScheduled a|postgres: SignalReceived s|"
+        );
+    }
+
+    #[test]
+    fn an_output_with_no_event_gives_an_empty_order() {
+        assert_eq!(event_order(&pattern(), ""), "");
+        assert_eq!(event_order(&pattern(), "postgres: TimerFired\n"), "");
+    }
+
+    #[test]
+    fn a_failing_binary_counts_as_a_failure() {
+        let (passed, _) = run_once("false", &[], "t").unwrap();
+        assert!(!passed);
+        let (passed, output) = run_once("echo", &["postgres:".into()], "Activity").unwrap();
+        assert!(passed);
+        assert_eq!(output, "postgres: Activity --exact\n");
+        let (passed, _) = run_once("definitely-not-a-test-binary", &[], "t").unwrap();
+        assert!(!passed);
+    }
 }
