@@ -187,6 +187,48 @@ pub(crate) const fn runs_retention(enabled: bool, run_on: RetentionRunOn, schedu
     enabled && retention_placed(run_on, scheduler)
 }
 
+/// The capabilities that a `[roles.<name>]` preset turns off below its
+/// base, and that Harvest reads only through the base.
+///
+/// Harvest follows the base of a preset (issue #2477). A preset that turns
+/// off `job_workers`, `scheduler` or `retention` does not stop the Harvest
+/// worker, the scheduler or the janitor. A `pin = []` turns off
+/// `job_workers`. Issue #2480 maps each capability.
+#[must_use]
+pub(crate) fn preset_overrides(role: &autumn_web::config::Role) -> Vec<&'static str> {
+    if !role.is_preset() {
+        return Vec::new();
+    }
+    let own = role.capabilities();
+    let base = role.base().capabilities();
+    [
+        ("job_workers", own.job_workers, base.job_workers),
+        ("scheduler", own.scheduler, base.scheduler),
+        ("retention", own.retention, base.retention),
+    ]
+    .into_iter()
+    .filter(|(_, own, base)| own != base)
+    .map(|(name, _, _)| name)
+    .collect()
+}
+
+/// Log one `warn!` when a preset turns off a capability that Harvest does
+/// not read yet. See [`preset_overrides`].
+pub(crate) fn warn_preset_overrides(role: &autumn_web::config::Role) {
+    let overrides = preset_overrides(role);
+    if overrides.is_empty() {
+        return;
+    }
+    tracing::warn!(
+        "the Autumn role `{}` turns off {}, but Harvest follows only its base `{}`. Set \
+         harvest.worker_enabled and harvest.scheduler_enabled to match. Issue #2480 tracks \
+         the mapping",
+        role.name(),
+        overrides.join(", "),
+        role.base().as_str(),
+    );
+}
+
 /// Run `f` and return its log output at `level` and above.
 #[cfg(test)]
 pub(crate) fn capture_logs(level: tracing::Level, f: impl FnOnce()) -> String {
@@ -245,6 +287,49 @@ mod tests {
             .filter(|line| line.contains(" WARN "))
             .map(str::to_owned)
             .collect()
+    }
+
+    /// Resolve the role that `toml` selects.
+    fn resolve_role(toml: &str) -> autumn_web::config::Role {
+        toml::from_str::<autumn_web::config::AutumnConfig>(toml)
+            .expect("parses")
+            .resolve_role()
+            .expect("resolves")
+    }
+
+    /// Issue #2479: a preset that turns off a capability warns, because
+    /// Harvest follows only its base. A built-in role and a pin warn not.
+    #[test]
+    fn a_preset_capability_override_warns() {
+        let role = resolve_role(
+            "role = \"cron\"\n[roles.cron]\nbase = \"worker\"\nscheduler = false\n\
+             retention = false\n",
+        );
+        assert_eq!(
+            super::preset_overrides(&role),
+            vec!["scheduler", "retention"]
+        );
+        let out = super::capture_logs(tracing::Level::WARN, || {
+            super::warn_preset_overrides(&role);
+        });
+        assert!(out.contains("role `cron`"), "{out}");
+        assert!(out.contains("scheduler, retention"), "{out}");
+        assert!(out.contains("base `worker`"), "{out}");
+
+        let no_workers =
+            resolve_role("role = \"api\"\n[roles.api]\nbase = \"combined\"\npin = []\n");
+        assert_eq!(super::preset_overrides(&no_workers), vec!["job_workers"]);
+
+        let pinned = resolve_role(
+            "role = \"priority\"\n[roles.priority]\nbase = \"worker\"\npin = [\"priority\"]\n",
+        );
+        assert_eq!(super::preset_overrides(&pinned), Vec::<&str>::new());
+        let builtin = resolve_role("role = \"web\"\n");
+        assert_eq!(super::preset_overrides(&builtin), Vec::<&str>::new());
+        let out = super::capture_logs(tracing::Level::WARN, || {
+            super::warn_preset_overrides(&builtin);
+        });
+        assert!(!out.contains("WARN"), "{out}");
     }
 
     #[test]

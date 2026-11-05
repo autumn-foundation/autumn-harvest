@@ -133,6 +133,12 @@ pub struct DispatchConfigView {
 pub struct WorkerConfigView {
     /// Task queues this worker polls.
     pub queues: Vec<String>,
+    /// Task queues that code declares (issue #2479). Config or the role pin
+    /// can narrow `queues` to a subset of these.
+    pub declared_queues: Vec<String>,
+    /// Where `queues` comes from: `code`, `explicit` or `role` (issue
+    /// #2479). `code` means that nothing narrows the declared list.
+    pub queue_source: &'static str,
     /// Per-queue dispatch weights (sorted for stable output). Empty = equal share.
     pub queue_weights: BTreeMap<String, u32>,
     /// Whether claims rotate across fairness keys (issue #1976).
@@ -476,6 +482,8 @@ impl WorkerConfigView {
 
         Self {
             queues: queues.clone(),
+            declared_queues: queues.clone(),
+            queue_source: "code",
             queue_weights: queue_weights.iter().map(|(k, v)| (k.clone(), *v)).collect(),
             fairness_keys: *fairness_keys,
             max_concurrent_workflows: *max_concurrent_workflows,
@@ -953,6 +961,12 @@ mod tests {
         let json = serde_json::to_value(&view).expect("serialize");
 
         assert_eq!(json["queues"], serde_json::json!(["alpha", "beta"]));
+        // Issue #2479: nothing narrows a plain capture.
+        assert_eq!(
+            json["declared_queues"],
+            serde_json::json!(["alpha", "beta"])
+        );
+        assert_eq!(json["queue_source"], "code");
         assert_eq!(json["queue_weights"]["alpha"], 7);
         assert_eq!(json["build_id"], "build-sentinel-9001");
         assert_eq!(json["deployment_name"], "prod-blue-sentinel");

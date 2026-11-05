@@ -902,6 +902,87 @@ async fn a_nested_failure_keeps_the_usage_of_the_whole_subtree() {
     assert_eq!(state.tokens_used, 1 + 2 + 2 + 2 + 2, "the subtree is paid");
 }
 
+/// A child answer of 9 000 characters. It ends with the child input, so a
+/// cut shows.
+fn long_answer(input: &str) -> String {
+    format!("{}{input}", "x".repeat(9_000))
+}
+
+/// The root fans out to three peers. Each peer answers with a long text.
+fn long_trip_model() -> Arc<FnModel> {
+    FnModel::new(|request| {
+        let input = first_user(request);
+        if input == ROOT_INPUT {
+            return if results(request).is_empty() {
+                three_delegations(3)
+            } else {
+                text("trip planned", 3)
+            };
+        }
+        text(&long_answer(&input), 2)
+    })
+}
+
+/// The delegation results that the root read last.
+fn delegation_results(model: &FnModel) -> Vec<Value> {
+    let last = model
+        .requests()
+        .into_iter()
+        .rfind(|request| first_user(request) == ROOT_INPUT)
+        .unwrap();
+    results(&last)
+        .iter()
+        .map(|result| serde_json::from_str(result).unwrap())
+        .collect()
+}
+
+// Issue #2481: `tool_output_limit` governs a fan-out answer.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_harness_limit_governs_a_fan_out_answer() {
+    let (_dir, db) = fresh_db();
+    let model = long_trip_model();
+    let harness = trip_harness(model.clone()).tool_output_limit(20_000);
+    let mut rt = runtime(&db, harness);
+    let (exec, report) = run(&mut rt, &trip_task(3)).await;
+
+    assert_eq!(children_started(&rt, exec).len(), 3, "the children fan out");
+    let found = delegation_results(&model);
+    assert_eq!(found.len(), 3);
+    for (result, input) in found
+        .iter()
+        .zip(["find flights", "find hotels", "check visas"])
+    {
+        let answer = result["answer"].as_str().unwrap_or_default();
+        assert!(
+            answer == long_answer(input),
+            "{input}: {} characters, whole: {}",
+            answer.chars().count(),
+            answer.ends_with(input)
+        );
+        assert_eq!(result["truncated"], false);
+    }
+    assert_eq!(report.delegations.len(), 3);
+    assert!(report.delegations.iter().all(|r| !r.answer_truncated));
+}
+
+// Issue #2481: a cut fan-out answer is marked for the model and the report.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cut_fan_out_answer_is_marked() {
+    let (_dir, db) = fresh_db();
+    let model = long_trip_model();
+    let harness = trip_harness(model.clone()).tool_output_limit(100);
+    let mut rt = runtime(&db, harness);
+    let (exec, report) = run(&mut rt, &trip_task(3)).await;
+
+    assert_eq!(children_started(&rt, exec).len(), 3, "the children fan out");
+    for result in delegation_results(&model) {
+        assert_eq!(result["answer"], format!("{}…[truncated]", "x".repeat(100)));
+        assert_eq!(result["truncated"], true);
+    }
+    assert_eq!(report.delegations.len(), 3);
+    assert!(report.delegations.iter().all(|r| r.answer_truncated));
+}
+
 // ---------------------------------------------------------------------------
 // A delegation that runs alone names why (issue #2483).
 // ---------------------------------------------------------------------------

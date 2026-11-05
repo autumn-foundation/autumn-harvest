@@ -875,6 +875,28 @@ async fn an_invalid_operator_startup_value_refuses_boot() {
     assert!(error.to_string().contains("fial"), "{error}");
 }
 
+/// Issue #2479: the embedding reads `AUTUMN_HARVEST__WORKER__QUEUES`. An
+/// undeclared queue refuses boot and names the queue.
+#[tokio::test]
+async fn an_operator_worker_queue_list_reaches_the_runner() {
+    let _serial = SERIAL.lock().await;
+    let (url, _db) = database().await;
+    let _env = EnvGuard::set(&[("AUTUMN_HARVEST__WORKER__QUEUES", "priorty")]);
+
+    let result = HarvestEmbedding::new(
+        builder().build(),
+        config(&url),
+        HarvestRunnerResources::new(pool(&url)),
+    )
+    .start()
+    .await;
+
+    let Err(error) = result else {
+        panic!("an undeclared operator queue must refuse boot");
+    };
+    assert!(error.to_string().contains("priorty"), "{error}");
+}
+
 /// A profile the embedder set on its own API state survives the ambient
 /// read, and that state is the one the runtime installs.
 #[tokio::test]

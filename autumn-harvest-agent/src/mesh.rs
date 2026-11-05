@@ -135,6 +135,15 @@ pub struct Peer {
     /// caller expects, and the profile of the agent decides.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// The cap on the answer of the peer, in characters (issue #2481).
+    ///
+    /// `None` uses [`AgentHarness::tool_output_limit`](crate::AgentHarness::tool_output_limit).
+    /// The peer lookup writes that value here, so history records it. A
+    /// lookup recorded before issue #2481 has `None`. Its run keeps the old
+    /// cut of 8 000 characters. A byte share of the request cap of the
+    /// caller also cuts the answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer_limit: Option<usize>,
 }
 
 /// The default time a caller waits for the reply of a durable peer: ten
@@ -158,6 +167,7 @@ impl Peer {
             agent: None,
             reply_timeout_secs: None,
             model: None,
+            answer_limit: None,
         }
     }
 
@@ -238,6 +248,14 @@ impl Peer {
     #[must_use]
     pub const fn read_only(mut self) -> Self {
         self.read_only = true;
+        self
+    }
+
+    /// Set the cap on the answer of the peer, in characters. It overrides
+    /// the harness `tool_output_limit` for this peer only.
+    #[must_use]
+    pub const fn answer_limit(mut self, chars: usize) -> Self {
+        self.answer_limit = Some(chars);
         self
     }
 }
@@ -749,6 +767,9 @@ pub struct DelegationRecord {
     /// The context resets of the child itself (issue #2453).
     #[serde(default, skip_serializing_if = "crate::types::is_zero")]
     pub resets: u32,
+    /// `true` when the harness cuts the answer of the child (issue #2481).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub answer_truncated: bool,
     /// Why the delegation ran alone, when the task allowed a fan-out (issue
     /// #2483). `None` when the delegation ran in a batch, when it was
     /// refused, or when the bound is under 2.
@@ -804,6 +825,17 @@ mod tests {
 
     fn set(names: &[&str]) -> BTreeSet<String> {
         names.iter().map(|name| (*name).to_owned()).collect()
+    }
+
+    // Issue #2481: a lookup records the limit, and a large limit survives
+    // the round trip through history.
+    #[test]
+    fn an_answer_limit_round_trips_and_none_is_left_out() {
+        let peer = Peer::new("a", "b").answer_limit(usize::MAX);
+        let value = serde_json::to_value(&peer).unwrap();
+        assert_eq!(serde_json::from_value::<Peer>(value).unwrap(), peer);
+        let plain = serde_json::to_value(Peer::new("a", "b")).unwrap();
+        assert!(plain.get("answer_limit").is_none());
     }
 
     #[test]

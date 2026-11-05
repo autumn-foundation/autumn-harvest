@@ -719,8 +719,9 @@ loopback. The scope must include `openid`.
 **Limits.**
 
 - Roles are fixed at login. After `max_session_age` (default 12 hours) the
-  user must log in again. Set it with `OidcLogin::with_max_session_age`. An
-  age under one second becomes one second.
+  user must log in again. Set it with `OidcLogin::with_max_session_age`. The
+  login time has a one-second resolution, so a session can end up to one
+  second early. An age under two seconds becomes two seconds.
 - The claim map reads the signed ID token only.
 - Logout does not end the session at the identity provider.
 - `api_with_oidc` and `api_with_auth` replace each other. The last call

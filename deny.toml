@@ -173,52 +173,33 @@ ignore = [
     # multiplication. The effect depends on the compiler and the CPU. The fix
     # is in 0.7.6, and the advisory covers every lower version.
     #
-    # No fix is possible from this repo. elliptic-curve 0.13.8 is the only
-    # crate that depends on crypto-bigint, and it requires `0.5`
-    # (elliptic-curve-0.13.8/Cargo.toml:61-62). autumn-web 0.9.0 pins
-    # `p256 = "0.13"` as a required dependency (Cargo.toml:941-948). It
-    # also turns on the `rust_crypto` feature of jsonwebtoken 11.1.0
-    # (Cargo.toml:876-879). That feature pins p256 and p384 0.13
-    # (jsonwebtoken-11.1.0/Cargo.toml:53-57). On 2026-10-24, each crate of
-    # the chain is at the last release of its line. So a `cargo update`, a
-    # feature change or a `[patch]` cannot move crypto-bigint.
+    # Since autumn-web 0.10.0, one path holds crypto-bigint 0.5.5. A host app
+    # on the autumn-web defaults keeps it, so this repo cannot drop it. A
+    # build with no `jwt` feature and no `oidc` feature would drop it. autumn-web turns on the `rust_crypto`
+    # feature of jsonwebtoken 11.1.0 through its default `jwt` feature.
+    # jsonwebtoken pins p256 and p384 0.13 (jsonwebtoken-11.1.0/Cargo.toml:53-57).
+    # p256 0.13 needs elliptic-curve 0.13.8, which requires crypto-bigint
+    # `0.5` (elliptic-curve-0.13.8/Cargo.toml:61-62). autumn-web 0.10.0 moved
+    # its own `p256` to 0.14, which takes crypto-bigint 0.7.10, a fixed
+    # version. So Web Push signs and does ECDH on the fixed version.
     #
     # Verdict: undetermined from this repo alone, as for RUSTSEC-2023-0071.
     # Code in this workspace runs no P-256 or P-384 secret-key operation.
-    # The `oidc` feature only verifies ID tokens (autumn-web-0.9.0
-    # src/auth.rs:1523, 1577), and each verify input is public. The only JWT
-    # signer here is a test that uses EdDSA
+    # The `oidc` feature only verifies ID tokens, and each verify input is
+    # public. The only JWT signer here is a test that uses EdDSA
     # (autumn-harvest-plugin/tests/oidc_login.rs:194-199). Ed25519 does not
-    # use crypto-bigint.
-    #
-    # The open part is the Web Push module of autumn-web. It has no feature
-    # gate (src/lib.rs:670), so each build that links autumn-harvest-plugin
-    # holds it. `WebPush::send` signs an ES256 VAPID JWT with the long-term
-    # private key (src/push/vapid.rs:147). It also does ECDH with a new key
-    # for each message (src/push/encryption.rs:84, 129). On these secrets,
-    # p256 runs crypto-bigint add_mod, sub_mod and mul_wide
-    # (p256-0.13.2/src/arithmetic/scalar.rs:99-117). add_mod subtracts with
-    # sbb (crypto-bigint-0.5.5/src/uint/add_mod.rs:13). So this path runs the
-    # class of operation that the advisory names. A subscriber can name its
-    # own https endpoint and so get each VAPID signature
-    # (src/push/store.rs:321-353). Nothing in this workspace sets `[push]`
-    # or calls `WebPush`. With `AUTUMN_PUSH__PRIVATE_KEY` set and no code,
-    # `AppBuilder::run` parses the key and derives its public key at boot
-    # (src/app.rs:5144).
-    #
-    # The crypto-bigint source on these paths has no secret-dependent branch
-    # (src/limb/sub.rs:10-16, src/uint/add_mod.rs:9-22). Any leak depends on
-    # the compiler and the CPU.
+    # use crypto-bigint. A secret-key operation on 0.5.5 needs a host app
+    # that signs ES256 or ES384 with jsonwebtoken. Any leak depends on the
+    # compiler and the CPU.
     #
     # Revisit when one of these happens:
-    # - autumn-web or jsonwebtoken moves to elliptic-curve 0.14, so
-    #   crypto-bigint can reach 0.7.6. Bump it and delete this entry.
-    # - A second crypto-bigint version appears in Cargo.lock. This id would
+    # - jsonwebtoken moves to elliptic-curve 0.14, so the 0.5.5 copy leaves
+    #   Cargo.lock. Delete this entry.
+    # - A third crypto-bigint version appears in Cargo.lock. This id would
     #   hide it too, so bump that version to 0.7.6 or later.
-    # - Code or config here sets `[push] private_key` or
-    #   `AUTUMN_PUSH__PRIVATE_KEY`, or calls `WebPush`. Or it signs ES256 or
-    #   ES384, or makes a JWK from an EC private key, with jsonwebtoken.
-    { id = "RUSTSEC-2026-0387", reason = "undetermined from this repo. Code here runs no P-256 or P-384 secret-key operation. OIDC only verifies, and the one test signer uses EdDSA. autumn-web 0.9.0 has ungated Web Push. It signs ES256 and does ECDH through p256 0.13 when a host app sets [push] and calls WebPush. No upgrade exists: autumn-web 0.9.0 pins p256 0.13, and its jsonwebtoken 11.1.0 pins p256 and p384 0.13. Any leak depends on the compiler and the CPU. Revisit: either crate moves to elliptic-curve 0.14, a second crypto-bigint version appears, or code or config here uses Web Push or signs with an EC key." },
+    # - Code or config here signs ES256 or ES384, or makes a JWK from an EC
+    #   private key, with jsonwebtoken.
+    { id = "RUSTSEC-2026-0387", reason = "undetermined from this repo. Code here runs no P-256 or P-384 secret-key operation. OIDC only verifies, and the one test signer uses EdDSA. Since autumn-web 0.10.0, only jsonwebtoken 11.1.0 holds crypto-bigint 0.5.5, through its pinned p256 and p384 0.13. autumn-web itself, Web Push included, uses p256 0.14 and the fixed crypto-bigint 0.7.10. Any leak depends on the compiler and the CPU. Revisit: jsonwebtoken moves to elliptic-curve 0.14, a third crypto-bigint version appears, or code here signs with an EC key." },
 
     # RUSTSEC-2024-0384 — `instant` 0.1.13 is unmaintained (no vulnerability,
     # "no safe upgrade available"). Pulled by parking_lot 0.11 / wasm-timer ->
@@ -229,6 +210,20 @@ ignore = [
     # autumn-harvest-plugin/Cargo.toml). Revisit: postgresql_archive drops
     # its parking_lot 0.11 dependency, or instant gains a maintained fork.
     { id = "RUSTSEC-2024-0384", reason = "unmaintained, no safe upgrade exists; reached only through dev-runtime-managed (local `cargo dev` tooling), off by default and never shipped. Revisit: postgresql_archive moves off parking_lot 0.11, or instant is forked/revived." },
+
+    # RUSTSEC-2026-0440: astral-tokio-tar 0.6.4 is unmaintained. It reports
+    # no vulnerability, and no safe upgrade exists. testcontainers 0.27 pulls
+    # it. Only tests use testcontainers: the dev-dependencies here, and the
+    # `test-support` feature of autumn-web, which only those dev-dependencies
+    # turn on. No release build holds it. Revisit: testcontainers moves to a
+    # maintained tar crate.
+    { id = "RUSTSEC-2026-0440", reason = "unmaintained, no safe upgrade exists; reached only through testcontainers in tests and autumn-web's test-support feature, never in a release build. Revisit: testcontainers moves to a maintained tar crate." },
+
+    # RUSTSEC-2026-0441: pin-utils 0.1.1 is unmaintained. It reports no
+    # vulnerability, and no safe upgrade exists. `std::pin::pin!` replaces it.
+    # Code here does not use it. loom, the AWS SDK and wasmtimer pull it.
+    # Revisit: those crates move to `std::pin::pin!`.
+    { id = "RUSTSEC-2026-0441", reason = "unmaintained, no safe upgrade exists; no vulnerability. A transitive dependency of loom, the AWS SDK and wasmtimer, not used directly here. Revisit: those crates move to std::pin::pin!." },
 
     # RUSTSEC-2026-0098 / -0099 / -0104 (rustls-webpki 0.101.7) and the
     # h2@0.3.27 half of RUSTSEC-2026-0258 — FIXED, not deferred. All four
