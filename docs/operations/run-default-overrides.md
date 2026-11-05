@@ -1,4 +1,4 @@
-# Runtime SLA, execution-timeout, chain-cap and concurrency-limit overrides
+# Runtime SLA, execution-timeout, chain-cap, concurrency-limit and quota overrides
 
 A workflow type declares three durations in code: its soft `sla`, its hard
 `execution_timeout` and its chain cap `chain_execution_timeout`. It declares
@@ -14,6 +14,11 @@ A workflow type can also declare a concurrency policy through
 `#[workflow(concurrency(key = ..., limit = ...))]`. An operator override
 changes its `limit` at runtime (issue #2407). The key and `on_conflict` stay
 as declared.
+
+A workflow type can also declare a per-tenant quota through
+`#[workflow(quota(key = ..., max_active_executions = ..., ...))]`. An operator
+override changes its three admission caps at runtime (issue #2408). The key
+and the LLM caps stay as declared.
 
 ## Quick reference
 
@@ -54,12 +59,26 @@ curl -X PATCH https://<host>/api/harvest/admin/workflow-types/tenant_sync/run-de
      -H 'Content-Type: application/json' \
      -d '{"concurrency_limit": null}'
 
+# A tenant floods the fleet: refuse new runs of a key past 10 active runs.
+curl -X PATCH https://<host>/api/harvest/admin/workflow-types/tenant_import/run-defaults \
+     -H 'Content-Type: application/json' \
+     -d '{"quota_max_active_executions": 10, "reason": "INC-4824"}'
+
+# Return that cap to its code value, and keep the other quota caps.
+curl -X PATCH https://<host>/api/harvest/admin/workflow-types/tenant_import/run-defaults \
+     -H 'Content-Type: application/json' \
+     -d '{"quota_max_active_executions": null}'
+
 # Read the code value, the override and the effective value.
 curl https://<host>/api/harvest/admin/workflow-types/nightly_etl/run-defaults
 ```
 
 Both routes need the admin role. Each `PATCH` writes one
 `workflow_type.run_defaults` audit row, a refused request included.
+
+The quota caps follow the same rule. An older process refuses each
+`quota_max_*` field with a 400, and it admits under the code caps. An older
+process reads a row with quota caps only as an override that sets nothing.
 
 ## Fields
 
@@ -69,11 +88,17 @@ Both routes need the admin role. Each `PATCH` writes one
 | `execution_timeout_secs` | The hard execution timeout in whole seconds, from 1 to 3153600000 (100 years). A run past it is ended. |
 | `chain_execution_timeout_secs` | The cap of a new continue-as-new chain in whole seconds, from 1 to 3153600000 (100 years). A chain past it is ended. Refused for a DAG. |
 | `concurrency_limit` | The concurrency limit of a new start, from 1 to 2147483647. Refused for a type with no concurrency policy, a DAG included, and for a latest-wins type. |
+| `quota_max_active_executions` | The quota cap on the active runs of one key, from 1 to 4294967295. |
+| `quota_max_history_bytes` | The quota cap on the history bytes of the active runs of one key, from 1 to 9223372036854775807. |
+| `quota_max_dead_letters` | The quota cap on the dead letters of one key, from 1 to 4294967295. |
 | `clear_override` | `true` deletes the stored override before the other fields merge. |
 | `reason` | Free text stored with the override. |
 | `recompute_in_flight` | `true` moves the SLA deadline of the runs in flight. Default `false`. |
 
-Each duration and `concurrency_limit` is tri-state:
+The route refuses each `quota_max_*` field for a type with no quota admission
+cap, a DAG included. Such a type stamps and locks no key for a cap.
+
+Each duration, `concurrency_limit` and each `quota_max_*` field is tri-state:
 
 - An absent key keeps the stored override.
 - `null` returns the field to its code value.
@@ -211,6 +236,39 @@ the same lock. So a newer, lower limit never meets a stale raise.
 `workflow` group. It reads the stored override, not a cache.
 `max_concurrent` is the largest cap that a live row of the key stores. So it
 can differ from `effective_limit` until the older rows finish.
+
+## Quota limits
+
+Each admission reads the quota caps again. No row stores a cap. So:
+
+- **A lower cap** refuses the next admission of a key over it, with the `429`
+  of issue #946. Admission is the only place where a cap applies. A run in
+  flight continues, and no run ends. A workflow retry is still exempt. A
+  continue-as-new successor has no quota check. A child spawn that the cap
+  refuses defers its parent with a backoff, as before.
+- **A higher cap** admits the next admission under it. No pass is needed.
+- **A cap that code leaves unset** can be set, on a type with at least one
+  admission cap. `null` returns it to uncapped.
+- **`clear_override`** restores every code cap.
+
+Each start, child spawn, fork, DLQ redrive and cross-shard child takes the
+override, because each one calls `enforce_quota_admission`. A cross-shard
+child takes the override of the process on its target shard. Quota stays
+shard-local, as in `docs/sharding.md`.
+
+`GET /admin/quotas` shows the source of each cap:
+
+| Field | Meaning |
+|-------|---------|
+| `limits` | The effective caps: the override, then code. |
+| `code_limits` | The caps declared in code. |
+| `override` | The stored caps with `reason`, `updated_by` and `updated_at`, or `null`. |
+
+Each usage entry carries the three fields. `workflow_types` lists them for
+each registered type with an admission cap, so an override shows before its
+type has usage. The route reads the stored override from the default shard.
+If that read fails, it shows the cache of the serving process, with no
+reason, actor or time.
 
 ## Mixed versions
 

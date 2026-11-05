@@ -1848,6 +1848,70 @@ async fn a_fork_is_admitted_under_the_tenant_quota() {
     assert_eq!(row.quota_key.as_deref(), Some(other.as_str()));
 }
 
+/// A fork takes the operator override of the quota caps (issue #2408). A
+/// lower cap refuses it, and a clear restores the code cap.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fork_takes_the_quota_override() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let queue = unique("quota-ovr");
+    let mut conn = connect(&url).await;
+    let input = json!({ "tag": queue, "amount": 1, "tenant": queue });
+    let source = seed_run(&mut conn, &queue, &input).await;
+    diesel::update(harvest_workflow_executions::table.find(source.as_uuid()))
+        .set(SetExt(
+            harvest_workflow_executions_ext::quota_key.eq(Some(queue.as_str())),
+        ))
+        .execute(&mut conn)
+        .await
+        .expect("stamp the source key");
+    let mut info = fork_pay_wf_info();
+    let name = info.name;
+    info.quota =
+        Some(autumn_harvest::quota::QuotaPolicy::new("tenant").with_max_active_executions(5));
+    let quota_registry = Arc::new(HandlerRegistry::new(
+        vec![info],
+        activities![fork_charge, fork_receipt],
+    ));
+    let lower = autumn_harvest::run_defaults::RunDefaultFields {
+        quota: autumn_harvest::quota::QuotaLimits {
+            max_active_executions: Some(1),
+            ..autumn_harvest::quota::QuotaLimits::default()
+        },
+        ..autumn_harvest::run_defaults::RunDefaultFields::default()
+    };
+    quota_registry.run_defaults().write_through(name, lower);
+
+    let over = fork_workflow_execution(
+        &mut conn,
+        source,
+        request(ForkEffects::Live),
+        Some(&quota_registry),
+    )
+    .await;
+    assert!(
+        matches!(
+            over,
+            Err(WorkflowForkError::Harvest(
+                autumn_harvest::error::HarvestError::QuotaExceeded { limit: 1, .. }
+            ))
+        ),
+        "the source meets the lower cap of 1: {over:?}"
+    );
+
+    quota_registry.run_defaults().write_through(
+        name,
+        autumn_harvest::run_defaults::RunDefaultFields::default(),
+    );
+    fork_workflow_execution(
+        &mut conn,
+        source,
+        request(ForkEffects::Live),
+        Some(&quota_registry),
+    )
+    .await
+    .expect("the code cap of 5 admits the fork again");
+}
+
 /// A source with no stored quota key, such as a reset run, resolves the key
 /// from its input. A kept input then cannot skip the quota.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

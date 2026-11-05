@@ -1153,6 +1153,9 @@ pub(crate) async fn enforce_quota_admission(
     let Some(key) = quota_key else {
         return Ok(Vec::new());
     };
+    // The operator override of the caps applies here (issue #2408). Every
+    // admission path calls this function, so none can skip the override.
+    let policy = crate::run_defaults::current_quota_policy(workflow_name, policy);
 
     // Serialize check-then-admit for this key under a transaction-scoped
     // advisory lock (auto-released at commit or rollback) so concurrent

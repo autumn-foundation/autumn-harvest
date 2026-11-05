@@ -198,6 +198,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          quota_enforcement_tests
 linux        autumn-harvest         integration                      -                          quota_history_bytes_perf_tests
 linux        autumn-harvest         integration                      -                          quota_lock_ordering_tests
+linux        autumn-harvest         integration                      -                          quota_override_db_tests
 linux        autumn-harvest         integration                      -                          quota_reconcile_candidate_bound_tests
 linux        autumn-harvest         integration                      -                          quota_reconcile_candidate_scan_perf_tests
 linux        autumn-harvest         integration                      -                          quota_reconcile_tests
@@ -378,6 +379,7 @@ linux        autumn-harvest-plugin  query_integration                -          
 linux        autumn-harvest-plugin  queue_coverage_integration       -                          -
 linux        autumn-harvest-plugin  queue_pause_integration          -                          -
 linux        autumn-harvest-plugin  quota_admin_integration          -                          -
+linux        autumn-harvest-plugin  quota_override_integration       -                          -
 linux        autumn-harvest-plugin  rate_limit_key_admin_integration  -                          -
 linux        autumn-harvest-plugin  read_path_decode_integration     -                          -
 linux        autumn-harvest-plugin  remote_tasks_integration         mcp,unified-dag-execution  -
