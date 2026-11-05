@@ -1279,7 +1279,8 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         ::autumn_harvest::types::ExecutionId::new_for_shard(shard)
                     });
 
-                    let (concurrency_key, concurrency_limit, concurrency_on_conflict) = if let Some(ref policy) = info.concurrency {
+                    // Issue #2407: an operator override wins over the declared limit.
+                    let (concurrency_key, concurrency_limit, concurrency_on_conflict) = if let Some(ref policy) = client.apply_concurrency_run_default(info.name, info.concurrency) {
                         let key = ::autumn_harvest::concurrency::resolve_concurrency_key(&policy.key_expr, &input);
                         (key, Some(policy.limit), policy.on_conflict)
                     } else {
@@ -1379,7 +1380,8 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         ::autumn_harvest::types::ExecutionId::new_for_shard(shard)
                     });
 
-                    let (concurrency_key, concurrency_limit, concurrency_on_conflict) = if let Some(ref policy) = info.concurrency {
+                    // Issue #2407: an operator override wins over the declared limit.
+                    let (concurrency_key, concurrency_limit, concurrency_on_conflict) = if let Some(ref policy) = client.apply_concurrency_run_default(info.name, info.concurrency) {
                         let key = ::autumn_harvest::concurrency::resolve_concurrency_key(&policy.key_expr, &input);
                         (key, Some(policy.limit), policy.on_conflict)
                     } else {

@@ -1987,8 +1987,7 @@ pub(crate) async fn enqueue_fork_workflow_task(
     enqueue.fairness_key = crate::queue_fairness::fairness_key_for(None, quota_key);
     if let Some(reg) = registry
         && let Some(input) = &decoded
-        && let Some(info) = reg.workflows.get(&fork.workflow_name)
-        && let Some(policy) = &info.concurrency
+        && let Some(policy) = reg.concurrency_policy(&fork.workflow_name)
     {
         enqueue.concurrency_key =
             crate::concurrency::resolve_concurrency_key(policy.key_expr, input);

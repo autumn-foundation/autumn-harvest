@@ -124,6 +124,7 @@ async fn framework_outbox_start_takes_the_run_default_override() {
             execution_timeout: Some(std::time::Duration::from_secs(600)),
             sla: None,
             chain_execution_timeout: Some(std::time::Duration::from_mins(15)),
+            concurrency_limit: None,
         },
     );
     state.insert_extension(registry);

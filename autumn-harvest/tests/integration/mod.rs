@@ -110,6 +110,9 @@ mod completion_callback_tests;
 mod completion_trigger_outbox_queue_perf;
 mod concurrency_key_tests;
 mod concurrency_model_ci;
+#[cfg(feature = "db")]
+mod concurrency_override_db_tests;
+mod concurrency_override_guard;
 mod concurrency_supersede_tests;
 mod contention_adaptive_atomicity_docs;
 mod context_headers_tests;
