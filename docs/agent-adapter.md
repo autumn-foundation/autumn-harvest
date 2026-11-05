@@ -1307,7 +1307,7 @@ async fn choose(
 | `AnonId` | `eval::anon::assign` gives the ids, as for an evidence bundle. The key of a candidate is `Candidate::digest`. An id is `c-` and a hex prefix of `SHA-256(seed, source run id, Candidate::digest)`. The prefix has at least 12 digits. It grows until no two ids are equal. `formal/verus/src/agent_anonymise.rs` proves the width rule. |
 | The order | The pool lists the ids in order. The input order changes no id and no text. The candidates also run in pool order. |
 | `text` | `AnonymisedPool::render`: the source end, then per id the counts, the end, each scorer verdict, each turn verdict, and each turn decision as JSON. It holds no model name, overlay digest, label or input index. |
-| `pool` | The same content as JSON. Each `AnonymisedEvaluation` keeps every field of `Evaluation` except `overlay_digest`. The recorded end is in the pool once. |
+| `pool` | The same content as JSON. Each `AnonymisedEvaluation` keeps every field of `Evaluation` except `overlay_digest` and `candidate_cost_usd_micros` (issue #2380). A price names a model. The recorded end is in the pool once. |
 | `key` | Each id with its `CandidateRef`: the input index, the candidate digest, the overlay digest and the label. Keep it from the reader. `AnonymisedReport` does not implement `Serialize`, and its `Debug` form hides the key. |
 | A failure text | Each run end error, report error and scorer reject reason replaces each label, digest, route and model id of the pool with `[redacted]`. A judge route of a scorer counts as a route. The source end gets the same treatment. Each route that a run asks for counts, with the model id behind it in each harness. So a route that a candidate keeps from the source, such as the model of a recorded peer, counts too. Only a whole name is replaced, so a short route such as `a` also replaces that word. |
 | `Candidate::label` | An operator name, such as an overlay version id. It enters the digest, never the text. |
@@ -2248,9 +2248,10 @@ an overlay go live without a person. A change takes effect at the next
 read, with no restart: the next op, or the next refine run.
 
 Today the store enforces `ceilings`, `auto_adopt.parts` and
-`auto_adopt.max_per_day`. The other settings are kernels for open issues:
-the probe of #2378, the refine workflow of #2380, the adoption gate of
-#2381 and the lesson library of #2382. Those issues will read them.
+`auto_adopt.max_per_day`. The refine workflow of #2380 reads `ceilings`,
+`probe_effects` and `proposal_attempts` (section 22). The other settings
+are kernels for open issues: the adoption gate of #2381 and the lesson
+library of #2382. Those issues will read them.
 
 | Setting | Meaning | Default | Range |
 |---|---|---|---|
@@ -2632,3 +2633,115 @@ model of the loop. With every answer rejected, a run with `retries = c`
 asks for exactly `c + 1` answers. The proptest
 `the_answers_of_a_run_never_pass_the_cap` links the model to the engine
 kernels. The design is in [`DESIGN-2442.md`](design/DESIGN-2442.md).
+
+## 22. Refine a kind (issue #2380)
+
+The workflow `agent_refine` runs Propose, Probe and Compose over recorded
+runs of one kind. It needs the `eval` feature. It never runs on a live op.
+The design is in [`DESIGN-2380.md`](design/DESIGN-2380.md).
+
+```rust
+use std::path::Path;
+use std::sync::Arc;
+use autumn_harvest_agent::refine::{OverlayComposer, RefineInput, RefineMode};
+use autumn_harvest_agent::{
+    AgentHarness, AgentModel, AgentProfile, MeshBudget, OverlayProposer, ProfileOverlayStore,
+    sqlite,
+};
+use autumn_harvest_sqlite::{ExecutionId, SqliteRuntime};
+
+fn refine(
+    model: Arc<dyn AgentModel>,
+    profile: AgentProfile,
+    store: Arc<dyn ProfileOverlayStore>,
+    proposer: Arc<dyn OverlayProposer>,
+    composer: Arc<dyn OverlayComposer>,
+    db: &Path,
+    run: ExecutionId,
+    seed: u64,
+) -> Result<ExecutionId, Box<dyn std::error::Error>> {
+    let harness = AgentHarness::new(model)
+        .agent(profile)
+        .overlay_store(store)
+        .proposer(proposer)
+        .composer(composer)
+        .refine_sources(Arc::new(sqlite::Sources::open(db)));
+    let mut rt = SqliteRuntime::open(db)?;
+    sqlite::register(&mut rt, Arc::new(harness));
+    let input = RefineInput::new("support", vec![run], 2, RefineMode::Parallel, seed)
+        .budget(MeshBudget::daily("refine").max_tokens(200_000));
+    Ok(sqlite::start_refine(&mut rt, &input)?)
+}
+```
+
+On Postgres, install `postgres::Sources::new(pg)` and start the workflow
+`agent_refine` with the same input.
+
+| Input | Meaning | Range |
+|---|---|---|
+| `kind` | The kind to refine. | An agent name |
+| `source_runs` | Ended `agent_loop` runs of the kind. | 1 to 16, each once |
+| `k` | The width of each round. | 1 to 8 |
+| `mode` | `parallel` or `sequential`. | |
+| `seed` | The seed of the opaque ids and of each stage. | Any `u64` |
+| `budget` | A `MeshBudget` cap on the spend of the run. The run compares its own spend with the caps. The period does not apply. | Optional |
+
+- **Start.** `agent_refine_start` checks each source before any model
+  call. A bad source fails the run with a named error:
+  `RefineSourceNotFound`, `RefineSourceNotAgentRun`,
+  `RefineSourceInFlight`, `RefineSourceOtherKind`,
+  `RefineSourceNotReplayable` or `RefineSourceOverCeilings`. The last one
+  means that the source ran with a bound above the policy ceilings. Each
+  stage of a source checks its replies against the profile of that
+  source, as its probe does. A reply must also apply to each other source,
+  so the run can carry it to a later source. It must apply to the
+  registered profile of the kind too, so the kind can take the chosen
+  overlay. Call `AgentTask::kind` when you start an
+  `agent_loop` run, so the run names its kind. A run with no kind gets
+  `RefineSourceOtherKind`, and so does each run recorded before this
+  release. A durable `agent` run has no replay probe yet, so it gets
+  `RefineSourceNotReplayable`.
+- **Parallel.** For each source, k INV and k DOM stages start from one
+  base. Each candidate gets one probe. k compositions read the shared
+  probes. Each candidate composition gets one probe. One selection
+  follows.
+- **Sequential.** For each source, k steps. Each step runs INV, DOM, their
+  probes, one composition and its probe. A candidate composition is the
+  base of the next step.
+- **Probe.** `eval::evaluate` against the recorded source, so the base
+  rollout costs nothing. A probe that stubs a tool call asks for a live
+  re-probe with `probe_effects`. The fork applies the overlay under the
+  policy ceilings, as the stages do. SQLite has no fork, so the probe records
+  `live re-probe skipped: SQLite has no fork` in the stage notes.
+- **Compose and select.** An `OverlayComposer` reads the probes under
+  opaque ids, with the anonymised pool of issue #2376. The pool redacts
+  each route that a probe asked for, with its model id. So a route that a
+  probe inherits from its source task, or the route of a recorded peer, is
+  redacted too. With a workspace store, the composer also reads an
+  evidence bundle, which hides the same names. An `OverlaySelector` picks
+  one id. The rule picks in its place when no selector is installed, or when
+  the selector fails, times out or names an id outside the pool. The rule
+  takes a completed end first, then the fewest stubbed tool calls, then
+  the lowest id.
+- **Budget identity.** For each source, both modes run 3k sessions. Each
+  candidate stage adds one probe. A `KeptBase` or `FellBack` stage adds
+  none. A run that ran its whole plan checks the counts. A mismatch fails
+  it with `RefineBudgetIdentity`.
+- **Spend.** A proposer, composer or selector reports each model call
+  with `charge`. `ModelProposer` charges each of its calls. Each step
+  writes its calls to the cost ledger under the refine run. With a budget,
+  the run stops before the next step once its own spend reaches a cap. It
+  ends as `budget_exhausted` with no `chosen` overlay. A live re-probe
+  records its rows under the fork. The run counts the spend of a
+  completed fork from its report.
+- **Rollout.** An older worker cannot decode a stage request with a
+  `sample` above 1. Start a refine run only after every worker runs this
+  release.
+- **Crash.** Each step is one recorded activity. A crash re-runs only the
+  step in flight.
+
+The run ends with a `RefineReport`: the status (`chosen`, `unchanged` or
+`budget_exhausted`), the chosen overlay, one record per stage, each
+selection and the `RefineLedger`. It holds no id of the refine run and no
+time, so one seed and one script give byte-identical reports. The
+adoption gate of #2381 takes the chosen overlay.

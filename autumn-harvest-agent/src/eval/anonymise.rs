@@ -77,8 +77,9 @@ pub struct CandidateRef {
 
 /// One [`Evaluation`] with no identity.
 ///
-/// It keeps every field of `Evaluation` except `overlay_digest`. The
-/// recorded end is the same for each candidate, so
+/// It keeps every field of `Evaluation` except `overlay_digest` and
+/// `candidate_cost_usd_micros`. A price names a model, so the cost is an
+/// identity. The recorded end is the same for each candidate, so
 /// [`AnonymisedPool::recorded`] holds it once.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AnonymisedEvaluation {
@@ -109,6 +110,15 @@ pub struct AnonymisedEvaluation {
     /// The rule of [`Evaluation::scorer_usage`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scorer_usage: Option<TokenUsage>,
+    /// The rule of [`Evaluation::candidate_usage`] (issue #2380). The pool
+    /// leaves out the cost, because a price names a model.
+    #[serde(default, skip_serializing_if = "is_no_usage")]
+    pub candidate_usage: TokenUsage,
+}
+
+/// Whether `usage` is empty, so an entry leaves it out.
+fn is_no_usage(usage: &TokenUsage) -> bool {
+    *usage == TokenUsage::default()
 }
 
 /// The candidates of one source, in pool order, with no identity.
@@ -241,6 +251,33 @@ pub async fn compare_anonymised(
     })
 }
 
+/// The pool of recorded `entries` under their ids, in id order (issue
+/// #2380). No candidate runs again.
+///
+/// `identities` are the names to redact from each failure text, such as
+/// the overlay digests and the model names of the pool.
+pub fn recorded_pool(
+    recorded: RunEnd,
+    mut entries: Vec<(AnonId, Evaluation)>,
+    mut identities: Vec<String>,
+) -> AnonymisedPool {
+    identities.retain(|name| !name.is_empty());
+    identities.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+    identities.dedup();
+    let scrub = Scrub {
+        identities,
+        clear_run_ids: false,
+    };
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    AnonymisedPool {
+        recorded: scrub_end(recorded, &scrub),
+        candidates: entries
+            .into_iter()
+            .map(|(id, evaluation)| anonymise(evaluation, id, &scrub))
+            .collect(),
+    }
+}
+
 /// What [`anonymise`] removes from the values that it keeps.
 struct Scrub {
     /// Each identity of the pool, longest first.
@@ -284,6 +321,9 @@ fn anonymise(evaluation: Evaluation, id: AnonId, scrub: &Scrub) -> AnonymisedEva
         recorded_verdict,
         candidate_verdict,
         scorer_usage,
+        candidate_usage,
+        // A price names a model, so the cost is an identity.
+        candidate_cost_usd_micros: _,
     } = evaluation;
     AnonymisedEvaluation {
         id,
@@ -297,6 +337,7 @@ fn anonymise(evaluation: Evaluation, id: AnonId, scrub: &Scrub) -> AnonymisedEva
         recorded_verdict: recorded_verdict.map(|verdict| scrub_verdict(verdict, scrub)),
         candidate_verdict: candidate_verdict.map(|verdict| scrub_verdict(verdict, scrub)),
         scorer_usage,
+        candidate_usage,
     }
 }
 

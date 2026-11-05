@@ -62,7 +62,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 
-use super::anon::{self, CandidateKey};
+use super::anon::{self, AnonId, CandidateKey};
 use super::{
     Divergence, EvalError, Evaluation, RunEnd, Side, TurnDecision, Verdict, decode, task_of,
 };
@@ -326,6 +326,16 @@ pub async fn write_bundle(
         },
         candidates,
     })
+}
+
+/// The bundle id of each of `evaluations`, in input order (issue #2380).
+/// An anonymised pool of the same probes uses the same ids.
+pub(crate) fn candidate_ids(
+    seed: u64,
+    source: &[WorkflowEvent],
+    evaluations: &[Evaluation],
+) -> Vec<AnonId> {
+    anon::assign(seed, &source_run_id(source), &candidate_keys(evaluations))
 }
 
 /// Each candidate with its anonymous id, in id order.
