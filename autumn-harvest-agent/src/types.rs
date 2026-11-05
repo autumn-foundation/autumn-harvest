@@ -9,6 +9,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
+use crate::answer_check::AnswerCheck;
 use crate::context_reset::ContextReset;
 use crate::draw::{Draw, DrawId};
 use crate::flow::Released;
@@ -288,6 +289,10 @@ pub struct AgentTask {
     /// id. Use [`run_draws`](crate::run_draws) to start draws.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub draw: Option<Draw>,
+    /// The check of each final answer (issue #2442). `None` accepts each
+    /// answer. See [`answer_check`](crate::answer_check).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer_check: Option<AnswerCheck>,
     /// The probe mark of the run (issue #2378). `None` is a normal run. See
     /// [`Probe`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -364,8 +369,17 @@ impl AgentTask {
             skills: BTreeMap::new(),
             allowed_effects: None,
             draw: None,
+            answer_check: None,
             probe: None,
         }
+    }
+
+    /// Check each final answer with `check`. See
+    /// [`answer_check`](Self::answer_check).
+    #[must_use]
+    pub fn answer_check(mut self, check: AnswerCheck) -> Self {
+        self.answer_check = Some(check);
+        self
     }
 
     /// Let the run save notes and reset near the request cap. See
@@ -942,6 +956,9 @@ pub enum AgentStop {
     /// before it failed (issue #2328). Only a task with `report_failure`
     /// ends under it.
     Failed,
+    /// The answer check rejected more answers than its cap allows (issue
+    /// #2442). The report holds each reason.
+    AnswerRejected,
 }
 
 /// The workflow output: how the run ended and what it produced.
@@ -997,6 +1014,10 @@ pub struct AgentReport {
     /// delegated child counts its own.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub resets: u32,
+    /// The reason of each answer that the answer check rejected, in order
+    /// (issue #2442).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub answer_rejections: Vec<String>,
 }
 
 /// The transcript without system messages.

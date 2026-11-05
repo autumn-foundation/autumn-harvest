@@ -14,6 +14,7 @@
 //!   draws.
 //! - [`agent_sample`] runs best-of-N or rejection sampling. It scores each
 //!   draw and selects one (issue #2443).
+//! - [`admit_answer_check`] caps the answer check of a run (issue #2442).
 //!
 //! A run never carries a policy field. [`AgentTask`](crate::AgentTask),
 //! [`AgentOp`](crate::AgentOp), [`DrawsInput`] and [`SampleInput`] refuse
@@ -27,8 +28,8 @@ mod sample;
 mod store;
 
 pub use admit::{
-    Admission, Ask, DrawPlan, REFUSED_PREFIX, Refusal, SampleStep, admit, draw_plan, sample_step,
-    wave_end,
+    Admission, Ask, DrawPlan, REFUSED_PREFIX, Refusal, SampleStep, admit, admit_answer_check,
+    answer_retry_cap, draw_plan, retry_after_reject, sample_step, wave_end,
 };
 pub use draws::{
     DRAWS_WORKFLOW_NAME, DrawsInput, DrawsReport, agent_draws, agent_draws_info,
