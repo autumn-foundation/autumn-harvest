@@ -605,11 +605,11 @@ jobs:
       # Issue #2364: every function that sends SQL has a Ledger profile in
       # docs/ledger/. A new query without one, or a profile that no longer
       # matches its query, fails here. See docs/ledger/README.md.
-      - name: Ledger profiles (docs/audits/ledger-profiles.py)
+      - name: Ledger profiles (cargo xtask audit ledger-profiles)
         run: |
-          python3 docs/audits/ledger-profiles.py --self-test
-          python3 docs/audits/ledger-profiles.py
-          python3 docs/audits/ledger-census.py --self-test
+          cargo xtask audit ledger-profiles --self-test
+          cargo xtask audit ledger-profiles
+          cargo xtask audit ledger-census --self-test
 
       # Issue #1831: a doc claim that shipped code made false fails the build.
       - name: Doc claim drift (docs/audits/doc-claim-drift.py)
@@ -777,14 +777,14 @@ jobs:
           fi
 
       # Folio corpus harness: per-shard weight drift report for row-ordinal
-      # sharding (see docs/audits/shard-weight-drift.py). The coverage nightly
+      # sharding (see xtask/src/audit/shard_weight_drift.rs). The coverage nightly
       # shards that way. `test-db-linux` partitions by test hash now, so the
       # report no longer describes it. Report-only (always exits
-      # 0): the script's own docstring explains why gating now would redden
+      # 0): the module's own doc comment explains why gating now would redden
       # every open PR on a pre-existing collision this step cannot itself
-      # fix. Pure Python stdlib, no deps, no network, no cargo build.
-      - name: Shard-weight drift report (docs/audits/shard-weight-drift.py)
-        run: python3 docs/audits/shard-weight-drift.py
+      # fix. No network, and no build of the workspace crates: only xtask.
+      - name: Shard-weight drift report (cargo xtask audit shard-weight-drift)
+        run: cargo xtask audit shard-weight-drift
       # The nightly coverage report and ratchet use this script (issue
       # #1818). The self-test checks the LCOV merge, the llvm-cov JSON line
       # rule and the ratchet in seconds, so a break shows on the PR.
@@ -1450,7 +1450,8 @@ jobs:
       # partitioned over every shard.
       #
       # 21, not 11 (issue #1685 review; see also PR #1703's
-      # `docs/audits/shard-weight-drift.py`, a report-only harness that
+      # shard-weight-drift harness, now `cargo xtask audit shard-weight-drift`,
+      # a report-only harness that
       # independently reaches the same "no N is collision-free" finding
       # below with a more careful count -- it resolves substring-matched
       # manifest filters and plugin-crate rows this comment's own earlier
@@ -1477,7 +1478,8 @@ jobs:
       # Round 3 (Codex review) found the real bug behind both: five
       # manifest `filter` values are Cargo substring/prefix matches, not
       # filenames, so the naive per-row weight lookup silently scored them
-      # 0. Switched to PR #1703's `docs/audits/shard-weight-drift.py`, a
+      # 0. Switched to PR #1703's shard-weight-drift harness (now
+      # `cargo xtask audit shard-weight-drift`), a
       # harness that resolves plugin-crate rows and substring filters
       # correctly, and re-swept N=9-24 with it. 20 came out best in that
       # range (max 247, versus 17's true max, which is higher than round

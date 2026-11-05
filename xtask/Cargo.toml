@@ -15,6 +15,7 @@ path = "src/main.rs"
 [dependencies]
 smop = { version = "0.3.2", default-features = false, features = ["sh", "fs", "path", "env", "cli", "json", "toml", "glob", "time"] }
 regex = "1"
+rusqlite = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = "0.9"
