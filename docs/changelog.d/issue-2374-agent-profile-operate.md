@@ -24,7 +24,7 @@ store of #2371 and the recorded read of #2372.
   `GET .../versions/{version}`, `GET .../diff?a=&b=`,
   `POST .../activate` and `POST .../rollback`. Install the store with
   `HarvestPlugin::agent_overlay_store`. Without it, each route is `404`.
-  The SQLite plugin refuses that call for now (#2471).
+  The SQLite plugin refuses that call for now (epic #2466).
   `activate` requires `expected_active`, so each call is a
   compare-and-swap. A stale pointer is a `409` that names the active
   version.

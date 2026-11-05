@@ -326,7 +326,7 @@ pub struct HarvestPlugin {
 
 /// One registered broker connector: a binding plus the source that feeds it.
 #[cfg(feature = "connectors")]
-struct ConnectorRegistration {
+pub(crate) struct ConnectorRegistration {
     binding: std::sync::Arc<crate::connector::SourceBinding>,
     source: std::sync::Arc<dyn crate::connector::EventSource>,
     config: Option<crate::connector::ConnectorRuntimeConfig>,
@@ -334,7 +334,7 @@ struct ConnectorRegistration {
 
 /// A running connector consumer loop.
 #[cfg(feature = "connectors")]
-struct ConnectorRuntimeHandle {
+pub(crate) struct ConnectorRuntimeHandle {
     shutdown: CancellationToken,
     handle: JoinHandle<()>,
 }
@@ -354,7 +354,7 @@ struct ConnectorRuntimeHandle {
 /// every drain deadline at the same instant, so the total is the slowest
 /// connector rather than their sum.
 #[cfg(feature = "connectors")]
-async fn stop_connectors(connectors: Vec<ConnectorRuntimeHandle>) {
+pub(crate) async fn stop_connectors(connectors: Vec<ConnectorRuntimeHandle>) {
     let draining: Vec<JoinHandle<()>> = connectors
         .into_iter()
         .map(|connector| {
@@ -368,6 +368,218 @@ async fn stop_connectors(connectors: Vec<ConnectorRuntimeHandle>) {
             && !error.is_cancelled()
         {
             tracing::warn!(error = %error, "harvest connector failed during shutdown");
+        }
+    }
+}
+
+/// Whether a `Starts` binding dedupes on broker coordinates (issue #2471).
+///
+/// That mode stores its claim in the Postgres start-idempotency table
+/// (issue #808). SQLite has none, so a redelivery would start a second run.
+#[cfg(all(feature = "sqlite", feature = "connectors"))]
+fn sqlite_coordinate_starts(
+    connectors: &[ConnectorRegistration],
+    workflows: &[WorkflowInfo],
+) -> bool {
+    let by_name = workflow_infos_by_name(workflows);
+    connectors.iter().any(|connector| {
+        let binding = &connector.binding;
+        matches!(
+            binding.target,
+            crate::connector::ConnectorTarget::Starts { .. }
+        ) && crate::connector::resolve_idempotency_mode(
+            binding.target,
+            binding.idempotency_mode,
+            by_name.get(binding.target.workflow()).copied(),
+        ) == crate::connector::IdempotencyMode::BrokerCoordinates
+    })
+}
+
+/// Validate the broker bindings (issue #944). Both backends run it before
+/// the builder is stashed, because `workflow_infos()` exists only pre-build.
+/// A misconfigured binding is a startup panic, never a consumer that
+/// silently dispatches nothing.
+#[cfg(feature = "connectors")]
+#[allow(clippy::too_many_lines)] // One check per rule, moved from `build_postgres`.
+pub(crate) fn validate_connectors(connectors: &[ConnectorRegistration], builder: &HarvestBuilder) {
+    if !connectors.is_empty() {
+        let bindings: Vec<_> = connectors
+            .iter()
+            .map(|c| std::sync::Arc::clone(&c.binding))
+            .collect();
+        let borrowed: Vec<&crate::connector::SourceBinding> =
+            bindings.iter().map(std::sync::Arc::as_ref).collect();
+        let dag_names: Vec<String> = builder
+            .dag_infos()
+            .iter()
+            .filter(|d| d.workflow_handler.is_some())
+            .map(|d| d.name.to_string())
+            .collect();
+        // `validate_bindings` takes a slice of values; rebuild one from
+        // the Arc'd registrations without cloning the mappers.
+        if let Err(e) = crate::connector::validate_bindings_refs(
+            &borrowed,
+            builder.workflow_infos(),
+            &dag_names,
+        ) {
+            panic!("harvest connector configuration error: {e}");
+        }
+        // One source per binding. Sharing one across registrations gives
+        // each its own `OffsetTracker` over a single client, which loses
+        // messages on Kafka and silently splits the queue on SQS.
+        let identities: Vec<usize> = connectors
+            .iter()
+            .map(|r| std::sync::Arc::as_ptr(&r.source).cast::<()>() as usize)
+            .collect();
+        if let Some((i, j)) = first_shared_source(&identities) {
+            panic!(
+                "harvest connector bindings '{}' and '{}' share one event source: each \
+                 binding gets its own consumer loop and its own offset tracker, so two \
+                 loops over one client would split the stream between them -- on Kafka \
+                 one tracker can commit past offsets the other has not made durable \
+                 (lost on a crash), and on SQS neither target would see every message. \
+                 Give each binding its own source. To fan one stream out to two targets, \
+                 use two Kafka consumers with distinct group ids, or two SQS queues \
+                 behind an SNS topic",
+                connectors[i].binding.name, connectors[j].binding.name,
+            );
+        }
+        // The same clash reached a different way: two *separately
+        // constructed* sources over one physical subscription have
+        // distinct pointers, so the identity check above cannot see them,
+        // but they still compete for the same messages. An adapter that
+        // declares no identity keeps the pointer check only.
+        let subscriptions: Vec<Option<String>> = connectors
+            .iter()
+            .map(|r| r.source.subscription_identity())
+            .collect();
+        if let Some((i, j)) = first_shared_identity(&subscriptions) {
+            panic!(
+                "harvest connector bindings '{}' and '{}' consume the same physical \
+                 subscription ('{}'): both receive loops compete for the same messages, \
+                 so each binding sees an arbitrary SUBSET rather than the whole stream -- \
+                 on SQS every receiver on a queue competes, and on Kafka two consumers in \
+                 one group split the partitions between them. To fan one stream out to \
+                 two targets, use two Kafka consumers with DISTINCT group ids, or two SQS \
+                 queues behind an SNS topic",
+                connectors[i].binding.name,
+                connectors[j].binding.name,
+                subscriptions[i].as_deref().unwrap_or("<unknown>"),
+            );
+        }
+        // Two bindings on DISTINCT subscriptions consuming the same
+        // logical stream into the same target is legitimate fan-in across
+        // independent brokers, so it is not rejected -- but on one broker
+        // it double-dispatches every message (each binding derives its own
+        // idempotency key, since the name namespaces it), so say it once.
+        // Reached only when the identity check above passed, i.e. the two
+        // are genuinely different subscriptions.
+        let pairs: Vec<(&str, &str, Option<&str>)> = connectors
+            .iter()
+            .map(|r| {
+                (
+                    r.binding.stream.as_str(),
+                    r.binding.target.workflow(),
+                    r.binding.target.signal_name(),
+                )
+            })
+            .collect();
+        if let Some((i, j)) = first_duplicate_stream_target(&pairs) {
+            tracing::warn!(
+                first = connectors[i].binding.name,
+                second = connectors[j].binding.name,
+                stream = connectors[i].binding.stream,
+                workflow = connectors[i].binding.target.workflow(),
+                "two harvest connector bindings consume the same stream into the same \
+                 target from different subscriptions: every message is dispatched TWICE \
+                 (each binding namespaces its own idempotency key by binding name, so \
+                 the two do not dedupe each other). Intentional for fan-in across \
+                 independent brokers; otherwise consolidate them or retarget one"
+            );
+        }
+        // Last-wins, so this warning describes the definition the engine
+        // will actually execute -- see `workflow_infos_by_name`.
+        let target_infos = workflow_infos_by_name(builder.workflow_infos());
+        for registration in connectors {
+            assert!(
+                binding_stream_matches_adapter(
+                    &registration.binding.stream,
+                    registration.source.stream(),
+                ),
+                "harvest connector binding '{}' declares stream '{}' but its adapter \
+                 consumes '{}': the two must match or the consumer would silently \
+                 never deliver anything",
+                registration.binding.name,
+                registration.binding.stream,
+                registration.source.stream()
+            );
+            // Not fatal: a bounded dedupe guarantee is correct for most
+            // deployments, and only the operator knows how far back their
+            // broker can replay. But the bound is invisible otherwise, so
+            // say it out loud once at startup -- naming the knob that
+            // actually governs THIS binding's claim.
+            match untuned_dedupe_bound(
+                crate::connector::resolve_idempotency_mode(
+                    registration.binding.target,
+                    registration.binding.idempotency_mode,
+                    target_infos
+                        .get(registration.binding.target.workflow())
+                        .copied(),
+                ),
+                registration.binding.target,
+                builder.start_idempotency_window_config(),
+                builder
+                    .retention_config()
+                    .effective_max_age(registration.binding.target.workflow()),
+            ) {
+                Some(UntunedDedupeBound::StartIdempotencyWindow) => {
+                    tracing::warn!(
+                        binding = registration.binding.name,
+                        stream = registration.binding.stream,
+                        "harvest connector dedupes on broker coordinates, but \
+                         `start_idempotency_window` is the 24h default: a redelivery \
+                         arriving after the claim is purged would start a SECOND \
+                         execution. Size the window to how far back your broker can \
+                         replay (Kafka retention / SQS message retention) via \
+                         `HarvestBuilder::start_idempotency_window`"
+                    );
+                }
+                Some(UntunedDedupeBound::ExecutionRetention { max_age }) => {
+                    tracing::warn!(
+                        binding = registration.binding.name,
+                        stream = registration.binding.stream,
+                        workflow = registration.binding.target.workflow(),
+                        retention_secs = max_age.as_secs(),
+                        "harvest connector binding's dedupe record lives with its \
+                         EXECUTION ROW (a `signals_with_start` claim cascade-deletes \
+                         with the run; a `workflow_id` binding passes no claim at all \
+                         and dedupes on the reuse-policy attach): retention is the \
+                         bound here, NOT `start_idempotency_window`, which this path \
+                         never reserves. A redelivery arriving after the run is \
+                         collected would start a SECOND execution. Size \
+                         `RetentionConfig` for this workflow to at least how far back \
+                         your broker can replay"
+                    );
+                }
+                None => {}
+            }
+            assert!(
+                crate::connector::broker_native_dead_letter_is_supported(
+                    registration.binding.dead_letter_mode,
+                    registration.source.has_native_dead_letter(),
+                ),
+                "harvest connector binding '{}' asks for broker-native dead-lettering, but \
+                 its adapter for stream '{}' reports no dead-letter destination that \
+                 abandoning a message feeds, so a poison message would be re-read forever \
+                 instead of being quarantined. Kafka has no per-message nack at all. SQS \
+                 needs a redrive policy on the queue: add one, or (when the source was built \
+                 with `SqsSource::new`, or its `GetQueueAttributes` probe was denied) declare \
+                 it with `SqsSourceConfig::has_redrive_policy(true)`. Otherwise drop \
+                 `.broker_native_dead_letter()` so poison messages land in \
+                 `harvest_connector_dead_letters` instead",
+                registration.binding.name,
+                registration.binding.stream,
+            );
         }
     }
 }
@@ -474,6 +686,18 @@ impl HarvestPlugin {
     #[must_use]
     pub fn worker(mut self, config: WorkerConfig) -> Self {
         self.builder = self.builder.worker(config);
+        self
+    }
+
+    /// Add a workflow schedule in code (issue #2471).
+    ///
+    /// The scheduler upserts it at boot on both backends. An operator
+    /// override from `PATCH /admin/schedules/{id}` wins over it. With
+    /// `harvest.scheduler_enabled = false` it never fires. A schedule of an
+    /// unknown workflow fails the build on Postgres and the boot on SQLite.
+    #[must_use]
+    pub fn workflow_schedule(mut self, schedule: autumn_harvest::policy::WorkflowSchedule) -> Self {
+        self.builder = self.builder.workflow_schedule(schedule);
         self
     }
 
@@ -1374,17 +1598,14 @@ const fn binding_stream_matches_adapter(declared: &str, adapter: &str) -> bool {
 }
 
 #[cfg(feature = "connectors")]
-fn spawn_connectors(
+pub(crate) fn spawn_connectors(
     registrations: &[ConnectorRegistration],
     api_state: &crate::api::HarvestApiState,
     metrics: &std::sync::Arc<dyn autumn_harvest::telemetry::MetricsRecorder>,
     workflows: &[WorkflowInfo],
-    dead_letter_pool: &DbPool,
+    sink: &std::sync::Arc<dyn crate::connector::DeadLetterSink>,
 ) -> Vec<ConnectorRuntimeHandle> {
     let mut handles = Vec::with_capacity(registrations.len());
-    let sink: std::sync::Arc<dyn crate::connector::DeadLetterSink> = std::sync::Arc::new(
-        crate::connector::PostgresDeadLetterSink::new(dead_letter_pool.clone()),
-    );
 
     // Last-wins, matching `HandlerRegistry` and the validation pass -- see
     // `workflow_infos_by_name` for why first-wins is a correctness bug here.
@@ -1400,7 +1621,7 @@ fn spawn_connectors(
             std::sync::Arc::clone(metrics),
             info,
         )
-        .with_dead_letter_sink(std::sync::Arc::clone(&sink));
+        .with_dead_letter_sink(std::sync::Arc::clone(sink));
         let runtime = match registration.config {
             Some(config) => runtime.with_config(config),
             None => runtime,
@@ -1479,23 +1700,28 @@ impl HarvestPlugin {
                 refused.push((option, issue));
             }
         };
-        refuse(
-            self.mcp_tools_enabled || self.mcp_tasks_enabled,
-            "HarvestPlugin::mcp_tools / mcp_tasks",
-            2471,
-        );
+        // MCP, webhooks and connectors start runs through the SQLite handle
+        // (issue #2471). A field that SQLite cannot honour is refused here.
         #[cfg(feature = "webhooks")]
         refuse(
-            !self.webhook_triggers.is_empty(),
-            "HarvestPlugin::webhooks",
-            2471,
+            self.webhook_triggers.iter().any(|t| t.queue.is_some()),
+            "#[webhook(queue = ..)]: one SQLite writer drains every queue",
+            crate::sqlite::EPIC_ISSUE,
         );
         #[cfg(feature = "connectors")]
-        refuse(
-            !self.connectors.is_empty(),
-            "HarvestPlugin::connector",
-            2471,
-        );
+        {
+            refuse(
+                self.connectors.iter().any(|c| c.binding.queue.is_some()),
+                "SourceBinding::queue: one SQLite writer drains every queue",
+                crate::sqlite::EPIC_ISSUE,
+            );
+            refuse(
+                sqlite_coordinate_starts(&self.connectors, self.builder.workflow_infos()),
+                "a Starts connector binding in BrokerCoordinates mode: SQLite has no start \
+                 idempotency table. Use IdempotencyMode::WorkflowId",
+                crate::sqlite::EPIC_ISSUE,
+            );
+        }
         #[cfg(feature = "metrics")]
         refuse(
             self.metrics_scrape_enabled,
@@ -1505,12 +1731,12 @@ impl HarvestPlugin {
         refuse(
             self.canary_config.is_some(),
             "HarvestPlugin::synthetic_canary",
-            2471,
+            crate::sqlite::EPIC_ISSUE,
         );
         refuse(
             self.agent_overlay_store.is_some(),
             "HarvestPlugin::agent_overlay_store",
-            2471,
+            crate::sqlite::EPIC_ISSUE,
         );
         // This backend stores no codec envelope, so a read has nothing to
         // decode. The option would only look like a protection.
@@ -1542,6 +1768,23 @@ impl HarvestPlugin {
                     rate_limit: self.api_rate_limit,
                     roles: self.roles,
                 },
+                #[cfg(feature = "mcp")]
+                mcp: McpMount {
+                    tools: self.mcp_tools_enabled,
+                    tasks: self.mcp_tasks_enabled,
+                    middleware: self.mcp_tool_middleware,
+                    tools_prefix: self.mcp_tools_prefix,
+                    tasks_path: self.mcp_tasks_path,
+                    roles: None,
+                    #[cfg(feature = "oidc")]
+                    oidc: None,
+                    api_path: None,
+                    role_auth_enabled: self.role_auth_enabled,
+                },
+                #[cfg(feature = "webhooks")]
+                webhooks: self.webhook_triggers,
+                #[cfg(feature = "connectors")]
+                connectors: self.connectors,
                 #[cfg(feature = "oidc")]
                 oidc: self.oidc,
                 refused,
@@ -1708,186 +1951,7 @@ impl HarvestPlugin {
         // pre-build), so a misconfigured binding is a startup panic rather
         // than a consumer that silently never dispatches anything.
         #[cfg(feature = "connectors")]
-        if !connectors.is_empty() {
-            let bindings: Vec<_> = connectors
-                .iter()
-                .map(|c| std::sync::Arc::clone(&c.binding))
-                .collect();
-            let borrowed: Vec<&crate::connector::SourceBinding> =
-                bindings.iter().map(std::sync::Arc::as_ref).collect();
-            let dag_names: Vec<String> = builder
-                .dag_infos()
-                .iter()
-                .filter(|d| d.workflow_handler.is_some())
-                .map(|d| d.name.to_string())
-                .collect();
-            // `validate_bindings` takes a slice of values; rebuild one from
-            // the Arc'd registrations without cloning the mappers.
-            if let Err(e) = crate::connector::validate_bindings_refs(
-                &borrowed,
-                builder.workflow_infos(),
-                &dag_names,
-            ) {
-                panic!("harvest connector configuration error: {e}");
-            }
-            // One source per binding. Sharing one across registrations gives
-            // each its own `OffsetTracker` over a single client, which loses
-            // messages on Kafka and silently splits the queue on SQS.
-            let identities: Vec<usize> = connectors
-                .iter()
-                .map(|r| std::sync::Arc::as_ptr(&r.source).cast::<()>() as usize)
-                .collect();
-            if let Some((i, j)) = first_shared_source(&identities) {
-                panic!(
-                    "harvest connector bindings '{}' and '{}' share one event source: each \
-                     binding gets its own consumer loop and its own offset tracker, so two \
-                     loops over one client would split the stream between them -- on Kafka \
-                     one tracker can commit past offsets the other has not made durable \
-                     (lost on a crash), and on SQS neither target would see every message. \
-                     Give each binding its own source. To fan one stream out to two targets, \
-                     use two Kafka consumers with distinct group ids, or two SQS queues \
-                     behind an SNS topic",
-                    connectors[i].binding.name, connectors[j].binding.name,
-                );
-            }
-            // The same clash reached a different way: two *separately
-            // constructed* sources over one physical subscription have
-            // distinct pointers, so the identity check above cannot see them,
-            // but they still compete for the same messages. An adapter that
-            // declares no identity keeps the pointer check only.
-            let subscriptions: Vec<Option<String>> = connectors
-                .iter()
-                .map(|r| r.source.subscription_identity())
-                .collect();
-            if let Some((i, j)) = first_shared_identity(&subscriptions) {
-                panic!(
-                    "harvest connector bindings '{}' and '{}' consume the same physical \
-                     subscription ('{}'): both receive loops compete for the same messages, \
-                     so each binding sees an arbitrary SUBSET rather than the whole stream -- \
-                     on SQS every receiver on a queue competes, and on Kafka two consumers in \
-                     one group split the partitions between them. To fan one stream out to \
-                     two targets, use two Kafka consumers with DISTINCT group ids, or two SQS \
-                     queues behind an SNS topic",
-                    connectors[i].binding.name,
-                    connectors[j].binding.name,
-                    subscriptions[i].as_deref().unwrap_or("<unknown>"),
-                );
-            }
-            // Two bindings on DISTINCT subscriptions consuming the same
-            // logical stream into the same target is legitimate fan-in across
-            // independent brokers, so it is not rejected -- but on one broker
-            // it double-dispatches every message (each binding derives its own
-            // idempotency key, since the name namespaces it), so say it once.
-            // Reached only when the identity check above passed, i.e. the two
-            // are genuinely different subscriptions.
-            let pairs: Vec<(&str, &str, Option<&str>)> = connectors
-                .iter()
-                .map(|r| {
-                    (
-                        r.binding.stream.as_str(),
-                        r.binding.target.workflow(),
-                        r.binding.target.signal_name(),
-                    )
-                })
-                .collect();
-            if let Some((i, j)) = first_duplicate_stream_target(&pairs) {
-                tracing::warn!(
-                    first = connectors[i].binding.name,
-                    second = connectors[j].binding.name,
-                    stream = connectors[i].binding.stream,
-                    workflow = connectors[i].binding.target.workflow(),
-                    "two harvest connector bindings consume the same stream into the same \
-                     target from different subscriptions: every message is dispatched TWICE \
-                     (each binding namespaces its own idempotency key by binding name, so \
-                     the two do not dedupe each other). Intentional for fan-in across \
-                     independent brokers; otherwise consolidate them or retarget one"
-                );
-            }
-            // Last-wins, so this warning describes the definition the engine
-            // will actually execute -- see `workflow_infos_by_name`.
-            let target_infos = workflow_infos_by_name(builder.workflow_infos());
-            for registration in &connectors {
-                assert!(
-                    binding_stream_matches_adapter(
-                        &registration.binding.stream,
-                        registration.source.stream(),
-                    ),
-                    "harvest connector binding '{}' declares stream '{}' but its adapter \
-                     consumes '{}': the two must match or the consumer would silently \
-                     never deliver anything",
-                    registration.binding.name,
-                    registration.binding.stream,
-                    registration.source.stream()
-                );
-                // Not fatal: a bounded dedupe guarantee is correct for most
-                // deployments, and only the operator knows how far back their
-                // broker can replay. But the bound is invisible otherwise, so
-                // say it out loud once at startup -- naming the knob that
-                // actually governs THIS binding's claim.
-                match untuned_dedupe_bound(
-                    crate::connector::resolve_idempotency_mode(
-                        registration.binding.target,
-                        registration.binding.idempotency_mode,
-                        target_infos
-                            .get(registration.binding.target.workflow())
-                            .copied(),
-                    ),
-                    registration.binding.target,
-                    builder.start_idempotency_window_config(),
-                    builder
-                        .retention_config()
-                        .effective_max_age(registration.binding.target.workflow()),
-                ) {
-                    Some(UntunedDedupeBound::StartIdempotencyWindow) => {
-                        tracing::warn!(
-                            binding = registration.binding.name,
-                            stream = registration.binding.stream,
-                            "harvest connector dedupes on broker coordinates, but \
-                             `start_idempotency_window` is the 24h default: a redelivery \
-                             arriving after the claim is purged would start a SECOND \
-                             execution. Size the window to how far back your broker can \
-                             replay (Kafka retention / SQS message retention) via \
-                             `HarvestBuilder::start_idempotency_window`"
-                        );
-                    }
-                    Some(UntunedDedupeBound::ExecutionRetention { max_age }) => {
-                        tracing::warn!(
-                            binding = registration.binding.name,
-                            stream = registration.binding.stream,
-                            workflow = registration.binding.target.workflow(),
-                            retention_secs = max_age.as_secs(),
-                            "harvest connector binding's dedupe record lives with its \
-                             EXECUTION ROW (a `signals_with_start` claim cascade-deletes \
-                             with the run; a `workflow_id` binding passes no claim at all \
-                             and dedupes on the reuse-policy attach): retention is the \
-                             bound here, NOT `start_idempotency_window`, which this path \
-                             never reserves. A redelivery arriving after the run is \
-                             collected would start a SECOND execution. Size \
-                             `RetentionConfig` for this workflow to at least how far back \
-                             your broker can replay"
-                        );
-                    }
-                    None => {}
-                }
-                assert!(
-                    crate::connector::broker_native_dead_letter_is_supported(
-                        registration.binding.dead_letter_mode,
-                        registration.source.has_native_dead_letter(),
-                    ),
-                    "harvest connector binding '{}' asks for broker-native dead-lettering, but \
-                     its adapter for stream '{}' reports no dead-letter destination that \
-                     abandoning a message feeds, so a poison message would be re-read forever \
-                     instead of being quarantined. Kafka has no per-message nack at all. SQS \
-                     needs a redrive policy on the queue: add one, or (when the source was built \
-                     with `SqsSource::new`, or its `GetQueueAttributes` probe was denied) declare \
-                     it with `SqsSourceConfig::has_redrive_policy(true)`. Otherwise drop \
-                     `.broker_native_dead_letter()` so poison messages land in \
-                     `harvest_connector_dead_letters` instead",
-                    registration.binding.name,
-                    registration.binding.stream,
-                );
-            }
-        }
+        validate_connectors(&connectors, &builder);
 
         // Issue #597: generate the MCP tool routes before the builder is
         // stashed in the runtime slot. These are app-level typed routes
@@ -1895,95 +1959,22 @@ impl HarvestPlugin {
         // `mount_mcp` can project them into the tool catalog; handlers fail
         // closed until `on_startup` installs the runtime.
         #[cfg(feature = "mcp")]
-        let mcp_routes = if mcp_tools_enabled || mcp_tasks_enabled {
-            // Codex review (PR #908, P1): `HarvestPlugin` cannot detect or
-            // intercept `AppBuilder::secure_mcp(...)` -- that's configured on
-            // the outer app builder, after this `Plugin::build` call returns
-            // -- so there is no way to *guarantee* these routes are
-            // protected. `secure_mcp` only gates the `/mcp` JSON-RPC
-            // envelope, not a generated tool route's own direct HTTP path
-            // (these are registered via `AppBuilder::routes`, not `nest`).
-            // Surface the gap loudly at startup instead of leaving it silent.
-            // Issue #1978: custom roles also gate the tool routes. The role
-            // gate sits inside the host auth layer, which sets the roles. An
-            // OIDC mount has its own tool gate, which checks the session too.
-            #[cfg(feature = "oidc")]
-            let mcp_tool_middleware = oidc.as_ref().map_or_else(
-                || with_mcp_tool_roles(mcp_tool_middleware, roles.clone(), &api_state),
-                |login| Some(oidc_mcp_tool_gate(api_state.clone(), login.clone())),
-            );
-            #[cfg(not(feature = "oidc"))]
-            let mcp_tool_middleware =
-                with_mcp_tool_roles(mcp_tool_middleware, roles.clone(), &api_state);
-            if mcp_tools_unprotected(mcp_tools_enabled, mcp_tool_middleware.is_some()) {
-                tracing::warn!(
-                    "HarvestPlugin::mcp_tools() is enabled with no HarvestPlugin::api_with_auth(..) \
-                     configured. autumn-web's secure_mcp(...) gates only the /mcp JSON-RPC \
-                     envelope, not the direct HTTP paths of the generated tool routes. Outside the \
-                     dev profile, the start_/signal_/update_ tool routes answer 401 to a caller \
-                     with no admin session (issue #1802). In the dev profile, or with \
-                     allow_unauthenticated_mutations(), they are reachable UNAUTHENTICATED. \
-                     Configure HarvestPlugin::api_with_auth(path, mw) to protect them."
-                );
-            }
-            // Issue #2005: `secure_mcp` never covers the task route either.
-            if mcp_tools_unprotected(mcp_tasks_enabled, mcp_tool_middleware.is_some()) {
-                tracing::warn!(
-                    "HarvestPlugin::mcp_tasks() is enabled with no HarvestPlugin::api_with_auth(..) \
-                     configured. Outside the dev profile the task route answers 401 to a caller \
-                     with no admin session. Configure api_with_auth(path, mw) to protect it."
-                );
-            }
-            let prefix =
-                crate::mcp_tools::tools_prefix(api_path.as_deref(), mcp_tools_prefix.as_deref());
-            // A unified DAG's shadow `WorkflowInfo` (auto-registered by
-            // `.dags(...)`) lives in `builder.workflow_infos()` alongside
-            // ordinary workflows; `collect_descriptors` cross-references
-            // `builder.dag_infos()` to tell them apart, routing a DAG's start
-            // tool through the DAG trigger contract and omitting its signal
-            // tool (issue #601 follow-up).
-            let descriptors = crate::mcp_tools::collect_descriptors(
-                builder.workflow_infos(),
-                builder.update_handlers(),
-                builder.dag_infos(),
-            );
-            let mut routes = if mcp_tools_enabled {
-                crate::mcp_tools::record_schemas(&descriptors);
-                crate::mcp_tools::build_mcp_tool_routes(
-                    &prefix,
-                    &descriptors,
-                    &api_state,
-                    mcp_tool_middleware.as_ref(),
-                    // Issue #776 (F1): gate mutating MCP tools for read-only
-                    // principals. These routes are app-level (outside the
-                    // `enforce_read_only_class` layer on the nested management
-                    // router), so the read-only class boundary is applied here too.
-                    role_auth_enabled,
-                )
-            } else {
-                Vec::new()
-            };
-            if mcp_tasks_enabled {
-                let path = mcp_tasks_path.unwrap_or_else(|| crate::mcp_tasks::tasks_path(&prefix));
-                // The task route exposes only `start_{wf}`, so a collision
-                // among the other `/mcp` tool names must not drop a workflow.
-                let task_descriptors = crate::mcp_tools::collect_task_descriptors(
-                    builder.workflow_infos(),
-                    builder.update_handlers(),
-                    builder.dag_infos(),
-                );
-                routes.push(crate::mcp_tasks::build_mcp_task_route(
-                    &path,
-                    &task_descriptors,
-                    &api_state,
-                    mcp_tool_middleware.as_ref(),
-                    role_auth_enabled,
-                ));
-            }
-            Some(routes)
-        } else {
-            None
-        };
+        let mcp_routes = build_mcp_routes(
+            McpMount {
+                tools: mcp_tools_enabled,
+                tasks: mcp_tasks_enabled,
+                middleware: mcp_tool_middleware,
+                tools_prefix: mcp_tools_prefix,
+                tasks_path: mcp_tasks_path,
+                roles: roles.clone(),
+                #[cfg(feature = "oidc")]
+                oidc: oidc.clone(),
+                api_path: api_path.clone(),
+                role_auth_enabled,
+            },
+            &builder,
+            &api_state,
+        );
 
         // Issue #608: deployment-level opt-in for read-path payload decoding,
         // co-located with the codec-registry mirror so both are in place
@@ -2128,6 +2119,133 @@ impl HarvestPlugin {
             app
         }
     }
+}
+
+/// The MCP settings of a plugin (issues #597, #2005 and #2471).
+#[cfg(feature = "mcp")]
+pub(crate) struct McpMount {
+    pub tools: bool,
+    pub tasks: bool,
+    pub middleware: Option<McpToolMiddlewareFn>,
+    pub tools_prefix: Option<String>,
+    pub tasks_path: Option<String>,
+    pub roles: Option<crate::roles::HarvestRoles>,
+    #[cfg(feature = "oidc")]
+    pub oidc: Option<crate::oidc::OidcLogin>,
+    pub api_path: Option<String>,
+    pub role_auth_enabled: bool,
+}
+
+/// Build the MCP tool and task routes, or `None` when both are off.
+///
+/// Both backends call it, so a route keeps one shape and one auth stack.
+/// The routes are app-level typed routes (`AppBuilder::routes`, not
+/// `nest`), so autumn-web's `mount_mcp` can project them into the tool
+/// catalog. A handler fails closed until `on_startup` installs the backend.
+#[cfg(feature = "mcp")]
+pub(crate) fn build_mcp_routes(
+    mount: McpMount,
+    builder: &HarvestBuilder,
+    api_state: &HarvestApiState,
+) -> Option<Vec<autumn_web::Route>> {
+    let McpMount {
+        tools: mcp_tools_enabled,
+        tasks: mcp_tasks_enabled,
+        middleware: mcp_tool_middleware,
+        tools_prefix: mcp_tools_prefix,
+        tasks_path: mcp_tasks_path,
+        roles,
+        #[cfg(feature = "oidc")]
+        oidc,
+        api_path,
+        role_auth_enabled,
+    } = mount;
+    if !(mcp_tools_enabled || mcp_tasks_enabled) {
+        return None;
+    }
+    // Codex review (PR #908, P1): `HarvestPlugin` cannot detect or
+    // intercept `AppBuilder::secure_mcp(...)` -- that's configured on
+    // the outer app builder, after this `Plugin::build` call returns
+    // -- so there is no way to *guarantee* these routes are
+    // protected. `secure_mcp` only gates the `/mcp` JSON-RPC
+    // envelope, not a generated tool route's own direct HTTP path
+    // (these are registered via `AppBuilder::routes`, not `nest`).
+    // Surface the gap loudly at startup instead of leaving it silent.
+    // Issue #1978: custom roles also gate the tool routes. The role
+    // gate sits inside the host auth layer, which sets the roles. An
+    // OIDC mount has its own tool gate, which checks the session too.
+    #[cfg(feature = "oidc")]
+    let mcp_tool_middleware = oidc.as_ref().map_or_else(
+        || with_mcp_tool_roles(mcp_tool_middleware, roles, api_state),
+        |login| Some(oidc_mcp_tool_gate(api_state.clone(), login.clone())),
+    );
+    #[cfg(not(feature = "oidc"))]
+    let mcp_tool_middleware = with_mcp_tool_roles(mcp_tool_middleware, roles, api_state);
+    if mcp_tools_unprotected(mcp_tools_enabled, mcp_tool_middleware.is_some()) {
+        tracing::warn!(
+            "HarvestPlugin::mcp_tools() is enabled with no HarvestPlugin::api_with_auth(..) \
+             configured. autumn-web's secure_mcp(...) gates only the /mcp JSON-RPC \
+             envelope, not the direct HTTP paths of the generated tool routes. Outside the \
+             dev profile, the start_/signal_/update_ tool routes answer 401 to a caller \
+             with no admin session (issue #1802). In the dev profile, or with \
+             allow_unauthenticated_mutations(), they are reachable UNAUTHENTICATED. \
+             Configure HarvestPlugin::api_with_auth(path, mw) to protect them."
+        );
+    }
+    // Issue #2005: `secure_mcp` never covers the task route either.
+    if mcp_tools_unprotected(mcp_tasks_enabled, mcp_tool_middleware.is_some()) {
+        tracing::warn!(
+            "HarvestPlugin::mcp_tasks() is enabled with no HarvestPlugin::api_with_auth(..) \
+             configured. Outside the dev profile the task route answers 401 to a caller \
+             with no admin session. Configure api_with_auth(path, mw) to protect it."
+        );
+    }
+    let prefix = crate::mcp_tools::tools_prefix(api_path.as_deref(), mcp_tools_prefix.as_deref());
+    // A unified DAG's shadow `WorkflowInfo` (auto-registered by
+    // `.dags(...)`) lives in `builder.workflow_infos()` alongside
+    // ordinary workflows; `collect_descriptors` cross-references
+    // `builder.dag_infos()` to tell them apart, routing a DAG's start
+    // tool through the DAG trigger contract and omitting its signal
+    // tool (issue #601 follow-up).
+    let descriptors = crate::mcp_tools::collect_descriptors(
+        builder.workflow_infos(),
+        builder.update_handlers(),
+        builder.dag_infos(),
+    );
+    let mut routes = if mcp_tools_enabled {
+        crate::mcp_tools::record_schemas(&descriptors);
+        crate::mcp_tools::build_mcp_tool_routes(
+            &prefix,
+            &descriptors,
+            api_state,
+            mcp_tool_middleware.as_ref(),
+            // Issue #776 (F1): gate mutating MCP tools for read-only
+            // principals. These routes are app-level (outside the
+            // `enforce_read_only_class` layer on the nested management
+            // router), so the read-only class boundary is applied here too.
+            role_auth_enabled,
+        )
+    } else {
+        Vec::new()
+    };
+    if mcp_tasks_enabled {
+        let path = mcp_tasks_path.unwrap_or_else(|| crate::mcp_tasks::tasks_path(&prefix));
+        // The task route exposes only `start_{wf}`, so a collision
+        // among the other `/mcp` tool names must not drop a workflow.
+        let task_descriptors = crate::mcp_tools::collect_task_descriptors(
+            builder.workflow_infos(),
+            builder.update_handlers(),
+            builder.dag_infos(),
+        );
+        routes.push(crate::mcp_tasks::build_mcp_task_route(
+            &path,
+            &task_descriptors,
+            api_state,
+            mcp_tool_middleware.as_ref(),
+            role_auth_enabled,
+        ));
+    }
+    Some(routes)
 }
 
 /// Put the custom-role gate inside the tool-route auth layer (issue #1978).
@@ -2807,12 +2925,15 @@ async fn start_harvest_runtime(
     let connectors = if connector_registrations.is_empty() {
         Vec::new()
     } else {
+        let sink: std::sync::Arc<dyn crate::connector::DeadLetterSink> = std::sync::Arc::new(
+            crate::connector::PostgresDeadLetterSink::new(harvest_db_pool.clone_inner()),
+        );
         spawn_connectors(
             &connector_registrations,
             api_state,
             &built_metrics,
             &built_workflow_infos,
-            &harvest_db_pool.clone_inner(),
+            &sink,
         )
     };
 

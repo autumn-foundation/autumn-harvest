@@ -503,8 +503,23 @@ pub struct HarvestApiState {
     /// The token and audit store of a SQLite app (issue #2469).
     #[cfg(feature = "sqlite")]
     sqlite_auth_store: Arc<Mutex<Option<Arc<autumn_harvest_sqlite::SqliteAuthStore>>>>,
+    /// The control Harvest of a SQLite app (issue #2471). MCP, webhook and
+    /// connector starts go through it, not the Postgres start path.
+    #[cfg(feature = "sqlite")]
+    sqlite_backend: Arc<SqliteBackendSlot>,
     /// Set on a SQLite app, whose store keeps no run tenant (issue #2469).
     no_run_tenants: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// The SQLite handle of a [`HarvestApiState`] (issue #2471).
+///
+/// `on` is set at build. The handle is set at startup. A request between
+/// the two gets `503`, never the Postgres path.
+#[cfg(feature = "sqlite")]
+#[derive(Default)]
+struct SqliteBackendSlot {
+    on: std::sync::atomic::AtomicBool,
+    handle: std::sync::OnceLock<crate::sqlite::HarvestSqlite>,
 }
 
 impl Default for HarvestApiState {
@@ -570,6 +585,8 @@ impl Default for HarvestApiState {
             require_embedded_harvest_mode: Arc::new(Mutex::new(false)),
             #[cfg(feature = "sqlite")]
             sqlite_auth_store: Arc::new(Mutex::new(None)),
+            #[cfg(feature = "sqlite")]
+            sqlite_backend: Arc::default(),
             no_run_tenants: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
@@ -1411,6 +1428,33 @@ impl HarvestApiState {
             .ok_or_else(|| HarvestError::Config("harvest runtime is not started".to_string()))
     }
 
+    /// The metrics recorder of the webhook receivers.
+    ///
+    /// A SQLite app has no telemetry registry, so it records nothing (issue
+    /// #2471). Before startup, both backends return an error, which the
+    /// caller answers with `503`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when the backend is not running yet.
+    #[cfg(feature = "webhooks")]
+    pub(crate) fn trigger_metrics(
+        &self,
+    ) -> Result<Arc<dyn autumn_harvest::telemetry::MetricsRecorder>, String> {
+        #[cfg(feature = "sqlite")]
+        if let Some(handle) = self.sqlite_handle() {
+            return handle
+                .map(|_| {
+                    Arc::new(autumn_harvest::NoOpMetrics)
+                        as Arc<dyn autumn_harvest::telemetry::MetricsRecorder>
+                })
+                .map_err(|error| error.to_string());
+        }
+        self.runtime()
+            .map(|runtime| runtime.registry().telemetry().metrics.clone())
+            .map_err(|error| error.to_string())
+    }
+
     /// The store of tokens and audit rows, or `None` before startup.
     ///
     /// A SQLite app uses its Harvest file (issue #2469). Every other app
@@ -1442,6 +1486,42 @@ impl HarvestApiState {
             .sqlite_auth_store
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = Some(store);
+    }
+
+    /// Mark this state as the state of a SQLite app (issue #2471).
+    #[cfg(feature = "sqlite")]
+    pub(crate) fn set_sqlite_backend(&self) {
+        self.sqlite_backend
+            .on
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Install the control Harvest of a SQLite app (issue #2471).
+    #[cfg(feature = "sqlite")]
+    pub(crate) fn install_sqlite_handle(&self, handle: crate::sqlite::HarvestSqlite) {
+        let _ = self.sqlite_backend.handle.set(handle);
+    }
+
+    /// The control Harvest of a SQLite app (issue #2471).
+    ///
+    /// `None` on Postgres. `Some(Err)` is a `503` before startup.
+    #[cfg(all(
+        feature = "sqlite",
+        any(feature = "mcp", feature = "webhooks", feature = "connectors")
+    ))]
+    pub(crate) fn sqlite_handle(
+        &self,
+    ) -> Option<Result<crate::sqlite::HarvestSqlite, AutumnError>> {
+        // Fully qualified: diesel's `RunQueryDsl::load` would win.
+        if !std::sync::atomic::AtomicBool::load(
+            &self.sqlite_backend.on,
+            std::sync::atomic::Ordering::Acquire,
+        ) {
+            return None;
+        }
+        Some(self.sqlite_backend.handle.get().cloned().ok_or_else(|| {
+            AutumnError::service_unavailable_msg("the Harvest SQLite backend is not running yet")
+        }))
     }
 
     /// Mark a store that keeps no run tenant, as on SQLite (issue #2469).
@@ -34112,7 +34192,7 @@ async fn load_schedule_by_id_with_shard(
     resolve_schedule_with_shard(api_state, schedule_id).await
 }
 
-fn parse_schedule_expr_with_tz(
+pub(crate) fn parse_schedule_expr_with_tz(
     expr: &str,
     timezone: &str,
 ) -> Result<autumn_harvest::policy::Schedule, String> {

@@ -90,7 +90,7 @@ fn decode(raw: Option<&str>) -> Result<Vec<(String, String)>, AutumnError> {
 
 #[derive(Deserialize)]
 pub(super) struct IdParams {
-    id: String,
+    pub(super) id: String,
 }
 
 #[derive(Deserialize)]

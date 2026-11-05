@@ -784,7 +784,7 @@ mod tests {
     // These tests build the relay with no background task, so each count
     // is exact. `tests/sqlite_plugin/outbox.rs` runs it in a booted app.
 
-    use super::super::driver::{Driver, Registry};
+    use super::super::driver::{Driver, Registry, Retention};
     use super::super::handle::Catalog;
     use autumn_harvest::prelude::*;
     use autumn_harvest_sqlite::ExecutionFilter;
@@ -825,22 +825,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let registry = Registry {
             workflows: vec![ship_info(), hold_info()],
-            activities: Vec::new(),
-            updates: Vec::new(),
-            signals: Vec::new(),
-            queries: Vec::new(),
-            log_policy: None,
-            state: autumn_harvest::context::empty_shared_state(),
+            ..Registry::empty()
         };
         let path = dir.path().join("app.harvest.db");
         let runtime = Driver::open(&path, &registry).unwrap();
-        let driver = Driver::start(runtime, Duration::from_millis(20));
+        let retention = Arc::new(Retention::new(&registry.retention));
+        let driver = Driver::start(runtime, Duration::from_millis(20), Arc::clone(&retention));
         let reader = autumn_harvest_sqlite::SqliteReader::open(&path).unwrap();
         let harvest = HarvestSqlite::new(
             driver.sender.clone(),
             reader,
             path,
             Arc::new(Catalog::of(&registry)),
+            retention,
         );
         let pool = pool(&format!("sqlite://{}", dir.path().join("app.db").display()));
         ensure_schema(&pool).await.unwrap();

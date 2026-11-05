@@ -145,6 +145,67 @@ impl DeadLetterSink for PostgresDeadLetterSink {
     }
 }
 
+/// A sink that writes to `harvest_connector_dead_letters` in the Harvest
+/// file of a SQLite app (issue #2471).
+///
+/// The table has the Postgres columns, and the same unique idempotency key.
+/// The write runs on the blocking pool.
+#[cfg(feature = "sqlite")]
+pub struct SqliteDeadLetterSink {
+    store: std::sync::Arc<autumn_harvest_sqlite::SqliteAuthStore>,
+}
+
+#[cfg(feature = "sqlite")]
+impl std::fmt::Debug for SqliteDeadLetterSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SqliteDeadLetterSink")
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(feature = "sqlite")]
+impl SqliteDeadLetterSink {
+    /// Write dead letters to the file of `store`.
+    #[must_use]
+    pub const fn new(store: std::sync::Arc<autumn_harvest_sqlite::SqliteAuthStore>) -> Self {
+        Self { store }
+    }
+}
+
+#[cfg(feature = "sqlite")]
+#[async_trait]
+impl DeadLetterSink for SqliteDeadLetterSink {
+    async fn write(
+        &self,
+        entry: &ConnectorDeadLetter,
+    ) -> Result<DeadLetterOutcome, ConnectorError> {
+        let store = std::sync::Arc::clone(&self.store);
+        let entry = entry.clone();
+        let inserted = tokio::task::spawn_blocking(move || {
+            store.insert_dead_letter(&autumn_harvest_sqlite::NewDeadLetter {
+                binding: &entry.binding,
+                stream: &entry.stream,
+                coordinates: &entry.coordinates,
+                idempotency_key: &entry.idempotency_key,
+                workflow_name: &entry.workflow_name,
+                reason: entry.reason.as_str(),
+                detail: &entry.detail,
+                attempts: entry.attempts,
+                payload: &entry.payload,
+                failed_at: entry.failed_at,
+            })
+        })
+        .await
+        .map_err(|e| ConnectorError::Broker(format!("dead-letter task: {e}")))?
+        .map_err(|e| ConnectorError::Broker(format!("dead-letter insert: {e}")))?;
+        Ok(if inserted {
+            DeadLetterOutcome::Recorded
+        } else {
+            DeadLetterOutcome::AlreadyRecorded
+        })
+    }
+}
+
 /// Insert one dead-letter row, reporting whether it created it.
 ///
 /// Split out from the sink so integration tests can drive it against a

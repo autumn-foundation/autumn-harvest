@@ -113,6 +113,8 @@ pub use binding::{
     MappedMessage, MappingError, MessageMapper, SourceBinding, has_deferred_admission,
     resolve_idempotency_mode, validate_bindings, validate_bindings_refs,
 };
+#[cfg(feature = "sqlite")]
+pub use dead_letter::SqliteDeadLetterSink;
 pub use dead_letter::{
     ConnectorDeadLetter, DeadLetterOutcome, DeadLetterSink, NoopDeadLetterSink,
     PostgresDeadLetterSink, RecordingDeadLetterSink, UnconfiguredDeadLetterSink,

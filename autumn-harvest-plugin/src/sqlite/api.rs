@@ -21,6 +21,8 @@
 //! the token and audit tables of the Harvest file. `sqlite::build` wraps
 //! this router in the admin-auth layer stack of `api.rs`, as on Postgres.
 //!
+//! The schedule and retention admin routes are in `ops` (issue #2471).
+//!
 //! With `sqlite_per_tenant`, `/tenants/{key}/..` serves the same routes on
 //! one fleet tenant (issue #2472). `{key}` is the app's routing key. The gate
 //! covers these routes too.
@@ -261,6 +263,7 @@ fn routes(flags: &HarvestApiState) -> Router<ApiState> {
             post(signal_by_id),
         )
         .merge(read_routes(flags))
+        .merge(super::ops::routes(flags))
         .merge(super::ui::routes())
         // `AppBuilder::nest` drops a nested fallback, so a catch-all route
         // stands in for it. A static or a parameter route still wins.
@@ -336,8 +339,8 @@ struct IdParams {
 }
 
 #[derive(Deserialize)]
-struct NameParams {
-    workflow_name: String,
+pub(super) struct NameParams {
+    pub(super) workflow_name: String,
 }
 
 #[derive(Deserialize)]
@@ -347,9 +350,9 @@ struct ByIdParams {
 }
 
 #[derive(Deserialize)]
-struct SignalParams {
-    id: String,
-    signal_name: String,
+pub(super) struct SignalParams {
+    pub(super) id: String,
+    pub(super) signal_name: String,
 }
 
 #[derive(Deserialize)]
@@ -366,9 +369,9 @@ struct QueryParams {
 }
 
 #[derive(Deserialize)]
-struct UpdateParams {
-    id: String,
-    update_name: String,
+pub(super) struct UpdateParams {
+    pub(super) id: String,
+    pub(super) update_name: String,
 }
 
 // ── Errors ───────────────────────────────────────────────────────────────────
@@ -486,7 +489,7 @@ pub(super) async fn refuse_query_parameters(
     .into_response()
 }
 
-async fn not_ported() -> Response {
+pub(super) async fn not_ported() -> Response {
     (
         StatusCode::NOT_IMPLEMENTED,
         Json(json!({
@@ -1105,7 +1108,7 @@ fn signal_error(error: HarvestSqliteError) -> Response {
     }
 }
 
-async fn start(
+pub(super) async fn start(
     State(state): State<ApiState>,
     Path(NameParams { workflow_name }): Path<NameParams>,
     session: Option<axum::Extension<Session>>,
@@ -1132,13 +1135,22 @@ async fn start(
     options.memo = request.memo;
     options.search_attributes = request.search_attrs.unwrap_or_default();
     let input = request.input.unwrap_or(Value::Null);
-    let started = match state
-        .handle()?
-        .start_with_state(&workflow_name, input, options)
-        .await
-    {
+    Ok(start_reply(&state.handle()?, &workflow_name, input, options).await)
+}
+
+/// Start a run, and answer the Postgres start response.
+///
+/// The start route and the MCP, webhook and connector triggers share it
+/// (issue #2471), so they answer one shape.
+pub(super) async fn start_reply(
+    handle: &HarvestSqlite,
+    workflow_name: &str,
+    input: Value,
+    options: StartOptions,
+) -> Response {
+    let started = match handle.start_with_state(workflow_name, input, options).await {
         Ok(started) => started,
-        Err(error) => return Ok(write_error(error)),
+        Err(error) => return write_error(error),
     };
     let status = if started.outcome.created {
         StatusCode::CREATED
@@ -1147,7 +1159,7 @@ async fn start(
     };
     // Postgres sends `started_fresh` only for an idempotency key or a
     // `conflict_policy`. This backend refuses both, so the field is absent.
-    Ok((
+    (
         status,
         Json(json!({
             "execution_id": started.outcome.exec_id.to_string(),
@@ -1156,7 +1168,7 @@ async fn start(
             "state": started.state,
         })),
     )
-        .into_response())
+        .into_response()
 }
 
 /// `POST /workflows/{workflow_name}/signal-with-start`.
@@ -1210,23 +1222,32 @@ async fn signal_with_start(
     let session = session.map(|axum::Extension(session)| session);
     require_admin_for_policy(&state, body.id_reuse_policy.as_deref(), session).await?;
     let reuse_policy = crate::api::parse_reuse_policy(body.id_reuse_policy.as_deref())?;
-    let handle = state.handle()?;
-    // The runtime checks the start input when the call starts a run, and the
-    // signal payload, as Postgres does.
-    let started = match handle
-        .signal_with_start_state(SignalWithStartParams {
-            workflow_name: workflow_name.clone(),
-            workflow_id: body.workflow_id.clone(),
-            input: body.start_input.unwrap_or(Value::Null),
-            reuse_policy,
-            signal_name: body.signal_name,
-            signal_payload: body.signal_payload.unwrap_or(Value::Null),
-            idempotency_key: body.idempotency_key,
-        })
-        .await
-    {
+    let request = SignalWithStartParams {
+        workflow_name,
+        workflow_id: body.workflow_id,
+        input: body.start_input.unwrap_or(Value::Null),
+        reuse_policy,
+        signal_name: body.signal_name,
+        signal_payload: body.signal_payload.unwrap_or(Value::Null),
+        idempotency_key: body.idempotency_key,
+    };
+    Ok(signal_with_start_reply(&state.handle()?, request).await)
+}
+
+/// Run a signal-with-start, and answer the Postgres response.
+///
+/// The route and the webhook and connector triggers share it (issue #2471).
+/// The runtime checks the start input when the call starts a run, and the
+/// signal payload, as Postgres does.
+pub(super) async fn signal_with_start_reply(
+    handle: &HarvestSqlite,
+    request: SignalWithStartParams,
+) -> Response {
+    let workflow_name = request.workflow_name.clone();
+    let workflow_id = request.workflow_id.clone();
+    let started = match handle.signal_with_start_state(request).await {
         Ok(started) => started,
-        Err(error) => return Ok(write_error(error)),
+        Err(error) => return write_error(error),
     };
     let outcome = started.outcome;
     let status = if outcome.started_fresh {
@@ -1234,18 +1255,18 @@ async fn signal_with_start(
     } else {
         StatusCode::OK
     };
-    Ok((
+    (
         status,
         Json(json!({
             "execution_id": outcome.exec_id.to_string(),
             "workflow_name": workflow_name,
-            "workflow_id": body.workflow_id,
+            "workflow_id": workflow_id,
             "state": started.state,
             "started_fresh": outcome.started_fresh,
             "signal_delivered": outcome.signal_delivered,
         })),
     )
-        .into_response())
+        .into_response()
 }
 
 /// The exactly-once key: the `Idempotency-Key` header, then the
@@ -1298,7 +1319,7 @@ fn raw_idempotency_key(
     Ok(None)
 }
 
-async fn signal(
+pub(super) async fn signal(
     State(state): State<ApiState>,
     Path(SignalParams { id, signal_name }): Path<SignalParams>,
     RawQuery(raw): RawQuery,
@@ -1519,7 +1540,7 @@ struct UpdateBody {
 /// `wait=completed`: `200` with `update_id` and `output`, or `409` with
 /// `update_id` and `error`. `wait=admitted` and `timeout_secs` are refused,
 /// because there is nothing to wait for.
-async fn update(
+pub(super) async fn update(
     State(state): State<ApiState>,
     Path(UpdateParams { id, update_name }): Path<UpdateParams>,
     RawQuery(raw): RawQuery,

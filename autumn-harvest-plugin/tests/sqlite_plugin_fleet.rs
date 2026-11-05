@@ -736,6 +736,54 @@ async fn an_oidc_login_keeps_tenant_health_public() {
     fx.fleet.close_all().await;
 }
 
+#[workflow]
+async fn every_second(_ctx: &WorkflowContext, _n: Value) -> Result<(), String> {
+    Ok(())
+}
+
+/// `harvest.scheduler_enabled = false` on a SQLite app (issue #2471): the
+/// boot upserts no code schedule and no slot fires.
+///
+/// The flag is a process environment variable. This binary holds the test
+/// because no other test in it uses a schedule, so the flag changes nothing
+/// else here. `tests/sqlite_plugin.rs` proves that the same schedule fires
+/// with the flag on.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_disabled_scheduler_fires_no_code_schedule() {
+    // SAFETY: no other test in this binary reads the variable concurrently
+    // for a schedule. Each one tolerates either value.
+    unsafe { std::env::set_var("AUTUMN_HARVEST__SCHEDULER_ENABLED", "false") };
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = AutumnConfig::default();
+    config.database.url = Some(format!("sqlite://{}", dir.path().join("app.db").display()));
+    let client = TestApp::new()
+        .config(config)
+        .profile("dev")
+        .plugin(
+            HarvestPlugin::new()
+                .workflows(workflows![every_second])
+                .workflow_schedule(autumn_harvest::policy::WorkflowSchedule::new(
+                    "every_second",
+                    autumn_harvest::policy::Schedule::Interval(Duration::from_secs(1)),
+                ))
+                .api("/harvest"),
+        )
+        .build();
+    // SAFETY: as above. The boot read the variable already.
+    unsafe { std::env::remove_var("AUTUMN_HARVEST__SCHEDULER_ENABLED") };
+
+    // Three slots pass. With the scheduler on, each one starts a run.
+    tokio::time::sleep(Duration::from_millis(3200)).await;
+    let schedules: Value = client.get("/harvest/admin/schedules").send().await.json();
+    assert_eq!(schedules, json!([]), "no code schedule is upserted");
+    let runs: Value = client
+        .get("/harvest/workflows?workflow_name=every_second")
+        .send()
+        .await
+        .json();
+    assert_eq!(runs, json!([]), "no slot fires");
+}
+
 /// The outbox of a fleet app lives in the control database, and the control
 /// Harvest runs each start. A tenant database has no outbox table, so a
 /// write there fails rather than wait for a relay (issue #2470).

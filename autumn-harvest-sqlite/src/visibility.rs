@@ -421,6 +421,31 @@ impl SqliteReader {
     ) -> SqliteResult<Vec<LlmLedgerRow>> {
         crate::llm_ledger::rows_between(&self.conn, from, until)
     }
+
+    /// Every stored schedule, by workflow name (issue #2471). See
+    /// [`SqliteRuntime::list_schedules`](crate::SqliteRuntime::list_schedules).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqliteError::Corrupt`] for a stored value that does not
+    /// parse, and [`SqliteError::Sqlite`] if the query fails.
+    pub fn list_schedules(&self) -> SqliteResult<Vec<crate::ScheduleSummary>> {
+        crate::schedule::list(&self.conn)
+    }
+
+    /// The stored operator override of the schedule of `workflow_name`, if
+    /// any (issue #2471).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqliteError::Corrupt`] for a stored override that does not
+    /// parse, and [`SqliteError::Sqlite`] if the query fails.
+    pub fn schedule_override(
+        &self,
+        workflow_name: &str,
+    ) -> SqliteResult<Option<crate::ScheduleOverride>> {
+        crate::schedule::load_override(&self.conn, workflow_name)
+    }
 }
 
 /// The operator reads of the management API (issue #2468).
