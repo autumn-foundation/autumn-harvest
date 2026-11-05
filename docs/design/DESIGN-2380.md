@@ -31,7 +31,8 @@ pub struct RefineInput {
 
 ### The steps
 
-1. `agent_refine_start` reads each source run through the installed
+1. `agent_refine_policy` reads the policy of the kind once (#2394).
+2. `agent_refine_start` reads each source run through the installed
    `RefineSources`. It checks each run in this order:
    1. The run exists.
    2. It is an `agent_loop` or `agent` run.
@@ -39,11 +40,15 @@ pub struct RefineInput {
    4. It is of `kind`. An `agent_loop` run names its kind in
       `AgentTask::kind`. A run with no kind fails this check.
    5. The replay probe can read it.
+   6. The active overlay applies to the profile of the recorded task,
+      under the policy ceilings. Otherwise each probe of the source would
+      fail. The error is `RefineSourceOverCeilings`.
 
    A failed check fails the run with a named `RefineError`. No model call
    runs before this step ends. The step also reads the base profile, the
-   active overlay and the evidence text of each source.
-2. `agent_refine_policy` reads the policy of the kind once (#2394).
+   active overlay and, for each source, its profile and evidence text.
+   Each stage of a source checks its replies against the source profile,
+   as its probe does.
 3. The loop runs each source in input order. The overlay that a source
    chooses is the current overlay of the next source.
 4. The run checks the ledger before each step that can spend. A spend at

@@ -1044,3 +1044,42 @@ async fn a_failed_stage_keeps_the_spend_of_its_last_attempt() {
         assert!(!error.contains("attempt"), "replay-stable text: {error}");
     }
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_source_past_the_policy_ceilings_is_refused_before_any_call() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut f = fixture(
+        &dir.path().join("a.db"),
+        Proposer::default(),
+        Composer::default(),
+        Model::default(),
+    );
+    // The source ran with more steps than the kind profile allows now. Each
+    // probe would apply an overlay to that profile and fail.
+    let mut wide = task(KIND);
+    wide.max_steps = 30;
+    let exec = sqlite::start(&mut f.rt, &wide).unwrap();
+    assert!(matches!(
+        f.rt.run_until_blocked(exec).await.unwrap(),
+        RunState::Completed(_)
+    ));
+    let input = RefineInput::new(KIND, vec![exec], 1, RefineMode::Parallel, 1);
+    let state = refine(&mut f.rt, &input).await;
+    assert_eq!(error_type(&state), "RefineSourceOverCeilings");
+    assert_eq!(f.proposer.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(f.model.probe_calls.load(Ordering::SeqCst), 0);
+
+    // A source within the ceilings refines, and each stage checks its replies
+    // against the profile of that source.
+    let mut narrow = task(KIND);
+    narrow.max_steps = 12;
+    let exec = sqlite::start(&mut f.rt, &narrow).unwrap();
+    assert!(matches!(
+        f.rt.run_until_blocked(exec).await.unwrap(),
+        RunState::Completed(_)
+    ));
+    let input = RefineInput::new(KIND, vec![exec], 1, RefineMode::Parallel, 1);
+    let report = report_of(refine(&mut f.rt, &input).await);
+    assert_eq!(report.ledger.sessions, 3);
+    assert_eq!(report.ledger.probes, 3);
+}

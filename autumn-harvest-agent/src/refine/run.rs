@@ -5,11 +5,12 @@
 //! [`RefineReport`]. It never runs on a live op. The design is in
 //! `docs/design/DESIGN-2380.md`.
 //!
-//! 1. [`agent_refine_start`] checks every source run before any model
-//!    call. It reads the base profile, the active overlay and the evidence
-//!    text of each source.
-//! 2. `agent_refine_policy` reads the policy of the kind once (issue
+//! 1. `agent_refine_policy` reads the policy of the kind once (issue
 //!    #2394).
+//! 2. [`agent_refine_start`] checks every source run before any model
+//!    call. It reads the base profile, the active overlay, and the profile
+//!    and the evidence text of each source. Each stage of a source checks
+//!    its replies against the source profile, as its probe does.
 //! 3. Each source runs in input order. The overlay that a source chooses
 //!    is the current overlay of the next source.
 //! 4. The run checks its budget before each step. A spent budget ends it as
@@ -35,7 +36,7 @@ use super::compose::{
     agent_refine_compose_info, agent_refine_select_info, source_events,
 };
 use super::ledger::{MAX_REFINE_K, MAX_SOURCE_RUNS, RefineError, RefineLedger, RefineMode};
-use super::policy::RefinePolicy;
+use super::policy::{PolicyCeilings, RefinePolicy};
 use super::policy_read::read_refine_policy;
 use super::propose::{
     Dimension, Evidence, ProposalAttempts, ProposeRequest, SpentDetails, Stage, StageOutcome,
@@ -165,6 +166,19 @@ pub struct SourceBrief {
     pub run: ExecutionId,
     /// The source run as text, for the proposers.
     pub evidence: String,
+    /// The profile of the recorded task. A probe applies each overlay to
+    /// it, so each stage of the source checks its replies against it too.
+    pub profile: AgentProfile,
+}
+
+/// The input of [`agent_refine_start`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StartRequest {
+    /// The input of the run.
+    pub input: RefineInput,
+    /// The ceilings of the recorded policy read.
+    pub ceilings: PolicyCeilings,
 }
 
 /// The output of [`agent_refine_start`].
@@ -180,6 +194,8 @@ pub struct RefineStart {
     /// step asks no model, so the budget gate skips it.
     #[serde(default)]
     pub selector: bool,
+    /// The policy ceilings, resolved against the base profile.
+    pub ceilings: Ceilings,
 }
 
 /// The part of the loop that a stage plays.
@@ -393,8 +409,9 @@ fn kind_of(record: &super::sources::SourceRecord) -> Result<Option<String>, Stri
 /// when a read fails.
 pub(crate) async fn run_start(
     harness: &AgentHarness,
-    input: RefineInput,
+    request: StartRequest,
 ) -> Result<RefineStart, String> {
+    let StartRequest { input, ceilings } = request;
     input.validate().map_err(|err| failure(&err))?;
     let sources = harness.sources().ok_or_else(|| {
         ActivityFailure::non_retryable(
@@ -449,7 +466,14 @@ pub(crate) async fn run_start(
         check_source(&record.events).map_err(|err| not_replayable(err.to_string()))?;
         let evidence =
             render_source(&record.events).map_err(|err| not_replayable(err.to_string()))?;
-        briefs.push(SourceBrief { run, evidence });
+        let task = task_of(&record.events).map_err(|err| not_replayable(err.to_string()))?;
+        let mut source_profile = crate::eval::source_profile(&task);
+        source_profile.kind.clone_from(&input.kind);
+        briefs.push(SourceBrief {
+            run,
+            evidence,
+            profile: source_profile,
+        });
     }
     let profile = harness.agent_profile(&input.kind).ok_or_else(|| {
         failure(&RefineError::InvalidInput(format!(
@@ -457,6 +481,7 @@ pub(crate) async fn run_start(
             input.kind
         )))
     })?;
+    let ceilings = ceilings.resolve(&profile);
     let current = match harness.overlays() {
         None => ProfileOverlay::default(),
         Some(store) => store
@@ -466,11 +491,24 @@ pub(crate) async fn run_start(
             .map(|stored| stored.overlay().clone())
             .unwrap_or_default(),
     };
+    // Each stage and probe of a source starts from `current` on the source
+    // profile. A source that the ceilings refuse would fail its first stage
+    // after earlier sources spent, so the start step refuses it now.
+    for brief in &briefs {
+        if let Err(err) = crate::agent::overlay::apply(&brief.profile, &current, &ceilings, harness)
+        {
+            return Err(failure(&RefineError::SourceOverCeilings {
+                run: brief.run.to_string(),
+                reason: truncate(&err.to_string(), MAX_NOTE_CHARS),
+            }));
+        }
+    }
     Ok(RefineStart {
         profile,
         current,
         sources: briefs,
         selector: harness.overlay_selector().is_some(),
+        ceilings,
     })
 }
 
@@ -485,9 +523,9 @@ pub(crate) async fn run_start(
 )]
 pub async fn agent_refine_start(
     ctx: &ActivityContext,
-    input: RefineInput,
+    request: StartRequest,
 ) -> Result<RefineStart, String> {
-    run_start(crate::workflow::harness(ctx)?, input).await
+    run_start(crate::workflow::harness(ctx)?, request).await
 }
 
 /// Probe `request.overlay` against its recorded source, and re-probe it
@@ -582,7 +620,6 @@ pub(crate) fn probe_calls(result: &ProbeResult) -> Vec<autumn_harvest::llm_ledge
 struct Refine<'a> {
     ctx: &'a WorkflowContext,
     input: &'a RefineInput,
-    profile: &'a AgentProfile,
     ceilings: Ceilings,
     attempts: ProposalAttempts,
     effects: BTreeSet<ToolEffect>,
@@ -686,7 +723,7 @@ impl Refine<'_> {
         let request = ProposeRequest {
             dimension,
             evidence: Evidence::text(source.evidence.clone()),
-            profile: self.profile.clone(),
+            profile: source.profile.clone(),
             current: base.clone(),
             ceilings: self.ceilings.clone(),
             attempts: self.attempts,
@@ -739,7 +776,7 @@ impl Refine<'_> {
     ) -> Result<usize, String> {
         let request = ComposeRequest {
             source: source.run,
-            profile: self.profile.clone(),
+            profile: source.profile.clone(),
             current: base.clone(),
             ceilings: self.ceilings.clone(),
             attempts: self.attempts,
@@ -993,13 +1030,18 @@ pub async fn agent_refine(
     ctx: &WorkflowContext,
     input: RefineInput,
 ) -> Result<RefineReport, String> {
-    let start: RefineStart = ctx
-        .execute_activity(&agent_refine_start_info(), input.clone())
-        .await
-        .map_err(|err| start_failure(&err))?;
+    input.validate().map_err(|err| failure(&err))?;
     let policy: RefinePolicy = read_refine_policy(ctx, &input.kind)
         .await
         .map_err(|err| err.to_string())?;
+    let request = StartRequest {
+        input: input.clone(),
+        ceilings: policy.ceilings.clone(),
+    };
+    let start: RefineStart = ctx
+        .execute_activity(&agent_refine_start_info(), request)
+        .await
+        .map_err(|err| start_failure(&err))?;
     if let Some(budget) = &input.budget
         && let Err(err) =
             ctx.upsert_search_attrs([(MESH_ATTR.to_owned(), Some(serde_json::json!(budget.mesh)))])
@@ -1009,8 +1051,7 @@ pub async fn agent_refine(
     let mut run = Refine {
         ctx,
         input: &input,
-        profile: &start.profile,
-        ceilings: policy.ceilings.resolve(&start.profile),
+        ceilings: start.ceilings.clone(),
         attempts: policy.proposal_attempts,
         effects: policy.probe_effects.clone(),
         current: start.current.clone(),

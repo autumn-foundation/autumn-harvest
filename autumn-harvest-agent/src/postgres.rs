@@ -1091,6 +1091,10 @@ impl crate::eval::LiveProbeHost for PostgresAgents {
 /// the wait both fit in one attempt.
 pub const LIVE_REPROBE_WAIT: Duration = Duration::from_mins(60);
 
+/// How often a live re-probe reads the state of its fork.
+#[cfg(feature = "eval")]
+const LIVE_REPROBE_POLL: Duration = Duration::from_secs(1);
+
 /// The source runs of a refine run, from Postgres (issue #2380).
 ///
 /// The read uses the codecs and the offloader of the target. With the
@@ -1139,6 +1143,24 @@ impl Sources {
 }
 
 impl Sources {
+    /// Wait until the fork `exec` ends, up to [`LIVE_REPROBE_WAIT`].
+    ///
+    /// An approval wait of a probe times out to a deny after
+    /// `PROBE_APPROVAL_TIMEOUT_SECS`, so the wait goes on through it. It
+    /// returns the last state when the deadline passes first.
+    #[cfg(feature = "eval")]
+    async fn wait_end(&self, exec: ExecutionId) -> HarvestResult<RunState> {
+        let deadline = Instant::now() + LIVE_REPROBE_WAIT;
+        loop {
+            let state = run_state(&self.pg, exec).await?;
+            let open = matches!(state, RunState::Running | RunState::WaitingSignal(_));
+            if !open || Instant::now() >= deadline {
+                return Ok(state);
+            }
+            tokio::time::sleep(LIVE_REPROBE_POLL).await;
+        }
+    }
+
     /// Cancel the fork `exec`. A failed cancel logs a warning.
     #[cfg(feature = "eval")]
     async fn cancel(&self, exec: ExecutionId) {
@@ -1187,9 +1209,15 @@ impl crate::refine::RefineSources for Sources {
             )
             .await
             .map_err(|err| LiveProbeError::Failed(err.to_string()))?;
-            let state = wait_run(&self.pg, probe.exec_id, LIVE_REPROBE_WAIT)
-                .await
-                .map_err(|err| LiveProbeError::Failed(err.to_string()))?;
+            let state = match self.wait_end(probe.exec_id).await {
+                Ok(state) => state,
+                Err(err) => {
+                    // The fork commits before the wait. A failed wait leaves
+                    // no task that watches it, so stop it now.
+                    self.cancel(probe.exec_id).await;
+                    return Err(LiveProbeError::Failed(err.to_string()));
+                }
+            };
             let exec_id = probe.exec_id.to_string();
             let end = match state {
                 RunState::Completed(output) => {

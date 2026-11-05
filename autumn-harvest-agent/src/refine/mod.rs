@@ -54,8 +54,8 @@ pub use propose::{
 #[cfg(feature = "eval")]
 pub use run::{
     LiveReprobe, ProbeRecord, ProbeRequest, ProbeResult, REFINE_WORKFLOW_NAME, RefineInput,
-    RefineReport, RefineStart, SelectionRecord, SourceBrief, StageRecord, StageRole, agent_refine,
-    agent_refine_info, agent_refine_probe, agent_refine_probe_info, agent_refine_start,
-    agent_refine_start_info,
+    RefineReport, RefineStart, SelectionRecord, SourceBrief, StageRecord, StageRole, StartRequest,
+    agent_refine, agent_refine_info, agent_refine_probe, agent_refine_probe_info,
+    agent_refine_start, agent_refine_start_info,
 };
 pub use sources::{LiveEnd, LiveProbeError, LiveRequest, RefineSources, SourceRecord};

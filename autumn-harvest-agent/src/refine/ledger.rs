@@ -175,6 +175,16 @@ pub enum RefineError {
         /// Why.
         reason: String,
     },
+    /// The current overlay does not apply to the profile of the source
+    /// under the policy ceilings. The source can have run with a higher
+    /// bound, for example. Each probe of the source would fail.
+    #[error("the source run {run} is past the policy ceilings: {reason}")]
+    SourceOverCeilings {
+        /// The source run.
+        run: String,
+        /// Why.
+        reason: String,
+    },
     /// A count does not match the identity.
     #[error(
         "the refine ledger breaks its identity: {sessions} sessions of {expected_sessions}, {probes} probes of {expected_probes}"
@@ -206,6 +216,7 @@ impl RefineError {
             Self::SourceInFlight { .. } => "RefineSourceInFlight",
             Self::SourceOtherKind { .. } => "RefineSourceOtherKind",
             Self::SourceNotReplayable { .. } => "RefineSourceNotReplayable",
+            Self::SourceOverCeilings { .. } => "RefineSourceOverCeilings",
             Self::BudgetIdentity { .. } => "RefineBudgetIdentity",
             Self::Stage(_) => "RefineStageFailed",
         }

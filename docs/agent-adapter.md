@@ -2332,8 +2332,11 @@ On Postgres, install `postgres::Sources::new(pg)` and start the workflow
 - **Start.** `agent_refine_start` checks each source before any model
   call. A bad source fails the run with a named error:
   `RefineSourceNotFound`, `RefineSourceNotAgentRun`,
-  `RefineSourceInFlight`, `RefineSourceOtherKind` or
-  `RefineSourceNotReplayable`. Call `AgentTask::kind` when you start an
+  `RefineSourceInFlight`, `RefineSourceOtherKind`,
+  `RefineSourceNotReplayable` or `RefineSourceOverCeilings`. The last one
+  means that the source ran with a bound above the policy ceilings. Each
+  stage of a source checks its replies against the profile of that
+  source, as its probe does. Call `AgentTask::kind` when you start an
   `agent_loop` run, so the run names its kind. A run with no kind gets
   `RefineSourceOtherKind`, and so does each run recorded before this
   release. A durable `agent` run has no replay probe yet, so it gets
