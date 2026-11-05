@@ -75,9 +75,10 @@ const FINAL_TURN_PATCH: &str = "agent_final_turn_rules";
 /// with the old input.
 const CHILD_FAILURE_REPORT_PATCH: &str = "agent_child_failure_report";
 
-/// The gate of a reset after a tool round over the cap (issue #2461). The
-/// loop asks it only where the new branch would run. A history recorded
-/// before the gate holds no marker there, so it ends the run as it ran.
+/// The gate of the rules for a tool round over the cap (issue #2461). The
+/// loop asks it only where a new rule changes the branch: a round that
+/// resets, and a stopped save round. A history recorded before the gate
+/// holds no marker there, so it replays as it ran.
 const RESET_ON_FULL_PATCH: &str = "agent_reset_on_full_round";
 
 /// The registered workflow name.
@@ -848,13 +849,8 @@ pub(crate) async fn run_segment(
 
         match Box::pin(run_round(ctx, run, progress, tree, slot, &turn, calls)).await? {
             RoundEnd::Continue => {}
-            // The reset of a save round runs next, with the notes it has.
-            RoundEnd::Full if progress.reset.pending => {}
-            RoundEnd::Full => {
-                // Not every call ran, so the text of the turn is no answer.
-                // It can claim work that never ran.
-                progress.last_text = narration;
-                if !reset_on_full_round(ctx, run, progress, tree, &extra_tools, input) {
+            RoundEnd::Full { stopped } => {
+                if !full_round_goes_on(ctx, run, progress, tree, input, stopped, narration) {
                     return Ok(AgentStop::TranscriptFull);
                 }
             }
@@ -886,6 +882,34 @@ fn save_reply(progress: &Progress, turn: &ModelTurn, over_budget: bool) -> bool 
     progress.reset.pending && !over_budget && turn.stop != StopReason::MaxTokens
 }
 
+/// Whether a segment goes on after a tool round over the cap.
+///
+/// The reset of a save round runs next, with the notes it has. Any other
+/// round goes on only when [`reset_on_full_round`] resets it. A round that
+/// the loop guard or an interrupt also stopped never goes on, so the stop
+/// holds. A save round before that rule went on, so the gate keeps that
+/// history (issue #2461).
+///
+/// Not every call ran, so the text of the turn is no answer. It can claim
+/// work that never ran. So `narration`, the text before the turn, comes back
+/// unless the save round goes on.
+fn full_round_goes_on(
+    ctx: &WorkflowContext,
+    run: Run<'_>,
+    progress: &mut Progress,
+    tree: &Tree,
+    input: &str,
+    stopped: bool,
+    narration: String,
+) -> bool {
+    let save_round = progress.reset.pending;
+    if save_round && !(stopped && ctx.patched(RESET_ON_FULL_PATCH)) {
+        return true;
+    }
+    progress.last_text = narration;
+    !save_round && !stopped && reset_on_full_round(ctx, run, progress, tree, input)
+}
+
 /// Whether a tool round over the cap resets, and does not end the run
 /// (issue #2461).
 ///
@@ -893,16 +917,15 @@ fn save_reply(progress: &Progress, turn: &ModelTurn, over_budget: bool) -> bool 
 /// result or `DROPPED_FULL`, and a call that did not run shows
 /// `NOT_RUN_FULL`. So the model does not run a call with an effect again.
 ///
-/// The round resets when a reset is left and the window after the reset
-/// falls under the threshold. Then the next request takes the reset, with a
-/// save turn first when one fits. The check reads only recorded data, so
-/// replay takes the same branch.
+/// The round resets when a reset is left and the window after the reset,
+/// with the notes of that time, falls under the threshold. Then the next
+/// request takes the reset, with a save turn first when one fits. The check
+/// reads only recorded data, so replay takes the same branch.
 fn reset_on_full_round(
     ctx: &WorkflowContext,
     run: Run<'_>,
     progress: &mut Progress,
     tree: &Tree,
-    extra_tools: &[ToolDefinition],
     input: &str,
 ) -> bool {
     let Some(setting) = run.task.context_reset else {
@@ -914,7 +937,13 @@ fn reset_on_full_round(
     };
     progress.reset.kept = Some([call.clone(), answers.clone()]);
     let after = reset_window(run.task, progress, input);
-    let after_len = json_len(&next_request(run, progress, tree, extra_tools, after));
+    let after_len = json_len(&next_request(
+        run,
+        progress,
+        tree,
+        &run.extra_tools(),
+        after,
+    ));
     let resets = full_round_resets(
         progress.reset.count,
         setting.max_resets,
@@ -1345,8 +1374,9 @@ async fn system_prompt(
 enum RoundEnd {
     /// Every call has an answer. Ask the model again.
     Continue,
-    /// The next request would exceed the request cap.
-    Full,
+    /// The next request would exceed the request cap. `stopped` is true when
+    /// the loop guard or an interrupt also stopped the round.
+    Full { stopped: bool },
     /// The loop guard stopped the run.
     Loop,
     /// An interrupt ended the round (issue #2265).
@@ -1457,10 +1487,11 @@ fn flow_after(tree: &Tree, turn: &ModelTurn) -> (BTreeSet<String>, Released) {
 /// each call does not fit, no call runs. The model could not read a result.
 ///
 /// The round drops a result that does not fit, and runs no more calls. The
-/// run then ends, so the model never reads a later result. With a context
-/// reset left, the run resets instead (issue #2461). No more calls run after
-/// the loop guard stops the run either. Each call still gets an answer, so
-/// the transcript stays valid and shows what ran.
+/// run then ends, so the model never reads a later result. With a reset left
+/// and room in the reset window, the run resets instead (issue #2461). A
+/// round that the loop guard or an interrupt also stopped never resets. No
+/// more calls run after the loop guard stops the run either. Each call still
+/// gets an answer, so the transcript stays valid and shows what ran.
 async fn run_round(
     ctx: &WorkflowContext,
     run: Run<'_>,
@@ -1557,7 +1588,9 @@ async fn run_round(
         content: results,
     });
     Ok(if full {
-        RoundEnd::Full
+        RoundEnd::Full {
+            stopped: looped || progress.interrupted,
+        }
     } else if looped {
         RoundEnd::Loop
     } else if progress.interrupted {
@@ -3258,7 +3291,21 @@ mod tests {
             assistant(vec![followup_call("h2")]),
             tool(vec![result("h2", "dropped")]),
         ]);
-        assert_eq!(reset_window(&task, &progress, "audit").len(), 5);
+        let ids: Vec<String> = reset_window(&task, &progress, "audit")
+            .iter()
+            .map(|message| match &message.content[0] {
+                ContentPart::Text(text) => text.clone(),
+                ContentPart::ToolCall { id, .. }
+                | ContentPart::ToolResult {
+                    tool_call_id: id, ..
+                } => id.clone(),
+            })
+            .collect();
+        assert_eq!(
+            ids,
+            ["audit", "f1", "f1", "h2", "h2"],
+            "the booking comes first"
+        );
     }
 
     fn followup_call(id: &str) -> ContentPart {

@@ -195,7 +195,6 @@ pub proof fn theorem_resets_never_pass_the_cap(
     }
 }
 
-
 /// A round over the cap resets when a reset is left and the window after the
 /// reset falls under the threshold (issue #2461). A zero cap never resets.
 pub open spec fn full_round(resets: int, max_resets: int, after_len: int, cap: int, percent: int) -> bool {

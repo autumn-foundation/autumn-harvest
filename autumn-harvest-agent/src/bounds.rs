@@ -158,9 +158,9 @@ pub const fn reset_due(resets: u32, max_resets: u32, len: u64, cap: u64, percent
 /// #2461)?
 ///
 /// `after_len` is the size of the request after the reset, with the round
-/// kept. The round resets when a reset is left and that request falls under
-/// `percent` of `cap`. So the request after the reset fits the cap. A
-/// `cap` of zero is no cap, so no round passes it.
+/// kept and the notes of that time. The round resets when a reset is left
+/// and that request falls under `percent` of `cap`. So that request fits the
+/// cap. A `cap` of zero is no cap, so no round passes it.
 /// `formal/verus/src/agent_reset.rs` proves it for every input.
 #[must_use]
 pub const fn full_round_resets(
@@ -274,6 +274,9 @@ mod tests {
         // 0 counts as 1, so only an empty window fits.
         assert!(full_round_resets(0, 1, 0, 100, 0));
         assert!(!full_round_resets(0, 1, 1, 100, 0));
+        // Half of 3 bytes is 1.5, so 1 byte is under it and 2 bytes are not.
+        assert!(full_round_resets(0, 1, 1, 3, 50));
+        assert!(!full_round_resets(0, 1, 2, 3, 50));
     }
 
     proptest::proptest! {
@@ -285,10 +288,14 @@ mod tests {
             cap in 0_u64..u64::MAX,
             percent in 0_u8..=255,
         ) {
+            let clamped = u128::from(percent.clamp(1, 100));
+            let under = u128::from(after_len) * 100 < u128::from(cap) * clamped;
+            proptest::prop_assert_eq!(
+                full_round_resets(resets, max_resets, after_len, cap, percent),
+                resets < max_resets && cap > 0 && under
+            );
             if full_round_resets(resets, max_resets, after_len, cap, percent) {
                 proptest::prop_assert!(after_len < cap);
-                proptest::prop_assert!(resets < max_resets);
-                proptest::prop_assert!(!reset_due(resets, max_resets, after_len, cap, percent));
             }
         }
 

@@ -14,9 +14,9 @@
 //! The reset reads only recorded data, so replay takes the same reset.
 //! `docs/design/DESIGN-2453.md` records the design.
 //!
-//! A tool round can pass the cap first. With a reset left, that round makes
-//! a reset due, and the new window keeps the round with its answers. So the
-//! model sees which calls ran (issue #2461). `docs/design/DESIGN-2461.md`
+//! A tool round can pass the cap first. With a reset left and room in the
+//! new window, that round makes a reset due. The new window keeps the round
+//! with its answers, so the model sees which calls ran (issue #2461). `docs/design/DESIGN-2461.md`
 //! records that rule.
 //!
 //! The model wrote the notes, maybe under the influence of a tool result.

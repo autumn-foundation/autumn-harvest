@@ -790,16 +790,20 @@ let task = AgentTask::new("audit the ledger")
   the answer of each call: its result, `DROPPED_FULL` or `NOT_RUN_FULL`. So
   the model sees which calls ran, and does not run a call with an effect
   again. The round goes after the bookings and before the notes.
-- That reset runs only when its window falls under the threshold. Else, or
-  with no reset left, the run ends as `transcript_full`, as before.
-- The patch marker `agent_reset_on_full_round` gates that branch. A run
-  recorded before it ends as it ran.
+- That reset runs only when its window, with the notes of that time, falls
+  under the threshold. If not, or with no reset left, the run ends as
+  `transcript_full`, as before.
+- A full round that the loop guard or an interrupt also stopped never
+  resets, so the stop holds. Such a save round ends the run too.
+- The patch marker `agent_reset_on_full_round` gates both rules. A run
+  recorded before it replays as it ran.
 
 A task with no `context_reset` field takes no new path, so a recorded run
 replays as it ran.
 `formal/verus/src/agent_reset.rs` proves that a request over the cap always
 reaches the threshold, and that no run passes `max_resets`. It also proves
-that the window after a full-round reset fits the cap.
+that the window after a full-round reset, with the notes of that time, fits
+the cap.
 `docs/design/DESIGN-2453.md` and `docs/design/DESIGN-2461.md` record the
 design.
 

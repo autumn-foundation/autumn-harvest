@@ -116,8 +116,8 @@ A zero cap is no cap, so it never resets. A `reset_at_percent` of 0 counts as
 1, and a value over 100 counts as 100.
 
 **A tool round over the cap (issue #2461).** A tool round can pass the cap
-in one step. With a reset left, that round makes a reset due, and the run
-goes on. The new window keeps the round with its answers, so the model sees
+in one step. With a reset left and room in the new window, that round
+makes a reset due, and the run goes on. The new window keeps the round with its answers, so the model sees
 which calls ran. `docs/design/DESIGN-2461.md` records the rule.
 
 ## 6. Acceptance criteria and their tests

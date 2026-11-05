@@ -963,6 +963,50 @@ fn huge_tool() -> Arc<dyn Tool> {
     .shared()
 }
 
+/// An external tool that records each run and returns `HUGE` bytes. Its
+/// result never fits after a `big` result.
+fn export_tool(recorder: &Arc<Recorder>) -> Arc<dyn Tool> {
+    let recorder = Arc::clone(recorder);
+    FnTool::new(
+        "export",
+        "Exports the ledger.",
+        json!({"type": "object"}),
+        move |input: Value| {
+            let recorder = Arc::clone(&recorder);
+            async move {
+                recorder.push(input);
+                Ok(json!("z".repeat(HUGE)))
+            }
+        },
+    )
+    .effect(ToolEffect::External)
+    .shared()
+}
+
+/// The tool calls named `name` that the history scheduled.
+fn scheduled_calls(
+    rt: &autumn_harvest_sqlite::SqliteRuntime,
+    exec: ExecutionId,
+    name: &str,
+) -> usize {
+    rt.load_history(exec)
+        .unwrap()
+        .into_iter()
+        .filter(|event| {
+            matches!(event, WorkflowEvent::ActivityScheduled { name: activity, input, .. }
+                if activity == "agent_tool_call" && input["call"]["name"] == name)
+        })
+        .count()
+}
+
+/// Whether the history of `exec` holds the marker of the #2461 gate.
+fn holds_the_marker(rt: &autumn_harvest_sqlite::SqliteRuntime, exec: ExecutionId) -> bool {
+    rt.load_history(exec).unwrap().into_iter().any(|event| {
+        matches!(&event, WorkflowEvent::MarkerRecorded { name, .. }
+            if name == "patch:agent_reset_on_full_round")
+    })
+}
+
 /// The `big` harness with the `huge` tool too.
 fn wide_harness(model: Arc<dyn AgentModel>) -> AgentHarness {
     harness(model).tool(huge_tool())
@@ -1066,12 +1110,10 @@ async fn a_round_over_the_cap_resets_and_the_run_goes_on() {
     assert!(holds_no_huge_result(after));
     // The reset made room, so the result now reaches the model.
     assert!(!holds_no_huge_result(&requests[4]));
-    let marker = rt
-        .load_history(exec)
-        .unwrap()
-        .into_iter()
-        .any(|event| matches!(&event, WorkflowEvent::MarkerRecorded { name, .. } if name == "patch:agent_reset_on_full_round"));
-    assert!(marker, "the new branch records its patch marker");
+    assert!(
+        holds_the_marker(&rt, exec),
+        "the new branch records its patch marker"
+    );
 }
 
 /// AC 2 and AC 3 of #2461: the window after the reset shows which calls
@@ -1098,7 +1140,10 @@ async fn the_window_after_a_full_round_shows_which_calls_ran() {
     assert_eq!(report.stop, AgentStop::Completed);
     assert_eq!(report.resets, 1);
     let after = &model.requests()[3].messages;
-    assert_eq!(call_ids(after)[..3], ["e1", "h1", "e2"]);
+    assert_eq!(
+        call_ids(after),
+        ["e1", "h1", "e2", "harvest_restored_notes"]
+    );
     let ran = answer_to(after, "e1");
     assert!(ran.contains("echo"), "e1 ran and shows its result: {ran}");
     assert!(answer_to(after, "h1").contains(DROPPED));
@@ -1110,20 +1155,22 @@ async fn the_window_after_a_full_round_shows_which_calls_ran() {
     );
 }
 
-/// AC 3 of #2461: the reset and its replay never run a call again. Only a
-/// call of the model runs.
+/// AC 3 of #2461: a call with an effect whose own result is dropped ran
+/// once. The window says that it ran, and the history schedules it once.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_call_with_an_effect_does_not_run_twice_after_the_reset() {
     let (_dir, db) = fresh_db();
-    let recorder = Arc::new(Recorder::default());
+    let sends = Arc::new(Recorder::default());
+    let exports = Arc::new(Recorder::default());
     let model = ScriptedModel::new(vec![
         turn(&[save("s1", "rows 1 to 6 are fine"), big("c1")]),
-        turn(&[send("e1", "a"), huge("h1")]),
-        turn(&[save("s2", "sent to a")]),
-        answer("sent", 1),
+        turn(&[send("e1", "a"), ("x1".into(), "export".into(), json!({}))]),
+        turn(&[save("s2", "sent to a; the export ran")]),
+        answer("sent and exported", 1),
     ]);
-    let harness =
-        wide_harness(model.clone()).tool(recorded_tool("send", ToolEffect::External, &recorder));
+    let harness = wide_harness(model.clone())
+        .tool(recorded_tool("send", ToolEffect::External, &sends))
+        .tool(export_tool(&exports));
     let mut rt = runtime(&db, harness);
 
     let exec = sqlite::start(&mut rt, &task(Some(setting(1)))).unwrap();
@@ -1131,21 +1178,15 @@ async fn a_call_with_an_effect_does_not_run_twice_after_the_reset() {
 
     assert_eq!(report.stop, AgentStop::Completed);
     assert_eq!(report.resets, 1);
-    assert_eq!(recorder.runs(), [json!({"to": "a"})]);
-    let save_turn = &model.requests()[2];
-    assert!(is_save_turn(save_turn));
-    assert!(answer_to(&save_turn.messages, "e1").contains("echo"));
-    // A replay of the history runs no tool.
-    let replay = WorkflowReplayer::new()
-        .register(vec![agent_loop_info()])
-        .with_execution_id(exec)
-        .replay_from_events(rt.load_history(exec).unwrap())
-        .await;
-    assert!(
-        matches!(replay.status, ReplayStatus::ReplaySucceeded),
-        "{replay}"
-    );
-    assert_eq!(recorder.runs().len(), 1);
+    let after = &model.requests()[3].messages;
+    assert!(answer_to(after, "e1").contains("echo"));
+    let export = answer_to(after, "x1");
+    assert!(export.contains(DROPPED), "{export}");
+    assert!(!export.contains(NOT_RUN), "the export ran: {export}");
+    assert_eq!(sends.runs(), [json!({"to": "a"})]);
+    assert_eq!(exports.runs().len(), 1);
+    assert_eq!(scheduled_calls(&rt, exec, "send"), 1);
+    assert_eq!(scheduled_calls(&rt, exec, "export"), 1);
 }
 
 /// The report of a run with no `run_id`, which differs per execution.
@@ -1186,6 +1227,30 @@ async fn with_no_reset_left_a_full_round_ends_as_before() {
         shapes.push(report_shape(&report));
     }
     assert_eq!(shapes[0], shapes[1]);
+}
+
+/// AC 4 of #2461: with no reset left, the script of the #2456 fixture
+/// gives the report that the old code recorded.
+#[tokio::test(flavor = "multi_thread")]
+async fn with_no_reset_left_the_report_matches_the_recorded_one() {
+    let (_dir, db) = fresh_db();
+    let model = ScriptedModel::new(vec![
+        turn(&[save("s1", "rows 1 to 6 are fine"), big("c1")]),
+        turn(&[huge("h1")]),
+        answer("unreachable", 1),
+    ]);
+    let mut rt = runtime(&db, wide_harness(model.clone()));
+    let exec = sqlite::start(&mut rt, &task(Some(setting(0)))).unwrap();
+    let live = report(rt.run_until_blocked(exec).await.unwrap());
+
+    let doc: Value = serde_json::from_str(FULL_ROUND_2456_HISTORY).unwrap();
+    let events: Vec<WorkflowEvent> = serde_json::from_value(doc["events"].clone()).unwrap();
+    let Some(WorkflowEvent::WorkflowCompleted { output, .. }) = events.last() else {
+        panic!("the recorded run completed");
+    };
+    let recorded: AgentReport = serde_json::from_value(output.clone()).unwrap();
+    assert_eq!(report_shape(&live), report_shape(&recorded));
+    assert!(!holds_the_marker(&rt, exec));
 }
 
 /// A full round after the last reset ends the run as `transcript_full`.
@@ -1234,10 +1299,31 @@ async fn a_run_recorded_before_the_rule_replays_unchanged() {
     let replay = WorkflowReplayer::new()
         .register(vec![agent_loop_info()])
         .with_execution_id(exec)
-        .replay_from_events(events)
+        .replay_from_events(events.clone())
         .await;
     assert!(
         matches!(replay.status, ReplayStatus::ReplaySucceeded),
+        "{replay}"
+    );
+
+    // The gate sits at the end of the full round. A marker there takes the
+    // new branch, which this history does not hold.
+    let mut gated = events;
+    let end = gated.len() - 1;
+    gated.insert(
+        end,
+        WorkflowEvent::MarkerRecorded {
+            name: "patch:agent_reset_on_full_round".into(),
+            details: json!(1),
+        },
+    );
+    let replay = WorkflowReplayer::new()
+        .register(vec![agent_loop_info()])
+        .with_execution_id(exec)
+        .replay_from_events(gated)
+        .await;
+    assert!(
+        matches!(replay.status, ReplayStatus::NonDeterminismDetected { .. }),
         "{replay}"
     );
 }
@@ -1247,6 +1333,43 @@ fn full_round_crash_script() -> Vec<Reply> {
     full_round_script()
 }
 
+/// The model call inside which the full-round crash child aborts.
+const ABORT_ENV: &str = "CONTEXT_RESET_CRASH_ABORT";
+
+/// Crash the child inside model call `abort_on`, then resume the run.
+/// Returns the requests before and after the crash.
+async fn crash_and_resume(abort_on: usize) -> (Vec<ChatRequest>, Vec<ChatRequest>, AgentReport) {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("agent.db");
+    let log_path = dir.path().join("requests.log");
+    let status = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "child_crashes_right_after_a_full_round_reset",
+            "--nocapture",
+        ])
+        .env(DB_ENV, &db)
+        .env(LOG_ENV, &log_path)
+        .env(ABORT_ENV, abort_on.to_string())
+        .status()
+        .unwrap();
+    assert!(!status.success(), "the child must crash, not finish");
+    let before = logged_requests(&log_path, "child");
+    assert_eq!(before.len(), abort_on, "the child dies inside that call");
+
+    let mut rest = full_round_crash_script();
+    rest.drain(..abort_on - 1);
+    let model = logged(rest, &log_path, "parent", None);
+    let mut rt = runtime(&db, wide_harness(model));
+    let exec: ExecutionId = std::fs::read_to_string(db.with_extension("exec"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    let report = report(rt.run_until_blocked(exec).await.unwrap());
+    let after = logged_requests(&log_path, "parent");
+    (before, after, report)
+}
+
 /// The child half of the full-round crash test. It aborts inside the first
 /// model call after the reset.
 #[tokio::test(flavor = "multi_thread")]
@@ -1254,11 +1377,12 @@ async fn child_crashes_right_after_a_full_round_reset() {
     let (Some(db), Some(log_path)) = (std::env::var_os(DB_ENV), std::env::var_os(LOG_ENV)) else {
         return;
     };
+    let abort_on = std::env::var(ABORT_ENV).map_or(4, |n| n.parse().unwrap());
     let model = logged(
         full_round_crash_script(),
         Path::new(&log_path),
         "child",
-        Some(4),
+        Some(abort_on),
     );
     let mut rt = runtime(Path::new(&db), wide_harness(model));
     let exec = sqlite::start(&mut rt, &task(Some(setting(1)))).unwrap();
@@ -1271,47 +1395,35 @@ async fn child_crashes_right_after_a_full_round_reset() {
 /// same window and cache key.
 #[tokio::test(flavor = "multi_thread")]
 async fn crash_after_a_full_round_reset_replays_the_same_window() {
-    let dir = tempfile::tempdir().unwrap();
-    let db = dir.path().join("agent.db");
-    let log_path = dir.path().join("requests.log");
-    let status = Command::new(std::env::current_exe().unwrap())
-        .args([
-            "--exact",
-            "child_crashes_right_after_a_full_round_reset",
-            "--nocapture",
-        ])
-        .env(DB_ENV, &db)
-        .env(LOG_ENV, &log_path)
-        .status()
-        .unwrap();
-    assert!(!status.success(), "the child must crash, not finish");
-    let before = logged_requests(&log_path, "child");
-    assert_eq!(before.len(), 4, "the child dies inside the fourth call");
+    let (before, after, report) = crash_and_resume(4).await;
     assert!(is_save_turn(&before[2]));
     assert!(
         holds_no_huge_result(&before[3]),
         "the fourth call follows the reset"
     );
     assert!(answer_to(&before[3].messages, "h1").contains(DROPPED));
-
-    let mut rest = full_round_crash_script();
-    rest.drain(..3);
-    let model = logged(rest, &log_path, "parent", None);
-    let mut rt = runtime(&db, wide_harness(model));
-    let exec: ExecutionId = std::fs::read_to_string(db.with_extension("exec"))
-        .unwrap()
-        .parse()
-        .unwrap();
-    let state = rt.run_until_blocked(exec).await.unwrap();
-    let report: AgentReport = report(state);
     assert_eq!(report.stop, AgentStop::Completed);
     assert_eq!(report.resets, 1);
-
-    let after = logged_requests(&log_path, "parent");
     assert_eq!(after[0], before[3], "replay rebuilds the same window");
     let cache = response_cache(&Arc::new(MemStore::default()));
     let key = |request: &ChatRequest| cache.key(KeyTenant::None, "m", request).unwrap();
     assert_eq!(key(&after[0]), key(&before[3]));
+}
+
+/// A crash inside the save turn of a full round replays to the same save
+/// turn. The kept round is in history, not in worker memory.
+#[tokio::test(flavor = "multi_thread")]
+async fn crash_in_the_save_turn_of_a_full_round_replays_the_same_window() {
+    let (before, after, report) = crash_and_resume(3).await;
+    assert!(is_save_turn(&before[2]));
+    assert_eq!(after[0], before[2], "replay rebuilds the same save turn");
+    assert_eq!(report.stop, AgentStop::Completed);
+    assert_eq!(report.resets, 1);
+    assert!(
+        holds_no_huge_result(&after[1]),
+        "the reset follows the save turn"
+    );
+    assert!(answer_to(&after[1].messages, "h1").contains(DROPPED));
 }
 
 /// A kept round that leaves the window over the threshold frees no room.
@@ -1334,6 +1446,7 @@ async fn a_kept_round_that_frees_no_room_ends_the_run() {
     assert_eq!(report.resets, 0);
     assert_eq!(model.calls(), 2);
     assert!(tool_results(&report).last().unwrap().contains(DROPPED));
+    assert!(!holds_the_marker(&rt, exec), "the gate is not asked");
 }
 
 /// A booking in the full round shows once in the window after the reset.
@@ -1363,4 +1476,191 @@ async fn a_booking_in_the_full_round_shows_once() {
     let after = &model.requests()[3].messages;
     assert_eq!(call_ids(after), ["f1", "h1", "harvest_restored_notes"]);
     assert!(answer_to(after, "f1").contains("scheduled"));
+}
+
+/// A full round that the loop guard also stopped ends the run. A reset
+/// would let the run go on past the stop.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_full_round_that_the_loop_guard_stopped_ends_the_run() {
+    // At 90 % the kept round leaves room, so only the stop ends the run.
+    let roomy = ContextReset::new(1, 90).max_notes_bytes(1_000);
+    let guard = LoopGuard {
+        warn_after: u32::MAX,
+        stop_after: 2,
+        window: 30,
+    };
+    let mut ends = Vec::new();
+    for guard in [guard, LoopGuard::disabled()] {
+        let (_dir, db) = fresh_db();
+        // The second call repeats the first. It trips the guard, and its
+        // result does not fit.
+        let model = ScriptedModel::new(vec![
+            turn(&[huge("h1"), huge("h2")]),
+            turn(&[save("s1", "one huge read")]),
+            answer("done", 1),
+        ]);
+        let mut rt = runtime(&db, wide_harness(model.clone()));
+        let exec = sqlite::start(&mut rt, &task(Some(roomy)).loop_guard(guard)).unwrap();
+        let report = report(rt.run_until_blocked(exec).await.unwrap());
+        ends.push((report.stop, report.resets, model.calls()));
+    }
+    assert_eq!(ends[0], (AgentStop::TranscriptFull, 0, 1), "the stop holds");
+    assert_eq!(
+        ends[1],
+        (AgentStop::Completed, 1, 3),
+        "with no stop, it resets"
+    );
+}
+
+/// With no room for the notes of a save turn, a full round resets at once.
+/// The window still keeps the round.
+#[tokio::test(flavor = "multi_thread")]
+async fn with_no_room_for_a_save_turn_a_full_round_resets_at_once() {
+    let (_dir, db) = fresh_db();
+    let model = ScriptedModel::new(vec![
+        turn(&[save("s1", "rows 1 to 6 are fine"), big("c1")]),
+        turn(&[huge("h1")]),
+        turn(&[huge("h2")]),
+        answer("row 7 is wrong", 1),
+    ]);
+    let mut rt = runtime(&db, wide_harness(model.clone()));
+
+    // The window after the round and 13 000 bytes of notes exceed the cap.
+    let reset = ContextReset::new(1, 50).max_notes_bytes(13_000);
+    let exec = sqlite::start(&mut rt, &task(Some(reset))).unwrap();
+    let report = report(rt.run_until_blocked(exec).await.unwrap());
+
+    assert_eq!(report.stop, AgentStop::Completed);
+    assert_eq!(report.resets, 1);
+    let after = &model.requests()[2];
+    assert!(!is_save_turn(after));
+    assert_eq!(
+        shape(&after.messages),
+        [
+            (ChatRole::System, "You audit.".to_owned()),
+            (ChatRole::User, "audit the ledger".to_owned()),
+            (ChatRole::Assistant, "call huge ".to_owned()),
+            (ChatRole::Tool, "result".to_owned()),
+            (
+                ChatRole::Assistant,
+                format!("call {SAVE_PROGRESS_TOOL} rows 1 to 6 are fine")
+            ),
+            (ChatRole::Tool, "result".to_owned()),
+        ],
+    );
+}
+
+/// A save round over the cap in the new path still resets. The window keeps
+/// the full round and the earlier notes.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_save_round_over_the_cap_after_a_full_round_still_resets() {
+    let (_dir, db) = fresh_db();
+    // The save call comes first, and the round has no room for it.
+    let many: Vec<(String, String, Value)> = std::iter::once(save("s2", "never saved"))
+        .chain((0..100).map(|n| big(&format!("m{n}"))))
+        .collect();
+    let model = ScriptedModel::new(vec![
+        turn(&[save("s1", "rows 1 to 6 are fine"), big("c1")]),
+        turn(&[huge("h1")]),
+        turn(&many),
+        answer("done", 1),
+    ]);
+    let mut rt = runtime(&db, wide_harness(model.clone()));
+
+    let exec = sqlite::start(&mut rt, &task(Some(setting(1)))).unwrap();
+    let report = report(rt.run_until_blocked(exec).await.unwrap());
+
+    assert_eq!(report.stop, AgentStop::Completed);
+    assert_eq!(report.resets, 1);
+    let after = &model.requests()[3].messages;
+    assert_eq!(call_ids(after), ["h1", "harvest_restored_notes"]);
+    assert!(json!(after).to_string().contains("rows 1 to 6 are fine"));
+}
+
+/// A delegated child resets on its own full round. Its parent does not.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_delegated_child_resets_on_a_full_round() {
+    let (_dir, db) = fresh_db();
+    let model = ScriptedModel::new(vec![
+        // The parent.
+        turn(&[(
+            "d1".into(),
+            "delegate".into(),
+            json!({"agent": "helper", "task": "count the rows"}),
+        )]),
+        // The child.
+        turn(&[save("k1", "counting"), big("k2")]),
+        turn(&[huge("k3")]),
+        turn(&[save("k4", "the huge read did not fit")]),
+        answer("12 rows", 1),
+        // The parent again.
+        answer("the helper counted 12 rows", 1),
+    ]);
+    let harness =
+        wide_harness(model.clone()).peer(Peer::new("helper", "Counts.").system("You count."));
+    let mut rt = runtime(&db, harness);
+
+    let parent = task(Some(setting(1))).mandate(Mandate::new("auditor").peers(["helper"]));
+    let exec = sqlite::start(&mut rt, &parent).unwrap();
+    let report = report(rt.run_until_blocked(exec).await.unwrap());
+
+    assert_eq!(report.stop, AgentStop::Completed);
+    assert_eq!(report.resets, 0);
+    assert_eq!(report.delegations[0].resets, 1);
+    let child = &model.requests()[4].messages;
+    assert_eq!(call_ids(child), ["k3", "harvest_restored_notes"]);
+    assert!(holds_the_marker(&rt, exec));
+}
+
+/// A reset after a full round keeps each steer of the op after the round.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_full_round_reset_keeps_the_steers_of_the_op() {
+    let (_dir, db) = fresh_db();
+    let model = ScriptedModel::new(vec![
+        // The first attempt fails, so the op waits on its retry backoff.
+        Err(autumn_harvest_agent::AgentError::new(
+            autumn_harvest_agent::ErrorKind::RateLimited,
+            "slow down",
+        )),
+        turn(&[save("s1", "rows 1 to 5 are fine"), big("c1")]),
+        turn(&[huge("h1")]),
+        turn(&[save("s2", "rows 1 to 8 are fine")]),
+        answer("row 9 is fine too", 1),
+    ]);
+    let mut profile = AgentProfile::new("auditor").context_reset(setting(1));
+    profile.max_request_bytes = Some(CAP);
+    profile.loop_guard = LoopGuard::disabled();
+    let mut rt = runtime(&db, wide_harness(model.clone()).agent(profile));
+    let agent = agent_id("acct-5");
+    sqlite::send(&mut rt, &agent, &AgentOp::message("audit the ledger"), None).unwrap();
+    sqlite::drive(&mut rt, &agent).await.unwrap();
+    let steer = AgentOp::urgent(
+        "also check row 9",
+        "s-1",
+        autumn_harvest_agent::Urgency::Steer,
+    );
+    sqlite::send(&mut rt, &agent, &steer, Some("s-1")).unwrap();
+    let exec = sqlite::current_run(&rt, &agent).unwrap().unwrap();
+    let later = autumn_harvest::chrono::Utc::now() + autumn_harvest::chrono::Duration::seconds(60);
+    rt.run_until_blocked_as_of(exec, later).await.unwrap();
+    sqlite::drive(&mut rt, &agent).await.unwrap();
+
+    let requests = model.requests();
+    assert_eq!(requests.len(), 5);
+    assert_eq!(
+        shape(&requests[4].messages),
+        [
+            (ChatRole::User, "audit the ledger".to_owned()),
+            (ChatRole::Assistant, "call huge ".to_owned()),
+            (ChatRole::Tool, "result".to_owned()),
+            (
+                ChatRole::Assistant,
+                format!("call {SAVE_PROGRESS_TOOL} rows 1 to 8 are fine")
+            ),
+            (ChatRole::Tool, "result".to_owned()),
+            (ChatRole::User, "also check row 9".to_owned()),
+        ]
+    );
+    let state = sqlite::state(&rt, &agent).await.unwrap().unwrap();
+    assert_eq!(state.last_answer.as_deref(), Some("row 9 is fine too"));
 }
