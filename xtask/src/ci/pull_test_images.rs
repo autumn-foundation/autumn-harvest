@@ -179,9 +179,13 @@ fn images_to_pull(args: &[String]) -> Result<std::result::Result<Vec<String>, ()
         if args.iter().any(String::is_empty) {
             return Ok(Err(()));
         }
-        // The script split the joined arguments on whitespace.
+        // The script split the joined arguments on the default IFS.
         let joined = args.join(" ");
-        return Ok(Ok(joined.split_whitespace().map(str::to_string).collect()));
+        return Ok(Ok(joined
+            .split(run_suites::is_ifs)
+            .filter(|image| !image.is_empty())
+            .map(str::to_string)
+            .collect()));
     }
     // Pull ElasticMQ only on the shard that runs `connector_sqs_broker`. The
     // dry run lists the cargo calls of this shard without running them. So no
@@ -319,5 +323,9 @@ mod tests {
         let got = images_to_pull(&names(&["postgres:16", "a b"])).ok();
         assert_eq!(got, Some(Ok(names(&["postgres:16", "a", "b"]))));
         assert_eq!(images_to_pull(&names(&["x", ""])).ok(), Some(Err(())));
+        // Only a space, a tab or a newline splits a word, as the default IFS
+        // did. A no-break space stays inside the name.
+        let got = images_to_pull(&names(&["a\tb\nc", "d\u{a0}e"])).ok();
+        assert_eq!(got, Some(Ok(names(&["a", "b", "c", "d\u{a0}e"]))));
     }
 }

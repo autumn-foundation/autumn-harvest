@@ -16,9 +16,9 @@
 //! bundle is complete.
 //!
 //! Source of truth: the per-suite CI runs are now DATA in the manifest
-//! `.github/ci/integration-suites.txt` (executed by `cargo xtask ci run-suites`,
-//! which the `test` job invokes), not copy-pasted `cargo test` steps in
-//! `ci.yml`. This guard parses that structured manifest instead of scraping
+//! `.github/ci/integration-suites.txt`. They are not copy-pasted `cargo test`
+//! steps in `ci.yml`. `cargo xtask ci run-suites` executes the manifest, and
+//! the `test` job invokes it. This guard parses that structured manifest instead of scraping
 //! `run:` lines — the columns are already split, so the old `--test-threads=1`
 //! special-casing, `--no-run` string-grepping, and `module::filter`
 //! re-tokenization are gone. A target is NOT credited as run when its manifest
@@ -296,10 +296,11 @@ impl SuiteRow {
 }
 
 fn parse_manifest() -> Vec<SuiteRow> {
-    // Fail-closed value allowlists: an unknown `osclass` routes a suite to NO
-    // run-mode (`runs()`/`do_compile` both ignore it) → a silently-never-run
-    // suite, exactly the gap this guard exists to catch; an unknown `crate`
-    // would never match a coverage lookup. Reject either as a typo.
+    // Fail-closed value allowlists. An unknown `osclass` routes a suite to NO
+    // run-mode, because `runs()` and `compile_plan` both ignore it. That is a
+    // silently-never-run suite, exactly the gap this guard exists to catch.
+    // An unknown `crate` would never match a coverage lookup. Reject either
+    // as a typo.
     // extend this set when a new crate/osclass is introduced.
     const VALID_OSCLASS: &[&str] = &["linux", "linuxpart", "allos", "compileonly"];
     const VALID_CRATE: &[&str] = &[

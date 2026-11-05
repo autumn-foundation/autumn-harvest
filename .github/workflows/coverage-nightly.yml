@@ -131,8 +131,12 @@ jobs:
       # `show-env` below instruments each later build. The steps after it run
       # this binary directly. A `cargo xtask` call there would build an
       # instrumented `xtask`, and its profile data would join the report.
+      # The copy leaves `target`, because `cargo llvm-cov clean --workspace`
+      # runs `cargo clean` on each workspace package, `xtask` too.
       - name: Build xtask before the coverage environment
-        run: cargo build --quiet --package xtask
+        run: |
+          cargo build --quiet --package xtask
+          cp target/debug/xtask "$RUNNER_TEMP"/xtask
       - name: Pre-pull Docker test images
         run: cargo xtask ci pull-test-images
       - name: Run the Linux manifest suites under coverage
@@ -145,14 +149,14 @@ jobs:
           coverage_env="$(cargo llvm-cov show-env --sh --branch)"
           eval "$coverage_env"
           cargo llvm-cov clean --workspace
-          ./target/debug/xtask ci run-suites run linux
+          "$RUNNER_TEMP"/xtask ci run-suites run linux
       - name: Export coverage
         if: ${{ !cancelled() }}
         run: |
           coverage_env="$(cargo llvm-cov show-env --sh --branch)"
           eval "$coverage_env"
           cargo llvm-cov report --branch --json --output-path db.json
-          ./target/debug/xtask ci coverage convert db.json --root "$GITHUB_WORKSPACE" \
+          "$RUNNER_TEMP"/xtask ci coverage convert db.json --root "$GITHUB_WORKSPACE" \
             --output "db-${SEMAPHORE_SHARD_INDEX}.lcov"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: ${{ !cancelled() }}

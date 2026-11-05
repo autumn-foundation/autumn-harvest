@@ -388,7 +388,7 @@ pub fn compile_plan(records: &[&str], shard: Option<Shard>) -> Vec<Invocation> {
 
     let mut plan = Vec::new();
     let mut current: Option<(&str, &str, Vec<&str>)> = None;
-    for (krate, feats, target) in grouped {
+    for (krate, feats, target) in grouped.into_iter().map(read_tab_fields) {
         if krate.is_empty() {
             continue;
         }
@@ -409,6 +409,24 @@ pub fn compile_plan(records: &[&str], shard: Option<Shard>) -> Vec<Invocation> {
     plan
 }
 
+/// Splits a sorted `crate<TAB>features<TAB>target` line as the script read it.
+///
+/// The script read each line with `IFS=<TAB> read -r c f t`. A tab is IFS
+/// whitespace, so a run of tabs is one separator. So an empty field moves
+/// the next field into its place. Only a short row has an empty field.
+fn read_tab_fields<'a>(row: (&'a str, &'a str, &'a str)) -> (&'a str, &'a str, &'a str) {
+    let mut fields = <[&str; 3]>::from(row)
+        .into_iter()
+        .filter(|field| !field.is_empty());
+    let mut next = || fields.next().unwrap_or("");
+    (next(), next(), next())
+}
+
+/// True for a character of the default `IFS`: a space, a tab or a newline.
+pub const fn is_ifs(c: char) -> bool {
+    matches!(c, ' ' | '\t' | '\n')
+}
+
 /// One `--no-run` call for a (crate, features) group.
 fn compile_invocation(krate: &str, feats: &str, targets: &[&str]) -> Invocation {
     let mut argv = words(&["cargo", "test", "-p", krate]);
@@ -416,7 +434,12 @@ fn compile_invocation(krate: &str, feats: &str, targets: &[&str]) -> Invocation 
         argv.push("--features".into());
         argv.push(feats.into());
     }
-    for target in targets.iter().flat_map(|t| t.split_whitespace()) {
+    // The script split the joined targets on the default IFS.
+    for target in targets
+        .iter()
+        .flat_map(|t| t.split(is_ifs))
+        .filter(|t| !t.is_empty())
+    {
         argv.push("--test".into());
         argv.push(target.into());
     }
@@ -985,6 +1008,28 @@ linuxpart    autumn-harvest         integration   -                 store_tests
             ]
         );
         assert_eq!(plan[0].label, "compile autumn-harvest-plugin (-)");
+    }
+
+    #[test]
+    fn compile_reads_a_short_row_as_the_tab_read_did() {
+        // A row with no features column gives `crate<TAB><TAB>target`. The
+        // tab read collapses the two tabs, so the target lands in `features`.
+        let plan = compile_plan(&["linux autumn-harvest-plugin solo"], None);
+        assert_eq!(
+            plan_lines(&plan),
+            vec!["cargo test -p autumn-harvest-plugin --features solo --no-run"]
+        );
+        assert_eq!(plan[0].label, "compile autumn-harvest-plugin (solo)");
+        assert_eq!(read_tab_fields(("a", "b", "c")), ("a", "b", "c"));
+        assert_eq!(read_tab_fields(("a", "", "")), ("a", "", ""));
+    }
+
+    #[test]
+    fn compile_splits_targets_on_the_default_ifs_only() {
+        // A carriage return is not in the default IFS, so it stays in the
+        // target, as the unquoted shell expansion kept it.
+        let plan = compile_plan(&["linux autumn-harvest-plugin t\r -  -"], None);
+        assert_eq!(plan[0].argv[4..6], ["--test", "t\r"]);
     }
 
     #[test]

@@ -135,25 +135,29 @@ Measure one DB shard too. The DB suites need Docker. Without the shard
 variables, the runner runs every row, which takes hours. Build `xtask`
 before `show-env`, and run the built binary after it. Otherwise the
 coverage environment instruments `xtask` too, and its code joins the
-report:
+report. Copy the binary out of `target`. `cargo llvm-cov clean
+--workspace` runs `cargo clean` on each workspace package, so it deletes
+`target/debug/xtask`:
 
 ```sh
 cargo build --quiet --package xtask
+cp target/debug/xtask /tmp/xtask
 coverage_env="$(cargo llvm-cov show-env --sh --branch)"
 eval "$coverage_env"
 cargo llvm-cov clean --workspace
 SEMAPHORE_SHARD_COUNT=21 SEMAPHORE_SHARD_INDEX=0 \
   HARVEST_DEV_REQUIRE_POSTGRES=1 HARVEST_TEST_REQUIRE_REDIS=1 \
-  ./target/debug/xtask ci run-suites run linux
+  /tmp/xtask ci run-suites run linux
 cargo llvm-cov report --branch --json --output-path db.json
-./target/debug/xtask ci coverage convert db.json --root "$PWD" --output db.lcov
+/tmp/xtask ci coverage convert db.json --root "$PWD" --output db.lcov
 ```
 
-Then merge and summarize:
+Then merge and summarize. The shell still holds the coverage environment,
+so use the copy here too:
 
 ```sh
-cargo xtask ci coverage merge --output merged.lcov unit.lcov db.lcov
-cargo xtask ci coverage summary merged.lcov \
+/tmp/xtask ci coverage merge --output merged.lcov unit.lcov db.lcov
+/tmp/xtask ci coverage summary merged.lcov \
   --baseline .github/ci/coverage-baseline.json \
   --json summary.json --markdown summary.md
 ```

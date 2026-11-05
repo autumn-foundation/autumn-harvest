@@ -20,18 +20,26 @@ const BASELINE: &str = ".github/ci/coverage-baseline.json";
 /// The coverage command, without the program that runs it.
 ///
 /// A step runs it as `cargo xtask ci coverage` or, after the coverage
-/// environment is set, as the prebuilt `./target/debug/xtask ci coverage`.
+/// environment is set, as the prebuilt copy `"$RUNNER_TEMP"/xtask ci coverage`.
 const COVERAGE: &str = "xtask ci coverage";
 
 /// The `cargo xtask` form of [`COVERAGE`].
 const CARGO_COVERAGE: &str = "cargo xtask ci coverage";
 
-/// The `db` step that builds `xtask` before the coverage environment.
+/// The script lines of the `db` step that builds `xtask` before the coverage
+/// environment.
 ///
 /// `show-env` instruments each later build. A `cargo xtask` call after it
 /// would build an instrumented `xtask`, and its profile data would join the
 /// report. So the steps after it run the prebuilt binary.
-const BUILD_XTASK: &str = "cargo build --quiet --package xtask";
+///
+/// The copy leaves `target`. `cargo llvm-cov clean --workspace` runs `cargo
+/// clean` on each workspace package, `xtask` too. So it deletes
+/// `target/debug/xtask` before the suites start.
+const BUILD_XTASK: &[&str] = &[
+    "cargo build --quiet --package xtask",
+    "cp target/debug/xtask \"$RUNNER_TEMP\"/xtask",
+];
 
 /// The critical modules that issue #1818 names.
 const CRITICAL: &[&str] = &[
@@ -59,7 +67,7 @@ const DB_RUN: &[&str] = &[
     "coverage_env=\"$(cargo llvm-cov show-env --sh --branch)\"",
     "eval \"$coverage_env\"",
     "cargo llvm-cov clean --workspace",
-    "./target/debug/xtask ci run-suites run linux",
+    "\"$RUNNER_TEMP\"/xtask ci run-suites run linux",
 ];
 
 /// The `if` of a step that also runs after a failed test, but not after a
@@ -163,20 +171,24 @@ fn runs_the_linux_rows_instrumented(job: &serde_yaml::Value) -> bool {
 
 /// True when one ungated step builds `xtask` before the [`DB_RUN`] step.
 ///
-/// The steps from the [`DB_RUN`] step on must not run `cargo xtask`. Each one
-/// sees the coverage environment, or follows a step that set it.
+/// The steps from the [`DB_RUN`] step on must not run `cargo xtask` or
+/// `target/debug/xtask`. Each one sees the coverage environment, or follows a
+/// step that set it.
 fn builds_xtask_first(job: &serde_yaml::Value) -> bool {
     let steps = steps(job);
     let build = steps
         .iter()
-        .position(|s| ungated(s) && str_at(s, &["run"]).trim() == BUILD_XTASK);
+        .position(|s| ungated(s) && script_lines(str_at(s, &["run"])) == BUILD_XTASK);
     let suites = steps
         .iter()
         .position(|s| script_lines(str_at(s, &["run"])) == DB_RUN);
+    // `cargo llvm-cov clean --workspace` deletes `target/debug/xtask`, so a
+    // later step must not run that path either.
     let later_cargo_xtask = suites.is_some_and(|from| {
-        steps[from..]
-            .iter()
-            .any(|s| str_at(s, &["run"]).contains("cargo xtask"))
+        steps[from..].iter().any(|s| {
+            let run = str_at(s, &["run"]);
+            run.contains("cargo xtask") || run.contains("target/debug/xtask")
+        })
     });
     matches!((build, suites), (Some(b), Some(r)) if b < r) && !later_cargo_xtask
 }
@@ -286,8 +298,8 @@ fn db_shards_run_every_linux_row_under_coverage() {
     );
     assert!(
         builds_xtask_first(db),
-        "an ungated `db` step must run `{BUILD_XTASK}` before the coverage environment, and \
-         no later step may run `cargo xtask`"
+        "an ungated `db` step must run {BUILD_XTASK:?} before the coverage environment, and \
+         no later step may run `cargo xtask` or `target/debug/xtask`"
     );
     assert!(
         shards_cover_every_row(db),
@@ -407,6 +419,39 @@ fn db_step_check_rejects_a_broken_run() {
     assert!(
         !job(&[DB_RUN[0], DB_RUN[1], DB_RUN[2], &swallowed], ""),
         "a swallowed failure"
+    );
+}
+
+/// Self-test: the `xtask` build check rejects each way to lose the binary.
+#[test]
+fn build_check_rejects_a_lost_binary() {
+    let job = |scripts: &[&[&str]]| {
+        let body: String = scripts
+            .iter()
+            .enumerate()
+            .map(|(i, lines)| {
+                let lines = lines.join("\n        ");
+                format!("  - name: s{i}\n    run: |\n        {lines}\n")
+            })
+            .collect();
+        let text = format!("steps:\n{body}");
+        builds_xtask_first(&parse_workflow_text(&text).expect("synthetic job must parse"))
+    };
+    assert!(job(&[BUILD_XTASK, DB_RUN]));
+    assert!(!job(&[DB_RUN, BUILD_XTASK]), "a build after the suites");
+    assert!(
+        !job(&[&BUILD_XTASK[..1], DB_RUN]),
+        "no copy out of `target`"
+    );
+    let stale: &[&str] = &["./target/debug/xtask ci coverage convert db.json"];
+    assert!(
+        !job(&[BUILD_XTASK, DB_RUN, stale]),
+        "a binary that the clean deletes"
+    );
+    let rebuilt: &[&str] = &["cargo xtask ci coverage convert db.json"];
+    assert!(
+        !job(&[BUILD_XTASK, DB_RUN, rebuilt]),
+        "an instrumented rebuild"
     );
 }
 
