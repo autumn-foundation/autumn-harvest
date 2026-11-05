@@ -129,7 +129,7 @@ jobs:
           fi
           # Issue #1614: a docs-only change to the standalone chapter, its
           # reference or its crate still runs the `standalone-chapter` job.
-          if echo "$changed" | grep -qE '^(docs/embedding\.md|docs/getting-started/(standalone-axum|02-first-workflow)\.md|examples/standalone-quickstart/|scripts/run-standalone-chapter\.sh)'; then
+          if echo "$changed" | grep -qE '^(docs/embedding\.md|docs/getting-started/(standalone-axum|02-first-workflow)\.md|examples/standalone-quickstart/|xtask/src/dev/run_standalone_chapter\.rs)'; then
             echo "chapter=true" >> "$GITHUB_OUTPUT"
           else
             echo "chapter=false" >> "$GITHUB_OUTPUT"
@@ -1882,7 +1882,7 @@ jobs:
           cargo build -p autumn-harvest-cli
           cargo build -p standalone-quickstart
       - name: Run the bash blocks of docs/getting-started/standalone-axum.md
-        run: ./scripts/run-standalone-chapter.sh
+        run: cargo xtask dev run-standalone-chapter
       # The `docs/embedding.md` Rust fences compile as doctests. This job, not
       # `lint`, runs them, because it already builds the plugin. A filter that
       # matches nothing passes with "0 passed", so the step requires a pass.
@@ -1918,7 +1918,7 @@ jobs:
           --health-timeout 5s
           --health-retries 10
     steps:
-      # Full history: the script finds the previous release by its tag.
+      # Full history: the smoke finds the previous release by its tag.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
@@ -1939,7 +1939,7 @@ jobs:
           DATABASE_URL: postgres://postgres:postgres@localhost:5432/mvsmoke
           # No debug info: it halves the size of two debug builds.
           CARGO_PROFILE_DEV_DEBUG: "0"
-        run: ./scripts/run-mixed-version-smoke.sh
+        run: cargo xtask dev run-mixed-version-smoke
 
   openapi-client-smoke:
     name: Generated TypeScript client drives a running plugin
