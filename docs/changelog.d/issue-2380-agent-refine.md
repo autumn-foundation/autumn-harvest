@@ -19,7 +19,9 @@ anonymised pool of #2376, the evidence bundle of #2377, the live probe of
   `agent_loop` run names its kind with `AgentTask::kind`. A durable
   `agent` run has no replay probe yet, so it gets
   `RefineSourceNotReplayable`. Each stage of a source checks its replies
-  against the profile of that source, as its probe does.
+  against the profile of that source, as its probe does. A reply must
+  also apply to each other source, so a carried overlay fits each later
+  source.
 - **Steps.** `agent_refine_probe` runs `eval::evaluate` and, when it stubs
   a tool call, a live re-probe through `RefineSources::live_probe`.
   `agent_refine_compose` runs an `OverlayComposer` over the probes under

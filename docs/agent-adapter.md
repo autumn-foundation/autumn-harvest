@@ -2336,7 +2336,8 @@ On Postgres, install `postgres::Sources::new(pg)` and start the workflow
   `RefineSourceNotReplayable` or `RefineSourceOverCeilings`. The last one
   means that the source ran with a bound above the policy ceilings. Each
   stage of a source checks its replies against the profile of that
-  source, as its probe does. Call `AgentTask::kind` when you start an
+  source, as its probe does. A reply must also apply to each other source,
+  so the run can carry it to a later source. Call `AgentTask::kind` when you start an
   `agent_loop` run, so the run names its kind. A run with no kind gets
   `RefineSourceOtherKind`, and so does each run recorded before this
   release. A durable `agent` run has no replay probe yet, so it gets

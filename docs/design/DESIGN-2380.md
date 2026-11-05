@@ -48,7 +48,8 @@ pub struct RefineInput {
    runs before this step ends. The step also reads the base profile, the
    active overlay and, for each source, its profile and evidence text.
    Each stage of a source checks its replies against the source profile,
-   as its probe does.
+   as its probe does. A reply must also apply to the profile of each other
+   source, so the run can carry it to any later source.
 3. The loop runs each source in input order. The overlay that a source
    chooses is the current overlay of the next source.
 4. The run checks the ledger before each step that can spend. A spend at
@@ -167,6 +168,7 @@ guard.
 | A spent run still names a winner. | `BudgetExhausted` has no `chosen`. |
 | The composer learns the order of a candidate. | The pool lists opaque ids in a seeded order. No reader context holds the seed. |
 | A failure text names a model. | The pool redacts each digest, each model route and its provider id. |
+| A carried overlay does not fit a later source, such as a read-only one. | Each stage reply must apply to the profile of every source of the run. |
 | The selector names an id outside the pool. | The step ignores the id, takes the rule pick and records a note. |
 | A failed attempt hides its spend. | The failure details hold the spend of the last attempt. |
 | A live fork runs on with no end. | The probe cancels a fork that does not end in 60 minutes. |

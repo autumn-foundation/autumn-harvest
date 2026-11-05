@@ -128,6 +128,8 @@ struct Proposer {
     calls: AtomicUsize,
     keep: Option<(Dimension, u32)>,
     log: Option<PathBuf>,
+    /// Add `read_only: false` to each proposal.
+    clear_read_only: bool,
 }
 
 impl OverlayProposer for Proposer {
@@ -150,6 +152,7 @@ impl OverlayProposer for Proposer {
                     "{from}\n{} edit {}",
                     context.dimension, context.sample
                 )),
+                read_only: self.clear_read_only.then_some(false),
                 ..ProfileOverlay::default()
             }
         };
@@ -162,6 +165,8 @@ impl OverlayProposer for Proposer {
 struct Composer {
     calls: AtomicUsize,
     log: Option<PathBuf>,
+    /// Add `read_only: false` to each composition.
+    clear_read_only: bool,
 }
 
 impl OverlayComposer for Composer {
@@ -179,6 +184,7 @@ impl OverlayComposer for Composer {
                 context.sample,
                 context.candidates.len()
             )),
+            read_only: self.clear_read_only.then_some(false),
             ..ProfileOverlay::default()
         };
         Box::pin(async move { Ok(ProposerReply::Overlay(reply)) })
@@ -1082,4 +1088,51 @@ async fn a_source_past_the_policy_ceilings_is_refused_before_any_call() {
     let report = report_of(refine(&mut f.rt, &input).await);
     assert_eq!(report.ledger.sessions, 3);
     assert_eq!(report.ledger.probes, 3);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_carried_overlay_fits_each_later_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut f = fixture(
+        &dir.path().join("a.db"),
+        Proposer {
+            clear_read_only: true,
+            ..Proposer::default()
+        },
+        Composer {
+            clear_read_only: true,
+            ..Composer::default()
+        },
+        Model::default(),
+    );
+    // The first source can write. The second one ran read-only, and the
+    // default ceilings never clear `read_only`.
+    let writable = source(&mut f.rt, KIND).await;
+    let mut locked = task(KIND);
+    locked.read_only = true;
+    let exec = sqlite::start(&mut f.rt, &locked).unwrap();
+    assert!(matches!(
+        f.rt.run_until_blocked(exec).await.unwrap(),
+        RunState::Completed(_)
+    ));
+    for mode in [RefineMode::Parallel, RefineMode::Sequential] {
+        let input = RefineInput::new(KIND, vec![writable, exec], 1, mode, 3);
+        let report = report_of(refine(&mut f.rt, &input).await);
+        // No reply that clears `read_only` is a candidate, so nothing that
+        // the second source refuses is carried to it.
+        assert_eq!(report.ledger.sessions, 6, "{mode:?}");
+        assert_eq!(report.ledger.fell_back, 6, "{mode:?}");
+        assert_eq!(report.ledger.probes, 0, "{mode:?}");
+        assert_eq!(report.status, RefineStatus::Unchanged, "{mode:?}");
+        for stage in &report.stages {
+            let StageOutcome::FellBack { error } = &stage.outcome else {
+                panic!("{stage:?}");
+            };
+            assert!(error.contains("clears read_only"), "{error}");
+            // A stage of the first source refuses the reply for the second.
+            if stage.source == writable {
+                assert!(error.contains("another source"), "{error}");
+            }
+        }
+    }
 }

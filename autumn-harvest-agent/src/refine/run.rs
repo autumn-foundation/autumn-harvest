@@ -620,6 +620,8 @@ pub(crate) fn probe_calls(result: &ProbeResult) -> Vec<autumn_harvest::llm_ledge
 struct Refine<'a> {
     ctx: &'a WorkflowContext,
     input: &'a RefineInput,
+    /// Every source of the run, in input order.
+    sources: &'a [SourceBrief],
     ceilings: Ceilings,
     attempts: ProposalAttempts,
     effects: BTreeSet<ToolEffect>,
@@ -728,6 +730,7 @@ impl Refine<'_> {
             ceilings: self.ceilings.clone(),
             attempts: self.attempts,
             sample,
+            others: self.others(source),
         };
         let stage: Stage = match self
             .ctx
@@ -783,6 +786,7 @@ impl Refine<'_> {
             sample,
             seed: self.input.seed,
             probes: self.probed(stages),
+            others: self.others(source),
         };
         let composition: Composition = match self
             .ctx
@@ -818,6 +822,16 @@ impl Refine<'_> {
             probe: None,
             notes: composition.notes,
         }))
+    }
+
+    /// The profiles of each source other than `source`. A stage reply must
+    /// apply to each of them, so the run can carry it to any source.
+    fn others(&self, source: &SourceBrief) -> Vec<AgentProfile> {
+        self.sources
+            .iter()
+            .filter(|other| other.run != source.run)
+            .map(|other| other.profile.clone())
+            .collect()
     }
 
     /// The probed candidates of `stages`, in that order.
@@ -1051,6 +1065,7 @@ pub async fn agent_refine(
     let mut run = Refine {
         ctx,
         input: &input,
+        sources: &start.sources,
         ceilings: start.ceilings.clone(),
         attempts: policy.proposal_attempts,
         effects: policy.probe_effects.clone(),

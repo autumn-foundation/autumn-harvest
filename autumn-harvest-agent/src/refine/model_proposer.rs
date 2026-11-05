@@ -599,6 +599,7 @@ mod tests {
             current: ProfileOverlay::default(),
             attempts: ProposalAttempts::default(),
             sample: 1,
+            others: Vec::new(),
         };
         let stage = run_stage(&harness, request).await.unwrap();
         assert_eq!(

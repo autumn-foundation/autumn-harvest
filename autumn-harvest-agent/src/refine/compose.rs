@@ -164,6 +164,10 @@ pub struct ComposeRequest {
     pub seed: u64,
     /// The probes of the round.
     pub probes: Vec<ProbedCandidate>,
+    /// The profiles of the other sources of the run. A valid reply applies
+    /// to each of them too.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub others: Vec<AgentProfile>,
 }
 
 /// The output of [`agent_refine_compose`].
@@ -367,6 +371,7 @@ pub(crate) async fn run_compose(
         current: &request.current,
         ceilings: &request.ceilings,
         attempts: request.attempts,
+        others: &request.others,
     };
     let edited = edit_stage(harness, &edit, &ask).await?;
     let (usage, cost_usd_micros) = total(&edited.charges);

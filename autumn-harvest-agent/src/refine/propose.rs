@@ -281,6 +281,10 @@ pub struct ProposeRequest {
     /// The sample number of the stage, from 1 (issue #2380).
     #[serde(default = "first_sample", skip_serializing_if = "is_first_sample")]
     pub sample: u32,
+    /// The profiles of the other sources of a refine run (issue #2380). A
+    /// valid reply applies to each of them too.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub others: Vec<AgentProfile>,
 }
 
 /// The sample of a request that names none.
@@ -419,6 +423,9 @@ pub(crate) struct Edit<'a> {
     pub ceilings: &'a Ceilings,
     /// The number of attempts.
     pub attempts: ProposalAttempts,
+    /// The profiles of the other sources of the run. A reply must apply to
+    /// each of them too, so a carried overlay fits each later source.
+    pub others: &'a [AgentProfile],
 }
 
 /// The end of one stage.
@@ -510,6 +517,7 @@ pub(crate) async fn run_stage_metered(
         ceilings,
         attempts,
         sample,
+        others,
     } = request;
     let ask = ProposeAsk {
         proposer: proposer.as_ref(),
@@ -525,6 +533,7 @@ pub(crate) async fn run_stage_metered(
         current: &current,
         ceilings: &ceilings,
         attempts,
+        others: &others,
     };
     let edited = edit_stage(harness, &edit, &ask).await?;
     let (usage, cost_usd_micros) = total(&edited.charges);
@@ -565,6 +574,7 @@ pub(crate) async fn edit_stage(
     let cap = harness.result_cap();
     let check = Check {
         profile: edit.profile,
+        others: edit.others,
         ceilings: edit.ceilings,
         registry: harness,
         base: with_named_model(base),
@@ -686,6 +696,8 @@ fn with_named_model(mut profile: AgentProfile) -> AgentProfile {
 /// The inputs that check one reply.
 struct Check<'a> {
     profile: &'a AgentProfile,
+    /// The profiles of the other sources of the run.
+    others: &'a [AgentProfile],
     ceilings: &'a Ceilings,
     registry: &'a AgentHarness,
     /// The profile under `current`, with its model named.
@@ -705,6 +717,11 @@ impl Check<'_> {
         };
         let applied = overlay::apply(self.profile, &overlay, self.ceilings, self.registry)
             .map_err(|err| format!("the overlay is refused: {err}"))?;
+        for other in self.others {
+            overlay::apply(other, &overlay, self.ceilings, self.registry).map_err(|err| {
+                format!("the overlay is refused for another source of the run: {err}")
+            })?;
+        }
         if with_named_model(applied) == self.base {
             return Ok(None);
         }
@@ -862,6 +879,7 @@ mod tests {
             current,
             attempts: ProposalAttempts::new(attempts).unwrap(),
             sample: 1,
+            others: Vec::new(),
         }
     }
 
