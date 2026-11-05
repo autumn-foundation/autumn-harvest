@@ -339,14 +339,9 @@ pub async fn build_queue_coverage_report(
     let declared = runtime
         .as_ref()
         .map(|runtime| declared_queues(runtime.queues(), filter.as_deref()));
-    let writable: BTreeSet<i32> = runtime.as_ref().map_or_else(BTreeSet::new, |runtime| {
-        runtime
-            .router()
-            .writable_shards()
-            .iter()
-            .map(|shard| shard.as_i32())
-            .collect()
-    });
+    let writable: BTreeSet<i32> = runtime
+        .as_ref()
+        .map_or_else(BTreeSet::new, |runtime| placement_shards(runtime.router()));
 
     let futures = expected_shards
         .iter()
@@ -382,6 +377,18 @@ pub async fn build_queue_coverage_report(
         .flatten()
         .map(merge_queue_name_sets);
     report
+}
+
+/// The shards that take new runs (issue #2479).
+///
+/// These are the writable shards. With none, `ShardRouter` places each new
+/// run on the default shard, so that shard counts.
+fn placement_shards(router: &autumn_harvest::shard::ShardRouter) -> BTreeSet<i32> {
+    let writable = router.writable_shards();
+    if writable.is_empty() {
+        return BTreeSet::from([router.default_shard().as_i32()]);
+    }
+    writable.iter().map(|shard| shard.as_i32()).collect()
 }
 
 /// The declared queues that `shard_id` must poll (issue #2479).
@@ -1180,6 +1187,27 @@ mod tests {
             declared_queues(&["a".to_owned(), "b".to_owned()], Some("b")),
             vec!["b".to_owned()]
         );
+    }
+
+    /// Issue #2479: the shards that take new runs. With no writable shard,
+    /// the router places new runs on the default shard.
+    #[test]
+    fn placement_falls_back_to_the_default_shard() {
+        use autumn_harvest::shard::ShardRouter;
+        use autumn_harvest::types::ShardId;
+
+        let router = ShardRouter::new(
+            vec![ShardId::new(0), ShardId::new(1)],
+            vec![ShardId::new(1)],
+            ShardId::new(0),
+        );
+        assert_eq!(placement_shards(&router), BTreeSet::from([1]));
+        let drained = ShardRouter::new(
+            vec![ShardId::new(0), ShardId::new(1)],
+            Vec::new(),
+            ShardId::new(1),
+        );
+        assert_eq!(placement_shards(&drained), BTreeSet::from([1]));
     }
 
     /// Issue #2479: with no runtime, the list is unknown, not empty. An

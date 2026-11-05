@@ -195,6 +195,20 @@ ignore = [
     # its parking_lot 0.11 dependency, or instant gains a maintained fork.
     { id = "RUSTSEC-2024-0384", reason = "unmaintained, no safe upgrade exists; reached only through dev-runtime-managed (local `cargo dev` tooling), off by default and never shipped. Revisit: postgresql_archive moves off parking_lot 0.11, or instant is forked/revived." },
 
+    # RUSTSEC-2026-0440: astral-tokio-tar 0.6.4 is unmaintained. It reports
+    # no vulnerability, and no safe upgrade exists. testcontainers 0.27 pulls
+    # it. Only tests use testcontainers: the dev-dependencies here, and the
+    # `test-support` feature of autumn-web, which only those dev-dependencies
+    # turn on. No release build holds it. Revisit: testcontainers moves to a
+    # maintained tar crate.
+    { id = "RUSTSEC-2026-0440", reason = "unmaintained, no safe upgrade exists; reached only through testcontainers in tests and autumn-web's test-support feature, never in a release build. Revisit: testcontainers moves to a maintained tar crate." },
+
+    # RUSTSEC-2026-0441: pin-utils 0.1.1 is unmaintained. It reports no
+    # vulnerability, and no safe upgrade exists. `std::pin::pin!` replaces it.
+    # Code here does not use it. loom, the AWS SDK and wasmtimer pull it.
+    # Revisit: those crates move to `std::pin::pin!`.
+    { id = "RUSTSEC-2026-0441", reason = "unmaintained, no safe upgrade exists; no vulnerability. A transitive dependency of loom, the AWS SDK and wasmtimer, not used directly here. Revisit: those crates move to std::pin::pin!." },
+
     # RUSTSEC-2026-0098 / -0099 / -0104 (rustls-webpki 0.101.7) and the
     # h2@0.3.27 half of RUSTSEC-2026-0258 — FIXED, not deferred. All four
     # traced to the same root cause, previously mis-scoped in this file as

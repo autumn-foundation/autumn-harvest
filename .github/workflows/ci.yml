@@ -2243,8 +2243,9 @@ jobs:
         run: cargo run -p autumn-harvest-cli --bin harvest -- new demo_app --path "${RUNNER_TEMP}/scaffold"
       - name: Build the scaffolded project against the release candidates
         # Harvest 0.8 is not available on crates.io until this release lands.
-        # Patch only the two workspace crates under test; autumn-web 0.9 still
+        # Patch only the two workspace crates under test; autumn-web still
         # resolves from crates.io, just as it will for users of `harvest new`.
+        # The template names the autumn-web series of the plugin in this tree.
         run: |
           cargo build --manifest-path "${RUNNER_TEMP}/scaffold/Cargo.toml" \
             --config 'patch.crates-io.autumn-harvest.path="autumn-harvest"' \
