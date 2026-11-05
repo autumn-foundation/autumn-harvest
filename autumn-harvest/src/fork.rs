@@ -1031,6 +1031,9 @@ async fn admit_fork(
     let Some(policy) = policy else {
         return Ok(None);
     };
+    // The operator override of the caps applies to the history check below
+    // too (issue #2408).
+    let policy = crate::run_defaults::current_quota_policy(name, policy);
     let key = match &request.input {
         Some(input) => crate::quota::resolve_quota_key(policy.key_expr, input),
         None => {

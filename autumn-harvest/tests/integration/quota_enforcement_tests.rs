@@ -106,7 +106,7 @@ use crate::integration_e2e::{
 // Shared harness
 // ---------------------------------------------------------------------------
 
-async fn connect(url: &str) -> AsyncPgConnection {
+pub async fn connect(url: &str) -> AsyncPgConnection {
     AsyncPgConnection::establish(url)
         .await
         .expect("connect to test database")
@@ -115,11 +115,11 @@ async fn connect(url: &str) -> AsyncPgConnection {
 /// A unique workflow-type name per test — the registry and
 /// [`GLOBAL_WORKFLOW_METADATA`] are process-global, so every test needs its
 /// own namespace to avoid cross-test interference.
-fn leaked(prefix: &str) -> &'static str {
+pub fn leaked(prefix: &str) -> &'static str {
     Box::leak(format!("{prefix}_{}", Uuid::new_v4().simple()).into_boxed_str())
 }
 
-fn wf_meta(quota: QuotaPolicy) -> WorkflowMetadata {
+pub fn wf_meta(quota: QuotaPolicy) -> WorkflowMetadata {
     WorkflowMetadata {
         concurrency: None,
         max_input_bytes: None,
@@ -152,7 +152,7 @@ static TEST_SERIAL: LazyLock<tokio::sync::Mutex<()>> =
     LazyLock::new(|| tokio::sync::Mutex::new(()));
 
 /// Take [`TEST_SERIAL`] for the rest of the calling test. Call it first.
-async fn serial() -> tokio::sync::MutexGuard<'static, ()> {
+pub async fn serial() -> tokio::sync::MutexGuard<'static, ()> {
     TEST_SERIAL.lock().await
 }
 
@@ -162,12 +162,12 @@ async fn serial() -> tokio::sync::MutexGuard<'static, ()> {
 ///
 /// It does not lock [`TEST_SERIAL`] itself. The calling test already holds
 /// that lock through [`serial`], and a `tokio` mutex is not re-entrant.
-struct MetadataGuard {
+pub struct MetadataGuard {
     previous: Option<HashMap<String, WorkflowMetadata>>,
 }
 
 impl MetadataGuard {
-    fn install(map: HashMap<String, WorkflowMetadata>) -> Self {
+    pub fn install(map: HashMap<String, WorkflowMetadata>) -> Self {
         let previous = {
             let mut lock = GLOBAL_WORKFLOW_METADATA.write().expect("metadata lock");
             lock.take()
@@ -180,7 +180,7 @@ impl MetadataGuard {
     }
 
     /// Convenience for the common single-workflow-type case.
-    fn install_one(workflow_name: &'static str, quota: QuotaPolicy) -> Self {
+    pub fn install_one(workflow_name: &'static str, quota: QuotaPolicy) -> Self {
         let mut map = HashMap::new();
         map.insert(workflow_name.to_string(), wf_meta(quota));
         Self::install(map)
@@ -199,7 +199,7 @@ impl Drop for MetadataGuard {
 /// production default, mirroring `cross_type_continue_as_new_tests.rs`'s
 /// `start_root` literal exactly (so this stays a faithful production shape,
 /// not a hand-trimmed one).
-fn params<'a>(
+pub fn params<'a>(
     workflow_name: &'a str,
     workflow_id: &'a str,
     exec_id: ExecutionId,
@@ -255,7 +255,7 @@ fn params<'a>(
 /// pre-generated candidate `exec_id` alongside the outcome so a REJECTED
 /// attempt can still be checked for "no row exists under this id" (the
 /// `Err` variant itself carries no `exec_id`).
-async fn try_start(
+pub async fn try_start(
     conn: &mut AsyncPgConnection,
     workflow_name: &str,
     workflow_id: &str,
@@ -276,7 +276,7 @@ async fn try_start(
 
 /// A fresh, uniquely-`workflow_id`'d start that must succeed — the common
 /// case in every test below.
-async fn start_ok(
+pub async fn start_ok(
     conn: &mut AsyncPgConnection,
     workflow_name: &str,
     input: serde_json::Value,
@@ -287,7 +287,7 @@ async fn start_ok(
     exec_id
 }
 
-async fn count_rows(conn: &mut AsyncPgConnection, sql: &str, binds: &[&str]) -> i64 {
+pub async fn count_rows(conn: &mut AsyncPgConnection, sql: &str, binds: &[&str]) -> i64 {
     #[derive(diesel::QueryableByName)]
     struct Count {
         #[diesel(sql_type = diesel::sql_types::BigInt)]
@@ -370,7 +370,11 @@ async fn task_scheduled_at_after_a_retry_cycle(
     }
 }
 
-async fn active_count(conn: &mut AsyncPgConnection, workflow_name: &str, quota_key: &str) -> i64 {
+pub async fn active_count(
+    conn: &mut AsyncPgConnection,
+    workflow_name: &str,
+    quota_key: &str,
+) -> i64 {
     count_rows(
         conn,
         "SELECT COUNT(*)::BIGINT AS n FROM harvest_workflow_executions \
@@ -385,7 +389,7 @@ async fn active_count(conn: &mut AsyncPgConnection, workflow_name: &str, quota_k
 /// REJECTED replace rolls back the whole transaction, including the seal of
 /// the row being replaced (it must still read its pre-replace state, never
 /// left half-sealed).
-async fn row_state(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> String {
+pub async fn row_state(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> String {
     #[derive(diesel::QueryableByName)]
     struct State {
         #[diesel(sql_type = diesel::sql_types::Text)]
@@ -438,7 +442,7 @@ async fn assert_no_task_row(conn: &mut AsyncPgConnection, exec_id: ExecutionId) 
     );
 }
 
-async fn mark_terminal(conn: &mut AsyncPgConnection, exec_id: ExecutionId, state: &str) {
+pub async fn mark_terminal(conn: &mut AsyncPgConnection, exec_id: ExecutionId, state: &str) {
     diesel::sql_query(
         "UPDATE harvest_workflow_executions SET state = $1, completed_at = NOW() WHERE id = $2",
     )
@@ -460,7 +464,7 @@ async fn mark_terminal(conn: &mut AsyncPgConnection, exec_id: ExecutionId, state
 /// shape. `current` is checked via a caller-supplied predicate rather than
 /// exact equality where the value is implementation-detail-fragile (e.g.
 /// `pg_column_size` byte counts).
-fn assert_quota_exceeded(
+pub fn assert_quota_exceeded(
     err: &HarvestError,
     expected_workflow_name: &str,
     expected_key: &str,
@@ -1011,7 +1015,7 @@ fn phase_two<'a>(
     Box::pin(async move { Ok(serde_json::json!({"ran": "phase_two", "input": input})) })
 }
 
-fn wf_info(name: &'static str, handler: WorkflowHandlerFn) -> WorkflowInfo {
+pub fn wf_info(name: &'static str, handler: WorkflowHandlerFn) -> WorkflowInfo {
     WorkflowInfo {
         quota: None,
         declared_activities: None,
@@ -1066,11 +1070,14 @@ fn act_info(name: &'static str, handler: ActivityHandlerFn) -> ActivityInfo {
     }
 }
 
-fn registry(infos: Vec<WorkflowInfo>) -> Arc<HandlerRegistry> {
+pub fn registry(infos: Vec<WorkflowInfo>) -> Arc<HandlerRegistry> {
     Arc::new(HandlerRegistry::new(infos, vec![]))
 }
 
-async fn load_execution(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> WorkflowExecution {
+pub async fn load_execution(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+) -> WorkflowExecution {
     harvest_workflow_executions::table
         .find(exec_id.as_uuid())
         .select(WorkflowExecution::as_select())
@@ -1115,7 +1122,7 @@ async fn drive_transition(
 /// Start a root execution through the real start path (not the direct
 /// `try_start`/`params` helpers above, since the worker needs a genuinely
 /// dispatchable task -- `quota_key` resolution is identical either way).
-async fn start_root(
+pub async fn start_root(
     conn: &mut AsyncPgConnection,
     workflow_name: &str,
     workflow_id: &str,
@@ -1282,7 +1289,7 @@ async fn continue_as_new_cross_type_to_no_quota_workflow_clears_quota_key() {
 // type's tenant-quota footprint is an orthogonal concern this exercises.
 // ---------------------------------------------------------------------------
 
-fn detached_quota_parent<'a>(
+pub fn detached_quota_parent<'a>(
     ctx: &'a WorkflowContext,
     input: serde_json::Value,
 ) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
@@ -1305,7 +1312,7 @@ fn detached_quota_parent<'a>(
     })
 }
 
-fn detached_quota_child<'a>(
+pub fn detached_quota_child<'a>(
     _ctx: &'a WorkflowContext,
     _input: serde_json::Value,
 ) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {

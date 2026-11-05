@@ -89,6 +89,7 @@
 //! See `docs/agent-adapter.md` for the whole pattern.
 
 pub mod agent;
+pub mod answer_check;
 pub mod approval;
 pub mod bounds;
 pub mod consolidate;
@@ -153,6 +154,9 @@ pub use agent::{
     agent_profile_info, agent_profile_overlay, agent_profile_overlay_info, agent_workspace_floor,
     agent_workspace_floor_info, agent_workspace_reset, agent_workspace_reset_info,
     agent_workspace_retain, agent_workspace_retain_info,
+};
+pub use answer_check::{
+    AnswerCheck, CheckAdmission, CheckRequest, agent_answer_check, agent_answer_check_info,
 };
 pub use approval::Approval;
 pub use consolidate::{

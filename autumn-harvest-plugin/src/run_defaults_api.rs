@@ -1,12 +1,13 @@
 //! `GET` and `PATCH /admin/workflow-types/{workflow_name}/run-defaults`
-//! (issues #2387, #2406 and #2407).
+//! (issues #2387, #2406, #2407 and #2408).
 //!
-//! The routes read and change the operator override of the `sla`, the
-//! `execution_timeout`, the `chain_execution_timeout` and the concurrency
-//! `limit` of one workflow type. A DAG uses its own name. A DAG declares no
-//! chain cap, so the route refuses a chain cap for a DAG. The override lives on
-//! the default shard. See [`autumn_harvest::run_defaults`] for the precedence
-//! and the cache.
+//! The routes read and change the operator override of one workflow type.
+//! It holds the `sla`, the `execution_timeout`, the
+//! `chain_execution_timeout`, the concurrency `limit` and the three quota
+//! admission caps. A DAG uses its own name. A DAG declares no chain cap, so
+//! the route refuses a chain cap for a DAG. The override lives on the default
+//! shard. See [`autumn_harvest::run_defaults`] for the precedence and the
+//! cache.
 //!
 //! A change reaches new starts in this process at once, through a write
 //! through to the cache. Other processes see it within their refresh period.
@@ -20,6 +21,11 @@
 //! a stored cap. It refuses a limit for a type with no concurrency policy. It
 //! also refuses a limit for a latest-wins type, because a later drop of that
 //! limit cancels runs in flight.
+//!
+//! A change to a quota cap applies to the next admission, in every process
+//! within its refresh period. Each admission reads the caps again, so no row
+//! changes and no run ends. The route refuses a quota cap for a type with no
+//! quota admission cap, because its starts lock no key.
 
 use std::time::Duration;
 
@@ -29,6 +35,7 @@ use autumn_harvest::audit::{
 use autumn_harvest::concurrency::ConcurrencyPolicy;
 use autumn_harvest::error::HarvestError;
 use autumn_harvest::models::NewAuditRecord;
+use autumn_harvest::quota::{QuotaLimits, QuotaLimitsPatch, QuotaPolicy};
 use autumn_harvest::run_defaults::{
     RUN_DEFAULTS_TTL, RunDefaultChange, RunDefaultFields, RunDefaultOverride, RunDefaultPatch,
     get_run_default_override, raise_waiting_concurrency_caps, recompute_in_flight_sla,
@@ -60,6 +67,12 @@ pub struct RunDefaultSecs {
     pub chain_execution_timeout_secs: Option<u64>,
     /// The concurrency limit of a new start, a count (issue #2407).
     pub concurrency_limit: Option<u32>,
+    /// The quota cap on the active runs of one key (issue #2408).
+    pub quota_max_active_executions: Option<u32>,
+    /// The quota cap on the history bytes of one key (issue #2408).
+    pub quota_max_history_bytes: Option<u64>,
+    /// The quota cap on the dead letters of one key (issue #2408).
+    pub quota_max_dead_letters: Option<u32>,
 }
 
 impl From<RunDefaultFields> for RunDefaultSecs {
@@ -69,6 +82,9 @@ impl From<RunDefaultFields> for RunDefaultSecs {
             execution_timeout_secs: fields.execution_timeout.map(|d| d.as_secs()),
             chain_execution_timeout_secs: fields.chain_execution_timeout.map(|d| d.as_secs()),
             concurrency_limit: fields.concurrency_limit,
+            quota_max_active_executions: fields.quota.max_active_executions,
+            quota_max_history_bytes: fields.quota.max_history_bytes,
+            quota_max_dead_letters: fields.quota.max_dead_letters,
         }
     }
 }
@@ -84,6 +100,15 @@ pub struct RunDefaultOverrideView {
     pub chain_execution_timeout_secs: Option<u64>,
     /// The concurrency limit that the override sets, if any (issue #2407).
     pub concurrency_limit: Option<u32>,
+    /// The quota cap on active runs that the override sets, if any (issue
+    /// #2408).
+    pub quota_max_active_executions: Option<u32>,
+    /// The quota cap on history bytes that the override sets, if any (issue
+    /// #2408).
+    pub quota_max_history_bytes: Option<u64>,
+    /// The quota cap on dead letters that the override sets, if any (issue
+    /// #2408).
+    pub quota_max_dead_letters: Option<u32>,
     /// The operator's stated reason.
     pub reason: Option<String>,
     /// The actor that last changed the override.
@@ -100,6 +125,9 @@ impl From<RunDefaultOverride> for RunDefaultOverrideView {
             execution_timeout_secs: secs.execution_timeout_secs,
             chain_execution_timeout_secs: secs.chain_execution_timeout_secs,
             concurrency_limit: secs.concurrency_limit,
+            quota_max_active_executions: secs.quota_max_active_executions,
+            quota_max_history_bytes: secs.quota_max_history_bytes,
+            quota_max_dead_letters: secs.quota_max_dead_letters,
             reason: stored.reason,
             updated_by: stored.updated_by,
             updated_at: stored.updated_at,
@@ -172,6 +200,12 @@ pub struct RunDefaultsPatchRequest {
     chain_execution_timeout_secs: Option<Option<u64>>,
     #[serde(default, deserialize_with = "deserialize_tristate")]
     concurrency_limit: Option<Option<u32>>,
+    #[serde(default, deserialize_with = "deserialize_tristate")]
+    quota_max_active_executions: Option<Option<u32>>,
+    #[serde(default, deserialize_with = "deserialize_tristate")]
+    quota_max_history_bytes: Option<Option<u64>>,
+    #[serde(default, deserialize_with = "deserialize_tristate")]
+    quota_max_dead_letters: Option<Option<u32>>,
     #[serde(default)]
     clear_override: bool,
     reason: Option<String>,
@@ -187,6 +221,16 @@ impl RunDefaultsPatchRequest {
             sla: to_duration(self.sla_secs),
             chain_execution_timeout: to_duration(self.chain_execution_timeout_secs),
             concurrency_limit: self.concurrency_limit,
+            quota: self.quota_patch(),
+        }
+    }
+
+    /// The quota part of the patch (issue #2408).
+    const fn quota_patch(&self) -> QuotaLimitsPatch {
+        QuotaLimitsPatch {
+            max_active_executions: self.quota_max_active_executions,
+            max_history_bytes: self.quota_max_history_bytes,
+            max_dead_letters: self.quota_max_dead_letters,
         }
     }
 
@@ -195,6 +239,7 @@ impl RunDefaultsPatchRequest {
             && self.execution_timeout_secs.is_none()
             && self.chain_execution_timeout_secs.is_none()
             && self.concurrency_limit.is_none()
+            && self.quota_patch().is_empty()
             && !self.clear_override
             && !self.recompute_in_flight
     }
@@ -228,6 +273,10 @@ fn code_fields(runtime: &HarvestApiRuntime, workflow_name: &str) -> Option<RunDe
             sla: info.sla,
             chain_execution_timeout: info.chain_execution_timeout,
             concurrency_limit: info.concurrency.map(|policy| policy.limit),
+            quota: info
+                .quota
+                .map(|policy| QuotaLimits::of(&policy))
+                .unwrap_or_default(),
         }),
         None if runtime.is_registered_dag(workflow_name) => Some(RunDefaultFields::default()),
         None => None,
@@ -243,13 +292,38 @@ fn code_policy(runtime: &HarvestApiRuntime, workflow_name: &str) -> Option<Concu
         .and_then(|info| info.concurrency)
 }
 
+/// The code quota policy of a type (issue #2408). A DAG declares none.
+fn code_quota(runtime: &HarvestApiRuntime, workflow_name: &str) -> Option<QuotaPolicy> {
+    runtime
+        .registry()
+        .workflows
+        .get(workflow_name)
+        .and_then(|info| info.quota)
+}
+
+/// The code policies that an override applies to.
+#[derive(Debug, Clone, Copy)]
+struct CodePolicies {
+    concurrency: Option<ConcurrencyPolicy>,
+    quota: Option<QuotaPolicy>,
+}
+
+impl CodePolicies {
+    fn of(runtime: &HarvestApiRuntime, workflow_name: &str) -> Self {
+        Self {
+            concurrency: code_policy(runtime, workflow_name),
+            quota: code_quota(runtime, workflow_name),
+        }
+    }
+}
+
 /// The values that a new run takes: the override, then code.
 ///
-/// `policy` is the code concurrency policy. A latest-wins policy takes the
-/// larger limit, as at start.
+/// A latest-wins concurrency policy keeps its code limit, as at start. A
+/// quota policy with no admission cap keeps its code caps, as at admission.
 fn effective_fields(
     code: RunDefaultFields,
-    policy: Option<ConcurrencyPolicy>,
+    policies: CodePolicies,
     stored: Option<&RunDefaultOverride>,
 ) -> RunDefaultFields {
     let Some(stored) = stored else {
@@ -262,8 +336,13 @@ fn effective_fields(
         chain_execution_timeout: stored.fields.apply_chain(code.chain_execution_timeout),
         concurrency_limit: stored
             .fields
-            .apply_concurrency(policy)
+            .apply_concurrency(policies.concurrency)
             .map(|policy| policy.limit),
+        quota: stored
+            .fields
+            .apply_quota(policies.quota)
+            .map(|policy| QuotaLimits::of(&policy))
+            .unwrap_or_default(),
     }
 }
 
@@ -277,11 +356,11 @@ struct Reports {
 fn view(
     workflow_name: &str,
     code: RunDefaultFields,
-    policy: Option<ConcurrencyPolicy>,
+    policies: CodePolicies,
     stored: Option<RunDefaultOverride>,
     reports: Reports,
 ) -> RunDefaultsView {
-    let effective = effective_fields(code, policy, stored.as_ref());
+    let effective = effective_fields(code, policies, stored.as_ref());
     RunDefaultsView {
         workflow_name: workflow_name.to_string(),
         code: code.into(),
@@ -309,11 +388,11 @@ pub async fn get_run_defaults(
     let stored = get_run_default_override(&mut conn, &workflow_name)
         .await
         .map_err(map_error)?;
-    let policy = code_policy(&runtime, &workflow_name);
+    let policies = CodePolicies::of(&runtime, &workflow_name);
     Ok(Json(view(
         &workflow_name,
         code,
-        policy,
+        policies,
         stored,
         Reports::default(),
     )))
@@ -545,6 +624,25 @@ fn refuse_concurrency_limit(
     })
 }
 
+/// The reason to refuse the quota caps of a request, if any (issue #2408).
+///
+/// A type with no quota admission cap stamps and locks no key for one. So a
+/// cap that an override adds could not apply on every path. A `null` sets no
+/// cap, so it is never refused.
+fn refuse_quota_caps(
+    request: &RunDefaultsPatchRequest,
+    policy: Option<QuotaPolicy>,
+) -> Option<String> {
+    if !request.quota_patch().sets_any() || policy.is_some_and(|p| p.has_any_cap()) {
+        return None;
+    }
+    Some(
+        "the type declares no quota admission cap (max_active_executions, \
+         max_history_bytes or max_dead_letters), so quota_max_* is refused"
+            .to_string(),
+    )
+}
+
 /// `PATCH /admin/workflow-types/{workflow_name}/run-defaults`.
 pub async fn patch_run_defaults(
     Extension(api_state): Extension<HarvestApiState>,
@@ -563,8 +661,9 @@ pub async fn patch_run_defaults(
     let request = match request {
         Ok(Json(request)) if request.is_empty() => Err(String::from(
             "empty patch: set sla_secs, execution_timeout_secs, \
-             chain_execution_timeout_secs, concurrency_limit, clear_override or \
-             recompute_in_flight",
+             chain_execution_timeout_secs, concurrency_limit, \
+             quota_max_active_executions, quota_max_history_bytes, \
+             quota_max_dead_letters, clear_override or recompute_in_flight",
         )),
         Ok(Json(request)) => Ok(request),
         Err(rejection) => Err(format!("invalid request body: {}", rejection.body_text())),
@@ -591,8 +690,10 @@ pub async fn patch_run_defaults(
         audit_patch(&mut conn, ctx, &workflow_name, Some(summary)).await?;
         return Err(AutumnError::bad_request_msg(summary));
     }
-    let policy = code_policy(&runtime, &workflow_name);
-    if let Some(summary) = refuse_concurrency_limit(&request, policy) {
+    let policies = CodePolicies::of(&runtime, &workflow_name);
+    let refusal = refuse_concurrency_limit(&request, policies.concurrency)
+        .or_else(|| refuse_quota_caps(&request, policies.quota));
+    if let Some(summary) = refusal {
         audit_patch(&mut conn, ctx, &workflow_name, Some(&summary)).await?;
         return Err(AutumnError::bad_request_msg(summary));
     }
@@ -628,7 +729,7 @@ pub async fn patch_run_defaults(
     // Holding this one would starve a small pool.
     drop(conn);
 
-    let effective = effective_fields(code, policy, stored.as_ref());
+    let effective = effective_fields(code, policies, stored.as_ref());
     let recompute = if request.recompute_in_flight {
         let job = ShardJob::Recompute {
             code_sla: code.sla,
@@ -643,7 +744,7 @@ pub async fn patch_run_defaults(
     } else {
         None
     };
-    let concurrency_raise = match (policy, effective.concurrency_limit) {
+    let concurrency_raise = match (policies.concurrency, effective.concurrency_limit) {
         (Some(policy), Some(limit)) if request.touches_concurrency_limit() => {
             Some(raise_on_every_shard(&api_state, &pool, &workflow_name, policy, limit).await?)
         }
@@ -653,5 +754,5 @@ pub async fn patch_run_defaults(
         recompute,
         concurrency_raise,
     };
-    Ok(Json(view(&workflow_name, code, policy, stored, reports)))
+    Ok(Json(view(&workflow_name, code, policies, stored, reports)))
 }
