@@ -273,23 +273,23 @@ network namespace. SMT and swap give warnings.
 ### The guest image
 
 ```sh
-scripts/sandbox/build-guest-image.sh /var/lib/harvest/image
+cargo xtask sandbox build-guest-image /var/lib/harvest/image
 ```
 
-The script writes `vmlinux`, `rootfs.ext4` and `image.sha256`. It builds
+The command writes `vmlinux`, `rootfs.ext4` and `image.sha256`. It builds
 them in a stage directory first, so a failed build keeps the old image. A
-failed final rename puts the old files back. When that fails too, the script
+failed final rename puts the old files back. When that fails too, the command
 keeps the old files in a backup directory and names it. The root file system is a
 container image, `python:3.12-alpine` with `bash` and `nodejs` by default,
 plus the guest agent at `/sbin/harvest-guest-agent`. The image controls its
-links, so the script resolves `/sbin` and each directory it makes inside the
+links, so the command resolves `/sbin` and each directory it makes inside the
 image, as a chroot would. No image link can take a root write to the host. Set
-`BASE_IMAGE` for another image, and pin it by digest. Run the script as root,
+`BASE_IMAGE` for another image, and pin it by digest. Run the command as root,
 or install `fakeroot`, so root owns the files in the image.
 
-The kernel comes from the Firecracker CI artifacts. The script pins a default
+The kernel comes from the Firecracker CI artifacts. The command pins a default
 kernel by its SHA-256 digest and checks the digest on each build. For another
-kernel, set `KERNEL_URL` and `KERNEL_SHA256` together. The script refuses a
+kernel, set `KERNEL_URL` and `KERNEL_SHA256` together. The command refuses a
 `KERNEL_URL` without a digest.
 
 A jailed launcher also needs root to own `vmlinux` and `rootfs.ext4` on the
@@ -318,11 +318,11 @@ it runs. So the backend checks the image again after each run. After a write,
 the run returns a config error and no outcome. The watch needs one inotify instance per
 launcher. A full `fs.inotify` limit fails the launcher start as a config error.
 
-The pin holds a shared `flock` on each image directory while it links. The
-script holds an exclusive `flock` on the output directory while it renames,
+The pin holds a shared `flock` on each image directory while it links. The publish
+command holds an exclusive `flock` on the output directory while it renames,
 and so does a snapshot publish. So a launcher never pins half a publish. A
-tool that publishes in another way must take the same lock. The script needs
-`flock` from util-linux.
+tool that publishes in another way must take the same lock. The publish
+command takes the lock with the `flock` system call.
 
 The guest agent is process 1. It mounts `/proc`, `/sys`, the cgroup v2 file
 system, `/dev`, `/tmp` and a `/work` tmpfs. It listens on vsock port 52. Each
@@ -549,7 +549,7 @@ weekly. It builds the guest image and runs the ignored KVM tests. Run them on
 a KVM host like this:
 
 ```sh
-scripts/sandbox/build-guest-image.sh /tmp/image
+cargo xtask sandbox build-guest-image /tmp/image
 HARVEST_FIRECRACKER_BIN=/usr/local/bin/firecracker \
   HARVEST_GUEST_KERNEL=/tmp/image/vmlinux HARVEST_GUEST_ROOTFS=/tmp/image/rootfs.ext4 \
   cargo test -p autumn-harvest --no-default-features --features sandbox-activities --lib \
