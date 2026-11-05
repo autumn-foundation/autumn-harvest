@@ -7,6 +7,7 @@
 //! its floor in `.github/ci/coverage-baseline.json`.
 
 use std::collections::BTreeSet;
+use std::fmt::Write as _;
 
 use super::ci_run_coverage::{
     DRAFT_SKIP, SHELL_OPERATORS, alerts_on_scheduled_failure, dated_nightly, job_needs,
@@ -426,14 +427,12 @@ fn db_step_check_rejects_a_broken_run() {
 #[test]
 fn build_check_rejects_a_lost_binary() {
     let job = |scripts: &[&[&str]]| {
-        let body: String = scripts
-            .iter()
-            .enumerate()
-            .map(|(i, lines)| {
-                let lines = lines.join("\n        ");
-                format!("  - name: s{i}\n    run: |\n        {lines}\n")
-            })
-            .collect();
+        let mut body = String::new();
+        for (i, lines) in scripts.iter().enumerate() {
+            let lines = lines.join("\n        ");
+            write!(body, "  - name: s{i}\n    run: |\n        {lines}\n")
+                .expect("writing to a String cannot fail");
+        }
         let text = format!("steps:\n{body}");
         builds_xtask_first(&parse_workflow_text(&text).expect("synthetic job must parse"))
     };

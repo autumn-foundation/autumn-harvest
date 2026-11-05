@@ -213,8 +213,10 @@ fn the_image_script_pins_its_default_kernel_by_digest() {
     let kernel = source
         .split_once("struct Kernel {")
         .and_then(|(_, rest)| rest.split_once('}'))
-        .map(|(body, _)| body)
-        .unwrap_or_else(|| panic!("{IMAGE_MODULE} must define `struct Kernel`"));
+        .map_or_else(
+            || panic!("{IMAGE_MODULE} must define `struct Kernel`"),
+            |(body, _)| body,
+        );
     assert!(
         kernel.contains("sha256: String,"),
         "{IMAGE_MODULE} must check the kernel digest on every path: {kernel}"
