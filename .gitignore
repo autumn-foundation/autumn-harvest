@@ -29,7 +29,7 @@ clients/typescript/*.tgz
 # following the docs verbatim leaves the checkout dirty with a database that
 # — once run against a real key — holds every prompt, tool input, and file
 # the agent read. Guarded by
-# scripts/check-agentd-runtime-artifacts-ignored.sh.
+# `cargo xtask check agentd-runtime-artifacts-ignored`.
 /agentd.db*
 /agentd.sock*
 

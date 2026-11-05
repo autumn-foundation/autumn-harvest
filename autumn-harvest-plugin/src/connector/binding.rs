@@ -793,7 +793,7 @@ mod tests {
         // cluster or a recreated topic" section. Ignore this function's
         // own indentation when comparing the two.
         //
-        // scripts/check-broker-connector-cutover-example.sh checks for
+        // `cargo xtask check broker-connector-cutover-example` checks for
         // drift between the doc and this test. A real compile of this
         // test enforces the doc's correctness. CI's `connector` lib-test
         // job runs it on every change. No regex offers the same guarantee.
