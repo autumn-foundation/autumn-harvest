@@ -1775,10 +1775,9 @@ async fn a_template1_backend_blocks_create_database_but_ours_does_not() {
 ///
 /// `#[ignore]`d on purpose: this is a one-shot evidence-capture tool, not a
 /// repeatable CI assertion — its output is read by a human reviewing the PR,
-/// not asserted on. See
-/// `cargo xtask perf queue-pause-claim`, which runs this
-/// exact test twice — once against the pre-fix shape of `queue.rs`, once
-/// against the current tree — to produce the paired
+/// not asserted on. See `cargo xtask perf queue-pause-claim`. It runs this
+/// exact test twice: once against the pre-fix shape of `queue.rs`, and once
+/// against the current tree. The two runs produce the paired
 /// `docs/perf-artifacts/queue-pause-claim-anti-join/` files the PR cites.
 ///
 /// Self-detects which shape it is currently measuring by inspecting
@@ -4495,10 +4494,9 @@ async fn zz_capture_sticky_routing_claim_evidence() {
 ///
 /// `#[ignore]`d on purpose: this is a one-shot evidence-capture tool, not a
 /// repeatable CI assertion — its output is read by a human reviewing the PR,
-/// not asserted on. See
-/// `cargo xtask perf concurrency-key-claim`, which runs
-/// this exact test twice — once against the pre-fix shape of `queue.rs`, once
-/// against the current tree — to produce the paired
+/// not asserted on. See `cargo xtask perf concurrency-key-claim`. It runs
+/// this exact test twice: once against the pre-fix shape of `queue.rs`, and
+/// once against the current tree. The two runs produce the paired
 /// `docs/perf-artifacts/concurrency-key-claim-predicate/` files the PR cites.
 ///
 /// Self-detects which shape it is currently measuring by inspecting

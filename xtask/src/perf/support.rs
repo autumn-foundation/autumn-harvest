@@ -941,6 +941,36 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn toggle_stashes_an_uncommitted_fix_and_pops_it_with_the_index() {
+        // The staged fix plus an unstaged edit. `git diff --quiet` sees the
+        // unstaged edit, so the command takes the stash path.
+        let (dir, ctx, toggle) = scratch_repo(&["pre-fix query\n"]);
+        fs::write_string(ctx.path(QUEUE_RS), "MARKER staged\n").unwrap();
+        git(&ctx.root, &["add", QUEUE_RS]);
+        fs::write_string(ctx.path(QUEUE_RS), "MARKER staged\nunstaged\n").unwrap();
+        let code = run_toggle(&ctx, &toggle).unwrap();
+        assert_eq!(code, ExitCode::SUCCESS);
+        let seen_before = fs::read_string(dir.path().join("seen-before")).unwrap();
+        assert_eq!(seen_before, "pre-fix query\n");
+        assert_eq!(
+            fs::read_string(ctx.path(QUEUE_RS)).unwrap(),
+            "MARKER staged\nunstaged\n"
+        );
+        assert_eq!(
+            git(&ctx.root, &["status", "--porcelain"]),
+            "MM autumn-harvest/src/queue.rs\n"
+        );
+        assert_eq!(
+            git(&ctx.root, &["show", &format!(":{QUEUE_RS}")]),
+            "MARKER staged\n"
+        );
+        assert_eq!(git(&ctx.root, &["stash", "list"]), "");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn toggle_restores_a_fully_staged_fix_from_the_index() {
+        // `git diff --quiet` compares the tree with the index only. So a
+        // staged fix takes the history path, as it did in the shell.
         let (dir, ctx, toggle) = scratch_repo(&["pre-fix query\n"]);
         fs::write_string(ctx.path(QUEUE_RS), "MARKER staged\n").unwrap();
         git(&ctx.root, &["add", QUEUE_RS]);
@@ -956,7 +986,6 @@ mod tests {
             git(&ctx.root, &["status", "--porcelain"]),
             "M  autumn-harvest/src/queue.rs\n"
         );
-        assert_eq!(git(&ctx.root, &["stash", "list"]), "");
     }
 
     #[cfg(unix)]

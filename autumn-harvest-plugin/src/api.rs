@@ -43657,19 +43657,19 @@ async fn db_conn_for_dag(
 /// Postgres cannot know the threshold is already satisfied until it has
 /// counted every single matching row, so a workflow with 500,000 recorded
 /// events pays to have all 500,000 counted merely to answer "yes, that's
-/// `>= 10,000`". Profiled on a 5.3M-row `harvest_events` fixture (5,000
-/// ordinary executions plus 15 long-running ones with 50k-450k events each;
-/// `cargo xtask perf history-bloat`, artifacts
-/// committed under `docs/perf-artifacts/history-bloat-filter/`):
+/// `>= 10,000`". The profile uses a 5.3M-row `harvest_events` fixture. It
+/// holds 5,000 ordinary executions plus 15 long-running ones with 50k-450k
+/// events each. `cargo xtask perf history-bloat` builds it, and the
+/// artifacts are under `docs/perf-artifacts/history-bloat-filter/`. There,
 /// `(SELECT COUNT(*) ...) >= 10000` against a 448,175-event execution reads
-/// 3,976 total buffers (`pg_stat_statements.total_buffers`, corroborated by
-/// `EXPLAIN (ANALYZE, BUFFERS)` showing `shared hit=6 read=3970`) via a
-/// Parallel Index Only Scan in this fixture's current state, but the access
-/// path Postgres picks for the unbounded scan is sensitive to whether the
-/// table's visibility map is fresh -- see
-/// `docs/performance-history-bloat-filter.md#the-problem` for a fixture state
-/// in which the identical query instead read 158,593 buffers via a Parallel
-/// Seq Scan. What is *not* sensitive to that: `COUNT(*)` has no early exit
+/// 3,976 total buffers via a Parallel Index Only Scan. That figure is
+/// `pg_stat_statements.total_buffers`. `EXPLAIN (ANALYZE, BUFFERS)` agrees
+/// with `shared hit=6 read=3970`. This holds in the current state of the
+/// fixture. The access path that Postgres picks for the unbounded scan
+/// depends on whether the visibility map of the table is fresh.
+/// `docs/performance-history-bloat-filter.md#the-problem` shows a fixture
+/// state in which the identical query read 158,593 buffers via a Parallel
+/// Seq Scan instead. What is *not* sensitive to that: `COUNT(*)` has no early exit
 /// regardless of which access path answers it, so every one of the 448,175
 /// matching rows still has to be visited to confirm the threshold.
 ///

@@ -263,6 +263,19 @@ fn percent(part: u128, whole: u128) -> f64 {
     (100 * part) as f64 / whole as f64
 }
 
+/// Returns the frame at `index`, as the Python list index `ftbl[index]` did.
+///
+/// A negative index counts from the end of the table, as it does in Python.
+fn frame_at<'a>(ftbl: &[&'a str], index: i64) -> Option<&'a str> {
+    let position = if index < 0 {
+        let back = usize::try_from(index.unsigned_abs()).ok()?;
+        ftbl.len().checked_sub(back)?
+    } else {
+        usize::try_from(index).ok()?
+    };
+    ftbl.get(position).copied()
+}
+
 fn field<'a>(value: &'a Value, key: &str) -> Result<&'a Value> {
     value
         .get(key)
@@ -309,10 +322,8 @@ pub fn write_report(dhat: &Value, out: &mut String) -> Result<()> {
             .context("\"fs\" is not an array")?
             .iter()
             .map(|index| {
-                let index = index.as_u64().context("a frame index is not an integer")?;
-                usize::try_from(index)
-                    .ok()
-                    .and_then(|index| ftbl.get(index).copied())
+                let index = index.as_i64().context("a frame index is not an integer")?;
+                frame_at(&ftbl, index)
                     .with_context(|| format!("frame index {index} is out of range"))
             })
             .collect::<Result<_>>()?;
@@ -521,6 +532,20 @@ serde_json_elsewhere call sites:
             serde_json::from_str(r#"{"ftbl": ["a"], "pps": [{"tb": 1, "tbk": 1, "fs": [3]}]}"#)
                 .unwrap();
         assert!(report(&dhat).is_err());
+    }
+
+    #[test]
+    fn a_negative_frame_index_counts_from_the_end_as_in_python() {
+        let ftbl = ["a", "b", "c"];
+        assert_eq!(frame_at(&ftbl, -1), Some("c"));
+        assert_eq!(frame_at(&ftbl, -3), Some("a"));
+        assert_eq!(frame_at(&ftbl, -4), None);
+        assert_eq!(frame_at(&ftbl, 2), Some("c"));
+        assert_eq!(frame_at(&ftbl, 3), None);
+        let dhat: Value =
+            serde_json::from_str(r#"{"ftbl": ["a"], "pps": [{"tb": 1, "tbk": 1, "fs": [-1]}]}"#)
+                .unwrap();
+        assert!(report(&dhat).unwrap().contains("other_uncategorized"));
     }
 
     #[test]

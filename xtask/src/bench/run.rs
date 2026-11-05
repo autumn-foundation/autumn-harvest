@@ -42,6 +42,14 @@ pub fn utc_stamp() -> String {
     time::format(&time::now(), "%Y%m%dT%H%M%SZ")
 }
 
+/// Runs `program` with its output discarded, and reports whether it succeeded.
+///
+/// This is the shell probe `if ! program args >/dev/null 2>&1`. A program
+/// that is not on `PATH` fails the probe, as it did in the shell.
+pub fn probe(program: &str, args: &[&str]) -> bool {
+    sh::cmd(program).args(args).success().unwrap_or(false)
+}
+
 /// Tears the topology down on exit, unless `HARVEST_BENCH_KEEP=1`.
 struct Topology {
     compose_file: PathBuf,
@@ -74,7 +82,7 @@ pub fn run(_args: Args) -> Result<ExitCode> {
     let benchmarks = ctx.path("benchmarks");
     let compose_file = benchmarks.join("docker-compose.yml");
 
-    if !sh::cmd("docker").args(["compose", "version"]).success()? {
+    if !probe("docker", &["compose", "version"]) {
         eprintln!("docker compose is required: see https://docs.docker.com/compose/install/");
         return Ok(ExitCode::FAILURE);
     }
@@ -149,6 +157,13 @@ mod tests {
             report_path(dir, Some("/tmp/out.md".into()), "x.md"),
             PathBuf::from("/tmp/out.md")
         );
+    }
+
+    #[test]
+    fn probe_fails_for_a_missing_program() {
+        assert!(probe("sh", &["-c", "exit 0"]));
+        assert!(!probe("sh", &["-c", "exit 3"]));
+        assert!(!probe("xtask-surely-missing-program", &["version"]));
     }
 
     #[test]

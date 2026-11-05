@@ -25,7 +25,7 @@ use std::process::{Command, ExitCode, Stdio};
 
 use smop::prelude::*;
 
-use super::run::{report_path, utc_stamp};
+use super::run::{probe, report_path, utc_stamp};
 use crate::perf::broken_session_scan::support::{self, Ctx};
 
 /// How many one-second readiness probes to try before the bench starts anyway.
@@ -60,7 +60,7 @@ pub fn run(_args: Args) -> Result<ExitCode> {
     let name = format!("harvest-notify-bench-{}", std::process::id());
     let port = support::var_or("HARVEST_NOTIFY_BENCH_PORT", "55440");
 
-    if !sh::cmd("docker").arg("version").success()? {
+    if !probe("docker", &["version"]) {
         eprintln!("docker is required: see https://docs.docker.com/get-docker/");
         return Ok(ExitCode::FAILURE);
     }
@@ -80,8 +80,9 @@ pub fn run(_args: Args) -> Result<ExitCode> {
     }
     // The init server listens on a socket only. So a TCP check waits for the real one.
     for _ in 0..READY_ATTEMPTS {
-        let ready = sh::cmd("docker")
-            .args([
+        let ready = probe(
+            "docker",
+            &[
                 "exec",
                 &container.name,
                 "pg_isready",
@@ -89,8 +90,8 @@ pub fn run(_args: Args) -> Result<ExitCode> {
                 "127.0.0.1",
                 "-U",
                 "postgres",
-            ])
-            .success()?;
+            ],
+        );
         if ready {
             break;
         }
