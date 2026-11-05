@@ -183,7 +183,7 @@ remaining cost is the algorithm's inherent work — SipHash lookups in
   (`clippy::stable_sort_primitive` on a test's `Vec<&str>::sort()`, newly
   flagged because the element type changed from `String` to `&str`) is
   fixed (`sort_unstable()`).
-* `python3 docs/audits/comment-hygiene.py --base origin/trunk-dev` — see PR.
+* `cargo xtask audit comment-hygiene --base origin/trunk-dev` — see PR.
 
 ## 🔬 Reproduce
 

@@ -159,7 +159,7 @@ Well clear of the ≥5%-of-workload floor too.
   targets (`dead_code` in `replay_profile_support.rs`, `missing_const_for_fn`
   in `critical_path_profile.rs`) that reproduce identically on
   `origin/trunk-dev` with no changes applied.
-* `python3 docs/audits/comment-hygiene.py --base origin/trunk-dev` — clean,
+* `cargo xtask audit comment-hygiene --base origin/trunk-dev` — clean,
   no Tier A findings, no Tier B regressions.
 
 ## 🔬 Reproduce

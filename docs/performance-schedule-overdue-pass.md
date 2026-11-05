@@ -219,7 +219,7 @@ target with `pg_stat_statements` preloaded.
 ## Verification
 
 - `cargo fmt --all` — clean.
-- `python3 docs/audits/comment-hygiene.py --base origin/trunk-dev` — no
+- `cargo xtask audit comment-hygiene --base origin/trunk-dev` — no
   Tier A findings, no Tier B regressions.
 - `cargo clippy -p autumn-harvest --no-default-features --features db
   --all-targets -- -D warnings` — fails on six pre-existing errors in
