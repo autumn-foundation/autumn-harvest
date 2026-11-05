@@ -155,6 +155,13 @@ mod signals {
 impl Shield {
     /// Ignores the deferred signals until the shield drops.
     #[must_use]
+    #[cfg_attr(
+        not(unix),
+        allow(
+            clippy::missing_const_for_fn,
+            reason = "only the Unix body makes a call that is not const"
+        )
+    )]
     pub fn raise() -> Self {
         #[cfg(unix)]
         {

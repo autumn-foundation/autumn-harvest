@@ -612,6 +612,13 @@ fn python_text(bytes: &[u8]) -> Result<String> {
 }
 
 /// The signal that ended a process, as Python reports it.
+#[cfg_attr(
+    not(unix),
+    allow(
+        clippy::missing_const_for_fn,
+        reason = "only the Unix body makes a call that is not const"
+    )
+)]
 fn signal_of(status: std::process::ExitStatus) -> Option<i32> {
     #[cfg(unix)]
     {

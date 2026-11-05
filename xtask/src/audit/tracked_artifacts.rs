@@ -16,9 +16,7 @@
 //! Usage: `cargo xtask audit tracked-artifacts [--self-test]`.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::OsStr;
 use std::io::Read;
-use std::os::unix::ffi::OsStrExt;
 use std::process::ExitCode;
 
 use smop::prelude::*;
@@ -79,6 +77,25 @@ fn findings(
     Ok(found)
 }
 
+/// Turns the raw path bytes of `git ls-files -z` into a path.
+///
+/// On Unix a path is bytes, so each byte is kept. Git for Windows prints
+/// paths as UTF-8, so the bytes decode as UTF-8 there.
+#[cfg(unix)]
+fn os_path(raw: &[u8]) -> std::path::PathBuf {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt as _;
+    OsStr::from_bytes(raw).into()
+}
+
+/// Turns the raw path bytes of `git ls-files -z` into a path.
+///
+/// Git for Windows prints paths as UTF-8, so the bytes decode as UTF-8.
+#[cfg(not(unix))]
+fn os_path(raw: &[u8]) -> std::path::PathBuf {
+    String::from_utf8_lossy(raw).into_owned().into()
+}
+
 /// Returns the first bytes of a regular file, or `None` to skip it.
 ///
 /// A path that cannot be examined, such as a file that the work tree lacks,
@@ -86,7 +103,7 @@ fn findings(
 /// that cannot be read is an error. Python raised there, so the gate failed
 /// closed. A silent skip would pass a binary file that it never read.
 fn read_head(path: &TrackedPath) -> Result<Option<Vec<u8>>> {
-    let full = repo_root().join(OsStr::from_bytes(&path.raw));
+    let full = repo_root().join(os_path(&path.raw));
     // A symlink holds a path, and a gitlink is a directory.
     let Ok(meta) = std::fs::symlink_metadata(&full) else {
         return Ok(None);

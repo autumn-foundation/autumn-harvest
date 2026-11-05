@@ -139,6 +139,13 @@ fn fail<T>(message: impl fmt::Display) -> Result<T> {
 }
 
 /// The exit code of `status`, as a shell reports it.
+#[cfg_attr(
+    not(unix),
+    allow(
+        clippy::unnecessary_lazy_evaluations,
+        reason = "only the Unix closure reads the status"
+    )
+)]
 fn exit_of(status: ExitStatus) -> Exit {
     let code = status.code().or_else(|| {
         #[cfg(unix)]
