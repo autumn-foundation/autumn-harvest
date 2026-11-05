@@ -594,13 +594,15 @@ pub async fn a_token_for_another_audience_is_refused(backend: &impl OidcBackend)
 pub async fn an_old_session_must_log_in_again(backend: &impl OidcBackend) {
     let idp = start_idp().await;
     set_claims(&idp, json!({ "groups": ["support"] }));
+    // The age is raised to the two-second minimum. A session then lasts at
+    // least one real second, so the first request always gets in.
     let login = login(&idp).with_max_session_age(Duration::from_secs(1));
     let mut browser = Browser::new(backend.app(login));
     assert_eq!(browser.login().await.status, StatusCode::SEE_OTHER);
     let api = browser.get(&format!("{MOUNT}/workflows")).await;
     assert!(admitted(&api), "{} {}", api.status, api.body);
-    // The login time has a one-second resolution. Wait past two ticks.
-    tokio::time::sleep(Duration::from_millis(2100)).await;
+    // The login time has a one-second resolution. Wait past three ticks.
+    tokio::time::sleep(Duration::from_millis(3100)).await;
     let api = browser.get(&format!("{MOUNT}/workflows")).await;
     assert_eq!(api.status, StatusCode::UNAUTHORIZED);
 }
