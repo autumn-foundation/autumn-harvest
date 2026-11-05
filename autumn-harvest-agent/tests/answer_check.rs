@@ -757,3 +757,28 @@ async fn a_rejected_answer_is_never_delivered() {
     assert_eq!(sent.len(), 1);
     assert_eq!(sent[0].text, "The agent stopped early: answer_rejected.");
 }
+
+// A streamed run publishes the durable text of a checked answer only when
+// the answer passes. A reader that reconnects never reads a rejected answer.
+#[tokio::test]
+async fn a_streamed_run_publishes_no_durable_text_of_a_rejected_answer() {
+    let outcome = WorkflowTestEnv::new()
+        .mock_activity_retries("agent_answer_check", vec![Ok(admitted(1))])
+        .mock_activity_retries("agent_model_turn", vec![Ok(turn("not json"))])
+        .mock_activity_retries("agent_model_turn", vec![Ok(turn("{}"))])
+        .mock_activity_retries("agent_score", vec![Ok(json!({"reject": "not JSON"}))])
+        .mock_activity_retries("agent_score", vec![Ok(json!({"score": 1.0}))])
+        .run(
+            agent_loop_info().handler,
+            serde_json::to_value(task(1).stream()).unwrap(),
+        )
+        .await;
+    let report: AgentReport = serde_json::from_value(outcome.result.clone().unwrap()).unwrap();
+    assert_eq!(report.stop, AgentStop::Completed);
+    let shown: Vec<String> = outcome
+        .recorded_durable_progress()
+        .iter()
+        .map(|chunk| chunk.chunk["text"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(shown, ["{}"], "only the answer that passed");
+}

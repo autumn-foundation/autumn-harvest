@@ -2260,6 +2260,10 @@ returns `ErrorKind::Config`, and the model is not called.
 - A bound that ends the run after a retry does not report the rejected
   answer as the text.
 - The transcript keeps each rejected answer and each retry message.
+- With `stream`, the durable text of a final answer goes out only after
+  the answer passes the check. A reader that reconnects never reads a
+  rejected answer. The live token stream still shows each answer while it
+  streams.
 
 ### Safety and size
 

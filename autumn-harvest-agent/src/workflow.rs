@@ -799,7 +799,11 @@ pub(crate) async fn run_segment(
 
         progress.usage = progress.usage.saturating_add(turn.usage);
         progress.add_cost(turn.cost_usd_micros.unwrap_or(0));
-        publish_turn_text(ctx, run, progress, &turn)?;
+        // A run with an answer check publishes a final answer only after the
+        // check (issue #2442). A run with no check publishes each turn here.
+        if progress.check.is_none() || !turn.calls().is_empty() {
+            publish_turn_text(ctx, run, progress, &turn)?;
+        }
         // The activity drops a reply that does not fit the result cap. The
         // turn then holds no text and no calls, so the segment ends here.
         if turn.oversized {
@@ -811,7 +815,7 @@ pub(crate) async fn run_segment(
         let calls = turn.calls();
 
         if calls.is_empty() {
-            match Box::pin(answer_turn(ctx, task, progress, &turn, over_budget)).await? {
+            match Box::pin(answer_turn(ctx, run, progress, &turn, over_budget)).await? {
                 Some(stop) => return Ok(stop),
                 None => continue,
             }
@@ -893,14 +897,21 @@ async fn admit_check(
 /// `None` asks the model again. That is the reply to a save turn (issue
 /// #2453), or an answer that the check rejected within its cap (issue
 /// #2442). Only an answer that completes is checked.
+///
+/// With a check, the loop publishes the durable text of the turn here. A
+/// rejected or unchecked answer then never reaches the durable stream.
 async fn answer_turn(
     ctx: &WorkflowContext,
-    task: &AgentTask,
+    run: Run<'_>,
     progress: &mut Progress,
     turn: &ModelTurn,
     over_budget: bool,
 ) -> Result<Option<AgentStop>, String> {
+    let checked = progress.check.is_some();
     if save_reply(progress, turn, over_budget) {
+        if checked {
+            publish_turn_text(ctx, run, progress, turn)?;
+        }
         return Ok(None);
     }
     let narration = progress.last_text.clone();
@@ -908,11 +919,17 @@ async fn answer_turn(
     let answer = turn.text();
     let stop = answer_stop(turn, over_budget);
     if stop != AgentStop::Completed {
+        if checked {
+            publish_turn_text(ctx, run, progress, turn)?;
+        }
         progress.answer = Some(answer);
         return Ok(Some(stop));
     }
-    match answer_check::check(ctx, task, progress, &answer).await? {
+    match answer_check::check(ctx, run.task, progress, &answer).await? {
         Checked::Passed => {
+            if checked {
+                publish_turn_text(ctx, run, progress, turn)?;
+            }
             progress.answer = Some(answer);
             Ok(Some(stop))
         }
