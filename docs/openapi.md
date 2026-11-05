@@ -17,8 +17,8 @@ contract to canonical route list to document, and a test pins every link. See
 [Guarantees](#guarantees).
 
 The crate carries its own copy because a published crate can package no file
-from outside its own directory. `scripts/regenerate-openapi.sh` writes both
-copies from one transform, and a test fails when either drifts.
+from outside its own directory. `cargo xtask dev regenerate-openapi` writes
+both copies from one transform, and a test fails when either drifts.
 
 ## If your app already serves `/openapi.json`
 
@@ -146,7 +146,7 @@ compiles the workspace, which is the slow part; the client steps take seconds.
 ## Regenerate the artifacts
 
 ```sh
-scripts/regenerate-openapi.sh
+cargo xtask dev regenerate-openapi
 ```
 
 Run it whenever `docs/api-contract.json` changes. CI fails otherwise.
