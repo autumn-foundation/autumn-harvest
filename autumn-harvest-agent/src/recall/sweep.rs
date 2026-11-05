@@ -25,11 +25,14 @@ const FINGERPRINT_HEX: usize = 12;
 ///
 /// Each item runs on the agent `<config>/<item>.<fingerprint>`. The
 /// fingerprint hashes the item, the profile and the model id. With an
-/// overlay store, the profile is the one that the active overlay changes,
-/// so an activation gives new agents. Each op has
-/// the idempotency key `recall:<agent name>:<n>`. A rerun with the same
-/// inputs on the same database therefore calls no model for a finished
-/// item. A changed item, profile, overlay or model gets new agents.
+/// overlay store, it hashes the profile with the active overlay applied.
+/// An activation therefore gives new agents. Each op has the idempotency
+/// key `recall:<agent name>:<n>`. A rerun with the same inputs on the same
+/// database calls no model for a finished item. A changed item, profile,
+/// overlay or model gets new agents.
+///
+/// Do not activate an overlay while a sweep runs. The fingerprint reads the
+/// overlay once for each item, and each op reads it again.
 ///
 /// A model with no `model_id` has no stable identity. Its fingerprint also
 /// hashes the start time of the sweep, so each sweep gets new agents.
