@@ -54,21 +54,24 @@ pub fn run(_args: Args) -> Result<ExitCode> {
 ///
 /// Each line reads `<name>: bins=['a', 'b']`, the Python list form that the
 /// old guard printed. `None` means that the metadata has no package list.
+///
+/// `None` also means that a field is missing where the old Python parser
+/// raised a `KeyError`. Those fields are the `targets` of a package, the
+/// `kind` of a target and the `name` of a bin target. The old guard then
+/// failed closed. A target that the parser skips silently could hide a
+/// second binary.
 fn violations(metadata: &Value) -> Option<Vec<String>> {
     let packages = metadata.get("packages")?.as_array()?;
     let mut bad = Vec::new();
     for package in packages {
         let targets = package.get("targets")?.as_array()?;
-        let bins: Vec<&str> = targets
-            .iter()
-            .filter(|target| {
-                target
-                    .get("kind")
-                    .and_then(Value::as_array)
-                    .is_some_and(|kinds| kinds.iter().any(|kind| kind == "bin"))
-            })
-            .filter_map(|target| target.get("name").and_then(Value::as_str))
-            .collect();
+        let mut bins: Vec<&str> = Vec::new();
+        for target in targets {
+            let kinds = target.get("kind")?.as_array()?;
+            if kinds.iter().any(|kind| kind == "bin") {
+                bins.push(target.get("name")?.as_str()?);
+            }
+        }
         let default_run = package
             .get("default_run")
             .is_some_and(|value| value.as_str().is_some_and(|s| !s.is_empty()));
@@ -189,6 +192,26 @@ mod tests {
         assert!(report.stderr().contains("failing closed"));
         let report = evaluate(Some(&serde_json::json!({ "no": "packages" })));
         assert_eq!(report.code(), 1);
+    }
+
+    #[test]
+    fn a_target_without_a_name_or_kind_fails_closed() {
+        let nameless = serde_json::json!({ "packages": [{ "name": "p", "targets": [
+            { "kind": ["bin"] },
+            { "name": "b", "kind": ["bin"] },
+        ]}]});
+        let report = evaluate(Some(&nameless));
+        assert_eq!(report.code(), 1);
+        assert!(report.stderr().contains("failing closed"));
+        assert_eq!(report.stdout(), "");
+        let kindless = serde_json::json!({ "packages": [{ "name": "p", "targets": [
+            { "name": "lib" },
+        ]}]});
+        assert!(
+            evaluate(Some(&kindless))
+                .stderr()
+                .contains("failing closed")
+        );
     }
 
     #[test]

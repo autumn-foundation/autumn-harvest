@@ -48,11 +48,17 @@ pub fn run(_args: Args) -> Result<ExitCode> {
 
 /// Reads a file the way Python's `open()` does in text mode.
 ///
-/// Universal newlines turn `\r\n` and a lone `\r` into `\n`.
-fn read_text(path: &Path) -> Result<String> {
-    let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-    let text = String::from_utf8(bytes).with_context(|| format!("decoding {}", path.display()))?;
-    Ok(text.replace("\r\n", "\n").replace('\r', "\n"))
+/// Universal newlines turn `\r\n` and a lone `\r` into `\n`. The old guard
+/// read each file in a Python helper. A file that did not decode as UTF-8
+/// made that helper fail and print nothing. The guard then reported its
+/// normal "could not find" finding with exit code 1. So an unreadable file
+/// gives an empty text here, and the caller reports that same finding.
+fn read_text(path: &Path) -> String {
+    std::fs::read(path)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .map(|text| text.replace("\r\n", "\n").replace('\r', "\n"))
+        .unwrap_or_default()
 }
 
 /// Returns the whole body of the ```` ```rust ```` fence that holds the anchor.
@@ -114,7 +120,7 @@ fn evaluate(root: &Path) -> Result<Report> {
         }
     }
 
-    let doc = doc_block(&read_text(&root.join(DOC))?)?;
+    let doc = doc_block(&read_text(&root.join(DOC)))?;
     if doc.is_empty() {
         report.fail(format!(
             "{DOC}: could not find the cutover example's {ANCHOR} call; has the chapter been restructured? Update this guard (and the compiled copy in {SRC}) to match."
@@ -128,7 +134,7 @@ fn evaluate(root: &Path) -> Result<Report> {
         return Ok(report);
     }
 
-    let src = src_block(&read_text(&root.join(SRC))?)?;
+    let src = src_block(&read_text(&root.join(SRC)))?;
     if src.is_empty() {
         report.fail(format!(
             "{SRC}: could not find the // cutover-example-start ... // cutover-example-end markers in cutover_example_from_getting_started_ch13_type_checks; has the test moved or been renamed? Update this guard to match."
@@ -216,5 +222,46 @@ mod tests {
     fn src_block_dedents_by_the_common_indent_only() {
         let text = "  // cutover-example-start\n    a\n\n      b\n  // cutover-example-end\n";
         assert_eq!(src_block(text).expect("src"), "a\n\n  b");
+    }
+
+    #[test]
+    fn a_crlf_doc_still_matches() {
+        let dir = fixture(EXAMPLE, EXAMPLE);
+        let doc = dir.path().join(DOC);
+        let crlf = std::fs::read_to_string(&doc)
+            .expect("doc")
+            .replace('\n', "\r\n");
+        std::fs::write(&doc, crlf).expect("crlf");
+        let report = evaluate(dir.path()).expect("evaluate");
+        assert_eq!(report.code(), 0, "{}", report.stderr());
+    }
+
+    #[test]
+    fn a_file_that_is_not_utf8_is_a_finding_not_an_error() {
+        let dir = fixture(EXAMPLE, EXAMPLE);
+        let doc = dir.path().join(DOC);
+        let mut bytes = std::fs::read(&doc).expect("doc");
+        bytes.extend_from_slice(b"\xff\n");
+        std::fs::write(&doc, bytes).expect("bad doc");
+        let report = evaluate(dir.path()).expect("evaluate");
+        assert_eq!(report.code(), 1);
+        assert!(
+            report
+                .stderr()
+                .contains("could not find the cutover example's")
+        );
+
+        let dir = fixture(EXAMPLE, EXAMPLE);
+        let src = dir.path().join(SRC);
+        let mut bytes = std::fs::read(&src).expect("src");
+        bytes.extend_from_slice(b"// \xff\n");
+        std::fs::write(&src, bytes).expect("bad src");
+        let report = evaluate(dir.path()).expect("evaluate");
+        assert_eq!(report.code(), 1);
+        assert!(
+            report
+                .stderr()
+                .contains("could not find the // cutover-example-start")
+        );
     }
 }

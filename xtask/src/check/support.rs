@@ -206,12 +206,14 @@ pub fn window_from(text: &str, start: &str) -> String {
 /// Each entry holds the `./`-prefixed path that grep prints and the full
 /// path. The walk includes hidden directories and does not follow symlinks,
 /// like `grep -r`. It leaves out `./target/`, like the
-/// `grep -vE "^\./target/"` filter of the old guards. Grep lists files in
-/// directory order. The walk sorts them, so the output order is stable.
+/// `grep -vE "^\./target/"` filter of the old guards.
+///
+/// Grep walks the tree depth first and lists each directory in the order that
+/// the file system returns. The walk keeps that same order and does not sort.
+/// So a finding in two files prints in the same order as the old guard.
 pub fn markdown_files(root: &Path) -> Vec<(String, PathBuf)> {
     let mut found = Vec::new();
     for entry in walkdir::WalkDir::new(root)
-        .sort_by_file_name()
         .into_iter()
         .filter_map(std::result::Result::ok)
     {
@@ -224,11 +226,8 @@ pub fn markdown_files(root: &Path) -> Vec<(String, PathBuf)> {
         let shown = format!("./{}", relative.to_string_lossy());
         // `--include="*.md"` matches the name case-sensitively, and it also
         // matches a file named `.md`, which has no extension for `Path`.
-        #[allow(clippy::case_sensitive_file_extension_comparisons)]
-        let is_markdown = entry
-            .file_name()
-            .to_str()
-            .is_some_and(|name| name.ends_with(".md"));
+        // The match reads the raw bytes, so a name that is not UTF-8 counts.
+        let is_markdown = entry.file_name().as_encoded_bytes().ends_with(b".md");
         if is_markdown && !shown.starts_with("./target/") {
             found.push((shown, entry.path().to_path_buf()));
         }
@@ -423,6 +422,38 @@ mod tests {
         assert_eq!(report.stdout(), "ok\n");
         assert_eq!(report.stderr(), "bad\n");
         assert_eq!(report.code(), 1);
+    }
+
+    #[test]
+    fn markdown_files_match_the_grep_include_rule() {
+        let dir = fs::temp_dir().expect("temp dir");
+        for file in [
+            "a.md",
+            ".hidden/b.md",
+            "docs/target/c.md",
+            "docs/.md",
+            "target/d.md",
+            "e.MD",
+            "f.txt",
+        ] {
+            let full = dir.path().join(file);
+            std::fs::create_dir_all(full.parent().expect("parent")).expect("mkdir");
+            std::fs::write(full, "x").expect("write");
+        }
+        let mut shown: Vec<String> = markdown_files(dir.path())
+            .into_iter()
+            .map(|(shown, _)| shown)
+            .collect();
+        shown.sort();
+        assert_eq!(
+            shown,
+            [
+                "./.hidden/b.md",
+                "./a.md",
+                "./docs/.md",
+                "./docs/target/c.md"
+            ]
+        );
     }
 
     #[test]
