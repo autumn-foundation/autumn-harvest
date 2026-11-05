@@ -21,9 +21,11 @@
 //! The command fails in three cases. A result differs from its expectation,
 //! TLC fails for another reason, or a directory has no trace for a spec.
 //!
-//! The port reads JSON as Python does. An object keeps the order of its
-//! keys, and a repeated key keeps its first place and its last value. Each
-//! error names a value in the `repr` form of Python.
+//! The port reads JSON as the `json` module of Python 3.12 does. The
+//! [`py_json`] module holds that decoder. Each error names a value in the
+//! `repr` form of Python.
+
+mod py_json;
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -33,8 +35,8 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+use py_json::{Decode, Json, PyStr, str_repr};
 use regex::Regex;
-use serde::de::{self, Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
 use smop::prelude::*;
 
 /// Arguments of `cargo xtask dev formal-traces`.
@@ -117,244 +119,6 @@ const TLC_TIMEOUT_SECS: u64 = 900;
 
 /// TLC integers are 32-bit.
 const MAX_INT: i128 = (1 << 31) - 1;
-
-/// A JSON value as Python's `json.loads` returns it.
-#[derive(Debug, Clone, PartialEq)]
-enum Json {
-    Null,
-    Bool(bool),
-    Int(i128),
-    Float(f64),
-    Str(String),
-    List(Vec<Self>),
-    Dict(Vec<(String, Self)>),
-}
-
-impl Json {
-    /// The value under `key` of a dict, or `None`.
-    fn get(&self, key: &str) -> Option<&Self> {
-        match self {
-            Self::Dict(items) => items.iter().find(|(k, _)| k == key).map(|(_, v)| v),
-            _ => None,
-        }
-    }
-
-    /// The value under `key`, with `Null` for a missing key or a non-dict.
-    fn field(&self, key: &str) -> &Self {
-        self.get(key).unwrap_or(&Self::Null)
-    }
-
-    /// The string of a `Str`.
-    fn as_str(&self) -> Option<&str> {
-        match self {
-            Self::Str(text) => Some(text),
-            _ => None,
-        }
-    }
-
-    /// Python's `repr` of the value.
-    fn repr(&self) -> String {
-        match self {
-            Self::Null => "None".to_string(),
-            Self::Bool(true) => "True".to_string(),
-            Self::Bool(false) => "False".to_string(),
-            Self::Int(n) => n.to_string(),
-            Self::Float(x) => float_repr(*x),
-            Self::Str(text) => str_repr(text),
-            Self::List(items) => {
-                let items: Vec<String> = items.iter().map(Self::repr).collect();
-                format!("[{}]", items.join(", "))
-            }
-            Self::Dict(items) => {
-                let items: Vec<String> = items
-                    .iter()
-                    .map(|(k, v)| format!("{}: {}", str_repr(k), v.repr()))
-                    .collect();
-                format!("{{{}}}", items.join(", "))
-            }
-        }
-    }
-}
-
-impl<'de> Deserialize<'de> for Json {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        deserializer.deserialize_any(JsonVisitor)
-    }
-}
-
-/// Builds a [`Json`] from any serde input.
-struct JsonVisitor;
-
-impl<'de> Visitor<'de> for JsonVisitor {
-    type Value = Json;
-
-    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("a JSON value")
-    }
-
-    fn visit_unit<E: de::Error>(self) -> Result<Json, E> {
-        Ok(Json::Null)
-    }
-
-    fn visit_none<E: de::Error>(self) -> Result<Json, E> {
-        Ok(Json::Null)
-    }
-
-    fn visit_bool<E: de::Error>(self, value: bool) -> Result<Json, E> {
-        Ok(Json::Bool(value))
-    }
-
-    fn visit_i64<E: de::Error>(self, value: i64) -> Result<Json, E> {
-        Ok(Json::Int(i128::from(value)))
-    }
-
-    fn visit_u64<E: de::Error>(self, value: u64) -> Result<Json, E> {
-        Ok(Json::Int(i128::from(value)))
-    }
-
-    fn visit_f64<E: de::Error>(self, value: f64) -> Result<Json, E> {
-        Ok(Json::Float(value))
-    }
-
-    fn visit_str<E: de::Error>(self, value: &str) -> Result<Json, E> {
-        Ok(Json::Str(value.to_string()))
-    }
-
-    fn visit_string<E: de::Error>(self, value: String) -> Result<Json, E> {
-        Ok(Json::Str(value))
-    }
-
-    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Json, A::Error> {
-        let mut items = Vec::new();
-        while let Some(item) = seq.next_element()? {
-            items.push(item);
-        }
-        Ok(Json::List(items))
-    }
-
-    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Json, A::Error> {
-        let mut items: Vec<(String, Json)> = Vec::new();
-        while let Some((key, value)) = map.next_entry::<String, Json>()? {
-            // A Python dict keeps the first place of a key and its last value.
-            if let Some(slot) = items.iter_mut().find(|(k, _)| *k == key) {
-                slot.1 = value;
-            } else {
-                items.push((key, value));
-            }
-        }
-        Ok(Json::Dict(items))
-    }
-}
-
-/// Python's `repr` of a float.
-///
-/// Python prints the shortest digits that round trip. It uses an exponent
-/// when the exponent is below -4 or at least 16.
-fn float_repr(x: f64) -> String {
-    if x.is_nan() {
-        return "nan".to_string();
-    }
-    if x.is_infinite() {
-        return if x > 0.0 { "inf" } else { "-inf" }.to_string();
-    }
-    let sci = format!("{x:e}");
-    let (mantissa, exponent) = sci.split_once('e').unwrap_or((&sci, "0"));
-    let exponent: i32 = exponent.parse().unwrap_or(0);
-    let (sign, mantissa) = mantissa
-        .strip_prefix('-')
-        .map_or(("", mantissa), |m| ("-", m));
-    let digits: String = mantissa.chars().filter(char::is_ascii_digit).collect();
-    if (-4..16).contains(&exponent) {
-        let point = exponent + 1;
-        let text = if point <= 0 {
-            let zeros = "0".repeat(usize::try_from(-point).unwrap_or(0));
-            format!("0.{zeros}{digits}")
-        } else {
-            let point = usize::try_from(point).unwrap_or(0);
-            if digits.len() <= point {
-                format!("{digits}{}.0", "0".repeat(point - digits.len()))
-            } else {
-                format!("{}.{}", &digits[..point], &digits[point..])
-            }
-        };
-        return format!("{sign}{text}");
-    }
-    let (head, tail) = digits.split_at(1);
-    let body = if tail.is_empty() {
-        head.to_string()
-    } else {
-        format!("{head}.{tail}")
-    };
-    let mark = if exponent < 0 { '-' } else { '+' };
-    format!("{sign}{body}e{mark}{:02}", exponent.abs())
-}
-
-/// Python's `repr` of a string.
-///
-/// The quote is `'` unless the text holds `'` and no `"`. A character that
-/// Python does not print goes out as an escape. The test for that is close
-/// to `str.isprintable`, but it does not know unassigned code points.
-fn str_repr(text: &str) -> String {
-    let quote = if text.contains('\'') && !text.contains('"') {
-        '"'
-    } else {
-        '\''
-    };
-    let mut out = String::new();
-    out.push(quote);
-    for c in text.chars() {
-        match c {
-            '\\' => out.push_str("\\\\"),
-            '\t' => out.push_str("\\t"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            c if c == quote => {
-                out.push('\\');
-                out.push(c);
-            }
-            c if !is_printable(c) => {
-                let code = u32::from(c);
-                if code < 0x100 {
-                    let _ = write!(out, "\\x{code:02x}");
-                } else if code < 0x1_0000 {
-                    let _ = write!(out, "\\u{code:04x}");
-                } else {
-                    let _ = write!(out, "\\U{code:08x}");
-                }
-            }
-            c => out.push(c),
-        }
-    }
-    out.push(quote);
-    out
-}
-
-/// Close to Python's `str.isprintable` for one character.
-fn is_printable(c: char) -> bool {
-    if c == ' ' {
-        return true;
-    }
-    if c.is_control() || c.is_whitespace() {
-        return false;
-    }
-    // The format characters of Unicode category Cf that occur in practice.
-    !matches!(
-        c,
-        '\u{ad}'
-            | '\u{600}'..='\u{605}'
-            | '\u{61c}'
-            | '\u{6dd}'
-            | '\u{70f}'
-            | '\u{180e}'
-            | '\u{200b}'..='\u{200f}'
-            | '\u{202a}'..='\u{202e}'
-            | '\u{2060}'..='\u{2064}'
-            | '\u{2066}'..='\u{206f}'
-            | '\u{feff}'
-            | '\u{fff9}'..='\u{fffb}'
-            | '\u{e000}'..='\u{f8ff}'
-    )
-}
 
 /// A trace file that the command cannot check.
 #[derive(Debug)]
@@ -487,8 +251,12 @@ fn parse(p: &Patterns, path: &str, text: &str) -> Result<Trace, TraceError> {
         if is_blank(line) {
             return Err(TraceError(format!("{path}:{number}: blank line")));
         }
-        let row: Json = serde_json::from_str(line)
-            .map_err(|error| TraceError(format!("{path}:{number}: {error}")))?;
+        // A crash of Python also ended the script with exit code 1. Its
+        // traceback named the same exception.
+        let row = py_json::loads(line).map_err(|error| {
+            let (Decode::Invalid(text) | Decode::Crash(text)) = error;
+            TraceError(format!("{path}:{number}: {text}"))
+        })?;
         rows.push(row);
     }
     if rows.len() < 2 {
@@ -513,14 +281,16 @@ fn parse(p: &Patterns, path: &str, text: &str) -> Result<Trace, TraceError> {
     };
     let mut parsed = Vec::new();
     for (guard, expect) in checks {
-        let known = guards(spec).iter().any(|(name, _)| name == guard);
+        let known = guard
+            .as_str()
+            .filter(|g| guards(spec).iter().any(|(name, _)| name == g));
         let text = expect.as_str().filter(|e| p.expect.is_match(e));
-        match text {
-            Some(text) if known => parsed.push((guard.clone(), text.to_string())),
+        match (known, text) {
+            (Some(guard), Some(text)) => parsed.push((guard.to_string(), text.to_string())),
             _ => {
                 return Err(TraceError(format!(
                     "{path}: bad check {}: {}",
-                    str_repr(guard),
+                    guard.repr(),
                     expect.repr()
                 )));
             }
@@ -556,7 +326,7 @@ struct Step {
 /// The specs are symmetric in their workers, so the rename keeps the
 /// verdict. Equal traces then share one TLC run.
 fn normalize(lines: &[Json]) -> (Vec<Step>, Vec<String>) {
-    let mut names: Vec<(String, String)> = Vec::new();
+    let mut names: Vec<(PyStr, String)> = Vec::new();
     let mut name = |worker: &Json| -> String {
         let Json::Str(worker) = worker else {
             return String::new();
@@ -824,7 +594,17 @@ fn run_tlc(p: &Patterns, jar: &Path, run_dir: &str) -> Result<Outcome> {
     let code = status
         .code()
         .or_else(|| signal_of(status).map(|signal| -signal));
-    Ok(classify(p, code, &format!("{out}{err}")))
+    let log = format!("{}{}", python_text(&out)?, python_text(&err)?);
+    Ok(classify(p, code, &log))
+}
+
+/// The text of a pipe, as `subprocess.run(..., text=True)` reads it.
+///
+/// Python decodes the bytes as UTF-8 and fails on a bad byte. It then turns
+/// each `\r\n` and each lone `\r` into `\n`.
+fn python_text(bytes: &[u8]) -> Result<String> {
+    let text = std::str::from_utf8(bytes).context("decoding the TLC output as UTF-8")?;
+    Ok(text.replace("\r\n", "\n").replace('\r', "\n"))
 }
 
 /// The signal that ended a process, as Python reports it.
@@ -852,10 +632,9 @@ fn reader<R: std::io::Read + Send + 'static>(pipe: Option<R>) -> std::thread::Jo
     })
 }
 
-/// The text that a [`reader`] thread read.
-fn join_reader(handle: std::thread::JoinHandle<Vec<u8>>) -> String {
-    let bytes = handle.join().unwrap_or_default();
-    String::from_utf8_lossy(&bytes).into_owned()
+/// The bytes that a [`reader`] thread read.
+fn join_reader(handle: std::thread::JoinHandle<Vec<u8>>) -> Vec<u8> {
+    handle.join().unwrap_or_default()
 }
 
 /// The file line that TLC could not match, from the search depth.
@@ -1066,17 +845,24 @@ fn run_all(
 /// The string of a path as Python's `pathlib` prints it.
 ///
 /// `pathlib` drops empty and `.` parts. An empty path prints as `.`.
+/// POSIX gives a path that starts with exactly two slashes its own meaning,
+/// so `pathlib` keeps both of them.
 fn py_path(text: &str) -> String {
-    let absolute = text.starts_with('/');
+    let root = if text.starts_with("//") && !text.starts_with("///") {
+        "//"
+    } else if text.starts_with('/') {
+        "/"
+    } else {
+        ""
+    };
     let parts: Vec<&str> = text
         .split('/')
         .filter(|part| !part.is_empty() && *part != ".")
         .collect();
     let body = parts.join("/");
-    match (absolute, body.is_empty()) {
-        (true, _) => format!("/{body}"),
-        (false, true) => ".".to_string(),
-        (false, false) => body,
+    match (root, body.is_empty()) {
+        ("", true) => ".".to_string(),
+        _ => format!("{root}{body}"),
     }
 }
 
@@ -1084,7 +870,7 @@ fn py_path(text: &str) -> String {
 fn join(base: &str, name: &str) -> String {
     match base {
         "." | "" => name.to_string(),
-        "/" => format!("/{name}"),
+        "/" | "//" => format!("{base}{name}"),
         _ => format!("{base}/{name}"),
     }
 }
@@ -1253,19 +1039,58 @@ mod tests {
 
     #[test]
     fn repr_matches_python() {
-        let value: Json =
-            serde_json::from_str(r#"{"b":[1,-2.5,null,true],"a":"it's","b":{"x":"q\"'"}}"#)
-                .expect("parses");
+        let value = py_json::loads(r#"{"b":[1,-2.5,null,true],"a":"it's","b":{"x":"q\"'"}}"#)
+            .expect("parses");
         assert_eq!(value.repr(), r#"{'b': {'x': 'q"\''}, 'a': "it's"}"#);
         assert_eq!(str_repr("tab\there\u{1}\u{a0}é"), r"'tab\there\x01\xa0é'");
-        assert_eq!(float_repr(1.0), "1.0");
-        assert_eq!(float_repr(0.1), "0.1");
-        assert_eq!(float_repr(1e16), "1e+16");
-        assert_eq!(float_repr(1e15), "1000000000000000.0");
-        assert_eq!(float_repr(0.0001), "0.0001");
-        assert_eq!(float_repr(0.00001), "1e-05");
-        assert_eq!(float_repr(-1.5e-7), "-1.5e-07");
-        assert_eq!(float_repr(123.456), "123.456");
+    }
+
+    #[test]
+    fn json_numbers_keep_their_python_type() {
+        let attempt = |value: &str| {
+            let line = INIT.replace("\"attempt\":0", &format!("\"attempt\":{value}"));
+            parse(&patterns(), "t", &trace(&[HEADER, &line])).map(|_| ())
+        };
+        // Python reads `-0` as the int 0, which is a count.
+        assert!(attempt("-0").is_ok());
+        let error = |value: &str| attempt(value).err().map(|e| e.0);
+        assert_eq!(error("-0.0").as_deref(), Some("t:2: bad attempt -0.0"));
+        assert_eq!(error("NaN").as_deref(), Some("t:2: bad attempt nan"));
+        assert_eq!(
+            error("123456789012345678901234567890123456789012").as_deref(),
+            Some("t:2: bad attempt 123456789012345678901234567890123456789012")
+        );
+    }
+
+    #[test]
+    fn python_json_quirks_keep_a_trace_valid() {
+        // Python accepts each of these values in a field that the check
+        // does not read, so the trace stays valid.
+        for value in ["NaN", "-Infinity", "\"\\ud800\"", "1e400"] {
+            let header = HEADER.replace("\"checks\"", &format!("\"case\":{value},\"checks\""));
+            assert!(
+                parse(&patterns(), "t", &trace(&[&header, INIT])).is_ok(),
+                "{value}"
+            );
+        }
+        let lone = INIT.replace("\"worker\":null", "\"worker\":\"\\udc00\"");
+        assert!(parse(&patterns(), "t", &trace(&[HEADER, &lone])).is_ok());
+        let bad = INIT.replace("PENDING", "\\ud800");
+        assert_eq!(
+            parse(&patterns(), "t", &trace(&[HEADER, &bad]))
+                .err()
+                .map(|e| e.0),
+            Some("t:2: bad state '\\ud800'".to_string())
+        );
+        assert_eq!(
+            parse(&patterns(), "t", &trace(&[HEADER, "{\"op\":\"init\",}"]))
+                .err()
+                .map(|e| e.0),
+            Some(
+                "t:2: Expecting property name enclosed in double quotes: line 1 column 14 (char 13)"
+                    .to_string()
+            )
+        );
     }
 
     #[test]
@@ -1287,7 +1112,7 @@ mod tests {
             r#"{"op":"write","state":"RUNNING","worker":"bo","attempt":2,"strikes":0,"terminal":0,"actor":null,"by":"amy"}"#.to_string(),
         ]
         .iter()
-        .map(|l| serde_json::from_str(l).expect("parses"))
+        .map(|l| py_json::loads(l).expect("parses"))
         .collect();
         let (steps, workers) = normalize(&lines);
         assert_eq!(workers, ["w1", "w2", "w3"]);
@@ -1314,7 +1139,7 @@ mod tests {
                 .replace("\"strikes\":0", "\"strikes\":3"),
         ]
         .iter()
-        .map(|l| serde_json::from_str(l).expect("parses"))
+        .map(|l| py_json::loads(l).expect("parses"))
         .collect();
         let (steps, workers) = normalize(&lines);
         let model = model_text("WorkflowTaskClaim", &steps, &workers);
@@ -1384,7 +1209,7 @@ mod tests {
         assert!(!meets("accept", "error"));
         let lines: Vec<Json> = [INIT, &INIT.replace("init", "write")]
             .iter()
-            .map(|l| serde_json::from_str(l).expect("parses"))
+            .map(|l| py_json::loads(l).expect("parses"))
             .collect();
         let (steps, _) = normalize(&lines);
         assert_eq!(
@@ -1406,6 +1231,9 @@ mod tests {
         assert_eq!(py_path("./a//b/./"), "a/b");
         assert_eq!(py_path(""), ".");
         assert_eq!(py_path("/x/../y"), "/x/../y");
+        assert_eq!(py_path("//x/./y/"), "//x/y");
+        assert_eq!(py_path("///x"), "/x");
+        assert_eq!(join("//", "f"), "//f");
         assert_eq!(join(".", "f"), "f");
         assert_eq!(join("a", "f"), "a/f");
     }
@@ -1434,6 +1262,12 @@ mod tests {
         assert!(
             matches!(one, Err(TraceError(ref m)) if m.ends_with(": no trace for WorkflowTaskClaim"))
         );
+    }
+
+    #[test]
+    fn tlc_output_reads_as_python_text() {
+        assert_eq!(python_text(b"a\r\nb\rc\n").expect("utf-8"), "a\nb\nc\n");
+        assert!(python_text(b"\xff").is_err());
     }
 
     #[test]

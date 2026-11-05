@@ -229,13 +229,49 @@ impl fmt::Display for StepFailed {
 impl std::error::Error for StepFailed {}
 
 /// Runs one step with inherited stdio. A failed step ends the command.
+///
+/// A program that does not start fails as in the shell, with exit code 127
+/// or 126.
 pub fn step(command: sh::CommandBuilder) -> Result<()> {
-    let status = command.status()?;
+    let line = command.to_string();
+    let program = line
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .to_string();
+    let status = match command.status() {
+        Ok(status) => status,
+        Err(error) => {
+            let Some((code, reason)) = start_failure(&error, Path::new(&program)) else {
+                return Err(error);
+            };
+            eprintln!("{reason}");
+            return Err(StepFailed(code).into());
+        }
+    };
     if status.success() {
         Ok(())
     } else {
         Err(StepFailed(shell_code(status)).into())
     }
+}
+
+/// The shell exit code and message of a program that did not start.
+///
+/// The shell gives 127 for a missing program and 126 for one that it cannot
+/// run. The message is the text of the shell without the prefix of the
+/// script name and line. Another error gives `None`.
+pub fn start_failure(error: &smop::anyhow::Error, program: &Path) -> Option<(i32, String)> {
+    let io = error.root_cause().downcast_ref::<std::io::Error>()?;
+    let program = program.display().to_string();
+    let named = program.contains('/');
+    let (code, reason) = match io.kind() {
+        std::io::ErrorKind::NotFound if named => (NOT_FOUND, "No such file or directory"),
+        std::io::ErrorKind::NotFound => (NOT_FOUND, "command not found"),
+        std::io::ErrorKind::PermissionDenied => (126, "Permission denied"),
+        _ => return None,
+    };
+    Some((code, format!("{program}: {reason}")))
 }
 
 /// Maps a [`StepFailed`] error to the exit code of its step.
@@ -409,6 +445,27 @@ mod tests {
         assert_eq!(outcome.expect("mapped"), ExitCode::from(3));
         let other = finish(Err(anyhow!("plain")));
         assert!(other.is_err());
+    }
+
+    #[test]
+    fn a_program_that_does_not_start_fails_as_in_the_shell() {
+        let outcome = finish(step(sh::cmd("no-such-program-xtask")).map(|()| ExitCode::SUCCESS));
+        assert_eq!(outcome.expect("mapped"), ExitCode::from(127));
+        let denied = anyhow!(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        assert_eq!(
+            start_failure(&denied, Path::new("/x/verus")),
+            Some((126, "/x/verus: Permission denied".to_string()))
+        );
+        let missing = anyhow!(std::io::Error::from(std::io::ErrorKind::NotFound));
+        assert_eq!(
+            start_failure(&missing, Path::new("/x/verus")),
+            Some((127, "/x/verus: No such file or directory".to_string()))
+        );
+        assert_eq!(
+            start_failure(&missing, Path::new("cargo")),
+            Some((127, "cargo: command not found".to_string()))
+        );
+        assert_eq!(start_failure(&anyhow!("plain"), Path::new("x")), None);
     }
 
     #[test]

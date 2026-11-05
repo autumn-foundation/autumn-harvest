@@ -19,7 +19,9 @@ use std::process::ExitCode;
 use regex::Regex;
 use smop::prelude::*;
 
-use super::formal_models::{finish, grep_lines, step, tee_merged, verify_sha256};
+use super::formal_models::{
+    StepFailed, finish, grep_lines, start_failure, step, tee_merged, verify_sha256,
+};
 use crate::util::repo_path;
 
 /// The pinned Verus release.
@@ -98,8 +100,15 @@ fn check_proofs() -> Result<ExitCode> {
     } else {
         dir
     };
-    let version = fs::read_string(dir.join("version.json"))?;
-    let toolchain = toolchain(&version)?;
+    // The script read the toolchain with Python under `set -e`. A missing
+    // or bad version.json ended it with the exit code 1 of Python.
+    let toolchain = match fs::read_string(dir.join("version.json")).and_then(|v| toolchain(&v)) {
+        Ok(toolchain) => toolchain,
+        Err(error) => {
+            eprintln!("error: {error:#}");
+            return Err(StepFailed(1).into());
+        }
+    };
     step(sh::cmd("rustup").args(["toolchain", "install", &toolchain, "--profile", "minimal"]))?;
 
     let mut command = std::process::Command::new(&verus);
@@ -109,7 +118,19 @@ fn check_proofs() -> Result<ExitCode> {
         .arg(repo_path(CRATE_ROOT))
         .arg("--crate-type=lib")
         .env_remove("RUSTUP_TOOLCHAIN");
-    let (status, log) = tee_merged(&mut command)?;
+    let (status, log) = match tee_merged(&mut command) {
+        Ok(run) => run,
+        Err(error) => {
+            // The shell reports a program that does not start on the
+            // stderr of the pipe, so the message goes through `tee`.
+            let Some((code, reason)) = start_failure(&error, &verus) else {
+                return Err(error);
+            };
+            println!("{reason}");
+            eprintln!("verus exited {code}");
+            return Ok(ExitCode::FAILURE);
+        }
+    };
     let code = super::formal_models::shell_code(status);
     if code != 0 {
         eprintln!("verus exited {code}");

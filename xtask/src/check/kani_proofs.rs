@@ -8,12 +8,13 @@
 //! verifies fewer proofs than the source holds, for example when a feature
 //! that gates a proof is missing.
 
+use std::path::Path;
 use std::process::ExitCode;
 
 use regex::Regex;
 use smop::prelude::*;
 
-use super::formal_models::{StepFailed, finish, grep_lines, shell_code, tee_merged};
+use super::formal_models::{StepFailed, finish, grep_lines, shell_code, start_failure, tee_merged};
 use crate::util::repo_root;
 
 /// The Kani run. `formal_models_coverage.rs` reads this line.
@@ -97,7 +98,19 @@ fn check_proofs() -> Result<ExitCode> {
         .args(words)
         .current_dir(&root)
         .env_remove("RUSTUP_TOOLCHAIN");
-    let (status, log) = tee_merged(&mut command)?;
+    let (status, log) = match tee_merged(&mut command) {
+        Ok(run) => run,
+        Err(error) => {
+            // The shell reports a program that does not start on the
+            // stderr of the pipe. Under `pipefail` the script then ended
+            // with its exit code.
+            let Some((code, reason)) = start_failure(&error, Path::new(program)) else {
+                return Err(error);
+            };
+            println!("{reason}");
+            return Err(StepFailed(code).into());
+        }
+    };
     if !status.success() {
         return Err(StepFailed(shell_code(status)).into());
     }
