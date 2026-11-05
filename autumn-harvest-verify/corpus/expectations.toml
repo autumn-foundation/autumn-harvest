@@ -452,6 +452,14 @@ trace_contains = []
 
 [[workflow]]
 crate = "harvest-verify-corpus-clean"
+workflow = "harvest_verify_corpus_clean::wf_test_macro_names_type::wf_test_macro_names_type"
+verdict = "proven-deterministic"
+mechanism = "a Saga step captures a String, and a cfg(test) proptest! block names String (issue #2545)"
+launder = "n/a - a test-only macro that declares no type must not make String writable"
+trace_contains = []
+
+[[workflow]]
+crate = "harvest-verify-corpus-clean"
 workflow = "harvest_verify_corpus_clean::wf_try_on_clean_result::wf_try_on_clean_result"
 verdict = "proven-deterministic"
 mechanism = "`?` on a clean Result: a `switchInt` on a ControlFlow discriminant with sinks after it"
