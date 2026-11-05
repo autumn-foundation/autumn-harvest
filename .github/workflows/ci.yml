@@ -541,39 +541,39 @@ jobs:
         run: python3 docs/audits/config-cli-drift.py
 
       # Folio corpus harness: audit-catalog coverage scan (see
-      # docs/audits/audit-catalog-coverage.py). docs/audits/README.md is
+      # xtask/src/audit/audit_catalog_coverage.rs). docs/audits/README.md is
       # itself a docs page — the catalog a contributor reads to find out
-      # which audit scripts exist and whether each is wired into CI. This
-      # fails the build if a script lands in docs/audits/ without a row
-      # naming it there, so the catalog cannot silently fall behind the
-      # directory it describes. Pure Python stdlib, no deps, no network.
-      - name: Folio audit-catalog coverage (docs/audits/audit-catalog-coverage.py)
-        run: python3 docs/audits/audit-catalog-coverage.py
+      # which audit commands exist and whether each is wired into CI. This
+      # fails the build if a `cargo xtask audit` subcommand lands without a
+      # row naming it there, or a row names no subcommand, so the catalog
+      # cannot silently fall behind the commands it describes. No network.
+      - name: Folio audit-catalog coverage (cargo xtask audit audit-catalog-coverage)
+        run: cargo xtask audit audit-catalog-coverage
 
       # Issue #1831: a tracked binary or a patch leftover fails the build.
-      # The script lists the binaries that the repository needs.
-      - name: Tracked artifacts (docs/audits/tracked-artifacts.py)
+      # The command lists the binaries that the repository needs.
+      - name: Tracked artifacts (cargo xtask audit tracked-artifacts)
         run: |
-          python3 docs/audits/tracked-artifacts.py --self-test
-          python3 docs/audits/tracked-artifacts.py
+          cargo xtask audit tracked-artifacts --self-test
+          cargo xtask audit tracked-artifacts
 
       # Issue #2341: the authz.rs/tenant.rs tenant-header-validation clone
       # class is linked, not merged (2 instances, below the rule-of-three
       # merge bar). This substitutes for the abstraction the numerosity gate
       # did not clear: a fix landing in one copy and not the other fails here.
-      - name: Tenant-header-validation sync (docs/audits/tenant-header-validation-sync.py)
+      - name: Tenant-header-validation sync (cargo xtask audit tenant-header-validation-sync)
         run: |
-          python3 docs/audits/tenant-header-validation-sync.py --self-test
-          python3 docs/audits/tenant-header-validation-sync.py
+          cargo xtask audit tenant-header-validation-sync --self-test
+          cargo xtask audit tenant-header-validation-sync
 
       # Issue #2358: two copies of required_migration_versions exist, in
       # preflight.rs and shard_health.rs. Two copies are below the
       # rule-of-three merge bar, so the code links them and does not merge
       # them. This step fails when one copy changes and the other does not.
-      - name: Required-migration-versions sync (docs/audits/required-migration-versions-sync.py)
+      - name: Required-migration-versions sync (cargo xtask audit required-migration-versions-sync)
         run: |
-          python3 docs/audits/required-migration-versions-sync.py --self-test
-          python3 docs/audits/required-migration-versions-sync.py
+          cargo xtask audit required-migration-versions-sync --self-test
+          cargo xtask audit required-migration-versions-sync
 
       # Issue #2521: autumn-harvest-cli/src/lib.rs and
       # autumn-harvest-plugin/src/dev/dsn.rs each define
@@ -582,25 +582,25 @@ jobs:
       # autumn-harvest core would be a public-API change needing a human
       # call, so the code links them and does not merge them. This step
       # fails when one copy's keyword list changes and the other does not.
-      - name: Libpq-keyword sync (docs/audits/libpq-keyword-sync.py)
+      - name: Libpq-keyword sync (cargo xtask audit libpq-keyword-sync)
         run: |
-          python3 docs/audits/libpq-keyword-sync.py --self-test
-          python3 docs/audits/libpq-keyword-sync.py
+          cargo xtask audit libpq-keyword-sync --self-test
+          cargo xtask audit libpq-keyword-sync
 
       # Issue #2492: every diesel table! keeps 32 columns or fewer, so the
       # workspace and every embedder build diesel at its default tier. A wider
       # table splits over two declarations (autumn-harvest/src/table_split.rs).
-      - name: Diesel table width (docs/audits/diesel-table-width.py)
+      - name: Diesel table width (cargo xtask audit diesel-table-width)
         run: |
-          python3 docs/audits/diesel-table-width.py --self-test
-          python3 docs/audits/diesel-table-width.py
+          cargo xtask audit diesel-table-width --self-test
+          cargo xtask audit diesel-table-width
 
       # Only listed files sit at the repository root. A design record goes in
-      # docs/design/. The script lists each root file with a reason.
-      - name: Root files (docs/audits/root-files.py)
+      # docs/design/. The command lists each root file with a reason.
+      - name: Root files (cargo xtask audit root-files)
         run: |
-          python3 docs/audits/root-files.py --self-test
-          python3 docs/audits/root-files.py
+          cargo xtask audit root-files --self-test
+          cargo xtask audit root-files
 
       # Issue #2364: every function that sends SQL has a Ledger profile in
       # docs/ledger/. A new query without one, or a profile that no longer
