@@ -668,6 +668,8 @@ pub mod worker;
 pub mod worker_outlier;
 #[cfg(feature = "db")]
 pub mod workers;
+/// The operator override of a workflow retry policy (issue #2409).
+pub mod workflow_retry;
 
 pub use adaptive_limit::AdaptiveLimitConfig;
 pub use admission_gate::{

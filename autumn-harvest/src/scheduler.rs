@@ -5376,14 +5376,11 @@ async fn tick_one_workflow_schedule(
                         });
                     }
                 }
-                let effective_retry = schedule
-                    .retry_policy
-                    .as_ref()
-                    .and_then(|v| {
-                        serde_json::from_value::<crate::policy::RetryPolicy>(v.clone()).ok()
-                    })
-                    .or_else(|| wf_info.and_then(|info| info.retry_policy.clone()))
-                    .and_then(|p| serde_json::to_value(&p).ok());
+                // A schedule policy carries its source (issue #2409).
+                let effective_retry = crate::workflow_retry::schedule_retry_value(
+                    schedule.retry_policy.as_ref(),
+                    wf_info.and_then(|info| info.retry_policy.as_ref()),
+                );
                 let start_options = crate::debounce::DebounceStartOptions {
                     reuse_policy: Some("reject_duplicate".to_string()),
                     execution_timeout_secs: execution_timeout.map(|d| d.num_seconds()),
@@ -5470,6 +5467,11 @@ async fn tick_one_workflow_schedule(
 
         // Provenance ref for a scheduled fire is the triggering schedule id (#740).
         let schedule_id_str = schedule.id.to_string();
+        // A schedule policy wins and carries its source (issue #2409).
+        let schedule_retry = crate::workflow_retry::schedule_retry_policy(
+            schedule.retry_policy.as_ref(),
+            wf_info.and_then(|info| info.retry_policy.as_ref()),
+        );
         // Latest-wins supersede counters (issue #811, Codex round 1): the
         // metrics-less wrapper discards the collected cancellations, so a
         // scheduled fire that sheds an incumbent emitted neither
@@ -5513,11 +5515,8 @@ async fn tick_one_workflow_schedule(
                     // Logical slot = the slot encoded in workflow_id (original_slot), so
                     // carryover ordering and the migration backfill agree (issue #488).
                     scheduled_for: Some(*original_slot),
-                    workflow_retry_policy: schedule
-                        .retry_policy
-                        .as_ref()
-                        .and_then(|v| serde_json::from_value(v.clone()).ok())
-                        .or_else(|| wf_info.and_then(|info| info.retry_policy.clone())),
+                    workflow_retry_policy: schedule_retry.0,
+                    workflow_retry_source: schedule_retry.1,
                     max_workflow_attempts_ceiling: registry.max_workflow_attempts_ceiling,
                     // Normal scheduler-tick fire — attributed as the schedule's cadence (issue #534).
                     origin: Some(crate::execution::ORIGIN_SCHEDULED),
@@ -7367,14 +7366,11 @@ async fn drain_claimed_buffered_schedule(
                         break;
                     }
                 }
-                let effective_retry = schedule
-                    .retry_policy
-                    .as_ref()
-                    .and_then(|v| {
-                        serde_json::from_value::<crate::policy::RetryPolicy>(v.clone()).ok()
-                    })
-                    .or_else(|| wf_info.and_then(|info| info.retry_policy.clone()))
-                    .and_then(|p| serde_json::to_value(&p).ok());
+                // A schedule policy carries its source (issue #2409).
+                let effective_retry = crate::workflow_retry::schedule_retry_value(
+                    schedule.retry_policy.as_ref(),
+                    wf_info.and_then(|info| info.retry_policy.as_ref()),
+                );
                 let start_options = crate::debounce::DebounceStartOptions {
                     reuse_policy: Some("reject_duplicate".to_string()),
                     // Issue #1412: thread the DAG/workflow's declared
@@ -7459,6 +7455,11 @@ async fn drain_claimed_buffered_schedule(
 
         // Provenance ref for a buffered scheduled fire is the schedule id (#740).
         let schedule_id_str = schedule.id.to_string();
+        // A schedule policy wins and carries its source (issue #2409).
+        let schedule_retry = crate::workflow_retry::schedule_retry_policy(
+            schedule.retry_policy.as_ref(),
+            wf_info.and_then(|info| info.retry_policy.as_ref()),
+        );
         // Latest-wins supersede counters (issue #811, Codex round 1) --
         // the buffered drain shares the tick's gap.
         let start_result =
@@ -7498,11 +7499,8 @@ async fn drain_claimed_buffered_schedule(
                     sla,
                     schedule_id: Some(schedule.id),
                     scheduled_for: Some(scheduled_for),
-                    workflow_retry_policy: schedule
-                        .retry_policy
-                        .as_ref()
-                        .and_then(|v| serde_json::from_value(v.clone()).ok())
-                        .or_else(|| wf_info.and_then(|info| info.retry_policy.clone())),
+                    workflow_retry_policy: schedule_retry.0,
+                    workflow_retry_source: schedule_retry.1,
                     max_workflow_attempts_ceiling: registry.max_workflow_attempts_ceiling,
                     // Normal scheduler-tick fire — attributed as the schedule's cadence (issue #534).
                     origin: Some(crate::execution::ORIGIN_SCHEDULED),

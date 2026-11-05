@@ -1,4 +1,4 @@
-# Runtime SLA, execution-timeout, chain-cap, concurrency-limit and quota overrides
+# Runtime SLA, execution-timeout, chain-cap, concurrency-limit, quota and retry overrides
 
 A workflow type declares three durations in code: its soft `sla`, its hard
 `execution_timeout` and its chain cap `chain_execution_timeout`. It declares
@@ -19,6 +19,13 @@ A workflow type can also declare a per-tenant quota through
 `#[workflow(quota(key = ..., max_active_executions = ..., ...))]`. An operator
 override changes its three admission caps at runtime (issue #2408). The key
 and the LLM caps stay as declared.
+
+A workflow type can also declare a workflow retry policy in
+`WorkflowInfo::retry_policy`, for example through
+`WorkflowInfo::with_retry_policy`. An operator override changes three of
+its fields at runtime: `max_attempts`, `initial_interval` and
+`max_interval` (issue #2409). The backoff coefficient, the jitter and
+`non_retryable_errors` stay as declared.
 
 ## Quick reference
 
@@ -69,6 +76,22 @@ curl -X PATCH https://<host>/api/harvest/admin/workflow-types/tenant_import/run-
      -H 'Content-Type: application/json' \
      -d '{"quota_max_active_executions": null}'
 
+# Stop the workflow retries of a type, for runs in flight too.
+curl -X PATCH https://<host>/api/harvest/admin/workflow-types/billing_sync/run-defaults \
+     -H 'Content-Type: application/json' \
+     -d '{"retry_max_attempts": 1, "reason": "INC-4825"}'
+
+# Slow them instead: start the backoff at 10 minutes. The declared jitter
+# still applies.
+curl -X PATCH https://<host>/api/harvest/admin/workflow-types/billing_sync/run-defaults \
+     -H 'Content-Type: application/json' \
+     -d '{"retry_initial_interval_ms": 600000}'
+
+# Return the retry fields to the code value.
+curl -X PATCH https://<host>/api/harvest/admin/workflow-types/billing_sync/run-defaults \
+     -H 'Content-Type: application/json' \
+     -d '{"retry_max_attempts": null, "retry_initial_interval_ms": null}'
+
 # Read the code value, the override and the effective value.
 curl https://<host>/api/harvest/admin/workflow-types/nightly_etl/run-defaults
 ```
@@ -87,6 +110,9 @@ Both routes need the admin role. Each `PATCH` writes one
 | `quota_max_active_executions` | The quota cap on the active runs of one key, from 1 to 4294967295. |
 | `quota_max_history_bytes` | The quota cap on the history bytes of the active runs of one key, from 1 to 9223372036854775807. |
 | `quota_max_dead_letters` | The quota cap on the dead letters of one key, from 1 to 4294967295. |
+| `retry_max_attempts` | The workflow retry `max_attempts`, the first attempt included, from 1 to 2147483647 and at most the fleet ceiling. `1` stops the retries. |
+| `retry_initial_interval_ms` | The base delay before the first retry, in whole milliseconds, from 1 to 31536000000 (365 days). |
+| `retry_max_interval_ms` | The upper bound on each retry delay, in whole milliseconds, from 1 to 31536000000 (365 days). When both interval fields are set, at least `retry_initial_interval_ms`. |
 | `clear_override` | `true` deletes the stored override before the other fields merge. |
 | `reason` | Free text stored with the override. |
 | `recompute_in_flight` | `true` moves the SLA deadline of the runs in flight. Default `false`. |
@@ -95,7 +121,13 @@ The route refuses a value in a `quota_max_*` field for a type with no quota
 admission cap, a DAG included. Such a type stamps and locks no key for a cap.
 A `null` sets no cap, so the route accepts it on any type.
 
-Each duration, `concurrency_limit` and each `quota_max_*` field is tri-state:
+The route refuses a value in a `retry_*` field for a type with no code
+`retry_policy`, a DAG included. A run of such a type stores no policy, so the
+field has nothing to apply to. The route also refuses a `retry_max_attempts`
+above the fleet ceiling `max_workflow_attempts`.
+
+Each duration, `concurrency_limit`, each `quota_max_*` field and each
+`retry_*` field is tri-state:
 
 - An absent key keeps the stored override.
 - `null` returns the field to its code value.
@@ -281,6 +313,48 @@ example because the default shard was down at boot, also admits under the
 code caps until a refresh succeeds. Watch for the refresh warning in the
 log.
 
+## Retry policy
+
+Each start stores the retry policy of its run on the execution row. The
+failure path applies the override over that stored policy when
+the run fails. So:
+
+- **A change applies to the next failure of any run of the type**, in flight
+  or new. `retry_max_attempts: 1` stops the retries of the runs in flight at
+  their next failure. A run whose attempt count already reaches the new value
+  does not retry.
+- **An attempt that already started is not affected.** A running attempt is
+  never cancelled. A retry that a failure already scheduled keeps its row,
+  its fire time and its stored policy. Its own failure takes the override.
+- **The stored policy never changes.** A retry successor stores the policy of
+  its run, not the effective one. So `clear_override`, or a `null`, restores
+  the code value at the next failure.
+- **The effective `max_interval` is never below the effective
+  `initial_interval`** when the override sets an interval. `max_interval`
+  caps each delay, so a lower cap would hide the first delay. So a longer
+  `retry_initial_interval_ms` alone also raises the cap, and a
+  `retry_max_interval_ms` alone below the first delay rises to it.
+- **The declared jitter and backoff still apply.** The interval is the base
+  of each delay. With the default full jitter, a delay can be shorter than
+  the base.
+- **365 days is the longest interval.** A retry starts with a delay, and the
+  start refuses a delay above 365 days. A longer delay would end the chain.
+- **The fleet ceiling** `max_workflow_attempts` still caps `max_attempts`.
+  The failure path also clamps an override value to the ceiling of its own
+  process.
+
+A schedule's own `retry_policy` wins for the runs that the schedule starts.
+The override does not apply to them. Each schedule path marks such
+a policy with the key `_harvest_retry_source: "schedule"` in the stored JSON.
+A retry, a same-type continue-as-new and a re-run of such a run keep the mark.
+A schedule run that inherits the code policy has no mark, so the override
+applies to it.
+
+The failure path reads the overrides through the cache of the last
+`HandlerRegistry` that the process built. Each worker refreshes it. The
+decision runs outside workflow code, so the override does not change replay.
+The `WorkflowRetryScheduled` event keeps its shape.
+
 ## Mixed versions
 
 Set a limit only after every process runs this release. An older process
@@ -296,9 +370,19 @@ An older process that serves `clear_override` with another field writes only
 its own columns, so the stored quota caps stay in force. Its response does
 not show them.
 
+The retry fields follow the same rule. An older process refuses each
+`retry_*` field with a 400. An older worker ignores the override, and it
+decides each failure with the stored policy. An older process that schedules
+a retry of a schedule run drops the schedule mark, so the override then
+applies to that chain. A run that an older process started from a schedule
+policy has no mark either. If an older process clears the last other field
+of a row, it deletes the row, the retry fields included.
+
 To roll back, deploy the older release first. Then run the down migration of
+`20261105062317_harvest_run_default_retry_policy`, then that of
 `20261105015009_harvest_run_default_quota_limits`. This release reads the
-quota columns, so it fails each refresh once they are gone.
+quota and retry columns, so it fails each refresh once they are gone. The
+retry down migration deletes each override row that sets only retry fields.
 
 ## Grants
 

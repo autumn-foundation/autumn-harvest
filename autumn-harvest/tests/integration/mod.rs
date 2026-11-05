@@ -348,6 +348,9 @@ mod retry_budget_tests;
 mod retry_chain_routing_tests;
 mod retry_clock_skew_tests;
 mod retry_now_tests;
+#[cfg(feature = "db")]
+mod retry_override_db_tests;
+mod retry_override_guard;
 mod run_defaults_chain_guard;
 #[cfg(feature = "db")]
 mod run_defaults_chain_tests;

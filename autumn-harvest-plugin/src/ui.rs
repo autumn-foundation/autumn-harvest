@@ -10591,12 +10591,13 @@ async fn execute_schedule_trigger_ui(
         ..
     } = runtime.registry().resolve_dispatch_deadline(workflow_name);
     // Schedule-level retry_policy takes precedence over the workflow-type default,
-    // mirroring the automated tick, backfill, and API trigger-now paths.
-    let ui_trigger_retry_policy = row
-        .retry_policy
-        .as_ref()
-        .and_then(|v| serde_json::from_value(v.clone()).ok())
-        .or(wf_default_retry_policy);
+    // mirroring the automated tick, backfill, and API trigger-now paths. A
+    // schedule policy carries its source (issue #2409).
+    let (ui_trigger_retry_policy, ui_trigger_retry_source) =
+        autumn_harvest::workflow_retry::schedule_retry_policy(
+            row.retry_policy.as_ref(),
+            wf_default_retry_policy.as_ref(),
+        );
 
     // Provenance ref for a manual UI schedule trigger is the schedule id (#740).
     let ui_schedule_id_str = row.id.to_string();
@@ -10634,6 +10635,7 @@ async fn execute_schedule_trigger_ui(
             // resolved for a manual fire.
             schedule_id: Some(row.id),
             workflow_retry_policy: ui_trigger_retry_policy,
+            workflow_retry_source: ui_trigger_retry_source,
             max_workflow_attempts_ceiling: runtime.registry().max_workflow_attempts_ceiling,
             origin: Some(autumn_harvest::execution::ORIGIN_MANUAL_TRIGGER),
             // Manual UI schedule trigger (issue #740): provenance is `schedule`,

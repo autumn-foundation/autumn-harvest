@@ -218,6 +218,7 @@ async fn seed_workflows(database_url: &str, workflow_name: &str, count: usize) -
                 scheduled_for: None,
                 workflow_attempt: 1,
                 workflow_retry_policy: None,
+                workflow_retry_source: autumn_harvest::workflow_retry::RetryPolicySource::Type,
                 retry_of_exec_id: None,
                 max_workflow_attempts_ceiling: None,
                 origin: None,

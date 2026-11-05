@@ -875,6 +875,13 @@ impl HandlerRegistry {
         if let Ok(mut lock) = crate::completion_trigger::GLOBAL_MAX_WORKFLOW_CHAIN_TIMEOUT.write() {
             *lock = None;
         }
+        // The failure path clamps a retry override to this ceiling (issue
+        // #2409), so it resets with the other ceilings.
+        if let Ok(mut lock) =
+            crate::completion_trigger::GLOBAL_MAX_WORKFLOW_ATTEMPTS_CEILING.write()
+        {
+            *lock = None;
+        }
         let mut activities: HashMap<String, ActivityInfo> = activities
             .into_iter()
             .map(|a| (a.name.to_string(), a))
@@ -10149,6 +10156,14 @@ pub async fn persist_workflow_failure(
             .unwrap_or_else(|| exec_id.shard()),
     };
 
+    // The stored policy of this run and its source (issue #2409). A retry
+    // successor stores these, never the effective policy. So a clear of the
+    // operator override restores the code value at the next failure.
+    let stored_retry = execution.and_then(|exec| {
+        exec.workflow_retry_policy
+            .as_ref()
+            .and_then(crate::workflow_retry::decode_stored)
+    });
     // Pre-compute the retry plan (pure, no DB) before entering the transaction.
     let retry_plan: Option<(ExecutionId, RetryPolicy, u32, std::time::Duration)> =
         // Issue #782: a contained handler-panic terminal must NOT also spawn a
@@ -10159,11 +10174,14 @@ pub async fn persist_workflow_failure(
         if nd_details.is_none()
             && decoded.error_type.as_deref() != Some(crate::failure::ERROR_TYPE_HANDLER_PANIC)
         {
-            execution.and_then(|exec| {
-                let policy: RetryPolicy = exec
-                    .workflow_retry_policy
-                    .as_ref()
-                    .and_then(|v| serde_json::from_value(v.clone()).ok())?;
+            execution.zip(stored_retry.clone()).and_then(|(exec, (stored, source))| {
+                // Issue #2409: the operator override applies over the stored
+                // policy here, at the failure. A schedule policy wins.
+                let policy = crate::run_defaults::current_retry_policy(
+                    &exec.workflow_name,
+                    stored,
+                    source,
+                );
                 let attempt = exec.workflow_attempt.cast_unsigned();
                 if attempt >= policy.max_attempts {
                     return None;
@@ -10311,7 +10329,13 @@ pub async fn persist_workflow_failure(
                     schedule_id: exec_ref.schedule_id,
                     scheduled_for: exec_ref.scheduled_for,
                     workflow_attempt: attempt + 1,
-                    workflow_retry_policy: Some(policy),
+                    // The stored policy and its source, not `policy`.
+                    workflow_retry_policy: stored_retry.as_ref().map(|(stored, _)| stored.clone()),
+                    workflow_retry_source: stored_retry
+                        .as_ref()
+                        .map_or(crate::workflow_retry::RetryPolicySource::Type, |(_, source)| {
+                            *source
+                        }),
                     retry_of_exec_id: Some(exec_id.as_uuid()),
                     origin: exec_ref.origin.as_deref(),
                     // A retry is the same logical run trying again (issue #523).

@@ -34,7 +34,7 @@ New route families added in **0.5.0** (all in the contract; each has a CLI verb)
 - `GET /admin/config` — redacted effective runtime config (#695).
 - `GET /admin/usage` — per-tenant/per-workflow historical usage report (#596).
 - `GET /admin/workflow-types/reachability` — safe-handler-removal pre-flight (#520).
-- `GET` / `PATCH /admin/workflow-types/{workflow_name}/run-defaults` — runtime SLA, execution-timeout, chain-cap, concurrency-limit and quota-cap override (#2387, #2406, #2407, #2408).
+- `GET` / `PATCH /admin/workflow-types/{workflow_name}/run-defaults` — runtime SLA, execution-timeout, chain-cap, concurrency-limit, quota-cap and workflow-retry override (#2387, #2406, #2407, #2408, #2409).
 - `GET /admin/overrides` — every schedule and run-default override, with actor, reason and time (#2388).
 - `GET` / `PUT` / `DELETE /admin/agents/{kind}/sampling-policy` — the sampling policy of an agent kind. Only an operator sets or resets it (#2439).
 - `GET /agents/{kind}/profile`, `.../versions`, `.../versions/{version}`, `.../diff` and `POST .../activate`, `.../rollback` — agent profile overlays (#2374).

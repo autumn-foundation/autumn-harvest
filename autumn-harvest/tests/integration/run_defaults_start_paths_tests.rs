@@ -181,6 +181,7 @@ async fn an_inline_target_start_takes_the_overrides() {
             chain_execution_timeout: Some(4 * HOUR),
             concurrency_limit: None,
             quota: autumn_harvest::quota::QuotaLimits::default(),
+            retry: autumn_harvest::workflow_retry::RetryLimits::default(),
         }),
         (None, None),
     )
@@ -223,6 +224,7 @@ async fn the_fleet_ceilings_cap_an_inline_target_start() {
             chain_execution_timeout: Some(20 * HOUR),
             concurrency_limit: None,
             quota: autumn_harvest::quota::QuotaLimits::default(),
+            retry: autumn_harvest::workflow_retry::RetryLimits::default(),
         }),
         (Some(HOUR), Some(2 * HOUR)),
     )
@@ -257,6 +259,7 @@ async fn the_outbox_sweep_start_takes_the_overrides_and_the_ceiling() {
             chain_execution_timeout: Some(20 * HOUR),
             concurrency_limit: None,
             quota: autumn_harvest::quota::QuotaLimits::default(),
+            retry: autumn_harvest::workflow_retry::RetryLimits::default(),
         }),
         (None, Some(5 * HOUR)),
     )
@@ -379,6 +382,7 @@ async fn update_with_start_takes_the_overrides() {
             chain_execution_timeout: Some(4 * HOUR),
             concurrency_limit: None,
             quota: autumn_harvest::quota::QuotaLimits::default(),
+            retry: autumn_harvest::workflow_retry::RetryLimits::default(),
         },
     );
     let row = run_uws(&url, &client_with(&url, cache, None)).await;

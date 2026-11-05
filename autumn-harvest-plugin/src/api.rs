@@ -8048,7 +8048,7 @@ pub const fn management_api_request_fields()
             ]),
         ),
         // Run-default overrides of a workflow type (issues #2387, #2406,
-        // #2407 and #2408).
+        // #2407, #2408 and #2409).
         (
             "PATCH",
             "/admin/workflow-types/{workflow_name}/run-defaults",
@@ -8060,6 +8060,9 @@ pub const fn management_api_request_fields()
                 "quota_max_active_executions",
                 "quota_max_history_bytes",
                 "quota_max_dead_letters",
+                "retry_max_attempts",
+                "retry_initial_interval_ms",
+                "retry_max_interval_ms",
                 "clear_override",
                 "reason",
                 "recompute_in_flight",
@@ -31697,18 +31700,17 @@ async fn trigger_schedule_now(
             },
         );
     // Schedule-level retry_policy takes precedence over the workflow-type default,
-    // mirroring the automated tick and backfill paths (scheduler.rs).
-    let manual_trigger_retry_policy = schedule
-        .retry_policy
-        .as_ref()
-        .and_then(|v| serde_json::from_value(v.clone()).ok())
-        .or_else(|| {
+    // mirroring the automated tick and backfill paths (scheduler.rs). A
+    // schedule policy carries its source (issue #2409).
+    let (manual_trigger_retry_policy, manual_trigger_retry_source) =
+        autumn_harvest::workflow_retry::schedule_retry_policy(
+            schedule.retry_policy.as_ref(),
             runtime
                 .registry
                 .workflows
                 .get(&workflow_name)
-                .and_then(|info| info.retry_policy.clone())
-        });
+                .and_then(|info| info.retry_policy.as_ref()),
+        );
 
     // Start-throttle admission (issue #607 code review): a manual trigger-now
     // must pace like scheduled/backfilled fires rather than always admitting
@@ -31831,9 +31833,9 @@ async fn trigger_schedule_now(
                 .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX)),
             max_workflow_input_bytes: Some(effective_cap),
             trace_context: None,
-            workflow_retry_policy: manual_trigger_retry_policy
-                .as_ref()
-                .and_then(|p| serde_json::to_value(p).ok()),
+            workflow_retry_policy: manual_trigger_retry_policy.as_ref().map(|p| {
+                autumn_harvest::workflow_retry::encode_stored(p, manual_trigger_retry_source)
+            }),
             max_workflow_attempts_ceiling: api_state.max_workflow_attempts(),
             completion_callbacks: None,
             schedule_id: Some(schedule_id),
@@ -31996,6 +31998,7 @@ async fn trigger_schedule_now(
             // relies on — only scheduled fires and backfills advance the carryover cursor.
             schedule_id: Some(schedule_id),
             workflow_retry_policy: manual_trigger_retry_policy,
+            workflow_retry_source: manual_trigger_retry_source,
             max_workflow_attempts_ceiling: api_state.max_workflow_attempts(),
             origin: Some(autumn_harvest::execution::ORIGIN_MANUAL_TRIGGER),
             start_source: autumn_harvest::StartSource::Schedule,
@@ -33287,21 +33290,15 @@ pub(crate) async fn schedule_backfill_inner(
                             continue;
                         }
                     }
-                    let effective_retry = schedule
-                        .retry_policy
-                        .as_ref()
-                        .and_then(|v| {
-                            serde_json::from_value::<autumn_harvest::policy::RetryPolicy>(v.clone())
-                                .ok()
-                        })
-                        .or_else(|| {
-                            runtime
-                                .registry
-                                .workflows
-                                .get(&wf_name)
-                                .and_then(|info| info.retry_policy.clone())
-                        })
-                        .and_then(|p| serde_json::to_value(&p).ok());
+                    // A schedule policy carries its source (issue #2409).
+                    let effective_retry = autumn_harvest::workflow_retry::schedule_retry_value(
+                        schedule.retry_policy.as_ref(),
+                        runtime
+                            .registry
+                            .workflows
+                            .get(&wf_name)
+                            .and_then(|info| info.retry_policy.as_ref()),
+                    );
                     let start_options = autumn_harvest::debounce::DebounceStartOptions {
                         reuse_policy: Some("reject_duplicate".to_string()),
                         // Issue #743 review (PR #1141, Finding #5): a throttled
@@ -33442,6 +33439,16 @@ pub(crate) async fn schedule_backfill_inner(
                 // `backfill`, referencing the schedule id and the operator actor —
                 // matching the throttled branch above.
                 let schedule_id_str = schedule_id.to_string();
+                // A schedule policy wins and carries its source (issue #2409).
+                let (backfill_retry_policy, backfill_retry_source) =
+                    autumn_harvest::workflow_retry::schedule_retry_policy(
+                        schedule.retry_policy.as_ref(),
+                        runtime
+                            .registry
+                            .workflows
+                            .get(&wf_name)
+                            .and_then(|info| info.retry_policy.as_ref()),
+                    );
                 let result = start_or_load_workflow_execution_with_metrics_and_codecs(
                     &mut conn,
                     StartWorkflowParams {
@@ -33476,17 +33483,8 @@ pub(crate) async fn schedule_backfill_inner(
                         // Backfilled runs share the schedule's carryover lineage (issue #488).
                         schedule_id: Some(schedule_id),
                         scheduled_for: Some(*original_slot),
-                        workflow_retry_policy: schedule
-                            .retry_policy
-                            .as_ref()
-                            .and_then(|v| serde_json::from_value(v.clone()).ok())
-                            .or_else(|| {
-                                runtime
-                                    .registry
-                                    .workflows
-                                    .get(&wf_name)
-                                    .and_then(|info| info.retry_policy.clone())
-                            }),
+                        workflow_retry_policy: backfill_retry_policy,
+                        workflow_retry_source: backfill_retry_source,
                         max_workflow_attempts_ceiling: runtime
                             .registry
                             .max_workflow_attempts_ceiling,
@@ -33778,6 +33776,13 @@ pub(crate) async fn schedule_backfill_inner(
                 // Provenance for a non-throttled DAG backfill (issue #740):
                 // `backfill`, referencing the schedule id and the operator actor.
                 let schedule_id_str = schedule_id.to_string();
+                // A DAG declares no retry policy. A schedule policy carries its
+                // source (issue #2409).
+                let (dag_retry_policy, dag_retry_source) =
+                    autumn_harvest::workflow_retry::schedule_retry_policy(
+                        schedule.retry_policy.as_ref(),
+                        None,
+                    );
                 let start_result = start_or_load_workflow_execution_with_metrics_and_codecs(
                     &mut conn,
                     StartWorkflowParams {
@@ -33793,10 +33798,8 @@ pub(crate) async fn schedule_backfill_inner(
                         // Backfilled runs share the schedule's carryover lineage (issue #488).
                         schedule_id: Some(schedule_id),
                         scheduled_for: Some(*original_slot),
-                        workflow_retry_policy: schedule
-                            .retry_policy
-                            .as_ref()
-                            .and_then(|v| serde_json::from_value(v.clone()).ok()),
+                        workflow_retry_policy: dag_retry_policy,
+                        workflow_retry_source: dag_retry_source,
                         max_workflow_attempts_ceiling: runtime
                             .registry
                             .max_workflow_attempts_ceiling,
@@ -57261,6 +57264,7 @@ mod tests {
                 scheduled_for: None,
                 workflow_attempt: 1,
                 workflow_retry_policy: None,
+                workflow_retry_source: autumn_harvest::workflow_retry::RetryPolicySource::Type,
                 retry_of_exec_id: None,
                 max_workflow_attempts_ceiling: None,
                 origin: None,
@@ -57353,6 +57357,7 @@ mod tests {
                 scheduled_for: None,
                 workflow_attempt: 1,
                 workflow_retry_policy: None,
+                workflow_retry_source: autumn_harvest::workflow_retry::RetryPolicySource::Type,
                 retry_of_exec_id: None,
                 max_workflow_attempts_ceiling: None,
                 origin: None,
@@ -57482,6 +57487,7 @@ mod tests {
                 scheduled_for: None,
                 workflow_attempt: 1,
                 workflow_retry_policy: None,
+                workflow_retry_source: autumn_harvest::workflow_retry::RetryPolicySource::Type,
                 retry_of_exec_id: None,
                 max_workflow_attempts_ceiling: None,
                 origin: None,
@@ -57617,6 +57623,7 @@ mod tests {
                 scheduled_for: None,
                 workflow_attempt: 1,
                 workflow_retry_policy: None,
+                workflow_retry_source: autumn_harvest::workflow_retry::RetryPolicySource::Type,
                 retry_of_exec_id: None,
                 max_workflow_attempts_ceiling: None,
                 origin: None,

@@ -2888,6 +2888,7 @@ mod tests {
                 chain_execution_timeout: Some(3 * hour),
                 concurrency_limit: None,
                 quota: crate::quota::QuotaLimits::default(),
+                retry: crate::workflow_retry::RetryLimits::default(),
             },
         );
         let client = residency_client().with_run_defaults(cache);
