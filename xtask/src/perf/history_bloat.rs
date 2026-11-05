@@ -272,7 +272,7 @@ impl Drop for DropDatabase<'_> {
         let sql = format!("DROP DATABASE IF EXISTS {} WITH (FORCE);", self.0.db_name);
         let mut command = Bench::psql(&self.0.admin, &["-v", "ON_ERROR_STOP=1", "-c", &sql]);
         command.stderr(Stdio::null());
-        let _ = support::status_to(&mut command, Stdio::null());
+        support::cleanup(&mut command);
     }
 }
 

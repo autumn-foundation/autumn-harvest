@@ -97,8 +97,34 @@ mod tests {
         fn raise(signum: std::os::raw::c_int) -> std::os::raw::c_int;
     }
 
+    /// Set in the child process that runs the real signal test.
+    const CHILD: &str = "XTASK_INTERRUPT_TEST_CHILD";
+
+    /// The flag is global to the process. So the signal test runs in a child
+    /// process, and a set flag never reaches a test on another thread.
     #[test]
     fn a_guard_turns_an_interrupt_into_the_flag() {
+        let exe = std::env::current_exe().expect("the test binary has a path");
+        let status = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "interrupt::tests::signal_under_a_guard",
+                "--ignored",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .status()
+            .expect("the child test runs");
+        assert!(status.success(), "the child signal test failed: {status}");
+    }
+
+    /// The child half of the test above. It does nothing in a normal run.
+    #[test]
+    #[ignore = "runs only as the child process of a_guard_turns_an_interrupt_into_the_flag"]
+    fn signal_under_a_guard() {
+        if std::env::var_os(CHILD).is_none() {
+            return;
+        }
         let guard = install();
         assert!(!requested(), "a new guard starts with a clear flag");
         // SAFETY: the guard holds the handler for SIGINT, so the signal only

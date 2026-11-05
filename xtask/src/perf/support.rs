@@ -118,92 +118,12 @@ pub fn exit_code(status: ExitStatus) -> ExitCode {
     ExitCode::from(status_code(status))
 }
 
-/// Defers Ctrl-C, `SIGTERM` and `SIGHUP` while the parent waits for a child.
-///
-/// A shell runs its `EXIT` trap when the operator interrupts a child. Rust
-/// runs no `Drop` when a signal kills the process. So each wait raises a
-/// shield. The signal still reaches the child, because the terminal sends it
-/// to the whole process group. The child exits, the wait returns, and the
-/// cleanup guards of the caller run.
-///
-/// A child inherits ignored signals. So the shield goes up only after the
-/// spawn, and it comes down before the next spawn.
-pub struct Shield {
-    _private: (),
-}
-
-#[cfg(unix)]
-mod signals {
-    use std::os::raw::c_int;
-    use std::sync::Mutex;
-
-    pub const DEFERRED: [c_int; 3] = [1, 2, 15];
-    pub const SIG_IGN: usize = 1;
-
-    /// The number of raised shields, and the dispositions that the first one saved.
-    ///
-    /// Only the first shield changes the dispositions, and only the last one
-    /// restores them. So overlapping shields cannot leave a signal ignored.
-    pub static STATE: Mutex<(usize, [usize; 3])> = Mutex::new((0, [0; 3]));
-
-    unsafe extern "C" {
-        /// The C library `signal` call. A handler is a pointer-sized value.
-        pub fn signal(signum: c_int, handler: usize) -> usize;
-    }
-}
-
-impl Shield {
-    /// Ignores the deferred signals until the shield drops.
-    #[must_use]
-    #[cfg_attr(
-        not(unix),
-        allow(
-            clippy::missing_const_for_fn,
-            reason = "only the Unix body makes a call that is not const"
-        )
-    )]
-    pub fn raise() -> Self {
-        #[cfg(unix)]
-        {
-            let mut state = signals::STATE
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if state.0 == 0 {
-                for (slot, signum) in state.1.iter_mut().zip(signals::DEFERRED) {
-                    // SAFETY: `signal` with `SIG_IGN` installs no Rust code as
-                    // a handler. It only changes the disposition of this process.
-                    *slot = unsafe { signals::signal(signum, signals::SIG_IGN) };
-                }
-            }
-            state.0 += 1;
-        }
-        Self { _private: () }
-    }
-}
-
-impl Drop for Shield {
-    fn drop(&mut self) {
-        #[cfg(unix)]
-        {
-            let mut state = signals::STATE
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            state.0 = state.0.saturating_sub(1);
-            if state.0 == 0 {
-                for (previous, signum) in state.1.iter().zip(signals::DEFERRED) {
-                    // SAFETY: the value came from `signal` for the same signal.
-                    // So it is a disposition that this process had before.
-                    unsafe {
-                        signals::signal(signum, *previous);
-                    }
-                }
-            }
-        }
-    }
-}
-
 /// Starts `command`, and names the command line in the error.
+///
+/// After an interrupt, it starts nothing. The caller then unwinds, so its
+/// cleanup guards run.
 fn spawn(command: &mut Command) -> Result<Child> {
+    stop_on_interrupt()?;
     command
         .spawn()
         .with_context(|| format!("Failed to execute command: {}", describe(command)))
@@ -219,10 +139,35 @@ pub fn describe(command: &Command) -> String {
     line
 }
 
-/// Waits for `child` behind a [`Shield`].
+/// Waits for `child`. After an interrupt, it fails, so the caller unwinds.
 fn wait(child: &mut Child) -> Result<ExitStatus> {
-    let _shield = Shield::raise();
-    child.wait().context("Failed to wait for a child process")
+    let status = child.wait().context("Failed to wait for a child process")?;
+    stop_on_interrupt()?;
+    Ok(status)
+}
+
+/// Runs a cleanup command with stdout discarded, and ignores its result.
+///
+/// A drop guard calls it. The guard often runs because of an interrupt, so
+/// this helper skips the interrupt check of [`status`].
+pub fn cleanup(command: &mut Command) {
+    command.stdout(Stdio::null());
+    if let Ok(mut child) = command.spawn() {
+        let _ = child.wait();
+    }
+}
+
+/// Fails once Ctrl-C, `SIGTERM` or `SIGHUP` has arrived.
+///
+/// `main` holds an [`interrupt`](crate::interrupt) guard for each perf and
+/// bench command. So a signal sets a flag, and this process keeps running.
+/// A shell ran its `EXIT` trap at that point. Here the error unwinds the
+/// command, and each cleanup guard runs on drop. `main` then exits 130.
+pub fn stop_on_interrupt() -> Result<()> {
+    if crate::interrupt::requested() {
+        bail!("interrupted");
+    }
+    Ok(())
 }
 
 /// Runs `command` with inherited stdio and returns its status.
@@ -271,7 +216,6 @@ pub fn capture(command: &mut Command) -> Result<(ExitStatus, String)> {
     let mut child = spawn(command)?;
     let mut stdout = Vec::new();
     let read = {
-        let _shield = Shield::raise();
         child
             .stdout
             .take()
@@ -323,13 +267,10 @@ pub fn tee_stdout(command: &mut Command, out: &Path) -> Result<ExitStatus> {
 pub fn pipe_stdout(command: &mut Command, sink: &mut dyn Write) -> Result<ExitStatus> {
     command.stdout(Stdio::piped());
     let mut child = spawn(command)?;
-    let copied = {
-        let _shield = Shield::raise();
-        child
-            .stdout
-            .take()
-            .map_or(Ok(0), |mut pipe| io::copy(&mut pipe, sink))
-    };
+    let copied = child
+        .stdout
+        .take()
+        .map_or(Ok(0), |mut pipe| io::copy(&mut pipe, sink));
     let status = wait(&mut child)?;
     copied.context("Failed to copy the output of a child process")?;
     Ok(status)
@@ -344,10 +285,7 @@ fn merged(command: &mut Command, sink: &mut dyn Write) -> Result<ExitStatus> {
     // The command still holds the write ends. Replace them, so the pipe
     // closes when the child exits and the copy below sees end of file.
     command.stdout(Stdio::inherit()).stderr(Stdio::inherit());
-    let copied = {
-        let _shield = Shield::raise();
-        io::copy(&mut reader, sink)
-    };
+    let copied = { io::copy(&mut reader, sink) };
     // A failed copy stops early, before end of file. Close the read end
     // first, so the child gets a broken pipe and the wait returns.
     drop(reader);
@@ -771,8 +709,10 @@ mod tests {
     use super::*;
 
     /// A sink that refuses every write, as a log on a full disk does.
+    #[cfg(unix)]
     struct FullDisk;
 
+    #[cfg(unix)]
     impl Write for FullDisk {
         fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
             Err(io::Error::other("no space left on device"))

@@ -68,7 +68,7 @@ impl Drop for Topology {
             .arg(&self.compose_file)
             .args(["down", "-v"])
             .stderr(Stdio::null());
-        let _ = support::status_to(&mut down, Stdio::null());
+        support::cleanup(&mut down);
     }
 }
 

@@ -40,7 +40,7 @@ impl Drop for Container {
     fn drop(&mut self) {
         let mut remove = Command::new("docker");
         remove.args(["rm", "-f", &self.name]).stderr(Stdio::null());
-        let _ = support::status_to(&mut remove, Stdio::null());
+        support::cleanup(&mut remove);
     }
 }
 
@@ -80,6 +80,7 @@ pub fn run(_args: Args) -> Result<ExitCode> {
     }
     // The init server listens on a socket only. So a TCP check waits for the real one.
     for _ in 0..READY_ATTEMPTS {
+        support::stop_on_interrupt()?;
         let ready = probe(
             "docker",
             &[
