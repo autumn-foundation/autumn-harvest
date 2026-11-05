@@ -464,6 +464,7 @@ fn child_report(input: &Value) -> Value {
         workspace: None,
         error: None,
         resets: 0,
+        answer_rejections: Vec::new(),
     })
 }
 

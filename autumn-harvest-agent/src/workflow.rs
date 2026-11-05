@@ -32,6 +32,7 @@ use crate::agent::{
     agent_info, agent_memory_reset_info, agent_profile_info, agent_profile_overlay_info,
     agent_workspace_floor_info, agent_workspace_reset_info, agent_workspace_retain_info,
 };
+use crate::answer_check::{self, Checked};
 use crate::approval::{Approval, Decision, approval_signal, await_decision, decode_decision};
 use crate::bounds::{
     RoundBudget, full_round_resets, json_len, reaches_percent, reset_due, sibling_cap,
@@ -141,6 +142,11 @@ pub(crate) struct Progress {
     /// The steer messages of this segment. A reset keeps them, so a reset
     /// never drops a message from a person.
     pub(crate) steers: Vec<ChatMessage>,
+    /// The admitted answer check of the run (issue #2442).
+    pub(crate) check: Option<answer_check::ActiveCheck>,
+    /// The reason of each answer that the check rejected, follow-ups
+    /// included.
+    pub(crate) rejections: Vec<String>,
 }
 
 /// The notes and the context resets of one run (issue #2453).
@@ -228,6 +234,8 @@ impl Progress {
             workspace: None,
             reset: ResetState::default(),
             steers: Vec::new(),
+            check: None,
+            rejections: Vec::new(),
         }
     }
 
@@ -273,6 +281,7 @@ impl Progress {
             workspace: self.workspace.as_ref().and_then(|mount| mount.head.clone()),
             error: None,
             resets: self.reset.count,
+            answer_rejections: self.rejections.clone(),
         }
     }
 
@@ -532,6 +541,9 @@ pub(crate) async fn drive(
     }
     let mut tree = root_tree(ctx, task, &progress.run_id);
     let agent = root_member(ctx, task).await?;
+    if let Some(failed) = Box::pin(admit_check(ctx, task, &mut progress, &tree)).await? {
+        return Ok((failed, 0));
+    }
     let mut input = task.input.as_str();
     let mut delivered = 0_u32;
     loop {
@@ -803,7 +815,11 @@ pub(crate) async fn run_segment(
 
         progress.usage = progress.usage.saturating_add(turn.usage);
         progress.add_cost(turn.cost_usd_micros.unwrap_or(0));
-        publish_turn_text(ctx, run, progress, &turn)?;
+        // A run with an answer check publishes a final answer only after the
+        // check (issue #2442). A run with no check publishes each turn here.
+        if progress.check.is_none() || !turn.calls().is_empty() {
+            publish_turn_text(ctx, run, progress, &turn)?;
+        }
         // The activity drops a reply that does not fit the result cap. The
         // turn then holds no text and no calls, so the segment ends here.
         if turn.oversized {
@@ -815,12 +831,10 @@ pub(crate) async fn run_segment(
         let calls = turn.calls();
 
         if calls.is_empty() {
-            if save_reply(progress, &turn, over_budget) {
-                continue;
+            match Box::pin(answer_turn(ctx, run, progress, &turn, over_budget)).await? {
+                Some(stop) => return Ok(stop),
+                None => continue,
             }
-            progress.push_assistant(&turn);
-            progress.answer = Some(turn.text());
-            return Ok(answer_stop(&turn, over_budget));
         }
         // A turn with calls that ends here is NOT added to the transcript. A
         // tool call with no result would make the transcript invalid for the
@@ -863,6 +877,85 @@ pub(crate) async fn run_segment(
                 progress.last_text = narration;
                 return Ok(AgentStop::Interrupted);
             }
+        }
+    }
+}
+
+/// Read the policy of the answer check of `task` and admit the check
+/// (issue #2442). It runs before the first model call.
+///
+/// Returns the failed report of a refused check under `report_failure`.
+///
+/// # Errors
+///
+/// Returns the refusal, or the error of the policy read.
+async fn admit_check(
+    ctx: &WorkflowContext,
+    task: &AgentTask,
+    progress: &mut Progress,
+    tree: &Tree,
+) -> Result<Option<AgentReport>, String> {
+    match answer_check::admit(ctx, task).await {
+        Ok(check) => {
+            progress.check = check;
+            Ok(None)
+        }
+        Err(error) if task.report_failure => Ok(Some(progress.failure(error, tree))),
+        Err(error) => Err(error),
+    }
+}
+
+/// End the segment on `turn`, a turn with no calls, and return its stop.
+///
+/// `None` asks the model again. That is the reply to a save turn (issue
+/// #2453), or an answer that the check rejected within its cap (issue
+/// #2442). Only an answer that completes is checked.
+///
+/// With a check, the loop publishes the durable text of the turn here. A
+/// rejected or unchecked answer then never reaches the durable stream.
+async fn answer_turn(
+    ctx: &WorkflowContext,
+    run: Run<'_>,
+    progress: &mut Progress,
+    turn: &ModelTurn,
+    over_budget: bool,
+) -> Result<Option<AgentStop>, String> {
+    let checked = progress.check.is_some();
+    if save_reply(progress, turn, over_budget) {
+        if checked {
+            publish_turn_text(ctx, run, progress, turn)?;
+        }
+        return Ok(None);
+    }
+    let narration = progress.last_text.clone();
+    progress.push_assistant(turn);
+    let answer = turn.text();
+    let stop = answer_stop(turn, over_budget);
+    if stop != AgentStop::Completed {
+        if checked {
+            publish_turn_text(ctx, run, progress, turn)?;
+        }
+        progress.answer = Some(answer);
+        return Ok(Some(stop));
+    }
+    match answer_check::check(ctx, run.task, progress, &answer).await? {
+        Checked::Passed => {
+            if checked {
+                publish_turn_text(ctx, run, progress, turn)?;
+            }
+            progress.answer = Some(answer);
+            Ok(Some(stop))
+        }
+        // The report keeps the last answer. No answer is delivered.
+        Checked::Stop(AgentStop::AnswerRejected) => Ok(Some(AgentStop::AnswerRejected)),
+        // A rejected or unchecked answer is not the text of the report.
+        Checked::Retry => {
+            progress.last_text = narration;
+            Ok(None)
+        }
+        Checked::Stop(stop) => {
+            progress.last_text = narration;
+            Ok(Some(stop))
         }
     }
 }
@@ -2785,6 +2878,8 @@ fn child_task(
         // A child is part of the draw of its parent, so its requests keep
         // the draw id. It has its own run id, so it drops the root.
         draw: task.draw.as_ref().map(Draw::inherited),
+        // Only the answer of the root run is checked (issue #2442).
+        answer_check: None,
         // A child of a probe is a probe with the same effects (issue #2378).
         probe: task.probe,
     }
@@ -3105,6 +3200,7 @@ pub fn activities() -> Vec<ActivityInfo> {
         crate::sampling::agent_sampling_policy_info(),
         crate::refine::agent_refine_policy_info(),
         crate::score::agent_score_info(),
+        crate::answer_check::agent_answer_check_info(),
         crate::score::agent_sample_score_info(),
         crate::consolidate::agent_consolidate_read_info(),
         crate::consolidate::agent_consolidate_turn_info(),

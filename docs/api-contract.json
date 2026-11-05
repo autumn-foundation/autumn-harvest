@@ -6945,7 +6945,7 @@
       "path": "/admin/overrides",
       "category": "admin",
       "read_only": true,
-      "description": "List every operator override (issue #2388). schedule_overrides holds each DAG and workflow schedule override (issues #2385 and #2386), read from every shard pool: kind, name, fields (the stored override fields by their PATCH names), reason, updated_by, created_at, updated_at and shard_ids. run_default_overrides holds each run-default override (issues #2387, #2406 and #2407) from the default shard: workflow_name, sla_secs, execution_timeout_secs, chain_execution_timeout_secs, concurrency_limit, reason, updated_by and updated_at. unavailable_shards names each shard that could not be read; its overrides are absent from the list.",
+      "description": "List every operator override (issue #2388). schedule_overrides holds each DAG and workflow schedule override (issues #2385 and #2386), read from every shard pool: kind, name, fields (the stored override fields by their PATCH names), reason, updated_by, created_at, updated_at and shard_ids. run_default_overrides holds each run-default override (issues #2387, #2406, #2407 and #2408) from the default shard: workflow_name, sla_secs, execution_timeout_secs, chain_execution_timeout_secs, concurrency_limit, quota_max_active_executions, quota_max_history_bytes, quota_max_dead_letters, reason, updated_by and updated_at. unavailable_shards names each shard that could not be read; its overrides are absent from the list.",
       "params": [],
       "request_body": null,
       "success_response": {
@@ -7150,7 +7150,7 @@
       "path": "/admin/workflow-types/{workflow_name}/run-defaults",
       "category": "admin",
       "read_only": true,
-      "description": "Read the run defaults of one workflow type (issues #2387, #2406 and #2407). code holds the sla_secs, execution_timeout_secs, chain_execution_timeout_secs and concurrency_limit declared in code. override holds the stored operator override (sla_secs, execution_timeout_secs, chain_execution_timeout_secs, concurrency_limit, reason, updated_by, updated_at), or null. effective holds the values a new run takes: the override, then code. The start clamps still apply after it: sla is clamped to execution_timeout, the fleet ceiling caps execution_timeout, and the fleet chain ceiling caps chain_execution_timeout. A latest-wins type keeps its code concurrency_limit.",
+      "description": "Read the run defaults of one workflow type (issues #2387, #2406, #2407 and #2408). code holds the sla_secs, execution_timeout_secs, chain_execution_timeout_secs, concurrency_limit, quota_max_active_executions, quota_max_history_bytes and quota_max_dead_letters declared in code. override holds the stored operator override (the same seven fields, reason, updated_by, updated_at), or null. effective holds the values a new run takes: the override, then code. The start clamps still apply after it: sla is clamped to execution_timeout, the fleet ceiling caps execution_timeout, and the fleet chain ceiling caps chain_execution_timeout. A latest-wins type keeps its code concurrency_limit. A type with no quota admission cap keeps its code quota caps.",
       "params": [
         {
           "name": "workflow_name",
@@ -7186,7 +7186,7 @@
       "path": "/admin/workflow-types/{workflow_name}/run-defaults",
       "category": "admin",
       "read_only": false,
-      "description": "Set, change or clear the run-default override of one workflow type (issues #2387, #2406 and #2407). The override wins over the code value for every new run and survives a restart. It reaches this process at once and every other process within its refresh period (about 5 seconds). Each duration is tri-state: absent keeps the stored override, null returns the field to its code value, a value sets it. A merge that sets no field deletes the override. With recompute_in_flight, the SLA deadline of each RUNNING, SUSPENDED or PAUSED run of the type that has not breached moves to the new effective SLA, on every shard, and the response gains recompute (moved_runs, unavailable_shards, superseded). A recompute stops when a newer change to the type replaces its SLA, and then reports superseded true. A hard deadline_at never changes. A chain_deadline_at never changes either: a chain in flight keeps its stored cap, and the override applies to the next chain that starts. A DAG declares no chain cap, so chain_execution_timeout_secs on a DAG is a 400. concurrency_limit applies to the next start and never lowers the cap of a run in flight. A PATCH that names concurrency_limit or clear_override, for a type with a concurrency policy, also raises the stored cap of each PENDING or RUNNING workflow task row of the type to the new effective limit, on every shard, and the response gains concurrency_raise (raised_tasks, unavailable_shards, superseded). Further raises run 10 seconds, 1 minute and 5 minutes later, for the starts that a process with a stale cache stored. No raise lowers a stored cap. The response has the same shape as GET.",
+      "description": "Set, change or clear the run-default override of one workflow type (issues #2387, #2406, #2407 and #2408). The override wins over the code value for every new run and survives a restart. It reaches this process at once and every other process within its refresh period (about 5 seconds). Each duration is tri-state: absent keeps the stored override, null returns the field to its code value, a value sets it. A merge that sets no field deletes the override. With recompute_in_flight, the SLA deadline of each RUNNING, SUSPENDED or PAUSED run of the type that has not breached moves to the new effective SLA, on every shard, and the response gains recompute (moved_runs, unavailable_shards, superseded). A recompute stops when a newer change to the type replaces its SLA, and then reports superseded true. A hard deadline_at never changes. A chain_deadline_at never changes either: a chain in flight keeps its stored cap, and the override applies to the next chain that starts. A DAG declares no chain cap, so chain_execution_timeout_secs on a DAG is a 400. concurrency_limit applies to the next start and never lowers the cap of a run in flight. A PATCH that names concurrency_limit or clear_override, for a type with a concurrency policy, also raises the stored cap of each PENDING or RUNNING workflow task row of the type to the new effective limit, on every shard, and the response gains concurrency_raise (raised_tasks, unavailable_shards, superseded). Further raises run 10 seconds, 1 minute and 5 minutes later, for the starts that a process with a stale cache stored. No raise lowers a stored cap. Each quota_max_* field applies to the next admission of a key in every process: a lower cap refuses new work for a tenant over it with the 429 of issue #946, and never ends a run in flight. A parent whose child spawn a lower cap refuses waits with a backoff, and its own execution_timeout still applies. No row stores a quota cap, so no pass runs. The response has the same shape as GET.",
       "idempotency": "Idempotent: applying the same override twice is a no-op.",
       "params": [
         {
@@ -7222,6 +7222,21 @@
             "description": "Override the concurrency limit of a new start, from 1 to 2147483647. The key and on_conflict stay as declared. null returns to code. Refused for a type with no concurrency policy, a DAG included, and for a latest-wins (cancel_running) type."
           },
           {
+            "name": "quota_max_active_executions",
+            "required": false,
+            "description": "Override the quota cap on the active runs of one key, from 1 to 4294967295. The quota key and the LLM caps stay as declared. null returns to code and is accepted on any type. A value is refused for a type with no quota admission cap, a DAG included."
+          },
+          {
+            "name": "quota_max_history_bytes",
+            "required": false,
+            "description": "Override the quota cap on the history bytes of the active runs of one key, from 1 to 9223372036854775807. null returns to code and is accepted on any type. A value is refused for a type with no quota admission cap, a DAG included."
+          },
+          {
+            "name": "quota_max_dead_letters",
+            "required": false,
+            "description": "Override the quota cap on the dead letters of one key, from 1 to 4294967295. null returns to code and is accepted on any type. A value is refused for a type with no quota admission cap, a DAG included."
+          },
+          {
             "name": "clear_override",
             "required": false,
             "description": "true deletes the stored override before the other fields merge."
@@ -7250,7 +7265,7 @@
       "error_responses": [
         {
           "status": 400,
-          "description": "Empty patch, unknown field, a duration of zero or past 100 years, chain_execution_timeout_secs for a DAG, or a concurrency_limit of zero, past 2147483647, for a type with no policy, or for a latest-wins type."
+          "description": "Empty patch, unknown field, a duration of zero or past 100 years, chain_execution_timeout_secs for a DAG, a concurrency_limit of zero, past 2147483647, for a type with no policy, or for a latest-wins type, or a quota_max_* cap of zero, past its bound, or for a type with no quota admission cap."
         },
         {
           "status": 404,
@@ -8128,7 +8143,7 @@
       "path": "/admin/quotas",
       "category": "admin",
       "read_only": true,
-      "description": "List usage-vs-limit for every resolved `(workflow_name, quota_key)` pair with declared per-tenant resource quotas (issue #946). Each entry reports the current active-execution count, aggregate history bytes, and dead-letter count for the key against the workflow type's currently-registered `QuotaPolicy` limits. Admin-gated: like `/admin/concurrency`, `/admin/debounce`, and `/admin/start-throttle`, the quota_key resolves from user/tenant-derived input fields, so an unauthenticated caller could otherwise enumerate tenant identifiers across the fleet.",
+      "description": "List usage-vs-limit for every resolved `(workflow_name, quota_key)` pair with declared per-tenant resource quotas (issue #946). Each entry reports the current active-execution count, aggregate history bytes, and dead-letter count for the key against the workflow type's effective limits: the operator override of issue #2408, then the currently-registered `QuotaPolicy` limits. Admin-gated: like `/admin/concurrency`, `/admin/debounce`, and `/admin/start-throttle`, the quota_key resolves from user/tenant-derived input fields, so an unauthenticated caller could otherwise enumerate tenant identifiers across the fleet.",
       "idempotency": "Read-only; always idempotent.",
       "params": [],
       "request_body": null,
@@ -8136,10 +8151,12 @@
         "status": 200,
         "fields": [
           "quotas",
+          "workflow_types",
+          "override_source",
           "status",
           "unavailable_shards"
         ],
-        "notes": "Quota enforcement is shard-local by design (issue #946 AC8): the same (workflow_name, quota_key) pair can carry independent usage on every shard a tenant's traffic happens to land on, since shard routing hashes on workflow_id, not the quota key -- so the effective cap across the whole fleet is per-shard-limit multiplied by shards touched. Each entry in `quotas` therefore reports both a fleet-wide `usage` object (active_executions, history_bytes, dead_letters, summed across shards for convenience) AND a `shards` array of per-shard objects {shard_id, active_executions, history_bytes, dead_letters} so an operator can see exactly which shard(s) a tenant is actually capped on. `limits` reports the workflow type's CURRENTLY registered QuotaPolicy caps (max_active_executions, max_history_bytes, max_dead_letters; each null when uncapped or the workflow type declares no quota policy at all) -- resolved live against the registry, not persisted with the usage rows, so an edited policy is reflected immediately rather than against a stale snapshot. An unreachable shard degrades the response to `status: \"partial\"` (naming it in `unavailable_shards`) rather than failing the whole read; usage totals then reflect only the reachable shards and are a lower bound."
+        "notes": "Quota enforcement is shard-local by design (issue #946 AC8): the same (workflow_name, quota_key) pair can carry independent usage on every shard a tenant's traffic happens to land on, since shard routing hashes on workflow_id, not the quota key -- so the effective cap across the whole fleet is per-shard-limit multiplied by shards touched. Each entry in `quotas` therefore reports both a fleet-wide `usage` object (active_executions, history_bytes, dead_letters, summed across shards for convenience) AND a `shards` array of per-shard objects {shard_id, active_executions, history_bytes, dead_letters} so an operator can see exactly which shard(s) a tenant is actually capped on. `limits` reports the EFFECTIVE caps (max_active_executions, max_history_bytes, max_dead_letters; each null when uncapped or the workflow type declares no quota policy at all): the operator override of issue #2408, then the CURRENTLY registered QuotaPolicy caps -- resolved live against the registry, not persisted with the usage rows. `code_limits` holds the registered caps. `override` names the stored override (max_active_executions, max_history_bytes, max_dead_letters, reason, updated_by, updated_at, applies), or null; applies is false when the type has no admission cap, so the override changes nothing. `override_source` is \"table\" when the overrides were read from the default shard, or \"cache\" when that read failed and the cache of the serving process was used, then with null reason, updated_by and updated_at. `workflow_types` lists workflow_name, limits, code_limits and override for each registered type with an admission cap, so an override shows before its type has usage. An unreachable shard degrades the response to `status: \"partial\"` (naming it in `unavailable_shards`) rather than failing the whole read; usage totals then reflect only the reachable shards and are a lower bound."
       },
       "error_responses": [
         {

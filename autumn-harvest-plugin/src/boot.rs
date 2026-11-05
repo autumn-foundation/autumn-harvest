@@ -117,11 +117,42 @@ pub async fn load_boot_admission_gates(api_state: &HarvestApiState, pool: &DbPoo
     }
 }
 
+/// Load the run-default overrides of `runtime` once, before it serves a
+/// start (issue #2408).
+///
+/// The refresh loop first runs one second after it starts. A web-only
+/// process has no worker loop to load the cache sooner. A start in that
+/// window would admit under the code quota caps and concurrency limits. A
+/// load failure logs a warning and does not block startup.
+pub async fn load_boot_run_defaults(runtime: &HarvestApiRuntime, pool: &DbPool) {
+    let mut conn = match acquire_conn(pool).await {
+        Ok(conn) => conn,
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "could not acquire a connection to load run-default overrides at startup"
+            );
+            return;
+        }
+    };
+    if let Err(error) = runtime
+        .registry()
+        .run_defaults()
+        .refresh_if_stale(&mut conn)
+        .await
+    {
+        tracing::warn!(
+            error = %error,
+            "could not load run-default overrides at startup; the refresh loop retries"
+        );
+    }
+}
+
 /// Reload the run-default overrides of the installed runtime (issue #2387).
 ///
 /// The API start paths read that cache. A failed load keeps the last
-/// snapshot, because an override only moves a deadline and never admits a
-/// start.
+/// snapshot, and the next tick retries. Until a load succeeds, a concurrency
+/// limit or a quota cap of an override does not apply in this process.
 async fn refresh_run_defaults(
     api_state: &HarvestApiState,
     conn: &mut diesel_async::AsyncPgConnection,
@@ -866,6 +897,44 @@ mod load_shed_sampler_tests {
         .execute(conn)
         .await
         .expect("insert task");
+    }
+
+    /// Issue #2408: the boot load fills the run-default cache before the
+    /// first start, so a quota cap applies from the first request.
+    #[tokio::test]
+    async fn the_boot_load_fills_the_run_default_cache() {
+        let Ok(url) = std::env::var("HARVEST_TEST_DATABASE_URL") else {
+            eprintln!("SKIP: HARVEST_TEST_DATABASE_URL unset");
+            return;
+        };
+        let pool = build_pool(&url);
+        let mut conn = pool.get().await.expect("connect to test DB");
+        let name = format!("boot_quota_{}", uuid::Uuid::new_v4().simple());
+        diesel::sql_query(
+            "INSERT INTO harvest_run_default_overrides \
+                 (workflow_name, quota_max_active_executions, updated_by, created_at, updated_at) \
+             VALUES ($1, 3, 'ops', NOW(), NOW())",
+        )
+        .bind::<Text, _>(&name)
+        .execute(&mut conn)
+        .await
+        .expect("insert override");
+
+        let runtime = runtime(registry());
+        assert!(runtime.registry().run_defaults().get(&name).is_none());
+        super::load_boot_run_defaults(&runtime, &pool).await;
+        let loaded = runtime.registry().run_defaults().get(&name);
+
+        diesel::sql_query("DELETE FROM harvest_run_default_overrides WHERE workflow_name = $1")
+            .bind::<Text, _>(&name)
+            .execute(&mut conn)
+            .await
+            .expect("scrub override");
+        let expected = autumn_harvest::quota::QuotaLimits {
+            max_active_executions: Some(3),
+            ..autumn_harvest::quota::QuotaLimits::default()
+        };
+        assert_eq!(loaded.map(|fields| fields.quota), Some(expected));
     }
 
     /// The sampler spawned before `install` trips on its first tick.
