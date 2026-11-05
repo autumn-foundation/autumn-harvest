@@ -200,11 +200,17 @@ fn run_cargo_deny(log: &Path) -> Result<u8> {
     match spawned {
         Ok(status) => Ok(exit_code(status)),
         // The shell logged a missing `cargo` and scanned on with status 127.
-        // Then the alert names the cause instead of a bare error.
+        // Then the alert names the cause instead of a bare error. A `cargo`
+        // that cannot run gave status 126, as here.
         Err(error) => {
-            std::fs::write(log, format!("cargo: {error}\n"))
+            let (message, status) = match error.kind() {
+                std::io::ErrorKind::NotFound => ("command not found".to_string(), 127),
+                std::io::ErrorKind::PermissionDenied => ("Permission denied".to_string(), 126),
+                _ => (error.to_string(), 127),
+            };
+            std::fs::write(log, format!("cargo: {message}\n"))
                 .with_context(|| format!("writing {}", log.display()))?;
-            Ok(127)
+            Ok(status)
         }
     }
 }
@@ -295,11 +301,17 @@ fn issue_number_titled(listing: &str, title: &str) -> Result<Option<String>> {
         if is_pull_request || issue.get("title").and_then(Value::as_str) != Some(title) {
             continue;
         }
-        return Ok(match issue.get("number") {
-            None | Some(Value::Null | Value::Bool(false)) => None,
-            Some(Value::String(number)) => Some(number.clone()),
-            Some(number) => Some(number.to_string()),
-        });
+        // `jq -r` prints a string raw and any other value as JSON. The shell
+        // then drops each trailing newline. An empty number is no issue.
+        let number = match issue.get("number") {
+            None | Some(Value::Null | Value::Bool(false)) => return Ok(None),
+            Some(Value::String(number)) => number.clone(),
+            Some(number) => {
+                serde_json::to_string_pretty(number).context("rendering the issue number")?
+            }
+        };
+        let number = number.trim_end_matches('\n');
+        return Ok((!number.is_empty()).then(|| number.to_string()));
     }
     Ok(None)
 }
@@ -401,6 +413,20 @@ mod tests {
     fn lookup_needs_an_exact_title() {
         let listing = format!(r#"[{{"number":31,"title":"{TITLE} (old)"}}]"#);
         assert_eq!(issue_number_titled(&listing, TITLE).unwrap(), None);
+    }
+
+    #[test]
+    fn lookup_reads_the_number_as_the_shell_did() {
+        let empty = format!(r#"[{{"number":"","title":"{TITLE}"}}]"#);
+        assert_eq!(issue_number_titled(&empty, TITLE).unwrap(), None);
+        let padded = format!(r#"[{{"number":"31\n","title":"{TITLE}"}}]"#);
+        assert_eq!(
+            issue_number_titled(&padded, TITLE).unwrap().as_deref(),
+            Some("31")
+        );
+        let skipped =
+            format!(r#"[{{"number":null,"title":"{TITLE}"}},{{"number":7,"title":"{TITLE}"}}]"#);
+        assert_eq!(issue_number_titled(&skipped, TITLE).unwrap(), None);
     }
 
     #[test]

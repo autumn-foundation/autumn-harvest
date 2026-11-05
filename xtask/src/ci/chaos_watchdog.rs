@@ -174,7 +174,8 @@ fn total_count(reply: &str) -> Result<String> {
             other => serde_json::to_string_pretty(&other).context("rendering the run count")?,
         });
     }
-    Ok(lines.join("\n"))
+    // The command substitution of the shell drops each trailing newline.
+    Ok(lines.join("\n").trim_end_matches('\n').to_string())
 }
 
 /// True when `text` is a plain decimal count.
@@ -291,11 +292,17 @@ fn issue_number_titled(listing: &str, title: &str) -> Result<Option<String>> {
         if is_pull_request || issue.get("title").and_then(Value::as_str) != Some(title) {
             continue;
         }
-        return Ok(match issue.get("number") {
-            None | Some(Value::Null | Value::Bool(false)) => None,
-            Some(Value::String(number)) => Some(number.clone()),
-            Some(number) => Some(number.to_string()),
-        });
+        // `jq -r` prints a string raw and any other value as JSON. The shell
+        // then drops each trailing newline. An empty number is no issue.
+        let number = match issue.get("number") {
+            None | Some(Value::Null | Value::Bool(false)) => return Ok(None),
+            Some(Value::String(number)) => number.clone(),
+            Some(number) => {
+                serde_json::to_string_pretty(number).context("rendering the issue number")?
+            }
+        };
+        let number = number.trim_end_matches('\n');
+        return Ok((!number.is_empty()).then(|| number.to_string()));
     }
     Ok(None)
 }
@@ -357,6 +364,26 @@ mod tests {
         assert!(!is_count(&count));
         assert!(!is_count(""));
         assert!(!is_count(&total_count(r#"{"total_count":1.5}"#).unwrap()));
+    }
+
+    #[test]
+    fn the_count_drops_trailing_newlines_as_the_shell_did() {
+        assert_eq!(total_count(r#"{"total_count":"3\n\n"}"#).unwrap(), "3");
+        let two = total_count(r#"{"total_count":1}{"total_count":1}"#).unwrap();
+        assert_eq!(two, "1\n1");
+        assert!(!is_count(&two));
+    }
+
+    #[test]
+    fn an_empty_issue_number_is_no_issue() {
+        let title = alert_title();
+        let empty = format!("[{{\"number\":\"\",\"title\":\"{title}\"}}]");
+        assert_eq!(issue_number_titled(&empty, &title).unwrap(), None);
+        let padded = format!("[{{\"number\":\"78\\n\",\"title\":\"{title}\"}}]");
+        assert_eq!(
+            issue_number_titled(&padded, &title).unwrap().as_deref(),
+            Some("78")
+        );
     }
 
     #[test]

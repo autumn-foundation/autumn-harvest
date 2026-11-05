@@ -25,8 +25,9 @@ use smop::prelude::*;
 pub struct Args {
     /// The test binary.
     ///
-    /// The shell split it into words, so it can hold a program and its
-    /// leading arguments.
+    /// The command splits it into words and expands each glob, as the shell
+    /// did. So it can hold a program and its leading arguments, or a glob
+    /// such as `target/debug/deps/integration-*`.
     #[arg(value_name = "TEST_BINARY")]
     pub bin: String,
     /// The exact name of the test to run.
@@ -48,9 +49,7 @@ pub fn run(args: Args) -> Result<ExitCode> {
         runs,
         spinners,
     } = args;
-    let mut words = bin.split_whitespace();
-    let program = words.next().unwrap_or_default().to_string();
-    let leading: Vec<String> = words.map(str::to_string).collect();
+    let command_line = test_argv(&bin, &test);
     let pattern = Regex::new("postgres:.*(Activity|Signal)").context("the event pattern")?;
 
     let stop = Arc::new(AtomicBool::new(false));
@@ -67,7 +66,7 @@ pub fn run(args: Args) -> Result<ExitCode> {
 
     let mut failures = 0_u64;
     for index in 1..=runs {
-        let (passed, output) = run_once(&program, &leading, &test)?;
+        let (passed, output) = run_once(&command_line)?;
         if !passed {
             failures += 1;
             println!("run {index} FAIL: {}", event_order(&pattern, &output));
@@ -83,19 +82,67 @@ pub fn run(args: Args) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// Runs the test once and returns whether it passed and its output.
+/// The command line of one run, as the shell built `$bin "$t" --exact`.
+///
+/// The shell split the unquoted `$bin` on spaces, tabs and newlines. Then it
+/// expanded each word that holds a glob character. A pattern that matches no
+/// path stays as it is, as bash does without `nullglob`. An empty `$bin` gave
+/// no word, so the test name became the program.
+fn test_argv(bin: &str, test: &str) -> Vec<String> {
+    let mut argv: Vec<String> = bin
+        .split([' ', '\t', '\n'])
+        .filter(|word| !word.is_empty())
+        .flat_map(expand_word)
+        .collect();
+    argv.extend([test.to_string(), "--exact".to_string()]);
+    argv
+}
+
+/// Expands one unquoted word as a shell glob.
+///
+/// A word with no glob character, a pattern that matches nothing, or a
+/// pattern that cannot be read stays as it is.
+fn expand_word(word: &str) -> Vec<String> {
+    if !word.contains(['*', '?', '[']) {
+        return vec![word.to_string()];
+    }
+    match fs::glob(word) {
+        Ok(paths) if !paths.is_empty() => paths
+            .into_iter()
+            .map(|path| with_dot_prefix(word, &path.to_string_lossy()))
+            .collect(),
+        _ => vec![word.to_string()],
+    }
+}
+
+/// Gives the match `path` of the pattern `word` the leading `./` of `word`.
+///
+/// The glob crate drops a leading `./`, and bash keeps it. Without it, a bare
+/// name resolves on `PATH` instead of the current directory.
+fn with_dot_prefix(word: &str, path: &str) -> String {
+    if word.starts_with("./") && !path.starts_with("./") {
+        format!("./{path}")
+    } else {
+        path.to_string()
+    }
+}
+
+/// Runs `command_line` once. It returns whether the run passed and
+/// its output.
 ///
 /// The output holds stdout and stderr, interleaved, as `2>&1` gave them. A
 /// binary that cannot start is a failed run, as it was for the shell.
-fn run_once(program: &str, leading: &[String], test: &str) -> Result<(bool, String)> {
+fn run_once(command_line: &[String]) -> Result<(bool, String)> {
+    let Some((program, rest)) = command_line.split_first() else {
+        bail!("the test command line is empty");
+    };
     let scratch = fs::temp_dir()?;
     let path = scratch.path().join("run.log");
     let file =
         std::fs::File::create(&path).with_context(|| format!("creating {}", path.display()))?;
     let stderr = file.try_clone().context("opening the run log")?;
     let status = Command::new(program)
-        .args(leading)
-        .args([test, "--exact"])
+        .args(rest)
         .stdin(Stdio::inherit())
         .stdout(Stdio::from(file))
         .stderr(Stdio::from(stderr))
@@ -169,12 +216,47 @@ mod tests {
 
     #[test]
     fn a_failing_binary_counts_as_a_failure() {
-        let (passed, _) = run_once("false", &[], "t").unwrap();
+        let (passed, _) = run_once(&test_argv("false", "t")).unwrap();
         assert!(!passed);
-        let (passed, output) = run_once("echo", &["postgres:".into()], "Activity").unwrap();
+        let (passed, output) = run_once(&test_argv("echo postgres:", "Activity")).unwrap();
         assert!(passed);
         assert_eq!(output, "postgres: Activity --exact\n");
-        let (passed, _) = run_once("definitely-not-a-test-binary", &[], "t").unwrap();
+        let (passed, _) = run_once(&test_argv("definitely-not-a-test-binary", "t")).unwrap();
         assert!(!passed);
+    }
+
+    #[test]
+    fn the_binary_splits_into_words_as_the_shell_did() {
+        assert_eq!(
+            test_argv(" env\tFOO=1  ./bin\n", "a::b"),
+            ["env", "FOO=1", "./bin", "a::b", "--exact"]
+        );
+        assert_eq!(test_argv("", "a::b"), ["a::b", "--exact"]);
+        assert_eq!(
+            test_argv("./bin\u{a0}x", "t"),
+            ["./bin\u{a0}x", "t", "--exact"]
+        );
+    }
+
+    #[test]
+    fn a_glob_in_the_binary_expands_or_stays() {
+        let dir = fs::temp_dir().unwrap();
+        for name in ["integration-b", "integration-a"] {
+            fs::write_string(dir.path().join(name), "").unwrap();
+        }
+        let pattern = format!("{}/integration-*", dir.path().display());
+        assert_eq!(
+            expand_word(&pattern),
+            [
+                format!("{}/integration-a", dir.path().display()),
+                format!("{}/integration-b", dir.path().display()),
+            ]
+        );
+        let none = format!("{}/nothing-*", dir.path().display());
+        assert_eq!(expand_word(&none), std::slice::from_ref(&none));
+        assert_eq!(expand_word("./plain"), ["./plain"]);
+        assert_eq!(with_dot_prefix("./test*", "testbin"), "./testbin");
+        assert_eq!(with_dot_prefix("./test*", "./testbin"), "./testbin");
+        assert_eq!(with_dot_prefix("target/x-*", "target/x-1"), "target/x-1");
     }
 }
