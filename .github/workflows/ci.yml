@@ -620,10 +620,10 @@ jobs:
       # Issue #1614: the standalone getting-started chapter shows the files of
       # examples/standalone-quickstart byte for byte, and keeps the markers
       # that the `standalone-chapter` job runs.
-      - name: Standalone chapter sync (docs/audits/standalone-chapter-sync.py)
+      - name: Standalone chapter sync (cargo xtask audit standalone-chapter-sync)
         run: |
-          python3 docs/audits/standalone-chapter-sync.py --self-test
-          python3 docs/audits/standalone-chapter-sync.py
+          cargo xtask audit standalone-chapter-sync --self-test
+          cargo xtask audit standalone-chapter-sync
 
       # Folio corpus harness: Rust syntax check for every ```rust fence in
       # docs/getting-started/*.md and README.md (see
@@ -692,30 +692,26 @@ jobs:
           python3 -m openapi_spec_validator docs/openapi.json
           python3 -m openapi_spec_validator autumn-harvest-plugin/openapi.json
 
-      # Workflow YAML parse check (see docs/audits/workflow-yaml-parse.py).
+      # Workflow YAML parse check (see xtask/src/audit/workflow_yaml_parse/).
       # GitHub runs an unparsable workflow file as a zero-job failed run on
       # every push and never fires its triggers. chaos.yml sat in that state
-      # from its first commit, so its nightly suite never ran. Runs after
-      # `setup-python` above, which is where PyYAML can be installed. The pin
-      # keeps a PyYAML release from reddening lint.
-      - name: Workflow YAML parses (docs/audits/workflow-yaml-parse.py)
-        run: |
-          python3 -m pip install --quiet --disable-pip-version-check "PyYAML==6.0.2"
-          python3 docs/audits/workflow-yaml-parse.py
+      # from its first commit, so its nightly suite never ran. The command
+      # reads YAML as PyYAML does, and its parser is compiled in.
+      - name: Workflow YAML parses (cargo xtask audit workflow-yaml-parse)
+        run: cargo xtask audit workflow-yaml-parse
 
-      # Supply-chain pin lint (issue #1826, docs/audits/action-sha-pin.py).
+      # Supply-chain pin lint (issue #1826, xtask/src/audit/action_sha_pin.rs).
       # A tag or branch ref can move to new code. Each `uses:` must pin a
-      # commit SHA with a `# <tag>` comment. The self-test runs first. Runs
-      # after the PyYAML install above, because the script parses YAML.
-      - name: Action SHA pins (docs/audits/action-sha-pin.py)
+      # commit SHA with a `# <tag>` comment. The self-test runs first.
+      - name: Action SHA pins (cargo xtask audit action-sha-pin)
         run: |
-          python3 docs/audits/action-sha-pin.py --self-test
-          python3 docs/audits/action-sha-pin.py
+          cargo xtask audit action-sha-pin --self-test
+          cargo xtask audit action-sha-pin
 
       # Issue #1989. Lint the worker chart, then check the image contract.
       # The audit renders the chart with `helm template`. The pinned version
       # and its checksum stop a new Helm release from failing the lint job.
-      - name: Worker chart and image contract (docs/audits/worker-image-contract.py)
+      - name: Worker chart and image contract (cargo xtask audit worker-image-contract)
         env:
           HELM_VERSION: "3.21.0"
           HELM_SHA256: "0093eb572e3d2380f094df162ddb525e219249de88957afe24cfbb19632acd36"
@@ -728,15 +724,15 @@ jobs:
           tar -xzf "${RUNNER_TEMP}/helm.tar.gz" -C "${RUNNER_TEMP}/helm-bin" --strip-components=1 linux-amd64/helm
           export PATH="${RUNNER_TEMP}/helm-bin:${PATH}"
           helm lint --strict charts/autumn-harvest-worker -f charts/autumn-harvest-worker/ci/lint-values.yaml
-          python3 docs/audits/worker-image-contract.py --self-test
-          python3 docs/audits/worker-image-contract.py
+          cargo xtask audit worker-image-contract --self-test
+          cargo xtask audit worker-image-contract
 
       # Issue #1828. The rolling-deploy contract page and the
       # `mixed-version-smoke` job must both exist and name each other.
-      - name: Mixed-version contract guard (docs/audits/mixed-version-contract.py)
+      - name: Mixed-version contract guard (cargo xtask audit mixed-version-contract)
         run: |
-          python3 docs/audits/mixed-version-contract.py --self-test
-          python3 docs/audits/mixed-version-contract.py
+          cargo xtask audit mixed-version-contract --self-test
+          cargo xtask audit mixed-version-contract
       # The smoke crate is not a workspace member, so `cargo fmt --all` skips it.
       - name: Format check of the mixed-version smoke crate
         run: rustfmt --edition 2024 --check scripts/mixed-version-smoke/src/*.rs

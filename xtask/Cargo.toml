@@ -20,6 +20,9 @@ serde_json = { workspace = true }
 serde_yaml = "0.9"
 toml = { workspace = true }
 walkdir = "2"
+# The libyaml port that serde_yaml wraps. The PyYAML-compatible reader of
+# the contracts audits needs its event API, which serde_yaml hides.
+unsafe-libyaml = "0.2.11"
 
 [lints]
 workspace = true
