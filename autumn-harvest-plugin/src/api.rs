@@ -9213,6 +9213,7 @@ pub const fn management_api_response_fields()
                 "items",
                 "shards",
                 "excluded_paused_queues",
+                "unpolled_declared_queues",
             ]),
         ),
         (

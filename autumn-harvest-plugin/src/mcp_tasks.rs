@@ -944,6 +944,8 @@ pub fn build_mcp_task_route(
         // The class that a route macro sets when it names none (since autumn-web 0.9).
         criticality: autumn_web::Criticality::Default,
         seo: autumn_web::SeoRouteDefaults::EMPTY,
+        // The group of the plugin that registers the route (since autumn-web 0.10).
+        group: None,
     }
 }
 

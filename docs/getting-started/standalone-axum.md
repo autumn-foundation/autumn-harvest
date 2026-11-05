@@ -42,7 +42,7 @@ publish = false
 [dependencies]
 autumn-harvest = { version = "0.9.0", path = "../../autumn-harvest" }
 autumn-harvest-plugin = { version = "0.9.0", path = "../../autumn-harvest-plugin" }
-autumn-web = "0.9"
+autumn-web = "0.10"
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
 tracing = "0.1"

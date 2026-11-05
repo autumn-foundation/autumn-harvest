@@ -167,7 +167,7 @@ fn generated_cargo_toml_uses_cratesio_version_deps_and_no_path() {
         cargo.contains("autumn-harvest-plugin = \"0.9\""),
         "cargo: {cargo}"
     );
-    assert!(cargo.contains("autumn-web = \"0.9\""), "cargo: {cargo}");
+    assert!(cargo.contains("autumn-web = \"0.10\""), "cargo: {cargo}");
     assert!(cargo.contains("features = [\"db\"]"), "cargo: {cargo}");
     assert!(
         !cargo.contains("path ="),
