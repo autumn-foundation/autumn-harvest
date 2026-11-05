@@ -561,8 +561,12 @@ struct MacroCall {
     declares: BTreeSet<String>,
 }
 
-/// The std and logging macros that never declare a type.
-const TYPE_FREE_MACROS: [&str; 38] = [
+/// The std, logging and `proptest` macros that never declare a type.
+///
+/// A `proptest!` call declares test functions. It is usually under
+/// `#[cfg(test)]`, but the index reads that code too. So a type name in its
+/// body must not become opaque (issue #2545).
+const TYPE_FREE_MACROS: [&str; 45] = [
     "assert",
     "assert_eq",
     "assert_ne",
@@ -594,6 +598,13 @@ const TYPE_FREE_MACROS: [&str; 38] = [
     "pin",
     "print",
     "println",
+    "prop_assert",
+    "prop_assert_eq",
+    "prop_assert_ne",
+    "prop_assume",
+    "prop_compose",
+    "prop_oneof",
+    "proptest",
     "stringify",
     "todo",
     "trace",
@@ -1286,6 +1297,24 @@ mod tests {
         }
         // A std macro declares no type, and a path is not a bare name.
         assert!(!opaque("Order"), "{index:?}");
+    }
+
+    #[test]
+    fn a_test_macro_makes_no_type_opaque() {
+        // Issue #2545. A `proptest!` body declares tests, not types. A name
+        // in it must not change the verdict of an unrelated workflow.
+        let mut index = SourceIndex::default();
+        index.absorb_syn(
+            "#[cfg(test)] mod t { proptest! { #[test] fn p(s in any::<String>(), id: CandidateId) {\n\
+             prop_assert_eq!(s, s); prop_assert!(id == id); } } }\n\
+             prop_compose! { fn pair()(a in 0u8.., b in 0u8..) -> Pair { Pair(a, b) } }\n",
+            &[],
+        );
+        index.expand_macros();
+        let opaque = |ty: &str| index.type_fields.get(ty).is_some_and(|f| f.opaque);
+        for ty in ["String", "CandidateId", "Pair"] {
+            assert!(!opaque(ty), "{ty}: {index:?}");
+        }
     }
 
     #[test]

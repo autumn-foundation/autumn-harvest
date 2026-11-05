@@ -3616,6 +3616,7 @@ dependencies = [
  "autumn-harvest",
  "harvest-verify-corpus-helpers",
  "harvest-verify-corpus-helpers-deep",
+ "proptest",
  "serde",
  "serde_json",
 ]
