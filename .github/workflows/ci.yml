@@ -1207,7 +1207,7 @@ jobs:
       # portable protocol, policy and capture tests.
       - name: Run sandboxed code activity tests
         if: needs.changes.outputs.code == 'true' && matrix.shard == 1
-        run: cargo test -p autumn-harvest --no-default-features --features sandbox-activities --lib sandbox
+        run: cargo sandbox-test
       - name: Run sandbox guest agent tests
         if: needs.changes.outputs.code == 'true' && matrix.shard == 0
         run: cargo test -p autumn-harvest-sandbox-guest

@@ -551,7 +551,7 @@ fn each_guide_test_command_runs_in_ci() {
     let workflow = read(".github/workflows/ci.yml");
     let commands: Vec<&str> = testing
         .lines()
-        .filter(|line| line.starts_with("cargo test"))
+        .filter(|line| line.starts_with("cargo test") || line.starts_with("cargo sandbox-test"))
         .collect();
     assert!(commands.len() >= 3, "the guide lists the test commands");
     for command in commands {
@@ -560,6 +560,81 @@ fn each_guide_test_command_runs_in_ci() {
             "ci.yml must run the guide command `{command}`"
         );
     }
+}
+
+/// The dev-dependencies that the DB-free test path must not build.
+const HEAVY_DEV_DEPS: &[&str] = &[
+    "testcontainers",
+    "testcontainers-modules",
+    "criterion",
+    "stateright",
+    "autumn-harvest-agent",
+];
+
+/// The cfg that turns the light test path on (issue #2487).
+const LIGHT_CFG: &str = "harvest_light";
+
+fn manifest() -> toml::Table {
+    read("autumn-harvest/Cargo.toml")
+        .parse()
+        .expect("the core manifest must parse")
+}
+
+#[test]
+fn heavy_dev_dependencies_are_off_on_the_light_path() {
+    let manifest = manifest();
+    let plain = manifest["dev-dependencies"]
+        .as_table()
+        .expect("the manifest has `[dev-dependencies]`");
+    for name in HEAVY_DEV_DEPS {
+        assert!(
+            !plain.contains_key(*name),
+            "`{name}` must sit under a `cfg(not({LIGHT_CFG}))` table"
+        );
+    }
+    let gated: BTreeSet<&str> = manifest["target"]
+        .as_table()
+        .expect("the manifest has target tables")
+        .iter()
+        .filter(|(cfg, _)| cfg.contains(LIGHT_CFG) && cfg.contains("not("))
+        .filter_map(|(_, table)| table.get("dev-dependencies")?.as_table())
+        .flat_map(toml::Table::keys)
+        .map(String::as_str)
+        .collect();
+    for name in HEAVY_DEV_DEPS {
+        assert!(
+            gated.contains(name),
+            "`{name}` must be gated by `{LIGHT_CFG}`"
+        );
+    }
+}
+
+#[test]
+fn the_light_cfg_is_registered_and_aliased() {
+    let root = read("Cargo.toml");
+    assert!(
+        root.contains(&format!("'cfg({LIGHT_CFG})'")),
+        "the workspace lint table must register `{LIGHT_CFG}`"
+    );
+    let config = read(".cargo/config.toml");
+    let alias = section(&config, "\nsandbox-test = [", "\n]")
+        .expect("`.cargo/config.toml` must define the `sandbox-test` alias");
+    assert!(
+        alias.contains(LIGHT_CFG),
+        "the alias must set `{LIGHT_CFG}`"
+    );
+}
+
+#[test]
+fn the_guide_documents_the_light_command_and_ci_runs_it() {
+    let guide = read(GUIDE);
+    let testing = section(&guide, "## Testing", "\n## ").expect("the guide has `## Testing`");
+    let command = "cargo sandbox-test";
+    assert!(testing.contains(command), "the guide must name `{command}`");
+    assert!(
+        read(".github/workflows/ci.yml").contains(&format!("run: {command}")),
+        "ci.yml must run `{command}`"
+    );
 }
 
 #[test]

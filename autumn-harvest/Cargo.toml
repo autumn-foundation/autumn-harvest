@@ -373,7 +373,6 @@ required-features = ["debugger"]
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 proptest = { workspace = true }
-criterion = { version = "0.8", features = ["html_reports", "async_tokio"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 trybuild = "1"
 tempfile = "3"
@@ -408,16 +407,23 @@ serde_yaml = "0.9"
 # (`tests/loom_models.rs`) never uses testcontainers, so gate it to non-loom
 # builds; the Docker-backed integration tests that DO use it always run under a
 # normal build where `cfg(not(loom))` is true, so this is transparent to them.
-[target.'cfg(not(loom))'.dev-dependencies]
+[target.'cfg(not(any(loom, harvest_light)))'.dev-dependencies]
 testcontainers = { workspace = true }
 testcontainers-modules = { workspace = true }
+
+# The light test path (issue #2487) sets `--cfg harvest_light`. It skips the
+# heavy dev-dependencies below, so `cargo sandbox-test` builds no Docker client,
+# no benchmark harness and no model checker. Run `cargo sandbox-test` for it.
+# The `tests/`, `benches/` and `examples/` targets need the full set.
+[target.'cfg(not(harvest_light))'.dev-dependencies]
+criterion = { version = "0.8", features = ["html_reports", "async_tokio"] }
 
 # Runs the real `agent_loop` on a Postgres worker to measure the resident hit
 # rate (issue #2013). The loom and shuttle models never use it.
 # Keep this dependency path-only, with no `version`. The agent crate depends on
 # this crate, so a versioned edge makes a cycle. Cargo then cannot order a
 # workspace `cargo publish`. A path-only dev-dependency is stripped on publish.
-[target.'cfg(not(any(loom, shuttle)))'.dev-dependencies]
+[target.'cfg(not(any(loom, shuttle, harvest_light)))'.dev-dependencies]
 autumn-harvest-agent = { path = "../autumn-harvest-agent" }
 # Explores every interleaving of the DST oracles within a bound (the
 # `stateright` test target). Dev-only, so it never ships. The loom and Shuttle
