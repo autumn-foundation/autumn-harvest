@@ -165,7 +165,7 @@ impl WorkerQueues {
 
     /// True when the role pin names no declared queue.
     #[must_use]
-    pub fn pin_misses(&self) -> bool {
+    pub fn pin_missed(&self) -> bool {
         let pin_set = self.pin.as_ref().is_some_and(|pin| !pin.is_empty());
         pin_misses(
             self.source == QueueSource::Explicit,
@@ -188,7 +188,7 @@ impl WorkerQueues {
             source = %self.source,
             "harvest worker queues resolved"
         );
-        if worker_enabled && self.pin_misses() {
+        if worker_enabled && self.pin_missed() {
             tracing::warn!(
                 "the Autumn role pin names no Harvest queue ({}), so the Harvest worker polls \
                  each declared queue ({}). To narrow it, set {WORKER_QUEUES_ENV} or \
@@ -273,7 +273,7 @@ mod tests {
         assert_eq!(queues.declared(), declared.as_slice());
         assert_eq!(queues.source(), QueueSource::Code);
         assert_eq!(queues.unpolled(), Vec::<String>::new());
-        assert!(!queues.pin_misses());
+        assert!(!queues.pin_missed());
     }
 
     #[test]
@@ -330,7 +330,7 @@ mod tests {
         assert_eq!(queues.polled(), names(&["priority"]).as_slice());
         assert_eq!(queues.source(), QueueSource::Role);
         assert_eq!(queues.pin(), Some(pin.as_slice()));
-        assert!(!queues.pin_misses());
+        assert!(!queues.pin_missed());
     }
 
     #[test]
@@ -340,7 +340,7 @@ mod tests {
         let queues = WorkerQueues::resolve(&declared, &names(&["default"]), Some(&pin)).unwrap();
         assert_eq!(queues.polled(), names(&["default"]).as_slice());
         assert_eq!(queues.source(), QueueSource::Explicit);
-        assert!(!queues.pin_misses());
+        assert!(!queues.pin_missed());
     }
 
     #[test]
@@ -350,7 +350,7 @@ mod tests {
         let queues = WorkerQueues::resolve(&declared, &[], Some(&pin)).unwrap();
         assert_eq!(queues.polled(), declared.as_slice());
         assert_eq!(queues.source(), QueueSource::Code);
-        assert!(queues.pin_misses());
+        assert!(queues.pin_missed());
         let logs = crate::process_role::capture_logs(tracing::Level::WARN, || queues.log(true));
         assert!(logs.contains("emails"), "{logs}");
         assert!(logs.contains("default, priority"), "{logs}");
@@ -367,7 +367,7 @@ mod tests {
         let queues = WorkerQueues::resolve(&declared, &[], Some(&[])).unwrap();
         assert_eq!(queues.polled(), declared.as_slice());
         assert_eq!(queues.source(), QueueSource::Code);
-        assert!(!queues.pin_misses());
+        assert!(!queues.pin_missed());
     }
 
     #[test]
