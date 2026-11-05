@@ -192,24 +192,14 @@ pub struct Composition {
     pub notes: Vec<String>,
 }
 
-/// The pool of `probes` of the source `events`, and the ids in input order.
+/// The names that a pool and a bundle of `probes` hide, as in
+/// `compare_anonymised`. They are each overlay digest, each model route and
+/// the provider id of each route.
 ///
-/// Each failure text of the pool loses each overlay digest, each model
-/// route and the provider id of each route, as in `compare_anonymised`.
 /// The routes are the default route, each overlay model and each route that
 /// a probe asked for. A probe can inherit the route of its source task, or
 /// ask for the route of a recorded peer.
-fn pool_of(
-    harness: &AgentHarness,
-    events: &[WorkflowEvent],
-    seed: u64,
-    probes: &[ProbedCandidate],
-) -> Result<(Vec<ComposeCandidate>, AnonymisedPool), String> {
-    let evaluations: Vec<Evaluation> = probes
-        .iter()
-        .map(|probe| probe.evaluation.clone())
-        .collect();
-    let ids = candidate_ids(seed, events, &evaluations);
+fn identities_of(harness: &AgentHarness, probes: &[ProbedCandidate]) -> Vec<String> {
     let mut routes: BTreeSet<Option<String>> = BTreeSet::from([None]);
     let mut identities: Vec<String> = Vec::new();
     for probe in probes {
@@ -225,6 +215,24 @@ fn pool_of(
         }
         identities.extend(route);
     }
+    identities
+}
+
+/// The pool of `probes` of the source `events`, and the ids in input order.
+///
+/// Each failure text of the pool loses each name of [`identities_of`].
+fn pool_of(
+    harness: &AgentHarness,
+    events: &[WorkflowEvent],
+    seed: u64,
+    probes: &[ProbedCandidate],
+) -> Result<(Vec<ComposeCandidate>, AnonymisedPool), String> {
+    let evaluations: Vec<Evaluation> = probes
+        .iter()
+        .map(|probe| probe.evaluation.clone())
+        .collect();
+    let ids = candidate_ids(seed, events, &evaluations);
+    let identities = identities_of(harness, probes);
     let recorded = recorded_end(events).map_err(|err| err.to_string())?;
     let pool = recorded_pool(
         recorded,
@@ -338,12 +346,10 @@ pub(crate) async fn run_compose(
                 format!("refine/{}", request.source),
                 request.seed,
             );
-            let hidden: BTreeSet<String> = request
-                .probes
-                .iter()
-                .filter_map(|probe| probe.overlay.model.clone())
-                .collect();
-            for name in hidden {
+            // The bundle hides the same names as the pool. It renders the
+            // evaluations again, so a hidden name of the pool must be hidden
+            // here too.
+            for name in identities_of(harness, &request.probes) {
                 workspace = workspace.hide(name);
             }
             let evaluations: Vec<Evaluation> = request

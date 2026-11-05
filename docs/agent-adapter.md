@@ -2480,7 +2480,8 @@ On Postgres, install `postgres::Sources::new(pg)` and start the workflow
   each route that a probe asked for, with its model id. So a route that a
   probe inherits from its source task, or the route of a recorded peer, is
   redacted too. With a workspace store, the composer also reads an
-  evidence bundle. An `OverlaySelector` picks one id. The rule picks in its place when no selector is installed, or when
+  evidence bundle, which hides the same names. An `OverlaySelector` picks
+  one id. The rule picks in its place when no selector is installed, or when
   the selector fails, times out or names an id outside the pool. The rule
   takes a completed end first, then the fewest stubbed tool calls, then
   the lowest id.

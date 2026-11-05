@@ -1418,3 +1418,100 @@ async fn a_recorded_peer_route_and_its_model_id_are_redacted_from_the_pool() {
         assert!(!pool.contains(identity), "{identity} leaks: {pool}");
     }
 }
+
+/// A composer that keeps the text of each file of its evidence bundle.
+#[derive(Debug)]
+struct KeepBundle {
+    store: autumn_harvest_agent::WorkspaceStore,
+    seen: std::sync::Mutex<Vec<String>>,
+}
+
+impl OverlayComposer for KeepBundle {
+    fn compose<'a>(
+        &'a self,
+        context: &'a ComposeContext<'a>,
+    ) -> BoxFuture<'a, Result<ProposerReply, AgentError>> {
+        Box::pin(async move {
+            let manifest = context.bundle.expect("a workspace store writes a bundle");
+            let bundle = autumn_harvest_agent::eval::evidence::read_bundle(&self.store, manifest)
+                .await
+                .unwrap();
+            let texts: Vec<String> = bundle
+                .files
+                .files()
+                .iter()
+                .map(|(path, file)| {
+                    let text = String::from_utf8(file.data.clone()).unwrap();
+                    format!("{path}\n{text}")
+                })
+                .collect();
+            self.seen.lock().unwrap().extend(texts);
+            Ok(ProposerReply::Overlay(ProfileOverlay::default()))
+        })
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_inherited_route_and_its_model_id_are_hidden_from_the_bundle() {
+    // Each probe inherits the route of the kind, as in the pool test. It
+    // fails with an error that names the route and its model id.
+    let route = "route-bundle-5d3e";
+    let id = "model-bundle-id-7a4c";
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("a.db");
+    let store = autumn_harvest_agent::WorkspaceStore::new(
+        Arc::new(autumn_harvest_agent::InMemoryWorkspaceBlobs::default()),
+        autumn_harvest::payload_codec::PayloadCodecs::default(),
+    );
+    let keep = Arc::new(KeepBundle {
+        store: store.clone(),
+        seen: std::sync::Mutex::default(),
+    });
+    let base = AgentHarness::new(Arc::new(Model::default()) as Arc<dyn AgentModel>)
+        .model_named(route, Arc::new(Routed { id, route }))
+        .agent(
+            AgentProfile::new(KIND)
+                .system(BASE)
+                .max_steps(20)
+                .model(route),
+        )
+        .workspace(store);
+    let overlays = InMemoryOverlayStore::new(Arc::new(base.clone()));
+    let harness = base
+        .overlay_store(Arc::new(overlays))
+        .proposer(Arc::new(Proposer::default()))
+        .composer(Arc::clone(&keep) as Arc<dyn OverlayComposer>)
+        .refine_sources(Arc::new(sqlite::Sources::open(&db)));
+    let mut rt = SqliteRuntime::open(&db).unwrap();
+    sqlite::register(&mut rt, Arc::new(harness));
+    let exec = sqlite::start(&mut rt, &task(KIND).model(route)).unwrap();
+    let state = rt.run_until_blocked(exec).await.unwrap();
+    assert!(matches!(state, RunState::Completed(_)), "{state:?}");
+
+    let report = report_of(
+        refine(
+            &mut rt,
+            &RefineInput::new(KIND, vec![exec], 1, RefineMode::Parallel, 5),
+        )
+        .await,
+    );
+
+    assert_eq!(report.ledger.probes, 2, "{report:#?}");
+    for stage in &report.stages {
+        assert!(
+            stage.notes.iter().all(|note| !note.contains("bundle")),
+            "{:?}",
+            stage.notes
+        );
+    }
+    let seen = keep.seen.lock().unwrap().clone();
+    assert!(!seen.is_empty(), "the composer reads the bundle");
+    let all = seen.join("\n");
+    assert!(
+        all.contains("is down"),
+        "a rollout holds the failure: {all}"
+    );
+    for identity in [id, route] {
+        assert!(!all.contains(identity), "{identity} leaks: {all}");
+    }
+}

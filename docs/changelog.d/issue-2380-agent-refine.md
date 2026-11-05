@@ -27,7 +27,8 @@ anonymised pool of #2376, the evidence bundle of #2377, the live probe of
   a tool call, a live re-probe through `RefineSources::live_probe`.
   `agent_refine_compose` runs an `OverlayComposer` over the probes under
   opaque ids. The pool redacts each model route that a probe asked for,
-  with its model id, so an inherited or a peer route is redacted too.
+  with its model id, so an inherited or a peer route is redacted too. The
+  evidence bundle of a compose step hides the same names.
   `agent_refine_select` runs an `OverlaySelector`. A rule
   picks when no selector is installed, or when the selector fails, times
   out or names an id outside the pool.
