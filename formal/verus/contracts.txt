@@ -155,6 +155,13 @@ pub proof fn theorem_a_zero_cap_never_resets(resets: int, max_resets: int, len: 
 pub open spec fn after(resets: int, max_resets: int, len: int, cap: int, percent: int) -> int { if due(resets, max_resets, len, cap, percent) { resets + 1 } else { resets } }
 pub open spec fn count(resets: int, max_resets: int, lens: Seq < int >, cap: int, percent: int) -> int decreases lens.len(), { if lens.len() == 0 { resets } else { count(after(resets, max_resets, lens [0], cap, percent), max_resets, lens.subrange(1, lens.len() as int), cap, percent,) } }
 pub proof fn theorem_resets_never_pass_the_cap(resets: int, max_resets: int, lens: Seq < int >, cap: int, percent: int,) requires 0 <= resets <= max_resets, ensures resets <= count(resets, max_resets, lens, cap, percent) <= max_resets, decreases lens.len(),
+pub open spec fn full_round(resets: int, max_resets: int, after_len: int, cap: int, percent: int) -> bool { resets < max_resets && cap > 0 &&! reaches(after_len, cap, percent) }
+pub fn full_round_resets(resets: u32, max_resets: u32, after_len: u64, cap: u64, percent: u8) -> (r: bool) ensures r == full_round(resets as int, max_resets as int, after_len as int, cap as int, percent as int),
+pub proof fn theorem_a_full_round_reset_fits_the_cap(resets: int, max_resets: int, after_len: int, cap: int, percent: int,) requires 0 <= after_len, 0 <= percent, full_round(resets, max_resets, after_len, cap, percent), ensures after_len < cap, resets + 1 <= max_resets,
+pub proof fn theorem_a_zero_cap_never_resets_a_round(resets: int, max_resets: int, after_len: int, percent: int,) ensures ! full_round(resets, max_resets, after_len, 0, percent),
+pub open spec fn after_event(resets: int, max_resets: int, event: (bool, int), cap: int, percent: int,) -> int { if event.0 { if full_round(resets, max_resets, event.1, cap, percent) { resets + 1 } else { resets } } else { after(resets, max_resets, event.1, cap, percent) } }
+pub open spec fn count_events(resets: int, max_resets: int, events: Seq < (bool, int) >, cap: int, percent: int,) -> int decreases events.len(), { if events.len() == 0 { resets } else { count_events(after_event(resets, max_resets, events [0], cap, percent), max_resets, events.subrange(1, events.len() as int), cap, percent,) } }
+pub proof fn theorem_mixed_resets_never_pass_the_cap(resets: int, max_resets: int, events: Seq < (bool, int) >, cap: int, percent: int,) requires 0 <= resets <= max_resets, ensures resets <= count_events(resets, max_resets, events, cap, percent) <= max_resets, decreases events.len(),
 
 ## formal/verus/src/agent_sampling.rs
 pub const MAX_PARALLEL_CHILDREN: u32 = 16;

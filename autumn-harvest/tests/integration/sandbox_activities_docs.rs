@@ -551,7 +551,7 @@ fn each_guide_test_command_runs_in_ci() {
     let workflow = read(".github/workflows/ci.yml");
     let commands: Vec<&str> = testing
         .lines()
-        .filter(|line| line.starts_with("cargo test"))
+        .filter(|line| line.starts_with("cargo test") || line.starts_with("cargo sandbox-test"))
         .collect();
     assert!(commands.len() >= 3, "the guide lists the test commands");
     for command in commands {
@@ -559,6 +559,200 @@ fn each_guide_test_command_runs_in_ci() {
             workflow.contains(command),
             "ci.yml must run the guide command `{command}`"
         );
+    }
+}
+
+/// The dev-dependencies that the DB-free test path must not build.
+const HEAVY_DEV_DEPS: &[&str] = &[
+    "testcontainers",
+    "testcontainers-modules",
+    "criterion",
+    "stateright",
+    "autumn-harvest-agent",
+];
+
+/// Name prefixes that never belong in plain `[dev-dependencies]`.
+const HEAVY_PREFIXES: &[&str] = &["diesel", "bollard", "hyper", "tokio-postgres", "sqlx"];
+
+/// The cfg that turns the light test path on (issue #2487).
+const LIGHT_CFG: &str = "harvest_light";
+
+/// The exact arguments of the `sandbox-test` alias.
+const ALIAS_ARGS: &[&str] = &[
+    "test",
+    "--config",
+    "build.rustflags=['--cfg', 'harvest_light']",
+    "-p",
+    "autumn-harvest",
+    "--no-default-features",
+    "--features",
+    "sandbox-activities",
+    "--lib",
+    "sandbox",
+];
+
+fn parse_toml(relative: &str) -> toml::Table {
+    read(relative)
+        .parse()
+        .unwrap_or_else(|err| panic!("{relative} must parse: {err}"))
+}
+
+/// True when `cfg` is false on the light path: `cfg(not(harvest_light))`, or
+/// `cfg(not(any(..., harvest_light, ...)))` with plain items.
+fn excludes_light(cfg: &str) -> bool {
+    let cfg: String = cfg.chars().filter(|c| !c.is_whitespace()).collect();
+    if cfg == format!("cfg(not({LIGHT_CFG}))") {
+        return true;
+    }
+    cfg.strip_prefix("cfg(not(any(")
+        .and_then(|rest| rest.strip_suffix(")))"))
+        .is_some_and(|items| !items.contains('(') && items.split(',').any(|i| i == LIGHT_CFG))
+}
+
+/// Each `(cfg, table)` pair of dev-dependencies. The cfg is `None` for the
+/// plain table.
+fn dev_dependency_tables(manifest: &toml::Table) -> Vec<(Option<String>, &toml::Table)> {
+    let mut tables: Vec<_> = manifest
+        .get("dev-dependencies")
+        .and_then(toml::Value::as_table)
+        .map(|table| (None, table))
+        .into_iter()
+        .collect();
+    if let Some(targets) = manifest.get("target").and_then(toml::Value::as_table) {
+        for (cfg, target) in targets {
+            if let Some(table) = target
+                .get("dev-dependencies")
+                .and_then(toml::Value::as_table)
+            {
+                tables.push((Some(cfg.clone()), table));
+            }
+        }
+    }
+    tables
+}
+
+/// The crate that a dependency entry names, which `package` can rename.
+fn crate_name<'a>(key: &'a str, entry: &'a toml::Value) -> &'a str {
+    entry
+        .get("package")
+        .and_then(toml::Value::as_str)
+        .unwrap_or(key)
+}
+
+#[test]
+fn heavy_dev_dependencies_are_off_on_the_light_path() {
+    let manifest = parse_toml("autumn-harvest/Cargo.toml");
+    let mut seen = BTreeSet::new();
+    for (cfg, table) in dev_dependency_tables(&manifest) {
+        for (key, entry) in table {
+            let name = crate_name(key, entry);
+            let heavy = HEAVY_DEV_DEPS.contains(&name)
+                || (cfg.is_none() && HEAVY_PREFIXES.iter().any(|p| name.starts_with(p)));
+            if !heavy {
+                continue;
+            }
+            seen.insert(name);
+            assert!(
+                cfg.as_deref().is_some_and(excludes_light),
+                "`{name}` must sit in a table that excludes `{LIGHT_CFG}`, not in {cfg:?}"
+            );
+        }
+    }
+    for name in HEAVY_DEV_DEPS {
+        assert!(
+            seen.contains(name),
+            "`{name}` must stay gated by `{LIGHT_CFG}`"
+        );
+    }
+}
+
+#[test]
+fn the_light_path_has_no_always_on_database_dependency() {
+    let manifest = parse_toml("autumn-harvest/Cargo.toml");
+    let dependencies = manifest["dependencies"]
+        .as_table()
+        .expect("the manifest has `[dependencies]`");
+    for (key, entry) in dependencies {
+        let name = crate_name(key, entry);
+        if HEAVY_PREFIXES.iter().any(|p| name.starts_with(p)) {
+            let optional = entry.get("optional").and_then(toml::Value::as_bool);
+            assert_eq!(optional, Some(true), "`{name}` must stay optional");
+        }
+    }
+}
+
+#[test]
+fn the_light_cfg_is_registered_and_aliased() {
+    let root = parse_toml("Cargo.toml");
+    let registered = root["workspace"]["lints"]["rust"]["unexpected_cfgs"]["check-cfg"]
+        .as_array()
+        .expect("the workspace lint table sets `check-cfg`");
+    let cfg = format!("cfg({LIGHT_CFG})");
+    assert!(
+        registered.iter().any(|v| v.as_str() == Some(cfg.as_str())),
+        "the workspace lint table must register `{cfg}`"
+    );
+    let config = parse_toml(".cargo/config.toml");
+    let alias: Vec<&str> = config["alias"]["sandbox-test"]
+        .as_array()
+        .expect("`.cargo/config.toml` must define the `sandbox-test` alias")
+        .iter()
+        .filter_map(toml::Value::as_str)
+        .collect();
+    assert_eq!(alias, ALIAS_ARGS, "the alias must keep its exact arguments");
+}
+
+/// The `run` commands of each step of each job in `ci.yml`.
+fn ci_run_commands() -> Vec<String> {
+    let workflow: serde_yaml::Value =
+        serde_yaml::from_str(&read(".github/workflows/ci.yml")).expect("ci.yml must parse");
+    let mut commands = Vec::new();
+    if let Some(jobs) = workflow.get("jobs").and_then(serde_yaml::Value::as_mapping) {
+        for job in jobs.values() {
+            let steps = job.get("steps").and_then(serde_yaml::Value::as_sequence);
+            for step in steps.into_iter().flatten() {
+                if let Some(run) = step.get("run").and_then(serde_yaml::Value::as_str) {
+                    commands.push(run.trim().to_owned());
+                }
+            }
+        }
+    }
+    commands
+}
+
+#[test]
+fn the_guide_documents_the_light_command_and_ci_runs_it() {
+    let guide = read(GUIDE);
+    let testing = section(&guide, "## Testing", "\n## ").expect("the guide has `## Testing`");
+    let command = "cargo sandbox-test";
+    assert!(
+        testing.lines().any(|line| line == command),
+        "the guide must list `{command}` on its own line"
+    );
+    assert!(
+        ci_run_commands().iter().any(|run| run == command),
+        "a ci.yml step must run exactly `{command}`"
+    );
+}
+
+#[test]
+fn light_cfg_matching_is_strict() {
+    for good in [
+        "cfg(not(harvest_light))",
+        "cfg( not( harvest_light ) )",
+        "cfg(not(any(loom, harvest_light)))",
+        "cfg(not(any(loom, shuttle, harvest_light)))",
+    ] {
+        assert!(excludes_light(good), "{good} excludes the light path");
+    }
+    for bad in [
+        "cfg(not(loom))",
+        "cfg(any(harvest_light, not(loom)))",
+        "cfg(all(harvest_light, not(unix)))",
+        "cfg(harvest_light)",
+        "cfg(not(any(loom, not(harvest_light))))",
+    ] {
+        assert!(!excludes_light(bad), "{bad} keeps the light path");
     }
 }
 

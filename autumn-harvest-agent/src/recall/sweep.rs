@@ -7,6 +7,7 @@ use autumn_harvest_sqlite::{RunState, SqliteRuntime};
 use sha2::{Digest, Sha256};
 
 use super::{RecallFixture, RecallItem, RecallOutcome, RecallReport, RecallRow};
+use crate::agent::profile_read::OverlayRead;
 use crate::agent::{AgentId, AgentOp};
 use crate::harness::AgentHarness;
 use crate::score::{ExactMatch, ScoreContext, ScoreInput, Scorer};
@@ -23,10 +24,15 @@ const FINGERPRINT_HEX: usize = 12;
 /// [`harness`](super::harness) gives the standard configs.
 ///
 /// Each item runs on the agent `<config>/<item>.<fingerprint>`. The
-/// fingerprint hashes the item, the profile and the model id. Each op has
-/// the idempotency key `recall:<agent name>:<n>`. A rerun with the same
-/// inputs on the same database therefore calls no model for a finished
-/// item. A changed item, profile or model gets new agents.
+/// fingerprint hashes the item, the profile and the model id. With an
+/// overlay store, it hashes the profile with the active overlay applied.
+/// An activation therefore gives new agents. Each op has the idempotency
+/// key `recall:<agent name>:<n>`. A rerun with the same inputs on the same
+/// database calls no model for a finished item. A changed item, profile,
+/// overlay or model gets new agents.
+///
+/// Do not activate an overlay while a sweep runs. The fingerprint reads the
+/// overlay once for each item, and each op reads it again.
 ///
 /// A model with no `model_id` has no stable identity. Its fingerprint also
 /// hashes the start time of the sweep, so each sweep gets new agents.
@@ -77,7 +83,7 @@ async fn run_item(
     run: &str,
 ) -> Result<RecallOutcome, String> {
     let question = item.ops.last().ok_or("the item has no op")?;
-    let name = agent_name(harness, config, item, run)?;
+    let name = agent_name(harness, config, item, run).await?;
     let id = AgentId::new(config, &name).map_err(|err| err.to_string())?;
     for (n, op) in item.ops.iter().enumerate() {
         let key = format!("recall:{name}:{n}");
@@ -131,23 +137,39 @@ fn run_nonce() -> String {
 /// that the profile runs. These are the model of each op and the model of
 /// each episode pass. A model with no id adds `run` in place of the id, so
 /// no other sweep reuses its agents.
-fn agent_name(
+///
+/// With an overlay store, the profile is the op profile: the bare profile
+/// with the active overlay applied (issue #2556). An overlay can change the
+/// prompt and the model, so the op model comes from that profile. The pass
+/// model comes from the bare profile, as the episode pass reads it. An
+/// overlay that does not apply gives an error, as it does for an op.
+async fn agent_name(
     harness: &AgentHarness,
     config: &str,
     item: &RecallItem,
     run: &str,
 ) -> Result<String, String> {
-    let profile = harness
+    let bare = harness
         .agent_profile(config)
         .ok_or_else(|| format!("the harness has no profile {config:?}"))?;
-    // A pass with no model of its own runs on the profile model.
-    let pass = profile
+    // The episode pass reads the bare profile, so its model falls back to
+    // the bare profile model and not to the overlay model.
+    let pass = bare
         .episodes
         .as_ref()
-        .and_then(|settings| settings.model.as_deref())
-        .or(profile.model.as_deref());
+        .and_then(|settings| settings.model.clone())
+        .or_else(|| bare.model.clone());
+    let profile = if harness.overlays().is_some() {
+        let request = OverlayRead {
+            kind: config.to_owned(),
+            profile: bare,
+        };
+        harness.overlaid_profile(&request).await?.profile
+    } else {
+        bare
+    };
     let mut models = Vec::new();
-    for name in [profile.model.as_deref(), pass] {
+    for name in [profile.model.as_deref(), pass.as_deref()] {
         let identity = harness
             .model(name)?
             .model_id()

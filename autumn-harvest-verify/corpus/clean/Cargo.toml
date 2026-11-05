@@ -16,6 +16,9 @@ harvest-verify-corpus-helpers-deep = { version = "0.9.0", path = "../helpers-dee
 serde = { workspace = true }
 serde_json = { workspace = true }
 
+[dev-dependencies]
+proptest = { workspace = true }
+
 # Verifier fixture code. Each function has the exact shape that
 # `corpus/expectations.toml` pins, so a rewrite to suit a style lint
 # changes the MIR under test. Style, complexity and perf lints only
