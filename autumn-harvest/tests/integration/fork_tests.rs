@@ -20,7 +20,7 @@ use std::time::Duration;
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::fork::{
     ForkActivityOverride, ForkEffects, WorkflowForkError, WorkflowForkRequest,
-    fork_workflow_execution, is_recorded_fork,
+    fork_workflow_execution, is_recorded_fork, skips_completion_effects,
 };
 use autumn_harvest::models::{NewWorkflowExecution, WorkflowExecution};
 use autumn_harvest::prelude::*;
@@ -2366,7 +2366,8 @@ async fn a_source_erased_after_the_fork_serves_no_record() {
     assert!(error.contains("no recorded result"), "{error}");
 }
 
-/// Only a recorded fork skips completion callbacks and triggers.
+/// A recorded fork and a quiet live fork skip completion callbacks and
+/// triggers (issues #2000 and #2378). A plain live fork sends them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn only_a_recorded_fork_suppresses_completion_notifications() {
     let (url, _container) = setup_test_database_url_or_env().await;
@@ -2384,25 +2385,36 @@ async fn only_a_recorded_fork_suppresses_completion_notifications() {
     let recorded = fork(&url, source, request(ForkEffects::Recorded)).await;
     let live = fork(&url, source, request(ForkEffects::Live)).await;
     let live_of_recorded = fork(&url, recorded, request(ForkEffects::Live)).await;
+    let quiet = fork(&url, source, request(ForkEffects::LiveQuiet)).await;
+    let live_of_quiet = fork(&url, quiet, request(ForkEffects::Live)).await;
 
-    for (exec_id, expected) in [
-        (source, false),
-        (recorded, true),
-        (live, false),
-        (live_of_recorded, false),
+    for (exec_id, recorded_mode, skips) in [
+        (source, false, false),
+        (recorded, true, true),
+        (live, false, false),
+        (live_of_recorded, false, false),
+        (quiet, false, true),
+        (live_of_quiet, false, false),
     ] {
         let row = snapshot(&url, exec_id).await.0;
         assert_eq!(
             is_recorded_fork(&mut conn, &row)
                 .await
                 .expect("read marker"),
-            expected,
+            recorded_mode,
+            "{exec_id}"
+        );
+        assert_eq!(
+            skips_completion_effects(&mut conn, &row)
+                .await
+                .expect("read marker"),
+            skips,
             "{exec_id}"
         );
     }
     // The marker gates the callbacks, so each row keeps the targets. A live
     // fork of a recorded fork then sends them.
-    for exec_id in [recorded, live, live_of_recorded] {
+    for exec_id in [recorded, live, live_of_recorded, quiet, live_of_quiet] {
         let row = snapshot(&url, exec_id).await.0;
         assert_eq!(row.completion_callbacks, Some(targets.clone()), "{exec_id}");
     }

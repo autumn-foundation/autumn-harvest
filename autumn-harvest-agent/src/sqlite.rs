@@ -632,3 +632,26 @@ fn multi_thread_handle() -> Result<tokio::runtime::Handle, String> {
     }
     Ok(handle)
 }
+
+/// SQLite has no fork, so it cannot run a live probe (issue #2378).
+#[cfg(feature = "eval")]
+impl crate::eval::LiveProbeHost for SqliteRuntime {
+    fn source_run(
+        &self,
+        _source: ExecutionId,
+    ) -> BoxFuture<'_, Result<crate::eval::SourceRun, crate::eval::EvalError>> {
+        Box::pin(std::future::ready(Err(
+            crate::eval::EvalError::Unsupported("SQLite"),
+        )))
+    }
+
+    fn fork_live(
+        &self,
+        _source: ExecutionId,
+        _input: Value,
+    ) -> BoxFuture<'_, Result<crate::eval::ProbeFork, crate::eval::EvalError>> {
+        Box::pin(std::future::ready(Err(
+            crate::eval::EvalError::Unsupported("SQLite"),
+        )))
+    }
+}

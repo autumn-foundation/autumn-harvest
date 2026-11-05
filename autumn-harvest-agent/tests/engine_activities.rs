@@ -176,6 +176,7 @@ async fn the_tool_handler_runs_the_named_tool_with_its_context() {
             arguments: json!({"k": 1}),
         },
         workspace: None,
+        probe_effects: None,
     };
 
     let info = agent_tool_call_info();
@@ -412,6 +413,7 @@ async fn a_huge_tool_error_still_fits_the_result_cap() {
                 arguments: json!({}),
             },
             workspace: None,
+            probe_effects: None,
         })
         .await
         .unwrap();
@@ -643,6 +645,7 @@ async fn a_read_only_call_refuses_a_write_tool_at_run_time() {
                 arguments: json!({}),
             },
             workspace: None,
+            probe_effects: None,
         })
         .await
         .unwrap();
@@ -777,6 +780,7 @@ async fn a_zero_result_cap_leaves_a_big_reply_and_a_big_tool_result_alone() {
                 arguments: json!({}),
             },
             workspace: None,
+            probe_effects: None,
         })
         .await
         .unwrap();

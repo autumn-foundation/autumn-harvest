@@ -37,6 +37,83 @@ pub const DEFAULT_APPROVAL_TIMEOUT_SECS: u64 = 3_600;
 /// this one.
 pub const MAX_PARALLEL_CHILDREN: u32 = 16;
 
+/// The error code of a tool call that a live probe refuses (issue #2378).
+pub const PROBE_EFFECT_REFUSED: &str = "probe_effect_refused";
+
+/// The mark of a live probe run (issue #2378).
+///
+/// A run with the mark runs a tool only when the tool effect is in
+/// [`effects`](Self::effects). The tool-call activity checks it, so a policy
+/// cannot change it. Each delegated child keeps the mark. The fork event of
+/// the run names the source.
+///
+/// The mark is one byte in memory, so `AgentTask` does not grow. A future
+/// that holds a task is close to the `large_futures` threshold. The wire
+/// shape is `{"effects": ["read_only"]}`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "ProbeWire", into = "ProbeWire")]
+pub struct Probe {
+    /// One bit for each effect, in the order of [`ToolEffect::ALL`].
+    mask: u8,
+}
+
+impl Probe {
+    /// A probe that may run the tools of `effects`.
+    #[must_use]
+    pub fn new(effects: impl IntoIterator<Item = ToolEffect>) -> Self {
+        let mask = effects
+            .into_iter()
+            .fold(0, |mask, effect| mask | Self::bit(effect));
+        Self { mask }
+    }
+
+    /// Whether the probe may run a tool of `effect`.
+    #[must_use]
+    pub const fn allows(self, effect: ToolEffect) -> bool {
+        self.mask & Self::bit(effect) != 0
+    }
+
+    /// The tool effects that the probe may run.
+    #[must_use]
+    pub fn effects(self) -> BTreeSet<ToolEffect> {
+        ToolEffect::ALL
+            .into_iter()
+            .filter(|effect| self.allows(*effect))
+            .collect()
+    }
+
+    const fn bit(effect: ToolEffect) -> u8 {
+        match effect {
+            ToolEffect::ReadOnly => 1,
+            ToolEffect::Internal => 2,
+            ToolEffect::Write => 4,
+            ToolEffect::External => 8,
+        }
+    }
+}
+
+/// The wire shape of a [`Probe`]. An unknown key fails to decode, so an
+/// old worker never drops a part of the mark.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProbeWire {
+    effects: BTreeSet<ToolEffect>,
+}
+
+impl From<ProbeWire> for Probe {
+    fn from(wire: ProbeWire) -> Self {
+        Self::new(wire.effects)
+    }
+}
+
+impl From<Probe> for ProbeWire {
+    fn from(probe: Probe) -> Self {
+        Self {
+            effects: probe.effects(),
+        }
+    }
+}
+
 /// The input of one agent run: the workflow input.
 // The flags are independent switches on a recorded payload. A flat bool per
 // switch keeps the wire shape plain, so the lint is allowed here.
@@ -211,6 +288,10 @@ pub struct AgentTask {
     /// answer. See [`answer_check`](crate::answer_check).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub answer_check: Option<AnswerCheck>,
+    /// The probe mark of the run (issue #2378). `None` is a normal run. See
+    /// [`Probe`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe: Option<Probe>,
 }
 
 impl Serialize for AgentTask {
@@ -284,6 +365,7 @@ impl AgentTask {
             allowed_effects: None,
             draw: None,
             answer_check: None,
+            probe: None,
         }
     }
 
@@ -761,6 +843,11 @@ pub struct ToolCallRequest {
     /// decision says (issue #2439). `None` allows each effect.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowed_effects: Option<BTreeSet<ToolEffect>>,
+    /// The effects of a live probe (issue #2378). A tool of another effect
+    /// gets [`PROBE_EFFECT_REFUSED`] and does not run. `None` is a normal
+    /// run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe_effects: Option<BTreeSet<ToolEffect>>,
 }
 
 /// What a run holds for one `load_skill` call (issue #2373).
@@ -812,6 +899,20 @@ impl ToolOutcome {
     pub fn error(message: &str) -> Self {
         Self {
             content: serde_json::json!({ "error": message }).to_string(),
+            is_error: true,
+            workspace: None,
+        }
+    }
+
+    /// The refusal of a live probe for a tool of `effect` (issue #2378).
+    #[must_use]
+    pub fn probe_refused(effect: ToolEffect) -> Self {
+        Self {
+            content: serde_json::json!({
+                "error": PROBE_EFFECT_REFUSED,
+                "effect": effect,
+            })
+            .to_string(),
             is_error: true,
             workspace: None,
         }
