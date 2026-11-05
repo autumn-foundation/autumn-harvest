@@ -348,6 +348,9 @@ fn merged(command: &mut Command, sink: &mut dyn Write) -> Result<ExitStatus> {
         let _shield = Shield::raise();
         io::copy(&mut reader, sink)
     };
+    // A failed copy stops early, before end of file. Close the read end
+    // first, so the child gets a broken pipe and the wait returns.
+    drop(reader);
     let status = wait(&mut child)?;
     copied.context("Failed to copy the output of a child process")?;
     Ok(status)
@@ -766,6 +769,35 @@ pub fn run_toggle(ctx: &Ctx, toggle: &Toggle) -> Result<ExitCode> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A sink that refuses every write, as a log on a full disk does.
+    struct FullDisk;
+
+    impl Write for FullDisk {
+        fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+            Err(io::Error::other("no space left on device"))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A failed log write must not leave the child blocked on a full pipe.
+    /// `tee` exits there, so the child gets a broken pipe and stops.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_sink_does_not_hang_the_merged_pipe() {
+        let (done, outcome) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = merged(&mut Command::new("yes"), &mut FullDisk);
+            let _ = done.send(result.is_err());
+        });
+        let failed = outcome
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("merged must return after a failed write");
+        assert!(failed, "a failed log write must fail the capture");
+    }
 
     #[test]
     fn var_or_treats_an_empty_value_as_unset() {
