@@ -997,6 +997,22 @@ jobs:
             /usr/local/share/boost /usr/lib/jvm "$AGENT_TOOLSDIRECTORY" || true
           sudo docker image prune --all --force > /dev/null 2>&1 || true
           df -h /
+      # Shard 3 ended with its agent-tests step still running and no later
+      # step ran. A dead runner skips the summary steps below, so they
+      # cannot show a disk that filled. Bash reads `BASH_ENV` at start, so
+      # each step prints free space when it exits. The line streams to the
+      # live log. The guard variable keeps child shells quiet.
+      - name: Print free disk at the end of every step (Linux)
+        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
+        shell: bash
+        run: |
+          cat > "$RUNNER_TEMP/disk-trap.sh" <<'TRAP'
+          if [ -z "${SEMAPHORE_DISK_TRAP:-}" ]; then
+            export SEMAPHORE_DISK_TRAP=1
+            trap 'echo "disk-free: $(df -h / | awk "NR==2{print \$4, \$5}")"' EXIT
+          fi
+          TRAP
+          echo "BASH_ENV=$RUNNER_TEMP/disk-trap.sh" >> "$GITHUB_ENV"
       # kache executable caching broke uplifted binaries on macOS:
       # `target/debug/harvest` and a build-script copy failed with "cannot
       # execute binary file". Test binaries in `deps/` ran. The CLI caches
