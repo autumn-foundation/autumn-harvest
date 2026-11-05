@@ -469,10 +469,10 @@ fn event_row_count_findings(pats: &Patterns, page: &str, text: &str) -> Vec<Stri
             }
             // Emphasis and code marks do not change a rendered count.
             let plain = plain_markdown(pats, &cells.join(" | "));
-            for m in pats.count.find_iter(&plain) {
+            // The count pattern holds `\b`, so the search uses Python word rules.
+            for m in pycompat::find_iter_python_words(&pats.count, &plain) {
                 found.push(format!(
-                    "{page}:{n}: the `event.rs` row states \"{}\". Drop the count: it drifts from event.rs.",
-                    m.as_str()
+                    "{page}:{n}: the `event.rs` row states \"{m}\". Drop the count: it drifts from event.rs."
                 ));
             }
         }
@@ -946,6 +946,19 @@ mod tests {
             &"RELEASE_NOTES.md: newest heading is 0.7.0, the workspace is 0.8.0. CHANGELOG.md holds the release history."
                 .to_owned()
         ));
+    }
+
+    #[test]
+    fn a_count_uses_python_word_boundaries() {
+        let pats = Patterns::new().unwrap();
+        let rows = "| M | P |\n|---|---|\n| `event.rs` | 50 variants\u{301} |\n| `event.rs` | \u{b2}49 variants |\n";
+        let found = event_row_count_findings(&pats, "x.md", rows);
+        assert_eq!(
+            found,
+            [
+                "x.md:3: the `event.rs` row states \"50 variants\". Drop the count: it drifts from event.rs."
+            ]
+        );
     }
 
     #[test]

@@ -41,7 +41,7 @@
 //!
 //! - `slugify` reads the raw Markdown source of a heading, not the text that
 //!   GitHub renders. The markup that this corpus puts in headings does not
-//!   show the difference: bold, code and emoji pass through or are removed as
+//!   show the difference. Bold, code and emoji pass through or are removed as
 //!   punctuation either way. A heading that is itself a link, such as
 //!   `## [Guide](guide.md)`, slugs as "Guide" on GitHub. Here it slugs from the
 //!   raw link text and gives garbage. A correct fix renders inline Markdown to
@@ -307,9 +307,9 @@ fn mask_fenced_lines(pats: &Patterns, lines: &[&str]) -> Vec<String> {
 
 /// Returns the GitHub heading slug of a heading.
 ///
-/// The rule lowercases, drops each character that is not a word character,
-/// whitespace or a hyphen, and then replaces each space with a hyphen one for
-/// one. Runs of spaces are not collapsed first. A dropped character, such as
+/// The rule lowercases the heading. It drops each character that is not a
+/// word character, whitespace or a hyphen. Then it replaces each space with a
+/// hyphen, one for one. Runs of spaces are not collapsed first. A dropped character, such as
 /// the em dash in "runtime — file", leaves its spaces behind. So that heading
 /// slugs to "runtime--file", with a double hyphen. A collapse before the
 /// space pass gives single hyphens and reports each such anchor as broken.

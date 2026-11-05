@@ -6,6 +6,7 @@
 //!
 //! - `\s` in Python also matches the four separators U+001C to U+001F.
 //! - `\w` in Python matches letters, numbers and `_`, but not combining marks.
+//! - `\b` in Python uses that `\w` class, not the Rust one.
 //! - `str.splitlines` breaks on more than `\n`.
 //! - `Path.read_text` translates `\r\n` and `\r` to `\n`.
 //! - `Path.resolve` resolves symbolic links before it applies `..`.
@@ -144,6 +145,54 @@ pub fn regex(pattern: &str) -> Result<Regex> {
         }
     }
     Regex::new(&out).with_context(|| format!("compiling regex {pattern}"))
+}
+
+/// Reports whether `c` is a word character for the `\w` class of the Rust regex crate.
+fn is_rust_word(c: char) -> bool {
+    static WORD: OnceLock<Option<Regex>> = OnceLock::new();
+    WORD.get_or_init(|| Regex::new(r"^\w$").ok())
+        .as_ref()
+        .is_some_and(|re| {
+            let mut buf = [0u8; 4];
+            re.is_match(c.encode_utf8(&mut buf))
+        })
+}
+
+/// Returns each match of `re` in `text`, with the `\b` word boundary of Python.
+///
+/// A Rust `\b` uses the Rust `\w` class. That class also holds combining
+/// marks, connector punctuation and joiners. The Python class excludes them,
+/// but it holds other numbers, such as `²`. So `50 variants` and a combining
+/// mark after it match in Python only.
+///
+/// The search runs on a copy of `text`. In the copy, each character whose
+/// word status differs is replaced. The substitute has the Python status. A
+/// Python word character becomes `ꙮ`, and any other character becomes
+/// U+FFFC. The pattern must not hold either substitute.
+pub fn find_iter_python_words<'h>(re: &Regex, text: &'h str) -> Vec<&'h str> {
+    let mut shadow = String::with_capacity(text.len());
+    // `starts[k]` is the original offset of the copy offset `k`. A substitute
+    // takes 3 bytes, so the copy is at most 3 times as long as `text`.
+    let mut starts = vec![usize::MAX; text.len() * 3 + 1];
+    for (i, c) in text.char_indices() {
+        let python = is_word(c);
+        let sub = if python == is_rust_word(c) {
+            c
+        } else if python {
+            '\u{a66e}'
+        } else {
+            '\u{fffc}'
+        };
+        starts[shadow.len()] = i;
+        shadow.push(sub);
+    }
+    starts[shadow.len()] = text.len();
+    re.find_iter(&shadow)
+        .filter_map(|m| {
+            let (s, e) = (starts[m.start()], starts[m.end()]);
+            (s != usize::MAX && e != usize::MAX).then(|| &text[s..e])
+        })
+        .collect()
 }
 
 /// Resolves `path` as Python `Path.resolve()` does in its non-strict mode.
@@ -450,6 +499,19 @@ mod tests {
         assert_eq!(repr("a'b\"c"), "'a\\'b\"c'");
         assert_eq!(repr("tab\there\\"), "'tab\\there\\\\'");
         assert_eq!(repr("é\u{7f}\u{200b}"), "'é\\x7f\\u200b'");
+    }
+
+    #[test]
+    fn word_boundaries_follow_python() {
+        let re = regex(r"\b\d+ x\b").unwrap();
+        // A combining mark is no word character in Python, so `\b` holds.
+        assert_eq!(
+            find_iter_python_words(&re, "5 x\u{301} 7 x"),
+            ["5 x", "7 x"]
+        );
+        // `²` is a word character in Python, so no `\b` precedes the 4.
+        assert_eq!(find_iter_python_words(&re, "\u{b2}4 x"), [] as [&str; 0]);
+        assert_eq!(find_iter_python_words(&re, "é4 x 9 xa"), [] as [&str; 0]);
     }
 
     #[test]
