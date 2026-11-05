@@ -51,7 +51,7 @@ Declared with `#[workflow(...)]` and registered with `WorkerBuilder`.
 | `WorkflowInfo.debounce` | no. `GET /admin/debounce` reads pending bursts. | A burst in flight holds its window. A new window splits or merges bursts in a way that no caller can predict. | deploy-only |
 | `WorkflowInfo.batch` | no | A batch in flight holds its size and wait. A change mid-batch has the same problem as debounce. | deploy-only |
 | `WorkflowInfo.throttle` | yes, TTL'd pacing override, `POST /admin/start-throttle/{workflow_name}/override` (#945) | New starts only. | already runtime |
-| `WorkflowInfo.quota` | no. `GET /admin/quotas` reads usage. | The limits are read at each start and each admission. A lower limit refuses new work for a tenant, and never ends a run. | override (#2408), limits only |
+| `WorkflowInfo.quota` | yes, the three admission caps only, run-defaults route (#2408). `GET /admin/quotas` reads usage and names the override. | The limits are read at each start and each admission. A lower limit refuses new work for a tenant, and never ends a run. `key_expr` and the LLM caps stay deploy-only. | override (#2408), limits only |
 | `WorkflowInfo.max_input_bytes` | no | A schema-level bound that callers code against. | deploy-only |
 | `WorkflowInfo.owner` | no | Metadata for alerts. | deploy-only |
 | `WorkflowInfo.runbook_url` | no | Metadata for alerts. | deploy-only |

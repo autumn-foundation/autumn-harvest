@@ -284,6 +284,9 @@ impl HarvestEmbedding {
         // not from the install below, so its first tick cannot race the install.
         let gate_refresh =
             boot::spawn_gate_refresh(&api_state, &storage_pool, &runner.api_runtime());
+        // Load the overrides before the first start, so a quota cap or a
+        // concurrency limit applies from the first request (issue #2408).
+        boot::load_boot_run_defaults(&runner.api_runtime(), &default_pool).await;
         api_state.install(runner.api_runtime());
         admission_guard.commit();
 

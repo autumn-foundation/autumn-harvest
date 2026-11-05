@@ -176,6 +176,7 @@ pub proof fn theorem_mixed_resets_never_pass_the_cap(resets: int, max_resets: in
 
 ## formal/verus/src/agent_sampling.rs
 pub const MAX_PARALLEL_CHILDREN: u32 = 16;
+pub const MAX_ANSWER_RETRIES: u32 = 16;
 pub enum DrawPlan { Run { draws: u32, concurrency: u32 }, NoDraws, TooManyDraws, TooManyConcurrent, }
 pub open spec fn spec_cap(max_concurrent: u32) -> int { if max_concurrent > MAX_PARALLEL_CHILDREN { MAX_PARALLEL_CHILDREN as int } else if max_concurrent == 0 { 1 } else { max_concurrent as int } }
 pub fn draw_plan(max_draws: u32, max_concurrent: u32, draws: u32, asked: u32) -> (r: DrawPlan) ensures draws == 0 <==> r is NoDraws, r is TooManyDraws <==> (draws > 0 && draws > max_draws), r is TooManyConcurrent <==> (draws > 0 && draws <= max_draws && asked > spec_cap(max_concurrent,)), r is Run ==> r -> Run_draws == draws, r is Run ==> 1 <= r -> Run_draws <= max_draws, r is Run ==> 1 <= r -> Run_concurrency, r is Run ==> r -> Run_concurrency <= r -> Run_draws, r is Run ==> r -> Run_concurrency <= MAX_PARALLEL_CHILDREN, r is Run ==> r -> Run_concurrency <= spec_cap(max_concurrent), r is Run && asked > 0 && asked <= draws ==> r -> Run_concurrency == asked,
@@ -188,6 +189,10 @@ pub fn sample_step(draws: u32, started: u32, concurrency: u32, budgeted: bool, t
 pub proof fn theorem_each_draw_of_a_wave_gets_a_token(left: int, width: int, index: int) requires 1 <= width <= left, ensures crate::agent_siblings::share(left, width, index) >= 1, crate::agent_siblings::total(left, width, width) == left,
 pub open spec fn spec_next_policy_revision(current: u64) -> Option < u64 > { if current < u64::MAX { Some((current + 1) as u64) } else { None } }
 pub fn next_policy_revision(current: u64) -> (r: Option < u64 >) ensures r == spec_next_policy_revision(current), r.is_some() ==> r.unwrap() == current + 1, r.is_some() ==> r.unwrap() >= 1, r.is_none() ==> current == u64::MAX,
+pub fn answer_retry_cap(policy_max: u32, asked: u32) -> (r: Option < u32 >) ensures r.is_some() ==> r.unwrap() == asked, r.is_some() ==> asked <= policy_max && asked <= MAX_ANSWER_RETRIES, r.is_none() ==> asked > policy_max || asked > MAX_ANSWER_RETRIES,
+pub fn retry_after_reject(rejections: u32, cap: u32) -> (r: bool) ensures r == (rejections <= cap),
+pub open spec fn spec_answers(cap: int, rejections: int) -> int decreases cap + 1 - rejections, { if rejections < 1 || rejections > cap { rejections } else { spec_answers(cap, rejections + 1) } }
+pub proof fn theorem_a_run_asks_for_cap_plus_one_answers(cap: int, rejections: int) requires 1 <= rejections <= cap + 1, ensures spec_answers(cap, rejections) == cap + 1, decreases cap + 1 - rejections,
 
 ## formal/verus/src/agent_select.rs
 pub open spec fn key(bits: i64) -> i64 { bits ^ ((((bits >> 63i64) as u64) >> 1u64) as i64) }

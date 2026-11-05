@@ -8047,8 +8047,8 @@ pub const fn management_api_request_fields()
                 "reason",
             ]),
         ),
-        // Run-default overrides of a workflow type (issues #2387, #2406 and
-        // #2407).
+        // Run-default overrides of a workflow type (issues #2387, #2406,
+        // #2407 and #2408).
         (
             "PATCH",
             "/admin/workflow-types/{workflow_name}/run-defaults",
@@ -8057,6 +8057,9 @@ pub const fn management_api_request_fields()
                 "execution_timeout_secs",
                 "chain_execution_timeout_secs",
                 "concurrency_limit",
+                "quota_max_active_executions",
+                "quota_max_history_bytes",
+                "quota_max_dead_letters",
                 "clear_override",
                 "reason",
                 "recompute_in_flight",
@@ -9417,7 +9420,13 @@ pub const fn management_api_response_fields()
         (
             "GET",
             "/admin/quotas",
-            Some(&["quotas", "status", "unavailable_shards"]),
+            Some(&[
+                "quotas",
+                "workflow_types",
+                "override_source",
+                "status",
+                "unavailable_shards",
+            ]),
         ),
         (
             "GET",
@@ -40770,6 +40779,11 @@ fn merge_paused_queue_rows(
 /// `/admin/concurrency`'s cross-shard sum) but always also lists the full
 /// per-shard breakdown, so an operator can see exactly which shard(s) a
 /// tenant is actually capped on.
+///
+/// `limits` holds the effective caps, after the operator override of issue
+/// #2408. `code_limits` and `override` show where each cap comes from.
+/// `workflow_types` lists each type with an admission cap, so an override
+/// shows before its type has usage.
 async fn list_quotas_handler(
     Extension(api_state): Extension<HarvestApiState>,
 ) -> Result<Json<Value>, AutumnError> {
@@ -40788,12 +40802,172 @@ async fn list_quotas_handler(
     .await?;
 
     let collected = shard_fanout::collect_fanout_rows(observations);
+    let default_shard = api_state
+        .storage_pool()
+        .map_err(map_error)?
+        .default_shard()
+        .as_i32();
+    let default_down = collected
+        .unavailable_shards
+        .iter()
+        .any(|shard| shard.shard_id == default_shard);
+    let (overrides, source) =
+        load_quota_overrides(&api_state, &runtime.registry, default_down).await;
 
     Ok(Json(serde_json::json!({
-        "quotas": merge_quota_rows(collected.rows, &runtime.registry),
+        "quotas": merge_quota_rows(collected.rows, &runtime.registry, &overrides),
+        "workflow_types": quota_workflow_types(&runtime.registry, &overrides),
+        "override_source": source,
         "status": collected.status,
         "unavailable_shards": collected.unavailable_shards,
     })))
+}
+
+/// The stored quota override of one type, as `GET /admin/quotas` names it
+/// (issue #2408).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct QuotaOverrideView {
+    limits: ::autumn_harvest::quota::QuotaLimits,
+    reason: Option<String>,
+    updated_by: Option<String>,
+    updated_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// The stored quota overrides, by type, and their source (issue #2408).
+///
+/// The read takes the table on the default shard, so the view never shows a
+/// stale override. The source is then `table`. When that read fails, the
+/// view takes the cache of this process, which is what this process
+/// enforces. The source is then `cache`, and the cache holds no reason,
+/// actor or time. `default_down` skips the read when the usage fan-out could
+/// not reach the default shard, so the request waits for it only once.
+async fn load_quota_overrides(
+    api_state: &HarvestApiState,
+    registry: &HandlerRegistry,
+    default_down: bool,
+) -> (
+    std::collections::HashMap<String, QuotaOverrideView>,
+    &'static str,
+) {
+    let stored = async {
+        if default_down {
+            return Err("the default shard is unavailable".to_string());
+        }
+        let pool = api_state.storage_pool().map_err(|e| e.to_string())?;
+        let mut conn = acquire_conn(pool.default_pool())
+            .await
+            .map_err(|e| format!("{e:?}"))?;
+        ::autumn_harvest::run_defaults::load_run_default_overrides(&mut conn)
+            .await
+            .map_err(|e| e.to_string())
+    }
+    .await;
+    match stored {
+        Ok(rows) => {
+            let overrides = rows
+                .into_iter()
+                .filter(|row| !row.fields.quota.is_empty())
+                .map(|row| {
+                    let view = QuotaOverrideView {
+                        limits: row.fields.quota,
+                        reason: row.reason,
+                        updated_by: Some(row.updated_by),
+                        updated_at: Some(row.updated_at),
+                    };
+                    (row.workflow_name, view)
+                })
+                .collect();
+            (overrides, "table")
+        }
+        Err(reason) => {
+            tracing::warn!(
+                reason,
+                "GET /admin/quotas could not read the stored overrides; it shows the cache"
+            );
+            (cached_quota_overrides(registry), "cache")
+        }
+    }
+}
+
+/// The quota overrides in the cache of this process, by registered type
+/// (issue #2408). The cache holds no reason, actor or time.
+fn cached_quota_overrides(
+    registry: &HandlerRegistry,
+) -> std::collections::HashMap<String, QuotaOverrideView> {
+    registry
+        .workflows
+        .keys()
+        .filter_map(|name| {
+            let fields = registry.run_defaults().get(name)?;
+            (!fields.quota.is_empty()).then(|| {
+                let view = QuotaOverrideView {
+                    limits: fields.quota,
+                    reason: None,
+                    updated_by: None,
+                    updated_at: None,
+                };
+                (name.clone(), view)
+            })
+        })
+        .collect()
+}
+
+/// The `limits`, `code_limits` and `override` of one type (issues #946 and
+/// #2408).
+///
+/// `limits` follows the same rule as admission. Each cap of the override
+/// replaces the code cap. A type with no admission cap keeps its code caps.
+/// A type with no quota policy reports null caps. `override.applies` is
+/// `false` when the type has no admission cap, so the override changes
+/// nothing.
+fn quota_limit_fields(
+    policy: Option<::autumn_harvest::quota::QuotaPolicy>,
+    stored: Option<&QuotaOverrideView>,
+) -> serde_json::Map<String, Value> {
+    use ::autumn_harvest::quota::QuotaLimits;
+    let caps = |limits: QuotaLimits| serde_json::to_value(limits).unwrap_or(Value::Null);
+    let code = policy.map(|p| QuotaLimits::of(&p)).unwrap_or_default();
+    let effective = match (policy, stored) {
+        (Some(policy), Some(stored)) => QuotaLimits::of(&stored.limits.apply(policy)),
+        _ => code,
+    };
+    let applies = policy.is_some_and(|p| p.has_any_cap());
+    let named = stored.map_or(Value::Null, |stored| {
+        let mut view = caps(stored.limits);
+        view["applies"] = serde_json::json!(applies);
+        view["reason"] = serde_json::json!(stored.reason);
+        view["updated_by"] = serde_json::json!(stored.updated_by);
+        view["updated_at"] = serde_json::json!(stored.updated_at);
+        view
+    });
+    let mut fields = serde_json::Map::new();
+    fields.insert("limits".to_string(), caps(effective));
+    fields.insert("code_limits".to_string(), caps(code));
+    fields.insert("override".to_string(), named);
+    fields
+}
+
+/// Each registered type with a quota admission cap, by name (issue #2408).
+fn quota_workflow_types(
+    registry: &HandlerRegistry,
+    overrides: &std::collections::HashMap<String, QuotaOverrideView>,
+) -> Vec<Value> {
+    let mut names: Vec<&String> = registry
+        .workflows
+        .iter()
+        .filter(|(_, info)| info.quota.is_some_and(|p| p.has_any_cap()))
+        .map(|(name, _)| name)
+        .collect();
+    names.sort();
+    names
+        .into_iter()
+        .map(|name| {
+            let policy = registry.workflows.get(name).and_then(|info| info.quota);
+            let mut entry = quota_limit_fields(policy, overrides.get(name));
+            entry.insert("workflow_name".to_string(), serde_json::json!(name));
+            Value::Object(entry)
+        })
+        .collect()
 }
 
 /// Merge per-shard quota usage rows into one entry per `(workflow_name,
@@ -40803,10 +40977,12 @@ async fn list_quotas_handler(
 /// The declared `limits` are resolved from the CURRENT registered
 /// `WorkflowInfo.quota` for `workflow_name` (never persisted with the usage
 /// rows themselves), so a policy edited after a key accrued usage is reported
-/// against the live policy, not a stale snapshot.
+/// against the live policy, not a stale snapshot. The operator override of
+/// issue #2408 then applies, as at admission.
 fn merge_quota_rows(
     rows: Vec<(i32, ::autumn_harvest::quota::QuotaKeyUsage)>,
     registry: &HandlerRegistry,
+    overrides: &std::collections::HashMap<String, QuotaOverrideView>,
 ) -> Vec<Value> {
     let mut by_key: std::collections::BTreeMap<
         (String, String),
@@ -40837,29 +41013,37 @@ fn merge_quota_rows(
                 .get(&workflow_name)
                 .and_then(|info| info.quota);
 
-            serde_json::json!({
-                "workflow_name": workflow_name,
-                "quota_key": quota_key,
-                "usage": {
+            let mut entry = serde_json::Map::new();
+            entry.insert(
+                "workflow_name".to_string(),
+                serde_json::json!(workflow_name),
+            );
+            entry.insert("quota_key".to_string(), serde_json::json!(quota_key));
+            entry.insert(
+                "usage".to_string(),
+                serde_json::json!({
                     "active_executions": total_active,
                     "history_bytes": total_history_bytes,
                     "dead_letters": total_dead_letters,
-                },
-                "limits": {
-                    "max_active_executions": policy.and_then(|p| p.max_active_executions),
-                    "max_history_bytes": policy.and_then(|p| p.max_history_bytes),
-                    "max_dead_letters": policy.and_then(|p| p.max_dead_letters),
-                },
-                "shards": shard_rows
+                }),
+            );
+            entry.extend(quota_limit_fields(policy, overrides.get(&workflow_name)));
+            entry.insert(
+                "shards".to_string(),
+                shard_rows
                     .iter()
-                    .map(|(shard_id, row)| serde_json::json!({
-                        "shard_id": shard_id,
-                        "active_executions": row.active_executions,
-                        "history_bytes": row.history_bytes,
-                        "dead_letters": row.dead_letters,
-                    }))
-                    .collect::<Vec<_>>(),
-            })
+                    .map(|(shard_id, row)| {
+                        serde_json::json!({
+                            "shard_id": shard_id,
+                            "active_executions": row.active_executions,
+                            "history_bytes": row.history_bytes,
+                            "dead_letters": row.dead_letters,
+                        })
+                    })
+                    .collect::<Vec<_>>()
+                    .into(),
+            );
+            Value::Object(entry)
         })
         .collect()
 }
@@ -53933,6 +54117,39 @@ mod tests {
             result.expect_err("an empty key is a 400").status(),
             axum::http::StatusCode::BAD_REQUEST
         );
+    }
+
+    /// Issue #2408: `limits` takes the override only for a type with an
+    /// admission cap. `override.applies` says whether it changes anything.
+    #[test]
+    fn quota_limit_fields_report_effective_code_and_override() {
+        use autumn_harvest::quota::{QuotaLimits, QuotaPolicy};
+
+        let stored = QuotaOverrideView {
+            limits: QuotaLimits {
+                max_active_executions: Some(1),
+                ..QuotaLimits::default()
+            },
+            reason: Some("INC-1".to_string()),
+            updated_by: Some("ops".to_string()),
+            updated_at: None,
+        };
+        let code = QuotaPolicy::new("tenant").with_max_active_executions(5);
+        let fields = quota_limit_fields(Some(code), Some(&stored));
+        assert_eq!(fields["limits"]["max_active_executions"], 1);
+        assert_eq!(fields["code_limits"]["max_active_executions"], 5);
+        assert_eq!(fields["override"]["max_active_executions"], 1);
+        assert_eq!(fields["override"]["reason"], "INC-1");
+        assert_eq!(fields["override"]["applies"], true);
+
+        let capless = QuotaPolicy::new("tenant");
+        let fields = quota_limit_fields(Some(capless), Some(&stored));
+        assert_eq!(fields["limits"]["max_active_executions"], Value::Null);
+        assert_eq!(fields["override"]["applies"], false);
+
+        let fields = quota_limit_fields(Some(code), None);
+        assert_eq!(fields["limits"], fields["code_limits"]);
+        assert_eq!(fields["override"], Value::Null);
     }
 
     // ── issue #811 (Codex round 1, P2): activity concurrency groups always defer

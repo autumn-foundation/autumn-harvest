@@ -4107,6 +4107,7 @@ mod tests {
                 sla: Some(std::time::Duration::from_secs(45)),
                 chain_execution_timeout: Some(std::time::Duration::from_mins(15)),
                 concurrency_limit: None,
+                quota: crate::quota::QuotaLimits::default(),
             },
         );
         let got = resolve_target_run_defaults(

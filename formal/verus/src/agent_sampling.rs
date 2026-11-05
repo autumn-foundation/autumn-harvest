@@ -2,8 +2,10 @@
 //!
 //! `draw_plan` admits the draw count and the concurrency of one run.
 //! `wave_end` splits the draws into waves. `next_policy_revision` counts
-//! the changes of a policy row. The copies below are the kernels in
-//! `sampling/admit.rs` of the agent crate and in `agent_policy_log.rs`.
+//! the changes of a policy row. `answer_retry_cap` and
+//! `retry_after_reject` bound the answer check of a run (issue #2442). The
+//! copies below are the kernels in `sampling/admit.rs` of the agent crate
+//! and in `agent_policy_log.rs`.
 //!
 //! The proofs show:
 //!
@@ -13,6 +15,12 @@
 //! - Each wave holds from 1 to `concurrency` draws, and the waves cover
 //!   each draw once. So no more than `concurrency` draws run at one time.
 //! - A revision moves up by one and never wraps.
+//! - An answer check never has more retries than the policy cap or
+//!   `MAX_ANSWER_RETRIES`.
+//! - In `spec_answers`, a spec model of the loop, a run with the cap `c`
+//!   asks for exactly `c + 1` answers when each answer is rejected. The
+//!   proptest `the_answers_of_a_run_never_pass_the_cap` links the model to
+//!   the engine kernels.
 //!
 //! `sample_step` gives the next wave of an `agent_sample` run (issue
 //! #2443). A wave holds from 1 to `concurrency` draws, and never passes
@@ -27,6 +35,9 @@ verus! {
 
 /// The bound on concurrent children in the agent crate.
 pub const MAX_PARALLEL_CHILDREN: u32 = 16;
+
+/// The bound on the answer retries of a policy in the agent crate.
+pub const MAX_ANSWER_RETRIES: u32 = 16;
 
 /// The integer part of an admission.
 pub enum DrawPlan {
@@ -225,6 +236,58 @@ pub fn next_policy_revision(current: u64) -> (r: Option<u64>)
         Some(current + 1)
     } else {
         None
+    }
+}
+
+// mirror: autumn-harvest-agent/src/sampling/admit.rs answer_retry_cap
+pub fn answer_retry_cap(policy_max: u32, asked: u32) -> (r: Option<u32>)
+    ensures
+        r.is_some() ==> r.unwrap() == asked,
+        r.is_some() ==> asked <= policy_max && asked <= MAX_ANSWER_RETRIES,
+        r.is_none() ==> asked > policy_max || asked > MAX_ANSWER_RETRIES,
+{
+    let mut cap = policy_max;
+    if cap > MAX_ANSWER_RETRIES {
+        cap = MAX_ANSWER_RETRIES;
+    }
+    if asked > cap {
+        return None;
+    }
+    Some(asked)
+}
+
+// mirror: autumn-harvest-agent/src/sampling/admit.rs retry_after_reject
+pub fn retry_after_reject(rejections: u32, cap: u32) -> (r: bool)
+    ensures
+        r == (rejections <= cap),
+{
+    rejections <= cap
+}
+
+/// The answers of a run whose every answer is rejected, from the answer
+/// with the count `rejections`. The loop asks again while
+/// `retry_after_reject` holds.
+pub open spec fn spec_answers(cap: int, rejections: int) -> int
+    decreases cap + 1 - rejections,
+{
+    if rejections < 1 || rejections > cap {
+        rejections
+    } else {
+        spec_answers(cap, rejections + 1)
+    }
+}
+
+/// With the cap `cap`, a run asks for exactly `cap + 1` answers when the
+/// check rejects each one.
+pub proof fn theorem_a_run_asks_for_cap_plus_one_answers(cap: int, rejections: int)
+    requires
+        1 <= rejections <= cap + 1,
+    ensures
+        spec_answers(cap, rejections) == cap + 1,
+    decreases cap + 1 - rejections,
+{
+    if rejections <= cap {
+        theorem_a_run_asks_for_cap_plus_one_answers(cap, rejections + 1);
     }
 }
 

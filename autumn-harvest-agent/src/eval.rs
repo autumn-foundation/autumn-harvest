@@ -2548,6 +2548,7 @@ mod tests {
                 workspace: None,
                 error: None,
                 resets: 0,
+                answer_rejections: Vec::new(),
             })
         };
         let done = report(crate::AgentStop::Completed);

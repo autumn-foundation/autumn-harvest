@@ -31,6 +31,7 @@ use crate::agent::{
     agent_info, agent_memory_reset_info, agent_profile_info, agent_profile_overlay_info,
     agent_workspace_floor_info, agent_workspace_reset_info, agent_workspace_retain_info,
 };
+use crate::answer_check::{CheckRequest, admission, agent_answer_check_info};
 use crate::approval::Approval;
 use crate::consolidate::{
     CONSOLIDATE_WORKFLOW_NAME, CONSOLIDATION_ATTR, ConsolidateTask, agent_consolidate_info,
@@ -141,6 +142,14 @@ fn register_sampling(rt: &mut SqliteRuntime, harness: &Arc<AgentHarness>) {
         call(input, |kind: String| {
             let h = Arc::clone(&h);
             async move { h.sampling_policy(&kind).await }
+        })
+    });
+    // SQLite keeps no run tenant, so the task tenant applies (issue #2442).
+    let h = Arc::clone(harness);
+    rt.register_activity_with_body(&agent_answer_check_info(), move |input| {
+        call(input, |request: CheckRequest| {
+            let h = Arc::clone(&h);
+            async move { admission(&h, &request, request.tenant.as_deref()).await }
         })
     });
 }
