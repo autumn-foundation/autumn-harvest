@@ -2459,8 +2459,9 @@ struct Sent<'a> {
     answer: &'a str,
 }
 
-/// Give the task of a strategy op what each draw reads: the mandate of a
-/// peer message, the transcript, the labels and the state memory.
+/// Give the task of a strategy op what each draw reads. That is the
+/// mandate of a peer message, the transcript and the progress notes. It is
+/// also the labels and the state memory.
 fn draw_op_task(
     task: &mut AgentTask,
     state: &AgentState,
@@ -2473,7 +2474,7 @@ fn draw_op_task(
         task.read_only |= mandate.read_only;
         task.waiting = peer.waiting.to_vec();
     }
-    // A draw keeps no progress notes. Its notes would not reach the state,
+    // A draw saves no progress notes. Its notes would not reach the state,
     // so the next op would restore stale ones.
     task.context_reset = None;
     task.history.clone_from(&state.transcript);
@@ -2483,6 +2484,13 @@ fn draw_op_task(
         .chain(profile.mandate.iter().flat_map(|m| &m.flow_labels))
         .cloned()
         .collect();
+    // A draw reads the notes of the agent, as a segment does. The kept
+    // transcript drops the restored pair, and the state keeps its notes.
+    if let Some(notes) = &state.notes {
+        task.history
+            .extend(crate::context_reset::restored(&notes.text));
+        task.flow_labels.extend(notes.labels.iter().cloned());
+    }
     if task.memory_in_state && !state.memory.is_empty() {
         // A draw reads the state memory but cannot edit it.
         let snapshot = crate::memory::render_snapshot(&state.memory);

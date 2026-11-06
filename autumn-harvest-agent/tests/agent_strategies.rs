@@ -657,3 +657,72 @@ async fn a_beam_op_checks_max_draws_but_not_the_fan_out() {
     let error = state(&rt, &agent).await.last_error.unwrap_or_default();
     assert!(error.contains("draws_exceeded"), "{error}");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_draw_reads_the_progress_notes_of_the_agent() {
+    let (_dir, db) = fresh_db();
+    let model = TryFnModel::new(|request: &ChatRequest| {
+        if let Some(draw) = request.draw {
+            return answer(["a", "b", "c"][draw.get() as usize % 3], 5);
+        }
+        let saved = request
+            .messages
+            .iter()
+            .any(|message| message.role == ChatRole::Tool);
+        if saved {
+            answer("saved", 5)
+        } else {
+            common::calls(
+                &[(
+                    "s1",
+                    SAVE_PROGRESS_TOOL,
+                    serde_json::json!({"notes": "customer id 42"}),
+                )],
+                5,
+            )
+        }
+    });
+    let profile = AgentProfile::new(KIND)
+        .window(4)
+        .context_reset(ContextReset::new(1, 90));
+    let mut rt = runtime(&db, harness(model.clone(), profile, &best_of(3)));
+    let agent = desk("fifteen");
+
+    send(&mut rt, &agent, &AgentOp::message("Remember my id.")).await;
+    send(&mut rt, &agent, &AgentOp::message("Hi.")).await;
+    let window = serde_json::json!(state(&rt, &agent).await.transcript).to_string();
+    assert!(
+        !window.contains("customer id 42"),
+        "the window dropped op 1, so only the notes hold the id: {window}"
+    );
+    let before = state(&rt, &agent).await.notes;
+    assert_eq!(
+        before.as_ref().map(|notes| notes.text.as_str()),
+        Some("customer id 42")
+    );
+    let op = AgentOp::message("Pick a letter.").with_sample(best_of_three());
+    send(&mut rt, &agent, &op).await;
+
+    let draws: Vec<ChatRequest> = model
+        .requests()
+        .into_iter()
+        .filter(|request| request.draw.is_some())
+        .collect();
+    assert_eq!(draws.len(), 3);
+    for request in &draws {
+        let text = serde_json::json!(request.messages).to_string();
+        assert!(
+            text.contains("customer id 42"),
+            "a draw reads the notes: {text}"
+        );
+    }
+    let after = state(&rt, &agent).await;
+    assert_eq!(after.failures, 0, "{:?}", after.last_error);
+    assert_eq!(after.notes, before, "a draw changes no notes");
+    assert_eq!(after.last_answer.as_deref(), Some("b"));
+    let kept = serde_json::json!(after.transcript).to_string();
+    assert!(
+        !kept.contains(autumn_harvest_agent::context_reset::RESTORED_CALL_ID),
+        "the transcript keeps no restored copy: {kept}"
+    );
+}

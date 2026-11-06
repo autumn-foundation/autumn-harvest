@@ -2069,8 +2069,9 @@ let op = AgentOp::message("Name a prime.").with_sample(sample);
   because each draw carries the transcript.
 - A steer message with a strategy runs as its own op. An interrupt, a
   pause or a delete does not stop the draws of a running strategy op.
-- A draw has no memory tool, no workspace, no follow-ups and no progress
-  notes. It reads the state memory in its system prompt.
+- A draw has no memory tool, no workspace, no follow-ups and no context
+  reset. It reads the state memory in its system prompt and the progress
+  notes in its window. It changes neither.
 - A worker that predates `OpSample` drops the field and runs a plain
   segment. Upgrade every worker before a client sends a strategy op.
 

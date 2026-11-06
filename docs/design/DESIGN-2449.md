@@ -122,7 +122,7 @@ A refused or failed op changes no transcript. A peer gets the refusal in
   draws that ran, or fails with `no_accepted_draw`.
 - A judge call does not check the mesh budget before the call.
 - An interrupt does not stop the draws of a running op.
-- A draw does not read the progress notes of the agent.
+- A draw reads the progress notes of the agent, but saves none.
 - A worker that predates `max_draws` drops the field from a peer message.
 - The `delegate` tool cannot ask for a strategy. Only an op can.
 - A draw has no memory tool, no workspace and no follow-ups, as in
