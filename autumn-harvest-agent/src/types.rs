@@ -301,6 +301,13 @@ pub struct AgentTask {
     /// takes only source runs of that kind.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
+    /// Run one beam step: one model turn and its tool round. `history`
+    /// holds the beam, so the run adds no user message for `input`. A tool
+    /// round ends the run with [`AgentStop::StepEnded`]. Only `agent_sample`
+    /// sets it. Its step has no follow-ups, no answer check and no context
+    /// reset.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub beam_step: bool,
 }
 
 impl Serialize for AgentTask {
@@ -376,6 +383,7 @@ impl AgentTask {
             answer_check: None,
             probe: None,
             kind: None,
+            beam_step: false,
         }
     }
 
@@ -971,6 +979,9 @@ pub enum AgentStop {
     /// The answer check rejected more answers than its cap allows (issue
     /// #2442). The report holds each reason.
     AnswerRejected,
+    /// A beam step ran its model turn and its tool round. The transcript
+    /// holds both, so a later step can go on from it.
+    StepEnded,
 }
 
 /// The workflow output: how the run ended and what it produced.
@@ -1061,6 +1072,30 @@ mod tests {
         assert_eq!(task.input, "hi");
         assert_eq!(task.history, Vec::new());
         assert_eq!(task.max_total_tokens, None);
+    }
+
+    #[test]
+    fn the_beam_step_flag_is_off_by_default_and_not_written_when_off() {
+        let task = AgentTask::new("hi");
+        assert!(!task.beam_step);
+        assert!(
+            serde_json::to_value(&task)
+                .unwrap()
+                .get("beam_step")
+                .is_none()
+        );
+        let step = AgentTask {
+            beam_step: true,
+            ..task
+        };
+        let value = serde_json::to_value(&step).unwrap();
+        assert_eq!(value["beam_step"], json!(true));
+        let back: AgentTask = serde_json::from_value(value).unwrap();
+        assert!(back.beam_step);
+        assert_eq!(
+            serde_json::to_value(AgentStop::StepEnded).unwrap(),
+            json!("step_ended")
+        );
     }
 
     #[test]

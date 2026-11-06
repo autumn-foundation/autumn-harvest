@@ -608,3 +608,56 @@ async fn a_draw_of_a_strategy_op_gets_no_context_reset() {
     assert_eq!(state.last_answer.as_deref(), Some("b"));
     assert!(state.notes.is_none(), "{:?}", state.notes);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_beam_op_checks_max_draws_but_not_the_fan_out() {
+    let (_dir, db) = fresh_db();
+    let model = by_draw(&["b"], "plain");
+    let policy = SamplingPolicy {
+        strategies: BTreeSet::from([Strategy::Beam]),
+        max_draws: 8,
+        ..SamplingPolicy::default()
+    };
+    // Three steps under one delegation: a beam keeps its own count.
+    let roomy = Mandate::new(KIND).max_delegations(1).max_draws(3);
+    let profile = AgentProfile::new(KIND).mandate(roomy);
+    let mut rt = runtime(&db, harness(model.clone(), profile, &policy));
+    let agent = desk("fourteen");
+    let beam = OpSample::new(
+        SampleStrategy::beam(1, 1, 3),
+        ScorerRef::deterministic("table").unwrap(),
+    );
+    send(
+        &mut rt,
+        &agent,
+        &AgentOp::message("Pick.").with_sample(beam),
+    )
+    .await;
+    let state = state(&rt, &agent).await;
+    assert_eq!(state.failures, 0, "{:?}", state.last_error);
+    assert_eq!(state.last_answer.as_deref(), Some("b"));
+
+    // The same beam passes a cap of two draws.
+    let (_dir2, db2) = fresh_db();
+    let model = by_draw(&["b"], "plain");
+    let tight = Mandate::new(KIND).max_draws(2);
+    let profile = AgentProfile::new(KIND).mandate(tight);
+    let mut rt = runtime(&db2, harness(model.clone(), profile, &policy));
+    let beam = OpSample::new(
+        SampleStrategy::beam(1, 1, 3),
+        ScorerRef::deterministic("table").unwrap(),
+    );
+    send(
+        &mut rt,
+        &agent,
+        &AgentOp::message("Pick.").with_sample(beam),
+    )
+    .await;
+    assert!(model.requests().is_empty(), "no step runs");
+    let error = state_of(&rt, &agent).await;
+    assert!(error.contains("draws_exceeded"), "{error}");
+}
+
+async fn state_of(rt: &SqliteRuntime, agent: &AgentId) -> String {
+    state(rt, agent).await.last_error.unwrap_or_default()
+}

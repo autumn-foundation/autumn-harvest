@@ -2050,6 +2050,9 @@ let op = AgentOp::message("Name a prime.").with_sample(sample);
 - The mandate admits the draws first: `draws_exceeded`, then
   `fan_out_exhausted`. The sampling policy of the kind then admits the
   strategy. A refusal comes before any model call.
+- A beam (section 20) checks `max_draws` against its steps only. A step
+  continues the run of its beam, and the beam counts its delegations step
+  by step.
 - A refused or failed op is a failed op. The transcript stays as it was,
   and the next op runs. A peer gets a mandate refusal in
   `PeerReply::refusal`, and any other error in `PeerReply::error`.
@@ -2565,7 +2568,8 @@ model is not called.
   passed;
 - `selected`: the `AgentReport` of the selected draw;
 - `stopped`: `completed`, `accepted` (a rejection run found a pass),
-  `budget_exceeded` or `score_failed`;
+  `budget_exceeded`, `score_failed` or `rounds_exhausted` (a beam run
+  ended its last round with a live beam);
 - `attempts`: the draws that ran;
 - `draws`: for each draw, its stop, verdict, usage and cost. The usage and
   the cost include the judge calls of the draw;
@@ -2577,6 +2581,95 @@ Each `ModelTurn` carries the cost that the ledger recorded for it, and
 `AgentReport::cost_usd_micros` sums it, as `usage` sums the tokens.
 
 The design is in [`DESIGN-2443.md`](design/DESIGN-2443.md).
+
+### Beam search
+
+Best-of-N scores whole runs. Beam search scores each model turn, so a
+path that goes wrong at step 2 stops there.
+
+```rust
+use autumn_harvest_agent::sampling::{SampleInput, SampleStrategy, ScorerRef};
+
+// The policy of `researcher` must list `beam`, with
+// `max_draws >= width × expansion × max_rounds`, here 12.
+
+let input = SampleInput::new(
+    "researcher",
+    "Find the path.",
+    SampleStrategy::beam(2, 2, 3),
+    ScorerRef::deterministic("path_score").unwrap(),
+);
+// SQLite: autumn_harvest_agent::sqlite::start_sample(&mut rt, &input)
+```
+
+| Field | What it does |
+|---|---|
+| `width` | The most beams that a round keeps. The run stops when `width` beams are complete. |
+| `expansion` | The model turns that each live beam gets in a round. |
+| `max_rounds` | The most rounds. |
+
+A beam is a transcript. Round 0 has one beam: the user message. Each
+round expands each live beam `expansion` times. Each expansion is a step:
+a child `agent_loop` run with `AgentTask::beam_step` set. A step sends
+its beam as `history`, asks for one model turn, and runs the tool round
+that the turn asks for. A tool round ends the step with `step_ended`. A
+final answer ends it with `completed`. So a kept beam pays for its new
+turn only. Its prefix is data in the request, not a new model call.
+
+Each step has its own draw id, so two steps of one beam never share a
+cached answer. Each step gets `draw_effects`, as a draw does. Each step
+also gets the flow labels of its beam, so a flow rule sees the labels of
+each earlier round.
+
+The scorer of the input is the step scorer. `agent_sample_score` scores
+each step. The score input holds the whole transcript of the beam, and
+its `stop` is `step_ended` until the beam is complete. `ExactMatch` and
+`JsonSchema` give a `step_ended` step the score 0, so a beam keeps it
+below each passed answer. A step that ends with another stop gets a
+reject and no score call.
+
+A step continues its beam, so it also continues the step count. A beam of
+round `r` holds `r` tool rounds, so its step may run `max_steps - r` more.
+With none left, a step that asks for a tool ends `steps_exhausted`. So a
+path never runs more tool rounds than one run of the profile. In the same
+way, the mandate of a step allows only the delegations that its beam has
+not used.
+
+After each round, `beam_rank` keeps the best steps: at most `width` less
+the complete beams. It calls `select` once per kept step, so a tie goes
+to the lowest draw id, and a reject is never kept. A kept step with a
+final answer is complete and leaves the pool. Each other kept step is
+live in the next round, in rank order.
+
+The run stops with `completed` when `width` beams are complete, or when
+no beam is live. It stops with `rounds_exhausted` after `max_rounds` with
+a live beam.
+The outcome is `select` over the complete beams, and `selected` holds the
+report of the best one. Its transcript is the whole path, but its usage
+covers its last step only. The totals are on `SampleReport`. With no
+complete beam, the outcome is `no_accepted_draw`.
+
+Each draw record holds `beam`: its `round`, its `parent` step and its
+`fate` (`live`, `complete` or `pruned`). So the report holds the verdicts
+of each round.
+
+The policy admits `width × expansion × max_rounds` as the draw count,
+before the first model call. The product saturates, so an overflow is
+refused as `too_many_draws`. The budget and the stops of best-of-N apply
+to each round.
+
+Known limits:
+
+- Each step sends its whole beam as input tokens. The loop checks a token
+  cap between model calls, and a step makes one call. So a step can pass
+  its share of the budget by the size of its beam.
+- A step that delegates also runs the model calls of its child. The draw
+  count bounds the turns of the steps only.
+- The loop guard of a step sees only its own turn. `max_rounds` bounds a
+  loop across rounds.
+- A step has no context reset, because a reset rewrites the beam.
+
+The design is in [`DESIGN-2446.md`](design/DESIGN-2446.md).
 
 ## 21. Answer check (issue #2442)
 
@@ -2919,3 +3012,121 @@ on the harness that implements `MemoryStore::ensure_block` and
   notes why.
 - **Fleet.** `InMemoryMemoryStore` lives in one process. Each worker of a
   fleet needs the same durable store.
+
+## 25. Refine an agent
+
+The refine loop improves the setup of an agent kind from its recorded
+runs. Sections 16, 18 and 22 to 24 describe the parts. This section shows
+how the parts fit. [ADR 0016](adr/0016-agent-refinement.md) records the
+four decisions, and [ADR 0014](adr/0014-operator-refine-policy.md)
+records the policy rule.
+
+```sh
+cargo run -p autumn-harvest-agent --features sqlite,eval --example agent_refine
+```
+
+`autumn-harvest-agent/examples/agent_refine.rs` runs the loop on SQLite
+with scripted models. It needs no API key and no network. The refine
+workflow needs the `eval` feature.
+
+1. Op 1 is a recorded `agent_loop` run of the kind `support`. Its prompt
+   lacks a refund rule, so the `ExactMatch` scorer rejects its answer.
+2. `agent_refine` with k = 1 reads op 1. The proposer adds the rule, and
+   the probe replays op 1 under the candidate.
+3. The run waits at the adoption gate. The example approves it.
+4. Op 2 goes to the durable agent `support/customer-2`. It reads the
+   adopted version 1, so its answer passes. The example exits non-zero
+   when op 2 fails.
+
+Its tests also send a reject. Op 2 then fails, so the check is not
+vacuous.
+
+### The loop
+
+The loop runs offline. It reads ended runs only, and it never changes an
+op in flight. A durable op reads the active version at its start. It
+never reads a waiting candidate.
+
+1. **Policy.** The run reads the `RefinePolicy` of the kind once, through
+   a recorded activity ([section 18](#18-the-refine-policy-issue-2394)).
+2. **Propose.** A proposer writes INV and DOM candidates from the
+   evidence of the source runs
+   ([section 16](#16-propose-an-overlay-issue-2379)). It tries up to
+   `proposal_attempts` times. With no valid reply, the stage inherits its
+   base.
+3. **Probe and compose.** Each candidate replays against its source. A
+   composer combines the probed candidates
+   ([section 22](#22-refine-a-kind-issue-2380)). In parallel mode, a
+   selector or the fallback rule picks one. In sequential mode, each
+   composition is the base of the next step.
+4. **Adopt.** The chosen overlay goes to the adoption gate
+   ([section 23](#23-the-adoption-gate)).
+5. **Learn.** With a memory store, each adoption adds one lesson to the
+   lesson library of the kind ([section 24](#24-the-lesson-library)).
+
+Run the loop from a schedule or by hand. Never run it on the path of an
+op.
+
+### The budget identity
+
+A session is one proposer or composer stage. For each source, both modes
+run 3k sessions. Each candidate stage adds one probe. A `KeptBase` or
+`FellBack` stage adds none. A run that ran its whole plan checks the
+counts, and a mismatch fails it with `RefineBudgetIdentity`. In the
+example, k = 1 gives 3 sessions. The INV stage keeps its base, so the run
+makes 2 probes. With a `MeshBudget`, the run stops before the next step
+once its spend reaches a token or cost cap.
+
+### Ceilings
+
+The operator sets the ceilings. Each stage, each probe, the store and the
+gate apply an overlay under them.
+
+- `ceilings.max_steps`, `ceilings.max_total_tokens` and
+  `ceilings.max_output_tokens` bound the three `max_*` fields.
+  `ceilings.models` lists the models that an overlay may name. The
+  default of each is `null`, the profile value, so an overlay can only
+  narrow.
+- An overlay can set `read_only`, but it cannot clear it. No policy
+  setting allows a clear.
+- An overlay holds a prompt, guardrails, tool guidance, skills, a model,
+  bounds and `read_only` only. It has no field for tools, tool rules,
+  flow rules, a mandate, scripts or plugins. It refuses an unknown key
+  when it decodes, so a model cannot add one.
+
+### Probes and their safety
+
+A probe replays the recorded source, so the base rollout costs nothing.
+No tool runs in a replay. The recorded outcome of the same call answers
+a tool call, and a call with no recorded outcome gets an error stub
+([section 12](#12-evaluate-a-candidate-overlay)). A probe with a stub
+asks for a live re-probe on a fork. The tool-call activity of that fork
+runs only the `ToolEffect`s of `probe_effects`. By default,
+`probe_effects` holds `read_only` only. So a live re-probe runs no tool
+that declares a write. SQLite has no fork, so a SQLite run skips the
+live re-probe and notes it.
+
+### Adoption
+
+By default, a person adopts each overlay. `auto_adopt.parts` is empty,
+so the chosen overlay waits at the gate. A person approves, edits or
+rejects it before `approval_timeout`. No decision at the deadline counts
+as a reject. An operator can list parts in `auto_adopt.parts`. A
+candidate that changes only those parts then goes live without a person,
+under the daily cap `auto_adopt.max_per_day`.
+
+### The policy
+
+Each setting of `RefinePolicy` is a runtime operator setting with a safe
+default. [The settings table](#18-the-refine-policy-issue-2394) lists
+each one with its default and range. This section names the settings
+that shape the loop. Only an operator writes the policy. No model output
+carries it, so the loop cannot widen its own gate.
+
+### The lesson library
+
+With a memory store, each adoption adds one lesson to the library of the
+kind. The next run reads the library and gives it to each proposer as
+data, with its flow labels. `lessons.max_entries` bounds the library,
+and the oldest lesson goes first. The example installs an
+`InMemoryMemoryStore`, so its run writes one lesson.

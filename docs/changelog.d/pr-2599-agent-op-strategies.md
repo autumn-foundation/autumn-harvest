@@ -16,9 +16,11 @@ of a whole subtree. The design is in `docs/design/DESIGN-2449.md`.
   `Peer::max_draws` narrows a child. `delegate`, `outbound` and `accept`
   take the smaller cap with `mesh::meet_cap`. `from_meta` reads the new
   key. A cap of `None` sends no key, so an old receiver still reads it.
-- Each draw counts as one delegation. `Mandate::admit_draws` refuses with
-  the new `Refusal::DrawsExceeded`, then `Refusal::FanOutExhausted`. The
-  draws split the rest of the fan-out with `sibling_cap`.
+- Each draw of best-of-N or rejection counts as one delegation.
+  `Mandate::admit_draws` refuses with the new `Refusal::DrawsExceeded`,
+  then `Refusal::FanOutExhausted`. The draws split the rest of the fan-out
+  with `sibling_cap`. A beam checks `max_draws` only, because it counts
+  its delegations per path. A beam op starts from the transcript.
 - `sampling::Refusal::Mandate` carries a mandate refusal of a sample run.
   A peer gets it as `PeerReply::refusal`.
 - `agent_sample` checks the profile mandate too, behind the patch
