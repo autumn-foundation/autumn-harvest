@@ -215,11 +215,19 @@ fn json_field(answer: &str, pointer: &str) -> Option<String> {
             };
         }
     }
-    match serde_json::from_str(raw.get()).ok()? {
-        serde_json::Value::Null => None,
-        serde_json::Value::String(text) => Some(text.trim().to_owned()),
-        serde_json::Value::Number(_) => number_text(raw.get()),
-        other => Some(other.to_string()),
+    // The first byte names the kind of a valid JSON value. A number never
+    // goes through `Value`, which refuses one past the `f64` range.
+    let text = raw.get();
+    match text.as_bytes().first()? {
+        b'n' => None,
+        b'"' => serde_json::from_str::<String>(text)
+            .ok()
+            .map(|text| text.trim().to_owned()),
+        b'-' | b'0'..=b'9' => number_text(text),
+        b't' | b'f' => Some(text.to_owned()),
+        _ => serde_json::from_str::<serde_json::Value>(text)
+            .ok()
+            .map(|value| value.to_string()),
     }
 }
 
@@ -633,11 +641,23 @@ mod tests {
             (r#"{"n": -12.50e+1}"#, Some("-125")),
             (r#"{"n": -0e5}"#, Some("0")),
             (r#"{"n": 1e999999999}"#, None),
+            (r#"{"n": [true, 1e309]}"#, None),
             (r#"{"n": 1e-999999999}"#, None),
         ];
         for (answer, want) in cases {
             assert_eq!(key.key_of(answer).as_deref(), want, "{answer}");
         }
+        let past_f64 = format!("1{}", "0".repeat(309));
+        assert_eq!(
+            key.key_of(r#"{"n": 1e309}"#),
+            Some(past_f64.clone()),
+            "a number past the f64 range keeps its key"
+        );
+        assert_eq!(
+            key.key_of(r#"{"n": -1E+309}"#),
+            Some(format!("-{past_f64}"))
+        );
+        assert_eq!(key.key_of(r#"{"n": false}"#).as_deref(), Some("false"));
     }
 
     #[test]
