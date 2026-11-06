@@ -477,7 +477,7 @@ async fn run_waves(
                 Judge::Score(rule) => score_draw(ctx, rule, task, draw, report, halt).await?,
                 Judge::Vote(key) => vote_draw(ctx, key, draw, report).await?,
             };
-            halt = halt.or(halted);
+            halt = merge_stop(halt, halted);
             passed |= passes(&input.strategy, &one.record.verdict);
             spent = spent.saturating_add(one.record.usage.total());
             scored.push(one);
@@ -494,6 +494,17 @@ async fn run_waves(
         if let Some(stop) = halt {
             return Ok((scored, stop));
         }
+    }
+}
+
+/// The stop of a wave after a draw adds the stop `next`.
+///
+/// The first stop holds, except that a failed score or key wins over each
+/// other stop. So a broken key is never hidden behind a budget stop.
+fn merge_stop(halt: Option<SampleStop>, next: Option<SampleStop>) -> Option<SampleStop> {
+    match next {
+        Some(SampleStop::ScoreFailed) => next,
+        _ => halt.or(next),
     }
 }
 
@@ -728,6 +739,23 @@ fn report(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_failed_score_wins_over_each_other_stop() {
+        use SampleStop::{BudgetExceeded, ScoreFailed};
+        assert_eq!(merge_stop(None, None), None);
+        assert_eq!(merge_stop(None, Some(BudgetExceeded)), Some(BudgetExceeded));
+        assert_eq!(merge_stop(Some(BudgetExceeded), None), Some(BudgetExceeded));
+        assert_eq!(
+            merge_stop(Some(BudgetExceeded), Some(ScoreFailed)),
+            Some(ScoreFailed),
+            "a later failed key replaces an earlier budget stop"
+        );
+        assert_eq!(
+            merge_stop(Some(ScoreFailed), Some(BudgetExceeded)),
+            Some(ScoreFailed)
+        );
+    }
 
     #[test]
     fn the_tree_budget_is_the_smaller_cap() {

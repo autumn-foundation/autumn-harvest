@@ -2887,7 +2887,7 @@ let input = SampleInput::vote("researcher", "What is 17 * 23?", 5, AnswerKey::La
 |---|---|
 | `trimmed` | The answer with no white space at each end. |
 | `last_number` | The last decimal number, in canonical form: `1,200.50` gives `1200.5`, and `.5` gives `0.5`. Only ASCII digits count. An exponent is a number of its own, so `1e5` gives `5`. |
-| `{"json_field": "/a/b"}` | The field at a JSON pointer (RFC 6901) of the JSON answer. A string gives its trimmed text. A number gives its decimal form, so `1`, `1.0` and `1e0` all give `1`. `null` gives no key. Each other value gives its JSON text. |
+| `{"json_field": "/a/b"}` | The field at a JSON pointer (RFC 6901) of the JSON answer. A string gives its trimmed text. A number gives its exact decimal form, so `1`, `1.0` and `1e0` all give `1`, and no digit is lost. `null` gives no key. Each other value gives its JSON text. |
 | `{"custom": "id"}` | The result of the app `AnswerKeyFn` with this id, which must be an agent name. Add it with `AgentHarness::answer_key`. Make it a fast, pure function: it runs inline, with no time budget. |
 
 - **Votes.** Only a draw that completed casts a vote. A draw with no key,
@@ -2910,8 +2910,8 @@ let input = SampleInput::vote("researcher", "What is 17 * 23?", 5, AnswerKey::La
 - **Failures.** A failed key activity gives the draw a reject, and the
   run stops with `score_failed`. So does a worker that has no function
   for an app key, so a fleet that is half upgraded never casts empty
-  votes. A failed key wins over a settled vote. A settled vote wins over
-  a budget stop.
+  votes. A failed key wins over a settled vote and over a budget stop. A
+  settled vote wins over a budget stop.
 - **Report.** `SampleReport::tally` holds the votes of each key, the
   winner first. `SampleDraw::key` holds the key of each draw.
 - **Durability.** The recorded `agent_vote_key` activity applies each

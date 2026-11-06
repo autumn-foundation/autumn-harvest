@@ -34,7 +34,7 @@ base64 = "0.23"
 # `join_all` runs the child runs of a fan-out at the same time (issue #2270).
 futures = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
+serde_json = { workspace = true, features = ["raw_value"] }
 sha2 = "0.11"
 thiserror = { workspace = true }
 tokio = { workspace = true }

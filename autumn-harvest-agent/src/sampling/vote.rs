@@ -48,8 +48,8 @@ pub enum AnswerKey {
     LastNumber,
     /// The field at this JSON pointer (RFC 6901) of the answer. The
     /// trimmed answer must be JSON. A string field gives its trimmed text.
-    /// A number gives its decimal form, so `1`, `1.0` and `1e0` all give
-    /// `1`. A bool, an array or an object gives its JSON text. A `null`
+    /// A number gives its exact decimal form, so `1`, `1.0` and `1e0` all
+    /// give `1`, and no digit is lost. A bool, an array or an object gives its JSON text. A `null`
     /// field gives no key.
     JsonField(String),
     /// The app key function with this id. See [`AnswerKeyFn`].
@@ -169,6 +169,12 @@ fn last_number(answer: &str) -> Option<String> {
         last = Some((negative, whole, fraction));
     }
     let (negative, whole, fraction) = last?;
+    Some(canonical_decimal(negative, &whole, &fraction))
+}
+
+/// The canonical text of a decimal: no leading zeros, no trailing fraction
+/// zeros and no `-0`.
+fn canonical_decimal(negative: bool, whole: &str, fraction: &str) -> String {
     let whole = whole.trim_start_matches('0');
     let fraction = fraction.trim_end_matches('0');
     let mut text = String::new();
@@ -180,31 +186,94 @@ fn last_number(answer: &str) -> Option<String> {
         text.push('.');
         text.push_str(fraction);
     }
-    Some(text)
+    text
 }
 
 /// The field at `pointer` of the JSON answer `answer`.
+///
+/// The walk keeps the raw text of each value. So a number keeps each digit
+/// of its source, and never passes through `f64`.
 fn json_field(answer: &str, pointer: &str) -> Option<String> {
-    let value: serde_json::Value = serde_json::from_str(answer.trim()).ok()?;
-    match value.pointer(pointer)? {
+    use serde_json::value::RawValue;
+
+    let mut raw: &RawValue = serde_json::from_str(answer.trim()).ok()?;
+    if !pointer.is_empty() {
+        for token in pointer.strip_prefix('/')?.split('/') {
+            let token = token.replace("~1", "/").replace("~0", "~");
+            raw = match raw.get().as_bytes().first()? {
+                b'{' => {
+                    let map: std::collections::BTreeMap<String, &RawValue> =
+                        serde_json::from_str(raw.get()).ok()?;
+                    *map.get(&token)?
+                }
+                b'[' => {
+                    let index = array_index(&token)?;
+                    let list: Vec<&RawValue> = serde_json::from_str(raw.get()).ok()?;
+                    *list.get(index)?
+                }
+                _ => return None,
+            };
+        }
+    }
+    match serde_json::from_str(raw.get()).ok()? {
         serde_json::Value::Null => None,
         serde_json::Value::String(text) => Some(text.trim().to_owned()),
-        serde_json::Value::Number(number) => number_text(number),
+        serde_json::Value::Number(_) => number_text(raw.get()),
         other => Some(other.to_string()),
     }
 }
 
-/// The decimal form of a JSON number, with no exponent and no `-0`.
-fn number_text(number: &serde_json::Number) -> Option<String> {
-    if let Some(n) = number.as_i64() {
-        return Some(n.to_string());
+/// The array index of a pointer token: digits with no leading zero.
+fn array_index(token: &str) -> Option<usize> {
+    let digits = !token.is_empty() && token.bytes().all(|b| b.is_ascii_digit());
+    let lead = token.len() > 1 && token.starts_with('0');
+    if digits && !lead {
+        token.parse().ok()
+    } else {
+        None
     }
-    if let Some(n) = number.as_u64() {
-        return Some(n.to_string());
+}
+
+/// The decimal form of the JSON number text `text`, with no exponent.
+///
+/// It works on the digits, so it keeps each one. A form longer than
+/// [`MAX_KEY_BYTES`] gives `None`, so a large exponent builds no text.
+fn number_text(text: &str) -> Option<String> {
+    let (negative, rest) = text
+        .strip_prefix('-')
+        .map_or((false, text), |rest| (true, rest));
+    let (mantissa, exponent) = match rest.find(['e', 'E']) {
+        Some(at) => (&rest[..at], rest[at + 1..].parse::<i64>().ok()?),
+        None => (rest, 0),
+    };
+    let (whole, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    let digits = format!("{whole}{fraction}");
+    let digits = digits.trim_start_matches('0');
+    if digits.is_empty() {
+        return Some("0".to_owned());
     }
-    let value = number.as_f64().filter(|value| value.is_finite())?;
-    let text = format!("{value}");
-    Some(if text == "-0" { "0".to_owned() } else { text })
+    // The point sits `point` digits after the first significant digit.
+    let skipped = i64::try_from(format!("{whole}{fraction}").len() - digits.len()).ok()?;
+    let point = i64::try_from(whole.len())
+        .ok()?
+        .checked_add(exponent)?
+        .checked_sub(skipped)?;
+    let count = i64::try_from(digits.len()).ok()?;
+    let limit = i64::try_from(MAX_KEY_BYTES).ok()?;
+    if point > limit || point < -limit {
+        return None;
+    }
+    let (whole, fraction) = if point <= 0 {
+        let zeros = "0".repeat(usize::try_from(-point).ok()?);
+        (String::new(), format!("{zeros}{digits}"))
+    } else if point >= count {
+        let zeros = "0".repeat(usize::try_from(point - count).ok()?);
+        (format!("{digits}{zeros}"), String::new())
+    } else {
+        let at = usize::try_from(point).ok()?;
+        (digits[..at].to_owned(), digits[at..].to_owned())
+    };
+    Some(canonical_decimal(negative, &whole, &fraction))
 }
 
 /// An app function that maps a final answer to its key.
@@ -546,6 +615,52 @@ mod tests {
                 "{answer:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_json_number_key_keeps_each_digit() {
+        let key = AnswerKey::json_field("/n");
+        let cases = [
+            (r#"{"n": 9007199254740993}"#, Some("9007199254740993")),
+            (r#"{"n": 9007199254740993.0}"#, Some("9007199254740993")),
+            (
+                r#"{"n": 0.1000000000000000055511}"#,
+                Some("0.1000000000000000055511"),
+            ),
+            (r#"{"n": 0.1}"#, Some("0.1")),
+            (r#"{"n": 1.5e3}"#, Some("1500")),
+            (r#"{"n": 2.5E-3}"#, Some("0.0025")),
+            (r#"{"n": -12.50e+1}"#, Some("-125")),
+            (r#"{"n": -0e5}"#, Some("0")),
+            (r#"{"n": 1e999999999}"#, None),
+            (r#"{"n": 1e-999999999}"#, None),
+        ];
+        for (answer, want) in cases {
+            assert_eq!(key.key_of(answer).as_deref(), want, "{answer}");
+        }
+    }
+
+    #[test]
+    fn a_json_pointer_walks_escapes_and_arrays() {
+        let answer = r#"{"a/b": {"m~n": [10, {"x": "y"}]}}"#;
+        let at = |pointer: &str| AnswerKey::json_field(pointer).key_of(answer);
+        assert_eq!(at("/a~1b/m~0n/0").as_deref(), Some("10"));
+        assert_eq!(at("/a~1b/m~0n/1/x").as_deref(), Some("y"));
+        assert_eq!(at("/a~1b/m~0n/2"), None);
+        assert_eq!(at("/a~1b/m~0n/01"), None, "an index has no leading zero");
+        assert_eq!(at("/a~1b/m~0n/+1"), None);
+        assert_eq!(at("/missing"), None);
+        assert_eq!(
+            AnswerKey::json_field("").key_of(" 42 ").as_deref(),
+            Some("42")
+        );
+        assert_eq!(
+            AnswerKey::json_field("/a")
+                .key_of(r#"{"a": 1, "a": 2}"#)
+                .as_deref(),
+            Some("2"),
+            "the last of two equal keys wins, as in serde_json"
+        );
     }
 
     #[test]
