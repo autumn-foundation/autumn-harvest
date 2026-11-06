@@ -303,9 +303,9 @@ async fn remove(
 ///
 /// # Errors
 ///
-/// Returns a retryable error when the policy read or a store call fails
-/// with a kind that a retry can fix, or does not answer in time. A refusal
-/// of the store is [`LessonOutcome::Failed`], not an error.
+/// Returns the error of the policy read. Returns a retryable error when a
+/// store call fails with a retryable kind, or does not answer in time. A
+/// refusal of the store is [`LessonOutcome::Failed`], not an error.
 pub(crate) async fn run_write(
     harness: &AgentHarness,
     request: LessonRequest,
