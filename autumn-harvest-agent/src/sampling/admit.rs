@@ -7,6 +7,7 @@
 //! [`draw_plan`] and [`wave_end`] hold the integer part.
 //! [`admit_answer_check`] admits the answer check of a run (issue #2442).
 //! [`answer_retry_cap`] and [`retry_after_reject`] hold its integer part.
+//! [`beam_draws`] and [`beam_slots`] bound a beam run.
 //! `formal/verus/src/agent_sampling.rs` proves them.
 
 use std::collections::BTreeSet;
@@ -347,6 +348,26 @@ pub const fn sample_step(
     SampleStep::Wave { width }
 }
 
+/// The draws of a beam run: `width × expansion × max_rounds`.
+///
+/// The product saturates at `u32::MAX`, so an overflow asks for more than
+/// any policy allows. Each round expands at most `width` beams.
+///
+/// `formal/verus/src/agent_sampling.rs` proves it.
+#[must_use]
+pub const fn beam_draws(width: u32, expansion: u32, max_rounds: u32) -> u32 {
+    width.saturating_mul(expansion).saturating_mul(max_rounds)
+}
+
+/// The beams that a beam round may keep: `width` less the beams that are
+/// complete, and never below 0.
+///
+/// `formal/verus/src/agent_sampling.rs` proves it.
+#[must_use]
+pub const fn beam_slots(width: u32, complete: u32) -> u32 {
+    width.saturating_sub(complete)
+}
+
 /// Compare `ask` with `policy`.
 ///
 /// The checks go in order: the strategy, the draw count, the concurrency,
@@ -636,6 +657,34 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_beam_draws_are_the_saturated_product() {
+        assert_eq!(beam_draws(2, 2, 3), 12);
+        assert_eq!(beam_draws(0, 2, 3), 0);
+        assert_eq!(beam_draws(2, 0, 3), 0);
+        assert_eq!(beam_draws(2, 2, 0), 0);
+        assert_eq!(beam_draws(u32::MAX, 2, 1), u32::MAX);
+        assert_eq!(beam_draws(65_536, 65_536, 2), u32::MAX);
+    }
+
+    #[test]
+    fn the_beam_slots_are_the_width_less_the_complete_beams() {
+        assert_eq!(beam_slots(2, 0), 2);
+        assert_eq!(beam_slots(2, 1), 1);
+        assert_eq!(beam_slots(2, 2), 0);
+        assert_eq!(beam_slots(2, 5), 0);
+    }
+
+    #[test]
+    fn a_beam_over_max_draws_is_refused() {
+        let policy = allowing(Strategy::Beam, 11, 4);
+        assert_eq!(
+            admit(&policy, &ask(Strategy::Beam, beam_draws(2, 2, 3))),
+            Err(Refusal::TooManyDraws { asked: 12, max: 11 })
+        );
+        assert!(admit(&policy, &ask(Strategy::Beam, beam_draws(2, 2, 2))).is_ok());
+    }
+
     proptest! {
         #[test]
         fn a_sample_step_never_passes_a_bound(
@@ -692,6 +741,34 @@ mod tests {
                 }
                 prop_assert_eq!(seen, run);
             }
+        }
+
+        #[test]
+        fn a_model_beam_never_runs_more_steps_than_its_draws(
+            width in 0_u32..=6,
+            expansion in 0_u32..=6,
+            rounds in 0_u32..=6,
+            completes in proptest::collection::vec(0_u32..=6, 0..=6),
+        ) {
+            // A model of the loop of `run_beam`. Each round expands at most
+            // the open slots. The draws bound each schedule that the
+            // completions allow. `keep_beams` has its own unit test.
+            let mut complete = 0_u32;
+            let mut live = 1_u32;
+            let mut steps = 0_u32;
+            for round in 0..rounds {
+                let slots = beam_slots(width, complete);
+                if slots == 0 || live == 0 {
+                    break;
+                }
+                prop_assert!(live <= width.max(1));
+                steps += live * expansion;
+                let kept = slots.min(live * expansion);
+                let done = completes.get(round as usize).copied().unwrap_or(0).min(kept);
+                complete += done;
+                live = kept - done;
+            }
+            prop_assert!(steps <= beam_draws(width, expansion, rounds));
         }
 
         #[test]

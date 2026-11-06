@@ -2510,8 +2510,9 @@ model is not called.
   passed;
 - `selected`: the `AgentReport` of the selected draw;
 - `stopped`: `completed`, `accepted` (a rejection run found a pass),
-  `budget_exceeded`, `score_failed` or `settled` (a vote leader cannot
-  lose);
+  `budget_exceeded`, `score_failed`, `settled` (a vote leader cannot
+  lose) or `rounds_exhausted` (a beam run ended its last round with a live
+  beam);
 - `attempts`: the draws that ran;
 - `draws`: for each draw, its stop, verdict, usage, cost and, for a vote,
   its key (section 26). The usage and
@@ -2523,6 +2524,95 @@ Each `ModelTurn` carries the cost that the ledger recorded for it, and
 `AgentReport::cost_usd_micros` sums it, as `usage` sums the tokens.
 
 The design is in [`DESIGN-2443.md`](design/DESIGN-2443.md).
+
+### Beam search
+
+Best-of-N scores whole runs. Beam search scores each model turn, so a
+path that goes wrong at step 2 stops there.
+
+```rust
+use autumn_harvest_agent::sampling::{SampleInput, SampleStrategy, ScorerRef};
+
+// The policy of `researcher` must list `beam`, with
+// `max_draws >= width × expansion × max_rounds`, here 12.
+
+let input = SampleInput::new(
+    "researcher",
+    "Find the path.",
+    SampleStrategy::beam(2, 2, 3),
+    ScorerRef::deterministic("path_score").unwrap(),
+);
+// SQLite: autumn_harvest_agent::sqlite::start_sample(&mut rt, &input)
+```
+
+| Field | What it does |
+|---|---|
+| `width` | The most beams that a round keeps. The run stops when `width` beams are complete. |
+| `expansion` | The model turns that each live beam gets in a round. |
+| `max_rounds` | The most rounds. |
+
+A beam is a transcript. Round 0 has one beam: the user message. Each
+round expands each live beam `expansion` times. Each expansion is a step:
+a child `agent_loop` run with `AgentTask::beam_step` set. A step sends
+its beam as `history`, asks for one model turn, and runs the tool round
+that the turn asks for. A tool round ends the step with `step_ended`. A
+final answer ends it with `completed`. So a kept beam pays for its new
+turn only. Its prefix is data in the request, not a new model call.
+
+Each step has its own draw id, so two steps of one beam never share a
+cached answer. Each step gets `draw_effects`, as a draw does. Each step
+also gets the flow labels of its beam, so a flow rule sees the labels of
+each earlier round.
+
+The scorer of the input is the step scorer. `agent_sample_score` scores
+each step. The score input holds the whole transcript of the beam, and
+its `stop` is `step_ended` until the beam is complete. `ExactMatch` and
+`JsonSchema` give a `step_ended` step the score 0, so a beam keeps it
+below each passed answer. A step that ends with another stop gets a
+reject and no score call.
+
+A step continues its beam, so it also continues the step count. A beam of
+round `r` holds `r` tool rounds, so its step may run `max_steps - r` more.
+With none left, a step that asks for a tool ends `steps_exhausted`. So a
+path never runs more tool rounds than one run of the profile. In the same
+way, the mandate of a step allows only the delegations that its beam has
+not used.
+
+After each round, `beam_rank` keeps the best steps: at most `width` less
+the complete beams. It calls `select` once per kept step, so a tie goes
+to the lowest draw id, and a reject is never kept. A kept step with a
+final answer is complete and leaves the pool. Each other kept step is
+live in the next round, in rank order.
+
+The run stops with `completed` when `width` beams are complete, or when
+no beam is live. It stops with `rounds_exhausted` after `max_rounds` with
+a live beam.
+The outcome is `select` over the complete beams, and `selected` holds the
+report of the best one. Its transcript is the whole path, but its usage
+covers its last step only. The totals are on `SampleReport`. With no
+complete beam, the outcome is `no_accepted_draw`.
+
+Each draw record holds `beam`: its `round`, its `parent` step and its
+`fate` (`live`, `complete` or `pruned`). So the report holds the verdicts
+of each round.
+
+The policy admits `width × expansion × max_rounds` as the draw count,
+before the first model call. The product saturates, so an overflow is
+refused as `too_many_draws`. The budget and the stops of best-of-N apply
+to each round.
+
+Known limits:
+
+- Each step sends its whole beam as input tokens. The loop checks a token
+  cap between model calls, and a step makes one call. So a step can pass
+  its share of the budget by the size of its beam.
+- A step that delegates also runs the model calls of its child. The draw
+  count bounds the turns of the steps only.
+- The loop guard of a step sees only its own turn. `max_rounds` bounds a
+  loop across rounds.
+- A step has no context reset, because a reset rewrites the beam.
+
+The design is in [`DESIGN-2446.md`](design/DESIGN-2446.md).
 
 ## 21. Answer check (issue #2442)
 
