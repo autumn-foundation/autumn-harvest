@@ -472,8 +472,13 @@ fn plan(policy: &SamplingPolicy, input: &SweepInput, total: u32) -> Result<Plan,
     let asked = input
         .concurrency
         .map_or_else(|| cap.min(total), NonZeroU32::get);
+    // The most draws that one item can run at the same time. A beam
+    // round runs `width * expansion` steps.
     let wide = match input.strategy {
         SampleStrategy::BestOfN { n } => n,
+        SampleStrategy::Beam {
+            width, expansion, ..
+        } => width.saturating_mul(expansion),
         _ => 1,
     };
     let SweepPlan::Run { items, draws } = sweep_plan(policy.max_concurrent_draws, asked, wide)
@@ -1122,6 +1127,38 @@ mod tests {
             bytes: 0,
         });
         assert_eq!(check_items(&many).unwrap_err().code(), "too_many_items");
+    }
+
+    #[test]
+    fn a_beam_item_counts_each_step_of_its_round() {
+        let policy = SamplingPolicy {
+            strategies: std::collections::BTreeSet::from([super::super::Strategy::Beam]),
+            max_draws: 64,
+            max_concurrent_draws: 8,
+            ..SamplingPolicy::default()
+        };
+        let input = SweepInput::new(
+            "k",
+            SweepItems::inline(vec![SweepItem::new("a"), SweepItem::new("b")]),
+            SampleStrategy::beam(2, 2, 3),
+            ScorerRef::deterministic("exact_match").unwrap(),
+        );
+        let plan = plan(&policy, &input, 2).unwrap();
+        assert_eq!(
+            (plan.items, plan.draws),
+            (2, 4),
+            "2 items x 4 steps is the cap"
+        );
+        let wide = SweepInput {
+            strategy: SampleStrategy::beam(4, 4, 1),
+            ..input
+        };
+        let plan = super::plan(&policy, &wide, 2).unwrap();
+        assert_eq!(
+            (plan.items, plan.draws),
+            (2, 4),
+            "the cap bounds a wider round"
+        );
     }
 
     #[test]

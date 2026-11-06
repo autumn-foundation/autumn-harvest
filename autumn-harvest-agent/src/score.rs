@@ -942,10 +942,16 @@ impl JsonSchema {
     }
 }
 
-/// A reject for a run that did not complete, or `None` for one that did.
+/// The verdict of a run that did not complete, or `None` for one that did.
 ///
-/// A run that stopped another way can hold a cut or missing answer.
+/// A run that stopped another way can hold a cut or missing answer, so it
+/// gets a reject. A beam step that ended with a tool round has no answer
+/// yet. It gets the score 0, so a beam search keeps it below each passed
+/// answer and above each failed one.
 fn incomplete(stop: AgentStop) -> Option<Verdict> {
+    if stop == AgentStop::StepEnded {
+        return Some(Verdict::Score(FiniteF64(0.0)));
+    }
     (stop != AgentStop::Completed).then(|| {
         let name = serde_json::to_value(stop)
             .ok()
@@ -1569,6 +1575,17 @@ mod tests {
             panic!("a cut run must be rejected");
         };
         assert!(reason.contains("output_capped"), "{reason}");
+    }
+
+    #[tokio::test]
+    async fn a_built_in_scorer_gives_a_beam_step_the_score_zero() {
+        let step = ScoreInput::new("Walk.", "", AgentStop::StepEnded);
+        assert_eq!(
+            verdict_of(&ExactMatch::new("done"), &step).await,
+            score(0.0)
+        );
+        let schema = JsonSchema::new(json!({"type": "object"}));
+        assert_eq!(verdict_of(&schema, &step).await, score(0.0));
     }
 
     fn person_schema() -> serde_json::Value {

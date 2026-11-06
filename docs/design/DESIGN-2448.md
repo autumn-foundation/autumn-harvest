@@ -117,8 +117,8 @@ pub struct SweepReport {
    each item before the first model call.
 2. `sweep_plan` (the kernel) gives the item concurrency `c` and the draws
    per item `d`. `c` is the ask, or else the cap or the item count,
-   whichever is lower. `d` is `cap / c`, at most `n` for best-of-N and 1
-   for each other strategy. So `c × d ≤ cap`. An ask over the cap is
+   whichever is lower. `d` is `cap / c`, at most `n` for best-of-N,
+   `width × expansion` for a beam and 1 for each other strategy. So `c × d ≤ cap`. An ask over the cap is
    refused with `too_many_concurrent_draws`.
 3. Each item runs as one `agent_sample` child with the concurrency `d`. A
    wave holds at most `c` items. `sample_step` gives its width over the

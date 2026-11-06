@@ -717,7 +717,10 @@ async fn open_segment(
     if task.context_reset.is_some() && input == followup::WAKE_MESSAGE {
         progress.reset.woken_by = booking(&messages);
     }
-    messages.push(ChatMessage::text(ChatRole::User, input));
+    // A beam step continues its history, which holds the user message.
+    if !task.beam_step {
+        messages.push(ChatMessage::text(ChatRole::User, input));
+    }
     if progress.reset.restore
         && let Some(notes) = &progress.reset.notes
     {
@@ -874,6 +877,8 @@ pub(crate) async fn run_segment(
         progress.push_assistant(&turn);
 
         match Box::pin(run_round(ctx, run, progress, tree, slot, &turn, calls)).await? {
+            // A beam step ends after its first tool round.
+            RoundEnd::Continue if task.beam_step => return Ok(AgentStop::StepEnded),
             RoundEnd::Continue => {}
             RoundEnd::Full { stopped } => {
                 if !full_round_goes_on(ctx, run, progress, tree, input, stopped, narration) {
@@ -3016,6 +3021,8 @@ fn child_task(
         probe: task.probe,
         // A peer is another agent, so it is not of the kind of the parent.
         kind: None,
+        // A child runs its whole task. Only the root of a step stops early.
+        beam_step: false,
     }
 }
 

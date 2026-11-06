@@ -14,6 +14,8 @@
 //!   draws.
 //! - [`agent_sample`] runs best-of-N or rejection sampling. It scores each
 //!   draw and selects one (issue #2443).
+//! - [`agent_sample`] also runs step-level beam search. It scores each model
+//!   turn and keeps the best beams with [`beam_rank`].
 //! - [`admit_answer_check`] caps the answer check of a run (issue #2442).
 //! - [`agent_sweep`] runs one strategy over a fixed set of inputs, and
 //!   keeps one row for each item.
@@ -21,8 +23,8 @@
 //! A run never carries a policy field. [`AgentTask`](crate::AgentTask),
 //! [`AgentOp`](crate::AgentOp), [`DrawsInput`] and [`SampleInput`] refuse
 //! each name in [`SAMPLING_POLICY_FIELDS`]. The design is in
-//! `docs/design/DESIGN-2439.md`, `docs/design/DESIGN-2443.md` and
-//! `docs/design/DESIGN-2448.md`.
+//! `docs/design/DESIGN-2439.md`, `docs/design/DESIGN-2443.md`,
+//! `docs/design/DESIGN-2446.md` and `docs/design/DESIGN-2448.md`.
 
 mod admit;
 mod draws;
@@ -33,8 +35,8 @@ mod sweep;
 
 pub use admit::{
     Admission, Ask, DrawPlan, REFUSED_PREFIX, Refusal, SampleStep, SweepPlan, admit,
-    admit_answer_check, answer_retry_cap, draw_plan, retry_after_reject, sample_step, sweep_plan,
-    wave_end,
+    admit_answer_check, answer_retry_cap, beam_draws, beam_slots, draw_plan, retry_after_reject,
+    sample_step, sweep_plan, wave_end,
 };
 pub use draws::{
     DRAWS_WORKFLOW_NAME, DrawsInput, DrawsReport, agent_draws, agent_draws_info,
@@ -46,8 +48,8 @@ pub use policy::{
     ScorerRef, Scorers, Strategy,
 };
 pub use sample::{
-    SAMPLE_WORKFLOW_NAME, SampleDraw, SampleInput, SampleOutcome, SampleReport, SampleStop,
-    SampleStrategy, agent_sample, agent_sample_info,
+    BeamFate, BeamStep, SAMPLE_WORKFLOW_NAME, SampleDraw, SampleInput, SampleOutcome, SampleReport,
+    SampleStop, SampleStrategy, agent_sample, agent_sample_info, beam_rank,
 };
 #[cfg(feature = "postgres")]
 pub use store::PostgresSamplingPolicyStore;
