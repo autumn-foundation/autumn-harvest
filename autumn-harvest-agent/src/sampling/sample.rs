@@ -18,6 +18,7 @@
 //! The design is in `docs/design/DESIGN-2443.md` and
 //! `docs/design/DESIGN-2446.md`.
 
+use std::collections::BTreeSet;
 use std::num::NonZeroU32;
 
 use autumn_harvest::prelude::*;
@@ -470,10 +471,12 @@ struct BeamShape {
     max_rounds: u32,
 }
 
-/// One live beam: the step that ends it and its transcript.
+/// One live beam: the step that ends it, its transcript and the flow
+/// labels that it exercised.
 struct Beam {
     draw: Option<DrawId>,
     messages: Vec<ChatMessage>,
+    flow_labels: BTreeSet<String>,
 }
 
 /// Run the rounds of a beam run, and score each step.
@@ -505,6 +508,7 @@ async fn run_beam(
     let mut live = vec![Beam {
         draw: None,
         messages: vec![ChatMessage::text(ChatRole::User, input.input.clone())],
+        flow_labels: task.flow_labels.clone(),
     }];
     for round in 0..shape.max_rounds {
         let slots = beam_slots(shape.width, complete);
@@ -587,7 +591,7 @@ async fn run_steps(
         let tasks = (0..width)
             .zip(wave)
             .map(|(index, parent)| {
-                let mut one = step_task(steps.task, parent.messages.clone());
+                let mut one = step_task(steps.task, parent);
                 if steps.budget.is_some() {
                     one.max_total_tokens = Some(sibling_cap(left, width, index));
                 }
@@ -620,11 +624,16 @@ async fn run_steps(
     }
 }
 
-/// The task of one beam step: `task` in step mode, with `history` as its
-/// beam. A step has no context reset, because a reset rewrites the beam.
-fn step_task(task: &AgentTask, history: Vec<ChatMessage>) -> AgentTask {
+/// The task of one beam step: `task` in step mode, with `beam` as its
+/// history.
+///
+/// A step continues the run of its beam, so it also continues its flow
+/// labels. A flow rule then sees each label of the beam, from each round.
+/// A step has no context reset, because a reset rewrites the beam.
+fn step_task(task: &AgentTask, beam: &Beam) -> AgentTask {
     AgentTask {
-        history,
+        history: beam.messages.clone(),
+        flow_labels: beam.flow_labels.clone(),
         beam_step: true,
         context_reset: None,
         ..task.clone()
@@ -660,6 +669,7 @@ fn keep_beams(round: &mut [Scored], slots: u32, complete: &mut u32) -> Vec<Beam>
             live.push(Beam {
                 draw: Some(draw),
                 messages: one.report.messages.clone(),
+                flow_labels: one.report.flow_labels.clone(),
             });
         }
     }

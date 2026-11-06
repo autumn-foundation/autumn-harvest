@@ -2556,7 +2556,9 @@ final answer ends it with `completed`. So a kept beam pays for its new
 turn only. Its prefix is data in the request, not a new model call.
 
 Each step has its own draw id, so two steps of one beam never share a
-cached answer. Each step gets `draw_effects`, as a draw does.
+cached answer. Each step gets `draw_effects`, as a draw does. Each step
+also gets the flow labels of its beam, so a flow rule sees the labels of
+each earlier round.
 
 The scorer of the input is the step scorer. `agent_sample_score` scores
 each step. The score input holds the whole transcript of the beam, and

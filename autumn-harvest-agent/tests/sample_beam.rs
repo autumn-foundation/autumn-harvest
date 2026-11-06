@@ -429,3 +429,86 @@ async fn the_beam_history_replays_to_the_same_selection() {
         "a step that ran a tool round ends step_ended"
     );
 }
+
+// ── flow labels ─────────────────────────────────────────────────────────────
+
+/// A read-only tool named `name` with the flow label `label`. It counts its
+/// runs.
+fn labelled(name: &str, label: &str, runs: &Arc<Recorder>) -> Arc<dyn Tool> {
+    let runs = Arc::clone(runs);
+    FnTool::new(
+        name,
+        "A labelled tool.",
+        json!({"type": "object"}),
+        move |input| {
+            let runs = Arc::clone(&runs);
+            async move {
+                runs.push(input);
+                Ok(json!("ok"))
+            }
+        },
+    )
+    .effect(ToolEffect::ReadOnly)
+    .label(label)
+    .shared()
+}
+
+/// A step scorer that scores each step 1.
+#[derive(Debug)]
+struct Flat;
+
+impl Scorer for Flat {
+    fn id(&self) -> &str {
+        "flat"
+    }
+
+    fn score<'a>(
+        &'a self,
+        _input: &'a ScoreInput,
+        _cx: &'a ScoreContext<'_>,
+    ) -> BoxFuture<'a, Result<Verdict, AgentError>> {
+        Box::pin(std::future::ready(Verdict::score(1.0)))
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_beam_carries_its_flow_labels_into_the_next_step() {
+    let (_dir, db) = fresh_db();
+    let reads = Arc::new(Recorder::default());
+    let sends = Arc::new(Recorder::default());
+    // The first step reads a secret. The second step sends.
+    let model = TryFnModel::new(
+        |request: &ChatRequest| match results(&request.messages).len() {
+            0 => calls(&[("c0", "read", json!({}))], 5),
+            1 => calls(&[("c1", "send", json!({}))], 5),
+            _ => answer("done", 5),
+        },
+    );
+    let harness = AgentHarness::new(model)
+        .agent(AgentProfile::new(KIND))
+        .tool(labelled("read", "secret", &reads))
+        .tool(labelled("send", "outbound", &sends))
+        .flow_rules(autumn_harvest_agent::FlowRules::new().forbid(
+            ["secret", "outbound"],
+            autumn_harvest_agent::Rule::Deny("no secret leaves".into()),
+        ))
+        .scorer(Arc::new(Flat))
+        .sampling_policies(store_with(&policy(&[Strategy::Beam], 3)));
+    let mut rt = runtime(&db, harness);
+    let input = SampleInput::new(
+        KIND,
+        "Leak it.",
+        SampleStrategy::beam(1, 1, 3),
+        ScorerRef::deterministic("flat").unwrap(),
+    );
+    let report = sample_report(drive(&mut rt, &input).await);
+
+    assert_eq!(reads.runs().len(), 1, "the first step reads the secret");
+    assert_eq!(
+        sends.runs().len(),
+        0,
+        "the second step holds the label of the first, so the rule denies the send"
+    );
+    let selected = report.selected.expect("the beam completes");
+    assert!(selected.flow_labels.contains("secret"), "{selected:?}");
+}

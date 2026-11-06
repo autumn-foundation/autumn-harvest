@@ -46,6 +46,7 @@ Options for each open question. The chosen option is in bold.
 | A complete beam runs again. | A beam that ends with a final answer leaves the pool. |
 | The live pool grows past the width. | Each round keeps at most `width` minus the complete beams. |
 | A policy field rides in the input. | `SampleInput` denies unknown fields. |
+| A step drops the flow labels of its beam, so a flow rule misses a pair of labels from two rounds. | Each beam keeps the flow labels of its last step. The next step gets them as `flow_labels`, as a continuation does. |
 
 ## 4. Six thinking hats
 
@@ -123,5 +124,6 @@ pub enum BeamFate { Live, Complete, Pruned }
 | `max_rounds` with no complete beam gives `no_accepted_draw` | `max_rounds_with_no_complete_beam_selects_nothing` |
 | A product over `max_draws` is refused before a model call | `a_beam_over_max_draws_is_refused_before_any_model_call` |
 | Same history, same selected beam | `the_beam_history_replays_to_the_same_selection` |
+| A flow rule sees the labels of each round | `a_beam_carries_its_flow_labels_into_the_next_step` |
 | `beam` must be in `strategies` | `a_kind_that_does_not_list_beam_is_refused` |
 | The kernel | `formal/verus/src/agent_sampling.rs` and the unit tests of `admit.rs` |
