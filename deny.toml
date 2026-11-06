@@ -330,6 +330,15 @@ ignore = [
     # code here calls the crate. Revisit: the AWS SDK, loom and wasmtimer
     # move to `core::pin::pin!` or pin-project-lite.
     { id = "RUSTSEC-2026-0441", reason = "unmaintained, not a vulnerability, no safe upgrade: pin-utils arrives only through the AWS SDK crates of optional features, loom under --cfg loom, and wasmtimer under dev-runtime-managed. No code here calls it. Revisit: those crates drop it." },
+
+    # RUSTSEC-2026-0249 — smartstring 1.0.1 is unmaintained (not a
+    # vulnerability). Its repository was archived on 2026-05-03, and the
+    # advisory names no safe upgrade. Rhai depends on it with no feature to
+    # turn it off. Rhai reaches this graph only through
+    # `examples/rhai-scripts`, which is `publish = false`. No published crate
+    # links it. Revisit: Rhai moves to compact_str or smol_str, or the example
+    # drops Rhai.
+    { id = "RUSTSEC-2026-0249", reason = "unmaintained, not a vulnerability, no safe upgrade: smartstring arrives only through rhai in examples/rhai-scripts (publish = false). No published crate links it. Revisit: rhai drops smartstring, or the example drops rhai." },
 ]
 
 # ---------------------------------------------------------------------------
@@ -362,6 +371,15 @@ exceptions = [
     # crate rather than added to `allow` so a *reachable* LGPL dependency
     # would still fail the gate.
     { allow = ["LGPL-2.1-or-later"], crate = "r-efi" },
+    # Two dependencies of Rhai, reached only through `examples/rhai-scripts`
+    # (`publish = false`). No published crate links either one. smartstring
+    # is MPL-2.0, a file-level copyleft. The example uses it unmodified, as a
+    # dependency. tiny-keccak is CC0-1.0, a public-domain dedication, through
+    # ahash's `compile-time-rng`. Scoped to each crate, so a new MPL or CC0
+    # dependency elsewhere still fails the gate. Revisit: Rhai drops
+    # smartstring, or the example drops Rhai.
+    { allow = ["MPL-2.0"], crate = "smartstring" },
+    { allow = ["CC0-1.0"], crate = "tiny-keccak" },
 ]
 
 [licenses.private]
