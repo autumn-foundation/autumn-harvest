@@ -73,6 +73,23 @@ pub enum Refusal {
     },
     /// The profile of the kind belongs to another tenant (issue #2442).
     OtherTenant,
+    /// A sweep has no item.
+    NoItems,
+    /// A sweep has more items than [`MAX_SWEEP_ITEMS`](super::MAX_SWEEP_ITEMS).
+    TooManyItems {
+        /// The items of the sweep.
+        asked: u32,
+        /// The cap.
+        max: u32,
+    },
+    /// One item of a sweep is larger than
+    /// [`MAX_SWEEP_ITEM_BYTES`](super::MAX_SWEEP_ITEM_BYTES).
+    ItemTooLarge {
+        /// The index of the item.
+        item: u32,
+        /// The cap, in bytes.
+        max: u64,
+    },
     /// A cascade tier names a model outside `cascade_models`.
     TierModelNotAllowed {
         /// The model that the tier names.
@@ -109,6 +126,9 @@ impl Refusal {
             Self::TooManyAnswerRetries { .. } => "too_many_answer_retries",
             Self::UnknownScorer { .. } => "unknown_scorer",
             Self::OtherTenant => "other_tenant",
+            Self::NoItems => "no_items",
+            Self::TooManyItems { .. } => "too_many_items",
+            Self::ItemTooLarge { .. } => "item_too_large",
             Self::TierModelNotAllowed { .. } => "tier_model_not_allowed",
             Self::NotPermitted => "not_permitted",
             Self::SampleOnly { .. } => "sample_only",
@@ -156,6 +176,13 @@ impl std::fmt::Display for Refusal {
             ),
             Self::UnknownScorer { scorer } => write!(f, "the harness has no scorer {scorer}"),
             Self::OtherTenant => f.write_str("the profile of the kind belongs to another tenant"),
+            Self::NoItems => f.write_str("the sweep has no item"),
+            Self::TooManyItems { asked, max } => {
+                write!(f, "the sweep has {asked} items; the cap is {max}")
+            }
+            Self::ItemTooLarge { item, max } => {
+                write!(f, "item {item} is larger than {max} bytes")
+            }
             Self::TierModelNotAllowed { model } => write!(
                 f,
                 "the policy of this kind does not allow the tier model {model:?}"
@@ -351,6 +378,52 @@ pub const fn sample_step(
     SampleStep::Wave { width }
 }
 
+/// The concurrency of a sweep. See [`sweep_plan`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SweepPlan {
+    /// Run at most `items` items at the same time, each with at most
+    /// `draws` draws at the same time.
+    Run {
+        /// The items at the same time.
+        items: u32,
+        /// The draws of one item at the same time.
+        draws: u32,
+    },
+    /// The sweep asks for more items at the same time than the cap.
+    TooManyConcurrent,
+}
+
+/// The concurrency of a sweep under the policy cap `max_concurrent`.
+///
+/// `asked` is the item concurrency that the sweep asks for, or 0 for the
+/// cap. `wide` is the most draws that one item can run at the same time.
+/// The items and their draws share the cap, so `items * draws` is never
+/// above the cap. Both are at least 1.
+///
+/// `formal/verus/src/agent_sweep.rs` proves it.
+#[must_use]
+pub const fn sweep_plan(max_concurrent: u32, asked: u32, wide: u32) -> SweepPlan {
+    let mut cap = max_concurrent;
+    if cap > MAX_PARALLEL_CHILDREN {
+        cap = MAX_PARALLEL_CHILDREN;
+    }
+    if cap == 0 {
+        cap = 1;
+    }
+    if asked > cap {
+        return SweepPlan::TooManyConcurrent;
+    }
+    let items = if asked == 0 { cap } else { asked };
+    let mut draws = cap / items;
+    if draws > wide {
+        draws = wide;
+    }
+    if draws == 0 {
+        draws = 1;
+    }
+    SweepPlan::Run { items, draws }
+}
+
 /// The next step of a cascade run. See [`cascade_step`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CascadeStep {
@@ -446,28 +519,54 @@ pub fn admit(policy: &SamplingPolicy, ask: &Ask<'_>) -> Result<Admission, Refusa
             strategy: ask.strategy,
         });
     }
+    admit_draws(policy, ask.draws, ask.concurrency, ask.scorer)
+}
+
+/// Compare a single draw with `policy`.
+///
+/// The default policy makes each run a single draw, so the policy needs no
+/// strategy for it. The concurrency and the scorer checks still apply.
+///
+/// # Errors
+///
+/// Returns the first [`Refusal`].
+pub(super) fn admit_single(
+    policy: &SamplingPolicy,
+    concurrency: u32,
+    scorer: Option<&ScorerRef>,
+) -> Result<Admission, Refusal> {
+    admit_draws(policy, 1, concurrency, scorer)
+}
+
+/// The checks of [`admit`] after the strategy check.
+fn admit_draws(
+    policy: &SamplingPolicy,
+    asked_draws: u32,
+    asked_concurrency: u32,
+    scorer: Option<&ScorerRef>,
+) -> Result<Admission, Refusal> {
     let (draws, concurrency) = match draw_plan(
         policy.max_draws,
         policy.max_concurrent_draws,
-        ask.draws,
-        ask.concurrency,
+        asked_draws,
+        asked_concurrency,
     ) {
         DrawPlan::Run { draws, concurrency } => (draws, concurrency),
         DrawPlan::NoDraws => return Err(Refusal::NoDraws),
         DrawPlan::TooManyDraws => {
             return Err(Refusal::TooManyDraws {
-                asked: ask.draws,
+                asked: asked_draws,
                 max: policy.max_draws,
             });
         }
         DrawPlan::TooManyConcurrent => {
             return Err(Refusal::TooManyConcurrentDraws {
-                asked: ask.concurrency,
+                asked: asked_concurrency,
                 max: policy.max_concurrent_draws.min(MAX_PARALLEL_CHILDREN),
             });
         }
     };
-    if let Some(scorer) = ask.scorer {
+    if let Some(scorer) = scorer {
         check_scorer(policy, scorer)?;
     }
     Ok(Admission {
@@ -522,6 +621,36 @@ mod tests {
             draws,
             concurrency: 0,
             scorer: None,
+        }
+    }
+
+    #[test]
+    fn a_sweep_plan_shares_the_cap() {
+        assert_eq!(sweep_plan(4, 2, 3), SweepPlan::Run { items: 2, draws: 2 });
+        assert_eq!(sweep_plan(4, 0, 3), SweepPlan::Run { items: 4, draws: 1 });
+        assert_eq!(sweep_plan(8, 3, 1), SweepPlan::Run { items: 3, draws: 1 });
+        assert_eq!(sweep_plan(2, 3, 1), SweepPlan::TooManyConcurrent);
+        assert_eq!(sweep_plan(0, 0, 0), SweepPlan::Run { items: 1, draws: 1 });
+    }
+
+    proptest! {
+        #[test]
+        fn a_sweep_plan_never_passes_the_cap(
+            max_concurrent in 0_u32..64,
+            asked in 0_u32..64,
+            wide in 0_u32..300,
+        ) {
+            let cap = max_concurrent.clamp(1, MAX_PARALLEL_CHILDREN);
+            match sweep_plan(max_concurrent, asked, wide) {
+                SweepPlan::Run { items, draws } => {
+                    prop_assert!(asked <= cap);
+                    prop_assert!(items >= 1 && draws >= 1);
+                    prop_assert!(items * draws <= cap);
+                    prop_assert!(draws <= wide.max(1));
+                    prop_assert!(asked == 0 || items == asked);
+                }
+                SweepPlan::TooManyConcurrent => prop_assert!(asked > cap),
+            }
         }
     }
 

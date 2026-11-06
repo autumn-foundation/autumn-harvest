@@ -321,7 +321,7 @@ async fn a_kind_that_does_not_list_beam_is_refused() {
 #[test]
 fn the_beam_strategy_maps_to_the_policy_strategy() {
     let beam = SampleStrategy::beam(2, 3, 4);
-    assert_eq!(beam.policy_strategy(), Strategy::Beam);
+    assert_eq!(beam.policy_strategy(), Some(Strategy::Beam));
     assert_eq!(beam.draws(), 24, "width × expansion × max_rounds");
     assert_eq!(SampleStrategy::beam(u32::MAX, 2, 2).draws(), u32::MAX);
     assert_eq!(

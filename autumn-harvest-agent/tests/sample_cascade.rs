@@ -753,7 +753,7 @@ fn the_cascade_wire_form() {
         serde_json::from_value::<SampleStrategy>(value).unwrap(),
         strategy
     );
-    assert_eq!(strategy.policy_strategy(), Strategy::Cascade);
+    assert_eq!(strategy.policy_strategy(), Some(Strategy::Cascade));
     assert_eq!(strategy.draws(), 2);
     let bad = serde_json::json!({"cascade": {"tiers": [{"model": "m", "threshold": "NaN"}]}});
     assert!(serde_json::from_value::<SampleStrategy>(bad).is_err());

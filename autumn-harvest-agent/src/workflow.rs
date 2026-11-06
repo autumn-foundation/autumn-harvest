@@ -3306,8 +3306,8 @@ pub async fn agent_discover_peers(
 }
 
 /// The workflows to register on a `HarvestBuilder`: `agent_loop`,
-/// `agent_heartbeat`, the durable `agent`, the strategy runs `agent_draws`
-/// and `agent_sample`, and the pass `agent_consolidate`.
+/// `agent_heartbeat`, the durable `agent`, the strategy runs `agent_draws`,
+/// `agent_sample` and `agent_sweep`, and the pass `agent_consolidate`.
 ///
 /// With the `eval` feature, it also holds the refine run `agent_refine`
 /// (issue #2380).
@@ -3320,6 +3320,7 @@ pub fn workflows() -> Vec<WorkflowInfo> {
         agent_info(),
         crate::sampling::agent_draws_info(),
         crate::sampling::agent_sample_info(),
+        crate::sampling::agent_sweep_info(),
         crate::consolidate::agent_consolidate_info(),
         crate::consolidate_all::agent_consolidate_all_info(),
     ];
@@ -3351,6 +3352,7 @@ pub fn activities() -> Vec<ActivityInfo> {
         crate::score::agent_score_info(),
         crate::answer_check::agent_answer_check_info(),
         crate::score::agent_sample_score_info(),
+        crate::sampling::agent_sweep_items_info(),
         crate::consolidate::agent_consolidate_read_info(),
         crate::consolidate::agent_consolidate_turn_info(),
         crate::consolidate::agent_consolidate_write_info(),

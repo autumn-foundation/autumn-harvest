@@ -16,6 +16,7 @@ mod overlay_log;
 mod agent_propose;
 mod agent_refine;
 mod agent_sampling;
+mod agent_sweep;
 mod agent_select;
 mod agent_profile_read;
 mod agent_anonymise;

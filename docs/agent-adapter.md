@@ -2198,8 +2198,9 @@ verdict. History records it, so replay never calls the scorer again.
 - A verdict encodes as `{"score": 0.5}` or `{"reject": "reason"}`.
 
 **Built-in scorers.** `ExactMatch` compares the trimmed answer with the
-trimmed expected text. Each built-in scorer checks one fixed target. For
-a target per task, write an app scorer. `JsonSchema` reads the answer as JSON, with or
+trimmed expected text. `ExactMatch::new(text)` checks one fixed target.
+`ExactMatch::per_item()` reads `ScoreInput::expected`, and rejects an
+input with none. `JsonSchema` reads the answer as JSON, with or
 without a Markdown code fence, and checks it with the engine schema check.
 That check covers a subset of JSON Schema: see
 `autumn_harvest::info::validate_against_schema`. Each gives `Score(1.0)` on
@@ -2463,6 +2464,7 @@ let input = SampleInput::new(
 
 | Strategy | What it does |
 |---|---|
+| `single` | Runs one draw and scores it. The policy needs no strategy for it, because the default policy makes each run a single draw. The concurrency and the scorer checks still apply. |
 | `best_of_n { n }` | Runs `n` draws, scores each, and selects with `select` (section 17). A tie goes to the lowest draw id. |
 | `rejection { max_attempts, threshold }` | Runs draws until one scores at or above `threshold`, up to `max_attempts` draws. It runs one draw at a time unless the input asks for more. It stops after the wave that holds the pass. |
 | `cascade { tiers }` | Asks each tier in order, one draw per tier, and stops at the first answer at or above the threshold of its tier. See "Model cascade" below. |
@@ -2497,6 +2499,17 @@ The `agent_sample_score` activity scores each draw. It is `agent_score`,
 but it also returns the tokens and the cost of the judge calls. A draw
 that failed, or that a budget stopped, gets a reject and no score call.
 The run cuts each tool result of a score input to 16 KiB.
+
+`SampleInput::expected` sets the expected answer of the run. Each score
+input carries it in `ScoreInput::expected`. Only `ExactMatch::per_item()`
+reads it. `ExactMatch::new(text)` keeps its own text, so a caller cannot
+change the target of an operator scorer.
+
+`SampleInput::brief` drops the transcript of the selected draw from the
+report. The answer stays. `SampleReport::refused` is `true` when an LLM
+budget refused a model call or a judge call. A spent token cap does not
+set it. `SampleReport::overlay_version` names the overlay of the profile
+that built the draws.
 
 A judge call may name only the judge model of the input `ScorerRef`,
 which the policy admitted. So the scorer must name that model, and `None`
@@ -3151,3 +3164,160 @@ kind. The next run reads the library and gives it to each proposer as
 data, with its flow labels. `lessons.max_entries` bounds the library,
 and the oldest lesson goes first. The example installs an
 `InMemoryMemoryStore`, so its run writes one lesson.
+
+## 26. Dataset sweep (issue #2448)
+
+`agent_sweep` runs one strategy over a fixed set of inputs, durably. Each
+item runs as a child `agent_sample` run (section 20). The report holds one
+row for each item and the totals. So a sweep compares strategies, such as
+best-of-3 with a cheap model against one draw with a strong model.
+
+```rust
+use autumn_harvest_agent::ExactMatch;
+use autumn_harvest_agent::sampling::{
+    SampleStrategy, ScorerRef, SweepInput, SweepItem, SweepItems,
+};
+
+let items = vec![
+    SweepItem::new("What is 2 + 2?").expected("4"),
+    SweepItem::new("What is 3 + 3?").expected("6"),
+];
+let input = SweepInput::new(
+    "researcher",
+    SweepItems::inline(items),
+    SampleStrategy::single(),
+    ScorerRef::deterministic(ExactMatch::ID).unwrap(),
+)
+.concurrency(1)
+.max_total_tokens(50_000);
+// SQLite: autumn_harvest_agent::sqlite::start_sweep(&mut rt, &input)
+```
+
+Install `ExactMatch::per_item()` as the scorer, so each item compares
+with its own expected answer. `examples/sweep_compare.rs` compares two
+strategies and prints the table.
+
+### Admission
+
+Before the first model call, the sweep checks these, in order:
+
+1. The kind is a valid name (`invalid_kind`).
+2. The list has at least one item (`no_items`), at most `MAX_SWEEP_ITEMS`
+   (`too_many_items`), and no inline item over `MAX_SWEEP_ITEM_BYTES`
+   (`item_too_large`).
+3. The kind has a profile (`unknown_kind`).
+4. The policy cap covers the item concurrency
+   (`too_many_concurrent_draws`).
+5. The policy admits the strategy, the draws and the scorer of one item,
+   as `agent_sample` does.
+6. A stored list matches its reference. The first page read checks it.
+
+The items and their draws share the `max_concurrent_draws` cap of the
+policy. `sweep_plan` gives the item concurrency `c`: the ask, or else the
+cap or the item count, whichever is lower. A best-of-N item gets
+`d = cap / c` draws at the same time, at most `n`. A beam item gets
+`d = cap / c`, at most `width × expansion`. Each other strategy gets
+`d = 1`. So `c × d` is never above the cap. The report holds `c` in
+`concurrency` and `d` in `draw_concurrency`.
+
+### Crash and resume
+
+Each item is one child run, so history records the end of each item. A
+crash runs only the items in flight again. A completed item never runs
+again, and its model calls are not sent again.
+
+### The budget
+
+The items share one token budget: `max_total_tokens` of the input. The
+sweep starts each wave of items with the tokens that are left. Item `i` of
+a wave gets the cap `sibling_cap(left, width, i)`. A failed child returns
+no spend, so its whole share counts as spent.
+
+An item that spends its token share, or the token cap of its profile,
+stops as `budget_exceeded`. The sweep goes on with the tokens that are
+left, and stops when none is left.
+
+The LLM budgets apply to each child, as to each run. When an LLM budget
+refuses a call of a child, the sweep stops after that wave. A child whose
+every draw an LLM budget refused before any spend is `not_run`. Each item
+that did not start is `not_run` too. `stopped` is then `budget_exceeded`.
+
+### Configuration changes
+
+Each child reads the profile and the policy of the kind again, as every
+`agent_sample` run does. A run never carries a policy, so a sweep cannot
+pin one. Each row holds the policy `revision` and the `overlay_version`
+that its child read. When a child reads another revision or another
+overlay version than the sweep, the sweep stops after that wave with
+`config_changed`. So an operator change applies at once, and one report
+never mixes two configurations without saying so.
+
+### Items by reference
+
+A workflow input holds at most 2 MiB. Put a larger list in a
+`SweepItemStore`, and pass the reference:
+
+```rust,no_run
+# async fn demo(
+#     payload_store: std::sync::Arc<dyn autumn_harvest::payload_store::PayloadStore>,
+#     codecs: autumn_harvest::payload_codec::PayloadCodecs,
+#     harness: autumn_harvest_agent::AgentHarness,
+#     list: Vec<autumn_harvest_agent::sampling::SweepItem>,
+# ) -> Result<(), autumn_harvest_agent::AgentError> {
+use autumn_harvest_agent::ExactMatch;
+use autumn_harvest_agent::sampling::{SampleStrategy, ScorerRef, SweepInput, SweepItemStore};
+
+let store = SweepItemStore::new(payload_store, codecs);
+let items = store.put(&list).await?; // SweepItems::Stored(..)
+let harness = harness.sweep_items(store);
+let scorer = ScorerRef::deterministic(ExactMatch::ID).expect("a valid id");
+let input = SweepInput::new("researcher", items, SampleStrategy::single(), scorer);
+# let _ = (harness, input);
+# Ok(())
+# }
+```
+
+- The reference holds the key, the SHA-256 digest of the list, the item
+  count and the size. Each read checks all three, so the list cannot
+  change during a sweep.
+- A list holds at most `MAX_SWEEP_LIST_BYTES` (16 MiB).
+- The `agent_sweep_items` activity reads one page at a time. A page holds
+  at most `MAX_SWEEP_PAGE_BYTES` (1 MiB) of items, and at least one.
+  History records each page. Keep the activity result cap of the engine
+  above 2 MiB.
+- The codec registry encodes the list, so an encrypting codec encrypts it
+  at rest. The digest binds the plain list, so a list from before a codec
+  rollout still reads.
+- The store read has the hook timeout of the harness.
+- Give the store its own payload store. The orphan sweep of an engine
+  store deletes a blob that no run references.
+- The store is not scoped to a tenant. A reference names one list by its
+  key and its digest.
+
+### The report
+
+`SweepReport::rows` holds one `SweepRow` for each item, in item order:
+
+- `status`: `completed`, `budget_exceeded`, `failed` or `not_run`;
+- `verdict`: the verdict of the selected draw. With no selection, it is
+  the best score, else the first reject. A reason is cut to 256 bytes;
+- `accepted`: whether the item selected a draw that passed. A cascade
+  that escalates keeps its best answer, but it is not accepted;
+- `answer`: the selected answer, cut to 512 bytes;
+- `draws`, `usage` and `cost_usd_micros`: the spend of the item tree,
+  judge calls included;
+- `revision` and `overlay_version`: the configuration of the child;
+- `error`: the error of a child that failed in the engine. The sweep goes
+  on after a failed child.
+
+`SweepReport::totals` holds `mean_score` (a reject counts as 0),
+`accept_rate` (accepted over run), `usage`, `cost_usd_micros` and
+`cost_per_accepted_usd_micros`. The total cost equals the cost ledger rows
+of the sweep tree, except for a failed child, whose spend only the ledger
+keeps. `stopped` is `completed`, `budget_exceeded` or `config_changed`.
+
+Each child runs with `SampleInput::brief`, so its result in the sweep
+history holds no transcript. The sweep does not use continue-as-new.
+`MAX_SWEEP_ITEMS` (1000) bounds its history. Nothing in the policy caps
+the draws of one sweep: set `max_total_tokens` to bound its spend. The
+design is in [`DESIGN-2448.md`](design/DESIGN-2448.md).

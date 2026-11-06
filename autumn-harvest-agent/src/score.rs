@@ -268,6 +268,10 @@ pub struct ScoreInput {
     /// The tool results of the run, in order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<ToolRecord>,
+    /// The answer that the input expects, such as the answer of a dataset
+    /// item. A scorer may ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected: Option<String>,
 }
 
 impl ScoreInput {
@@ -279,7 +283,15 @@ impl ScoreInput {
             answer: answer.into(),
             stop,
             tools: Vec::new(),
+            expected: None,
         }
+    }
+
+    /// Set the expected answer.
+    #[must_use]
+    pub fn expected(mut self, expected: impl Into<String>) -> Self {
+        self.expected = Some(expected.into());
+        self
     }
 
     /// Add one tool result.
@@ -305,6 +317,7 @@ impl ScoreInput {
             answer: report.text.clone(),
             stop: report.stop,
             tools: tool_records(&report.messages),
+            expected: None,
         }
     }
 }
@@ -804,12 +817,15 @@ pub async fn agent_sample_score(
 
 /// A scorer that accepts an answer equal to the expected text.
 ///
-/// It trims both texts. A match gives `Score(1.0)`. A miss, or a run that
-/// did not complete, gives a reject.
+/// It trims both texts. A scorer from [`Self::new`] compares with its own
+/// text, so a caller cannot change it. A scorer from [`Self::per_item`]
+/// compares with the expected answer of each input. A match gives
+/// `Score(1.0)`. A miss, a run that does not complete, or no expected text
+/// gives a reject.
 #[derive(Debug, Clone)]
 pub struct ExactMatch {
     id: String,
-    expected: String,
+    expected: Option<String>,
 }
 
 impl ExactMatch {
@@ -821,7 +837,18 @@ impl ExactMatch {
     pub fn new(expected: impl Into<String>) -> Self {
         Self {
             id: Self::ID.to_owned(),
-            expected: expected.into(),
+            expected: Some(expected.into()),
+        }
+    }
+
+    /// A scorer with no text of its own, under the id [`Self::ID`]. It
+    /// reads [`ScoreInput::expected`], as a dataset sweep gives it, and
+    /// rejects an input with none.
+    #[must_use]
+    pub fn per_item() -> Self {
+        Self {
+            id: Self::ID.to_owned(),
+            expected: None,
         }
     }
 
@@ -843,12 +870,16 @@ impl Scorer for ExactMatch {
         input: &'a ScoreInput,
         _cx: &'a ScoreContext<'_>,
     ) -> BoxFuture<'a, Result<Verdict, AgentError>> {
-        let verdict = incomplete(input.stop).unwrap_or_else(|| {
-            if input.answer.trim() == self.expected.trim() {
+        let expected = self
+            .expected
+            .as_deref()
+            .map_or(input.expected.as_deref(), Some);
+        let verdict = incomplete(input.stop).unwrap_or_else(|| match expected {
+            None => Verdict::reject("the input has no expected answer"),
+            Some(expected) if input.answer.trim() == expected.trim() => {
                 Verdict::Score(FiniteF64::ONE)
-            } else {
-                Verdict::reject("the answer does not match the expected text")
             }
+            Some(_) => Verdict::reject("the answer does not match the expected text"),
         });
         Box::pin(std::future::ready(Ok(verdict)))
     }
@@ -1508,6 +1539,30 @@ mod tests {
         assert_eq!(verdict_of(&scorer, &input).await, score(1.0));
         assert_eq!(scorer.id(), ExactMatch::ID);
         assert_eq!(ExactMatch::new("x").with_id("city").id(), "city");
+    }
+
+    #[tokio::test]
+    async fn only_a_per_item_exact_match_reads_the_expected_answer() {
+        let fixed = ExactMatch::new("Paris");
+        let item =
+            ScoreInput::new("Capital of Peru?", "Lima", AgentStop::Completed).expected("Lima");
+        assert!(
+            verdict_of(&fixed, &item).await.is_reject(),
+            "a caller cannot change the text of a fixed scorer"
+        );
+        let per_item = ExactMatch::per_item();
+        assert_eq!(per_item.id(), ExactMatch::ID);
+        assert_eq!(verdict_of(&per_item, &item).await, score(1.0));
+        let bare = ScoreInput::new("Capital of Peru?", "Lima", AgentStop::Completed);
+        let Verdict::Reject(reason) = verdict_of(&per_item, &bare).await else {
+            panic!("an input with no expected answer must be rejected");
+        };
+        assert!(reason.contains("no expected answer"), "{reason}");
+        let wire = serde_json::to_value(&bare).unwrap();
+        assert!(
+            wire.get("expected").is_none(),
+            "an old record keeps its shape"
+        );
     }
 
     #[tokio::test]

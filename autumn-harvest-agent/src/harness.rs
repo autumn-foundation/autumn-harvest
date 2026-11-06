@@ -32,7 +32,10 @@ use crate::policy::{
 };
 use crate::refine::{DEFAULT_PROPOSER_TIMEOUT, OverlayProposer};
 use crate::response_cache::{CacheKey, KeyTenant, ResponseCache};
-use crate::sampling::{PolicyRead, PolicyStoreError, SamplingPolicy, SamplingPolicyStore};
+use crate::sampling::{
+    PolicyRead, PolicyStoreError, SamplingPolicy, SamplingPolicyStore, SweepItem, SweepItemStore,
+    SweepPage,
+};
 use crate::score::Scorer;
 use crate::skill::{LOAD_SKILL_TOOL, SkillTool};
 use crate::tool::{Tool, ToolContext, ToolEffect};
@@ -151,6 +154,7 @@ pub struct AgentHarness {
     #[cfg(feature = "eval")]
     selector: Option<Arc<dyn crate::refine::OverlaySelector>>,
     sampling: Option<Arc<dyn SamplingPolicyStore>>,
+    sweep_items: Option<SweepItemStore>,
     scorers: BTreeMap<String, Arc<dyn Scorer>>,
     score_timeout: Duration,
     overlays: Option<Arc<dyn ProfileOverlayStore>>,
@@ -176,6 +180,7 @@ impl AgentHarness {
             #[cfg(feature = "eval")]
             selector: None,
             sampling: None,
+            sweep_items: None,
             scorers: BTreeMap::new(),
             score_timeout: DEFAULT_SCORE_TIMEOUT,
             overlays: None,
@@ -342,6 +347,42 @@ impl AgentHarness {
     pub fn sampling_policies(mut self, store: Arc<dyn SamplingPolicyStore>) -> Self {
         self.sampling = Some(store);
         self
+    }
+
+    /// Set the store of sweep item lists.
+    ///
+    /// A sweep whose input holds a stored reference reads its items here.
+    /// Without a store, such a sweep fails before its first model call.
+    #[must_use]
+    pub fn sweep_items(mut self, store: SweepItemStore) -> Self {
+        self.sweep_items = Some(store);
+        self
+    }
+
+    /// One page of a stored sweep list, for the `agent_sweep_items`
+    /// activity.
+    ///
+    /// # Errors
+    ///
+    /// Returns a non-retryable error when the harness has no item store, or
+    /// the list does not match its reference. Returns a retryable error
+    /// when the store fails or takes longer than the hook timeout.
+    pub async fn sweep_page(&self, page: &SweepPage) -> Result<Vec<SweepItem>, String> {
+        let Some(store) = &self.sweep_items else {
+            return Err(ActivityFailure::non_retryable(
+                "Config",
+                "the harness has no sweep item store; add it with AgentHarness::sweep_items",
+            )
+            .into_error_payload());
+        };
+        match tokio::time::timeout(self.hook_timeout, store.page(&page.items, page.start)).await {
+            Ok(Ok(items)) => Ok(items),
+            Ok(Err(err)) => Err(model_failure(&err)),
+            Err(_) => Err(model_failure(&AgentError::new(
+                ErrorKind::Unavailable,
+                "the sweep item store did not answer within the hook timeout",
+            ))),
+        }
     }
 
     /// The sampling policy of `kind`, for the `agent_sampling_policy`
