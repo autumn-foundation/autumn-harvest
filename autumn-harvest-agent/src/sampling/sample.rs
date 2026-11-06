@@ -692,23 +692,34 @@ fn passes(strategy: &SampleStrategy, draw: DrawId, verdict: &Verdict) -> bool {
 /// The run selects the best draw that passes. When no tier of a cascade
 /// accepts, it selects the best draw that has a score, as `escalated`.
 fn outcome(strategy: &SampleStrategy, scored: &[Scored]) -> SampleOutcome {
-    let pick = |keep: &dyn Fn(&SampleDraw) -> bool| {
-        let verdicts: Vec<(DrawId, Verdict)> = scored
-            .iter()
-            .filter(|one| keep(&one.record))
-            .map(|one| (one.record.draw, one.record.verdict.clone()))
-            .collect();
-        select(&verdicts)
-    };
-    if let Some(draw) = pick(&|record| passes(strategy, record.draw, &record.verdict)) {
+    if let Some(draw) = best(strategy, scored, true) {
         return SampleOutcome::Selected { draw };
     }
     if matches!(strategy, SampleStrategy::Cascade { .. })
-        && let Some(draw) = pick(&|record| !record.verdict.is_reject())
+        && let Some(draw) = best(strategy, scored, false)
     {
         return SampleOutcome::Escalated { draw };
     }
     SampleOutcome::NoAcceptedDraw
+}
+
+/// The best draw by [`select`]. With `passing`, only a draw that passes
+/// the check of `strategy` counts. Without it, each draw with a score
+/// counts.
+fn best(strategy: &SampleStrategy, scored: &[Scored], passing: bool) -> Option<DrawId> {
+    let mut verdicts: Vec<(DrawId, Verdict)> = Vec::with_capacity(scored.len());
+    for one in scored {
+        let record = &one.record;
+        let keep = if passing {
+            passes(strategy, record.draw, &record.verdict)
+        } else {
+            !record.verdict.is_reject()
+        };
+        if keep {
+            verdicts.push((record.draw, record.verdict.clone()));
+        }
+    }
+    select(&verdicts)
 }
 
 /// The report of the run: the selection, each draw and the totals.
