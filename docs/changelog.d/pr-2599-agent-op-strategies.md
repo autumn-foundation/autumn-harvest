@@ -16,7 +16,8 @@ of a whole subtree. The design is in `docs/design/DESIGN-2449.md`.
   `Peer::max_draws` narrows a child. `delegate`, `outbound` and `accept`
   take the smaller cap with `mesh::meet_cap`. `from_meta` reads the new
   key. A cap of `None` sends no key, so an old receiver still reads it.
-- Each draw of best-of-N or rejection counts as one delegation.
+- Each draw of best-of-N or rejection, and each tier of a cascade, counts
+  as one delegation.
   `Mandate::admit_draws` refuses with the new `Refusal::DrawsExceeded`,
   then `Refusal::FanOutExhausted`. The draws split the rest of the fan-out
   with `sibling_cap`. A beam checks `max_draws` only, because it counts

@@ -726,3 +726,41 @@ async fn a_draw_reads_the_progress_notes_of_the_agent() {
         "the transcript keeps no restored copy: {kept}"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn each_tier_of_a_cascade_op_counts_against_the_fan_out() {
+    let (_dir, db) = fresh_db();
+    let model = by_draw(&["b"], "plain");
+    let policy = SamplingPolicy {
+        strategies: BTreeSet::from([Strategy::Cascade]),
+        max_draws: 2,
+        cascade_models: BTreeSet::from(["cheap".to_owned(), "strong".to_owned()]),
+        ..SamplingPolicy::default()
+    };
+    let profile = AgentProfile::new(KIND).mandate(Mandate::new(KIND).max_delegations(1));
+    let harness = AgentHarness::new(model.clone())
+        .model_named("cheap", model.clone())
+        .model_named("strong", model.clone())
+        .agent(profile)
+        .scorer(Arc::new(letters()))
+        .sampling_policies(store_with(&policy));
+    let mut rt = runtime(&db, harness);
+    let agent = desk("seventeen");
+
+    let pass = FiniteF64::new(0.8).unwrap();
+    let cascade = SampleStrategy::cascade([
+        autumn_harvest_agent::sampling::Tier::new("cheap", pass),
+        autumn_harvest_agent::sampling::Tier::new("strong", pass),
+    ]);
+    let sample = OpSample::new(cascade, ScorerRef::deterministic("table").unwrap());
+    send(
+        &mut rt,
+        &agent,
+        &AgentOp::message("Pick.").with_sample(sample),
+    )
+    .await;
+
+    assert!(model.requests().is_empty(), "no tier runs");
+    let error = state(&rt, &agent).await.last_error.unwrap_or_default();
+    assert!(error.contains("fan_out_exhausted"), "{error}");
+}

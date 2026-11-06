@@ -208,6 +208,9 @@ pub struct PolicySetArgs {
     /// The cap of the in-loop answer check, 0 to 16. Default: 0.
     #[arg(long, conflicts_with = "json")]
     pub max_answer_retries: Option<u32>,
+    /// The harness models that a cascade tier may name. Default: none.
+    #[arg(long, conflicts_with = "json")]
+    pub cascade_models: Option<String>,
     /// The whole policy as one JSON object. It replaces every other flag.
     #[arg(long)]
     pub json: Option<String>,
@@ -309,6 +312,7 @@ fn policy_body(args: &PolicySetArgs) -> Result<Value, CliError> {
         ("strategies", &args.strategies),
         ("draw_effects", &args.draw_effects),
         ("judge_models", &args.judge_models),
+        ("cascade_models", &args.cascade_models),
     ] {
         if let Some(raw) = value {
             policy.insert(key.to_owned(), json!(list(raw)));

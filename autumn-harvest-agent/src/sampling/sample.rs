@@ -12,6 +12,9 @@
 //!   History records each verdict.
 //! - Best-of-N runs each draw, then calls [`select`]. Rejection stops after
 //!   the first wave that holds a pass.
+//! - A cascade asks one tier at a time, each with its own model. It stops
+//!   at the first tier that accepts. [`cascade_step`] skips each tier that
+//!   the mandate forbids.
 //! - Beam search runs one model turn per draw. Each round expands each live
 //!   beam, scores each step and keeps the best beams with [`beam_rank`].
 //!
@@ -19,7 +22,8 @@
 //!   with the task of the op. The mandate of that task bounds the draws.
 //!
 //! The designs are in `docs/design/DESIGN-2443.md`,
-//! `docs/design/DESIGN-2446.md` and `docs/design/DESIGN-2449.md`.
+//! `docs/design/DESIGN-2445.md`, `docs/design/DESIGN-2446.md` and
+//! `docs/design/DESIGN-2449.md`.
 
 use std::collections::BTreeSet;
 use std::num::NonZeroU32;
@@ -28,7 +32,8 @@ use autumn_harvest::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use super::admit::{
-    Admission, Ask, Refusal, SampleStep, admit, beam_draws, beam_slots, sample_step,
+    Admission, Ask, CascadeStep, Refusal, SampleStep, admit, admit_tiers, beam_draws, beam_slots,
+    cascade_step, sample_step,
 };
 use super::draws::{draw_task, profile_task, read_policy, read_profile};
 use super::policy::{ScorerRef, Strategy};
@@ -47,12 +52,38 @@ use crate::types::{AgentReport, AgentStop, AgentTask};
 /// The workflow name of [`agent_sample`].
 pub const SAMPLE_WORKFLOW_NAME: &str = "agent_sample";
 
+/// One tier of a cascade: a harness model and the lowest score that the
+/// tier accepts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct Tier {
+    /// The harness model of the tier, as `AgentHarness::model_named` names
+    /// it. The policy must list it in `cascade_models`.
+    pub model: String,
+    /// The lowest score that the tier accepts.
+    pub threshold: FiniteF64,
+}
+
+impl Tier {
+    /// A tier that asks `model` and accepts a score at or above
+    /// `threshold`.
+    #[must_use]
+    pub fn new(model: impl Into<String>, threshold: FiniteF64) -> Self {
+        Self {
+            model: model.into(),
+            threshold,
+        }
+    }
+}
+
 /// The strategy of one `agent_sample` run.
 ///
 /// It encodes as `{"best_of_n": {"n": 3}}`,
 /// `{"rejection": {"max_attempts": 4, "threshold": 0.8}}` or
+/// `{"cascade": {"tiers": [{"model": "small", "threshold": 0.8}]}}` or
 /// `{"beam": {"width": 2, "expansion": 2, "max_rounds": 3}}`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 #[non_exhaustive]
 pub enum SampleStrategy {
@@ -68,6 +99,12 @@ pub enum SampleStrategy {
         max_attempts: u32,
         /// The lowest score that passes.
         threshold: FiniteF64,
+    },
+    /// Ask each tier in order, one draw per tier. Stop at the first answer
+    /// that scores at or above the threshold of its tier.
+    Cascade {
+        /// The tiers, the cheapest first.
+        tiers: Vec<Tier>,
     },
     /// Step-level beam search. Each round expands each live beam with
     /// `expansion` model turns, scores each step and keeps the best
@@ -98,6 +135,14 @@ impl SampleStrategy {
         }
     }
 
+    /// A cascade over `tiers`, the cheapest first.
+    #[must_use]
+    pub fn cascade(tiers: impl IntoIterator<Item = Tier>) -> Self {
+        Self::Cascade {
+            tiers: tiers.into_iter().collect(),
+        }
+    }
+
     /// Beam search of `width` beams, `expansion` turns per beam and at
     /// most `max_rounds` rounds.
     #[must_use]
@@ -111,26 +156,29 @@ impl SampleStrategy {
 
     /// The policy strategy, such as `best_of_n`.
     #[must_use]
-    pub const fn policy_strategy(self) -> Strategy {
+    pub const fn policy_strategy(&self) -> Strategy {
         match self {
             Self::BestOfN { .. } => Strategy::BestOfN,
             Self::Rejection { .. } => Strategy::Rejection,
+            Self::Cascade { .. } => Strategy::Cascade,
             Self::Beam { .. } => Strategy::Beam,
         }
     }
 
-    /// The most draws of the run. For a beam, it is
-    /// `width × expansion × max_rounds`, saturated at `u32::MAX`.
+    /// The most draws of the run. A cascade has one draw per tier. For a
+    /// beam, it is `width × expansion × max_rounds`, saturated at
+    /// `u32::MAX`.
     #[must_use]
-    pub const fn draws(self) -> u32 {
+    pub fn draws(&self) -> u32 {
         match self {
-            Self::BestOfN { n } => n,
-            Self::Rejection { max_attempts, .. } => max_attempts,
+            Self::BestOfN { n } => *n,
+            Self::Rejection { max_attempts, .. } => *max_attempts,
+            Self::Cascade { tiers } => u32::try_from(tiers.len()).unwrap_or(u32::MAX),
             Self::Beam {
                 width,
                 expansion,
                 max_rounds,
-            } => beam_draws(width, expansion, max_rounds),
+            } => beam_draws(*width, *expansion, *max_rounds),
         }
     }
 }
@@ -177,7 +225,7 @@ impl OpSample {
     #[must_use]
     pub fn asked_concurrency(&self) -> u32 {
         self.concurrency
-            .map_or_else(|| default_concurrency(self.strategy), NonZeroU32::get)
+            .map_or_else(|| default_concurrency(&self.strategy), NonZeroU32::get)
     }
 }
 
@@ -197,7 +245,8 @@ pub struct SampleInput {
     /// The scorer. The policy must allow it.
     pub scorer: ScorerRef,
     /// The most draws at the same time. `None` takes the cap of the policy
-    /// for best-of-N and beam search, and 1 for rejection.
+    /// for best-of-N and beam search, and 1 for rejection and for a
+    /// cascade. A cascade refuses a value above 1.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub concurrency: Option<NonZeroU32>,
     /// The token budget of the whole run tree. It narrows the cap of the
@@ -253,8 +302,26 @@ pub enum SampleOutcome {
         /// The draw.
         draw: DrawId,
     },
+    /// No tier of a cascade accepted. The run selected the best draw with
+    /// [`select`].
+    Escalated {
+        /// The draw.
+        draw: DrawId,
+    },
     /// No draw passed.
     NoAcceptedDraw,
+}
+
+/// A cascade tier whose model the mandate forbids. The run never asks it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct SkippedTier {
+    /// The index of the tier.
+    pub tier: u32,
+    /// The model of the tier.
+    pub model: String,
+    /// Why the run skipped the tier.
+    pub refusal: Refusal,
 }
 
 /// Why the run started no more draws.
@@ -328,6 +395,10 @@ pub struct SampleDraw {
     /// The run id of the draw.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_id: Option<String>,
+    /// The harness model of a cascade tier. `None` for each other
+    /// strategy, so its report keeps its bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     /// Why the draw run ended.
     pub stop: AgentStop,
     /// The verdict of the scorer.
@@ -372,6 +443,11 @@ pub struct SampleReport {
     pub selected: Option<AgentReport>,
     /// Each draw, in draw order.
     pub draws: Vec<SampleDraw>,
+    /// Each cascade tier whose model the mandate forbids, in tier order.
+    /// The run never asks such a tier. A skipped tier encodes as
+    /// `{"tier": 0, "model": "m", "refusal": {"refusal": "not_permitted"}}`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skipped: Vec<SkippedTier>,
     /// The tokens of the run tree, judge calls included.
     pub usage: TokenUsage,
     /// The cost of the run tree, judge calls included, in millionths of a
@@ -444,9 +520,9 @@ pub async fn agent_sample(
 ///
 /// `task` is the task of each draw before [`draw_task`]. Its token cap is
 /// the budget of the whole run. With `mandate_check`, the mandate of
-/// `task` admits the draws first. Each draw of best-of-N or rejection
-/// counts as one delegation, and the draws split the delegations left with
-/// `sibling_cap`. A beam checks `max_draws` only.
+/// `task` admits the draws first. Each draw of best-of-N or rejection and
+/// each tier of a cascade counts as one delegation. The draws split the
+/// delegations left with `sibling_cap`. A beam checks `max_draws` only.
 ///
 /// A durable agent calls it for an op that carries an [`OpSample`]. That
 /// task holds the transcript, the labels and the narrowed mandate of the
@@ -472,13 +548,24 @@ pub async fn sample_task(
     let read = read_policy(ctx, kind)
         .await
         .map_err(SampleFailure::Engine)?;
+    let concurrency = sample.asked_concurrency();
     let ask = Ask {
         strategy: sample.strategy.policy_strategy(),
         draws: sample.strategy.draws(),
-        concurrency: sample.asked_concurrency(),
+        concurrency,
         scorer: Some(&sample.scorer),
     };
     let admission = admit(&read.policy, &ask).map_err(SampleFailure::Refused)?;
+    if let SampleStrategy::Cascade { tiers } = &sample.strategy {
+        if concurrency > 1 {
+            let refusal = Refusal::TooManyConcurrentDraws {
+                asked: concurrency,
+                max: 1,
+            };
+            return Err(SampleFailure::Refused(refusal));
+        }
+        admit_tiers(&read.policy, tiers).map_err(SampleFailure::Refused)?;
+    }
     let budget = task.max_total_tokens;
     let draw = draw_task(task, &admission.draw_effects);
     let waves = Waves {
@@ -488,30 +575,48 @@ pub async fn sample_task(
         budget,
         delegations,
     };
-    let (scored, stopped) = match sample.strategy {
+    let ended = run_strategy(ctx, &waves)
+        .await
+        .map_err(SampleFailure::Engine)?;
+    Ok(report(
+        kind,
+        &sample.strategy,
+        read.revision,
+        admission.concurrency,
+        ended,
+    ))
+}
+
+/// Run the draws of the strategy of `waves`.
+async fn run_strategy(ctx: &WorkflowContext, waves: &Waves<'_>) -> Result<Ended, String> {
+    match &waves.sample.strategy {
+        SampleStrategy::Cascade { tiers } => run_tiers(ctx, waves, tiers).await,
         SampleStrategy::Beam {
             width,
             expansion,
             max_rounds,
         } => {
             let shape = BeamShape {
-                width,
-                expansion,
-                max_rounds,
+                width: *width,
+                expansion: *expansion,
+                max_rounds: *max_rounds,
             };
-            run_beam(ctx, &waves, shape).await
+            let (scored, stopped) = run_beam(ctx, waves, shape).await?;
+            Ok(Ended {
+                scored,
+                skipped: Vec::new(),
+                stopped,
+            })
         }
-        _ => run_waves(ctx, &waves).await,
+        _ => {
+            let (scored, stopped) = run_waves(ctx, waves).await?;
+            Ok(Ended {
+                scored,
+                skipped: Vec::new(),
+                stopped,
+            })
+        }
     }
-    .map_err(SampleFailure::Engine)?;
-    Ok(report(
-        kind,
-        sample.strategy,
-        read.revision,
-        admission.concurrency,
-        scored,
-        stopped,
-    ))
 }
 
 /// Admit the draws of `sample` under `mandate`. Returns the delegations
@@ -549,13 +654,13 @@ fn draw_delegations(delegations: Option<u32>, draws: u32, n: u32) -> Option<u32>
 
 /// The concurrency of a run that asks for none.
 ///
-/// Best-of-N takes the cap of the policy (0). Rejection stops at the first
-/// pass, so it runs one draw at a time. A wider wave would pay for draws
-/// after the pass.
-const fn default_concurrency(strategy: SampleStrategy) -> u32 {
+/// Best-of-N takes the cap of the policy (0). Rejection and a cascade stop
+/// at the first pass, so they run one draw at a time. A wider wave would
+/// pay for draws after the pass.
+const fn default_concurrency(strategy: &SampleStrategy) -> u32 {
     match strategy {
         SampleStrategy::BestOfN { .. } | SampleStrategy::Beam { .. } => 0,
-        SampleStrategy::Rejection { .. } => 1,
+        SampleStrategy::Rejection { .. } | SampleStrategy::Cascade { .. } => 1,
     }
 }
 
@@ -574,6 +679,13 @@ struct Scored {
     report: AgentReport,
     /// The delegations of the beam that a beam step extends. 0 for a draw.
     parent_delegations: u32,
+}
+
+/// The draws of a run, the tiers that it skipped, and why it stopped.
+struct Ended {
+    scored: Vec<Scored>,
+    skipped: Vec<SkippedTier>,
+    stopped: SampleStop,
 }
 
 /// The fixed parts of the draws of one run.
@@ -654,7 +766,7 @@ async fn run_waves(
             let (one, halted) =
                 score_draw(ctx, sample, task, DrawId::new(id), report, halt).await?;
             halt = halt.or(halted);
-            passed |= passes(sample.strategy, &one.record.verdict);
+            passed |= passes(&sample.strategy, one.record.draw, &one.record.verdict);
             spent = spent.saturating_add(one.record.usage.total());
             scored.push(one);
         }
@@ -664,6 +776,123 @@ async fn run_waves(
         if let Some(stop) = halt {
             return Ok((scored, stop));
         }
+    }
+}
+
+/// Whether the mandate of `task` allows the harness model `model`.
+fn permits(task: &AgentTask, model: &str) -> bool {
+    task.mandate
+        .as_ref()
+        .is_none_or(|mandate| mandate.allows_model(Some(model)))
+}
+
+/// Each tier whose model the mandate forbids, as `allowed` gives it.
+///
+/// The mandate does not change during a run. So the list does not depend
+/// on why the run stops.
+fn forbidden(tiers: &[Tier], allowed: &[bool]) -> Vec<SkippedTier> {
+    tiers
+        .iter()
+        .zip(allowed)
+        .enumerate()
+        .filter(|(_, (_, allowed))| !**allowed)
+        .map(|(index, (tier, _))| SkippedTier {
+            tier: u32::try_from(index).unwrap_or(u32::MAX),
+            model: tier.model.clone(),
+            refusal: Refusal::NotPermitted,
+        })
+        .collect()
+}
+
+/// Ask the tiers of a cascade in order, and score each answer.
+///
+/// [`cascade_step`] gives the next tier. Tier `i` is draw `i`, and it asks
+/// the model of the tier with the rest of the token budget. The run skips
+/// each tier that the mandate forbids, and the report names each one.
+///
+/// The run stops at the first tier that accepts. It also stops after a
+/// failed score, and when a budget refuses a tier or a judge call. A tier
+/// that fails gets a reject, and the run asks the next tier.
+async fn run_tiers(
+    ctx: &WorkflowContext,
+    waves: &Waves<'_>,
+    tiers: &[Tier],
+) -> Result<Ended, String> {
+    let Waves {
+        sample,
+        task,
+        admission,
+        budget,
+        delegations,
+    } = *waves;
+    let allowed: Vec<bool> = tiers
+        .iter()
+        .map(|tier| permits(task, &tier.model))
+        .collect();
+    let skipped = forbidden(tiers, &allowed);
+    let mut scored: Vec<Scored> = Vec::new();
+    let mut spent: u32 = 0;
+    let mut next = 0;
+    loop {
+        let left = budget.map_or(0, |max| max.saturating_sub(spent));
+        let (index, tier) = match cascade_step(&allowed, next, budget.is_some(), left) {
+            CascadeStep::Done => {
+                return Ok(Ended {
+                    scored,
+                    skipped,
+                    stopped: SampleStop::Completed,
+                });
+            }
+            CascadeStep::BudgetExceeded => {
+                return Ok(Ended {
+                    scored,
+                    skipped,
+                    stopped: SampleStop::BudgetExceeded,
+                });
+            }
+            CascadeStep::Run { tier } => {
+                let Some(found) = tiers.get(tier) else {
+                    return Err(format!("the cascade has no tier {tier}"));
+                };
+                (tier, found)
+            }
+        };
+        let id = DrawId::new(u32::try_from(index).unwrap_or(u32::MAX));
+        let mut draw = task.clone();
+        draw.model = Some(tier.model.clone());
+        if budget.is_some() {
+            draw.max_total_tokens = Some(left);
+        }
+        let share = draw_delegations(delegations, admission.draws, id.get());
+        if let (Some(share), Some(mandate)) = (share, draw.mandate.as_mut()) {
+            mandate.max_delegations = share;
+        }
+        let ended = run_draw_tasks(ctx, vec![(id, draw.clone())]).await?;
+        let Some(report) = ended.into_iter().next() else {
+            return Err(format!("the tier {index} returned no report"));
+        };
+        let report = report?;
+        let halt = (report.stop == AgentStop::BudgetExceeded).then_some(SampleStop::BudgetExceeded);
+        let (mut one, halted) = score_draw(ctx, sample, &draw, id, report, halt).await?;
+        one.record.model = Some(tier.model.clone());
+        spent = spent.saturating_add(one.record.usage.total());
+        let accepted = passes(&sample.strategy, id, &one.record.verdict);
+        scored.push(one);
+        if accepted {
+            return Ok(Ended {
+                scored,
+                skipped,
+                stopped: SampleStop::Accepted,
+            });
+        }
+        if let Some(stop) = halt.or(halted) {
+            return Ok(Ended {
+                scored,
+                skipped,
+                stopped: stop,
+            });
+        }
+        next = index + 1;
     }
 }
 
@@ -1022,6 +1251,7 @@ async fn score_draw(
     let record = SampleDraw {
         draw,
         run_id: report.run_id.clone(),
+        model: None,
         stop: report.stop,
         verdict,
         usage: report.usage.saturating_add(usage),
@@ -1037,16 +1267,21 @@ async fn score_draw(
     Ok((scored, stop))
 }
 
-/// Whether `verdict` passes the check of `strategy`.
+/// Whether `verdict` of the draw `draw` passes the check of `strategy`.
 ///
 /// Best-of-N and beam search pass each score, and `select` never picks a
-/// reject. Rejection passes a score at or above the threshold.
-fn passes(strategy: SampleStrategy, verdict: &Verdict) -> bool {
+/// reject. Rejection passes a score at or above the threshold. A cascade
+/// passes a score at or above the threshold of the tier of the draw.
+fn passes(strategy: &SampleStrategy, draw: DrawId, verdict: &Verdict) -> bool {
+    let at_least =
+        |threshold: FiniteF64| verdict.as_score().is_some_and(|score| score >= threshold);
     match strategy {
         SampleStrategy::BestOfN { .. } | SampleStrategy::Beam { .. } => !verdict.is_reject(),
-        SampleStrategy::Rejection { threshold, .. } => {
-            verdict.as_score().is_some_and(|score| score >= threshold)
-        }
+        SampleStrategy::Rejection { threshold, .. } => at_least(*threshold),
+        SampleStrategy::Cascade { tiers } => usize::try_from(draw.get())
+            .ok()
+            .and_then(|index| tiers.get(index))
+            .is_some_and(|tier| at_least(tier.threshold)),
     }
 }
 
@@ -1058,24 +1293,59 @@ fn selectable(record: &SampleDraw) -> bool {
         .is_none_or(|beam| beam.fate == BeamFate::Complete)
 }
 
+/// The selection of a run.
+///
+/// The run selects the best draw that passes. When no tier of a cascade
+/// accepts, it selects the best draw that has a score, as `escalated`.
+fn outcome(strategy: &SampleStrategy, scored: &[Scored]) -> SampleOutcome {
+    if let Some(draw) = best(strategy, scored, true) {
+        return SampleOutcome::Selected { draw };
+    }
+    if matches!(strategy, SampleStrategy::Cascade { .. })
+        && let Some(draw) = best(strategy, scored, false)
+    {
+        return SampleOutcome::Escalated { draw };
+    }
+    SampleOutcome::NoAcceptedDraw
+}
+
+/// The best selectable draw by [`select`]. With `passing`, only a draw
+/// that passes the check of `strategy` counts. Without it, each draw with
+/// a score counts.
+fn best(strategy: &SampleStrategy, scored: &[Scored], passing: bool) -> Option<DrawId> {
+    let mut verdicts: Vec<(DrawId, Verdict)> = Vec::with_capacity(scored.len());
+    for one in scored {
+        let record = &one.record;
+        let keep = if passing {
+            passes(strategy, record.draw, &record.verdict)
+        } else {
+            !record.verdict.is_reject()
+        };
+        if keep && selectable(record) {
+            verdicts.push((record.draw, record.verdict.clone()));
+        }
+    }
+    select(&verdicts)
+}
+
 /// The report of the run: the selection, each draw and the totals.
 fn report(
     kind: &str,
-    strategy: SampleStrategy,
+    strategy: &SampleStrategy,
     revision: u64,
     concurrency: u32,
-    scored: Vec<Scored>,
-    stopped: SampleStop,
+    ended: Ended,
 ) -> SampleReport {
-    let passing: Vec<(DrawId, Verdict)> = scored
-        .iter()
-        .filter(|one| passes(strategy, &one.record.verdict) && selectable(&one.record))
-        .map(|one| (one.record.draw, one.record.verdict.clone()))
-        .collect();
-    let chosen = select(&passing);
-    let outcome = chosen.map_or(SampleOutcome::NoAcceptedDraw, |draw| {
-        SampleOutcome::Selected { draw }
-    });
+    let Ended {
+        scored,
+        skipped,
+        stopped,
+    } = ended;
+    let outcome = outcome(strategy, &scored);
+    let chosen = match outcome {
+        SampleOutcome::Selected { draw } | SampleOutcome::Escalated { draw } => Some(draw),
+        SampleOutcome::NoAcceptedDraw => None,
+    };
     let usage = scored.iter().fold(TokenUsage::default(), |usage, one| {
         usage.saturating_add(one.record.usage)
     });
@@ -1097,7 +1367,7 @@ fn report(
     }
     SampleReport {
         kind: kind.to_owned(),
-        strategy,
+        strategy: strategy.clone(),
         revision,
         concurrency,
         outcome,
@@ -1105,6 +1375,7 @@ fn report(
         attempts,
         selected,
         draws,
+        skipped,
         usage,
         cost_usd_micros,
         flow_labels,
@@ -1128,12 +1399,46 @@ mod tests {
     fn a_rejection_passes_a_score_at_the_threshold() {
         let at = FiniteF64::new(0.5).unwrap();
         let strategy = SampleStrategy::rejection(3, at);
-        assert!(passes(strategy, &Verdict::score(0.5).unwrap()));
-        assert!(!passes(strategy, &Verdict::score(0.49).unwrap()));
-        assert!(!passes(strategy, &Verdict::reject("no")));
+        let draw = DrawId::new(0);
+        assert!(passes(&strategy, draw, &Verdict::score(0.5).unwrap()));
+        assert!(!passes(&strategy, draw, &Verdict::score(0.49).unwrap()));
+        assert!(!passes(&strategy, draw, &Verdict::reject("no")));
         let best = SampleStrategy::best_of_n(3);
-        assert!(passes(best, &Verdict::score(-1e300).unwrap()));
-        assert!(!passes(best, &Verdict::reject("no")));
+        assert!(passes(&best, draw, &Verdict::score(-1e300).unwrap()));
+        assert!(!passes(&best, draw, &Verdict::reject("no")));
+    }
+
+    #[test]
+    fn a_cascade_passes_at_the_threshold_of_the_tier_of_the_draw() {
+        let tier = |model: &str, value| Tier::new(model, FiniteF64::new(value).unwrap());
+        let cascade = SampleStrategy::cascade([tier("cheap", 0.9), tier("strong", 0.5)]);
+        let score = Verdict::score(0.6).unwrap();
+        assert!(!passes(&cascade, DrawId::new(0), &score));
+        assert!(passes(&cascade, DrawId::new(1), &score));
+        assert!(!passes(&cascade, DrawId::new(2), &score), "no tier 2");
+        assert!(!passes(&cascade, DrawId::new(1), &Verdict::reject("no")));
+    }
+
+    #[test]
+    fn a_cascade_runs_one_draw_at_a_time_by_default() {
+        let cascade = SampleStrategy::cascade([Tier::new("m", FiniteF64::ONE)]);
+        assert_eq!(default_concurrency(&cascade), 1);
+        assert_eq!(default_concurrency(&SampleStrategy::best_of_n(2)), 0);
+    }
+
+    #[test]
+    fn the_report_names_each_forbidden_tier() {
+        let tiers = [
+            Tier::new("a", FiniteF64::ONE),
+            Tier::new("b", FiniteF64::ONE),
+            Tier::new("c", FiniteF64::ONE),
+        ];
+        let named: Vec<(u32, String)> = forbidden(&tiers, &[true, false, false])
+            .into_iter()
+            .map(|skip| (skip.tier, skip.model))
+            .collect();
+        assert_eq!(named, [(1, "b".to_owned()), (2, "c".to_owned())]);
+        assert_eq!(forbidden(&tiers, &[true, true, true]), []);
     }
 
     #[test]
@@ -1238,6 +1543,7 @@ mod tests {
         let record = SampleDraw {
             draw: DrawId::new(draw),
             run_id: None,
+            model: None,
             stop,
             verdict,
             usage: TokenUsage::default(),
@@ -1292,7 +1598,7 @@ mod tests {
 
     #[test]
     fn the_beam_strategy_defaults_to_the_concurrency_cap() {
-        assert_eq!(default_concurrency(SampleStrategy::beam(2, 2, 2)), 0);
+        assert_eq!(default_concurrency(&SampleStrategy::beam(2, 2, 2)), 0);
     }
 
     #[test]

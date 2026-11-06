@@ -8,6 +8,9 @@
 //! Issue #2405: two shards on one pool share one schedule table. The shard
 //! that does not own a DAG must not delete the row of the shard that does.
 //!
+//! The carry writes under the DR fence of both shards. A retry after a
+//! failed source delete keeps an operator clear on the new owner.
+//!
 //! Execution: honours `HARVEST_TEST_DATABASE_URL` for the admin connection
 //! and creates one fresh database per shard off it. Otherwise it boots a
 //! testcontainers Postgres 16 and does the same. Separate databases are
@@ -20,7 +23,7 @@ use std::time::Duration;
 
 use autumn_harvest::policy::{OverlapPolicy, Schedule, WorkflowSchedule};
 use autumn_harvest::schedule_override::{
-    ScheduleOverridePatch, get_dag_override, update_dag_override,
+    ScheduleOverridePatch, clear_dag_override, get_dag_override, update_dag_override,
 };
 use autumn_harvest::scheduler::{DagCatalog, RegisteredDag, SchedulerMonitor, tick_once_sharded};
 use autumn_harvest::shard::{ShardRouter, ShardedDbPool};
@@ -55,12 +58,18 @@ impl Shards {
             .iter()
             .map(|(shard, url)| (*shard, build_pool(url)))
             .collect();
-        ShardedDbPool::from_map(pools, OLD)
+        let default = *pools.keys().next().expect("two shards");
+        ShardedDbPool::from_map(pools, default)
     }
 }
 
 /// Create one fresh, migrated database for each of the two shards.
 async fn setup_shards() -> Shards {
+    setup_shard_pair(OLD, NEW).await
+}
+
+/// Create one fresh, migrated database for each of `old` and `new`.
+async fn setup_shard_pair(old: ShardId, new: ShardId) -> Shards {
     let (admin_url, container) = if let Ok(url) = std::env::var("HARVEST_TEST_DATABASE_URL") {
         (url, None)
     } else {
@@ -80,7 +89,7 @@ async fn setup_shards() -> Shards {
         .await
         .expect("admin connect");
     let mut urls = BTreeMap::new();
-    for shard in [OLD, NEW] {
+    for shard in [old, new] {
         let db_name = format!(
             "h2389_s{}_{}",
             shard.as_i32(),
@@ -136,20 +145,20 @@ fn router_after() -> ShardRouter {
 
 /// A DAG name that moves from the old shard to the new one.
 fn moving_dag_name() -> String {
-    let after = router_after();
+    dag_routed_to(&router_after(), NEW, "reshard_dag")
+}
+
+/// A DAG name with `prefix` that `router` places on `shard`.
+fn dag_routed_to(router: &ShardRouter, shard: ShardId, prefix: &str) -> String {
     (0..1000)
-        .map(|i| format!("reshard_dag_{i}"))
-        .find(|name| after.pick_for_dag(name) == NEW)
-        .expect("one of 1000 names routes to the new shard")
+        .map(|i| format!("{prefix}_{i}"))
+        .find(|name| router.pick_for_dag(name) == shard)
+        .expect("one of 1000 names routes to the shard")
 }
 
 /// A DAG name that moves from the new shard back to the old one.
 fn returning_dag_name() -> String {
-    let after = router_after();
-    (0..1000)
-        .map(|i| format!("reshard_back_{i}"))
-        .find(|name| after.pick_for_dag(name) == OLD)
-        .expect("one of 1000 names routes to the old shard")
+    dag_routed_to(&router_after(), OLD, "reshard_back")
 }
 
 fn code_dag(name: &str) -> RegisteredDag {
@@ -198,6 +207,16 @@ async fn tick_with(
     dag: &RegisteredDag,
     ws: WorkflowSchedule,
 ) {
+    try_tick(pool, router, dag, ws).await.expect("tick");
+}
+
+/// One tick with the schedule `ws` for `dag`, and its result.
+async fn try_tick(
+    pool: &ShardedDbPool,
+    router: ShardRouter,
+    dag: &RegisteredDag,
+    ws: WorkflowSchedule,
+) -> autumn_harvest::error::HarvestResult<()> {
     let mut catalog = DagCatalog::new();
     catalog.insert(dag.name.clone(), dag.clone());
     tick_once_sharded(
@@ -209,7 +228,6 @@ async fn tick_with(
         SchedulerMonitor::offline(),
     )
     .await
-    .expect("tick");
 }
 
 async fn schedule_expr(conn: &mut AsyncPgConnection, dag_name: &str) -> Option<String> {
@@ -344,6 +362,89 @@ async fn a_failed_move_keeps_the_override_and_a_retry_completes_it() {
     tick(&pool, router_after(), &dag).await;
     assert_eq!(override_schedule(&mut old, &dag.name).await, None);
     assert_eq!(override_schedule(&mut new, &dag.name).await, MINUTELY);
+    assert_eq!(
+        schedule_expr(&mut new, &dag.name).await.as_deref(),
+        Some("interval:60")
+    );
+}
+
+/// A retry after a failed source delete keeps an operator clear.
+///
+/// The copy lands, and the source delete fails. The operator then clears the
+/// override on the new owner. No later tick may copy the stale source row
+/// back: not while the delete still fails, and not when it succeeds.
+#[tokio::test]
+async fn an_operator_clear_survives_a_retried_carry() {
+    let shards = setup_shards().await;
+    let pool = shards.pool();
+    let dag = code_dag(&moving_dag_name());
+    seed_on_old_shard(&shards, &pool, &dag).await;
+    let mut old = shards.conn(OLD).await;
+    let mut new = shards.conn(NEW).await;
+    refuse(&mut old, "DELETE").await;
+    tick(&pool, router_after(), &dag).await;
+    assert_eq!(override_schedule(&mut old, &dag.name).await, MINUTELY);
+    assert_eq!(override_schedule(&mut new, &dag.name).await, MINUTELY);
+
+    let cleared = clear_dag_override(&mut new, &dag.name)
+        .await
+        .expect("clear on the new owner");
+    assert!(cleared, "the new owner held the copy");
+    tick(&pool, router_after(), &dag).await;
+    assert_eq!(
+        override_schedule(&mut new, &dag.name).await,
+        None,
+        "a retry whose delete fails again keeps the clear"
+    );
+    assert_eq!(override_schedule(&mut old, &dag.name).await, MINUTELY);
+    allow(&mut old).await;
+    tick(&pool, router_after(), &dag).await;
+
+    assert_eq!(
+        override_schedule(&mut new, &dag.name).await,
+        None,
+        "the clear on the new owner stays"
+    );
+    assert_eq!(
+        override_schedule(&mut old, &dag.name).await,
+        None,
+        "the retry deletes the stale source row"
+    );
+    assert_eq!(
+        schedule_expr(&mut new, &dag.name).await.as_deref(),
+        Some("interval:3600"),
+        "the new owner runs the code value"
+    );
+}
+
+/// An override that moves out, back and out again arrives each time.
+///
+/// Each move leaves a record of the copy on the shard that received it. A
+/// record that outlives its row must not make a later move skip the copy.
+#[tokio::test]
+async fn an_override_survives_a_round_trip_reshard() {
+    let shards = setup_shards().await;
+    let pool = shards.pool();
+    let dag = code_dag(&moving_dag_name());
+    seed_on_old_shard(&shards, &pool, &dag).await;
+    let mut old = shards.conn(OLD).await;
+    let mut new = shards.conn(NEW).await;
+
+    tick(&pool, router_after(), &dag).await;
+    assert_eq!(override_schedule(&mut new, &dag.name).await, MINUTELY);
+    // The old shard is first in shard order, so the move back takes two ticks.
+    tick(&pool, router_before(), &dag).await;
+    tick(&pool, router_before(), &dag).await;
+    assert_eq!(override_schedule(&mut old, &dag.name).await, MINUTELY);
+    assert_eq!(override_schedule(&mut new, &dag.name).await, None);
+    tick(&pool, router_after(), &dag).await;
+
+    assert_eq!(
+        override_schedule(&mut new, &dag.name).await,
+        MINUTELY,
+        "the third move delivers the override"
+    );
+    assert_eq!(override_schedule(&mut old, &dag.name).await, None);
     assert_eq!(
         schedule_expr(&mut new, &dag.name).await.as_deref(),
         Some("interval:60")
@@ -583,4 +684,325 @@ async fn allow(conn: &mut AsyncPgConnection) {
     )
     .await
     .expect("drop refusal");
+}
+
+// The DR fence of the carry. These tests pin the process-global fence
+// registry, so they hold its lock and use shard ids that no other test uses.
+
+const DR_OLD: ShardId = ShardId::new(50);
+const DR_NEW: ShardId = ShardId::new(51);
+
+/// The advisory key that holds one carry statement.
+const HOLD_KEY: i64 = 7_413_001;
+
+/// Make each `statement` on the override table of this database wait while
+/// a test holds [`HOLD_KEY`].
+async fn hold_override_statements(conn: &mut AsyncPgConnection, statement: &str) {
+    let returned = if statement == "DELETE" { "OLD" } else { "NEW" };
+    conn.batch_execute(&format!(
+        "CREATE FUNCTION dr_hold_carry() RETURNS trigger LANGUAGE plpgsql AS \
+         $$ BEGIN PERFORM pg_advisory_xact_lock_shared({HOLD_KEY}); RETURN {returned}; END $$; \
+         CREATE TRIGGER dr_hold_carry BEFORE {statement} ON harvest_schedule_overrides \
+         FOR EACH ROW EXECUTE FUNCTION dr_hold_carry();"
+    ))
+    .await
+    .expect("install the hold");
+}
+
+/// Wait until a session of this database waits for [`HOLD_KEY`].
+async fn wait_for_held_statement(conn: &mut AsyncPgConnection) {
+    #[derive(diesel::QueryableByName)]
+    struct Count {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        n: i64,
+    }
+    let probe = format!(
+        "SELECT count(*) AS n FROM pg_locks l JOIN pg_database d ON d.oid = l.database \
+         WHERE d.datname = current_database() AND l.locktype = 'advisory' \
+         AND NOT l.granted AND l.objid = {HOLD_KEY}"
+    );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let waiting = diesel::sql_query(&probe)
+            .get_result::<Count>(conn)
+            .await
+            .expect("read the lock table")
+            .n;
+        if waiting > 0 {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the carry never reached the held statement"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// End every DR fence guard session on this database. The old region then
+/// loses its barrier, as a network partition does.
+async fn end_guard_sessions(conn: &mut AsyncPgConnection) {
+    conn.batch_execute(
+        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+         WHERE datname = current_database() AND application_name = 'harvest_dr_fence_pass'",
+    )
+    .await
+    .expect("end the guard sessions");
+}
+
+/// How many copy records this database holds for `dag_name`.
+async fn copy_records(conn: &mut AsyncPgConnection, dag_name: &str) -> i64 {
+    use autumn_harvest::schema::harvest_schedule_override_receipts::dsl;
+    dsl::harvest_schedule_override_receipts
+        .filter(dsl::name.eq(dag_name))
+        .count()
+        .get_result(conn)
+        .await
+        .expect("read the copy records")
+}
+
+/// A DAG with an override on [`DR_OLD`], under DR pins of both shards.
+struct DrCarry {
+    shards: Shards,
+    pool: ShardedDbPool,
+    after: ShardRouter,
+    dag: RegisteredDag,
+}
+
+/// Pin both DR shards and register a DAG with an override on [`DR_OLD`].
+async fn pinned_carry(prefix: &str) -> DrCarry {
+    use autumn_harvest::replication::{FenceRegistry, ensure_generation_row};
+
+    let shards = setup_shard_pair(DR_OLD, DR_NEW).await;
+    let pool = shards.pool();
+    let before = ShardRouter::new(vec![DR_OLD, DR_NEW], vec![DR_OLD], DR_OLD);
+    let after = ShardRouter::new(vec![DR_OLD, DR_NEW], vec![DR_OLD, DR_NEW], DR_OLD);
+    let dag = code_dag(&dag_routed_to(&after, DR_NEW, prefix));
+    let mut old = shards.conn(DR_OLD).await;
+    let mut new = shards.conn(DR_NEW).await;
+    let old_generation = ensure_generation_row(&mut old, DR_OLD)
+        .await
+        .expect("old generation row");
+    let new_generation = ensure_generation_row(&mut new, DR_NEW)
+        .await
+        .expect("new generation row");
+    FenceRegistry::clear();
+    FenceRegistry::register(DR_OLD, old_generation).expect("pin the old shard");
+    FenceRegistry::register(DR_NEW, new_generation).expect("pin the new shard");
+    update_dag_override(&mut old, &dag, &every_minute(), "ops", None)
+        .await
+        .expect("set override");
+    tick(&pool, before, &dag).await;
+    assert_eq!(
+        schedule_expr(&mut old, &dag.name).await.as_deref(),
+        Some("interval:60")
+    );
+    DrCarry {
+        shards,
+        pool,
+        after,
+        dag,
+    }
+}
+
+/// Promote `shard` while a carry waits there.
+///
+/// The test holds `statement` of the carry on `shard` and promotes `shard`.
+/// It ends the guard sessions of the old region there. It then frees the
+/// statement and lets the tick end.
+async fn promote_during_carry(carry: &DrCarry, shard: ShardId, statement: &str) {
+    use autumn_harvest::replication::bump_generation;
+
+    let mut held = carry.shards.conn(shard).await;
+    let mut holder = carry.shards.conn(shard).await;
+    holder
+        .batch_execute(&format!("SELECT pg_advisory_lock({HOLD_KEY})"))
+        .await
+        .expect("hold the statement");
+    hold_override_statements(&mut held, statement).await;
+    let tick = {
+        let (pool, router, dag) = (carry.pool.clone(), carry.after.clone(), carry.dag.clone());
+        tokio::spawn(async move { try_tick(&pool, router, &dag, lowered(&dag)).await })
+    };
+    wait_for_held_statement(&mut held).await;
+
+    let bump = {
+        let url = carry.shards.urls[&shard].clone();
+        tokio::spawn(async move {
+            let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+            bump_generation(&mut conn, shard, "failover", "test").await
+        })
+    };
+    end_guard_sessions(&mut held).await;
+    tokio::time::timeout(Duration::from_secs(60), bump)
+        .await
+        .expect("the bump ends")
+        .expect("the bump task joins")
+        .expect("the promotion commits");
+    holder
+        .batch_execute(&format!("SELECT pg_advisory_unlock({HOLD_KEY})"))
+        .await
+        .expect("free the statement");
+    // The stopped pass makes the tick fail or succeed. Only its writes count.
+    let _ = tokio::time::timeout(Duration::from_secs(60), tick)
+        .await
+        .expect("the tick ends")
+        .expect("the tick task joins");
+}
+
+/// A promotion of the destination during a carry stops every write of the
+/// old process.
+///
+/// The copy waits on the destination. The new region then promotes the
+/// destination, and the old region loses its guard sessions. When the copy
+/// can go on, the old process must write nothing: no copy on the new shard
+/// and no delete on the old one. A later tick of the old process writes
+/// nothing either.
+#[tokio::test]
+async fn a_promotion_during_a_carry_stops_every_write_of_the_old_process() {
+    let _fence_serial = crate::cross_region_dr_tests::registry_guard().await;
+    let carry = pinned_carry("dr_carry").await;
+    let mut old = carry.shards.conn(DR_OLD).await;
+    let mut new = carry.shards.conn(DR_NEW).await;
+
+    promote_during_carry(&carry, DR_NEW, "INSERT").await;
+
+    let name = carry.dag.name.as_str();
+    assert_eq!(
+        override_schedule(&mut new, name).await,
+        None,
+        "the old process copies nothing after the promotion"
+    );
+    assert_eq!(copy_records(&mut new, name).await, 0);
+    assert_eq!(
+        override_schedule(&mut old, name).await,
+        MINUTELY,
+        "the old process deletes nothing after the promotion"
+    );
+
+    try_tick(
+        &carry.pool,
+        carry.after.clone(),
+        &carry.dag,
+        lowered(&carry.dag),
+    )
+    .await
+    .expect("a later tick of the old process runs");
+    assert_eq!(override_schedule(&mut new, name).await, None);
+    assert_eq!(copy_records(&mut new, name).await, 0);
+    assert_eq!(
+        schedule_expr(&mut new, name).await,
+        None,
+        "the old process writes no schedule row on the promoted shard"
+    );
+    assert_eq!(override_schedule(&mut old, name).await, MINUTELY);
+}
+
+/// A promotion of the source during a carry stops its delete.
+///
+/// The copy lands before the promotion. The delete then waits on the source,
+/// and the new region promotes the source. The source must keep its row, so
+/// the old process writes nothing there after the promotion.
+#[tokio::test]
+async fn a_promotion_of_the_source_during_a_carry_stops_its_delete() {
+    let _fence_serial = crate::cross_region_dr_tests::registry_guard().await;
+    let carry = pinned_carry("dr_source").await;
+    let mut old = carry.shards.conn(DR_OLD).await;
+    let mut new = carry.shards.conn(DR_NEW).await;
+
+    promote_during_carry(&carry, DR_OLD, "DELETE").await;
+
+    let name = carry.dag.name.as_str();
+    assert_eq!(
+        override_schedule(&mut new, name).await,
+        MINUTELY,
+        "the copy committed before the promotion"
+    );
+    assert_eq!(copy_records(&mut new, name).await, 1);
+    assert_eq!(
+        override_schedule(&mut old, name).await,
+        MINUTELY,
+        "the old process deletes nothing after the promotion"
+    );
+
+    try_tick(
+        &carry.pool,
+        carry.after.clone(),
+        &carry.dag,
+        lowered(&carry.dag),
+    )
+    .await
+    .expect("a later tick of the old process runs");
+    assert_eq!(override_schedule(&mut old, name).await, MINUTELY);
+}
+
+/// A carry on a shard that this process lost writes nothing on either shard.
+///
+/// The pass guards cover the carry in the scheduler. Each carry transaction
+/// also asserts the fence of its own shard. This test calls the carry with no
+/// guard, so only those asserts stand between it and a write.
+#[tokio::test]
+async fn a_fenced_carry_writes_nothing() {
+    use autumn_harvest::replication::{FenceRegistry, bump_generation, ensure_generation_row};
+    use autumn_harvest::schedule_override::carry_dag_override;
+
+    let _fence_serial = crate::cross_region_dr_tests::registry_guard().await;
+    let shards = setup_shard_pair(DR_OLD, DR_NEW).await;
+    let dag = code_dag("dr_fenced_carry");
+    let mut old = shards.conn(DR_OLD).await;
+    let mut new = shards.conn(DR_NEW).await;
+    let old_generation = ensure_generation_row(&mut old, DR_OLD)
+        .await
+        .expect("old generation row");
+    let new_generation = ensure_generation_row(&mut new, DR_NEW)
+        .await
+        .expect("new generation row");
+    update_dag_override(&mut old, &dag, &every_minute(), "ops", None)
+        .await
+        .expect("set override");
+    FenceRegistry::clear();
+    FenceRegistry::register(DR_OLD, old_generation).expect("pin the old shard");
+    FenceRegistry::register(DR_NEW, new_generation).expect("pin the new shard");
+
+    // A bump promotes the destination, and the fence refuses the copy.
+    bump_generation(&mut new, DR_NEW, "failover", "test")
+        .await
+        .expect("promote the new shard");
+    let refused = carry_dag_override(&mut old, &mut new, DR_OLD, DR_NEW, &dag.name).await;
+    assert!(
+        matches!(
+            refused,
+            Err(autumn_harvest::error::HarvestError::ShardFenced { .. })
+        ),
+        "{refused:?}"
+    );
+    assert_eq!(override_schedule(&mut new, &dag.name).await, None);
+    assert_eq!(override_schedule(&mut old, &dag.name).await, MINUTELY);
+
+    // The pin of the destination is current again, and a bump promotes the
+    // source. The copy lands, and the fence refuses the delete.
+    let promoted_new = autumn_harvest::replication::current_generation(&mut new, DR_NEW)
+        .await
+        .expect("read the new generation")
+        .expect("the new shard has a row");
+    FenceRegistry::clear();
+    FenceRegistry::register(DR_OLD, old_generation).expect("pin the old shard");
+    FenceRegistry::register(DR_NEW, promoted_new).expect("pin the new shard");
+    bump_generation(&mut old, DR_OLD, "failover", "test")
+        .await
+        .expect("promote the old shard");
+    let refused = carry_dag_override(&mut old, &mut new, DR_OLD, DR_NEW, &dag.name).await;
+    assert!(
+        matches!(
+            refused,
+            Err(autumn_harvest::error::HarvestError::ShardFenced { .. })
+        ),
+        "{refused:?}"
+    );
+    assert_eq!(override_schedule(&mut new, &dag.name).await, MINUTELY);
+    assert_eq!(
+        override_schedule(&mut old, &dag.name).await,
+        MINUTELY,
+        "a fenced source keeps its row"
+    );
 }

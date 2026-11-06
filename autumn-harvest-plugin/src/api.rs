@@ -21814,6 +21814,10 @@ async fn batch_start_workflows(
                 .registry
                 .chain_execution_timeout(&item.workflow_name);
             let sla = clamp_info_default_sla(info_sla, info_execution_timeout);
+            // Both start paths take this timeout. The start caps it at the
+            // fleet ceiling, and clamps the SLA to the result.
+            let execution_timeout =
+                info_execution_timeout.and_then(|d| chrono::Duration::from_std(d).ok());
             let item_workflow_retry_policy = info_retry_policy;
 
             // Start-throttle admission (issue #607) — best-effort batches only.
@@ -21926,7 +21930,7 @@ async fn batch_start_workflows(
                 }
                 let start_options = autumn_harvest::debounce::DebounceStartOptions {
                     reuse_policy: None,
-                    execution_timeout_secs: None,
+                    execution_timeout_secs: execution_timeout.map(|d| d.num_seconds()),
                     memo: None,
                     search_attrs: item.search_attributes.clone(),
                     sla_secs: sla.map(|d| d.num_seconds()),
@@ -22040,6 +22044,7 @@ async fn batch_start_workflows(
                     StartWorkflowParams {
                         search_attrs: item.search_attributes.clone(),
                         trace_context: trace_ctx,
+                        execution_timeout,
                         max_execution_timeout_ceiling: max_exec_timeout_ceiling,
                         // Chain-scoped lifetime cap (issue #617): workflow-type default
                         // + fleet-wide ceiling-as-default, at parity with the per-run

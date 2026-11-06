@@ -189,9 +189,10 @@ durable receiver returns `model_forbidden` when the accepted mandate does
 not allow its own model. Only a send to a durable peer returns `deadlock` or
 `peer_unavailable`.
 A strategy run returns `draws_exceeded`, then `fan_out_exhausted`, before
-its first draw. Each draw of best-of-N or rejection counts as one
-delegation, and the draws split the delegations left with `sibling_cap`. A
-beam checks `max_draws` only, because it counts its delegations per path.
+its first draw. Each draw of best-of-N or rejection, and each tier of a
+cascade, counts as one delegation. The draws split the delegations left
+with `sibling_cap`. A beam checks `max_draws` only, because it counts its
+delegations per path.
 `Refusal` implements `std::error::Error`.
 
 The report keeps a peer name only when it is a valid agent name. Any other

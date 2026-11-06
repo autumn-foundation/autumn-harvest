@@ -15,6 +15,7 @@ use std::collections::BTreeSet;
 use serde::{Deserialize, Serialize};
 
 use super::policy::{MAX_ANSWER_RETRIES, SamplingPolicy, ScorerId, ScorerRef, Scorers, Strategy};
+use super::sample::Tier;
 use crate::answer_check::AnswerCheck;
 use crate::tool::ToolEffect;
 use crate::types::MAX_PARALLEL_CHILDREN;
@@ -72,6 +73,19 @@ pub enum Refusal {
     },
     /// The profile of the kind belongs to another tenant (issue #2442).
     OtherTenant,
+    /// A cascade tier names a model outside `cascade_models`.
+    TierModelNotAllowed {
+        /// The model that the tier names.
+        model: String,
+    },
+    /// The mandate of the profile does not allow the model of a cascade
+    /// tier. The run skips the tier, and it does not fail.
+    NotPermitted,
+    /// `agent_draws` cannot run the strategy. Only `agent_sample` runs it.
+    SampleOnly {
+        /// The strategy that the run asked for.
+        strategy: Strategy,
+    },
     /// The kind is not a valid agent kind.
     InvalidKind,
     /// No agent profile has the kind, so no task can be built.
@@ -102,6 +116,9 @@ impl Refusal {
             Self::TooManyAnswerRetries { .. } => "too_many_answer_retries",
             Self::UnknownScorer { .. } => "unknown_scorer",
             Self::OtherTenant => "other_tenant",
+            Self::TierModelNotAllowed { .. } => "tier_model_not_allowed",
+            Self::NotPermitted => "not_permitted",
+            Self::SampleOnly { .. } => "sample_only",
             Self::InvalidKind => "invalid_kind",
             Self::UnknownKind => "unknown_kind",
             Self::Mandate { mandate } => mandate.code(),
@@ -147,6 +164,16 @@ impl std::fmt::Display for Refusal {
             ),
             Self::UnknownScorer { scorer } => write!(f, "the harness has no scorer {scorer}"),
             Self::OtherTenant => f.write_str("the profile of the kind belongs to another tenant"),
+            Self::TierModelNotAllowed { model } => write!(
+                f,
+                "the policy of this kind does not allow the tier model {model:?}"
+            ),
+            Self::NotPermitted => {
+                f.write_str("the mandate of this kind does not allow the model of the tier")
+            }
+            Self::SampleOnly { strategy } => {
+                write!(f, "only agent_sample runs {strategy}")
+            }
             Self::InvalidKind => f.write_str("the kind is not a valid agent kind"),
             Self::UnknownKind => f.write_str("no agent profile has the kind"),
             Self::Mandate { mandate } => {
@@ -337,6 +364,67 @@ pub const fn sample_step(
         width = tokens_left;
     }
     SampleStep::Wave { width }
+}
+
+/// The next step of a cascade run. See [`cascade_step`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CascadeStep {
+    /// Ask the tier `tier`.
+    Run {
+        /// The index of the tier.
+        tier: usize,
+    },
+    /// No tier that the mandate allows is left.
+    Done,
+    /// A tier is left, but the token budget is spent.
+    BudgetExceeded,
+}
+
+/// The next step of a cascade run whose next tier is `next`.
+///
+/// `allowed[i]` says whether the mandate allows the model of tier `i`. The
+/// step is the first allowed tier at or after `next`. The run skips each
+/// tier between them. `budgeted` says whether the run has a token budget,
+/// and `tokens_left` holds the rest of it.
+///
+/// `formal/verus/src/agent_sampling.rs` proves it.
+#[must_use]
+pub const fn cascade_step(
+    allowed: &[bool],
+    next: usize,
+    budgeted: bool,
+    tokens_left: u32,
+) -> CascadeStep {
+    let mut tier = next;
+    while tier < allowed.len() && !allowed[tier] {
+        tier += 1;
+    }
+    if tier >= allowed.len() {
+        return CascadeStep::Done;
+    }
+    if budgeted && tokens_left == 0 {
+        return CascadeStep::BudgetExceeded;
+    }
+    CascadeStep::Run { tier }
+}
+
+/// Refuse the first tier whose model is outside `cascade_models`.
+///
+/// It runs before the first model call. The refusal cuts a long model
+/// name.
+///
+/// # Errors
+///
+/// Returns [`Refusal::TierModelNotAllowed`].
+pub fn admit_tiers(policy: &SamplingPolicy, tiers: &[Tier]) -> Result<(), Refusal> {
+    tiers
+        .iter()
+        .find(|tier| !policy.cascade_models.contains(&tier.model))
+        .map_or(Ok(()), |tier| {
+            Err(Refusal::TierModelNotAllowed {
+                model: crate::harness::truncate(&tier.model, crate::mesh::MAX_ITEM_LEN),
+            })
+        })
 }
 
 /// The draws of a beam run: `width × expansion × max_rounds`.
@@ -659,6 +747,99 @@ mod tests {
             sample_step(4, 0, 0, false, 0),
             SampleStep::Wave { width: 1 }
         );
+    }
+
+    #[test]
+    fn a_cascade_step_skips_each_forbidden_tier() {
+        let allowed = [false, true, false, true];
+        assert_eq!(
+            cascade_step(&allowed, 0, false, 0),
+            CascadeStep::Run { tier: 1 }
+        );
+        assert_eq!(
+            cascade_step(&allowed, 2, false, 0),
+            CascadeStep::Run { tier: 3 }
+        );
+        assert_eq!(cascade_step(&allowed, 4, false, 0), CascadeStep::Done);
+        assert_eq!(cascade_step(&allowed, 9, false, 0), CascadeStep::Done);
+        assert_eq!(cascade_step(&[false, false], 0, true, 0), CascadeStep::Done);
+        assert_eq!(
+            cascade_step(&allowed, 0, true, 0),
+            CascadeStep::BudgetExceeded
+        );
+        assert_eq!(
+            cascade_step(&allowed, 0, true, 1),
+            CascadeStep::Run { tier: 1 }
+        );
+        assert_eq!(cascade_step(&[], 0, false, 0), CascadeStep::Done);
+    }
+
+    #[test]
+    fn each_tier_model_must_be_in_the_policy() {
+        let tiers = [
+            Tier::new("cheap", crate::FiniteF64::ONE),
+            Tier::new("strong", crate::FiniteF64::ONE),
+        ];
+        let mut policy = SamplingPolicy::default();
+        assert_eq!(
+            admit_tiers(&policy, &tiers),
+            Err(Refusal::TierModelNotAllowed {
+                model: "cheap".to_owned()
+            })
+        );
+        policy.cascade_models.insert("cheap".to_owned());
+        assert_eq!(
+            admit_tiers(&policy, &tiers),
+            Err(Refusal::TierModelNotAllowed {
+                model: "strong".to_owned()
+            })
+        );
+        policy.cascade_models.insert("strong".to_owned());
+        assert_eq!(admit_tiers(&policy, &tiers), Ok(()));
+        let long = Tier::new("m".repeat(10_000), crate::FiniteF64::ONE);
+        let Err(Refusal::TierModelNotAllowed { model }) = admit_tiers(&policy, &[long]) else {
+            panic!("a long model is refused");
+        };
+        assert!(model.len() < 1_000, "the error cuts the model");
+        assert_eq!(
+            Refusal::TierModelNotAllowed {
+                model: "x".to_owned()
+            }
+            .error_text(),
+            "sampling refused (tier_model_not_allowed): the policy of this kind does not allow the tier model \"x\""
+        );
+        assert_eq!(Refusal::NotPermitted.code(), "not_permitted");
+    }
+
+    proptest! {
+        #[test]
+        fn a_cascade_step_never_runs_a_forbidden_tier(
+            allowed in proptest::collection::vec(proptest::bool::ANY, 0..12),
+            next in 0_usize..14,
+            budgeted: bool,
+            tokens_left in 0_u32..3,
+        ) {
+            let first = (next..allowed.len()).find(|&i| allowed[i]);
+            match cascade_step(&allowed, next, budgeted, tokens_left) {
+                CascadeStep::Run { tier } => {
+                    prop_assert_eq!(Some(tier), first);
+                    prop_assert!(!(budgeted && tokens_left == 0));
+                }
+                CascadeStep::Done => prop_assert_eq!(first, None),
+                CascadeStep::BudgetExceeded => {
+                    prop_assert!(first.is_some() && budgeted && tokens_left == 0);
+                }
+            }
+            // A loop that moves past each tier runs each allowed tier once.
+            let mut ran = Vec::new();
+            let mut at = 0;
+            while let CascadeStep::Run { tier } = cascade_step(&allowed, at, false, 0) {
+                ran.push(tier);
+                at = tier + 1;
+            }
+            let expected: Vec<usize> = (0..allowed.len()).filter(|&i| allowed[i]).collect();
+            prop_assert_eq!(ran, expected);
+        }
     }
 
     #[test]

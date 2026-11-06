@@ -28,6 +28,7 @@ The chosen option is in bold.
 | The meet of two caps | the parent value · **the smaller value; `None` only when both sides are `None`** |
 | Draws and fan-out | ignore fan-out · **each draw is one delegation unit; the draws split the rest with `sibling_cap`** |
 | A beam and fan-out | each step is one unit · **`max_draws` only; a beam counts delegations per path** |
+| A cascade and fan-out | `max_draws` only · **each tier is one unit, as each tier is a run of its own** |
 | The refusal | a sampling refusal · **`mesh::Refusal::DrawsExceeded`, so a peer reply names it** |
 | The mesh budget | a new check · **each draw carries the mesh of the profile, so the model-turn check applies** |
 | Old histories | no gate · **a patch marker gates the mandate check in `agent_sample`** |

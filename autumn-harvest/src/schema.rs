@@ -497,6 +497,19 @@ diesel::table! {
 diesel::table! {
     use diesel::sql_types::*;
 
+    /// The version of each override row that a reshard carry delivered to
+    /// this shard. A retried carry skips a delivered version.
+    harvest_schedule_override_receipts (kind, name) {
+        kind -> Text,
+        name -> Text,
+        row_updated_at -> Timestamptz,
+        received_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
+    use diesel::sql_types::*;
+
     harvest_schedules (id) {
         id -> Uuid,
         dag_name -> Nullable<Text>,
@@ -1525,6 +1538,7 @@ diesel::allow_tables_to_appear_in_same_query!(
     harvest_schedule_decisions,
     harvest_run_default_overrides,
     harvest_schedule_overrides,
+    harvest_schedule_override_receipts,
     harvest_rate_limit_buckets,
     harvest_completion_triggers,
     harvest_completion_trigger_fires,
