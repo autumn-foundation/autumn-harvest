@@ -16,7 +16,6 @@ use super::policy::{OverlayPart, RefinePolicy};
 use crate::agent::overlay::ProfileOverlay;
 use crate::agent::overlay_store::{
     AutoAdoptOutcome, OverlayStoreError, OverlayVersion, ProfileOverlayStore, Provenance,
-    StoredOverlay,
 };
 use crate::harness::truncate;
 use crate::mesh::MAX_NAME_LEN;
@@ -121,9 +120,37 @@ pub struct Adoption {
     /// Why the candidate waits, if it does.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wait: Option<WaitReason>,
+    /// The active version when it was not the expected one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superseded_by: Option<OverlayVersion>,
 }
 
-/// Adopt `candidate` for `kind`, or store it to wait for a person.
+/// Adopt `candidate` for `kind` over the active version, or store it to
+/// wait for a person. See [`adopt_over`].
+///
+/// # Errors
+///
+/// The errors of the store. [`OverlayStoreError::Conflict`] means that the
+/// pointer moved after the read. A retry reads it again.
+pub async fn adopt(
+    store: &dyn ProfileOverlayStore,
+    kind: &str,
+    candidate: &ProfileOverlay,
+    run: ExecutionId,
+    policy: &RefinePolicy,
+) -> Result<Adoption, OverlayStoreError> {
+    let expected = store.active(kind).await?.map(|stored| stored.version());
+    let adoption = adopt_over(store, kind, candidate, run, expected, policy).await?;
+    if adoption.refine_status == RefineStatus::Superseded {
+        return Err(OverlayStoreError::Conflict {
+            actual: adoption.superseded_by,
+        });
+    }
+    Ok(adoption)
+}
+
+/// Adopt `candidate` for `kind` over the version `expected`, or store it
+/// to wait for a person.
 ///
 /// `run` is the refine run. `policy` is the policy that the run read once.
 /// The store checks it with its current policy, and the stricter of the
@@ -147,13 +174,15 @@ pub struct Adoption {
 ///
 /// # Errors
 ///
-/// The errors of the store. [`OverlayStoreError::Conflict`] means that the
-/// pointer moved after the read. A retry reads it again.
-pub async fn adopt(
+/// The errors of the store. A pointer that is not `expected` gives
+/// [`RefineStatus::Superseded`], not an error, so a candidate built on an
+/// older version never goes live.
+pub async fn adopt_over(
     store: &dyn ProfileOverlayStore,
     kind: &str,
     candidate: &ProfileOverlay,
     run: ExecutionId,
+    expected: Option<OverlayVersion>,
     policy: &RefinePolicy,
 ) -> Result<Adoption, OverlayStoreError> {
     let own = Provenance::auto(run);
@@ -163,6 +192,7 @@ pub async fn adopt(
             refine_status: RefineStatus::AutoAdopted,
             version: Some(done.version()),
             wait: None,
+            superseded_by: None,
         });
     }
     let waits = Provenance::refine(run);
@@ -175,19 +205,31 @@ pub async fn adopt(
             refine_status: RefineStatus::AwaitingApproval,
             version: Some(earlier.version()),
             wait: None,
+            superseded_by: None,
         });
     }
-    let active = store.active(kind).await?;
-    let expected = active.as_ref().map(StoredOverlay::version);
-    let wait = match store
+    let outcome = match store
         .auto_adopt(kind, candidate, run, expected, policy)
-        .await?
+        .await
     {
+        Ok(outcome) => outcome,
+        Err(OverlayStoreError::Conflict { actual }) => {
+            return Ok(Adoption {
+                refine_status: RefineStatus::Superseded,
+                version: None,
+                wait: None,
+                superseded_by: actual,
+            });
+        }
+        Err(err) => return Err(err),
+    };
+    let wait = match outcome {
         AutoAdoptOutcome::Adopted(version) => {
             return Ok(Adoption {
                 refine_status: RefineStatus::AutoAdopted,
                 version: Some(version),
                 wait: None,
+                superseded_by: None,
             });
         }
         AutoAdoptOutcome::Unchanged => {
@@ -195,6 +237,7 @@ pub async fn adopt(
                 refine_status: RefineStatus::Unchanged,
                 version: None,
                 wait: None,
+                superseded_by: None,
             });
         }
         AutoAdoptOutcome::NeedsApproval { parts } => WaitReason::PartsNeedApproval { parts },
@@ -215,5 +258,6 @@ pub async fn adopt(
         refine_status: RefineStatus::AwaitingApproval,
         version: Some(version),
         wait: Some(wait),
+        superseded_by: None,
     })
 }

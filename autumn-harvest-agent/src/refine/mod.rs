@@ -30,7 +30,7 @@ pub mod propose;
 pub mod run;
 pub mod sources;
 
-pub use adopt::{Adoption, RefineStatus, WaitReason, adopt};
+pub use adopt::{Adoption, RefineStatus, WaitReason, adopt, adopt_over};
 pub use bundle::{BundleFile, BundleManifest};
 #[cfg(feature = "eval")]
 pub use compose::{

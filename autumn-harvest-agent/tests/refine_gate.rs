@@ -707,3 +707,30 @@ async fn a_pointer_move_during_the_loop_makes_approve_superseded() {
     assert_eq!(gate.superseded_by, operator);
     assert_eq!(active(&f.store).await, operator);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pointer_move_during_the_loop_stops_an_auto_adoption() {
+    let mut f = fixture();
+    let policy = RefinePolicy {
+        auto_adopt: AutoAdopt {
+            parts: std::iter::once(OverlayPart::System).collect(),
+            ..AutoAdopt::default()
+        },
+        ..RefinePolicy::default()
+    };
+    f.store
+        .set_policy(KIND, &policy, None, Provenance::operator("ops"))
+        .await
+        .unwrap();
+    *f.proposer.meddle.lock().unwrap() = Some(Arc::clone(&f.store));
+    let run = f.source().await;
+    let input = RefineInput::new(KIND, vec![run], 1, RefineMode::Sequential, 7);
+    let exec = sqlite::start_refine(&mut f.rt, &input).unwrap();
+    let report = report_of(f.drive(exec).await);
+    assert_eq!(report.status, RefineStatus::Superseded, "{report:?}");
+    let versions = stored_versions(&f.store).await;
+    assert_eq!(versions.len(), 1, "only the operator version: {versions:?}");
+    assert_eq!(versions[0].1, Provenance::operator("ops"));
+    assert_eq!(active(&f.store).await, Some(versions[0].0));
+    assert_eq!(f.attr(exec, REFINE_STATUS_ATTR), Some(json!("superseded")));
+}

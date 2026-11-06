@@ -2759,8 +2759,10 @@ design is in [`DESIGN-2381.md`](design/DESIGN-2381.md). The gate needs an
 overlay store on the harness. With none, the adoption step fails the run
 as `OverlayStoreMissing`. A dry run needs no store.
 
-1. `agent_refine_adopt` calls `refine::adopt`. A candidate whose changed
-   parts the policy lists goes live as `auto:<run>`, under the daily cap.
+1. `agent_refine_adopt` calls `refine::adopt_over` with the version that
+   was active at refine start. A moved pointer ends the run as
+   `superseded`. A candidate whose changed parts the policy lists goes
+   live as `auto:<run>`, under the daily cap.
    The step puts any other candidate as an inactive version
    `refine:<run>`. It also reads the head of the activation log.
 2. The run drops each decision that arrived before this point. Then it

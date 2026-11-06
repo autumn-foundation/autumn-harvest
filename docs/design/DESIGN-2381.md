@@ -113,6 +113,7 @@ How can the gate put the wrong overlay live? Each failure has a guard.
 | An approval overwrites a newer operator version. | The CAS on the start pointer. The run ends as `superseded`. |
 | An `edit` passes the ceilings. | `overlay::apply` under the run ceilings, then the store validator under the current policy. Both must pass. |
 | An `edit` changes `auto_adopt` or another policy key. | `ProfileOverlay` is `deny_unknown_fields`. The payload does not decode. |
+| An auto adoption replaces a newer operator version. | `adopt_over` expects the start version. A moved pointer ends the run as `superseded`. |
 | A retry puts a second version. | Each activity finds its own version first. |
 | A retry of `approve` undoes a rollback. | A move after `seen` ends the decision with no move. |
 | An operator moves the pointer away and back during the decision. | The swap checks `seen` under the lock. |

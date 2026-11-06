@@ -34,6 +34,10 @@ overlay goes live. The design is in `docs/design/DESIGN-2381.md`.
 - `RefineInput::dry_run` ends the run after the loop with `chosen`, stores
   nothing and opens no gate. `RefineReport::gate` holds the gate record.
   `RefineStart::active` holds the version active at the start.
+- `refine::adopt_over` adopts over the version that was active at refine
+  start. A moved pointer gives `superseded`, with
+  `Adoption::superseded_by`, and stores nothing. So an auto adoption never
+  replaces a newer operator version. `refine::adopt` keeps its contract.
 - `refine::adopt` finds its own `refine:<run>` version first on a retry. So
   it puts no second version, and a new day or a wider policy never changes
   the outcome of a retry. A lost race on the policy is now retryable.

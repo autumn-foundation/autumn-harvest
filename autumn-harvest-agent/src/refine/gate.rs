@@ -3,7 +3,9 @@
 //! When `agent_refine` chooses an overlay, the gate decides whether it
 //! goes live. The design is in `docs/design/DESIGN-2381.md`.
 //!
-//! 1. [`agent_refine_adopt`] calls [`adopt`]. A candidate that the policy
+//! 1. [`agent_refine_adopt`] calls [`adopt_over`] over the version that was
+//!    active at refine start. A moved pointer ends the run as superseded.
+//!    A candidate that the policy
 //!    allows goes live as `auto:<run>`. The step puts any other candidate
 //!    as an inactive version, with the provenance `refine:<run>`. It also
 //!    reads the head of the activation log.
@@ -30,7 +32,7 @@ use autumn_harvest::prelude::*;
 use autumn_harvest::types::ExecutionId;
 use serde::{Deserialize, Serialize};
 
-use super::adopt::{Adoption, RefineStatus, WaitReason, adopt};
+use super::adopt::{Adoption, RefineStatus, WaitReason, adopt_over};
 #[cfg(feature = "eval")]
 use super::policy::GateState;
 use super::policy::RefinePolicy;
@@ -275,6 +277,8 @@ pub struct AdoptRequest {
     pub candidate: ProfileOverlay,
     /// The refine run.
     pub run: ExecutionId,
+    /// The version that was active at refine start.
+    pub expected: Option<OverlayVersion>,
     /// The policy that the run read.
     pub policy: RefinePolicy,
 }
@@ -282,7 +286,7 @@ pub struct AdoptRequest {
 /// The output of [`agent_refine_adopt`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GateOpen {
-    /// The result of [`adopt`].
+    /// The result of [`adopt_over`].
     pub adoption: Adoption,
     /// The sequence number of the last move of the pointer after the step,
     /// or `None` for no move. A decision moves nothing when the log moved
@@ -385,8 +389,9 @@ pub(crate) async fn head_of(
         .map_err(|err| store_failure(&err))
 }
 
-/// Run [`adopt`] for the chosen overlay of a refine run, then read the head
-/// of the activation log.
+/// Run [`adopt_over`] for the chosen overlay of a refine run, over the
+/// version that was active at refine start. Then read the head of the
+/// activation log.
 ///
 /// # Errors
 ///
@@ -398,11 +403,12 @@ pub(crate) async fn run_adopt(
     request: AdoptRequest,
 ) -> Result<GateOpen, String> {
     let store = harness.overlays().ok_or_else(no_store)?;
-    let adoption = adopt(
+    let adoption = adopt_over(
         store.as_ref(),
         &request.kind,
         &request.candidate,
         request.run,
+        request.expected,
         &request.policy,
     )
     .await
@@ -654,7 +660,8 @@ fn gate_failure(what: &str, err: &HarvestError) -> String {
 #[cfg(feature = "eval")]
 impl Gate<'_> {
     /// Run the gate. Returns the status of the run and the gate record.
-    /// The record is `None` when the store found no change.
+    /// The record is `None` when the store found no change, or when the
+    /// pointer moved before the gate.
     ///
     /// # Errors
     ///
@@ -666,6 +673,7 @@ impl Gate<'_> {
             kind: self.kind.to_owned(),
             candidate: self.chosen.clone(),
             run,
+            expected: self.expected,
             policy: self.policy.clone(),
         };
         let open: GateOpen = self
@@ -674,6 +682,9 @@ impl Gate<'_> {
             .await
             .map_err(|err| gate_failure("the adoption step failed", &err))?;
         let GateOpen { adoption, seen } = open;
+        if adoption.refine_status == RefineStatus::Superseded {
+            return Ok((RefineStatus::Superseded, None));
+        }
         let Some(version) = adoption.version else {
             return Ok((RefineStatus::Unchanged, None));
         };

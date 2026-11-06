@@ -412,7 +412,8 @@ pub struct RefineReport {
     /// The counts and the spend.
     pub ledger: RefineLedger,
     /// The adoption gate. `None` when the run chose no overlay, when the
-    /// store found no change, and for a dry run.
+    /// store found no change, when the pointer moved before the gate, and
+    /// for a dry run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gate: Option<GateRecord>,
 }
