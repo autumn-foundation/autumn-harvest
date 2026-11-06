@@ -3351,6 +3351,7 @@ pub fn activities() -> Vec<ActivityInfo> {
         crate::score::agent_score_info(),
         crate::answer_check::agent_answer_check_info(),
         crate::score::agent_sample_score_info(),
+        crate::sampling::agent_vote_key_info(),
         crate::consolidate::agent_consolidate_read_info(),
         crate::consolidate::agent_consolidate_turn_info(),
         crate::consolidate::agent_consolidate_write_info(),
