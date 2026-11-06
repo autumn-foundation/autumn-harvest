@@ -35,8 +35,8 @@ of a whole subtree. The design is in `docs/design/DESIGN-2449.md`.
   parks the agent. An op whose draws spent no token waits first in line.
 - A streaming agent publishes the selected answer of a strategy op on
   its own durable stream. A draw streams nothing.
-- A judge model must be in `Mandate::models`. A cascade op needs one tier
-  model that the mandate allows. It never checks the profile model. A transcript over the
+- A judge model must be in `Mandate::models`. A cascade peer op checks
+  only its tier models, never the profile model. A transcript over the
   workflow input cap fails the op before any draw.
 - **Behavior change.** A new `agent_sample` run under a profile mandate
   counts each draw against `max_delegations` (16 by default). So

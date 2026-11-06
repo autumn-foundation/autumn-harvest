@@ -2056,8 +2056,8 @@ let op = AgentOp::message("Name a prime.").with_sample(sample);
 - Each tier of a cascade (section 20) is a run of its own, so it counts as
   one delegation, as a draw of best-of-N does. A cascade peer op checks
   the tier models against the accepted mandate, not the model of the
-  profile. It skips each forbidden tier, and with no tier left it gets
-  `model_forbidden`.
+  profile. It skips each forbidden tier. With no tier left, it ends with
+  `no_accepted_draw`.
 - A refused or failed op is a failed op. The transcript stays as it was,
   and the next op runs. A peer gets a mandate refusal in
   `PeerReply::refusal`, and any other error in `PeerReply::error`.

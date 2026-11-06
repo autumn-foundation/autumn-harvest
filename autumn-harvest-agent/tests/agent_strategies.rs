@@ -825,7 +825,7 @@ async fn a_cascade_peer_op_checks_the_tier_models_not_the_profile_model() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_cascade_peer_op_with_no_allowed_tier_is_refused() {
+async fn a_cascade_peer_op_with_no_allowed_tier_asks_no_model() {
     let (_dir, db) = fresh_db();
     let model = by_draw(&["b"], "plain");
     let mut rt = runtime(&db, cascade_harness(&model));
@@ -837,5 +837,9 @@ async fn a_cascade_peer_op_with_no_allowed_tier_is_refused() {
 
     assert!(model.requests().is_empty(), "no tier runs");
     let replies = sent_signals(&rt, &agent);
-    assert_eq!(replies[0]["value"]["refusal"], "model_forbidden");
+    let reply = &replies[0]["value"];
+    // The run skips each forbidden tier, so it ends with no accepted draw.
+    assert!(reply["refusal"].is_null(), "{reply}");
+    let error = reply["error"].as_str().unwrap_or_default();
+    assert!(error.contains("no_accepted_draw"), "{reply}");
 }
