@@ -189,3 +189,35 @@ fn a_closed_stdout_ends_history_quietly() {
     assert_eq!(done.status.code(), Some(0), "{done:?}");
     assert!(done.stderr.is_empty(), "no panic: {done:?}");
 }
+
+#[cfg(unix)]
+#[test]
+fn status_shows_progress_beside_a_live_run() {
+    let dir = TempDir::new().expect("a temp dir");
+    std::fs::write(
+        dir.path().join("busy.rhai"),
+        r#"
+        progress("busy");
+        sh("touch started; while [ ! -f go ]; do sleep 0.02; done");
+        "ok"
+        "#,
+    )
+    .expect("write the script");
+    let child = harvest(dir.path())
+        .args(["run", "busy.rhai", "--id", "b1"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn");
+    wait_until("the step to start", || dir.path().join("started").exists());
+
+    // The live `run` holds the writer lock while its step runs.
+    let status = stdout(&output(harvest(dir.path()).args(["status", "b1"])));
+    assert!(status.contains("state     RUNNING"), "{status}");
+    assert!(status.contains("progress  busy"), "{status}");
+
+    std::fs::write(dir.path().join("go"), "").expect("release the step");
+    let done = child.wait_with_output().expect("wait");
+    assert_eq!(done.status.code(), Some(0), "{done:?}");
+    assert_eq!(String::from_utf8_lossy(&done.stdout).trim(), "ok");
+}

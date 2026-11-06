@@ -18,6 +18,9 @@ chrono = { workspace = true }
 # `no_time` removes `timestamp()`, so a script body cannot read the clock.
 # `serde` converts script values to and from the JSON that history stores.
 rhai = { version = "1.27.0", default-features = false, features = ["std", "no_time", "serde"] }
+# A read-only connection for the `status` query beside a live writer. The
+# version matches the one the backend links, so there is one SQLite.
+rusqlite = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 # The shell and file helpers that the host activities call, and the CLI.

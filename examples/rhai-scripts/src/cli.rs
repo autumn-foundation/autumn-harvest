@@ -322,7 +322,7 @@ async fn show(db: &Path, run: &str) -> Result<(), Stop> {
     for task in &pending.tasks {
         say!("call      {task:?}");
     }
-    match live_status(db, exec).await {
+    match crate::status(db, exec).await {
         Ok(status) => {
             say!("calls     {}", status["calls"]);
             if let Some(progress) = status["progress"].as_str().filter(|p| !p.is_empty()) {
@@ -332,13 +332,6 @@ async fn show(db: &Path, run: &str) -> Result<(), Stop> {
         Err(note) => say!("progress  unavailable: {note}"),
     }
     Ok(())
-}
-
-/// The answer of the `status` query. The query replays the run.
-async fn live_status(db: &Path, exec: ExecutionId) -> Result<Value, String> {
-    // No echo sink here, so the replay prints nothing.
-    let rt = crate::open(db).map_err(text)?;
-    rt.query(exec, "status", Value::Null).await.map_err(text)
 }
 
 /// `history`: the saved calls of one run, then its log lines.

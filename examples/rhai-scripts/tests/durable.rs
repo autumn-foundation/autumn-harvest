@@ -298,3 +298,33 @@ async fn a_parse_error_is_caught_before_a_run_starts() {
     assert_ne!(error, "");
     rhai_scripts::bridge::check(r#"sh("true")"#).expect("a valid script parses");
 }
+
+#[tokio::test]
+async fn status_reads_progress_while_the_writer_holds_the_database() {
+    let dir = scratch();
+    // This runtime keeps the writer lock for the whole test, as a live `run` does.
+    let mut rt = rhai_scripts::open(db(&dir)).expect("open");
+    let source = r#"
+        progress("deploying");
+        sh("true");
+        wait_for("go");
+    "#;
+    let exec = start(&mut rt, &dir, source);
+    let state = rt.run_until_blocked(exec).await.expect("drive");
+    assert!(matches!(state, RunState::WaitingSignal(_)), "got {state:?}");
+
+    // A second writer is refused, so the read must not need one.
+    assert!(
+        rhai_scripts::open(db(&dir)).is_err(),
+        "the writer lock is held"
+    );
+    // `calls` counts the `wait_for` that the run is parked on.
+    let status = rhai_scripts::status(db(&dir), exec).await.expect("status");
+    assert_eq!(status, json!({ "progress": "deploying", "calls": 2 }));
+
+    // The read changes nothing: the writer drives the run on as before.
+    rt.send_signal(exec, "go", Value::Null).expect("signal");
+    completes(&mut rt, exec).await;
+    let done = rhai_scripts::status(db(&dir), exec).await.expect("status");
+    assert_eq!(done, json!({ "progress": "deploying", "calls": 2 }));
+}

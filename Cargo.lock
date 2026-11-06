@@ -6404,6 +6404,7 @@ dependencies = [
  "autumn-harvest-sqlite",
  "chrono",
  "rhai",
+ "rusqlite",
  "serde",
  "serde_json",
  "smop",

@@ -26,18 +26,22 @@ What shipped:
   reply channel, and the script stops with Rhai's non-catchable terminate
   error.
 - The CLI: `run`, `resume`, `approve`, `status` and `history`. A run that
-  waits for a signal exits 3.
+  waits for a signal exits 3. `status` replays the `status` query over a
+  read-only connection (`ReplayInput::load` and the core's
+  `drive_query_replay_async`), so it reports progress beside a live `run`
+  that holds the writer lock.
 
 No engine change, no new `WorkflowEvent` variant and no migration.
 
-Test evidence: `cargo test -p rhai-scripts`. The 10 tests in
+Test evidence: `cargo test -p rhai-scripts`. The 11 tests in
 `tests/durable.rs` drive the workflow in process. They cover values and
 arguments, a restart during a signal wait, a durable timer driven with
 `run_until_blocked_as_of`, `try`/`catch` over a failed step, an uncaught
 failure, the sandbox, the operation bound, the `print` sink and log, and the
-`status` query on a parked run. The 5 tests in `tests/cli.rs` run the binary.
+`status` query on a parked run, also while a writer holds the lock. The 6
+tests in `tests/cli.rs` run the binary.
 One sends SIGKILL to a run during its second step, edits the script, and
 resumes it. Step one runs once, step two runs twice, and the edit has no
 effect. Another is a regression test for a panic on a closed stdout
-(`history | head`). CI runs the suite on Linux and macOS, and a clippy step
-covers the crate.
+(`history | head`). One reads `status` beside a live `run`. CI runs the
+suite on Linux and macOS, and a clippy step covers the crate.

@@ -120,7 +120,9 @@ be safe to repeat: check for the tag before you create it.
 ## Limits
 
 - One process drives a database at a time. The SQLite runtime takes a writer
-  lock. `status` and `history` read beside a live `run`. A second `run`,
+  lock. `status` and `history` read beside a live `run`, through a
+  read-only connection. `status` replays the run there to answer its
+  progress. A second `run`,
   `resume` or `approve` on the same file fails fast while one is active.
 - `sh` captures standard output. A long command prints nothing until it ends.
   Use `print` to report progress.
@@ -137,6 +139,8 @@ cargo test -p rhai-scripts
 [`tests/durable.rs`](tests/durable.rs) drives the workflow in process: the
 values, a restart during a signal wait, a durable timer, `try`/`catch` over a
 failed step, the sandbox, the operation bound, the `print` log and the
-`status` query. [`tests/cli.rs`](tests/cli.rs) runs the binary. One test
-sends SIGKILL to a run during its second step, edits the script, and resumes
-it. Step one runs once, step two runs twice, and the edit has no effect.
+`status` query, also while a writer holds the database.
+[`tests/cli.rs`](tests/cli.rs) runs the binary. One test sends SIGKILL to a
+run during its second step, edits the script, and resumes it. Step one runs
+once, step two runs twice, and the edit has no effect. Another reads `status`
+beside a live `run`.
