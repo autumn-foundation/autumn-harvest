@@ -719,3 +719,23 @@ async fn the_sample_history_replays_clean() {
         );
     }
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_brief_run_drops_the_transcript_of_the_selected_draw() {
+    let (_dir, db) = fresh_db();
+    let scorer = || Table(vec![("a", 0.5)]);
+    let mut rt = runtime(&db, harness(by_draw(&["a"]), scorer(), &sampling(1)));
+    let input = SampleInput::new(KIND, "Pick.", SampleStrategy::best_of_n(1), table());
+    let full = sample_report(drive(&mut rt, &input).await);
+    assert_ne!(full.selected.as_ref().unwrap().messages.len(), 0);
+    let mut brief = input;
+    brief.brief = true;
+    let short = sample_report(drive(&mut rt, &brief).await);
+    let selected = short.selected.as_ref().unwrap();
+    assert!(
+        selected.messages.is_empty(),
+        "the history keeps no transcript"
+    );
+    assert_eq!(selected.text, "a", "the answer stays");
+    assert!(!short.refused);
+}

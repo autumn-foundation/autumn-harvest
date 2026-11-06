@@ -22,9 +22,9 @@ use autumn_harvest::payload_store::PayloadStore;
 use autumn_harvest_agent::bounds::{exceeds_activity_input, json_len};
 use autumn_harvest_agent::model::BoxFuture;
 use autumn_harvest_agent::sampling::{
-    InMemorySamplingPolicyStore, ItemStatus, MAX_SWEEP_ITEM_BYTES, SampleStrategy, SamplingPolicy,
-    SamplingPolicyStore, ScorerRef, Strategy, SweepInput, SweepItem, SweepItemStore, SweepItems,
-    SweepReport, SweepStop,
+    InMemorySamplingPolicyStore, MAX_SWEEP_ITEM_BYTES, MAX_SWEEP_LIST_BYTES, PolicyRead,
+    SampleStrategy, SamplingPolicy, SamplingPolicyStore, ScorerRef, Strategy, SweepInput,
+    SweepItem, SweepItemStatus, SweepItemStore, SweepItems, SweepReport, SweepStop,
 };
 use autumn_harvest_agent::{
     AgentError, AgentHarness, AgentModel, AgentProfile, ChatRequest, ChatResponse, ContentPart,
@@ -144,13 +144,23 @@ async fn a_five_item_sweep_with_exact_match_gives_five_rows() {
     assert_eq!(accepted, [true, true, false, true, false]);
     for (n, row) in report.rows.iter().enumerate() {
         assert_eq!(row.item as usize, n, "the rows keep the item order");
-        assert_eq!(row.status, ItemStatus::Completed);
+        assert_eq!(row.status, SweepItemStatus::Completed);
         assert_eq!(row.draws, 1, "a single draw");
         let verdict = row.verdict.as_ref().expect("each row has a verdict");
-        assert_eq!(verdict.is_reject(), !row.accepted, "row {n}: {verdict:?}");
+        if row.accepted {
+            assert_eq!(verdict.as_score().map(FiniteF64::get), Some(1.0), "row {n}");
+        } else {
+            assert!(verdict.is_reject(), "row {n}: {verdict:?}");
+        }
+        assert_eq!(row.usage.total(), 5, "row {n} keeps the tokens of its draw");
+        assert_eq!(row.revision, Some(0), "row {n} reads the default policy");
     }
-    assert_eq!(report.rows[0].answer.as_deref(), Some("2"));
-    assert_eq!(report.rows[2].answer, None, "no draw was selected");
+    let answers: Vec<Option<&str>> = report
+        .rows
+        .iter()
+        .map(|row| row.answer.as_deref())
+        .collect();
+    assert_eq!(answers, [Some("2"), Some("4"), None, Some("8"), None]);
     let totals = &report.totals;
     assert_eq!(totals.items, 5);
     assert_eq!(totals.run, 5);
@@ -276,15 +286,15 @@ async fn a_budget_for_two_items_marks_the_rest_not_run() {
     let report = sweep_report(drive(&mut rt, &input).await);
 
     assert_eq!(report.stopped, SweepStop::BudgetExceeded);
-    let statuses: Vec<ItemStatus> = report.rows.iter().map(|row| row.status).collect();
+    let statuses: Vec<SweepItemStatus> = report.rows.iter().map(|row| row.status).collect();
     assert_eq!(
         statuses,
         [
-            ItemStatus::Completed,
-            ItemStatus::Completed,
-            ItemStatus::NotRun,
-            ItemStatus::NotRun,
-            ItemStatus::NotRun,
+            SweepItemStatus::Completed,
+            SweepItemStatus::Completed,
+            SweepItemStatus::NotRun,
+            SweepItemStatus::NotRun,
+            SweepItemStatus::NotRun,
         ]
     );
     for row in &report.rows[2..] {
@@ -351,15 +361,15 @@ async fn an_llm_budget_refusal_stops_the_sweep() {
     let report = sweep_report(drive(&mut rt, &input).await);
 
     assert_eq!(report.stopped, SweepStop::BudgetExceeded);
-    let statuses: Vec<ItemStatus> = report.rows.iter().map(|row| row.status).collect();
+    let statuses: Vec<SweepItemStatus> = report.rows.iter().map(|row| row.status).collect();
     assert_eq!(
         statuses[..2],
-        [ItemStatus::Completed, ItemStatus::Completed]
+        [SweepItemStatus::Completed, SweepItemStatus::Completed]
     );
     assert!(
         statuses[2..]
             .iter()
-            .all(|status| *status == ItemStatus::NotRun),
+            .all(|status| *status == SweepItemStatus::NotRun),
         "{statuses:?}"
     );
     assert_eq!(model.requests().len(), 2, "no model call for items 3 to 5");
@@ -392,7 +402,7 @@ impl AgentModel for Priced {
 #[tokio::test(flavor = "multi_thread")]
 async fn the_total_cost_equals_the_ledger_of_the_sweep_tree() {
     let (_dir, db) = fresh_db();
-    // Draw n of each item spends 4 + n tokens, so the rows differ.
+    // Draw n of each item spends 4 + n tokens, so each item spends 9.
     let inner = TryFnModel::new(|request: &ChatRequest| {
         let n = request.draw.map_or(0, autumn_harvest_agent::DrawId::get);
         let text = if n == 1 { "4" } else { "2" };
@@ -485,10 +495,10 @@ async fn a_list_over_the_activity_cap_goes_by_reference() {
     assert_eq!(report.rows.len(), 36);
     assert_eq!(report.totals.accepted, 36, "the sweep read each item");
     assert_eq!(model.requests().len(), 36);
-    assert!(
-        blobs.gets() >= 3,
-        "a page holds at most 1 MiB of items: {} reads",
-        blobs.gets()
+    assert_eq!(
+        blobs.gets(),
+        3,
+        "a page holds at most 1 MiB of items, and each page is read once"
     );
 }
 
@@ -567,5 +577,250 @@ async fn the_sweep_history_replays_clean() {
     assert!(
         matches!(replay.status, ReplayStatus::ReplaySucceeded),
         "{replay}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stored_list_with_no_item_store_fails_before_any_model_call() {
+    let (_dir, db) = fresh_db();
+    let blobs = Arc::new(MemStore::default());
+    let stored = item_store(&blobs).put(&five_items()).await.unwrap();
+    let model = three_of_five();
+    let mut rt = runtime(&db, harness(model.clone()));
+    let input = SweepInput::new(KIND, stored, SampleStrategy::single(), exact());
+    match drive(&mut rt, &input).await {
+        RunState::Failed(error) => assert!(error.contains("sweep item store"), "{error}"),
+        other => panic!("expected a failure, got {other:?}"),
+    }
+    assert_eq!(model.requests().len(), 0);
+}
+
+#[tokio::test]
+async fn the_store_refuses_a_list_over_the_list_cap() {
+    let blobs = Arc::new(MemStore::default());
+    let item = SweepItem::new("x".repeat(MAX_SWEEP_ITEM_BYTES - 64));
+    let count = usize::try_from(MAX_SWEEP_LIST_BYTES).unwrap() / (MAX_SWEEP_ITEM_BYTES - 64) + 1;
+    let err = item_store(&blobs)
+        .put(&vec![item; count])
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("larger than"), "{err}");
+    assert_eq!(blobs.len(), 0, "the store wrote nothing");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_spent_profile_cap_stops_its_item_and_not_the_sweep() {
+    let (_dir, db) = fresh_db();
+    let policy = SamplingPolicy {
+        strategies: BTreeSet::from([Strategy::BestOfN]),
+        max_draws: 2,
+        ..SamplingPolicy::default()
+    };
+    // The profile pays for one draw of 5 tokens per item.
+    let mut profile = AgentProfile::new(KIND);
+    profile.max_total_tokens = Some(5);
+    let model = three_of_five();
+    let harness = AgentHarness::new(model.clone())
+        .agent(profile)
+        .scorer(Arc::new(ExactMatch::per_item()))
+        .sampling_policies(store_with(&policy));
+    let mut rt = runtime(&db, harness);
+    let input = SweepInput::new(
+        KIND,
+        SweepItems::inline(five_items()),
+        SampleStrategy::best_of_n(2),
+        exact(),
+    );
+    let report = sweep_report(drive(&mut rt, &input).await);
+    assert_eq!(report.stopped, SweepStop::Completed, "each item runs");
+    assert!(
+        report
+            .rows
+            .iter()
+            .all(|row| row.status == SweepItemStatus::BudgetExceeded && row.draws == 1)
+    );
+    assert_eq!(model.requests().len(), 5, "one draw for each item");
+    assert_eq!(report.totals.accepted, 3);
+}
+
+/// A policy store that answers read `n` with `read(n)`.
+struct Scripted {
+    reads: std::sync::atomic::AtomicUsize,
+    read: Box<
+        dyn Fn(usize) -> Result<PolicyRead, autumn_harvest_agent::sampling::PolicyStoreError>
+            + Send
+            + Sync,
+    >,
+}
+
+impl std::fmt::Debug for Scripted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Scripted")
+    }
+}
+
+impl Scripted {
+    fn new(
+        read: impl Fn(usize) -> Result<PolicyRead, autumn_harvest_agent::sampling::PolicyStoreError>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            reads: std::sync::atomic::AtomicUsize::new(0),
+            read: Box::new(read),
+        })
+    }
+}
+
+impl SamplingPolicyStore for Scripted {
+    fn read<'a>(
+        &'a self,
+        _kind: &'a str,
+    ) -> BoxFuture<'a, Result<PolicyRead, autumn_harvest_agent::sampling::PolicyStoreError>> {
+        let n = self.reads.fetch_add(1, Ordering::SeqCst);
+        Box::pin(std::future::ready((self.read)(n)))
+    }
+
+    fn set<'a>(
+        &'a self,
+        _kind: &'a str,
+        _policy: &'a SamplingPolicy,
+        _actor: &'a str,
+    ) -> BoxFuture<
+        'a,
+        Result<
+            autumn_harvest_agent::sampling::PolicyChange,
+            autumn_harvest_agent::sampling::PolicyStoreError,
+        >,
+    > {
+        unreachable!("the sweep never sets a policy")
+    }
+
+    fn reset<'a>(
+        &'a self,
+        _kind: &'a str,
+        _actor: &'a str,
+    ) -> BoxFuture<
+        'a,
+        Result<
+            autumn_harvest_agent::sampling::PolicyChange,
+            autumn_harvest_agent::sampling::PolicyStoreError,
+        >,
+    > {
+        unreachable!("the sweep never resets a policy")
+    }
+
+    fn audit<'a>(
+        &'a self,
+        _kind: &'a str,
+        _limit: u32,
+    ) -> BoxFuture<
+        'a,
+        Result<
+            Vec<autumn_harvest_agent::sampling::PolicyAudit>,
+            autumn_harvest_agent::sampling::PolicyStoreError,
+        >,
+    > {
+        unreachable!("the sweep never reads the audit")
+    }
+}
+
+fn revision(revision: u64) -> PolicyRead {
+    PolicyRead {
+        policy: SamplingPolicy::default(),
+        revision,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_policy_change_during_the_sweep_stops_it() {
+    let (_dir, db) = fresh_db();
+    // The sweep and items 1 and 2 read revision 3. Item 3 reads revision 4.
+    let store = Scripted::new(|n| Ok(revision(if n < 3 { 3 } else { 4 })));
+    let model = three_of_five();
+    let mut rt = runtime(&db, harness(model.clone()).sampling_policies(store));
+    let input = SweepInput::new(
+        KIND,
+        SweepItems::inline(five_items()),
+        SampleStrategy::single(),
+        exact(),
+    );
+    let report = sweep_report(drive(&mut rt, &input).await);
+    assert_eq!(report.stopped, SweepStop::ConfigChanged);
+    assert_eq!(report.revision, 3);
+    let revisions: Vec<Option<u64>> = report.rows.iter().map(|row| row.revision).collect();
+    assert_eq!(revisions, [Some(3), Some(3), Some(4), None, None]);
+    assert_eq!(report.rows[3].status, SweepItemStatus::NotRun);
+    assert_eq!(model.requests().len(), 3, "no item starts after the change");
+}
+
+fn corrupt() -> autumn_harvest_agent::sampling::PolicyStoreError {
+    autumn_harvest_agent::sampling::PolicyStoreError::Corrupt {
+        reason: "test".to_owned(),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_child_gives_a_failed_row_and_the_sweep_goes_on() {
+    let (_dir, db) = fresh_db();
+    // Read 1 is the sweep. Read 2 is item 1, which fails.
+    let store = Scripted::new(|n| {
+        if n == 1 {
+            Err(corrupt())
+        } else {
+            Ok(revision(0))
+        }
+    });
+    let model = three_of_five();
+    let mut rt = runtime(&db, harness(model.clone()).sampling_policies(store));
+    let input = SweepInput::new(
+        KIND,
+        SweepItems::inline(five_items()),
+        SampleStrategy::single(),
+        exact(),
+    );
+    let report = sweep_report(drive(&mut rt, &input).await);
+    assert_eq!(report.rows[0].status, SweepItemStatus::Failed);
+    assert!(report.rows[0].error.as_deref().unwrap().contains("corrupt"));
+    assert_eq!(report.totals.failed, 1);
+    assert!(
+        report.rows[1..]
+            .iter()
+            .all(|row| row.status == SweepItemStatus::Completed)
+    );
+    assert_eq!(report.stopped, SweepStop::Completed);
+    assert_eq!(model.requests().len(), 4);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_child_spends_its_whole_share_of_the_budget() {
+    let (_dir, db) = fresh_db();
+    let store = Scripted::new(|n| {
+        if n == 1 {
+            Err(corrupt())
+        } else {
+            Ok(revision(0))
+        }
+    });
+    let model = three_of_five();
+    let mut rt = runtime(&db, harness(model.clone()).sampling_policies(store));
+    // Item 1 gets the whole budget as its share, and its spend is unknown.
+    let input = SweepInput::new(
+        KIND,
+        SweepItems::inline(five_items()),
+        SampleStrategy::single(),
+        exact(),
+    )
+    .concurrency(1)
+    .max_total_tokens(10);
+    let report = sweep_report(drive(&mut rt, &input).await);
+    assert_eq!(report.rows[0].status, SweepItemStatus::Failed);
+    assert_eq!(report.stopped, SweepStop::BudgetExceeded);
+    assert_eq!(report.totals.not_run, 4);
+    assert_eq!(
+        model.requests().len(),
+        0,
+        "no item runs past the charged share"
     );
 }

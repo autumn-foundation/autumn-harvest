@@ -48,6 +48,13 @@ answer gives a rule.
 | A large answer or reason makes the report too large. | A row keeps at most 512 bytes of the answer and 256 bytes of a reason. |
 | A single draw needs a policy entry that the operator did not give. | `single` needs no strategy. The policy still admits the scorer. |
 | A policy field rides in the input. | `SweepInput` and `SweepItem` deny unknown fields. |
+| The operator changes the policy or the overlay during a sweep, and the report mixes two configurations. | Each row holds the revision and the overlay version of its child. A child with another configuration stops the sweep with `config_changed`. |
+| A per-item token cap stops the whole sweep. | Only an LLM budget refusal (`SampleReport::refused`) stops the sweep. A spent share or profile cap stops its item only. |
+| A failed child spends tokens that the budget never sees. | A failed child counts its whole share as spent. |
+| A cache hit with no usage counts as `not_run`. | `not_run` needs a refusal and only refused draws with no spend. |
+| Each child result puts a whole transcript into the sweep history. | Each child runs with `SampleInput::brief`. |
+| A caller changes the target of an operator scorer. | Only `ExactMatch::per_item` reads `expected`. |
+| A stored list of 64 MiB is decoded on each page read. | A list holds at most 16 MiB, and each read checks its size. |
 | The total cost differs from the ledger. | The total sums the cost of each child report. Each child sums the ledger cost of its turns and its judge calls. |
 
 ## 4. Six thinking hats
@@ -63,7 +70,8 @@ answer gives a rule.
 - **Black (risks).** A field on `SampleInput` and `ScoreInput` touches
   recorded types. Each new field is optional and serde skips it when empty,
   so old histories decode. A sweep of 1000 items has a long history. The
-  sweep does not use continue-as-new.
+  sweep does not use continue-as-new. Each child reads the policy again,
+  because a run never carries a policy.
 - **Yellow (benefits).** A crash costs only the items in flight. One report
   compares strategies by score, accept rate and cost per accepted answer.
 - **Green (ideas).** `agent_refine` can run a sweep as a probe. A vote or a
@@ -77,6 +85,8 @@ answer gives a rule.
 
 ```rust
 pub enum SampleStrategy { Single, BestOfN { n }, Rejection { max_attempts, threshold } }
+// SampleInput adds `expected` and `brief`.
+// SampleReport adds `overlay_version` and `refused`.
 pub struct SweepItem { input: String, expected: Option<String> }
 pub enum SweepItems { Inline(Vec<SweepItem>), Stored(SweepItemsRef) }
 pub struct SweepItemsRef { key: String, digest: String, items: u32, bytes: u64 }
@@ -85,19 +95,20 @@ pub struct SweepInput {
     scorer: ScorerRef, concurrency: Option<NonZeroU32>,
     max_total_tokens: Option<u32>,
 }
-pub enum ItemStatus { Completed, BudgetExceeded, Failed, NotRun }
+pub enum SweepItemStatus { Completed, BudgetExceeded, Failed, NotRun }
 pub struct SweepRow {
     item, status, verdict: Option<Verdict>, accepted, answer: Option<String>,
     draws, usage, cost_usd_micros, error: Option<String>,
+    revision: Option<u64>, overlay_version: Option<OverlayVersion>,
 }
 pub struct SweepTotals {
     items, run, accepted, not_run, failed, mean_score, accept_rate,
     usage, cost_usd_micros, cost_per_accepted_usd_micros,
 }
-pub enum SweepStop { Completed, BudgetExceeded }
+pub enum SweepStop { Completed, BudgetExceeded, ConfigChanged }
 pub struct SweepReport {
-    kind, strategy, revision, concurrency, draw_concurrency, stopped,
-    rows: Vec<SweepRow>, totals: SweepTotals,
+    kind, strategy, scorer, revision, overlay_version, concurrency,
+    draw_concurrency, stopped, rows: Vec<SweepRow>, totals: SweepTotals,
 }
 ```
 
@@ -105,32 +116,39 @@ pub struct SweepReport {
    each, as `agent_sample` does. It admits the strategy and the scorer of
    each item before the first model call.
 2. `sweep_plan` (the kernel) gives the item concurrency `c` and the draws
-   per item `d`. `c` is the ask, or the cap of the policy. `d` is
-   `cap / c`, at most the draws of the strategy. So `c × d ≤ cap`. An ask
-   over the cap is refused with `too_many_concurrent_draws`.
+   per item `d`. `c` is the ask, or else the cap or the item count,
+   whichever is lower. `d` is `cap / c`, at most `n` for best-of-N and 1
+   for each other strategy. So `c × d ≤ cap`. An ask over the cap is
+   refused with `too_many_concurrent_draws`.
 3. Each item runs as one `agent_sample` child with the concurrency `d`. A
    wave holds at most `c` items. `sample_step` gives its width over the
    items. Item `i` of a wave gets the token cap `sibling_cap(left, width,
    i)`.
-4. After a wave, the spend of each item counts against the budget. A child
-   that stops `budget_exceeded` stops the sweep. With no token left and
-   items left, the sweep stops. Each item that did not start is `not_run`.
-5. A `budget_exceeded` child with no tokens and no cost is `not_run`: the
-   budget refused it before its first model call.
+4. After a wave, the spend of each item counts against the budget. A
+   failed child counts its whole share. A child that an LLM budget refused
+   (`SampleReport::refused`) stops the sweep. A spent share or profile cap
+   stops its item only. With no token left and items left, the sweep
+   stops. Each item that did not start is `not_run`.
+5. A refused child whose every draw was refused with no spend is
+   `not_run`: the budget refused it before its first model call.
 6. A child that fails in the engine gives a `failed` row with the error.
    The sweep goes on. Its spend is not in the report.
 7. A stored list is read in pages. A page holds at most 1 MiB of items, and
-   at least one item. Each read checks the digest and the item count.
+   at least one. A list holds at most 16 MiB. Each read checks the digest,
+   the size and the item count.
 8. `SampleInput::expected` passes the expected answer of an item to
-   `ScoreInput::expected`. `ExactMatch` compares with it when it is set.
-   `ExactMatch::per_item` has no text of its own and rejects an item with
-   no expected answer.
+   `ScoreInput::expected`. Only `ExactMatch::per_item` reads it, and it
+   rejects an item with none. `ExactMatch::new` keeps its own text.
 9. The row verdict is the verdict of the selected draw. With no selection,
    it is the best score, or the first reject.
 10. `mean_score` is the mean over the rows with a verdict. A reject counts
     as 0. `accept_rate` is the accepted rows over the rows that ran.
     `cost_per_accepted_usd_micros` is the total cost over the accepted
     rows, rounded down.
+11. Each child reads the profile and the policy again. A child with
+    another policy revision or overlay version stops the sweep after its
+    wave with `config_changed`. Each row holds what its child read.
+12. Each child runs with `brief`, so its result holds no transcript.
 
 **Known limits.**
 
@@ -139,6 +157,9 @@ pub struct SweepReport {
 - The orphan sweep of a shared payload store can delete a stored list that
   no run references. Give the item store its own payload store.
 - A failed child loses its spend in the report. The ledger keeps it.
+- Nothing in the policy caps the draws of one sweep. `max_total_tokens`
+  bounds its spend.
+- The item store is not scoped to a tenant.
 - The loop checks a token cap between model calls, so an item can pass its
   share by one call, as in `agent_sample`.
 
@@ -153,3 +174,5 @@ pub struct SweepReport {
 | A list over the activity cap goes by reference | `a_list_over_the_activity_cap_goes_by_reference` |
 | An example compares two strategies | `examples/sweep_compare.rs` |
 | The kernel | `formal/verus/src/agent_sweep.rs` and the proptest `a_sweep_plan_never_passes_the_cap` |
+| An LLM budget refusal stops the sweep | `an_llm_budget_refusal_stops_the_sweep` |
+| Review follow-ups | `a_policy_change_during_the_sweep_stops_it`, `a_spent_profile_cap_stops_its_item_and_not_the_sweep`, `a_failed_child_gives_a_failed_row_and_the_sweep_goes_on`, `a_failed_child_spends_its_whole_share_of_the_budget`, `a_stored_list_with_no_item_store_fails_before_any_model_call`, `the_store_refuses_a_list_over_the_list_cap`, `a_brief_run_drops_the_transcript_of_the_selected_draw` and `only_a_per_item_exact_match_reads_the_expected_answer` |

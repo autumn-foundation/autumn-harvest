@@ -21,10 +21,11 @@ use autumn_harvest::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use super::admit::{Admission, Ask, Refusal, SampleStep, admit, admit_single, sample_step};
-use super::draws::{draw_task, profile_task, read_policy, read_profile};
+use super::draws::{draw_task, profile_task, read_policy, read_profile_versioned};
 use super::policy::{SamplingPolicy, ScorerRef, Strategy};
 use autumn_harvest::llm_budget::LlmBudgetExceeded;
 
+use crate::agent::overlay_store::OverlayVersion;
 use crate::bounds::{exceeds_activity_input, sibling_cap};
 use crate::draw::{DrawId, run_draw_tasks};
 use crate::harness::cut_bytes;
@@ -132,9 +133,14 @@ pub struct SampleInput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_total_tokens: Option<u32>,
     /// The expected answer. Each score input carries it, so a scorer such
-    /// as [`ExactMatch`](crate::ExactMatch) can compare with it.
+    /// as [`ExactMatch::per_item`](crate::ExactMatch::per_item) can compare
+    /// with it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected: Option<String>,
+    /// Drop the transcript of the selected draw from the report. A sweep
+    /// sets it, so each child result in its history stays short.
+    #[serde(default, skip_serializing_if = "crate::types::is_false")]
+    pub brief: bool,
 }
 
 impl SampleInput {
@@ -154,6 +160,7 @@ impl SampleInput {
             concurrency: None,
             max_total_tokens: None,
             expected: None,
+            brief: false,
         }
     }
 
@@ -241,6 +248,10 @@ pub struct SampleReport {
     pub strategy: SampleStrategy,
     /// The revision of the policy that the run read. 0 for every default.
     pub revision: u64,
+    /// The overlay version of the profile that built each draw. `None` is
+    /// the bare profile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overlay_version: Option<OverlayVersion>,
     /// The most draws at the same time.
     pub concurrency: u32,
     /// The selection.
@@ -254,6 +265,10 @@ pub struct SampleReport {
     pub selected: Option<AgentReport>,
     /// Each draw, in draw order.
     pub draws: Vec<SampleDraw>,
+    /// Whether an LLM budget refused a model call or a judge call of the
+    /// run. A spent token cap does not set it.
+    #[serde(default, skip_serializing_if = "crate::types::is_false")]
+    pub refused: bool,
     /// The tokens of the run tree, judge calls included.
     pub usage: TokenUsage,
     /// The cost of the run tree, judge calls included, in millionths of a
@@ -279,7 +294,7 @@ pub async fn agent_sample(
     if !valid_name(&input.kind) {
         return Err(Refusal::InvalidKind.error_text());
     }
-    let Some(profile) = read_profile(ctx, &input.kind).await? else {
+    let Some((profile, overlay_version)) = read_profile_versioned(ctx, &input.kind).await? else {
         return Err(Refusal::UnknownKind.error_text());
     };
     let read = read_policy(ctx, &input.kind).await?;
@@ -289,14 +304,15 @@ pub async fn agent_sample(
         &admission.draw_effects,
     );
     let budget = tree_budget(task.max_total_tokens, input.max_total_tokens);
-    let (scored, stopped) = run_waves(ctx, &input, &task, &admission, budget).await?;
-    Ok(report(
-        input,
-        read.revision,
-        admission.concurrency,
-        scored,
-        stopped,
-    ))
+    let brief = input.brief;
+    let (scored, stopped, refused) = run_waves(ctx, &input, &task, &admission, budget).await?;
+    let mut report = report(input, read.revision, admission.concurrency, scored, stopped);
+    report.overlay_version = overlay_version;
+    report.refused = refused;
+    if brief && let Some(selected) = &mut report.selected {
+        selected.messages.clear();
+    }
+    Ok(report)
 }
 
 /// Compare the strategy, the concurrency and the scorer of `input` with
@@ -366,13 +382,16 @@ struct Scored {
 /// also stops after a failed score, and when a budget refuses a draw or a
 /// judge call. A pass wins over the other stops, because the run has its
 /// answer.
+///
+/// The flag is `true` when an LLM budget refused a model call or a judge
+/// call. A spent token cap does not set it.
 async fn run_waves(
     ctx: &WorkflowContext,
     input: &SampleInput,
     task: &AgentTask,
     admission: &Admission,
     budget: Option<u32>,
-) -> Result<(Vec<Scored>, SampleStop), String> {
+) -> Result<(Vec<Scored>, SampleStop, bool), String> {
     let mut scored: Vec<Scored> = Vec::new();
     let mut spent: u32 = 0;
     loop {
@@ -386,8 +405,8 @@ async fn run_waves(
             left,
         );
         let width = match step {
-            SampleStep::Done => return Ok((scored, SampleStop::Completed)),
-            SampleStep::BudgetExceeded => return Ok((scored, SampleStop::BudgetExceeded)),
+            SampleStep::Done => return Ok((scored, SampleStop::Completed, false)),
+            SampleStep::BudgetExceeded => return Ok((scored, SampleStop::BudgetExceeded, false)),
             SampleStep::Wave { width } => width,
         };
         let tasks = (0..width)
@@ -413,11 +432,13 @@ async fn run_waves(
             spent = spent.saturating_add(one.record.usage.total());
             scored.push(one);
         }
+        // Only an LLM budget refusal halts a wave with `BudgetExceeded`.
+        let refused = halt == Some(SampleStop::BudgetExceeded);
         if passed && matches!(input.strategy, SampleStrategy::Rejection { .. }) {
-            return Ok((scored, SampleStop::Accepted));
+            return Ok((scored, SampleStop::Accepted, refused));
         }
         if let Some(stop) = halt {
-            return Ok((scored, stop));
+            return Ok((scored, stop, refused));
         }
     }
 }
@@ -559,12 +580,14 @@ fn report(
         kind: input.kind,
         strategy: input.strategy,
         revision,
+        overlay_version: None,
         concurrency,
         outcome,
         stopped,
         attempts,
         selected,
         draws,
+        refused: false,
         usage,
         cost_usd_micros,
     }

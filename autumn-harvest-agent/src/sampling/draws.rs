@@ -29,6 +29,7 @@ use serde::{Deserialize, Serialize};
 use super::admit::{Admission, Ask, Refusal, admit, wave_end};
 use super::policy::{ScorerRef, Strategy};
 use super::store::PolicyRead;
+use crate::agent::overlay_store::OverlayVersion;
 use crate::agent::profile_read::{OverlayRead, ProfileRead, overlaid};
 use crate::agent::{AgentProfile, agent_profile_info, agent_profile_overlay_info};
 use crate::draw::DrawId;
@@ -156,6 +157,17 @@ pub(super) async fn read_profile(
     ctx: &WorkflowContext,
     kind: &str,
 ) -> Result<Option<AgentProfile>, String> {
+    Ok(read_profile_versioned(ctx, kind)
+        .await?
+        .map(|(profile, _)| profile))
+}
+
+/// [`read_profile`], with the overlay version that the profile holds.
+/// `None` is the bare profile.
+pub(super) async fn read_profile_versioned(
+    ctx: &WorkflowContext,
+    kind: &str,
+) -> Result<Option<(AgentProfile, Option<OverlayVersion>)>, String> {
     let read: Option<ProfileRead> = ctx
         .execute_activity(&agent_profile_info(), kind.to_owned())
         .await
@@ -164,7 +176,7 @@ pub(super) async fn read_profile(
         return Ok(None);
     };
     if !read.overlay_store {
-        return Ok(Some(read.profile));
+        return Ok(Some((read.profile, None)));
     }
     let request = OverlayRead {
         kind: kind.to_owned(),
@@ -175,8 +187,8 @@ pub(super) async fn read_profile(
         .await
         .map_err(|err| err.to_string())?;
     Ok(Some(match op.overlay_version {
-        Some(_) => overlaid(&read.profile, &op.profile),
-        None => read.profile,
+        Some(version) => (overlaid(&read.profile, &op.profile), Some(version)),
+        None => (read.profile, None),
     }))
 }
 

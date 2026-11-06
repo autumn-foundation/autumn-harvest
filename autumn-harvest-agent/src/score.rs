@@ -817,9 +817,11 @@ pub async fn agent_sample_score(
 
 /// A scorer that accepts an answer equal to the expected text.
 ///
-/// It trims both texts. The expected answer of the input wins over the
-/// text of the scorer. A match gives `Score(1.0)`. A miss, a run that did
-/// not complete, or an input with no expected text gives a reject.
+/// It trims both texts. A scorer from [`Self::new`] compares with its own
+/// text, so a caller cannot change it. A scorer from [`Self::per_item`]
+/// compares with the expected answer of each input. A match gives
+/// `Score(1.0)`. A miss, a run that does not complete, or no expected text
+/// gives a reject.
 #[derive(Debug, Clone)]
 pub struct ExactMatch {
     id: String,
@@ -840,8 +842,8 @@ impl ExactMatch {
     }
 
     /// A scorer with no text of its own, under the id [`Self::ID`]. It
-    /// reads the expected answer of each input, as a dataset sweep gives
-    /// it.
+    /// reads [`ScoreInput::expected`], as a dataset sweep gives it, and
+    /// rejects an input with none.
     #[must_use]
     pub fn per_item() -> Self {
         Self {
@@ -868,7 +870,10 @@ impl Scorer for ExactMatch {
         input: &'a ScoreInput,
         _cx: &'a ScoreContext<'_>,
     ) -> BoxFuture<'a, Result<Verdict, AgentError>> {
-        let expected = input.expected.as_deref().or(self.expected.as_deref());
+        let expected = self
+            .expected
+            .as_deref()
+            .map_or(input.expected.as_deref(), Some);
         let verdict = incomplete(input.stop).unwrap_or_else(|| match expected {
             None => Verdict::reject("the input has no expected answer"),
             Some(expected) if input.answer.trim() == expected.trim() => {
@@ -1531,11 +1536,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exact_match_prefers_the_expected_answer_of_the_input() {
+    async fn only_a_per_item_exact_match_reads_the_expected_answer() {
         let fixed = ExactMatch::new("Paris");
         let item =
             ScoreInput::new("Capital of Peru?", "Lima", AgentStop::Completed).expected("Lima");
-        assert_eq!(verdict_of(&fixed, &item).await, score(1.0));
+        assert!(
+            verdict_of(&fixed, &item).await.is_reject(),
+            "a caller cannot change the text of a fixed scorer"
+        );
         let per_item = ExactMatch::per_item();
         assert_eq!(per_item.id(), ExactMatch::ID);
         assert_eq!(verdict_of(&per_item, &item).await, score(1.0));

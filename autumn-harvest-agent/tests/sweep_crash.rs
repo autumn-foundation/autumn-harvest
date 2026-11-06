@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use autumn_harvest_agent::model::BoxFuture;
 use autumn_harvest_agent::sampling::{
-    ItemStatus, SampleStrategy, ScorerRef, SweepInput, SweepItem, SweepItems, SweepReport,
+    SampleStrategy, ScorerRef, SweepInput, SweepItem, SweepItemStatus, SweepItems, SweepReport,
 };
 use autumn_harvest_agent::{
     AgentError, AgentHarness, AgentModel, AgentProfile, ChatRequest, ChatResponse, ContentPart,
@@ -187,6 +187,6 @@ async fn a_crash_after_item_three_resumes_at_item_four() {
         report
             .rows
             .iter()
-            .all(|row| row.status == ItemStatus::Completed && row.accepted)
+            .all(|row| row.status == SweepItemStatus::Completed && row.accepted)
     );
 }

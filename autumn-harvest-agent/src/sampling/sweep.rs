@@ -4,14 +4,15 @@
 //! for each item. History records the end of each child, so a crash runs
 //! only the items in flight again. A completed item never runs again.
 //!
-//! - The sweep reads the profile and the policy once each. It admits the
-//!   strategy and the scorer before the first model call.
+//! - The sweep reads the profile and the policy, and admits the strategy
+//!   and the scorer before the first model call. Each child reads them
+//!   again. A child that reads another configuration stops the sweep.
 //! - [`sweep_plan`](super::sweep_plan) splits the policy cap between the
 //!   items and their draws.
 //! - The items share one token budget. Each wave splits the rest with
 //!   `sibling_cap`, as in `agent_sample`.
-//! - A child that stops `budget_exceeded` stops the sweep. Each item that
-//!   did not start is `not_run`.
+//! - An LLM budget refusal in a child stops the sweep. Each item that did
+//!   not start is `not_run`.
 //! - A list over the activity cap goes in a [`SweepItemStore`]. The input
 //!   then holds a [`SweepItemsRef`], and the sweep reads the items in
 //!   recorded pages.
@@ -22,7 +23,7 @@ use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::Duration;
 
-use autumn_harvest::payload_codec::{PayloadCodecs, is_codec_envelope};
+use autumn_harvest::payload_codec::PayloadCodecs;
 use autumn_harvest::payload_store::PayloadStore;
 use autumn_harvest::policy::RetryPolicy;
 use autumn_harvest::prelude::*;
@@ -31,12 +32,13 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use super::admit::{Refusal, SampleStep, SweepPlan, sample_step, sweep_plan};
-use super::draws::{read_policy, read_profile};
+use super::draws::{read_policy, read_profile_versioned};
 use super::policy::{SamplingPolicy, ScorerRef};
 use super::sample::{
     SAMPLE_WORKFLOW_NAME, SampleInput, SampleOutcome, SampleReport, SampleStop, SampleStrategy,
     admit_sample,
 };
+use crate::agent::overlay_store::OverlayVersion;
 use crate::bounds::{json_len, sibling_cap};
 use crate::error::{AgentError, ErrorKind};
 use crate::harness::cut_bytes;
@@ -44,7 +46,7 @@ use crate::mesh::valid_name;
 use crate::message::TokenUsage;
 use crate::response_cache::hex;
 use crate::score::{FiniteF64, Verdict, select};
-use crate::types::MAX_PARALLEL_CHILDREN;
+use crate::types::{AgentStop, MAX_PARALLEL_CHILDREN};
 use crate::workflow::harness;
 
 /// The workflow name of [`agent_sweep`].
@@ -59,14 +61,20 @@ pub const MAX_SWEEP_ITEMS: u32 = 1_000;
 /// cap of an activity.
 pub const MAX_SWEEP_ITEM_BYTES: usize = 64 * 1024;
 
+/// The most bytes of one stored list, as JSON.
+///
+/// Each page read decodes the whole list, so the cap bounds the work of a
+/// sweep.
+pub const MAX_SWEEP_LIST_BYTES: u64 = 16 * 1024 * 1024;
+
 /// The most bytes of the items of one page read, as JSON.
-pub const MAX_PAGE_BYTES: usize = 1024 * 1024;
+pub const MAX_SWEEP_PAGE_BYTES: usize = 1024 * 1024;
 
 /// The most bytes of the answer that a row keeps.
-pub const MAX_ROW_ANSWER_BYTES: usize = 512;
+pub const MAX_SWEEP_ANSWER_BYTES: usize = 512;
 
 /// The most bytes of a reject reason or an error that a row keeps.
-pub const MAX_ROW_REASON_BYTES: usize = 256;
+pub const MAX_SWEEP_REASON_BYTES: usize = 256;
 
 /// One input of a sweep.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -119,7 +127,7 @@ pub struct SweepItemsRef {
 ///
 /// It encodes as `{"inline": [...]}` or `{"stored": {...}}`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", deny_unknown_fields)]
+#[serde(rename_all = "snake_case")]
 pub enum SweepItems {
     /// The items, in order.
     Inline(Vec<SweepItem>),
@@ -213,15 +221,15 @@ impl SweepInput {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
-pub enum ItemStatus {
-    /// The item ran to its end.
+pub enum SweepItemStatus {
+    /// The item runs to its end.
     Completed,
-    /// A budget stopped the item after it spent.
+    /// A budget stops the item after it spends.
     BudgetExceeded,
-    /// The child run failed in the engine. The row holds the error.
+    /// The child run fails in the engine. The row holds the error.
     Failed,
-    /// The item made no model call: the sweep stopped first, or a budget
-    /// refused the first call.
+    /// The item makes no model call: the sweep stops first, or an LLM
+    /// budget refuses each first call.
     NotRun,
 }
 
@@ -232,34 +240,42 @@ pub struct SweepRow {
     /// The index of the item, from 0.
     pub item: u32,
     /// What happened to the item.
-    pub status: ItemStatus,
-    /// The verdict of the selected draw. With no selection, the best
-    /// score, else the first reject. `None` when no draw ran.
+    pub status: SweepItemStatus,
+    /// The verdict of the selected draw. With no selection, it is the best
+    /// score, else the first reject. `None` when no draw runs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verdict: Option<Verdict>,
     /// Whether the item selected a draw.
     pub accepted: bool,
-    /// The answer of the selected draw, cut to [`MAX_ROW_ANSWER_BYTES`].
+    /// The answer of the selected draw, cut to [`MAX_SWEEP_ANSWER_BYTES`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub answer: Option<String>,
-    /// The draws that ran.
+    /// The number of draws that the item runs.
     pub draws: u32,
     /// The tokens of the item tree, judge calls included.
     pub usage: TokenUsage,
     /// The cost of the item tree, in millionths of a US dollar.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "crate::agent::is_zero")]
     pub cost_usd_micros: u64,
-    /// The error of a failed item, cut to [`MAX_ROW_REASON_BYTES`].
+    /// The error of a failed item, cut to [`MAX_SWEEP_REASON_BYTES`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// The policy revision that the child reads. `None` when no child
+    /// report comes back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<u64>,
+    /// The overlay version of the profile that builds the draws of the
+    /// child. `None` is the bare profile, or no child report.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overlay_version: Option<OverlayVersion>,
 }
 
 impl SweepRow {
-    /// The row of an item that made no model call.
+    /// The row of an item that makes no model call.
     const fn not_run(item: u32) -> Self {
         Self {
             item,
-            status: ItemStatus::NotRun,
+            status: SweepItemStatus::NotRun,
             verdict: None,
             accepted: false,
             answer: None,
@@ -267,6 +283,8 @@ impl SweepRow {
             usage: TokenUsage::new(0, 0),
             cost_usd_micros: 0,
             error: None,
+            revision: None,
+            overlay_version: None,
         }
     }
 }
@@ -295,7 +313,7 @@ pub struct SweepTotals {
     /// The tokens of the sweep tree.
     pub usage: TokenUsage,
     /// The cost of the sweep tree, in millionths of a US dollar.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "crate::agent::is_zero")]
     pub cost_usd_micros: u64,
     /// `cost_usd_micros / accepted`, rounded down. `None` when no item
     /// selected a draw.
@@ -303,15 +321,18 @@ pub struct SweepTotals {
     pub cost_per_accepted_usd_micros: Option<u64>,
 }
 
-/// Why the sweep started no more items.
+/// Why the sweep starts no more items.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum SweepStop {
-    /// Each item started.
+    /// Each item starts.
     Completed,
-    /// A budget refused an item, or no token is left.
+    /// An LLM budget refuses a call of an item, or no token is left.
     BudgetExceeded,
+    /// A child reads another policy revision or another overlay version
+    /// than the sweep. The rows of that wave keep what each child read.
+    ConfigChanged,
 }
 
 /// The result of one `agent_sweep` run.
@@ -324,13 +345,17 @@ pub struct SweepReport {
     pub strategy: SampleStrategy,
     /// The scorer of each item.
     pub scorer: ScorerRef,
-    /// The revision of the policy that the sweep read. 0 for every default.
+    /// The revision of the policy that the sweep reads. 0 for every default.
     pub revision: u64,
+    /// The overlay version of the profile that the sweep reads. `None` is
+    /// the bare profile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overlay_version: Option<OverlayVersion>,
     /// The most items at the same time.
     pub concurrency: u32,
     /// The most draws of one item at the same time.
     pub draw_concurrency: u32,
-    /// Why the sweep stopped.
+    /// Why the sweep stops.
     pub stopped: SweepStop,
     /// One row for each item, in item order.
     pub rows: Vec<SweepRow>,
@@ -354,14 +379,18 @@ pub async fn agent_sweep(ctx: &WorkflowContext, input: SweepInput) -> Result<Swe
         return Err(Refusal::InvalidKind.error_text());
     }
     let total = check_items(&input.items).map_err(|refusal| refusal.error_text())?;
-    if read_profile(ctx, &input.kind).await?.is_none() {
+    let Some((_, overlay_version)) = read_profile_versioned(ctx, &input.kind).await? else {
         return Err(Refusal::UnknownKind.error_text());
-    }
+    };
     let read = read_policy(ctx, &input.kind).await?;
-    let plan = plan(&read.policy, &input).map_err(|refusal| refusal.error_text())?;
+    let plan = plan(&read.policy, &input, total).map_err(|refusal| refusal.error_text())?;
     let mut source = ItemSource::new(&input.items);
     let mut rows = Vec::with_capacity(usize::try_from(total).unwrap_or(0));
-    let stopped = run_items(ctx, &input, plan, total, &mut source, &mut rows).await?;
+    let admitted = Admitted {
+        revision: read.revision,
+        overlay_version,
+    };
+    let stopped = run_items(ctx, &input, plan, admitted, total, &mut source, &mut rows).await?;
     let ran = u32::try_from(rows.len()).unwrap_or(u32::MAX);
     rows.extend((ran..total).map(SweepRow::not_run));
     let totals = totals(total, &rows);
@@ -370,12 +399,30 @@ pub async fn agent_sweep(ctx: &WorkflowContext, input: SweepInput) -> Result<Swe
         strategy: input.strategy,
         scorer: input.scorer,
         revision: read.revision,
+        overlay_version,
         concurrency: plan.items,
         draw_concurrency: plan.draws,
         stopped,
         rows,
         totals,
     })
+}
+
+/// The policy revision and the overlay version that the sweep admits
+/// under.
+#[derive(Debug, Clone, Copy)]
+struct Admitted {
+    revision: u64,
+    overlay_version: Option<OverlayVersion>,
+}
+
+impl Admitted {
+    /// Whether `row` comes from a child that read another configuration.
+    fn differs(self, row: &SweepRow) -> bool {
+        row.revision.is_some_and(|revision| {
+            revision != self.revision || row.overlay_version != self.overlay_version
+        })
+    }
 }
 
 /// The item concurrency and the draw concurrency of a sweep.
@@ -418,8 +465,13 @@ fn check_item_sizes(items: &[SweepItem]) -> Result<(), Refusal> {
 /// [`sweep_plan`] splits the cap between the items and their draws. The
 /// sample admission then checks the strategy, the draws and the scorer of
 /// one item, with the draw concurrency of the plan.
-fn plan(policy: &SamplingPolicy, input: &SweepInput) -> Result<Plan, Refusal> {
-    let asked = input.concurrency.map_or(0, NonZeroU32::get);
+fn plan(policy: &SamplingPolicy, input: &SweepInput, total: u32) -> Result<Plan, Refusal> {
+    // With no ask, the sweep takes the cap, at most one slot per item. The
+    // draws of each item then share the rest of the cap.
+    let cap = policy.max_concurrent_draws.clamp(1, MAX_PARALLEL_CHILDREN);
+    let asked = input
+        .concurrency
+        .map_or_else(|| cap.min(total), NonZeroU32::get);
     let wide = match input.strategy {
         SampleStrategy::BestOfN { n } => n,
         _ => 1,
@@ -445,6 +497,7 @@ fn item_input(input: &SweepInput, item: &SweepItem, draws: u32) -> SampleInput {
     )
     .concurrency(draws);
     sample.expected.clone_from(&item.expected);
+    sample.brief = true;
     sample
 }
 
@@ -453,10 +506,16 @@ fn item_input(input: &SweepInput, item: &SweepItem, draws: u32) -> SampleInput {
 /// [`sample_step`] gives the width of each wave over the items. Item `i`
 /// of a wave gets the token cap `sibling_cap(left, width, i)`. After the
 /// wave, the spend of each item counts against the budget.
+///
+/// Each child reads the profile and the policy again. A child that reads
+/// another configuration stops the sweep after its wave, so a change by
+/// the operator applies at once. A configuration change wins over a
+/// budget stop.
 async fn run_items(
     ctx: &WorkflowContext,
     input: &SweepInput,
     plan: Plan,
+    admitted: Admitted,
     total: u32,
     source: &mut ItemSource<'_>,
     rows: &mut Vec<SweepRow>,
@@ -485,15 +544,25 @@ async fn run_items(
             .spawn_child_workflow_fan_out_collect_raw(children)
             .await
             .map_err(|err| err.to_string())?;
-        let mut halt = false;
-        for (item, result) in (started..).zip(ended) {
+        let mut halt = None;
+        for ((index, item), result) in (0..width).zip(started..).zip(ended) {
             let (row, refused) = row_of(item, result);
-            halt |= refused;
-            spent = spent.saturating_add(row.usage.total());
+            if admitted.differs(&row) {
+                halt = Some(SweepStop::ConfigChanged);
+            } else if refused {
+                halt = halt.or(Some(SweepStop::BudgetExceeded));
+            }
+            // A failed child returns no spend, so its whole share counts.
+            let cost = if row.status == SweepItemStatus::Failed && budget.is_some() {
+                sibling_cap(left, width, index)
+            } else {
+                row.usage.total()
+            };
+            spent = spent.saturating_add(cost);
             rows.push(row);
         }
-        if halt {
-            return Ok(SweepStop::BudgetExceeded);
+        if let Some(stop) = halt {
+            return Ok(stop);
         }
     }
 }
@@ -552,10 +621,11 @@ impl<'a> ItemSource<'a> {
     }
 }
 
-/// The row of item `item`, and whether a budget stopped it.
+/// The row of item `item`, and whether an LLM budget refused a call of it.
 ///
-/// A child that a budget stopped with no spend is `not_run`: the budget
-/// refused its first model call. A child that fails gives a `failed` row.
+/// A child that stops `budget_exceeded` gives a `budget_exceeded` row. A
+/// child whose every draw an LLM budget refused before any spend is
+/// `not_run`. A child that fails gives a `failed` row.
 fn row_of(item: u32, result: Result<Value, String>) -> (SweepRow, bool) {
     let report = result.and_then(|value| {
         serde_json::from_value::<SampleReport>(value).map_err(|err| err.to_string())
@@ -564,40 +634,51 @@ fn row_of(item: u32, result: Result<Value, String>) -> (SweepRow, bool) {
         Ok(report) => report,
         Err(error) => {
             let row = SweepRow {
-                status: ItemStatus::Failed,
-                error: Some(cut_bytes(error, MAX_ROW_REASON_BYTES)),
+                status: SweepItemStatus::Failed,
+                error: Some(cut_bytes(error, MAX_SWEEP_REASON_BYTES)),
                 ..SweepRow::not_run(item)
             };
             return (row, false);
         }
     };
     let budget = report.stopped == SampleStop::BudgetExceeded;
-    if budget && report.usage.total() == 0 && report.cost_usd_micros == 0 {
-        return (SweepRow::not_run(item), true);
+    let never_ran = report
+        .draws
+        .iter()
+        .all(|draw| draw.stop == AgentStop::BudgetExceeded && draw.usage.total() == 0);
+    if report.refused && never_ran {
+        let row = SweepRow {
+            revision: Some(report.revision),
+            overlay_version: report.overlay_version,
+            ..SweepRow::not_run(item)
+        };
+        return (row, true);
     }
     let row = SweepRow {
         item,
         status: if budget {
-            ItemStatus::BudgetExceeded
+            SweepItemStatus::BudgetExceeded
         } else {
-            ItemStatus::Completed
+            SweepItemStatus::Completed
         },
         verdict: row_verdict(&report),
         accepted: matches!(report.outcome, SampleOutcome::Selected { .. }),
         answer: report
             .selected
             .as_ref()
-            .map(|selected| cut_bytes(selected.text.clone(), MAX_ROW_ANSWER_BYTES)),
+            .map(|selected| cut_bytes(selected.text.clone(), MAX_SWEEP_ANSWER_BYTES)),
         draws: report.attempts,
         usage: report.usage,
         cost_usd_micros: report.cost_usd_micros,
         error: None,
+        revision: Some(report.revision),
+        overlay_version: report.overlay_version,
     };
-    (row, budget)
+    (row, report.refused)
 }
 
 /// The verdict of a row: the selected draw, else the best score, else the
-/// first reject. A reject reason is cut to [`MAX_ROW_REASON_BYTES`].
+/// first reject. A reject reason is cut to [`MAX_SWEEP_REASON_BYTES`].
 fn row_verdict(report: &SampleReport) -> Option<Verdict> {
     let all: Vec<_> = report
         .draws
@@ -613,19 +694,19 @@ fn row_verdict(report: &SampleReport) -> Option<Verdict> {
         .or_else(|| all.first())
         .map(|(_, verdict)| verdict.clone())?;
     Some(match verdict {
-        Verdict::Reject(reason) => Verdict::reject(cut_bytes(reason, MAX_ROW_REASON_BYTES)),
+        Verdict::Reject(reason) => Verdict::reject(cut_bytes(reason, MAX_SWEEP_REASON_BYTES)),
         scored @ Verdict::Score(_) => scored,
     })
 }
 
 /// The totals of `rows`.
 fn totals(items: u32, rows: &[SweepRow]) -> SweepTotals {
-    let count = |status: ItemStatus| {
+    let count = |status: SweepItemStatus| {
         let n = rows.iter().filter(|row| row.status == status).count();
         u32::try_from(n).unwrap_or(u32::MAX)
     };
-    let not_run = count(ItemStatus::NotRun);
-    let failed = count(ItemStatus::Failed);
+    let not_run = count(SweepItemStatus::NotRun);
+    let failed = count(SweepItemStatus::Failed);
     let run = u32::try_from(rows.len())
         .unwrap_or(u32::MAX)
         .saturating_sub(not_run);
@@ -691,7 +772,7 @@ pub struct SweepPage {
 
 /// One page of a stored list, as an activity.
 ///
-/// A page holds the items from `start`, at most [`MAX_PAGE_BYTES`] of
+/// A page holds the items from `start`, at most [`MAX_SWEEP_PAGE_BYTES`] of
 /// them, and at least one. It is empty only when `start` is past the end.
 ///
 /// # Errors
@@ -701,7 +782,7 @@ pub struct SweepPage {
 /// when the store fails.
 #[activity(
     start_to_close = "1m",
-    retry = RetryPolicy::exponential(3, Duration::from_secs(1))
+    retry = RetryPolicy::exponential(8, Duration::from_secs(2))
 )]
 pub async fn agent_sweep_items(
     ctx: &ActivityContext,
@@ -745,8 +826,9 @@ impl SweepItemStore {
     /// # Errors
     ///
     /// Returns a `Config` error for an empty list, a list over
-    /// [`MAX_SWEEP_ITEMS`] or an item over [`MAX_SWEEP_ITEM_BYTES`]. The
-    /// store then writes nothing. Returns an `Unavailable` error when the
+    /// [`MAX_SWEEP_ITEMS`] or [`MAX_SWEEP_LIST_BYTES`], an item over
+    /// [`MAX_SWEEP_ITEM_BYTES`], or a list that does not encode. The store
+    /// then writes nothing. Returns an `Unavailable` error when the
     /// store fails.
     pub async fn put(&self, items: &[SweepItem]) -> Result<SweepItems, AgentError> {
         let count = u32::try_from(items.len()).unwrap_or(u32::MAX);
@@ -762,9 +844,15 @@ impl SweepItemStore {
         // The digest reads the canonical form: a JSON value sorts its keys,
         // so a read after the codec gives the same bytes.
         let value = serde_json::to_value(items)
-            .map_err(|err| AgentError::new(ErrorKind::Decode, err.to_string()))?;
+            .map_err(|err| AgentError::new(ErrorKind::Config, err.to_string()))?;
         let plain = serde_json::to_vec(&value)
-            .map_err(|err| AgentError::new(ErrorKind::Decode, err.to_string()))?;
+            .map_err(|err| AgentError::new(ErrorKind::Config, err.to_string()))?;
+        if plain.len() as u64 > MAX_SWEEP_LIST_BYTES {
+            return Err(AgentError::new(
+                ErrorKind::Config,
+                format!("the list is larger than {MAX_SWEEP_LIST_BYTES} bytes"),
+            ));
+        }
         let digest = hex(&Sha256::digest(&plain));
         let encoded = self.codecs.encode_payload(&value).map_err(|_| {
             AgentError::new(
@@ -773,7 +861,7 @@ impl SweepItemStore {
             )
         })?;
         let bytes = serde_json::to_vec(&encoded)
-            .map_err(|err| AgentError::new(ErrorKind::Decode, err.to_string()))?;
+            .map_err(|err| AgentError::new(ErrorKind::Config, err.to_string()))?;
         let key = self
             .store
             .put(&bytes)
@@ -791,14 +879,20 @@ impl SweepItemStore {
     ///
     /// # Errors
     ///
-    /// Returns a `Decode` error when the list has another digest, another
-    /// count or an item over [`MAX_SWEEP_ITEM_BYTES`]. Returns an
+    /// Returns a `Decode` error when the list has another digest, size or
+    /// count, or an item over [`MAX_SWEEP_ITEM_BYTES`]. Returns an
     /// `Unavailable` error when the store fails.
     pub async fn page(
         &self,
         items: &SweepItemsRef,
         start: u32,
     ) -> Result<Vec<SweepItem>, AgentError> {
+        if items.bytes > MAX_SWEEP_LIST_BYTES {
+            return Err(AgentError::new(
+                ErrorKind::Decode,
+                format!("a stored sweep list is larger than {MAX_SWEEP_LIST_BYTES} bytes"),
+            ));
+        }
         let bytes = self
             .store
             .get(&items.key)
@@ -806,7 +900,7 @@ impl SweepItemStore {
             .map_err(|err| AgentError::new(ErrorKind::Unavailable, err.to_string()))?;
         let list = self.decode(&bytes, items)?;
         let from = usize::try_from(start).unwrap_or(usize::MAX);
-        let max = MAX_PAGE_BYTES as u64;
+        let max = MAX_SWEEP_PAGE_BYTES as u64;
         let mut size = 0_u64;
         let mut page = Vec::new();
         for item in list.into_iter().skip(from) {
@@ -824,20 +918,12 @@ impl SweepItemStore {
     /// The errors use fixed text, because a serde error can quote an item.
     fn decode(&self, bytes: &[u8], items: &SweepItemsRef) -> Result<Vec<SweepItem>, AgentError> {
         let shape = || AgentError::new(ErrorKind::Decode, "a stored sweep list does not decode");
+        // The digest of the reference binds the plain list. So a plain blob
+        // from before a codec rollout still reads.
         let value: Value = serde_json::from_slice(bytes).map_err(|_| shape())?;
-        let encoding = self
-            .codecs
-            .active_codec_id()
-            .unwrap_or_else(|| self.codecs.default_codec_id());
-        if encoding != "identity" && !is_codec_envelope(&value) {
-            return Err(AgentError::new(
-                ErrorKind::Decode,
-                "a stored sweep list is not a codec envelope",
-            ));
-        }
         let decoded = self.codecs.decode_payload(&value).map_err(|_| shape())?;
         let plain = serde_json::to_vec(&decoded).map_err(|_| shape())?;
-        if hex(&Sha256::digest(&plain)) != items.digest {
+        if plain.len() as u64 != items.bytes || hex(&Sha256::digest(&plain)) != items.digest {
             return Err(AgentError::new(
                 ErrorKind::Decode,
                 "the stored sweep list has another digest than its reference",
@@ -892,7 +978,7 @@ mod tests {
         let (row, halted) = row_of(4, Ok(value.clone()));
         assert!(!halted);
         assert_eq!(row.item, 4);
-        assert_eq!(row.status, ItemStatus::Completed);
+        assert_eq!(row.status, SweepItemStatus::Completed);
         assert!(!row.accepted);
         assert_eq!(
             row.verdict.and_then(|verdict| verdict.as_score()),
@@ -906,7 +992,7 @@ mod tests {
 
     #[test]
     fn a_row_cuts_a_long_reject_reason() {
-        let long = "r".repeat(MAX_ROW_REASON_BYTES * 4);
+        let long = "r".repeat(MAX_SWEEP_REASON_BYTES * 4);
         let value = sample(
             "completed",
             &serde_json::json!("no_accepted_draw"),
@@ -916,45 +1002,77 @@ mod tests {
         let Some(Verdict::Reject(reason)) = row.verdict else {
             panic!("expected a reject");
         };
-        assert!(reason.len() <= MAX_ROW_REASON_BYTES);
+        assert!(reason.len() <= MAX_SWEEP_REASON_BYTES);
     }
 
     #[test]
-    fn a_budget_stop_with_spend_is_budget_exceeded_and_halts() {
-        let value = sample(
+    fn a_budget_stop_halts_only_on_an_llm_refusal() {
+        let mut value = sample(
             "budget_exceeded",
             &serde_json::json!({"selected": {"draw": 0}}),
             &serde_json::json!([draw(0, &serde_json::json!({"score": 1.0}))]),
         );
-        let (row, halted) = row_of(0, Ok(value));
-        assert!(halted);
-        assert_eq!(row.status, ItemStatus::BudgetExceeded);
+        let (row, halted) = row_of(0, Ok(value.clone()));
+        assert!(!halted, "a spent token cap stops the item only");
+        assert_eq!(row.status, SweepItemStatus::BudgetExceeded);
         assert!(row.accepted);
         assert_eq!(row.cost_usd_micros, 9);
+        value["refused"] = serde_json::json!(true);
+        let (row, halted) = row_of(0, Ok(value));
+        assert!(halted, "an LLM refusal stops the sweep");
+        assert_eq!(
+            row.status,
+            SweepItemStatus::BudgetExceeded,
+            "the item spent"
+        );
+    }
+
+    #[test]
+    fn an_item_refused_before_any_spend_is_not_run() {
+        let refused_draw = serde_json::json!({
+            "draw": 0, "stop": "budget_exceeded", "verdict": {"reject": "budget"},
+            "usage": {"input_tokens": 0, "output_tokens": 0},
+        });
+        let mut value = sample(
+            "budget_exceeded",
+            &serde_json::json!("no_accepted_draw"),
+            &serde_json::json!([refused_draw]),
+        );
+        value["refused"] = serde_json::json!(true);
+        let (row, halted) = row_of(3, Ok(value.clone()));
+        assert!(halted);
+        assert_eq!(row.status, SweepItemStatus::NotRun);
+        assert_eq!(row.revision, Some(0));
+        // A draw that completes with no spend, such as a cache hit, ran.
+        value["draws"] = serde_json::json!([draw(0, &serde_json::json!({"score": 1.0}))]);
+        value["outcome"] = serde_json::json!({"selected": {"draw": 0}});
+        let (row, _) = row_of(3, Ok(value));
+        assert_eq!(row.status, SweepItemStatus::BudgetExceeded);
+        assert!(row.accepted);
     }
 
     #[test]
     fn a_failed_child_gives_a_failed_row_that_does_not_halt() {
-        let (row, halted) = row_of(2, Err("e".repeat(MAX_ROW_REASON_BYTES * 2)));
+        let (row, halted) = row_of(2, Err("e".repeat(MAX_SWEEP_REASON_BYTES * 2)));
         assert!(!halted);
-        assert_eq!(row.status, ItemStatus::Failed);
-        assert!(row.error.unwrap().len() <= MAX_ROW_REASON_BYTES);
+        assert_eq!(row.status, SweepItemStatus::Failed);
+        assert!(row.error.unwrap().len() <= MAX_SWEEP_REASON_BYTES);
         assert_eq!(row.draws, 0);
     }
 
     #[test]
     fn the_totals_count_each_status() {
         let mut accepted = SweepRow::not_run(0);
-        accepted.status = ItemStatus::Completed;
+        accepted.status = SweepItemStatus::Completed;
         accepted.accepted = true;
         accepted.verdict = Some(Verdict::score(1.0).unwrap());
         accepted.cost_usd_micros = 10;
         let mut rejected = SweepRow::not_run(1);
-        rejected.status = ItemStatus::Completed;
+        rejected.status = SweepItemStatus::Completed;
         rejected.verdict = Some(Verdict::reject("no"));
         rejected.cost_usd_micros = 5;
         let mut failed = SweepRow::not_run(2);
-        failed.status = ItemStatus::Failed;
+        failed.status = SweepItemStatus::Failed;
         let rows = [accepted, rejected, failed, SweepRow::not_run(3)];
         let totals = totals(4, &rows);
         assert_eq!(
@@ -976,7 +1094,7 @@ mod tests {
         let mut rows = Vec::new();
         for item in 0..2 {
             let mut row = SweepRow::not_run(item);
-            row.status = ItemStatus::Completed;
+            row.status = SweepItemStatus::Completed;
             row.verdict = Some(Verdict::score(f64::MAX).unwrap());
             rows.push(row);
         }

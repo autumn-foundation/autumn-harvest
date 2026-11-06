@@ -421,7 +421,7 @@ pub fn admit(policy: &SamplingPolicy, ask: &Ask<'_>) -> Result<Admission, Refusa
 /// # Errors
 ///
 /// Returns the first [`Refusal`].
-pub fn admit_single(
+pub(super) fn admit_single(
     policy: &SamplingPolicy,
     concurrency: u32,
     scorer: Option<&ScorerRef>,
