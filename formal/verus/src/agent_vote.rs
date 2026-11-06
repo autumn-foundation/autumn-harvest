@@ -615,8 +615,8 @@ proof fn lemma_relabel(s: Seq<(u32, Option<u32>)>, f: spec_fn(u32) -> u32, keys:
 /// The engine numbers each key by its first appearance. So a different
 /// cast order gives another numbering and another order of the same
 /// votes. Here `t` holds the votes of `s` renamed by `f`, in any order.
-/// With one vote per draw, the winner of `t` is the rename of the winner
-/// of `s`, with the same votes and the same first draw.
+/// With one vote per draw, the winner of `t` is the renamed winner of
+/// `s`. It keeps its votes and its first draw.
 pub proof fn theorem_a_cast_order_does_not_change_the_winner(
     s: Seq<(u32, Option<u32>)>,
     t: Seq<(u32, Option<u32>)>,
