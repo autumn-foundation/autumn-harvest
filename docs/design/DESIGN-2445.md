@@ -47,7 +47,9 @@ gives a rule.
 | A NaN threshold accepts each score. | A threshold is a `FiniteF64`. A NaN does not decode. |
 | The ledger cannot tell the tiers apart. | Each tier asks its own harness model, so each ledger row holds the model id of its tier. |
 | An older worker drops `cascade_models`. | The policy denies unknown keys. An older worker fails closed. The key skips its default on encode. |
-| A tier index runs twice. | `cascade_step` returns a tier at or after `next`, and the run moves `next` past it. Verus proves the step. |
+| A tier index runs twice. | `cascade_step` returns a tier at or after `next`, and the run moves `next` past it. Verus proves the step and the loop. |
+| `agent_draws` runs a cascade as a plain fan-out of the profile model. | `agent_draws` refuses `cascade` with `sample_only`. |
+| A best-of-N report gains a field and changes its bytes. | `SampleDraw::model` is set for a cascade draw only. |
 
 ## 4. Six thinking hats
 
@@ -95,12 +97,14 @@ pub struct SkippedTier { pub tier: u32, pub model: String, pub refusal: Refusal 
    concurrency, the scorer and the judge model. `admit_tiers` then checks
    that `cascade_models` lists each tier model. A miss fails the run with
    `sampling refused (tier_model_not_allowed)`.
-2. A cascade asks for a concurrency of 1. A larger ask is refused with
-   `too_many_concurrent_draws`.
+2. A cascade asks for a concurrency of 1. After the checks of step 1, a
+   larger ask is refused with `too_many_concurrent_draws`.
 3. `cascade_step` (the kernel) gives the next tier: the first tier at or
    after `next` that the mandate allows. With no such tier, the step is
    `Done`. With no token left, the step is `BudgetExceeded`.
-4. The run names each tier that it passes over with `not_permitted`.
+4. The report names each tier that the mandate forbids with
+   `not_permitted`. The mandate does not change during a run, so the list
+   does not depend on why the run stops.
 5. Tier `i` is draw `i`. It runs the task of the profile with
    `model = tiers[i].model`, and with the rest of the token budget.
 6. The run scores the tier. A score at or above the tier threshold
@@ -110,7 +114,9 @@ pub struct SkippedTier { pub tier: u32, pub model: String, pub refusal: Refusal 
    stop or a failed score stops the run, as for the other strategies.
 8. When no tier accepts, `select` picks the best verdict of the tiers that
    ran. The outcome is `escalated`. With each tier rejected, it is
-   `no_accepted_draw`.
+   `no_accepted_draw`. A budget stop or a failed score can also give
+   `escalated`, and `stopped` names the reason.
+9. `agent_draws` refuses `cascade` with `sample_only`.
 
 **Known limits.**
 
@@ -130,5 +136,6 @@ pub struct SkippedTier { pub tier: u32, pub model: String, pub refusal: Refusal 
 | One ledger row per tier with its model id | `the_ledger_has_one_row_per_tier_with_its_model_id` |
 | A crash after tier 1 resumes at tier 2 | `a_crash_after_tier_one_resumes_at_tier_two` in `tests/sample_cascade_crash.rs` |
 | A tier model outside the policy is refused first | `a_tier_model_outside_the_policy_is_refused_before_any_model_call` |
-| The kernel | `formal/verus/src/agent_sampling.rs` and the proptest `a_cascade_step_never_runs_a_forbidden_tier` |
+| The kernel and the loop | `cascade_step` and `cascade_order` in `formal/verus/src/agent_sampling.rs`, and the proptest `a_cascade_step_never_runs_a_forbidden_tier` |
+| Review follow-ups | `a_budget_stop_still_names_each_forbidden_tier`, `the_strategy_check_comes_before_the_cascade_concurrency_check`, `a_tier_model_that_the_harness_lacks_fails_and_the_next_tier_runs`, `a_cascade_with_no_tier_is_refused`, `agent_draws_refuses_a_cascade` and `a_best_of_n_report_records_no_draw_model` |
 | The guide | `docs/agent-adapter.md`, section 20, "Model cascade" |

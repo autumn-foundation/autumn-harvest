@@ -2418,7 +2418,8 @@ wider effects than a single run of its kind.
   id `n`, so N draws are N samples, not one cached answer.
 
 `agent_draws` returns each draw report. An engine failure of a draw fails
-the run. `agent_sample` (section 20) scores the draws and selects one.
+the run. `agent_draws` refuses `cascade` with `sample_only`, because only
+`agent_sample` asks a model per tier. `agent_sample` (section 20) scores the draws and selects one.
 
 ### Upgrade every worker first
 
@@ -2509,12 +2510,14 @@ model is not called.
 - `outcome`: `selected { draw }`; `escalated { draw }` when no tier of a
   cascade accepted; or `no_accepted_draw` when no draw passed;
 - `selected`: the `AgentReport` of the selected draw;
-- `stopped`: `completed`, `accepted` (a rejection run found a pass),
+- `stopped`: `completed`, `accepted` (a rejection or cascade run found a pass),
   `budget_exceeded` or `score_failed`;
 - `attempts`: the draws that ran;
-- `draws`: for each draw, its model, stop, verdict, usage and cost. The
-  usage and the cost include the judge calls of the draw;
-- `skipped`: each cascade tier that the run did not ask, with its refusal;
+- `draws`: for each draw, its stop, verdict, usage and cost. The usage and
+  the cost include the judge calls of the draw. A cascade draw also holds
+  the `model` of its tier;
+- `skipped`: each cascade tier whose model the mandate forbids, with its
+  refusal;
 - `usage` and `cost_usd_micros`: the totals. They equal the cost ledger
   rows of the run tree.
 
@@ -2559,16 +2562,21 @@ The run asks the tiers in order, one draw per tier. Tier `i` is draw `i`.
    the run with `sampling refused (tier_model_not_allowed)` before any
    model call.
 2. A cascade runs one tier at a time. A `concurrency` above 1 fails with
-   `too_many_concurrent_draws`.
+   `too_many_concurrent_draws`, after the checks of step 1.
 3. When the mandate of the profile does not allow the model of a tier
-   (`Mandate::allows_model`), the run skips the tier. `skipped` names it
-   with the refusal `not_permitted`, and the next tier runs.
+   (`Mandate::allows_model`), the run skips the tier, and the next tier
+   runs. `skipped` names each such tier with the refusal `not_permitted`,
+   as `{"tier": 0, "model": "cheap", "refusal": {"refusal":
+   "not_permitted"}}`.
 4. The run stops at the first tier whose score is at or above its
    threshold. The outcome is `selected`, and `stopped` is `accepted`.
 5. A tier that fails gets a reject, and the next tier runs.
 6. When no tier accepts, `select` picks the best score among the tiers that
    ran. The outcome is `escalated`. With each tier rejected, it is
    `no_accepted_draw`.
+7. A budget stop or a failed score can end the run before the last tier.
+   The outcome is then `escalated` when a tier has a score. `stopped`
+   gives the reason, so check it before you deliver the answer.
 
 The tiers share the token budget. Each tier gets the tokens that are
 left. Each tier is a child run, and history records each score. So a

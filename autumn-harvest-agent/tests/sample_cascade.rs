@@ -19,8 +19,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use autumn_harvest_agent::model::BoxFuture;
 use autumn_harvest_agent::sampling::{
-    InMemorySamplingPolicyStore, Refusal, SampleInput, SampleOutcome, SampleReport, SampleStop,
-    SampleStrategy, SamplingPolicy, SamplingPolicyStore, ScorerRef, SkippedTier, Strategy, Tier,
+    DrawsInput, InMemorySamplingPolicyStore, Refusal, SampleInput, SampleOutcome, SampleReport,
+    SampleStop, SampleStrategy, SamplingPolicy, SamplingPolicyStore, ScorerRef, SkippedTier,
+    Strategy, Tier,
 };
 use autumn_harvest_agent::{
     AgentError, AgentHarness, AgentModel, AgentProfile, AgentStop, ChatRequest, ChatResponse,
@@ -262,6 +263,9 @@ async fn the_cheap_tier_accepts_and_the_strong_model_is_not_called() {
     assert_eq!(report.draws[0].model.as_deref(), Some("cheap"));
     assert_eq!(report.skipped, []);
     assert_eq!(report.concurrency, 1);
+    let rows = ledger_rows(&rt);
+    let ids: Vec<&str> = rows.iter().map(|row| row.model.as_str()).collect();
+    assert_eq!(ids, ["cheap-v1"], "the ledger holds only the cheap row");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -566,6 +570,56 @@ async fn a_spent_budget_stops_the_cascade_before_the_strong_tier() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_budget_stop_still_names_each_forbidden_tier() {
+    let (_dir, db) = fresh_db();
+    let models = Models::new("meh", "great");
+    let scorer = Table(vec![("meh", 0.3), ("great", 0.95)]);
+    let policy = cascade_policy(&["cheap", "mid", "strong"]);
+    let profile = AgentProfile::new(KIND).mandate(Mandate::new(KIND).models(["cheap", "strong"]));
+    let mut rt = runtime(&db, models.harness(profile, scorer, &policy));
+    // The cheap tier spends the whole budget. The mid tier is forbidden.
+    let input = SampleInput::new(
+        KIND,
+        "Answer well.",
+        SampleStrategy::cascade([tier("cheap", 0.5), tier("mid", 0.7), tier("strong", 0.8)]),
+        table(),
+    )
+    .max_total_tokens(5);
+    let report = sample_report(drive(&mut rt, &input).await);
+    assert_eq!(report.stopped, SampleStop::BudgetExceeded);
+    assert_eq!(models.strong.calls(), 0);
+    let tiers: Vec<(u32, &str)> = report
+        .skipped
+        .iter()
+        .map(|skip| (skip.tier, skip.model.as_str()))
+        .collect();
+    assert_eq!(
+        tiers,
+        [(1, "mid")],
+        "the reason of the stop does not matter"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_strategy_check_comes_before_the_cascade_concurrency_check() {
+    let (_dir, db) = fresh_db();
+    let models = Models::new("meh", "great");
+    let policy = SamplingPolicy {
+        strategies: BTreeSet::from([Strategy::BestOfN]),
+        max_concurrent_draws: 4,
+        ..cascade_policy(&["cheap", "strong"])
+    };
+    let mut rt = runtime(
+        &db,
+        models.harness(AgentProfile::new(KIND), Table(Vec::new()), &policy),
+    );
+    match drive(&mut rt, &two_tiers(0.5, 0.8).concurrency(2)).await {
+        RunState::Failed(error) => assert!(error.contains("strategy_not_allowed"), "{error}"),
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn each_tier_rejected_selects_nothing() {
     let (_dir, db) = fresh_db();
     let models = Models::new("meh", "ok");
@@ -593,6 +647,95 @@ async fn a_cascade_with_each_tier_forbidden_runs_no_model() {
     assert_eq!(report.stopped, SampleStop::Completed);
     let tiers: Vec<u32> = report.skipped.iter().map(|skip| skip.tier).collect();
     assert_eq!(tiers, [0, 1]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_tier_model_that_the_harness_lacks_fails_and_the_next_tier_runs() {
+    let (_dir, db) = fresh_db();
+    let models = Models::new("meh", "great");
+    let scorer = Table(vec![("great", 0.95)]);
+    let policy = cascade_policy(&["absent", "strong"]);
+    let mut rt = runtime(
+        &db,
+        models.harness(AgentProfile::new(KIND), scorer, &policy),
+    );
+    let input = SampleInput::new(
+        KIND,
+        "Answer well.",
+        SampleStrategy::cascade([tier("absent", 0.5), tier("strong", 0.8)]),
+        table(),
+    );
+    let report = sample_report(drive(&mut rt, &input).await);
+    assert_eq!(report.draws[0].stop, AgentStop::Failed);
+    assert_eq!(report.draws[0].model.as_deref(), Some("absent"));
+    assert_eq!(models.cheap.calls(), 0, "no fall back to another model");
+    assert_eq!(
+        report.outcome,
+        SampleOutcome::Selected {
+            draw: DrawId::new(1)
+        }
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cascade_with_no_tier_is_refused() {
+    let (_dir, db) = fresh_db();
+    let models = Models::new("meh", "great");
+    let policy = cascade_policy(&["cheap"]);
+    let mut rt = runtime(
+        &db,
+        models.harness(AgentProfile::new(KIND), Table(Vec::new()), &policy),
+    );
+    let input = SampleInput::new(KIND, "x", SampleStrategy::cascade([]), table());
+    match drive(&mut rt, &input).await {
+        RunState::Failed(error) => assert!(error.contains("no_draws"), "{error}"),
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn agent_draws_refuses_a_cascade() {
+    let (_dir, db) = fresh_db();
+    let models = Models::new("meh", "great");
+    let policy = cascade_policy(&["cheap", "strong"]);
+    let mut rt = runtime(
+        &db,
+        models.harness(AgentProfile::new(KIND), Table(Vec::new()), &policy),
+    );
+    let input = DrawsInput::new(KIND, "x", Strategy::Cascade, 2);
+    let exec = sqlite::start_draws(&mut rt, &input).unwrap();
+    match rt.run_until_blocked(exec).await.unwrap() {
+        RunState::Failed(error) => {
+            assert!(
+                error.starts_with("sampling refused (sample_only)"),
+                "{error}"
+            );
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    assert_eq!(models.cheap.calls() + models.strong.calls(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_best_of_n_report_records_no_draw_model() {
+    let (_dir, db) = fresh_db();
+    let models = Models::new("good", "great");
+    let policy = SamplingPolicy {
+        strategies: BTreeSet::from([Strategy::BestOfN]),
+        ..cascade_policy(&["cheap"])
+    };
+    let profile = AgentProfile::new(KIND).model("cheap");
+    let mut rt = runtime(
+        &db,
+        models.harness(profile, Table(vec![("good", 0.9)]), &policy),
+    );
+    let input = SampleInput::new(KIND, "x", SampleStrategy::best_of_n(1), table());
+    let report = sample_report(drive(&mut rt, &input).await);
+    assert_eq!(models.cheap.calls(), 1, "the profile model answers");
+    assert_eq!(report.draws[0].model, None);
+    let wire = serde_json::to_value(&report).unwrap();
+    assert!(wire["draws"][0].get("model").is_none(), "the bytes stay");
+    assert!(wire.get("skipped").is_none());
 }
 
 #[test]

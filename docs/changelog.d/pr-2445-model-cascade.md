@@ -15,13 +15,17 @@ in `docs/design/DESIGN-2445.md`.
   fails the run with `tier_model_not_allowed` before any model call. A
   cascade with a `concurrency` above 1 is refused.
 - A tier whose model the mandate of the profile does not allow is skipped.
-  `SampleReport::skipped` names it with `Refusal::NotPermitted`. A failed
-  tier gets a reject, and the next tier runs.
-- `SampleDraw::model` records the harness model of each draw. Each tier
-  asks its own model, so the cost ledger has one row per tier with the
-  model id of that tier.
-- `cascade_step` gives the next tier. Verus proves it, and a spec model
-  shows that each tier runs at most once, in order.
+  `SampleReport::skipped` names each such tier with
+  `Refusal::NotPermitted`. A failed tier gets a reject, and the next tier
+  runs.
+- `SampleDraw::model` records the harness model of each cascade draw. A
+  best-of-N or rejection report keeps its bytes. Each tier asks its own
+  model, so the cost ledger has one row per tier with the model id of
+  that tier.
+- `agent_draws` refuses `cascade` with `sample_only`.
+- `cascade_step` gives the next tier. Verus proves it. Verus also proves
+  `cascade_order`, the loop over the step: it asks each allowed tier once,
+  in order.
 - CLI: `harvest agents sampling policy <kind> set --cascade-models a,b`.
 - No migration. No new `WorkflowEvent` variant. No new activity.
 

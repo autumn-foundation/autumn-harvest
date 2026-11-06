@@ -187,7 +187,7 @@ pub struct SamplingPolicy {
     #[serde(default)]
     pub max_answer_retries: u32,
     /// The harness models that a cascade tier may name. None by default,
-    /// so each cascade is refused.
+    /// so the policy refuses each cascade.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub cascade_models: BTreeSet<String>,
 }

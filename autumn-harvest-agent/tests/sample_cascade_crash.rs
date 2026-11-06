@@ -173,6 +173,11 @@ async fn a_crash_after_tier_one_resumes_at_tier_two() {
     let cheap = all.iter().filter(|line| line.ends_with("cheap")).count();
     assert_eq!(cheap, 1, "tier 1 is never called again");
     assert_eq!(report.draws.len(), 2);
+    assert_eq!(report.draws[0].model.as_deref(), Some("cheap"));
+    assert!(
+        report.draws[0].verdict.is_reject(),
+        "the score of tier 1 from before the crash"
+    );
     assert_eq!(
         report.outcome,
         SampleOutcome::Selected {

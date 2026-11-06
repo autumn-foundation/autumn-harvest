@@ -77,9 +77,14 @@ pub enum Refusal {
         /// The model that the tier names.
         model: String,
     },
-    /// The mandate of the kind does not allow the model of a cascade tier.
-    /// The run skips the tier, and it does not fail.
+    /// The mandate of the profile does not allow the model of a cascade
+    /// tier. The run skips the tier, and it does not fail.
     NotPermitted,
+    /// `agent_draws` cannot run the strategy. Only `agent_sample` runs it.
+    SampleOnly {
+        /// The strategy that the run asked for.
+        strategy: Strategy,
+    },
     /// The kind is not a valid agent kind.
     InvalidKind,
     /// No agent profile has the kind, so no task can be built.
@@ -105,6 +110,7 @@ impl Refusal {
             Self::OtherTenant => "other_tenant",
             Self::TierModelNotAllowed { .. } => "tier_model_not_allowed",
             Self::NotPermitted => "not_permitted",
+            Self::SampleOnly { .. } => "sample_only",
             Self::InvalidKind => "invalid_kind",
             Self::UnknownKind => "unknown_kind",
         }
@@ -155,6 +161,9 @@ impl std::fmt::Display for Refusal {
             ),
             Self::NotPermitted => {
                 f.write_str("the mandate of this kind does not allow the model of the tier")
+            }
+            Self::SampleOnly { strategy } => {
+                write!(f, "only agent_sample runs {strategy}")
             }
             Self::InvalidKind => f.write_str("the kind is not a valid agent kind"),
             Self::UnknownKind => f.write_str("no agent profile has the kind"),
@@ -385,8 +394,8 @@ pub const fn cascade_step(
 
 /// Refuse the first tier whose model is outside `cascade_models`.
 ///
-/// It runs before the first model call. A long model name is cut in the
-/// refusal.
+/// It runs before the first model call. The refusal cuts a long model
+/// name.
 ///
 /// # Errors
 ///

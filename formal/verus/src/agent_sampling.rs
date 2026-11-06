@@ -32,6 +32,8 @@
 //! that the mandate forbids, and it never returns a tier before `next`.
 //! `spec_ran` is a spec model of the run. In it, each tier runs at most
 //! once and in order. Each tier that runs is one that the mandate allows.
+//! `cascade_order` is the loop of the engine over `cascade_step`. The
+//! proof shows that it asks exactly the tiers of `spec_ran`.
 
 use vstd::arithmetic::div_mod::*;
 use vstd::prelude::*;
@@ -345,6 +347,62 @@ pub proof fn theorem_the_step_tier_heads_the_run(allowed: Seq<bool>, next: int)
     if next < allowed.len() && !allowed[next] {
         theorem_the_step_tier_heads_the_run(allowed, next + 1);
     }
+}
+
+/// The loop of `run_tiers` with no budget and no tier that accepts. It
+/// calls `cascade_step`, asks the tier, and moves `next` past it. The
+/// proof shows that it asks exactly the tiers of `spec_ran`, in order.
+pub fn cascade_order(allowed: &[bool]) -> (r: Vec<usize>)
+    ensures
+        r@.map_values(|t: usize| t as int) == spec_ran(allowed@, 0),
+{
+    let len = allowed.len();
+    let mut ran: Vec<usize> = Vec::new();
+    let mut next: usize = 0;
+    loop
+        invariant
+            len == allowed@.len(),
+            next <= len,
+            ran@.map_values(|t: usize| t as int) + spec_ran(allowed@, next as int) == spec_ran(
+                allowed@,
+                0,
+            ),
+        ensures
+            ran@.map_values(|t: usize| t as int) == spec_ran(allowed@, 0),
+        decreases len - next,
+    {
+        proof {
+            theorem_the_step_tier_heads_the_run(allowed@, next as int);
+        }
+        let step = cascade_step(allowed, next, false, 0);
+        match step {
+            CascadeStep::Run { tier } => {
+                proof {
+                    assert(tier < len);
+                    assert(tier as int == spec_first_allowed(allowed@, next as int));
+                    let before = ran@.map_values(|t: usize| t as int);
+                    let rest = spec_ran(allowed@, tier as int + 1);
+                    assert(ran@.push(tier).map_values(|t: usize| t as int) =~= before.push(
+                        tier as int,
+                    ));
+                    assert(before.push(tier as int) + rest =~= before + (seq![tier as int]
+                        + rest));
+                }
+                ran.push(tier);
+                next = tier + 1;
+            },
+            _ => {
+                proof {
+                    assert(spec_first_allowed(allowed@, next as int) >= allowed@.len());
+                    assert(spec_ran(allowed@, next as int).len() == 0);
+                    let before = ran@.map_values(|t: usize| t as int);
+                    assert(before + spec_ran(allowed@, next as int) =~= before);
+                }
+                break ;
+            },
+        }
+    }
+    ran
 }
 
 /// `next_policy_revision` as a spec.

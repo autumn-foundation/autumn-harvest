@@ -13,7 +13,7 @@
 //! - [`agent_draws`] reads the policy once, admits the request and runs the
 //!   draws.
 //! - [`agent_sample`] runs best-of-N, rejection sampling or a model
-//!   cascade. It scores each draw and selects one (issue #2443).
+//!   cascade. It scores each draw and selects one.
 //! - [`admit_answer_check`] caps the answer check of a run (issue #2442).
 //!
 //! A run never carries a policy field. [`AgentTask`](crate::AgentTask),

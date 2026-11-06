@@ -48,6 +48,7 @@ pub const SAMPLE_WORKFLOW_NAME: &str = "agent_sample";
 /// tier accepts.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct Tier {
     /// The harness model of the tier, as `AgentHarness::model_named` names
     /// it. The policy must list it in `cascade_models`.
@@ -224,7 +225,7 @@ pub enum SampleOutcome {
     NoAcceptedDraw,
 }
 
-/// A cascade tier that the run did not ask.
+/// A cascade tier whose model the mandate forbids. The run never asks it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct SkippedTier {
@@ -261,7 +262,8 @@ pub struct SampleDraw {
     /// The run id of the draw.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_id: Option<String>,
-    /// The harness model of the draw. `None` is the default model.
+    /// The harness model of a cascade tier. `None` for each other
+    /// strategy, so its report keeps its bytes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     /// Why the draw run ended.
@@ -299,7 +301,9 @@ pub struct SampleReport {
     pub selected: Option<AgentReport>,
     /// Each draw, in draw order.
     pub draws: Vec<SampleDraw>,
-    /// Each cascade tier that the run skipped, in tier order.
+    /// Each cascade tier whose model the mandate forbids, in tier order.
+    /// The run never asks such a tier. A skipped tier encodes as
+    /// `{"tier": 0, "model": "m", "refusal": {"refusal": "not_permitted"}}`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub skipped: Vec<SkippedTier>,
     /// The tokens of the run tree, judge calls included.
@@ -334,13 +338,6 @@ pub async fn agent_sample(
     let concurrency = input
         .concurrency
         .map_or_else(|| default_concurrency(&input.strategy), NonZeroU32::get);
-    if matches!(input.strategy, SampleStrategy::Cascade { .. }) && concurrency > 1 {
-        let refusal = Refusal::TooManyConcurrentDraws {
-            asked: concurrency,
-            max: 1,
-        };
-        return Err(refusal.error_text());
-    }
     let ask = Ask {
         strategy: input.strategy.policy_strategy(),
         draws: input.strategy.draws(),
@@ -349,6 +346,13 @@ pub async fn agent_sample(
     };
     let admission = admit(&read.policy, &ask).map_err(|refusal| refusal.error_text())?;
     if let SampleStrategy::Cascade { tiers } = &input.strategy {
+        if concurrency > 1 {
+            let refusal = Refusal::TooManyConcurrentDraws {
+                asked: concurrency,
+                max: 1,
+            };
+            return Err(refusal.error_text());
+        }
         admit_tiers(&read.policy, tiers).map_err(|refusal| refusal.error_text())?;
     }
     let task = draw_task(
@@ -476,25 +480,29 @@ fn permits(task: &AgentTask, model: &str) -> bool {
         .is_none_or(|mandate| mandate.allows_model(Some(model)))
 }
 
-/// The tiers `from..to` of `tiers`, each named as skipped by the mandate.
-fn skips(tiers: &[Tier], from: usize, to: usize) -> impl Iterator<Item = SkippedTier> + '_ {
+/// Each tier whose model the mandate forbids, as `allowed` gives it.
+///
+/// The mandate does not change during a run. So the list does not depend
+/// on why the run stops.
+fn forbidden(tiers: &[Tier], allowed: &[bool]) -> Vec<SkippedTier> {
     tiers
         .iter()
+        .zip(allowed)
         .enumerate()
-        .take(to)
-        .skip(from)
-        .map(|(index, tier)| SkippedTier {
+        .filter(|(_, (_, allowed))| !**allowed)
+        .map(|(index, (tier, _))| SkippedTier {
             tier: u32::try_from(index).unwrap_or(u32::MAX),
             model: tier.model.clone(),
             refusal: Refusal::NotPermitted,
         })
+        .collect()
 }
 
 /// Ask the tiers of a cascade in order, and score each answer.
 ///
 /// [`cascade_step`] gives the next tier. Tier `i` is draw `i`, and it asks
-/// the model of the tier with the rest of the token budget. The run names
-/// each tier that the mandate forbids, and asks the next one.
+/// the model of the tier with the rest of the token budget. The run skips
+/// each tier that the mandate forbids, and the report names each one.
 ///
 /// The run stops at the first tier that accepts. It also stops after a
 /// failed score, and when a budget refuses a tier or a judge call. A tier
@@ -510,15 +518,14 @@ async fn run_tiers(
         .iter()
         .map(|tier| permits(task, &tier.model))
         .collect();
+    let skipped = forbidden(tiers, &allowed);
     let mut scored: Vec<Scored> = Vec::new();
-    let mut skipped: Vec<SkippedTier> = Vec::new();
     let mut spent: u32 = 0;
     let mut next = 0;
     loop {
         let left = budget.map_or(0, |max| max.saturating_sub(spent));
         let (index, tier) = match cascade_step(&allowed, next, budget.is_some(), left) {
             CascadeStep::Done => {
-                skipped.extend(skips(tiers, next, tiers.len()));
                 return Ok(Ended {
                     scored,
                     skipped,
@@ -533,7 +540,6 @@ async fn run_tiers(
                 });
             }
             CascadeStep::Run { tier } => {
-                skipped.extend(skips(tiers, next, tier));
                 let Some(found) = tiers.get(tier) else {
                     return Err(format!("the cascade has no tier {tier}"));
                 };
@@ -552,7 +558,8 @@ async fn run_tiers(
         };
         let report = report?;
         let halt = (report.stop == AgentStop::BudgetExceeded).then_some(SampleStop::BudgetExceeded);
-        let (one, halted) = score_draw(ctx, input, &draw, id, report, halt).await?;
+        let (mut one, halted) = score_draw(ctx, input, &draw, id, report, halt).await?;
+        one.record.model = Some(tier.model.clone());
         spent = spent.saturating_add(one.record.usage.total());
         let accepted = passes(&input.strategy, id, &one.record.verdict);
         scored.push(one);
@@ -653,7 +660,7 @@ async fn score_draw(
     let record = SampleDraw {
         draw,
         run_id: report.run_id.clone(),
-        model: task.model.clone(),
+        model: None,
         stop: report.stop,
         verdict,
         usage: report.usage.saturating_add(usage),
@@ -792,17 +799,18 @@ mod tests {
     }
 
     #[test]
-    fn the_skips_name_each_tier_in_the_range() {
+    fn the_report_names_each_forbidden_tier() {
         let tiers = [
             Tier::new("a", FiniteF64::ONE),
             Tier::new("b", FiniteF64::ONE),
             Tier::new("c", FiniteF64::ONE),
         ];
-        let named: Vec<(u32, String)> = skips(&tiers, 1, 3)
+        let named: Vec<(u32, String)> = forbidden(&tiers, &[true, false, false])
+            .into_iter()
             .map(|skip| (skip.tier, skip.model))
             .collect();
         assert_eq!(named, [(1, "b".to_owned()), (2, "c".to_owned())]);
-        assert_eq!(skips(&tiers, 2, 2).count(), 0);
+        assert_eq!(forbidden(&tiers, &[true, true, true]), []);
     }
 
     #[test]
