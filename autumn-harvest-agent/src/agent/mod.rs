@@ -270,7 +270,8 @@ pub enum Control {
     },
     /// Run the held ops in order, then take new ones.
     Resume,
-    /// Clear the memory of the agent.
+    /// Clear the memory of the agent. Also remove each lesson of the kind
+    /// that names the agent, so a lesson that other agents share goes too.
     ResetMemory,
     /// Clear the transcript, its progress notes and its flow labels. The
     /// labels of the memory notes and of the workspace files stay.
@@ -1674,16 +1675,29 @@ impl AgentRun<'_> {
             .map_err(|err| err.to_string())
     }
 
-    /// Remove each lesson of the kind that a run of the agent is a source
-    /// of, and count them. Returns `None` when the harness has no memory
-    /// store.
+    /// Remove each lesson of the kind that names the agent, and count them.
+    /// Returns `None` when the harness has no memory store, or when the
+    /// agent id does not parse.
+    ///
+    /// The match step records the lessons first, so a retried removal
+    /// keeps the count.
     async fn erase_lessons(&self) -> Result<Option<u64>, String> {
         let Ok(id) = &self.id else {
             return Ok(None);
         };
+        let agent = id.as_str().to_owned();
+        let matched: Option<crate::refine::LessonMatch> = self
+            .ctx
+            .execute_activity(&crate::refine::agent_lesson_match_info(), agent.clone())
+            .await
+            .map_err(|err| format!("{err}"))?;
+        let Some(matched) = matched else {
+            return Ok(None);
+        };
         let erase = crate::refine::LessonErase {
-            agent: id.as_str().to_owned(),
+            agent,
             key: EditKey::new(format!("lessons:{}", self.ctx.new_uuid())),
+            matched,
         };
         self.ctx
             .execute_activity(&crate::refine::agent_lesson_erase_info(), erase)

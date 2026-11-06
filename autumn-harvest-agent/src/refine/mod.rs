@@ -49,10 +49,11 @@ pub use gate::{
 };
 pub use ledger::{MAX_REFINE_K, MAX_SOURCE_RUNS, RefineError, RefineLedger, RefineMode};
 pub use lessons::{
-    LESSONS_BLOCK, Lesson, LessonErase, LessonOutcome, LessonRequest, MAX_LESSON_CHARS,
-    MAX_SNAPSHOT_CHARS, MAX_WHY_CHARS, agent_lesson_erase, agent_lesson_erase_info,
-    agent_refine_lesson, agent_refine_lesson_info, evictions, lesson_scope, lessons_block,
-    read_lessons, writes_lesson,
+    LESSONS_BLOCK, Lesson, LessonErase, LessonMatch, LessonOutcome, LessonRequest,
+    MAX_LESSON_CHARS, MAX_SNAPSHOT_CHARS, MAX_WHY_CHARS, agent_lesson_erase,
+    agent_lesson_erase_info, agent_lesson_match, agent_lesson_match_info, agent_refine_lesson,
+    agent_refine_lesson_info, evictions, lesson_scope, lessons_block, names_agent, read_lessons,
+    writes_lesson,
 };
 pub use meter::{Charge, Meter};
 pub use model_proposer::{

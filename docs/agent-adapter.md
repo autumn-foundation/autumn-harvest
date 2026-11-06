@@ -1496,7 +1496,7 @@ idempotency key. An app without the module sends the same signal.
 | `user_message` | Runs one segment with the text as the user message. |
 | `control: pause` | Holds each later message in the state. |
 | `control: resume` | Runs the held messages in order, then takes new ones. |
-| `control: reset_memory` | Clears the memory: the scope `agent:<id>`, or the state memory. |
+| `control: reset_memory` | Clears the memory: the scope `agent:<id>`, or the state memory. It also removes each lesson of the kind that names the agent (section 24). |
 | `control: clear_transcript` | Clears the transcript. Only the labels of the memory and of the workspace files stay (issues #2272, #2274). |
 | `control: reset_workspace` | Deletes every workspace snapshot of the agent (issue #2274). |
 
@@ -2823,13 +2823,17 @@ on the harness that implements `MemoryStore::ensure_block` and
 - **Scope.** The memory scope `kind:<kind>:lessons` holds one block,
   `lessons`. Each entry is one lesson as one line of JSON. It holds the
   adopted `version`, the `why` and `lesson` text of the select step, the
-  `sources` exec ids and the `agents` ids. `refine::read_lessons` decodes
-  a block.
+  `sources` exec ids and the `agents` ids. `agents` holds each agent of
+  the kind that a source names: its workflow id, the agent of its memory
+  scope `agent:<id>`, and each agent of its mandate chain. It also holds
+  each agent of the lessons that the run read. `refine::read_lessons`
+  decodes a block.
 - **Write.** A run that ends `adopted` or `auto_adopted` runs
   `agent_refine_lesson`. A rejected, timed-out or superseded run writes
   none. The report holds the result in `lesson`: `written`, with the
-  version and the evicted count, or `failed`, with the error. A failed
-  write never undoes the adoption.
+  version and the evicted count of the attempt that answered, or
+  `failed`, with the error. A failed write never undoes the adoption. A
+  cancel during the write still cancels the run.
 - **Taint.** The lesson keeps the flow labels of the run: each label of
   each source and of the lessons that the run read. The report holds them
   in `flow_labels`. A store that cannot keep labels refuses a labelled
@@ -2838,15 +2842,22 @@ on the harness that implements `MemoryStore::ensure_block` and
   the oldest lessons until the block holds at most that many. A change of
   the bound applies to the next write.
 - **Read.** The start step records the library, cut to the newest lessons
-  in 32 768 characters. Each proposer stage gets it in
-  `ProposeContext::lessons`, with its labels. `ModelProposer` puts it in
-  its prompt as data.
+  that fit 32 768 rendered characters. A failed read gives no library and
+  a warning. Each proposer stage gets it in `ProposeContext::lessons`,
+  with its labels. `ModelProposer` puts it in its prompt as data.
 - **Why and lesson.** A selector gives the text with
   `OverlaySelector::choose`. The default calls `select` and gives none. A
   rule pick and a sequential run give none.
 - **Erase.** `Control::ResetMemory` removes each lesson of the kind whose
-  `agents` holds the agent id. A source is a run of the agent when its
-  workflow id is the agent id. `AgentState::lessons_removed` counts them,
-  and `harvest agents erase` reports `lessons_removed`.
-- **Upgrade.** A run that started on an older release has no source
-  labels, so it writes no lesson. Its report notes why.
+  `agents` holds the agent id, also one that other agents share.
+  `agent_lesson_match` records the matches first, so a retried removal
+  keeps the count. The removal step fails while a match remains.
+  `AgentState::lessons_removed` counts them, and `harvest agents erase`
+  reports `lessons_removed`. History keeps copies of the text in each
+  refine run that read or wrote a lesson. Erase those runs too.
+- **Upgrade.** Upgrade each activity worker first: an older worker
+  refuses a `ProposeRequest` with `lessons`. A run that started on an
+  older release has no source labels, so it writes no lesson. Its report
+  notes why.
+- **Fleet.** `InMemoryMemoryStore` lives in one process. Each worker of a
+  fleet needs the same durable store.

@@ -482,12 +482,12 @@ pub trait MemoryStore: Send + Sync + std::fmt::Debug {
     }
 
     /// Add `block` to `scope` when the scope holds no block with its label.
-    /// A block that the scope holds stays as it is. A new scope first gets
-    /// its default blocks, as [`load`](Self::load) gives them.
+    /// A new scope then holds only `block`, with no default block.
     ///
-    /// The lesson library of a kind calls it before its first write. The
-    /// default refuses, so a store that cannot add a block never reports
-    /// one.
+    /// The call is idempotent. It matches a block by its label only, so a
+    /// held block keeps its description, limit and entries. The lesson
+    /// library of a kind calls it before each write. The default returns a
+    /// `Config` error.
     ///
     /// # Errors
     ///
@@ -628,10 +628,7 @@ impl MemoryStore for InMemoryMemoryStore {
         block: MemoryBlock,
     ) -> BoxFuture<'a, Result<(), AgentError>> {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        let blocks = state
-            .scopes
-            .entry(scope.clone())
-            .or_insert_with(|| self.template.clone());
+        let blocks = state.scopes.entry(scope.clone()).or_default();
         if !blocks.iter().any(|held| held.label == block.label) {
             blocks.push(block);
         }
@@ -899,8 +896,27 @@ mod tests {
         store.ensure_block(&scope, block).await.unwrap();
         let blocks = store.load(&scope).await.unwrap();
         let labels: Vec<&str> = blocks.iter().map(|b| b.label.as_str()).collect();
+        assert_eq!(labels, ["lessons"], "a new scope holds only the block");
+        assert_eq!(blocks[0].entries, ["one"]);
+        // A scope with its default blocks keeps them.
+        let agent = MemoryScope::new("agent:support/ada");
+        let note = MemoryOp::Add {
+            block: "memory".to_owned(),
+            text: "a note".to_owned(),
+        };
+        store.apply(&agent, note, &EditKey::new("n")).await.unwrap();
+        store
+            .ensure_block(&agent, MemoryBlock::new("lessons", "d", 1))
+            .await
+            .unwrap();
+        let labels: Vec<String> = store
+            .load(&agent)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|b| b.label)
+            .collect();
         assert_eq!(labels, ["memory", "user", "lessons"]);
-        assert_eq!(blocks[2].entries, ["one"]);
     }
 
     #[tokio::test]

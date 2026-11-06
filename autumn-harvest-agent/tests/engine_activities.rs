@@ -304,6 +304,7 @@ fn the_engine_registration_builds() {
             "agent_episode_append",
             "agent_episode_reset",
             "agent_refine_lesson",
+            "agent_lesson_match",
             "agent_lesson_erase",
         ]
     );

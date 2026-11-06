@@ -3351,6 +3351,7 @@ pub fn activities() -> Vec<ActivityInfo> {
         crate::consolidate::agent_episode_append_info(),
         crate::consolidate::agent_episode_reset_info(),
         crate::refine::agent_refine_lesson_info(),
+        crate::refine::agent_lesson_match_info(),
         crate::refine::agent_lesson_erase_info(),
     ];
     #[cfg(feature = "eval")]

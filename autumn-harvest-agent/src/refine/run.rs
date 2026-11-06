@@ -198,9 +198,11 @@ pub struct SourceBrief {
     /// release has none, so its run writes no lesson.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub labels: Option<BTreeSet<String>>,
-    /// The workflow id of the source, when it is an agent id of the kind.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub agent: Option<String>,
+    /// The agents of the kind that the source names: its workflow id, the
+    /// agent of its memory scope `agent:<id>`, and each agent of its
+    /// mandate chain.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub agents: BTreeSet<String>,
 }
 
 /// The input of [`agent_refine_start`].
@@ -238,9 +240,13 @@ pub struct RefineStart {
     #[serde(default)]
     pub active_read: bool,
     /// The lesson library of the kind. Each proposer stage reads it. `None`
-    /// when the worker has no memory store, or the library is empty.
+    /// when the worker has no memory store, the library is empty, or the
+    /// read failed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lessons: Option<MemorySnapshot>,
+    /// The agents that the lessons of [`Self::lessons`] name.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub lesson_agents: BTreeSet<String>,
 }
 
 /// The part of the loop that a stage plays.
@@ -532,16 +538,24 @@ fn brief_of(
     let task = task_of(&record.events).map_err(|err| not_replayable(err.to_string()))?;
     let mut source_profile = crate::eval::source_profile(&task);
     kind.clone_into(&mut source_profile.kind);
-    let agent = AgentId::parse(&record.workflow_id)
-        .ok()
+    let scope_agent = task
+        .memory_scope
+        .as_ref()
+        .and_then(|scope| scope.as_str().strip_prefix("agent:"));
+    let chain = task.mandate.iter().flat_map(|mandate| mandate.chain.iter());
+    let agents = std::iter::once(record.workflow_id.as_str())
+        .chain(scope_agent)
+        .chain(chain.map(String::as_str))
+        .filter_map(|name| AgentId::parse(name).ok())
         .filter(|id| id.kind() == kind)
-        .map(|id| id.as_str().to_owned());
+        .map(|id| id.as_str().to_owned())
+        .collect();
     Ok(SourceBrief {
         run,
         evidence,
         profile: source_profile,
         labels: Some(labels),
-        agent,
+        agents,
     })
 }
 
@@ -602,7 +616,7 @@ pub(crate) async fn run_start(
             }));
         }
     }
-    let lessons = lessons_of(harness, &input.kind).await?;
+    let (lessons, lesson_agents) = lessons_of(harness, &input.kind).await.unzip();
     Ok(RefineStart {
         profile,
         current,
@@ -612,20 +626,33 @@ pub(crate) async fn run_start(
         active: active.as_ref().map(StoredOverlay::version),
         active_read: true,
         lessons,
+        lesson_agents: lesson_agents.unwrap_or_default(),
     })
 }
 
-/// The snapshot of the lesson library of `kind`, or `None` with no memory
-/// store.
-async fn lessons_of(harness: &AgentHarness, kind: &str) -> Result<Option<MemorySnapshot>, String> {
-    let Ok(store) = harness.memory_store() else {
-        return Ok(None);
-    };
-    let blocks = tokio::time::timeout(harness.hook_limit(), store.load(&lesson_scope(kind)))
-        .await
-        .map_err(|_| "the memory store did not answer in time".to_owned())?
-        .map_err(|err| format!("the lesson library read failed: {err}"))?;
-    Ok(super::lessons::snapshot(&blocks))
+/// The snapshot of the lesson library of `kind`, and the agents that it
+/// names. `None` with no memory store.
+///
+/// A failed read gives `None` and a warning. The proposers then read no
+/// lesson, so the run takes no lesson label. A store fault never fails the
+/// start step.
+async fn lessons_of(
+    harness: &AgentHarness,
+    kind: &str,
+) -> Option<(MemorySnapshot, BTreeSet<String>)> {
+    let store = harness.memory_store().ok()?;
+    let read = tokio::time::timeout(harness.hook_limit(), store.load(&lesson_scope(kind))).await;
+    match read {
+        Ok(Ok(blocks)) => super::lessons::snapshot(&blocks),
+        Ok(Err(err)) => {
+            tracing::warn!(error = %err, "the lesson library was not read");
+            None
+        }
+        Err(_) => {
+            tracing::warn!("the lesson library read timed out");
+            None
+        }
+    }
 }
 
 /// The start step of a refine run, as an activity. See [`run_start`].
@@ -1258,7 +1285,7 @@ pub async fn agent_refine(
         start: &start,
     }
     .lesson(ctx, run.reason.clone(), flow_labels.clone())
-    .await;
+    .await?;
     Ok(RefineReport {
         kind: input.kind.clone(),
         mode: input.mode,
@@ -1291,15 +1318,21 @@ impl Ended<'_> {
     ///
     /// `reason` holds the `why` and `lesson` text of the selection that set
     /// the chosen overlay.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`write_lesson`].
     async fn lesson(
         &self,
         ctx: &WorkflowContext,
         (why, lesson): (Option<String>, Option<String>),
         labels: Option<BTreeSet<String>>,
-    ) -> Option<LessonOutcome> {
-        let version = self.adopted?;
+    ) -> Result<Option<LessonOutcome>, String> {
+        let Some(version) = self.adopted else {
+            return Ok(None);
+        };
         if !writes_lesson(self.status) || !ctx.patched(LESSON_PATCH) {
-            return None;
+            return Ok(None);
         }
         let lesson = Lesson {
             version,
@@ -1310,10 +1343,13 @@ impl Ended<'_> {
                 .start
                 .sources
                 .iter()
-                .filter_map(|source| source.agent.clone())
+                .flat_map(|source| source.agents.iter().cloned())
+                .chain(self.start.lesson_agents.iter().cloned())
                 .collect(),
         };
-        Some(write_lesson(ctx, &self.input.kind, lesson, labels).await)
+        write_lesson(ctx, &self.input.kind, lesson, labels)
+            .await
+            .map(Some)
     }
 }
 
@@ -1331,19 +1367,23 @@ fn run_labels(start: &RefineStart) -> Option<BTreeSet<String>> {
     Some(labels)
 }
 
-/// Add the lesson of an adoption. A failure is a note, so the adoption
-/// stands.
+/// Add the lesson of an adoption. A failed or timed-out step is a note, so
+/// the adoption stands.
+///
+/// # Errors
+///
+/// Returns any other engine error, such as a cancel, as a run failure.
 async fn write_lesson(
     ctx: &WorkflowContext,
     kind: &str,
     lesson: Lesson,
     labels: Option<BTreeSet<String>>,
-) -> LessonOutcome {
+) -> Result<LessonOutcome, String> {
     let Some(labels) = labels else {
-        return LessonOutcome::Failed {
+        return Ok(LessonOutcome::Failed {
             error: "a source of an older release holds no flow labels, so the run writes no lesson"
                 .to_owned(),
-        };
+        });
     };
     let request = LessonRequest {
         kind: kind.to_owned(),
@@ -1355,10 +1395,13 @@ async fn write_lesson(
         .execute_activity(&agent_refine_lesson_info(), request)
         .await
     {
-        Ok(outcome) => outcome,
-        Err(err) => LessonOutcome::Failed {
-            error: error_text(&err),
-        },
+        Ok(outcome) => Ok(outcome),
+        Err(err @ (HarvestError::ActivityFailed { .. } | HarvestError::Timeout { .. })) => {
+            Ok(LessonOutcome::Failed {
+                error: error_text(&err),
+            })
+        }
+        Err(err) => Err(step_failure("the lesson step failed", &err)),
     }
 }
 
@@ -1476,6 +1519,7 @@ mod tests {
             active: None,
             active_read: true,
             lessons: None,
+            lesson_agents: BTreeSet::new(),
         };
         let mut old = serde_json::to_value(&start).unwrap();
         old.as_object_mut().unwrap().remove("active_read");
@@ -1484,6 +1528,40 @@ mod tests {
         let again: RefineStart =
             serde_json::from_value(serde_json::to_value(&start).unwrap()).unwrap();
         assert!(again.active_read);
+    }
+
+    #[test]
+    fn a_source_of_an_older_release_gives_no_run_labels() {
+        let brief = |labels: Option<&[&str]>| SourceBrief {
+            run: ExecutionId::new(),
+            evidence: String::new(),
+            profile: AgentProfile::new("support"),
+            labels: labels.map(|items| items.iter().map(|item| (*item).to_owned()).collect()),
+            agents: BTreeSet::new(),
+        };
+        let mut start = RefineStart {
+            profile: AgentProfile::new("support"),
+            current: ProfileOverlay::default(),
+            sources: vec![brief(Some(&["a"])), brief(Some(&["b"]))],
+            selector: false,
+            ceilings: Ceilings::from_profile(&AgentProfile::new("support")),
+            active: None,
+            active_read: true,
+            lessons: Some(MemorySnapshot::Labelled {
+                text: String::new(),
+                labels: BTreeSet::from(["c".to_owned()]),
+            }),
+            lesson_agents: BTreeSet::new(),
+        };
+        let all: BTreeSet<String> = ["a", "b", "c"].map(str::to_owned).into();
+        assert_eq!(run_labels(&start), Some(all));
+        start.sources.push(brief(None));
+        assert_eq!(run_labels(&start), None, "an old source holds no labels");
+        // An old brief decodes with no labels and no agents.
+        let mut old = serde_json::to_value(brief(Some(&["a"]))).unwrap();
+        old.as_object_mut().unwrap().remove("labels");
+        let read: SourceBrief = serde_json::from_value(old).unwrap();
+        assert_eq!(read.labels, None);
     }
 
     #[test]

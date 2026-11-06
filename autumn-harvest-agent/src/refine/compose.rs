@@ -483,6 +483,9 @@ pub trait OverlaySelector: Send + Sync + fmt::Debug {
     /// Pick one id, and say why and what the pick teaches. The lesson
     /// library keeps that text when the pick goes live. The default calls
     /// [`select`](Self::select) and gives no text.
+    ///
+    /// The refine run calls `choose` only. A selector that overrides it
+    /// still implements `select`.
     fn choose<'a>(
         &'a self,
         context: &'a SelectContext<'a>,
