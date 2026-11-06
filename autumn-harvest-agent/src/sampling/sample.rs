@@ -12,8 +12,11 @@
 //!   History records each verdict.
 //! - Best-of-N runs each draw, then calls [`select`]. Rejection stops after
 //!   the first wave that holds a pass.
+//! - A vote keys each draw with an [`AnswerKey`], and needs no scorer. It
+//!   stops after the first wave whose leader cannot lose.
 //!
-//! The design is in `docs/design/DESIGN-2443.md`.
+//! The design is in `docs/design/DESIGN-2443.md` and
+//! `docs/design/DESIGN-2444.md`.
 
 use std::num::NonZeroU32;
 
@@ -23,6 +26,9 @@ use serde::{Deserialize, Serialize};
 use super::admit::{Admission, Ask, Refusal, SampleStep, admit, sample_step};
 use super::draws::{draw_task, profile_task, read_policy, read_profile};
 use super::policy::{ScorerRef, Strategy};
+use super::vote::{
+    AnswerKey, MAX_KEY_BYTES, Tally, VoteCount, VoteKeyReply, VoteKeyRequest, agent_vote_key_info,
+};
 use autumn_harvest::llm_budget::LlmBudgetExceeded;
 
 use crate::bounds::{exceeds_activity_input, sibling_cap};
@@ -40,9 +46,10 @@ pub const SAMPLE_WORKFLOW_NAME: &str = "agent_sample";
 
 /// The strategy of one `agent_sample` run.
 ///
-/// It encodes as `{"best_of_n": {"n": 3}}` or
-/// `{"rejection": {"max_attempts": 4, "threshold": 0.8}}`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// It encodes as `{"best_of_n": {"n": 3}}`,
+/// `{"rejection": {"max_attempts": 4, "threshold": 0.8}}` or
+/// `{"vote": {"n": 5, "key": "last_number"}}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 #[non_exhaustive]
 pub enum SampleStrategy {
@@ -58,6 +65,14 @@ pub enum SampleStrategy {
         max_attempts: u32,
         /// The lowest score that passes.
         threshold: FiniteF64,
+    },
+    /// Run up to `n` draws, key each answer, and select the most common
+    /// key. A tie goes to the key whose first vote has the lowest draw id.
+    Vote {
+        /// The most draws.
+        n: u32,
+        /// How each answer maps to its key.
+        key: AnswerKey,
     },
 }
 
@@ -77,21 +92,28 @@ impl SampleStrategy {
         }
     }
 
+    /// A vote of up to `n` draws under `key`.
+    #[must_use]
+    pub const fn vote(n: u32, key: AnswerKey) -> Self {
+        Self::Vote { n, key }
+    }
+
     /// The policy strategy, such as `best_of_n`.
     #[must_use]
-    pub const fn policy_strategy(self) -> Strategy {
+    pub const fn policy_strategy(&self) -> Strategy {
         match self {
             Self::BestOfN { .. } => Strategy::BestOfN,
             Self::Rejection { .. } => Strategy::Rejection,
+            Self::Vote { .. } => Strategy::Vote,
         }
     }
 
     /// The most draws of the run.
     #[must_use]
-    pub const fn draws(self) -> u32 {
+    pub const fn draws(&self) -> u32 {
         match self {
-            Self::BestOfN { n } => n,
-            Self::Rejection { max_attempts, .. } => max_attempts,
+            Self::BestOfN { n } | Self::Vote { n, .. } => *n,
+            Self::Rejection { max_attempts, .. } => *max_attempts,
         }
     }
 }
@@ -109,10 +131,12 @@ pub struct SampleInput {
     pub input: String,
     /// The strategy.
     pub strategy: SampleStrategy,
-    /// The scorer. The policy must allow it.
-    pub scorer: ScorerRef,
+    /// The scorer. The policy must allow it. Best-of-N and rejection need
+    /// one. A vote takes none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scorer: Option<ScorerRef>,
     /// The most draws at the same time. `None` takes the cap of the policy
-    /// for best-of-N, and 1 for rejection.
+    /// for best-of-N and a vote, and 1 for rejection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub concurrency: Option<NonZeroU32>,
     /// The token budget of the whole run tree. It narrows the cap of the
@@ -134,7 +158,21 @@ impl SampleInput {
             kind: kind.into(),
             input: input.into(),
             strategy,
-            scorer,
+            scorer: Some(scorer),
+            concurrency: None,
+            max_total_tokens: None,
+        }
+    }
+
+    /// A vote of up to `n` draws over `input` for the kind `kind`. Each
+    /// answer maps to its key with `key`.
+    #[must_use]
+    pub fn vote(kind: impl Into<String>, input: impl Into<String>, n: u32, key: AnswerKey) -> Self {
+        Self {
+            kind: kind.into(),
+            input: input.into(),
+            strategy: SampleStrategy::vote(n, key),
+            scorer: None,
             concurrency: None,
             max_total_tokens: None,
         }
@@ -161,12 +199,13 @@ impl SampleInput {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SampleOutcome {
-    /// The run selected this draw.
+    /// The run selected this draw. For a vote, it is the first draw of
+    /// the winning key.
     Selected {
         /// The draw.
         draw: DrawId,
     },
-    /// No draw passed.
+    /// No draw passed. For a vote, no draw had a key.
     NoAcceptedDraw,
 }
 
@@ -181,9 +220,12 @@ pub enum SampleStop {
     Accepted,
     /// A budget refused the next draw.
     BudgetExceeded,
-    /// A score failed, so the run started no more draws. The verdict of
-    /// the draw names the error.
+    /// A score or an app key failed, so the run started no more draws.
+    /// The verdict of the draw names the error.
     ScoreFailed,
+    /// The leader of a vote keeps the lead whatever the draws left vote,
+    /// so the run started no more draws.
+    Settled,
 }
 
 /// The record of one draw.
@@ -197,8 +239,12 @@ pub struct SampleDraw {
     pub run_id: Option<String>,
     /// Why the draw run ended.
     pub stop: AgentStop,
-    /// The verdict of the scorer.
+    /// The verdict of the scorer. For a vote, a draw with a key gets a
+    /// score of 1, and a draw with no key gets a reject with the reason.
     pub verdict: Verdict,
+    /// The key of the answer, for a vote.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
     /// The tokens of the draw run and of its judge calls.
     pub usage: TokenUsage,
     /// The cost of the draw run and of its judge calls, in millionths of a
@@ -230,6 +276,10 @@ pub struct SampleReport {
     pub selected: Option<AgentReport>,
     /// Each draw, in draw order.
     pub draws: Vec<SampleDraw>,
+    /// The votes of each key, the winner first. Empty unless the run is a
+    /// vote.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tally: Vec<VoteCount>,
     /// The tokens of the run tree, judge calls included.
     pub usage: TokenUsage,
     /// The cost of the run tree, judge calls included, in millionths of a
@@ -259,21 +309,27 @@ pub async fn agent_sample(
         return Err(Refusal::UnknownKind.error_text());
     };
     let read = read_policy(ctx, &input.kind).await?;
+    let voting = matches!(input.strategy, SampleStrategy::Vote { .. });
     let ask = Ask {
         strategy: input.strategy.policy_strategy(),
         draws: input.strategy.draws(),
         concurrency: input
             .concurrency
-            .map_or_else(|| default_concurrency(input.strategy), NonZeroU32::get),
-        scorer: Some(&input.scorer),
+            .map_or_else(|| default_concurrency(&input.strategy), NonZeroU32::get),
+        // A vote refuses a scorer below, so the policy never checks one.
+        scorer: if voting { None } else { input.scorer.as_ref() },
     };
     let admission = admit(&read.policy, &ask).map_err(|refusal| refusal.error_text())?;
+    let judge = judge_of(&input).map_err(|refusal| refusal.error_text())?;
+    if let Judge::Vote(AnswerKey::Custom(id)) = judge {
+        probe_key(ctx, id).await?;
+    }
     let task = draw_task(
         &profile_task(&profile, &input.input),
         &admission.draw_effects,
     );
     let budget = tree_budget(task.max_total_tokens, input.max_total_tokens);
-    let (scored, stopped) = run_waves(ctx, &input, &task, &admission, budget).await?;
+    let (scored, stopped) = run_waves(ctx, judge, &input, &task, &admission, budget).await?;
     Ok(report(
         input,
         read.revision,
@@ -285,14 +341,63 @@ pub async fn agent_sample(
 
 /// The concurrency of a run that asks for none.
 ///
-/// Best-of-N takes the cap of the policy (0). Rejection stops at the first
-/// pass, so it runs one draw at a time. A wider wave would pay for draws
-/// after the pass.
-const fn default_concurrency(strategy: SampleStrategy) -> u32 {
+/// Best-of-N and a vote take the cap of the policy (0). Rejection stops at
+/// the first pass, so it runs one draw at a time. A wider wave would pay
+/// for draws after the pass.
+const fn default_concurrency(strategy: &SampleStrategy) -> u32 {
     match strategy {
-        SampleStrategy::BestOfN { .. } => 0,
+        SampleStrategy::BestOfN { .. } | SampleStrategy::Vote { .. } => 0,
         SampleStrategy::Rejection { .. } => 1,
     }
+}
+
+/// How the run judges each draw.
+#[derive(Debug, Clone, Copy)]
+enum Judge<'a> {
+    /// Score each draw with this scorer.
+    Score(&'a ScorerRef),
+    /// Key each draw for a vote.
+    Vote(&'a AnswerKey),
+}
+
+/// The judge of `input`.
+///
+/// # Errors
+///
+/// Best-of-N and rejection with no scorer give `NoScorer`. A vote with a
+/// scorer gives `ScorerNotUsed`, and a vote with a bad key gives
+/// `InvalidAnswerKey`.
+fn judge_of(input: &SampleInput) -> Result<Judge<'_>, Refusal> {
+    match (&input.strategy, &input.scorer) {
+        (SampleStrategy::Vote { .. }, Some(_)) => Err(Refusal::ScorerNotUsed),
+        (SampleStrategy::Vote { key, .. }, None) if key.is_valid() => Ok(Judge::Vote(key)),
+        (SampleStrategy::Vote { .. }, None) => Err(Refusal::InvalidAnswerKey),
+        (_, Some(scorer)) => Ok(Judge::Score(scorer)),
+        (strategy, None) => Err(Refusal::NoScorer {
+            strategy: strategy.policy_strategy(),
+        }),
+    }
+}
+
+/// Check that the harness has the app key function `id`, before the first
+/// draw.
+///
+/// # Errors
+///
+/// Returns the `unknown_answer_key` refusal when the harness lacks it, and
+/// an engine error as text.
+async fn probe_key(ctx: &WorkflowContext, id: &str) -> Result<(), String> {
+    let reply: VoteKeyReply = ctx
+        .execute_activity(&agent_vote_key_info(), VoteKeyRequest::new(id, None))
+        .await
+        .map_err(|err| err.to_string())?;
+    if reply.known {
+        return Ok(());
+    }
+    Err(Refusal::UnknownAnswerKey {
+        key: crate::harness::truncate(id, crate::mesh::MAX_NAME_LEN),
+    }
+    .error_text())
 }
 
 /// The token budget of the run tree: the smaller of the two caps.
@@ -316,12 +421,14 @@ struct Scored {
 /// the token cap `sibling_cap(left, width, i)`. After the score, the spend
 /// of each draw and of its judge calls counts against the budget.
 ///
-/// The run starts no more draws after a rejection wave with a pass. It
-/// also stops after a failed score, and when a budget refuses a draw or a
-/// judge call. A pass wins over the other stops, because the run has its
+/// The run starts no more draws after a rejection wave with a pass, and
+/// after a vote wave whose leader cannot lose. It also stops after a
+/// failed score, and when a budget refuses a draw or a judge call. A pass
+/// and a settled vote win over the other stops, because the run has its
 /// answer.
 async fn run_waves(
     ctx: &WorkflowContext,
+    judge: Judge<'_>,
     input: &SampleInput,
     task: &AgentTask,
     admission: &Admission,
@@ -361,14 +468,23 @@ async fn run_waves(
             if report.stop == AgentStop::BudgetExceeded {
                 halt = halt.or(Some(SampleStop::BudgetExceeded));
             }
-            let (one, halted) = score_draw(ctx, input, task, DrawId::new(id), report, halt).await?;
+            let draw = DrawId::new(id);
+            let (one, halted) = match judge {
+                Judge::Score(scorer) => score_draw(ctx, scorer, task, draw, report, halt).await?,
+                Judge::Vote(key) => vote_draw(ctx, key, draw, report).await?,
+            };
             halt = halt.or(halted);
-            passed |= passes(input.strategy, &one.record.verdict);
+            passed |= passes(&input.strategy, &one.record.verdict);
             spent = spent.saturating_add(one.record.usage.total());
             scored.push(one);
         }
         if passed && matches!(input.strategy, SampleStrategy::Rejection { .. }) {
             return Ok((scored, SampleStop::Accepted));
+        }
+        let ran = u32::try_from(scored.len()).unwrap_or(u32::MAX);
+        let left = admission.draws.saturating_sub(ran);
+        if matches!(judge, Judge::Vote(_)) && left > 0 && tally_of(&scored).settled(left) {
+            return Ok((scored, SampleStop::Settled));
         }
         if let Some(stop) = halt {
             return Ok((scored, stop));
@@ -385,7 +501,7 @@ const MAX_SCORED_TOOL_BYTES: usize = 16 * 1024;
 /// Each tool result is cut to [`MAX_SCORED_TOOL_BYTES`]. A request that
 /// still does not fit would fail the run after the draws were paid.
 fn score_request(
-    input: &SampleInput,
+    scorer: &ScorerRef,
     task: &AgentTask,
     report: &AgentReport,
 ) -> Option<ScoreRequest> {
@@ -394,8 +510,8 @@ fn score_request(
         let content = std::mem::take(&mut tool.content);
         tool.content = cut_bytes(content, MAX_SCORED_TOOL_BYTES);
     }
-    let request = ScoreRequest::new(input.scorer.id.as_str(), score)
-        .admitted_judges(input.scorer.judge_model.clone());
+    let request =
+        ScoreRequest::new(scorer.id.as_str(), score).admitted_judges(scorer.judge_model.clone());
     (!exceeds_activity_input(&request)).then_some(request)
 }
 
@@ -417,7 +533,7 @@ fn score_request(
 /// Returns an engine error, such as a cancellation, as text.
 async fn score_draw(
     ctx: &WorkflowContext,
-    input: &SampleInput,
+    scorer: &ScorerRef,
     task: &AgentTask,
     draw: DrawId,
     report: AgentReport,
@@ -431,7 +547,7 @@ async fn score_draw(
         unscored("a budget stopped the draw, so the run did not score it")
     } else if halt.is_some() {
         unscored("the run stopped before it scored the draw")
-    } else if let Some(request) = score_request(input, task, &report) {
+    } else if let Some(request) = score_request(scorer, task, &report) {
         match ctx
             .execute_activity::<_, SampleScore>(&agent_sample_score_info(), request)
             .await
@@ -457,26 +573,104 @@ async fn score_draw(
         run_id: report.run_id.clone(),
         stop: report.stop,
         verdict,
+        key: None,
         usage: report.usage.saturating_add(usage),
         cost_usd_micros: report.cost_usd_micros.saturating_add(cost),
     };
     Ok((Scored { record, report }, stop))
 }
 
+/// Key one draw for a vote.
+///
+/// Only a draw that completed casts a vote. A built-in key runs here, as
+/// a pure function of the recorded answer. An app key runs in the recorded
+/// `agent_vote_key` activity. A draw with a key gets a score of 1. A draw
+/// with no key gets a reject that names the reason.
+///
+/// A failed app key gives a reject and the stop `ScoreFailed`.
+///
+/// # Errors
+///
+/// Returns an engine error, such as a cancellation, as text.
+async fn vote_draw(
+    ctx: &WorkflowContext,
+    key: &AnswerKey,
+    draw: DrawId,
+    report: AgentReport,
+) -> Result<(Scored, Option<SampleStop>), String> {
+    let mut stop = None;
+    let found = if report.stop != AgentStop::Completed {
+        Err("the draw did not complete, so it casts no vote".to_owned())
+    } else if let AnswerKey::Custom(id) = key {
+        let request = VoteKeyRequest::new(id.as_str(), Some(report.text.clone()));
+        if exceeds_activity_input(&request) {
+            Err("the answer is too large to record, so it casts no vote".to_owned())
+        } else {
+            match ctx
+                .execute_activity::<_, VoteKeyReply>(&agent_vote_key_info(), request)
+                .await
+            {
+                Ok(reply) => reply.key.ok_or_else(no_key),
+                Err(err @ HarvestError::ActivityFailed { .. }) => {
+                    stop = Some(SampleStop::ScoreFailed);
+                    Err(format!("the answer key failed: {err}"))
+                }
+                Err(err) => return Err(err.to_string()),
+            }
+        }
+    } else {
+        key.key_of(&report.text).ok_or_else(no_key)
+    };
+    let (key, verdict) = match found {
+        Ok(key) if !key.is_empty() && key.len() <= MAX_KEY_BYTES => {
+            (Some(key), Verdict::Score(FiniteF64::ONE))
+        }
+        Ok(_) => (None, Verdict::reject(no_key())),
+        Err(reason) => (None, Verdict::reject(reason)),
+    };
+    let record = SampleDraw {
+        draw,
+        run_id: report.run_id.clone(),
+        stop: report.stop,
+        verdict,
+        key,
+        usage: report.usage,
+        cost_usd_micros: report.cost_usd_micros,
+    };
+    Ok((Scored { record, report }, stop))
+}
+
+/// The reject reason of a draw whose answer has no key.
+fn no_key() -> String {
+    "the answer has no key, so the draw casts no vote".to_owned()
+}
+
+/// The votes of the draws in `scored`.
+fn tally_of(scored: &[Scored]) -> Tally {
+    let mut tally = Tally::new();
+    for one in scored {
+        tally.cast(one.record.draw, one.record.key.as_deref());
+    }
+    tally
+}
+
 /// Whether `verdict` passes the check of `strategy`.
 ///
-/// Best-of-N passes each score, and `select` never picks a reject.
-/// Rejection passes a score at or above the threshold.
-fn passes(strategy: SampleStrategy, verdict: &Verdict) -> bool {
+/// Best-of-N and a vote pass each score, and `select` never picks a
+/// reject. Rejection passes a score at or above the threshold.
+fn passes(strategy: &SampleStrategy, verdict: &Verdict) -> bool {
     match strategy {
-        SampleStrategy::BestOfN { .. } => !verdict.is_reject(),
+        SampleStrategy::BestOfN { .. } | SampleStrategy::Vote { .. } => !verdict.is_reject(),
         SampleStrategy::Rejection { threshold, .. } => {
-            verdict.as_score().is_some_and(|score| score >= threshold)
+            verdict.as_score().is_some_and(|score| score >= *threshold)
         }
     }
 }
 
 /// The report of the run: the selection, each draw and the totals.
+///
+/// A vote selects the first draw of the winning key, and reports the full
+/// tally. Each other strategy calls [`select`] over the draws that pass.
 fn report(
     input: SampleInput,
     revision: u64,
@@ -484,12 +678,17 @@ fn report(
     scored: Vec<Scored>,
     stopped: SampleStop,
 ) -> SampleReport {
-    let passing: Vec<(DrawId, Verdict)> = scored
-        .iter()
-        .filter(|one| passes(input.strategy, &one.record.verdict))
-        .map(|one| (one.record.draw, one.record.verdict.clone()))
-        .collect();
-    let chosen = select(&passing);
+    let (chosen, tally) = if matches!(input.strategy, SampleStrategy::Vote { .. }) {
+        let tally = tally_of(&scored);
+        (tally.winner().map(|winner| winner.first), tally.counts())
+    } else {
+        let passing: Vec<(DrawId, Verdict)> = scored
+            .iter()
+            .filter(|one| passes(&input.strategy, &one.record.verdict))
+            .map(|one| (one.record.draw, one.record.verdict.clone()))
+            .collect();
+        (select(&passing), Vec::new())
+    };
     let outcome = chosen.map_or(SampleOutcome::NoAcceptedDraw, |draw| {
         SampleOutcome::Selected { draw }
     });
@@ -518,6 +717,7 @@ fn report(
         attempts,
         selected,
         draws,
+        tally,
         usage,
         cost_usd_micros,
     }
@@ -540,12 +740,15 @@ mod tests {
     fn a_rejection_passes_a_score_at_the_threshold() {
         let at = FiniteF64::new(0.5).unwrap();
         let strategy = SampleStrategy::rejection(3, at);
-        assert!(passes(strategy, &Verdict::score(0.5).unwrap()));
-        assert!(!passes(strategy, &Verdict::score(0.49).unwrap()));
-        assert!(!passes(strategy, &Verdict::reject("no")));
+        assert!(passes(&strategy, &Verdict::score(0.5).unwrap()));
+        assert!(!passes(&strategy, &Verdict::score(0.49).unwrap()));
+        assert!(!passes(&strategy, &Verdict::reject("no")));
         let best = SampleStrategy::best_of_n(3);
-        assert!(passes(best, &Verdict::score(-1e300).unwrap()));
-        assert!(!passes(best, &Verdict::reject("no")));
+        assert!(passes(&best, &Verdict::score(-1e300).unwrap()));
+        assert!(!passes(&best, &Verdict::reject("no")));
+        let vote = SampleStrategy::vote(3, AnswerKey::Trimmed);
+        assert!(passes(&vote, &Verdict::Score(FiniteF64::ONE)));
+        assert!(!passes(&vote, &Verdict::reject("no key")));
     }
 
     #[test]
@@ -573,7 +776,12 @@ mod tests {
             SampleStrategy::best_of_n(1),
             ScorerRef::deterministic("exact_match").unwrap(),
         );
-        let request = score_request(&input, &AgentTask::new("x"), &report).unwrap();
+        let request = score_request(
+            input.scorer.as_ref().unwrap(),
+            &AgentTask::new("x"),
+            &report,
+        )
+        .unwrap();
         assert_eq!(request.input.tools.len(), 1);
         assert!(request.input.tools[0].content.len() <= MAX_SCORED_TOOL_BYTES);
         assert_eq!(

@@ -238,6 +238,14 @@ required-features = ["sqlite"]
 name = "sample_postgres"
 required-features = ["postgres"]
 
+[[test]]
+name = "vote"
+required-features = ["sqlite"]
+
+[[test]]
+name = "vote_crash"
+required-features = ["sqlite"]
+
 # The `postgres` module on a real worker: the Postgres form of the SQLite
 # helpers.
 [[test]]

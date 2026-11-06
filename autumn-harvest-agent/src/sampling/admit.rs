@@ -71,6 +71,20 @@ pub enum Refusal {
     },
     /// The profile of the kind belongs to another tenant (issue #2442).
     OtherTenant,
+    /// The strategy needs a scorer, and the run names none.
+    NoScorer {
+        /// The strategy that the run asked for.
+        strategy: Strategy,
+    },
+    /// A vote names a scorer. A vote uses no scorer.
+    ScorerNotUsed,
+    /// The answer key of a vote is not valid.
+    InvalidAnswerKey,
+    /// The harness has no app key function with the id of the vote.
+    UnknownAnswerKey {
+        /// The id, cut to 64 bytes.
+        key: String,
+    },
     /// The kind is not a valid agent kind.
     InvalidKind,
     /// No agent profile has the kind, so no task can be built.
@@ -94,6 +108,10 @@ impl Refusal {
             Self::TooManyAnswerRetries { .. } => "too_many_answer_retries",
             Self::UnknownScorer { .. } => "unknown_scorer",
             Self::OtherTenant => "other_tenant",
+            Self::NoScorer { .. } => "no_scorer",
+            Self::ScorerNotUsed => "scorer_not_used",
+            Self::InvalidAnswerKey => "invalid_answer_key",
+            Self::UnknownAnswerKey { .. } => "unknown_answer_key",
             Self::InvalidKind => "invalid_kind",
             Self::UnknownKind => "unknown_kind",
         }
@@ -138,6 +156,12 @@ impl std::fmt::Display for Refusal {
             ),
             Self::UnknownScorer { scorer } => write!(f, "the harness has no scorer {scorer}"),
             Self::OtherTenant => f.write_str("the profile of the kind belongs to another tenant"),
+            Self::NoScorer { strategy } => write!(f, "{strategy} needs a scorer"),
+            Self::ScorerNotUsed => f.write_str("a vote uses no scorer"),
+            Self::InvalidAnswerKey => f.write_str("the answer key of the vote is not valid"),
+            Self::UnknownAnswerKey { key } => {
+                write!(f, "the harness has no answer key function {key:?}")
+            }
             Self::InvalidKind => f.write_str("the kind is not a valid agent kind"),
             Self::UnknownKind => f.write_str("no agent profile has the kind"),
         }

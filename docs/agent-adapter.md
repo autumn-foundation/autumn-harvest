@@ -2463,6 +2463,7 @@ let input = SampleInput::new(
 |---|---|
 | `best_of_n { n }` | Runs `n` draws, scores each, and selects with `select` (section 17). A tie goes to the lowest draw id. |
 | `rejection { max_attempts, threshold }` | Runs draws until one scores at or above `threshold`, up to `max_attempts` draws. It runs one draw at a time unless the input asks for more. It stops after the wave that holds the pass. |
+| `vote { n, key }` | Keys each answer, and selects the most common key. It needs no scorer. See section 25. |
 
 The run reads the profile and the sampling policy of the kind once each,
 as `agent_draws` does (section 19). The policy admits the strategy, the
@@ -2508,7 +2509,8 @@ model is not called.
   passed;
 - `selected`: the `AgentReport` of the selected draw;
 - `stopped`: `completed`, `accepted` (a rejection run found a pass),
-  `budget_exceeded` or `score_failed`;
+  `budget_exceeded`, `score_failed` or `settled` (a vote leader cannot
+  lose);
 - `attempts`: the draws that ran;
 - `draws`: for each draw, its stop, verdict, usage and cost. The usage and
   the cost include the judge calls of the draw;
@@ -2861,3 +2863,55 @@ on the harness that implements `MemoryStore::ensure_block` and
   notes why.
 - **Fleet.** `InMemoryMemoryStore` lives in one process. Each worker of a
   fleet needs the same durable store.
+
+## 25. The vote strategy
+
+A vote runs a task many times, keys each final answer, and selects the
+most common key. This is self-consistency. It needs no scorer and no
+judge, so its only spend is the draws. It works when an answer has a
+canonical form, such as a number, a label or a tool name.
+
+```rust
+use autumn_harvest_agent::sampling::{AnswerKey, SampleInput};
+
+// The policy of `researcher` must list `vote`, with `max_draws >= 5`.
+
+let input = SampleInput::vote("researcher", "What is 17 * 23?", 5, AnswerKey::LastNumber)
+    .concurrency(1);
+// SQLite: autumn_harvest_agent::sqlite::start_sample(&mut rt, &input)
+```
+
+| Key | The key of an answer |
+|---|---|
+| `trimmed` | The answer with no white space at each end. |
+| `last_number` | The last decimal number, in canonical form: `1,200.50` gives `1200.5`. |
+| `{"json_field": "/a/b"}` | The field at a JSON pointer of the JSON answer. A string gives its text, `null` gives no key, and each other value gives its JSON text. |
+| `{"custom": "id"}` | The result of the app `AnswerKeyFn` with this id. Add it with `AgentHarness::answer_key`. |
+
+- **Votes.** Only a draw that completed casts a vote. A draw with no key,
+  or with a key over 1 KiB, casts no vote. Its verdict is a reject that
+  names the reason. A draw with a key gets a score of 1.
+- **Winner.** The key with the most votes wins. A tie goes to the key
+  whose first vote has the lowest draw id. The run selects that first
+  draw. With no vote at all, the outcome is `no_accepted_draw`.
+- **Early stop.** After each wave, let `lead` and `second` be the top two
+  counts, and `left` the draws not yet started. When
+  `lead > second + left`, the run starts no more draws and `stopped` is
+  `settled`. The draws of the wave all count. Verus proves that the
+  winner is then the winner of the full run, for each way the left draws
+  could vote, and that the order in which draws end does not change it.
+  A lower concurrency makes the stop come sooner.
+- **Report.** `SampleReport::tally` holds the votes of each key, the
+  winner first. `SampleDraw::key` holds the key of each draw.
+- **Durability.** The run keys a built-in key in workflow code, from the
+  recorded answer. The `agent_vote_key` activity calls an app key, so
+  history records it. After a crash, replay rebuilds the tally, and the
+  run starts only the draws that are missing.
+- **Refusals.** Each one comes before any model call: a kind whose policy
+  does not list `vote` (`strategy_not_allowed`), a vote with a scorer
+  (`scorer_not_used`), a key that is not valid (`invalid_answer_key`) and
+  an app key that the harness lacks (`unknown_answer_key`). Best-of-N and
+  rejection with no scorer give `no_scorer`.
+
+The draws share the token budget and the draw effects of section 20. The
+design is in [`DESIGN-2444.md`](design/DESIGN-2444.md).
