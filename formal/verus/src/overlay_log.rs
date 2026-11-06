@@ -385,7 +385,7 @@ pub fn decide_guarded(
             } else {
                 ActivateDecision::Conflict
             }
-        },
+        }
         other => other,
     }
 }

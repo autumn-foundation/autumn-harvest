@@ -208,6 +208,13 @@ pub const fn decide_guarded(
     }
 }
 
+/// The log head that a guarded move read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReadHead {
+    /// The `seq` of the last move, or `None` for an empty log.
+    pub seq: Option<u64>,
+}
+
 /// One move request for a raw log. The caller validates the version first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MoveRequest<'a> {
@@ -223,10 +230,10 @@ pub struct MoveRequest<'a> {
     /// then also needs that move to be the last one. See
     /// [`decide_rollback`].
     pub after_seq: Option<u64>,
-    /// For a guarded move, the `seq` of the last move that the caller read,
-    /// or `Some(None)` for an empty log. The swap then also needs the log
-    /// to be unchanged. See [`decide_guarded`]. A rollback ignores it.
-    pub head: Option<Option<u64>>,
+    /// For a guarded move, the log head that the caller read. The swap then
+    /// also needs the log to be unchanged. See [`decide_guarded`]. A
+    /// rollback ignores it.
+    pub head: Option<ReadHead>,
 }
 
 impl MoveRequest<'_> {
@@ -256,7 +263,7 @@ impl MoveRequest<'_> {
                 _ => ActivateDecision::Conflict,
             },
             (None, _) => match self.head {
-                Some(read_seq) => decide_guarded(known, self.expected, actual, read_seq, last_seq),
+                Some(read) => decide_guarded(known, self.expected, actual, read.seq, last_seq),
                 None => decide_activate(known, self.expected, actual),
             },
         }
@@ -1289,7 +1296,7 @@ mod tests {
             actor_kind: AUTHOR_REFINE,
             actor: "run",
             after_seq: None,
-            head: Some(Some(5)),
+            head: Some(ReadHead { seq: Some(5) }),
         };
         assert!(guarded.needs_last_seq());
         assert_eq!(guarded.decide(true, Some(2), Some(5)), Activate);

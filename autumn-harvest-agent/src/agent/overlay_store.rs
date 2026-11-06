@@ -34,8 +34,8 @@ use autumn_harvest::ExecutionId;
 use autumn_harvest::chrono::{DateTime, Utc};
 use autumn_harvest::overlay_log::{
     AUTHOR_AUTO, AUTHOR_OPERATOR, AUTHOR_REFINE, ActivateDecision, ActivateOutcome, AutoAdoptRaw,
-    AutoMoveDecision, MoveRequest, OverlayRow, PolicyExpect, decide_auto_move, logs_activation,
-    next_overlay_version, policy_write_passes, rollback_target, utc_day,
+    AutoMoveDecision, MoveRequest, OverlayRow, PolicyExpect, ReadHead, decide_auto_move,
+    logs_activation, next_overlay_version, policy_write_passes, rollback_target, utc_day,
 };
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
 use autumn_harvest::overlay_log::{AutoAdoptRequest, PolicyAppend, PolicyRow, PolicyWrite};
@@ -1095,7 +1095,7 @@ const fn move_request<'b>(
     actor: &Provenance,
     author: &'b str,
     after_seq: Option<u64>,
-    head: Option<Option<u64>>,
+    head: Option<ReadHead>,
 ) -> MoveRequest<'b> {
     MoveRequest {
         version: version.get(),
@@ -1233,8 +1233,14 @@ impl ProfileOverlayStore for InMemoryOverlayStore {
         Box::pin(async move {
             activate_checked(self, &*self.validator, kind, version, &actor, || async {
                 let author = actor.author();
-                let request =
-                    move_request(version, expected_active, &actor, &author, None, Some(head));
+                let request = move_request(
+                    version,
+                    expected_active,
+                    &actor,
+                    &author,
+                    None,
+                    Some(ReadHead { seq: head }),
+                );
                 Ok(self.swap_now(kind, &request, &actor))
             })
             .await
@@ -1683,8 +1689,14 @@ impl ProfileOverlayStore for SqliteOverlayStore {
         Box::pin(async move {
             activate_checked(self, &*self.validator, kind, version, &actor, || async {
                 let author = actor.author();
-                let request =
-                    move_request(version, expected_active, &actor, &author, None, Some(head));
+                let request = move_request(
+                    version,
+                    expected_active,
+                    &actor,
+                    &author,
+                    None,
+                    Some(ReadHead { seq: head }),
+                );
                 self.log.activate(kind, &request).map_err(backend)
             })
             .await
@@ -1974,8 +1986,14 @@ impl ProfileOverlayStore for PostgresOverlayStore {
         Box::pin(async move {
             activate_checked(self, &*self.validator, kind, version, &actor, || async {
                 let author = actor.author();
-                let request =
-                    move_request(version, expected_active, &actor, &author, None, Some(head));
+                let request = move_request(
+                    version,
+                    expected_active,
+                    &actor,
+                    &author,
+                    None,
+                    Some(ReadHead { seq: head }),
+                );
                 self.swap(kind, &request).await
             })
             .await

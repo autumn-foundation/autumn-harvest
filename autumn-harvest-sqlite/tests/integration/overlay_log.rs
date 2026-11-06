@@ -3,7 +3,7 @@
 //! The typed store and the shared suite are in `autumn-harvest-agent`.
 //! These tests cover the guard, which only raw SQL can reach.
 
-use autumn_harvest::overlay_log::{ActivateOutcome, MoveRequest};
+use autumn_harvest::overlay_log::{ActivateOutcome, MoveRequest, ReadHead};
 
 /// A plain activation by the operator `actor`.
 const fn mv(version: u64, expected: Option<u64>, actor: &str) -> MoveRequest<'_> {
@@ -284,7 +284,7 @@ fn sqlite_refuses_a_rollback_over_a_stale_move() {
     // keeps the pointer but moves the head, so the guarded swap refuses it.
     let head = log.last_activation("support").expect("last").map(|m| m.seq);
     let guarded = MoveRequest {
-        head: Some(head),
+        head: Some(ReadHead { seq: head }),
         ..mv(1, Some(3), "run")
     };
     log.activate("support", &mv(2, Some(3), "ops"))
@@ -297,7 +297,7 @@ fn sqlite_refuses_a_rollback_over_a_stale_move() {
     );
     let head = log.last_activation("support").expect("last").map(|m| m.seq);
     let fresh = MoveRequest {
-        head: Some(head),
+        head: Some(ReadHead { seq: head }),
         ..mv(1, Some(3), "run")
     };
     assert_eq!(
