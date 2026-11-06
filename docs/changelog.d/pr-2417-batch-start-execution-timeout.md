@@ -13,8 +13,12 @@ What shipped:
   ceiling. The start caps the timeout at that ceiling and clamps the SLA to
   the result.
 - The outbound webhook-delivery start had the same gap. It applied the SLA
-  override and dropped the timeout. It now takes the declared timeout, the
-  override and the fleet ceiling.
+  override and dropped the timeout. It now takes the declared timeout and
+  chain cap, their overrides and both fleet ceilings.
+- A source guard, `run_defaults_timeout_guard`, fails on a
+  `StartWorkflowParams` literal with a base that does not set
+  `execution_timeout`, or sets it to `None`. It also fails on a
+  `DebounceStartOptions` literal with `execution_timeout_secs: None`.
 - The completion-trigger start sites already took these values (#2511). New
   DB tests read `deadline_at` and `sla_deadline_at` on all three sites: the
   same-shard start, the immediate relay (`DeferredTriggerStart::spawn`) and
@@ -36,5 +40,8 @@ Tests:
   `each_target_site_sets_the_override_deadline_and_clamps_the_sla` and
   `each_target_site_caps_the_override_deadline_at_the_fleet_ceiling`.
 - `autumn-harvest-plugin/src/plugin.rs`: `webhook_run_defaults_tests`.
+- `autumn-harvest/tests/integration/run_defaults_timeout_guard.rs`:
+  `no_start_site_drops_the_execution_timeout` and its self-test. On the
+  earlier source it flags the two batch sites and the webhook site.
 
 Design: [`docs/design/DESIGN-2417.md`](../design/DESIGN-2417.md).

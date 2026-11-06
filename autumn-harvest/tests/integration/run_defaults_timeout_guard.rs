@@ -1,11 +1,16 @@
-//! Guard: each start site passes the resolved execution timeout.
+//! Guard: each start literal passes the resolved execution timeout.
 //!
 //! A start site resolves the timeout of its type, with any operator
-//! override. A site that builds `StartWorkflowParams` from a base and leaves
-//! out `execution_timeout` drops that value, so its run gets no
-//! `deadline_at`. A `DebounceStartOptions` with `execution_timeout_secs:
-//! None` drops it from a deferred start in the same way. This guard scans the
-//! crates that start runs, and fails on each such literal.
+//! override. A `StartWorkflowParams` literal that has a base and does not set
+//! `execution_timeout`, or sets it to `None`, drops that value. Its run then
+//! gets no `deadline_at`. A `DebounceStartOptions` literal with
+//! `execution_timeout_secs: None` drops it from a deferred start in the same
+//! way. This guard scans the crates that start runs, and fails on each such
+//! literal.
+//!
+//! The guard reads struct literals only. A start from a bare
+//! `StartWorkflowParams::new` call, or through `SignalWithStartParams`, is
+//! out of its scope.
 
 use std::path::{Path, PathBuf};
 
@@ -17,14 +22,19 @@ const SOURCE_DIRS: [&str; 4] = [
     "autumn-harvest-agent/src",
 ];
 
-/// The literals that may leave out the timeout, as `(file, line)`.
+/// The literals that may drop the timeout, as `(file, field entry)`.
 ///
-/// The line is one line inside the literal. A literal here starts no run.
+/// The entry is one top-level field of the literal, with no string in it.
+/// The scan blanks each string. A literal here starts no run.
 const ALLOWED: [(&str, &str); 1] = [(
     // A unit test of the struct-update syntax.
     "autumn-harvest/src/execution.rs",
-    "owner: Some(\"team\"),",
+    "priority: Priority::High",
 )];
+
+/// The struct names that the guard checks.
+const PARAMS: &str = "StartWorkflowParams";
+const OPTIONS: &str = "DebounceStartOptions";
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -52,78 +62,191 @@ fn rust_files(root: &Path, dir: &str, out: &mut Vec<String>) {
     }
 }
 
-/// The code part of a line, without a trailing `//` comment.
-fn code(line: &str) -> &str {
-    line.split("//").next().unwrap_or_default()
+const fn is_ident(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
 }
 
-/// The lines of the literal that opens at `start`, up to its closing brace.
-fn literal<'a>(lines: &'a [&'a str], start: usize) -> &'a [&'a str] {
-    let mut depth = 0_i32;
-    for (offset, line) in lines[start..].iter().enumerate() {
-        for c in code(line).chars() {
-            match c {
-                '{' => depth += 1,
-                '}' => depth -= 1,
-                _ => {}
+fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+/// The offset just past the `"` that closes a plain string. `from` is the
+/// first byte inside the string.
+const fn plain_string_end(bytes: &[u8], from: usize) -> usize {
+    let mut i = from;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i += 2,
+            b'"' => return i + 1,
+            _ => i += 1,
+        }
+    }
+    bytes.len()
+}
+
+/// The end of the raw string `r#"…"#` that opens at `at`, if one opens
+/// there.
+fn raw_string_end(bytes: &[u8], at: usize) -> Option<usize> {
+    if bytes[at] != b'r' || (at > 0 && is_ident(bytes[at - 1])) {
+        return None;
+    }
+    let hashes = bytes[at + 1..].iter().take_while(|&&b| b == b'#').count();
+    let quote = at + 1 + hashes;
+    if bytes.get(quote) != Some(&b'"') {
+        return None;
+    }
+    let mut close = vec![b'"'];
+    close.extend(std::iter::repeat_n(b'#', hashes));
+    Some(find(&bytes[quote + 1..], &close).map_or(bytes.len(), |n| quote + 1 + n + close.len()))
+}
+
+/// The end of the comment, string or char literal that opens at `i`, if
+/// one opens there.
+fn noise_end(bytes: &[u8], i: usize) -> Option<usize> {
+    let rest = &bytes[i..];
+    if rest.starts_with(b"//") {
+        return Some(find(rest, b"\n").map_or(bytes.len(), |n| i + n));
+    }
+    if rest.starts_with(b"/*") {
+        return Some(find(rest, b"*/").map_or(bytes.len(), |n| i + n + 2));
+    }
+    if let Some(end) = raw_string_end(bytes, i) {
+        return Some(end);
+    }
+    match rest {
+        [b'"', ..] => Some(plain_string_end(bytes, i + 1)),
+        // An escaped char, such as '\n' or '\''.
+        [b'\'', b'\\', ..] => Some(
+            bytes[i + 3..]
+                .iter()
+                .position(|&b| b == b'\'')
+                .map_or(bytes.len(), |n| i + 3 + n + 1),
+        ),
+        // A plain char, such as '{'. A lifetime has no second quote.
+        [b'\'', _, b'\'', ..] => Some(i + 3),
+        _ => None,
+    }
+}
+
+/// The source with each comment, string and char literal replaced by
+/// spaces. Newlines stay, so each offset keeps its line.
+fn blank_noise(source: &str) -> Vec<u8> {
+    let bytes = source.as_bytes();
+    let mut out = bytes.to_vec();
+    let mut i = 0;
+    while i < bytes.len() {
+        let Some(end) = noise_end(bytes, i) else {
+            i += 1;
+            continue;
+        };
+        for byte in &mut out[i..end] {
+            if *byte != b'\n' {
+                *byte = b' ';
             }
         }
-        if depth <= 0 {
-            return &lines[start..=start + offset];
-        }
+        i = end;
     }
-    &lines[start..]
+    out
 }
 
-/// Whether a line names the field `field` in a struct literal.
-fn names_field(line: &str, field: &str) -> bool {
-    let trimmed = code(line).trim();
-    trimmed
-        .strip_prefix(field)
-        .is_some_and(|rest| rest.is_empty() || rest.starts_with([':', ',']))
+/// The top-level field entries of the literal whose `{` sits at `open`.
+///
+/// Each entry has its white space collapsed. A nested call or literal stays
+/// inside its entry.
+fn entries(code: &[u8], open: usize) -> Vec<String> {
+    let mut depth = 0_usize;
+    let mut out = Vec::new();
+    let mut current = String::new();
+    for &byte in &code[open..] {
+        match byte {
+            b'{' | b'(' | b'[' => {
+                depth += 1;
+                if depth == 1 {
+                    continue;
+                }
+            }
+            b'}' | b')' | b']' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    break;
+                }
+            }
+            b',' if depth == 1 => {
+                out.push(std::mem::take(&mut current));
+                continue;
+            }
+            _ => {}
+        }
+        current.push(char::from(byte));
+    }
+    out.push(current);
+    out.into_iter()
+        .map(|e| e.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|e| !e.is_empty())
+        .collect()
 }
 
-/// Whether `line` opens a struct literal of `name`, not a definition.
-fn opens_literal(line: &str, name: &str) -> bool {
-    let code = code(line);
-    code.contains(&format!("{name} {{"))
-        && !code.contains("struct ")
-        && !code.contains("impl")
-        && !code.contains("->")
+/// The field that an entry sets, for `name: value` or the shorthand `name`.
+fn field(entry: &str) -> &str {
+    entry.split(':').next().unwrap_or_default().trim()
 }
 
-/// The literals in `source` that drop the timeout, as `(line, first line
-/// of the literal)`.
+/// Whether the literal of `name` with these entries drops the timeout.
+fn drops_timeout(name: &str, entries: &[String]) -> bool {
+    let set = |f: &str| entries.iter().find(|e| field(e) == f);
+    if name == OPTIONS {
+        return set("execution_timeout_secs").is_some_and(|e| e.ends_with(": None"));
+    }
+    // A bare `..` ends a pattern, not a literal.
+    if entries.iter().any(|e| e == "..") {
+        return false;
+    }
+    // A literal with no base sets every field, so the compiler checks it.
+    let has_base = entries.iter().any(|e| e.starts_with(".."));
+    has_base && set("execution_timeout").is_none_or(|e| e.ends_with(": None"))
+}
+
+/// Whether the text before `at` on its line opens a definition.
+fn is_definition(code: &[u8], at: usize) -> bool {
+    let line_start = code[..at]
+        .iter()
+        .rposition(|&b| b == b'\n')
+        .map_or(0, |n| n + 1);
+    let before = String::from_utf8_lossy(&code[line_start..at]);
+    before.contains("struct ") || before.contains("impl") || before.contains("->")
+}
+
+/// The literals in `source` that drop the timeout. Each item holds the
+/// line number and the field entries of the literal.
 fn dropped_timeouts(source: &str) -> Vec<(usize, Vec<String>)> {
-    let lines: Vec<&str> = source.lines().collect();
+    let code = blank_noise(source);
     let mut found = Vec::new();
-    for start in 0..lines.len() {
-        let params = opens_literal(lines[start], "StartWorkflowParams");
-        let options = opens_literal(lines[start], "DebounceStartOptions");
-        if !params && !options {
-            continue;
-        }
-        let body = literal(&lines, start);
-        let drops = if params {
-            // A literal with no base names every field already.
-            let has_base = body.iter().any(|l| code(l).trim_start().starts_with(".."));
-            has_base && !body.iter().any(|l| names_field(l, "execution_timeout"))
-        } else {
-            body.iter()
-                .any(|l| names_field(l, "execution_timeout_secs") && code(l).contains(": None"))
-        };
-        if drops {
-            let text = body.iter().map(|l| l.trim().to_string()).collect();
-            found.push((start + 1, text));
+    for name in [PARAMS, OPTIONS] {
+        let mut from = 0;
+        while let Some(hit) = find(&code[from..], name.as_bytes()) {
+            let at = from + hit;
+            from = at + name.len();
+            let whole_word = (at == 0 || !is_ident(code[at - 1]))
+                && !code.get(from).copied().is_some_and(is_ident);
+            let gap = code[from..].iter().take_while(|b| **b == b' ').count();
+            if !whole_word || code.get(from + gap) != Some(&b'{') || is_definition(&code, at) {
+                continue;
+            }
+            let fields = entries(&code, from + gap);
+            if drops_timeout(name, &fields) {
+                let line = code[..at].split(|&b| b == b'\n').count();
+                found.push((line, fields));
+            }
         }
     }
+    found.sort();
     found
 }
 
-fn allowed(file: &str, body: &[String]) -> bool {
+fn allowed(file: &str, fields: &[String]) -> bool {
     ALLOWED
         .iter()
-        .any(|(f, line)| *f == file && body.iter().any(|l| l == line))
+        .any(|(f, entry)| *f == file && fields.iter().any(|e| e == entry))
 }
 
 #[test]
@@ -137,8 +260,8 @@ fn no_start_site_drops_the_execution_timeout() {
     let mut offenders = Vec::new();
     for file in &files {
         let source = std::fs::read_to_string(root.join(file)).expect("read source");
-        for (line, body) in dropped_timeouts(&source) {
-            if !allowed(file, &body) {
+        for (line, fields) in dropped_timeouts(&source) {
+            if !allowed(file, &fields) {
                 offenders.push(format!("{file}:{line}"));
             }
         }
@@ -150,49 +273,64 @@ fn no_start_site_drops_the_execution_timeout() {
     );
 }
 
-/// The guard is live. It flags a literal that drops the timeout, and it
-/// skips a literal that passes it, a full literal and a definition.
+/// The guard is live. Each sample from `a` to `g` drops the timeout. Each
+/// `ok_*` sample sets it or sets every field. The last lines hold no
+/// literal.
 #[test]
 fn the_guard_flags_a_dropped_timeout_only() {
-    let sample = "let a = StartWorkflowParams {\n\
-                  \x20   sla,\n\
-                  \x20   ..StartWorkflowParams::new()\n\
-                  };\n\
-                  let b = StartWorkflowParams {\n\
-                  \x20   execution_timeout,\n\
-                  \x20   ..StartWorkflowParams::new()\n\
-                  };\n\
-                  let c = StartWorkflowParams {\n\
-                  \x20   max_execution_timeout_ceiling: ceiling,\n\
-                  \x20   ..StartWorkflowParams::new()\n\
-                  };\n\
-                  let d = DebounceStartOptions {\n\
-                  \x20   execution_timeout_secs: None,\n\
-                  };\n\
-                  let e = DebounceStartOptions {\n\
-                  \x20   execution_timeout_secs: timeout.map(secs),\n\
-                  };\n\
-                  pub struct StartWorkflowParams {\n\
-                  \x20   sla: u8,\n\
-                  \x20   ..x\n\
-                  }\n";
+    let sample = r##"
+let a = StartWorkflowParams {
+    sla,
+    ..StartWorkflowParams::new("https://x", "}", r#"{"k": 1}"#)
+};
+let b = StartWorkflowParams { sla, ..base };
+let c = StartWorkflowParams{
+    max_execution_timeout_ceiling: ceiling,
+    owner: f(info.name, execution_timeout),
+    ..base
+};
+let d = crate::execution::StartWorkflowParams {
+    execution_timeout: None,
+    ..base
+};
+let e = DebounceStartOptions {
+    execution_timeout_secs: None,
+    sla_secs: None,
+};
+let f = DebounceStartOptions { execution_timeout_secs: None, ..x };
+let g = StartWorkflowParams {
+    // execution_timeout,
+    ..base
+};
+let ok_shorthand = StartWorkflowParams { execution_timeout, ..base };
+let ok_value = StartWorkflowParams {
+    execution_timeout: info.timeout.map(chrono),
+    ..StartWorkflowParams::new('{', "x")
+};
+let ok_full = StartWorkflowParams { sla, owner };
+let ok_secs = DebounceStartOptions { execution_timeout_secs: t.map(secs) };
+let StartWorkflowParams { sla, .. } = params;
+pub struct StartWorkflowParams { sla: u8 }
+// let h = StartWorkflowParams { sla, ..base };
+let s = "StartWorkflowParams { sla, ..base }";
+"##;
     let lines: Vec<usize> = dropped_timeouts(sample)
         .into_iter()
         .map(|(n, _)| n)
         .collect();
-    assert_eq!(lines, [1, 9, 13], "a, c and d drop the timeout");
+    assert_eq!(lines, [2, 6, 7, 12, 16, 20, 21]);
 }
 
 /// Each allowed literal still exists, so the list holds no stale entry.
 #[test]
 fn each_allowed_literal_still_exists() {
     let root = repo_root();
-    for (file, line) in ALLOWED {
+    for (file, entry) in ALLOWED {
         let source = std::fs::read_to_string(root.join(file)).expect("read source");
         let hits = dropped_timeouts(&source)
             .into_iter()
-            .filter(|(_, body)| body.iter().any(|l| l == line))
+            .filter(|(_, fields)| fields.iter().any(|e| e == entry))
             .count();
-        assert_eq!(hits, 1, "{file}: `{line}` must name one allowed literal");
+        assert_eq!(hits, 1, "{file}: `{entry}` must name one allowed literal");
     }
 }

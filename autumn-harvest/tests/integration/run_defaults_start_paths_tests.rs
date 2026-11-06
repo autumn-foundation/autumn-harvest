@@ -346,6 +346,11 @@ async fn sweep_target(url: &str, source: &'static str, target: &'static str) -> 
 /// Relay one outbox row through `DeferredTriggerStart::spawn`, the immediate
 /// relay of a cross-shard evaluation. `sla` is the value from evaluation
 /// time, which the struct carries.
+///
+/// `spawn` reads the global pool. Another test in this binary can install
+/// its own pool between the reads, and the relay then finds no row. A failed
+/// relay leaves the row in place, so each attempt installs the pool again
+/// and spawns again.
 async fn relay_target(
     url: &str,
     source: &'static str,
@@ -354,9 +359,7 @@ async fn relay_target(
 ) -> WorkflowExecution {
     let mut conn = connect(url).await;
     let row = insert_outbox_row(&mut conn, source, target).await;
-    // The constructor installs the global pool that `spawn` reads.
-    let _pool = ShardedDbPool::single(build_test_pool(url));
-    DeferredTriggerStart {
+    let relay = DeferredTriggerStart {
         outbox_id: row.id,
         source_exec_id: row.source_exec.as_uuid(),
         trigger_id: row.trigger_id,
@@ -380,18 +383,22 @@ async fn relay_target(
         max_workflow_attempts_ceiling: None,
         codecs: autumn_harvest::payload_codec::PayloadCodecs::default(),
         tenant: None,
-    }
-    .spawn();
-    // The relay runs on a detached task. Wait for its start.
-    for _ in 0..200 {
-        let mut rows = target_rows(&mut conn, target).await;
-        if !rows.is_empty() {
-            assert_eq!(rows.len(), 1, "the relay starts one target");
-            return rows.remove(0);
+    };
+    for _attempt in 0..10 {
+        // The constructor installs the global pool that `spawn` reads.
+        let _pool = ShardedDbPool::single(build_test_pool(url));
+        relay.clone().spawn();
+        // The relay runs on a detached task. Wait for its start.
+        for _ in 0..20 {
+            let mut rows = target_rows(&mut conn, target).await;
+            if !rows.is_empty() {
+                assert_eq!(rows.len(), 1, "the relay starts one target");
+                return rows.remove(0);
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    panic!("the relay did not start the target within 10 seconds");
+    panic!("the relay did not start the target in 10 attempts");
 }
 
 // ── Deadlines of a target run ───────────────────────────────────────────────
@@ -452,7 +459,7 @@ fn timeout_override(execution_timeout: Duration) -> RunDefaultFields {
     }
 }
 
-/// AC2 and AC3: each site gives `deadline_at = started_at + override`, and
+/// Each site gives `deadline_at = started_at + override`, and
 /// clamps the declared SLA to that timeout.
 #[tokio::test]
 async fn each_target_site_sets_the_override_deadline_and_clamps_the_sla() {
@@ -475,7 +482,7 @@ async fn each_target_site_sets_the_override_deadline_and_clamps_the_sla() {
     }
 }
 
-/// AC3: each site caps the override at the fleet ceiling, and clamps the
+/// Each site caps the override at the fleet ceiling, and clamps the
 /// SLA to the capped timeout.
 #[tokio::test]
 async fn each_target_site_caps_the_override_deadline_at_the_fleet_ceiling() {

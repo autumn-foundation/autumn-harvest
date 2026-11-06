@@ -51,7 +51,8 @@ const CHAIN_WF: &str = "looping_poller";
 const HOUR: Duration = Duration::from_hours(1);
 /// A type that declares `execution_timeout = 1h` and `sla = 3h` in code.
 const BATCH_WF: &str = "bulk_import";
-/// `BATCH_WF` with a start throttle of one token per tenant.
+/// Declares the values of `BATCH_WF`, and a start throttle of one token
+/// per tenant.
 const THROTTLED_WF: &str = "paced_import";
 
 async fn setup_test_database_url() -> (String, ContainerAsync<Postgres>) {
@@ -841,7 +842,7 @@ async fn run_of(url: &str, workflow_id: &str) -> Uuid {
 /// Refill the bucket of `THROTTLED_WF`, and fire its deferred starts.
 async fn fire_deferred(url: &str) {
     let mut conn = connect(url).await;
-    diesel::sql_query(
+    let refilled = diesel::sql_query(
         "UPDATE harvest_rate_limit_buckets SET tokens = 1.0, last_refilled_at = NOW() \
          WHERE key = $1",
     )
@@ -849,6 +850,7 @@ async fn fire_deferred(url: &str) {
     .execute(&mut conn)
     .await
     .expect("refill bucket");
+    assert_eq!(refilled, 1, "the bucket key of the throttle exists");
     let fired = autumn_harvest::throttle::fire_due_throttled_starts(
         &mut conn,
         &None,
@@ -887,7 +889,7 @@ async fn throttled_batch(url: &str, app: &axum::Router) -> (Uuid, Uuid) {
     )
 }
 
-/// AC1: an immediate batch start, best-effort and atomic, gets
+/// An immediate batch start, best-effort and atomic, gets
 /// `deadline_at = started_at + override`. The declared 3h SLA clamps to it.
 #[tokio::test]
 async fn a_batch_start_takes_the_timeout_override() {
@@ -914,7 +916,7 @@ async fn a_batch_start_takes_the_timeout_override() {
     }
 }
 
-/// AC1: a throttled batch start gets the override deadline, on the item
+/// A throttled batch start gets the override deadline, on the item
 /// that takes a token and on the item that the scanner fires later.
 #[tokio::test]
 async fn a_throttled_batch_start_takes_the_timeout_override() {
@@ -932,7 +934,7 @@ async fn a_throttled_batch_start_takes_the_timeout_override() {
     );
 }
 
-/// AC3: the fleet ceiling caps the override on each batch path, and the
+/// The fleet ceiling caps the override on each batch path, and the
 /// SLA clamps to the capped timeout.
 #[tokio::test]
 async fn the_fleet_ceiling_caps_a_batch_start_override() {
@@ -944,9 +946,14 @@ async fn the_fleet_ceiling_caps_a_batch_start_override() {
         assert_eq!(status, StatusCode::OK, "{body}");
     }
     batch_start(&app, false, vec![batch_item(BATCH_WF, "bulk-capped")]).await;
+    batch_start(&app, true, vec![batch_item(BATCH_WF, "bulk-capped-atomic")]).await;
     let (now, later) = throttled_batch(&url, &app).await;
     for (path, id) in [
         ("immediate", run_of(&url, "bulk-capped").await),
+        (
+            "immediate, atomic",
+            run_of(&url, "bulk-capped-atomic").await,
+        ),
         ("throttled, token", now),
         ("throttled, deferred", later),
     ] {
