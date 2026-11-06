@@ -2570,7 +2570,9 @@ reject and no score call.
 A step continues its beam, so it also continues the step count. A beam of
 round `r` holds `r` tool rounds, so its step may run `max_steps - r` more.
 With none left, a step that asks for a tool ends `steps_exhausted`. So a
-path never runs more tool rounds than one run of the profile.
+path never runs more tool rounds than one run of the profile. In the same
+way, the mandate of a step allows only the delegations that its beam has
+not used.
 
 After each round, `beam_rank` keeps the best steps: at most `width` less
 the complete beams. It calls `select` once per kept step, so a tie goes

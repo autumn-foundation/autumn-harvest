@@ -17,8 +17,9 @@ strategy is `beam`.
   outcome is the best complete beam, or `no_accepted_draw`.
 - `SampleDraw::beam` records the round, the parent and the fate of each
   step.
-- A step continues the flow labels and the step count of its beam. A step
-  of round `r` may run `max_steps - r` tool rounds.
+- A step continues the flow labels, the step count and the delegation
+  count of its beam. A step of round `r` may run `max_steps - r` tool
+  rounds, and its mandate allows only the delegations that are left.
 - `ExactMatch` and `JsonSchema` give a `step_ended` step the score 0, so
   they work as step scorers.
 - The policy admits `beam_draws(width, expansion, max_rounds)`, the

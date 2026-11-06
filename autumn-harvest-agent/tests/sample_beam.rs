@@ -665,3 +665,67 @@ async fn a_round_keeps_by_score_not_by_draw_order() {
     assert_eq!(report.selected.unwrap().text, "RL");
     assert_eq!(model.requests().len(), 10);
 }
+
+/// Whether `request` comes from the helper peer.
+fn from_helper(request: &ChatRequest) -> bool {
+    request.messages.iter().any(|message| {
+        message
+            .content
+            .iter()
+            .any(|part| matches!(part, ContentPart::Text(text) if text == "You help."))
+    })
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_beam_carries_its_delegation_count_into_the_next_step() {
+    let (_dir, db) = fresh_db();
+    // Each root turn delegates until it has 2 tool results, then answers.
+    let model = TryFnModel::new(|request: &ChatRequest| {
+        if from_helper(request) {
+            return answer("ok", 1);
+        }
+        let n = results(&request.messages).len();
+        if n >= 2 {
+            return answer("done", 5);
+        }
+        calls(
+            &[(
+                &format!("d{n}"),
+                autumn_harvest_agent::mesh::DELEGATE_TOOL,
+                json!({"agent": "helper", "task": "help"}),
+            )],
+            5,
+        )
+    });
+    let mut profile = AgentProfile::new(KIND);
+    profile.mandate = Some(
+        autumn_harvest_agent::Mandate::new(KIND)
+            .peers(["helper"])
+            .max_delegations(1),
+    );
+    let harness = AgentHarness::new(model.clone())
+        .agent(profile)
+        .peer(autumn_harvest_agent::Peer::new("helper", "Helps.").system("You help."))
+        .scorer(Arc::new(Flat))
+        .sampling_policies(store_with(&SamplingPolicy {
+            // A delegation is an internal effect.
+            draw_effects: BTreeSet::from([ToolEffect::ReadOnly, ToolEffect::Internal]),
+            ..policy(&[Strategy::Beam], 3)
+        }));
+    let mut rt = runtime(&db, harness);
+    let input = SampleInput::new(
+        KIND,
+        "Get help twice.",
+        SampleStrategy::beam(1, 1, 3),
+        ScorerRef::deterministic("flat").unwrap(),
+    );
+    let report = sample_report(drive(&mut rt, &input).await);
+
+    let helper_calls = model.requests().iter().filter(|r| from_helper(r)).count();
+    assert_eq!(
+        helper_calls, 1,
+        "the mandate allows one delegation along the whole path"
+    );
+    let selected = report.selected.expect("the beam completes");
+    assert_eq!(selected.text, "done");
+}

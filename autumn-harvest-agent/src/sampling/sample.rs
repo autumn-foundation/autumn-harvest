@@ -397,6 +397,8 @@ const fn tree_budget(profile: Option<u32>, input: Option<u32>) -> Option<u32> {
 struct Scored {
     record: SampleDraw,
     report: AgentReport,
+    /// The delegations of the beam that a beam step extends. 0 for a draw.
+    parent_delegations: u32,
 }
 
 /// Run the waves of the run, and score each draw.
@@ -473,12 +475,13 @@ struct BeamShape {
     max_rounds: u32,
 }
 
-/// One live beam: the step that ends it, its transcript and the flow
-/// labels that it exercised.
+/// One live beam: the step that ends it, its transcript, the flow labels
+/// that it exercised and the delegations that it used.
 struct Beam {
     draw: Option<DrawId>,
     messages: Vec<ChatMessage>,
     flow_labels: BTreeSet<String>,
+    delegations: u32,
 }
 
 /// Run the rounds of a beam run, and score each step.
@@ -511,6 +514,7 @@ async fn run_beam(
         draw: None,
         messages: vec![ChatMessage::text(ChatRole::User, input.input.clone())],
         flow_labels: task.flow_labels.clone(),
+        delegations: 0,
     }];
     for round in 0..shape.max_rounds {
         let slots = beam_slots(shape.width, complete);
@@ -614,6 +618,7 @@ async fn run_steps(
             let (mut one, halted) =
                 score_draw(ctx, steps.input, steps.task, draw, report, halt).await?;
             halt = halt.or(halted);
+            one.parent_delegations = parent.delegations;
             one.record.beam = Some(BeamStep {
                 round: steps.round,
                 parent: parent.draw,
@@ -633,15 +638,22 @@ async fn run_steps(
 /// as its history.
 ///
 /// A step continues the run of its beam, so it also continues its flow
-/// labels and its step count. A beam of round `r` holds `r` tool rounds.
-/// So the step may run `max_steps - r` tool rounds, as one run of the task
-/// would. With none left, the model may still answer.
+/// labels, its step count and its delegation count. A beam of round `r`
+/// holds `r` tool rounds. So the step may run `max_steps - r` tool rounds,
+/// as one run of the task would. With none left, the model may still
+/// answer. The mandate of the step allows only the delegations that the
+/// beam has not used.
 ///
 /// A step makes one model call. It has no context reset, because a reset
 /// rewrites the beam. It has no answer check, because a rejected answer
 /// asks the model again.
 fn step_task(task: &AgentTask, beam: &Beam, round: u32) -> AgentTask {
+    let mut mandate = task.mandate.clone();
+    if let Some(mandate) = mandate.as_mut() {
+        mandate.max_delegations = mandate.max_delegations.saturating_sub(beam.delegations);
+    }
     AgentTask {
+        mandate,
         history: beam.messages.clone(),
         flow_labels: beam.flow_labels.clone(),
         max_steps: task.max_steps.saturating_sub(round),
@@ -668,6 +680,7 @@ fn keep_beams(round: &mut [Scored], slots: u32, complete: &mut u32) -> Vec<Beam>
             continue;
         };
         let complete_now = one.record.stop == AgentStop::Completed;
+        let parent_delegations = one.parent_delegations;
         if let Some(beam) = one.record.beam.as_mut() {
             beam.fate = if complete_now {
                 BeamFate::Complete
@@ -682,10 +695,21 @@ fn keep_beams(round: &mut [Scored], slots: u32, complete: &mut u32) -> Vec<Beam>
                 draw: Some(draw),
                 messages: one.report.messages.clone(),
                 flow_labels: one.report.flow_labels.clone(),
+                delegations: parent_delegations.saturating_add(used_delegations(&one.report)),
             });
         }
     }
     live
+}
+
+/// The delegations that `report` ran. A refused delegation uses none.
+fn used_delegations(report: &AgentReport) -> u32 {
+    let used = report
+        .delegations
+        .iter()
+        .filter(|record| record.refusal.is_none())
+        .count();
+    u32::try_from(used).unwrap_or(u32::MAX)
 }
 
 /// The best `keep` draws of `verdicts`, best first.
@@ -794,7 +818,12 @@ async fn score_draw(
         cost_usd_micros: report.cost_usd_micros.saturating_add(cost),
         beam: None,
     };
-    Ok((Scored { record, report }, stop))
+    let scored = Scored {
+        record,
+        report,
+        parent_delegations: 0,
+    };
+    Ok((scored, stop))
 }
 
 /// Whether `verdict` passes the check of `strategy`.
@@ -1004,7 +1033,11 @@ mod tests {
                 fate: BeamFate::Pruned,
             }),
         };
-        Scored { record, report }
+        Scored {
+            record,
+            report,
+            parent_delegations: 0,
+        }
     }
 
     #[test]
