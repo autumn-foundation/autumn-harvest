@@ -96,7 +96,10 @@ default from `WorkerConfig` applies only when neither sets a value. An
 override that sets `schedule_to_close_ms` counts as an attempt bound, so the
 builder default `start_to_close` then does not apply.
 
-A local activity takes `retry_*` and `start_to_close_ms`. The worker still
+A local activity takes `retry_*` and `start_to_close_ms`. A raw local call,
+such as `execute_local_activity_raw` from a DAG, reads no code value. It
+resolves call site, then override, then builder default, and a retry field
+applies only over the builder policy. The worker still
 clamps its `start_to_close` to `WorkerConfig::max_local_activity_start_to_close`.
 `effective` does not show that clamp, because the cap belongs to each worker.
 

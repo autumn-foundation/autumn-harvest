@@ -7111,13 +7111,43 @@ impl WorkflowContext {
         // in `execute_local_activity_raw_resolved`, which carries the full
         // `Duration` so a subsecond OR sub-millisecond floor never truncates to
         // `0` (issue #620, Codex P2).
-        self.execute_local_activity_raw_resolved(
+        let (retry_policy, start_to_close) = self.raw_local_call_defaults(
             name,
-            input,
             retry_policy,
             start_to_close_secs.map(std::time::Duration::from_secs),
-        )
-        .await
+        );
+        self.execute_local_activity_raw_resolved(name, input, retry_policy, start_to_close)
+            .await
+    }
+
+    /// The retry policy and the `start_to_close` of a raw local call.
+    ///
+    /// A raw call reads no code value. So it resolves call site, then
+    /// operator override, then builder default. A retry field applies only
+    /// over the builder policy, so the override never adds a policy.
+    fn raw_local_call_defaults(
+        &self,
+        name: &str,
+        retry_policy: Option<crate::policy::RetryPolicy>,
+        start_to_close: Option<std::time::Duration>,
+    ) -> (
+        Option<crate::policy::RetryPolicy>,
+        Option<std::time::Duration>,
+    ) {
+        let fields = self
+            .activity_overrides
+            .as_ref()
+            .filter(|_| !crate::activity_defaults::is_reserved_activity(name))
+            .and_then(|cache| cache.activity(name));
+        let Some(fields) = fields else {
+            return (retry_policy, start_to_close);
+        };
+        let retry_policy = retry_policy.or_else(|| {
+            self.default_activity_retry_policy
+                .clone()
+                .map(|policy| fields.retry.apply(policy))
+        });
+        (retry_policy, start_to_close.or(fields.start_to_close))
     }
 
     /// Core local-activity dispatch state machine underlying
@@ -34371,6 +34401,42 @@ mod activity_override_tests {
         assert_eq!(
             scheduled(&commands[0]),
             (Some(6), Some(Duration::from_secs(2)))
+        );
+    }
+
+    /// A raw local call reads no code value. It takes the override over the
+    /// builder default, and a call-site value still wins.
+    #[tokio::test]
+    async fn a_raw_local_call_takes_the_override() {
+        let ctx = WorkflowContext::new_test()
+            .with_activity_defaults(Some(RetryPolicy::fixed(4, Duration::from_millis(5))), None)
+            .with_activity_overrides(cache("checksum"));
+        let call = ctx.execute_local_activity_raw("checksum", Value::from(1), None, None);
+        let commands = commands_of(&ctx, call).await;
+        assert_eq!(scheduled(&commands[0]), (Some(1), Some(OVERRIDE_STC)));
+
+        let ctx = WorkflowContext::new_test()
+            .with_activity_defaults(Some(RetryPolicy::fixed(4, Duration::from_millis(5))), None)
+            .with_activity_overrides(cache("checksum"));
+        let call = ctx.execute_local_activity_raw(
+            "checksum",
+            Value::from(1),
+            Some(RetryPolicy::fixed(6, Duration::from_millis(5))),
+            Some(2),
+        );
+        let commands = commands_of(&ctx, call).await;
+        assert_eq!(
+            scheduled(&commands[0]),
+            (Some(6), Some(Duration::from_secs(2)))
+        );
+
+        let ctx = WorkflowContext::new_test().with_activity_overrides(cache("checksum"));
+        let call = ctx.execute_local_activity_raw("checksum", Value::from(1), None, None);
+        let commands = commands_of(&ctx, call).await;
+        assert_eq!(
+            scheduled(&commands[0]),
+            (None, Some(OVERRIDE_STC)),
+            "no builder policy, so the override adds none"
         );
     }
 
