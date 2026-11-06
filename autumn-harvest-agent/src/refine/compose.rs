@@ -23,6 +23,7 @@ use autumn_harvest::types::ExecutionId;
 use serde::{Deserialize, Serialize};
 
 use super::bundle::BundleManifest;
+use super::lessons::{MAX_LESSON_CHARS, MAX_WHY_CHARS};
 use super::meter::{Charge, Meter, total};
 use super::propose::{
     Ask, Edit, ProposalAttempts, ProposerReply, StageOutcome, edit_stage, record_calls,
@@ -478,6 +479,60 @@ pub trait OverlaySelector: Send + Sync + fmt::Debug {
         &'a self,
         context: &'a SelectContext<'a>,
     ) -> BoxFuture<'a, Result<AnonId, AgentError>>;
+
+    /// Pick one id, and say why and what the pick teaches. The lesson
+    /// library keeps that text when the pick goes live. The default calls
+    /// [`select`](Self::select) and gives no text.
+    fn choose<'a>(
+        &'a self,
+        context: &'a SelectContext<'a>,
+    ) -> BoxFuture<'a, Result<Choice, AgentError>> {
+        Box::pin(async move { self.select(context).await.map(Choice::new) })
+    }
+}
+
+/// The pick of a selector, with its reasons.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Choice {
+    /// The opaque id of the pick.
+    pub id: AnonId,
+    /// Why the selector picked it. Empty for no text.
+    pub why: String,
+    /// What the pick teaches the next refine. Empty for no text.
+    pub lesson: String,
+}
+
+impl Choice {
+    /// A pick of `id` with no text.
+    #[must_use]
+    pub const fn new(id: AnonId) -> Self {
+        Self {
+            id,
+            why: String::new(),
+            lesson: String::new(),
+        }
+    }
+
+    /// Say why the selector picked the id.
+    #[must_use]
+    pub fn why(mut self, why: impl Into<String>) -> Self {
+        self.why = why.into();
+        self
+    }
+
+    /// Say what the pick teaches the next refine.
+    #[must_use]
+    pub fn lesson(mut self, lesson: impl Into<String>) -> Self {
+        self.lesson = lesson.into();
+        self
+    }
+}
+
+/// `text` cut to `max` characters, or `None` for a blank text.
+fn reason(text: &str, max: usize) -> Option<String> {
+    let text = text.trim();
+    (!text.is_empty()).then(|| truncate(text, max))
 }
 
 /// The input of [`agent_refine_select`].
@@ -522,6 +577,12 @@ pub struct Selection {
     /// Why the rule replaced the pick of the installed selector.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// Why the selector picked the id. A rule pick has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub why: Option<String>,
+    /// What the pick teaches the next refine. A rule pick has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lesson: Option<String>,
 }
 
 /// The rule pick of `pool`: a completed end first, then the fewest
@@ -571,6 +632,8 @@ pub(crate) async fn run_select(
         usage: TokenUsage::default(),
         cost_usd_micros: 0,
         note: None,
+        why: None,
+        lesson: None,
     };
     let Some(selector) = harness.overlay_selector() else {
         return Ok((selection, Vec::new()));
@@ -587,21 +650,23 @@ pub(crate) async fn run_select(
         meter: Some(&meter),
     };
     let budget = harness.proposer_budget();
-    let picked = tokio::time::timeout(budget, selector.select(&context)).await;
+    let picked = tokio::time::timeout(budget, selector.choose(&context)).await;
     let charges = meter.take();
     let (usage, cost_usd_micros) = total(&charges);
     selection.usage = usage;
     selection.cost_usd_micros = cost_usd_micros;
     match picked {
-        Ok(Ok(id)) => match index_of(&id) {
+        Ok(Ok(choice)) => match index_of(&choice.id) {
             Some(index) => {
                 selection.index = Some(index);
-                selection.id = Some(id);
+                selection.why = reason(&choice.why, MAX_WHY_CHARS);
+                selection.lesson = reason(&choice.lesson, MAX_LESSON_CHARS);
+                selection.id = Some(choice.id);
                 selection.by = SelectedBy::Selector;
             }
             None => {
                 selection.note = Some(truncate(
-                    &format!("the selector named {id}, which is not in the pool"),
+                    &format!("the selector named {}, which is not in the pool", choice.id),
                     MAX_NOTE_CHARS,
                 ));
             }

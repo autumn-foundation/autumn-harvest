@@ -19,6 +19,9 @@
 //!    [`RefineLedger::check`].
 //! 6. A run that chose an overlay runs the adoption gate of
 //!    [`gate`](super::gate). A dry run ends before it.
+//! 7. A run that adopted an overlay adds one lesson to the library of
+//!    [`lessons`](super::lessons). A failed write is a note. The adoption
+//!    stands.
 //!
 //! Each stage, probe and selection is one recorded activity. A crash
 //! re-runs only the step in flight.
@@ -39,6 +42,10 @@ use super::compose::{
 };
 use super::gate::{Gate, GateRecord, set_failed, set_status};
 use super::ledger::{MAX_REFINE_K, MAX_SOURCE_RUNS, RefineError, RefineLedger, RefineMode};
+use super::lessons::{
+    LESSON_PATCH, Lesson, LessonOutcome, LessonRequest, agent_refine_lesson_info, lesson_scope,
+    writes_lesson,
+};
 use super::policy::{PolicyCeilings, RefinePolicy};
 use super::policy_read::read_refine_policy;
 use super::propose::{
@@ -50,9 +57,10 @@ use crate::agent::overlay::{Ceilings, ProfileOverlay};
 use crate::agent::overlay_store::{OverlayVersion, StoredOverlay};
 use crate::agent::{AGENT_WORKFLOW_NAME, AgentId, AgentProfile};
 use crate::eval::anon::AnonId;
-use crate::eval::evidence::render_source;
+use crate::eval::evidence::{render_source, source_labels};
 use crate::eval::{Candidate, Evaluation, RunEnd, check_source, evaluate_routed, task_of};
 use crate::harness::{AgentHarness, truncate};
+use crate::memory::MemorySnapshot;
 use crate::mesh_control::{MESH_ATTR, MeshBudget};
 use crate::message::TokenUsage;
 use crate::tool::ToolEffect;
@@ -186,6 +194,13 @@ pub struct SourceBrief {
     /// The profile of the recorded task. A probe applies each overlay to
     /// it, so each stage of the source checks its replies against it too.
     pub profile: AgentProfile,
+    /// The flow labels that the source recorded. A record of an older
+    /// release has none, so its run writes no lesson.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub labels: Option<BTreeSet<String>>,
+    /// The workflow id of the source, when it is an agent id of the kind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
 }
 
 /// The input of [`agent_refine_start`].
@@ -222,6 +237,10 @@ pub struct RefineStart {
     /// and opens no gate, as that release did.
     #[serde(default)]
     pub active_read: bool,
+    /// The lesson library of the kind. Each proposer stage reads it. `None`
+    /// when the worker has no memory store, or the library is empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lessons: Option<MemorySnapshot>,
 }
 
 /// The part of the loop that a stage plays.
@@ -380,6 +399,12 @@ pub struct SelectionRecord {
     /// Why the rule replaced the pick of the installed selector.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// Why the selector picked the id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub why: Option<String>,
+    /// What the pick teaches the next refine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lesson: Option<String>,
 }
 
 /// The output of [`agent_refine`].
@@ -416,6 +441,13 @@ pub struct RefineReport {
     /// for a dry run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gate: Option<GateRecord>,
+    /// The flow labels of the run: the labels of each source and of the
+    /// lessons that the run read.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub flow_labels: BTreeSet<String>,
+    /// The lesson write. `None` when the run adopted nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lesson: Option<LessonOutcome>,
 }
 
 /// A failure payload of `err` with its name.
@@ -448,6 +480,71 @@ async fn active_of(harness: &AgentHarness, kind: &str) -> Result<Option<StoredOv
     }
 }
 
+/// Check one source `record` of `kind`, and read its brief.
+///
+/// # Errors
+///
+/// Returns the failure payload of a [`RefineError`].
+fn brief_of(
+    run: ExecutionId,
+    record: &super::sources::SourceRecord,
+    kind: &str,
+) -> Result<SourceBrief, String> {
+    let name = run.to_string();
+    if record.workflow_name != WORKFLOW_NAME && record.workflow_name != AGENT_WORKFLOW_NAME {
+        return Err(failure(&RefineError::SourceNotAgentRun {
+            run: name,
+            workflow: truncate(&record.workflow_name, crate::mesh::MAX_NAME_LEN),
+        }));
+    }
+    if !record.ended {
+        return Err(failure(&RefineError::SourceInFlight { run: name }));
+    }
+    let found = kind_of(record).map_err(|reason| {
+        failure(&RefineError::SourceNotReplayable {
+            run: name.clone(),
+            reason,
+        })
+    })?;
+    if found.as_deref() != Some(kind) {
+        return Err(failure(&RefineError::SourceOtherKind {
+            run: name,
+            kind: kind.to_owned(),
+            found: found.map(|kind| truncate(&kind, crate::mesh::MAX_NAME_LEN)),
+        }));
+    }
+    if record.workflow_name == AGENT_WORKFLOW_NAME {
+        return Err(failure(&RefineError::SourceNotReplayable {
+            run: name,
+            reason: "the replay probe reads agent_loop runs only, not a durable agent run"
+                .to_owned(),
+        }));
+    }
+    let not_replayable = |reason: String| {
+        failure(&RefineError::SourceNotReplayable {
+            run: name.clone(),
+            reason,
+        })
+    };
+    check_source(&record.events).map_err(|err| not_replayable(err.to_string()))?;
+    let evidence = render_source(&record.events).map_err(|err| not_replayable(err.to_string()))?;
+    let labels = source_labels(&record.events).map_err(|err| not_replayable(err.to_string()))?;
+    let task = task_of(&record.events).map_err(|err| not_replayable(err.to_string()))?;
+    let mut source_profile = crate::eval::source_profile(&task);
+    kind.clone_into(&mut source_profile.kind);
+    let agent = AgentId::parse(&record.workflow_id)
+        .ok()
+        .filter(|id| id.kind() == kind)
+        .map(|id| id.as_str().to_owned());
+    Ok(SourceBrief {
+        run,
+        evidence,
+        profile: source_profile,
+        labels: Some(labels),
+        agent,
+    })
+}
+
 /// Check every source of `input`, then read the base profile, the active
 /// overlay and the evidence of each source.
 ///
@@ -470,58 +567,16 @@ pub(crate) async fn run_start(
     })?;
     let mut briefs = Vec::with_capacity(input.source_runs.len());
     for &run in &input.source_runs {
-        let name = run.to_string();
         let record = sources
             .source(run)
             .await
             .map_err(|err| format!("the source read failed: {err}"))?
-            .ok_or_else(|| failure(&RefineError::SourceNotFound { run: name.clone() }))?;
-        if record.workflow_name != WORKFLOW_NAME && record.workflow_name != AGENT_WORKFLOW_NAME {
-            return Err(failure(&RefineError::SourceNotAgentRun {
-                run: name,
-                workflow: truncate(&record.workflow_name, crate::mesh::MAX_NAME_LEN),
-            }));
-        }
-        if !record.ended {
-            return Err(failure(&RefineError::SourceInFlight { run: name }));
-        }
-        let found = kind_of(&record).map_err(|reason| {
-            failure(&RefineError::SourceNotReplayable {
-                run: name.clone(),
-                reason,
-            })
-        })?;
-        if found.as_deref() != Some(input.kind.as_str()) {
-            return Err(failure(&RefineError::SourceOtherKind {
-                run: name,
-                kind: input.kind.clone(),
-                found: found.map(|kind| truncate(&kind, crate::mesh::MAX_NAME_LEN)),
-            }));
-        }
-        if record.workflow_name == AGENT_WORKFLOW_NAME {
-            return Err(failure(&RefineError::SourceNotReplayable {
-                run: name,
-                reason: "the replay probe reads agent_loop runs only, not a durable agent run"
-                    .to_owned(),
-            }));
-        }
-        let not_replayable = |reason: String| {
-            failure(&RefineError::SourceNotReplayable {
-                run: name.clone(),
-                reason,
-            })
-        };
-        check_source(&record.events).map_err(|err| not_replayable(err.to_string()))?;
-        let evidence =
-            render_source(&record.events).map_err(|err| not_replayable(err.to_string()))?;
-        let task = task_of(&record.events).map_err(|err| not_replayable(err.to_string()))?;
-        let mut source_profile = crate::eval::source_profile(&task);
-        source_profile.kind.clone_from(&input.kind);
-        briefs.push(SourceBrief {
-            run,
-            evidence,
-            profile: source_profile,
-        });
+            .ok_or_else(|| {
+                failure(&RefineError::SourceNotFound {
+                    run: run.to_string(),
+                })
+            })?;
+        briefs.push(brief_of(run, &record, &input.kind)?);
     }
     let profile = harness.agent_profile(&input.kind).ok_or_else(|| {
         failure(&RefineError::InvalidInput(format!(
@@ -547,6 +602,7 @@ pub(crate) async fn run_start(
             }));
         }
     }
+    let lessons = lessons_of(harness, &input.kind).await?;
     Ok(RefineStart {
         profile,
         current,
@@ -555,7 +611,21 @@ pub(crate) async fn run_start(
         ceilings,
         active: active.as_ref().map(StoredOverlay::version),
         active_read: true,
+        lessons,
     })
+}
+
+/// The snapshot of the lesson library of `kind`, or `None` with no memory
+/// store.
+async fn lessons_of(harness: &AgentHarness, kind: &str) -> Result<Option<MemorySnapshot>, String> {
+    let Ok(store) = harness.memory_store() else {
+        return Ok(None);
+    };
+    let blocks = tokio::time::timeout(harness.hook_limit(), store.load(&lesson_scope(kind)))
+        .await
+        .map_err(|_| "the memory store did not answer in time".to_owned())?
+        .map_err(|err| format!("the lesson library read failed: {err}"))?;
+    Ok(super::lessons::snapshot(&blocks))
 }
 
 /// The start step of a refine run, as an activity. See [`run_start`].
@@ -687,6 +757,11 @@ struct Refine<'a> {
     exhausted: bool,
     /// Whether the worker has a selector.
     selector: bool,
+    /// The lesson library that each proposer stage reads.
+    lessons: Option<&'a MemorySnapshot>,
+    /// The `why` and `lesson` text of the selection that set the current
+    /// overlay.
+    reason: (Option<String>, Option<String>),
 }
 
 /// Whether a stage that failed with `err` falls back to the current
@@ -784,6 +859,7 @@ impl Refine<'_> {
             attempts: self.attempts,
             sample,
             others: self.others(source),
+            lessons: self.lessons.cloned(),
         };
         let stage: Stage = match self
             .ctx
@@ -979,6 +1055,8 @@ impl Refine<'_> {
             id: selection.id,
             by: selection.by,
             note: selection.note,
+            why: selection.why,
+            lesson: selection.lesson,
         });
         Ok(stage)
     }
@@ -1006,6 +1084,8 @@ impl Refine<'_> {
                 ),
                 MAX_NOTE_CHARS,
             )),
+            why: None,
+            lesson: None,
         }
     }
 
@@ -1055,6 +1135,11 @@ impl Refine<'_> {
             && let Some(overlay) = self.overlay_of(chosen)
         {
             self.current = overlay;
+            self.reason = self
+                .selections
+                .last()
+                .map(|pick| (pick.why.clone(), pick.lesson.clone()))
+                .unwrap_or_default();
         }
         Ok(true)
     }
@@ -1083,6 +1168,7 @@ impl Refine<'_> {
             }
             if let Some(overlay) = self.overlay_of(composition) {
                 self.current = overlay;
+                self.reason = (None, None);
             }
         }
         Ok(true)
@@ -1113,12 +1199,7 @@ pub async fn agent_refine(
         .execute_activity(&agent_refine_start_info(), request)
         .await
         .map_err(|err| start_failure(&err))?;
-    if let Some(budget) = &input.budget
-        && let Err(err) =
-            ctx.upsert_search_attrs([(MESH_ATTR.to_owned(), Some(serde_json::json!(budget.mesh)))])
-    {
-        tracing::warn!(error = %err, "the refine mesh attribute was not set");
-    }
+    set_mesh(ctx, &input);
     let mut run = Refine {
         ctx,
         input: &input,
@@ -1134,6 +1215,8 @@ pub async fn agent_refine(
         selections: Vec::new(),
         exhausted: false,
         selector: start.selector,
+        lessons: start.lessons.as_ref(),
+        reason: (None, None),
     };
     for source in &start.sources {
         let more = match input.mode {
@@ -1164,27 +1247,18 @@ pub async fn agent_refine(
             (RefineStatus::Chosen, Some(run.current.clone()))
         }
     };
-    let (status, gate) = match &chosen {
-        Some(overlay) if status == RefineStatus::Chosen && !input.dry_run && start.active_read => {
-            let gate = Gate {
-                ctx,
-                kind: &input.kind,
-                chosen: overlay,
-                expected: start.active,
-                policy: &policy,
-                ceilings: &start.ceilings,
-            };
-            match gate.run().await {
-                Ok(ended) => ended,
-                Err(err) => {
-                    set_failed(ctx, &input.kind);
-                    return Err(err);
-                }
-            }
-        }
-        _ => (status, None),
-    };
+    let (status, gate) = gate_of(ctx, &input, &start, &policy, status, chosen.as_ref()).await?;
     set_status(ctx, &input.kind, status);
+    let flow_labels = run_labels(&start);
+    let adopted = gate.as_ref().and_then(|gate| gate.adopted);
+    let lesson = Ended {
+        status,
+        adopted,
+        input: &input,
+        start: &start,
+    }
+    .lesson(ctx, run.reason.clone(), flow_labels.clone())
+    .await;
     Ok(RefineReport {
         kind: input.kind.clone(),
         mode: input.mode,
@@ -1197,7 +1271,140 @@ pub async fn agent_refine(
         selections: run.selections,
         ledger: run.ledger,
         gate,
+        flow_labels: flow_labels.unwrap_or_default(),
+        lesson,
     })
+}
+
+/// How a refine run ended, as its lesson write reads it.
+struct Ended<'a> {
+    status: RefineStatus,
+    /// The version that went live, if any.
+    adopted: Option<OverlayVersion>,
+    input: &'a RefineInput,
+    start: &'a RefineStart,
+}
+
+impl Ended<'_> {
+    /// Write the lesson of an adoption. Returns `None` when the run adopted
+    /// nothing, or when its history predates the lesson write.
+    ///
+    /// `reason` holds the `why` and `lesson` text of the selection that set
+    /// the chosen overlay.
+    async fn lesson(
+        &self,
+        ctx: &WorkflowContext,
+        (why, lesson): (Option<String>, Option<String>),
+        labels: Option<BTreeSet<String>>,
+    ) -> Option<LessonOutcome> {
+        let version = self.adopted?;
+        if !writes_lesson(self.status) || !ctx.patched(LESSON_PATCH) {
+            return None;
+        }
+        let lesson = Lesson {
+            version,
+            why: why.unwrap_or_default(),
+            lesson: lesson.unwrap_or_default(),
+            sources: self.input.source_runs.clone(),
+            agents: self
+                .start
+                .sources
+                .iter()
+                .filter_map(|source| source.agent.clone())
+                .collect(),
+        };
+        Some(write_lesson(ctx, &self.input.kind, lesson, labels).await)
+    }
+}
+
+/// The flow labels of a run: the labels of each source and of the lessons
+/// that it read. `None` when a source of an older release has no labels.
+fn run_labels(start: &RefineStart) -> Option<BTreeSet<String>> {
+    let mut labels = start
+        .lessons
+        .as_ref()
+        .map(MemorySnapshot::labels)
+        .unwrap_or_default();
+    for source in &start.sources {
+        labels.extend(source.labels.as_ref()?.iter().cloned());
+    }
+    Some(labels)
+}
+
+/// Add the lesson of an adoption. A failure is a note, so the adoption
+/// stands.
+async fn write_lesson(
+    ctx: &WorkflowContext,
+    kind: &str,
+    lesson: Lesson,
+    labels: Option<BTreeSet<String>>,
+) -> LessonOutcome {
+    let Some(labels) = labels else {
+        return LessonOutcome::Failed {
+            error: "a source of an older release holds no flow labels, so the run writes no lesson"
+                .to_owned(),
+        };
+    };
+    let request = LessonRequest {
+        kind: kind.to_owned(),
+        run: ctx.execution_id(),
+        lesson,
+        labels,
+    };
+    match ctx
+        .execute_activity(&agent_refine_lesson_info(), request)
+        .await
+    {
+        Ok(outcome) => outcome,
+        Err(err) => LessonOutcome::Failed {
+            error: error_text(&err),
+        },
+    }
+}
+
+/// Run the adoption gate of a run that chose `chosen`. A dry run, a run
+/// that chose nothing and a start record of an older release keep
+/// `status`, with no gate.
+///
+/// # Errors
+///
+/// Returns the failure of the gate. The run then gets `refine_status =
+/// failed`.
+async fn gate_of(
+    ctx: &WorkflowContext,
+    input: &RefineInput,
+    start: &RefineStart,
+    policy: &RefinePolicy,
+    status: RefineStatus,
+    chosen: Option<&ProfileOverlay>,
+) -> Result<(RefineStatus, Option<GateRecord>), String> {
+    match chosen {
+        Some(overlay) if status == RefineStatus::Chosen && !input.dry_run && start.active_read => {
+            let gate = Gate {
+                ctx,
+                kind: &input.kind,
+                chosen: overlay,
+                expected: start.active,
+                policy,
+                ceilings: &start.ceilings,
+            };
+            gate.run()
+                .await
+                .inspect_err(|_| set_failed(ctx, &input.kind))
+        }
+        _ => Ok((status, None)),
+    }
+}
+
+/// Set the search attribute `agent_mesh` of a run with a budget to the
+/// mesh of the budget. A failure writes a warning.
+fn set_mesh(ctx: &WorkflowContext, input: &RefineInput) {
+    if let Some(budget) = &input.budget
+        && let Err(err) =
+            ctx.upsert_search_attrs([(MESH_ATTR.to_owned(), Some(serde_json::json!(budget.mesh)))])
+    {
+        tracing::warn!(error = %err, "the refine mesh attribute was not set");
+    }
 }
 
 /// The run failure of a start step that failed with `err`. A named
@@ -1268,6 +1475,7 @@ mod tests {
             ceilings: Ceilings::from_profile(&AgentProfile::new("support")),
             active: None,
             active_read: true,
+            lessons: None,
         };
         let mut old = serde_json::to_value(&start).unwrap();
         old.as_object_mut().unwrap().remove("active_read");

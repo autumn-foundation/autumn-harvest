@@ -1645,9 +1645,9 @@ app must clear those stores itself.
    A pass that still runs is a failure in the report.
 6. The report sums each count over every run and child:
    `events_scrubbed`, `stream_chunks_deleted`, `ledger_rows_deleted`,
-   `entity_states_scrubbed` and the rest. `episodes_erased` and
-   `facts_erased` come from the final state. It lists each skipped child
-   and each failure.
+   `entity_states_scrubbed` and the rest. `episodes_erased`,
+   `facts_erased` and `lessons_removed` come from the final state. It
+   lists each skipped child and each failure.
 
 The spend of an erased run leaves the LLM budget and mesh budget sums.
 
@@ -2253,9 +2253,9 @@ read, with no restart: the next op, or the next refine run.
 
 Today the store enforces `ceilings`, `auto_adopt.parts` and
 `auto_adopt.max_per_day`. The refine workflow of #2380 reads `ceilings`,
-`probe_effects` and `proposal_attempts` (section 22). The other settings
-are kernels for open issues: the adoption gate of #2381 and the lesson
-library of #2382. Those issues will read them.
+`probe_effects` and `proposal_attempts` (section 22). The adoption gate
+reads `auto_adopt` and `approval_timeout` (section 23). The lesson library
+reads `lessons.max_entries` at each write (section 24).
 
 | Setting | Meaning | Default | Range |
 |---|---|---|---|
@@ -2811,3 +2811,42 @@ server serves. The other commands take the execution id in any UUID
 spelling and send its canonical form. On SQLite, `sqlite::decide_refine`
 sends a decision, and `ExecutionFilter::search_attribute` lists the runs
 that wait. On Postgres, `postgres::decide_refine` sends it.
+
+## 24. The lesson library
+
+Each adoption adds one lesson to the library of its kind. The next refine
+of the kind reads the library. The design is in
+[`DESIGN-2382.md`](design/DESIGN-2382.md). The library needs a memory store
+on the harness that implements `MemoryStore::ensure_block` and
+`MemoryStore::apply_labelled`. `InMemoryMemoryStore` does.
+
+- **Scope.** The memory scope `kind:<kind>:lessons` holds one block,
+  `lessons`. Each entry is one lesson as one line of JSON. It holds the
+  adopted `version`, the `why` and `lesson` text of the select step, the
+  `sources` exec ids and the `agents` ids. `refine::read_lessons` decodes
+  a block.
+- **Write.** A run that ends `adopted` or `auto_adopted` runs
+  `agent_refine_lesson`. A rejected, timed-out or superseded run writes
+  none. The report holds the result in `lesson`: `written`, with the
+  version and the evicted count, or `failed`, with the error. A failed
+  write never undoes the adoption.
+- **Taint.** The lesson keeps the flow labels of the run: each label of
+  each source and of the lessons that the run read. The report holds them
+  in `flow_labels`. A store that cannot keep labels refuses a labelled
+  write.
+- **Bound.** The write reads the current `lessons.max_entries`. It removes
+  the oldest lessons until the block holds at most that many. A change of
+  the bound applies to the next write.
+- **Read.** The start step records the library, cut to the newest lessons
+  in 32 768 characters. Each proposer stage gets it in
+  `ProposeContext::lessons`, with its labels. `ModelProposer` puts it in
+  its prompt as data.
+- **Why and lesson.** A selector gives the text with
+  `OverlaySelector::choose`. The default calls `select` and gives none. A
+  rule pick and a sequential run give none.
+- **Erase.** `Control::ResetMemory` removes each lesson of the kind whose
+  `agents` holds the agent id. A source is a run of the agent when its
+  workflow id is the agent id. `AgentState::lessons_removed` counts them,
+  and `harvest agents erase` reports `lessons_removed`.
+- **Upgrade.** A run that started on an older release has no source
+  labels, so it writes no lesson. Its report notes why.

@@ -481,6 +481,29 @@ pub trait MemoryStore: Send + Sync + std::fmt::Debug {
         ))))
     }
 
+    /// Add `block` to `scope` when the scope holds no block with its label.
+    /// A block that the scope holds stays as it is. A new scope first gets
+    /// its default blocks, as [`load`](Self::load) gives them.
+    ///
+    /// The lesson library of a kind calls it before its first write. The
+    /// default refuses, so a store that cannot add a block never reports
+    /// one.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the store cannot add the block.
+    fn ensure_block<'a>(
+        &'a self,
+        scope: &'a MemoryScope,
+        block: MemoryBlock,
+    ) -> BoxFuture<'a, Result<(), AgentError>> {
+        let _ = (scope, block);
+        Box::pin(std::future::ready(Err(AgentError::new(
+            ErrorKind::Config,
+            "this memory store cannot add a block: implement MemoryStore::ensure_block",
+        ))))
+    }
+
     /// Apply one edit from a run with the flow labels `labels`, and keep
     /// them with the entry (issue #2272). Call [`apply_labelled_op`] so the
     /// rules are the same in every store.
@@ -597,6 +620,23 @@ impl MemoryStore for InMemoryMemoryStore {
         labels: &'a BTreeSet<String>,
     ) -> BoxFuture<'a, Result<MemoryBlock, AgentError>> {
         Box::pin(std::future::ready(self.apply_now(scope, &op, key, labels)))
+    }
+
+    fn ensure_block<'a>(
+        &'a self,
+        scope: &'a MemoryScope,
+        block: MemoryBlock,
+    ) -> BoxFuture<'a, Result<(), AgentError>> {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let blocks = state
+            .scopes
+            .entry(scope.clone())
+            .or_insert_with(|| self.template.clone());
+        if !blocks.iter().any(|held| held.label == block.label) {
+            blocks.push(block);
+        }
+        drop(state);
+        Box::pin(std::future::ready(Ok(())))
     }
 
     fn clear<'a>(&'a self, scope: &'a MemoryScope) -> BoxFuture<'a, Result<(), AgentError>> {
@@ -843,6 +883,54 @@ mod tests {
                 .contains("no entry")
         );
         assert!(apply_op(&mut b, &add("  ")).is_err());
+    }
+
+    #[tokio::test]
+    async fn ensure_block_adds_a_block_once_and_keeps_its_entries() {
+        let store = InMemoryMemoryStore::new();
+        let scope = MemoryScope::new("kind:support:lessons");
+        let block = MemoryBlock::new("lessons", "d", 100);
+        store.ensure_block(&scope, block.clone()).await.unwrap();
+        let add = MemoryOp::Add {
+            block: "lessons".to_owned(),
+            text: "one".to_owned(),
+        };
+        store.apply(&scope, add, &EditKey::new("k")).await.unwrap();
+        store.ensure_block(&scope, block).await.unwrap();
+        let blocks = store.load(&scope).await.unwrap();
+        let labels: Vec<&str> = blocks.iter().map(|b| b.label.as_str()).collect();
+        assert_eq!(labels, ["memory", "user", "lessons"]);
+        assert_eq!(blocks[2].entries, ["one"]);
+    }
+
+    #[tokio::test]
+    async fn the_default_ensure_block_refuses() {
+        #[derive(Debug)]
+        struct Bare;
+        impl MemoryStore for Bare {
+            fn load<'a>(
+                &'a self,
+                _scope: &'a MemoryScope,
+            ) -> BoxFuture<'a, Result<Vec<MemoryBlock>, AgentError>> {
+                Box::pin(std::future::ready(Ok(Vec::new())))
+            }
+            fn apply<'a>(
+                &'a self,
+                _scope: &'a MemoryScope,
+                _op: MemoryOp,
+                _key: &'a EditKey,
+            ) -> BoxFuture<'a, Result<MemoryBlock, AgentError>> {
+                Box::pin(std::future::ready(Err(AgentError::new(
+                    ErrorKind::Tool,
+                    "unused",
+                ))))
+            }
+        }
+        let err = Bare
+            .ensure_block(&MemoryScope::new("s"), MemoryBlock::new("b", "d", 1))
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::Config);
     }
 
     #[tokio::test]

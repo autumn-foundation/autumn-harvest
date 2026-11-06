@@ -25,7 +25,7 @@ holds the policy log of each kind. A missing policy means every default.
 | `probe_effects` | `[read_only]` | `eval::live_probe` (#2378) | Yes, in the tool-call activity of the probe. `agent_refine` (#2380) passes it. |
 | `ceilings` | the profile values and model | the store validator and the op read (#2370, #2372) | Yes |
 | `proposal_attempts` | `2` | `ProposeRequest::attempts` (#2379) | No. The workflow of #2380 copies it. |
-| `lessons.max_entries` | `64` | the lesson library (#2382) | No. #2382 will read it. |
+| `lessons.max_entries` | `64` | `agent_refine_lesson` (#2382) | Yes, at each lesson write. See [DESIGN-2382](DESIGN-2382.md). |
 
 ### The type
 
@@ -269,7 +269,7 @@ the kernels:
 - #2381 will call `refine::adopt`, and `RefinePolicy::gate_state` for
   `timed_out`.
 - #2378 checks `probe_effects` in the tool-call activity of the probe.
-- #2382 will read `lessons.max_entries`.
+- #2382 reads `lessons.max_entries` at each lesson write.
 
 The AC names an `agent_refine` input. #2380 builds it as `RefineInput`,
 which refuses each unknown key. `ProposeRequest` refuses each policy key

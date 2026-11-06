@@ -126,6 +126,7 @@ fn request() -> ProposeRequest {
         attempts: ProposalAttempts::default(),
         sample: 1,
         others: Vec::new(),
+        lessons: None,
     }
 }
 
