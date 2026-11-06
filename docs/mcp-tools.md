@@ -17,6 +17,11 @@ through the real, authenticated handler pipeline.
 
 ## Opt-in
 
+**MCP tool exposure needs the plugin runtime, which is Postgres only.** The
+SQLite runtime has no HTTP edge. On `SqliteRuntime`, `#[workflow(mcp)]` has no
+effect: the workflow runs, and no tools appear. Registration logs one `WARN`
+that names the workflow (issue #2488).
+
 Three pieces, each explicit:
 
 ```rust

@@ -463,7 +463,7 @@
 //!   is unaffected either way), `owner` / `runbook_url` / `severity` (#372),
 //!   `description` + `input_schema` / `output_schema` / `error_schema` (#373 —
 //!   HTTP-edge discovery/validation, and this backend has no HTTP edge), `mcp` (#597
-//!   — HTTP-edge MCP tool exposure), `declared_activities` / `declared_children`
+//!   — HTTP-edge MCP tool exposure; registration logs one `WARN`, issue #2488), `declared_activities` / `declared_children`
 //!   (#802 — an opt-in dependency declaration consumed only by the Postgres plugin's
 //!   `catalog_consistency` deploy-time preflight check and its `/workflows/registered`
 //!   discovery endpoint, neither of which this backend has; the core execution path

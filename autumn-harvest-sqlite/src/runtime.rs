@@ -694,6 +694,9 @@ impl SqliteRuntime {
     /// panic message names the specific feature and points at the supported
     /// alternative. Running the workflow with the feature silently missing would
     /// diverge from the declared `#[workflow(...)]` contract (Codex #1069 P2).
+    ///
+    /// A workflow with `mcp = true` registers and runs. It logs one `WARN`,
+    /// because this backend exposes no MCP tools (issue #2488).
     pub fn register_workflow(&mut self, info: &WorkflowInfo) {
         if let Some((feature, hint)) = unsupported_workflow_feature(info) {
             panic!(
@@ -703,6 +706,17 @@ impl SqliteRuntime {
                  #1068 follow-ups) — registering it anyway would silently drop the \
                  setting and diverge from the #[workflow(...)] contract. {hint}",
                 info.name,
+            );
+        }
+        if info.mcp {
+            // `mcp` only marks the workflow for the Postgres plugin. Tell the
+            // operator now, so nobody expects tools that never appear (issue #2488).
+            tracing::warn!(
+                workflow = info.name,
+                "the `mcp` flag has no effect on the SQLite runtime. \
+                 This runtime has no HTTP edge, so it exposes no MCP tools. \
+                 MCP tool exposure needs the Postgres plugin runtime. \
+                 The workflow still runs."
             );
         }
         self.workflows.insert(info.name.to_string(), info.handler);
@@ -6169,7 +6183,8 @@ const fn command_name(cmd: &WorkflowCommand) -> &'static str {
 ///   `sla_breached` metric; NO wrong execution), `owner` / `runbook_url` / `severity`
 ///   (#372), `description` + `input_schema` / `output_schema` / `error_schema` (#373 —
 ///   HTTP-edge discovery/validation, and this backend has no HTTP edge), `mcp` (#597 —
-///   HTTP-edge tool exposure), and `module` (diagnostics).
+///   HTTP-edge tool exposure; registration logs one `WARN`, issue #2488), and
+///   `module` (diagnostics).
 /// - **HONORED**: `name` (registration key), `handler` (dispatch fn),
 ///   `execution_timeout` (#243) and the workflow-level `retry_policy` (#523).
 ///   Issue #2029 added the last two.
@@ -6911,6 +6926,65 @@ mod feature_gate_tests {
             unsupported_workflow_feature(&info).is_none(),
             "metadata/observability-only fields must be accepted (inert)",
         );
+    }
+
+    /// Run `f` and return everything it logged at `WARN` or above.
+    fn warnings_during(f: impl FnOnce()) -> String {
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone, Default)]
+        struct Sink(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Sink {
+            type Writer = Self;
+            fn make_writer(&'a self) -> Self {
+                self.clone()
+            }
+        }
+
+        let sink = Sink::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(sink.clone())
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        let bytes = sink.0.lock().unwrap().clone();
+        String::from_utf8(bytes).unwrap()
+    }
+
+    // Issue #2488: `mcp` is inert here, so registration must say so.
+    #[test]
+    fn an_mcp_workflow_warns_at_registration_and_still_runs() {
+        let mut info = base_wf_info();
+        info.mcp = true;
+        let mut rt = super::SqliteRuntime::open_in_memory().unwrap();
+        let logged = warnings_during(|| rt.register_workflow(&info));
+        assert!(logged.contains("base_wf"), "names the workflow: {logged}");
+        assert!(logged.contains("mcp"), "names the flag: {logged}");
+        assert!(
+            logged.contains("no HTTP edge"),
+            "gives the reason: {logged}"
+        );
+        assert!(
+            rt.start_workflow("base_wf", serde_json::json!(1)).is_ok(),
+            "the workflow still starts"
+        );
+    }
+
+    #[test]
+    fn a_workflow_without_mcp_does_not_warn() {
+        let mut rt = super::SqliteRuntime::open_in_memory().unwrap();
+        let logged = warnings_during(|| rt.register_workflow(&base_wf_info()));
+        assert!(logged.is_empty(), "no warning expected: {logged}");
     }
 
     // Issue #2029: the timeout and the workflow retry are honored.
