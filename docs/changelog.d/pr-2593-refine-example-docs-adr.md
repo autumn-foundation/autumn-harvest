@@ -1,4 +1,4 @@
-## The refine example, guide section and ADR (issue #2383)
+## The refine example, guide section and ADR (issue #2383, PR #2593)
 
 The refine loop of epic #2369 now has an example, a guide section and an
 ADR. The design is in `docs/design/DESIGN-2383.md`.
