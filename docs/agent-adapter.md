@@ -2351,6 +2351,7 @@ is the safe value.
 | `scorers` | The scorer ids that the kind may use: `deterministic`, or `{"only": [ids]}` | `deterministic`: each scorer that calls no model |
 | `judge_models` | The models that a judge scorer may call | none |
 | `max_answer_retries` | The cap of the answer check (section 21). 0 to 16. | 0 |
+| `cascade_models` | The harness models that a cascade tier may name (section 20) | none, so each cascade is refused |
 
 An unknown key fails the decode. So an older worker never drops a setting
 that a newer worker recorded. The run of that older worker fails closed,
@@ -2417,7 +2418,8 @@ wider effects than a single run of its kind.
   id `n`, so N draws are N samples, not one cached answer.
 
 `agent_draws` returns each draw report. An engine failure of a draw fails
-the run. `agent_sample` (section 20) scores the draws and selects one.
+the run. `agent_draws` refuses `cascade` with `sample_only`, because only
+`agent_sample` asks a model per tier. `agent_sample` (section 20) scores the draws and selects one.
 
 ### Upgrade every worker first
 
@@ -2464,6 +2466,7 @@ let input = SampleInput::new(
 | `best_of_n { n }` | Runs `n` draws, scores each, and selects with `select` (section 17). A tie goes to the lowest draw id. |
 | `rejection { max_attempts, threshold }` | Runs draws until one scores at or above `threshold`, up to `max_attempts` draws. It runs one draw at a time unless the input asks for more. It stops after the wave that holds the pass. |
 | `vote { n, key }` | Keys each answer, and selects the most common key. It needs no scorer. See section 26. |
+| `cascade { tiers }` | Asks each tier in order, one draw per tier, and stops at the first answer at or above the threshold of its tier. See "Model cascade" below. |
 
 The run reads the profile and the sampling policy of the kind once each,
 as `agent_draws` does (section 19). The policy admits the strategy, the
@@ -2506,17 +2509,20 @@ model is not called.
 
 `SampleReport` holds:
 
-- `outcome`: `selected { draw }`, or `no_accepted_draw` when no draw
-  passed;
+- `outcome`: `selected { draw }`; `escalated { draw }` when no tier of a
+  cascade accepted; or `no_accepted_draw` when no draw passed;
 - `selected`: the `AgentReport` of the selected draw;
-- `stopped`: `completed`, `accepted` (a rejection run found a pass),
-  `budget_exceeded`, `score_failed`, `settled` (a vote leader cannot
-  lose) or `rounds_exhausted` (a beam run ended its last round with a live
-  beam);
+- `stopped`: `completed`, `accepted` (a rejection or cascade run found a
+  pass), `budget_exceeded`, `score_failed`, `settled` (a vote leader
+  cannot lose) or `rounds_exhausted` (a beam run ended its last round with
+  a live beam);
 - `attempts`: the draws that ran;
-- `draws`: for each draw, its stop, verdict, usage, cost and, for a vote,
-  its key (section 26). The usage and
-  the cost include the judge calls of the draw;
+- `draws`: for each draw, its stop, verdict, usage and cost. The usage and
+  the cost include the judge calls of the draw. A cascade draw also holds
+  the `model` of its tier, and a vote draw its key (section 26);
+- `skipped`: each cascade tier whose model the mandate forbids, with its
+  refusal;
+- `tally`: for a vote, the votes of each key, the winner first;
 - `usage` and `cost_usd_micros`: the totals. They equal the cost ledger
   rows of the run tree.
 
@@ -2524,6 +2530,82 @@ Each `ModelTurn` carries the cost that the ledger recorded for it, and
 `AgentReport::cost_usd_micros` sums it, as `usage` sums the tokens.
 
 The design is in [`DESIGN-2443.md`](design/DESIGN-2443.md).
+
+### Model cascade (issue #2445)
+
+A cascade asks a cheap model first and scores the answer. It asks a
+stronger model only when the score is below the threshold of the tier.
+
+```rust
+use autumn_harvest_agent::sampling::{SampleInput, SampleStrategy, ScorerRef, Tier};
+use autumn_harvest_agent::{ExactMatch, FiniteF64};
+
+// The policy of `researcher` must list `cascade`, with `max_draws >= 2`
+// and `cascade_models` of `["cheap", "strong"]`. The harness adds both
+// models with `AgentHarness::model_named`.
+
+let input = SampleInput::new(
+    "researcher",
+    "Name a prime.",
+    SampleStrategy::cascade([
+        Tier::new("cheap", FiniteF64::new(0.5).unwrap()),
+        Tier::new("strong", FiniteF64::new(0.8).unwrap()),
+    ]),
+    ScorerRef::deterministic(ExactMatch::ID).unwrap(),
+);
+// SQLite: autumn_harvest_agent::sqlite::start_sample(&mut rt, &input)
+```
+
+```sh
+harvest agents sampling policy researcher set --strategies cascade --max-draws 2 --cascade-models cheap,strong
+```
+
+The run asks the tiers in order, one draw per tier. Tier `i` is draw `i`.
+
+1. The policy admits the strategy, the tier count as the draw count, and
+   the scorer. `cascade_models` must list each tier model. A miss fails
+   the run with `sampling refused (tier_model_not_allowed)` before any
+   model call.
+2. A cascade runs one tier at a time. A `concurrency` above 1 fails with
+   `too_many_concurrent_draws`, after the checks of step 1.
+3. When the mandate of the profile does not allow the model of a tier
+   (`Mandate::allows_model`), the run skips the tier, and the next tier
+   runs. `skipped` names each such tier with the refusal `not_permitted`,
+   as `{"tier": 0, "model": "cheap", "refusal": {"refusal":
+   "not_permitted"}}`.
+4. The run stops at the first tier whose score is at or above its
+   threshold. The outcome is `selected`, and `stopped` is `accepted`.
+5. A tier that fails gets a reject, and the next tier runs.
+6. When no tier accepts, `select` picks the best score among the tiers that
+   ran. The outcome is `escalated`. With each tier rejected, it is
+   `no_accepted_draw`.
+7. A budget stop or a failed score can end the run before the last tier.
+   The outcome is then `escalated` when a tier has a score. `stopped`
+   gives the reason, so check it before you deliver the answer.
+
+The tiers share the token budget. Each tier gets the tokens that are
+left. Each tier is a child run, and history records each score. So a
+crash after tier 1 resumes at tier 2, and never asks tier 1 again.
+
+#### The ledger rows
+
+Each tier asks its own harness model, so each ledger row holds the model
+id of its tier. Say that `cheap` has the model id `cheap-v1` at 1
+micro-dollar per token, and `strong` has `strong-v1` at 20. The cheap
+answer scores 0.3, under 0.5. The strong answer scores 0.95, at or above
+0.8. The run writes these rows:
+
+| `model` | `activity_name` | Tokens | `cost_usd_micros` |
+|---|---|---|---|
+| `cheap-v1` | `agent_model_turn` | 5 | 5 |
+| `strong-v1` | `agent_model_turn` | 7 | 140 |
+
+`draws[0].model` is `cheap` and `draws[1].model` is `strong`. Each draw
+cost equals its row, and `cost_usd_micros` of the report is 145. When the
+cheap answer accepts, the ledger holds only the first row. The test
+`the_ledger_has_one_row_per_tier_with_its_model_id` checks these rows.
+
+The design is in [`DESIGN-2445.md`](design/DESIGN-2445.md).
 
 ### Beam search
 

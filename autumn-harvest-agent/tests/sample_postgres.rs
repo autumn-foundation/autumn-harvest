@@ -1,8 +1,9 @@
 //! The `agent_sample` workflow on a Postgres worker (issue #2443).
 //!
 //! Best-of-3 picks the answer that the scorer prefers. The usage of each
-//! draw sums to the `harvest_llm_ledger` rows of the run tree. A vote with
-//! an app key runs its key in the `agent_vote_key` activity.
+//! draw sums to the `harvest_llm_ledger` rows of the run tree. A two-tier
+//! cascade writes one ledger row per tier, with the model id of the tier.
+//! A vote with an app key runs its key in the `agent_vote_key` activity.
 //!
 //! The tests use `HARVEST_TEST_DATABASE_URL` when it is set. Point it at a
 //! dedicated database. Without it, each test starts a Postgres container.
@@ -23,11 +24,11 @@ use autumn_harvest::{
 use autumn_harvest_agent::sampling::{
     AnswerKey, AnswerKeyFn, PostgresSamplingPolicyStore, SAMPLE_WORKFLOW_NAME, SampleInput,
     SampleOutcome, SampleReport, SampleStop, SampleStrategy, SamplingPolicy, SamplingPolicyStore,
-    ScorerRef, Strategy, VoteCount,
+    ScorerRef, Strategy, Tier, VoteCount,
 };
 use autumn_harvest_agent::{
     AgentError, AgentHarness, AgentModel, AgentProfile, BoxFuture, ChatRequest, ChatResponse,
-    ContentPart, DrawId, ExactMatch, StopReason, TokenUsage, workflow,
+    ContentPart, DrawId, ExactMatch, FiniteF64, StopReason, TokenUsage, workflow,
 };
 use diesel::sql_types::{BigInt, Nullable, Text, Uuid as SqlUuid};
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
@@ -285,6 +286,133 @@ async fn best_of_three_on_postgres_picks_b_and_sums_to_the_ledger() {
     assert_eq!(i64::try_from(tokens).unwrap(), ledger.tokens);
     assert_eq!(i64::try_from(cost).unwrap(), ledger.cost);
     assert_eq!(cost, 42, "3 draws of 7 tokens at 2 micro-dollars");
+}
+
+/// A priced model with its own model id. It answers `text` to each
+/// request that holds `marker`, and `"c"` to each other request.
+#[derive(Debug)]
+struct TierModel {
+    id: &'static str,
+    text: &'static str,
+    price: u64,
+    marker: String,
+}
+
+impl AgentModel for TierModel {
+    fn chat<'a>(
+        &'a self,
+        request: &'a ChatRequest,
+    ) -> BoxFuture<'a, Result<ChatResponse, AgentError>> {
+        let ours = request.messages.iter().any(|message| {
+            message
+                .content
+                .iter()
+                .any(|part| matches!(part, ContentPart::Text(text) if text.contains(&self.marker)))
+        });
+        let text = if ours { self.text } else { "c" };
+        Box::pin(std::future::ready(Ok(ChatResponse {
+            content: vec![ContentPart::Text(text.to_owned())],
+            stop_reason: StopReason::EndTurn,
+            usage: TokenUsage::new(6, 1),
+        })))
+    }
+
+    fn model_id(&self) -> Option<&str> {
+        Some(self.id)
+    }
+
+    fn cost_usd_micros(&self, usage: &TokenUsage) -> Option<u64> {
+        Some(u64::from(usage.total()) * self.price)
+    }
+}
+
+#[derive(diesel::QueryableByName)]
+struct ModelRow {
+    #[diesel(sql_type = Text)]
+    model: String,
+    #[diesel(sql_type = Nullable<BigInt>)]
+    cost: Option<i64>,
+}
+
+/// The ledger rows of the child runs of `exec`, by model id.
+async fn ledger_models(url: &str, exec: ExecutionId) -> Vec<ModelRow> {
+    let mut conn = AsyncPgConnection::establish(url).await.expect("connect");
+    diesel::sql_query(
+        "SELECT l.model, l.cost_usd_micros AS cost
+         FROM harvest_llm_ledger l
+         WHERE l.workflow_exec_id IN (
+             SELECT id FROM harvest_workflow_executions WHERE parent_id = $1)
+         ORDER BY l.model",
+    )
+    .bind::<SqlUuid, _>(exec.as_uuid())
+    .load(&mut conn)
+    .await
+    .expect("read the ledger")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_two_tier_cascade_on_postgres_writes_one_ledger_row_per_tier() {
+    let (url, _container) = database().await;
+    let kind = unique("cascade");
+    let store = Arc::new(PostgresSamplingPolicyStore::new(pool(&url)));
+    let policy = SamplingPolicy {
+        strategies: BTreeSet::from([Strategy::Cascade]),
+        max_draws: 2,
+        cascade_models: BTreeSet::from(["cheap".to_owned(), "strong".to_owned()]),
+        ..SamplingPolicy::default()
+    };
+    store.set(&kind, &policy, "ops@example.com").await.unwrap();
+    let model = |id, text, price| {
+        Arc::new(TierModel {
+            id,
+            text,
+            price,
+            marker: kind.clone(),
+        })
+    };
+    let harness = AgentHarness::new(model("default-v1", "c", 0))
+        .model_named("cheap", model("cheap-v1", "a", 1))
+        .model_named("strong", model("strong-v1", "b", 20))
+        .agent(AgentProfile::new(&kind))
+        .scorer(Arc::new(ExactMatch::new("b")))
+        .sampling_policies(store);
+    let tier = |model: &str| Tier::new(model, FiniteF64::ONE);
+    let input = SampleInput::new(
+        &kind,
+        format!("Pick a letter ({kind})."),
+        SampleStrategy::cascade([tier("cheap"), tier("strong")]),
+        ScorerRef::deterministic(ExactMatch::ID).unwrap(),
+    );
+    let queue = unique("cascade-q");
+    let exec = start(&url, &queue, &input).await;
+    let worker = worker(&queue, harness);
+    let handle = tokio::spawn({
+        let worker = Arc::clone(&worker);
+        let pool = pool(&url);
+        async move { worker.run(&pool).await }
+    });
+    let report = outcome(&url, exec).await;
+    worker.shutdown();
+    handle.abort();
+
+    assert_eq!(
+        report.outcome,
+        SampleOutcome::Selected {
+            draw: DrawId::new(1)
+        }
+    );
+    assert_eq!(report.selected.as_ref().map(|r| r.text.as_str()), Some("b"));
+    let rows = ledger_models(&url, exec).await;
+    let rows: Vec<(&str, Option<i64>)> = rows
+        .iter()
+        .map(|row| (row.model.as_str(), row.cost))
+        .collect();
+    assert_eq!(
+        rows,
+        [("cheap-v1", Some(7)), ("strong-v1", Some(140))],
+        "one row per tier, with the model id and the cost of the tier"
+    );
+    assert_eq!(report.cost_usd_micros, 147);
 }
 
 /// A key function that maps `a` to `vowel` and each other answer to
