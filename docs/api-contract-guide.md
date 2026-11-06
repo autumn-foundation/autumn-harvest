@@ -212,7 +212,7 @@ live route set registered in `harvest_api_router` against `docs/api-contract.jso
 2. Update `management_api_routes()` in the same file (keeps the canonical list
    in sync with the router).
 3. Update `docs/api-contract.json` to reflect the new route or schema change.
-4. Run `scripts/regenerate-openapi.sh`. It rewrites both generated OpenAPI
+4. Run `cargo xtask dev regenerate-openapi`. It rewrites both generated OpenAPI
    copies from the contract (issue #694). Skipping it fails CI.
 5. Add a changelog fragment in `docs/changelog.d/` that marks the change as
    breaking or non-breaking per the compatibility rules above.

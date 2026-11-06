@@ -8,7 +8,10 @@ modules from dropping.
 
 - **`unit`** runs the `autumn-harvest` lib tests with `--all-features`.
 - **`db`** runs every `linux` row of `.github/ci/integration-suites.txt`.
-  It uses the shard layout of `test-db-linux`.
+  It shards by row ordinal, with the shard count of `test-db-linux`.
+  That CI job itself runs the rows from one nextest archive and
+  partitions them by test hash. See
+  [`ci-db-archive.md`](ci-db-archive.md).
 - **`report`** merges the LCOV file of each job. It publishes the
   `coverage-report` artifact and the run summary.
 
@@ -87,7 +90,7 @@ a run in which every test job passed. Download `summary.json` from that run
 and run this command:
 
 ```sh
-python3 .github/ci/coverage.py ratchet --update \
+cargo xtask ci coverage ratchet --update \
   --baseline .github/ci/coverage-baseline.json --summary summary.json
 ```
 
@@ -125,34 +128,42 @@ Measure the lib tests. The `clean` step removes old profile data:
 cargo llvm-cov clean --workspace
 cargo llvm-cov --branch --no-report -p autumn-harvest --all-features --lib
 cargo llvm-cov report --branch --json --output-path unit.json
-python3 .github/ci/coverage.py convert unit.json --root "$PWD" --output unit.lcov
+cargo xtask ci coverage convert unit.json --root "$PWD" --output unit.lcov
 ```
 
 Measure one DB shard too. The DB suites need Docker. Without the shard
-variables, `run-suites.sh` runs every row, which takes hours:
+variables, the runner runs every row, which takes hours. Build `xtask`
+before `show-env`, and run the built binary after it. Otherwise the
+coverage environment instruments `xtask` too, and its code joins the
+report. Copy the binary out of `target`. `cargo llvm-cov clean
+--workspace` runs `cargo clean` on each workspace package, so it deletes
+`target/debug/xtask`:
 
 ```sh
+cargo build --quiet --package xtask
+cp target/debug/xtask /tmp/xtask
 coverage_env="$(cargo llvm-cov show-env --sh --branch)"
 eval "$coverage_env"
 cargo llvm-cov clean --workspace
 SEMAPHORE_SHARD_COUNT=21 SEMAPHORE_SHARD_INDEX=0 \
   HARVEST_DEV_REQUIRE_POSTGRES=1 HARVEST_TEST_REQUIRE_REDIS=1 \
-  bash .github/ci/run-suites.sh run linux
+  /tmp/xtask ci run-suites run linux
 cargo llvm-cov report --branch --json --output-path db.json
-python3 .github/ci/coverage.py convert db.json --root "$PWD" --output db.lcov
+/tmp/xtask ci coverage convert db.json --root "$PWD" --output db.lcov
 ```
 
-Then merge and summarize:
+Then merge and summarize. The shell still holds the coverage environment,
+so use the copy here too:
 
 ```sh
-python3 .github/ci/coverage.py merge --output merged.lcov unit.lcov db.lcov
-python3 .github/ci/coverage.py summary merged.lcov \
+/tmp/xtask ci coverage merge --output merged.lcov unit.lcov db.lcov
+/tmp/xtask ci coverage summary merged.lcov \
   --baseline .github/ci/coverage-baseline.json \
   --json summary.json --markdown summary.md
 ```
 
-Run `python3 .github/ci/coverage.py --self-test` after you change the
-script. The CI `lint` job runs it too.
+Run `cargo xtask ci coverage --self-test` after you change
+`xtask/src/ci/coverage/`. The CI `lint` job runs it too.
 
 ## Guards
 

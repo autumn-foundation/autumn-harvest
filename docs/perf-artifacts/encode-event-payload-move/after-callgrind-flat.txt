@@ -1,0 +1,89 @@
+--------------------------------------------------------------------------------
+Profile data file 'after.cg' (creator: callgrind-3.22.0)
+--------------------------------------------------------------------------------
+I1 cache: 
+D1 cache: 
+LL cache: 
+Timerange: Basic block 0 - 170365616
+Trigger: Program termination
+Profiled target:  ./after.bin (PID 16114, part 1)
+Events recorded:  Ir
+Events shown:     Ir
+Event sort order: Ir
+Thresholds:       95
+Include dirs:     
+User annotated:   
+Auto-annotation:  on
+
+--------------------------------------------------------------------------------
+Ir                   
+--------------------------------------------------------------------------------
+855,768,802 (100.0%)  PROGRAM TOTALS
+
+--------------------------------------------------------------------------------
+Ir                    file:function
+--------------------------------------------------------------------------------
+114,873,121 (13.42%)  ./malloc/./malloc/malloc.c:_int_free [/usr/lib/x86_64-linux-gnu/libc.so.6]
+ 75,033,932 ( 8.77%)  ./malloc/./malloc/malloc.c:malloc [/usr/lib/x86_64-linux-gnu/libc.so.6]
+ 48,094,600 ( 5.62%)  ./malloc/./malloc/malloc.c:free [/usr/lib/x86_64-linux-gnu/libc.so.6]
+ 39,146,565 ( 4.57%)  ???:<alloc::collections::btree::map::IntoIter<alloc::string::String, serde_json::value::Value>>::dying_next [after.bin]
+ 38,017,336 ( 4.44%)  ./malloc/./malloc/malloc.c:_int_malloc [/usr/lib/x86_64-linux-gnu/libc.so.6]
+ 37,007,488 ( 4.32%)  ./string/../sysdeps/x86_64/multiarch/memmove-vec-unaligned-erms.S:__memcpy_avx_unaligned_erms [/usr/lib/x86_64-linux-gnu/libc.so.6]
+ 36,365,526 ( 4.25%)  ./string/../sysdeps/x86_64/multiarch/memcmp-avx2-movbe.S:__memcmp_avx2_movbe [/usr/lib/x86_64-linux-gnu/libc.so.6]
+ 31,285,980 ( 3.66%)  ???:<alloc::string::String as core::clone::Clone>::clone [after.bin]
+ 31,113,285 ( 3.64%)  ???:<str as serde_json::value::index::Index>::index_into_mut [after.bin]
+ 29,335,257 ( 3.43%)  ???:autumn_harvest::payload_codec::payload_or_a_descendant_is_a_codec_envelope'2 [after.bin]
+ 27,525,708 ( 3.22%)  ???:<autumn_harvest::payload_codec::PayloadCodecs>::decode_event [after.bin]
+ 24,998,967 ( 2.92%)  ???:<alloc::collections::btree::map::BTreeMap<alloc::string::String, serde_json::value::Value>>::insert [after.bin]
+ 23,046,534 ( 2.69%)  ???:<alloc::collections::btree::map::BTreeMap<_, _, _> as core::clone::Clone>::clone::clone_subtree::<alloc::string::String, serde_json::value::Value, alloc::alloc::Global>'2 [after.bin]
+ 17,927,658 ( 2.09%)  ???:<autumn_harvest::payload_codec::PayloadCodecs>::encode_event_owned [after.bin]
+ 17,593,884 ( 2.06%)  ???:autumn_harvest::payload_codec::codec_envelope_parts [after.bin]
+ 15,458,940 ( 1.81%)  ???:__rustc::__rdl_alloc [after.bin]
+ 13,024,044 ( 1.52%)  ???:core::ptr::drop_glue::<serde_json::value::Value>'2 [after.bin]
+ 12,507,200 ( 1.46%)  ???:serde_json::ser::format_escaped_str_contents::<&mut alloc::vec::Vec<u8>, serde_json::ser::CompactFormatter> [after.bin]
+ 11,546,010 ( 1.35%)  ???:<alloc::collections::btree::map::IntoIter<alloc::string::String, autumn_harvest::calendar::RegisteredCalendar>>::dying_next [after.bin]
+ 10,460,844 ( 1.22%)  ???:<alloc::collections::btree::node::Handle<alloc::collections::btree::node::NodeRef<alloc::collections::btree::node::marker::Mut, alloc::string::String, serde_json::value::Value, alloc::collections::btree::node::marker::Leaf>, alloc::collections::btree::node::marker::Edge>>::insert_recursing::<alloc::alloc::Global, <alloc::collections::btree::map::entry::VacantEntry<alloc::string::String, serde_json::value::Value>>::insert_entry::{closure#0}> [after.bin]
+  9,332,295 ( 1.09%)  ???:<serde_json::map::Map<alloc::string::String, serde_json::value::Value> as serde_core::de::Deserializer>::deserialize_any::<<<autumn_harvest::event::WorkflowEvent as serde_core::de::Deserialize>::deserialize::__Seed as serde_core::de::DeserializeSeed>::deserialize::__Visitor> [after.bin]
+  9,088,212 ( 1.06%)  ???:<serde_json::value::de::MapDeserializer as serde_core::de::MapAccess>::next_key_seed::<core::marker::PhantomData<<<autumn_harvest::event::WorkflowEvent as serde_core::de::Deserialize>::deserialize::__Seed as serde_core::de::DeserializeSeed>::deserialize::__Field>> [after.bin]
+  9,015,048 ( 1.05%)  ???:<alloc::collections::btree::map::BTreeMap<_, _, _> as core::clone::Clone>::clone::clone_subtree::<alloc::string::String, serde_json::value::Value, alloc::alloc::Global> [after.bin]
+  8,675,940 ( 1.01%)  ???:<alloc::collections::btree::map::BTreeMap<alloc::string::String, serde_json::value::Value>>::remove::<str> [after.bin]
+  8,294,580 ( 0.97%)  ???:<serde_core::de::value::MapDeserializer<core::iter::adapters::map::Map<core::iter::adapters::chain::Chain<core::iter::sources::once::Once<(&str, serde_json::value::Value)>, core::option::IntoIter<(&str, serde_json::value::Value)>>, autumn_harvest::payload_codec::event_from_wire::{closure#2}>, serde_json::error::Error> as serde_core::de::MapAccess>::next_key_seed::<serde::private::de::content::TagContentOtherFieldVisitor> [after.bin]
+  8,008,560 ( 0.94%)  ???:<alloc::collections::btree::node::Handle<alloc::collections::btree::node::NodeRef<alloc::collections::btree::node::marker::Mut, alloc::string::String, serde_json::value::Value, alloc::collections::btree::node::marker::Leaf>, alloc::collections::btree::node::marker::KV>>::remove_leaf_kv::<<alloc::collections::btree::map::entry::OccupiedEntry<alloc::string::String, serde_json::value::Value>>::remove_kv::{closure#0}, alloc::alloc::Global> [after.bin]
+  6,101,760 ( 0.71%)  ???:<<autumn_harvest::event::WorkflowEvent as serde_core::de::Deserialize>::deserialize::__Visitor as serde_core::de::Visitor>::visit_map::<&mut serde_core::de::value::MapDeserializer<core::iter::adapters::map::Map<core::iter::adapters::chain::Chain<core::iter::sources::once::Once<(&str, serde_json::value::Value)>, core::option::IntoIter<(&str, serde_json::value::Value)>>, autumn_harvest::payload_codec::event_from_wire::{closure#2}>, serde_json::error::Error>> [after.bin]
+  5,953,500 ( 0.70%)  ???:uuid::fmt::encode_hyphenated [after.bin]
+  5,826,546 ( 0.68%)  ???:<<alloc::collections::btree::node::Handle<alloc::collections::btree::node::NodeRef<alloc::collections::btree::node::marker::Dying, _, _, _>, alloc::collections::btree::node::marker::KV>>::drop_key_val::Dropper<serde_json::value::Value> as core::ops::drop::Drop>::drop'2 [after.bin]
+  5,779,809 ( 0.68%)  ???:<serde_json::value::Value as <[_]>::to_vec_in::ConvertVec>::to_vec::<alloc::alloc::Global> [after.bin]
+  5,751,732 ( 0.67%)  ???:core::ptr::drop_glue::<alloc::collections::btree::map::IntoIter<alloc::string::String, serde_json::value::Value>> [after.bin]
+  5,663,637 ( 0.66%)  ???:<autumn_harvest::event::WorkflowEvent>::payload_slot [after.bin]
+  5,525,352 ( 0.65%)  ???:autumn_harvest::payload_codec::payload_or_a_descendant_is_a_codec_envelope [after.bin]
+  5,152,989 ( 0.60%)  ./malloc/./malloc/arena.c:free
+  5,101,257 ( 0.60%)  ???:<<alloc::collections::btree::node::Handle<alloc::collections::btree::node::NodeRef<alloc::collections::btree::node::marker::Dying, _, _, _>, alloc::collections::btree::node::marker::KV>>::drop_key_val::Dropper<serde_json::value::Value> as core::ops::drop::Drop>::drop [after.bin]
+  4,988,742 ( 0.58%)  ???:core::ptr::drop_glue::<alloc::collections::btree::map::BTreeMap<alloc::string::String, serde_json::value::Value>> [after.bin]
+  4,840,820 ( 0.57%)  ???:<serde_json::value::Value as serde_core::ser::Serialize>::serialize::<&mut serde_json::ser::Serializer<&mut alloc::vec::Vec<u8>>>'2 [after.bin]
+  3,918,522 ( 0.46%)  ???:core::ptr::drop_glue::<serde_json::value::Value> [after.bin]
+  3,670,590 ( 0.43%)  ???:<serde_json::value::ser::SerializeMap as serde_core::ser::SerializeStruct>::serialize_field::<serde::private::ser::AdjacentlyTaggedEnumVariant> [after.bin]
+  3,667,356 ( 0.43%)  ???:<serde_json::value::ser::SerializeMap as serde_core::ser::SerializeStruct>::serialize_field::<autumn_harvest::types::UpdateId> [after.bin]
+  3,098,550 ( 0.36%)  ???:<serde_json::value::ser::SerializeMap as serde_core::ser::SerializeStruct>::serialize_field::<<autumn_harvest::event::WorkflowEvent as serde_core::ser::Serialize>::serialize::__AdjacentlyTagged> [after.bin]
+  3,050,880 ( 0.36%)  ???:<serde_core::de::value::MapDeserializer<core::iter::adapters::map::Map<core::iter::adapters::chain::Chain<core::iter::sources::once::Once<(&str, serde_json::value::Value)>, core::option::IntoIter<(&str, serde_json::value::Value)>>, autumn_harvest::payload_codec::event_from_wire::{closure#2}>, serde_json::error::Error> as serde_core::de::Deserializer>::deserialize_any::<<autumn_harvest::event::WorkflowEvent as serde_core::de::Deserialize>::deserialize::__Visitor> [after.bin]
+  2,619,540 ( 0.31%)  ???:uuid::parser::decode_hex32 [after.bin]
+  2,595,033 ( 0.30%)  ???:<<autumn_harvest::event::WorkflowEvent as serde_core::ser::Serialize>::serialize::__AdjacentlyTagged as serde_core::ser::Serialize>::serialize::<serde_json::value::ser::Serializer> [after.bin]
+  2,459,079 ( 0.29%)  ???:<autumn_harvest::event::WorkflowEvent as serde_core::ser::Serialize>::serialize::<serde_json::value::ser::Serializer> [after.bin]
+  2,431,170 ( 0.28%)  ???:<serde::private::de::AdjacentlyTaggedEnumVariantVisitor<<autumn_harvest::event::WorkflowEvent as serde_core::de::Deserialize>::deserialize::__Field> as serde_core::de::Visitor>::visit_enum::<serde_json::value::de::EnumDeserializer> [after.bin]
+  2,363,022 ( 0.28%)  ???:core::ptr::drop_glue::<autumn_harvest::event::WorkflowEvent> [after.bin]
+  2,343,306 ( 0.27%)  ???:<autumn_harvest::payload_codec::PayloadCodecs>::encode_event [after.bin]
+  2,286,144 ( 0.27%)  ???:uuid::parser::try_parse [after.bin]
+  2,144,709 ( 0.25%)  ???:<autumn_harvest::payload_codec::PayloadCodecs>::encode_payload_owned [after.bin]
+  2,110,185 ( 0.25%)  ???:<serde_json::value::ser::SerializeMap as serde_core::ser::SerializeMap>::serialize_entry::<str, alloc::string::String> [after.bin]
+  2,002,140 ( 0.23%)  ???:<alloc::collections::btree::node::Handle<alloc::collections::btree::node::NodeRef<alloc::collections::btree::node::marker::Mut, alloc::string::String, serde_json::value::Value, alloc::collections::btree::node::marker::LeafOrInternal>, alloc::collections::btree::node::marker::KV>>::remove_kv_tracking::<<alloc::collections::btree::map::entry::OccupiedEntry<alloc::string::String, serde_json::value::Value>>::remove_kv::{closure#0}, alloc::alloc::Global> [after.bin]
+  2,002,140 ( 0.23%)  ???:<serde_json::value::ser::SerializeMap as serde_core::ser::SerializeStruct>::end [after.bin]
+  1,934,142 ( 0.23%)  ???:<<autumn_harvest::event::WorkflowEvent as serde_core::de::Deserialize>::deserialize::__FieldVisitor as serde_core::de::Visitor>::visit_str::<serde_json::error::Error> [after.bin]
+  1,906,800 ( 0.22%)  ???:core::ptr::drop_glue::<[core::option::Option<serde_json::value::Value>; 6]> [after.bin]
+
+--------------------------------------------------------------------------------
+The following files chosen for auto-annotation could not be found:
+--------------------------------------------------------------------------------
+  ./malloc/./malloc/arena.c
+  ./malloc/./malloc/malloc.c
+  ./string/../sysdeps/x86_64/multiarch/memcmp-avx2-movbe.S
+  ./string/../sysdeps/x86_64/multiarch/memmove-vec-unaligned-erms.S
+

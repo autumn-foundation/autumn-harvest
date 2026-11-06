@@ -36,7 +36,9 @@ use autumn_web::reexports::axum::Router;
 
 use crate::api::{HarvestApiState, StandaloneAdminAuth, harvest_api_router};
 use crate::boot::{self, AdmissionGlobalsGuard, GateRefreshRuntime};
-use crate::config::{HarvestRuntimeConfig, HarvestStartupConfig, OrphanStartupAction};
+use crate::config::{
+    HarvestRuntimeConfig, HarvestStartupConfig, HarvestWorkerConfig, OrphanStartupAction,
+};
 use crate::runner::{HarvestRunner, HarvestRunnerResources, run_startup_orphan_gate};
 use crate::ui::harvest_ui_router;
 
@@ -65,6 +67,8 @@ impl HarvestEmbedding {
     /// `config.startup` is the code default. The operator config file and
     /// the `AUTUMN_HARVEST_STARTUP__*` variables override it at start. See
     /// [`crate::config::HarvestStartupConfig::with_operator_overrides`].
+    /// `config.worker` works the same way, with `[harvest.worker]` and
+    /// `AUTUMN_HARVEST__WORKER__QUEUES` (issue #2479).
     ///
     /// Some steps belong to the plugin only, because they need an autumn-web
     /// `AppState`. This entry point does not run the outbox relay, the broker
@@ -191,7 +195,8 @@ impl HarvestEmbedding {
         Box::pin(async move {
             // Read the environment before the first await. `&dyn Env` is not
             // `Sync`, so holding it would make this future not `Send`.
-            let operator = OperatorInputs::read(self.config.startup, &OsEnv)?;
+            let operator =
+                OperatorInputs::read(self.config.startup, self.config.worker.clone(), &OsEnv)?;
             Box::pin(self.start_with(operator)).await
         })
     }
@@ -213,6 +218,7 @@ impl HarvestEmbedding {
 
         warn_if_operator_weakens_the_orphan_gate(config.startup, operator.startup);
         config.startup = operator.startup;
+        config.worker = operator.worker;
         if config.outbox.enabled {
             tracing::warn!(
                 "HarvestEmbedding does not run the workflow-start outbox relay. The relay needs \
@@ -251,6 +257,12 @@ impl HarvestEmbedding {
         api_state.set_workflow_result_notification_database_urls(urls);
         api_state.set_payload_codecs(built.payload_codecs().clone());
 
+        // Issue #2479: a queue typo stops the boot before the first I/O.
+        crate::runner::resolve_worker_queues(
+            &built.worker_config().queues,
+            &config,
+            resources.role_pin().as_deref(),
+        )?;
         boot::load_boot_admission_gates(&api_state, &default_pool).await;
         run_startup_orphan_gate(config.startup.orphaned_workflows, &built, &resources).await?;
         // The mirror sets a process global, so it runs after the last refusal
@@ -272,6 +284,9 @@ impl HarvestEmbedding {
         // not from the install below, so its first tick cannot race the install.
         let gate_refresh =
             boot::spawn_gate_refresh(&api_state, &storage_pool, &runner.api_runtime());
+        // Load the overrides before the first start, so a quota cap or a
+        // concurrency limit applies from the first request (issue #2408).
+        boot::load_boot_run_defaults(&runner.api_runtime(), &default_pool).await;
         api_state.install(runner.api_runtime());
         admission_guard.commit();
 
@@ -370,17 +385,27 @@ fn mount_router(
 struct OperatorInputs {
     /// The code startup config with the operator overrides applied.
     startup: HarvestStartupConfig,
+    /// The code worker config with the operator overrides applied.
+    worker: HarvestWorkerConfig,
     /// The profile from the environment, if any.
     profile: Option<String>,
 }
 
 impl OperatorInputs {
-    fn read(code_startup: HarvestStartupConfig, env: &dyn Env) -> autumn_web::AutumnResult<Self> {
+    fn read(
+        code_startup: HarvestStartupConfig,
+        code_worker: HarvestWorkerConfig,
+        env: &dyn Env,
+    ) -> autumn_web::AutumnResult<Self> {
         let startup = code_startup
+            .with_operator_overrides(env)
+            .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?;
+        let worker = code_worker
             .with_operator_overrides(env)
             .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?;
         Ok(Self {
             startup,
+            worker,
             profile: ambient_profile(env),
         })
     }

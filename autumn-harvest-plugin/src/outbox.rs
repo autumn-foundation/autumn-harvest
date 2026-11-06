@@ -108,6 +108,8 @@ impl HarvestWorkflowOutboxRow {
 /// Persist a workflow-start request in the application database outbox.
 ///
 /// Duplicate `(workflow_name, workflow_id)` requests are ignored so callers can retry safely.
+/// This writer takes a Postgres connection. On a SQLite app, use
+/// `sqlite::enqueue_workflow_start_outbox` (issue #2470).
 ///
 /// # Errors
 ///
@@ -150,15 +152,21 @@ pub async fn enqueue_workflow_start_outbox(
 /// Claim one batch of due outbox rows and attempt delivery to Harvest storage.
 ///
 /// The returned count is the number of rows successfully delivered, not the number claimed.
+/// A SQLite app in embedded mode drains its own outbox (issue #2470).
 ///
 /// # Errors
 ///
 /// Returns an [`AutumnError`] when the app database pool is unavailable or row claiming/updating
-/// fails.
+/// fails. On SQLite, it also fails when the driver has stopped, or when an activity or a
+/// workflow calls it.
 pub async fn drain_workflow_start_outbox_once(
     state: &AppState,
     limit: i64,
 ) -> Result<usize, AutumnError> {
+    #[cfg(feature = "sqlite")]
+    if let Some(outbox) = state.extension::<crate::sqlite::SqliteOutbox>() {
+        return outbox.drain_once(limit).await;
+    }
     drain_workflow_start_outbox_batch(state, limit)
         .await
         .map(|stats| stats.delivered)
@@ -259,11 +267,14 @@ fn outbox_mark_flush_due_now(
         .is_zero()
 }
 
-/// Why the outbox has no app pool. A SQLite app has no Postgres outbox at
-/// all (issue #2472). Its own outbox is #2470.
+/// Why the outbox has no app pool.
+///
+/// A SQLite app has its own outbox in embedded mode (issue #2470). Split and
+/// external mode keep Harvest in Postgres and run no relay (issue #2472).
 const fn no_outbox_pool() -> &'static str {
     if cfg!(feature = "sqlite") {
-        "the transactional outbox is not available on a SQLite app (autumn-harvest#2470)"
+        "the transactional outbox of a SQLite app needs harvest.mode = \"embedded\" and an app \
+         database (autumn-harvest#2470)"
     } else {
         "Database not configured for Harvest outbox"
     }
@@ -495,11 +506,18 @@ async fn flush_outbox_marks_or_err(
 /// Drain all currently due workflow-start outbox rows.
 ///
 /// The returned count is the number of rows successfully delivered.
+/// A SQLite app in embedded mode drains its own outbox (issue #2470).
 ///
 /// # Errors
 ///
-/// Returns an [`AutumnError`] when claiming or marking any outbox row fails.
+/// Returns an [`AutumnError`] when claiming or marking any outbox row fails. On SQLite, it
+/// also fails when the driver has stopped, or when an activity or a workflow calls it.
 pub async fn flush_workflow_start_outbox(state: &AppState) -> Result<usize, AutumnError> {
+    // A SQLite app in embedded mode drains its own outbox (issue #2470).
+    #[cfg(feature = "sqlite")]
+    if let Some(outbox) = state.extension::<crate::sqlite::SqliteOutbox>() {
+        return outbox.flush().await;
+    }
     let config = outbox_config(state);
     if !config.enabled {
         return Ok(0);
@@ -619,6 +637,18 @@ pub(crate) async fn dispatch_workflow_start_request(
         .as_ref()
         .and_then(|registry| registry.max_workflow_execution_timeout)
         .map(to_chrono);
+    // Issue #2406: an outbox start begins a new chain. It takes the chain cap
+    // of the type, the operator override and the fleet chain ceiling, as the
+    // API start does.
+    let to_chrono_opt = |d: std::time::Duration| chrono::Duration::from_std(d).ok();
+    let chain_execution_timeout = registry_ext
+        .as_ref()
+        .and_then(|registry| registry.chain_execution_timeout(&request.workflow_name))
+        .and_then(to_chrono_opt);
+    let max_workflow_chain_timeout_ceiling = registry_ext
+        .as_ref()
+        .and_then(|registry| registry.max_workflow_chain_timeout)
+        .and_then(to_chrono_opt);
 
     // Issue #1243: `WorkflowStarted.input` is payload-bearing. Fall back to
     // the identity registry only when no `HandlerRegistry` extension is
@@ -640,6 +670,8 @@ pub(crate) async fn dispatch_workflow_start_request(
             sla,
             execution_timeout,
             max_execution_timeout_ceiling,
+            chain_execution_timeout,
+            max_workflow_chain_timeout_ceiling,
             workflow_retry_policy: info_retry_policy,
             max_workflow_attempts_ceiling,
             // Started by the cross-shard outbox dispatcher (issue #740).
@@ -847,7 +879,18 @@ async fn mark_outbox_rows_failed_batch(
 }
 
 fn retry_delay_ms(config: &HarvestOutboxConfig, row: &HarvestWorkflowOutboxRow) -> u64 {
-    let attempt = u32::try_from(row.delivery_attempts.max(0)).unwrap_or(u32::MAX);
+    retry_delay_for_attempts(config, row.delivery_attempts)
+}
+
+/// The backoff after a failed start, from the attempts made before it.
+///
+/// Both backends use it. The delay doubles with each attempt, and
+/// `max_retry_delay_ms` caps it.
+pub(crate) fn retry_delay_for_attempts(
+    config: &HarvestOutboxConfig,
+    delivery_attempts: i64,
+) -> u64 {
+    let attempt = u32::try_from(delivery_attempts.max(0)).unwrap_or(u32::MAX);
     let multiplier = 1_u64 << attempt.min(16);
     config
         .base_retry_delay_ms

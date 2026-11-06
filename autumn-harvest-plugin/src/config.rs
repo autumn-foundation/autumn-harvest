@@ -58,6 +58,125 @@ pub struct HarvestReadinessConfig {
     pub require_shard_readiness: bool,
 }
 
+/// The processes that run the retention janitor (issue #2478).
+///
+/// `HarvestBuilder::retention` sets what retention deletes. This value sets
+/// where it runs. The TOML key is `[harvest.retention] run_on`. The
+/// environment variable is `AUTUMN_HARVEST_RETENTION__RUN_ON`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+#[non_exhaustive]
+pub enum RetentionRunOn {
+    /// Run retention where the resolved scheduler runs. This is the default.
+    /// A `web` role runs no scheduler, so it runs no retention.
+    #[default]
+    Scheduler,
+    /// Run retention on each process. This is the behaviour before issue
+    /// #2478. Row leases keep concurrent janitors correct.
+    All,
+}
+
+impl RetentionRunOn {
+    /// The config value, as an operator writes it.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Scheduler => "scheduler",
+            Self::All => "all",
+        }
+    }
+}
+
+impl std::fmt::Display for RetentionRunOn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// The `[harvest.retention]` section (issue #2478).
+///
+/// It holds the placement only. The policy is Rust-only, on
+/// `HarvestBuilder::retention`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct HarvestRetentionConfig {
+    /// The processes that run the retention janitor.
+    pub run_on: RetentionRunOn,
+}
+
+/// The `[harvest.worker]` section (issue #2479).
+///
+/// It narrows the queues that the worker of this process polls. Code
+/// declares the full set with `WorkerConfig::with_queues`. See
+/// [`crate::worker_queues`].
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct HarvestWorkerConfig {
+    /// The queues that this process polls. Each name must be declared in
+    /// code. An empty list means "not set". The role pin then applies, if it
+    /// names a declared queue. Otherwise the worker polls each declared
+    /// queue.
+    pub queues: Vec<String>,
+}
+
+impl HarvestWorkerConfig {
+    /// Apply the operator settings over this code value (issue #2479).
+    ///
+    /// The sources and their precedence are those of
+    /// [`HarvestStartupConfig::with_operator_overrides`]. Only
+    /// `[harvest.worker]` and its variable are read. A source that names no
+    /// list keeps the code value.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError`] when a config file cannot be read or parsed,
+    /// or when a queue name is blank.
+    pub fn with_operator_overrides(mut self, env: &dyn Env) -> Result<Self, ConfigError> {
+        for path in operator_config_paths(env) {
+            if let Some(worker) = load_worker_section(&path)? {
+                self.apply_partial(worker);
+            }
+        }
+        self.apply_env_overrides(env)?;
+        self.validate()?;
+        Ok(self)
+    }
+
+    fn apply_partial(&mut self, partial: PartialHarvestWorkerConfig) {
+        if let Some(queues) = partial.queues {
+            self.queues = queues;
+        }
+    }
+
+    /// An empty value clears the list, as for `AUTUMN_JOBS__PIN`.
+    ///
+    /// The name follows the Autumn form `AUTUMN_<section>__<key>`. The other
+    /// Harvest sections use `AUTUMN_HARVEST_<SECTION>__<KEY>`, so an operator
+    /// can write that form by mistake. Nothing would read it, so it stops
+    /// the boot and names the right variable.
+    fn apply_env_overrides(&mut self, env: &dyn Env) -> Result<(), ConfigError> {
+        if env.var("AUTUMN_HARVEST_WORKER__QUEUES").is_ok() {
+            return Err(ConfigError::Validation(
+                "AUTUMN_HARVEST_WORKER__QUEUES is not a Harvest variable; set \
+                 AUTUMN_HARVEST__WORKER__QUEUES instead"
+                    .to_owned(),
+            ));
+        }
+        if let Ok(queues) = env.var("AUTUMN_HARVEST__WORKER__QUEUES") {
+            self.queues = crate::worker_queues::parse_env_list(&queues);
+        }
+        Ok(())
+    }
+
+    fn validate(&self) -> Result<(), ConfigError> {
+        if self.queues.iter().any(|name| name.trim().is_empty()) {
+            return Err(ConfigError::Validation(format!(
+                "{} has a blank queue name",
+                crate::worker_queues::WORKER_QUEUES_KEY
+            )));
+        }
+        Ok(())
+    }
+}
+
 /// Highest accepted `harvest.redis.poll_interval_ms`.
 ///
 /// The value is the wait of one blocking read. The worker checks shutdown and
@@ -170,14 +289,21 @@ impl HarvestStartupConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HarvestRuntimeConfig {
     pub mode: HarvestMode,
-    pub worker_enabled: bool,
-    pub scheduler_enabled: bool,
+    /// Run the local worker. `None` follows the process role (issue #2477).
+    /// See [`crate::process_role`].
+    pub worker_enabled: Option<bool>,
+    /// Run the local scheduler. `None` follows the process role (issue #2477).
+    pub scheduler_enabled: Option<bool>,
     pub database: HarvestDatabaseConfig,
     pub outbox: HarvestOutboxConfig,
     pub batch: HarvestBatchConfig,
     pub readiness: HarvestReadinessConfig,
     pub startup: HarvestStartupConfig,
     pub redis: HarvestRedisConfig,
+    /// Where the retention janitor runs (issue #2478).
+    pub retention: HarvestRetentionConfig,
+    /// The queues that the worker polls (issue #2479).
+    pub worker: HarvestWorkerConfig,
 }
 
 impl HarvestRuntimeConfig {
@@ -209,15 +335,30 @@ impl HarvestRuntimeConfig {
         Ok(config)
     }
 
+    /// Resolve the worker and scheduler switches for `role` (issue #2477).
+    ///
+    /// `role` is the Autumn process role, or `None` with no `AppState`.
+    #[must_use]
+    pub const fn process_switches(
+        &self,
+        role: Option<autumn_web::config::ProcessRole>,
+    ) -> crate::process_role::ProcessSwitches {
+        crate::process_role::ProcessSwitches::resolve(
+            self.worker_enabled,
+            self.scheduler_enabled,
+            role,
+        )
+    }
+
     fn apply_partial(&mut self, partial: PartialHarvestRuntimeConfig) {
         if let Some(mode) = partial.mode {
             self.mode = mode;
         }
         if let Some(worker_enabled) = partial.worker_enabled {
-            self.worker_enabled = worker_enabled;
+            self.worker_enabled = Some(worker_enabled);
         }
         if let Some(scheduler_enabled) = partial.scheduler_enabled {
-            self.scheduler_enabled = scheduler_enabled;
+            self.scheduler_enabled = Some(scheduler_enabled);
         }
         if let Some(url) = partial.database.url {
             self.database.url = Some(url);
@@ -274,6 +415,10 @@ impl HarvestRuntimeConfig {
         if let Some(reconcile_batch) = partial.redis.reconcile_batch {
             self.redis.reconcile_batch = reconcile_batch;
         }
+        if let Some(run_on) = partial.retention.run_on {
+            self.retention.run_on = run_on;
+        }
+        self.worker.apply_partial(partial.worker);
     }
 
     fn apply_env_overrides(&mut self, env: &dyn Env) -> Result<(), ConfigError> {
@@ -282,12 +427,17 @@ impl HarvestRuntimeConfig {
         }
 
         if let Ok(worker_enabled) = env.var("AUTUMN_HARVEST__WORKER_ENABLED") {
-            self.worker_enabled = parse_bool("AUTUMN_HARVEST__WORKER_ENABLED", &worker_enabled)?;
+            self.worker_enabled = Some(parse_bool(
+                "AUTUMN_HARVEST__WORKER_ENABLED",
+                &worker_enabled,
+            )?);
         }
 
         if let Ok(scheduler_enabled) = env.var("AUTUMN_HARVEST__SCHEDULER_ENABLED") {
-            self.scheduler_enabled =
-                parse_bool("AUTUMN_HARVEST__SCHEDULER_ENABLED", &scheduler_enabled)?;
+            self.scheduler_enabled = Some(parse_bool(
+                "AUTUMN_HARVEST__SCHEDULER_ENABLED",
+                &scheduler_enabled,
+            )?);
         }
 
         if let Ok(url) = env.var("AUTUMN_HARVEST_DATABASE__URL") {
@@ -376,6 +526,11 @@ impl HarvestRuntimeConfig {
             self.redis.reconcile_batch =
                 parse_usize("AUTUMN_HARVEST_REDIS__RECONCILE_BATCH", &reconcile_batch)?;
         }
+        if let Ok(run_on) = env.var("AUTUMN_HARVEST_RETENTION__RUN_ON") {
+            self.retention.run_on =
+                parse_retention_run_on("AUTUMN_HARVEST_RETENTION__RUN_ON", &run_on)?;
+        }
+        self.worker.apply_env_overrides(env)?;
 
         Ok(())
     }
@@ -434,6 +589,7 @@ impl HarvestRuntimeConfig {
         }
 
         self.validate_redis()?;
+        self.worker.validate()?;
 
         Ok(())
     }
@@ -578,14 +734,16 @@ impl Default for HarvestRuntimeConfig {
     fn default() -> Self {
         Self {
             mode: HarvestMode::Embedded,
-            worker_enabled: true,
-            scheduler_enabled: true,
+            worker_enabled: None,
+            scheduler_enabled: None,
             database: HarvestDatabaseConfig::default(),
             outbox: HarvestOutboxConfig::default(),
             batch: HarvestBatchConfig::default(),
             readiness: HarvestReadinessConfig::default(),
             startup: HarvestStartupConfig::default(),
             redis: HarvestRedisConfig::default(),
+            retention: HarvestRetentionConfig::default(),
+            worker: HarvestWorkerConfig::default(),
         }
     }
 }
@@ -664,6 +822,24 @@ struct PartialHarvestRuntimeConfig {
     redis: PartialHarvestRedisConfig,
     #[serde(default)]
     sqlite: PartialHarvestSqliteConfig,
+    #[serde(default)]
+    retention: PartialHarvestRetentionConfig,
+    #[serde(default)]
+    worker: PartialHarvestWorkerConfig,
+}
+
+/// `[harvest.worker]` is a new section, so it refuses an unknown key. A typo
+/// such as `queue = [...]` must stop the boot. It must not leave the worker
+/// unnarrowed in silence.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PartialHarvestWorkerConfig {
+    queues: Option<Vec<String>>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PartialHarvestRetentionConfig {
+    run_on: Option<RetentionRunOn>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -911,28 +1087,52 @@ struct StartupOnlyHarvest {
     startup: PartialHarvestStartupConfig,
 }
 
+/// Only the `[harvest.worker]` table of a config file.
+#[derive(Debug, Default, Deserialize)]
+struct WorkerOnlyRoot {
+    #[serde(default)]
+    harvest: WorkerOnlyHarvest,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct WorkerOnlyHarvest {
+    #[serde(default)]
+    worker: PartialHarvestWorkerConfig,
+}
+
 /// Read `[harvest.startup]` from `path`. A missing file gives `None`.
+fn load_startup_section(path: &Path) -> Result<Option<PartialHarvestStartupConfig>, ConfigError> {
+    Ok(load_section::<StartupOnlyRoot>(path, "startup")?.map(|root| root.harvest.startup))
+}
+
+/// Read `[harvest.worker]` from `path`. A missing file gives `None`.
+fn load_worker_section(path: &Path) -> Result<Option<PartialHarvestWorkerConfig>, ConfigError> {
+    Ok(load_section::<WorkerOnlyRoot>(path, "worker")?.map(|root| root.harvest.worker))
+}
+
+/// Read one `[harvest.<table>]` view of `path`. A missing file gives `None`.
 ///
 /// The parse error names the file and the byte offset only. The TOML error
 /// text quotes the failing line, which can hold a password.
-fn load_startup_section(path: &Path) -> Result<Option<PartialHarvestStartupConfig>, ConfigError> {
+fn load_section<R: serde::de::DeserializeOwned>(
+    path: &Path,
+    table: &str,
+) -> Result<Option<R>, ConfigError> {
     let contents = match std::fs::read_to_string(path) {
         Ok(contents) => contents,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(ConfigError::Io(error)),
     };
-    toml::from_str::<StartupOnlyRoot>(&contents)
-        .map(|root| Some(root.harvest.startup))
-        .map_err(|error| {
-            let offset = error
-                .span()
-                .map_or_else(String::new, |span| format!(" at byte {}", span.start));
-            ConfigError::Validation(format!(
-                "could not parse {}{offset}: the file is not valid TOML, or \
-                 [harvest.startup] holds an invalid value",
-                path.display()
-            ))
-        })
+    toml::from_str::<R>(&contents).map(Some).map_err(|error| {
+        let offset = error
+            .span()
+            .map_or_else(String::new, |span| format!(" at byte {}", span.start));
+        ConfigError::Validation(format!(
+            "could not parse {}{offset}: the file is not valid TOML, or \
+             [harvest.{table}] holds an invalid value",
+            path.display()
+        ))
+    })
 }
 
 fn resolve_profile(env: &dyn Env) -> Option<String> {
@@ -997,6 +1197,21 @@ fn parse_orphan_startup_action(key: &str, value: &str) -> Result<OrphanStartupAc
         "fail" => Ok(OrphanStartupAction::Fail),
         _ => Err(ConfigError::Validation(format!(
             "invalid orphaned_workflows value for {key}: {value:?}; expected one of: off, warn, fail"
+        ))),
+    }
+}
+
+/// Parse a [`RetentionRunOn`] from an environment override (issue #2478).
+///
+/// The match ignores case, as for `orphaned_workflows`. A TOML value must be
+/// lowercase. An unknown value is an error, so a typo cannot turn retention
+/// off.
+fn parse_retention_run_on(key: &str, value: &str) -> Result<RetentionRunOn, ConfigError> {
+    match value.to_ascii_lowercase().as_str() {
+        "scheduler" => Ok(RetentionRunOn::Scheduler),
+        "all" => Ok(RetentionRunOn::All),
+        _ => Err(ConfigError::Validation(format!(
+            "invalid retention run_on value for {key}: {value:?}; expected one of: scheduler, all"
         ))),
     }
 }
@@ -1101,9 +1316,40 @@ mod tests {
         let config = HarvestRuntimeConfig::load_with_env(&env).expect("harvest config should load");
 
         assert_eq!(config.mode, HarvestMode::Embedded);
-        assert!(config.worker_enabled);
-        assert!(config.scheduler_enabled);
+        // Unset means "follow the process role" (issue #2477).
+        assert_eq!(config.worker_enabled, None);
+        assert_eq!(config.scheduler_enabled, None);
         assert_eq!(config.database.url, None);
+    }
+
+    /// `AUTUMN_HARVEST__WORKER_ENABLED` stays the explicit override (issue
+    /// #2477). Each env value and each TOML value is kept as explicit.
+    #[test]
+    fn an_env_or_toml_switch_is_kept_as_an_explicit_value() {
+        for value in [true, false] {
+            let env = MockEnv::new()
+                .with("AUTUMN_HARVEST__WORKER_ENABLED", &value.to_string())
+                .with("AUTUMN_HARVEST__SCHEDULER_ENABLED", &value.to_string());
+            let config = HarvestRuntimeConfig::load_with_env(&env).expect("loads");
+            assert_eq!(config.worker_enabled, Some(value));
+            assert_eq!(config.scheduler_enabled, Some(value));
+        }
+
+        let dir = unique_temp_dir("harvest-config-switch-true");
+        write_file(
+            &dir.join("autumn.toml"),
+            "[harvest]\nworker_enabled = true\n",
+        );
+        let env = MockEnv::new().with("AUTUMN_MANIFEST_DIR", dir.to_string_lossy().as_ref());
+        let config = HarvestRuntimeConfig::load_with_env(&env).expect("loads");
+        assert_eq!(config.worker_enabled, Some(true));
+        assert_eq!(config.scheduler_enabled, None);
+
+        let env = MockEnv::new()
+            .with("AUTUMN_MANIFEST_DIR", dir.to_string_lossy().as_ref())
+            .with("AUTUMN_HARVEST__WORKER_ENABLED", "false");
+        let config = HarvestRuntimeConfig::load_with_env(&env).expect("loads");
+        assert_eq!(config.worker_enabled, Some(false), "the env beats the file");
     }
 
     /// The `prod` profile turns on `strict_config` (since autumn-web 0.9).
@@ -1206,8 +1452,8 @@ url = "postgres://harvest:harvest@localhost:5432/harvest"
             HarvestRuntimeConfig::load_with_env(&env).expect("external config should load");
 
         assert_eq!(config.mode, HarvestMode::External);
-        assert!(!config.worker_enabled);
-        assert!(!config.scheduler_enabled);
+        assert_eq!(config.worker_enabled, Some(false));
+        assert_eq!(config.scheduler_enabled, Some(false));
         assert_eq!(
             config.database.url.as_deref(),
             Some("postgres://harvest:harvest@localhost:5432/harvest")
@@ -1239,8 +1485,8 @@ mode = "embedded"
             HarvestRuntimeConfig::load_with_env(&env).expect("env override config should load");
 
         assert_eq!(config.mode, HarvestMode::External);
-        assert!(!config.worker_enabled);
-        assert!(!config.scheduler_enabled);
+        assert_eq!(config.worker_enabled, Some(false));
+        assert_eq!(config.scheduler_enabled, Some(false));
         assert_eq!(
             config.database.url.as_deref(),
             Some("postgres://harvest:harvest@localhost:5432/env_override")
@@ -2029,5 +2275,212 @@ orphaned_workflows = "fail"
     fn write_file(path: &Path, contents: &str) {
         fs::write(path, contents)
             .unwrap_or_else(|error| panic!("failed to write {}: {error}", path.display()));
+    }
+
+    /// Issue #2478: retention follows the scheduler by default.
+    #[test]
+    fn retention_run_on_defaults_to_the_scheduler() {
+        let config = HarvestRuntimeConfig::load_with_env(&MockEnv::new()).expect("loads");
+        assert_eq!(config.retention.run_on, RetentionRunOn::Scheduler);
+        assert_eq!(
+            HarvestRetentionConfig::default().run_on,
+            RetentionRunOn::Scheduler
+        );
+    }
+
+    /// `[harvest.retention] run_on` sets the placement. The env beats the file.
+    #[test]
+    fn retention_run_on_from_toml_and_env() {
+        let dir = unique_temp_dir("harvest-config-retention-run-on");
+        write_file(
+            &dir.join("autumn.toml"),
+            "[harvest.retention]\nrun_on = \"all\"\n",
+        );
+        let env = MockEnv::new().with("AUTUMN_MANIFEST_DIR", dir.to_string_lossy().as_ref());
+        let config = HarvestRuntimeConfig::load_with_env(&env).expect("loads");
+        assert_eq!(config.retention.run_on, RetentionRunOn::All);
+
+        let env = MockEnv::new()
+            .with("AUTUMN_MANIFEST_DIR", dir.to_string_lossy().as_ref())
+            .with("AUTUMN_HARVEST_RETENTION__RUN_ON", "scheduler");
+        let config = HarvestRuntimeConfig::load_with_env(&env).expect("loads");
+        assert_eq!(config.retention.run_on, RetentionRunOn::Scheduler);
+
+        for value in ["all", "ALL", "All"] {
+            let env = MockEnv::new().with("AUTUMN_HARVEST_RETENTION__RUN_ON", value);
+            let config = HarvestRuntimeConfig::load_with_env(&env).expect("loads");
+            assert_eq!(config.retention.run_on, RetentionRunOn::All, "{value}");
+        }
+    }
+
+    /// A typo must stop the boot. It must not turn retention off.
+    #[test]
+    fn retention_run_on_rejects_an_unknown_value() {
+        let env = MockEnv::new().with("AUTUMN_HARVEST_RETENTION__RUN_ON", "worker");
+        let error = HarvestRuntimeConfig::load_with_env(&env).expect_err("must refuse");
+        let message = error.to_string();
+        assert!(message.contains("run_on"), "{message}");
+        assert!(message.contains("scheduler, all"), "{message}");
+
+        let dir = unique_temp_dir("harvest-config-retention-run-on-reject");
+        write_file(
+            &dir.join("autumn.toml"),
+            "[harvest.retention]\nrun_on = \"everywhere\"\n",
+        );
+        let env = MockEnv::new().with("AUTUMN_MANIFEST_DIR", dir.to_string_lossy().as_ref());
+        let error = HarvestRuntimeConfig::load_with_env(&env).expect_err("must refuse");
+        let message = error.to_string();
+        assert!(message.contains("everywhere"), "{message}");
+
+        // A TOML value must be lowercase, as for `orphaned_workflows`.
+        write_file(
+            &dir.join("autumn.toml"),
+            "[harvest.retention]\nrun_on = \"All\"\n",
+        );
+        let error = HarvestRuntimeConfig::load_with_env(&env).expect_err("must refuse");
+        assert!(error.to_string().contains("All"), "{error}");
+    }
+
+    /// The labels are the config values, so an operator can paste a log
+    /// line back.
+    #[test]
+    fn retention_run_on_labels_are_the_config_values() {
+        assert_eq!(RetentionRunOn::Scheduler.as_str(), "scheduler");
+        assert_eq!(RetentionRunOn::All.as_str(), "all");
+        assert_eq!(RetentionRunOn::All.to_string(), "all");
+    }
+
+    fn queue_names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|name| (*name).to_owned()).collect()
+    }
+
+    /// The sibling form of the variable stops the boot and names the right
+    /// one, so a typo cannot leave the worker unnarrowed.
+    #[test]
+    fn worker_queues_refuse_the_sibling_variable_form() {
+        let env = MockEnv::new().with("AUTUMN_HARVEST_WORKER__QUEUES", "priority");
+        let error = HarvestRuntimeConfig::load_with_env(&env).expect_err("must refuse");
+        assert!(
+            error
+                .to_string()
+                .contains("set AUTUMN_HARVEST__WORKER__QUEUES"),
+            "{error}"
+        );
+        let error = HarvestWorkerConfig::default()
+            .with_operator_overrides(&env)
+            .expect_err("must refuse");
+        assert!(
+            error.to_string().contains("AUTUMN_HARVEST_WORKER__QUEUES"),
+            "{error}"
+        );
+    }
+
+    /// Issue #2479: no setting narrows the worker by default.
+    #[test]
+    fn worker_queues_default_to_unset() {
+        let config = HarvestRuntimeConfig::load_with_env(&MockEnv::new()).expect("loads");
+        assert_eq!(config.worker.queues, Vec::<String>::new());
+        assert_eq!(HarvestWorkerConfig::default().queues, Vec::<String>::new());
+    }
+
+    /// `[harvest.worker] queues` sets the list. A profile file beats the root
+    /// file, and the environment beats both.
+    #[test]
+    fn worker_queues_from_toml_profile_and_env() {
+        let dir = unique_temp_dir("harvest-config-worker-queues");
+        write_file(
+            &dir.join("autumn.toml"),
+            "[harvest.worker]\nqueues = [\"priority\", \"bulk\"]\n",
+        );
+        let env = MockEnv::new().with("AUTUMN_MANIFEST_DIR", dir.to_string_lossy().as_ref());
+        let config = HarvestRuntimeConfig::load_with_env(&env).expect("loads");
+        assert_eq!(config.worker.queues, queue_names(&["priority", "bulk"]));
+
+        write_file(
+            &dir.join("autumn-prod.toml"),
+            "[harvest.worker]\nqueues = [\"bulk\"]\n",
+        );
+        let env = MockEnv::new()
+            .with("AUTUMN_MANIFEST_DIR", dir.to_string_lossy().as_ref())
+            .with("AUTUMN_ENV", "prod");
+        let config = HarvestRuntimeConfig::load_with_env(&env).expect("loads");
+        assert_eq!(config.worker.queues, queue_names(&["bulk"]));
+
+        let env = MockEnv::new()
+            .with("AUTUMN_MANIFEST_DIR", dir.to_string_lossy().as_ref())
+            .with("AUTUMN_ENV", "prod")
+            .with("AUTUMN_HARVEST__WORKER__QUEUES", "priority");
+        let config = HarvestRuntimeConfig::load_with_env(&env).expect("loads");
+        assert_eq!(config.worker.queues, queue_names(&["priority"]));
+    }
+
+    /// The variable is comma-separated. An empty value clears the list, as
+    /// `AUTUMN_JOBS__PIN` does.
+    #[test]
+    fn worker_queues_env_is_comma_separated_and_empty_clears() {
+        let env = MockEnv::new().with("AUTUMN_HARVEST__WORKER__QUEUES", " priority, bulk ,");
+        let config = HarvestRuntimeConfig::load_with_env(&env).expect("loads");
+        assert_eq!(config.worker.queues, queue_names(&["priority", "bulk"]));
+
+        let dir = unique_temp_dir("harvest-config-worker-queues-clear");
+        write_file(
+            &dir.join("autumn.toml"),
+            "[harvest.worker]\nqueues = [\"priority\"]\n",
+        );
+        let env = MockEnv::new()
+            .with("AUTUMN_MANIFEST_DIR", dir.to_string_lossy().as_ref())
+            .with("AUTUMN_HARVEST__WORKER__QUEUES", "");
+        let config = HarvestRuntimeConfig::load_with_env(&env).expect("loads");
+        assert_eq!(config.worker.queues, Vec::<String>::new());
+    }
+
+    /// A blank name or an unknown key in `[harvest.worker]` stops the boot.
+    #[test]
+    fn worker_queues_refuse_a_blank_name_and_an_unknown_key() {
+        let dir = unique_temp_dir("harvest-config-worker-queues-reject");
+        write_file(
+            &dir.join("autumn.toml"),
+            "[harvest.worker]\nqueues = [\"priority\", \" \"]\n",
+        );
+        let env = MockEnv::new().with("AUTUMN_MANIFEST_DIR", dir.to_string_lossy().as_ref());
+        let error = HarvestRuntimeConfig::load_with_env(&env).expect_err("must refuse");
+        assert!(
+            error.to_string().contains("harvest.worker.queues"),
+            "{error}"
+        );
+
+        write_file(
+            &dir.join("autumn.toml"),
+            "[harvest.worker]\nqueue = [\"priority\"]\n",
+        );
+        let error = HarvestRuntimeConfig::load_with_env(&env).expect_err("must refuse");
+        assert!(error.to_string().contains("queue"), "{error}");
+    }
+
+    /// A standalone embedding keeps its code list unless an operator source
+    /// names one.
+    #[test]
+    fn worker_operator_overrides_apply_over_the_code_list() {
+        let code = HarvestWorkerConfig {
+            queues: queue_names(&["default"]),
+        };
+        let kept = code
+            .clone()
+            .with_operator_overrides(&MockEnv::new())
+            .expect("loads");
+        assert_eq!(kept, code);
+
+        let dir = unique_temp_dir("harvest-config-worker-overlay");
+        write_file(
+            &dir.join("autumn.toml"),
+            "[harvest]\nworker_enabled = \"not a bool\"\n[harvest.worker]\nqueues = [\"bulk\"]\n",
+        );
+        let env = MockEnv::new().with("AUTUMN_MANIFEST_DIR", dir.to_string_lossy().as_ref());
+        let from_file = code.clone().with_operator_overrides(&env).expect("loads");
+        assert_eq!(from_file.queues, queue_names(&["bulk"]));
+
+        let env = env.with("AUTUMN_HARVEST__WORKER__QUEUES", "priority");
+        let from_env = code.with_operator_overrides(&env).expect("loads");
+        assert_eq!(from_env.queues, queue_names(&["priority"]));
     }
 }

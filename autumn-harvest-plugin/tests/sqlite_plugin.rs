@@ -3,8 +3,10 @@
 //! Each test boots a real app through `TestApp`, with the app database and
 //! the Harvest file in a temp directory. No Postgres and no Docker run.
 //!
-//! Run it with `cargo test -p autumn-harvest-plugin --features sqlite --test
-//! sqlite_plugin`.
+//! Run it with `cargo test -p autumn-harvest-plugin --features
+//! sqlite,oidc,mcp,webhooks,connectors --test sqlite_plugin`. Without `oidc`,
+//! the OIDC checks do not run. Without the trigger features, the MCP, webhook
+//! and connector checks do not run (issue #2471).
 
 #![cfg(feature = "sqlite")]
 // The `#[workflow]` and `#[activity]` macros need an `async fn`.
@@ -20,6 +22,38 @@ use autumn_web::AppState;
 use autumn_web::config::AutumnConfig;
 use autumn_web::test::{TestApp, TestClient};
 use serde_json::{Value, json};
+
+#[path = "support/wire_contract.rs"]
+mod wire_contract;
+
+#[path = "sqlite_plugin/wire_parity.rs"]
+mod wire_parity;
+
+#[path = "sqlite_plugin/read_parity.rs"]
+mod read_parity;
+
+#[path = "support/token_contract.rs"]
+mod token_contract;
+
+#[path = "support/role_contract.rs"]
+mod role_contract;
+
+#[cfg(feature = "oidc")]
+#[path = "support/oidc_contract.rs"]
+mod oidc_contract;
+
+#[path = "sqlite_plugin/auth_parity.rs"]
+mod auth_parity;
+
+#[path = "sqlite_plugin/ops_parity.rs"]
+mod ops_parity;
+
+#[cfg(all(feature = "mcp", feature = "webhooks", feature = "connectors"))]
+#[path = "sqlite_plugin/trigger_parity.rs"]
+mod trigger_parity;
+
+#[path = "sqlite_plugin/outbox.rs"]
+mod outbox;
 
 /// A value given to `HarvestPlugin::state`. The activity reads it back.
 #[derive(Debug)]
@@ -137,7 +171,7 @@ async fn a_workflow_runs_end_to_end_over_http() {
         .json(&json!({ "ok": true }))
         .send()
         .await;
-    signal.assert_ok();
+    signal.assert_status(202);
     let signal: Value = signal.json();
     assert_eq!(signal["signal_delivered"], true);
     // The same key again is not delivered twice.
@@ -170,7 +204,7 @@ async fn a_workflow_runs_end_to_end_over_http() {
     assert_eq!(by_id["execution"]["id"], exec);
 
     let list: Value = client
-        .get("/harvest/workflows?workflow_name=greet&state=completed")
+        .get("/harvest/workflows?workflow_name=greet&state=COMPLETED")
         .send()
         .await
         .json();
@@ -195,7 +229,10 @@ async fn a_workflow_runs_end_to_end_over_http() {
         .send()
         .await
         .json();
-    assert_eq!(registered, json!([{ "name": "greet" }]));
+    // The Postgres record: the schema fields are null when absent.
+    assert_eq!(registered.as_array().map(Vec::len), Some(1));
+    assert_eq!(registered[0]["name"], "greet");
+    assert_eq!(registered[0]["input_schema"], Value::Null);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -205,14 +242,6 @@ async fn an_unported_route_answers_501_and_names_the_epic() {
     let response = client.get("/harvest/admin/status").send().await;
     response.assert_status(501);
     response.assert_body_contains("issues/2466");
-    // The Postgres result contract (204 while running, the compact state,
-    // the successor chain) is not ported yet (#2489), so it is not faked.
-    let id = autumn_harvest::ExecutionId::new();
-    let response = client
-        .get(&format!("/harvest/workflows/{id}/result"))
-        .send()
-        .await;
-    response.assert_status(501);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -239,17 +268,6 @@ async fn an_unsupported_start_option_is_a_400_not_a_silent_drop() {
     response.assert_status(400);
     response.assert_body_contains("Idempotency-Key");
 
-    // A history read with Postgres paging options must not answer the whole
-    // history as if it had honoured them.
-    let id = autumn_harvest::ExecutionId::new();
-    for query in ["after=10", "event_type=WorkflowFailed", "limit=1"] {
-        let response = client
-            .get(&format!("/harvest/workflows/{id}/history?{query}"))
-            .send()
-            .await;
-        response.assert_status(400);
-        response.assert_body_contains("#2489");
-    }
     let runs: Value = client.get("/harvest/workflows").send().await.json();
     assert_eq!(runs, json!([]), "a refused start writes nothing");
 }
@@ -301,14 +319,17 @@ fn an_option_with_no_sqlite_port_fails_the_build_and_names_its_issue() {
     let built = std::panic::catch_unwind(|| {
         TestApp::new()
             .config(config(dir.path()))
-            .plugin(plugin().enable_api_tokens())
+            .plugin(plugin().decode_payloads_on_read())
     });
     let payload = built.err().expect("the build refuses the option");
     let message = payload
         .downcast_ref::<String>()
         .cloned()
         .unwrap_or_default();
-    assert!(message.contains("enable_api_tokens (#2469)"), "{message}");
+    assert!(
+        message.contains("decode_payloads_on_read (#2466)"),
+        "{message}"
+    );
 }
 
 /// The SQLite worker reads no cost hold, so the plugin refuses the option
@@ -378,7 +399,7 @@ async fn a_restart_resumes_the_run_from_the_harvest_file() {
         .json(&json!("after restart"))
         .send()
         .await
-        .assert_ok();
+        .assert_status(202);
     let result = wait_completed(&client, &exec).await;
     assert_eq!(result["output"]["shouted"], "hi WASP app=true");
     assert_eq!(result["output"]["go"], "after restart");
@@ -529,7 +550,7 @@ async fn a_signal_that_breaks_its_schema_is_refused_before_it_is_staged() {
         .json(&json!({ "ok": true }))
         .send()
         .await
-        .assert_ok();
+        .assert_status(202);
     let result = wait_completed(&client, &exec).await;
     assert_eq!(result["output"]["go"], json!({ "ok": true }));
 }

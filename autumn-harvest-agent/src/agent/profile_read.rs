@@ -9,7 +9,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::AgentProfile;
-use super::overlay::{Ceilings, ProfileOverlay, apply};
+use super::overlay::{ProfileOverlay, apply};
 use super::overlay_store::{OverlayStoreError, OverlayVersion};
 use crate::harness::{AgentHarness, truncate};
 use crate::mesh::MAX_NAME_LEN;
@@ -129,8 +129,10 @@ impl AgentHarness {
     /// The version must validate under the harness profile of the kind, as
     /// [`OverlayValidator`](super::overlay_store::OverlayValidator) checks
     /// it. Then it applies to the run profile under the run ceilings. Both
-    /// use [`Ceilings::from_profile`], with this harness as the registry. So
-    /// a deploy that narrows a bound or removes a model refuses an old
+    /// use the ceilings of the refine policy of the kind (issue #2394), with
+    /// this harness as the registry. The read takes the policy in the same
+    /// activity, so history records both. Under the default policy, a
+    /// deploy that narrows a bound or removes a model refuses an old
     /// version. A deploy that changes the profile model refuses only a
     /// version that names a model.
     ///
@@ -155,22 +157,29 @@ impl AgentHarness {
                 "the run of the kind {kind_name:?} reads overlays, and this worker has no overlay store"
             ));
         };
-        let active = match store.active(kind).await {
-            Ok(active) => active,
-            Err(OverlayStoreError::Backend { message }) => {
-                return Err(format!("the overlay store failed: {message}"));
+        let read = |err: OverlayStoreError| match err {
+            OverlayStoreError::Backend { message } => {
+                format!("the overlay store failed: {message}")
             }
-            Err(err) => return Err(refused("OverlayReadFailed", err.to_string())),
+            err => refused("OverlayReadFailed", err.to_string()),
+        };
+        let active = store.active(kind).await.map_err(read)?;
+        let policy = match active {
+            Some(_) => store.policy(kind).await.map_err(read)?.policy,
+            None => crate::refine::policy::RefinePolicy::default(),
         };
         let run = &request.profile;
         let active = active.map(|stored| {
             // The version must still validate under this deploy, as a put
             // and an activation check it. Then it applies to the run
-            // profile under the run ceilings. So each bound that it sets is
-            // at most the run bound and the deploy bound.
+            // profile. Both use the policy ceilings of the kind. Under the
+            // default policy, each bound is at most the run bound and the
+            // deploy bound. A raised policy ceiling lets a bound go above
+            // both, as the operator chose (issue #2394).
             let overlay = stored.overlay();
-            let applied = apply(&current, overlay, &Ceilings::from_profile(&current), self)
-                .and_then(|_| apply(run, overlay, &Ceilings::from_profile(run), self));
+            let ceilings = &policy.ceilings;
+            let applied = apply(&current, overlay, &ceilings.resolve(&current), self)
+                .and_then(|_| apply(run, overlay, &ceilings.resolve(run), self));
             (stored.version(), applied)
         });
         match op_profile(run.clone(), active) {
@@ -295,6 +304,7 @@ mod tests {
             &self,
             _kind: &str,
             _overlay: &ProfileOverlay,
+            _policy: &crate::refine::policy::RefinePolicy,
         ) -> Result<(), OverlayStoreError> {
             Ok(())
         }
@@ -312,9 +322,15 @@ mod tests {
         )
         .await
         .unwrap();
-        crate::ProfileOverlayStore::activate(&store, "support", version, None)
-            .await
-            .unwrap();
+        crate::ProfileOverlayStore::activate(
+            &store,
+            "support",
+            version,
+            None,
+            crate::Provenance::operator("ops"),
+        )
+        .await
+        .unwrap();
         AgentHarness::new(std::sync::Arc::new(NoModel))
             .agent(current)
             .overlay_store(std::sync::Arc::new(store))

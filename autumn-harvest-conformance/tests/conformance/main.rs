@@ -12,6 +12,7 @@ mod pg;
 mod runner;
 mod scenario;
 mod sqlite;
+mod timing;
 
 /// Make one test per scenario, and the list that the coverage guard reads.
 ///

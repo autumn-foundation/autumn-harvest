@@ -22,7 +22,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
-use autumn_harvest::info::WorkflowInfo;
 use autumn_web::AppState;
 use autumn_web::db::fleet::{DatabaseFleet, FleetDatabase, FleetLifecycle};
 use autumn_web::error::AutumnError;
@@ -30,7 +29,8 @@ use autumn_web::fleet_layout::FleetDbKey;
 use autumn_web::reexports::axum;
 use tokio_util::sync::CancellationToken;
 
-use super::driver::{Driver, Registry};
+use super::driver::{Driver, Registry, Retention};
+use super::handle::Catalog;
 use super::handle::{HarvestSqlite, HarvestSqliteError};
 
 /// How long a caller waits for a tenant driver that another task starts.
@@ -109,7 +109,8 @@ struct Shared {
     /// `None` once [`HarvestFleet::release`] ran. The registry holds a clone
     /// of `AppState`, which holds this fleet, so the release breaks a cycle.
     registry: Mutex<Option<Arc<Registry>>>,
-    infos: Vec<WorkflowInfo>,
+    /// The definitions that a tenant handle reads (issue #2468).
+    catalog: Arc<Catalog>,
     tick: Duration,
     tenants: Mutex<HashMap<FleetDbKey, Slot>>,
     /// The last start generation.
@@ -143,17 +144,12 @@ impl std::fmt::Debug for HarvestFleet {
 }
 
 impl HarvestFleet {
-    pub(crate) fn new(
-        fleet: DatabaseFleet,
-        registry: Arc<Registry>,
-        infos: Vec<WorkflowInfo>,
-        tick: Duration,
-    ) -> Self {
+    pub(crate) fn new(fleet: DatabaseFleet, registry: Arc<Registry>, tick: Duration) -> Self {
         Self {
             shared: Arc::new(Shared {
                 fleet,
+                catalog: Arc::new(Catalog::of(&registry)),
                 registry: Mutex::new(Some(registry)),
-                infos,
                 tick,
                 tenants: Mutex::new(HashMap::new()),
                 generation: AtomicU64::new(0),
@@ -365,6 +361,8 @@ impl Shared {
                 format!("the per-tenant Harvest has stopped, so {key} gets no driver")
             })?;
         let runtime = Driver::open(&path, &registry)?;
+        // Each tenant file has its own retention status (issue #2471).
+        let retention = Arc::new(Retention::new(&registry.retention));
         drop(registry);
         let reader = autumn_harvest_sqlite::SqliteReader::open(&path)
             .map_err(|error| format!("cannot open a reader on {}: {error}", path.display()))?;
@@ -379,8 +377,14 @@ impl Shared {
             }
         });
         let _entered = tokio.enter();
-        let (sender, task) =
-            Driver::spawn_tenant(runtime, self.tick, key.clone(), stop.clone(), on_exit);
+        let (sender, task) = Driver::spawn_tenant(
+            runtime,
+            self.tick,
+            Arc::clone(&retention),
+            key.clone(),
+            stop.clone(),
+            on_exit,
+        );
         // The fleet stops the driver before it closes the database.
         db.register_worker(stop.clone(), task);
         if stop.is_cancelled() {
@@ -388,7 +392,10 @@ impl Shared {
             // driver at once.
             return Err(format!("{key} closed while its Harvest started"));
         }
-        Ok(HarvestSqlite::new(sender, reader, path, self.infos.clone()).for_tenant(key))
+        Ok(
+            HarvestSqlite::new(sender, reader, path, Arc::clone(&self.catalog), retention)
+                .for_tenant(key),
+        )
     }
 
     /// Remove the slot of `key` when it still has `generation`.
@@ -523,14 +530,8 @@ mod tests {
             }))
             .expect("fleet config");
         let fleet = DatabaseFleet::builder(config).build().expect("fleet");
-        let registry = Arc::new(Registry {
-            workflows: Vec::new(),
-            activities: Vec::new(),
-            updates: Vec::new(),
-            signals: Vec::new(),
-            state: autumn_harvest::context::empty_shared_state(),
-        });
-        HarvestFleet::new(fleet, registry, Vec::new(), Duration::from_millis(250)).shared
+        let registry = Arc::new(Registry::empty());
+        HarvestFleet::new(fleet, registry, Duration::from_millis(250)).shared
     }
 
     fn acme(shared: &Shared) -> FleetDbKey {
@@ -593,17 +594,10 @@ mod tests {
             }))
             .expect("fleet config");
         let fleet = DatabaseFleet::builder(config).build().expect("fleet");
-        let registry = Arc::new(Registry {
-            workflows: Vec::new(),
-            activities: Vec::new(),
-            updates: Vec::new(),
-            signals: Vec::new(),
-            state: autumn_harvest::context::empty_shared_state(),
-        });
+        let registry = Arc::new(Registry::empty());
         let harvest = HarvestFleet::new(
             fleet.clone(),
             Arc::clone(&registry),
-            Vec::new(),
             Duration::from_millis(250),
         );
         harvest.install().await;

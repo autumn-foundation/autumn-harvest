@@ -30,6 +30,8 @@ struct Spans {
     timeout: Option<f64>,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Double>)]
     sla: Option<f64>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Double>)]
+    chain: Option<f64>,
 }
 
 #[derive(Debug, QueryableByName)]
@@ -81,7 +83,7 @@ fn noop_handler<'a>(
 }
 
 /// Issue #2387: an outbox start takes the operator's timeout and SLA override,
-/// as an API start does.
+/// as an API start does. Issue #2406: it takes the chain cap override too.
 #[tokio::test]
 async fn framework_outbox_start_takes_the_run_default_override() {
     const HOUR: std::time::Duration = std::time::Duration::from_secs(3600);
@@ -96,7 +98,7 @@ async fn framework_outbox_start_takes_the_run_default_override() {
         module: "outbox_integration",
         handler: noop_handler,
         execution_timeout: Some(3 * HOUR),
-        chain_execution_timeout: None,
+        chain_execution_timeout: Some(2 * HOUR),
         sla: Some(2 * HOUR),
         concurrency: None,
         debounce: None,
@@ -121,6 +123,10 @@ async fn framework_outbox_start_takes_the_run_default_override() {
         autumn_harvest::run_defaults::RunDefaultFields {
             execution_timeout: Some(std::time::Duration::from_secs(600)),
             sla: None,
+            chain_execution_timeout: Some(std::time::Duration::from_mins(15)),
+            concurrency_limit: None,
+            quota: autumn_harvest::quota::QuotaLimits::default(),
+            retry: autumn_harvest::workflow_retry::RetryLimits::default(),
         },
     );
     state.insert_extension(registry);
@@ -146,7 +152,8 @@ async fn framework_outbox_start_takes_the_run_default_override() {
         .expect("connect to the harvest database");
     let spans: Spans = diesel::sql_query(
         "SELECT EXTRACT(EPOCH FROM deadline_at - started_at)::float8 AS timeout, \
-                EXTRACT(EPOCH FROM sla_deadline_at - started_at)::float8 AS sla \
+                EXTRACT(EPOCH FROM sla_deadline_at - started_at)::float8 AS sla, \
+                EXTRACT(EPOCH FROM chain_deadline_at - started_at)::float8 AS chain \
          FROM harvest_workflow_executions WHERE workflow_id = 'user-onboarding:2387'",
     )
     .get_result(&mut conn)
@@ -162,6 +169,11 @@ async fn framework_outbox_start_takes_the_run_default_override() {
     assert!(
         (sla - 600.0).abs() < 2.0,
         "the SLA is clamped to the timeout: {sla}"
+    );
+    let chain = spans.chain.expect("the run has a chain deadline");
+    assert!(
+        (chain - 900.0).abs() < 2.0,
+        "the override chain cap applies: {chain}"
     );
 }
 

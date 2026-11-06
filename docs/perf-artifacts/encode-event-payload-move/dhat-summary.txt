@@ -1,0 +1,9 @@
+payload_codec_profile, PAYLOAD_CODEC_PROFILE_REPS=20, valgrind --tool=dhat
+
+before (trunk-dev 4b6ec95)
+Total:     204,334,356 bytes in 1,694,676 blocks
+At t-gmax: 6,682,102 bytes in 55,579 blocks
+
+after (issue #2499)
+Total:     204,713,343 bytes in 1,733,421 blocks
+At t-gmax: 6,682,102 bytes in 55,579 blocks

@@ -71,6 +71,13 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
+/// Hash map for the history index's UUID-newtype keys.
+///
+/// `foldhash` costs far less than `SipHash` on a 16-byte key. It keeps a random per-map seed.
+type IdMap<K, V> = HashMap<K, V, foldhash::fast::RandomState>;
+/// Hash set for the history index's UUID-newtype keys. See [`IdMap`].
+type IdSet<K> = HashSet<K, foldhash::fast::RandomState>;
+
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde::Serialize;
 
@@ -268,16 +275,16 @@ struct HistoryIndex {
     /// avoids a `Uuid::to_string()` allocation-plus-format AND a
     /// variable-length `SipHash` pass on every touch — a wide fan-out's
     /// history scan is the whole cost of this index, so both add up.
-    activities: HashMap<ActivityExecId, (String, DateTime<Utc>)>,
+    activities: IdMap<ActivityExecId, (String, DateTime<Utc>)>,
     /// activity ids with a recorded terminal (completed/failed/timed out/
     /// externally resolved).
-    closed_activities: HashSet<ActivityExecId>,
+    closed_activities: IdSet<ActivityExecId>,
     /// `activity_id` → (name, scheduled-at) for local activities.
-    local_activities: HashMap<ActivityExecId, (String, DateTime<Utc>)>,
+    local_activities: IdMap<ActivityExecId, (String, DateTime<Utc>)>,
     /// local activity ids with a recorded terminal (completed/exhausted).
-    closed_local_activities: HashSet<ActivityExecId>,
+    closed_local_activities: IdSet<ActivityExecId>,
     /// `activity_id` → (name, awaiting-since, deadline) for external handoffs.
-    external_activities: HashMap<ActivityExecId, ExternalActivityMeta>,
+    external_activities: IdMap<ActivityExecId, ExternalActivityMeta>,
     /// Per-timer-id FIFO of open (unpaired) arms: `TimerFired`/`TimerCancelled`
     /// closes the oldest open arm (the poll-loop re-arm idiom).
     open_timer_arms: HashMap<String, VecDeque<OpenTimerArm>>,
@@ -287,7 +294,7 @@ struct HistoryIndex {
     ///
     /// Keyed by the native `ExecutionId` (`Copy`, same rationale as
     /// `activities` above).
-    children: HashMap<ExecutionId, (String, DateTime<Utc>)>,
+    children: IdMap<ExecutionId, (String, DateTime<Utc>)>,
     /// Insertion order of open children.
     child_order: Vec<ExecutionId>,
     /// Update id → (handler name, admitted-at) for unresolved updates,
@@ -414,14 +421,26 @@ impl HistoryIndex {
     /// external row a unique id, so it never hits that case either.
     fn with_capacity(counts: &HistoryCounts) -> Self {
         Self {
-            activities: HashMap::with_capacity(counts.activities),
-            closed_activities: HashSet::with_capacity(counts.closed_activities),
-            local_activities: HashMap::with_capacity(counts.local_activities),
-            closed_local_activities: HashSet::with_capacity(counts.closed_local_activities),
-            external_activities: HashMap::new(),
+            activities: IdMap::with_capacity_and_hasher(
+                counts.activities,
+                foldhash::fast::RandomState::default(),
+            ),
+            closed_activities: IdSet::with_capacity_and_hasher(
+                counts.closed_activities,
+                foldhash::fast::RandomState::default(),
+            ),
+            local_activities: IdMap::with_capacity_and_hasher(
+                counts.local_activities,
+                foldhash::fast::RandomState::default(),
+            ),
+            closed_local_activities: IdSet::with_capacity_and_hasher(
+                counts.closed_local_activities,
+                foldhash::fast::RandomState::default(),
+            ),
+            external_activities: IdMap::default(),
             open_timer_arms: HashMap::new(),
             timer_order: Vec::new(),
-            children: HashMap::new(),
+            children: IdMap::default(),
             child_order: Vec::with_capacity(counts.children),
             pending_updates: Vec::new(),
             open_external_awaits: Vec::new(),

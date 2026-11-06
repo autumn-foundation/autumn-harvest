@@ -719,8 +719,9 @@ loopback. The scope must include `openid`.
 **Limits.**
 
 - Roles are fixed at login. After `max_session_age` (default 12 hours) the
-  user must log in again. Set it with `OidcLogin::with_max_session_age`. An
-  age under one second becomes one second.
+  user must log in again. Set it with `OidcLogin::with_max_session_age`. The
+  login time has a one-second resolution, so a session can end up to one
+  second early. An age under two seconds becomes two seconds.
 - The claim map reads the signed ID token only.
 - Logout does not end the session at the identity provider.
 - `api_with_oidc` and `api_with_auth` replace each other. The last call
@@ -1691,7 +1692,7 @@ credentials. The plugin re-exports `aws_sdk_kms`.
 
 ```toml
 [dependencies]
-autumn-harvest-plugin = { version = "0.9", features = ["aws-kms"] }
+autumn-harvest-plugin = { version = "0.10", features = ["aws-kms"] }
 aws-config = { version = "1", features = ["behavior-version-latest"] }
 ```
 
@@ -1736,7 +1737,7 @@ path "transit/decrypt/harvest" { capabilities = ["update"] }
 
 ```toml
 [dependencies]
-autumn-harvest-plugin = { version = "0.9", features = ["vault-transit"] }
+autumn-harvest-plugin = { version = "0.10", features = ["vault-transit"] }
 ```
 
 ```rust,ignore
@@ -1867,8 +1868,8 @@ quotes the scan output. To close the issue, fix each finding or add a reasoned
 ### Pinned actions and Dependabot
 
 Each `uses:` pins a commit SHA, with a `# <tag>` comment. A tag can move to new
-code, and a SHA cannot. `docs/audits/action-sha-pin.py` fails the `lint` job on
-any other form.
+code, and a SHA cannot. `cargo xtask audit action-sha-pin` fails the `lint` job
+on any other form.
 
 `.github/dependabot.yml` opens weekly update pull requests against `trunk-dev`,
 for `cargo` and `github-actions`. Dependabot changes the SHA and the comment
@@ -1888,10 +1889,10 @@ Verify the signature. Replace the version in each name:
 
 ```sh
 cosign verify-blob \
-  --bundle harvest-0.9.0-x86_64-unknown-linux-gnu.tar.gz.sigstore.json \
-  --certificate-identity https://github.com/autumn-foundation/autumn-harvest/.github/workflows/release.yml@refs/tags/v0.9.0 \
+  --bundle harvest-0.10.0-x86_64-unknown-linux-gnu.tar.gz.sigstore.json \
+  --certificate-identity https://github.com/autumn-foundation/autumn-harvest/.github/workflows/release.yml@refs/tags/v0.10.0 \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-  harvest-0.9.0-x86_64-unknown-linux-gnu.tar.gz
+  harvest-0.10.0-x86_64-unknown-linux-gnu.tar.gz
 ```
 
 Verify the build provenance and the SBOM attestation. Always pass the tag
@@ -1899,13 +1900,13 @@ and the workflow. `--repo` alone accepts an attestation from any workflow
 run of this repository.
 
 ```sh
-gh attestation verify harvest-0.9.0-x86_64-unknown-linux-gnu.tar.gz \
+gh attestation verify harvest-0.10.0-x86_64-unknown-linux-gnu.tar.gz \
   --repo autumn-foundation/autumn-harvest \
-  --source-ref refs/tags/v0.9.0 \
+  --source-ref refs/tags/v0.10.0 \
   --signer-workflow autumn-foundation/autumn-harvest/.github/workflows/release.yml
-gh attestation verify harvest-0.9.0-x86_64-unknown-linux-gnu.tar.gz \
+gh attestation verify harvest-0.10.0-x86_64-unknown-linux-gnu.tar.gz \
   --repo autumn-foundation/autumn-harvest \
-  --source-ref refs/tags/v0.9.0 \
+  --source-ref refs/tags/v0.10.0 \
   --signer-workflow autumn-foundation/autumn-harvest/.github/workflows/release.yml \
   --predicate-type https://cyclonedx.org/bom
 ```

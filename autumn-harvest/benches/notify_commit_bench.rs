@@ -14,7 +14,7 @@
 //! # Running
 //!
 //! ```text
-//! ./benchmarks/notify-commit.sh
+//! cargo xtask bench notify-commit
 //!
 //! # Or against an existing server (a scratch table is created and dropped):
 //! HARVEST_NOTIFY_BENCH_URL=postgres://postgres:postgres@localhost:5432/postgres \

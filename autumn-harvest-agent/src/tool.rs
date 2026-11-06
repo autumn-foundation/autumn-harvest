@@ -27,6 +27,28 @@ pub enum ToolEffect {
     External,
 }
 
+impl ToolEffect {
+    /// Every effect, from least to most impact.
+    pub const ALL: [Self; 4] = [Self::ReadOnly, Self::Internal, Self::Write, Self::External];
+
+    /// The wire name, such as `read_only`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ReadOnly => "read_only",
+            Self::Internal => "internal",
+            Self::Write => "write",
+            Self::External => "external",
+        }
+    }
+}
+
+impl std::fmt::Display for ToolEffect {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// The facts a tool gets with each call.
 ///
 /// `run_id`, `step` and `call_id` together are an idempotency key. A call
@@ -294,5 +316,9 @@ mod tests {
         assert!(ToolEffect::ReadOnly < ToolEffect::Internal);
         assert!(ToolEffect::Internal < ToolEffect::Write);
         assert!(ToolEffect::Write < ToolEffect::External);
+        for effect in ToolEffect::ALL {
+            let wire = serde_json::to_value(effect).unwrap();
+            assert_eq!(wire, serde_json::json!(effect.as_str()));
+        }
     }
 }

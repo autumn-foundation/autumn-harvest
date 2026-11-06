@@ -36734,6 +36734,1453 @@ folds fragments in here.
   rows that the redrive delete keeps. Design record:
   `docs/design/DESIGN-2401.md`. No new `WorkflowEvent` variant and no replay
   impact.
+- **Tooling** (implemented): Dependency update, MSRV 1.97 — see PR #2523. Updates every workspace dependency that can move. `testcontainers` stays at 0.27, because `testcontainers-modules` 0.15 needs it. `rusqlite` stays at 0.40, because `autumn-web` 0.9 needs `libsqlite3-sys` 0.38.
+
+  **MSRV.** The MSRV rises from 1.88 to 1.97, which `wasmtime` 50 needs.
+
+  **Behavior changes for operators:**
+
+  - **Certificate trust.** `reqwest` 0.13 uses the OS trust store. It no longer
+    uses the bundled Mozilla roots. An image with no CA certificates now fails TLS.
+    A private CA in the OS store is now trusted.
+  - **Cron at the end of DST.** An hourly or shorter schedule in a time zone now
+    also fires in the repeated hour. Croner 2.2 skipped the second pass, or
+    returned a time before the reference. A fixed daily job still fires once.
+  - **Cron parsing.** `0 0 LW * *` and 7-field expressions with a year now parse.
+    An expression with a `+` prefix, such as `+0 0 * * *`, no longer parses. Such a
+    stored schedule stops firing, so check for one before you upgrade.
+  - **Seeded simulations.** `random_range` draws through `StdRng`, so a simulation
+    seed can produce a different value. Replay is not affected, because it reads
+    the recorded value.
+
+  **Embedders.** `reqwest` builds with `rustls-no-provider`, so `aws-lc-rs` stays
+  out of the default build. `autumn_harvest_plugin::http::client_builder` installs
+  `ring` if the process has no provider. An embedder that calls `random_range` with
+  a custom `SampleUniform` type must implement the `rand` 0.10 trait.
+
+  **Guards.** `HVG002` and `DET002` now also flag the `rand` 0.10 names:
+  `rand::rng`, `SysRng`, `random`, `random_range`, `random_bool` and `random_ratio`.
+
+  **Removed crates.** `fs4` (`std::fs::File::try_lock` replaces it) and unused
+  direct dependencies in the Redis crate, the sandbox guest and three examples.
+- **Plugin** (implemented): SQLite app: split mode and per-tenant Harvest — see issue #2472 (epic #2466). Two topologies for a `HarvestPlugin` app on `autumn-web/sqlite`. The Postgres default build does not change. The design record is `docs/design/DESIGN-2472.md`.
+
+  - **Split and external mode.** `harvest.mode = "split"` or `"external"` no
+    longer fails the boot of a SQLite app. The plugin takes its Postgres path
+    on `harvest.database.url`, with the whole management API and every
+    builder option. Under `sqlite` it builds that Postgres pool itself, with
+    `pg_tls::connect`, because `autumn-web` builds SQLite pools only. Its
+    `sslmode=require` checks the certificate, and it reads no `sslrootcert`.
+    The boot probes one connection and logs the remedy. The
+    outbox migration set is not registered on the SQLite app database. The
+    outbox relay and `AppDbPool` stay off. The build refuses
+    `harvest.sqlite.path` and `sqlite_per_tenant()` in these modes.
+  - **Per-tenant Harvest.** `HarvestPlugin::sqlite_per_tenant()` gives each
+    open fleet database its own Harvest file (`acme.db` gives
+    `acme.harvest.db`) and its own driver. A `FleetLifecycle` starts the
+    driver on open and registers it as a worker of the database, so a close
+    stops it. A delete removes the Harvest file and its sidecars. The control
+    Harvest keeps running. `HarvestFleet` (extension and extractor) returns a
+    `HarvestSqlite` that holds the tenant's lease. `HarvestTenant::current()`
+    gives the tenant key inside an activity. `.api(path)` serves the core
+    routes on one tenant under `{path}/tenants/{key}/..`, behind the same auth
+    and #1802 gate. These routes never create a tenant. The boot fails
+    without a fleet. In `slot` mode the slot database is the unit.
+  - **No new `WorkflowEvent` variant. No migration.** autumn#3536 is not
+    needed: Harvest applies its own schema to its own file.
+  - **Limits.** A closed tenant runs nothing until it opens again. A fleet
+    restore does not roll back the Harvest file. Replication does not ship it.
+
+  Tests: `tests/sqlite_plugin_split.rs` runs a workflow with an activity and a
+  signal in split and external mode on a Postgres container (new CI job
+  `sqlite-plugin-split`). `tests/sqlite_plugin_fleet.rs` covers per-tenant
+  files and drivers, isolation, the tenant routes, a close and reopen, a
+  delete with its sidecars, the lease count, a tenant open before startup,
+  the mutation gate, a route that never creates a tenant and a slot fleet.
+  The split suite also checks the build refusals. Unit tests cover the mode
+  routing, the refusals, the pool builder, the outbox predicate and the
+  registry generations.
+- **Fix** (implemented): Durable route: no final 500 on a chain that still moves — see issue #2491. The durable route walks a continue-as-new chain to its last run, in at most `max_chain_steps` steps. At the cap, it answered a final `500 result-unavailable` when each run that it read had ended. On a chain that moved during the walk, that answer was wrong: a retry found the result. CI saw this in `same_type_chain_takes_one_step` and `rerun_of_a_chain_end_keeps_the_original_outcome`.
+
+  - At the cap, the route now reads the chain tail on each physical database.
+    A chain with a live run answers pending. A migration seal never counts as
+    live, because its copy is the run.
+  - A chain that has ended gets a second walk. That walk reads only data that
+    no longer changes. It answers the result, or a final 500 when it caps at
+    the same run as the first walk. Any other second walk answers pending.
+  - `Successor.live` is gone. The tail read replaces it.
+  - `RunReads::chain_live` and `live_chain_run_exists` are new. The query
+    filters on the `id` key and on `first_exec_id`, which has an index. Its
+    Ledger profile is in `docs/ledger/autumn-harvest-plugin/durable_route.toml`.
+
+  No new `WorkflowEvent` variant. No migration. The design record is
+  `docs/design/DESIGN-2491.md`. Unit tests on the fake chain, one of them a
+  property test, run the race with no database. `chain_step_cap_answers_pending_while_the_chain_runs`
+  proves it on Postgres.
+- **Agents** (implemented): Operate agent profile overlays: list, show, diff, activate, rollback — see issue #2374. An operator can now see which overlay version each agent kind runs, see what changed, and roll back, with no code. Parent: #2369. It builds on the store of #2371 and the recorded read of #2372.
+
+  - **Activation log.** Each `ProfileOverlayStore` logs each move of the
+    pointer: the version before, the version after, and the actor. The move
+    and its row commit in one transaction. An activation of the active
+    version logs nothing. `last_activation` reads the last move.
+  - **Breaking.** `ProfileOverlayStore::activate` takes an actor, a
+    `Provenance`, as its last argument. A store also implements
+    `last_activation` and `rollback`. The raw log functions take a
+    `MoveRequest`.
+  - **Rollback.** `ProfileOverlayStore::rollback(kind, actor)` activates the
+    version that was active before the current one, over the expected
+    pointer. The swap also needs the move that it read to be the last one,
+    so a pointer that moved away and back is a `Conflict`. A second rollback
+    undoes the first one. With no earlier activation it returns
+    `NoEarlierActivation` and changes nothing.
+  - **Diff.** `overlay_diff` returns each part that differs between two
+    overlays, with its path and both values.
+  - **Routes.** `GET /agents/{kind}/profile`, `GET .../versions`,
+    `GET .../versions/{version}`, `GET .../diff?a=&b=`,
+    `POST .../activate` and `POST .../rollback`. Install the store with
+    `HarvestPlugin::agent_overlay_store`. Without it, each route is `404`.
+    The SQLite plugin refuses that call for now (epic #2466).
+    `activate` requires `expected_active`, so each call is a
+    compare-and-swap. A stale pointer is a `409` that names the active
+    version.
+  - **Roles.** The two writes are `Mutating` and not admin-only. The
+    `harvest-operator` role reaches them. A `read` role gets `403`.
+  - **Audit.** Each activate and rollback request writes
+    `agent_profile.activate` or `agent_profile.rollback`, target type
+    `agent_profile`, with the kind, the operator id and `from vN to vM`. An
+    activation of the active version records `unchanged at vN`. The move and
+    its audit run in a task of their own, so a dropped client cannot stop the
+    audit. The audit export ships each row.
+  - **CLI.** `harvest agents profile list|show|diff|activate|rollback`.
+    `activate` without `--expected` reads the active version first.
+  - **Proof.** `formal/verus/src/overlay_log.rs` proves that a rollback
+    restores the version before the current one, that a rollback with no
+    earlier activation changes nothing, and that a rollback over a stale
+    read changes nothing.
+
+  **Migration.** `20261102142302_harvest_agent_overlay_activations` adds
+  `harvest_agent_overlay_activations`. The trigger
+  `harvest_agent_overlay_activations_immutable_trg` refuses each `UPDATE` of
+  a row. The table is new and not hot.
+
+  The design is in [`docs/design/DESIGN-2374.md`](design/DESIGN-2374.md).
+- **Testing** (implemented): Conformance: exact retry backoffs in the corpus — see issue #2517. `race_timer_wins` failed in the coverage nightly. On Postgres, the activity won the race against a one-second timer. Its "60 s" retry backoff came from `RetryPolicy::fixed`, which applies full jitter. The Postgres worker drew a delay in `[0, 60 s]` from a seed of random ids. `SQLite` waits the base delay. About one run in sixty drew a delay under the timer.
+
+  - The corpus wraps each positive backoff in `exact`, which sets
+    `JitterPolicy::None`. That covers `slow_retry`, `very_slow_retry` and
+    `gated_retry`.
+  - `corpus::all_activities` lists every corpus activity. `RACE_TIMER` names
+    the timer of `race_timer_wins`.
+  - `timing.rs` adds guards that run without Docker. Each corpus activity
+    has a retry policy and is in `all_activities`. Each corpus retry
+    waits its base delay for 1000 seeds. The race loser retries after the race
+    timer, with one second to spare.
+
+  Test-only change. No engine change, no new `WorkflowEvent` variant, no
+  migration. Both guards failed before the fix: seed 18 gave a 1.49 s retry.
+  The full suite passes on Postgres 16, and `race_timer_wins` passed 60 of 60
+  repeated runs.
+- **Performance** (implemented): Encode moves payload trees — see issue #2499. `PayloadCodecs::encode_event` called `serde_json::to_value` on the whole event. That copied each payload tree through serde, one key insert at a time.
+
+  - `PayloadCodecs::encode_event_owned` is new. It lifts each payload out of
+    the event, serializes the rest, and moves each encoded payload into the
+    stored value. No payload tree is copied.
+  - `encode_event` keeps its signature. It clones the event and calls the
+    owned variant. A clone is a cheaper copy than serde.
+  - `fork.rs` calls the owned variant.
+  - The decode path lost a second payload lift that moved nothing.
+    `WorkflowEvent::payload_slot_mut` is gone, because it copied
+    `payload_slot`.
+
+  The stored bytes do not change. `payload_codec_profile` drops 19.4% of its
+  instructions (1,062,066,352 to 855,768,802). `encode_event` drops 31.3%.
+
+  No new `WorkflowEvent` variant. No migration. The design record is
+  `docs/design/DESIGN-2499.md`, and the measurement is
+  `docs/performance-encode-event-payload-move.md`. Unit tests compare each
+  variant with the old encode under three codecs. An arbitrary sweep covers
+  each variant. `tests/encode_event_allocs.rs` pins the allocation count.
+- **Plugin** (implemented): SQLite management API keeps the Postgres wire contract — see issue #2489 (epic #2466). The SQLite `HarvestPlugin` routes now answer as the Postgres routes do. An audit of every ported route found each difference. Each one is ported or documented in `docs/sqlite-plugin.md`. The plan is `docs/design/DESIGN-2489.md`.
+
+  - **`GET /workflows/{id}/result`** and its by-id form. A run that is not
+    terminal answers `204` with `Retry-After: 1`. A terminal run answers the
+    compact `WorkflowResult`. The read follows the continue-as-new and
+    workflow retry chains to the last run. `wait` long-polls.
+  - **History paging.** `GET /workflows/{id}/history` takes `after`, `limit`
+    and `event_type`, with the Postgres cursor. Each event has `id`,
+    `event_id`, `timestamp`, `type` and `data`. `SqliteReader::history_page`,
+    `SqliteReader::successor` and `SqliteReader::parent` are new.
+    `harvest_events` gains a `recorded_at` column. The `INSERT` writes it, so
+    the append-only guard is unchanged. Replay does not read it.
+  - **Reads.** Describe caps its history at 100 events and adds `parent_id`,
+    `external_handoffs` and `legal_hold`. A by-id read sets
+    `X-Harvest-Execution-Id`, prefers the running run, and refuses an empty
+    id with `400`. A listing refuses an unknown `state` and pages 50 / 200.
+    `/workflows/registered` returns the full record. `/health/live` and
+    `/health/ready` keep the Postgres bodies.
+  - **Writes.** A signal answers `202`, and `400` for a terminal run. A
+    signal-with-start that starts a run answers `201`. A duplicate start
+    answers the Postgres `409` body. A repeat cancel or terminate answers an
+    idempotent `202`. An update answers `update_id`, and `409` when its
+    handler fails. Query errors map to `400`, `408` and `410`.
+  - **Retry routing (#843).** A signal, cancel, terminate, query or update to
+    a `FAILED` run with a live retry acts on the retry. A signal names it in
+    `routed_execution_id`.
+  - **One contract, two backends.** `tests/support/wire_contract.rs` holds the
+    checks. The SQLite suite and the Postgres result, history and by-id
+    integration tests run them.
+- **Feature** (implemented): Override a workflow type's chain cap at runtime — see issue #2406. `WorkflowInfo::chain_execution_timeout` (#617) caps a whole continue-as-new chain. It was fixed at startup. `PATCH /admin/workflow-types/{workflow_name}/run-defaults` now takes `chain_execution_timeout_secs`, with the tri-state, the bound and the cache of the #2387 fields. `GET` shows it in `code`, `override` and `effective`.
+
+  **Semantics.** The override applies to the next chain that starts. A
+  continue-as-new successor copies the stored `chain_deadline_at`, also across a
+  type change. So a chain in flight keeps its deadline, and
+  `recompute_in_flight` never moves it. The fleet ceiling
+  `max_workflow_chain_timeout` still caps the override. Clearing the override
+  restores the code value. A DAG declares no chain cap, so the route refuses
+  one for a DAG.
+
+  **One resolver.** `HandlerRegistry::chain_execution_timeout` applies the
+  override. Every start path of a new chain calls it, or
+  `apply_chain_run_default`. The guard `run_defaults_chain_guard` fails on a
+  start path that reads the declared field itself.
+
+  **Gaps closed.** The outbox start, the Vantage trigger-now of a workflow
+  schedule and the typed `signal_with_start` stub set no chain cap before. They
+  now take the chain cap of the type, the override and the fleet chain ceiling.
+  A child spawn now caps its chain cap with the fleet ceiling. The typed `start`
+  and `signal_with_start` stubs of `#[workflow]` now apply the run-default
+  overrides of a client that shares the cache (#2387). A completion-trigger
+  start still sets no chain cap. Issue #2511 tracks it.
+
+  **Migration.** `20261102141324_harvest_run_default_chain_timeout` adds the
+  nullable column `chain_execution_timeout_secs` to
+  `harvest_run_default_overrides`, and widens the row check to three columns.
+  No `WorkflowEvent` variant and no replay impact. Design:
+  `docs/design/DESIGN-2406.md`.
+
+  **Upgrade guide (for the next release).** Run the migration. Who is
+  affected: a deployment that starts runs through the outbox, a Vantage
+  trigger-now or the typed `signal_with_start` stub, and that sets
+  `max_workflow_chain_timeout` or declares `chain_execution_timeout`. Those
+  runs now get a chain deadline, or a shorter one. A child run is now capped
+  by the fleet chain ceiling. During a roll, an older process refuses
+  `chain_execution_timeout_secs` with a 400 and starts chains with the code
+  value. So set a chain cap only after every process runs the new release.
+  See the migration row in `docs/upgrading/0.5.0.md`.
+
+  **Tests.** Unit tests on the fields, the cache and the resolver. DB tests on
+  a chain-only row, the bound and the table check. HTTP tests for each
+  acceptance criterion and for the DAG refusal. Worker tests for a same-type
+  and a cross-type successor. Outbox and Vantage tests for the closed gaps.
+- **Agents** (implemented): Probe evidence bundle as workspace files — see issue #2377. A proposer or a composer can now read the full evidence of a probe from files. Parent: #2369. It builds on the overlay candidates of #2375 and the workspaces of #2274.
+
+  - **Writer.** `eval::evidence::write_bundle(workspace, source,
+    evaluations, overlay)` writes `task.md`, `rollouts/source.md`, one
+    `rollouts/<id>.md` and `diffs/<id>.md` per candidate,
+    `overlay/current.json`, `flow_labels.json` and `MISSION.md` into one
+    workspace snapshot. It returns a `WrittenBundle`: the `BundleManifest`
+    for the editor and the id-to-evaluation map for the caller.
+    `read_bundle` loads the files and the flow labels.
+  - **Parts.** A Markdown file over the part cap splits into numbered parts.
+    The parts joined in order equal the single render. Nothing is cut.
+    `formal/verus/src/evidence_parts.rs` proves that the parts tile the text.
+  - **One put.** The bundle is one `WorkspaceStore::save`. A put that stops
+    before its rename leaves no key.
+  - **Erasure and labels.** An erased source gives `EvidenceError::Erased`.
+    An encoded payload gives `Undecodable`. `flow_labels.json` carries the
+    flow labels of the source run (#2272), mandate and peer labels included.
+  - **Anonymous ids.** `eval::anon` gives each candidate an id `c-<hex>`
+    from a required seed, the source run id and the overlay digest. #2376
+    can reuse it. The writer masks each candidate digest and each hidden
+    name, then refuses a leak with `EvidenceError::Leak`. A recorded name
+    is a JSON string in a code span, so it cannot forge a heading.
+  - **Proposer.** `refine::Evidence::Bundle` holds a manifest. Its `render`
+    is the `MISSION.md` pointer. `ModelProposer` refuses a bundle as a
+    `Config` error, because it has no workspace.
+  - No new `WorkflowEvent` variant, no migration and no SQL.
+  - Tests: `tests/evidence.rs` covers the criteria on recorded SQLite runs.
+    The unit and property tests in `eval/evidence.rs` and `eval/anon.rs`
+    cover the split, the ids and the masks. The stopped-put unit test in
+    `eval/evidence.rs` stops a real `DirWorkspaceBlobs` put before its
+    rename.
+- **Plugin** (implemented): SQLite app: API tokens, roles, OIDC and audit — see issue #2469 (epic #2466). A `HarvestPlugin` app on `autumn-web/sqlite` now builds with `enable_api_tokens`, `api_with_role_auth`, `with_roles`, `with_authorizer`, `with_api_rate_limit` and `api_with_oidc`. Slice 1 refused each one at build. The Postgres default build does not change. The design record is `docs/design/DESIGN-2469.md`.
+
+  - **One layer stack.** The SQLite router goes through
+    `apply_admin_auth_layers`, then host auth, then the OIDC session boundary,
+    as on Postgres. No layer has a SQLite copy.
+  - **One store seam.** `crate::auth_store::AuthStore` has a Postgres and a
+    SQLite variant. The token layer, the token routes, `GET /admin/audit` and
+    each deny audit (token scope, role, authorizer, tenant binding, rate limit)
+    use it. A SQLite call runs on the blocking pool.
+  - **Tables in the Harvest file.** `autumn_harvest_sqlite::SqliteAuthStore`
+    adds `harvest_api_tokens` and `harvest_audit_log`. It opens its own
+    connection, so a token check never waits for the driver. A trigger refuses
+    each `UPDATE` of an audit row.
+  - **Routes.** The SQLite router serves the Postgres handlers of
+    `GET`/`POST /admin/tokens`, `DELETE /admin/tokens/{id}` and
+    `GET /admin/audit`.
+  - **Fail closed on tenants.** The SQLite store keeps no run tenant. A token
+    mint with a `tenant` is a `400`. A verified tenant gets `501` on each
+    non-public route, with one `authz.deny` row.
+  - **Shared tests.** The bodies of the token, role and OIDC suites moved to
+    `tests/support/{token,role,oidc}_contract.rs`. `token_auth_integration`,
+    `custom_roles` and `oidc_login` run them on Postgres. The `auth_parity`
+    module of `tests/sqlite_plugin.rs` runs them on a SQLite app. CI's
+    `sqlite-plugin` job turns on `oidc`.
+  - **One connection per call on Postgres.** An `AuthSession` holds one
+    connection, so a lookup or a change and its audit row share it. The
+    token layer gives it back before the handler runs (#1827).
+  - **Two writers on one file.** The store reads on a read-only connection.
+    Each `SqliteRuntime` transaction now begins `IMMEDIATE`. The runtime and
+    the store then wait for each other on the busy timeout, and neither fails
+    with `SQLITE_BUSY`. The store opens before the driver starts.
+  - **Audit retention.** The store honours `audit_retention_days`, at boot
+    and after each 256 audit writes.
+  - **Tenant routes.** The stack wraps the `/tenants/{key}` routes inside the
+    nest, with one shared rate limiter. Each layer sees the core route. The
+    authorizer sees `{key}` as the tenant, and a header that names another
+    tenant is a `400`.
+  - **No new `WorkflowEvent` variant. No Postgres migration.** The store
+    creates the SQLite tables when it opens the file.
+  - **Limits.** The workflow routes on SQLite write no audit row yet.
+- **CI** (implemented): Live-DB test binaries built once with cargo nextest archive — see PR #2543. Each of the 21 `Test DB (linux, shard N)` jobs compiled its own manifest rows. On a green trunk-dev run, shard 15 spent 15.6 of the 22.4 minutes of its suite step compiling.
+
+  A new `test-db-archive` job builds every `linux` and `linuxpart` test binary
+  into one cargo-nextest archive. It uses the union of the row features and no
+  debug info. Each shard unpacks the archive into `./target` and runs its slice
+  with `--partition hash:<k>/21`, so a large suite spreads over every shard. The
+  `linuxpart` pass is partitioned the same way. It no longer runs whole on
+  shard 0.
+
+  `run-suites.sh` gains the `archive`, `extract`, `nextest` and `filterset`
+  modes. The coverage nightly keeps `run linux` and its row-ordinal sharding.
+  See `docs/testing/ci-db-archive.md`.
+
+  No engine change, no migration, no new `WorkflowEvent` variant.
+
+  **Tests.** `ci_nextest_archive.rs` checks that the archive holds each live-DB
+  crate, target and feature, that each row gives one filterset term, that the
+  shard index maps to the partition, and that `ci.yml` wires both jobs.
+- **Plugin** (implemented): SQLite read API parity, Vantage and declarative queries — see issue #2468 (epic #2466). The SQLite `HarvestPlugin` now serves the read routes that slice 1 answered with `501`. Each route keeps its Postgres path, status codes and JSON shape. A route that reads no query key refuses one, as the core routes do. The plan is `docs/design/DESIGN-2468.md`.
+
+  - **Read routes.** `GET /workflows/count`, `/workflows/summaries`,
+    `/workflows/registered/{name}/schema` and `/interface`,
+    `/workflows/{id}/children` (also by-id), `/tree`, `/run-chain`,
+    `/timeline`, `/logs`, `/awaitables`, `/stack` (also by-id) and
+    `/history/export`. Each route reads the file through `SqliteReader`, never
+    the driver. It then calls the same pure step as its Postgres route:
+    `build_count_response`, `LineageWalk`, `assemble_run_chain`,
+    `derive_timeline`, `classify_replayed_wait_set` or
+    `export_history_decoded`. Summaries, logs and awaitables keep the
+    Postgres admin gate.
+  - **Vantage.** `{api}/ui/workflows` lists the runs. `{api}/ui/workflows/{id}`
+    shows one run, its payloads, its children and its history. The pages link
+    only to SQLite pages and hold no form that writes.
+  - **Declarative queries.** `queries![..]` no longer fails the build.
+    `SqliteRuntime::register_query` registers a handler per workflow. The
+    drive, the query replay and the awaitables replay all pass it.
+  - **Durable workflow logs.** `HarvestPlugin::workflow_log_persistence` and
+    `SqliteRuntime::set_workflow_log_policy` store the `ctx.log_*` lines in a
+    new `harvest_workflow_logs` table. The dedup, the cap and the latched
+    marker follow Postgres (#790). The lines share the cycle transaction, and
+    a purge removes them. The write is best effort, as on Postgres: a failed
+    write never fails the cycle. The table is new, so an older file gets it on open.
+    It is not `harvest_events`, so the append-only guard is unchanged.
+  - **New reads.** `SqliteReader::count_executions`, `children`,
+    `parents_with_children`, `timed_history`, `pending_work`, `workflow_logs`,
+    `count_workflow_logs`, `workflow_log_truncated` and `replay_input`.
+  - **Refusals.** `decode_payloads_on_read` now names the epic. This backend
+    stores no codec envelope, so the option has nothing to decode.
+  - **One contract, two backends.** `tests/support/wire_contract.rs` gains a
+    shape check per route. The SQLite `read_parity` suite and the Postgres
+    suite of each route call it.
+- **Agents** (implemented): Operator refine policy per kind: auto-adopt, caps, probe effects and ceilings — see issue #2394. An operator now decides each choice of the refine loop, per agent kind, at run time. Parent: #2369. It builds on the store of #2371 and the operator surface of #2374. ADR 0014 records the rule.
+
+  - **`RefinePolicy`.** `auto_adopt.parts`, `auto_adopt.max_per_day`,
+    `approval_timeout`, `probe_effects`, `ceilings`, `proposal_attempts` and
+    `lessons.max_entries`. Each key has a safe default, and the defaults
+    never adopt. Each bounded value checks its range when it decodes. An
+    unknown key fails.
+  - **Storage.** Each `ProfileOverlayStore` holds an append-only policy log
+    per kind: `policy`, `set_policy` (a compare-and-swap on the revision),
+    `reset_policy` and `policy_log`. Only an operator writes it. Each row
+    keeps the old and the new policy.
+  - **Breaking.** `OverlayValidator::validate` takes the policy. A store
+    implements the five new methods. `Provenance` has the variant `Auto`,
+    with the author kind `auto`. `ProposeRequest` refuses an unknown key.
+  - **Ceilings.** The store validator and the op read apply each overlay
+    under `policy.ceilings.resolve(profile)`. The op read records the policy
+    with the overlay.
+  - **Auto adoption.** `ProfileOverlayStore::auto_adopt` enforces the gate.
+    A part goes live only when the run policy and the current stored policy
+    both allow it, and the stricter daily cap counts. One transaction puts
+    the version as `auto:<run>`, counts the auto moves of the UTC day of the
+    store clock (`with_clock`) and moves the pointer. `refine::adopt` wraps
+    it. `refine_status` is `auto_adopted`, `awaiting_approval` or
+    `unchanged`. `timed_out` is for the gate of #2381.
+  - **Kernels for the open consumers.** `RefinePolicy::gate_state` for the
+    gate of #2381, `probe_rules` for the probe of #2378, and
+    `read_refine_policy` with the activity `agent_refine_policy` for the
+    refine run of #2380. Today the ceilings, the parts and the cap are
+    enforced. The other settings wait for those issues.
+  - **No self-widening.** `ProfileOverlay` and `AgentOp` refuse each policy
+    key. `ProposeRequest` refuses each one except `ceilings`, which holds
+    the resolved ceilings of the recorded read. `put`, `activate` and
+    `rollback` refuse an `auto` actor.
+  - **Routes.** `GET` and `PUT /agents/{kind}/profile/policy`,
+    `POST .../policy/reset` and `GET .../policy/changes`. The writes are
+    `Mutating`, so a read role gets `403`. Each write adds an
+    `agent_profile.policy_set` or `agent_profile.policy_reset` audit row
+    with each changed key and its old and new value.
+  - **CLI.** `harvest agents profile policy <kind> show|set|reset|history`.
+    `set` reads the policy and changes only the named keys.
+  - **Proof.** `formal/verus/src/refine_policy.rs` proves that the default
+    never adopts, that an empty change never adopts and that a gate timeout
+    is final. `formal/verus/src/overlay_log.rs` proves that the auto moves
+    of a day never pass the cap.
+
+  **Migration.** `20261103134706_harvest_agent_refine_policies` adds
+  `harvest_agent_refine_policies` with a trigger that refuses each
+  `UPDATE`, and widens the author kind `CHECK` of the two overlay tables to
+  allow `auto`. The tables are not hot. SQLite gets the same table and
+  guard.
+
+  The design is in [`docs/design/DESIGN-2394.md`](design/DESIGN-2394.md).
+- **Agents** (implemented): Agent episode log and consolidation pass — see issue #2454. `AgentProfile::episodes` keeps an episode log for each durable agent of a kind. It is off by default. The workflow `agent_consolidate` turns the episodes into entity–relation facts in the memory of the agent. The design is in `docs/design/DESIGN-2454.md`.
+
+  - At the end of an op that keeps its transcript and may write memory, the
+    activity `agent_episode_append` appends one episode to the scope
+    `agent:<id>:episodes`. The key `episode:<run id>` makes a retry or a
+    crash append once.
+  - `max_episodes` bounds the log. The oldest goes first, and the next pass
+    reports each unconsolidated episode that an eviction dropped.
+  - A pass checks the LLM budget of its run before its one model call
+    (#1997), and records one cost ledger call (#1996). Each fact write
+    carries `<pass>:<hash>`, so a crash mid-pass writes no fact twice.
+  - A fact lists its source episode ids and carries the labels of every
+    episode of its pass. A store with no label support refuses it.
+  - The trigger is a schedule (`consolidate::schedule`) or every N episodes,
+    as a child pass. The trigger counts appends since the last pass, so a
+    failed pass waits for N more appends, also on a full log. A failed pass
+    fails the op. On SQLite, `sqlite::consolidate` starts one pass.
+  - A clear keeps an empty log with a new generation. A pass that runs
+    across a reset writes no fact after it and ends as `reset`. A log keeps
+    only hashes of derived facts.
+  - `Control::ResetMemory` clears the episodes, behind the patch gate
+    `agent_episode_reset`, and counts them in `AgentState::episode_reset`.
+    `harvest agents erase` reports `episodes_erased` and `facts_erased`, and
+    erases each scheduled pass by its search attribute
+    `agent_consolidation_of`.
+  - New activities: `agent_consolidate_read`, `agent_consolidate_turn`,
+    `agent_consolidate_write`, `agent_episode_append` and
+    `agent_episode_reset`. A worker with a hand-picked activity list must add
+    them. No new `WorkflowEvent` variant and no migration.
+  - `formal/verus/src/agent_episodes.rs` proves the eviction and trigger
+    kernels in `bounds.rs`.
+
+  Tests: `autumn-harvest-agent/tests/episodes.rs` covers each acceptance
+  criterion, with two crash tests that abort a child process. The CLI tests
+  in `agents_cli.rs` and `agents.rs` cover the erase report and the scheduled
+  passes.
+- **Fix** (implemented): Completion-trigger and typed update-with-start starts take the run defaults — see issue #2511. Two start paths ignored the chain cap and the run-default overrides.
+
+  - **Completion-trigger target starts.** The in-process start, the immediate
+    outbox relay and the outbox sweep set no `execution_timeout` and no chain
+    cap. They now take the declared value of the target type, the operator
+    override (#2387, #2406) and the fleet ceilings. A deferred start resolves
+    them when it fires, so the outbox row needs no new column. The one exception
+    is the SLA of the immediate relay. It keeps the value of evaluation time.
+  - **Typed `update_with_start` stub.** It passed `None` for both chain fields.
+    It now resolves the execution timeout, the SLA and the chain cap like the
+    typed `start` stub, and it passes the client chain ceiling.
+
+  **Behavior change.** A target type that declares an `execution_timeout` now
+  gets that timeout on a completion-trigger start. Before, such a run had none.
+
+  **API.** `HandlerRegistry::with_max_workflow_chain_timeout` and
+  `with_max_workflow_execution_timeout` are no longer `const fn`. They write the
+  ceilings that the completion-trigger path reads. `WorkflowMetadata` has two
+  new public fields, `execution_timeout` and `chain_execution_timeout`.
+
+  No migration is needed. No `WorkflowEvent` changes. The design is
+  `docs/design/DESIGN-2511.md`.
+
+  **Tests.** Unit tests cover the resolver. DB tests cover the inline start,
+  the outbox sweep and the typed stub, each with an override and a ceiling. The
+  guard `run_defaults_chain_guard` now finds a read through `Self::info()`. It
+  allows one line, the metadata copy in `worker.rs`. A source test checks that
+  each of the three start sites resolves the run defaults.
+- **Agents** (implemented): Anonymised comparison reports — see issue #2376. A model that reads a comparison to pick a candidate is no longer biased by labels or order. Parent: #2369. It builds on the overlay candidates of #2375. The design is in `docs/design/DESIGN-2376.md`.
+
+  - **`eval::compare_anonymised(history, candidates, seed)`** runs a pool of
+    any size on one source. It returns an `AnonymisedReport`: the rendered
+    `text`, the structured `pool` and the `key`. The text and the pool hold no
+    model name, overlay digest, label or input index.
+  - **Ids.** Each candidate gets `c-<hex>`, a prefix of
+    `SHA-256(seed, source run id, Candidate::digest)`. The pool sorts by that
+    hash, so the input order changes no id and no text. The prefix has at
+    least 12 digits and grows until no two ids are equal.
+  - **Key.** Each id maps to a `CandidateRef`: the input index, the candidate
+    digest, the overlay digest and the label. `AnonymisedReport` does not
+    implement `Serialize`, so one call cannot encode the key with the text.
+  - **Candidate identity.** `Candidate::label` names a candidate, for example
+    with an overlay version id. `Candidate::digest` hashes the overlay digest,
+    the label, the routes, the admitted models, the ceilings and the turn cap.
+    Equal digests give `EvalError::DuplicateCandidate` before any model call.
+  - **Failure texts.** Each run end error and report error replaces each
+    label, digest, route and model id of the pool with `[redacted]`. The
+    source end counts too. The routes are each route that a run asks for,
+    so a root or peer route that a candidate keeps from the source counts.
+    Only a whole name is replaced.
+  - **Behaviour change.** A `Candidate::agent_model` route to a model that the
+    harness does not hold now gives `OverlayError::UnknownModel` before any
+    call. A new `eval_` call id no longer holds the provider id, because its
+    form names the vendor.
+  - **Kept fields.** `AnonymisedEvaluation` keeps every field of `Evaluation`
+    except `overlay_digest`. An exhaustive destructure fails the build when
+    `Evaluation` gains a field.
+  - **One id scheme.** The ids come from `eval::anon::assign` of #2377, so a
+    report and an evidence bundle share one scheme. `assign` now picks the
+    id width with the proven `shared_digits` and `id_width` kernel. The width
+    rule is unchanged for distinct keys.
+  - **Proof.** `formal/verus/src/agent_anonymise.rs` mirrors `shared_digits`
+    and `id_width` in `eval/anon.rs`. It proves that the width is the least
+    safe width from the floor, and that two prefixes of that width differ.
+  - **Tests.** The change adds fifteen integration tests to
+    `autumn-harvest-agent/tests/eval.rs` and ten unit tests. One unit
+    test is a proptest. It checks that any input order gives each candidate
+    the same id and rank.
+  - No new `WorkflowEvent` variant. No migration.
+- **Agents** (implemented): Agent helpers for Postgres: the `postgres` module of `autumn-harvest-agent`. The `postgres` feature of `autumn-harvest-agent` now adds a `postgres` module. It mirrors the `sqlite` module function by function, so an app whose workers run on Postgres no longer builds a 35-field signal-with-start by hand.
+
+  - `PostgresAgents` is the target: `single(pool)` for one database, or
+    `sharded(&pools, router)` for a sharded fleet, with `with_codecs` and
+    `with_queue`.
+  - `register`, `start`, `start_heartbeat`, `decide`, `send`, `delete`,
+    `current_run`, `state`, `LedgerSpend` and `pause_mesh` do what their
+    `sqlite` namesakes do.
+  - A worker drives each run, so `sqlite::drive` has no copy. `wait_for` waits
+    on the projected state of a durable agent. `run_state` and `wait_run`
+    report a run as `Completed`, `Failed`, `WaitingSignal`, `Ended` or
+    `Running`. `pending_approvals` reads the open approval waits from history.
+  - A steer or an interrupt that races a continue-as-new resolves the successor
+    and goes again.
+  - The new example `postgres_agent` runs the approval and restart story of
+    `sqlite_agent` on Postgres, then sends two messages to a durable agent.
+
+  Core gains two read-only queries for the mesh controls, each with a Ledger
+  profile: `execution::list_running_with_search_attrs` (`per_request`) and
+  `llm_ledger::spend_for_search_attrs` (`per_task`). The GIN index
+  `idx_harvest_we_search` and `harvest_llm_ledger_recorded_at` serve them.
+  No migration, no new `WorkflowEvent` variant, and no write to
+  `harvest_events`.
+
+  Test evidence: `autumn-harvest-agent/tests/postgres_agents.rs` runs eight
+  tests on a real Postgres worker. They cover an approval round trip,
+  message-id dedupe, delete, a mesh pause that spares another mesh, the mesh
+  spend sum, a heartbeat tick, a two-shard lookup, and a state read by replay
+  when the snapshot is past the side-effect cap. Five unit tests cover
+  the approval-wait scan.
+- **Performance** (implemented): Awaitables history index uses foldhash. `project_awaitables` hashes UUID-newtype keys in its history index. It now uses `foldhash::fast::RandomState` instead of `SipHash`. The `awaitables_profile` harness drops from 2,727,202,632 to about 2,058M instructions (-24.5%). Allocation counts do not change. `foldhash` is now a non-optional dependency of `autumn-harvest`. It was already optional under the `metrics-rs` feature. No output changes. See `docs/performance-awaitables-hasher.md`.
+- **Agents** (implemented): Operator sampling policy per agent kind — see issue #2439. `sampling` adds `SamplingPolicy` to `autumn-harvest-agent`. It holds the limits of every strategy of epic #2438 for one agent kind. Each setting has a safe default, and a change needs no restart.
+
+  - Settings: `strategies` (none), `max_draws` (1), `max_concurrent_draws`
+    (1, at most `MAX_PARALLEL_CHILDREN`), `draw_effects` (`[read_only]`),
+    `scorers` (`deterministic`), `judge_models` (none) and
+    `max_answer_retries` (0). An unknown key fails the decode.
+  - `SamplingPolicyStore` keeps one policy per kind. A set validates the
+    policy. Each set and reset writes an audit row with the old and new
+    policy, in the same transaction. Stores: `InMemorySamplingPolicyStore`,
+    `SqliteSamplingPolicyStore` and `PostgresSamplingPolicyStore`.
+  - `agent_draws` reads the `AgentProfile` of the kind and its policy once
+    each, in recorded activities. A kind with no profile is refused. The
+    profile builds each draw, and the caller gives only the input text.
+    `sampling::admit` refuses a request over the policy before any model
+    call, with a named `sampling::Refusal`. The draws run as child
+    `agent_loop` runs, in waves of at most the admitted concurrency.
+  - `AgentTask::allowed_effects` narrows the tool effects of a run. A draw
+    gets `draw_effects` met with the effects of its profile. The decision
+    phase and the tool-call activity both refuse any other effect. A draw
+    with no write effect is also read-only. Each wave is one `run_draws`
+    batch (#2440), so each draw has its own draw id and cache key.
+  - `AgentTask`, `AgentOp` and `DrawsInput` fail to decode with a key of
+    `SAMPLING_POLICY_FIELDS`.
+  - `GET`, `PUT` and `DELETE /admin/agents/{kind}/sampling-policy`. `PUT`
+    and `DELETE` need the operator role. The CLI is
+    `harvest agents sampling policy <kind> show|set|reset`.
+
+  `formal/verus/src/agent_sampling.rs` proves `draw_plan`, `wave_end` and
+  `next_policy_revision`: an admitted run never passes `max_draws` or the
+  concurrency cap, and the waves cover each draw once.
+
+  **Migration.** `20261102032158_harvest_agent_policies` adds
+  `harvest_agent_policies` and `harvest_agent_policy_audit`. The tables are
+  new and not hot. No `WorkflowEvent` variant, no replay impact.
+  `GET /admin/preflight` checks `SELECT`, `INSERT` and `UPDATE` on
+  `harvest_agent_policies`, `SELECT` and `INSERT` on
+  `harvest_agent_policy_audit`, and `USAGE` on
+  `harvest_agent_policy_audit_id_seq`.
+
+  The design is in `docs/design/DESIGN-2439.md`.
+- **Agents** (implemented): Score evaluations — see issue #2447. `eval::evaluate` and `eval::compare` now report a scorer verdict for each run end. Divergence is not quality, so an experiment can now compare methods by score.
+
+  - `Candidate::scorer(Arc<dyn Scorer>)` adds a `score::Scorer` (issue #2441).
+  - `Evaluation` gains `recorded_verdict`, `candidate_verdict` and
+    `scorer_usage`. With no scorer, each is `None` and the JSON has no new
+    key. A golden test pins that JSON.
+  - The scorer reads the final answer of each completed end. A failed end
+    gets no verdict. The harness scores the recorded report. It reads no
+    verdict from history.
+  - A judge scorer calls the models of the candidate harness. Its tokens go
+    to `scorer_usage`, not to the candidate usage. `ScoreContext::usage`
+    sums them.
+  - The harness scores the source before the first candidate model call. A
+    scorer error fails with `EvalError::Scorer`. It names the side and holds
+    the judge tokens before the error.
+  - `Comparison::first_verdict` and `second_verdict` give the verdict of
+    each candidate. Two
+    candidates with the same scorer and harness share one source verdict.
+  - `compare_anonymised` keeps the verdicts. It redacts each reject reason,
+    with each judge route and its model id, then cuts it.
+  - Breaking for a struct literal or an exhaustive destructure of
+    `Evaluation` or `AnonymisedEvaluation`: each has three new public fields.
+  - No new `WorkflowEvent` variant and no migration.
+
+  Tests: `autumn-harvest-agent/tests/eval.rs`, section "Scored evaluations".
+  Design: `docs/design/DESIGN-2447.md`.
+- **Agents** (implemented): Long-horizon recall eval for durable agents — see issue #2455. The new module `autumn_harvest_agent::recall` measures what a durable agent forgets across ops.
+
+  - `RecallFixture::builtin` holds six original items. Each item states a
+    fact in an early op and asks for it in its last op. No third-party dataset
+    is in it.
+  - `recall::profiles` gives four configs, each with a window of 2 messages:
+    `window`, `notes` (#2453), `memory` (store memory only) and `episodes`
+    (#2454). `memory` is the comparison for `episodes`, because both give the
+    model the `memory` tool.
+  - `recall::sweep` (feature `sqlite`) runs each item on its own agent, one op
+    per session, and scores the last answer with `ExactMatch` (#2441). The
+    report has one row for each config and item. A failed item reads `error`,
+    and the other rows keep their scores. An op that does not end, such as one
+    on a retry timer, fails its item.
+  - The agent name holds a fingerprint of the item, the profile and the model.
+    A rerun with the same inputs on the same file calls no model for a
+    finished item. A changed input, or a model with no `model_id`, gets new
+    agents.
+  - `ReaderModel` answers only from its request. CI uses it to prove that the
+    eval sees a loss.
+  - The new example crate `recall-eval` runs the eval on Claude and prints the
+    table for `docs/performance-agent-recall.md`.
+
+  The sweep is a plain driver, not the `agent_sweep` workflow of #2448, which
+  is still open. It adds no migration, no `WorkflowEvent` variant and no
+  query. It writes `harvest_events` only through the existing agent workflow.
+
+  Test evidence: `autumn-harvest-agent/tests/recall.rs` runs twelve tests.
+  With the window only, a fact of op 1 scores 0. With notes or episodes, it
+  scores 1. A failed config, a config with no profile, and an op on a retry
+  timer each fail alone. A control item scores 1 with the window only. A rerun
+  calls no model. A rerun with another window, or with a model with no id,
+  runs again. Unit tests cover
+  the fixture checks, the model replies and the report table, with a property
+  test. `cargo test -p recall-eval --bins` checks the printed section.
+- **Performance** (implemented): Schedule catch-up walk parses the cron once. A catch-up walk parsed the cron expression again for each missed slot.
+
+  - `schedule_plan::SlotWalker` is new. It parses the schedule once and
+    returns slots with `next_after`.
+  - `next_fire_after` keeps its signature and result.
+  - The backfill planner and the catch-up planners use one walker per walk.
+- **Fix** (implemented): Colocated shards keep the DAG schedule row of the owner — see issue #2405. Two shards on one pool share one `harvest_schedules` table. Before the fix, the shard that did not own a DAG deleted the row of the owner as stale. If that shard came after the owner in shard order, the row was gone at the end of each tick. If it came before, the owner inserted the row again on each tick with a new `next_run_at`, so the schedule did not fire.
+
+  Now a shard does not collect a DAG schedule row when another shard on its
+  pool owns the DAG. The scheduler finds those shards with
+  `ShardedDbPool::same_physical_pool`. A shard with its own pool collects a
+  stale row as before. Two shards of one pool also collect a row when no shard
+  of that pool owns the DAG. The #2389 override move skips shards of one pool
+  for the same reason.
+
+  The firing pass of a shard also skips a DAG row that a pool peer owns. The
+  owner fires it, so the run carries the shard id of the owner. If the owner
+  is held, no peer fires the DAG for it.
+
+  `register_workflow_schedules_for_shard` and
+  `register_workflow_schedules_for_shard_with_codecs` take no pool, so they
+  collect as before.
+
+  No migration. No `WorkflowEvent` changes. No public API changes.
+
+  **Limit.** The scheduler finds shards of one pool through
+  `ShardedDbPool::same_physical_pool`: a cloned pool, or DSNs that
+  `from_dsns` reads as one database. Two pools built apart for one database
+  are not found.
+
+  **Tests.** DB tests are in `schedule_override_reshard_db_tests.rs`. Two
+  shards on one pool keep one row over two ticks, with the same id and
+  `next_run_at`. This holds with the owner first and with the owner last in
+  shard order, and for a DAG on every writable shard. A due DAG on a colocated
+  pool fires once, with the shard id of the owner. A shard with its own pool
+  deletes a stale row. Two shards of one pool delete a row that moved to a
+  shard on another pool. Unit tests cover `pool_peer_owns`, `pool_peers`,
+  `peer_owned_dags` and `fired_by_a_peer`.
+- **Plugin** (implemented): SQLite app: transactional outbox — see issue #2470 (epic #2466). A SQLite app in embedded mode gets the transactional outbox of the Postgres path. The Postgres default build does not change. The design record is `docs/design/DESIGN-2470.md`.
+
+  - **Writer.** `sqlite::enqueue_workflow_start_outbox(conn, &request)` takes
+    the `WorkflowStartRequest` of Postgres. It writes on the caller's
+    connection, so the start commits or rolls back with the business rows. A
+    duplicate key is a no-op. It refuses an empty or blank `workflow_id`, a
+    `queue_name` other than `"default"`, `search_attrs` that is not an object
+    of JSON primitives, and a database with no outbox table.
+  - **Table.** The startup hook creates `harvest_workflow_outbox` in the app's
+    primary database with `CREATE TABLE IF NOT EXISTS`, as
+    `autumn_web::outbox` does. In a fleet app, only the control database gets
+    it, so autumn#3536 is not needed. Times are epoch milliseconds. There is no
+    claim column. `sqlite::OUTBOX_SCHEMA_SQL` holds the DDL. A partial index
+    holds the undelivered rows. The boot compiles each statement of the writer
+    and the relay with `EXPLAIN`, so a table of another shape fails the boot.
+  - **Relay.** It runs on the `harvest.outbox.*` settings. Each row goes to the
+    driver as the new `StartOnce` command, which returns any run of the key,
+    in any state, before it starts one. The new
+    `SqliteRuntime::newest_run_of_key` answers that from the key index. This
+    is stricter than the Postgres reuse policy over a sealed run. A mutex keeps two drains in one
+    process apart. The shutdown hook stops the relay before the driver.
+    `flush_workflow_start_outbox` and `drain_workflow_start_outbox_once`
+    drain the SQLite outbox. A call from an activity or a workflow is refused,
+    because it would wait for its own driver task. A driver that stops outside
+    shutdown ends the relay with a warning. `claim_ttl_ms` has no effect on
+    SQLite.
+  - **Split and external mode.** The boot warns when the app database holds
+    undelivered starts that no relay drains.
+  - **Shared backoff.** `outbox::retry_delay_for_attempts` serves both
+    backends.
+  - **No new `WorkflowEvent` variant. No migration.**
+
+  Tests: `tests/sqlite_plugin/outbox.rs` (in the `sqlite_plugin` suite) proves
+  AC1 with a rolled-back business transaction, and AC2 with a crash before
+  the relay and a crash between the start and the mark. It also covers a
+  redelivery over a terminated run, a failed start with backoff, a duplicate
+  enqueue and an app with no database. `tests/sqlite_plugin_fleet.rs` runs a
+  start on the control Harvest and refuses a write on a tenant database. Unit
+  tests in `sqlite::outbox` drive the relay with no background task: a real
+  start whose mark fails, then a redelivery over the terminated run, the
+  `drain_once` limit, four concurrent flushes, a disabled relay, a stopped
+  driver and a flush on the driver task. They also cover the schema and its
+  shape check, the refusals, the rollback of the writer, a database with no
+  table and the stored start options. `StartOnce` and `newest_run_of_key`
+  have their own tests over a live, a terminated and a blank key.
+- **Plugin** (implemented): Worker and scheduler defaults from the Autumn process role — see issue #2477 (epic #2476). **Behaviour change on `web` replicas.** An `AUTUMN_ROLE=web` replica no longer runs the Harvest worker or scheduler. It still serves the management API and starts workflows. A fleet with only `web` replicas then claims no task. Add `worker` replicas, or set both switches to `true` on the `web` replicas before the upgrade.
+
+  - `HarvestRuntimeConfig::worker_enabled` and `scheduler_enabled` are now
+    `Option<bool>`. `None` is the default and follows the role. This is
+    **source-breaking**: a struct literal with `worker_enabled: true` fails to
+    compile. Write `Some(true)`, or leave the field unset. Ship it in a
+    minor release.
+  - `HarvestRunner::start` resolves both switches from the role of its
+    `AppState`. A `web` role gives `false`. A `worker` or `combined` role
+    gives `true`. A runtime with no `AppState`, such as a standalone runner,
+    has no role and keeps `true`.
+  - An explicit value wins. `AUTUMN_HARVEST__WORKER_ENABLED` and
+    `AUTUMN_HARVEST__SCHEDULER_ENABLED` still set it. A value against the
+    role logs one `warn!` per switch, with the switch, its value and the role.
+    An old API replica with `WORKER_ENABLED=false` and no `AUTUMN_ROLE` has
+    the `combined` role, so it now warns. Set `AUTUMN_ROLE=web` instead.
+  - Startup logs one `info!` with each value and its source: `explicit`,
+    `role` or `default`.
+  - New API: `HarvestRuntimeConfig::process_switches`,
+    `HarvestRunnerResources::process_role` and the `process_role` module
+    (`ProcessSwitches`, `ProcessSwitch`, `SwitchSource`). `SwitchSource` is
+    `#[non_exhaustive]`.
+  - The SQLite backend always runs its driver. The `web` role does not stop
+    it, and Harvest logs a warning that names the fix. An explicit `false` is
+    still refused. Its startup line gives the source `sqlite`.
+  - `HarvestRunner::start` takes each spawn decision from one `SpawnPlan`.
+    A unit test checks the plan for each role.
+
+  No `WorkflowEvent` variant, no migration, no replay impact.
+
+  `formal/verus/src/process_role.rs` proves the resolve table for every
+  input. A `web` role with no value runs no worker and no scheduler. No role
+  keeps `true`. An explicit value wins. The warning fires only on an override
+  against a known role. Unit tests in `process_role.rs` cover each role with no value,
+  and an explicit override on each role with its warning. The guide is
+  `docs/operations/process-roles.md`. The design is in
+  `docs/design/DESIGN-2477.md`.
+- **Agents** (implemented): `agent_sample`: best-of-N and rejection sampling — see issue #2443. `sampling::agent_sample` runs a task many times, scores each draw and selects one. Each draw is a durable child `agent_loop` run, so a crash costs only the draws in flight.
+
+  - `SampleStrategy::BestOfN { n }` runs `n` draws and calls `select`. A tie
+    goes to the lowest draw id. `SampleStrategy::Rejection { max_attempts,
+    threshold }` stops after the first wave with a score at or above
+    `threshold`.
+  - The profile of the kind builds each draw, and the sampling policy
+    (#2439) admits the strategy, the draw count, the concurrency and the
+    scorer. A draw gets `draw_effects`, `[read_only]` by default.
+  - The draws share one token budget: the cap of the profile, narrowed by
+    `SampleInput::max_total_tokens`. `sample_step` sizes each wave, and
+    `sibling_cap` splits the rest. With no token left, or after a draw that
+    ends `budget_exceeded`, the run starts no more draws and sets
+    `stopped = budget_exceeded`. `formal/verus/src/agent_sampling.rs`
+    proves `sample_step`.
+  - The new activity `agent_sample_score` scores a draw and returns a
+    `SampleScore`: the verdict, and the tokens and cost of its judge calls.
+    `ScoreRequest::admitted_judges` pins the judge model that the run
+    admitted. `ScoreContext::chat` refuses any other model with
+    `ErrorKind::Config`.
+  - A draw that failed, or that a budget stopped, is not scored. A failed
+    score does not fail the run: it stops the run with `score_failed`. A
+    judge call that the LLM budget refuses stops it with `budget_exceeded`.
+  - Rejection runs one draw at a time unless the input asks for more.
+  - `sqlite::start_sample` starts a run on SQLite. `sampling::sample_step`
+    and `SampleStep` are the step kernel.
+  - `SampleReport` holds the selected `AgentReport`, each verdict, and the
+    usage and cost of each draw. The totals equal the cost ledger rows of
+    the run tree.
+  - `ModelTurn::cost_usd_micros` and `AgentReport::cost_usd_micros` carry
+    the cost that the ledger records. Serde skips both when empty, so
+    a recorded history keeps its bytes.
+
+  Tests: `tests/sample.rs` (SQLite), `tests/sample_crash.rs` (a crash with
+  draw 2 in flight) and `tests/sample_postgres.rs` (a Postgres worker). The
+  design is in `docs/design/DESIGN-2443.md`.
+- **CI** (implemented): Balance the no-db shards and merge five plugin lib-test builds — see PR #2561. The `Test (no-db, <os>, shard N)` jobs set the length of a CI run. On trunk-dev run 41757040952, Windows shard 3 took 110 minutes, and the lightest Windows shard took 66.
+
+  Four changes, all in `ci.yml`:
+
+  - `Run all-features lib tests` moves from shard 3 to shard 0. There it runs
+    after `Compile db-backed tests`, which builds the same lib test binary. On
+    shard 3 it built that binary again, for 9 to 14 minutes.
+  - Five plugin lib-test steps become one. Each one selected its tests by a
+    name filter: `connector`, `aws_kms`, `object_store`, `vault_transit` and
+    `oidc`. Each step rebuilt the plugin crate under its own feature set. One
+    build with the union of the features runs the same tests. Locally, the
+    five filters select 272 tests, and the union build selects the same 272.
+    All of them pass.
+  - `Compile diagnose benchmark` had no shard condition, so all four Linux
+    shards compiled it, for about 11 minutes each. It now runs on shard 3.
+  - Five steps move to balance the measured totals: the CLI tests, the
+    saga-choreography tests, the metrics scrape example, and the Kafka and
+    WASM examples.
+
+  The `redis`, `webhooks`, `dev-runtime-managed` and default plugin lib-test
+  steps stay apart. Each runs the whole lib under its own feature set, and a
+  merge would change what they test.
+
+  On the first PR run, the long poles were 96.5 minutes on Windows (from
+  109.8) and 58.8 on Linux (from 69.7). macOS rose from 82.2 to 91.2. Shard
+  0 was the long pole on Windows and macOS. Its two compile steps took 5-12 minutes
+  longer than on the trunk-dev run, so the agent tests moved back to shard
+  3, and the saga-choreography tests moved to shard 1.
+
+  No engine change, no migration, no new `WorkflowEvent` variant.
+- **Feature** (implemented): Override a workflow type's concurrency limit at runtime — see issue #2407. `WorkflowInfo::concurrency` caps the runs that share a key. Its `limit` was fixed at startup. `PATCH /admin/workflow-types/{workflow_name}/run-defaults` now takes `concurrency_limit`, with the tri-state, the audit row and the cache of the other run-default fields. `GET` shows it in `code`, `override` and `effective`. The key and `on_conflict` stay deploy-only.
+
+  **Semantics.** A start stores its limit on its task row. So a lower limit
+  applies to the next start. A run in flight keeps its task and its cap, and a
+  lower limit cancels no run. A higher limit raises the stored cap of each live
+  task row of the type on every shard, so the next claim admits the waiting
+  starts. Further raises 10 seconds, 1 minute and 5 minutes later lift the
+  starts that a process with a stale cache stored. The response reports `concurrency_raise.raised_tasks`.
+  Clearing the override restores the code value. The route refuses a limit for
+  a type with no concurrency policy, for a latest-wins type
+  (`cancel_running`), and a limit of zero or above 2147483647. A later drop of
+  a latest-wins limit would cancel runs in flight.
+
+  **`GET /admin/concurrency`.** Each workflow type with a policy in a
+  `workflow` group now reports `code_limit`, `override_limit` and
+  `effective_limit`.
+
+  **One resolver.** `HandlerRegistry::concurrency_policy` applies the override.
+  Every start path calls it, or an `apply_concurrency*` helper. The guard
+  `concurrency_override_guard` fails on a `.concurrency` read that is not an
+  argument of such a call. A debounce, throttle, event-batch, completion-trigger
+  or cross-shard child start now resolves the limit when it fires. A same-type
+  continue-as-new successor and a workflow retry take a raised limit.
+
+  **Migration.** `20261104173743_harvest_run_default_concurrency_limit` adds the
+  nullable column `concurrency_limit` to `harvest_run_default_overrides`, and
+  widens the row check to four columns. No `WorkflowEvent` variant and no replay
+  impact. Design: `docs/design/DESIGN-2407.md`.
+
+  **Upgrade guide (for the next release).** Run the migration. During a roll,
+  an older process refuses `concurrency_limit` with a 400 and starts runs with
+  the code limit. So set a limit only after every process runs the new release,
+  and send no `PATCH` to an older process once a limit is stored.
+  See the migration row in `docs/upgrading/0.5.0.md`.
+
+  **Tests.** Unit tests on the fields, the merge, the cache and the resolvers.
+  DB tests on the store, the table check and the raise. HTTP tests for each
+  acceptance criterion, each refusal and the second raise. A source guard over
+  the start paths.
+- **Plugin** (implemented): SQLite app: schedules, retention, MCP, webhooks and connectors — see issue #2471 (epic #2466). A `HarvestPlugin` app on `autumn-web/sqlite` now builds with workflow schedules, `retention`, `mcp_tools`, `mcp_tasks`, `webhooks` and `connector`. Slice 1 refused each one at build. On Postgres, the one change is the new `HarvestPlugin::workflow_schedule`. The design record is `docs/design/DESIGN-2471.md`.
+
+  - **Schedules.** `HarvestPlugin::workflow_schedule` adds a code schedule on
+    both backends. The SQLite driver upserts it at boot.
+    `harvest.scheduler_enabled = false` fires no slot and upserts no code
+    schedule, as on Postgres. The engine gains
+    `SqliteRuntime::set_schedules_enabled` and `trigger_schedule`, and
+    `SqliteReader::list_schedules`.
+  - **Retention.** `RetentionConfig` maps to the new
+    `autumn_harvest_sqlite::PurgePolicy`: the global age, the per-type
+    `overrides` and `dry_run`. The driver runs a pass every
+    `tick_interval_secs`, between drive passes, in steps of eight batches with
+    a yield between steps (`PurgePolicy::batch_limit`). `run-now` queues a
+    pass, as on Postgres. `tenant_overrides`, `summary` and
+    `payload_orphan_grace_secs` are refused at build.
+  - **Admin routes.** `GET`/`POST`/`PATCH`/`DELETE` of `/admin/schedules`,
+    `/pause`, `/resume`, `/trigger`, `GET /admin/retention` and
+    `POST /admin/retention/run-now` serve on SQLite, with the Postgres paths
+    and field names. A schedule `{id}` is a UUID v5 of the workflow name. Each
+    write adds one audit row. Backfill, runs, decisions and preview answer
+    `501`.
+  - **One seam.** `HarvestApiState::sqlite_handle` is `None` on Postgres and
+    the control Harvest on SQLite. MCP tools and tasks, webhooks and
+    connectors branch there. A request before startup is a `503`, never the
+    Postgres path.
+  - **Connectors.** A poison message goes to `harvest_connector_dead_letters`
+    in the Harvest file, through `SqliteDeadLetterSink`. A `queue` and a
+    `Starts` binding in `BrokerCoordinates` mode are refused at build.
+  - **Webhooks.** A `queue` is refused at build. Each dispatch writes its
+    audit row to the Harvest file.
+  - **Refactors.** `validate_connectors` and `build_mcp_routes` moved out of
+    `build_postgres`, so both backends run one copy.
+  - **No new `WorkflowEvent` variant, no Postgres migration.** The SQLite
+    auth store adds one table, `harvest_connector_dead_letters`. The SQLite
+    `harvest_schedules` table gains `pause_reason`. An old file gets the
+    column on open.
+  - **Tests.** `autumn-harvest-sqlite`: `schedule_admin` and
+    `retention_policy`. Plugin: `ops_parity` and `trigger_parity` in
+    `tests/sqlite_plugin.rs`. CI's `sqlite-plugin` job turns on `mcp`,
+    `webhooks` and `connectors`.
+- **Agents** (implemented): A live probe on a fork — see issue #2378. `eval::live_probe(host, harness, source, overlay, allowed)` forks a recorded `agent_loop` run at event 0. The fork uses the new `ForkEffects::LiveQuiet`. Its input is the source task under the overlay, with the source ceilings. A new `AgentTask::probe` mark holds the allowed `ToolEffect`s as a one-byte mask, so `AgentTask` does not grow. Pass `RefinePolicy::probe_effects` as `allowed`. Its default is `[read_only]`.
+
+  - `agent_tool_call` reads the new `ToolCallRequest::probe_effects`. A tool
+    with another effect gets `{"error": "probe_effect_refused", "effect": ...}`
+    (`PROBE_EFFECT_REFUSED`), and `Tool::execute` does not run. The check is
+    in the activity body, so a permissive policy cannot bypass it. A probe
+    never calls the `memory` tool and never moves the workspace head.
+  - A probe run sends no report. Each delegation runs inline, as a probe
+    with the same set. A delegation to a durable peer is refused.
+  - The probe input has no follow-ups and no draw, `deliver` is off, and the
+    approval wait is one second.
+  - `ForkEffects::LiveQuiet` runs each activity for real. Its end sends no
+    completion callback and fires no completion trigger.
+    `fork::skips_completion_effects` replaces `is_recorded_fork` in the
+    terminal path.
+  - `LiveProbeHost` is the backend. `PostgresAgents` forks, with the new
+    `with_payload_offloader`. `SqliteRuntime` returns the new
+    `EvalError::Unsupported`. A failed read or fork is the new
+    `EvalError::Fork`.
+  - Core gains `fork::fork_workflow_execution_with_codecs`. A caller with no
+    handler registry forks with the codecs and the offloader of its workers.
+
+  No migration, and no write to `harvest_events`. `ForkEffects` has a new
+  value, `live_quiet`, in the `WorkflowForked` event. An older worker cannot
+  decode it, so it cannot run a probe. The new task fields are skipped when
+  empty, so a recorded task or request keeps its bytes. Start a probe only
+  after every worker runs this release.
+
+  Test evidence: `autumn-harvest-agent/tests/live_probe_postgres.rs` runs six
+  tests on a Postgres worker. `autumn-harvest-agent/tests/live_probe.rs` runs
+  five on SQLite. `eval::probe` has seven unit tests. `fork::tests` and
+  `fork_tests.rs` cover `LiveQuiet`. The design is in
+  `docs/design/DESIGN-2378.md`.
+- **Feature** (implemented): History shape fingerprints. `history_shape` reads a slice of `WorkflowEvent` and returns a type histogram, a stable FNV-1a fingerprint of the ordered event type names, and the index where two histories first differ. The module is pure. It adds no event variant, no SQL and no migration. Payload changes do not move the fingerprint.
+
+  **Tests.** Unit tests for the histogram, the fingerprint and the divergence
+  index, plus a doc test.
+- **Agents** (implemented): Recall sweep fingerprint reads the active overlay — see issue #2556. The `recall::sweep` fingerprint now hashes the op profile. With an overlay store, that is the bare profile with the active overlay applied, through `AgentHarness::overlaid_profile`. The model ids come from that profile too. An activation therefore gives new agents, and a rerun on the same file calls the model. A harness with no overlay store hashes the same bytes as before. An overlay that does not apply fails its item, as it fails an op.
+
+  Do not activate an overlay while a sweep runs.
+
+  Tests are in `autumn-harvest-agent/tests/recall.rs`: an activation, no
+  activation, a rollback, a model-only overlay and an overlay that does not
+  apply.
+- **Fix** (implemented): `harvest-verify`: test macros no longer make types writable — see issue #2545. A `proptest!` body that named `String` made `String` opaque, and so writable, for the whole analysis. Workflows that capture a `String` then read as `unknown`.
+
+  - **Fix.** `proptest`, `prop_assert`, `prop_assert_eq`, `prop_assert_ne`,
+    `prop_assume`, `prop_compose` and `prop_oneof` join `TYPE_FREE_MACROS`.
+    These macros declare tests and strategies, not types.
+  - **Not done.** The index still reads `#[cfg(test)]` code. It does not know
+    the target kind, and a `--test` target compiles that code. A skip would be
+    unsound there.
+  - **Tests.** `a_test_macro_makes_no_type_opaque` in `resolve/impls.rs`. The
+    corpus case `wf_test_macro_names_type` has a `#[cfg(test)]` `proptest!` block
+    that names `String`. Without the fix, it and `wf_saga_step` read `unknown`.
+- **Testing** (implemented): Light test path for the sandbox unit tests — see issue #2487. `cargo sandbox-test` runs the core sandbox unit tests without a database. It sets `--cfg harvest_light`. That cfg drops the heavy dev-dependencies of the core crate: `testcontainers`, `criterion`, `stateright` and the agent crate. The build has 180 crates instead of 316. It has no Diesel and no Docker client. The largest compile step peaked at 3.3 GiB, so the build fits an 8 GiB machine.
+
+  The `tests/`, `benches/` and `examples/` targets still need the full set. The
+  CI job for the sandbox tests runs the alias. The sandbox docs guards check the
+  manifest gating, the alias, the guide and the CI step. There is no migration
+  and no new event.
+- **Agents** (implemented): A tool round over the cap resets the context — see issue #2461. With `ContextReset` on, a tool round that passes the request cap no longer ends the run while a reset is left. The design is in `docs/design/DESIGN-2461.md`.
+
+  - The round drops the result that does not fit, as before. Then a reset is
+    due, with a save turn first when one fits.
+  - The reset window keeps the round: the assistant turn and the answer of
+    each call. A call that ran shows its result or `DROPPED_FULL`. A call that
+    did not run shows `NOT_RUN_FULL`. So the model does not run a call with an
+    effect again.
+  - The round resets only when its window, with the notes of that time,
+    falls under the threshold. If not, or with no reset left, the run ends as
+    `transcript_full`, with the same report as before.
+  - A full round that the loop guard or an interrupt also stopped never
+    resets, so the stop holds. Such a save round now ends the run too.
+  - The patch marker `agent_reset_on_full_round` gates both rules. The loop
+    asks it only where a rule changes the branch. A run recorded under the
+    #2456 rules replays unchanged. The fixture `full_round_2456_history.json`
+    proves it.
+  - The kernel `bounds::full_round_resets` has a Verus proof in
+    `formal/verus/src/agent_reset.rs`. The window after the reset, with the
+    notes of that time, fits the cap. No mix of resets passes `max_resets`.
+  - No new `WorkflowEvent` variant. No migration.
+  - Tests: sixteen in `autumn-harvest-agent/tests/context_reset.rs` and a
+    crash child, two unit tests in `workflow.rs`, and a unit test and a
+    property test in `bounds.rs`.
+- **Feature** (implemented): A fan-out names why a delegation ran alone — see issue #2483. `AgentTask::parallel_children(n)` batches only allowed `delegate` calls in a row, each to an inline peer. Before this change, any other delegation ran inline with no trace. Now its `DelegationRecord::serial` holds a `SerialReason`: `single_call`, `not_consecutive`, `gated`, `durable_peer` or `bound_reached`. A `debug` event logs the same reason once, not on replay. A bound under 2 names no reason, and a refused delegation keeps its refusal only.
+
+  **Design.** The new kernel `fan_out_plan` gives each call of a turn a step.
+  A step is the lead of a batch, a member, a lone call with its reason, or no
+  step. The
+  batches are the same as before. The proptest `the_plan_batches_as_before`
+  compares them with the old code. The reason comes from the recorded turn,
+  the recorded roster and the task, so replay is not affected. The field has
+  a serde default, so a report from before decodes. It is skipped when empty,
+  so a run with no lone delegation writes the same report as before. No `WorkflowEvent`
+  variant or migration is added.
+
+  **Proof.** `formal/verus/src/agent_fan_out.rs` mirrors `can_join` and
+  `fan_out_plan`. It proves that no step overflows. It proves that a bound
+  under 2 names no reason. It proves that each delegation that can run leads
+  a batch, joins one, or names a reason that is true of the turn. A batch
+  stops short of the bound only at the end of a run.
+
+  **Docs.** The mesh guide §15 lists the batching preconditions next to the
+  knob, with a table of the reasons. ADR 0013 records the decision.
+
+  **Tests.** `fan_out.rs` covers each reason end to end, a nested record that
+  reaches the root, replay, and a run with no bound. `durable_peers.rs`
+  covers `durable_peer`. The unit tests check each step against the spec of
+  the proof.
+- **Agents** (implemented): One consolidation schedule for many agents — see issue #2540. The engine keys a schedule by its workflow name. The old `consolidate::schedule(when, &agent)` therefore served one agent per deployment, and a second schedule replaced the first with no error. Now one schedule serves every agent. The design is in `docs/design/DESIGN-2540.md`.
+
+  - **Breaking.** `consolidate::schedule(when, &ConsolidateAll)` builds one
+    schedule of the new workflow `agent_consolidate_all`. The old per-agent
+    form is gone. A deployment keeps a stored per-agent schedule of
+    `agent_consolidate`, so delete it on upgrade.
+  - The activity `agent_consolidate_due` lists the running agents of each
+    kind with `episodes` and the trigger `Schedule`, by `agent_kind`. It
+    reads them through the new `AgentDirectory` trait. Install
+    `postgres::Directory` or `sqlite::Directory` with
+    `AgentHarness::directory`. With none, the read fails as
+    `AgentDirectoryMissing`.
+  - An agent with no pending episode gets no pass and no model call. An agent
+    whose pass still runs gets no second pass. A kind whose pass cannot run,
+    for example under a mandate that forbids the pass model, is not served.
+  - One firing starts at most `max_passes` passes, 16 by default and 256 at
+    most. The rest wait for the next firing. The turn order is round robin:
+    the least recent pass first, then the oldest pending episode. So an
+    agent whose pass marks nothing cannot starve the others. The dispatcher
+    waits for each pass. A failed pass is one row of the `DispatchReport`.
+  - `AgentDirectory::last_pass` reads the last pass of an agent. On Postgres
+    it uses the new engine query `execution::latest_with_search_attrs`, with
+    its Ledger profile.
+  - **Breaking.** `ConsolidateTask` gets `dispatched` and is now
+    `#[non_exhaustive]`. Build it with `ConsolidateTask::new`. A dispatched
+    pass publishes `agent_consolidation_of`, so `harvest agents erase` erases
+    it.
+  - New helpers: `sqlite::consolidate_all`, `postgres::consolidate` and
+    `postgres::consolidate_all`.
+  - New workflow `agent_consolidate_all` and new activity
+    `agent_consolidate_due`. `workflows()`, `activities()` and
+    `sqlite::register` list them. A worker with a hand-picked activity list
+    must add them. No new `WorkflowEvent` variant and no migration.
+  - `formal/verus/src/agent_dispatch.rs` proves the bound kernel
+    `bounds::dispatch_passes`.
+
+  Tests: `autumn-harvest-agent/tests/consolidate_all.rs` covers each
+  acceptance criterion on SQLite. `postgres_agents.rs` covers the Postgres
+  directory and the dispatcher on a real worker.
+- **Plugin** (implemented): Place the retention janitor by process role — see issue #2478 (epic #2476). **Behaviour change on `web` replicas.** The retention janitor now runs where the scheduler runs. An `AUTUMN_ROLE=web` replica runs no scheduler, so it runs no retention sweep. A `worker` or `combined` replica, or a standalone runner with the scheduler on, still runs it. Set `[harvest.retention] run_on = "all"` or `AUTUMN_HARVEST_RETENTION__RUN_ON=all` to keep the old behaviour.
+
+  - New config: `HarvestRuntimeConfig::retention`, a `HarvestRetentionConfig`
+    with `run_on: RetentionRunOn`. The values are `scheduler` (the default)
+    and `all`. An unknown value stops the boot. The environment value
+    ignores case. `RetentionRunOn` is `#[non_exhaustive]`.
+  - This is **source-breaking** for a `HarvestRuntimeConfig` struct literal
+    with no `..Default::default()`. Add `retention: Default::default()`.
+  - An explicit `scheduler_enabled` moves retention with it. Retention that
+    is off never runs.
+  - A process with retention on but not placed logs one `info!` that names
+    `run_on` and the fix.
+  - `POST /admin/retention/run-now` on a process with no placed janitor
+    returns 503. The message names `run_on = "all"`. On a split fleet the
+    `web` replicas serve the API, so `harvest retention run-now` returns 503
+    there by default.
+  - `GET /admin/retention` on such a process adds `placed_elsewhere: true`.
+    An empty `per_shard` then means "not here", not "idle". Every other
+    body is unchanged.
+  - A runner with no role and the scheduler off logs a `warn!`, not an
+    `info!`. Its retention may then run nowhere.
+  - `SpawnPlan` also decides the dispatch-metrics sampler (only with no
+    worker) and the post-commit notify sender (each process). The test
+    `each_role_places_each_runtime` pins each runtime on each role. The
+    rationale is in `docs/operations/process-roles.md`.
+  - The SQLite backend runs retention in its driver on every role, as
+    before. It ignores `run_on`.
+  - Registration as Autumn background tasks waits for autumn#3545. Issue
+    #2480 tracks it.
+
+  No `WorkflowEvent` variant, no migration, no replay impact.
+
+  `formal/verus/src/process_role.rs` proves `retention_placed` and
+  `runs_retention` for every input. With `run_on = "scheduler"`, retention
+  runs exactly where the scheduler runs. A `web` role with no explicit value
+  runs none. Each other role, and no role, runs it. `run_on = "all"` runs it
+  wherever it is on. The DB test `retention_follows_the_scheduler_placement`
+  in `api_scheduler_integration.rs` seeds an expired run and checks the
+  sweep on each placement. The design is in `docs/design/DESIGN-2478.md`.
+- **Agents** (implemented): Answer check in the agent loop — see issue #2442. `AgentTask::answer_check` scores each final answer in the same run. On a reject, the loop sends the reason to the model. The model then answers again, within a cap.
+
+  - `AnswerCheck` names an agent kind, a `ScorerRef` and `retries` (0 by
+    default). It denies unknown keys.
+  - The recorded activity `agent_answer_check` admits the check before the
+    first model call. The kind needs a profile of the tenant of the run.
+    The `SamplingPolicy` of the kind caps `retries` with
+    `max_answer_retries`, and it must allow the scorer and the judge model.
+    The harness must have the scorer. A refused check fails the run with a
+    named `sampling::Refusal`, and no model call runs. The new codes are
+    `too_many_answer_retries`, `unknown_scorer` and `other_tenant`.
+  - Each answer that completes is scored in `agent_score`. A reject adds a
+    user message with the reason. After `retries + 1` rejects, the run ends
+    under the new stop `AgentStop::AnswerRejected` (`answer_rejected`).
+    `AgentReport::answer_rejections` holds each reason. The delivery sends
+    only the notice of that stop.
+  - Each score request admits only the judge model of the check, through
+    `ScoreRequest::admitted_judges` (#2443). `ScoreContext::chat` refuses
+    any other model before the call.
+  - A retry counts against `max_total_tokens` and the LLM budgets. A judge
+    call that the budget refuses ends the run as `budget_exceeded`.
+  - `sampling::answer_retry_cap` and `sampling::retry_after_reject` hold the
+    integer part. `formal/verus/src/agent_sampling.rs` proves them.
+
+  **Compatibility.** The field is `#[serde(default)]`. The encoder skips it
+  when it is `None`. A task from before the change decodes with no check and
+  records no new event. This release adds no `WorkflowEvent` variant and no
+  migration. A worker from before this release ignores the field, so upgrade
+  every worker first. A decoder from before this release cannot read
+  `answer_rejected`. `AgentReport` gains a field, so a struct literal of it
+  needs `answer_rejections`.
+
+  Tests: `autumn-harvest-agent/tests/answer_check.rs`, one test per
+  acceptance line, and tests for each review finding. The design is in
+  `docs/design/DESIGN-2442.md`.
+- **Feature** (implemented): Override a workflow type's quota limits at runtime — see issue #2408. `WorkflowInfo::quota` declares three per-tenant admission caps. They were fixed at startup. `PATCH /admin/workflow-types/{workflow_name}/run-defaults` now takes `quota_max_active_executions`, `quota_max_history_bytes` and `quota_max_dead_letters`, with the tri-state, the audit row and the cache of the other run-default fields. `GET` shows them in `code`, `override` and `effective`. The key and the LLM caps stay deploy-only.
+
+  **Semantics.** No row stores a quota cap, and each admission reads the caps
+  again. So a lower cap refuses the next admission of a key over it, with the
+  `429` of issue #946. A run in flight continues: admission is the only place
+  where a cap applies. A parent whose child spawn a lower cap refuses waits
+  with a backoff, and its own `execution_timeout` still applies. A higher cap admits the next admission. Clearing the
+  override restores the code caps. An override can set a cap that code leaves
+  unset, on a type with at least one admission cap. The route refuses each
+  field for a type with no admission cap, and a cap of zero or past its
+  column.
+
+  **One resolver.** `enforce_quota_admission` applies the override through
+  `run_defaults::current_quota_policy`. Each start, child spawn, fork, DLQ
+  redrive and cross-shard child calls it. The fork applies it to its history
+  check too. The guard `quota_override_guard` fails on a `check_quota` call
+  outside `enforce_quota_admission`, and on a read of a code cap.
+
+  **`GET /admin/quotas`.** `limits` now holds the effective caps. Each entry
+  adds `code_limits` and `override`, which names the stored caps with
+  `reason`, `updated_by`, `updated_at` and `applies`. The new `workflow_types`
+  list holds the same fields for each type with an admission cap. The new
+  `override_source` says whether the overrides come from the table or, when
+  the default shard is down, from the process cache.
+
+  **Migration.** `20261105015009_harvest_run_default_quota_limits` adds three
+  nullable `BIGINT` columns to `harvest_run_default_overrides`, and widens the
+  row check to seven columns. Each count column also refuses a value past
+  `u32::MAX`, so no row can fail the load of every override. No `WorkflowEvent` variant and no replay impact.
+  Design: `docs/design/DESIGN-2408.md`.
+
+  **Upgrade guide (for the next release).** Run the migration. During a roll,
+  an older process refuses the quota fields with a 400 and admits under the
+  code caps. So set a cap only after every process runs the new release. See
+  the migration row in `docs/upgrading/0.5.0.md`.
+
+  **Tests.** Unit tests on `QuotaLimits`, the fields, the merge and the cache.
+  DB tests on the store, the table check, the admission and a worker-driven
+  child spawn that a lower cap defers. HTTP tests for
+  each acceptance criterion and each refusal. A source guard over the cap
+  reads.
+- **Documentation** (implemented): The agent guide examples compile as written — see issue #2482. The Rust examples in `docs/agent-adapter.md` and `docs/agent-mesh.md` did not compile. They passed bare values to `AgentHarness::tool`, used undefined bindings such as `harness` and `model`, and used `?` and `.await` outside a function. Eleven fences were marked `ignore`, so nothing checked them.
+
+  - **Fix.** Each of the 34 Rust fences now compiles. An example is a function.
+    Its parameters name the type of each value that it does not build, for
+    example `lookup: Arc<dyn Tool>`. The SQLite example of section 2 builds its
+    own harness and tool with `FnTool::shared`. No fence is `ignore`.
+  - **Harness.** `guide_snippets` in `autumn-harvest-agent/src/lib.rs` includes
+    both guides as doctests, as the harness of `docs/calendars.md` does. It
+    needs the `sqlite`, `postgres`, `eval` and `sandbox` features.
+  - **Guards.** `autumn-harvest-agent/tests/guide_snippets.rs` refuses a Rust
+    fence that rustdoc skips or changes, such as `ignore`, and a fence with no
+    language. It also checks the harness gate. It checks that the CI step
+    enables each feature of that gate.
+  - **CI.** Two steps in the `doc-snippets` job run the guards and the
+    doctests. That job is not gated on code changes, so a docs-only PR runs it.
+  - **Tests.** Before the fix, 19 fences failed, 11 were ignored and 4 passed.
+    After it, 34 pass. A mutated fence fails at its markdown line.
+- **Plugin** (implemented): Worker queues from config and from the role pin — see issue #2479 (epic #2476). Code declares the full set of queues with `WorkerConfig::with_queues`. Config can now narrow the queues that the worker of one process polls.
+
+  - New config: `HarvestRuntimeConfig::worker`, a `HarvestWorkerConfig` with
+    `queues`. TOML key `[harvest.worker] queues`. Variable
+    `AUTUMN_HARVEST__WORKER__QUEUES`, comma-separated. An empty list means
+    "not set". `[harvest.worker]` refuses an unknown key.
+  - An undeclared queue stops the boot. The error names it and the declared
+    queues. The check runs before the boot gates load and before a worker
+    starts. `AUTUMN_HARVEST_WORKER__QUEUES`, the sibling form, stops the boot
+    and names the right variable.
+  - With no explicit list, the `pin` of a named Autumn role narrows the
+    worker. Autumn job queues share the pin, so Harvest ignores a name that
+    it does not declare. A pin that names no declared queue changes nothing.
+    A process that runs the worker then logs one `warn!`. An explicit list
+    always wins. Harvest does not read `jobs.pin`.
+  - The worker polls in code order. The management API keeps the declared
+    list, so the default start queue does not move. The runner drops the
+    weight of each queue that the worker does not poll.
+  - Startup logs the declared queues, the polled queues and the source.
+  - `GET /admin/config` adds `worker.declared_queues` and
+    `worker.queue_source`. `worker.queues` is now the polled list.
+  - `GET /admin/queue-coverage` adds `unpolled_declared_queues`: each
+    declared queue with no live worker on a writable shard. It does not
+    change `uncovered`. `null` means "unknown": no runtime, or a writable
+    shard gave no answer. An idle shard whose worker read fails stays
+    `inspected`, as before.
+  - `harvest queue coverage --strict` exits `2` when the list is not empty,
+    `null` or missing, so it fails closed against an older server.
+  - Each Harvest route is in the `autumn-web` route group `harvest`. A
+    `[roles.<name>] mount` list must name it.
+  - Harvest follows only the `base` of a preset role. A preset that turns
+    off `job_workers` (`pin = []` included), `scheduler` or `retention` logs
+    one `warn!`. Issue #2480 maps each capability.
+  - `HarvestEmbedding` applies `[harvest.worker]` and the variable over the
+    code value, as it does for `[harvest.startup]`.
+  - The SQLite backend refuses a list. Its one driver runs each queue.
+  - This is **source-breaking** for a `HarvestRuntimeConfig` struct literal
+    with no `..Default::default()`. Add `worker: Default::default()`.
+  - The `autumn doctor --strict` hook waits for autumn#3545. Issue #2480
+    tracks it.
+
+  **Compatibility: `autumn-web` 0.10.** `autumn-harvest-plugin` now depends
+  on `autumn-web` 0.10, which adds named roles (autumn#3543). Its public API
+  holds `autumn-web` types, so ship this in a minor release, `0.10.0`, not
+  in a `0.9.x` patch. A patch would give a `0.9` app two `autumn-web`
+  copies on `cargo update`. An app with its
+  own `autumn-web` entry must bump it to `"0.10"`. A leftover `"0.9"` builds
+  two copies, and `HarvestPlugin` does not match the app's `AppBuilder`.
+  `cargo tree -i autumn-web` must show one version. The plugin follows two
+  API changes. `AppState::role()` now returns a `Role`, and Harvest reads
+  its `base()` for the switches of issue #2477. `Route` has a new `group`
+  field. `autumn-web` 0.10 also moves its own `p256` to 0.14. The
+  `RUSTSEC-2026-0387` entry in `deny.toml` now names the one path left, through
+  `jsonwebtoken`.
+
+  No `WorkflowEvent` variant, no migration, no replay impact.
+
+  `formal/verus/src/worker_queues.rs` proves `queue_source` and `pin_misses`
+  for every input. An explicit list wins. A role pin applies only with no
+  explicit list and only when it names a declared queue. The warning fires
+  only when the pin changes nothing. Proptests in `worker_queues.rs` check
+  that a resolved list is a non-empty subset of the declared list, in code
+  order. The DB test `a_worker_polls_only_the_queues_that_config_names` in
+  `api_scheduler_integration.rs` drains a `priority` run on a `priority` tier
+  and leaves a `default` run until a full tier starts.
+  `an_undeclared_worker_queue_fails_the_boot_with_its_name` checks the
+  refusal. The design is in `docs/design/DESIGN-2479.md`.
+- **Agents** (implemented): The harness limit governs delegation answers — see issue #2481. A delegation answer was cut at a fixed 8 000 characters. `AgentHarness::tool_output_limit` did not change that cut, and the cut was silent. Now the configured limit governs every delegation answer.
+
+  - `AgentHarness::tool_output_limit` caps each tool result and each
+    delegation answer. The default stays 8 000 characters.
+  - `Peer::answer_limit(chars)` overrides the harness limit for one peer.
+  - The rule covers an inline child, a fan-out child and a durable peer.
+  - The encoded delegation result is also cut to a sixth of the request cap,
+    as a tool result is under its result cap. The size counts each JSON
+    escape. So a large limit cannot drop a whole answer and end the run as
+    `transcript_full`.
+  - The delegation result JSON has `"truncated": true` or `false`. A cut sets
+    `DelegationRecord::answer_truncated` in the report and logs a warning.
+  - `Peer` gains a public field. A struct literal needs `..Peer::new(..)`.
+  - `agent_discover_peers` records the resolved limit on each `Peer`, so
+    replay cuts each answer as the live run did. A lookup recorded before this
+    change has no limit. That run keeps the old cut and the old JSON shape.
+    No `patched` gate and no new history event are needed.
+  - No migration.
+
+  The design is in [`docs/design/DESIGN-2481.md`](design/DESIGN-2481.md).
+  Its section 6 maps each rule to a test. The tests cover each delegation
+  path, the byte share, a nested cut, and a strict replay of a history that
+  `trunk-dev` recorded before the change. A property test covers the cut
+  flag.
+- **Plugin** (implemented): OIDC: the shortest session age is two seconds. The login time of an OIDC session has a one-second resolution. A session is live while its stored age is under `max_session_age`. With the old minimum of one second, a login late in a second expired at the next clock tick. The user then looped through the identity provider, which the minimum was there to stop. CI saw it as a flaky `an_old_session_must_log_in_again`.
+
+  - `OidcLogin::with_max_session_age` raises an age under two seconds to two
+    seconds. Each session then lasts at least one real second.
+  - A session can still end up to one second before its age. The docs say so.
+  - The unit test `the_smallest_age_keeps_a_session_across_one_clock_tick`
+    pins the case without a timing race. The contract test now waits past
+    three ticks.
+- **Agents** (implemented): `agent_refine` workflow: parallel and sequential modes, a fixed budget, crash-safe — see issue #2380. The refine loop of an agent kind now runs as one durable workflow. Parent: #2369. It uses the proposer of #2379, the overlay probe of #2375, the anonymised pool of #2376, the evidence bundle of #2377, the live probe of #2378 and the policy of #2394. The design is in `docs/design/DESIGN-2380.md`.
+
+  - **Workflow.** `agent_refine` takes a `RefineInput`: `kind`,
+    `source_runs` (1 to 16), `k` (1 to 8), `mode` (`parallel` or
+    `sequential`), `seed` and an optional `MeshBudget`. It needs the `eval`
+    feature. `sqlite::start_refine` starts it. `workflows()` and
+    `activities()` hold it and its steps.
+  - **Start.** The run reads its policy once. `agent_refine_start` then
+    checks every source before any model call. A bad source fails the run
+    with `RefineSourceNotFound`, `RefineSourceNotAgentRun`,
+    `RefineSourceInFlight`, `RefineSourceOtherKind`,
+    `RefineSourceNotReplayable` or `RefineSourceOverCeilings`. An
+    `agent_loop` run names its kind with `AgentTask::kind`. A durable
+    `agent` run has no replay probe yet, so it gets
+    `RefineSourceNotReplayable`. Each stage of a source checks its replies
+    against the profile of that source, as its probe does. A reply must
+    also apply to each other source and to the registered profile of the
+    kind. So a carried overlay fits each later source, and the kind can take
+    the chosen overlay.
+  - **Steps.** `agent_refine_probe` runs `eval::evaluate` and, when it stubs
+    a tool call, a live re-probe through `RefineSources::live_probe`.
+    `agent_refine_compose` runs an `OverlayComposer` over the probes under
+    opaque ids. The pool redacts each model route that a probe asked for,
+    with its model id, so an inherited or a peer route is redacted too. The
+    evidence bundle of a compose step hides the same names.
+    `agent_refine_select` runs an `OverlaySelector`. A rule
+    picks when no selector is installed, or when the selector fails, times
+    out or names an id outside the pool.
+  - **Budget identity.** Each source runs 3k sessions. Each candidate stage
+    adds one probe. `RefineLedger::check` fails a run that breaks it with
+    `RefineBudgetIdentity`. `formal/verus/src/agent_refine.rs` proves the
+    kernel `identity_holds` and that each plan meets the identity.
+  - **Spend.** `ProposeContext::charge` and the `charge` method of each new
+    context meter a model call. `ModelProposer` charges each call, so its
+    calls now reach the cost ledger. Each step writes its calls under the
+    refine run. A failed stage keeps the spend of its last attempt. A spent
+    budget ends the run as `RefineStatus::BudgetExhausted`, with no chosen
+    overlay.
+  - **Failures.** A failed stage falls back only on a failed or timed-out
+    activity. A failed select step takes the rule pick. A cancel or an
+    input over the cap fails the run with `RefineStageFailed`.
+  - **Additions.** `AgentTask::kind`, `RefineStatus::Chosen` and
+    `RefineStatus::BudgetExhausted`, `Evaluation::candidate_usage` and
+    `Evaluation::candidate_cost_usd_micros`, `ProposeRequest::sample`,
+    `Stage::usage` and `Stage::cost_usd_micros`, and `ProbeResult::routes`
+    and `ProbedCandidate::routes`. Each new field has a serde
+    default, so a recorded value decodes as before. An older worker cannot
+    decode a `ProposeRequest` with a `sample` above 1, so start a refine
+    run only after every worker runs this release.
+  - **Backends.** `sqlite::Sources` and `postgres::Sources` read the source
+    runs. Only Postgres runs a live re-probe, with the new
+    `eval::live_probe_with` under the policy ceilings of the run, as the
+    stages and the replay probe use. It waits through approval
+    waits, and it cancels a fork that does not end in 60 minutes or whose
+    wait fails. SQLite records `live re-probe skipped: SQLite has no fork`
+    in the stage notes.
+  - **Tests.** `autumn-harvest-agent/tests/refine_run.rs` covers each
+    criterion on SQLite, with a scripted proposer, composer and model. One
+    test aborts a child process after the third probe and resumes the run
+    to the same report as an uninterrupted run.
+- **Tooling** (implemented): Every repo script runs as `cargo xtask` on smop — see PR #2574. PR #2564 added the `xtask` crate, ADR 0015 and the `docs/xtask.md` command index, with one stub command per script. This entry ports all 96 scripts and deletes them. The CI gates, doc guards, check guards, perf evidence generators, bench drivers, sandbox image tools and dev helpers now run as `cargo xtask <group> <command>`. The groups are `audit`, `bench`, `check`, `ci`, `dev`, `perf` and `sandbox`. The crate builds on `smop` 0.3.2 for process, file system and CLI helpers.
+
+  Scope:
+
+  - `docs/audits/*.py` became `cargo xtask audit <name>`. Each `--self-test`
+    keeps its fixtures, and `audit-catalog-coverage` now reads the command list
+    from the clap enum.
+  - `scripts/check-*.sh` became `cargo xtask check <name>`.
+  - `.github/ci/*.sh` and `coverage.py` became `cargo xtask ci <name>`. The
+    `test-db-linux` sharding arithmetic is unchanged, and 21 of 21 shards print
+    the same plan.
+  - `autumn-harvest/scripts/*_perf_repro.sh` became `cargo xtask perf <name>`.
+  - `benchmarks/*.sh` became `cargo xtask bench run` and `bench notify-commit`.
+  - The sandbox, smoke, formal and fuzz scripts became `sandbox` and `dev`
+    commands.
+  - `examples/autoresearch/lab/`, `docs/assays/apparatus/` and
+    `docs/perf-artifacts/` keep their scripts. They are frozen evidence or an
+    external lab.
+
+  Design notes:
+
+  - Each port is checked for parity against its script. The checks compare
+    stdout, stderr and the exit code on the real tree, on the self-test
+    fixtures, and on mutated or fuzzed inputs. Tools such as cargo, docker and
+    psql are stubbed on `PATH` to record each call. The accepted differences
+    are few. An internal error now exits 2 with `error: ...`, where Python
+    printed a traceback and exited 1. clap refuses unknown arguments. Messages
+    that named a script now name its command.
+  - The audits that relied on Python regex lookaround use `fancy-regex`. The
+    YAML audits use a line-by-line port of the PyYAML 6 scanner and parser, so
+    they keep PyYAML 1.1 semantics with no `unsafe` code. `ledger-census
+    plan-sqlite` uses `rusqlite`. Every new dependency was already in
+    `Cargo.lock`.
+  - The guard tests that ran a script now run the built binary through
+    `tests/integration/xtask_bin.rs`.
+  - The `lint` job runs `cargo test -p xtask` before any gate. The workspace
+    clippy job already covers the crate.
+  - CLAUDE.md and AGENTS.md name the new commands. CLAUDE.md now says to add
+    an xtask command, not a script.
+
+  Test evidence: `cargo test -p xtask` passes 565 tests. Every audit passes on
+  the tree, with its self-test where it has one. The guard suites that read the
+  ported modules or run the binary pass. They are `ci_run_coverage`,
+  `ci_nextest_archive`, `coverage_nightly_wiring`, `release_pr_ci`,
+  `supply_chain_ci`, `chaos_watchdog`, `sandbox_activities_docs`,
+  `formal_models_coverage`, `formal_trace_coverage`,
+  `otel_workflow_semconv_docs`, `safety_report_docs`, `verus_proofs_coverage`,
+  `benchmarks_docs`, `fuzz_nightly_wiring` and the plugin's `openapi_spec`.
+- **Feature** (implemented): Override a workflow type's retry policy at runtime — see issue #2409. `WorkflowInfo::retry_policy` decides whether a failed run starts another attempt. Only a deploy changed it. `PATCH /admin/workflow-types/{workflow_name}/run-defaults` now takes `retry_max_attempts`, `retry_initial_interval_ms` and `retry_max_interval_ms`, with the tri-state, the audit row and the cache of the other run-default fields. `GET` shows them in `code`, `override` and `effective`. The backoff coefficient, the jitter and `non_retryable_errors` stay deploy-only.
+
+  **Semantics.** Each start still stores its policy on the execution row. The
+  failure path applies the override over that stored policy, through
+  `run_defaults::current_retry_policy`. So a change applies to the next
+  failure of any run of the type, in flight or new. `retry_max_attempts: 1`
+  stops the retries. A longer `retry_initial_interval_ms` slows them. An
+  attempt that already started keeps its row, its fire time and its stored
+  policy. A retry successor stores the policy of its run, never the effective
+  one, so a clear restores the code value. The fleet ceiling still caps
+  `max_attempts`.
+
+  **A schedule policy wins.** A schedule's own `retry_policy` still wins for
+  the runs that the schedule starts. Each schedule path picks its policy
+  through `workflow_retry::schedule_retry_policy`, which marks a schedule
+  policy with `_harvest_retry_source: "schedule"` in the stored JSON.
+  `StartWorkflowParams` gains `workflow_retry_source`. A retry, a same-type
+  continue-as-new and a re-run keep the mark. The guard
+  `retry_override_guard` fails on a schedule path that picks its policy by
+  hand. It also fails on a schedule start that does not take its source from
+  the helper, and on a decode of the stored JSON that drops the mark.
+
+  **Refusals.** The route refuses a retry field for a type with no code
+  `retry_policy`, a DAG included, and a `retry_max_attempts` above the fleet
+  ceiling. The write refuses zero, an interval past 365 days and a cap below
+  the first delay. A retry starts with a delay, and the start refuses a delay
+  past 365 days. The effective cap never falls below the first delay. The
+  declared backoff and jitter still apply.
+
+  **Migration.** `20261105062317_harvest_run_default_retry_policy` adds three
+  nullable columns to `harvest_run_default_overrides`, and widens the row
+  check to ten columns. No `WorkflowEvent` variant and no replay impact.
+  Design: `docs/design/DESIGN-2409.md`.
+
+  **Upgrade guide (for the next release).** Run the migration. During a roll,
+  an older process refuses the retry fields with a 400, and an older worker
+  decides each failure with the stored policy. So set a retry field only after
+  every process runs the new release. See the migration row in
+  `docs/upgrading/0.5.0.md`.
+
+  **Tests.** Unit tests on `RetryLimits`, the stored source, the merge, the
+  resolver and the ceiling. DB tests on the store and the table checks, and a
+  worker-driven test for each acceptance criterion, a scheduler fire included.
+  HTTP tests on the route, each refusal and the audit rows. A source guard over
+  the schedule paths and the decodes.
 - **Phase 4** (next): production hardening -- sharding, observability, metrics, dashboard (Vantage UI — Workers tab shipped in issue #142; DLQ, schedules, and DAG visualization pages remain); Step 5 of issue #256 (remove classic DAG executor, drop `harvest_dag_runs`). Note: the cancellation primitive and `Saga` both ship; their interaction semantics, idempotency contract, and replay-determinism contract are documented in `docs/saga.md` and locked in by three integration tests in `tests/saga_tests.rs` (issue #238).
 
 ---

@@ -174,7 +174,7 @@ cargo test -p autumn-harvest --lib -- \
 - `cargo fmt --all`: clean.
 - `cargo clippy -p autumn-harvest --all-targets --all-features -- -D warnings`:
   no new findings on `worker.rs`.
-- `python3 docs/audits/comment-hygiene.py --base origin/trunk-dev`: no Tier
+- `cargo xtask audit comment-hygiene --base origin/trunk-dev`: no Tier
   A findings, no Tier B regressions.
 - `cargo test -p autumn-harvest --lib`: full suite passes unchanged.
 

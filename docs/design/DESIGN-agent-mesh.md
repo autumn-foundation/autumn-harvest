@@ -78,7 +78,7 @@ mandate records the same bytes as before.
 | R11 | A refused gated call still adds its labels. | A label counts only when its call runs. Inside one turn, the decision step counts every call that is not denied. That fails closed. |
 | R12 | An inbound mandate from another process widens the local run. | `Mandate::accept` returns the meet. A test proves the result is never wider than either side. |
 | R13 | A peer name injects text into the tool description or the run id. | A name has 1 to 64 characters from `a-z`, `0-9`, `_` and `-`. Discovery drops a peer with any other name. |
-| R14 | The child answer floods the parent transcript. | The result keeps 8 000 characters. The request cap still applies. |
+| R14 | The child answer floods the parent transcript. | The result keeps `Peer::answer_limit` characters, else `tool_output_limit` characters, and marks a cut (issue #2481). The request cap still applies. |
 | R15 | An evaluation of a delegation run fails on the new activity. | `eval` mocks `agent_discover_peers` with the recorded result. |
 | R16 | Flow labels change the turn shape for every user. | The turn records labels only when the harness has flow rules. |
 | R17 | A cancel during a child leaves the parent waiting. | The child runs in the parent workflow. A cancel ends both at once. |

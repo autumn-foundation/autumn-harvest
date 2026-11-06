@@ -5,9 +5,12 @@
 //! copies below prove that no step overflows and that each one equals its
 //! spec. The theorems show that a request over the cap always reaches the
 //! threshold. So the check before a request finds a reset due while one is
-//! left. A zero cap never resets, and no reset passes `max_resets`. A tool
-//! round that passes the cap ends the run before that check, and these
-//! theorems do not cover it.
+//! left. A zero cap never resets, and no reset passes `max_resets`.
+//!
+//! A tool round can pass the cap before that check (issue #2461).
+//! `full_round_resets` then decides if the round resets. The theorems show
+//! that such a reset leaves a window that fits the cap. They also show that
+//! no mix of both kinds of reset passes `max_resets`.
 
 use vstd::prelude::*;
 
@@ -186,6 +189,122 @@ pub proof fn theorem_resets_never_pass_the_cap(
             next,
             max_resets,
             lens.subrange(1, lens.len() as int),
+            cap,
+            percent,
+        );
+    }
+}
+
+/// A round over the cap resets when a reset is left and the window after the
+/// reset falls under the threshold (issue #2461). A zero cap never resets.
+pub open spec fn full_round(resets: int, max_resets: int, after_len: int, cap: int, percent: int) -> bool {
+    resets < max_resets && cap > 0 && !reaches(after_len, cap, percent)
+}
+
+// mirror: autumn-harvest-agent/src/bounds.rs full_round_resets
+pub fn full_round_resets(resets: u32, max_resets: u32, after_len: u64, cap: u64, percent: u8) -> (r: bool)
+    ensures
+        r == full_round(resets as int, max_resets as int, after_len as int, cap as int, percent as int),
+{
+    resets < max_resets && cap > 0 && !reaches_percent(after_len, cap, percent)
+}
+
+/// The window after a full-round reset fits the cap, and a reset is left
+/// for it.
+pub proof fn theorem_a_full_round_reset_fits_the_cap(
+    resets: int,
+    max_resets: int,
+    after_len: int,
+    cap: int,
+    percent: int,
+)
+    requires
+        0 <= after_len,
+        0 <= percent,
+        full_round(resets, max_resets, after_len, cap, percent),
+    ensures
+        after_len < cap,
+        resets + 1 <= max_resets,
+{
+    theorem_a_request_under_the_threshold_fits(after_len, cap, percent);
+}
+
+/// A zero cap never resets a round.
+pub proof fn theorem_a_zero_cap_never_resets_a_round(
+    resets: int,
+    max_resets: int,
+    after_len: int,
+    percent: int,
+)
+    ensures
+        !full_round(resets, max_resets, after_len, 0, percent),
+{
+}
+
+/// The reset count after one event. An event is a request of `len` bytes,
+/// or a round over the cap whose reset window is `len` bytes.
+pub open spec fn after_event(
+    resets: int,
+    max_resets: int,
+    event: (bool, int),
+    cap: int,
+    percent: int,
+) -> int {
+    if event.0 {
+        if full_round(resets, max_resets, event.1, cap, percent) {
+            resets + 1
+        } else {
+            resets
+        }
+    } else {
+        after(resets, max_resets, event.1, cap, percent)
+    }
+}
+
+/// The reset count after a sequence of events.
+pub open spec fn count_events(
+    resets: int,
+    max_resets: int,
+    events: Seq<(bool, int)>,
+    cap: int,
+    percent: int,
+) -> int
+    decreases events.len(),
+{
+    if events.len() == 0 {
+        resets
+    } else {
+        count_events(
+            after_event(resets, max_resets, events[0], cap, percent),
+            max_resets,
+            events.subrange(1, events.len() as int),
+            cap,
+            percent,
+        )
+    }
+}
+
+/// No mix of requests and full rounds takes the reset count past
+/// `max_resets`, and the count never goes down.
+pub proof fn theorem_mixed_resets_never_pass_the_cap(
+    resets: int,
+    max_resets: int,
+    events: Seq<(bool, int)>,
+    cap: int,
+    percent: int,
+)
+    requires
+        0 <= resets <= max_resets,
+    ensures
+        resets <= count_events(resets, max_resets, events, cap, percent) <= max_resets,
+    decreases events.len(),
+{
+    if events.len() > 0 {
+        let next = after_event(resets, max_resets, events[0], cap, percent);
+        theorem_mixed_resets_never_pass_the_cap(
+            next,
+            max_resets,
+            events.subrange(1, events.len() as int),
             cap,
             percent,
         );

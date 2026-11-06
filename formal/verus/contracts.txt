@@ -8,6 +8,15 @@
 #   UPDATE_VERUS_CONTRACTS=1 cargo test -p autumn-harvest --test integration \
 #     verus_proofs_coverage::every_verus_contract_matches_the_stored_list
 
+## formal/verus/src/agent_anonymise.rs
+pub open spec fn common(a: Seq < u8 >, b: Seq < u8 >) -> nat decreases a.len(), { if a.len() == 0 || b.len() == 0 || a [0] != b [0] { 0 } else { 1 + common(a.drop_first(), b.drop_first()) } }
+proof fn lemma_common(a: Seq < u8 >, b: Seq < u8 >) ensures common(a, b) <= a.len(), common(a, b) <= b.len(), forall | i: int | 0 <= i < common(a, b) ==> a [i] == b [i], common(a, b) < a.len() && common(a, b) < b.len() ==> a [common(a, b) as int] != b [common(a, b,) as int], decreases a.len(),
+pub fn shared_digits(a:& [u8], b:& [u8]) -> (r: usize) ensures r == common(a @, b @),
+pub open spec fn safe(shared: Seq < usize >, cap: int, r: int) -> bool { forall | i: int | 0 <= i < shared.len() && shared [i] < cap ==> shared [i] < r }
+pub fn id_width(shared:& [usize], floor: usize, cap: usize) -> (r: usize) requires floor <= cap, ensures floor <= r <= cap, safe(shared @, cap as int, r as int), r == floor || exists | i: int | 0 <= i < shared @.len() && #[trigger] shared @ [i] < cap && r == shared @ [i] + 1,
+pub proof fn theorem_the_width_is_the_least_safe_width(shared: Seq < usize >, floor: int, cap: int, r: int) requires floor <= r <= cap, safe(shared, cap, r), r == floor || exists | i: int | 0 <= i < shared.len() && #[trigger] shared [i] < cap && r == shared [i] + 1, ensures forall | w: int | floor <= w < r ==>! safe(shared, cap, w),
+pub proof fn theorem_a_width_above_the_shared_count_splits_a_pair(a: Seq < u8 >, b: Seq < u8 >, width: int) requires common(a, b) < width, width <= a.len(), width <= b.len(), ensures a.subrange(0, width) != b.subrange(0, width),
+
 ## formal/verus/src/agent_dedupe.rs
 pub open spec fn spec_is_new(floor: int, seq: int, in_above: bool) -> bool { seq > floor &&! in_above }
 pub open spec fn spec_next_floor(floor: int, next_in_above: bool) -> int { if next_in_above && floor < u64::MAX { floor + 1 } else { floor } }
@@ -25,6 +34,58 @@ pub proof fn theorem_an_apply_is_the_plain_insert(floor: int, above: Set < int >
 proof fn lemma_apply_all_is_the_union(floor: int, above: Set < int >, applied: Set < int >, seqs: Seq < int >,) requires encodes(floor, above, applied), forall | i: int | 0 <= i < seqs.len() ==> 1 <= #[trigger] seqs [i], ensures encodes(apply_all(floor, above, seqs).0, apply_all(floor, above, seqs).1, applied.union(seqs.to_set()),), decreases seqs.len(),
 pub proof fn theorem_each_number_applies_once(seqs: Seq < int >, i: int) requires forall | j: int | 0 <= j < seqs.len() ==> 1 <= #[trigger] seqs [j], 0 <= i < seqs.len(), ensures ({ let before = apply_all(0, Set::empty(), seqs.take(i)); spec_is_new(before.0, seqs [i], before.1.contains(seqs [i])) ==! seqs.take(i).contains(seqs [i],) }), encodes(apply_all(0, Set::empty(), seqs).0, apply_all(0, Set::empty(), seqs).1, seqs.to_set(),),
 pub proof fn theorem_the_bound_makes_no_false_duplicate(floor: int, above: Set < int >, applied: Set < int >, seq: int, forgot: int,) requires sound(floor, above, applied), 1 <= seq, ensures ! spec_is_new(floor, seq, above.contains(seq)) ==> applied.contains(seq), sound(apply(floor, above, seq).0, apply(floor, above, seq).1, applied.insert(seq)), sound(floor, above.remove(forgot), applied),
+
+## formal/verus/src/agent_dispatch.rs
+pub const MAX_DISPATCH_PASSES: u32 = 256;
+pub open spec fn cap(max: int) -> int { if max == 0 { 1 } else if max > 256 { 256 } else { max } }
+pub open spec fn started(due: int, max: int) -> int { if due < cap(max) { due } else { cap(max) } }
+pub fn dispatch_passes(due: u64, max: u32) -> (r: u64) ensures r == started(due as int, max as int),
+pub proof fn theorem_a_firing_keeps_its_bound(due: int, max: int) requires 0 <= due, 0 <= max, ensures 1 <= cap(max) <= 256, 0 <= started(due, max) <= cap(max), started(due, max) <= due,
+pub proof fn theorem_a_due_agent_makes_progress(due: int, max: int) requires 0 < due, 0 <= max, ensures 1 <= started(due, max),
+pub proof fn theorem_agents_in_the_bound_never_wait(due: int, max: int) requires 0 <= due <= cap(max), 0 <= max, ensures started(due, max) == due,
+pub open spec fn left(due: int, max: int, n: nat) -> int decreases n, { if n == 0 { due } else { left(due - started(due, max), max, (n - 1) as nat) } }
+pub proof fn theorem_the_queue_drains(due: int, max: int, n: nat) requires 0 <= due, 0 <= max, due <= n * cap(max), ensures left(due, max, n) == 0, decreases n,
+
+## formal/verus/src/agent_episodes.rs
+pub open spec fn bound(max: int) -> int { if max == 0 { 1 } else { max } }
+pub open spec fn evicted(len: int, max: int) -> int { if len < bound(max) { 0 } else { len - bound(max) + 1 } }
+pub open spec fn after(len: int, max: int) -> int { len - evicted(len, max) + 1 }
+pub fn episode_evictions(len: u64, max: u64) -> (r: u64) ensures r == evicted(len as int, max as int),
+pub open spec fn due(appended: int, every: int) -> bool { every > 0 && appended >= every }
+pub fn consolidation_due(appended: u64, every: u32) -> (r: bool) ensures r == due(appended as int, every as int),
+pub proof fn theorem_an_append_keeps_the_bound(len: int, max: int) requires 0 <= len, 0 <= max, ensures 0 <= evicted(len, max) <= len, 1 <= after(len, max) <= bound(max),
+pub proof fn theorem_a_log_in_its_bound_evicts_at_most_one(len: int, max: int) requires 0 <= len <= bound(max), 0 <= max, ensures evicted(len, max) <= 1, len < bound(max) ==> evicted(len, max) == 0,
+pub open spec fn run(len: int, max: int, n: nat) -> int decreases n, { if n == 0 { len } else { run(after(len, max), max, (n - 1) as nat) } }
+pub proof fn theorem_no_sequence_passes_the_bound(len: int, max: int, n: nat) requires 0 <= len <= bound(max), 0 <= max, ensures 0 <= run(len, max, n) <= bound(max), decreases n,
+pub proof fn theorem_a_zero_trigger_never_fires(appended: int) ensures ! due(appended, 0),
+pub proof fn theorem_no_pass_is_due_under_the_trigger(appended: int, every: int) requires 0 <= appended < every, ensures ! due(appended, every),
+pub proof fn theorem_the_trigger_is_monotone(small: int, large: int, every: int) requires small <= large, due(small, every), ensures due(large, every),
+
+## formal/verus/src/agent_fan_out.rs
+pub enum SerialReason { SingleCall, NotConsecutive, Gated, DurablePeer, BoundReached, }
+pub enum Fit { Batchable, Gated, Durable, Other, }
+pub enum Step { Lead(usize), Member, Alone(SerialReason), Skip, }
+pub open spec fn joins(fit: Fit) -> bool { fit is Batchable }
+pub open spec fn count(fits: Seq < Fit >, n: int) -> int decreases n, { if n <= 0 { 0 } else { count(fits, n - 1) + if joins(fits [n - 1]) { 1int } else { 0int } } }
+pub open spec fn others(fits: Seq < Fit >, i: int) -> bool { exists | j: int | 0 <= j < fits.len() && j != i && #[trigger] joins(fits [j]) }
+pub open spec fn left(fits: Seq < Fit >, i: int) -> bool { 0 < i && joins(fits [i - 1]) }
+pub open spec fn right(fits: Seq < Fit >, i: int) -> bool { i + 1 < fits.len() && joins(fits [i + 1]) }
+pub open spec fn full_before(steps: Seq < Step >, bound: int, i: int) -> bool { bound <= i && steps [i - bound] is Lead && steps [i - bound] -> Lead_0 == bound }
+pub open spec fn reason_ok(fits: Seq < Fit >, i: int, reason: SerialReason) -> bool { match reason { SerialReason::Gated => fits [i] is Gated, SerialReason::DurablePeer => fits [i] is Durable, SerialReason::BoundReached => joins(fits [i]) && left(fits, i) &&! right(fits, i), SerialReason::NotConsecutive => joins(fits [i]) &&! left(fits, i) &&! right(fits, i) && others(fits, i), SerialReason::SingleCall => joins(fits [i]) &&! others(fits, i), } }
+pub open spec fn step_ok(fits: Seq < Fit >, bound: int, steps: Seq < Step >, i: int) -> bool { if bound < 2 { steps [i] is Skip } else { match steps [i] { Step::Skip => fits [i] is Other, Step::Lead(n) => 2 <= n <= bound && i + n <= steps.len() && (n < bound ==>! right(fits, i + n - 1)) && (left(fits, i) ==> full_before(steps, bound, i)) && (forall | j: int | i <= j < i + n ==> #[trigger] joins(fits [j])) && (forall | j: int | i < j < i + n ==> #[trigger] steps [j] is Member), Step::Member => joins(fits [i]) && exists | k: int | 0 <= k < i && #[trigger] steps [k] is Lead && i < k + steps [k] -> Lead_0, Step::Alone(reason) => reason_ok(fits, i, reason) && (reason is BoundReached ==> full_before(steps, bound, i)), } } }
+proof fn lemma_count_bounds(fits: Seq < Fit >, n: int) requires 0 <= n, ensures 0 <= count(fits, n) <= n, decreases n,
+proof fn lemma_a_lone_call_counts_one(fits: Seq < Fit >, n: int, i: int) requires 0 <= i < n <= fits.len(), joins(fits [i]), forall | j: int | 0 <= j < n && j != i ==>! #[trigger] joins(fits [j]), ensures count(fits, n) == 1, decreases n,
+proof fn lemma_none_counts_zero(fits: Seq < Fit >, n: int) requires 0 <= n <= fits.len(), forall | j: int | 0 <= j < n ==>! #[trigger] joins(fits [j]), ensures count(fits, n) == 0, decreases n,
+proof fn lemma_two_calls_count_two(fits: Seq < Fit >, n: int, i: int, j: int) requires 0 <= i < j < n <= fits.len(), joins(fits [i]), joins(fits [j]), ensures count(fits, n) >= 2, decreases n,
+proof fn lemma_one_call_counts_one(fits: Seq < Fit >, n: int, i: int) requires 0 <= i < n <= fits.len(), joins(fits [i]), ensures count(fits, n) >= 1, decreases n,
+proof fn lemma_the_count_names_the_others(fits: Seq < Fit >, i: int) requires 0 <= i < fits.len(), joins(fits [i]), ensures count(fits, fits.len() as int) > 1 <==> others(fits, i),
+pub open spec fn prefix_ok(fits: Seq < Fit >, bound: int, steps: Seq < Step >, n: int) -> bool { forall | i: int | 0 <= i < n ==> #[trigger] step_ok(fits, bound, steps, i) }
+proof fn lemma_push(fits: Seq < Fit >, bound: int, steps: Seq < Step >, step: Step, n: int) requires 0 <= n <= steps.len(), prefix_ok(fits, bound, steps, n), ensures prefix_ok(fits, bound, steps.push(step), n),
+proof fn lemma_push_member(fits: Seq < Fit >, bound: int, steps: Seq < Step >, at: int, len: usize) requires 2 <= bound, len <= bound, 0 <= at < steps.len() < at + len <= fits.len(), steps [at] == Step::Lead(len), prefix_ok(fits, bound, steps, at), forall | j: int | at <= j < at + len ==> #[trigger] joins(fits [j]), forall | j: int | at < j < steps.len() ==> #[trigger] steps [j] is Member, forall | j: int | at < j < steps.len() ==> #[trigger] step_ok(fits, bound, steps, j), ensures prefix_ok(fits, bound, steps.push(Step::Member), at), forall | j: int | at < j <= steps.len() ==> #[trigger] steps.push(Step::Member) [j] is Member, forall | j: int | at < j <= steps.len() ==> #[trigger] step_ok(fits, bound, steps.push(Step::Member), j),
+pub fn can_join(fit:& Fit) -> (r: bool) ensures r == joins(* fit),
+pub fn fan_out_plan(fits:& [Fit], bound: usize) -> (steps: Vec < Step >) ensures steps.len() == fits.len(), prefix_ok(fits @, bound as int, steps @, fits.len() as int),
+pub proof fn theorem_no_fallback_is_silent(fits: Seq < Fit >, bound: int, steps: Seq < Step >, i: int) requires 2 <= bound, 0 <= i < fits.len(), prefix_ok(fits, bound, steps, fits.len() as int), ! (fits [i] is Other), ensures ! (steps [i] is Skip),
+pub proof fn theorem_an_off_fan_out_names_no_reason(fits: Seq < Fit >, bound: int, steps: Seq < Step >, i: int,) requires bound < 2, 0 <= i < fits.len(), prefix_ok(fits, bound, steps, fits.len() as int), ensures steps [i] is Skip,
 
 ## formal/verus/src/agent_inbox.rs
 pub enum InboxStatus { Open, Paused, Parked, }
@@ -91,6 +152,18 @@ pub proof fn theorem_a_stage_is_bounded(verdicts: Seq < Verdict >, max: int) req
 pub proof fn theorem_a_stage_falls_back_exactly_when_every_attempt_is_invalid(verdicts: Seq < Verdict >, max: int,) requires 1 <= max, ensures run(verdicts, max, 1).0 is FallBack <==> forall | i: int | 1 <= i <= max ==> #[trigger] verdict_at(verdicts, i) is Invalid, run(verdicts, max, 1).0 is FallBack ==> run(verdicts, max, 1).1 == max,
 pub proof fn theorem_a_stage_stops_at_the_first_valid_reply(verdicts: Seq < Verdict >, max: int) requires 1 <= max, ensures ! (run(verdicts, max, 1).0 is FallBack) ==>! (verdict_at(verdicts, run(verdicts, max, 1).1,) is Invalid), forall | i: int | 1 <= i < run(verdicts, max, 1).1 ==> #[trigger] verdict_at(verdicts, i) is Invalid, run(verdicts, max, 1).0 is Keep <==> verdict_at(verdicts, run(verdicts, max, 1).1) is Same, run(verdicts, max, 1).0 is Propose <==> verdict_at(verdicts, run(verdicts, max, 1).1,) is Differs,
 
+## formal/verus/src/agent_refine.rs
+pub fn identity_holds(planned: u64, sessions: u64, probes: u64, skipped: u64) -> (r: bool) ensures r <==> (sessions == planned && skipped <= sessions && probes == sessions - skipped),
+pub open spec fn stages_of(parallel: bool, k: int) -> int { if parallel { 2 * k + k } else { 3 * k } }
+pub open spec fn count(outcomes: Seq < bool >, n: int) -> (int, int, int) decreases n, { if n <= 0 { (0, 0, 0) } else { let before = count(outcomes, n - 1); let candidate = if n - 1 < outcomes.len() { outcomes [n - 1] } else { true }; if candidate { (before.0 + 1, before.1 + 1, before.2) } else { (before.0 + 1, before.1, before.2 + 1) } } }
+proof fn lemma_count(outcomes: Seq < bool >, n: int) requires 0 <= n, ensures count(outcomes, n).0 == n, count(outcomes, n).1 + count(outcomes, n).2 == n, 0 <= count(outcomes, n).1, 0 <= count(outcomes, n).2, decreases n,
+pub proof fn theorem_both_modes_plan_three_k(k: int) requires 0 <= k, ensures stages_of(true, k) == 3 * k, stages_of(false, k) == 3 * k,
+pub proof fn theorem_each_plan_meets_the_identity(outcomes: Seq < bool >, parallel: bool, k: u64, sources: u64,) requires k <= 8, sources <= 16, ensures ({ let c = count(outcomes, sources * stages_of(parallel, k as int)); c.0 == 3 * k * sources && c.2 <= c.0 && c.1 == c.0 - c.2 }),
+pub open spec fn holds(planned: int, sessions: int, probes: int, skipped: int) -> bool { sessions == planned && skipped <= sessions && probes == sessions - skipped }
+pub proof fn theorem_the_kernel_meets_holds(planned: u64, sessions: u64, probes: u64, skipped: u64) ensures holds(planned as int, sessions as int, probes as int, skipped as int) == (sessions == planned && skipped <= sessions && probes as int == sessions as int - skipped as int),
+pub proof fn theorem_a_wrong_probe_count_breaks_it(planned: int, skipped: int) requires 0 <= skipped <= planned, ensures ! holds(planned, planned, planned - skipped - 1, skipped), ! holds(planned, planned, planned - skipped + 1, skipped),
+pub proof fn theorem_a_short_run_breaks_it(planned: int, probes: int, skipped: int) ensures ! holds(planned, planned - 1, probes, skipped),
+
 ## formal/verus/src/agent_reset.rs
 pub open spec fn clamped(percent: int) -> int { if percent == 0 { 1 } else if percent > 100 { 100 } else { percent } }
 pub open spec fn reaches(len: int, cap: int, percent: int) -> bool { cap > 0 && len * 100 >= cap * clamped(percent) }
@@ -105,6 +178,33 @@ pub proof fn theorem_a_zero_cap_never_resets(resets: int, max_resets: int, len: 
 pub open spec fn after(resets: int, max_resets: int, len: int, cap: int, percent: int) -> int { if due(resets, max_resets, len, cap, percent) { resets + 1 } else { resets } }
 pub open spec fn count(resets: int, max_resets: int, lens: Seq < int >, cap: int, percent: int) -> int decreases lens.len(), { if lens.len() == 0 { resets } else { count(after(resets, max_resets, lens [0], cap, percent), max_resets, lens.subrange(1, lens.len() as int), cap, percent,) } }
 pub proof fn theorem_resets_never_pass_the_cap(resets: int, max_resets: int, lens: Seq < int >, cap: int, percent: int,) requires 0 <= resets <= max_resets, ensures resets <= count(resets, max_resets, lens, cap, percent) <= max_resets, decreases lens.len(),
+pub open spec fn full_round(resets: int, max_resets: int, after_len: int, cap: int, percent: int) -> bool { resets < max_resets && cap > 0 &&! reaches(after_len, cap, percent) }
+pub fn full_round_resets(resets: u32, max_resets: u32, after_len: u64, cap: u64, percent: u8) -> (r: bool) ensures r == full_round(resets as int, max_resets as int, after_len as int, cap as int, percent as int),
+pub proof fn theorem_a_full_round_reset_fits_the_cap(resets: int, max_resets: int, after_len: int, cap: int, percent: int,) requires 0 <= after_len, 0 <= percent, full_round(resets, max_resets, after_len, cap, percent), ensures after_len < cap, resets + 1 <= max_resets,
+pub proof fn theorem_a_zero_cap_never_resets_a_round(resets: int, max_resets: int, after_len: int, percent: int,) ensures ! full_round(resets, max_resets, after_len, 0, percent),
+pub open spec fn after_event(resets: int, max_resets: int, event: (bool, int), cap: int, percent: int,) -> int { if event.0 { if full_round(resets, max_resets, event.1, cap, percent) { resets + 1 } else { resets } } else { after(resets, max_resets, event.1, cap, percent) } }
+pub open spec fn count_events(resets: int, max_resets: int, events: Seq < (bool, int) >, cap: int, percent: int,) -> int decreases events.len(), { if events.len() == 0 { resets } else { count_events(after_event(resets, max_resets, events [0], cap, percent), max_resets, events.subrange(1, events.len() as int), cap, percent,) } }
+pub proof fn theorem_mixed_resets_never_pass_the_cap(resets: int, max_resets: int, events: Seq < (bool, int) >, cap: int, percent: int,) requires 0 <= resets <= max_resets, ensures resets <= count_events(resets, max_resets, events, cap, percent) <= max_resets, decreases events.len(),
+
+## formal/verus/src/agent_sampling.rs
+pub const MAX_PARALLEL_CHILDREN: u32 = 16;
+pub const MAX_ANSWER_RETRIES: u32 = 16;
+pub enum DrawPlan { Run { draws: u32, concurrency: u32 }, NoDraws, TooManyDraws, TooManyConcurrent, }
+pub open spec fn spec_cap(max_concurrent: u32) -> int { if max_concurrent > MAX_PARALLEL_CHILDREN { MAX_PARALLEL_CHILDREN as int } else if max_concurrent == 0 { 1 } else { max_concurrent as int } }
+pub fn draw_plan(max_draws: u32, max_concurrent: u32, draws: u32, asked: u32) -> (r: DrawPlan) ensures draws == 0 <==> r is NoDraws, r is TooManyDraws <==> (draws > 0 && draws > max_draws), r is TooManyConcurrent <==> (draws > 0 && draws <= max_draws && asked > spec_cap(max_concurrent,)), r is Run ==> r -> Run_draws == draws, r is Run ==> 1 <= r -> Run_draws <= max_draws, r is Run ==> 1 <= r -> Run_concurrency, r is Run ==> r -> Run_concurrency <= r -> Run_draws, r is Run ==> r -> Run_concurrency <= MAX_PARALLEL_CHILDREN, r is Run ==> r -> Run_concurrency <= spec_cap(max_concurrent), r is Run && asked > 0 && asked <= draws ==> r -> Run_concurrency == asked,
+pub open spec fn spec_wave_end(draws: int, concurrency: int, start: int) -> int { let width = if concurrency == 0 { 1 } else { concurrency }; if start >= draws { draws } else if draws - start < width { draws } else { start + width } }
+pub fn wave_end(draws: u32, concurrency: u32, start: u32) -> (r: u32) ensures r == spec_wave_end(draws as int, concurrency as int, start as int), start < draws ==> start < r <= draws, start < draws && concurrency > 0 ==> r - start <= concurrency, start < draws && concurrency == 0 ==> r == start + 1, start >= draws ==> r == draws,
+pub open spec fn covered(draws: int, concurrency: int, start: int) -> int decreases draws - start, { if start >= draws || start < 0 { 0 } else { let end = spec_wave_end(draws, concurrency, start); if end <= start { 0 } else { (end - start) + covered(draws, concurrency, end) } } }
+pub proof fn theorem_the_waves_cover_each_draw_once(draws: int, concurrency: int, start: int) requires 0 <= start <= draws, concurrency >= 0, ensures covered(draws, concurrency, start) == draws - start, decreases draws - start,
+pub enum SampleStep { Wave { width: u32 }, Done, BudgetExceeded, }
+pub fn sample_step(draws: u32, started: u32, concurrency: u32, budgeted: bool, tokens_left: u32) -> (r: SampleStep) ensures r is Done <==> started >= draws, r is BudgetExceeded <==> (started < draws && budgeted && tokens_left == 0), r is Wave ==> 1 <= r -> Wave_width, r is Wave ==> started + r -> Wave_width <= draws, r is Wave && concurrency > 0 ==> r -> Wave_width <= concurrency, r is Wave && concurrency == 0 ==> r -> Wave_width == 1, r is Wave && budgeted ==> r -> Wave_width <= tokens_left,
+pub proof fn theorem_each_draw_of_a_wave_gets_a_token(left: int, width: int, index: int) requires 1 <= width <= left, ensures crate::agent_siblings::share(left, width, index) >= 1, crate::agent_siblings::total(left, width, width) == left,
+pub open spec fn spec_next_policy_revision(current: u64) -> Option < u64 > { if current < u64::MAX { Some((current + 1) as u64) } else { None } }
+pub fn next_policy_revision(current: u64) -> (r: Option < u64 >) ensures r == spec_next_policy_revision(current), r.is_some() ==> r.unwrap() == current + 1, r.is_some() ==> r.unwrap() >= 1, r.is_none() ==> current == u64::MAX,
+pub fn answer_retry_cap(policy_max: u32, asked: u32) -> (r: Option < u32 >) ensures r.is_some() ==> r.unwrap() == asked, r.is_some() ==> asked <= policy_max && asked <= MAX_ANSWER_RETRIES, r.is_none() ==> asked > policy_max || asked > MAX_ANSWER_RETRIES,
+pub fn retry_after_reject(rejections: u32, cap: u32) -> (r: bool) ensures r == (rejections <= cap),
+pub open spec fn spec_answers(cap: int, rejections: int) -> int decreases cap + 1 - rejections, { if rejections < 1 || rejections > cap { rejections } else { spec_answers(cap, rejections + 1) } }
+pub proof fn theorem_a_run_asks_for_cap_plus_one_answers(cap: int, rejections: int) requires 1 <= rejections <= cap + 1, ensures spec_answers(cap, rejections) == cap + 1, decreases cap + 1 - rejections,
 
 ## formal/verus/src/agent_select.rs
 pub open spec fn key(bits: i64) -> i64 { bits ^ ((((bits >> 63i64) as u64) >> 1u64) as i64) }
@@ -163,6 +263,15 @@ proof fn lemma_split_jitter(h: int, l: int, m: int) requires 0 <= h, 0 <= l, 0 <
 proof fn lemma_jitter_below_slot(slot: int, mix: int) requires 0 <= slot, 0 <= mix < two64(), ensures 0 <= spec_jitter(slot, mix), slot > 0 ==> spec_jitter(slot, mix) < slot, slot == 0 ==> spec_jitter(slot, mix) == 0,
 pub proof fn lemma_offset_in_slot(index: int, count: int, window: int, mix: int) requires 0 <= index < count, 0 <= window, 0 <= mix < two64(), ensures ({ let slot = window / count; let offset = slot * index + spec_jitter(slot, mix); &&& slot * index <= offset &&& slot > 0 ==> offset < slot * (index + 1) &&& window > 0 ==> offset < window }),
 pub fn spread_offset_nanos(index: u128, count: u128, window: u128, mix: u64) -> (r: u128) requires count > 0, ensures ({ let slot = (window / count) as int; r == saturate(saturate(slot * index) + spec_jitter(slot, mix as int)) }), index < count ==> r == (window / count) as int * index + spec_jitter((window / count) as int, mix as int),
+
+## formal/verus/src/evidence_parts.rs
+pub open spec fn spec_part_end(start: int, len: int, cap: int, cut: int) -> int { if len - start <= cap { len } else if start < cut && cut <= start + cap { cut } else { start + cap } }
+pub fn part_end(start: usize, len: usize, cap: usize, cut: usize) -> (r: usize) requires start < len, 0 < cap, ensures r == spec_part_end(start as int, len as int, cap as int, cut as int), start < r <= len, r - start <= cap, len - start <= cap ==> r == len,
+pub open spec fn tile(start: int, len: int, cap: int, cut: spec_fn(int) -> int) -> Seq < int > decreases len - start, { if start < 0 || start >= len || cap <= 0 { Seq::empty() } else { let end = spec_part_end(start, len, cap, cut(start)); seq ! [end] + tile(end, len, cap, cut) } }
+pub open spec fn part_start(ends: Seq < int >, start: int, i: int) -> int { if i == 0 { start } else { ends [i - 1] } }
+proof fn lemma_tile(start: int, len: int, cap: int, cut: spec_fn(int) -> int) requires 0 <= start <= len, 0 < cap, ensures (tile(start, len, cap, cut).len() == 0) == (start == len), tile(start, len, cap, cut).len() > 0 ==> tile(start, len, cap, cut).last() == len, forall | i: int | 0 <= i < tile(start, len, cap, cut).len() ==> part_start(tile(start, len, cap, cut), start, i,) < #[trigger] tile(start, len, cap, cut) [i] <= len, forall | i: int | 0 <= i < tile(start, len, cap, cut).len() ==> #[trigger] tile(start, len, cap, cut) [i] - part_start(tile(start, len, cap, cut), start, i) <= cap, decreases len - start,
+pub proof fn theorem_the_parts_tile_the_text(len: int, cap: int, cut: spec_fn(int) -> int) requires 0 <= len, 0 < cap, ensures (tile(0, len, cap, cut).len() == 0) == (len == 0), tile(0, len, cap, cut).len() > 0 ==> tile(0, len, cap, cut).last() == len, forall | i: int | 0 <= i < tile(0, len, cap, cut).len() ==> part_start(tile(0, len, cap, cut), 0, i) < #[trigger] tile(0, len, cap, cut) [i], forall | i: int | 0 <= i < tile(0, len, cap, cut).len() ==> #[trigger] tile(0, len, cap, cut) [i] - part_start(tile(0, len, cap, cut), 0, i) <= cap,
+pub proof fn theorem_a_text_that_fits_is_one_part(len: int, cap: int, cut: spec_fn(int) -> int) requires 0 < len <= cap, ensures tile(0, len, cap, cut) == seq ! [len],
 
 ## formal/verus/src/group_commit.rs
 pub open spec fn spec_accepts(batch_len: int, max_batch: int, same_tenure: bool, execution_in_batch: bool,) -> bool { batch_len < max_batch && same_tenure &&! execution_in_batch }
@@ -228,6 +337,34 @@ pub proof fn theorem_a_refused_activate_changes_nothing(log: Log, v: u64, expect
 pub proof fn theorem_a_step_keeps_the_invariant(log: Log, op: Op) requires inv(log), ensures inv(step(log, op)),
 pub proof fn theorem_no_call_rewrites_a_version(log: Log, ops: Seq < Op >) requires inv(log), ensures inv(run(log, ops)), log.bodies.len() <= run(log, ops).bodies.len(), run(log, ops).bodies.subrange(0, log.bodies.len() as int) == log.bodies, decreases ops.len(),
 pub proof fn theorem_exactly_one_of_two_activates_wins(log: Log, first: u64, second: u64) requires inv(log), holds(log, first), holds(log, second), log.active != Some(first), ensures spec_decide_activate(holds(log, first), log.active, log.active) == ActivateDecision::Activate, activate(log, first, log.active).active == Some(first), spec_decide_activate(holds(activate(log, first, log.active), second), log.active, activate(log, first, log.active).active,) == ActivateDecision::Conflict, activate(activate(log, first, log.active), second, log.active) == activate(log, first, log.active,),
+pub fn logs_activation(actual: Option < u64 >, version: u64) -> (r: bool) ensures r <==> actual != Some(version),
+pub struct RollbackPlan { pub target: u64, pub expected: u64, }
+pub open spec fn spec_rollback_target(from: Option < u64 >, to: u64) -> Option < RollbackPlan > { match from { Some(target) => Some(RollbackPlan { target, expected: to }), None => None, } }
+pub fn rollback_target(from: Option < u64 >, to: u64) -> (r: Option < RollbackPlan >) ensures r == spec_rollback_target(from, to), r.is_none() <==> from.is_none(), r.is_some() ==> r.unwrap().target == from.unwrap() && r.unwrap().expected == to,
+pub open spec fn spec_decide_rollback(known: bool, expected: u64, actual: Option < u64 >, read_seq: u64, last_seq: Option < u64 >,) -> ActivateDecision { if spec_decide_activate(known, Some(expected), actual) != ActivateDecision::Activate { spec_decide_activate(known, Some(expected), actual) } else if last_seq == Some(read_seq) { ActivateDecision::Activate } else { ActivateDecision::Conflict } }
+pub fn decide_rollback(known: bool, expected: u64, actual: Option < u64 >, read_seq: u64, last_seq: Option < u64 >,) -> (r: ActivateDecision) ensures r == spec_decide_rollback(known, expected, actual, read_seq, last_seq), r == ActivateDecision::Activate ==> last_seq == Some(read_seq), r == ActivateDecision::Activate ==> known && actual == Some(expected),
+pub struct Move { pub from: Option < u64 >, pub to: u64, }
+pub struct Heads { pub stored: u64, pub active: Option < u64 >, pub moves: Seq < Move >, }
+pub open spec fn chained(h: Heads) -> bool { &&& (h.moves.len() == 0 ==> h.active.is_none()) &&& (h.moves.len() > 0 ==> h.active == Some(h.moves.last().to)) &&& (h.moves.len() > 0 ==> h.moves [0].from.is_none()) &&& forall | i: int | 0 < i < h.moves.len() ==> #[trigger] h.moves [i].from == Some(h.moves [i - 1].to) &&& forall | i: int | 0 <= i < h.moves.len() ==> #[trigger] h.moves [i].from != Some(h.moves [i].to) &&& forall | i: int | 0 <= i < h.moves.len() ==> 1 <= #[trigger] h.moves [i].to <= h.stored }
+pub open spec fn activate_logged(h: Heads, v: u64, expected: Option < u64 >) -> Heads { let known = 1 <= v && v <= h.stored; if spec_decide_activate(known, expected, h.active) != ActivateDecision::Activate { h } else if h.active == Some(v) { h } else { Heads { stored: h.stored, active: Some(v), moves: h.moves.push(Move { from: h.active, to: v }) } } }
+pub open spec fn rollback(h: Heads) -> Heads { if h.moves.len() == 0 { h } else { match spec_rollback_target(h.moves.last().from, h.moves.last().to) { None => h, Some(plan) => activate_logged(h, plan.target, Some(plan.expected)), } } }
+pub proof fn theorem_an_activation_keeps_the_chain(h: Heads, v: u64, expected: Option < u64 >) requires chained(h), ensures chained(activate_logged(h, v, expected)), activate_logged(h, v, expected).stored == h.stored,
+pub proof fn theorem_a_rollback_keeps_the_chain(h: Heads) requires chained(h), ensures chained(rollback(h)),
+pub proof fn theorem_a_rollback_with_no_earlier_activation_changes_nothing(h: Heads) requires chained(h), h.moves.len() == 0 || h.moves.last().from.is_none(), ensures rollback(h) == h,
+pub proof fn theorem_a_rollback_restores_the_version_before(h: Heads) requires chained(h), h.moves.len() > 0, h.moves.last().from.is_some(), 1 <= h.moves.last().from.unwrap() <= h.stored, ensures rollback(h).active == h.moves.last().from, rollback(h).moves.len() == h.moves.len() + 1, rollback(h).moves.last() == (Move { from: h.active, to: h.moves.last().from.unwrap() }), rollback(rollback(h)).active == h.active,
+pub proof fn theorem_a_rollback_after_v1_then_v2_makes_v1_active(stored: u64) requires stored >= 2, ensures rollback(activate_logged(activate_logged(Heads { stored, active: None, moves: Seq::empty() }, 1, None), 2, Some(1u64),),).active == Some(1u64),
+pub proof fn theorem_exactly_one_of_two_rollbacks_wins(h: Heads) requires chained(h), h.moves.len() > 0, h.moves.last().from.is_some(), 1 <= h.moves.last().from.unwrap() <= h.stored, ensures rollback(h).active != h.active, activate_logged(rollback(h), h.moves.last().from.unwrap(), Some(h.moves.last().to)) == rollback(h),
+pub open spec fn last_seq(h: Heads) -> Option < u64 > { if h.moves.len() == 0 { None } else { Some(h.moves.len() as u64) } }
+pub open spec fn rollback_swap(h: Heads, plan: RollbackPlan, read_seq: u64) -> Heads { let known = 1 <= plan.target && plan.target <= h.stored; if spec_decide_rollback(known, plan.expected, h.active, read_seq, last_seq(h)) != ActivateDecision::Activate { h } else if h.active == Some(plan.target) { h } else { Heads { stored: h.stored, active: Some(plan.target), moves: h.moves.push(Move { from: h.active, to: plan.target }), } } }
+pub proof fn theorem_a_stale_rollback_changes_nothing(h: Heads, plan: RollbackPlan, read_seq: u64) requires h.moves.len() <= u64::MAX, last_seq(h) != Some(read_seq), ensures rollback_swap(h, plan, read_seq) == h,
+pub proof fn theorem_a_fresh_rollback_swap_is_the_rollback(h: Heads) requires chained(h), h.moves.len() > 0, h.moves.len() <= u64::MAX, h.moves.last().from.is_some(), ensures rollback_swap(h, spec_rollback_target(h.moves.last().from, h.moves.last().to).unwrap(), h.moves.len() as u64,) == rollback(h),
+pub proof fn theorem_a_move_away_and_back_fails_a_stale_rollback(h: Heads) requires chained(h), h.stored >= 3, h.moves.len() > 0, h.moves.len() < 1000, h.active == Some(2u64), h.moves.last().from == Some(1u64), ensures rollback_swap(activate_logged(activate_logged(h, 3, Some(2u64)), 2, Some(3u64)), RollbackPlan { target: 1, expected: 2 }, h.moves.len() as u64,) == activate_logged(activate_logged(h, 3, Some(2u64)), 2, Some(3u64)), activate_logged(activate_logged(h, 3, Some(2u64)), 2, Some(3u64)).active == Some(2u64),
+pub enum AutoMoveDecision { Move, Conflict, CapReached, }
+pub open spec fn spec_decide_auto_move(expected: Option < u64 >, actual: Option < u64 >, used: u64, cap: Option < u32 >,) -> AutoMoveDecision { if expected != actual { AutoMoveDecision::Conflict } else { match cap { Some(limit) => if used >= limit as u64 { AutoMoveDecision::CapReached } else { AutoMoveDecision::Move }, None => AutoMoveDecision::Move, } } }
+pub fn decide_auto_move(expected: Option < u64 >, actual: Option < u64 >, used: u64, cap: Option < u32 >) -> (r: AutoMoveDecision) ensures r == spec_decide_auto_move(expected, actual, used, cap), r is Move ==> expected == actual, r is Move && cap is Some ==> used < cap -> 0 as u64,
+pub open spec fn spec_auto_day(cap: Option < u32 >, used: u64, attempts: nat) -> u64 decreases attempts, { if attempts == 0 { used } else { let next = if spec_decide_auto_move(None, None, used, cap) is Move { (used + 1) as u64 } else { used }; spec_auto_day(cap, next, (attempts - 1) as nat) } }
+pub proof fn theorem_an_auto_day_never_passes_the_cap(limit: u32, used: u64, attempts: nat) requires used <= limit as u64, ensures spec_auto_day(Some(limit), used, attempts) <= limit as u64, decreases attempts,
+pub proof fn theorem_a_stale_auto_move_conflicts(expected: Option < u64 >, actual: Option < u64 >, used: u64, cap: Option < u32 >,) requires expected != actual, ensures spec_decide_auto_move(expected, actual, used, cap) is Conflict,
 
 ## formal/verus/src/owner_fence.rs
 pub fn next_epoch(epoch: i64) -> (r: Option < i64 >) ensures epoch < i64::MAX ==> r == Some((epoch + 1) as i64), epoch == i64::MAX ==> r == None::< i64 >,
@@ -246,6 +383,60 @@ pub proof fn theorem_a_batch_fences_only_its_locked_rows(epochs: Seq < int >, lo
 pub open spec fn skip_locked(wanted: Set < int >, takeable: Set < int >, busy: Set < int >) -> Set < int > { wanted.intersect(takeable).difference(busy) }
 pub proof fn theorem_a_batch_keeps_each_epoch_under_a_commit(epochs: Seq < int >, wanted: Set < int >, takeable: Set < int >, busy: Set < int >, p: int, pinned: int, holder_matches: bool,) requires 0 <= p < epochs.len(), ensures busy.contains(p) ==> batch(epochs, skip_locked(wanted, takeable, busy)) [p] == epochs [p], busy.contains(p) && holder_matches && pinned == epochs [p] ==> (holder_matches && pinned == batch(epochs, skip_locked(wanted, takeable, busy)) [p]), batch(epochs, skip_locked(wanted, takeable, busy)) [p] != epochs [p] ==> (wanted.contains(p) && takeable.contains(p) &&! busy.contains(p)),
 
+## formal/verus/src/process_role.rs
+pub enum ProcessRole { Combined, Web, Worker, }
+impl Clone for ProcessRole {
+fn clone(& self) -> (r: Self) ensures r ==* self,
+}
+impl Copy for ProcessRole {
+}
+pub open spec fn spec_role_default(role: Option < ProcessRole >) -> bool { match role { Some(ProcessRole::Web) => false, _ => true, } }
+pub open spec fn spec_switch_value(explicit: Option < bool >, default: bool) -> bool { match explicit { Some(value) => value, None => default, } }
+pub open spec fn spec_contradicts(explicit: Option < bool >, role: Option < ProcessRole >) -> bool { match explicit { Some(value) => role.is_some() && value != spec_role_default(role), None => false, } }
+pub fn role_default(role: Option < ProcessRole >) -> (r: bool) ensures r == spec_role_default(role),
+pub fn switch_value(explicit: Option < bool >, default: bool) -> (r: bool) ensures r == spec_switch_value(explicit, default),
+pub fn contradicts_role(explicit: Option < bool >, role: Option < ProcessRole >) -> (r: bool) ensures r == spec_contradicts(explicit, role),
+pub fn resolve_switch(explicit: Option < bool >, role: Option < ProcessRole >) -> (r: (bool, bool)) ensures r.0 == spec_switch_value(explicit, spec_role_default(role)), r.1 == spec_contradicts(explicit, role),
+pub proof fn theorem_a_web_role_runs_nothing_by_default() ensures ! spec_switch_value(None, spec_role_default(Some(ProcessRole::Web))),
+pub proof fn theorem_a_worker_or_combined_role_runs_both_by_default(role: ProcessRole) requires role != ProcessRole::Web, ensures spec_switch_value(None, spec_role_default(Some(role))),
+pub proof fn theorem_no_role_keeps_the_old_default() ensures spec_switch_value(None, spec_role_default(None)),
+pub proof fn theorem_an_explicit_value_wins(value: bool, role: Option < ProcessRole >) ensures spec_switch_value(Some(value), spec_role_default(role)) == value,
+pub proof fn theorem_a_warning_marks_each_override(explicit: Option < bool >, role: Option < ProcessRole >,) ensures role.is_some() ==> (spec_contradicts(explicit, role) <==> spec_switch_value(explicit, spec_role_default(role),) != spec_role_default(role)), role.is_none() ==>! spec_contradicts(explicit, role),
+pub enum RetentionRunOn { Scheduler, All, }
+impl Clone for RetentionRunOn {
+fn clone(& self) -> (r: Self) ensures r ==* self,
+}
+impl Copy for RetentionRunOn {
+}
+pub open spec fn spec_retention_placed(run_on: RetentionRunOn, scheduler: bool) -> bool { match run_on { RetentionRunOn::Scheduler => scheduler, RetentionRunOn::All => true, } }
+pub open spec fn spec_runs_retention(enabled: bool, run_on: RetentionRunOn, scheduler: bool,) -> bool { enabled && spec_retention_placed(run_on, scheduler) }
+pub fn retention_placed(run_on: RetentionRunOn, scheduler: bool) -> (r: bool) ensures r == spec_retention_placed(run_on, scheduler),
+pub fn runs_retention(enabled: bool, run_on: RetentionRunOn, scheduler: bool) -> (r: bool) ensures r == spec_runs_retention(enabled, run_on, scheduler),
+pub proof fn theorem_retention_follows_the_scheduler(enabled: bool, scheduler: bool) ensures spec_runs_retention(enabled, RetentionRunOn::Scheduler, scheduler) == (enabled && scheduler),
+pub proof fn theorem_a_web_role_runs_no_retention_by_default(enabled: bool) ensures ! spec_runs_retention(enabled, RetentionRunOn::Scheduler, spec_switch_value(None, spec_role_default(Some(ProcessRole::Web))),),
+pub proof fn theorem_other_roles_run_retention_by_default(role: Option < ProcessRole >) requires role != Some(ProcessRole::Web), ensures spec_runs_retention(true, RetentionRunOn::Scheduler, spec_switch_value(None, spec_role_default(role)),),
+pub proof fn theorem_an_explicit_scheduler_moves_retention(enabled: bool, scheduler: bool, role: Option < ProcessRole >,) ensures spec_runs_retention(enabled, RetentionRunOn::Scheduler, spec_switch_value(Some(scheduler), spec_role_default(role)),) == (enabled && scheduler),
+pub proof fn theorem_run_on_all_runs_retention_everywhere(enabled: bool, scheduler: bool) ensures spec_runs_retention(enabled, RetentionRunOn::All, scheduler) == enabled,
+pub proof fn theorem_disabled_retention_never_runs(run_on: RetentionRunOn, scheduler: bool) ensures ! spec_runs_retention(false, run_on, scheduler),
+
+## formal/verus/src/refine_policy.rs
+pub enum AdoptDecision { Adopt, Unchanged, NeedsApproval, CapReached, }
+pub open spec fn spec_parts_allowed(changed: u8, allowed: u8) -> bool { changed &! allowed == 0 }
+pub fn parts_allowed(changed: u8, allowed: u8) -> (r: bool) ensures r == spec_parts_allowed(changed, allowed),
+pub open spec fn spec_decide_adoption(allowed: u8, changed: u8, used_today: u32, cap: Option < u32 >,) -> AdoptDecision { if changed == 0 { AdoptDecision::Unchanged } else if ! spec_parts_allowed(changed, allowed) { AdoptDecision::NeedsApproval } else { match cap { Some(limit) => if used_today < limit { AdoptDecision::Adopt } else { AdoptDecision::CapReached }, None => AdoptDecision::Adopt, } } }
+pub fn decide_adoption(allowed: u8, changed: u8, used_today: u32, cap: Option < u32 >) -> (r: AdoptDecision) ensures r == spec_decide_adoption(allowed, changed, used_today, cap), r is Adopt ==> changed != 0, r is Adopt ==> spec_parts_allowed(changed, allowed), r is Adopt && cap is Some ==> used_today < cap -> 0,
+proof fn lemma_nothing_allowed(changed: u8) by (bit_vector) requires changed != 0, ensures changed &! 0u8 != 0,
+proof fn lemma_superset_allows(changed: u8, allowed: u8, wider: u8) by (bit_vector) requires changed &! allowed == 0, allowed &! wider == 0, ensures changed &! wider == 0,
+pub proof fn theorem_the_default_never_adopts(changed: u8, used_today: u32, cap: Option < u32 >) ensures ! (spec_decide_adoption(0, changed, used_today, cap) is Adopt),
+pub proof fn theorem_an_empty_change_is_unchanged(allowed: u8, used_today: u32, cap: Option < u32 >) ensures spec_decide_adoption(allowed, 0, used_today, cap) is Unchanged,
+pub proof fn theorem_a_wider_policy_keeps_an_adoption(allowed: u8, wider: u8, changed: u8, used_today: u32, cap: Option < u32 >,) requires allowed &! wider == 0, spec_decide_adoption(allowed, changed, used_today, cap) is Adopt, ensures spec_decide_adoption(wider, changed, used_today, cap) is Adopt,
+pub open spec fn spec_day(allowed: u8, cap: Option < u32 >, used: u32, changes: Seq < u8 >,) -> u32 decreases changes.len(), { if changes.len() == 0 { used } else { let next = if spec_decide_adoption(allowed, changes [0], used, cap) is Adopt { (used + 1) as u32 } else { used }; spec_day(allowed, cap, next, changes.subrange(1, changes.len() as int)) } }
+pub proof fn theorem_a_day_never_passes_the_cap(allowed: u8, limit: u32, used: u32, changes: Seq < u8 >,) requires used <= limit, ensures spec_day(allowed, Some(limit), used, changes) <= limit, decreases changes.len(),
+pub proof fn theorem_a_full_day_adopts_nothing(allowed: u8, limit: u32, used: u32, changed: u8) requires used >= limit, ensures ! (spec_decide_adoption(allowed, changed, used, Some(limit)) is Adopt),
+pub open spec fn spec_gate_timed_out(requested_ms: u64, now_ms: u64, timeout_ms: u64) -> bool { now_ms as int >= requested_ms as int + timeout_ms as int }
+pub fn gate_timed_out(requested_ms: u64, now_ms: u64, timeout_ms: u64) -> (r: bool) ensures r == spec_gate_timed_out(requested_ms, now_ms, timeout_ms),
+pub proof fn theorem_a_timeout_is_final(requested_ms: u64, now_ms: u64, later_ms: u64, timeout_ms: u64,) requires spec_gate_timed_out(requested_ms, now_ms, timeout_ms), later_ms >= now_ms, ensures spec_gate_timed_out(requested_ms, later_ms, timeout_ms),
+
 ## formal/verus/src/scan_skip.rs
 pub open spec fn skips(next: Seq < usize >, dead: Set < int >, k: int) -> bool { forall | m: int | k <= m < next [k] ==> #[trigger] dead.contains(m) }
 pub open spec fn links(next: Seq < usize >, dead: Set < int >) -> bool { &&& next.len() > 0 &&& next [next.len() - 1] == next.len() - 1 &&& forall | k: int | 0 <= k < next.len() ==> k <= #[trigger] next [k] < next.len() &&& forall | k: int | 0 <= k < next.len() ==> #[trigger] skips(next, dead, k) }
@@ -255,3 +446,21 @@ pub fn first_live(next:& mut [usize], from: usize, is_dead: impl Fn(usize) -> bo
 pub proof fn theorem_a_new_list_is_sound(next: Seq < usize >, dead: Set < int >) requires next.len() > 0, forall | k: int | 0 <= k < next.len() ==> #[trigger] next [k] == k, ensures links(next, dead),
 pub proof fn theorem_an_added_entry_keeps_the_links(next: Seq < usize >, dead: Set < int >) requires links(next, dead), next.len() < usize::MAX, ensures links(next.push(next.len() as usize), dead),
 pub proof fn theorem_more_dead_entries_keep_the_links(next: Seq < usize >, dead: Set < int >, more: Set < int >,) requires links(next, dead), dead.subset_of(more), ensures links(next, more),
+
+## formal/verus/src/worker_queues.rs
+pub enum QueueSource { Code, Explicit, Role, }
+impl Clone for QueueSource {
+fn clone(& self) -> (r: Self) ensures r ==* self,
+}
+impl Copy for QueueSource {
+}
+pub open spec fn spec_queue_source(explicit: bool, pin_hits: bool) -> QueueSource { if explicit { QueueSource::Explicit } else if pin_hits { QueueSource::Role } else { QueueSource::Code } }
+pub open spec fn spec_pin_misses(explicit: bool, pin_set: bool, pin_hits: bool) -> bool { ! explicit && pin_set &&! pin_hits }
+pub fn queue_source(explicit: bool, pin_hits: bool) -> (r: QueueSource) ensures r == spec_queue_source(explicit, pin_hits),
+pub fn pin_misses(explicit: bool, pin_set: bool, pin_hits: bool) -> (r: bool) ensures r == spec_pin_misses(explicit, pin_set, pin_hits),
+pub proof fn theorem_an_explicit_list_wins(pin_hits: bool) ensures spec_queue_source(true, pin_hits) == QueueSource::Explicit,
+pub proof fn theorem_a_hitting_pin_applies() ensures spec_queue_source(false, true) == QueueSource::Role,
+pub proof fn theorem_no_selection_keeps_the_code_set() ensures spec_queue_source(false, false) == QueueSource::Code,
+pub proof fn theorem_the_role_applies_only_below_config(explicit: bool, pin_hits: bool) ensures (spec_queue_source(explicit, pin_hits) == QueueSource::Role) <==> (! explicit && pin_hits),
+pub proof fn theorem_a_miss_keeps_the_code_set(explicit: bool, pin_set: bool, pin_hits: bool) ensures spec_pin_misses(explicit, pin_set, pin_hits) ==> spec_queue_source(explicit, pin_hits) == QueueSource::Code,
+pub proof fn theorem_no_pin_or_config_never_warns(explicit: bool, pin_set: bool, pin_hits: bool) ensures (! pin_set || explicit) ==>! spec_pin_misses(explicit, pin_set, pin_hits),

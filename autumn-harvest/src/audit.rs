@@ -74,6 +74,32 @@ pub const OP_DAG_PATCH: &str = "dag.patch";
 /// Audit operation: Set, changed or cleared the run-default override of a
 /// workflow type (issue #2387).
 pub const OP_WORKFLOW_TYPE_RUN_DEFAULTS: &str = "workflow_type.run_defaults";
+/// Audit operation: Set the sampling policy of an agent kind (issue #2439).
+pub const OP_AGENT_SAMPLING_POLICY_SET: &str = "agent.sampling_policy.set";
+/// Audit operation: Reset the sampling policy of an agent kind to every
+/// default (issue #2439).
+pub const OP_AGENT_SAMPLING_POLICY_RESET: &str = "agent.sampling_policy.reset";
+/// Audit operation: Activated an agent profile overlay version (issue
+/// #2374).
+///
+/// The target id is the agent kind. A succeeded row keeps `from v1 to v2` in
+/// `error_summary`, so the export ships both ends of the move.
+pub const OP_AGENT_PROFILE_ACTIVATE: &str = "agent_profile.activate";
+/// Audit operation: Rolled an agent profile overlay back to the version
+/// that was active before the current one (issue #2374).
+///
+/// The row has the same form as [`OP_AGENT_PROFILE_ACTIVATE`].
+pub const OP_AGENT_PROFILE_ROLLBACK: &str = "agent_profile.rollback";
+/// Audit operation: Set the refine policy of an agent kind (issue #2394).
+///
+/// The target id is the agent kind. A succeeded row keeps the revision and
+/// each changed key with its old and new value in `error_summary`.
+pub const OP_AGENT_PROFILE_POLICY_SET: &str = "agent_profile.policy_set";
+/// Audit operation: Reset the refine policy of an agent kind to every
+/// default (issue #2394).
+///
+/// The row has the same form as [`OP_AGENT_PROFILE_POLICY_SET`].
+pub const OP_AGENT_PROFILE_POLICY_RESET: &str = "agent_profile.policy_reset";
 /// Audit operation: Created a new workflow schedule.
 pub const OP_SCHEDULE_CREATE: &str = "schedule.create";
 /// Audit operation: Edited an existing workflow schedule in place (issue #771).
@@ -313,6 +339,10 @@ pub const TARGET_AUDIT_EXPORT: &str = "audit_export";
 pub const TARGET_ROUTE: &str = "route";
 /// Audit target type: a registered workflow type (issue #2387).
 pub const TARGET_WORKFLOW_TYPE: &str = "workflow_type";
+/// Audit target type: an agent kind (issue #2439).
+pub const TARGET_AGENT_KIND: &str = "agent_kind";
+/// Audit target type: the overlay pointer of one agent kind (issue #2374).
+pub const TARGET_AGENT_PROFILE: &str = "agent_profile";
 
 // ── Status constants ──────────────────────────────────────────────────────────
 
@@ -554,6 +584,43 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
     (
         "PATCH /admin/workflow-types/{workflow_name}/run-defaults",
         RouteClass::Mutating,
+    ),
+    // The sampling policy of an agent kind (issue #2439). Only an operator
+    // sets or resets it.
+    (
+        "GET /admin/agents/{kind}/sampling-policy",
+        RouteClass::ReadOnly,
+    ),
+    (
+        "PUT /admin/agents/{kind}/sampling-policy",
+        RouteClass::Mutating,
+    ),
+    (
+        "DELETE /admin/agents/{kind}/sampling-policy",
+        RouteClass::Mutating,
+    ),
+    // Agent profile overlays (issue #2374). The writes are not admin-only,
+    // so the `harvest-operator` role reaches them.
+    ("GET /agents/{kind}/profile", RouteClass::ReadOnly),
+    ("GET /agents/{kind}/profile/versions", RouteClass::ReadOnly),
+    (
+        "GET /agents/{kind}/profile/versions/{version}",
+        RouteClass::ReadOnly,
+    ),
+    ("GET /agents/{kind}/profile/diff", RouteClass::ReadOnly),
+    ("POST /agents/{kind}/profile/activate", RouteClass::Mutating),
+    ("POST /agents/{kind}/profile/rollback", RouteClass::Mutating),
+    // The refine policy of an agent kind (issue #2394). Only the operator
+    // role sets or resets it.
+    ("GET /agents/{kind}/profile/policy", RouteClass::ReadOnly),
+    ("PUT /agents/{kind}/profile/policy", RouteClass::Mutating),
+    (
+        "POST /agents/{kind}/profile/policy/reset",
+        RouteClass::Mutating,
+    ),
+    (
+        "GET /agents/{kind}/profile/policy/changes",
+        RouteClass::ReadOnly,
     ),
     ("GET /admin/history/exports", RouteClass::ReadOnly),
     ("GET /admin/history/export-sample", RouteClass::ReadOnly),
@@ -938,6 +1005,12 @@ pub const AUDITED_OPERATIONS: &[&str] = &[
     OP_DAG_TRIGGER,
     OP_DAG_PATCH,
     OP_WORKFLOW_TYPE_RUN_DEFAULTS,
+    OP_AGENT_SAMPLING_POLICY_SET,
+    OP_AGENT_SAMPLING_POLICY_RESET,
+    OP_AGENT_PROFILE_ACTIVATE,
+    OP_AGENT_PROFILE_ROLLBACK,
+    OP_AGENT_PROFILE_POLICY_SET,
+    OP_AGENT_PROFILE_POLICY_RESET,
     OP_SCHEDULE_CREATE,
     OP_SCHEDULE_UPDATE,
     OP_SCHEDULE_PAUSE,
@@ -1304,6 +1377,40 @@ pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
         "PATCH /admin/workflow-types/{workflow_name}/run-defaults",
         Some(OP_WORKFLOW_TYPE_RUN_DEFAULTS),
     ),
+    // The sampling policy of an agent kind (issue #2439).
+    ("GET /admin/agents/{kind}/sampling-policy", None),
+    (
+        "PUT /admin/agents/{kind}/sampling-policy",
+        Some(OP_AGENT_SAMPLING_POLICY_SET),
+    ),
+    (
+        "DELETE /admin/agents/{kind}/sampling-policy",
+        Some(OP_AGENT_SAMPLING_POLICY_RESET),
+    ),
+    // Agent profile overlays (issue #2374).
+    ("GET /agents/{kind}/profile", None),
+    ("GET /agents/{kind}/profile/versions", None),
+    ("GET /agents/{kind}/profile/versions/{version}", None),
+    ("GET /agents/{kind}/profile/diff", None),
+    (
+        "POST /agents/{kind}/profile/activate",
+        Some(OP_AGENT_PROFILE_ACTIVATE),
+    ),
+    (
+        "POST /agents/{kind}/profile/rollback",
+        Some(OP_AGENT_PROFILE_ROLLBACK),
+    ),
+    // The refine policy of an agent kind (issue #2394).
+    ("GET /agents/{kind}/profile/policy", None),
+    (
+        "PUT /agents/{kind}/profile/policy",
+        Some(OP_AGENT_PROFILE_POLICY_SET),
+    ),
+    (
+        "POST /agents/{kind}/profile/policy/reset",
+        Some(OP_AGENT_PROFILE_POLICY_RESET),
+    ),
+    ("GET /agents/{kind}/profile/policy/changes", None),
     ("GET /admin/history/exports", None),
     ("GET /admin/history/export-sample", None),
     ("GET /admin/external-handoffs", None),

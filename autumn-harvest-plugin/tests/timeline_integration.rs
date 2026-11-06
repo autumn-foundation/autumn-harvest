@@ -42,6 +42,9 @@ use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use tower::ServiceExt;
 
+#[path = "support/wire_contract.rs"]
+mod wire_contract;
+
 // DELIBERATE PARTIAL-SCHEMA FIXTURE — do NOT convert to `test_init_sql()`.
 // `timeline_classic_dag_run_returns_404` inserts a classic DAG run row directly
 // into `harvest_dag_runs`, but migration 20260514000000_drop_harvest_dag_runs
@@ -359,6 +362,7 @@ async fn seed_running(conn: &mut AsyncPgConnection, workflow_id: &str) -> Execut
             scheduled_for: None,
             workflow_attempt: 1,
             workflow_retry_policy: None,
+            workflow_retry_source: autumn_harvest::workflow_retry::RetryPolicySource::Type,
             retry_of_exec_id: None,
             max_workflow_attempts_ceiling: None,
             origin: None,
@@ -591,6 +595,8 @@ async fn timeline_completed_reconstructs_steps_with_split_and_slowest() {
     assert_eq!(body["rollup"]["busy_ms"], 8_000);
     assert_eq!(body["rollup"]["wait_ms"], 32_000);
     assert_eq!(body["rollup"]["total_wall_clock_ms"], 50_000);
+    // The shared shape check that the SQLite suite runs too (issue #2468).
+    wire_contract::timeline_shape(&body);
 }
 
 /// (3) A RUNNING (non-terminal) execution with an open activity → the step

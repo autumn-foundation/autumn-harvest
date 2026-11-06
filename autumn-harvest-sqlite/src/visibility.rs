@@ -345,6 +345,49 @@ impl SqliteReader {
         Ok(history)
     }
 
+    /// One page of the event history of `exec`, oldest first (issue #2489).
+    ///
+    /// It follows the Postgres cursor contract. See
+    /// [`HistoryPage`](crate::HistoryPage) for the ids.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqliteError::ExecutionNotFound`] for an unknown id. Returns
+    /// [`SqliteError::Sqlite`] if the query fails, and a JSON error for a row
+    /// that does not parse.
+    pub fn history_page(
+        &self,
+        exec: ExecutionId,
+        filter: &crate::HistoryFilter,
+    ) -> SqliteResult<crate::HistoryPage> {
+        crate::history_page::history_page(&self.conn, exec, filter)
+    }
+
+    /// The run that `exec` continued as, or the retry that it started, if
+    /// any (issue #2489). See
+    /// [`SqliteRuntime::successor`](crate::SqliteRuntime::successor).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqliteError::ExecutionNotFound`] for an unknown id. Returns
+    /// [`SqliteError::Sqlite`] if the query fails.
+    pub fn successor(&self, exec: ExecutionId) -> SqliteResult<Option<ExecutionId>> {
+        crate::store::successor(&self.conn, exec)
+    }
+
+    /// The parent run of `exec`, if it is a child run (issue #2489).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqliteError::ExecutionNotFound`] for an unknown id. Returns
+    /// [`SqliteError::Sqlite`] if the query fails.
+    pub fn parent(&self, exec: ExecutionId) -> SqliteResult<Option<ExecutionId>> {
+        if !crate::store::execution_exists(&self.conn, exec)? {
+            return Err(SqliteError::ExecutionNotFound(exec));
+        }
+        Ok(crate::store::parent_link(&self.conn, exec)?.map(|(parent, _)| parent))
+    }
+
     /// The cost ledger rows of `exec` (issue #2275). See
     /// [`SqliteRuntime::llm_ledger`](crate::SqliteRuntime::llm_ledger).
     ///
@@ -377,6 +420,155 @@ impl SqliteReader {
         until: DateTime<Utc>,
     ) -> SqliteResult<Vec<LlmLedgerRow>> {
         crate::llm_ledger::rows_between(&self.conn, from, until)
+    }
+
+    /// Every stored schedule, by workflow name (issue #2471). See
+    /// [`SqliteRuntime::list_schedules`](crate::SqliteRuntime::list_schedules).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqliteError::Corrupt`] for a stored value that does not
+    /// parse, and [`SqliteError::Sqlite`] if the query fails.
+    pub fn list_schedules(&self) -> SqliteResult<Vec<crate::ScheduleSummary>> {
+        crate::schedule::list(&self.conn)
+    }
+
+    /// The stored operator override of the schedule of `workflow_name`, if
+    /// any (issue #2471).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqliteError::Corrupt`] for a stored override that does not
+    /// parse, and [`SqliteError::Sqlite`] if the query fails.
+    pub fn schedule_override(
+        &self,
+        workflow_name: &str,
+    ) -> SqliteResult<Option<crate::ScheduleOverride>> {
+        crate::schedule::load_override(&self.conn, workflow_name)
+    }
+}
+
+/// The operator reads of the management API (issue #2468).
+impl SqliteReader {
+    /// The number of runs per `(state, workflow_name)` group.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqliteError::Sqlite`] if the query fails.
+    pub fn count_executions(
+        &self,
+        filter: &crate::CountFilter,
+    ) -> SqliteResult<Vec<crate::ExecutionCount>> {
+        crate::operator::count(&self.conn, filter)
+    }
+
+    /// The child runs of each of `parents`, oldest start first, as on
+    /// Postgres. `limit` caps the rows over all parents.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqliteError::Sqlite`] if the query fails, and
+    /// [`SqliteError::Corrupt`] for a row that does not parse.
+    pub fn children(
+        &self,
+        parents: &[ExecutionId],
+        limit: Option<u32>,
+    ) -> SqliteResult<Vec<crate::ChildRun>> {
+        crate::operator::children(&self.conn, parents, limit)
+    }
+
+    /// The parent of `exec` and its close policy, for a child run.
+    ///
+    /// The policy is `None` for an awaited child, and names the policy of a
+    /// detached child, such as `abandon`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqliteError::ExecutionNotFound`] for an unknown id. Returns
+    /// [`SqliteError::Sqlite`] if the query fails.
+    pub fn parent_link(
+        &self,
+        exec: ExecutionId,
+    ) -> SqliteResult<Option<(ExecutionId, Option<String>)>> {
+        if !crate::store::execution_exists(&self.conn, exec)? {
+            return Err(SqliteError::ExecutionNotFound(exec));
+        }
+        crate::store::parent_link(&self.conn, exec)
+    }
+
+    /// The runs of `parents` that have at least one child.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`children`](Self::children).
+    pub fn parents_with_children(&self, parents: &[ExecutionId]) -> SqliteResult<Vec<ExecutionId>> {
+        crate::operator::parents_with_children(&self.conn, parents)
+    }
+
+    /// The history of `exec`, oldest first, with the append time of each
+    /// event.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqliteError::ExecutionNotFound`] for an unknown id, and a
+    /// JSON error for a row that does not parse.
+    pub fn timed_history(&self, exec: ExecutionId) -> SqliteResult<Vec<crate::TimedEvent>> {
+        crate::operator::timed_history(&self.conn, exec)
+    }
+
+    /// The open tasks, the unfired timers and the undelivered signals of
+    /// `exec`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqliteError::ExecutionNotFound`] for an unknown id, and
+    /// [`SqliteError::Corrupt`] for a row that does not parse.
+    pub fn pending_work(&self, exec: ExecutionId) -> SqliteResult<crate::PendingWork> {
+        crate::operator::pending_work(&self.conn, exec)
+    }
+
+    /// One page of the durable log lines of `exec`, in emission order.
+    ///
+    /// The caller checks that the run exists. A run with no line reads as an
+    /// empty page.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqliteError::Sqlite`] if the query fails.
+    pub fn workflow_logs(
+        &self,
+        exec: ExecutionId,
+        filter: &crate::LogFilter,
+    ) -> SqliteResult<Vec<crate::LogLine>> {
+        crate::workflow_log::load(&self.conn, exec, filter)
+    }
+
+    /// The number of real log lines of `exec`. The marker does not count.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqliteError::Sqlite`] if the query fails.
+    pub fn count_workflow_logs(&self, exec: ExecutionId) -> SqliteResult<i64> {
+        crate::workflow_log::count(&self.conn, exec)
+    }
+
+    /// Whether `exec` reached its log line cap.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqliteError::Sqlite`] if the query fails.
+    pub fn workflow_log_truncated(&self, exec: ExecutionId) -> SqliteResult<bool> {
+        crate::workflow_log::truncated(&self.conn, exec)
+    }
+
+    /// The rows that a replay of `exec` reads.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqliteError::ExecutionNotFound`] for an unknown id, or a
+    /// read error.
+    pub fn replay_input(&self, exec: ExecutionId) -> SqliteResult<crate::ReplayInput> {
+        crate::query::ReplayInput::load(&self.conn, exec)
     }
 }
 

@@ -846,6 +846,8 @@ impl HandlerRegistry {
                             runbook_url: w.runbook_url.map(String::from),
                             severity: w.severity.map(String::from),
                             input_schema: w.input_schema,
+                            execution_timeout: w.execution_timeout,
+                            chain_execution_timeout: w.chain_execution_timeout,
                             sla: w.sla,
                             retry_policy: w.retry_policy.clone(),
                             quota: w.quota,
@@ -861,6 +863,24 @@ impl HandlerRegistry {
         let run_defaults: Arc<crate::run_defaults::RunDefaultsCache> = Arc::default();
         if let Ok(mut lock) = crate::completion_trigger::GLOBAL_RUN_DEFAULTS.write() {
             *lock = Some(Arc::clone(&run_defaults));
+        }
+        // The fleet ceilings reset with the other mirrors, so a registry built
+        // without the setters never inherits the ceilings of an earlier one.
+        // The setters run after the constructor and write the real values.
+        if let Ok(mut lock) =
+            crate::completion_trigger::GLOBAL_MAX_WORKFLOW_EXECUTION_TIMEOUT.write()
+        {
+            *lock = None;
+        }
+        if let Ok(mut lock) = crate::completion_trigger::GLOBAL_MAX_WORKFLOW_CHAIN_TIMEOUT.write() {
+            *lock = None;
+        }
+        // The failure path clamps a retry override to this ceiling (issue
+        // #2409), so it resets with the other ceilings.
+        if let Ok(mut lock) =
+            crate::completion_trigger::GLOBAL_MAX_WORKFLOW_ATTEMPTS_CEILING.write()
+        {
+            *lock = None;
         }
         let mut activities: HashMap<String, ActivityInfo> = activities
             .into_iter()
@@ -1041,12 +1061,16 @@ impl HandlerRegistry {
     /// chain default (issue #617). Applied to scheduler-fired starts so a whole
     /// scheduled continue-as-new chain is capped even when a workflow
     /// under-specifies (AC4).
+    ///
+    /// The setter also writes the mirror that the completion-trigger path
+    /// reads (issue #2511).
     #[must_use]
-    pub const fn with_max_workflow_chain_timeout(
-        mut self,
-        ceiling: Option<std::time::Duration>,
-    ) -> Self {
+    pub fn with_max_workflow_chain_timeout(mut self, ceiling: Option<std::time::Duration>) -> Self {
         self.max_workflow_chain_timeout = ceiling;
+        #[cfg(feature = "db")]
+        if let Ok(mut lock) = crate::completion_trigger::GLOBAL_MAX_WORKFLOW_CHAIN_TIMEOUT.write() {
+            *lock = ceiling;
+        }
         self
     }
 
@@ -1055,12 +1079,21 @@ impl HandlerRegistry {
     /// manual DAG trigger starts so a fleet-wide cap configured via
     /// `HarvestBuilder::max_workflow_execution_timeout` reaches
     /// scheduler-initiated starts identically to manual/HTTP starts.
+    ///
+    /// The setter also writes the mirror that the completion-trigger path
+    /// reads (issue #2511).
     #[must_use]
-    pub const fn with_max_workflow_execution_timeout(
+    pub fn with_max_workflow_execution_timeout(
         mut self,
         ceiling: Option<std::time::Duration>,
     ) -> Self {
         self.max_workflow_execution_timeout = ceiling;
+        #[cfg(feature = "db")]
+        if let Ok(mut lock) =
+            crate::completion_trigger::GLOBAL_MAX_WORKFLOW_EXECUTION_TIMEOUT.write()
+        {
+            *lock = ceiling;
+        }
         self
     }
 
@@ -1099,6 +1132,66 @@ impl HandlerRegistry {
     ) -> (Option<std::time::Duration>, Option<std::time::Duration>) {
         self.run_defaults
             .apply(workflow_name, execution_timeout, sla)
+    }
+
+    /// The effective chain cap of a registered workflow type (issue #2406).
+    ///
+    /// An operator override wins over the declared value. Every start of a
+    /// new chain resolves its chain cap here, or through
+    /// [`Self::apply_chain_run_default`]. The start then applies the fleet
+    /// chain ceiling. The call reads memory only.
+    #[must_use]
+    pub fn chain_execution_timeout(&self, workflow_name: &str) -> Option<std::time::Duration> {
+        let declared = self
+            .workflows
+            .get(workflow_name)
+            .and_then(|info| info.chain_execution_timeout);
+        self.apply_chain_run_default(workflow_name, declared)
+    }
+
+    /// Apply the chain cap override to a declared value (issue #2406).
+    ///
+    /// A start path that already holds the declared value calls this.
+    #[must_use]
+    pub fn apply_chain_run_default(
+        &self,
+        workflow_name: &str,
+        declared: Option<std::time::Duration>,
+    ) -> Option<std::time::Duration> {
+        self.run_defaults.apply_chain(workflow_name, declared)
+    }
+
+    /// The effective concurrency policy of a registered workflow type
+    /// (issue #2407).
+    ///
+    /// An operator override of the limit wins over the declared limit. The
+    /// key and `on_conflict` stay as declared. A start path that holds the
+    /// registry resolves its policy here, or through
+    /// [`Self::apply_concurrency_run_default`]. The call reads memory only.
+    #[must_use]
+    pub fn concurrency_policy(
+        &self,
+        workflow_name: &str,
+    ) -> Option<crate::concurrency::ConcurrencyPolicy> {
+        self.apply_concurrency_run_default(
+            workflow_name,
+            self.workflows
+                .get(workflow_name)
+                .and_then(|info| info.concurrency),
+        )
+    }
+
+    /// Apply the concurrency limit override to a declared policy
+    /// (issue #2407).
+    ///
+    /// A start path that already holds the declared policy calls this.
+    #[must_use]
+    pub fn apply_concurrency_run_default(
+        &self,
+        workflow_name: &str,
+        declared: Option<crate::concurrency::ConcurrencyPolicy>,
+    ) -> Option<crate::concurrency::ConcurrencyPolicy> {
+        self.run_defaults.apply_concurrency(workflow_name, declared)
     }
 
     /// Attach the large-payload offloader (issue #524).
@@ -1879,6 +1972,121 @@ mod resolve_dispatch_deadline_tests {
                 max_execution_timeout_ceiling: Some(chrono::Duration::seconds(3600)),
             }
         );
+    }
+
+    /// Issue #2406: the operator override of the chain cap wins over the
+    /// declared value. A field that the override does not set inherits it.
+    #[test]
+    fn the_chain_override_wins_over_the_declared_value() {
+        let hour = std::time::Duration::from_hours(1);
+        let mut declared = deadline_info_fixture("wf", None, None);
+        declared.chain_execution_timeout = Some(hour);
+        let registry = HandlerRegistry::new(vec![declared], vec![]);
+        assert_eq!(registry.chain_execution_timeout("wf"), Some(hour));
+
+        registry.run_defaults().write_through(
+            "wf",
+            crate::run_defaults::RunDefaultFields {
+                chain_execution_timeout: Some(2 * hour),
+                ..crate::run_defaults::RunDefaultFields::default()
+            },
+        );
+        assert_eq!(registry.chain_execution_timeout("wf"), Some(2 * hour));
+        assert_eq!(registry.apply_chain_run_default("wf", None), Some(2 * hour));
+        assert_eq!(registry.chain_execution_timeout("unregistered"), None);
+
+        // A child is a new chain, so it takes the override too.
+        let child = resolve_child_workflow_defaults(&registry, "wf");
+        assert_eq!(
+            child.chain_execution_timeout,
+            chrono::Duration::from_std(2 * hour).ok()
+        );
+
+        registry
+            .run_defaults()
+            .write_through("wf", crate::run_defaults::RunDefaultFields::default());
+        assert_eq!(registry.chain_execution_timeout("wf"), Some(hour));
+    }
+
+    /// Issue #2407: the operator override of the concurrency limit reaches a
+    /// worker-side enqueue, such as a child spawn. The key stays declared.
+    #[test]
+    fn the_concurrency_override_reaches_a_worker_enqueue() {
+        let mut declared = deadline_info_fixture("wf", None, None);
+        declared.concurrency = Some(crate::concurrency::ConcurrencyPolicy::new(
+            "input.tenant",
+            2,
+        ));
+        let registry = HandlerRegistry::new(
+            vec![declared, deadline_info_fixture("plain", None, None)],
+            vec![],
+        );
+        let input = serde_json::json!({ "tenant": "acme" });
+        assert_eq!(
+            resolve_workflow_concurrency(&registry, "wf", &input),
+            (Some("acme".to_string()), Some(2))
+        );
+
+        let fields = crate::run_defaults::RunDefaultFields {
+            concurrency_limit: Some(7),
+            ..crate::run_defaults::RunDefaultFields::default()
+        };
+        registry.run_defaults().write_through("wf", fields);
+        registry.run_defaults().write_through("plain", fields);
+        assert_eq!(
+            resolve_workflow_concurrency(&registry, "wf", &input),
+            (Some("acme".to_string()), Some(7))
+        );
+        assert_eq!(registry.concurrency_policy("wf").map(|p| p.limit), Some(7));
+        assert_eq!(
+            resolve_workflow_concurrency(&registry, "plain", &input),
+            (None, None),
+            "an override needs a declared policy"
+        );
+        assert_eq!(registry.concurrency_policy("unregistered"), None);
+    }
+
+    /// Issue #2407: a same-type successor or a retry keeps its stored cap,
+    /// and takes a raise, never a drop.
+    #[test]
+    fn a_carried_cap_takes_a_raise_and_never_a_drop() {
+        let policy = |limit| Some(crate::concurrency::ConcurrencyPolicy::new("input.k", limit));
+        assert_eq!(carried_concurrency_cap(Some(2), policy(5)), Some(5));
+        assert_eq!(carried_concurrency_cap(Some(5), policy(2)), Some(5));
+        assert_eq!(carried_concurrency_cap(Some(3), None), Some(3));
+        assert_eq!(carried_concurrency_cap(None, policy(5)), None);
+        assert_eq!(carried_concurrency_cap(Some(-1), policy(5)), None);
+    }
+
+    /// Issue #2406 AC2: the fleet chain ceiling caps the chain cap of a child,
+    /// override included. A child type with no cap stays uncapped.
+    #[test]
+    fn the_fleet_chain_ceiling_caps_a_child_override() {
+        let hour = std::time::Duration::from_hours(1);
+        let registry = HandlerRegistry::new(
+            vec![
+                deadline_info_fixture("wf", None, None),
+                deadline_info_fixture("uncapped", None, None),
+            ],
+            vec![],
+        )
+        .with_max_workflow_chain_timeout(Some(2 * hour));
+        registry.run_defaults().write_through(
+            "wf",
+            crate::run_defaults::RunDefaultFields {
+                chain_execution_timeout: Some(10 * hour),
+                ..crate::run_defaults::RunDefaultFields::default()
+            },
+        );
+        let child = resolve_child_workflow_defaults(&registry, "wf");
+        assert_eq!(
+            child.chain_execution_timeout,
+            Some(chrono::Duration::hours(2))
+        );
+        let deadline = child.chain_deadline_at.expect("a chain deadline");
+        assert!(deadline <= chrono::Utc::now() + chrono::Duration::hours(2));
+        let uncapped = resolve_child_workflow_defaults(&registry, "uncapped");
+        assert_eq!(uncapped.chain_execution_timeout, None);
     }
 
     /// A DAG's shadow `WorkflowInfo` resolves through the exact same code
@@ -9714,6 +9922,20 @@ async fn clear_nd_block(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> H
     Ok(())
 }
 
+/// The cap that a same-type successor or a retry carries over from its task
+/// row (issue #2407).
+///
+/// The new row is the same run in flight, so it keeps the stored cap. A
+/// current limit above that cap replaces it, so a raise reaches a long chain.
+/// A lower limit never tightens a run in flight. A row with no cap keeps none.
+fn carried_concurrency_cap(
+    stored: Option<i32>,
+    current: Option<crate::concurrency::ConcurrencyPolicy>,
+) -> Option<u32> {
+    let stored = stored.and_then(|cap| u32::try_from(cap).ok())?;
+    Some(current.map_or(stored, |policy| stored.max(policy.limit)))
+}
+
 /// Resolve `(concurrency_key, limit)` for a worker-side enqueue.
 ///
 /// Deliberately does NOT surface [`crate::concurrency::ConcurrencyOnConflict`]
@@ -9729,9 +9951,7 @@ fn resolve_workflow_concurrency(
     input: &serde_json::Value,
 ) -> (Option<String>, Option<u32>) {
     registry
-        .workflows
-        .get(workflow_name)
-        .and_then(|info| info.concurrency.as_ref())
+        .concurrency_policy(workflow_name)
         .map_or((None, None), |policy| {
             let key = crate::concurrency::resolve_concurrency_key(policy.key_expr, input);
             (key, Some(policy.limit))
@@ -9936,6 +10156,14 @@ pub async fn persist_workflow_failure(
             .unwrap_or_else(|| exec_id.shard()),
     };
 
+    // The stored policy of this run and its source (issue #2409). A retry
+    // successor stores these, never the effective policy. So a clear of the
+    // operator override restores the code value at the next failure.
+    let stored_retry = execution.and_then(|exec| {
+        exec.workflow_retry_policy
+            .as_ref()
+            .and_then(crate::workflow_retry::decode_stored)
+    });
     // Pre-compute the retry plan (pure, no DB) before entering the transaction.
     let retry_plan: Option<(ExecutionId, RetryPolicy, u32, std::time::Duration)> =
         // Issue #782: a contained handler-panic terminal must NOT also spawn a
@@ -9946,11 +10174,14 @@ pub async fn persist_workflow_failure(
         if nd_details.is_none()
             && decoded.error_type.as_deref() != Some(crate::failure::ERROR_TYPE_HANDLER_PANIC)
         {
-            execution.and_then(|exec| {
-                let policy: RetryPolicy = exec
-                    .workflow_retry_policy
-                    .as_ref()
-                    .and_then(|v| serde_json::from_value(v.clone()).ok())?;
+            execution.zip(stored_retry.clone()).and_then(|(exec, (stored, source))| {
+                // Issue #2409: the operator override applies over the stored
+                // policy here, at the failure. A schedule policy wins.
+                let policy = crate::run_defaults::current_retry_policy(
+                    &exec.workflow_name,
+                    stored,
+                    source,
+                );
                 let attempt = exec.workflow_attempt.cast_unsigned();
                 if attempt >= policy.max_attempts {
                     return None;
@@ -10098,7 +10329,13 @@ pub async fn persist_workflow_failure(
                     schedule_id: exec_ref.schedule_id,
                     scheduled_for: exec_ref.scheduled_for,
                     workflow_attempt: attempt + 1,
-                    workflow_retry_policy: Some(policy),
+                    // The stored policy and its source, not `policy`.
+                    workflow_retry_policy: stored_retry.as_ref().map(|(stored, _)| stored.clone()),
+                    workflow_retry_source: stored_retry
+                        .as_ref()
+                        .map_or(crate::workflow_retry::RetryPolicySource::Type, |(_, source)| {
+                            *source
+                        }),
                     retry_of_exec_id: Some(exec_id.as_uuid()),
                     origin: exec_ref.origin.as_deref(),
                     // A retry is the same logical run trying again (issue #523).
@@ -13593,37 +13830,35 @@ fn resolve_child_workflow_defaults(
     workflow_name: &str,
 ) -> ChildWorkflowDefaults {
     let child_wf_info = registry.workflows.get(workflow_name);
-    let (
-        owner,
-        runbook_url,
-        severity,
-        sla,
-        execution_timeout,
-        chain_execution_timeout,
-        retry_policy,
-        quota,
-    ) = child_wf_info.map_or((None, None, None, None, None, None, None, None), |w| {
-        (
-            w.owner,
-            w.runbook_url,
-            w.severity,
-            w.sla,
-            w.execution_timeout,
-            w.chain_execution_timeout,
-            w.retry_policy.clone(),
-            w.quota,
-        )
-    });
-    // Issue #2387: an operator override wins over the declared value.
+    let (owner, runbook_url, severity, sla, execution_timeout, retry_policy, quota) = child_wf_info
+        .map_or((None, None, None, None, None, None, None), |w| {
+            (
+                w.owner,
+                w.runbook_url,
+                w.severity,
+                w.sla,
+                w.execution_timeout,
+                w.retry_policy.clone(),
+                w.quota,
+            )
+        });
+    // Issues #2387 and #2406: an operator override wins over the declared value.
     let (execution_timeout, sla) =
         registry.apply_run_defaults(workflow_name, execution_timeout, sla);
+    let chain_execution_timeout = registry.chain_execution_timeout(workflow_name);
     let execution_timeout = execution_timeout.and_then(|d| chrono::Duration::from_std(d).ok());
     let sla = sla.and_then(|d| chrono::Duration::from_std(d).ok());
     let deadline_at = execution_timeout.map(|d| chrono::Utc::now() + d);
     let sla_deadline_at = sla.map(|d| chrono::Utc::now() + d);
     // A child is its own logical workflow → fresh chain origin (issue #617).
-    let chain_execution_timeout =
-        chain_execution_timeout.and_then(|d| chrono::Duration::from_std(d).ok());
+    // Issue #2406: the fleet chain ceiling caps the chain cap of a child, so
+    // an override cannot exceed it. A child type with no cap stays uncapped.
+    let chain_ceiling = registry
+        .max_workflow_chain_timeout
+        .and_then(|d| chrono::Duration::from_std(d).ok());
+    let chain_execution_timeout = chain_execution_timeout
+        .and_then(|d| chrono::Duration::from_std(d).ok())
+        .map(|d| chain_ceiling.map_or(d, |ceiling| d.min(ceiling)));
     // `checked_add_signed` guards against `Duration::MAX` overflow (issue
     // #617): `DateTime + Duration` panics; yield `None` instead.
     let chain_deadline_at =
@@ -24681,10 +24916,10 @@ async fn persist_workflow_continue_as_new_with_verdict(
             || {
                 (
                     persistence.task.concurrency_key.clone(),
-                    persistence
-                        .task
-                        .concurrency_cap
-                        .and_then(|cap| u32::try_from(cap).ok()),
+                    carried_concurrency_cap(
+                        persistence.task.concurrency_cap,
+                        registry.concurrency_policy(&execution.workflow_name),
+                    ),
                 )
             },
             |target| resolve_workflow_concurrency(registry, target, &input),
@@ -25043,10 +25278,10 @@ async fn persist_workflow_outcome(
                 Some(execution),
                 Some(registry.telemetry().metrics.as_ref()),
                 persistence.task.concurrency_key.clone(),
-                persistence
-                    .task
-                    .concurrency_cap
-                    .and_then(|c| u32::try_from(c).ok()),
+                carried_concurrency_cap(
+                    persistence.task.concurrency_cap,
+                    registry.concurrency_policy(&execution.workflow_name),
+                ),
                 crate::types::Priority::from_i32(persistence.task.priority).unwrap_or_default(),
                 persistence.task.fairness_key.clone(),
                 registry.payload_codecs(),

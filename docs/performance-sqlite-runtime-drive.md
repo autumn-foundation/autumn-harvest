@@ -156,9 +156,10 @@ Every one of `dhat`'s 397,344 allocated blocks / 48,293,750 bytes was
 categorized by walking its full call-stack (`ftbl`/`pps` in the `dhat.json`
 output) for a small set of mutually-exclusive frame markers, via the
 committed, auditable
-`autumn-harvest-sqlite/scripts/classify_dhat_allocations.py` — re-running it
+`cargo xtask perf classify-dhat-allocations` — re-running it
 against a freshly captured `dhat.json` (see "Reproduce" below) reproduces
-the table exactly; its module docstring specifies the full precedence order
+the table exactly; its module doc comment
+(`xtask/src/perf/classify_dhat_allocations.rs`) specifies the full precedence order
 and the rationale for each category boundary.
 
 **Methodology note — DHAT's default stack-capture depth silently
@@ -538,7 +539,7 @@ callgrind_annotate --threshold=100 callgrind.out | head -40
 valgrind --tool=dhat --dhat-out-file=dhat.json --num-callers=30 "$BIN"
 
 # Reproduce the "Allocation-site attribution" table above from that capture:
-python3 autumn-harvest-sqlite/scripts/classify_dhat_allocations.py dhat.json
+cargo xtask perf classify-dhat-allocations dhat.json
 ```
 
 `SQLITE_RUNTIME_PROFILE_N` (default `100`) and `SQLITE_RUNTIME_PROFILE_REPS`

@@ -26,6 +26,11 @@ durable inbox, and it survives a crash. A message can queue, steer the running
 segment, or interrupt it (issue #2265). See section 15 of
 [`docs/agent-adapter.md`](../docs/agent-adapter.md).
 
+An opt-in episode log (issue #2454) records each op of a durable agent. The
+workflow `agent_consolidate` turns the episodes into facts in the agent
+memory, under the LLM budget and the cost ledger. One schedule of
+`agent_consolidate_all` starts the passes of every agent (issue #2540).
+
 A run can delegate a task to a peer agent. An inline peer runs as a sub-agent
 in the same workflow. A durable peer is an `Agent` with its own history, inbox
 and budget (issue #2269). A mandate bounds the delegation tree, and flow rules
@@ -39,14 +44,18 @@ An app implements `AgentModel` for its provider.
 ```sh
 cargo run -p autumn-harvest-agent --features sqlite --example sqlite_agent
 cargo run -p autumn-harvest-agent --features sqlite --example agent_session_entity
+DATABASE_URL=postgres://localhost/harvest \
+  cargo run -p autumn-harvest-agent --features postgres --example postgres_agent
 ```
 
 The first example runs the agent loop once. The second runs a chat session
-as a durable `Agent`.
+as a durable `Agent`. The third runs both on Postgres, with a worker in the
+process.
 
 | Feature | Contents |
 |---|---|
 | `sqlite` | `sqlite::register`, `start`, `start_heartbeat` and `decide` for the embedded backend |
+| `postgres` | The same calls in `postgres`, for Postgres workers, and `PostgresOverlayStore` |
 | `eval` | `eval::evaluate`: re-drive a recorded run with a candidate model or prompt, and diff the decisions (issue #2001) |
 | `sandbox` | A tool that runs agent code in a sandbox. See [`docs/sandbox-activities.md`](../docs/sandbox-activities.md) |
 

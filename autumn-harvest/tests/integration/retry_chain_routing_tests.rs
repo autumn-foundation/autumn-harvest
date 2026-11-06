@@ -339,6 +339,7 @@ async fn start_workflow(
             scheduled_for: None,
             workflow_attempt: 1,
             workflow_retry_policy: retry_policy,
+            workflow_retry_source: autumn_harvest::workflow_retry::RetryPolicySource::Type,
             retry_of_exec_id: None,
             max_workflow_attempts_ceiling: None,
             origin: None,

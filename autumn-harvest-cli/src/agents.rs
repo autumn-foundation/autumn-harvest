@@ -11,9 +11,15 @@
 //! | `describe` | `GET /workflows/by-id/agent/{id}/query/harvest.entity.state` |
 //! | `pause`, `resume` | `POST /workflows/by-id/agent/{id}/signal/harvest.entity.op` |
 //! | `erase` | the signal route, then `POST /workflows/{id}/erase-payloads` for each run |
+//! | `sampling policy <kind> show`, `set`, `reset` | `GET`, `PUT`, `DELETE /admin/agents/{kind}/sampling-policy` |
 //!
 //! `erase` restarts an agent that ended with `POST /workflows/agent/signal-with-start`.
-//! The new run clears the memory and the workspace of the agent.
+//! The new run clears the memory, the episodes and the workspace of the
+//! agent. `erase` then erases each consolidation pass that a schedule
+//! started (issue #2454). A child pass goes with the erase of its agent run.
+//!
+//! `profile` operates the overlay versions of a kind (issue #2374). See
+//! [`crate::agent_profile`].
 
 use autumn_harvest::entity::{ENTITY_OP_SIGNAL, ENTITY_STATE_QUERY};
 use std::fmt::Write as _;
@@ -21,11 +27,19 @@ use std::fmt::Write as _;
 use clap::Subcommand;
 use serde_json::{Map, Value, json};
 
-use crate::{ApiRequest, Cli, CliError, execute_request, path_segment, query_encode};
+use crate::{ApiMethod, ApiRequest, Cli, CliError, execute_request, path_segment, query_encode};
 
 /// The workflow name of a durable agent. It is
 /// `autumn_harvest_agent::AGENT_WORKFLOW_NAME`.
 pub const AGENT_WORKFLOW: &str = "agent";
+
+/// The workflow name of a consolidation pass (issue #2454). It is
+/// `autumn_harvest_agent::CONSOLIDATE_WORKFLOW_NAME`.
+pub const CONSOLIDATE_WORKFLOW: &str = "agent_consolidate";
+
+/// The search attribute of a scheduled pass. It holds the agent id. It is
+/// `autumn_harvest_agent::consolidate::CONSOLIDATION_ATTR`.
+pub const CONSOLIDATION_ATTR: &str = "agent_consolidation_of";
 
 /// The page size of `list` when the caller gives none.
 const LIST_PAGE_SIZE: i64 = 50;
@@ -95,14 +109,16 @@ pub enum AgentCommand {
         /// The agent id, `<kind>/<name>`.
         agent_id: String,
     },
-    /// Erase an agent: its memory, workspace, history, stream chunks and
-    /// cost ledger rows.
+    /// Erase an agent: its memory, episodes, workspace, history, stream
+    /// chunks and cost ledger rows.
     ///
     /// The agent first gets a pause, a memory reset, a workspace reset and a
     /// delete. An agent that ended gets a new run for them. The command
     /// waits for the run to end. It then erases each run of each life of
-    /// the agent, and prints one report. `stores_reset` is `false` when a
-    /// reset failed, and `stores_error` names the error.
+    /// the agent, and each pass that a schedule started. It prints one
+    /// report. `stores_reset` is `false` when a reset failed, and
+    /// `stores_error` names the error. `episodes_erased` and
+    /// `facts_erased` count the episode log and its derived facts.
     Erase {
         /// The agent id, `<kind>/<name>`.
         agent_id: String,
@@ -113,6 +129,86 @@ pub enum AgentCommand {
         #[arg(long, default_value_t = 60)]
         wait_timeout_secs: u64,
     },
+    /// List, show, diff, activate and roll back the profile overlays of an
+    /// agent kind.
+    Profile {
+        #[command(subcommand)]
+        command: crate::agent_profile::ProfileCommand,
+    },
+    /// Read and change the operator sampling policy of an agent kind (issue
+    /// #2439).
+    Sampling {
+        #[command(subcommand)]
+        command: SamplingCommand,
+    },
+}
+
+/// The `harvest agents sampling` subcommands.
+#[derive(Debug, Subcommand)]
+pub enum SamplingCommand {
+    /// Show, set or reset the sampling policy of one agent kind.
+    ///
+    /// Only an operator can set or reset it. Each change writes an audit row
+    /// with the old and new policy.
+    Policy {
+        /// The agent kind, such as `researcher`.
+        kind: String,
+        #[command(subcommand)]
+        action: PolicyCommand,
+    },
+}
+
+/// The actions of `harvest agents sampling policy <kind>`.
+#[derive(Debug, Subcommand)]
+pub enum PolicyCommand {
+    /// Show the policy with each default, its revision and its newest audit
+    /// rows.
+    Show,
+    /// Replace the whole policy.
+    ///
+    /// A setting that you leave out takes its default. It does not keep its
+    /// stored value. Give each setting that you want, or give the whole
+    /// policy with `--json`.
+    Set(PolicySetArgs),
+    /// Restore every default.
+    Reset,
+}
+
+/// The settings of `harvest agents sampling policy <kind> set`.
+///
+/// A list flag takes comma-separated values. An empty value, such as
+/// `--strategies ''`, gives an empty list. At least one flag is required, so
+/// a bare `set` never restores every default. Use `reset` for that.
+#[derive(Debug, Default, clap::Args)]
+#[group(required = true, multiple = true)]
+pub struct PolicySetArgs {
+    /// The strategies that the kind may use: `best_of_n`, `rejection`,
+    /// `vote`, `cascade`, `beam`. Default: none.
+    #[arg(long, conflicts_with = "json")]
+    pub strategies: Option<String>,
+    /// The most draws of one strategy run, 1 to 256. Default: 1.
+    #[arg(long, conflicts_with = "json")]
+    pub max_draws: Option<u32>,
+    /// The most draws at the same time, 1 to 16. Default: 1.
+    #[arg(long, conflicts_with = "json")]
+    pub max_concurrent_draws: Option<u32>,
+    /// The tool effects that a draw may run: `read_only`, `internal`,
+    /// `write`, `external`. Default: `read_only`.
+    #[arg(long, conflicts_with = "json")]
+    pub draw_effects: Option<String>,
+    /// `deterministic`, or a list of scorer ids. A list allows only those
+    /// scorers. Default: `deterministic`.
+    #[arg(long, conflicts_with = "json")]
+    pub scorers: Option<String>,
+    /// The models that a judge scorer may call. Default: none.
+    #[arg(long, conflicts_with = "json")]
+    pub judge_models: Option<String>,
+    /// The cap of the in-loop answer check, 0 to 16. Default: 0.
+    #[arg(long, conflicts_with = "json")]
+    pub max_answer_retries: Option<u32>,
+    /// The whole policy as one JSON object. It replaces every other flag.
+    #[arg(long)]
+    pub json: Option<String>,
 }
 
 /// The request of a one-request agent command. `erase` has none.
@@ -151,7 +247,89 @@ pub fn agent_request(command: &AgentCommand) -> Result<ApiRequest, CliError> {
         }
         AgentCommand::Resume { agent_id } => Ok(signal(agent_id, control_payload("resume"))),
         AgentCommand::Erase { .. } => Err(CliError::AgentEraseIsMultiStep),
+        AgentCommand::Profile { command } => crate::agent_profile::profile_request(command),
+        AgentCommand::Sampling {
+            command: SamplingCommand::Policy { kind, action },
+        } => policy_request(kind, action),
     }
+}
+
+/// The route of the sampling policy of `kind`.
+fn policy_path(kind: &str) -> String {
+    format!("/admin/agents/{}/sampling-policy", path_segment(kind))
+}
+
+/// The request of one `agents sampling policy` action.
+fn policy_request(kind: &str, action: &PolicyCommand) -> Result<ApiRequest, CliError> {
+    let path = policy_path(kind);
+    Ok(match action {
+        PolicyCommand::Show => ApiRequest::get(path),
+        PolicyCommand::Set(args) => ApiRequest {
+            method: ApiMethod::Put,
+            path,
+            body: Some(json!({"policy": policy_body(args)?})),
+        },
+        PolicyCommand::Reset => ApiRequest {
+            method: ApiMethod::Delete,
+            path,
+            body: None,
+        },
+    })
+}
+
+/// The comma-separated values of a list flag. An empty value gives an empty
+/// list.
+fn list(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The policy object of `set`. It holds only the given settings. The server
+/// fills in each default and checks each bound.
+fn policy_body(args: &PolicySetArgs) -> Result<Value, CliError> {
+    if let Some(raw) = &args.json {
+        let policy: Value = serde_json::from_str(raw).map_err(|source| CliError::InvalidJson {
+            label: "sampling policy",
+            source,
+        })?;
+        if !policy.is_object() {
+            return Err(CliError::InvalidInput(
+                "--json must be a JSON object".to_owned(),
+            ));
+        }
+        return Ok(policy);
+    }
+    let mut policy = Map::new();
+    for (key, value) in [
+        ("strategies", &args.strategies),
+        ("draw_effects", &args.draw_effects),
+        ("judge_models", &args.judge_models),
+    ] {
+        if let Some(raw) = value {
+            policy.insert(key.to_owned(), json!(list(raw)));
+        }
+    }
+    for (key, value) in [
+        ("max_draws", args.max_draws),
+        ("max_concurrent_draws", args.max_concurrent_draws),
+        ("max_answer_retries", args.max_answer_retries),
+    ] {
+        if let Some(value) = value {
+            policy.insert(key.to_owned(), json!(value));
+        }
+    }
+    if let Some(raw) = &args.scorers {
+        let scorers = if raw.trim() == "deterministic" {
+            json!("deterministic")
+        } else {
+            json!({"only": list(raw)})
+        };
+        policy.insert("scorers".to_owned(), scorers);
+    }
+    Ok(Value::Object(policy))
 }
 
 /// The filters of `agents list`.
@@ -276,21 +454,66 @@ pub async fn erase_agent(
     execute_request(cli, &signal(agent_id, json!({"kind": "delete"}))).await?;
     let ended = wait_for_end(cli, agent_id, wait_timeout_secs).await?;
     let stores = stores_outcome(failures_before, execution(&ended).get("output"));
-    let runs = list_runs(cli, agent_id).await?;
+    let agent_runs = format!(
+        "workflow_name = {} AND workflow_id = {}",
+        literal(AGENT_WORKFLOW),
+        literal(agent_id)
+    );
+    let runs = list_runs(cli, &agent_runs).await?;
     let mut outcomes = Vec::new();
     for run in &runs {
         let Some(id) = run.get("id").and_then(Value::as_str) else {
             continue;
         };
-        let mut body = Map::new();
-        if let Some(reason) = reason {
-            body.insert("reason".to_owned(), json!(reason));
-        }
-        let path = format!("/workflows/{}/erase-payloads", path_segment(id));
-        outcomes
-            .push(execute_request(cli, &ApiRequest::post(path, Some(Value::Object(body)))).await?);
+        outcomes.push(erase_run(cli, id, reason).await?);
     }
-    Ok(erase_report(agent_id, &stores, &outcomes))
+    // A scheduled pass is no child of an agent run (issue #2454).
+    let passes = format!(
+        "workflow_name = {} AND attrs.{CONSOLIDATION_ATTR} = {}",
+        literal(CONSOLIDATE_WORKFLOW),
+        literal(agent_id)
+    );
+    let (closed, running) = pass_runs(&list_runs(cli, &passes).await?);
+    for id in &closed {
+        outcomes.push(erase_run(cli, id, reason).await?);
+    }
+    let mut report = erase_report(agent_id, &stores, &outcomes);
+    if let Some(Value::Array(failures)) = report.get_mut("failures") {
+        failures.extend(running);
+    }
+    Ok(report)
+}
+
+/// Erase the payloads of the run `id`.
+async fn erase_run(cli: &Cli, id: &str, reason: Option<&str>) -> Result<Value, CliError> {
+    let mut body = Map::new();
+    if let Some(reason) = reason {
+        body.insert("reason".to_owned(), json!(reason));
+    }
+    let path = format!("/workflows/{}/erase-payloads", path_segment(id));
+    execute_request(cli, &ApiRequest::post(path, Some(Value::Object(body)))).await
+}
+
+/// Split the pass rows of a list into the ids to erase and a failure for
+/// each pass that still runs (issue #2454). A running run keeps its
+/// history, so the erase cannot reach it yet.
+pub fn pass_runs(rows: &[Value]) -> (Vec<String>, Vec<Value>) {
+    let mut closed = Vec::new();
+    let mut running = Vec::new();
+    for row in rows {
+        let Some(id) = row.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        if is_terminal(row) {
+            closed.push(id.to_owned());
+        } else {
+            running.push(json!({
+                "execution_id": id,
+                "error": "the consolidation pass still runs: pause its schedule and erase again",
+            }));
+        }
+    }
+    (closed, running)
 }
 
 /// Whether the resets of `erase` worked.
@@ -300,6 +523,10 @@ pub struct StoresOutcome {
     pub reset: bool,
     /// The error of a failed reset.
     pub error: Option<String>,
+    /// The episodes that the memory reset removed (issue #2454).
+    pub episodes_erased: u64,
+    /// The derived facts that the memory reset removed (issue #2454).
+    pub facts_erased: u64,
 }
 
 /// Compare the failure count of the agent before the resets with its final
@@ -312,8 +539,18 @@ pub fn stores_outcome(failures_before: u64, output: Option<&Value>) -> StoresOut
         return StoresOutcome {
             reset: false,
             error: Some("the deleted run has no final state".to_owned()),
+            episodes_erased: 0,
+            facts_erased: 0,
         };
     };
+    let count = |key: &str| {
+        state
+            .get("episode_reset")
+            .and_then(|reset| reset.get(key))
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+    };
+    let (episodes_erased, facts_erased) = (count("episodes"), count("facts"));
     if failures(state) > failures_before {
         let error = state
             .get("last_error")
@@ -322,11 +559,15 @@ pub fn stores_outcome(failures_before: u64, output: Option<&Value>) -> StoresOut
         return StoresOutcome {
             reset: false,
             error: Some(error.to_owned()),
+            episodes_erased,
+            facts_erased,
         };
     }
     StoresOutcome {
         reset: true,
         error: None,
+        episodes_erased,
+        facts_erased,
     }
 }
 
@@ -381,19 +622,14 @@ async fn wait_for_end(
     }
 }
 
-/// Every run of every life of the agent, one page at a time.
-async fn list_runs(cli: &Cli, agent_id: &str) -> Result<Vec<Value>, CliError> {
-    let expr = format!(
-        "workflow_name = {} AND workflow_id = {}",
-        literal(AGENT_WORKFLOW),
-        literal(agent_id)
-    );
+/// Every run that the filter `expr` matches, one page at a time.
+async fn list_runs(cli: &Cli, expr: &str) -> Result<Vec<Value>, CliError> {
     let mut runs = Vec::new();
     let mut cursor: Option<String> = None;
     loop {
         let mut path = format!(
             "/workflows?filter={}&page_size={ERASE_PAGE_SIZE}",
-            query_encode(&expr)
+            query_encode(expr)
         );
         if let Some(cursor) = &cursor {
             let _ = write!(path, "&cursor={}", query_encode(cursor));
@@ -462,6 +698,8 @@ pub fn erase_report(agent_id: &str, stores: &StoresOutcome, outcomes: &[Value]) 
     if let Some(error) = &stores.error {
         report.insert("stores_error".to_owned(), json!(error));
     }
+    report.insert("episodes_erased".to_owned(), json!(stores.episodes_erased));
+    report.insert("facts_erased".to_owned(), json!(stores.facts_erased));
     report.insert("runs_erased".to_owned(), json!(runs));
     report.extend(totals);
     report.insert("skipped_children".to_owned(), Value::Array(skipped));
@@ -556,6 +794,8 @@ mod tests {
         let stores = StoresOutcome {
             reset: true,
             error: None,
+            episodes_erased: 0,
+            facts_erased: 0,
         };
         let report = erase_report("support/ada", &stores, &outcomes);
         assert_eq!(report["runs_erased"], 3);
@@ -569,13 +809,43 @@ mod tests {
     }
 
     #[test]
+    fn the_report_counts_the_erased_episodes_and_facts() {
+        // Issue #2454: the final state holds the counts of the episode reset.
+        let state = json!({"failures": 0, "episode_reset": {"episodes": 3, "facts": 2}});
+        let stores = stores_outcome(0, Some(&state));
+        assert!(stores.reset);
+        assert_eq!((stores.episodes_erased, stores.facts_erased), (3, 2));
+        let report = erase_report("support/ada", &stores, &[]);
+        assert_eq!(report["episodes_erased"], 3);
+        assert_eq!(report["facts_erased"], 2);
+        // A state with no reset counts erases nothing.
+        let plain = stores_outcome(0, Some(&json!({"failures": 0})));
+        assert_eq!((plain.episodes_erased, plain.facts_erased), (0, 0));
+    }
+
+    #[test]
+    fn a_running_pass_is_a_failure_and_a_closed_pass_is_erased() {
+        let rows = [
+            json!({"id": "p1", "state": "COMPLETED"}),
+            json!({"id": "p2", "state": "RUNNING"}),
+            json!({"state": "COMPLETED"}),
+        ];
+        let (erase, running) = pass_runs(&rows);
+        assert_eq!(erase, ["p1"]);
+        assert_eq!(running.len(), 1);
+        assert_eq!(running[0]["execution_id"], "p2");
+    }
+
+    #[test]
     fn a_reset_counts_only_when_the_final_state_shows_no_new_failure() {
         let clean = json!({"failures": 2});
         assert_eq!(
             stores_outcome(2, Some(&clean)),
             StoresOutcome {
                 reset: true,
-                error: None
+                error: None,
+                episodes_erased: 0,
+                facts_erased: 0,
             }
         );
         let failed = json!({"failures": 3, "last_error": "the store is down"});

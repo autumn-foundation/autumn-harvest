@@ -779,14 +779,18 @@
 //! deterministic primitive is **never** silently dropped, and a history written
 //! here always replays byte-identically on the core `WorkflowReplayer`.
 
+mod agent_policy_log;
 #[doc(hidden)]
 pub mod append_only;
+mod auth;
 mod composition;
 mod error;
 mod history_cap;
+mod history_page;
 mod llm_ledger;
 mod lock;
 mod mutex;
+mod operator;
 mod overlay_log;
 mod query;
 mod queue;
@@ -798,27 +802,45 @@ mod store;
 mod update;
 mod visibility;
 mod worker;
+mod workflow_log;
 
 pub use autumn_harvest::llm_ledger::LlmCall;
 pub use autumn_harvest::{ExecutionId, WorkflowEvent};
 
+#[doc(hidden)]
+pub use crate::agent_policy_log::SqlitePolicyLog;
+pub use crate::auth::{
+    AuditFilter, AuditRow, MAX_AUDIT_PAGE, NewAuditRow, NewDeadLetter, NewToken, SqliteAuthStore,
+    StoredToken,
+};
 pub use crate::error::{SqliteError, SqliteResult};
 pub use crate::history_cap::HistoryCapReason;
+pub use crate::history_page::{
+    DEFAULT_HISTORY_PAGE, HistoryFilter, HistoryPage, MAX_HISTORY_PAGE, PagedEvent,
+};
 pub use crate::llm_ledger::LlmLedgerRow;
+pub use crate::operator::{
+    BufferedSignal, ChildRun, CountFilter, ExecutionCount, PendingTask, PendingTimer, PendingWork,
+    TimedEvent,
+};
 #[doc(hidden)]
 pub use crate::overlay_log::SqliteOverlayLog;
-pub use crate::query::DEFAULT_QUERY_TIMEOUT;
+pub use crate::query::{DEFAULT_QUERY_TIMEOUT, ReplayInput};
 pub use crate::runtime::{
-    ActivityBody, ActivitySpec, ExecutionOutcome, LedgerActivityBody, RunState, SignalDelivery,
-    SignalWithStart, SignalWithStartOutcome, SqliteRuntime, StartOptions, StartOutcome,
-    UNSUPPORTED_FEATURE_ERROR_TYPE,
+    ActivityBody, ActivitySpec, AdmittedUpdate, ExecutionOutcome, LedgerActivityBody, RunState,
+    SignalDelivery, SignalWithStart, SignalWithStartOutcome, SqliteRuntime, StartOptions,
+    StartOutcome, UNSUPPORTED_FEATURE_ERROR_TYPE,
 };
 // The depth cap is shared with the Postgres backend (issue #2225).
-pub use crate::schedule::{ScheduleOverride, ScheduleSummary};
+pub use crate::retention::{PURGE_BATCH, PurgePolicy, PurgeReport};
+pub use crate::schedule::{ScheduleOverride, ScheduleSummary, ScheduleTrigger};
 pub use crate::store::ActivityAttempt;
 pub use crate::visibility::{
     DEFAULT_LIST_LIMIT, ExecutionDescription, ExecutionFilter, ExecutionPage, ExecutionSummary,
     ListCursor, MAX_FILTER_TERMS, MAX_LIST_LIMIT, SqliteReader, Stored,
+};
+pub use crate::workflow_log::{
+    LogFilter, LogLine, WORKFLOW_LOG_TRUNCATION_MESSAGE, WORKFLOW_LOG_TRUNCATION_SEQ,
 };
 #[doc(inline)]
 pub use autumn_harvest::payload_depth::{MAX_PAYLOAD_DEPTH, PAYLOAD_TOO_DEEP_ERROR_TYPE};

@@ -11,7 +11,11 @@ use autumn_harvest_agent::InMemoryOverlayStore;
 
 #[tokio::test]
 async fn the_in_memory_store_passes_the_suite() {
-    overlay_store_suite::run_all(&|validator| Box::new(InMemoryOverlayStore::new(validator))).await;
+    overlay_store_suite::run_all(
+        &|validator| Box::new(InMemoryOverlayStore::new(validator)),
+        &|validator, clock| Box::new(InMemoryOverlayStore::new(validator).with_clock(clock)),
+    )
+    .await;
 }
 
 #[cfg(feature = "sqlite")]
@@ -19,9 +23,16 @@ async fn the_in_memory_store_passes_the_suite() {
 async fn the_sqlite_store_passes_the_suite() {
     use autumn_harvest_agent::SqliteOverlayStore;
 
-    overlay_store_suite::run_all(&|validator| {
-        Box::new(SqliteOverlayStore::open_in_memory(validator).expect("open"))
-    })
+    overlay_store_suite::run_all(
+        &|validator| Box::new(SqliteOverlayStore::open_in_memory(validator).expect("open")),
+        &|validator, clock| {
+            Box::new(
+                SqliteOverlayStore::open_in_memory(validator)
+                    .expect("open")
+                    .with_clock(clock),
+            )
+        },
+    )
     .await;
 }
 
@@ -48,7 +59,10 @@ async fn the_sqlite_store_keeps_versions_across_a_reopen() {
             .put("support", &overlay, Provenance::operator("ops"))
             .await
             .expect("put");
-        store.activate("support", v1, None).await.expect("activate");
+        store
+            .activate("support", v1, None, Provenance::operator("ops"))
+            .await
+            .expect("activate");
         v1
     };
     let store = SqliteOverlayStore::open(&path, gate).expect("reopen");

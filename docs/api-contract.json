@@ -1,5 +1,5 @@
 {
-  "version": "0.9.0",
+  "version": "0.10.0",
   "contract_version": "2",
   "description": "Versioned machine-readable contract for the Harvest management API. Update this file and CHANGELOG.md whenever a route is added, removed, renamed, or its request/response shape changes.",
   "compatibility": {
@@ -26,7 +26,7 @@
   },
   "auth_note": "Route authorization posture is classified in issue #174. This contract records the route surface and category; auth enforcement is separate. The optional API rate limiter (issue #1827) can answer 429 with a Retry-After header in whole seconds on any route that is not PublicSafe. Its body is {\"error\": \"rate limited\", \"route_class\", \"retry_after_secs\"}. See docs/security-posture.md#api-rate-limiting.",
   "audit_note": "Mutating routes (read_only: false) are covered by the audit trail (issue #158). The audit endpoint itself is read-only.",
-  "openapi_note": "Two OpenAPI 3.1 documents are generated from this file (issue #694): autumn-harvest-plugin/openapi.json, which the crate compiles in and serves, and docs/openapi.json, the pretty-printed copy. Run `scripts/regenerate-openapi.sh` whenever a route, parameter, request field or response field changes here; it writes both. Every parameter must declare `in` and `required`, and every request body must declare `required`. The transform rejects an entry that does not, and refuses a request body on a read method. See docs/openapi.md.",
+  "openapi_note": "Two OpenAPI 3.1 documents are generated from this file (issue #694): autumn-harvest-plugin/openapi.json, which the crate compiles in and serves, and docs/openapi.json, the pretty-printed copy. Run `cargo xtask dev regenerate-openapi` whenever a route, parameter, request field or response field changes here; it writes both. Every parameter must declare `in` and `required`, and every request body must declare `required`. The transform rejects an entry that does not, and refuses a request body on a read method. See docs/openapi.md.",
   "routes": [
     {
       "method": "GET",
@@ -6859,7 +6859,7 @@
       "path": "/admin/queue-coverage",
       "category": "admin",
       "read_only": true,
-      "description": "Fleet-wide task-queue coverage (issue #774): report task queues with >=1 PENDING task and zero live workers polling them, fanned out across every readable shard. A worker is live for coverage purposes when its heartbeat is fresh and its status is Active or Draining (only Stopped/stale workers fail to cover) -- coverage means a poller exists, not that capacity is available (a saturated queue is #531/#742's job, not this endpoint's, and worker build_id is never consulted -- that is #171's build-id reachability). A queue currently paused via the queue-pause primitive is excluded from items/uncovered (already covered by harvest_queue_paused_too_long), but a queue that is both paused AND pollerless AND has real pending work is still named in excluded_paused_queues, since the pause alert alone fires on pause duration and can miss that combination for its full grace window; a paused queue that already has a live poller is absent from excluded_paused_queues (nothing to report). Each uncovered item[] carries pending_count, a bounded (5) set of representative sample_task_ids/sample_execution_ids for drill-down, and a per-shard shard_breakdown. An unreachable shard is named in shards[] (never silently dropped) and degrades status to partial/unavailable; uncovered is authoritative only when status == complete. No new WorkflowEvent variant, no migration -- read path only.",
+      "description": "Fleet-wide task-queue coverage (issue #774): report task queues with >=1 PENDING task and zero live workers polling them, fanned out across every readable shard. A worker is live for coverage purposes when its heartbeat is fresh and its status is Active or Draining (only Stopped/stale workers fail to cover) -- coverage means a poller exists, not that capacity is available (a saturated queue is #531/#742's job, not this endpoint's, and worker build_id is never consulted -- that is #171's build-id reachability). A queue currently paused via the queue-pause primitive is excluded from items/uncovered (already covered by harvest_queue_paused_too_long), but a queue that is both paused AND pollerless AND has real pending work is still named in excluded_paused_queues, since the pause alert alone fires on pause duration and can miss that combination for its full grace window; a paused queue that already has a live poller is absent from excluded_paused_queues (nothing to report). Each uncovered item[] carries pending_count, a bounded (5) set of representative sample_task_ids/sample_execution_ids for drill-down, and a per-shard shard_breakdown. An unreachable shard is named in shards[] (never silently dropped) and degrades status to partial/unavailable; uncovered is authoritative only when status == complete. unpolled_declared_queues (issue #2479) names each declared queue that no live worker polls on a writable shard, with or without pending work. A drained shard takes no new run, so it does not count. The declared list is the code list of the process that serves the request. Config or the role pin can narrow each worker to a subset, so a name there has no worker tier. It is null when unknown: no runtime is installed, or a writable shard gave no answer. It does not change uncovered. No new WorkflowEvent variant, no migration -- read path only.",
       "params": [
         {
           "name": "queue_name",
@@ -6880,7 +6880,8 @@
           "total_uncovered_queues",
           "items",
           "shards",
-          "excluded_paused_queues"
+          "excluded_paused_queues",
+          "unpolled_declared_queues"
         ]
       },
       "error_responses": [
@@ -6945,7 +6946,7 @@
       "path": "/admin/overrides",
       "category": "admin",
       "read_only": true,
-      "description": "List every operator override (issue #2388). schedule_overrides holds each DAG and workflow schedule override (issues #2385 and #2386), read from every shard pool: kind, name, fields (the stored override fields by their PATCH names), reason, updated_by, created_at, updated_at and shard_ids. run_default_overrides holds each run-default override (issue #2387) from the default shard: workflow_name, sla_secs, execution_timeout_secs, reason, updated_by and updated_at. unavailable_shards names each shard that could not be read; its overrides are absent from the list.",
+      "description": "List every operator override (issue #2388). schedule_overrides holds each DAG and workflow schedule override (issues #2385 and #2386), read from every shard pool: kind, name, fields (the stored override fields by their PATCH names), reason, updated_by, created_at, updated_at and shard_ids. run_default_overrides holds each run-default override (issues #2387, #2406, #2407, #2408 and #2409) from the default shard: workflow_name, sla_secs, execution_timeout_secs, chain_execution_timeout_secs, concurrency_limit, quota_max_active_executions, quota_max_history_bytes, quota_max_dead_letters, retry_max_attempts, retry_initial_interval_ms, retry_max_interval_ms, reason, updated_by and updated_at. unavailable_shards names each shard that could not be read; its overrides are absent from the list.",
       "params": [],
       "request_body": null,
       "success_response": {
@@ -7150,7 +7151,7 @@
       "path": "/admin/workflow-types/{workflow_name}/run-defaults",
       "category": "admin",
       "read_only": true,
-      "description": "Read the run defaults of one workflow type (issue #2387). code holds the sla_secs and execution_timeout_secs declared in code. override holds the stored operator override (sla_secs, execution_timeout_secs, reason, updated_by, updated_at), or null. effective holds the values a new run takes: the override, then code. The start clamps still apply after it: sla is clamped to execution_timeout, and the fleet ceiling caps execution_timeout.",
+      "description": "Read the run defaults of one workflow type (issues #2387, #2406, #2407, #2408 and #2409). code holds the sla_secs, execution_timeout_secs, chain_execution_timeout_secs, concurrency_limit, quota_max_active_executions, quota_max_history_bytes, quota_max_dead_letters, retry_max_attempts, retry_initial_interval_ms and retry_max_interval_ms declared in code. override holds the stored operator override (the same ten fields, reason, updated_by, updated_at), or null. effective holds the values a new run takes: the override, then code. The start clamps still apply after it: sla is clamped to execution_timeout, the fleet ceiling caps execution_timeout, and the fleet chain ceiling caps chain_execution_timeout. A latest-wins type keeps its code concurrency_limit. A type with no quota admission cap keeps its code quota caps. The retry fields are those of the next failure of a run that stores the code retry_policy, before the fleet ceiling clamps retry_max_attempts.",
       "params": [
         {
           "name": "workflow_name",
@@ -7186,7 +7187,7 @@
       "path": "/admin/workflow-types/{workflow_name}/run-defaults",
       "category": "admin",
       "read_only": false,
-      "description": "Set, change or clear the run-default override of one workflow type (issue #2387). The override wins over the code value for every new run and survives a restart. It reaches this process at once and every other process within its refresh period (about 5 seconds). Each duration is tri-state: absent keeps the stored override, null returns the field to its code value, a value sets it. A merge that sets no field deletes the override. With recompute_in_flight, the SLA deadline of each RUNNING, SUSPENDED or PAUSED run of the type that has not breached moves to the new effective SLA, on every shard, and the response gains recompute (moved_runs, unavailable_shards, superseded). A recompute stops when a newer change to the type replaces its SLA, and then reports superseded true. A hard deadline_at never changes. The response has the same shape as GET.",
+      "description": "Set, change or clear the run-default override of one workflow type (issues #2387, #2406, #2407, #2408 and #2409). The override wins over the code value for every new run and survives a restart. It reaches this process at once and every other process within its refresh period (about 5 seconds). Each duration is tri-state: absent keeps the stored override, null returns the field to its code value, a value sets it. A merge that sets no field deletes the override. With recompute_in_flight, the SLA deadline of each RUNNING, SUSPENDED or PAUSED run of the type that has not breached moves to the new effective SLA, on every shard, and the response gains recompute (moved_runs, unavailable_shards, superseded). A recompute stops when a newer change to the type replaces its SLA, and then reports superseded true. A hard deadline_at never changes. A chain_deadline_at never changes either: a chain in flight keeps its stored cap, and the override applies to the next chain that starts. A DAG declares no chain cap, so chain_execution_timeout_secs on a DAG is a 400. concurrency_limit applies to the next start and never lowers the cap of a run in flight. A PATCH that names concurrency_limit or clear_override, for a type with a concurrency policy, also raises the stored cap of each PENDING or RUNNING workflow task row of the type to the new effective limit, on every shard, and the response gains concurrency_raise (raised_tasks, unavailable_shards, superseded). Further raises run 10 seconds, 1 minute and 5 minutes later, for the starts that a process with a stale cache stored. No raise lowers a stored cap. Each quota_max_* field applies to the next admission of a key in every process: a lower cap refuses new work for a tenant over it with the 429 of issue #946, and never ends a run in flight. A parent whose child spawn a lower cap refuses waits with a backoff, and its own execution_timeout still applies. No row stores a quota cap, so no pass runs. Each retry_* field applies to the next failure of any run of the type, in flight or new, in every process. It replaces that field of the policy that the failed run stores. A retry attempt that already started keeps its row and its fire time. The declared backoff coefficient and jitter still apply, and the effective max_interval never falls below the effective initial_interval. A schedule's own retry_policy wins for the runs that the schedule starts. No row changes, so no pass runs. The response has the same shape as GET.",
       "idempotency": "Idempotent: applying the same override twice is a no-op.",
       "params": [
         {
@@ -7210,6 +7211,46 @@
             "name": "execution_timeout_secs",
             "required": false,
             "description": "Override hard execution timeout in whole seconds, from 1 to 3153600000 (100 years). null returns to code."
+          },
+          {
+            "name": "chain_execution_timeout_secs",
+            "required": false,
+            "description": "Override the cap of a new continue-as-new chain in whole seconds, from 1 to 3153600000 (100 years). The fleet chain ceiling still caps it. null returns to code. Refused for a DAG."
+          },
+          {
+            "name": "concurrency_limit",
+            "required": false,
+            "description": "Override the concurrency limit of a new start, from 1 to 2147483647. The key and on_conflict stay as declared. null returns to code. Refused for a type with no concurrency policy, a DAG included, and for a latest-wins (cancel_running) type."
+          },
+          {
+            "name": "quota_max_active_executions",
+            "required": false,
+            "description": "Override the quota cap on the active runs of one key, from 1 to 4294967295. The quota key and the LLM caps stay as declared. null returns to code and is accepted on any type. A value is refused for a type with no quota admission cap, a DAG included."
+          },
+          {
+            "name": "quota_max_history_bytes",
+            "required": false,
+            "description": "Override the quota cap on the history bytes of the active runs of one key, from 1 to 9223372036854775807. null returns to code and is accepted on any type. A value is refused for a type with no quota admission cap, a DAG included."
+          },
+          {
+            "name": "quota_max_dead_letters",
+            "required": false,
+            "description": "Override the quota cap on the dead letters of one key, from 1 to 4294967295. null returns to code and is accepted on any type. A value is refused for a type with no quota admission cap, a DAG included."
+          },
+          {
+            "name": "retry_max_attempts",
+            "required": false,
+            "description": "Override the workflow retry max_attempts of the next failure, the first attempt included, from 1 to 2147483647 and at most the fleet ceiling. 1 stops the retries. null returns to code and is accepted on any type. A value is refused for a type with no retry_policy, a DAG included."
+          },
+          {
+            "name": "retry_initial_interval_ms",
+            "required": false,
+            "description": "Override the base delay before the first retry in whole milliseconds, from 1 to 31536000000 (365 days). The effective max_interval rises to it when it is lower. null returns to code and is accepted on any type. A value is refused for a type with no retry_policy, a DAG included."
+          },
+          {
+            "name": "retry_max_interval_ms",
+            "required": false,
+            "description": "Override the upper bound on the delay between retries in whole milliseconds, from 1 to 31536000000 (365 days). When both interval fields are set, at least retry_initial_interval_ms. A cap below the first delay rises to it. null returns to code and is accepted on any type. A value is refused for a type with no retry_policy, a DAG included."
           },
           {
             "name": "clear_override",
@@ -7240,7 +7281,7 @@
       "error_responses": [
         {
           "status": 400,
-          "description": "Empty patch, unknown field, or a duration of zero or past 100 years."
+          "description": "Empty patch, unknown field, a duration of zero or past 100 years, chain_execution_timeout_secs for a DAG, a concurrency_limit of zero, past 2147483647, for a type with no policy, or for a latest-wins type, or a quota_max_* cap of zero, past its bound, or for a type with no quota admission cap, or a retry_* value for a type with no retry_policy, a retry_max_attempts of zero, past 2147483647 or above the fleet ceiling, a retry interval of zero or past 365 days, or a merged retry_max_interval_ms below retry_initial_interval_ms."
         },
         {
           "status": 404,
@@ -7249,6 +7290,649 @@
         {
           "status": 500,
           "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/admin/agents/{kind}/sampling-policy",
+      "category": "admin",
+      "read_only": true,
+      "description": "Read the sampling policy of one agent kind (issue #2439). policy is the full SamplingPolicy, with each default filled in: strategies, max_draws, max_concurrent_draws, draw_effects, scorers, judge_models and max_answer_retries. revision is 0 when no operator ever set or reset the policy. audit holds the newest 20 changes, the newest first. Each audit row has revision, action (set or reset), actor, old, new and at.",
+      "params": [
+        {
+          "name": "kind",
+          "in": "path",
+          "type": "string",
+          "required": true,
+          "description": "Agent kind: 1 to 64 characters from a-z, 0-9, _ and -."
+        }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "kind",
+          "revision",
+          "policy",
+          "audit"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "The kind is not valid."
+        },
+        {
+          "status": 500,
+          "description": "A stored policy is corrupt."
+        },
+        {
+          "status": 503,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "PUT",
+      "path": "/admin/agents/{kind}/sampling-policy",
+      "category": "admin",
+      "read_only": false,
+      "description": "Replace the sampling policy of one agent kind (issue #2439). A key that the policy leaves out takes its default. An unknown key fails the request. The store writes the policy and a harvest_agent_policy_audit row with the old and new policy in one transaction. Each request also writes a harvest_audit_log row with the operation agent.sampling_policy.set, a refused request included. The next strategy run of every process reads the new policy. A run in flight keeps the policy that it read at its start.",
+      "idempotency": "Not idempotent: each set adds 1 to the revision and writes an audit row.",
+      "params": [
+        {
+          "name": "kind",
+          "in": "path",
+          "type": "string",
+          "required": true,
+          "description": "Agent kind: 1 to 64 characters from a-z, 0-9, _ and -."
+        }
+      ],
+      "request_body": {
+        "required": true,
+        "free_form": false,
+        "fields": [
+          {
+            "name": "policy",
+            "type": "object",
+            "required": true,
+            "description": "The SamplingPolicy. Keys: strategies (best_of_n, rejection, vote, cascade, beam), max_draws (1 to 256), max_concurrent_draws (1 to 16), draw_effects (read_only, internal, write, external), scorers (\"deterministic\" or {\"only\": [ids]}), judge_models and max_answer_retries (0 to 16)."
+          }
+        ]
+      },
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "kind",
+          "revision",
+          "old",
+          "new"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "The body does not decode, has an unknown key, or a setting is out of bounds. The kind or the actor is not valid."
+        },
+        {
+          "status": 403,
+          "description": "The caller is not an operator. Nothing changes."
+        },
+        {
+          "status": 409,
+          "description": "The revision counter of the kind is full."
+        },
+        {
+          "status": 500,
+          "description": "A stored policy is corrupt."
+        },
+        {
+          "status": 503,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "DELETE",
+      "path": "/admin/agents/{kind}/sampling-policy",
+      "category": "admin",
+      "read_only": false,
+      "description": "Reset the sampling policy of one agent kind to every default (issue #2439). The row stays, so the revision never goes back. new is null in the response. The store writes a harvest_agent_policy_audit row with the old policy. Each request also writes a harvest_audit_log row with the operation agent.sampling_policy.reset, a refused request included.",
+      "idempotency": "Not idempotent: each reset adds 1 to the revision and writes an audit row.",
+      "params": [
+        {
+          "name": "kind",
+          "in": "path",
+          "type": "string",
+          "required": true,
+          "description": "Agent kind: 1 to 64 characters from a-z, 0-9, _ and -."
+        }
+      ],
+      "request_body": {
+        "required": false,
+        "free_form": false,
+        "fields": []
+      },
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "kind",
+          "revision",
+          "old",
+          "new"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "The kind or the actor is not valid."
+        },
+        {
+          "status": 403,
+          "description": "The caller is not an operator. Nothing changes."
+        },
+        {
+          "status": 409,
+          "description": "The revision counter of the kind is full."
+        },
+        {
+          "status": 500,
+          "description": "A stored policy is corrupt."
+        },
+        {
+          "status": 503,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/agents/{kind}/profile",
+      "category": "agent",
+      "read_only": true,
+      "description": "Show the active profile overlay of an agent kind (issue #2374). The body holds the version, its provenance ({author, id}), its created time, the sha256 digest and the overlay as JSON.",
+      "params": [
+        {
+          "name": "kind",
+          "in": "path",
+          "type": "string",
+          "required": true,
+          "description": "Agent kind: the name of an AgentProfile."
+        }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "kind",
+          "version",
+          "active",
+          "provenance",
+          "created_at",
+          "digest",
+          "overlay"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 404,
+          "description": "No overlay store is installed (HarvestPlugin::agent_overlay_store), or the kind has no active version."
+        },
+        {
+          "status": 500,
+          "description": "Store or database error."
+        }
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/agents/{kind}/profile/versions",
+      "category": "agent",
+      "read_only": true,
+      "description": "List the profile overlay versions of an agent kind, oldest first (issue #2374). Each version has its provenance ({author, id}) and created time. active names the active version, or null, and the active entry has active true. An unknown kind has no versions.",
+      "params": [
+        {
+          "name": "kind",
+          "in": "path",
+          "type": "string",
+          "required": true,
+          "description": "Agent kind: the name of an AgentProfile."
+        }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "kind",
+          "active",
+          "versions"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 404,
+          "description": "No overlay store is installed (HarvestPlugin::agent_overlay_store)."
+        },
+        {
+          "status": 500,
+          "description": "Store or database error."
+        }
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/agents/{kind}/profile/versions/{version}",
+      "category": "agent",
+      "read_only": true,
+      "description": "Show one profile overlay version of an agent kind as JSON (issue #2374). The body has the same shape as GET /agents/{kind}/profile.",
+      "params": [
+        {
+          "name": "kind",
+          "in": "path",
+          "type": "string",
+          "required": true,
+          "description": "Agent kind: the name of an AgentProfile."
+        },
+        {
+          "name": "version",
+          "in": "path",
+          "type": "string",
+          "required": true,
+          "description": "The version, from 1. A v prefix is accepted, such as v2."
+        }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "kind",
+          "version",
+          "active",
+          "provenance",
+          "created_at",
+          "digest",
+          "overlay"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "The version is not a number from 1."
+        },
+        {
+          "status": 404,
+          "description": "No overlay store is installed (HarvestPlugin::agent_overlay_store), or the kind has no such version."
+        },
+        {
+          "status": 500,
+          "description": "Store or database error."
+        }
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/agents/{kind}/profile/diff",
+      "category": "agent",
+      "read_only": true,
+      "description": "Show only the parts that differ between two profile overlay versions of an agent kind (issue #2374). Each entry of changes has a path (the keys from the root of the overlay JSON), the a value and the b value. An unset side is null. When both versions hold a map field, only the entries that differ show. Two equal versions give no change.",
+      "params": [
+        {
+          "name": "kind",
+          "in": "path",
+          "type": "string",
+          "required": true,
+          "description": "Agent kind: the name of an AgentProfile."
+        },
+        {
+          "name": "a",
+          "in": "query",
+          "type": "string",
+          "required": true,
+          "description": "The first version, from 1. A v prefix is accepted."
+        },
+        {
+          "name": "b",
+          "in": "query",
+          "type": "string",
+          "required": true,
+          "description": "The second version, from 1. A v prefix is accepted."
+        }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "kind",
+          "a",
+          "b",
+          "changes"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "A or b is absent, or is not a version."
+        },
+        {
+          "status": 404,
+          "description": "No overlay store is installed (HarvestPlugin::agent_overlay_store), or the kind has no such version."
+        },
+        {
+          "status": 500,
+          "description": "Store or database error."
+        }
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/agents/{kind}/profile/activate",
+      "category": "agent",
+      "read_only": false,
+      "description": "Make a profile overlay version active, with a compare-and-swap on the active version (issue #2374). The store validates the version again under the current profile, then moves the pointer and logs the move with the operator id. The next op of each agent of the kind reads the new version. The routes are not in ADMIN_SCOPE_ROUTES, so the mutate scope (the harvest-operator role) is enough. Audited under agent_profile.activate: the row has the kind as target_id, the operator id as actor, and from vN to vM in error_summary.",
+      "idempotency": "Idempotent: activating the active version over itself is a 200 that moves nothing and logs no move. Its audit row says unchanged at vN. A stale expected_active is a 409.",
+      "params": [
+        {
+          "name": "kind",
+          "in": "path",
+          "type": "string",
+          "required": true,
+          "description": "Agent kind: the name of an AgentProfile."
+        }
+      ],
+      "request_body": {
+        "required": true,
+        "free_form": false,
+        "fields": [
+          {
+            "name": "version",
+            "required": true,
+            "description": "The version to activate, from 1."
+          },
+          {
+            "name": "expected_active",
+            "required": true,
+            "description": "The active version that the caller read, or null for an unset pointer. A different active version refuses the call."
+          }
+        ]
+      },
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "kind",
+          "from",
+          "to",
+          "actor"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "Bad body: no expected_active, version 0, an unknown field, an invalid operator id, or a kind over 200 bytes."
+        },
+        {
+          "status": 404,
+          "description": "No overlay store is installed (HarvestPlugin::agent_overlay_store), the kind has no profile, or the kind has no such version."
+        },
+        {
+          "status": 409,
+          "description": "The active version is not expected_active. The message names the actual active version."
+        },
+        {
+          "status": 422,
+          "description": "The version no longer validates under the current profile."
+        },
+        {
+          "status": 500,
+          "description": "Store or database error. When the move committed but its audit row failed, the body holds committed true, kind, from and to. Do not send the request again."
+        },
+        {
+          "status": 503,
+          "description": "The database is unavailable."
+        }
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/agents/{kind}/profile/rollback",
+      "category": "agent",
+      "read_only": false,
+      "description": "Activate the version that was active before the current one (issue #2374). The store reads the last move from vN to vM, and activates vN over vM. The swap also needs that move to be the last one, so a pointer that moved after the read is a 409, also when it moved back. A second rollback undoes the first one. The routes are not in ADMIN_SCOPE_ROUTES, so the mutate scope (the harvest-operator role) is enough. Audited under agent_profile.rollback, with the same row form as activate.",
+      "idempotency": "Not idempotent: each rollback reverses the last move, so a second call restores the version before it.",
+      "params": [
+        {
+          "name": "kind",
+          "in": "path",
+          "type": "string",
+          "required": true,
+          "description": "Agent kind: the name of an AgentProfile."
+        }
+      ],
+      "request_body": {
+        "required": false,
+        "free_form": false,
+        "fields": []
+      },
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "kind",
+          "from",
+          "to",
+          "actor"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "The body is not an empty JSON object, the operator id is invalid, or the kind is over 200 bytes."
+        },
+        {
+          "status": 404,
+          "description": "No overlay store is installed (HarvestPlugin::agent_overlay_store), the kind has no profile, or the earlier version no longer exists."
+        },
+        {
+          "status": 409,
+          "description": "No earlier activation exists, or another call moved the pointer after the read. Nothing changed."
+        },
+        {
+          "status": 422,
+          "description": "The earlier version no longer validates under the current profile."
+        },
+        {
+          "status": 500,
+          "description": "Store or database error. When the move committed but its audit row failed, the body holds committed true, kind, from and to. Do not send the request again."
+        },
+        {
+          "status": 503,
+          "description": "The database is unavailable."
+        }
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/agents/{kind}/profile/policy",
+      "category": "agent",
+      "read_only": true,
+      "description": "Show the refine policy of an agent kind (issue #2394), with its revision. A kind with no stored policy shows every default and revision null. custom is false when the last change was a reset.",
+      "params": [
+        {
+          "name": "kind",
+          "in": "path",
+          "type": "string",
+          "required": true,
+          "description": "Agent kind: the name of an AgentProfile."
+        }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "kind",
+          "revision",
+          "custom",
+          "policy"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 404,
+          "description": "No overlay store is installed (HarvestPlugin::agent_overlay_store)."
+        },
+        {
+          "status": 500,
+          "description": "Store or database error, or a stored policy that does not decode."
+        }
+      ]
+    },
+    {
+      "method": "PUT",
+      "path": "/agents/{kind}/profile/policy",
+      "category": "agent",
+      "read_only": false,
+      "description": "Set the refine policy of an agent kind (issue #2394). The policy replaces the stored one. A key that it leaves out takes its default, and an unknown key or a value out of range is refused. Only the operator role sets it: the route is Mutating and not in ADMIN_SCOPE_ROUTES, so a read role gets 403. Audited under agent_profile.policy_set: error_summary holds the revision and each changed key with its old and new value. The store log keeps both whole bodies.",
+      "idempotency": "Compare-and-swap on expected_revision: a repeat of a succeeded call is a 409, because the revision moved.",
+      "params": [
+        {
+          "name": "kind",
+          "in": "path",
+          "type": "string",
+          "required": true,
+          "description": "Agent kind: the name of an AgentProfile."
+        }
+      ],
+      "request_body": {
+        "required": true,
+        "free_form": false,
+        "fields": [
+          {
+            "name": "policy",
+            "required": true,
+            "description": "The whole refine policy: auto_adopt, approval_timeout, probe_effects, ceilings, proposal_attempts and lessons. See docs/agent-adapter.md section 18."
+          },
+          {
+            "name": "expected_revision",
+            "required": true,
+            "description": "The revision that the caller read, or null when the kind has no change. A different revision refuses the call."
+          }
+        ]
+      },
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "kind",
+          "revision",
+          "custom",
+          "policy",
+          "actor",
+          "changes"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "Bad body: no expected_revision, an unknown key, a value out of range, an invalid operator id, or a kind over 200 bytes."
+        },
+        {
+          "status": 404,
+          "description": "No overlay store is installed (HarvestPlugin::agent_overlay_store)."
+        },
+        {
+          "status": 409,
+          "description": "The policy is at another revision. Nothing changed."
+        },
+        {
+          "status": 500,
+          "description": "Store or database error. When the change committed but its audit row failed, the body holds committed true, kind and revision. Do not send the request again."
+        },
+        {
+          "status": 503,
+          "description": "The database is unavailable."
+        }
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/agents/{kind}/profile/policy/reset",
+      "category": "agent",
+      "read_only": false,
+      "description": "Restore every default of the refine policy of an agent kind (issue #2394). It needs no revision, because the result is the same from any state. Only the operator role resets it. Audited under agent_profile.policy_reset, with the same row form as a set.",
+      "idempotency": "Idempotent in effect: each call leaves every default. Each call adds one change to the log.",
+      "params": [
+        {
+          "name": "kind",
+          "in": "path",
+          "type": "string",
+          "required": true,
+          "description": "Agent kind: the name of an AgentProfile."
+        }
+      ],
+      "request_body": {
+        "required": false,
+        "free_form": false,
+        "fields": []
+      },
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "kind",
+          "revision",
+          "custom",
+          "policy",
+          "actor",
+          "changes"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "The body is not an empty JSON object, the operator id is invalid, or the kind is over 200 bytes."
+        },
+        {
+          "status": 404,
+          "description": "No overlay store is installed (HarvestPlugin::agent_overlay_store)."
+        },
+        {
+          "status": 500,
+          "description": "Store or database error. When the change committed but its audit row failed, the body holds committed true, kind and revision. Do not send the request again."
+        },
+        {
+          "status": 503,
+          "description": "The database is unavailable."
+        }
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/agents/{kind}/profile/policy/changes",
+      "category": "agent",
+      "read_only": true,
+      "description": "List each change of the refine policy of an agent kind, oldest first (issue #2394). Each change holds its revision, the operator id, the time, the old and the new policy (null for every default) and the keys that changed.",
+      "params": [
+        {
+          "name": "kind",
+          "in": "path",
+          "type": "string",
+          "required": true,
+          "description": "Agent kind: the name of an AgentProfile."
+        }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "kind",
+          "changes"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 404,
+          "description": "No overlay store is installed (HarvestPlugin::agent_overlay_store)."
+        },
+        {
+          "status": 500,
+          "description": "Store or database error, or a stored policy that does not decode."
         }
       ]
     },
@@ -7357,7 +8041,7 @@
       "path": "/admin/concurrency",
       "category": "admin",
       "read_only": true,
-      "description": "Return live per-key concurrency statistics, grouped by (concurrency_key, task_type) and summed across shards: configured cap (max_concurrent), currently in-flight, and queued (pending) counts. Each row also carries a workflows array attributing the key to the workflow type(s) observed on it, each with the effective on_conflict overflow strategy their registered policy declares (\"defer\" = wait for a slot, \"cancel_running\" = latest-wins, issue #811). A workflow declaring no concurrency policy reports \"defer\". The workflows array is omitted when empty. Latest-wins supersede is shard-local; see docs/sharding.md.",
+      "description": "Return live per-key concurrency statistics, grouped by (concurrency_key, task_type) and summed across shards: configured cap (max_concurrent), currently in-flight, and queued (pending) counts. Each row also carries a workflows array attributing the key to the workflow type(s) observed on it, each with the effective on_conflict overflow strategy their registered policy declares (\"defer\" = wait for a slot, \"cancel_running\" = latest-wins, issue #811). A workflow declaring no concurrency policy reports \"defer\". On a workflow row, each workflow type with a policy also reports code_limit, override_limit (the stored operator override, or null) and effective_limit (issue #2407). max_concurrent is the largest cap that a live row of the key stores, so it can differ from effective_limit until older rows finish. The workflows array is omitted when empty. Latest-wins supersede is shard-local; see docs/sharding.md.",
       "params": [],
       "request_body": null,
       "success_response": {
@@ -7475,7 +8159,7 @@
       "path": "/admin/quotas",
       "category": "admin",
       "read_only": true,
-      "description": "List usage-vs-limit for every resolved `(workflow_name, quota_key)` pair with declared per-tenant resource quotas (issue #946). Each entry reports the current active-execution count, aggregate history bytes, and dead-letter count for the key against the workflow type's currently-registered `QuotaPolicy` limits. Admin-gated: like `/admin/concurrency`, `/admin/debounce`, and `/admin/start-throttle`, the quota_key resolves from user/tenant-derived input fields, so an unauthenticated caller could otherwise enumerate tenant identifiers across the fleet.",
+      "description": "List usage-vs-limit for every resolved `(workflow_name, quota_key)` pair with declared per-tenant resource quotas (issue #946). Each entry reports the current active-execution count, aggregate history bytes, and dead-letter count for the key against the workflow type's effective limits: the operator override of issue #2408, then the currently-registered `QuotaPolicy` limits. Admin-gated: like `/admin/concurrency`, `/admin/debounce`, and `/admin/start-throttle`, the quota_key resolves from user/tenant-derived input fields, so an unauthenticated caller could otherwise enumerate tenant identifiers across the fleet.",
       "idempotency": "Read-only; always idempotent.",
       "params": [],
       "request_body": null,
@@ -7483,10 +8167,12 @@
         "status": 200,
         "fields": [
           "quotas",
+          "workflow_types",
+          "override_source",
           "status",
           "unavailable_shards"
         ],
-        "notes": "Quota enforcement is shard-local by design (issue #946 AC8): the same (workflow_name, quota_key) pair can carry independent usage on every shard a tenant's traffic happens to land on, since shard routing hashes on workflow_id, not the quota key -- so the effective cap across the whole fleet is per-shard-limit multiplied by shards touched. Each entry in `quotas` therefore reports both a fleet-wide `usage` object (active_executions, history_bytes, dead_letters, summed across shards for convenience) AND a `shards` array of per-shard objects {shard_id, active_executions, history_bytes, dead_letters} so an operator can see exactly which shard(s) a tenant is actually capped on. `limits` reports the workflow type's CURRENTLY registered QuotaPolicy caps (max_active_executions, max_history_bytes, max_dead_letters; each null when uncapped or the workflow type declares no quota policy at all) -- resolved live against the registry, not persisted with the usage rows, so an edited policy is reflected immediately rather than against a stale snapshot. An unreachable shard degrades the response to `status: \"partial\"` (naming it in `unavailable_shards`) rather than failing the whole read; usage totals then reflect only the reachable shards and are a lower bound."
+        "notes": "Quota enforcement is shard-local by design (issue #946 AC8): the same (workflow_name, quota_key) pair can carry independent usage on every shard a tenant's traffic happens to land on, since shard routing hashes on workflow_id, not the quota key -- so the effective cap across the whole fleet is per-shard-limit multiplied by shards touched. Each entry in `quotas` therefore reports both a fleet-wide `usage` object (active_executions, history_bytes, dead_letters, summed across shards for convenience) AND a `shards` array of per-shard objects {shard_id, active_executions, history_bytes, dead_letters} so an operator can see exactly which shard(s) a tenant is actually capped on. `limits` reports the EFFECTIVE caps (max_active_executions, max_history_bytes, max_dead_letters; each null when uncapped or the workflow type declares no quota policy at all): the operator override of issue #2408, then the CURRENTLY registered QuotaPolicy caps -- resolved live against the registry, not persisted with the usage rows. `code_limits` holds the registered caps. `override` names the stored override (max_active_executions, max_history_bytes, max_dead_letters, reason, updated_by, updated_at, applies), or null; applies is false when the type has no admission cap, so the override changes nothing. `override_source` is \"table\" when the overrides were read from the default shard, or \"cache\" when that read failed and the cache of the serving process was used, then with null reason, updated_by and updated_at. `workflow_types` lists workflow_name, limits, code_limits and override for each registered type with an admission cap, so an override shows before its type has usage. An unreachable shard degrades the response to `status: \"partial\"` (naming it in `unavailable_shards`) rather than failing the whole read; usage totals then reflect only the reachable shards and are a lower bound."
       },
       "error_responses": [
         {

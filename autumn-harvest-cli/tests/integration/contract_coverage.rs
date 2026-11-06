@@ -37,6 +37,7 @@ const fn method_str(m: ApiMethod) -> &'static str {
         ApiMethod::Get => "GET",
         ApiMethod::Post => "POST",
         ApiMethod::Patch => "PATCH",
+        ApiMethod::Put => "PUT",
         ApiMethod::Delete => "DELETE",
     }
 }
@@ -384,6 +385,55 @@ fn agents_pause_and_resume_are_covered() {
     for args in [
         &["agents", "pause", "support/ada", "--reason", "audit"][..],
         &["agents", "resume", "support/ada"][..],
+    ] {
+        assert_covered(args);
+        assert_body_fields_documented(args);
+    }
+}
+
+// ── harvest agents profile (issue #2374) ───────────────────────────────────
+
+#[test]
+fn agents_profile_commands_are_covered() {
+    for args in [
+        &["agents", "profile", "list", "support"][..],
+        &["agents", "profile", "show", "support"][..],
+        &["agents", "profile", "show", "support", "--version", "v2"][..],
+        &["agents", "profile", "diff", "support", "1", "2"][..],
+        &[
+            "agents",
+            "profile",
+            "activate",
+            "support",
+            "2",
+            "--expected",
+            "1",
+        ][..],
+        &["agents", "profile", "rollback", "support"][..],
+        &["agents", "profile", "policy", "support", "show"][..],
+        &["agents", "profile", "policy", "support", "reset"][..],
+        &["agents", "profile", "policy", "support", "history"][..],
+    ] {
+        assert_covered(args);
+        assert_body_fields_documented(args);
+    }
+}
+
+#[test]
+fn agents_sampling_policy_is_covered() {
+    // Issue #2439.
+    for args in [
+        &["agents", "sampling", "policy", "researcher", "show"][..],
+        &[
+            "agents",
+            "sampling",
+            "policy",
+            "researcher",
+            "set",
+            "--max-draws",
+            "4",
+        ][..],
+        &["agents", "sampling", "policy", "researcher", "reset"][..],
     ] {
         assert_covered(args);
         assert_body_fields_documented(args);

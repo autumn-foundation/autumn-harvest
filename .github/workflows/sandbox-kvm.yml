@@ -2,14 +2,14 @@
 #
 # The `test-nodb` job of ci.yml runs the sandbox tests without KVM. This
 # workflow boots real microVMs on a GitHub runner with /dev/kvm. It builds the
-# guest image with scripts/sandbox/build-guest-image.sh and runs the ignored
+# guest image with `cargo xtask sandbox build-guest-image` and runs the ignored
 # `sandbox::firecracker::kvm_tests`. See docs/sandbox-activities.md.
 #
 # The tests whose names start with `root_` need root, so a second step runs
 # the test binary with sudo. They include the jailer and snapshot tests.
 #
 # The Firecracker release and the base image have pinned digests. The image
-# script pins its default kernel by digest, so this workflow boots that pin.
+# command pins its default kernel by digest, so this workflow boots that pin.
 # The Alpine packages come from the Alpine repository unpinned.
 name: Sandbox (KVM)
 
@@ -19,7 +19,7 @@ on:
       - "autumn-harvest/src/sandbox/**"
       - "autumn-harvest/Cargo.toml"
       - "autumn-harvest-sandbox-guest/**"
-      - "scripts/sandbox/**"
+      - "xtask/src/sandbox/**"
       - "Cargo.lock"
       - "rust-toolchain.toml"
       - ".github/workflows/sandbox-kvm.yml"
@@ -29,7 +29,7 @@ on:
       - "autumn-harvest/src/sandbox/**"
       - "autumn-harvest/Cargo.toml"
       - "autumn-harvest-sandbox-guest/**"
-      - "scripts/sandbox/**"
+      - "xtask/src/sandbox/**"
       - "Cargo.lock"
       - "rust-toolchain.toml"
       - ".github/workflows/sandbox-kvm.yml"
@@ -94,7 +94,7 @@ jobs:
           # fakeroot keeps root as the owner of the image files.
           sudo apt-get update -q
           sudo apt-get install -y --no-install-recommends fakeroot
-          scripts/sandbox/build-guest-image.sh "${RUNNER_TEMP}/image"
+          cargo xtask sandbox build-guest-image "${RUNNER_TEMP}/image"
           echo "HARVEST_GUEST_KERNEL=${RUNNER_TEMP}/image/vmlinux" >> "${GITHUB_ENV}"
           echo "HARVEST_GUEST_ROOTFS=${RUNNER_TEMP}/image/rootfs.ext4" >> "${GITHUB_ENV}"
       - name: Run the KVM tests

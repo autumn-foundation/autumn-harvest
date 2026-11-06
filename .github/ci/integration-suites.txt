@@ -36,7 +36,7 @@
 # CI integration-suite manifest — the single source of truth for which
 # Columns (whitespace-separated; `-` = none/absent):
 # `--test-threads=1` and `--no-run` are DERIVED from `osclass` by the runner and
-# `.github/ci/run-suites.sh` (which the `test` job invokes) and cross-checked
+# `cargo xtask ci run-suites` (which the `test` job invokes) and cross-checked
 # `manifest_is_sorted_and_unique`, fixed with:
 # are never written here — this is what keeps the `--test-threads=1`-after-`--`
 # by `autumn-harvest/tests/integration/ci_run_coverage.rs`.
@@ -125,6 +125,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          completion_callback_outcome_batch_perf
 linux        autumn-harvest         integration                      -                          completion_callback_tests
 linux        autumn-harvest         integration                      -                          completion_trigger_outbox_queue_perf
+linux        autumn-harvest         integration                      -                          concurrency_override_db_tests
 linux        autumn-harvest         integration                      -                          concurrency_supersede_tests
 linux        autumn-harvest         integration                      -                          cost_hold_tests
 linux        autumn-harvest         integration                      -                          cross_shard_children_tests
@@ -197,6 +198,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          quota_enforcement_tests
 linux        autumn-harvest         integration                      -                          quota_history_bytes_perf_tests
 linux        autumn-harvest         integration                      -                          quota_lock_ordering_tests
+linux        autumn-harvest         integration                      -                          quota_override_db_tests
 linux        autumn-harvest         integration                      -                          quota_reconcile_candidate_bound_tests
 linux        autumn-harvest         integration                      -                          quota_reconcile_candidate_scan_perf_tests
 linux        autumn-harvest         integration                      -                          quota_reconcile_tests
@@ -217,7 +219,10 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          retry_chain_routing_tests
 linux        autumn-harvest         integration                      -                          retry_clock_skew_tests
 linux        autumn-harvest         integration                      -                          retry_now_tests
+linux        autumn-harvest         integration                      -                          retry_override_db_tests
+linux        autumn-harvest         integration                      -                          run_defaults_chain_tests
 linux        autumn-harvest         integration                      -                          run_defaults_db_tests
+linux        autumn-harvest         integration                      -                          run_defaults_start_paths_tests
 linux        autumn-harvest         integration                      -                          scanner_lease_tests
 linux        autumn-harvest         integration                      -                          scanner_tick_db_tests
 linux        autumn-harvest         integration                      -                          schedule_decisions
@@ -308,12 +313,17 @@ linux        autumn-harvest         integration                      testing    
 linux        autumn-harvest         integration                      testing                    worker_session_tests
 linux        autumn-harvest         integration                      testing                    workflow_sim_ingest_tests
 linux        autumn-harvest         integration                      wasm-activities            wasm_activities_tests
+linux        autumn-harvest-agent   live_probe_postgres              eval,postgres              -
 linux        autumn-harvest-agent   overlay_read_postgres            postgres                   -
 linux        autumn-harvest-agent   overlay_store_postgres           postgres                   -
+linux        autumn-harvest-agent   postgres_agents                  postgres                   -
+linux        autumn-harvest-agent   sample_postgres                  postgres                   -
+linux        autumn-harvest-agent   sampling_policy_postgres         postgres                   -
 linux        autumn-harvest-agent   score_postgres                   postgres                   -
 linux        autumn-harvest-conformance  conformance                  -                          -
 linux        autumn-harvest-plugin  activity_info_api_integration    -                          -
 linux        autumn-harvest-plugin  admission_gate_authoritative_localpg  -                          -
+linux        autumn-harvest-plugin  agent_profile_integration        -                          -
 linux        autumn-harvest-plugin  api_rate_limit_integration       -                          -
 linux        autumn-harvest-plugin  api_scheduler_integration        -                          -
 linux        autumn-harvest-plugin  archival_integration             -                          -
@@ -327,6 +337,7 @@ linux        autumn-harvest-plugin  canary_integration               -          
 linux        autumn-harvest-plugin  codec_rotation_admin_integration  -                          -
 linux        autumn-harvest-plugin  completion_triggers_integration  -                          -
 linux        autumn-harvest-plugin  concurrency_admin_integration    -                          -
+linux        autumn-harvest-plugin  concurrency_override_integration -                          -
 linux        autumn-harvest-plugin  conflict_policy_integration      -                          -
 linux        autumn-harvest-plugin  connector_integration            connectors                 -
 linux        autumn-harvest-plugin  connector_sqs_broker             sqs                        -
@@ -370,6 +381,7 @@ linux        autumn-harvest-plugin  query_integration                -          
 linux        autumn-harvest-plugin  queue_coverage_integration       -                          -
 linux        autumn-harvest-plugin  queue_pause_integration          -                          -
 linux        autumn-harvest-plugin  quota_admin_integration          -                          -
+linux        autumn-harvest-plugin  quota_override_integration       -                          -
 linux        autumn-harvest-plugin  rate_limit_key_admin_integration  -                          -
 linux        autumn-harvest-plugin  read_path_decode_integration     -                          -
 linux        autumn-harvest-plugin  remote_tasks_integration         mcp,unified-dag-execution  -
@@ -378,9 +390,11 @@ linux        autumn-harvest-plugin  replay_diagnosis_integration     -          
 linux        autumn-harvest-plugin  replay_sample_export_integration  -                          -
 linux        autumn-harvest-plugin  retirement_check_integration     -                          -
 linux        autumn-harvest-plugin  retry_chain_routing_integration  -                          -
+linux        autumn-harvest-plugin  retry_override_integration       -                          -
 linux        autumn-harvest-plugin  run_chain_integration            -                          -
 linux        autumn-harvest-plugin  run_defaults_integration         -                          -
 linux        autumn-harvest-plugin  runner_orphan_gate_integration   -                          -
+linux        autumn-harvest-plugin  sampling_policy_integration      -                          -
 linux        autumn-harvest-plugin  scaling_api_tests                -                          -
 linux        autumn-harvest-plugin  schedule_bulk_audit_perf         -                          -
 linux        autumn-harvest-plugin  schedule_overdue_aux_perf        -                          -

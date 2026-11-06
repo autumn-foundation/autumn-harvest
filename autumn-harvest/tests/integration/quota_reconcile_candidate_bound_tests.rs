@@ -61,6 +61,8 @@ impl MetadataGuard {
                     runbook_url: None,
                     severity: None,
                     input_schema: None,
+                    execution_timeout: None,
+                    chain_execution_timeout: None,
                     sla: None,
                     retry_policy: None,
                     quota: Some(QuotaPolicy::new("tenant_id").with_max_active_executions(100_000)),

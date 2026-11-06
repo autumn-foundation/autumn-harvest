@@ -332,6 +332,19 @@ pub enum SqliteError {
     #[error("corrupt stored value: {0}")]
     Corrupt(String),
 
+    /// A walk of a workflow retry chain passed its bound (issue #2489).
+    ///
+    /// Postgres refuses the same walk with `RetryChainMaxDepthExceeded`. The
+    /// walk fails closed, so a write never lands on a failed run while its
+    /// live retry runs on.
+    #[error("the retry chain of execution {exec_id} is deeper than {max_depth} runs")]
+    RetryChainTooDeep {
+        /// The execution whose retry chain the walk followed.
+        exec_id: ExecutionId,
+        /// The bound that the walk passed.
+        max_depth: usize,
+    },
+
     /// The engine detected a replay **non-determinism** divergence: the current
     /// workflow code produced a command stream that disagrees with the recorded
     /// history (workflow-code drift across a deploy). This is **non-terminal**

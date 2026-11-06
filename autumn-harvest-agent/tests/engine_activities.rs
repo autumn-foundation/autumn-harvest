@@ -55,6 +55,7 @@ fn with_harness(harness: AgentHarness) -> ActivityContext {
 fn turn_request() -> ModelTurnRequest {
     ModelTurnRequest {
         skills: false,
+        allowed_effects: None,
         tool_guidance: std::collections::BTreeMap::new(),
         run_id: "run-1".into(),
         session_id: None,
@@ -160,6 +161,7 @@ async fn the_tool_handler_runs_the_named_tool_with_its_context() {
     let ctx = with_harness(harness);
     let request = ToolCallRequest {
         skill: None,
+        allowed_effects: None,
         run_id: "run-1".into(),
         session_id: None,
         step: 0,
@@ -174,6 +176,7 @@ async fn the_tool_handler_runs_the_named_tool_with_its_context() {
             arguments: json!({"k": 1}),
         },
         workspace: None,
+        probe_effects: None,
     };
 
     let info = agent_tool_call_info();
@@ -258,11 +261,21 @@ fn the_engine_registration_builds() {
         .activities(activities())
         .state(AgentHarness::new(ScriptedModel::new(Vec::new())))
         .build();
-    assert_eq!(built.workflow_count(), 3);
+    // The `eval` feature adds the refine run `agent_refine` (issue #2380).
+    let refine = usize::from(cfg!(feature = "eval"));
+    assert_eq!(built.workflow_count(), 7 + refine);
     assert!(built.state::<AgentHarness>().is_some());
     let names: Vec<&str> = activities().iter().map(|a| a.name).collect();
+    let refine_steps = [
+        "agent_refine_start",
+        "agent_refine_probe",
+        "agent_refine_compose",
+        "agent_refine_select",
+    ];
+    let (core, steps) = names.split_at(names.len() - 4 * refine);
+    assert_eq!(steps, &refine_steps[..4 * refine]);
     assert_eq!(
-        names,
+        core,
         [
             "agent_model_turn",
             "agent_tool_call",
@@ -277,16 +290,32 @@ fn the_engine_registration_builds() {
             "agent_workspace_reset",
             "agent_workspace_floor",
             "agent_refine_propose",
+            "agent_sampling_policy",
+            "agent_refine_policy",
             "agent_score",
+            "agent_answer_check",
+            "agent_sample_score",
+            "agent_consolidate_read",
+            "agent_consolidate_turn",
+            "agent_consolidate_write",
+            "agent_consolidate_due",
+            "agent_episode_append",
+            "agent_episode_reset",
         ]
     );
     let flows: Vec<&str> = workflows().iter().map(|w| w.name).collect();
+    let (core, refine_flow) = flows.split_at(flows.len() - refine);
+    assert_eq!(refine_flow, &["agent_refine"][..refine]);
     assert_eq!(
-        flows,
+        core,
         [
             autumn_harvest_agent::WORKFLOW_NAME,
             autumn_harvest_agent::heartbeat::HEARTBEAT_WORKFLOW_NAME,
             autumn_harvest_agent::AGENT_WORKFLOW_NAME,
+            autumn_harvest_agent::sampling::DRAWS_WORKFLOW_NAME,
+            autumn_harvest_agent::sampling::SAMPLE_WORKFLOW_NAME,
+            autumn_harvest_agent::CONSOLIDATE_WORKFLOW_NAME,
+            autumn_harvest_agent::CONSOLIDATE_ALL_WORKFLOW_NAME,
         ]
     );
 }
@@ -383,6 +412,7 @@ async fn a_huge_tool_error_still_fits_the_result_cap() {
     let outcome = harness
         .tool_call(ToolCallRequest {
             skill: None,
+            allowed_effects: None,
             run_id: "run-1".into(),
             session_id: None,
             step: 0,
@@ -397,6 +427,7 @@ async fn a_huge_tool_error_still_fits_the_result_cap() {
                 arguments: json!({}),
             },
             workspace: None,
+            probe_effects: None,
         })
         .await
         .unwrap();
@@ -613,6 +644,7 @@ async fn a_read_only_call_refuses_a_write_tool_at_run_time() {
     let outcome = harness
         .tool_call(ToolCallRequest {
             skill: None,
+            allowed_effects: None,
             run_id: "run-1".into(),
             session_id: None,
             step: 0,
@@ -627,6 +659,7 @@ async fn a_read_only_call_refuses_a_write_tool_at_run_time() {
                 arguments: json!({}),
             },
             workspace: None,
+            probe_effects: None,
         })
         .await
         .unwrap();
@@ -746,6 +779,7 @@ async fn a_zero_result_cap_leaves_a_big_reply_and_a_big_tool_result_alone() {
     let outcome = harness
         .tool_call(ToolCallRequest {
             skill: None,
+            allowed_effects: None,
             run_id: "run-1".into(),
             session_id: None,
             step: 0,
@@ -760,6 +794,7 @@ async fn a_zero_result_cap_leaves_a_big_reply_and_a_big_tool_result_alone() {
                 arguments: json!({}),
             },
             workspace: None,
+            probe_effects: None,
         })
         .await
         .unwrap();

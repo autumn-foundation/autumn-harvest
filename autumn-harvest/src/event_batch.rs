@@ -356,6 +356,9 @@ pub async fn admit_batched_start_with_codecs(
                         .and_then(|items| items.iter().next())
                         .cloned();
 
+                    // The stored JSON can mark a schedule policy. Keep that source (issue #2409).
+                    let (retry_policy, retry_source) =
+                        crate::workflow_retry::decode_optional(opts.workflow_retry_policy.as_ref());
                     let params = crate::execution::StartWorkflowParams {
                         execution_timeout,
                         memo: opts.memo,
@@ -366,7 +369,11 @@ pub async fn admit_batched_start_with_codecs(
                         chain_execution_timeout,
                         max_workflow_chain_timeout_ceiling,
                         concurrency_key: opts.concurrency_key,
-                        concurrency_limit: opts.concurrency_limit,
+                        // Issue #2407: the limit of the type when the start fires.
+                        concurrency_limit: crate::completion_trigger::fire_time_concurrency_limit(
+                            &row.workflow_name,
+                            opts.concurrency_limit,
+                        ),
                         concurrency_on_conflict: opts.concurrency_on_conflict.unwrap_or_default(),
                         priority,
                         max_workflow_input_bytes: opts.max_workflow_input_bytes.unwrap_or(u64::MAX),
@@ -375,10 +382,8 @@ pub async fn admit_batched_start_with_codecs(
                         severity: opts.severity.as_deref(),
                         context_headers: opts.context_headers,
                         sla,
-                        workflow_retry_policy: opts
-                            .workflow_retry_policy
-                            .clone()
-                            .and_then(|v| serde_json::from_value(v).ok()),
+                        workflow_retry_policy: retry_policy,
+                        workflow_retry_source: retry_source,
                         max_workflow_attempts_ceiling: opts.max_workflow_attempts_ceiling,
                         completion_callbacks: opts.completion_callbacks.clone(),
                         start_source: batch_start_source,
@@ -760,6 +765,9 @@ async fn fire_claimed_batch_row(
         .and_then(|items| items.iter().next())
         .cloned();
 
+    // The stored JSON can mark a schedule policy. Keep that source (issue #2409).
+    let (retry_policy, retry_source) =
+        crate::workflow_retry::decode_optional(opts.workflow_retry_policy.as_ref());
     let params = crate::execution::StartWorkflowParams {
         execution_timeout,
         memo: opts.memo,
@@ -770,7 +778,11 @@ async fn fire_claimed_batch_row(
         chain_execution_timeout,
         max_workflow_chain_timeout_ceiling,
         concurrency_key: opts.concurrency_key,
-        concurrency_limit: opts.concurrency_limit,
+        // Issue #2407: the limit of the type when the start fires.
+        concurrency_limit: crate::completion_trigger::fire_time_concurrency_limit(
+            &workflow_name,
+            opts.concurrency_limit,
+        ),
         concurrency_on_conflict: opts.concurrency_on_conflict.unwrap_or_default(),
         priority,
         max_workflow_input_bytes: opts.max_workflow_input_bytes.unwrap_or(u64::MAX),
@@ -779,9 +791,8 @@ async fn fire_claimed_batch_row(
         severity: opts.severity.as_deref(),
         context_headers: opts.context_headers,
         sla,
-        workflow_retry_policy: opts
-            .workflow_retry_policy
-            .and_then(|v| serde_json::from_value(v).ok()),
+        workflow_retry_policy: retry_policy,
+        workflow_retry_source: retry_source,
         max_workflow_attempts_ceiling: opts.max_workflow_attempts_ceiling,
         completion_callbacks: opts.completion_callbacks,
         start_source: batch_start_source,

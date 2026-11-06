@@ -323,7 +323,7 @@ follow-up candidate rather than attempting it.
 
 ```bash
 HARVEST_TEST_DATABASE_URL=postgres://postgres:postgres@localhost:5432/postgres \
-  ./autumn-harvest/scripts/quota_history_bytes_perf_repro.sh
+  cargo xtask perf quota-history-bytes
 ```
 
 Or directly:

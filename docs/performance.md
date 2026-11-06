@@ -853,7 +853,7 @@ sides of the fix — expected, not a discrepancy.
 rows and never touch the actively paused queue's rows (proven end-to-end by
 `tests/integration/queue_pause_tests.rs::claim_query_excludes_paused_queues_end_to_end`,
 which also covers resuming the queue). Reproduce with
-`autumn-harvest/scripts/queue_pause_claim_perf_repro.sh`, which needs either
+`cargo xtask perf queue-pause-claim`, which needs either
 `HARVEST_TEST_DATABASE_URL` (an admin connection string) or a reachable Docker
 daemon for its testcontainer fallback — not both.
 
@@ -872,7 +872,7 @@ yes/no bound question the query already settles identically at every depth,
 not a magnitude question depth could shift. Full artifacts are committed
 under [`docs/perf-artifacts/pause-array-size/`](perf-artifacts/pause-array-size/),
 reproducible via
-`autumn-harvest/scripts/pause_array_size_claim_perf_repro.sh`.
+`cargo xtask perf pause-array-size-claim`.
 
 | Predicate | Backlog | Worker's own `$2` | Ballast pauses seeded | `paused_*` array size | Sort method |
 |:--|--:|:--|--:|--:|:--|
@@ -1116,7 +1116,7 @@ five pass unchanged against the fixed query). Two new unit tests —
 and
 `queue::tests::concurrency_gate_ctes_are_defined_and_referenced_exactly_once_each`
 — pin the query's shape directly. Reproduce with
-`autumn-harvest/scripts/concurrency_key_claim_perf_repro.sh`, which needs
+`cargo xtask perf concurrency-key-claim`, which needs
 either `HARVEST_TEST_DATABASE_URL` (an admin connection string) or a reachable
 Docker daemon for its testcontainer fallback — not both.
 
@@ -2382,16 +2382,16 @@ from the benchmark are directly comparable.
 * `docs/perf-artifacts/queue-pause-claim-anti-join/` — committed before/after
   `EXPLAIN`/`pg_stat_statements` evidence for
   [the queue-pause anti-join fix](#the-queue-pause-anti-join-fix).
-* `autumn-harvest/scripts/queue_pause_claim_perf_repro.sh` — regenerates that
+* `cargo xtask perf queue-pause-claim` — regenerates that
   evidence from a clean checkout.
 * `docs/perf-artifacts/pause-array-size/` — committed `EXPLAIN` evidence for
   [the pause-array-size sweep](#the-pause-array-size-sweep-issue-1215).
-* `autumn-harvest/scripts/pause_array_size_claim_perf_repro.sh` — regenerates
+* `cargo xtask perf pause-array-size-claim` — regenerates
   that evidence from a clean checkout.
 * `docs/perf-artifacts/concurrency-key-claim-predicate/` — committed
   before/after `EXPLAIN`/`pg_stat_statements` evidence for
   [the concurrency-key gate fix](#the-concurrency-key-gate-fix).
-* `autumn-harvest/scripts/concurrency_key_claim_perf_repro.sh` — regenerates
+* `cargo xtask perf concurrency-key-claim` — regenerates
   that evidence from a clean checkout.
 * `docs/perf-artifacts/claim-paused-gate/` — the PAUSED-run gate after the
   `idx_harvest_we_paused` partial index (issue #2212, PR #2215). With 50
@@ -2402,19 +2402,19 @@ from the benchmark are directly comparable.
   predicate (#382) measurement referenced above.
 * `docs/perf-artifacts/capability-labels-claim-predicate/` — committed
   `EXPLAIN`/`pg_stat_statements` evidence for that measurement.
-* `autumn-harvest/scripts/capability_labels_claim_perf_repro.sh` — regenerates
+* `cargo xtask perf capability-labels-claim` — regenerates
   that evidence from a clean checkout.
 * [`docs/performance-schedule-to-close.md`](performance-schedule-to-close.md) — the `schedule_to_close_at` claim
   predicate (#378) measurement referenced above.
 * `docs/perf-artifacts/schedule-to-close-claim-predicate/` — committed
   `EXPLAIN`/`pg_stat_statements`/heap-growth evidence for that measurement.
-* `autumn-harvest/scripts/schedule_to_close_claim_perf_repro.sh` — regenerates
+* `cargo xtask perf schedule-to-close-claim` — regenerates
   that evidence from a clean checkout.
 * [`docs/performance-worker-sessions.md`](performance-worker-sessions.md) — the worker-sessions claim predicate
   (#606) measurement referenced above.
 * `docs/perf-artifacts/worker-session-claim-predicate/` — committed
   `EXPLAIN`/`pg_stat_statements` evidence for that measurement.
-* `autumn-harvest/scripts/worker_session_claim_perf_repro.sh` — regenerates
+* `cargo xtask perf worker-session-claim` — regenerates
   that evidence from a clean checkout.
 * [`docs/performance-history-ceiling.md`](performance-history-ceiling.md) — a separate scanner, not part of
   `claim_task_query()`: the workflow-history-ceiling check
@@ -2431,7 +2431,7 @@ from the benchmark are directly comparable.
   single-row query above.
 * `docs/perf-artifacts/claim-batched-seek-and-refine/` — committed `EXPLAIN`
   evidence for that measurement.
-* `autumn-harvest/scripts/claim_batched_seek_and_refine_perf_repro.sh` —
+* `cargo xtask perf claim-batched-seek-and-refine` —
   regenerates that evidence from a clean checkout.
 * [`docs/performance-task-queue-hygiene.md`](performance-task-queue-hygiene.md) —
   claim latency after 1M terminal task rows, before and after the
@@ -2650,6 +2650,10 @@ standalone note rather than part of the claim-path attribution table above:
   54.3% of its instructions in `payload_codec_profile`. The note also
   records the allocator and `preserve_order` alternatives measured for that
   issue.
+* [`docs/performance-encode-event-payload-move.md`](performance-encode-event-payload-move.md)
+  — `PayloadCodecs::encode_event_owned` moves each payload tree into the
+  stored value, and `encode_event` clones instead of a serde copy (issue
+  #2499). `payload_codec_profile` drops 19.4% of its instructions.
 * [`docs/performance-parent-close-cascade-unfinished-handlers.md`](performance-parent-close-cascade-unfinished-handlers.md)
   — the per-child `harvest_events` N+1 in
   `check_and_report_unfinished_handlers`'s parent-close-cascade callers,
@@ -2805,6 +2809,12 @@ standalone note rather than part of the claim-path attribution table above:
   the entity checkpoint continues the run near op 288. The transcript digest
   is 34.4% of the replay at 200 ops, and the entity snapshot work 27.0%.
   Baseline only.
+* [`docs/performance-agent-recall.md`](performance-agent-recall.md)
+  — the long-horizon recall eval of a durable `agent` (issue #2455). It
+  scores what each memory config keeps across ops: the window only,
+  progress notes, store memory and episodes. The scripted CI check scores
+  0.17, 1.00, 0.17 and 1.00, with notes and episodes at 1.00 by
+  construction. Real-model runs go on that page.
 * [`docs/performance-analyzer-large-payload.md`](performance-analyzer-large-payload.md)
   — `LargePayloadRule` in `HistoryAnalyzer::analyze`. It counts payload bytes
   without building the JSON text. Instructions fall from 1.32G to 298M, and

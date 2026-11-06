@@ -7,13 +7,14 @@
 
 use std::sync::Arc;
 
+use super::meter::Charge;
 use super::prompts::{DOM_TEMPLATE, INV_TEMPLATE};
-use super::propose::{Dimension, OverlayProposer, ProposeContext, ProposerReply};
+use super::propose::{Dimension, Evidence, OverlayProposer, ProposeContext, ProposerReply};
 use crate::agent::overlay::ProfileOverlay;
 use sha2::{Digest as _, Sha256};
 
 use crate::error::{AgentError, ErrorKind};
-use crate::harness::DEFAULT_MODEL;
+use crate::harness::{DEFAULT_MODEL, priced};
 use crate::message::{ChatMessage, ChatRole, ContentPart, StopReason};
 use crate::model::{AgentModel, BoxFuture, ChatRequest, ChatResponse};
 use crate::response_cache::hex;
@@ -216,8 +217,23 @@ impl OverlayProposer for ModelProposer {
         context: &'a ProposeContext<'a>,
     ) -> BoxFuture<'a, Result<ProposerReply, AgentError>> {
         Box::pin(async move {
+            // A bundle is files. This proposer has no workspace to read them,
+            // so the pointer alone would hide the evidence (issue #2377).
+            if matches!(context.evidence, Evidence::Bundle(_)) {
+                return Err(AgentError::new(
+                    ErrorKind::Config,
+                    "ModelProposer reads text evidence only, and it has no workspace to read a bundle",
+                ));
+            }
             let request = self.request(context);
             let response = self.model.chat(&request).await?;
+            // The provider bills the call, so the stage charges it before any
+            // check.
+            context.charge(Charge {
+                model_id: self.model.model_id().map(str::to_owned),
+                usage: response.usage,
+                cost_usd_micros: priced(self.model.as_ref(), &response.usage),
+            });
             if response.stop_reason == StopReason::MaxTokens {
                 return Err(AgentError::new(
                     ErrorKind::Decode,
@@ -479,6 +495,30 @@ mod tests {
         assert!(err.message().contains("output cap"), "{err}");
     }
 
+    #[tokio::test]
+    async fn a_bundle_is_refused_for_good_and_costs_no_call() {
+        let model = TextModel::new(vec![Ok(KEEP_BASE.to_owned())]);
+        let proposer = ModelProposer::new(model.clone());
+        let manifest = crate::refine::BundleManifest {
+            scope: "evidence:x".to_owned(),
+            head: crate::workspace::WorkspaceRef {
+                digest: "0".repeat(64),
+                bytes: 0,
+                files: 0,
+                generation: 0,
+            },
+            files: Vec::new(),
+            candidates: Vec::new(),
+            flow_labels: std::collections::BTreeSet::new(),
+        };
+        let evidence = Evidence::Bundle(manifest);
+        let current = ProfileOverlay::default();
+        let ctx = context(&evidence, &current, None);
+        let err = proposer.propose(&ctx).await.unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::Config);
+        assert!(model.requests.lock().unwrap().is_empty(), "no model call");
+    }
+
     #[test]
     fn a_retry_request_holds_the_rejection() {
         let proposer = ModelProposer::new(TextModel::new(Vec::new()));
@@ -558,6 +598,8 @@ mod tests {
             profile,
             current: ProfileOverlay::default(),
             attempts: ProposalAttempts::default(),
+            sample: 1,
+            others: Vec::new(),
         };
         let stage = run_stage(&harness, request).await.unwrap();
         assert_eq!(

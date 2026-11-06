@@ -6,7 +6,7 @@
 //!
 //! - `HARVEST_FIRECRACKER_BIN`: the Firecracker binary.
 //! - `HARVEST_GUEST_KERNEL` and `HARVEST_GUEST_ROOTFS`: the guest image from
-//!   `scripts/sandbox/build-guest-image.sh`.
+//!   `cargo xtask sandbox build-guest-image`.
 //! - `HARVEST_JAILER_BIN`: the jailer binary. The tests whose names start
 //!   with `root_` also need root, and they skip without both.
 

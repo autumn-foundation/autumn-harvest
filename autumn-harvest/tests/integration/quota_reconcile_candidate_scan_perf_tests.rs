@@ -74,7 +74,7 @@
 //! for the reading.
 //!
 //! Evidence-capture test below is ignored by default. Run via
-//! `autumn-harvest/scripts/quota_reconcile_candidate_scan_perf_repro.sh`.
+//! `cargo xtask perf quota-reconcile-candidate-scan`.
 //! Full write-up: `docs/performance-quota-reconcile-candidate-scan.md`.
 
 use std::collections::HashMap;
@@ -134,6 +134,8 @@ impl MetadataGuard {
                 runbook_url: None,
                 severity: None,
                 input_schema: None,
+                execution_timeout: None,
+                chain_execution_timeout: None,
                 sla: None,
                 retry_policy: None,
                 quota: Some(QuotaPolicy::new("tenant_id").with_max_active_executions(100_000)),
@@ -386,7 +388,7 @@ struct StatRow {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 #[ignore = "evidence generator, not a CI assertion -- run via \
-            autumn-harvest/scripts/quota_reconcile_candidate_scan_perf_repro.sh"]
+            cargo xtask perf quota-reconcile-candidate-scan"]
 #[allow(clippy::too_many_lines)] // one-shot evidence capture, not control flow
 async fn zz_capture_quota_reconcile_candidate_scan_evidence() {
     let Some(bench) = bench_db_or_skip().await else {

@@ -146,16 +146,138 @@ pub const fn reaches_percent(len: u64, cap: u64, percent: u8) -> bool {
 ///
 /// It is due when the run used fewer than `max_resets` resets and the
 /// request reaches `percent` of `cap`. A request over the cap always
-/// reaches it. A tool round can still pass the cap first and end the run.
+/// reaches it. A tool round can pass the cap first. [`full_round_resets`]
+/// decides that case.
 /// `formal/verus/src/agent_reset.rs` proves it for every input.
 #[must_use]
 pub const fn reset_due(resets: u32, max_resets: u32, len: u64, cap: u64, percent: u8) -> bool {
     resets < max_resets && reaches_percent(len, cap, percent)
 }
 
+/// Does a tool round over the cap reset, and not end the run (issue
+/// #2461)?
+///
+/// `after_len` is the size of the request after the reset, with the round
+/// kept and the notes of that time. The round resets when a reset is left
+/// and that request falls under `percent` of `cap`. So that request fits the
+/// cap. A `cap` of zero is no cap, so no round passes it.
+/// `formal/verus/src/agent_reset.rs` proves it for every input.
+#[must_use]
+pub const fn full_round_resets(
+    resets: u32,
+    max_resets: u32,
+    after_len: u64,
+    cap: u64,
+    percent: u8,
+) -> bool {
+    resets < max_resets && cap > 0 && !reaches_percent(after_len, cap, percent)
+}
+
+/// The episodes that one append evicts from a log of `len` episodes
+/// with the bound `max` (issue #2454).
+///
+/// A bound of 0 counts as 1, so the new episode always fits. After the
+/// append, the log holds at most the bound. An append to a log within the
+/// bound evicts at most one episode.
+/// `formal/verus/src/agent_episodes.rs` proves it for every input.
+#[must_use]
+pub const fn episode_evictions(len: u64, max: u64) -> u64 {
+    let max = if max == 0 { 1 } else { max };
+    if len < max { 0 } else { len - max + 1 }
+}
+
+/// Is a consolidation pass due after `appended` episodes since the last
+/// pass, with the trigger `every` (issue #2454)?
+///
+/// The count is of appends, not of pending episodes. A full log keeps its
+/// pending count, so only an append count moves the trigger. A trigger of
+/// 0 never fires.
+/// `formal/verus/src/agent_episodes.rs` proves it for every input.
+#[must_use]
+pub const fn consolidation_due(appended: u64, every: u32) -> bool {
+    every > 0 && appended >= every as u64
+}
+
+/// The most passes that one firing of `agent_consolidate_all` starts
+/// (issue #2540).
+pub const MAX_DISPATCH_PASSES: u32 = 256;
+
+/// The passes that one firing starts for `due` agents with the bound `max`
+/// (issue #2540).
+///
+/// A bound of 0 counts as 1, and the cap is [`MAX_DISPATCH_PASSES`]. A
+/// firing with a due agent starts at least one pass. The rest wait for the
+/// next firing.
+/// `formal/verus/src/agent_dispatch.rs` proves it for every input.
+#[must_use]
+pub const fn dispatch_passes(due: u64, max: u32) -> u64 {
+    let max = if max == 0 {
+        1
+    } else if max > MAX_DISPATCH_PASSES {
+        MAX_DISPATCH_PASSES
+    } else {
+        max
+    };
+    if due < max as u64 { due } else { max as u64 }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_append_keeps_the_log_in_its_bound() {
+        assert_eq!(episode_evictions(0, 2), 0);
+        assert_eq!(episode_evictions(1, 2), 0);
+        assert_eq!(episode_evictions(2, 2), 1);
+        // A bound of 0 counts as 1.
+        assert_eq!(episode_evictions(0, 0), 0);
+        assert_eq!(episode_evictions(1, 0), 1);
+        // A log over the bound shrinks to it.
+        assert_eq!(episode_evictions(5, 2), 4);
+    }
+
+    #[test]
+    fn a_pass_is_due_at_the_trigger() {
+        assert!(!consolidation_due(0, 3));
+        assert!(!consolidation_due(2, 3));
+        assert!(consolidation_due(3, 3));
+        assert!(consolidation_due(4, 3));
+        assert!(!consolidation_due(u64::MAX, 0));
+    }
+
+    #[test]
+    fn a_firing_starts_at_most_its_bound() {
+        assert_eq!(dispatch_passes(0, 16), 0);
+        assert_eq!(dispatch_passes(3, 16), 3);
+        assert_eq!(dispatch_passes(40, 16), 16);
+        // A bound of 0 counts as 1.
+        assert_eq!(dispatch_passes(5, 0), 1);
+        // The bound never passes the cap.
+        assert_eq!(
+            dispatch_passes(u64::MAX, u32::MAX),
+            u64::from(MAX_DISPATCH_PASSES)
+        );
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn a_firing_drains_the_queue(due in 0_u64..100_000, max in 0_u32..1_000) {
+            let started = dispatch_passes(due, max);
+            proptest::prop_assert!(started <= due);
+            proptest::prop_assert!(started <= u64::from(max.clamp(1, MAX_DISPATCH_PASSES)));
+            proptest::prop_assert!(due == 0 || started >= 1);
+        }
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn no_append_passes_the_bound(len in 0_u64..10_000, max in 0_u64..10_000) {
+            let evicted = episode_evictions(len, max);
+            proptest::prop_assert!(evicted <= len);
+            proptest::prop_assert!(len - evicted < max.max(1));
+        }
+    }
 
     #[test]
     fn the_threshold_is_a_percent_of_the_cap() {
@@ -189,7 +311,41 @@ mod tests {
         assert!(!reset_due(0, 1, 40, 100, 50));
     }
 
+    #[test]
+    fn a_full_round_resets_only_with_room_and_a_reset_left() {
+        assert!(full_round_resets(0, 1, 40, 100, 50));
+        assert!(!full_round_resets(0, 1, 50, 100, 50), "at the threshold");
+        assert!(!full_round_resets(1, 1, 40, 100, 50), "no reset left");
+        assert!(!full_round_resets(0, 0, 0, 100, 50));
+        assert!(!full_round_resets(0, 9, 0, 0, 50), "a zero cap is no cap");
+        // 0 counts as 1, so only an empty window fits.
+        assert!(full_round_resets(0, 1, 0, 100, 0));
+        assert!(!full_round_resets(0, 1, 1, 100, 0));
+        // Half of 3 bytes is 1.5, so 1 byte is under it and 2 bytes are not.
+        assert!(full_round_resets(0, 1, 1, 3, 50));
+        assert!(!full_round_resets(0, 1, 2, 3, 50));
+    }
+
     proptest::proptest! {
+        #[test]
+        fn a_full_round_reset_leaves_a_window_that_fits(
+            resets in 0_u32..8,
+            max_resets in 0_u32..8,
+            after_len in 0_u64..u64::MAX,
+            cap in 0_u64..u64::MAX,
+            percent in 0_u8..=255,
+        ) {
+            let clamped = u128::from(percent.clamp(1, 100));
+            let under = u128::from(after_len) * 100 < u128::from(cap) * clamped;
+            proptest::prop_assert_eq!(
+                full_round_resets(resets, max_resets, after_len, cap, percent),
+                resets < max_resets && cap > 0 && under
+            );
+            if full_round_resets(resets, max_resets, after_len, cap, percent) {
+                proptest::prop_assert!(after_len < cap);
+            }
+        }
+
         #[test]
         fn a_request_over_the_cap_always_reaches_the_threshold(
             cap in 1_u64..u64::MAX,

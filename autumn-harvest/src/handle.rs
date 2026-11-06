@@ -624,6 +624,59 @@ impl WorkflowHandleClient {
         self.inner.max_workflow_execution_timeout
     }
 
+    /// The effective `(execution_timeout, sla)` of a type (issue #2387).
+    ///
+    /// An operator override in the shared cache wins over each declared
+    /// value. A client with no cache returns the declared values. The
+    /// generated typed `start` and `signal_with_start` call this.
+    #[must_use]
+    pub fn apply_run_defaults(
+        &self,
+        workflow_name: &str,
+        execution_timeout: Option<Duration>,
+        sla: Option<Duration>,
+    ) -> (Option<Duration>, Option<Duration>) {
+        self.inner
+            .run_defaults
+            .as_ref()
+            .map_or((execution_timeout, sla), |cache| {
+                cache.apply(workflow_name, execution_timeout, sla)
+            })
+    }
+
+    /// The effective chain cap of a type (issue #2406).
+    ///
+    /// An operator override in the shared cache wins over `declared`. A
+    /// client with no cache returns `declared`. The start then applies the
+    /// fleet chain ceiling.
+    #[must_use]
+    pub fn apply_chain_run_default(
+        &self,
+        workflow_name: &str,
+        declared: Option<Duration>,
+    ) -> Option<Duration> {
+        self.inner
+            .run_defaults
+            .as_ref()
+            .map_or(declared, |cache| cache.apply_chain(workflow_name, declared))
+    }
+
+    /// The effective concurrency policy of a type (issue #2407).
+    ///
+    /// An operator override in the shared cache wins over the declared limit.
+    /// A client with no cache returns `declared`. The generated typed stubs
+    /// call this.
+    #[must_use]
+    pub fn apply_concurrency_run_default(
+        &self,
+        workflow_name: &str,
+        declared: Option<crate::concurrency::ConcurrencyPolicy>,
+    ) -> Option<crate::concurrency::ConcurrencyPolicy> {
+        self.inner.run_defaults.as_ref().map_or(declared, |cache| {
+            cache.apply_concurrency(workflow_name, declared)
+        })
+    }
+
     /// Get the chain-scoped lifetime cap ceiling (issue #617). Doubles as the
     /// fleet-wide chain default.
     #[must_use]
@@ -1263,26 +1316,21 @@ impl WorkflowHandleClient {
         info: &crate::info::WorkflowInfo,
         input: &Value,
     ) -> ResolvedStartDefaults {
-        let concurrency_key = info
-            .concurrency
+        // Issue #2407: an operator override wins over the declared limit.
+        let policy = self.apply_concurrency_run_default(info.name, info.concurrency);
+        let concurrency_key = policy
             .as_ref()
             .and_then(|policy| crate::concurrency::resolve_concurrency_key(policy.key_expr, input));
-        let concurrency_limit = info.concurrency.as_ref().map(|policy| policy.limit);
-        let concurrency_on_conflict = info
-            .concurrency
+        let concurrency_limit = policy.as_ref().map(|policy| policy.limit);
+        let concurrency_on_conflict = policy
             .as_ref()
             .map_or(crate::concurrency::ConcurrencyOnConflict::Defer, |policy| {
                 policy.on_conflict
             });
 
         // Issue #2387: an operator override wins over the declared value.
-        let (execution_timeout, sla) = self
-            .inner
-            .run_defaults
-            .as_ref()
-            .map_or((info.execution_timeout, info.sla), |cache| {
-                cache.apply(info.name, info.execution_timeout, info.sla)
-            });
+        let (execution_timeout, sla) =
+            self.apply_run_defaults(info.name, info.execution_timeout, info.sla);
         let execution_timeout = execution_timeout.and_then(|d| chrono::Duration::from_std(d).ok());
         // Effective SLA clamped to at most the hard execution timeout, mirroring
         // the HTTP start route's resolution (never a soft deadline past the hard
@@ -1290,8 +1338,9 @@ impl WorkflowHandleClient {
         let sla = sla
             .and_then(|d| chrono::Duration::from_std(d).ok())
             .map(|sla| execution_timeout.map_or(sla, |hard| sla.min(hard)));
-        let chain_execution_timeout = info
-            .chain_execution_timeout
+        // Issue #2406: the operator override of the chain cap wins too.
+        let chain_execution_timeout = self
+            .apply_chain_run_default(info.name, info.chain_execution_timeout)
             .and_then(|d| chrono::Duration::from_std(d).ok());
         let max_workflow_input_bytes = self.max_workflow_input_bytes(info.max_input_bytes);
         let max_workflow_execution_timeout_ceiling = self
@@ -2815,6 +2864,73 @@ mod tests {
             router,
             [(ShardId::new(0), "postgres://unused@127.0.0.1:1/unused")],
         )
+    }
+
+    /// Issues #2387 and #2406: a client that shares the cache applies each
+    /// override. The typed `start` and `signal_with_start` stubs call these.
+    /// A client with no cache returns the declared values.
+    #[test]
+    fn the_client_applies_the_run_default_overrides() {
+        let hour = Duration::from_hours(1);
+        let bare = residency_client();
+        assert_eq!(bare.apply_chain_run_default("wf", Some(hour)), Some(hour));
+        assert_eq!(
+            bare.apply_run_defaults("wf", Some(hour), None),
+            (Some(hour), None)
+        );
+
+        let cache = Arc::new(crate::run_defaults::RunDefaultsCache::new());
+        cache.write_through(
+            "wf",
+            crate::run_defaults::RunDefaultFields {
+                execution_timeout: Some(2 * hour),
+                sla: Some(hour / 2),
+                chain_execution_timeout: Some(3 * hour),
+                concurrency_limit: None,
+                quota: crate::quota::QuotaLimits::default(),
+                retry: crate::workflow_retry::RetryLimits::default(),
+            },
+        );
+        let client = residency_client().with_run_defaults(cache);
+        assert_eq!(
+            client.apply_chain_run_default("wf", Some(hour)),
+            Some(3 * hour)
+        );
+        assert_eq!(
+            client.apply_run_defaults("wf", Some(hour), None),
+            (Some(2 * hour), Some(hour / 2))
+        );
+        assert_eq!(
+            client.apply_chain_run_default("other", Some(hour)),
+            Some(hour),
+            "another type keeps its declared value"
+        );
+    }
+
+    /// Issue #2407: the typed stubs and the transactional start resolve the
+    /// concurrency policy through the client. A client with no cache keeps
+    /// the declared policy.
+    #[test]
+    fn the_client_applies_the_concurrency_limit_override() {
+        let declared = Some(crate::concurrency::ConcurrencyPolicy::new("input.k", 2));
+        assert_eq!(
+            residency_client().apply_concurrency_run_default("wf", declared),
+            declared
+        );
+        let cache = Arc::new(crate::run_defaults::RunDefaultsCache::new());
+        cache.write_through(
+            "wf",
+            crate::run_defaults::RunDefaultFields {
+                concurrency_limit: Some(6),
+                ..crate::run_defaults::RunDefaultFields::default()
+            },
+        );
+        let client = residency_client().with_run_defaults(cache);
+        let policy = client
+            .apply_concurrency_run_default("wf", declared)
+            .expect("policy");
+        assert_eq!((policy.key_expr, policy.limit), ("input.k", 6));
+        assert_eq!(client.apply_concurrency_run_default("wf", None), None);
     }
 
     /// AC1b/AC5 on the **handle** surface: the SDK's placement resolver reads

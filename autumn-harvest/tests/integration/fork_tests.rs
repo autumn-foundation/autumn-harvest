@@ -20,7 +20,7 @@ use std::time::Duration;
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::fork::{
     ForkActivityOverride, ForkEffects, WorkflowForkError, WorkflowForkRequest,
-    fork_workflow_execution, is_recorded_fork,
+    fork_workflow_execution, is_recorded_fork, skips_completion_effects,
 };
 use autumn_harvest::models::{NewWorkflowExecution, WorkflowExecution};
 use autumn_harvest::prelude::*;
@@ -1848,6 +1848,73 @@ async fn a_fork_is_admitted_under_the_tenant_quota() {
     assert_eq!(row.quota_key.as_deref(), Some(other.as_str()));
 }
 
+/// A fork takes the operator override of the quota caps (issue #2408). A
+/// lower cap refuses it, and a clear restores the code cap.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fork_takes_the_quota_override() {
+    // The override reaches admission through a process global. The lock keeps
+    // the other quota tests from replacing it.
+    let _serial = crate::quota_enforcement_tests::serial().await;
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let queue = unique("quota-ovr");
+    let mut conn = connect(&url).await;
+    let input = json!({ "tag": queue, "amount": 1, "tenant": queue });
+    let source = seed_run(&mut conn, &queue, &input).await;
+    diesel::update(harvest_workflow_executions::table.find(source.as_uuid()))
+        .set(SetExt(
+            harvest_workflow_executions_ext::quota_key.eq(Some(queue.as_str())),
+        ))
+        .execute(&mut conn)
+        .await
+        .expect("stamp the source key");
+    let mut info = fork_pay_wf_info();
+    let name = info.name;
+    info.quota =
+        Some(autumn_harvest::quota::QuotaPolicy::new("tenant").with_max_active_executions(5));
+    let quota_registry = Arc::new(HandlerRegistry::new(
+        vec![info],
+        activities![fork_charge, fork_receipt],
+    ));
+    let lower = autumn_harvest::run_defaults::RunDefaultFields {
+        quota: autumn_harvest::quota::QuotaLimits {
+            max_active_executions: Some(1),
+            ..autumn_harvest::quota::QuotaLimits::default()
+        },
+        ..autumn_harvest::run_defaults::RunDefaultFields::default()
+    };
+    quota_registry.run_defaults().write_through(name, lower);
+
+    let over = fork_workflow_execution(
+        &mut conn,
+        source,
+        request(ForkEffects::Live),
+        Some(&quota_registry),
+    )
+    .await;
+    assert!(
+        matches!(
+            over,
+            Err(WorkflowForkError::Harvest(
+                autumn_harvest::error::HarvestError::QuotaExceeded { limit: 1, .. }
+            ))
+        ),
+        "the source meets the lower cap of 1: {over:?}"
+    );
+
+    quota_registry.run_defaults().write_through(
+        name,
+        autumn_harvest::run_defaults::RunDefaultFields::default(),
+    );
+    fork_workflow_execution(
+        &mut conn,
+        source,
+        request(ForkEffects::Live),
+        Some(&quota_registry),
+    )
+    .await
+    .expect("the code cap of 5 admits the fork again");
+}
+
 /// A source with no stored quota key, such as a reset run, resolves the key
 /// from its input. A kept input then cannot skip the quota.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2366,7 +2433,8 @@ async fn a_source_erased_after_the_fork_serves_no_record() {
     assert!(error.contains("no recorded result"), "{error}");
 }
 
-/// Only a recorded fork skips completion callbacks and triggers.
+/// A recorded fork and a quiet live fork skip completion callbacks and
+/// triggers (issues #2000 and #2378). A plain live fork sends them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn only_a_recorded_fork_suppresses_completion_notifications() {
     let (url, _container) = setup_test_database_url_or_env().await;
@@ -2384,25 +2452,36 @@ async fn only_a_recorded_fork_suppresses_completion_notifications() {
     let recorded = fork(&url, source, request(ForkEffects::Recorded)).await;
     let live = fork(&url, source, request(ForkEffects::Live)).await;
     let live_of_recorded = fork(&url, recorded, request(ForkEffects::Live)).await;
+    let quiet = fork(&url, source, request(ForkEffects::LiveQuiet)).await;
+    let live_of_quiet = fork(&url, quiet, request(ForkEffects::Live)).await;
 
-    for (exec_id, expected) in [
-        (source, false),
-        (recorded, true),
-        (live, false),
-        (live_of_recorded, false),
+    for (exec_id, recorded_mode, skips) in [
+        (source, false, false),
+        (recorded, true, true),
+        (live, false, false),
+        (live_of_recorded, false, false),
+        (quiet, false, true),
+        (live_of_quiet, false, false),
     ] {
         let row = snapshot(&url, exec_id).await.0;
         assert_eq!(
             is_recorded_fork(&mut conn, &row)
                 .await
                 .expect("read marker"),
-            expected,
+            recorded_mode,
+            "{exec_id}"
+        );
+        assert_eq!(
+            skips_completion_effects(&mut conn, &row)
+                .await
+                .expect("read marker"),
+            skips,
             "{exec_id}"
         );
     }
     // The marker gates the callbacks, so each row keeps the targets. A live
     // fork of a recorded fork then sends them.
-    for exec_id in [recorded, live, live_of_recorded] {
+    for exec_id in [recorded, live, live_of_recorded, quiet, live_of_quiet] {
         let row = snapshot(&url, exec_id).await.0;
         assert_eq!(row.completion_callbacks, Some(targets.clone()), "{exec_id}");
     }

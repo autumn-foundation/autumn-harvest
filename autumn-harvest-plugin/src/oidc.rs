@@ -72,8 +72,13 @@ pub const OIDC_ACTOR_PREFIX: &str = crate::roles::OIDC_ACTOR_PREFIX;
 /// The default longest session age.
 pub const DEFAULT_MAX_SESSION_AGE: Duration = Duration::from_hours(12);
 
-/// The shortest session age. The login time has a one-second resolution.
-const MIN_SESSION_AGE: Duration = Duration::from_secs(1);
+/// The shortest session age.
+///
+/// The login time has a one-second resolution, so a session can end up to
+/// one second early. A login late in a second reaches a stored age of one
+/// second at the next tick. Two seconds keep each session for at least one
+/// real second.
+const MIN_SESSION_AGE: Duration = Duration::from_secs(2);
 
 /// The longest OIDC subject Harvest accepts, in bytes. OIDC Core sets the
 /// same limit.
@@ -218,9 +223,10 @@ impl OidcLogin {
 
     /// Set the longest session age. After it, the user must log in again.
     ///
-    /// The login time has a resolution of one second, so an age under one
-    /// second becomes one second. A shorter age would expire each session at
-    /// once and loop through the identity provider.
+    /// The login time has a resolution of one second, so a session can end
+    /// up to one second before `age`. An age under two seconds becomes two
+    /// seconds. A shorter age can expire a session at the next clock tick and
+    /// loop through the identity provider.
     #[must_use]
     pub fn with_max_session_age(self, age: Duration) -> Self {
         let mut inner = Arc::unwrap_or_clone(self.inner);
@@ -678,12 +684,23 @@ pub(crate) fn login_router(login: OidcLogin) -> Router<()> {
 ///
 /// `router` already carries the admin-auth stack, the role layer included.
 pub(crate) fn apply_oidc(router: Router<()>, login: &OidcLogin, api_tokens: bool) -> Router<()> {
-    router
-        .layer(axum::middleware::from_fn_with_state(
-            (login.clone(), api_tokens),
-            require_oidc_session,
-        ))
-        .merge(login_router(login.clone()))
+    session_boundary(router, login, api_tokens).merge(login_router(login.clone()))
+}
+
+/// Wrap `router` in the session boundary only.
+///
+/// The SQLite router wraps its tenant routes inside their nest (issue
+/// #2469). The boundary then sees the core path, so a public route stays
+/// public on a tenant.
+pub(crate) fn session_boundary(
+    router: Router<()>,
+    login: &OidcLogin,
+    api_tokens: bool,
+) -> Router<()> {
+    router.layer(axum::middleware::from_fn_with_state(
+        (login.clone(), api_tokens),
+        require_oidc_session,
+    ))
 }
 
 // ── Session boundary ──────────────────────────────────────────────────────────
@@ -939,15 +956,27 @@ mod tests {
     }
 
     #[test]
-    fn a_session_age_under_one_second_is_raised_to_one() {
-        let l = login().with_max_session_age(Duration::from_millis(500));
-        assert_eq!(l.max_session_age(), Duration::from_secs(1));
-        assert_eq!(
-            login()
-                .with_max_session_age(Duration::ZERO)
-                .max_session_age(),
-            Duration::from_secs(1)
-        );
+    fn a_session_age_under_two_seconds_is_raised_to_two() {
+        for age in [
+            Duration::ZERO,
+            Duration::from_millis(500),
+            Duration::from_secs(1),
+        ] {
+            let l = login().with_max_session_age(age);
+            assert_eq!(l.max_session_age(), Duration::from_secs(2), "{age:?}");
+        }
+        let l = login().with_max_session_age(Duration::from_secs(3));
+        assert_eq!(l.max_session_age(), Duration::from_secs(3));
+    }
+
+    // A login at 0.999 s stores second 0. At 1.001 s the stored age is one
+    // second. The smallest age must keep that session, or the user loops
+    // through the identity provider.
+    #[tokio::test]
+    async fn the_smallest_age_keeps_a_session_across_one_clock_tick() {
+        let l = login().with_max_session_age(Duration::ZERO);
+        let ticked = session(Some("u"), ROLE_VIEWER, now_unix() - 1);
+        assert_eq!(session_subject(&ticked, &l).await.as_deref(), Some("u"));
     }
 
     #[tokio::test]

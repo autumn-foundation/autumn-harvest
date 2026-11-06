@@ -15,7 +15,7 @@
 //! ```text
 //! # The documented one command (brings up the compose topology, runs the
 //! # whole matrix, tears it down again):
-//! ./benchmarks/run.sh
+//! cargo xtask bench run
 //!
 //! # Directly, against an already-running topology (one admin URL per shard):
 //! HARVEST_BENCH_SHARD_URLS=postgres://...:55432/postgres,postgres://...:55433/postgres \
@@ -28,7 +28,7 @@
 //!
 //! # Compare this run against the published baselines at the documented
 //! # tolerance and print a per-number verdict:
-//! HARVEST_BENCH_CHECK=1 ./benchmarks/run.sh
+//! HARVEST_BENCH_CHECK=1 cargo xtask bench run
 //! ```
 //!
 //! With none of those and no Docker daemon, the suite prints a skip notice and

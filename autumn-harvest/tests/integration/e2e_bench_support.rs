@@ -10,7 +10,7 @@
 //! # Consumers
 //!
 //! * `benches/e2e_bench.rs` — the full 4-scenario x 3-shard-count matrix. The
-//!   one command `benchmarks/run.sh` runs.
+//!   one command `cargo xtask bench run` runs.
 //! * `benches/replay_bench.rs` — reuses [`build_history`] and
 //!   [`sequential_workflow`] so the replay scenario published here and the #135
 //!   budget bench can never measure different histories.
@@ -230,7 +230,7 @@ pub const DISPATCHES_PER_WORKFLOW: usize = 2 * BENCH_ACTIVITIES.len() + 1;
 pub const SIGNAL_ROUTE_PREFIX: &str = "/api/harvest/workflows";
 
 /// Environment variable carrying one Postgres URL per shard, comma-separated.
-/// This is the path `benchmarks/run.sh` uses against the committed compose
+/// This is the path `cargo xtask bench run` uses against the committed compose
 /// topology.
 pub const SHARD_URLS_ENV_VAR: &str = "HARVEST_BENCH_SHARD_URLS";
 
@@ -2791,7 +2791,7 @@ mod tests {
 // Nothing in here is executed by a CI suite: no manifest row runs an end-to-end
 // scenario (issue #941 puts CI-gated end-to-end budgets out of scope, and
 // `benchmarks_docs.rs` asserts the absence). It is driven by
-// `benches/e2e_bench.rs`, which `benchmarks/run.sh` invokes.
+// `benches/e2e_bench.rs`, which `cargo xtask bench run` invokes.
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "db")]
@@ -4152,6 +4152,7 @@ pub mod db {
             scheduled_for: None,
             workflow_attempt: 1,
             workflow_retry_policy: None,
+            workflow_retry_source: autumn_harvest::workflow_retry::RetryPolicySource::Type,
             retry_of_exec_id: None,
             max_workflow_attempts_ceiling: None,
             origin: None,

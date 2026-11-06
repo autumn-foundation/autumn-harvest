@@ -83,6 +83,7 @@ mod child_fanout_tests;
 mod child_policy_tests;
 #[cfg(feature = "db")]
 mod child_timeout_tests;
+mod ci_nextest_archive;
 mod ci_run_coverage;
 mod circuit_breaker_wiring_tests;
 #[cfg(feature = "db")]
@@ -109,6 +110,9 @@ mod completion_callback_tests;
 mod completion_trigger_outbox_queue_perf;
 mod concurrency_key_tests;
 mod concurrency_model_ci;
+#[cfg(feature = "db")]
+mod concurrency_override_db_tests;
+mod concurrency_override_guard;
 mod concurrency_supersede_tests;
 mod contention_adaptive_atomicity_docs;
 mod context_headers_tests;
@@ -297,6 +301,9 @@ mod queue_pause_tests;
 mod quota_enforcement_tests;
 mod quota_history_bytes_perf_tests;
 mod quota_lock_ordering_tests;
+#[cfg(feature = "db")]
+mod quota_override_db_tests;
+mod quota_override_guard;
 mod quota_reconcile_candidate_bound_tests;
 mod quota_reconcile_candidate_scan_perf_tests;
 mod quota_reconcile_tests;
@@ -308,6 +315,7 @@ mod rate_limit_key_tests;
 #[cfg(feature = "db")]
 mod rebalance_markers_db_tests;
 mod redrive_tests;
+mod release_pr_ci;
 #[cfg(all(feature = "testing", feature = "db"))]
 mod remote_task_db_tests;
 #[cfg(feature = "testing")]
@@ -341,7 +349,15 @@ mod retry_chain_routing_tests;
 mod retry_clock_skew_tests;
 mod retry_now_tests;
 #[cfg(feature = "db")]
+mod retry_override_db_tests;
+mod retry_override_guard;
+mod run_defaults_chain_guard;
+#[cfg(feature = "db")]
+mod run_defaults_chain_tests;
+#[cfg(feature = "db")]
 mod run_defaults_db_tests;
+#[cfg(feature = "db")]
+mod run_defaults_start_paths_tests;
 mod runtime_parameter_inventory_docs;
 mod safety_report_docs;
 mod saga_tests;
@@ -488,3 +504,4 @@ mod workflow_task_timeout_tests;
 mod workflow_test_env_mid_run_tests;
 #[cfg(feature = "testing")]
 mod workflow_test_env_tests;
+mod xtask_bin;

@@ -168,7 +168,7 @@ constant nor served by any other index on this table.
 Full 50-request drain, `pg_stat_statements` total buffers, Postgres 16.13.
 
 Two harnesses measure this, over the same fixture, and both are committed.
-`autumn-harvest/scripts/external_outbox_scan_matrix.sh` produces the tables
+`cargo xtask perf external-outbox-scan-matrix` produces the tables
 below: it swaps schema and query text freely, which is what a comparison of
 combinations needs. The artifacts in `docs/perf-artifacts/external-outbox-scan/`
 come from the Rust evidence-capture test, which drives the shipped query
@@ -349,7 +349,7 @@ HARVEST_TEST_DATABASE_URL=postgres://postgres:postgres@localhost:5432/postgres \
 
 # Full evidence capture (seeds 1.02M event rows; about 40 seconds):
 HARVEST_TEST_DATABASE_URL=postgres://postgres:postgres@localhost:5432/postgres \
-  ./autumn-harvest/scripts/external_outbox_scan_perf_repro.sh
+  cargo xtask perf external-outbox-scan
 ```
 
 Artifacts land in `docs/perf-artifacts/external-outbox-scan/`.

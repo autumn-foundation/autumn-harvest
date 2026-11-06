@@ -26,8 +26,8 @@ sandbox = ["autumn-harvest/sandbox-activities", "dep:tokio-util"]
 
 [dependencies]
 # The backend-neutral core only: no Diesel, no Postgres, no autumn-web.
-autumn-harvest = { version = "0.9.0", path = "../autumn-harvest", default-features = false }
-autumn-harvest-sqlite = { version = "0.9.0", path = "../autumn-harvest-sqlite", optional = true }
+autumn-harvest = { version = "0.10.0", path = "../autumn-harvest", default-features = false }
+autumn-harvest-sqlite = { version = "0.10.0", path = "../autumn-harvest-sqlite", optional = true }
 # Workspace snapshots carry file bytes as base64 (issue #2274). The core
 # crate already depends on this version.
 base64 = "0.23"
@@ -45,9 +45,9 @@ tokio-util = { version = "0.7", optional = true }
 
 [dev-dependencies]
 # `testing` adds `ActivityContext::new_test_with_state` for the engine path.
-autumn-harvest = { version = "0.9.0", path = "../autumn-harvest", default-features = false, features = ["testing"] }
+autumn-harvest = { version = "0.10.0", path = "../autumn-harvest", default-features = false, features = ["testing"] }
 chrono = { workspace = true }
-autumn-harvest-sqlite = { version = "0.9.0", path = "../autumn-harvest-sqlite" }
+autumn-harvest-sqlite = { version = "0.10.0", path = "../autumn-harvest-sqlite" }
 proptest = { workspace = true }
 tempfile = "3"
 # The sandbox tool tests pass a cancellation token.
@@ -62,6 +62,9 @@ diesel = { workspace = true }
 diesel-async = { workspace = true }
 testcontainers = { workspace = true }
 testcontainers-modules = { workspace = true }
+# Captures the `harvest.audit` event of a capped auto adoption (issue #2394).
+# Already in the lockfile.
+tracing-subscriber = "0.3"
 
 [[test]]
 name = "sqlite_loop"
@@ -69,6 +72,10 @@ required-features = ["sqlite"]
 
 [[test]]
 name = "crash_resume"
+required-features = ["sqlite"]
+
+[[test]]
+name = "answer_check"
 required-features = ["sqlite"]
 
 [[test]]
@@ -120,8 +127,20 @@ name = "fan_out"
 required-features = ["sqlite"]
 
 [[test]]
+name = "fan_out_trace"
+required-features = ["sqlite"]
+
+[[test]]
 name = "draws"
 required-features = ["sqlite"]
+
+[[test]]
+name = "evidence"
+required-features = ["eval", "sqlite"]
+
+[[test]]
+name = "refine_run"
+required-features = ["eval", "sqlite"]
 
 [[test]]
 name = "transcript_delta"
@@ -152,6 +171,14 @@ name = "overlay_store_postgres"
 required-features = ["postgres"]
 
 [[test]]
+name = "sampling_policy_postgres"
+required-features = ["postgres"]
+
+[[test]]
+name = "sampling_policy"
+required-features = ["sqlite"]
+
+[[test]]
 name = "overlay_read"
 required-features = ["sqlite"]
 
@@ -172,6 +199,10 @@ name = "refine_propose"
 required-features = ["sqlite"]
 
 [[test]]
+name = "refine_policy"
+required-features = ["sqlite"]
+
+[[test]]
 name = "score"
 required-features = ["sqlite"]
 
@@ -179,12 +210,55 @@ required-features = ["sqlite"]
 name = "score_postgres"
 required-features = ["postgres"]
 
+[[test]]
+name = "live_probe"
+required-features = ["eval", "sqlite"]
+
+[[test]]
+name = "live_probe_postgres"
+required-features = ["eval", "postgres"]
+
+[[test]]
+name = "sample"
+required-features = ["sqlite"]
+
+[[test]]
+name = "sample_crash"
+required-features = ["sqlite"]
+
+[[test]]
+name = "sample_postgres"
+required-features = ["postgres"]
+
+# The `postgres` module on a real worker: the Postgres form of the SQLite
+# helpers.
+[[test]]
+name = "postgres_agents"
+required-features = ["postgres"]
+
+[[test]]
+name = "episodes"
+required-features = ["sqlite"]
+
+[[test]]
+name = "consolidate_all"
+required-features = ["sqlite"]
+
+[[test]]
+name = "recall"
+required-features = ["sqlite"]
+
 [lints]
 workspace = true
 
 [[example]]
 name = "sqlite_agent"
 required-features = ["sqlite"]
+
+# The same story on Postgres, with a worker in the process.
+[[example]]
+name = "postgres_agent"
+required-features = ["postgres"]
 
 # A session as a durable agent (issues #1975, #2263). `test = true` runs its
 # embedded tests in the crate's own `cargo test` step.

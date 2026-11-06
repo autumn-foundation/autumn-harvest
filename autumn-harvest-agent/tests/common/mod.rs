@@ -246,6 +246,11 @@ impl Recorder {
     pub fn runs(&self) -> Vec<Value> {
         self.runs.lock().unwrap().clone()
     }
+
+    /// Record one run with `input`.
+    pub fn push(&self, input: Value) {
+        self.runs.lock().unwrap().push(input);
+    }
 }
 
 /// A tool named `name` that records its runs and echoes its input.

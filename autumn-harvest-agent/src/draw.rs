@@ -149,6 +149,14 @@ pub async fn run_draws(
     ids: impl IntoIterator<Item = DrawId>,
 ) -> Result<Vec<Result<AgentReport, String>>, String> {
     let ids: Vec<DrawId> = ids.into_iter().collect();
+    // Check the batch before the copies, so a bad batch copies no task.
+    check_batch(&ids)?;
+    let tasks = ids.into_iter().map(|id| (id, task.clone())).collect();
+    run_draw_tasks(ctx, tasks).await
+}
+
+/// Refuse a batch over [`MAX_PARALLEL_CHILDREN`] ids, or with one id twice.
+fn check_batch(ids: &[DrawId]) -> Result<(), String> {
     let bound = usize::try_from(MAX_PARALLEL_CHILDREN).unwrap_or(usize::MAX);
     if ids.len() > bound {
         return Err(format!(
@@ -160,18 +168,31 @@ pub async fn run_draws(
     if let Some(id) = ids.iter().find(|id| !unique.insert(**id)) {
         return Err(format!("the batch holds the draw {id} twice"));
     }
+    Ok(())
+}
+
+/// [`run_draws`] with a task for each draw (issue #2443).
+///
+/// A sample run gives each draw of a wave its own token cap. The batch
+/// shares one root, as in `run_draws`.
+pub(crate) async fn run_draw_tasks(
+    ctx: &WorkflowContext,
+    tasks: Vec<(DrawId, AgentTask)>,
+) -> Result<Vec<Result<AgentReport, String>>, String> {
+    let ids: Vec<DrawId> = tasks.iter().map(|(id, _)| *id).collect();
+    check_batch(&ids)?;
     if ids.is_empty() {
         return Ok(Vec::new());
     }
     // History records the root, so replay, reset and fork read it back.
     let root = ctx.new_uuid().to_string();
-    // A send from a draw back up the chain is a deadlock, as in a fan-out.
-    let mut waiting = task.waiting.clone();
-    if crate::agent::AgentId::parse(ctx.workflow_id()).is_ok() {
-        waiting.push(ctx.workflow_id().to_owned());
-    }
     let mut inputs = Vec::with_capacity(ids.len());
-    for id in ids {
+    for (id, task) in tasks {
+        // A send from a draw back up the chain is a deadlock, as in a fan-out.
+        let mut waiting = task.waiting.clone();
+        if crate::agent::AgentId::parse(ctx.workflow_id()).is_ok() {
+            waiting.push(ctx.workflow_id().to_owned());
+        }
         let draw = AgentTask {
             draw: Some(Draw::rooted(root.clone(), id)),
             deliver: false,
@@ -181,8 +202,8 @@ pub async fn run_draws(
             unattended_memory_writes: false,
             workspace: None,
             followups: None,
-            waiting: waiting.clone(),
-            ..task.clone()
+            waiting,
+            ..task
         };
         let input = serde_json::to_value(&draw).map_err(|err| err.to_string())?;
         inputs.push((WORKFLOW_NAME.to_owned(), input));
@@ -235,6 +256,17 @@ mod tests {
         assert!(forged.run_id().is_err());
         let forged = Draw::rooted(format!("{ROOT}:s1"), DrawId::new(0));
         assert!(forged.run_id().is_err());
+    }
+
+    #[test]
+    fn a_batch_over_the_bound_or_with_a_repeat_is_refused() {
+        let bound = MAX_PARALLEL_CHILDREN;
+        let full: Vec<DrawId> = (0..bound).map(DrawId::new).collect();
+        assert!(check_batch(&full).is_ok());
+        let over: Vec<DrawId> = (0..=bound).map(DrawId::new).collect();
+        assert!(check_batch(&over).unwrap_err().contains("at most"));
+        let twice = [DrawId::new(1), DrawId::new(1)];
+        assert!(check_batch(&twice).unwrap_err().contains("twice"));
     }
 
     #[test]

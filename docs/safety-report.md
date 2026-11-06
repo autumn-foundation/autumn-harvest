@@ -71,7 +71,7 @@ only.
 Without Docker, some DB suites print `SKIPPED` and pass. One example is
 `cross_region_dr_tests`. Look for `SKIPPED` in the output.
 
-`scripts/check-formal-models.sh` downloads TLC and checks its SHA-256. To run
+`cargo xtask check formal-models` downloads TLC and checks its SHA-256. To run
 one config by hand, set `TLA2TOOLS_JAR` to the path of `tla2tools.jar` first.
 
 The last word of each Check cell says how often CI runs the check:

@@ -4,7 +4,7 @@
 #
 # github-actions: each `uses:` is pinned to a commit SHA with a `# <tag>`
 # comment. Dependabot updates the SHA and the comment together.
-# docs/audits/action-sha-pin.py rejects a pin with no SHA.
+# `cargo xtask audit action-sha-pin` rejects a pin with no SHA.
 #
 # cargo: `/` is the workspace. The CI `msrv` job catches an update that needs
 # a newer rustc. `/fuzz` is not listed. It has no lockfile, so Dependabot

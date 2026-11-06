@@ -31,6 +31,9 @@ use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use tower::ServiceExt;
 
+#[path = "support/wire_contract.rs"]
+mod wire_contract;
+
 type HarvestApiApp = axum::Router;
 
 fn billing_checkout_workflow<'a>(
@@ -381,6 +384,8 @@ async fn single_full_history_export_returns_replay_fixture_shape() {
     assert_eq!(json["status"]["terminal"], true);
     assert_eq!(json["payload_policy"], "full");
     assert_eq!(json["events"][1]["data"]["input"]["amount"], 42);
+    // The shared shape check that the SQLite suite runs too (issue #2468).
+    wire_contract::history_export_shape(&json, 4);
 
     let fixture_path = std::env::temp_dir().join(format!("autumn-history-export-{exec_id}.json"));
     std::fs::write(

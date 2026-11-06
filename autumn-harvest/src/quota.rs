@@ -371,6 +371,111 @@ impl QuotaPolicy {
     }
 }
 
+// ---------------------------------------------------------------------------
+// QuotaLimits -- the operator override of the admission caps (issue #2408)
+// ---------------------------------------------------------------------------
+
+/// The three admission caps that an operator override can set (issue #2408).
+///
+/// Each `None` inherits the code cap. The key and the LLM caps stay
+/// deploy-only. [`crate::run_defaults`] stores and caches these values.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct QuotaLimits {
+    /// The cap on non-terminal executions of one key.
+    pub max_active_executions: Option<u32>,
+    /// The cap on the history bytes of the active executions of one key.
+    pub max_history_bytes: Option<u64>,
+    /// The cap on the dead letters of one key.
+    pub max_dead_letters: Option<u32>,
+}
+
+impl QuotaLimits {
+    /// The admission caps that `policy` declares.
+    #[must_use]
+    pub const fn of(policy: &QuotaPolicy) -> Self {
+        Self {
+            max_active_executions: policy.max_active_executions,
+            max_history_bytes: policy.max_history_bytes,
+            max_dead_letters: policy.max_dead_letters,
+        }
+    }
+
+    /// Whether these limits set no cap.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.max_active_executions.is_none()
+            && self.max_history_bytes.is_none()
+            && self.max_dead_letters.is_none()
+    }
+
+    /// Apply these limits to the code policy of one type.
+    ///
+    /// Each set cap replaces the code cap. The key and the LLM caps do not
+    /// change. A policy with no admission cap comes back unchanged. Its
+    /// starts stamp and lock no key for an admission cap, so a cap that an
+    /// override adds could not apply on every path.
+    #[must_use]
+    pub const fn apply(&self, mut policy: QuotaPolicy) -> QuotaPolicy {
+        if !policy.has_any_cap() {
+            return policy;
+        }
+        if let Some(max) = self.max_active_executions {
+            policy.max_active_executions = Some(max);
+        }
+        if let Some(max) = self.max_history_bytes {
+            policy.max_history_bytes = Some(max);
+        }
+        if let Some(max) = self.max_dead_letters {
+            policy.max_dead_letters = Some(max);
+        }
+        policy
+    }
+}
+
+/// A partial change to stored [`QuotaLimits`] (issue #2408).
+///
+/// Each field is tri-state. The outer `None` keeps the stored cap.
+/// `Some(None)` returns the cap to the code value. `Some(Some(v))` sets `v`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct QuotaLimitsPatch {
+    /// The cap on non-terminal executions of one key.
+    pub max_active_executions: Option<Option<u32>>,
+    /// The cap on the history bytes of one key.
+    pub max_history_bytes: Option<Option<u64>>,
+    /// The cap on the dead letters of one key.
+    pub max_dead_letters: Option<Option<u32>>,
+}
+
+impl QuotaLimitsPatch {
+    /// Merge this patch over the stored limits.
+    #[must_use]
+    pub fn merge(&self, stored: QuotaLimits) -> QuotaLimits {
+        QuotaLimits {
+            max_active_executions: self
+                .max_active_executions
+                .unwrap_or(stored.max_active_executions),
+            max_history_bytes: self.max_history_bytes.unwrap_or(stored.max_history_bytes),
+            max_dead_letters: self.max_dead_letters.unwrap_or(stored.max_dead_letters),
+        }
+    }
+
+    /// Whether this patch names no cap.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.max_active_executions.is_none()
+            && self.max_history_bytes.is_none()
+            && self.max_dead_letters.is_none()
+    }
+
+    /// Whether this patch sets a cap. A `null` sets none.
+    #[must_use]
+    pub const fn sets_any(&self) -> bool {
+        matches!(self.max_active_executions, Some(Some(_)))
+            || matches!(self.max_history_bytes, Some(Some(_)))
+            || matches!(self.max_dead_letters, Some(Some(_)))
+    }
+}
+
 /// Resolve a [`QuotaPolicy::key_expr`] against a workflow input payload.
 ///
 /// A one-line delegate to [`crate::concurrency::resolve_concurrency_key`] —
@@ -1055,6 +1160,131 @@ mod tests {
         let copied = policy;
         // Both usable -- proves `Copy`, not just `Clone`.
         assert_eq!(policy.max_active_executions, copied.max_active_executions);
+    }
+
+    // -- QuotaLimits (issue #2408) -------------------------------------------
+
+    const CODE: QuotaPolicy = QuotaPolicy::new("tenant_id")
+        .with_max_active_executions(10)
+        .with_max_dead_letters(5);
+
+    #[test]
+    fn quota_limits_replace_only_the_caps_they_set() {
+        let limits = QuotaLimits {
+            max_active_executions: Some(2),
+            ..QuotaLimits::default()
+        };
+        let effective = limits.apply(CODE);
+        assert_eq!(effective.max_active_executions, Some(2));
+        assert_eq!(effective.max_dead_letters, Some(5), "an unset cap inherits");
+        assert_eq!(effective.max_history_bytes, None);
+        assert_eq!(
+            effective.key_expr, CODE.key_expr,
+            "the key stays the code key"
+        );
+    }
+
+    #[test]
+    fn quota_limits_can_set_a_cap_that_code_leaves_unset() {
+        let limits = QuotaLimits {
+            max_history_bytes: Some(4096),
+            ..QuotaLimits::default()
+        };
+        assert_eq!(limits.apply(CODE).max_history_bytes, Some(4096));
+    }
+
+    /// A policy with no admission cap opens no key gate. So an override never
+    /// adds a cap to it.
+    #[test]
+    fn quota_limits_never_apply_to_a_policy_with_no_admission_cap() {
+        let limits = QuotaLimits {
+            max_active_executions: Some(1),
+            max_history_bytes: Some(1),
+            max_dead_letters: Some(1),
+        };
+        let capless = QuotaPolicy::new("tenant_id");
+        assert_eq!(limits.apply(capless), capless);
+        let llm_only = QuotaPolicy::new("tenant_id").with_max_tenant_llm_tokens(9);
+        assert_eq!(limits.apply(llm_only), llm_only);
+    }
+
+    #[test]
+    fn quota_limits_keep_the_llm_caps() {
+        let code = CODE
+            .with_max_run_llm_tokens(7)
+            .with_tenant_llm_window_secs(60);
+        let limits = QuotaLimits {
+            max_dead_letters: Some(1),
+            ..QuotaLimits::default()
+        };
+        let effective = limits.apply(code);
+        assert_eq!(effective.max_run_llm_tokens, Some(7));
+        assert_eq!(effective.tenant_llm_window_secs, 60);
+    }
+
+    #[test]
+    fn empty_quota_limits_return_the_code_policy() {
+        assert!(QuotaLimits::default().is_empty());
+        assert_eq!(QuotaLimits::default().apply(CODE), CODE);
+    }
+
+    #[test]
+    fn quota_limits_of_a_policy_copy_its_admission_caps() {
+        assert_eq!(
+            QuotaLimits::of(&CODE),
+            QuotaLimits {
+                max_active_executions: Some(10),
+                max_history_bytes: None,
+                max_dead_letters: Some(5),
+            }
+        );
+    }
+
+    #[test]
+    fn a_lower_override_refuses_the_next_admission() {
+        let usage = QuotaUsage {
+            active_executions: 3,
+            ..QuotaUsage::default()
+        };
+        assert!(check_quota(&usage, &CODE).is_none(), "code cap 10 admits");
+        let lower = QuotaLimits {
+            max_active_executions: Some(3),
+            ..QuotaLimits::default()
+        };
+        let violation = check_quota(&usage, &lower.apply(CODE)).expect("refused");
+        assert_eq!(violation.resource, QuotaResource::ActiveExecutions);
+        assert_eq!(violation.limit, 3);
+    }
+
+    #[test]
+    fn quota_limits_patch_sets_clears_and_keeps() {
+        let stored = QuotaLimits {
+            max_active_executions: Some(4),
+            max_history_bytes: Some(100),
+            max_dead_letters: None,
+        };
+        let patch = QuotaLimitsPatch {
+            max_active_executions: Some(None),
+            max_dead_letters: Some(Some(2)),
+            ..QuotaLimitsPatch::default()
+        };
+        assert_eq!(
+            patch.merge(stored),
+            QuotaLimits {
+                max_active_executions: None,
+                max_history_bytes: Some(100),
+                max_dead_letters: Some(2),
+            }
+        );
+        assert!(QuotaLimitsPatch::default().is_empty());
+        assert!(!patch.is_empty());
+        assert!(patch.sets_any());
+        let clear_only = QuotaLimitsPatch {
+            max_history_bytes: Some(None),
+            ..QuotaLimitsPatch::default()
+        };
+        assert!(!clear_only.is_empty());
+        assert!(!clear_only.sets_any(), "a null sets no cap");
     }
 
     // -- resolve_quota_key --------------------------------------------------

@@ -28,3 +28,22 @@ dev = [
     "--bin", "harvest-dev",
     "--",
 ]
+
+# Workspace automation. Every CI gate, doc guard and perf evidence generator
+# runs through it, for example `cargo xtask audit comment-hygiene`.
+# `cargo xtask --help` lists the groups, and `docs/xtask.md` lists each command.
+xtask = ["run", "--quiet", "--package", "xtask", "--"]
+
+# The light test path for the sandbox unit tests (issue #2487). It needs no
+# database. The `harvest_light` cfg drops the heavy dev-dependencies of the core
+# crate. `RUSTFLAGS`, `CARGO_ENCODED_RUSTFLAGS` and a target `rustflags` entry
+# override the flag, so unset them first.
+sandbox-test = [
+    "test",
+    "--config", "build.rustflags=['--cfg', 'harvest_light']",
+    "-p", "autumn-harvest",
+    "--no-default-features",
+    "--features", "sandbox-activities",
+    "--lib",
+    "sandbox",
+]

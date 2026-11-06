@@ -9,6 +9,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
+use crate::answer_check::AnswerCheck;
 use crate::context_reset::ContextReset;
 use crate::draw::{Draw, DrawId};
 use crate::flow::Released;
@@ -22,6 +23,7 @@ use crate::message::{
 };
 use crate::policy::ToolDecision;
 use crate::skill::SkillText;
+use crate::tool::ToolEffect;
 use crate::workspace::{WorkspaceMount, WorkspaceRef};
 use serde::{Deserialize, Serialize};
 
@@ -35,11 +37,92 @@ pub const DEFAULT_APPROVAL_TIMEOUT_SECS: u64 = 3_600;
 /// this one.
 pub const MAX_PARALLEL_CHILDREN: u32 = 16;
 
+/// The error code of a tool call that a live probe refuses (issue #2378).
+pub const PROBE_EFFECT_REFUSED: &str = "probe_effect_refused";
+
+/// The mark of a live probe run (issue #2378).
+///
+/// A run with the mark runs a tool only when the tool effect is in
+/// [`effects`](Self::effects). The tool-call activity checks it, so a policy
+/// cannot change it. Each delegated child keeps the mark. The fork event of
+/// the run names the source.
+///
+/// The mark is one byte in memory, so `AgentTask` does not grow. A future
+/// that holds a task is close to the `large_futures` threshold. The wire
+/// shape is `{"effects": ["read_only"]}`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "ProbeWire", into = "ProbeWire")]
+pub struct Probe {
+    /// One bit for each effect, in the order of [`ToolEffect::ALL`].
+    mask: u8,
+}
+
+impl Probe {
+    /// A probe that may run the tools of `effects`.
+    #[must_use]
+    pub fn new(effects: impl IntoIterator<Item = ToolEffect>) -> Self {
+        let mask = effects
+            .into_iter()
+            .fold(0, |mask, effect| mask | Self::bit(effect));
+        Self { mask }
+    }
+
+    /// Whether the probe may run a tool of `effect`.
+    #[must_use]
+    pub const fn allows(self, effect: ToolEffect) -> bool {
+        self.mask & Self::bit(effect) != 0
+    }
+
+    /// The tool effects that the probe may run.
+    #[must_use]
+    pub fn effects(self) -> BTreeSet<ToolEffect> {
+        ToolEffect::ALL
+            .into_iter()
+            .filter(|effect| self.allows(*effect))
+            .collect()
+    }
+
+    const fn bit(effect: ToolEffect) -> u8 {
+        match effect {
+            ToolEffect::ReadOnly => 1,
+            ToolEffect::Internal => 2,
+            ToolEffect::Write => 4,
+            ToolEffect::External => 8,
+        }
+    }
+}
+
+/// The wire shape of a [`Probe`]. An unknown key fails to decode, so an
+/// old worker never drops a part of the mark.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProbeWire {
+    effects: BTreeSet<ToolEffect>,
+}
+
+impl From<ProbeWire> for Probe {
+    fn from(wire: ProbeWire) -> Self {
+        Self::new(wire.effects)
+    }
+}
+
+impl From<Probe> for ProbeWire {
+    fn from(probe: Probe) -> Self {
+        Self {
+            effects: probe.effects(),
+        }
+    }
+}
+
 /// The input of one agent run: the workflow input.
 // The flags are independent switches on a recorded payload. A flat bool per
 // switch keeps the wire shape plain, so the lint is allowed here.
+//
+// The derives are remote, so the trait impls below wrap them. The
+// `Deserialize` impl refuses each sampling policy field first (issue #2439).
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(remote = "Self")]
 pub struct AgentTask {
     /// The user message that starts this run.
     pub input: String,
@@ -155,6 +238,11 @@ pub struct AgentTask {
     /// (issue #2270). Each runs as a child `agent_loop` run. Zero or one runs
     /// them one after another, inline. The bound is
     /// [`MAX_PARALLEL_CHILDREN`].
+    ///
+    /// Only allowed `delegate` calls in a row, each to an inline peer, form a
+    /// batch. Each other delegation that runs alone names why in
+    /// [`DelegationRecord::serial`](crate::DelegationRecord::serial) (issue
+    /// #2483).
     #[serde(default, skip_serializing_if = "is_zero")]
     pub parallel_children: u32,
     /// The name of the harness model that runs this task (issue #2271).
@@ -190,11 +278,47 @@ pub struct AgentTask {
     /// `load_skill` tool. See [`skill`](crate::skill).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub skills: BTreeMap<String, SkillText>,
+    /// The tool effects that the run may run (issue #2439). `None` allows
+    /// each effect. It only narrows the run: `read_only` and the policy
+    /// still apply. A strategy draw sets it to the draw effects of its
+    /// policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_effects: Option<BTreeSet<ToolEffect>>,
     /// The draw of the run (issue #2440). Each model request carries its id.
     /// With a root, the run id is `{root}:s{n}`. A delegated child keeps the
     /// id. Use [`run_draws`](crate::run_draws) to start draws.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub draw: Option<Draw>,
+    /// The check of each final answer (issue #2442). `None` accepts each
+    /// answer. See [`answer_check`](crate::answer_check).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer_check: Option<AnswerCheck>,
+    /// The probe mark of the run (issue #2378). `None` is a normal run. See
+    /// [`Probe`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe: Option<Probe>,
+    /// The agent kind of the run (issue #2380). A refine run of a kind
+    /// takes only source runs of that kind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+}
+
+impl Serialize for AgentTask {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        Self::serialize(self, serializer)
+    }
+}
+
+/// The decode refuses each name in
+/// [`SAMPLING_POLICY_FIELDS`](crate::sampling::SAMPLING_POLICY_FIELDS), so a
+/// task never carries a policy. Any other unknown key still decodes, as
+/// before.
+impl<'de> Deserialize<'de> for AgentTask {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        crate::sampling::refuse_policy_fields::<D::Error>(&value, "an AgentTask")?;
+        Self::deserialize(value).map_err(serde::de::Error::custom)
+    }
 }
 
 /// Where the run id of a task comes from.
@@ -247,8 +371,20 @@ impl AgentTask {
             context_reset: None,
             tool_guidance: BTreeMap::new(),
             skills: BTreeMap::new(),
+            allowed_effects: None,
             draw: None,
+            answer_check: None,
+            probe: None,
+            kind: None,
         }
+    }
+
+    /// Check each final answer with `check`. See
+    /// [`answer_check`](Self::answer_check).
+    #[must_use]
+    pub fn answer_check(mut self, check: AnswerCheck) -> Self {
+        self.answer_check = Some(check);
+        self
     }
 
     /// Let the run save notes and reset near the request cap. See
@@ -256,6 +392,13 @@ impl AgentTask {
     #[must_use]
     pub const fn context_reset(mut self, setting: ContextReset) -> Self {
         self.context_reset = Some(setting);
+        self
+    }
+
+    /// Name the agent kind of the run (issue #2380).
+    #[must_use]
+    pub fn kind(mut self, kind: impl Into<String>) -> Self {
+        self.kind = Some(kind.into());
         self
     }
 
@@ -563,6 +706,11 @@ pub struct ModelTurnRequest {
     /// Offer the `load_skill` tool (issue #2373).
     #[serde(default, skip_serializing_if = "is_false")]
     pub skills: bool,
+    /// The tool effects that the run may run (issue #2439). The decision
+    /// phase denies a call to a tool of any other effect, and a call to an
+    /// unknown tool. `None` allows each effect.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_effects: Option<BTreeSet<ToolEffect>>,
     /// The draw of this turn (issue #2440). A recorded input with no field
     /// decodes as `None`, so a run in flight replays as it ran.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -607,6 +755,11 @@ pub struct ModelTurn {
     /// Empty unless the request set `interruptible`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub interruptible: Vec<bool>,
+    /// The cost of the call in millionths of a US dollar, as the cost
+    /// ledger records it (issue #2443). `None` for a cache hit, an unpriced
+    /// call, and a turn recorded before the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_usd_micros: Option<u64>,
 }
 
 impl ModelTurn {
@@ -626,6 +779,7 @@ impl ModelTurn {
             releases: Vec::new(),
             oversized: true,
             interruptible: Vec::new(),
+            cost_usd_micros: self.cost_usd_micros,
         }
     }
 
@@ -702,6 +856,15 @@ pub struct ToolCallRequest {
     /// when the run has no skills, so the tool is unknown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skill: Option<SkillLookup>,
+    /// Refuse a tool whose effect is not in the set, whatever the recorded
+    /// decision says (issue #2439). `None` allows each effect.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_effects: Option<BTreeSet<ToolEffect>>,
+    /// The effects of a live probe (issue #2378). A tool of another effect
+    /// gets [`PROBE_EFFECT_REFUSED`] and does not run. `None` is a normal
+    /// run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe_effects: Option<BTreeSet<ToolEffect>>,
 }
 
 /// What a run holds for one `load_skill` call (issue #2373).
@@ -757,6 +920,20 @@ impl ToolOutcome {
             workspace: None,
         }
     }
+
+    /// The refusal of a live probe for a tool of `effect` (issue #2378).
+    #[must_use]
+    pub fn probe_refused(effect: ToolEffect) -> Self {
+        Self {
+            content: serde_json::json!({
+                "error": PROBE_EFFECT_REFUSED,
+                "effect": effect,
+            })
+            .to_string(),
+            is_error: true,
+            workspace: None,
+        }
+    }
 }
 
 /// Why a run ended.
@@ -791,6 +968,9 @@ pub enum AgentStop {
     /// before it failed (issue #2328). Only a task with `report_failure`
     /// ends under it.
     Failed,
+    /// The answer check rejected more answers than its cap allows (issue
+    /// #2442). The report holds each reason.
+    AnswerRejected,
 }
 
 /// The workflow output: how the run ended and what it produced.
@@ -809,6 +989,11 @@ pub struct AgentReport {
     pub tool_calls: u32,
     /// Provider-reported tokens for the whole run, follow-ups included.
     pub usage: TokenUsage,
+    /// The priced cost of the same calls, in millionths of a US dollar
+    /// (issue #2443). It is the sum of the cost ledger rows of the run. An
+    /// unpriced call adds 0.
+    #[serde(default, skip_serializing_if = "crate::agent::is_zero")]
+    pub cost_usd_micros: u64,
     /// The transcript without the system prompt. Pass it as the history of the
     /// next run to continue the conversation.
     pub messages: Vec<ChatMessage>,
@@ -841,6 +1026,10 @@ pub struct AgentReport {
     /// delegated child counts its own.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub resets: u32,
+    /// The reason of each answer that the answer check rejected, in order
+    /// (issue #2442).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub answer_rejections: Vec<String>,
 }
 
 /// The transcript without system messages.
@@ -974,6 +1163,7 @@ mod tests {
     #[test]
     fn turn_text_joins_only_text_parts() {
         let turn = ModelTurn {
+            cost_usd_micros: None,
             content: vec![
                 ContentPart::Text("a".into()),
                 ContentPart::ToolCall {

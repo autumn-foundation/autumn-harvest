@@ -335,6 +335,7 @@ const SEEDS: SeedPlan = SeedPlan {
 /// be interrupted.
 fn tool_turn(name: &str, interruptible: bool) -> ModelTurn {
     ModelTurn {
+        cost_usd_micros: None,
         content: vec![ContentPart::ToolCall {
             id: "c1".into(),
             name: name.into(),
@@ -353,6 +354,7 @@ fn tool_turn(name: &str, interruptible: bool) -> ModelTurn {
 
 fn final_turn() -> ModelTurn {
     ModelTurn {
+        cost_usd_micros: None,
         content: vec![ContentPart::Text("done".into())],
         stop: StopReason::EndTurn,
         usage: TokenUsage::new(1, 1),

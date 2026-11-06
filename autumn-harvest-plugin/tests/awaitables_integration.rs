@@ -61,6 +61,9 @@ use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use tower::ServiceExt;
 use uuid::Uuid;
 
+#[path = "support/wire_contract.rs"]
+mod wire_contract;
+
 // ── Test workflows ─────────────────────────────────────────────────────────
 
 /// Parks on `wait_for_signal("approval")` — the issue's falsifiable delta.
@@ -380,6 +383,8 @@ async fn parked_signal_wait_names_the_awaited_signal() {
         awaitables[0].get("since").is_some(),
         "signal awaitable should carry a since timestamp: {body}"
     );
+    // The shared shape check that the SQLite suite runs too (issue #2468).
+    wire_contract::awaitables_shape(&body);
 }
 
 /// A pending activity reports name + id + since, and the deadline is enriched

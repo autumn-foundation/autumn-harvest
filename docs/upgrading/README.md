@@ -5,6 +5,7 @@ which versions can run side by side, and in which order to upgrade.
 
 Each release also has its own guide:
 
+- [0.9.0 to 0.10.0](0.10.0.md)
 - [0.8.0 to 0.9.0](0.9.0.md)
 - [0.7.0 to 0.8.0](0.8.0.md)
 - [0.6.0 to 0.7.0](0.7.0.md)
@@ -133,6 +134,25 @@ These 0.8 behaviors break the contract. Avoid each one during the roll.
   is recorded. See
   [0.8.0 §1.11](0.8.0.md#111-a-dropped-session-releases-its-slot).
 
+### Known limits for 0.9 and 0.10
+
+These 0.10 behaviors need care during the roll.
+
+- **Process roles (issues #2477 and #2478).** A 0.10 `AUTUMN_ROLE=web`
+  replica runs no worker, no scheduler and no retention janitor. A 0.9
+  `web` replica runs all three. So the worker capacity of the fleet falls as
+  the `web` replicas roll. Add `worker` replicas first, or set both switches
+  to `true` on the `web` replicas. See
+  [0.10.0 §1.3](0.10.0.md#13-a-web-replica-runs-no-worker-and-no-scheduler--behavior-change).
+- **Run-default overrides (issues #2406 to #2409).** A 0.9 process refuses
+  the new `PATCH` fields with a `400`. It starts and retries runs with the
+  code values. If it clears the last other field of a row, it deletes the
+  row, the new fields included. Set a new field after the roll, and send no
+  `PATCH` to a 0.9 process once one is stored.
+- **Schedule retry source (issue #2409).** A 0.9 worker that retries a run
+  started from a schedule's own retry policy drops the
+  `_harvest_retry_source` mark. A retry override then applies to that chain.
+
 ## Rolling deploy order
 
 1. Read the guide for N. Make the changes that it asks for.
@@ -153,7 +173,7 @@ To roll back, replace the N processes with N-1 processes. Keep the schema.
 ## How CI proves the contract
 
 The `mixed-version-smoke` job in `.github/workflows/ci.yml` runs
-`scripts/run-mixed-version-smoke.sh`. The script does these steps:
+`cargo xtask dev run-mixed-version-smoke`. The command does these steps:
 
 1. It finds N-1: the highest `vX.Y.Z` tag of an earlier minor version.
 2. It builds the smoke worker in `scripts/mixed-version-smoke` against this
@@ -181,10 +201,10 @@ Run it on your machine:
 ```sh
 git fetch --tags
 DATABASE_URL=postgres://postgres:postgres@localhost:5432/mvsmoke \
-  ./scripts/run-mixed-version-smoke.sh
+  cargo xtask dev run-mixed-version-smoke
 ```
 
-The script drops and recreates the `public` schema of that database. Set
+The command drops and recreates the `public` schema of that database. Set
 `MV_SMOKE_PREVIOUS` to test against another tag.
 
 When the API of N-1 differs from this tree, a cargo feature in
@@ -196,5 +216,6 @@ the codec envelope. It does not cover signals, child workflows, schedules,
 erasure, retention or key rotation. A change to one of those needs its own
 mixed-version reasoning in review.
 
-`docs/audits/mixed-version-contract.py` runs in the `lint` job. It fails
-when this page loses a section, or when the job or the script goes missing.
+`cargo xtask audit mixed-version-contract` runs in the `lint` job. It fails
+when this page loses a section, or when the job or the smoke command goes
+missing.

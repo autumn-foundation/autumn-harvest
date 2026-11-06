@@ -58,6 +58,7 @@ use autumn_harvest::audit::{
 use autumn_harvest::info::WorkflowInfo;
 use autumn_harvest::models::NewAuditRecord;
 use autumn_harvest::telemetry::{MetricsRecorder, WebhookOutcome};
+use autumn_harvest::types::WorkflowId;
 use autumn_harvest::webhook_trigger::{
     WebhookCtx, WebhookHandlerError, WebhookTarget, WebhookTriggerInfo, validate_webhook_triggers,
 };
@@ -331,6 +332,8 @@ fn build_webhook_route(trigger: &WebhookTriggerInfo, api_state: HarvestApiState)
         // An inbound webhook endpoint is machine-to-machine and is never
         // rendered or indexed, so it carries no SEO meta (since autumn-web 0.7).
         seo: autumn_web::SeoRouteDefaults::EMPTY,
+        // The group of the plugin that registers the route (since autumn-web 0.10).
+        group: None,
     }
 }
 
@@ -434,17 +437,16 @@ async fn handle_webhook(
     // automatic retry (arriving after the app finishes booting) would 409 as
     // a false duplicate forever instead of ever actually dispatching
     // (Codex review, PR #918).
-    let runtime = match api_state.runtime() {
-        Ok(r) => r,
+    let metrics = match api_state.trigger_metrics() {
+        Ok(metrics) => metrics,
         Err(e) => {
             return error_response(
                 axum::http::StatusCode::SERVICE_UNAVAILABLE,
                 "runtime_not_started",
-                &e.to_string(),
+                &e,
             );
         }
     };
-    let metrics = runtime.registry().telemetry().metrics.clone();
 
     // These routes skip `admit_mutation`, so they run the DR fence check
     // here (issue #1823). The refusal is a `503`. A `5xx` releases the replay
@@ -508,95 +510,109 @@ async fn handle_webhook(
         }
     };
 
-    let dispatch_response = match target {
-        WebhookTarget::Starts { workflow } => {
-            // Strip any upstream `Idempotency-Key` header before delegating.
-            // Issue #808 made `start_workflow` read this header as a
-            // *workflow-start* dedup key, but many webhook providers (Stripe
-            // et al.) send their OWN `Idempotency-Key` on deliveries -- that is
-            // the PROVIDER's key, not a Harvest start key. If it reached #808's
-            // key logic it would (a) collapse two DIFFERENT bindings/events that
-            // happen to reuse a provider key into one execution, and (b) trip
-            // #808's `idempotency_key` + throttle/debounce/batch mutual-exclusion
-            // `400`, breaking webhook starts for any throttled/debounced/batched
-            // target. Webhook starts already dedupe via the mapper's
-            // `workflow_id` (reuse policy on `(workflow_name, workflow_id)`), so
-            // removing the raw header restores that -- and only that -- dedup.
-            // `from_webhook` already sets the body `idempotency_key` to `None`;
-            // the header is the sole remaining source, so removing it fully
-            // disables #808 dedup for webhook-delegated starts. Use the same
-            // header-name constant the handler reads so the two can't drift.
-            let mut start_headers = headers.clone();
-            start_headers.remove(HEADER_IDEMPOTENCY_KEY);
-            // A lost fence session stops the dispatch with a `503`.
-            crate::api::run_dr_fenced(
-                &fence,
-                Box::pin(crate::api::start_workflow(
-                    Extension(api_state.clone()),
-                    axum::extract::Path(workflow.to_string()),
-                    None,
-                    None,
-                    start_headers,
-                    Ok(Json(StartWorkflowRequest::from_webhook(
-                        workflow_id.as_str().to_string(),
-                        payload,
-                        queue.map(str::to_string),
-                    ))),
-                )),
-            )
-            .await
-        }
-        WebhookTarget::SignalsWithStart {
-            workflow,
-            signal_name,
-        } => {
-            // Namespace the idempotency key by this binding (path +
-            // signal_name) rather than passing the raw provider delivery id
-            // straight through: `signal_with_start`'s dedupe is scoped to
-            // `(workflow_name, workflow_id, idempotency_key)` only -- it does
-            // not know about webhook endpoints or signal names. Two
-            // different `#[webhook(signals = ...)]` bindings that target the
-            // same (workflow_name, workflow_id) pair (e.g. two providers
-            // signalling one shared entity workflow) would otherwise collide
-            // whenever their raw delivery ids happen to match (a real risk
-            // for naive/generic senders using small sequential ids, or the
-            // same event redelivered to two configured paths) -- the second
-            // delivery would be misread as an idempotent replay of the
-            // first and its signal silently dropped. `path` alone already
-            // disambiguates every binding (`validate_webhook_triggers`
-            // forbids duplicate paths); `signal_name` is included for
-            // defense-in-depth. A same-binding redelivery of the same event
-            // still maps to the same key, so exactly-once dedup for the
-            // common case is unchanged.
-            //
-            // Unlike the `Starts` path above, the raw upstream `Idempotency-Key`
-            // header cannot leak into #808 dedup here: `signal_with_start_workflow`
-            // reads its exactly-once key exclusively from the request BODY
-            // (`request.idempotency_key`), never the header, so the namespaced
-            // key below is authoritative regardless of any provider header. No
-            // header stripping is needed on this path.
-            let namespaced_idempotency_key = ctx
-                .delivery_id
-                .as_deref()
-                .map(|delivery_id| format!("{path}:{signal_name}:{delivery_id}"));
-            // A lost fence session stops the dispatch with a `503`.
-            crate::api::run_dr_fenced(
-                &fence,
-                Box::pin(crate::api::signal_with_start_workflow(
-                    Extension(api_state.clone()),
-                    axum::extract::Path(workflow.to_string()),
-                    None,
-                    headers.clone(),
-                    Json(SignalWithStartRequest::from_webhook(
-                        workflow_id.as_str().to_string(),
-                        payload,
-                        signal_name.to_string(),
-                        namespaced_idempotency_key,
-                        queue.map(str::to_string),
+    // A SQLite app starts and signals through its handle (issue #2471).
+    let sqlite = sqlite_dispatch(
+        &api_state,
+        target,
+        path,
+        &workflow_id,
+        ctx.delivery_id.as_deref(),
+        &payload,
+    )
+    .await;
+    let dispatch_response = if let Some(response) = sqlite {
+        response
+    } else {
+        match target {
+            WebhookTarget::Starts { workflow } => {
+                // Strip any upstream `Idempotency-Key` header before delegating.
+                // Issue #808 made `start_workflow` read this header as a
+                // *workflow-start* dedup key, but many webhook providers (Stripe
+                // et al.) send their OWN `Idempotency-Key` on deliveries -- that is
+                // the PROVIDER's key, not a Harvest start key. If it reached #808's
+                // key logic it would (a) collapse two DIFFERENT bindings/events that
+                // happen to reuse a provider key into one execution, and (b) trip
+                // #808's `idempotency_key` + throttle/debounce/batch mutual-exclusion
+                // `400`, breaking webhook starts for any throttled/debounced/batched
+                // target. Webhook starts already dedupe via the mapper's
+                // `workflow_id` (reuse policy on `(workflow_name, workflow_id)`), so
+                // removing the raw header restores that -- and only that -- dedup.
+                // `from_webhook` already sets the body `idempotency_key` to `None`;
+                // the header is the sole remaining source, so removing it fully
+                // disables #808 dedup for webhook-delegated starts. Use the same
+                // header-name constant the handler reads so the two can't drift.
+                let mut start_headers = headers.clone();
+                start_headers.remove(HEADER_IDEMPOTENCY_KEY);
+                // A lost fence session stops the dispatch with a `503`.
+                crate::api::run_dr_fenced(
+                    &fence,
+                    Box::pin(crate::api::start_workflow(
+                        Extension(api_state.clone()),
+                        axum::extract::Path(workflow.to_string()),
+                        None,
+                        None,
+                        start_headers,
+                        Ok(Json(StartWorkflowRequest::from_webhook(
+                            workflow_id.as_str().to_string(),
+                            payload,
+                            queue.map(str::to_string),
+                        ))),
                     )),
-                )),
-            )
-            .await
+                )
+                .await
+            }
+            WebhookTarget::SignalsWithStart {
+                workflow,
+                signal_name,
+            } => {
+                // Namespace the idempotency key by this binding (path +
+                // signal_name) rather than passing the raw provider delivery id
+                // straight through: `signal_with_start`'s dedupe is scoped to
+                // `(workflow_name, workflow_id, idempotency_key)` only -- it does
+                // not know about webhook endpoints or signal names. Two
+                // different `#[webhook(signals = ...)]` bindings that target the
+                // same (workflow_name, workflow_id) pair (e.g. two providers
+                // signalling one shared entity workflow) would otherwise collide
+                // whenever their raw delivery ids happen to match (a real risk
+                // for naive/generic senders using small sequential ids, or the
+                // same event redelivered to two configured paths) -- the second
+                // delivery would be misread as an idempotent replay of the
+                // first and its signal silently dropped. `path` alone already
+                // disambiguates every binding (`validate_webhook_triggers`
+                // forbids duplicate paths); `signal_name` is included for
+                // defense-in-depth. A same-binding redelivery of the same event
+                // still maps to the same key, so exactly-once dedup for the
+                // common case is unchanged.
+                //
+                // Unlike the `Starts` path above, the raw upstream `Idempotency-Key`
+                // header cannot leak into #808 dedup here: `signal_with_start_workflow`
+                // reads its exactly-once key exclusively from the request BODY
+                // (`request.idempotency_key`), never the header, so the namespaced
+                // key below is authoritative regardless of any provider header. No
+                // header stripping is needed on this path.
+                let namespaced_idempotency_key = ctx
+                    .delivery_id
+                    .as_deref()
+                    .map(|delivery_id| namespaced_key(path, signal_name, delivery_id));
+                // A lost fence session stops the dispatch with a `503`.
+                crate::api::run_dr_fenced(
+                    &fence,
+                    Box::pin(crate::api::signal_with_start_workflow(
+                        Extension(api_state.clone()),
+                        axum::extract::Path(workflow.to_string()),
+                        None,
+                        headers.clone(),
+                        Json(SignalWithStartRequest::from_webhook(
+                            workflow_id.as_str().to_string(),
+                            payload,
+                            signal_name.to_string(),
+                            namespaced_idempotency_key,
+                            queue.map(str::to_string),
+                        )),
+                    )),
+                )
+                .await
+            }
         }
     };
 
@@ -615,6 +631,74 @@ async fn handle_webhook(
         reshape_dispatch_response(metrics.as_ref(), path, dispatch_response, audit_ctx),
     )
     .await
+}
+
+/// The signal-with-start key of one delivery: the binding's path, its
+/// signal, then the provider delivery id. See the `SignalsWithStart` arm.
+fn namespaced_key(path: &str, signal_name: &str, delivery_id: &str) -> String {
+    format!("{path}:{signal_name}:{delivery_id}")
+}
+
+/// Dispatch one delivery through the SQLite handle (issue #2471).
+///
+/// It returns `None` on Postgres. On SQLite it answers the Postgres start or
+/// signal-with-start response, so [`reshape_dispatch_response`] reads it
+/// unchanged. Before startup it answers `503`, which releases the replay
+/// key, so the provider retries.
+#[cfg(feature = "sqlite")]
+async fn sqlite_dispatch(
+    api_state: &HarvestApiState,
+    target: WebhookTarget,
+    path: &str,
+    workflow_id: &WorkflowId,
+    delivery_id: Option<&str>,
+    payload: &serde_json::Value,
+) -> Option<axum::response::Response> {
+    let handle = match api_state.sqlite_handle()? {
+        Ok(handle) => handle,
+        Err(error) => {
+            return Some(error_response(
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "runtime_not_started",
+                &error.to_string(),
+            ));
+        }
+    };
+    let workflow_id = workflow_id.as_str().to_string();
+    Some(match target {
+        WebhookTarget::Starts { workflow } => {
+            crate::sqlite::triggers::start(&handle, workflow, Some(workflow_id), payload.clone())
+                .await
+        }
+        WebhookTarget::SignalsWithStart {
+            workflow,
+            signal_name,
+        } => {
+            crate::sqlite::triggers::signal_with_start(
+                &handle,
+                workflow,
+                workflow_id,
+                signal_name.to_string(),
+                payload.clone(),
+                delivery_id.map(|delivery_id| namespaced_key(path, signal_name, delivery_id)),
+            )
+            .await
+        }
+    })
+}
+
+/// The Postgres build has no SQLite handle.
+#[cfg(not(feature = "sqlite"))]
+#[allow(clippy::unused_async)]
+async fn sqlite_dispatch(
+    _api_state: &HarvestApiState,
+    _target: WebhookTarget,
+    _path: &str,
+    _workflow_id: &WorkflowId,
+    _delivery_id: Option<&str>,
+    _payload: &serde_json::Value,
+) -> Option<axum::response::Response> {
+    None
 }
 
 /// Context needed to write the `webhook.trigger` audit row for one dispatch
@@ -797,6 +881,35 @@ async fn write_dispatch_audit(
     let (actor, source, request_id) =
         crate::api::audit_context(audit_ctx.headers, audit_ctx.api_state);
 
+    // A SQLite app keeps its audit rows in the Harvest file (issue #2471).
+    #[cfg(feature = "sqlite")]
+    if audit_ctx.api_state.sqlite_handle().is_some() {
+        let ar = NewAuditRecord {
+            actor: &actor,
+            operation: OP_WEBHOOK_TRIGGER,
+            target_type: TARGET_WORKFLOW,
+            target_id: exec_id.or(Some(audit_ctx.workflow_id)),
+            route_or_command: audit_ctx.route,
+            request_id: request_id.as_deref(),
+            idempotency_key: audit_ctx.delivery_id,
+            status,
+            error_summary,
+            shard_id: None,
+            source: &source,
+        };
+        let written = match audit_ctx.api_state.auth_store() {
+            Some(store) => match store.session().await {
+                Ok(mut session) => session.insert_audit(&ar).await.map_err(|e| e.to_string()),
+                Err(e) => Err(e.to_string()),
+            },
+            None => Err("the audit store is not open".to_owned()),
+        };
+        if let Err(e) = written {
+            tracing::error!(error = %e, "audit insert failed for webhook.trigger");
+        }
+        return;
+    }
+
     let acquired = if let Some(raw_exec_id) = exec_id {
         match crate::api::parse_execution_id(raw_exec_id) {
             Ok(id) => match crate::api::db_conn_for_execution(audit_ctx.api_state, id).await {
@@ -858,6 +971,47 @@ async fn write_dispatch_audit(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Before startup a SQLite app answers `503`, which releases the replay
+    /// key. A delivery never reaches the Postgres start path (issue #2471).
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn a_sqlite_delivery_before_startup_is_a_503() {
+        let api_state = HarvestApiState::new();
+        api_state.set_sqlite_backend();
+        let response = sqlite_dispatch(
+            &api_state,
+            WebhookTarget::Starts { workflow: "orders" },
+            "/hooks/orders",
+            &WorkflowId::new("o-1"),
+            Some("dlv-1"),
+            &serde_json::json!({}),
+        )
+        .await
+        .expect("a SQLite app answers on its own path");
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert!(
+            api_state.trigger_metrics().is_err(),
+            "no metrics before startup"
+        );
+        // A Postgres app takes its own path.
+        let postgres = HarvestApiState::new();
+        assert!(
+            sqlite_dispatch(
+                &postgres,
+                WebhookTarget::Starts { workflow: "orders" },
+                "/hooks/orders",
+                &WorkflowId::new("o-1"),
+                None,
+                &serde_json::json!({}),
+            )
+            .await
+            .is_none()
+        );
+    }
 
     #[derive(Default)]
     struct RecordingMetrics {

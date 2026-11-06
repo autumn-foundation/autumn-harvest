@@ -2146,7 +2146,7 @@ async fn reseed_end_to_end_fixture(url: &str) {
 /// the hot-contention fixture `docs/performance-claim-batched-seek-and-refine.md`
 /// cites.
 ///
-/// `autumn-harvest/scripts/claim_batched_seek_and_refine_perf_repro.sh`
+/// `cargo xtask perf claim-batched-seek-and-refine`
 /// also takes SQL-only `EXPLAIN` captures. Unlike those, this drives the
 /// REAL compiled functions over real connections. So it is the only
 /// source for that page's headline milliseconds-per-claim numbers. Each
@@ -2159,7 +2159,7 @@ async fn reseed_end_to_end_fixture(url: &str) {
 /// 400).
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 #[ignore = "evidence generator, not a CI assertion -- run via \
-            autumn-harvest/scripts/claim_batched_seek_and_refine_perf_repro.sh"]
+            cargo xtask perf claim-batched-seek-and-refine"]
 async fn zz_capture_claim_batched_end_to_end_latency() {
     let bench = match super::claim_bench_support::db::setup_bench_db().await {
         Ok(bench) => bench,

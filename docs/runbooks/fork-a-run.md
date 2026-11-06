@@ -40,6 +40,7 @@ The route is admin-only. Each call creates a new execution.
 |-----------|-----------------|----------------------------------------|---------------------------------|
 | `recorded` (default) | Takes an override, or the source result for the same name, occurrence and input. With neither, it fails with `ForkEffectUnavailable`. It never runs. | The fork run fails before the effect runs. A continue-as-new and a mutex acquire fail it too. | Not sent. |
 | `live` | Runs for real, unless an override applies. | Runs for real. | Sent. |
+| `live_quiet` | Runs for real, unless an override applies. | Runs for real. | Not sent (issue #2378). |
 
 A recorded fork cannot charge a card again under a new identity. Use
 `"effects": "live"` only when you want real effects.

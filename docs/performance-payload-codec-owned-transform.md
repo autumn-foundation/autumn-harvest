@@ -89,6 +89,11 @@ event field, so serde no longer copies the tree.
 [`performance-decode-event-payload-move.md`](performance-decode-event-payload-move.md)
 measures that change on this harness.
 
+Since issue #2499, `encode_event` calls `transform_event_data` only on its
+slow path. Its fast path still calls `encode_payload_owned`.
+[`performance-encode-event-payload-move.md`](performance-encode-event-payload-move.md)
+measures that change.
+
 ## 🔧 Change
 
 `autumn-harvest/src/payload_codec.rs`:
@@ -154,7 +159,7 @@ Well clear of the ≥5%-of-workload floor too.
   targets (`dead_code` in `replay_profile_support.rs`, `missing_const_for_fn`
   in `critical_path_profile.rs`) that reproduce identically on
   `origin/trunk-dev` with no changes applied.
-* `python3 docs/audits/comment-hygiene.py --base origin/trunk-dev` — clean,
+* `cargo xtask audit comment-hygiene --base origin/trunk-dev` — clean,
   no Tier A findings, no Tier B regressions.
 
 ## 🔬 Reproduce

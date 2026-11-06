@@ -5,7 +5,8 @@
 # chaos.yml run succeeds in 48 hours. It is a separate file, so a defect in
 # chaos.yml cannot also stop the alert.
 #
-# The logic is in .github/ci/chaos-watchdog.sh. The chaos_watchdog tests in
+# The logic is in `cargo xtask ci chaos-watchdog`
+# (xtask/src/ci/chaos_watchdog.rs). The chaos_watchdog tests in
 # autumn-harvest/tests/integration run it against a stub `gh`.
 name: Chaos watchdog
 
@@ -34,34 +35,49 @@ jobs:
     # Each step has its own timeout, and they sum to less than this. A step
     # timeout is a step failure, so the report step still runs. A job timeout
     # is a cancel, and then the report step does not run.
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         timeout-minutes: 2
+      # The watchdog runs through `cargo xtask`, so the job needs a toolchain.
+      # `rust-toolchain.toml` picks the release.
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        timeout-minutes: 3
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        timeout-minutes: 2
+      # A separate step, so a failed build is a red run. The report step below
+      # then posts it.
+      - name: Build the xtask binary
+        timeout-minutes: 5
+        run: cargo build --quiet --locked -p xtask
       - name: Alert when no scheduled chaos run succeeded in 48 h
         timeout-minutes: 3
         env:
           GH_TOKEN: ${{ github.token }}
-        run: bash .github/ci/chaos-watchdog.sh
+        run: cargo xtask ci chaos-watchdog
       # GitHub tells only the last editor of a cron about a failed scheduled
       # run. This step puts a red watchdog run on its own issue instead.
       - name: Report a failed watchdog run on an issue
         if: failure()
-        timeout-minutes: 2
+        timeout-minutes: 4
         env:
           GH_TOKEN: ${{ github.token }}
-        # If checkout failed, the script is not on disk. Then comment on the
-        # open issue, or open one, directly. The title must match
-        # `failed_title` in the script.
+        # The xtask binary reports the run when it builds. A failed checkout,
+        # toolchain or build leaves no binary. Then comment on the open issue,
+        # or open one, directly. The build has a bound, so this fallback
+        # always gets its turn. The title must match `FAILED_TITLE` in
+        # xtask/src/ci/chaos_watchdog.rs.
         run: |
-          if [ -f .github/ci/chaos-watchdog.sh ]; then
-            bash .github/ci/chaos-watchdog.sh self-failed
+          if [ -f Cargo.toml ] && timeout 150 cargo build --quiet --locked -p xtask; then
+            cargo xtask ci chaos-watchdog self-failed
             exit 0
           fi
           title="Chaos watchdog: a watchdog run failed"
-          body="The chaos watchdog run failed before checkout: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
-          # Same lookup as `open_issue_titled` in the script: the paginated
-          # REST listing, not the search index, which can lag.
+          body="The chaos watchdog run failed before it could report: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          # Same lookup as `open_issue_titled` in the xtask module: the
+          # paginated REST listing, not the search index, which can lag.
           issue="$(gh api --paginate -X GET "repos/$GITHUB_REPOSITORY/issues" \
             -f state=open -f per_page=100 \
             | jq -rs --arg title "$title" \

@@ -384,7 +384,7 @@ async fn capture(
 /// reachable Docker daemon for `claim_bench_support::db::setup_bench_db`'s
 /// testcontainer fallback.
 #[tokio::test]
-#[ignore = "seeds ~4M rows; run explicitly via scripts/history_ceiling_claim_perf_repro.sh"]
+#[ignore = "seeds ~4M rows; run explicitly via cargo xtask perf history-ceiling-claim"]
 async fn zz_capture_history_ceiling_claim_evidence() {
     use super::claim_bench_support::db;
 
