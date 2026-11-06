@@ -2467,7 +2467,8 @@ let input = SampleInput::new(
 
 The run reads the profile and the sampling policy of the kind once each,
 as `agent_draws` does (section 19). The policy admits the strategy, the
-draw count (`n` or `max_attempts`), the concurrency and the scorer. Each
+draw count (`n` or `max_attempts`), the concurrency and the scorer of
+best-of-N and rejection. Each
 draw gets `draw_effects`, so with the default `[read_only]` a draw that
 calls a `write` tool gets a refusal, and the tool body never runs.
 
@@ -2512,7 +2513,8 @@ model is not called.
   `budget_exceeded`, `score_failed` or `settled` (a vote leader cannot
   lose);
 - `attempts`: the draws that ran;
-- `draws`: for each draw, its stop, verdict, usage and cost. The usage and
+- `draws`: for each draw, its stop, verdict, usage, cost and, for a vote,
+  its key (section 25). The usage and
   the cost include the judge calls of the draw;
 - `usage` and `cost_usd_micros`: the totals. They equal the cost ledger
   rows of the run tree.
@@ -2884,34 +2886,46 @@ let input = SampleInput::vote("researcher", "What is 17 * 23?", 5, AnswerKey::La
 | Key | The key of an answer |
 |---|---|
 | `trimmed` | The answer with no white space at each end. |
-| `last_number` | The last decimal number, in canonical form: `1,200.50` gives `1200.5`. |
-| `{"json_field": "/a/b"}` | The field at a JSON pointer of the JSON answer. A string gives its text, `null` gives no key, and each other value gives its JSON text. |
-| `{"custom": "id"}` | The result of the app `AnswerKeyFn` with this id. Add it with `AgentHarness::answer_key`. |
+| `last_number` | The last decimal number, in canonical form: `1,200.50` gives `1200.5`, and `.5` gives `0.5`. Only ASCII digits count. An exponent is a number of its own, so `1e5` gives `5`. |
+| `{"json_field": "/a/b"}` | The field at a JSON pointer (RFC 6901) of the JSON answer. A string gives its trimmed text. A number gives its decimal form, so `1`, `1.0` and `1e0` all give `1`. `null` gives no key. Each other value gives its JSON text. |
+| `{"custom": "id"}` | The result of the app `AnswerKeyFn` with this id, which must be an agent name. Add it with `AgentHarness::answer_key`. Make it a fast, pure function: it runs inline, with no time budget. |
 
 - **Votes.** Only a draw that completed casts a vote. A draw with no key,
-  or with a key over 1 KiB, casts no vote. Its verdict is a reject that
-  names the reason. A draw with a key gets a score of 1.
+  or with a key over 1 KiB as JSON text, casts no vote. Its verdict is a
+  reject that names the reason. A draw with a key gets a score of 1.
 - **Winner.** The key with the most votes wins. A tie goes to the key
   whose first vote has the lowest draw id. The run selects that first
   draw. With no vote at all, the outcome is `no_accepted_draw`.
 - **Early stop.** After each wave, let `lead` and `second` be the top two
-  counts, and `left` the draws not yet started. When
-  `lead > second + left`, the run starts no more draws and `stopped` is
-  `settled`. The draws of the wave all count. Verus proves that the
-  winner is then the winner of the full run, for each way the left draws
-  could vote, and that the order in which draws end does not change it.
-  A lower concurrency makes the stop come sooner.
+  counts, and `left` the draws not yet started. When draws are left and
+  `lead > second + left`, the run starts no more draws, and `stopped` is
+  `settled`. Each draw of the wave counts. When the last wave decides the
+  vote, `stopped` is `completed`. Verus proves that the winner and its
+  first draw are then those of the full run, for each way the left draws
+  could vote. It also proves that the order in which draws end does not
+  change the winner.
+- **Concurrency.** A vote takes the cap of the policy by default. A run
+  whose draws fit in one wave never stops early. A lower concurrency lets
+  the run stop after fewer draws.
+- **Failures.** A failed key activity gives the draw a reject, and the
+  run stops with `score_failed`. So does a worker that has no function
+  for an app key, so a fleet that is half upgraded never casts empty
+  votes. A failed key wins over a settled vote. A settled vote wins over
+  a budget stop.
 - **Report.** `SampleReport::tally` holds the votes of each key, the
   winner first. `SampleDraw::key` holds the key of each draw.
-- **Durability.** The run keys a built-in key in workflow code, from the
-  recorded answer. The `agent_vote_key` activity calls an app key, so
-  history records it. After a crash, replay rebuilds the tally, and the
-  run starts only the draws that are missing.
+- **Durability.** The recorded `agent_vote_key` activity applies each
+  key, built-in or app. So replay reads each key, and a later change to a
+  key rule never changes a recorded run. After a crash, replay rebuilds
+  the tally, and the run starts only the draws that are missing.
 - **Refusals.** Each one comes before any model call: a kind whose policy
   does not list `vote` (`strategy_not_allowed`), a vote with a scorer
   (`scorer_not_used`), a key that is not valid (`invalid_answer_key`) and
   an app key that the harness lacks (`unknown_answer_key`). Best-of-N and
   rejection with no scorer give `no_scorer`.
+- **The gate of an app key.** The policy does not list app keys. A vote
+  can name only a function that the app added to its harness, and the
+  function gets no model and no context.
 
 The draws share the token budget and the draw effects of section 20. The
 design is in [`DESIGN-2444.md`](design/DESIGN-2444.md).

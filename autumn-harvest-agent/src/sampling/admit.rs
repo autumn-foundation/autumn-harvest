@@ -160,7 +160,7 @@ impl std::fmt::Display for Refusal {
             Self::ScorerNotUsed => f.write_str("a vote uses no scorer"),
             Self::InvalidAnswerKey => f.write_str("the answer key of the vote is not valid"),
             Self::UnknownAnswerKey { key } => {
-                write!(f, "the harness has no answer key function {key:?}")
+                write!(f, "the harness has no answer key function {key}")
             }
             Self::InvalidKind => f.write_str("the kind is not a valid agent kind"),
             Self::UnknownKind => f.write_str("no agent profile has the kind"),

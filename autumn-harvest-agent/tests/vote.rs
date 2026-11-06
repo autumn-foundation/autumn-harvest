@@ -60,7 +60,7 @@ fn by_draw(answers: &'static [&'static str]) -> Arc<TryFnModel> {
 struct Lower;
 
 impl AnswerKeyFn for Lower {
-    fn id(&self) -> &str {
+    fn id(&self) -> &'static str {
         "lower"
     }
 
@@ -106,7 +106,7 @@ fn count(key: &str, votes: u32, first: u32) -> VoteCount {
     VoteCount::new(key, votes, DrawId::new(first))
 }
 
-fn selected(draw: u32) -> SampleOutcome {
+const fn selected(draw: u32) -> SampleOutcome {
     SampleOutcome::Selected {
         draw: DrawId::new(draw),
     }
@@ -194,7 +194,7 @@ async fn a_vote_with_no_key_ends_with_no_accepted_draw() {
 
     assert_eq!(report.outcome, SampleOutcome::NoAcceptedDraw);
     assert!(report.selected.is_none());
-    assert!(report.tally.is_empty());
+    assert_eq!(report.tally, Vec::new());
     assert_eq!(report.attempts, 3);
     assert_eq!(report.stopped, SampleStop::Completed);
     assert!(report.draws.iter().all(|draw| draw.verdict.is_reject()));
@@ -378,20 +378,18 @@ fn a_sample_input_with_no_scorer_omits_the_key() {
 
 // ── replay ──────────────────────────────────────────────────────────────────
 
-#[tokio::test(flavor = "multi_thread")]
-async fn the_vote_history_replays_clean() {
+/// The history of the run `exec` and of each draw run, with its workflow.
+fn runs_of(
+    rt: &SqliteRuntime,
+    exec: autumn_harvest_sqlite::ExecutionId,
+) -> Vec<(
+    autumn_harvest_sqlite::ExecutionId,
+    autumn_harvest::WorkflowInfo,
+    Vec<autumn_harvest::event::WorkflowEvent>,
+)> {
     use autumn_harvest::event::WorkflowEvent;
-    use autumn_harvest::testing::{ReplayStatus, WorkflowReplayer};
     use autumn_harvest_agent::sampling::agent_sample_info;
     use autumn_harvest_agent::workflow::agent_loop_info;
-
-    let (_dir, db) = fresh_db();
-    let model = by_draw(&["Yes", "no", "YES", "yes"]);
-    let mut rt = runtime(&db, harness(model, &voting(4)));
-    let input = SampleInput::vote(KIND, "Agree?", 4, AnswerKey::custom("lower")).concurrency(2);
-    let exec = sqlite::start_sample(&mut rt, &input).unwrap();
-    let report = sample_report(rt.run_until_blocked(exec).await.unwrap());
-    assert_eq!(report.tally, [count("yes", 3, 0), count("no", 1, 1)]);
 
     let history = rt.load_history(exec).unwrap();
     let mut runs = vec![(exec, agent_sample_info(), history.clone())];
@@ -404,7 +402,21 @@ async fn the_vote_history_replays_clean() {
             ));
         }
     }
-    assert_eq!(runs.len(), 5, "the parent and 4 draws, in 2 waves");
+    runs
+}
+
+/// Replay each run of `runs`, and check that each replay succeeds.
+/// Returns the count of runs.
+async fn replays_clean(
+    runs: Vec<(
+        autumn_harvest_sqlite::ExecutionId,
+        autumn_harvest::WorkflowInfo,
+        Vec<autumn_harvest::event::WorkflowEvent>,
+    )>,
+) -> usize {
+    use autumn_harvest::testing::{ReplayStatus, WorkflowReplayer};
+
+    let count = runs.len();
     for (run, info, events) in runs {
         let replay = WorkflowReplayer::new()
             .register(vec![info])
@@ -416,4 +428,46 @@ async fn the_vote_history_replays_clean() {
             "{replay}"
         );
     }
+    count
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_vote_history_replays_clean() {
+    let (_dir, db) = fresh_db();
+    let model = by_draw(&["Yes", "no", "YES", "yes"]);
+    let mut rt = runtime(&db, harness(model, &voting(4)));
+    let input = SampleInput::vote(KIND, "Agree?", 4, AnswerKey::custom("lower")).concurrency(2);
+    let exec = sqlite::start_sample(&mut rt, &input).unwrap();
+    let report = sample_report(rt.run_until_blocked(exec).await.unwrap());
+    assert_eq!(report.tally, [count("yes", 3, 0), count("no", 1, 1)]);
+    assert_eq!(
+        replays_clean(runs_of(&rt, exec)).await,
+        5,
+        "the parent and 4 draws, in 2 waves"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_settled_vote_history_replays_clean() {
+    let (_dir, db) = fresh_db();
+    let model = by_draw(&["7", "7.0", "seven", "8"]);
+    let mut rt = runtime(&db, harness(model, &voting(4)));
+    let input = SampleInput::vote(KIND, "Count.", 4, AnswerKey::LastNumber).concurrency(1);
+    let exec = sqlite::start_sample(&mut rt, &input).unwrap();
+    let report = sample_report(rt.run_until_blocked(exec).await.unwrap());
+    assert_eq!(report.stopped, SampleStop::Settled);
+    assert_eq!(report.attempts, 3, "7 has 2 votes, 0 against, 1 left");
+    assert_eq!(replays_clean(runs_of(&rt, exec)).await, 4);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_vote_takes_the_concurrency_cap_of_the_policy_by_default() {
+    let (_dir, db) = fresh_db();
+    let model = by_draw(&["a"]);
+    let mut rt = runtime(&db, harness(model, &voting(5)));
+    let input = SampleInput::vote(KIND, "Pick.", 5, AnswerKey::Trimmed);
+    let report = sample_report(drive(&mut rt, &input).await);
+    assert_eq!(report.concurrency, 4, "the cap of the policy");
+    assert_eq!(report.attempts, 4, "4 votes for a beat 0 with 1 left");
+    assert_eq!(report.stopped, SampleStop::Settled);
 }

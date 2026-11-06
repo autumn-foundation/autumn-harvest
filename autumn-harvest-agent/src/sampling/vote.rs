@@ -6,13 +6,15 @@
 //!
 //! [`Tally`] counts the votes. Its integer kernel is `key_votes`,
 //! `pick_key`, `vote_winner`, `runner_up` and [`vote_settled`].
-//! `formal/verus/src/agent_vote.rs` proves it. When the leader cannot
-//! lose, the run starts no more draws, and the winner is still the winner
-//! of the full run. The order in which draws end does not change the
-//! result.
+//! `formal/verus/src/agent_vote.rs` proves the kernel. When the leader
+//! cannot lose, the run starts no more draws, and the winner is still the
+//! winner of the full run. The order in which draws end does not change
+//! the result.
 //!
-//! An app key function implements [`AnswerKeyFn`]. The recorded
-//! [`agent_vote_key`] activity calls it, so replay reads each app key.
+//! The recorded [`agent_vote_key`] activity applies each key, built-in or
+//! app. So replay reads each key, and a later change to a key rule never
+//! changes a recorded run. An app key function implements
+//! [`AnswerKeyFn`].
 
 use std::time::Duration;
 
@@ -24,7 +26,8 @@ use crate::draw::DrawId;
 use crate::harness::AgentHarness;
 use crate::mesh::{MAX_ITEM_LEN, valid_name};
 
-/// The most bytes of one key. A longer key casts no vote.
+/// The most bytes of one key as JSON text, quotes excluded. A longer key
+/// casts no vote.
 pub const MAX_KEY_BYTES: usize = 1024;
 
 /// How a vote maps a final answer to its key.
@@ -39,12 +42,15 @@ pub enum AnswerKey {
     Trimmed,
     /// The last decimal number of the answer, in canonical form. The form
     /// has no thousands commas, no leading zeros, no trailing fraction
-    /// zeros and no `-0`. So `1,200.50` gives `1200.5`.
+    /// zeros and no `-0`. So `1,200.50` gives `1200.5`, and `.5` gives
+    /// `0.5`. Only ASCII digits count, and an exponent is a number of its
+    /// own: `1e5` gives `5`.
     LastNumber,
     /// The field at this JSON pointer (RFC 6901) of the answer. The
-    /// trimmed answer must be JSON. A string field gives its text. A
-    /// number, a bool, an array or an object gives its JSON text. A
-    /// `null` field gives no key.
+    /// trimmed answer must be JSON. A string field gives its trimmed text.
+    /// A number gives its decimal form, so `1`, `1.0` and `1e0` all give
+    /// `1`. A bool, an array or an object gives its JSON text. A `null`
+    /// field gives no key.
     JsonField(String),
     /// The app key function with this id. See [`AnswerKeyFn`].
     Custom(String),
@@ -64,8 +70,8 @@ impl AnswerKey {
     }
 
     /// Whether the key is valid. A JSON pointer is empty or starts with
-    /// `/`, and has at most 128 bytes and no control character. A custom
-    /// id is an agent name.
+    /// `/`. It has at most 128 bytes and no control character, and each
+    /// `~` comes before `0` or `1`. A custom id is an agent name.
     #[must_use]
     pub fn is_valid(&self) -> bool {
         match self {
@@ -74,6 +80,10 @@ impl AnswerKey {
                 (pointer.is_empty() || pointer.starts_with('/'))
                     && pointer.len() <= MAX_ITEM_LEN
                     && !pointer.chars().any(char::is_control)
+                    && pointer
+                        .split('~')
+                        .skip(1)
+                        .all(|rest| rest.starts_with('0') || rest.starts_with('1'))
             }
             Self::Custom(id) => valid_name(id),
         }
@@ -95,16 +105,20 @@ impl AnswerKey {
     }
 }
 
-/// `key`, or `None` when it is empty or over [`MAX_KEY_BYTES`].
-fn fit_key(key: String) -> Option<String> {
-    (!key.is_empty() && key.len() <= MAX_KEY_BYTES).then_some(key)
+/// `key`, or `None` when it is empty or over [`MAX_KEY_BYTES`] as JSON
+/// text. The JSON form bounds the size of the report.
+pub fn fit_key(key: String) -> Option<String> {
+    let fits =
+        serde_json::to_string(&key).is_ok_and(|text| text.len() <= MAX_KEY_BYTES.saturating_add(2));
+    (!key.is_empty() && fits).then_some(key)
 }
 
 /// The last decimal number of `answer`, in canonical form.
 ///
 /// A comma joins two digit groups only when exactly three digits follow
-/// it. So `1,000` is one number, and `1,2,3` is three. A `-` right before
-/// the digits makes the number negative, unless a letter or a digit comes
+/// it. So `1,000` is one number, and `1,2,3` is three. A `.` right before
+/// the digits, with no digit before it, makes them a fraction. A `-` right
+/// before the number makes it negative, unless a letter or a digit comes
 /// before the `-`.
 fn last_number(answer: &str) -> Option<String> {
     let bytes = answer.as_bytes();
@@ -134,16 +148,24 @@ fn last_number(answer: &str) -> Option<String> {
             i += 1;
         }
         let mut fraction = String::new();
-        if bytes.get(i) == Some(&b'.') && digit(i + 1) {
+        let mut sign_at = start;
+        if start > 0 && bytes[start - 1] == b'.' && !digit(start.wrapping_sub(2)) {
+            fraction = std::mem::take(&mut whole);
+            sign_at = start - 1;
+        } else if bytes.get(i) == Some(&b'.') && digit(i + 1) {
             i += 1;
             while digit(i) {
                 fraction.push(char::from(bytes[i]));
                 i += 1;
             }
         }
-        let negative = start > 0
-            && bytes[start - 1] == b'-'
-            && (start < 2 || !bytes[start - 2].is_ascii_alphanumeric());
+        // The `-` is ASCII, so the slice before it ends on a char boundary.
+        let negative = sign_at > 0
+            && bytes[sign_at - 1] == b'-'
+            && !answer[..sign_at - 1]
+                .chars()
+                .next_back()
+                .is_some_and(char::is_alphanumeric);
         last = Some((negative, whole, fraction));
     }
     let (negative, whole, fraction) = last?;
@@ -166,18 +188,37 @@ fn json_field(answer: &str, pointer: &str) -> Option<String> {
     let value: serde_json::Value = serde_json::from_str(answer.trim()).ok()?;
     match value.pointer(pointer)? {
         serde_json::Value::Null => None,
-        serde_json::Value::String(text) => Some(text.clone()),
+        serde_json::Value::String(text) => Some(text.trim().to_owned()),
+        serde_json::Value::Number(number) => number_text(number),
         other => Some(other.to_string()),
     }
+}
+
+/// The decimal form of a JSON number, with no exponent and no `-0`.
+fn number_text(number: &serde_json::Number) -> Option<String> {
+    if let Some(n) = number.as_i64() {
+        return Some(n.to_string());
+    }
+    if let Some(n) = number.as_u64() {
+        return Some(n.to_string());
+    }
+    let value = number.as_f64().filter(|value| value.is_finite())?;
+    let text = format!("{value}");
+    Some(if text == "-0" { "0".to_owned() } else { text })
 }
 
 /// An app function that maps a final answer to its key.
 ///
 /// The [`agent_vote_key`] activity calls it, and history records each key.
-/// Make it a pure function of the answer. Return `None` when the answer
-/// has no key. A key over [`MAX_KEY_BYTES`] casts no vote.
+/// Make it a fast, pure function of the answer: the activity runs it
+/// inline, with no time budget. Return `None` when the answer has no key.
+/// A key over [`MAX_KEY_BYTES`] casts no vote.
+///
+/// The harness is the gate: a vote can name only a function that the app
+/// added with `AgentHarness::answer_key`.
 pub trait AnswerKeyFn: Send + Sync + std::fmt::Debug {
-    /// The id that [`AnswerKey::Custom`] names. It is an agent name.
+    /// The id that [`AnswerKey::Custom`] names. It must be an agent name,
+    /// or no vote can name it.
     fn id(&self) -> &str;
 
     /// The key of `answer`, or `None` for no key.
@@ -189,58 +230,79 @@ pub trait AnswerKeyFn: Send + Sync + std::fmt::Debug {
 #[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct VoteKeyRequest {
-    /// The id of the app key function.
-    pub key: String,
+    /// The answer key to apply.
+    pub key: AnswerKey,
     /// The answer to key. `None` only checks that the harness has the
-    /// function.
+    /// function of a custom key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub answer: Option<String>,
 }
 
 impl VoteKeyRequest {
-    /// A request for the key of `answer` under the function `key`.
+    /// A request for the key of `answer` under `key`.
     #[must_use]
-    pub fn new(key: impl Into<String>, answer: Option<String>) -> Self {
-        Self {
-            key: key.into(),
-            answer,
-        }
+    pub const fn new(key: AnswerKey, answer: Option<String>) -> Self {
+        Self { key, answer }
     }
 }
 
 /// The result of [`agent_vote_key`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct VoteKeyReply {
-    /// Whether the harness has the function.
+    /// Whether the harness has the function. Always true for a built-in
+    /// key.
     pub known: bool,
     /// The key of the answer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key: Option<String>,
 }
 
-/// Apply the app key function of `request` with `harness`.
-#[must_use]
-pub fn run_vote_key(harness: &AgentHarness, request: &VoteKeyRequest) -> VoteKeyReply {
-    let Some(function) = harness.answer_key_of(&request.key) else {
-        return VoteKeyReply {
+/// Apply the key of `request` with `harness`.
+///
+/// # Errors
+///
+/// Returns an error when the request holds an answer and the harness has
+/// no function for its custom key. A retry can then reach a worker that
+/// has it. A probe with no answer gets `known: false` instead.
+pub fn run_vote_key(
+    harness: &AgentHarness,
+    request: &VoteKeyRequest,
+) -> Result<VoteKeyReply, String> {
+    let AnswerKey::Custom(id) = &request.key else {
+        let key = request
+            .answer
+            .as_deref()
+            .and_then(|answer| request.key.key_of(answer));
+        return Ok(VoteKeyReply { known: true, key });
+    };
+    let Some(function) = harness.answer_key_of(id) else {
+        if request.answer.is_some() {
+            return Err(format!(
+                "this worker has no answer key function {:?}",
+                crate::harness::truncate(id, crate::mesh::MAX_NAME_LEN)
+            ));
+        }
+        return Ok(VoteKeyReply {
             known: false,
             key: None,
-        };
+        });
     };
     let key = request
         .answer
         .as_deref()
         .and_then(|answer| function.key(answer))
         .and_then(fit_key);
-    VoteKeyReply { known: true, key }
+    Ok(VoteKeyReply { known: true, key })
 }
 
-/// Key one answer with an app key function, as an activity.
+/// Key one answer, as an activity.
 ///
 /// # Errors
 ///
-/// Returns an error when no harness is installed.
+/// Returns the errors of [`run_vote_key`], and an error when the worker
+/// has no harness.
 #[activity(
     start_to_close = "1m",
     retry = RetryPolicy::exponential(3, Duration::from_secs(1))
@@ -249,7 +311,7 @@ pub async fn agent_vote_key(
     ctx: &ActivityContext,
     request: VoteKeyRequest,
 ) -> Result<VoteKeyReply, String> {
-    Ok(run_vote_key(crate::workflow::harness(ctx)?, &request))
+    run_vote_key(crate::workflow::harness(ctx)?, &request)
 }
 
 /// The votes of one key.
@@ -278,8 +340,10 @@ impl VoteCount {
 
 /// The votes of one run.
 ///
-/// Each draw casts at most one vote. A second vote of the same draw is
-/// ignored. Each key is held as the index of its first appearance.
+/// Each draw casts at most one vote. The tally ignores a second vote of
+/// the same draw. It holds each key as the index of its first appearance.
+/// The order of the votes does not change the winner, the counts or the
+/// early stop.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Tally {
     keys: Vec<String>,
@@ -365,12 +429,15 @@ const fn key_votes(votes: &[(u32, Option<u32>)], key: u32) -> (u32, u32) {
     let mut first = u32::MAX;
     let mut i = 0;
     while i < votes.len() {
-        if let Some(k) = votes[i].1 {
-            if k == key {
-                count += 1;
-                if votes[i].0 < first {
-                    first = votes[i].0;
-                }
+        let hit = if let Some(k) = votes[i].1 {
+            k == key
+        } else {
+            false
+        };
+        if hit {
+            count += 1;
+            if votes[i].0 < first {
+                first = votes[i].0;
             }
         }
         i += 1;
@@ -418,6 +485,7 @@ const fn vote_winner(votes: &[(u32, Option<u32>)], keys: u32) -> Option<(u32, u3
 
 /// The most votes of a key below `keys` other than `winner`. 0 when there
 /// is none.
+///
 /// `formal/verus/src/agent_vote.rs` proves it.
 const fn runner_up(votes: &[(u32, Option<u32>)], keys: u32, winner: u32) -> u32 {
     let mut second = 0;
@@ -462,6 +530,12 @@ mod tests {
             ("1,2,3", Some("3")),
             ("1,0000", Some("0")),
             ("0.5", Some("0.5")),
+            ("about .5", Some("0.5")),
+            ("-.25", Some("-0.25")),
+            ("1e5", Some("5")),
+            ("é-5", Some("5")),
+            ("e -5", Some("-5")),
+            ("1,234,567.890", Some("1234567.89")),
             ("no idea", None),
             ("", None),
         ];
@@ -479,6 +553,12 @@ mod tests {
         let key = AnswerKey::json_field("/a/b");
         assert_eq!(key.key_of(r#" {"a": {"b": "x"}} "#).as_deref(), Some("x"));
         assert_eq!(key.key_of(r#"{"a": {"b": 4}}"#).as_deref(), Some("4"));
+        for one in [r#"{"a": {"b": 1.0}}"#, r#"{"a": {"b": 1e0}}"#] {
+            assert_eq!(key.key_of(one).as_deref(), Some("1"), "{one}");
+        }
+        assert_eq!(key.key_of(r#"{"a": {"b": -0.0}}"#).as_deref(), Some("0"));
+        assert_eq!(key.key_of(r#"{"a": {"b": 2.5}}"#).as_deref(), Some("2.5"));
+        assert_eq!(key.key_of(r#"{"a": {"b": " x "}}"#).as_deref(), Some("x"));
         assert_eq!(key.key_of(r#"{"a": {"b": true}}"#).as_deref(), Some("true"));
         assert_eq!(key.key_of(r#"{"a": {"b": null}}"#), None);
         assert_eq!(key.key_of(r#"{"a": {}}"#), None);
@@ -495,6 +575,12 @@ mod tests {
         assert_eq!(AnswerKey::Trimmed.key_of("   "), None);
         let long = "x".repeat(MAX_KEY_BYTES + 1);
         assert_eq!(AnswerKey::Trimmed.key_of(&long), None);
+        let escaped = "\u{1}".repeat(MAX_KEY_BYTES / 2);
+        assert_eq!(
+            AnswerKey::Trimmed.key_of(&format!("a{escaped}a")),
+            None,
+            "the cap counts the JSON escapes"
+        );
         let fits = "x".repeat(MAX_KEY_BYTES);
         assert_eq!(AnswerKey::Trimmed.key_of(&fits), Some(fits));
         assert_eq!(AnswerKey::custom("f").key_of("a"), None);
@@ -508,6 +594,9 @@ mod tests {
         assert!(AnswerKey::json_field("/answer/0").is_valid());
         assert!(!AnswerKey::json_field("answer").is_valid());
         assert!(!AnswerKey::json_field("/\n").is_valid());
+        assert!(AnswerKey::json_field("/a~0b~1c").is_valid());
+        assert!(!AnswerKey::json_field("/a~2").is_valid());
+        assert!(!AnswerKey::json_field("/a~").is_valid());
         assert!(!AnswerKey::json_field(format!("/{}", "a".repeat(MAX_ITEM_LEN))).is_valid());
         assert!(AnswerKey::custom("lower").is_valid());
         assert!(!AnswerKey::custom("Lower").is_valid());
@@ -539,7 +628,7 @@ mod tests {
     fn an_empty_tally_has_no_winner() {
         let tally = Tally::new();
         assert_eq!(tally.winner(), None);
-        assert!(tally.counts().is_empty());
+        assert_eq!(tally.counts(), Vec::new());
         assert!(!tally.settled(0));
     }
 
@@ -558,6 +647,57 @@ mod tests {
                 VoteCount::new("c", 1, DrawId::new(4)),
             ]
         );
+    }
+
+    /// A model that the key tests never call.
+    #[derive(Debug)]
+    struct NoModel;
+
+    impl crate::model::AgentModel for NoModel {
+        fn chat<'a>(
+            &'a self,
+            _request: &'a crate::ChatRequest,
+        ) -> crate::model::BoxFuture<'a, Result<crate::model::ChatResponse, crate::AgentError>>
+        {
+            Box::pin(async { Err(crate::AgentError::new(crate::ErrorKind::Provider, "unused")) })
+        }
+    }
+
+    /// A key function that gives the answer twice.
+    #[derive(Debug)]
+    struct Twice;
+
+    impl AnswerKeyFn for Twice {
+        fn id(&self) -> &'static str {
+            "twice"
+        }
+
+        fn key(&self, answer: &str) -> Option<String> {
+            Some(answer.repeat(2))
+        }
+    }
+
+    #[test]
+    fn the_key_activity_applies_each_kind_of_key() {
+        let harness =
+            AgentHarness::new(std::sync::Arc::new(NoModel)).answer_key(std::sync::Arc::new(Twice));
+        let ask = |key: AnswerKey, answer: Option<&str>| {
+            run_vote_key(
+                &harness,
+                &VoteKeyRequest::new(key, answer.map(str::to_owned)),
+            )
+        };
+        let reply = ask(AnswerKey::LastNumber, Some("it is 4")).unwrap();
+        assert_eq!((reply.known, reply.key.as_deref()), (true, Some("4")));
+        let reply = ask(AnswerKey::custom("twice"), Some("ab")).unwrap();
+        assert_eq!(reply.key.as_deref(), Some("abab"));
+        let long = "x".repeat(MAX_KEY_BYTES);
+        let reply = ask(AnswerKey::custom("twice"), Some(&long)).unwrap();
+        assert_eq!(reply.key, None, "the app key passes the cap");
+        let probe = ask(AnswerKey::custom("missing"), None).unwrap();
+        assert!(!probe.known, "a probe learns that the function is missing");
+        let error = ask(AnswerKey::custom("missing"), Some("a")).unwrap_err();
+        assert!(error.contains("missing"), "{error}");
     }
 
     /// The winner of `answers` with the early stop, in waves of `width`.

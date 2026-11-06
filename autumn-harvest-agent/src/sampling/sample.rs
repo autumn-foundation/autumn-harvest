@@ -27,7 +27,7 @@ use super::admit::{Admission, Ask, Refusal, SampleStep, admit, sample_step};
 use super::draws::{draw_task, profile_task, read_policy, read_profile};
 use super::policy::{ScorerRef, Strategy};
 use super::vote::{
-    AnswerKey, MAX_KEY_BYTES, Tally, VoteCount, VoteKeyReply, VoteKeyRequest, agent_vote_key_info,
+    AnswerKey, Tally, VoteCount, VoteKeyReply, VoteKeyRequest, agent_vote_key_info, fit_key,
 };
 use autumn_harvest::llm_budget::LlmBudgetExceeded;
 
@@ -220,7 +220,7 @@ pub enum SampleStop {
     Accepted,
     /// A budget refused the next draw.
     BudgetExceeded,
-    /// A score or an app key failed, so the run started no more draws.
+    /// A score or a vote key failed, so the run started no more draws.
     /// The verdict of the draw names the error.
     ScoreFailed,
     /// The leader of a vote keeps the lead whatever the draws left vote,
@@ -321,8 +321,8 @@ pub async fn agent_sample(
     };
     let admission = admit(&read.policy, &ask).map_err(|refusal| refusal.error_text())?;
     let judge = judge_of(&input).map_err(|refusal| refusal.error_text())?;
-    if let Judge::Vote(AnswerKey::Custom(id)) = judge {
-        probe_key(ctx, id).await?;
+    if let Judge::Vote(key @ AnswerKey::Custom(id)) = judge {
+        probe_key(ctx, key, id).await?;
     }
     let task = draw_task(
         &profile_task(&profile, &input.input),
@@ -386,9 +386,12 @@ fn judge_of(input: &SampleInput) -> Result<Judge<'_>, Refusal> {
 ///
 /// Returns the `unknown_answer_key` refusal when the harness lacks it, and
 /// an engine error as text.
-async fn probe_key(ctx: &WorkflowContext, id: &str) -> Result<(), String> {
+async fn probe_key(ctx: &WorkflowContext, key: &AnswerKey, id: &str) -> Result<(), String> {
     let reply: VoteKeyReply = ctx
-        .execute_activity(&agent_vote_key_info(), VoteKeyRequest::new(id, None))
+        .execute_activity(
+            &agent_vote_key_info(),
+            VoteKeyRequest::new(key.clone(), None),
+        )
         .await
         .map_err(|err| err.to_string())?;
     if reply.known {
@@ -424,8 +427,9 @@ struct Scored {
 /// The run starts no more draws after a rejection wave with a pass, and
 /// after a vote wave whose leader cannot lose. It also stops after a
 /// failed score, and when a budget refuses a draw or a judge call. A pass
-/// and a settled vote win over the other stops, because the run has its
-/// answer.
+/// wins over the other stops, because the run has its answer. A settled
+/// vote wins over a budget stop. A failed key wins over a settled vote, so
+/// the stop names the broken key.
 async fn run_waves(
     ctx: &WorkflowContext,
     judge: Judge<'_>,
@@ -470,7 +474,7 @@ async fn run_waves(
             }
             let draw = DrawId::new(id);
             let (one, halted) = match judge {
-                Judge::Score(scorer) => score_draw(ctx, scorer, task, draw, report, halt).await?,
+                Judge::Score(rule) => score_draw(ctx, rule, task, draw, report, halt).await?,
                 Judge::Vote(key) => vote_draw(ctx, key, draw, report).await?,
             };
             halt = halt.or(halted);
@@ -483,7 +487,8 @@ async fn run_waves(
         }
         let ran = u32::try_from(scored.len()).unwrap_or(u32::MAX);
         let left = admission.draws.saturating_sub(ran);
-        if matches!(judge, Judge::Vote(_)) && left > 0 && tally_of(&scored).settled(left) {
+        let decided = matches!(judge, Judge::Vote(_)) && halt != Some(SampleStop::ScoreFailed);
+        if decided && left > 0 && tally_of(&scored).settled(left) {
             return Ok((scored, SampleStop::Settled));
         }
         if let Some(stop) = halt {
@@ -552,7 +557,7 @@ async fn score_draw(
             .execute_activity::<_, SampleScore>(&agent_sample_score_info(), request)
             .await
         {
-            Ok(scored) => (scored.verdict, scored.usage, scored.cost_usd_micros),
+            Ok(result) => (result.verdict, result.usage, result.cost_usd_micros),
             Err(err) if LlmBudgetExceeded::is_refusal(&err) => {
                 stop = Some(SampleStop::BudgetExceeded);
                 unscored("the LLM budget refused the score")
@@ -582,12 +587,12 @@ async fn score_draw(
 
 /// Key one draw for a vote.
 ///
-/// Only a draw that completed casts a vote. A built-in key runs here, as
-/// a pure function of the recorded answer. An app key runs in the recorded
-/// `agent_vote_key` activity. A draw with a key gets a score of 1. A draw
-/// with no key gets a reject that names the reason.
+/// Only a draw that completed casts a vote. The recorded `agent_vote_key`
+/// activity applies the key, so replay reads it. A draw with a key gets a
+/// score of 1. A draw with no key gets a reject that names the reason.
 ///
-/// A failed app key gives a reject and the stop `ScoreFailed`.
+/// A failed key activity gives a reject and the stop `ScoreFailed`. So
+/// does a worker that has no function for an app key.
 ///
 /// # Errors
 ///
@@ -599,33 +604,30 @@ async fn vote_draw(
     report: AgentReport,
 ) -> Result<(Scored, Option<SampleStop>), String> {
     let mut stop = None;
+    let request = VoteKeyRequest::new(key.clone(), Some(report.text.clone()));
     let found = if report.stop != AgentStop::Completed {
         Err("the draw did not complete, so it casts no vote".to_owned())
-    } else if let AnswerKey::Custom(id) = key {
-        let request = VoteKeyRequest::new(id.as_str(), Some(report.text.clone()));
-        if exceeds_activity_input(&request) {
-            Err("the answer is too large to record, so it casts no vote".to_owned())
-        } else {
-            match ctx
-                .execute_activity::<_, VoteKeyReply>(&agent_vote_key_info(), request)
-                .await
-            {
-                Ok(reply) => reply.key.ok_or_else(no_key),
-                Err(err @ HarvestError::ActivityFailed { .. }) => {
-                    stop = Some(SampleStop::ScoreFailed);
-                    Err(format!("the answer key failed: {err}"))
-                }
-                Err(err) => return Err(err.to_string()),
-            }
-        }
+    } else if exceeds_activity_input(&request) {
+        Err("the answer is too large to record, so it casts no vote".to_owned())
     } else {
-        key.key_of(&report.text).ok_or_else(no_key)
+        match ctx
+            .execute_activity::<_, VoteKeyReply>(&agent_vote_key_info(), request)
+            .await
+        {
+            Ok(reply) if !reply.known => {
+                stop = Some(SampleStop::ScoreFailed);
+                Err("the worker has no function for the answer key".to_owned())
+            }
+            Ok(reply) => reply.key.and_then(fit_key).ok_or_else(no_key),
+            Err(err @ HarvestError::ActivityFailed { .. }) => {
+                stop = Some(SampleStop::ScoreFailed);
+                Err(format!("the answer key failed: {err}"))
+            }
+            Err(err) => return Err(err.to_string()),
+        }
     };
     let (key, verdict) = match found {
-        Ok(key) if !key.is_empty() && key.len() <= MAX_KEY_BYTES => {
-            (Some(key), Verdict::Score(FiniteF64::ONE))
-        }
-        Ok(_) => (None, Verdict::reject(no_key())),
+        Ok(key) => (Some(key), Verdict::Score(FiniteF64::ONE)),
         Err(reason) => (None, Verdict::reject(reason)),
     };
     let record = SampleDraw {

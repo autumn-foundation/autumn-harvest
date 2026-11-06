@@ -293,7 +293,7 @@ async fn best_of_three_on_postgres_picks_b_and_sums_to_the_ledger() {
 struct Vowel;
 
 impl AnswerKeyFn for Vowel {
-    fn id(&self) -> &str {
+    fn id(&self) -> &'static str {
         "vowel"
     }
 

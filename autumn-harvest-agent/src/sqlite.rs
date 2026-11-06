@@ -134,8 +134,7 @@ pub fn register(rt: &mut SqliteRuntime, harness: Arc<AgentHarness>) {
     });
 }
 
-/// Register the strategy runs, their policy read (issue #2439) and the app
-/// key of a vote.
+/// Register the strategy runs, their policy read and the key of a vote.
 fn register_sampling(rt: &mut SqliteRuntime, harness: &Arc<AgentHarness>) {
     rt.register_workflow(&agent_draws_info());
     rt.register_workflow(&agent_sample_info());
@@ -149,7 +148,7 @@ fn register_sampling(rt: &mut SqliteRuntime, harness: &Arc<AgentHarness>) {
     let h = Arc::clone(harness);
     rt.register_activity_with_body(&agent_vote_key_info(), move |input| {
         call(input, |request: VoteKeyRequest| {
-            std::future::ready(Ok::<_, String>(run_vote_key(&h, &request)))
+            std::future::ready(run_vote_key(&h, &request))
         })
     });
     // SQLite keeps no run tenant, so the task tenant applies (issue #2442).

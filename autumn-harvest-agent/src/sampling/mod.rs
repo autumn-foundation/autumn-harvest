@@ -13,8 +13,8 @@
 //! - [`agent_draws`] reads the policy once, admits the request and runs the
 //!   draws.
 //! - [`agent_sample`] runs best-of-N or rejection sampling. It scores each
-//!   draw and selects one (issue #2443). It also runs a vote: it keys each
-//!   answer with an [`AnswerKey`], and the most common key wins.
+//!   draw and selects one. It also runs a vote: it keys each answer with an
+//!   [`AnswerKey`], and the most common key wins.
 //! - [`admit_answer_check`] caps the answer check of a run (issue #2442).
 //!
 //! A run never carries a policy field. [`AgentTask`](crate::AgentTask),
