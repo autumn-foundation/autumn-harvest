@@ -822,7 +822,7 @@ capacity.
 1. Run `harvest retention status`.
 2. Confirm retention is enabled and note `max_age`, `batch_size`, and dry-run state.
 3. Run `harvest retention run-now` only if the status shows eligible rows and no shard blockers.
-   On a split fleet, the API replicas run no janitor by default (issue #2478). There the status shows `placed_elsewhere: true` and no shard results, and `run-now` returns 503. Read the retention metrics of the `worker` replicas, or see [`process-roles.md`](../operations/process-roles.md#background-runtimes-issue-2478).
+   On a split fleet, the API replicas run no janitor by default (issue #2478). There the status shows `placed_elsewhere: true` and no shard results, and `run-now` returns 503. Read the retention metrics of the `worker` replicas, or see [`process-roles.md`](../operations/process-roles.md#background-runtimes).
 4. Check database storage pressure before changing retention settings.
 
 ### Likely causes

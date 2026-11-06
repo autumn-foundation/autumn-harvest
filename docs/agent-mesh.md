@@ -109,7 +109,7 @@ tokens. Keep the limit inside the context window of your model.
 A cut answer ends with `…[truncated]`. The result also has
 `"truncated": true`, the report sets `DelegationRecord::answer_truncated`,
 and the worker logs a warning. The peer lookup records the limit, so replay
-cuts each answer as the live run did. A run recorded before issue #2481
+cuts each answer as the live run did. A run recorded before 0.10.0
 keeps its old cut of 8 000 characters and has no `truncated` field.
 
 Tools key idempotency on `(run_id, step, call_id)`. A child has its own run

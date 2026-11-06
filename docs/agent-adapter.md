@@ -1262,8 +1262,8 @@ also refuses an overlay that `agent::overlay::apply` refuses. A history with pay
 encrypted payloads needs decoding first. The model call blocks in place, so
 run the evaluation on a multi-thread Tokio runtime.
 
-The evaluation is an in-memory fork at the first event. The database fork of
-issue #2000 is a separate feature.
+The evaluation is an in-memory fork at the first event. A database fork is a
+separate feature.
 
 ### Anonymise a pool
 
@@ -2252,7 +2252,7 @@ an overlay go live without a person. A change takes effect at the next
 read, with no restart: the next op, or the next refine run.
 
 Today the store enforces `ceilings`, `auto_adopt.parts` and
-`auto_adopt.max_per_day`. The refine workflow of #2380 reads `ceilings`,
+`auto_adopt.max_per_day`. The refine workflow reads `ceilings`,
 `probe_effects` and `proposal_attempts` (section 22). The adoption gate
 reads `auto_adopt` and `approval_timeout` (section 23). The lesson library
 reads `lessons.max_entries` at each write (section 24).
@@ -2299,7 +2299,7 @@ harvest agents profile policy support reset
   record. A change during the run never widens that run. A narrowing
   reaches its adoption at once, because the store also checks its current
   policy.
-- **Ceilings.** The store validator and the op read of #2372 apply each
+- **Ceilings.** The store validator and the op read apply each
   overlay under `policy.ceilings.resolve(profile)`. The op read takes the
   policy in the same recorded activity. A raised ceiling lets an overlay
   pass the profile bound. A lowered one fails the next op of a version
@@ -2320,7 +2320,7 @@ harvest agents profile policy support reset
 | `auto_adopted` | The candidate went live without a person. |
 | `awaiting_approval` | The candidate waits, with the reason. |
 | `unchanged` | The candidate changes no part. |
-| `timed_out` | The gate of #2381 waited for `approval_timeout`. It will use `RefinePolicy::gate_state`. |
+| `timed_out` | The adoption gate waited for `approval_timeout`. It will use `RefinePolicy::gate_state`. |
 
 - **Probes.** `eval::live_probe` takes the set of `probe_effects` (issue
   #2378). The tool-call activity of the probe refuses any other effect. A
@@ -2337,7 +2337,7 @@ proves that the auto moves of a day never pass the cap. The design is in [`DESIG
 
 ## 19. Sampling policy (issue #2439)
 
-Each strategy of epic #2438 runs more than one draw. A draw can call
+Each sampling strategy runs more than one draw. A draw can call
 tools. An operator sets the limits of each agent kind in one
 `SamplingPolicy`. A missing policy means every default, and each default
 is the safe value.
@@ -2894,7 +2894,7 @@ On Postgres, install `postgres::Sources::new(pg)` and start the workflow
   policy ceilings, as the stages do. SQLite has no fork, so the probe records
   `live re-probe skipped: SQLite has no fork` in the stage notes.
 - **Compose and select.** An `OverlayComposer` reads the probes under
-  opaque ids, with the anonymised pool of issue #2376. The pool redacts
+  opaque ids, with the anonymised pool. The pool redacts
   each route that a probe asked for, with its model id. So a route that a
   probe inherits from its source task, or the route of a recorded peer, is
   redacted too. With a workspace store, the composer also reads an
