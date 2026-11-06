@@ -198,8 +198,8 @@ pub struct SourceBrief {
     /// release has none, so its run writes no lesson.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub labels: Option<BTreeSet<String>>,
-    /// The agents of the kind that the source names: its workflow id, the
-    /// agent of its memory scope `agent:<id>`, and each agent of its
+    /// The agents of the kind that the source names. A run names the agent
+    /// of its workflow id, of its memory scope `agent:<id>` and of its
     /// mandate chain.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub agents: BTreeSet<String>,

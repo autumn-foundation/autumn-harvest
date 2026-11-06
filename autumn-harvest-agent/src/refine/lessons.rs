@@ -96,10 +96,10 @@ pub struct Lesson {
     pub lesson: String,
     /// The source runs of the refine run.
     pub sources: Vec<ExecutionId>,
-    /// The agents of the kind that a source run names: its workflow id, the
-    /// agent of its memory scope `agent:<id>`, and each agent of its
-    /// mandate chain. An erase of an agent removes each lesson that names
-    /// it.
+    /// The agents of the kind that a source run names. A run names the
+    /// agent of its workflow id, of its memory scope `agent:<id>` and of
+    /// its mandate chain. An erase of an agent removes each lesson that
+    /// names it.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub agents: BTreeSet<String>,
 }
@@ -521,9 +521,9 @@ pub struct LessonErase {
 ///
 /// # Errors
 ///
-/// Returns a non-retryable error for an agent id that does not parse, a
-/// retryable error for a lesson that is still there, and the store error
-/// otherwise.
+/// Returns a non-retryable error for an agent id that does not parse.
+/// Returns a retryable error for a lesson that is still there. Returns the
+/// store error otherwise.
 pub(crate) async fn run_erase(
     harness: &AgentHarness,
     request: LessonErase,
