@@ -49,6 +49,10 @@ const THREE_HOURS: Duration = Duration::from_hours(3);
 /// A type that declares `chain_execution_timeout = 1h` in code (issue #2406).
 const CHAIN_WF: &str = "looping_poller";
 const HOUR: Duration = Duration::from_hours(1);
+/// A type that declares `execution_timeout = 1h` and `sla = 3h` in code.
+const BATCH_WF: &str = "bulk_import";
+/// `BATCH_WF` with a start throttle of one token per tenant.
+const THROTTLED_WF: &str = "paced_import";
 
 async fn setup_test_database_url() -> (String, ContainerAsync<Postgres>) {
     let container = Postgres::default()
@@ -110,15 +114,31 @@ fn info(name: &'static str, sla: Option<Duration>) -> WorkflowInfo {
 }
 
 /// `WF` and `OTHER_WF` declare `sla = 3h` in code. `CHAIN_WF` declares a
-/// one-hour chain cap.
+/// one-hour chain cap. `BATCH_WF` and `THROTTLED_WF` declare a one-hour
+/// timeout and `sla = 3h`.
 fn registry() -> Arc<HandlerRegistry> {
     let mut chain = info(CHAIN_WF, None);
     chain.chain_execution_timeout = Some(HOUR);
+    let mut batch = info(BATCH_WF, Some(THREE_HOURS));
+    batch.execution_timeout = Some(HOUR);
+    let mut throttled = info(THROTTLED_WF, Some(THREE_HOURS));
+    throttled.execution_timeout = Some(HOUR);
+    throttled.throttle = Some(
+        autumn_harvest::throttle::ThrottlePolicy::from_rate_str(
+            "1/h",
+            Some(1.0),
+            Some("input.tenant_id"),
+            None,
+        )
+        .expect("valid rate"),
+    );
     Arc::new(HandlerRegistry::new(
         vec![
             info(WF, Some(THREE_HOURS)),
             info(OTHER_WF, Some(THREE_HOURS)),
             chain,
+            batch,
+            throttled,
         ],
         vec![],
     ))
@@ -133,7 +153,12 @@ fn build_app_with_admin(pool: &DbPool, admin: bool) -> axum::Router {
 }
 
 fn build_app_with(pool: &DbPool, admin: bool, chain_ceiling: Option<Duration>) -> axum::Router {
-    build_app_from(pool, admin, chain_ceiling, DagCatalog::default())
+    build_app_from(pool, admin, (None, chain_ceiling), DagCatalog::default())
+}
+
+/// An app with a fleet ceiling on `execution_timeout`.
+fn build_app_with_timeout_ceiling(pool: &DbPool, ceiling: Duration) -> axum::Router {
+    build_app_from(pool, true, (Some(ceiling), None), DagCatalog::default())
 }
 
 /// A DAG named `DAG` with no declared durations.
@@ -162,14 +187,16 @@ fn dag_catalog() -> DagCatalog {
     .expect("dag compiles")
 }
 
+/// `ceilings` is `(execution_timeout, chain_execution_timeout)`.
 fn build_app_from(
     pool: &DbPool,
     admin: bool,
-    chain_ceiling: Option<Duration>,
+    ceilings: (Option<Duration>, Option<Duration>),
     dags: DagCatalog,
 ) -> axum::Router {
     let api_state = HarvestApiState::new();
-    api_state.set_max_workflow_chain_timeout(chain_ceiling);
+    api_state.set_max_workflow_execution_timeout(ceilings.0);
+    api_state.set_max_workflow_chain_timeout(ceilings.1);
     // Issue #1802: set the opt-out. This test exercises the handler, not auth.
     api_state.set_allow_unauthenticated_mutations(true);
     api_state.set_admin_auth_boundary(admin);
@@ -760,7 +787,7 @@ async fn a_chain_cap_out_of_bounds_is_a_400() {
 #[tokio::test]
 async fn a_dag_refuses_a_chain_cap() {
     let (url, _container) = setup_test_database_url().await;
-    let app = build_app_from(&build_test_pool(&url), true, None, dag_catalog());
+    let app = build_app_from(&build_test_pool(&url), true, (None, None), dag_catalog());
 
     let (status, body) = patch(&app, DAG, json!({ "chain_execution_timeout_secs": 600 })).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
@@ -774,4 +801,159 @@ async fn a_dag_refuses_a_chain_cap() {
     let mut statuses = audit_statuses(&mut conn).await;
     statuses.sort();
     assert_eq!(statuses, ["failed", "succeeded", "succeeded"]);
+}
+
+// ── Batch starts ────────────────────────────────────────────────────────────
+
+/// Post one batch, and return its per-item results.
+async fn batch_start(app: &axum::Router, atomic: bool, items: Vec<Value>) -> Vec<Value> {
+    let (status, body) = request_json(
+        app,
+        "POST",
+        "/workflows/batch_start",
+        Some(json!({ "atomic": atomic, "items": items })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "batch start: {body}");
+    body["results"].as_array().expect("results").clone()
+}
+
+fn batch_item(name: &str, workflow_id: &str) -> Value {
+    json!({
+        "workflow_name": name,
+        "workflow_id": workflow_id,
+        "input": { "tenant_id": "acme" },
+    })
+}
+
+/// The run of `workflow_id`, which a batch or a throttle fire started.
+async fn run_of(url: &str, workflow_id: &str) -> Uuid {
+    use harvest_workflow_executions::dsl;
+    let mut conn = connect(url).await;
+    harvest_workflow_executions::table
+        .filter(dsl::workflow_id.eq(workflow_id))
+        .select(dsl::id)
+        .first::<Uuid>(&mut conn)
+        .await
+        .expect("a run for the workflow id")
+}
+
+/// Refill the bucket of `THROTTLED_WF`, and fire its deferred starts.
+async fn fire_deferred(url: &str) {
+    let mut conn = connect(url).await;
+    diesel::sql_query(
+        "UPDATE harvest_rate_limit_buckets SET tokens = 1.0, last_refilled_at = NOW() \
+         WHERE key = $1",
+    )
+    .bind::<diesel::sql_types::Text, _>(format!("start-throttle:{THROTTLED_WF}:acme"))
+    .execute(&mut conn)
+    .await
+    .expect("refill bucket");
+    let fired = autumn_harvest::throttle::fire_due_throttled_starts(
+        &mut conn,
+        &None,
+        &[] as &[autumn_harvest::types::ShardId],
+        &autumn_harvest::telemetry::NoOpMetrics,
+    )
+    .await
+    .expect("fire due");
+    assert_eq!(fired, 1, "the deferred start fires");
+}
+
+/// The hard and the soft budget of a run.
+async fn budgets(url: &str, id: Uuid) -> (Option<chrono::Duration>, Option<chrono::Duration>) {
+    let run = deadlines(url, id).await;
+    (run.timeout(), run.sla())
+}
+
+/// Start one item of `THROTTLED_WF` that takes the token, and one that
+/// defers. Fire the deferred one. Return both runs.
+async fn throttled_batch(url: &str, app: &axum::Router) -> (Uuid, Uuid) {
+    let results = batch_start(
+        app,
+        false,
+        vec![
+            batch_item(THROTTLED_WF, "paced-now"),
+            batch_item(THROTTLED_WF, "paced-later"),
+        ],
+    )
+    .await;
+    assert_eq!(results[0]["status"], json!("started"), "{results:?}");
+    assert_eq!(results[1]["status"], json!("deferred"), "{results:?}");
+    fire_deferred(url).await;
+    (
+        run_of(url, "paced-now").await,
+        run_of(url, "paced-later").await,
+    )
+}
+
+/// AC1: an immediate batch start, best-effort and atomic, gets
+/// `deadline_at = started_at + override`. The declared 3h SLA clamps to it.
+#[tokio::test]
+async fn a_batch_start_takes_the_timeout_override() {
+    let (url, _container) = setup_test_database_url().await;
+    let app = build_app(&build_test_pool(&url));
+
+    batch_start(&app, false, vec![batch_item(BATCH_WF, "bulk-code")]).await;
+    assert_eq!(
+        budgets(&url, run_of(&url, "bulk-code").await).await,
+        (secs(3600), secs(3600)),
+        "with no override, the declared 1h timeout applies"
+    );
+
+    let (status, body) = patch(&app, BATCH_WF, json!({ "execution_timeout_secs": 600 })).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    batch_start(&app, false, vec![batch_item(BATCH_WF, "bulk-best-effort")]).await;
+    batch_start(&app, true, vec![batch_item(BATCH_WF, "bulk-atomic")]).await;
+    for workflow_id in ["bulk-best-effort", "bulk-atomic"] {
+        assert_eq!(
+            budgets(&url, run_of(&url, workflow_id).await).await,
+            (secs(600), secs(600)),
+            "{workflow_id}: the 10m override is the deadline"
+        );
+    }
+}
+
+/// AC1: a throttled batch start gets the override deadline, on the item
+/// that takes a token and on the item that the scanner fires later.
+#[tokio::test]
+async fn a_throttled_batch_start_takes_the_timeout_override() {
+    let (url, _container) = setup_test_database_url().await;
+    let app = build_app(&build_test_pool(&url));
+
+    let (status, body) = patch(&app, THROTTLED_WF, json!({ "execution_timeout_secs": 600 })).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (now, later) = throttled_batch(&url, &app).await;
+    assert_eq!(budgets(&url, now).await, (secs(600), secs(600)));
+    assert_eq!(
+        budgets(&url, later).await,
+        (secs(600), secs(600)),
+        "the deferred fire keeps the override deadline"
+    );
+}
+
+/// AC3: the fleet ceiling caps the override on each batch path, and the
+/// SLA clamps to the capped timeout.
+#[tokio::test]
+async fn the_fleet_ceiling_caps_a_batch_start_override() {
+    let (url, _container) = setup_test_database_url().await;
+    let app = build_app_with_timeout_ceiling(&build_test_pool(&url), Duration::from_mins(30));
+
+    for name in [BATCH_WF, THROTTLED_WF] {
+        let (status, body) = patch(&app, name, json!({ "execution_timeout_secs": 7200 })).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    batch_start(&app, false, vec![batch_item(BATCH_WF, "bulk-capped")]).await;
+    let (now, later) = throttled_batch(&url, &app).await;
+    for (path, id) in [
+        ("immediate", run_of(&url, "bulk-capped").await),
+        ("throttled, token", now),
+        ("throttled, deferred", later),
+    ] {
+        assert_eq!(
+            budgets(&url, id).await,
+            (secs(1800), secs(1800)),
+            "{path}: the 30m ceiling caps the 2h override and the 3h SLA"
+        );
+    }
 }
