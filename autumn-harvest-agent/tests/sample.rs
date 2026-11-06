@@ -530,7 +530,7 @@ fn a_threshold_that_is_not_finite_fails_to_decode() {
     let value = json!({"rejection": {"max_attempts": 2, "threshold": 0.5}});
     let strategy: SampleStrategy = serde_json::from_value(value).unwrap();
     assert_eq!(strategy, SampleStrategy::rejection(2, threshold(0.5)));
-    assert_eq!(strategy.policy_strategy(), Strategy::Rejection);
+    assert_eq!(strategy.policy_strategy(), Some(Strategy::Rejection));
     assert_eq!(strategy.draws(), 2);
 }
 

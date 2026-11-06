@@ -20,9 +20,9 @@ use std::num::NonZeroU32;
 use autumn_harvest::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use super::admit::{Admission, Ask, Refusal, SampleStep, admit, sample_step};
+use super::admit::{Admission, Ask, Refusal, SampleStep, admit, admit_single, sample_step};
 use super::draws::{draw_task, profile_task, read_policy, read_profile};
-use super::policy::{ScorerRef, Strategy};
+use super::policy::{SamplingPolicy, ScorerRef, Strategy};
 use autumn_harvest::llm_budget::LlmBudgetExceeded;
 
 use crate::bounds::{exceeds_activity_input, sibling_cap};
@@ -40,12 +40,15 @@ pub const SAMPLE_WORKFLOW_NAME: &str = "agent_sample";
 
 /// The strategy of one `agent_sample` run.
 ///
-/// It encodes as `{"best_of_n": {"n": 3}}` or
+/// It encodes as `"single"`, `{"best_of_n": {"n": 3}}` or
 /// `{"rejection": {"max_attempts": 4, "threshold": 0.8}}`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 #[non_exhaustive]
 pub enum SampleStrategy {
+    /// Run one draw and score it. The policy needs no strategy for it,
+    /// because the default policy makes each run a single draw.
+    Single,
     /// Run `n` draws, score each, and select the best.
     BestOfN {
         /// The draws.
@@ -62,6 +65,12 @@ pub enum SampleStrategy {
 }
 
 impl SampleStrategy {
+    /// One draw.
+    #[must_use]
+    pub const fn single() -> Self {
+        Self::Single
+    }
+
     /// Best-of-`n`.
     #[must_use]
     pub const fn best_of_n(n: u32) -> Self {
@@ -77,12 +86,14 @@ impl SampleStrategy {
         }
     }
 
-    /// The policy strategy, such as `best_of_n`.
+    /// The policy strategy, such as `best_of_n`. `None` for a single
+    /// draw, which needs no strategy in the policy.
     #[must_use]
-    pub const fn policy_strategy(self) -> Strategy {
+    pub const fn policy_strategy(self) -> Option<Strategy> {
         match self {
-            Self::BestOfN { .. } => Strategy::BestOfN,
-            Self::Rejection { .. } => Strategy::Rejection,
+            Self::Single => None,
+            Self::BestOfN { .. } => Some(Strategy::BestOfN),
+            Self::Rejection { .. } => Some(Strategy::Rejection),
         }
     }
 
@@ -90,6 +101,7 @@ impl SampleStrategy {
     #[must_use]
     pub const fn draws(self) -> u32 {
         match self {
+            Self::Single => 1,
             Self::BestOfN { n } => n,
             Self::Rejection { max_attempts, .. } => max_attempts,
         }
@@ -119,6 +131,10 @@ pub struct SampleInput {
     /// profile, and never raises it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_total_tokens: Option<u32>,
+    /// The expected answer. Each score input carries it, so a scorer such
+    /// as [`ExactMatch`](crate::ExactMatch) can compare with it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected: Option<String>,
 }
 
 impl SampleInput {
@@ -137,7 +153,15 @@ impl SampleInput {
             scorer,
             concurrency: None,
             max_total_tokens: None,
+            expected: None,
         }
+    }
+
+    /// Give each score input the expected answer `expected`.
+    #[must_use]
+    pub fn expected(mut self, expected: impl Into<String>) -> Self {
+        self.expected = Some(expected.into());
+        self
     }
 
     /// Run at most `n` draws at the same time. A value of 0 takes the
@@ -259,15 +283,7 @@ pub async fn agent_sample(
         return Err(Refusal::UnknownKind.error_text());
     };
     let read = read_policy(ctx, &input.kind).await?;
-    let ask = Ask {
-        strategy: input.strategy.policy_strategy(),
-        draws: input.strategy.draws(),
-        concurrency: input
-            .concurrency
-            .map_or_else(|| default_concurrency(input.strategy), NonZeroU32::get),
-        scorer: Some(&input.scorer),
-    };
-    let admission = admit(&read.policy, &ask).map_err(|refusal| refusal.error_text())?;
+    let admission = admit_sample(&read.policy, &input).map_err(|refusal| refusal.error_text())?;
     let task = draw_task(
         &profile_task(&profile, &input.input),
         &admission.draw_effects,
@@ -283,15 +299,45 @@ pub async fn agent_sample(
     ))
 }
 
+/// Compare the strategy, the concurrency and the scorer of `input` with
+/// `policy`.
+///
+/// A single draw needs no strategy in the policy. It still meets the
+/// concurrency and the scorer checks.
+///
+/// # Errors
+///
+/// Returns the first [`Refusal`].
+pub(super) fn admit_sample(
+    policy: &SamplingPolicy,
+    input: &SampleInput,
+) -> Result<Admission, Refusal> {
+    let concurrency = input
+        .concurrency
+        .map_or_else(|| default_concurrency(input.strategy), NonZeroU32::get);
+    input.strategy.policy_strategy().map_or_else(
+        || admit_single(policy, concurrency, Some(&input.scorer)),
+        |strategy| {
+            let ask = Ask {
+                strategy,
+                draws: input.strategy.draws(),
+                concurrency,
+                scorer: Some(&input.scorer),
+            };
+            admit(policy, &ask)
+        },
+    )
+}
+
 /// The concurrency of a run that asks for none.
 ///
 /// Best-of-N takes the cap of the policy (0). Rejection stops at the first
 /// pass, so it runs one draw at a time. A wider wave would pay for draws
-/// after the pass.
+/// after the pass. A single draw runs alone.
 const fn default_concurrency(strategy: SampleStrategy) -> u32 {
     match strategy {
         SampleStrategy::BestOfN { .. } => 0,
-        SampleStrategy::Rejection { .. } => 1,
+        SampleStrategy::Single | SampleStrategy::Rejection { .. } => 1,
     }
 }
 
@@ -390,6 +436,7 @@ fn score_request(
     report: &AgentReport,
 ) -> Option<ScoreRequest> {
     let mut score = ScoreInput::from_run(task, report);
+    score.expected.clone_from(&input.expected);
     for tool in &mut score.tools {
         let content = std::mem::take(&mut tool.content);
         tool.content = cut_bytes(content, MAX_SCORED_TOOL_BYTES);
@@ -469,7 +516,7 @@ async fn score_draw(
 /// Rejection passes a score at or above the threshold.
 fn passes(strategy: SampleStrategy, verdict: &Verdict) -> bool {
     match strategy {
-        SampleStrategy::BestOfN { .. } => !verdict.is_reject(),
+        SampleStrategy::Single | SampleStrategy::BestOfN { .. } => !verdict.is_reject(),
         SampleStrategy::Rejection { threshold, .. } => {
             verdict.as_score().is_some_and(|score| score >= threshold)
         }
@@ -586,11 +633,62 @@ mod tests {
     fn the_strategy_maps_to_the_policy_strategy() {
         assert_eq!(
             SampleStrategy::best_of_n(4).policy_strategy(),
-            Strategy::BestOfN
+            Some(Strategy::BestOfN)
         );
         assert_eq!(SampleStrategy::best_of_n(4).draws(), 4);
         let rejection = SampleStrategy::rejection(5, FiniteF64::ONE);
-        assert_eq!(rejection.policy_strategy(), Strategy::Rejection);
+        assert_eq!(rejection.policy_strategy(), Some(Strategy::Rejection));
         assert_eq!(rejection.draws(), 5);
+        assert_eq!(SampleStrategy::single().policy_strategy(), None);
+        assert_eq!(SampleStrategy::single().draws(), 1);
+        assert_eq!(
+            serde_json::to_value(SampleStrategy::single()).unwrap(),
+            serde_json::json!("single")
+        );
+    }
+
+    fn single(scorer: &str) -> SampleInput {
+        SampleInput::new(
+            "k",
+            "x",
+            SampleStrategy::single(),
+            ScorerRef::deterministic(scorer).unwrap(),
+        )
+    }
+
+    #[test]
+    fn a_single_draw_needs_no_strategy_in_the_policy() {
+        let admission = admit_sample(&SamplingPolicy::default(), &single("exact_match")).unwrap();
+        assert_eq!((admission.draws, admission.concurrency), (1, 1));
+        let judge = SampleInput {
+            scorer: ScorerRef::judge("judge", "m").unwrap(),
+            ..single("exact_match")
+        };
+        assert_eq!(
+            admit_sample(&SamplingPolicy::default(), &judge)
+                .unwrap_err()
+                .code(),
+            "scorer_not_allowed",
+            "the scorer check still applies"
+        );
+        let wide = single("exact_match").concurrency(2);
+        assert_eq!(
+            admit_sample(&SamplingPolicy::default(), &wide)
+                .unwrap_err()
+                .code(),
+            "too_many_concurrent_draws"
+        );
+    }
+
+    #[test]
+    fn a_score_request_carries_the_expected_answer() {
+        let report: AgentReport = serde_json::from_value(serde_json::json!({
+            "stop": "completed", "text": "4", "steps_used": 1, "tool_calls": 0,
+            "usage": {"input_tokens": 1, "output_tokens": 1}, "messages": [],
+        }))
+        .unwrap();
+        let input = single("exact_match").expected("4");
+        let request = score_request(&input, &AgentTask::new("x"), &report).unwrap();
+        assert_eq!(request.input.expected.as_deref(), Some("4"));
     }
 }

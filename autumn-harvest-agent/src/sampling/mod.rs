@@ -15,21 +15,26 @@
 //! - [`agent_sample`] runs best-of-N or rejection sampling. It scores each
 //!   draw and selects one (issue #2443).
 //! - [`admit_answer_check`] caps the answer check of a run (issue #2442).
+//! - [`agent_sweep`] runs one strategy over a fixed set of inputs, and
+//!   keeps one row for each item.
 //!
 //! A run never carries a policy field. [`AgentTask`](crate::AgentTask),
 //! [`AgentOp`](crate::AgentOp), [`DrawsInput`] and [`SampleInput`] refuse
 //! each name in [`SAMPLING_POLICY_FIELDS`]. The design is in
-//! `docs/design/DESIGN-2439.md` and `docs/design/DESIGN-2443.md`.
+//! `docs/design/DESIGN-2439.md`, `docs/design/DESIGN-2443.md` and
+//! `docs/design/DESIGN-2448.md`.
 
 mod admit;
 mod draws;
 mod policy;
 mod sample;
 mod store;
+mod sweep;
 
 pub use admit::{
-    Admission, Ask, DrawPlan, REFUSED_PREFIX, Refusal, SampleStep, admit, admit_answer_check,
-    answer_retry_cap, draw_plan, retry_after_reject, sample_step, wave_end,
+    Admission, Ask, DrawPlan, REFUSED_PREFIX, Refusal, SampleStep, SweepPlan, admit,
+    admit_answer_check, admit_single, answer_retry_cap, draw_plan, retry_after_reject, sample_step,
+    sweep_plan, wave_end,
 };
 pub use draws::{
     DRAWS_WORKFLOW_NAME, DrawsInput, DrawsReport, agent_draws, agent_draws_info,
@@ -51,4 +56,10 @@ pub use store::SqliteSamplingPolicyStore;
 pub use store::{
     InMemorySamplingPolicyStore, MAX_AUDIT_ROWS, PolicyAction, PolicyAudit, PolicyChange,
     PolicyRead, PolicyStoreError, SamplingPolicyStore,
+};
+pub use sweep::{
+    ItemStatus, MAX_PAGE_BYTES, MAX_ROW_ANSWER_BYTES, MAX_ROW_REASON_BYTES, MAX_SWEEP_ITEM_BYTES,
+    MAX_SWEEP_ITEMS, SWEEP_WORKFLOW_NAME, SweepInput, SweepItem, SweepItemStore, SweepItems,
+    SweepItemsRef, SweepPage, SweepReport, SweepRow, SweepStop, SweepTotals, agent_sweep,
+    agent_sweep_info, agent_sweep_items, agent_sweep_items_info,
 };
