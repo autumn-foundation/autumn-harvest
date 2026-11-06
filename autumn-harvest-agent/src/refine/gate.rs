@@ -522,9 +522,9 @@ async fn edited(
 /// # Errors
 ///
 /// Returns a retryable error for a backend failure. Returns
-/// `OverlayStoreMissing` for a worker with no store, `RefineGateUnknownKind`
-/// for an edit of a kind that the harness does not know, and a
-/// non-retryable payload for any other store error.
+/// `OverlayStoreMissing` for a worker with no store. Returns
+/// `RefineGateUnknownKind` for an edit of a kind that the harness does not
+/// know. Any other store error gives a non-retryable payload.
 pub(crate) async fn run_decide(
     harness: &AgentHarness,
     request: DecideRequest,

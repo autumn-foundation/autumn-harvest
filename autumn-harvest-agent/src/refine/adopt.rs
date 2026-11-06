@@ -142,7 +142,7 @@ pub struct Adoption {
 /// reports it as adopted with no move. The version need not be active, so
 /// a retry never undoes a rollback or a later adoption. A retry also finds
 /// its own `refine:<run>` version of the same overlay first. It then waits
-/// with no reason and puts no second version, so a new day or a wider
+/// with no reason and puts no second version. So a new day or a wider
 /// policy never changes the outcome of a retry.
 ///
 /// # Errors
