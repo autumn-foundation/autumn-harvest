@@ -243,6 +243,14 @@ name = "sample_cascade_crash"
 required-features = ["sqlite"]
 
 [[test]]
+name = "sample_beam"
+required-features = ["sqlite"]
+
+[[test]]
+name = "sample_beam_crash"
+required-features = ["sqlite"]
+
+[[test]]
 name = "sample_postgres"
 required-features = ["postgres"]
 
@@ -281,6 +289,14 @@ required-features = ["postgres"]
 [[example]]
 name = "agent_session_entity"
 required-features = ["sqlite"]
+test = true
+
+# The refine loop of a kind, end to end: a failed op, a refine run, an
+# approval and a passed op. The refine workflow needs `eval`. `test = true`
+# runs its tests in the crate test step, and CI also runs `main`.
+[[example]]
+name = "agent_refine"
+required-features = ["sqlite", "eval"]
 test = true
 
 # Deterministic instruction-count harness for `AgentHarness::model_turn`, the

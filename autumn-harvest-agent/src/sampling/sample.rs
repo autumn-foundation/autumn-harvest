@@ -15,17 +15,21 @@
 //! - A cascade asks one tier at a time, each with its own model. It stops
 //!   at the first tier that accepts. [`cascade_step`] skips each tier that
 //!   the mandate forbids.
+//! - Beam search runs one model turn per draw. Each round expands each live
+//!   beam, scores each step and keeps the best beams with [`beam_rank`].
 //!
-//! The design is in `docs/design/DESIGN-2443.md` and
-//! `docs/design/DESIGN-2445.md`.
+//! The design is in `docs/design/DESIGN-2443.md`,
+//! `docs/design/DESIGN-2445.md` and `docs/design/DESIGN-2446.md`.
 
+use std::collections::BTreeSet;
 use std::num::NonZeroU32;
 
 use autumn_harvest::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use super::admit::{
-    Admission, Ask, CascadeStep, Refusal, SampleStep, admit, admit_tiers, cascade_step, sample_step,
+    Admission, Ask, CascadeStep, Refusal, SampleStep, admit, admit_tiers, beam_draws, beam_slots,
+    cascade_step, sample_step,
 };
 use super::draws::{draw_task, profile_task, read_policy, read_profile};
 use super::policy::{ScorerRef, Strategy};
@@ -35,7 +39,7 @@ use crate::bounds::{exceeds_activity_input, sibling_cap};
 use crate::draw::{DrawId, run_draw_tasks};
 use crate::harness::cut_bytes;
 use crate::mesh::valid_name;
-use crate::message::TokenUsage;
+use crate::message::{ChatMessage, ChatRole, TokenUsage};
 use crate::score::{
     FiniteF64, SampleScore, ScoreInput, ScoreRequest, Verdict, agent_sample_score_info, select,
 };
@@ -73,7 +77,8 @@ impl Tier {
 ///
 /// It encodes as `{"best_of_n": {"n": 3}}`,
 /// `{"rejection": {"max_attempts": 4, "threshold": 0.8}}` or
-/// `{"cascade": {"tiers": [{"model": "small", "threshold": 0.8}]}}`.
+/// `{"cascade": {"tiers": [{"model": "small", "threshold": 0.8}]}}` or
+/// `{"beam": {"width": 2, "expansion": 2, "max_rounds": 3}}`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 #[non_exhaustive]
@@ -96,6 +101,17 @@ pub enum SampleStrategy {
     Cascade {
         /// The tiers, the cheapest first.
         tiers: Vec<Tier>,
+    },
+    /// Step-level beam search. Each round expands each live beam with
+    /// `expansion` model turns, scores each step and keeps the best
+    /// `width` beams. The scorer of the input is the step scorer.
+    Beam {
+        /// The most beams that a round keeps.
+        width: u32,
+        /// The model turns that each live beam gets in a round.
+        expansion: u32,
+        /// The most rounds.
+        max_rounds: u32,
     },
 }
 
@@ -123,6 +139,17 @@ impl SampleStrategy {
         }
     }
 
+    /// Beam search of `width` beams, `expansion` turns per beam and at
+    /// most `max_rounds` rounds.
+    #[must_use]
+    pub const fn beam(width: u32, expansion: u32, max_rounds: u32) -> Self {
+        Self::Beam {
+            width,
+            expansion,
+            max_rounds,
+        }
+    }
+
     /// The policy strategy, such as `best_of_n`.
     #[must_use]
     pub const fn policy_strategy(&self) -> Strategy {
@@ -130,16 +157,24 @@ impl SampleStrategy {
             Self::BestOfN { .. } => Strategy::BestOfN,
             Self::Rejection { .. } => Strategy::Rejection,
             Self::Cascade { .. } => Strategy::Cascade,
+            Self::Beam { .. } => Strategy::Beam,
         }
     }
 
-    /// The most draws of the run. A cascade has one draw per tier.
+    /// The most draws of the run. A cascade has one draw per tier. For a
+    /// beam, it is `width × expansion × max_rounds`, saturated at
+    /// `u32::MAX`.
     #[must_use]
     pub fn draws(&self) -> u32 {
         match self {
             Self::BestOfN { n } => *n,
             Self::Rejection { max_attempts, .. } => *max_attempts,
             Self::Cascade { tiers } => u32::try_from(tiers.len()).unwrap_or(u32::MAX),
+            Self::Beam {
+                width,
+                expansion,
+                max_rounds,
+            } => beam_draws(*width, *expansion, *max_rounds),
         }
     }
 }
@@ -160,8 +195,8 @@ pub struct SampleInput {
     /// The scorer. The policy must allow it.
     pub scorer: ScorerRef,
     /// The most draws at the same time. `None` takes the cap of the policy
-    /// for best-of-N, and 1 for rejection and for a cascade. A cascade
-    /// refuses a value above 1.
+    /// for best-of-N and beam search, and 1 for rejection and for a
+    /// cascade. A cascade refuses a value above 1.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub concurrency: Option<NonZeroU32>,
     /// The token budget of the whole run tree. It narrows the cap of the
@@ -207,6 +242,8 @@ impl SampleInput {
 }
 
 /// The result of the selection.
+///
+/// A beam run selects among its complete beams only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SampleOutcome {
@@ -251,6 +288,38 @@ pub enum SampleStop {
     /// A score failed, so the run started no more draws. The verdict of
     /// the draw names the error.
     ScoreFailed,
+    /// A beam run ended its last round with a live beam. The run selects
+    /// among the beams that are complete.
+    RoundsExhausted,
+}
+
+/// What a beam round did with one step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum BeamFate {
+    /// The round kept the step. The next round expands it, unless the run
+    /// stops after this round.
+    Live,
+    /// The round kept the step, and its turn is a final answer. It leaves
+    /// the pool.
+    Complete,
+    /// The round did not keep the step.
+    Pruned,
+}
+
+/// The place of one step in a beam run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct BeamStep {
+    /// The round of the step, from 0. The first round expands the user
+    /// message.
+    pub round: u32,
+    /// The step that this step extends. `None` in the first round.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<DrawId>,
+    /// What the round did with the step.
+    pub fate: BeamFate,
 }
 
 /// The record of one draw.
@@ -276,6 +345,9 @@ pub struct SampleDraw {
     /// US dollar. An unpriced call adds 0.
     #[serde(default, skip_serializing_if = "crate::agent::is_zero")]
     pub cost_usd_micros: u64,
+    /// The place of the step in a beam run. `None` for each other strategy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub beam: Option<BeamStep>,
 }
 
 /// The result of one `agent_sample` run.
@@ -294,9 +366,11 @@ pub struct SampleReport {
     pub outcome: SampleOutcome,
     /// Why the run stopped.
     pub stopped: SampleStop,
-    /// The draws that ran.
+    /// The draws that ran. For a beam, each step is a draw.
     pub attempts: u32,
-    /// The report of the selected draw.
+    /// The report of the selected draw. For a beam, its transcript is the
+    /// whole path, but its usage and counts cover its last step only. The
+    /// totals of the run are on this report.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected: Option<AgentReport>,
     /// Each draw, in draw order.
@@ -360,14 +434,32 @@ pub async fn agent_sample(
         &admission.draw_effects,
     );
     let budget = tree_budget(task.max_total_tokens, input.max_total_tokens);
-    let ended = if let SampleStrategy::Cascade { tiers } = &input.strategy {
-        run_tiers(ctx, &input, tiers, &task, budget).await?
-    } else {
-        let (scored, stopped) = run_waves(ctx, &input, &task, &admission, budget).await?;
-        Ended {
-            scored,
-            skipped: Vec::new(),
-            stopped,
+    let ended = match &input.strategy {
+        SampleStrategy::Cascade { tiers } => run_tiers(ctx, &input, tiers, &task, budget).await?,
+        SampleStrategy::Beam {
+            width,
+            expansion,
+            max_rounds,
+        } => {
+            let shape = BeamShape {
+                width: *width,
+                expansion: *expansion,
+                max_rounds: *max_rounds,
+            };
+            let (scored, stopped) = run_beam(ctx, &input, &task, &admission, budget, shape).await?;
+            Ended {
+                scored,
+                skipped: Vec::new(),
+                stopped,
+            }
+        }
+        _ => {
+            let (scored, stopped) = run_waves(ctx, &input, &task, &admission, budget).await?;
+            Ended {
+                scored,
+                skipped: Vec::new(),
+                stopped,
+            }
         }
     };
     Ok(report(input, read.revision, admission.concurrency, ended))
@@ -380,7 +472,7 @@ pub async fn agent_sample(
 /// pay for draws after the pass.
 const fn default_concurrency(strategy: &SampleStrategy) -> u32 {
     match strategy {
-        SampleStrategy::BestOfN { .. } => 0,
+        SampleStrategy::BestOfN { .. } | SampleStrategy::Beam { .. } => 0,
         SampleStrategy::Rejection { .. } | SampleStrategy::Cascade { .. } => 1,
     }
 }
@@ -398,6 +490,8 @@ const fn tree_budget(profile: Option<u32>, input: Option<u32>) -> Option<u32> {
 struct Scored {
     record: SampleDraw,
     report: AgentReport,
+    /// The delegations of the beam that a beam step extends. 0 for a draw.
+    parent_delegations: u32,
 }
 
 /// The draws of a run, the tiers that it skipped, and why it stopped.
@@ -581,6 +675,269 @@ async fn run_tiers(
     }
 }
 
+/// The bounds of a beam run.
+#[derive(Debug, Clone, Copy)]
+struct BeamShape {
+    width: u32,
+    expansion: u32,
+    max_rounds: u32,
+}
+
+/// One live beam: the step that ends it, its transcript, the flow labels
+/// that it exercised and the delegations that it used.
+struct Beam {
+    draw: Option<DrawId>,
+    messages: Vec<ChatMessage>,
+    flow_labels: BTreeSet<String>,
+    delegations: u32,
+}
+
+/// Run the rounds of a beam run, and score each step.
+///
+/// The first round has one beam: the user message. Each round expands each live
+/// beam `expansion` times, in the order of the live beams. Each step is a
+/// child run in step mode. It sends the beam as its history and asks for
+/// one new model turn. So a kept beam pays only for its new turn.
+///
+/// The steps of a round run in waves of [`sample_step`], under the token
+/// budget of the run tree. After the round, [`beam_rank`] keeps the best
+/// steps, at most `width` less the complete beams. A kept step with a final
+/// answer is complete. Each other kept step is live in the next round.
+///
+/// The run stops when `width` beams are complete or no beam is live. It
+/// stops with `rounds_exhausted` after `max_rounds` with a live beam. A
+/// budget refusal or a failed score stops it after the round is ranked.
+async fn run_beam(
+    ctx: &WorkflowContext,
+    input: &SampleInput,
+    task: &AgentTask,
+    admission: &Admission,
+    budget: Option<u32>,
+    shape: BeamShape,
+) -> Result<(Vec<Scored>, SampleStop), String> {
+    let mut scored: Vec<Scored> = Vec::new();
+    let mut spent: u32 = 0;
+    let mut complete: u32 = 0;
+    let mut live = vec![Beam {
+        draw: None,
+        messages: vec![ChatMessage::text(ChatRole::User, input.input.clone())],
+        flow_labels: task.flow_labels.clone(),
+        delegations: 0,
+    }];
+    for round in 0..shape.max_rounds {
+        let slots = beam_slots(shape.width, complete);
+        if slots == 0 || live.is_empty() {
+            return Ok((scored, SampleStop::Completed));
+        }
+        // A plain loop, so the determinism analysis sees each call.
+        let mut parents: Vec<&Beam> = Vec::new();
+        for beam in &live {
+            for _ in 0..shape.expansion {
+                parents.push(beam);
+            }
+        }
+        let first = scored.len();
+        let halt = Box::pin(run_steps(
+            ctx,
+            Steps {
+                input,
+                task,
+                admission,
+                budget,
+                round,
+                parents: &parents,
+            },
+            &mut scored,
+            &mut spent,
+        ))
+        .await?;
+        live = keep_beams(&mut scored[first..], slots, &mut complete);
+        if let Some(stop) = halt {
+            return Ok((scored, stop));
+        }
+    }
+    let stop = if beam_slots(shape.width, complete) == 0 || live.is_empty() {
+        SampleStop::Completed
+    } else {
+        SampleStop::RoundsExhausted
+    };
+    Ok((scored, stop))
+}
+
+/// The steps of one beam round.
+struct Steps<'a> {
+    input: &'a SampleInput,
+    task: &'a AgentTask,
+    admission: &'a Admission,
+    budget: Option<u32>,
+    round: u32,
+    /// The beam of each step, in step order.
+    parents: &'a [&'a Beam],
+}
+
+/// Run the steps of one round in waves, score each, and add each to
+/// `scored` as pruned. Returns the stop of a budget refusal or of a failed
+/// score.
+///
+/// Step `n` of the run has the draw id `n`. So each step has its own draw
+/// id, run id and cache key, also when two steps share a beam.
+async fn run_steps(
+    ctx: &WorkflowContext,
+    steps: Steps<'_>,
+    scored: &mut Vec<Scored>,
+    spent: &mut u32,
+) -> Result<Option<SampleStop>, String> {
+    let planned = u32::try_from(steps.parents.len()).unwrap_or(u32::MAX);
+    let mut started: u32 = 0;
+    loop {
+        let left = steps.budget.map_or(0, |max| max.saturating_sub(*spent));
+        let step = sample_step(
+            planned,
+            started,
+            steps.admission.concurrency,
+            steps.budget.is_some(),
+            left,
+        );
+        let width = match step {
+            SampleStep::Done => return Ok(None),
+            SampleStep::BudgetExceeded => return Ok(Some(SampleStop::BudgetExceeded)),
+            SampleStep::Wave { width } => width,
+        };
+        let base = u32::try_from(scored.len()).unwrap_or(u32::MAX);
+        let wave = &steps.parents[started as usize..(started + width) as usize];
+        let tasks = (0..width)
+            .zip(wave)
+            .map(|(index, parent)| {
+                let mut one = step_task(steps.task, parent, steps.round);
+                if steps.budget.is_some() {
+                    one.max_total_tokens = Some(sibling_cap(left, width, index));
+                }
+                (DrawId::new(base + index), one)
+            })
+            .collect();
+        let ended = run_draw_tasks(ctx, tasks).await?;
+        let mut halt = None;
+        for ((id, report), parent) in (base..).zip(ended).zip(wave) {
+            let report = report?;
+            if report.stop == AgentStop::BudgetExceeded {
+                halt = halt.or(Some(SampleStop::BudgetExceeded));
+            }
+            let draw = DrawId::new(id);
+            let (mut one, halted) =
+                score_draw(ctx, steps.input, steps.task, draw, report, halt).await?;
+            halt = halt.or(halted);
+            one.parent_delegations = parent.delegations;
+            one.record.beam = Some(BeamStep {
+                round: steps.round,
+                parent: parent.draw,
+                fate: BeamFate::Pruned,
+            });
+            *spent = spent.saturating_add(one.record.usage.total());
+            scored.push(one);
+        }
+        if halt.is_some() {
+            return Ok(halt);
+        }
+        started += width;
+    }
+}
+
+/// The task of one beam step in `round`: `task` in step mode, with `beam`
+/// as its history.
+///
+/// A step continues the run of its beam, so it also continues its flow
+/// labels, its step count and its delegation count. A beam of round `r`
+/// holds `r` tool rounds. So the step may run `max_steps - r` tool rounds,
+/// as one run of the task would. With none left, the model may still
+/// answer. The mandate of the step allows only the delegations that the
+/// beam has not used.
+///
+/// A step makes one model call. It has no context reset, because a reset
+/// rewrites the beam. It has no answer check, because a rejected answer
+/// asks the model again.
+fn step_task(task: &AgentTask, beam: &Beam, round: u32) -> AgentTask {
+    let mut mandate = task.mandate.clone();
+    if let Some(mandate) = mandate.as_mut() {
+        mandate.max_delegations = mandate.max_delegations.saturating_sub(beam.delegations);
+    }
+    AgentTask {
+        mandate,
+        history: beam.messages.clone(),
+        flow_labels: beam.flow_labels.clone(),
+        max_steps: task.max_steps.saturating_sub(round),
+        beam_step: true,
+        answer_check: None,
+        context_reset: None,
+        ..task.clone()
+    }
+}
+
+/// Keep the best steps of one round, and return the live beams.
+///
+/// A step can stay only with a score. It is complete when its turn is a
+/// final answer. `complete` counts the complete beams of the run.
+fn keep_beams(round: &mut [Scored], slots: u32, complete: &mut u32) -> Vec<Beam> {
+    let ranked: Vec<(DrawId, Verdict)> = round
+        .iter()
+        .filter(|one| matches!(one.record.stop, AgentStop::Completed | AgentStop::StepEnded))
+        .map(|one| (one.record.draw, one.record.verdict.clone()))
+        .collect();
+    let mut live = Vec::new();
+    for draw in beam_rank(&ranked, slots) {
+        let Some(one) = round.iter_mut().find(|one| one.record.draw == draw) else {
+            continue;
+        };
+        let complete_now = one.record.stop == AgentStop::Completed;
+        let parent_delegations = one.parent_delegations;
+        if let Some(beam) = one.record.beam.as_mut() {
+            beam.fate = if complete_now {
+                BeamFate::Complete
+            } else {
+                BeamFate::Live
+            };
+        }
+        if complete_now {
+            *complete = complete.saturating_add(1);
+        } else {
+            live.push(Beam {
+                draw: Some(draw),
+                messages: one.report.messages.clone(),
+                flow_labels: one.report.flow_labels.clone(),
+                delegations: parent_delegations.saturating_add(used_delegations(&one.report)),
+            });
+        }
+    }
+    live
+}
+
+/// The delegations that `report` ran. A refused delegation uses none.
+fn used_delegations(report: &AgentReport) -> u32 {
+    let used = report
+        .delegations
+        .iter()
+        .filter(|record| record.refusal.is_none())
+        .count();
+    u32::try_from(used).unwrap_or(u32::MAX)
+}
+
+/// The best `keep` draws of `verdicts`, best first.
+///
+/// It calls [`select`] once per kept draw, over the draws that are left.
+/// So a tie goes to the lowest draw id, and a reject is never kept.
+#[must_use]
+pub fn beam_rank(verdicts: &[(DrawId, Verdict)], keep: u32) -> Vec<DrawId> {
+    let mut left: Vec<(DrawId, Verdict)> = verdicts.to_vec();
+    let mut kept = Vec::new();
+    while u32::try_from(kept.len()).unwrap_or(u32::MAX) < keep {
+        let Some(best) = select(&left) else {
+            break;
+        };
+        left.retain(|(draw, _)| *draw != best);
+        kept.push(best);
+    }
+    kept
+}
+
 /// The most bytes of one tool result that a score input keeps.
 const MAX_SCORED_TOOL_BYTES: usize = 16 * 1024;
 
@@ -630,10 +987,13 @@ async fn score_draw(
 ) -> Result<(Scored, Option<SampleStop>), String> {
     let unscored = |reason: &str| (Verdict::reject(reason), TokenUsage::default(), 0);
     let mut stop = None;
+    let beam = matches!(input.strategy, SampleStrategy::Beam { .. });
     let (verdict, usage, cost) = if report.stop == AgentStop::Failed {
         unscored("the draw failed, so the run did not score it")
     } else if report.stop == AgentStop::BudgetExceeded {
         unscored("a budget stopped the draw, so the run did not score it")
+    } else if beam && !matches!(report.stop, AgentStop::Completed | AgentStop::StepEnded) {
+        unscored("the step did not end with an answer or a tool round")
     } else if halt.is_some() {
         unscored("the run stopped before it scored the draw")
     } else if let Some(request) = score_request(input, task, &report) {
@@ -665,26 +1025,40 @@ async fn score_draw(
         verdict,
         usage: report.usage.saturating_add(usage),
         cost_usd_micros: report.cost_usd_micros.saturating_add(cost),
+        beam: None,
     };
-    Ok((Scored { record, report }, stop))
+    let scored = Scored {
+        record,
+        report,
+        parent_delegations: 0,
+    };
+    Ok((scored, stop))
 }
 
 /// Whether `verdict` of the draw `draw` passes the check of `strategy`.
 ///
-/// Best-of-N passes each score, and `select` never picks a reject.
-/// Rejection passes a score at or above the threshold. A cascade passes a
-/// score at or above the threshold of the tier of the draw.
+/// Best-of-N and beam search pass each score, and `select` never picks a
+/// reject. Rejection passes a score at or above the threshold. A cascade
+/// passes a score at or above the threshold of the tier of the draw.
 fn passes(strategy: &SampleStrategy, draw: DrawId, verdict: &Verdict) -> bool {
     let at_least =
         |threshold: FiniteF64| verdict.as_score().is_some_and(|score| score >= threshold);
     match strategy {
-        SampleStrategy::BestOfN { .. } => !verdict.is_reject(),
+        SampleStrategy::BestOfN { .. } | SampleStrategy::Beam { .. } => !verdict.is_reject(),
         SampleStrategy::Rejection { threshold, .. } => at_least(*threshold),
         SampleStrategy::Cascade { tiers } => usize::try_from(draw.get())
             .ok()
             .and_then(|index| tiers.get(index))
             .is_some_and(|tier| at_least(tier.threshold)),
     }
+}
+
+/// Whether `record` may be selected. A beam step must be a complete beam.
+/// Each draw of another strategy may be.
+fn selectable(record: &SampleDraw) -> bool {
+    record
+        .beam
+        .is_none_or(|beam| beam.fate == BeamFate::Complete)
 }
 
 /// The selection of a run.
@@ -703,9 +1077,9 @@ fn outcome(strategy: &SampleStrategy, scored: &[Scored]) -> SampleOutcome {
     SampleOutcome::NoAcceptedDraw
 }
 
-/// The best draw by [`select`]. With `passing`, only a draw that passes
-/// the check of `strategy` counts. Without it, each draw with a score
-/// counts.
+/// The best selectable draw by [`select`]. With `passing`, only a draw
+/// that passes the check of `strategy` counts. Without it, each draw with
+/// a score counts.
 fn best(strategy: &SampleStrategy, scored: &[Scored], passing: bool) -> Option<DrawId> {
     let mut verdicts: Vec<(DrawId, Verdict)> = Vec::with_capacity(scored.len());
     for one in scored {
@@ -715,7 +1089,7 @@ fn best(strategy: &SampleStrategy, scored: &[Scored], passing: bool) -> Option<D
         } else {
             !record.verdict.is_reject()
         };
-        if keep {
+        if keep && selectable(record) {
             verdicts.push((record.draw, record.verdict.clone()));
         }
     }
@@ -856,6 +1230,133 @@ mod tests {
             request.admitted_judges,
             Some(std::collections::BTreeSet::new())
         );
+    }
+
+    fn ids(ranked: &[DrawId]) -> Vec<u32> {
+        ranked.iter().map(|draw| draw.get()).collect()
+    }
+
+    #[test]
+    fn a_beam_rank_keeps_the_top_scores_and_never_a_reject() {
+        let score = |value| Verdict::score(value).unwrap();
+        let entries = [
+            (DrawId::new(0), score(0.4)),
+            (DrawId::new(1), score(0.9)),
+            (DrawId::new(2), Verdict::reject("no")),
+            (DrawId::new(3), score(0.9)),
+        ];
+        assert_eq!(
+            ids(&beam_rank(&entries, 2)),
+            [1, 3],
+            "a tie goes to the lower id"
+        );
+        assert_eq!(ids(&beam_rank(&entries, 9)), [1, 3, 0]);
+        assert_eq!(beam_rank(&entries, 0), Vec::<DrawId>::new());
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn a_beam_rank_is_the_sorted_prefix(
+            scores in proptest::collection::vec(proptest::option::of(-3_i8..=3), 0..=12),
+            keep in 0_u32..=14,
+        ) {
+            let entries: Vec<(DrawId, Verdict)> = scores
+                .iter()
+                .enumerate()
+                .map(|(i, score)| {
+                    let verdict = score.map_or_else(
+                        || Verdict::reject("no"),
+                        |value| Verdict::score(f64::from(value)).unwrap(),
+                    );
+                    (DrawId::new(u32::try_from(i).unwrap()), verdict)
+                })
+                .rev()
+                .collect();
+            let mut sorted: Vec<(i8, u32)> = scores
+                .iter()
+                .enumerate()
+                .filter_map(|(i, score)| score.map(|v| (v, u32::try_from(i).unwrap())))
+                .collect();
+            sorted.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+            let want: Vec<u32> = sorted
+                .into_iter()
+                .take(keep as usize)
+                .map(|(_, id)| id)
+                .collect();
+            proptest::prop_assert_eq!(ids(&beam_rank(&entries, keep)), want);
+        }
+    }
+
+    /// A pruned step of the second round with `stop` and `verdict`.
+    fn step(draw: u32, stop: AgentStop, verdict: Verdict) -> Scored {
+        let report: AgentReport = serde_json::from_value(serde_json::json!({
+            "stop": stop,
+            "text": "",
+            "steps_used": 1,
+            "tool_calls": 1,
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+            "messages": [],
+            "flow_labels": ["seen"],
+        }))
+        .unwrap();
+        let record = SampleDraw {
+            draw: DrawId::new(draw),
+            run_id: None,
+            model: None,
+            stop,
+            verdict,
+            usage: TokenUsage::default(),
+            cost_usd_micros: 0,
+            beam: Some(BeamStep {
+                round: 1,
+                parent: None,
+                fate: BeamFate::Pruned,
+            }),
+        };
+        Scored {
+            record,
+            report,
+            parent_delegations: 0,
+        }
+    }
+
+    #[test]
+    fn keep_beams_fills_the_slots_by_score_and_counts_the_complete() {
+        let score = |value| Verdict::score(value).unwrap();
+        let mut round = vec![
+            step(0, AgentStop::StepEnded, score(0.2)),
+            step(1, AgentStop::Completed, score(0.9)),
+            step(2, AgentStop::StepEnded, score(0.5)),
+            step(3, AgentStop::StepsExhausted, score(1.0)),
+            step(4, AgentStop::Completed, Verdict::reject("no")),
+        ];
+        let mut complete = 1;
+        let live = keep_beams(&mut round, 2, &mut complete);
+
+        assert_eq!(complete, 2, "draw 1 completes");
+        let ids: Vec<Option<u32>> = live.iter().map(|beam| beam.draw.map(DrawId::get)).collect();
+        assert_eq!(ids, [Some(2)], "a step with another stop is never kept");
+        assert!(live[0].flow_labels.contains("seen"));
+        let fates: Vec<BeamFate> = round
+            .iter()
+            .map(|one| one.record.beam.unwrap().fate)
+            .collect();
+        assert_eq!(
+            fates,
+            [
+                BeamFate::Pruned,
+                BeamFate::Complete,
+                BeamFate::Live,
+                BeamFate::Pruned,
+                BeamFate::Pruned,
+            ]
+        );
+        assert!(keep_beams(&mut round, 0, &mut complete).is_empty());
+    }
+
+    #[test]
+    fn the_beam_strategy_defaults_to_the_concurrency_cap() {
+        assert_eq!(default_concurrency(&SampleStrategy::beam(2, 2, 2)), 0);
     }
 
     #[test]

@@ -26,3 +26,10 @@ Cite a design record by its repository path, for example
 `docs/design/DESIGN-1971.md`. A Markdown link from a page in `docs/` is
 relative to that page. A link from a design record to another page in
 `docs/` starts with `../`.
+
+## ADRs
+
+[The ADR index](../adr/README.md) lists each ADR. An ADR records a
+decision, and a design record holds its plan. For example,
+[ADR 0016](../adr/0016-agent-refinement.md) records why agent refinement
+is offline and operator-governed. `DESIGN-2383.md` holds its plan.

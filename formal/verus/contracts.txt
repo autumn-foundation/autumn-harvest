@@ -213,6 +213,12 @@ pub fn answer_retry_cap(policy_max: u32, asked: u32) -> (r: Option < u32 >) ensu
 pub fn retry_after_reject(rejections: u32, cap: u32) -> (r: bool) ensures r == (rejections <= cap),
 pub open spec fn spec_answers(cap: int, rejections: int) -> int decreases cap + 1 - rejections, { if rejections < 1 || rejections > cap { rejections } else { spec_answers(cap, rejections + 1) } }
 pub proof fn theorem_a_run_asks_for_cap_plus_one_answers(cap: int, rejections: int) requires 1 <= rejections <= cap + 1, ensures spec_answers(cap, rejections) == cap + 1, decreases cap + 1 - rejections,
+pub open spec fn saturate32(n: int) -> int { if n > u32::MAX as int { u32::MAX as int } else { n } }
+pub open spec fn spec_beam_draws(width: int, expansion: int, max_rounds: int) -> int { saturate32(width * expansion * max_rounds) }
+pub fn beam_draws(width: u32, expansion: u32, max_rounds: u32) -> (r: u32) ensures r == spec_beam_draws(width as int, expansion as int, max_rounds as int), r == 0 <==> (width == 0 || expansion == 0 || max_rounds == 0),
+pub fn beam_slots(width: u32, complete: u32) -> (r: u32) ensures r <= width, complete >= width ==> r == 0, complete < width ==> r == width - complete,
+pub open spec fn spec_beam_steps(live: Seq < int >, expansion: int) -> int decreases live.len(), { if live.len() == 0 { 0 } else { live [0] * expansion + spec_beam_steps(live.drop_first(), expansion) } }
+pub proof fn theorem_a_beam_never_passes_its_draws(live: Seq < int >, width: int, expansion: int, max_rounds: int,) requires 0 <= width, 0 <= expansion, live.len() <= max_rounds, forall | i: int | 0 <= i < live.len() ==> 0 <= #[trigger] live [i] <= width, ensures spec_beam_steps(live, expansion) <= width * expansion * max_rounds, decreases live.len(),
 
 ## formal/verus/src/agent_select.rs
 pub open spec fn key(bits: i64) -> i64 { bits ^ ((((bits >> 63i64) as u64) >> 1u64) as i64) }

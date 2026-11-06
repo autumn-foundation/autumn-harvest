@@ -34,6 +34,12 @@
 //! once and in order. Each tier that runs is one that the mandate allows.
 //! `cascade_order` is the loop of the engine over `cascade_step`. The
 //! proof shows that it asks exactly the tiers of `spec_ran`.
+//!
+//! `beam_draws` and `beam_slots` bound a beam run of `agent_sample`. The
+//! draws are the product `width × expansion × max_rounds`, saturated. A
+//! round keeps at most `width` less the complete beams. So a round has at
+//! most `width` live beams, and the steps of each schedule never pass the
+//! admitted draws.
 
 use vstd::arithmetic::div_mod::*;
 use vstd::prelude::*;
@@ -478,6 +484,99 @@ pub proof fn theorem_a_run_asks_for_cap_plus_one_answers(cap: int, rejections: i
 {
     if rejections <= cap {
         theorem_a_run_asks_for_cap_plus_one_answers(cap, rejections + 1);
+    }
+}
+
+/// The saturation of a draw count at `u32::MAX`.
+pub open spec fn saturate32(n: int) -> int {
+    if n > u32::MAX as int { u32::MAX as int } else { n }
+}
+
+/// `beam_draws` as a spec: the product, saturated at `u32::MAX`.
+pub open spec fn spec_beam_draws(width: int, expansion: int, max_rounds: int) -> int {
+    saturate32(width * expansion * max_rounds)
+}
+
+// mirror: autumn-harvest-agent/src/sampling/admit.rs beam_draws
+pub fn beam_draws(width: u32, expansion: u32, max_rounds: u32) -> (r: u32)
+    ensures
+        r == spec_beam_draws(width as int, expansion as int, max_rounds as int),
+        r == 0 <==> (width == 0 || expansion == 0 || max_rounds == 0),
+{
+    proof {
+        let w = width as int;
+        let e = expansion as int;
+        let m = max_rounds as int;
+        assert(w * e >= 0 && w * e * m >= 0) by (nonlinear_arith)
+            requires w >= 0, e >= 0, m >= 0;
+        assert(w * e > u32::MAX as int && m >= 1 ==> w * e * m > u32::MAX as int)
+            by (nonlinear_arith)
+            requires w * e >= 0, m >= 0;
+        assert((w * e == 0 || m == 0) <==> w * e * m == 0) by (nonlinear_arith)
+            requires w * e >= 0, m >= 0;
+        assert((w == 0 || e == 0) <==> w * e == 0) by (nonlinear_arith)
+            requires w >= 0, e >= 0;
+        assert(u32::MAX as int * m == 0 <==> m == 0) by (nonlinear_arith)
+            requires m >= 0;
+        assert(m >= 1 ==> u32::MAX as int * m >= u32::MAX as int) by (nonlinear_arith)
+            requires m >= 0;
+    }
+    width.saturating_mul(expansion).saturating_mul(max_rounds)
+}
+
+// mirror: autumn-harvest-agent/src/sampling/admit.rs beam_slots
+pub fn beam_slots(width: u32, complete: u32) -> (r: u32)
+    ensures
+        r <= width,
+        complete >= width ==> r == 0,
+        complete < width ==> r == width - complete,
+{
+    width.saturating_sub(complete)
+}
+
+/// The steps of a beam run whose round `i` has `live[i]` live beams.
+pub open spec fn spec_beam_steps(live: Seq<int>, expansion: int) -> int
+    decreases live.len(),
+{
+    if live.len() == 0 {
+        0
+    } else {
+        live[0] * expansion + spec_beam_steps(live.drop_first(), expansion)
+    }
+}
+
+/// A run of at most `max_rounds` rounds, each with at most `width` live
+/// beams, runs at most `width × expansion × max_rounds` steps. So, when
+/// `beam_draws` does not saturate, the steps never pass it, and the
+/// admission bounds every schedule.
+pub proof fn theorem_a_beam_never_passes_its_draws(
+    live: Seq<int>,
+    width: int,
+    expansion: int,
+    max_rounds: int,
+)
+    requires
+        0 <= width,
+        0 <= expansion,
+        live.len() <= max_rounds,
+        forall|i: int| 0 <= i < live.len() ==> 0 <= #[trigger] live[i] <= width,
+    ensures
+        spec_beam_steps(live, expansion) <= width * expansion * max_rounds,
+    decreases live.len(),
+{
+    if live.len() == 0 {
+        assert(width * expansion * max_rounds >= 0) by (nonlinear_arith)
+            requires width >= 0, expansion >= 0, max_rounds >= 0;
+    } else {
+        let rest = live.drop_first();
+        assert forall|i: int| 0 <= i < rest.len() implies 0 <= #[trigger] rest[i] <= width by {
+            assert(rest[i] == live[i + 1]);
+        }
+        theorem_a_beam_never_passes_its_draws(rest, width, expansion, max_rounds - 1);
+        assert(live[0] * expansion <= width * expansion) by (nonlinear_arith)
+            requires 0 <= live[0] <= width, expansion >= 0;
+        assert(width * expansion * (max_rounds - 1) + width * expansion
+            == width * expansion * max_rounds) by (nonlinear_arith);
     }
 }
 
