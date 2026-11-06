@@ -3392,7 +3392,7 @@ mod webhook_run_defaults_tests {
         HandlerRegistry::new(vec![info], vec![])
     }
 
-    fn minutes(n: i64) -> Option<autumn_harvest::chrono::Duration> {
+    const fn minutes(n: i64) -> Option<autumn_harvest::chrono::Duration> {
         autumn_harvest::chrono::Duration::try_minutes(n)
     }
 
