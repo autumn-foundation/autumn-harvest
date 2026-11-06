@@ -490,6 +490,7 @@ impl RunDefaultsCache {
     }
 
     /// The count of activity write-throughs so far.
+    #[cfg_attr(not(feature = "db"), allow(dead_code))]
     fn activity_writes(&self) -> u64 {
         self.snapshot
             .read()
@@ -500,6 +501,7 @@ impl RunDefaultsCache {
     ///
     /// A write-through after that start is newer than the load. The method
     /// then keeps the map, so the process that served a change keeps it.
+    #[cfg_attr(not(feature = "db"), allow(dead_code))]
     fn replace_activities_loaded_at(
         &self,
         writes: u64,
