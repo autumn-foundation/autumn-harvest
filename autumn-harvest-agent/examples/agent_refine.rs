@@ -191,19 +191,19 @@ fn walk() -> Result<Walk, Box<dyn Error>> {
     })
 }
 
+/// The active version of the kind.
+async fn active(store: &InMemoryOverlayStore) -> Result<Option<OverlayVersion>, Box<dyn Error>> {
+    Ok(store.active(KIND).await?.map(|s| s.version()))
+}
+
+/// Check one answer with the built-in `ExactMatch` scorer.
+async fn check(harness: &AgentHarness, answer: &str) -> Result<Verdict, Box<dyn Error>> {
+    let input = ScoreInput::new(TASK, answer, AgentStop::Completed);
+    let cx = ScoreContext::unmetered(harness);
+    Ok(ExactMatch::new(PASS).score(&input, &cx).await?)
+}
+
 impl Walk {
-    /// The active version of the kind.
-    async fn active(&self) -> Result<Option<OverlayVersion>, Box<dyn Error>> {
-        Ok(self.store.active(KIND).await?.map(|s| s.version()))
-    }
-
-    /// Check one answer with the built-in `ExactMatch` scorer.
-    async fn check(&self, answer: &str) -> Result<Verdict, Box<dyn Error>> {
-        let input = ScoreInput::new(TASK, answer, AgentStop::Completed);
-        let cx = ScoreContext::unmetered(&self.harness);
-        Ok(ExactMatch::new(PASS).score(&input, &cx).await?)
-    }
-
     /// Op 1: a recorded `agent_loop` run of the kind, on the base prompt.
     async fn op1(&mut self) -> Result<(ExecutionId, String), Box<dyn Error>> {
         // The run takes the prompt and the bound of the profile.
@@ -268,13 +268,13 @@ impl Walk {
 /// Walk through the loop. The person sends `decision` at the gate.
 async fn run(decision: &RefineDecision) -> Result<Outcome, Box<dyn Error>> {
     let mut walk = walk()?;
-    let before = walk.active().await?;
+    let before = active(&walk.store).await?;
     let (op1_exec, op1_answer) = walk.op1().await?;
-    let op1 = walk.check(&op1_answer).await?;
+    let op1 = check(&walk.harness, &op1_answer).await?;
     let report = walk.refine(op1_exec, decision).await?;
-    let after = walk.active().await?;
+    let after = active(&walk.store).await?;
     let op2_answer = walk.op2().await?;
-    let op2 = walk.check(&op2_answer).await?;
+    let op2 = check(&walk.harness, &op2_answer).await?;
     Ok(Outcome {
         before,
         after,

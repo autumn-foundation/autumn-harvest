@@ -74,7 +74,9 @@ fn adr_files() -> Vec<String> {
     let mut names: Vec<String> = std::fs::read_dir(&dir)
         .unwrap_or_else(|e| panic!("list {}: {e}", dir.display()))
         .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
-        .filter(|name| name.ends_with(".md") && name != "README.md")
+        .filter(|name| {
+            Path::new(name).extension().is_some_and(|ext| ext == "md") && name != "README.md"
+        })
         .collect();
     names.sort();
     names
