@@ -61,7 +61,8 @@ declared. Use `retry_max_attempts = 1` to stop the retries.
 
 The write refuses these values:
 
-- zero, or a duration under 1 ms;
+- a zero value;
+- a `retry_max_attempts` over 2147483647;
 - a timeout over 100 years;
 - a retry interval over 365 days;
 - a merged `retry_max_interval_ms` below `retry_initial_interval_ms`.
@@ -78,6 +79,8 @@ The route also refuses a field that cannot apply:
 - any field of a reserved engine activity.
 
 Each `PATCH` writes one `activity_type.defaults` audit row, refused or not.
+A change and its audit row commit in one transaction, so no change applies
+unaudited.
 
 ## Precedence
 
@@ -90,12 +93,15 @@ values too.
 
 A field that the override does not set inherits the code value. The builder
 default from `WorkerConfig` applies only when neither sets a value. An
-override that sets `schedule_to_close_ms` or `heartbeat_timeout_ms` counts as
-an attempt bound, so the builder default `start_to_close` then does not
-apply.
+override that sets `schedule_to_close_ms` counts as an attempt bound, so the
+builder default `start_to_close` then does not apply.
 
 A local activity takes `retry_*` and `start_to_close_ms`. The worker still
 clamps its `start_to_close` to `WorkerConfig::max_local_activity_start_to_close`.
+`effective` does not show that clamp, because the cap belongs to each worker.
+
+A fan-out resolves its values once, when the call starts. So a windowed
+fan-out keeps the values of its start for each later window.
 
 ## When a change takes effect
 

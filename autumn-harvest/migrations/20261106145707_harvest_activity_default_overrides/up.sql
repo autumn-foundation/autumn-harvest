@@ -1,11 +1,11 @@
--- Operator overrides for the defaults of an activity type (epic #2384).
+-- Operator overrides for the defaults of an activity type.
 --
 -- `ActivityInfo` declares a retry policy, `start_to_close`,
 -- `heartbeat_timeout`, `schedule_to_start` and `schedule_to_close` in
 -- code. This table holds the values that an operator sets at runtime,
 -- keyed by the activity name. Precedence: call site, then override, then
--- code. A NULL column inherits the code value. A row that sets no column is
--- never stored.
+-- code, then builder default. A NULL column inherits the code value. A row
+-- that sets no column is never stored.
 --
 -- The override applies at schedule time. The task row stores the resolved
 -- values, and a retry reuses the row. So a scheduled activity keeps its

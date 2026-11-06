@@ -59,7 +59,7 @@ Decision: 2, 4, 5 and 6 together, 9 and 11.
 - Option 1 keys two kinds of type by one name. An activity and a workflow
   can share a name.
 - Option 3 needs a new loop in each process kind. Option 4 reuses the four
-  existing refresh paths, and one load replaces both maps.
+  existing refresh paths. Each refresh loads both tables.
 - Option 5 alone misses the typed calls, whose command carries the code
   value as a call-site option. Option 7 changes every command constructor
   and still leaves the simulator without a registry. Option 6 lets the
@@ -86,7 +86,7 @@ Decision: 2, 4, 5 and 6 together, 9 and 11.
 | The builder default `start_to_close` cuts a long attempt short after the override adds a `schedule_to_close`. | The worker checks the attempt bound on the effective values. |
 | A zero or huge value. | The write, the decode and the table `CHECK` refuse zero. A timeout stops at 100 years and an interval at 365 days. |
 | A row that the engine cannot read fails the load of every override. | The `CHECK` constraints match the decode bounds. |
-| A reserved session activity takes an override. | The route refuses the reserved names. The worker skips them. |
+| A reserved engine activity takes an override, so the liveness canary reports a false failure. | The route refuses the session and canary activities. The worker skips them. |
 | A change is not audited. | Each `PATCH` writes one audit row, refused or not. |
 | The override list omits activity overrides. | `GET /admin/overrides` lists them. |
 
@@ -120,7 +120,7 @@ Decision: 2, 4, 5 and 6 together, 9 and 11.
   apply only over a code value. `ActivityDefaultPatch` is the tri-state
   change.
 - `RunDefaultsCache` holds a second map, keyed by the activity name.
-  `refresh` loads both tables and replaces both maps.
+  `refresh` loads both tables. A failed load keeps its own map.
 - `WorkflowContext::with_activity_overrides` takes the cache. Each typed
   call resolves call site, then override, then code. A local activity
   resolves the same way, then the builder default.

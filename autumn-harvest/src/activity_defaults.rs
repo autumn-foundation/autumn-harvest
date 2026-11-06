@@ -25,7 +25,10 @@
 //! - The worker resolves the other values when it stores the task row. It
 //!   also resolves a value that the command does not carry.
 //! - A local activity resolves in the context. The worker freezes the result
-//!   in `LocalActivityScheduled`.
+//!   in `LocalActivityScheduled`. The worker still clamps its
+//!   `start_to_close` to `max_local_activity_start_to_close`.
+//! - A windowed fan-out resolves once, when the call starts. Each item of
+//!   that call takes the same values.
 //!
 //! ## Activities already scheduled
 //!
@@ -36,8 +39,8 @@
 //!
 //! ## What an override cannot add
 //!
-//! A retry field applies only over a code retry policy. An activity whose
-//! author declared no policy is not known to be safe to retry. A heartbeat
+//! A retry field applies only over a code retry policy. Code that declares no
+//! policy does not state that a retry is safe. A heartbeat
 //! timeout applies only over a code heartbeat timeout. An activity that does
 //! not heartbeat would time out on each attempt.
 
@@ -54,6 +57,16 @@ use crate::workflow_retry::{RetryLimits, RetryLimitsPatch};
 /// A schedule adds `schedule_to_close` to its time. A sum past the range of
 /// `chrono` panics, so the write refuses a value above this bound.
 pub const MAX_ACTIVITY_TIMEOUT: Duration = crate::run_defaults::MAX_RUN_DEFAULT;
+
+/// Whether `name` is an engine activity that takes no override.
+///
+/// The session activities and the liveness canary activity are engine
+/// machinery. An override of the canary would report a false failure.
+#[must_use]
+pub fn is_reserved_activity(name: &str) -> bool {
+    crate::context::is_reserved_session_activity_name(name)
+        || crate::canary::is_reserved_canary_name(name)
+}
 
 /// The five schedule-time values of one activity.
 ///
@@ -199,7 +212,7 @@ pub struct ActivityDefaultOverride {
     pub reason: Option<String>,
     /// The actor that last changed the override.
     pub updated_by: String,
-    /// When the override was first stored.
+    /// The time of the first write.
     pub created_at: DateTime<Utc>,
     /// When the override last changed.
     pub updated_at: DateTime<Utc>,
@@ -592,6 +605,13 @@ mod tests {
         info.default_schedule_to_start = Some(secs(60));
         info.default_schedule_to_close = Some(secs(600));
         info
+    }
+
+    #[test]
+    fn the_engine_activities_are_reserved() {
+        assert!(is_reserved_activity("__harvest_session_acquire"));
+        assert!(is_reserved_activity(crate::canary::CANARY_ACTIVITY_NAME));
+        assert!(!is_reserved_activity("charge"));
     }
 
     #[test]

@@ -5,8 +5,8 @@
 //! default shard. See [`autumn_harvest::activity_defaults`] for the
 //! precedence and the scope.
 //!
-//! A change reaches new schedules in this process at once, through a write
-//! through to the cache. Other processes see it within their refresh period.
+//! A change reaches new schedules in this process at once, because the route
+//! writes it through to the cache. Other processes see it within their refresh period.
 //! An activity that is already scheduled keeps its values. So no change runs
 //! a pass over stored rows.
 //!
@@ -171,6 +171,10 @@ pub struct ActivityDefaultsPatchRequest {
 }
 
 /// Whether a tri-state field sets a value. A `null` sets none.
+#[expect(
+    clippy::option_option,
+    reason = "serde tri-state: absent keeps, null returns to code, a value sets"
+)]
 const fn sets<T: Copy>(value: Option<Option<T>>) -> bool {
     matches!(value, Some(Some(_)))
 }
@@ -278,19 +282,15 @@ pub async fn get_activity_defaults(
     Ok(Json(view(&activity_name, &code, local, stored)))
 }
 
-/// Insert one `activity_type.defaults` audit row.
-///
-/// A failed request logs its audit error and keeps its own error. A
-/// succeeded request returns the audit error, because an unaudited change
-/// must not report success.
-async fn audit_patch(
-    conn: &mut AsyncPgConnection,
-    ctx: (&str, &str, Option<&str>),
-    activity_name: &str,
-    error_summary: Option<&str>,
-) -> Result<(), AutumnError> {
+/// One `activity_type.defaults` audit row. `error_summary` marks a failed
+/// request.
+const fn audit_record<'a>(
+    ctx: (&'a str, &'a str, Option<&'a str>),
+    activity_name: &'a str,
+    error_summary: Option<&'a str>,
+) -> NewAuditRecord<'a> {
     let (actor, source, request_id) = ctx;
-    let record = NewAuditRecord {
+    NewAuditRecord {
         actor,
         operation: OP_ACTIVITY_TYPE_DEFAULTS,
         target_type: TARGET_ACTIVITY_TYPE,
@@ -306,15 +306,58 @@ async fn audit_patch(
         error_summary,
         shard_id: None,
         source,
-    };
-    match audit::insert_audit(conn, &record).await {
-        Ok(_) => Ok(()),
-        Err(error) if error_summary.is_some() => {
-            tracing::warn!(error = %error, activity_name, "audit insert failed for activity defaults");
-            Ok(())
-        }
-        Err(error) => Err(map_error(error)),
     }
+}
+
+/// Insert the audit row of a refused request.
+///
+/// A failed insert logs its error, and the request keeps its own error.
+async fn audit_refusal(
+    conn: &mut AsyncPgConnection,
+    ctx: (&str, &str, Option<&str>),
+    activity_name: &str,
+    error_summary: &str,
+) {
+    let record = audit_record(ctx, activity_name, Some(error_summary));
+    if let Err(error) = audit::insert_audit(conn, &record).await {
+        tracing::warn!(error = %error, activity_name, "audit insert failed for activity defaults");
+    }
+}
+
+/// Why a change did not commit.
+enum ChangeFailure {
+    /// The store refused or failed the write.
+    Write(HarvestError),
+    /// The audit insert failed, so the write rolled back.
+    Audit(HarvestError),
+}
+
+impl From<diesel::result::Error> for ChangeFailure {
+    fn from(error: diesel::result::Error) -> Self {
+        Self::Write(error.into())
+    }
+}
+
+/// Write the change and its audit row in one transaction.
+///
+/// So a change never applies without its audit row.
+async fn commit_change(
+    conn: &mut AsyncPgConnection,
+    change: &ActivityDefaultChange<'_>,
+    record: &NewAuditRecord<'_>,
+) -> Result<Option<ActivityDefaultOverride>, ChangeFailure> {
+    use diesel_async::AsyncConnection;
+
+    Box::pin(conn.transaction(async |conn| {
+        let stored = update_activity_default_override(conn, change)
+            .await
+            .map_err(ChangeFailure::Write)?;
+        audit::insert_audit(conn, record)
+            .await
+            .map_err(ChangeFailure::Audit)?;
+        Ok(stored)
+    }))
+    .await
 }
 
 /// `PATCH /admin/activity-types/{activity_name}/defaults`.
@@ -330,8 +373,8 @@ pub async fn patch_activity_defaults(
     let (actor, source, request_id) = audit_context(&headers, &api_state);
     let ctx = (actor.as_str(), source.as_str(), request_id.as_deref());
 
-    // Unwrapped in the handler, so a bad body is this route's 400 with an
-    // audit row, not the plain-text 422 of axum.
+    // The handler unwraps the body, so a bad body gets this route's 400 with
+    // an audit row, not the plain-text 422 of axum.
     let request = match request {
         Ok(Json(request)) if request.is_empty() => Err(String::from(
             "empty patch: set retry_max_attempts, retry_initial_interval_ms, \
@@ -344,27 +387,27 @@ pub async fn patch_activity_defaults(
     let request = match request {
         Ok(request) => request,
         Err(summary) => {
-            audit_patch(&mut conn, ctx, &activity_name, Some(&summary)).await?;
+            audit_refusal(&mut conn, ctx, &activity_name, &summary).await;
             return Err(AutumnError::bad_request_msg(summary));
         }
     };
-    if autumn_harvest::context::is_reserved_session_activity_name(&activity_name) {
+    if autumn_harvest::activity_defaults::is_reserved_activity(&activity_name) {
         let summary = "the activity is a reserved engine activity, so its defaults are refused";
-        audit_patch(&mut conn, ctx, &activity_name, Some(summary)).await?;
+        audit_refusal(&mut conn, ctx, &activity_name, summary).await;
         return Err(AutumnError::bad_request_msg(summary));
     }
     let Some((code, local)) = code_values(&runtime, &activity_name) else {
-        audit_patch(
+        audit_refusal(
             &mut conn,
             ctx,
             &activity_name,
-            Some("activity type not registered"),
+            "activity type not registered",
         )
-        .await?;
+        .await;
         return Err(not_registered(&activity_name));
     };
     if let Some(summary) = request.refusal(&code, local) {
-        audit_patch(&mut conn, ctx, &activity_name, Some(&summary)).await?;
+        audit_refusal(&mut conn, ctx, &activity_name, &summary).await;
         return Err(AutumnError::bad_request_msg(summary));
     }
 
@@ -375,11 +418,12 @@ pub async fn patch_activity_defaults(
         actor: &actor,
         reason: request.reason.as_deref(),
     };
-    let stored = match update_activity_default_override(&mut conn, &change).await {
+    let record = audit_record(ctx, &activity_name, None);
+    let stored = match commit_change(&mut conn, &change, &record).await {
         Ok(stored) => stored,
-        Err(error) => {
+        Err(ChangeFailure::Write(error)) => {
             let summary = error.to_string();
-            audit_patch(&mut conn, ctx, &activity_name, Some(&summary)).await?;
+            audit_refusal(&mut conn, ctx, &activity_name, &summary).await;
             return Err(match error {
                 HarvestError::Config(message) => AutumnError::bad_request_msg(format!(
                     "invalid activity default override: {message}"
@@ -387,13 +431,13 @@ pub async fn patch_activity_defaults(
                 other => map_error(other),
             });
         }
+        Err(ChangeFailure::Audit(error)) => return Err(map_error(error)),
     };
     // Write through, so this process applies the change to its next schedule.
     runtime.registry().run_defaults().write_through_activity(
         &activity_name,
         stored.as_ref().map(|s| s.fields).unwrap_or_default(),
     );
-    audit_patch(&mut conn, ctx, &activity_name, None).await?;
     Ok(Json(view(&activity_name, &code, local, stored)))
 }
 

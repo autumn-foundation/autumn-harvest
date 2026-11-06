@@ -14,6 +14,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use autumn_harvest::RetentionConfig;
+use autumn_harvest::builder::WorkerConfig;
+use autumn_harvest::effective_config::{EffectiveConfigView, PayloadCapsView, PoolConfigView};
 use autumn_harvest::info::ActivityInfo;
 use autumn_harvest::policy::{JitterPolicy, RetryPolicy};
 use autumn_harvest::scheduler::{DagCatalog, SchedulerMonitor};
@@ -156,17 +158,49 @@ fn build_app(pool: &DbPool) -> (axum::Router, Arc<HandlerRegistry>) {
     api_state.set_allow_unauthenticated_mutations(true);
     api_state.set_admin_auth_boundary(true);
     api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
-    api_state.install(HarvestApiRuntime::new(
-        Arc::clone(&registry),
-        Arc::new(DagCatalog::default()),
-        Arc::new(Vec::new()),
-        Some("api-only".to_string()),
-        vec!["default".to_string()],
-        SchedulerMonitor::offline(),
-        HarvestRetentionRuntime::disabled(RetentionConfig::default()),
-        ShardRouter::single(),
-    ));
+    api_state.install(
+        HarvestApiRuntime::new(
+            Arc::clone(&registry),
+            Arc::new(DagCatalog::default()),
+            Arc::new(Vec::new()),
+            Some("api-only".to_string()),
+            vec!["default".to_string()],
+            SchedulerMonitor::offline(),
+            HarvestRetentionRuntime::disabled(RetentionConfig::default()),
+            ShardRouter::single(),
+        )
+        .with_effective_config(effective_config()),
+    );
     (harvest_api_router(api_state), registry)
+}
+
+/// A snapshot for `GET /admin/config`. Its values are not under test.
+fn effective_config() -> EffectiveConfigView {
+    EffectiveConfigView::capture(
+        &WorkerConfig::default(),
+        PayloadCapsView::new(
+            1024,
+            1024,
+            1024,
+            1024,
+            1024,
+            None,
+            None,
+            None,
+            Duration::from_secs(3600),
+            100,
+            false,
+            1024,
+        ),
+        &ShardRouter::single(),
+        PoolConfigView {
+            worker_pool_max_connections: 4,
+            shard_pool_count: 1,
+        },
+        Duration::from_millis(500),
+        None,
+        None,
+    )
 }
 
 async fn request_json(
@@ -332,6 +366,11 @@ async fn each_refused_change_is_audited_and_stores_nothing() {
         (
             "__harvest_session_acquire",
             json!({ "start_to_close_ms": 1_000 }),
+            "reserved",
+        ),
+        (
+            "__harvest_canary_probe_activity",
+            json!({ "schedule_to_start_ms": 1 }),
             "reserved",
         ),
     ];

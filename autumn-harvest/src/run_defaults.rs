@@ -307,6 +307,9 @@ struct Snapshot {
     overrides: Arc<HashMap<String, RunDefaultFields>>,
     /// The activity overrides, keyed by the activity name.
     activities: Arc<HashMap<String, ActivityDefaultFields>>,
+    /// The count of activity write-throughs. A load that started before the
+    /// last write-through does not replace the map.
+    activity_writes: u64,
 }
 
 /// The in-process copy of the overrides.
@@ -481,6 +484,34 @@ impl RunDefaultsCache {
             } else {
                 map.insert(activity_name.to_string(), fields);
             }
+            snapshot.activities = Arc::new(map);
+            snapshot.activity_writes += 1;
+        }
+    }
+
+    /// The count of activity write-throughs so far.
+    fn activity_writes(&self) -> u64 {
+        self.snapshot
+            .read()
+            .map_or(0, |snapshot| snapshot.activity_writes)
+    }
+
+    /// Replace the activity overrides with a load that started at `writes`.
+    ///
+    /// A write-through after that start is newer than the load. The method
+    /// then keeps the map, so the process that served a change keeps it.
+    fn replace_activities_loaded_at(
+        &self,
+        writes: u64,
+        overrides: impl IntoIterator<Item = ActivityDefaultOverride>,
+    ) {
+        let map = overrides
+            .into_iter()
+            .map(|value| (value.activity_name, value.fields))
+            .collect();
+        if let Ok(mut snapshot) = self.snapshot.write()
+            && snapshot.activity_writes == writes
+        {
             snapshot.activities = Arc::new(map);
         }
     }
@@ -906,7 +937,11 @@ mod db {
     /// a zero delay, as it refuses every other zero duration. The column holds
     /// whole milliseconds, so the write also refuses a delay under 1 ms. A
     /// delay above [`MAX_RETRY_INTERVAL`] would make the retry start fail.
-    pub(crate) fn check_retry_patch(retry: &RetryLimitsPatch) -> HarvestResult<()> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestError::Config`] that names the refused field.
+    pub fn check_retry_patch(retry: &RetryLimitsPatch) -> HarvestResult<()> {
         match retry.max_attempts.flatten() {
             Some(0) => {
                 return Err(HarvestError::Config(
@@ -943,7 +978,11 @@ mod db {
     /// `max_interval` caps each delay, so such a cap hides the first delay.
     /// The check runs on the merged row, because a patch can set one field
     /// and keep the stored value of the other.
-    pub(crate) fn check_retry_limits(retry: RetryLimits) -> HarvestResult<()> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestError::Config`] when the cap is below the first delay.
+    pub fn check_retry_limits(retry: RetryLimits) -> HarvestResult<()> {
         if let (Some(initial), Some(max)) = (retry.initial_interval, retry.max_interval)
             && max < initial
         {
@@ -1047,10 +1086,12 @@ mod db {
         /// [`load_activity_default_overrides`](crate::activity_defaults::load_activity_default_overrides).
         /// A failure of the workflow load wins.
         pub async fn refresh(&self, conn: &mut AsyncPgConnection) -> HarvestResult<()> {
+            let writes = self.activity_writes();
             let workflows = load_run_default_overrides(conn).await;
             let activities = crate::activity_defaults::load_activity_default_overrides(conn).await;
             let workflows = workflows.map(|overrides| self.replace(overrides));
-            let activities = activities.map(|overrides| self.replace_activities(overrides));
+            let activities =
+                activities.map(|overrides| self.replace_activities_loaded_at(writes, overrides));
             workflows.and(activities)
         }
 
@@ -1060,7 +1101,7 @@ mod db {
         ///
         /// # Errors
         ///
-        /// As [`load_run_default_overrides`].
+        /// As [`Self::refresh`].
         pub async fn refresh_if_stale(&self, conn: &mut AsyncPgConnection) -> HarvestResult<bool> {
             if !self.is_stale(RUN_DEFAULTS_TTL) {
                 return Ok(false);
@@ -1934,6 +1975,28 @@ mod tests {
         cache.replace_activities([]);
         assert_eq!(cache.activity("charge"), None);
         assert_eq!(cache.get("etl"), Some(limit_only(3)));
+    }
+
+    /// A load that started before a write-through is older than it. So it
+    /// never brings back the old value.
+    #[test]
+    fn a_load_older_than_a_write_through_keeps_the_write() {
+        let cache = RunDefaultsCache::new();
+        let writes = cache.activity_writes();
+        cache.write_through_activity("charge", LONGER);
+        cache.replace_activities_loaded_at(writes, []);
+        assert_eq!(
+            cache.activity("charge"),
+            Some(LONGER),
+            "the stale load is dropped"
+        );
+        let writes = cache.activity_writes();
+        cache.replace_activities_loaded_at(writes, []);
+        assert_eq!(
+            cache.activity("charge"),
+            None,
+            "a newer load replaces the map"
+        );
     }
 
     #[test]

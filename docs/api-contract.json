@@ -7336,7 +7336,7 @@
       "path": "/admin/activity-types/{activity_name}/defaults",
       "category": "admin",
       "read_only": false,
-      "description": "Set, change or clear the default override of one activity type. The override wins over the code value for every activity scheduled after the change, and survives a restart. A call-site value still wins over the override. It reaches this process at once and every other process within its refresh period (about 5 seconds). An activity that is already scheduled keeps the values of its task row, and a local activity keeps the values that its LocalActivityScheduled event froze, so replay is not affected. Each field is tri-state: absent keeps the stored override, null returns the field to its code value, a value sets it. A merge that sets no field deletes the override. Each PATCH writes one activity_type.defaults audit row, refused or not. The response has the same shape as GET.",
+      "description": "Set, change or clear the default override of one activity type. The override wins over the code value for every activity scheduled after the change, and survives a restart. A call-site value still wins over the override. It reaches this process at once and every other process within 5 seconds plus one refresh period (about 10 seconds). An activity that is already scheduled keeps the values of its task row, and a local activity keeps the values that its LocalActivityScheduled event froze, so replay is not affected. Each field is tri-state: absent keeps the stored override, null returns the field to its code value, a value sets it. A merge that sets no field deletes the override. Each PATCH writes one activity_type.defaults audit row, refused or not. The response has the same shape as GET.",
       "idempotency": "Idempotent: applying the same override twice is a no-op.",
       "params": [
         {
@@ -7411,7 +7411,7 @@
       "error_responses": [
         {
           "status": 400,
-          "description": "Empty patch, unknown field, a reserved engine activity, a timeout of zero, with a part of a millisecond or past 100 years, a retry_* value for an activity with no retry_policy, a heartbeat_timeout_ms for an activity with no code heartbeat_timeout, a heartbeat_timeout_ms, schedule_to_start_ms or schedule_to_close_ms for a local activity, a retry_max_attempts of zero or past 2147483647, a retry interval of zero or past 365 days, or a merged retry_max_interval_ms below retry_initial_interval_ms."
+          "description": "Empty patch, unknown field, a reserved engine activity, a timeout of zero or past 100 years, a retry_* value for an activity with no retry_policy, a heartbeat_timeout_ms for an activity with no code heartbeat_timeout, a heartbeat_timeout_ms, schedule_to_start_ms or schedule_to_close_ms for a local activity, a retry_max_attempts of zero or past 2147483647, a retry interval of zero or past 365 days, or a merged retry_max_interval_ms below retry_initial_interval_ms."
         },
         {
           "status": 404,

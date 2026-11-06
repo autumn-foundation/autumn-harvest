@@ -590,6 +590,15 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
         "PATCH /admin/workflow-types/{workflow_name}/run-defaults",
         RouteClass::Mutating,
     ),
+    // Default overrides of an activity type.
+    (
+        "GET /admin/activity-types/{activity_name}/defaults",
+        RouteClass::ReadOnly,
+    ),
+    (
+        "PATCH /admin/activity-types/{activity_name}/defaults",
+        RouteClass::Mutating,
+    ),
     // The sampling policy of an agent kind (issue #2439). Only an operator
     // sets or resets it.
     (

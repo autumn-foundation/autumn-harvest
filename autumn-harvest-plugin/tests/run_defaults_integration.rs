@@ -559,7 +559,12 @@ async fn the_override_list_names_actor_reason_and_time() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(
         body["overrides"],
-        json!({ "schedule_overrides": 1, "run_default_overrides": 1, "unavailable_shards": 0 })
+        json!({
+            "schedule_overrides": 1,
+            "run_default_overrides": 1,
+            "activity_default_overrides": 0,
+            "unavailable_shards": 0
+        })
     );
 }
 

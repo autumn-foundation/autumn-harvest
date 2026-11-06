@@ -4464,8 +4464,10 @@ impl WorkflowContext {
             ..crate::activity_defaults::ActivityDefaults::default()
         };
         let effective = match &self.activity_overrides {
-            Some(cache) => cache.apply_activity(info.name, code),
-            None => code,
+            Some(cache) if !crate::activity_defaults::is_reserved_activity(info.name) => {
+                cache.apply_activity(info.name, code)
+            }
+            _ => code,
         };
         (effective.retry_policy, effective.start_to_close)
     }
@@ -34269,6 +34271,71 @@ mod activity_override_tests {
         for command in scheduled_activities {
             assert_eq!(scheduled(command), (Some(1), Some(OVERRIDE_STC)));
         }
+    }
+
+    #[tokio::test]
+    async fn a_typed_collect_fan_out_takes_the_override() {
+        let ctx = WorkflowContext::new_test().with_activity_overrides(cache("charge"));
+        let info = info("charge", false);
+        let call = ctx.execute_activity_fan_out_collect::<_, Value>(&info, vec![1_u32, 2_u32]);
+        let commands = commands_of(&ctx, call).await;
+        let scheduled_activities = activities(&commands);
+        assert_eq!(scheduled_activities.len(), 2);
+        for command in scheduled_activities {
+            assert_eq!(scheduled(command), (Some(1), Some(OVERRIDE_STC)));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_typed_session_call_takes_the_override() {
+        let host_activity_id = ActivityExecId::new();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::MarkerRecorded {
+                name: "session:1".into(),
+                details: Value::from(uuid::Uuid::new_v4().to_string()),
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id: host_activity_id,
+                name: SESSION_ACQUIRE_ACTIVITY_NAME.to_string(),
+                input: Value::Null,
+                queue: "gpu-workers".to_string(),
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id: host_activity_id,
+                output: serde_json::json!("worker-42"),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events)
+            .with_activity_overrides(cache("charge"));
+        let session = ctx
+            .create_session(SessionOptions::new("gpu-workers"))
+            .await
+            .expect("the session replays");
+        let info = info("charge", false);
+        let commands = commands_of(&ctx, session.execute_activity::<_, Value>(&info, 1_u32)).await;
+        let scheduled_activities = activities(&commands);
+        assert_eq!(scheduled_activities.len(), 1);
+        assert_eq!(
+            scheduled(scheduled_activities[0]),
+            (Some(1), Some(OVERRIDE_STC))
+        );
+    }
+
+    /// The canary and the session activities are engine machinery.
+    #[tokio::test]
+    async fn an_engine_activity_takes_no_override() {
+        let ctx = WorkflowContext::new_test()
+            .with_activity_overrides(cache(crate::canary::CANARY_ACTIVITY_NAME));
+        let info = info(crate::canary::CANARY_ACTIVITY_NAME, false);
+        let commands = commands_of(&ctx, ctx.execute_activity::<_, Value>(&info, 1_u32)).await;
+        assert_eq!(scheduled(&commands[0]), (Some(4), Some(CODE_STC)));
     }
 
     #[tokio::test]

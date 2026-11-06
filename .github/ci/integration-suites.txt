@@ -322,6 +322,7 @@ linux        autumn-harvest-agent   sample_postgres                  postgres   
 linux        autumn-harvest-agent   sampling_policy_postgres         postgres                   -
 linux        autumn-harvest-agent   score_postgres                   postgres                   -
 linux        autumn-harvest-conformance  conformance                  -                          -
+linux        autumn-harvest-plugin  activity_defaults_integration    -                          -
 linux        autumn-harvest-plugin  activity_info_api_integration    -                          -
 linux        autumn-harvest-plugin  admission_gate_authoritative_localpg  -                          -
 linux        autumn-harvest-plugin  agent_profile_integration        -                          -

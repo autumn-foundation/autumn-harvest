@@ -3,9 +3,9 @@
 //!
 //! These tests check the store, the table checks and each acceptance
 //! criterion against Postgres. A worker drives each run. Its refresh loop
-//! loads the override from the table, as in production. Each test uses its
-//! own activity names and its own task queue, so a shared cluster needs no
-//! scrub.
+//! loads the override from the table, as in production. The store tests use
+//! fresh names. Each worker test uses its own queue and fixed names, and it
+//! clears its own override row first.
 //!
 //! The replay check needs the `testing` feature, so the module needs it too.
 //!
@@ -64,7 +64,7 @@ const OVERRIDE: ActivityDefaultFields = ActivityDefaultFields {
     start_to_close: Some(Duration::from_secs(90)),
     heartbeat_timeout: Some(Duration::from_secs(45)),
     schedule_to_start: Some(Duration::from_secs(120)),
-    schedule_to_close: Some(Duration::from_secs(1_200)),
+    schedule_to_close: Some(Duration::from_mins(20)),
 };
 
 /// A patch that sets each field of `fields`.
@@ -275,8 +275,110 @@ async fn the_table_refuses_a_row_that_the_engine_cannot_read() {
             .bind::<diesel::sql_types::Text, _>(&name)
             .execute(&mut conn)
             .await;
-        assert!(result.is_err(), "{sql} must be refused");
+        assert!(
+            matches!(
+                result,
+                Err(diesel::result::Error::DatabaseError(
+                    diesel::result::DatabaseErrorKind::CheckViolation,
+                    _
+                ))
+            ),
+            "{sql} must fail a CHECK: {result:?}"
+        );
     }
+}
+
+/// A row at each upper bound passes the table and decodes.
+#[tokio::test]
+async fn a_row_at_each_bound_loads() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let mut conn = connect(&url).await;
+    let name = unique("ado_bound");
+    diesel::sql_query(
+        "INSERT INTO harvest_activity_default_overrides \
+         (activity_name, updated_by, retry_max_attempts, retry_initial_interval_ms, \
+          retry_max_interval_ms, start_to_close_ms, heartbeat_timeout_ms, \
+          schedule_to_start_ms, schedule_to_close_ms) \
+         VALUES ($1, 'ops', 2147483647, 31536000000, 31536000000, 3153600000000, \
+                 3153600000000, 3153600000000, 3153600000000)",
+    )
+    .bind::<diesel::sql_types::Text, _>(&name)
+    .execute(&mut conn)
+    .await
+    .expect("a row at each bound");
+    let stored = get_activity_default_override(&mut conn, &name)
+        .await
+        .expect("the row decodes")
+        .expect("a row");
+    assert_eq!(stored.fields.schedule_to_close, Some(MAX_ACTIVITY_TIMEOUT));
+    assert_eq!(stored.fields.retry.max_interval, Some(MAX_RETRY_INTERVAL));
+    change(&mut conn, &name, ActivityDefaultPatch::default(), true)
+        .await
+        .expect("clear");
+}
+
+/// One failed load keeps its own map, and the other map still loads.
+#[tokio::test]
+async fn a_failed_activity_load_keeps_its_map_and_never_blocks_the_workflows() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let mut conn = connect(&url).await;
+    let name = unique("ado_isolate");
+    change(&mut conn, &name, set_all(OVERRIDE), false)
+        .await
+        .expect("set");
+    let cache = RunDefaultsCache::new();
+    cache.refresh(&mut conn).await.expect("refresh");
+    // A workflow override that lands after the first load.
+    let workflow = unique("ado_isolate_wf");
+    let sla = autumn_harvest::run_defaults::RunDefaultPatch {
+        sla: Some(Some(Duration::from_secs(60))),
+        ..Default::default()
+    };
+    autumn_harvest::run_defaults::update_run_default_override(
+        &mut conn,
+        &autumn_harvest::run_defaults::RunDefaultChange {
+            workflow_name: &workflow,
+            patch: sla,
+            clear: false,
+            actor: "ops",
+            reason: None,
+        },
+    )
+    .await
+    .expect("a workflow override");
+    assert!(cache.get(&workflow).is_none());
+
+    // The rename rolls back with the transaction, so the table stays.
+    let result: Result<(), diesel::result::Error> = Box::pin(conn.transaction(async |conn| {
+        diesel::sql_query(
+            "ALTER TABLE harvest_activity_default_overrides \
+             RENAME TO harvest_activity_default_overrides_gone",
+        )
+        .execute(conn)
+        .await?;
+        let refreshed = cache.refresh(conn).await;
+        assert!(refreshed.is_err(), "the activity load fails");
+        Err(diesel::result::Error::RollbackTransaction)
+    }))
+    .await;
+    assert!(result.is_err());
+    assert_eq!(
+        cache.activity(&name),
+        Some(OVERRIDE),
+        "the activity map stays"
+    );
+    assert!(
+        cache.get(&workflow).is_some(),
+        "the workflow map still loads"
+    );
+    change(&mut conn, &name, ActivityDefaultPatch::default(), true)
+        .await
+        .expect("clear");
+    diesel::sql_query("DELETE FROM harvest_run_default_overrides WHERE workflow_name = $1")
+        .bind::<diesel::sql_types::Text, _>(&workflow)
+        .execute(&mut conn)
+        .await
+        .expect("scrub the workflow override");
 }
 
 #[tokio::test]
@@ -305,6 +407,9 @@ async fn a_refresh_loads_and_drops_the_activity_overrides() {
 
 /// The first remote step waits for this.
 static RELEASE: AtomicBool = AtomicBool::new(false);
+
+/// The attempts of the first remote step. Its first attempt fails.
+static FIRST_ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
 
 /// The queue and the activity of the remote tests. The activity info must
 /// name its queue, so both are constants.
@@ -367,11 +472,16 @@ fn wf_info(name: &'static str, handler: WorkflowHandlerFn) -> WorkflowInfo {
     }
 }
 
+/// The first step waits for [`RELEASE`], and its first attempt then fails.
+/// So its retry runs after the change.
 fn remote_step(_ctx: &ActivityContext, input: Value) -> BoxFut<'_> {
     Box::pin(async move {
         if input["wait"] == json!(true) {
             while !AtomicBool::load(&RELEASE, Ordering::SeqCst) {
                 tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            if FIRST_ATTEMPTS.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Err("the first attempt fails".to_string());
             }
         }
         Ok(input)
@@ -411,9 +521,13 @@ fn registry(workflows: Vec<WorkflowInfo>, activities: Vec<ActivityInfo>) -> Arc<
     ))
 }
 
+/// A worker with no workflow cache. Each decision replays the stored history,
+/// so it replays the events before the change with the override in force.
 fn worker(id: &str, queue: &str, registry: Arc<HandlerRegistry>) -> Arc<Worker> {
     let mut config = runtime_config(id, 1, 1, Duration::from_secs(10));
     config.queues = vec![queue.to_string()];
+    config.workflow_cache_size = 0;
+    config.resident_workflows = false;
     Arc::new(Worker::new(config, registry).expect("worker"))
 }
 
@@ -479,18 +593,21 @@ async fn wait_for_cache(
     .expect("the refresh loop loads the change");
 }
 
-/// The five stored values of one row: attempts, first delay, attempt bound,
+/// The stored values of one row: attempts, first delay, attempt bound,
 /// heartbeat, wait bound and total bound.
 fn stored(row: &TaskQueueItem) -> (i32, Duration, Duration, Duration, Duration, Duration) {
     let policy: RetryPolicy =
         serde_json::from_value(row.retry_policy.clone().expect("a policy")).expect("decode");
     let std = |d: Option<chrono::Duration>| d.expect("a value").to_std().expect("positive");
     let created = row.created_at.expect("created_at");
-    let to_close = (row.schedule_to_close_at.expect("a deadline") - created)
-        .to_std()
-        .expect("positive");
-    // The deadline is set a moment before the insert. Round to the second.
-    let to_close = Duration::from_secs((to_close.as_millis() as u64 + 500) / 1000);
+    // The worker clock sets the deadline and the database clock sets
+    // `created_at`. Round to 10 seconds, which is far below the 600 s gap
+    // between the code value and the override.
+    let millis = (row.schedule_to_close_at.expect("a deadline") - created)
+        .num_milliseconds()
+        .max(0)
+        .unsigned_abs();
+    let to_close = Duration::from_secs((millis + 5_000) / 10_000 * 10);
     (
         row.max_attempts,
         policy.initial_interval,
@@ -512,14 +629,14 @@ fn code_values() -> (i32, Duration, Duration, Duration, Duration, Duration) {
     )
 }
 
-fn override_values() -> (i32, Duration, Duration, Duration, Duration, Duration) {
+const fn override_values() -> (i32, Duration, Duration, Duration, Duration, Duration) {
     (
         1,
         Duration::from_secs(2),
         Duration::from_secs(90),
         Duration::from_secs(45),
         Duration::from_secs(120),
-        Duration::from_secs(1_200),
+        Duration::from_mins(20),
     )
 }
 
@@ -543,6 +660,7 @@ async fn an_activity_scheduled_after_the_change_takes_the_override() {
     .await
     .expect("scrub");
     RELEASE.store(false, Ordering::SeqCst);
+    FIRST_ATTEMPTS.store(0, Ordering::SeqCst);
 
     let registry = registry(vec![wf_info(REMOTE_WF, remote_wf)], vec![remote_info()]);
     let pool: DbPool = build_test_pool(&url);
@@ -584,6 +702,10 @@ async fn an_activity_scheduled_after_the_change_takes_the_override() {
         "the first row never changes"
     );
     assert_eq!(
+        rows[0].attempt, 2,
+        "the retry of the first row runs under its stored budget, not the override of one attempt"
+    );
+    assert_eq!(
         stored(&rows[1]),
         override_values(),
         "a typed call takes the override"
@@ -620,7 +742,9 @@ async fn an_activity_scheduled_after_the_change_takes_the_override() {
     wait_for_cache(&registry, REMOTE_STEP, None).await;
     let next = start(&mut conn, REMOTE_WF, REMOTE_QUEUE, json!({"wait": false})).await;
     wait_for_execution_state_with_timeout(&url, next, "COMPLETED", Duration::from_secs(30)).await;
-    for row in activity_rows(&url, next).await {
+    let rows = activity_rows(&url, next).await;
+    assert_eq!(rows.len(), 3);
+    for row in rows {
         assert_eq!(
             stored(&row),
             code_values(),
@@ -672,11 +796,12 @@ fn local_wf(ctx: &WorkflowContext, input: Value) -> BoxFut<'_> {
     })
 }
 
-/// The retry `max_attempts` and `start_to_close` that a history froze.
-fn frozen(history: &[WorkflowEvent]) -> (Option<u32>, Option<Duration>) {
+/// The retry `max_attempts` and `start_to_close` of each
+/// `LocalActivityScheduled` of a history.
+fn frozen(history: &[WorkflowEvent]) -> Vec<(Option<u32>, Option<Duration>)> {
     history
         .iter()
-        .find_map(|event| match event {
+        .filter_map(|event| match event {
             WorkflowEvent::LocalActivityScheduled {
                 retry_policy,
                 start_to_close_nanos,
@@ -687,8 +812,11 @@ fn frozen(history: &[WorkflowEvent]) -> (Option<u32>, Option<Duration>) {
             )),
             _ => None,
         })
-        .expect("a LocalActivityScheduled event")
+        .collect()
 }
+
+/// A frozen budget that differs from the code value and the override.
+const FROZEN_ATTEMPTS: u32 = 3;
 
 /// AC3.
 ///
@@ -722,7 +850,10 @@ async fn a_local_activity_frozen_before_the_change_keeps_its_frozen_values() {
                 name: LOCAL_STEP.to_string(),
                 input: json!(1),
                 resolved: true,
-                retry_policy: Some(RetryPolicy::fixed(CODE_ATTEMPTS, Duration::from_millis(10))),
+                retry_policy: Some(RetryPolicy::fixed(
+                    FROZEN_ATTEMPTS,
+                    Duration::from_millis(10),
+                )),
                 start_to_close_nanos: Some(
                     u64::try_from(CODE_STC.as_nanos()).expect("fits in u64"),
                 ),
@@ -752,12 +883,22 @@ async fn a_local_activity_frozen_before_the_change_keeps_its_frozen_values() {
         .expect("set the override");
 
     let registry = registry(vec![wf_info(LOCAL_WF, local_wf)], vec![local_info()]);
+    // Load the override before the worker claims the run, so the recovery
+    // runs with the override in force.
+    registry
+        .run_defaults()
+        .refresh(&mut conn)
+        .await
+        .expect("refresh");
+    assert_eq!(
+        registry.run_defaults().activity(LOCAL_STEP),
+        Some(local_override)
+    );
     let pool: DbPool = build_test_pool(&url);
     let handle = spawn_test_worker(
         worker("w-ado-local", LOCAL_QUEUE, Arc::clone(&registry)),
         pool.clone(),
     );
-    wait_for_cache(&registry, LOCAL_STEP, Some(local_override)).await;
 
     wait_for_execution_state_with_timeout(&url, exec_id, "COMPLETED", Duration::from_secs(30))
         .await;
@@ -767,8 +908,13 @@ async fn a_local_activity_frozen_before_the_change_keeps_its_frozen_values() {
         .events;
     assert_eq!(
         frozen(&history),
-        (Some(CODE_ATTEMPTS), Some(CODE_STC)),
-        "the frozen values never change"
+        vec![(Some(FROZEN_ATTEMPTS), Some(CODE_STC))],
+        "the recovery appends no new schedule and keeps the frozen values"
+    );
+    assert_eq!(
+        AtomicUsize::load(&LOCAL_CALLS, Ordering::SeqCst),
+        2,
+        "the recovery retried under the frozen budget"
     );
 
     // A local activity scheduled after the change freezes the override.
@@ -779,7 +925,10 @@ async fn a_local_activity_frozen_before_the_change_keeps_its_frozen_values() {
         .await
         .expect("history")
         .events;
-    assert_eq!(frozen(&history), (Some(1), Some(Duration::from_secs(45))));
+    assert_eq!(
+        frozen(&history),
+        vec![(Some(1), Some(Duration::from_secs(45)))]
+    );
 
     change(&mut conn, LOCAL_STEP, ActivityDefaultPatch::default(), true)
         .await

@@ -11993,10 +11993,10 @@ fn build_activity_enqueue_plan(
             registry.default_activity_retry_policy()
         };
         // The operator override replaces the code values of the activity. A
-        // value that the command carries still wins. A reserved activity is
-        // engine machinery, so it takes no override.
+        // value that the command carries still wins. An engine activity takes
+        // no override.
         let code = crate::activity_defaults::ActivityDefaults::of(activity);
-        let defaults = if is_reserved {
+        let defaults = if crate::activity_defaults::is_reserved_activity(&scheduled.name) {
             code
         } else {
             registry
