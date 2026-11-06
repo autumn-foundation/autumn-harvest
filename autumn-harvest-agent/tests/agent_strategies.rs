@@ -633,9 +633,9 @@ async fn a_beam_op_checks_max_draws_but_not_the_fan_out() {
         &AgentOp::message("Pick.").with_sample(beam),
     )
     .await;
-    let state = state(&rt, &agent).await;
-    assert_eq!(state.failures, 0, "{:?}", state.last_error);
-    assert_eq!(state.last_answer.as_deref(), Some("b"));
+    let roomy_state = state(&rt, &agent).await;
+    assert_eq!(roomy_state.failures, 0, "{:?}", roomy_state.last_error);
+    assert_eq!(roomy_state.last_answer.as_deref(), Some("b"));
 
     // The same beam passes a cap of two draws.
     let (_dir2, db2) = fresh_db();
@@ -654,10 +654,6 @@ async fn a_beam_op_checks_max_draws_but_not_the_fan_out() {
     )
     .await;
     assert!(model.requests().is_empty(), "no step runs");
-    let error = state_of(&rt, &agent).await;
+    let error = state(&rt, &agent).await.last_error.unwrap_or_default();
     assert!(error.contains("draws_exceeded"), "{error}");
-}
-
-async fn state_of(rt: &SqliteRuntime, agent: &AgentId) -> String {
-    state(rt, agent).await.last_error.unwrap_or_default()
 }
