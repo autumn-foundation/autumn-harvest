@@ -221,3 +221,29 @@ fn status_shows_progress_beside_a_live_run() {
     assert_eq!(done.status.code(), Some(0), "{done:?}");
     assert_eq!(String::from_utf8_lossy(&done.stdout).trim(), "ok");
 }
+
+#[test]
+fn status_lists_every_run_past_one_page() {
+    let dir = TempDir::new().expect("a temp dir");
+    // More runs than one listing page holds (100).
+    let total = 105;
+    {
+        let mut rt = rhai_scripts::open(dir.path().join("runs.db")).expect("open");
+        for _ in 0..total {
+            let input = serde_json::to_value(rhai_scripts::ScriptInput {
+                path: "noop.rhai".to_string(),
+                source: "1".to_string(),
+                args: Vec::new(),
+                cwd: dir.path().display().to_string(),
+                max_operations: rhai_scripts::bridge::MAX_OPERATIONS,
+            })
+            .expect("input");
+            rt.start_workflow(rhai_scripts::WORKFLOW, input)
+                .expect("start");
+        }
+    }
+
+    let listed = output(harvest(dir.path()).arg("status"));
+    assert_eq!(listed.status.code(), Some(0), "{listed:?}");
+    assert_eq!(stdout(&listed).lines().count(), total);
+}

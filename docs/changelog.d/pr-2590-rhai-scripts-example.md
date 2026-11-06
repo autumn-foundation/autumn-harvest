@@ -38,10 +38,11 @@ Test evidence: `cargo test -p rhai-scripts`. The 11 tests in
 arguments, a restart during a signal wait, a durable timer driven with
 `run_until_blocked_as_of`, `try`/`catch` over a failed step, an uncaught
 failure, the sandbox, the operation bound, the `print` sink and log, and the
-`status` query on a parked run, also while a writer holds the lock. The 6
+`status` query on a parked run, also while a writer holds the lock. The 7
 tests in `tests/cli.rs` run the binary.
 One sends SIGKILL to a run during its second step, edits the script, and
 resumes it. Step one runs once, step two runs twice, and the edit has no
 effect. Another is a regression test for a panic on a closed stdout
-(`history | head`). One reads `status` beside a live `run`. CI runs the
+(`history | head`). One reads `status` beside a live `run`, and one lists more runs than one
+page holds. CI runs the
 suite on Linux and macOS, and a clippy step covers the crate.

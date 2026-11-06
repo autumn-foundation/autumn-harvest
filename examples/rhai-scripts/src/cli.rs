@@ -274,14 +274,28 @@ async fn sleep_to_next_timer(db: &Path, exec: ExecutionId) -> Result<(), String>
 /// `status` with no run: one line per run, newest first.
 ///
 /// A database that does not exist yet holds no run, so it lists nothing.
+/// The listing follows each page cursor, so it shows every run.
 fn list(db: &Path) -> Result<(), Stop> {
     if !db.exists() {
         return Ok(());
     }
-    let page = reader(db)?
-        .list_executions(&ExecutionFilter::new().workflow_name(WORKFLOW))
-        .map_err(text)?;
-    for run in page.executions {
+    let reader = reader(db)?;
+    let mut filter = ExecutionFilter::new().workflow_name(WORKFLOW);
+    loop {
+        let page = reader.list_executions(&filter).map_err(text)?;
+        print_runs(page.executions)?;
+        let Some(cursor) = page.next else {
+            return Ok(());
+        };
+        filter = ExecutionFilter::new()
+            .workflow_name(WORKFLOW)
+            .before(cursor);
+    }
+}
+
+/// One line per run of one listing page.
+fn print_runs(runs: Vec<autumn_harvest_sqlite::ExecutionSummary>) -> Result<(), Stop> {
+    for run in runs {
         let script = run
             .memo
             .into_value()
