@@ -141,8 +141,9 @@ pub struct Adoption {
 /// A retry after a lost reply finds its own `auto:<run>` version, and
 /// reports it as adopted with no move. The version need not be active, so
 /// a retry never undoes a rollback or a later adoption. A retry also finds
-/// its own `refine:<run>` version of the same overlay, so it puts no second
-/// version.
+/// its own `refine:<run>` version of the same overlay first. It then waits
+/// with no reason and puts no second version, so a new day or a wider
+/// policy never changes the outcome of a retry.
 ///
 /// # Errors
 ///
@@ -161,6 +162,18 @@ pub async fn adopt(
         return Ok(Adoption {
             refine_status: RefineStatus::AutoAdopted,
             version: Some(done.version()),
+            wait: None,
+        });
+    }
+    let waits = Provenance::refine(run);
+    if let Some(earlier) = versions
+        .iter()
+        .find(|stored| stored.provenance() == &waits && stored.overlay() == candidate)
+    {
+        // A retry keeps the outcome of its first attempt.
+        return Ok(Adoption {
+            refine_status: RefineStatus::AwaitingApproval,
+            version: Some(earlier.version()),
             wait: None,
         });
     }
@@ -197,15 +210,7 @@ pub async fn adopt(
             "a refined overlay waits: the auto adoption cap is reached"
         );
     }
-    let waits = Provenance::refine(run);
-    let earlier = versions
-        .iter()
-        .find(|stored| stored.provenance() == &waits && stored.overlay() == candidate)
-        .map(StoredOverlay::version);
-    let version = match earlier {
-        Some(version) => version,
-        None => store.put(kind, candidate, waits).await?,
-    };
+    let version = store.put(kind, candidate, waits).await?;
     Ok(Adoption {
         refine_status: RefineStatus::AwaitingApproval,
         version: Some(version),

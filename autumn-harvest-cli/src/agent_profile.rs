@@ -78,12 +78,14 @@ pub enum ProfileCommand {
         /// The agent kind.
         kind: String,
     },
-    /// List the refine runs of a kind that wait for a person.
+    /// List the refine runs of a kind that wait for a person. It needs the
+    /// `filter` of a Postgres server.
     Pending {
         /// The agent kind.
         kind: String,
     },
-    /// Approve the overlay that a waiting refine run stored.
+    /// Approve the overlay that a waiting refine run stored. A move of the
+    /// active version since refine start ends the run as superseded.
     Approve {
         /// The execution id of the refine run.
         run: String,
@@ -97,8 +99,9 @@ pub enum ProfileCommand {
         #[arg(long)]
         reason: Option<String>,
     },
-    /// Activate an edited overlay instead. The run checks it against the
-    /// ceilings, and keeps its wait when they refuse it.
+    /// Put an edited overlay for a waiting refine run, and activate it. The
+    /// run checks it against the ceilings. When they refuse it, the run
+    /// keeps its wait.
     Edit {
         /// The execution id of the refine run.
         run: String,
@@ -183,7 +186,7 @@ pub const REFINE_WORKFLOW: &str = "agent_refine";
 
 /// The signal prefix of the adoption gate. It is
 /// `autumn_harvest_agent::refine::SIGNAL_REFINE_APPROVAL`.
-pub const REFINE_APPROVAL_SIGNAL: &str = "refine_approval";
+pub const SIGNAL_REFINE_APPROVAL: &str = "refine_approval";
 
 /// The page size of `pending`.
 const PENDING_PAGE_SIZE: i64 = 50;
@@ -201,17 +204,37 @@ fn pending_path(kind: &str) -> String {
     )
 }
 
+/// The canonical form of the execution id `run`: 32 hex digits, in lower
+/// case, in groups of 8, 4, 4, 4 and 12. The gate names its signal with
+/// this form, so another spelling would never reach it.
+fn run_id(run: &str) -> Result<String, CliError> {
+    let digits: String = run.trim().chars().filter(|c| *c != '-').collect();
+    if digits.len() != 32 || !digits.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(CliError::InvalidInput(format!(
+            "invalid refine run {run:?}: use its execution id, a UUID"
+        )));
+    }
+    let digits = digits.to_ascii_lowercase();
+    Ok(format!(
+        "{}-{}-{}-{}-{}",
+        &digits[..8],
+        &digits[8..12],
+        &digits[12..16],
+        &digits[16..20],
+        &digits[20..]
+    ))
+}
+
 /// The decision `payload` for the gate of the refine run `run`.
-fn decision(run: &str, payload: Value) -> ApiRequest {
-    let run = run.trim();
-    ApiRequest::post(
+fn decision(run: &str, payload: Value) -> Result<ApiRequest, CliError> {
+    let run = run_id(run)?;
+    Ok(ApiRequest::post(
         format!(
-            "/workflows/{}/signal/{}",
-            path_segment(run),
-            path_segment(&format!("{REFINE_APPROVAL_SIGNAL}:{run}"))
+            "/workflows/{run}/signal/{}",
+            path_segment(&format!("{SIGNAL_REFINE_APPROVAL}:{run}"))
         ),
         Some(payload),
-    )
+    ))
 }
 
 /// The base path of the overlay routes of `kind`.
@@ -292,11 +315,11 @@ pub fn profile_request(command: &ProfileCommand) -> Result<ApiRequest, CliError>
             Some(json!({})),
         )),
         ProfileCommand::Pending { kind } => Ok(ApiRequest::get(pending_path(kind))),
-        ProfileCommand::Approve { run } => Ok(decision(run, json!({"verdict": "approve"}))),
-        ProfileCommand::Reject { run, reason } => Ok(decision(
+        ProfileCommand::Approve { run } => decision(run, json!({"verdict": "approve"})),
+        ProfileCommand::Reject { run, reason } => decision(
             run,
             json!({"verdict": "reject", "reason": reason.as_deref().unwrap_or_default()}),
-        )),
+        ),
         ProfileCommand::Edit { run, file } => {
             let overlay = crate::parse_json_source(None, Some(file), "overlay")?
                 .ok_or_else(|| CliError::InvalidInput("the overlay file is empty".to_owned()))?;
@@ -305,10 +328,7 @@ pub fn profile_request(command: &ProfileCommand) -> Result<ApiRequest, CliError>
                     "the overlay must be a JSON object".to_owned(),
                 ));
             }
-            Ok(decision(
-                run,
-                json!({"verdict": "edit", "overlay": overlay}),
-            ))
+            decision(run, json!({"verdict": "edit", "overlay": overlay}))
         }
         ProfileCommand::Policy { kind, action } => match action {
             PolicyAction::Show => Ok(ApiRequest::get(format!("{}/policy", base(kind)))),
@@ -786,6 +806,16 @@ mod tests {
         })
         .expect("one request");
         assert_eq!(request.method, ApiMethod::Get);
+        assert_eq!(
+            request.path,
+            format!(
+                "/workflows?state=RUNNING&filter={}&page_size=50",
+                query_encode(
+                    "workflow_name = 'agent_refine' AND attrs.refine_kind = 'support' \
+                     AND attrs.refine_status = 'waiting_approval'"
+                )
+            )
+        );
         let decoded = request
             .path
             .replace("%20", " ")
@@ -801,6 +831,29 @@ mod tests {
             "attrs.refine_status = 'waiting_approval'",
         ] {
             assert!(decoded.contains(part), "{part} in {decoded}");
+        }
+    }
+
+    #[test]
+    fn a_run_id_takes_its_canonical_form() {
+        let canonical = "0190a5a0-0000-7000-8000-00000000000a";
+        for spelling in [
+            canonical,
+            "0190A5A0-0000-7000-8000-00000000000A",
+            "0190a5a0000070008000-00000000000a",
+        ] {
+            assert_eq!(run_id(spelling).unwrap(), canonical, "{spelling}");
+        }
+        let bare = format!(" {} ", canonical.replace('-', ""));
+        assert_eq!(run_id(&bare).unwrap(), canonical);
+        for bad in ["", ".", "..", "x", "0190a5a0-0000-7000-8000-00000000000g"] {
+            assert!(run_id(bad).is_err(), "{bad}");
+            assert!(
+                profile_request(&ProfileCommand::Approve {
+                    run: bad.to_owned()
+                })
+                .is_err()
+            );
         }
     }
 

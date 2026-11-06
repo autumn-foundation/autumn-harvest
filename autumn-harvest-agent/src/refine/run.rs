@@ -37,7 +37,7 @@ use super::compose::{
     ComposeRequest, Composition, ProbedCandidate, SelectRequest, SelectedBy, Selection,
     agent_refine_compose_info, agent_refine_select_info, source_events,
 };
-use super::gate::{Gate, GateRecord, set_status};
+use super::gate::{Gate, GateRecord, set_failed, set_status};
 use super::ledger::{MAX_REFINE_K, MAX_SOURCE_RUNS, RefineError, RefineLedger, RefineMode};
 use super::policy::{PolicyCeilings, RefinePolicy};
 use super::policy_read::read_refine_policy;
@@ -214,9 +214,14 @@ pub struct RefineStart {
     /// The policy ceilings, resolved against the base profile.
     pub ceilings: Ceilings,
     /// The version that was active at the start. An approval of the gate
-    /// expects it. A record with no field decodes as an unset pointer.
+    /// expects it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active: Option<OverlayVersion>,
+    /// `true` when the step read [`Self::active`]. A record of an older
+    /// release has no such field. Its run then ends with the chosen overlay
+    /// and opens no gate, as that release did.
+    #[serde(default)]
+    pub active_read: bool,
 }
 
 /// The part of the loop that a stage plays.
@@ -548,6 +553,7 @@ pub(crate) async fn run_start(
         selector: harness.overlay_selector().is_some(),
         ceilings,
         active: active.as_ref().map(StoredOverlay::version),
+        active_read: true,
     })
 }
 
@@ -1158,17 +1164,22 @@ pub async fn agent_refine(
         }
     };
     let (status, gate) = match &chosen {
-        Some(overlay) if status == RefineStatus::Chosen && !input.dry_run => {
-            Gate {
+        Some(overlay) if status == RefineStatus::Chosen && !input.dry_run && start.active_read => {
+            let gate = Gate {
                 ctx,
                 kind: &input.kind,
                 chosen: overlay,
                 expected: start.active,
                 policy: &policy,
                 ceilings: &start.ceilings,
+            };
+            match gate.run().await {
+                Ok(ended) => ended,
+                Err(err) => {
+                    set_failed(ctx, &input.kind);
+                    return Err(err);
+                }
             }
-            .run()
-            .await?
         }
         _ => (status, None),
     };
@@ -1244,6 +1255,26 @@ mod tests {
         let mut kind = input(1, 1);
         kind.kind = "Not A Kind".to_owned();
         assert!(kind.validate().is_err());
+    }
+
+    #[test]
+    fn a_start_record_of_an_older_release_opens_no_gate() {
+        let start = RefineStart {
+            profile: AgentProfile::new("support"),
+            current: ProfileOverlay::default(),
+            sources: Vec::new(),
+            selector: false,
+            ceilings: Ceilings::from_profile(&AgentProfile::new("support")),
+            active: None,
+            active_read: true,
+        };
+        let mut old = serde_json::to_value(&start).unwrap();
+        old.as_object_mut().unwrap().remove("active_read");
+        let read: RefineStart = serde_json::from_value(old).unwrap();
+        assert!(!read.active_read);
+        let again: RefineStart =
+            serde_json::from_value(serde_json::to_value(&start).unwrap()).unwrap();
+        assert!(again.active_read);
     }
 
     #[test]

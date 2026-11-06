@@ -1,4 +1,4 @@
-//! The adoption gate of `agent_refine` on SQLite (issue #2381).
+//! The adoption gate of `agent_refine` on SQLite.
 //!
 //! A scripted proposer, composer and model drive each run. A test clock
 //! moves the deadline of the gate. Each test checks one criterion of the
@@ -14,9 +14,9 @@ use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::testing::{ReplayStatus, WorkflowReplayer};
 use autumn_harvest_agent::model::BoxFuture;
 use autumn_harvest_agent::refine::{
-    ApprovalTimeout, Charge, ComposeContext, OverlayComposer, REFINE_KIND_ATTR, REFINE_STATUS_ATTR,
-    RefineDecision, RefineInput, RefineMode, RefinePolicy, RefineReport, agent_refine_info,
-    refine_approval_signal,
+    ApprovalTimeout, Charge, ComposeContext, OverlayComposer, PolicyCeilings, REFINE_KIND_ATTR,
+    REFINE_STATUS_ATTR, RefineDecision, RefineInput, RefineMode, RefinePolicy, RefineReport,
+    agent_refine_info, refine_approval_signal,
 };
 use autumn_harvest_agent::{
     AgentError, AgentHarness, AgentId, AgentModel, AgentOp, AgentProfile, AgentTask, AutoAdopt,
@@ -77,7 +77,19 @@ impl AgentModel for Model {
 
 /// A proposer that adds one line to the current system text.
 #[derive(Debug, Default)]
-struct Proposer;
+struct Proposer {
+    /// With a store, the next call puts and activates an operator version,
+    /// as an operator does while the loop runs.
+    meddle: Mutex<Option<Arc<InMemoryOverlayStore>>>,
+}
+
+/// The overlay that an operator activates during the loop.
+fn operator_overlay() -> ProfileOverlay {
+    ProfileOverlay {
+        system: Some("Operator prompt.".to_owned()),
+        ..ProfileOverlay::default()
+    }
+}
 
 impl OverlayProposer for Proposer {
     fn propose<'a>(
@@ -85,6 +97,7 @@ impl OverlayProposer for Proposer {
         context: &'a ProposeContext<'a>,
     ) -> BoxFuture<'a, Result<ProposerReply, AgentError>> {
         context.charge(Charge::new(Some("scripted"), TokenUsage::new(1, 1)));
+        let meddle = self.meddle.lock().unwrap().take();
         let from = context.current.system.as_deref().unwrap_or(BASE);
         let reply = ProfileOverlay {
             system: Some(format!(
@@ -93,7 +106,15 @@ impl OverlayProposer for Proposer {
             )),
             ..ProfileOverlay::default()
         };
-        Box::pin(async move { Ok(ProposerReply::Overlay(reply)) })
+        Box::pin(async move {
+            if let Some(store) = meddle {
+                let ops = || Provenance::operator("ops");
+                let own = store.put(KIND, &operator_overlay(), ops()).await.unwrap();
+                let active = store.active(KIND).await.unwrap().map(|s| s.version());
+                store.activate(KIND, own, active, ops()).await.unwrap();
+            }
+            Ok(ProposerReply::Overlay(reply))
+        })
     }
 }
 
@@ -124,6 +145,7 @@ struct Fixture {
     rt: SqliteRuntime,
     store: Arc<InMemoryOverlayStore>,
     model: Arc<Model>,
+    proposer: Arc<Proposer>,
     clock: Arc<AtomicI64>,
 }
 
@@ -136,12 +158,13 @@ fn fixture() -> Fixture {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("gate.db");
     let model = Arc::new(Model::default());
+    let proposer = Arc::new(Proposer::default());
     let base = AgentHarness::new(Arc::clone(&model) as Arc<dyn AgentModel>)
         .agent(AgentProfile::new(KIND).system(BASE).max_steps(20));
     let store = Arc::new(InMemoryOverlayStore::new(Arc::new(base.clone())));
     let harness = base
         .overlay_store(Arc::clone(&store) as Arc<dyn ProfileOverlayStore>)
-        .proposer(Arc::new(Proposer) as Arc<dyn OverlayProposer>)
+        .proposer(Arc::clone(&proposer) as Arc<dyn OverlayProposer>)
         .composer(Arc::new(Composer) as Arc<dyn OverlayComposer>)
         .refine_sources(Arc::new(sqlite::Sources::open(&db)));
     let clock = Arc::new(AtomicI64::new(epoch().timestamp_millis()));
@@ -153,6 +176,7 @@ fn fixture() -> Fixture {
         rt,
         store,
         model,
+        proposer,
         clock,
     }
 }
@@ -356,6 +380,8 @@ async fn approve_activates_the_version_and_the_next_op_sees_its_prompt() {
 async fn an_edit_past_the_ceilings_is_refused_and_the_run_keeps_waiting() {
     let mut f = fixture();
     let exec = f.waiting().await;
+    // The edit comes late, so a reset of the deadline would show.
+    f.advance(6 * 24 * HOUR_MS);
     let wide = ProfileOverlay {
         max_steps: Some(1_000),
         ..ProfileOverlay::default()
@@ -377,8 +403,8 @@ async fn an_edit_past_the_ceilings_is_refused_and_the_run_keeps_waiting() {
         f.attr(exec, REFINE_STATUS_ATTR),
         Some(json!("waiting_approval"))
     );
-    // The refusal does not move the deadline.
-    f.advance(7 * 24 * HOUR_MS + 1_000);
+    // The deadline stays at seven days from the open.
+    f.advance(24 * HOUR_MS + 1_000);
     let report = report_of(f.drive(exec).await);
     assert_eq!(report.status, RefineStatus::TimedOut, "{report:?}");
     assert_eq!(active(&f.store).await, None);
@@ -386,6 +412,37 @@ async fn an_edit_past_the_ceilings_is_refused_and_the_run_keeps_waiting() {
     assert!(
         gate.notes.iter().any(|note| note.contains("refused")),
         "{gate:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_edit_past_the_run_ceilings_is_refused_after_a_wider_policy() {
+    let mut f = fixture();
+    let exec = f.waiting().await;
+    // The store now allows 1000 steps. The run read 20 at its start.
+    let wide = RefinePolicy {
+        ceilings: PolicyCeilings {
+            max_steps: std::num::NonZeroU32::new(1_000),
+            ..PolicyCeilings::default()
+        },
+        ..RefinePolicy::default()
+    };
+    f.store
+        .set_policy(KIND, &wide, None, Provenance::operator("ops"))
+        .await
+        .unwrap();
+    let edit = ProfileOverlay {
+        max_steps: Some(500),
+        ..ProfileOverlay::default()
+    };
+    f.decide(exec, &RefineDecision::Edit { overlay: edit });
+    let state = f.drive(exec).await;
+    assert!(blocked(&state), "{state:?}");
+    assert_eq!(active(&f.store).await, None);
+    assert_eq!(
+        stored_versions(&f.store).await.len(),
+        1,
+        "the store got no put"
     );
 }
 
@@ -418,7 +475,7 @@ async fn an_approval_sent_before_the_wait_opened_is_dropped_and_the_run_times_ou
     let run = f.source().await;
     let input = RefineInput::new(KIND, vec![run], 1, RefineMode::Sequential, 7);
     let exec = sqlite::start_refine(&mut f.rt, &input).unwrap();
-    // The run has not opened its wait yet.
+    // The run does not wait yet.
     f.decide(exec, &RefineDecision::Approve);
     let state = f.drive(exec).await;
     assert!(blocked(&state), "the early approval is dropped: {state:?}");
@@ -450,6 +507,7 @@ async fn an_operator_activation_during_the_wait_makes_approve_superseded() {
         "the operator version stays"
     );
     assert_eq!(f.attr(exec, REFINE_STATUS_ATTR), Some(json!("superseded")));
+    assert_eq!(report.gate.expect("a gate").superseded_by, Some(own));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -505,6 +563,12 @@ async fn an_unreadable_payload_keeps_the_wait() {
     f.decide(exec, &RefineDecision::Approve);
     let report = report_of(f.drive(exec).await);
     assert_eq!(report.status, RefineStatus::Adopted, "{report:?}");
+    let gate = report.gate.expect("a gate record");
+    assert_eq!(gate.decisions, 2);
+    assert!(
+        gate.notes.iter().any(|note| note.contains("unreadable")),
+        "{gate:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -608,4 +672,38 @@ async fn approve_expects_the_version_active_at_refine_start() {
     assert_eq!(active(&f.store).await, Some(chosen));
     let last = f.store.last_activation(KIND).await.unwrap().unwrap();
     assert_eq!(last.from(), Some(first));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restart_keeps_the_deadline() {
+    let mut f = fixture();
+    let exec = f.waiting().await;
+    f.advance(6 * 24 * HOUR_MS);
+    f.restart();
+    assert!(blocked(&f.drive(exec).await));
+    f.advance(24 * HOUR_MS + 1_000);
+    let report = report_of(f.drive(exec).await);
+    assert_eq!(report.status, RefineStatus::TimedOut, "{report:?}");
+    let events = f.rt.load_history(exec).unwrap();
+    replay(f.harness.clone(), events, exec).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pointer_move_during_the_loop_makes_approve_superseded() {
+    let mut f = fixture();
+    *f.proposer.meddle.lock().unwrap() = Some(Arc::clone(&f.store));
+    let exec = f.waiting().await;
+    let versions = stored_versions(&f.store).await;
+    let operator = versions
+        .iter()
+        .find(|(_, provenance, _)| provenance == &Provenance::operator("ops"))
+        .map(|(version, _, _)| *version);
+    assert!(operator.is_some(), "{versions:?}");
+    f.decide(exec, &RefineDecision::Approve);
+    let report = report_of(f.drive(exec).await);
+    assert_eq!(report.status, RefineStatus::Superseded, "{report:?}");
+    let gate = report.gate.expect("a gate record");
+    assert_eq!(gate.expected, None, "nothing was active at refine start");
+    assert_eq!(gate.superseded_by, operator);
+    assert_eq!(active(&f.store).await, operator);
 }
