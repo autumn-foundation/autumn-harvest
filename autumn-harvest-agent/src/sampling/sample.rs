@@ -517,10 +517,13 @@ async fn run_beam(
         if slots == 0 || live.is_empty() {
             return Ok((scored, SampleStop::Completed));
         }
-        let parents: Vec<&Beam> = live
-            .iter()
-            .flat_map(|beam| std::iter::repeat_n(beam, shape.expansion as usize))
-            .collect();
+        // A plain loop, so the determinism analysis sees each call.
+        let mut parents: Vec<&Beam> = Vec::new();
+        for beam in &live {
+            for _ in 0..shape.expansion {
+                parents.push(beam);
+            }
+        }
         let first = scored.len();
         let halt = Box::pin(run_steps(
             ctx,
