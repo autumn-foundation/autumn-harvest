@@ -22,6 +22,7 @@ mod agent_anonymise;
 mod agent_episodes;
 mod agent_dispatch;
 mod refine_policy;
+mod refine_gate;
 mod evidence_parts;
 mod process_role;
 mod worker_queues;

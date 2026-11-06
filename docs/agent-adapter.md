@@ -1584,6 +1584,10 @@ so a list of the agents due to wake reads only those agents.
 | `harvest agents profile diff <kind> <a> <b>` | `GET /agents/{kind}/profile/diff?a=&b=` |
 | `harvest agents profile activate <kind> <v> [--expected v\|none]` | `POST /agents/{kind}/profile/activate`, after the `list` route when `--expected` is absent |
 | `harvest agents profile rollback <kind>` | `POST /agents/{kind}/profile/rollback` |
+| `harvest agents profile pending <kind>` | `GET /workflows?state=RUNNING&filter=workflow_name = 'agent_refine' AND attrs.refine_kind = ... AND attrs.refine_status = 'waiting_approval'`, Postgres only |
+| `harvest agents profile approve <run>` | `POST /workflows/{run}/signal/refine_approval:{run}` |
+| `harvest agents profile reject <run> [--reason text]` | the same route, with `reject` |
+| `harvest agents profile edit <run> --file overlay.json` | the same route, with `edit` |
 
 **Profile overlays (issue #2374).** The `profile` commands use the routes
 of the overlay store. Install the store with
@@ -2740,8 +2744,70 @@ On Postgres, install `postgres::Sources::new(pg)` and start the workflow
 - **Crash.** Each step is one recorded activity. A crash re-runs only the
   step in flight.
 
-The run ends with a `RefineReport`: the status (`chosen`, `unchanged` or
-`budget_exhausted`), the chosen overlay, one record per stage, each
-selection and the `RefineLedger`. It holds no id of the refine run and no
-time, so one seed and one script give byte-identical reports. The
-adoption gate of #2381 takes the chosen overlay.
+The run ends with a `RefineReport`: the status, the chosen overlay, one
+record per stage, each selection, the `RefineLedger` and the gate record.
+It holds no id of the refine run and no time, so one seed and one script
+give byte-identical reports. A run that chose an overlay goes on to the
+adoption gate of section 23. `RefineInput::dry_run` ends the run after the
+loop with the status `chosen`. A dry run stores no version and opens no
+gate.
+
+## 23. The adoption gate
+
+A refine run that chose an overlay does not put it live by itself. The
+design is in [`DESIGN-2381.md`](design/DESIGN-2381.md). The gate needs an
+overlay store on the harness. With none, the adoption step fails the run
+as `OverlayStoreMissing`. A dry run needs no store.
+
+1. `agent_refine_adopt` calls `refine::adopt_over` with the version that
+   was active at refine start. A moved pointer ends the run as
+   `superseded`. A candidate whose changed parts the policy lists goes
+   live as `auto:<run>`, under the daily cap.
+   The step puts any other candidate as an inactive version
+   `refine:<run>`. It also reads the head of the activation log.
+2. The run drops each decision that arrived before this point. Then it
+   sets `refine_status = waiting_approval`.
+3. The run waits on the signal `refine_approval:<run>` until
+   `approval_timeout` of its policy passes. The default is 7 days.
+
+| Decision | Payload | Effect | `refine_status` |
+|---|---|---|---|
+| Approve | `{"verdict": "approve"}` | Activates the version over the version that was active at refine start. | `adopted` |
+| Edit | `{"verdict": "edit", "overlay": {...}}` | Checks the overlay under the run ceilings, puts it as `refine:<run>` and activates it. | `adopted` |
+| Reject | `{"verdict": "reject", "reason": "..."}` | Activates nothing. The version stays stored. | `rejected` |
+| No decision | | As reject, at the deadline. | `timed_out` |
+
+- **Superseded.** Any move of the pointer after refine start wins over a
+  decision, by an operator or by another run. So does any move after the
+  wait opens. An approve or an edit then activates nothing, and the run
+  ends as `superseded`. A retry of a decision never moves the pointer
+  again, so it never undoes a rollback.
+- **Refused.** The run ceilings or the store can refuse an edit. A lowered
+  ceiling can refuse an approve. The run notes the reason and waits until
+  the same deadline. A payload that does not decode does the same. A key
+  that the verdict does not read fails the decode, so an approve that
+  carries an overlay activates nothing.
+- **Early decision.** The run drops a decision that arrives before the
+  wait opens, as eval does. List the run first. The report counts each
+  dropped decision.
+- **Attributes.** The run sets `refine_kind` and `refine_status` at each
+  end: `adopted`, `rejected`, `timed_out`, `superseded`, `auto_adopted`,
+  `unchanged`, `budget_exhausted` or `chosen`. A run that fails in the gate
+  gets `failed`.
+- **Actor.** The move records the actor `refine:<run>`. History holds the
+  signal of the person.
+- **Upgrade.** A run that started on an older release opens no gate. It
+  ends with `chosen`, as that release did.
+
+```sh
+harvest agents profile pending support
+harvest agents profile approve <run>
+harvest agents profile reject <run> --reason "too long"
+harvest agents profile edit <run> --file overlay.json
+```
+
+`pending` sends the `filter` of `GET /workflows`, which only a Postgres
+server serves. The other commands take the execution id in any UUID
+spelling and send its canonical form. On SQLite, `sqlite::decide_refine`
+sends a decision, and `ExecutionFilter::search_attribute` lists the runs
+that wait. On Postgres, `postgres::decide_refine` sends it.

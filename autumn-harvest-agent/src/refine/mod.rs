@@ -11,11 +11,14 @@
 //! #2380). [`ledger`] counts that budget. The designs are in
 //! `docs/design/DESIGN-2379.md`, `docs/design/DESIGN-2380.md` and
 //! `docs/design/DESIGN-2394.md`.
+//! [`gate`] waits for a person before a chosen overlay goes live. Its
+//! design is in `docs/design/DESIGN-2381.md`.
 
 pub mod adopt;
 pub mod bundle;
 #[cfg(feature = "eval")]
 pub mod compose;
+pub mod gate;
 pub mod ledger;
 pub mod meter;
 pub mod model_proposer;
@@ -27,13 +30,19 @@ pub mod propose;
 pub mod run;
 pub mod sources;
 
-pub use adopt::{Adoption, RefineStatus, WaitReason, adopt};
+pub use adopt::{Adoption, RefineStatus, WaitReason, adopt, adopt_over};
 pub use bundle::{BundleFile, BundleManifest};
 #[cfg(feature = "eval")]
 pub use compose::{
     ComposeCandidate, ComposeContext, ComposeRequest, Composition, OverlayComposer,
     OverlaySelector, ProbedCandidate, SelectContext, SelectRequest, SelectedBy, Selection,
     agent_refine_compose, agent_refine_compose_info, agent_refine_select, agent_refine_select_info,
+};
+pub use gate::{
+    AdoptRequest, DecideOutcome, DecideRequest, GateAction, GateEvent, GateOpen, GateRecord,
+    GateStep, REFINE_KIND_ATTR, REFINE_STATUS_ATTR, RefineDecision, SIGNAL_REFINE_APPROVAL,
+    STATUS_FAILED, agent_refine_adopt, agent_refine_adopt_info, agent_refine_decide,
+    agent_refine_decide_info, gate_step, refine_approval_signal,
 };
 pub use ledger::{MAX_REFINE_K, MAX_SOURCE_RUNS, RefineError, RefineLedger, RefineMode};
 pub use meter::{Charge, Meter};

@@ -204,13 +204,29 @@ fn register_refine(rt: &mut SqliteRuntime, harness: &Arc<AgentHarness>) {
 #[cfg(feature = "eval")]
 fn register_refine_run(rt: &mut SqliteRuntime, harness: &Arc<AgentHarness>) {
     use crate::refine::compose::{run_compose, run_select};
+    use crate::refine::gate::{run_adopt, run_decide};
     use crate::refine::run::{probe_calls, run_probe, run_start};
     use crate::refine::{
-        agent_refine_compose_info, agent_refine_info, agent_refine_probe_info,
-        agent_refine_select_info, agent_refine_start_info,
+        agent_refine_adopt_info, agent_refine_compose_info, agent_refine_decide_info,
+        agent_refine_info, agent_refine_probe_info, agent_refine_select_info,
+        agent_refine_start_info,
     };
 
     rt.register_workflow(&agent_refine_info());
+    let h = Arc::clone(harness);
+    rt.register_activity_with_body(&agent_refine_adopt_info(), move |input| {
+        call(input, |input| {
+            let h = Arc::clone(&h);
+            async move { run_adopt(&h, input).await }
+        })
+    });
+    let h = Arc::clone(harness);
+    rt.register_activity_with_body(&agent_refine_decide_info(), move |input| {
+        call(input, |input| {
+            let h = Arc::clone(&h);
+            async move { run_decide(&h, input).await }
+        })
+    });
     let h = Arc::clone(harness);
     rt.register_activity_with_body(&agent_refine_start_info(), move |input| {
         call(input, |input| {
@@ -260,6 +276,27 @@ pub fn start_refine(
     rt.start_workflow(
         crate::refine::REFINE_WORKFLOW_NAME,
         serde_json::to_value(input)?,
+    )
+}
+
+/// Send a decision of a person to the adoption gate of the refine run
+/// `exec`.
+///
+/// The gate drops a decision that arrives before its wait opens. Wait for
+/// the search attribute `refine_status = waiting_approval` first.
+///
+/// # Errors
+///
+/// Returns an error when the runtime cannot record the signal.
+pub fn decide_refine(
+    rt: &mut SqliteRuntime,
+    exec: ExecutionId,
+    decision: &crate::refine::RefineDecision,
+) -> SqliteResult<()> {
+    rt.send_signal(
+        exec,
+        &crate::refine::refine_approval_signal(exec),
+        serde_json::to_value(decision)?,
     )
 }
 

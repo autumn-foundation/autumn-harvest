@@ -343,6 +343,9 @@ pub open spec fn spec_rollback_target(from: Option < u64 >, to: u64) -> Option <
 pub fn rollback_target(from: Option < u64 >, to: u64) -> (r: Option < RollbackPlan >) ensures r == spec_rollback_target(from, to), r.is_none() <==> from.is_none(), r.is_some() ==> r.unwrap().target == from.unwrap() && r.unwrap().expected == to,
 pub open spec fn spec_decide_rollback(known: bool, expected: u64, actual: Option < u64 >, read_seq: u64, last_seq: Option < u64 >,) -> ActivateDecision { if spec_decide_activate(known, Some(expected), actual) != ActivateDecision::Activate { spec_decide_activate(known, Some(expected), actual) } else if last_seq == Some(read_seq) { ActivateDecision::Activate } else { ActivateDecision::Conflict } }
 pub fn decide_rollback(known: bool, expected: u64, actual: Option < u64 >, read_seq: u64, last_seq: Option < u64 >,) -> (r: ActivateDecision) ensures r == spec_decide_rollback(known, expected, actual, read_seq, last_seq), r == ActivateDecision::Activate ==> last_seq == Some(read_seq), r == ActivateDecision::Activate ==> known && actual == Some(expected),
+pub open spec fn spec_decide_guarded(known: bool, expected: Option < u64 >, actual: Option < u64 >, read_seq: Option < u64 >, last_seq: Option < u64 >,) -> ActivateDecision { if spec_decide_activate(known, expected, actual) != ActivateDecision::Activate { spec_decide_activate(known, expected, actual) } else if last_seq == read_seq { ActivateDecision::Activate } else { ActivateDecision::Conflict } }
+pub fn decide_guarded(known: bool, expected: Option < u64 >, actual: Option < u64 >, read_seq: Option < u64 >, last_seq: Option < u64 >,) -> (r: ActivateDecision) ensures r == spec_decide_guarded(known, expected, actual, read_seq, last_seq), r == ActivateDecision::Activate ==> last_seq == read_seq, r == ActivateDecision::Activate ==> known && actual == expected,
+pub proof fn theorem_a_moved_log_never_passes_the_guard(known: bool, expected: Option < u64 >, actual: Option < u64 >, read_seq: Option < u64 >, last_seq: Option < u64 >,) requires last_seq != read_seq, ensures spec_decide_guarded(known, expected, actual, read_seq, last_seq) != ActivateDecision::Activate,
 pub struct Move { pub from: Option < u64 >, pub to: u64, }
 pub struct Heads { pub stored: u64, pub active: Option < u64 >, pub moves: Seq < Move >, }
 pub open spec fn chained(h: Heads) -> bool { &&& (h.moves.len() == 0 ==> h.active.is_none()) &&& (h.moves.len() > 0 ==> h.active == Some(h.moves.last().to)) &&& (h.moves.len() > 0 ==> h.moves [0].from.is_none()) &&& forall | i: int | 0 < i < h.moves.len() ==> #[trigger] h.moves [i].from == Some(h.moves [i - 1].to) &&& forall | i: int | 0 <= i < h.moves.len() ==> #[trigger] h.moves [i].from != Some(h.moves [i].to) &&& forall | i: int | 0 <= i < h.moves.len() ==> 1 <= #[trigger] h.moves [i].to <= h.stored }
@@ -418,6 +421,17 @@ pub proof fn theorem_other_roles_run_retention_by_default(role: Option < Process
 pub proof fn theorem_an_explicit_scheduler_moves_retention(enabled: bool, scheduler: bool, role: Option < ProcessRole >,) ensures spec_runs_retention(enabled, RetentionRunOn::Scheduler, spec_switch_value(Some(scheduler), spec_role_default(role)),) == (enabled && scheduler),
 pub proof fn theorem_run_on_all_runs_retention_everywhere(enabled: bool, scheduler: bool) ensures spec_runs_retention(enabled, RetentionRunOn::All, scheduler) == enabled,
 pub proof fn theorem_disabled_retention_never_runs(run_on: RetentionRunOn, scheduler: bool) ensures ! spec_runs_retention(false, run_on, scheduler),
+
+## formal/verus/src/refine_gate.rs
+pub enum GateEvent { Deadline, Unreadable, Reject, Activated, Refused, Conflict, }
+pub enum GateStep { Wait, Adopted, Rejected, TimedOut, Superseded, }
+pub open spec fn spec_gate_step(event: GateEvent) -> GateStep { match event { GateEvent::Deadline => GateStep::TimedOut, GateEvent::Unreadable => GateStep::Wait, GateEvent::Reject => GateStep::Rejected, GateEvent::Activated => GateStep::Adopted, GateEvent::Refused => GateStep::Wait, GateEvent::Conflict => GateStep::Superseded, } }
+pub fn gate_step(event: GateEvent) -> (r: GateStep) ensures r == spec_gate_step(event), r is Adopted <==> event is Activated, r is Wait <==> (event is Unreadable || event is Refused),
+pub open spec fn spec_gate(events: Seq < GateEvent >) -> GateStep decreases events.len(), { if events.len() == 0 { GateStep::Wait } else if spec_gate_step(events [0]) is Wait { spec_gate(events.subrange(1, events.len() as int)) } else { spec_gate_step(events [0]) } }
+pub proof fn theorem_only_an_activation_adopts(events: Seq < GateEvent >) requires spec_gate(events) is Adopted, ensures exists | i: int | 0 <= i < events.len() && events [i] is Activated && forall | j: int | 0 <= j < i ==> #[trigger] spec_gate_step(events [j]) is Wait, decreases events.len(),
+pub proof fn theorem_no_activation_never_adopts(events: Seq < GateEvent >) requires forall | i: int | 0 <= i < events.len() ==>! (#[trigger] events [i] is Activated), ensures ! (spec_gate(events) is Adopted),
+pub proof fn theorem_an_end_is_final(events: Seq < GateEvent >, more: Seq < GateEvent >) requires ! (spec_gate(events) is Wait), ensures spec_gate(events + more) == spec_gate(events), decreases events.len(),
+pub proof fn theorem_a_deadline_never_adopts() ensures spec_gate_step(GateEvent::Deadline) is TimedOut,
 
 ## formal/verus/src/refine_policy.rs
 pub enum AdoptDecision { Adopt, Unchanged, NeedsApproval, CapReached, }

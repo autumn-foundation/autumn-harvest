@@ -260,8 +260,17 @@ async fn source(rt: &mut SqliteRuntime, kind: &str) -> ExecutionId {
     exec
 }
 
+/// Start `input` as a dry run. These tests check the loop, so each run ends
+/// before the adoption gate. `refine_gate.rs` checks the gate.
+fn start_dry(
+    rt: &mut SqliteRuntime,
+    input: &RefineInput,
+) -> autumn_harvest_sqlite::SqliteResult<ExecutionId> {
+    sqlite::start_refine(rt, &input.clone().dry_run())
+}
+
 async fn refine(rt: &mut SqliteRuntime, input: &RefineInput) -> RunState {
-    let exec = sqlite::start_refine(rt, input).unwrap();
+    let exec = start_dry(rt, input).unwrap();
     rt.run_until_blocked(exec).await.unwrap()
 }
 
@@ -582,7 +591,7 @@ async fn child_refines_until_it_crashes() {
         .unwrap()
         .parse()
         .unwrap();
-    let exec = sqlite::start_refine(
+    let exec = start_dry(
         &mut f.rt,
         &RefineInput::new(KIND, vec![run], 2, RefineMode::Parallel, 5),
     )
@@ -686,7 +695,7 @@ async fn the_spend_is_charged_to_the_refine_run_in_the_cost_ledger() {
     let run = source(&mut f.rt, KIND).await;
     let input = RefineInput::new(KIND, vec![run], 1, RefineMode::Parallel, 7)
         .budget(MeshBudget::daily("refine").max_tokens(1_000_000));
-    let exec = sqlite::start_refine(&mut f.rt, &input).unwrap();
+    let exec = start_dry(&mut f.rt, &input).unwrap();
     let report = report_of(f.rt.run_until_blocked(exec).await.unwrap());
     let rows = f.rt.llm_ledger(exec).unwrap();
     let tokens: u64 = rows
@@ -934,7 +943,7 @@ async fn a_stage_that_fails_every_retry_falls_back_and_keeps_the_identity() {
     let mut rt = SqliteRuntime::open(&db).unwrap();
     sqlite::register(&mut rt, Arc::new(harness));
     let run = source(&mut rt, KIND).await;
-    let exec = sqlite::start_refine(
+    let exec = start_dry(
         &mut rt,
         &RefineInput::new(KIND, vec![run], 1, RefineMode::Sequential, 7),
     )
@@ -1037,7 +1046,7 @@ async fn a_failed_stage_keeps_the_spend_of_its_last_attempt() {
     let mut rt = SqliteRuntime::open(&db).unwrap();
     sqlite::register(&mut rt, Arc::new(harness));
     let run = source(&mut rt, KIND).await;
-    let exec = sqlite::start_refine(
+    let exec = start_dry(
         &mut rt,
         &RefineInput::new(KIND, vec![run], 1, RefineMode::Sequential, 7),
     )

@@ -271,9 +271,11 @@ fn the_engine_registration_builds() {
         "agent_refine_probe",
         "agent_refine_compose",
         "agent_refine_select",
+        "agent_refine_adopt",
+        "agent_refine_decide",
     ];
-    let (core, steps) = names.split_at(names.len() - 4 * refine);
-    assert_eq!(steps, &refine_steps[..4 * refine]);
+    let (core, steps) = names.split_at(names.len() - refine_steps.len() * refine);
+    assert_eq!(steps, &refine_steps[..refine_steps.len() * refine]);
     assert_eq!(
         core,
         [

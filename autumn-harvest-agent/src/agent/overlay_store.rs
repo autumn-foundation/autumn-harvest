@@ -34,8 +34,8 @@ use autumn_harvest::ExecutionId;
 use autumn_harvest::chrono::{DateTime, Utc};
 use autumn_harvest::overlay_log::{
     AUTHOR_AUTO, AUTHOR_OPERATOR, AUTHOR_REFINE, ActivateDecision, ActivateOutcome, AutoAdoptRaw,
-    AutoMoveDecision, MoveRequest, OverlayRow, PolicyExpect, decide_auto_move, logs_activation,
-    next_overlay_version, policy_write_passes, rollback_target, utc_day,
+    AutoMoveDecision, MoveRequest, OverlayRow, PolicyExpect, ReadHead, decide_auto_move,
+    logs_activation, next_overlay_version, policy_write_passes, rollback_target, utc_day,
 };
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
 use autumn_harvest::overlay_log::{AutoAdoptRequest, PolicyAppend, PolicyRow, PolicyWrite};
@@ -682,6 +682,35 @@ pub trait ProfileOverlayStore: Send + Sync + std::fmt::Debug {
         actor: Provenance,
     ) -> BoxFuture<'a, Result<(), OverlayStoreError>>;
 
+    /// As [`activate`](Self::activate), when the last move of the pointer
+    /// of `kind` is also the one that the caller read. `head` is its `seq`,
+    /// or `None` for no move. A move after the read gives
+    /// [`OverlayStoreError::Conflict`], also when the pointer came back.
+    ///
+    /// Each store of this crate checks `head` in the swap transaction. The
+    /// default checks it before the swap, so a move in between can pass.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`activate`](Self::activate).
+    fn activate_guarded<'a>(
+        &'a self,
+        kind: &'a str,
+        version: OverlayVersion,
+        expected_active: Option<OverlayVersion>,
+        head: Option<u64>,
+        actor: Provenance,
+    ) -> BoxFuture<'a, Result<(), OverlayStoreError>> {
+        Box::pin(async move {
+            let last = self.last_activation(kind).await?;
+            if last.as_ref().map(Activation::seq) != head {
+                let actual = self.active(kind).await?.map(|stored| stored.version());
+                return Err(OverlayStoreError::Conflict { actual });
+            }
+            self.activate(kind, version, expected_active, actor).await
+        })
+    }
+
     /// The last move of the pointer of `kind`, or `None`.
     ///
     /// # Errors
@@ -1066,6 +1095,7 @@ const fn move_request<'b>(
     actor: &Provenance,
     author: &'b str,
     after_seq: Option<u64>,
+    head: Option<ReadHead>,
 ) -> MoveRequest<'b> {
     MoveRequest {
         version: version.get(),
@@ -1076,6 +1106,7 @@ const fn move_request<'b>(
         actor_kind: actor.author_kind(),
         actor: author,
         after_seq,
+        head,
     }
 }
 
@@ -1184,7 +1215,32 @@ impl ProfileOverlayStore for InMemoryOverlayStore {
         Box::pin(async move {
             activate_checked(self, &*self.validator, kind, version, &actor, || async {
                 let author = actor.author();
-                let request = move_request(version, expected_active, &actor, &author, None);
+                let request = move_request(version, expected_active, &actor, &author, None, None);
+                Ok(self.swap_now(kind, &request, &actor))
+            })
+            .await
+        })
+    }
+
+    fn activate_guarded<'a>(
+        &'a self,
+        kind: &'a str,
+        version: OverlayVersion,
+        expected_active: Option<OverlayVersion>,
+        head: Option<u64>,
+        actor: Provenance,
+    ) -> BoxFuture<'a, Result<(), OverlayStoreError>> {
+        Box::pin(async move {
+            activate_checked(self, &*self.validator, kind, version, &actor, || async {
+                let author = actor.author();
+                let request = move_request(
+                    version,
+                    expected_active,
+                    &actor,
+                    &author,
+                    None,
+                    Some(ReadHead { seq: head }),
+                );
                 Ok(self.swap_now(kind, &request, &actor))
             })
             .await
@@ -1205,7 +1261,7 @@ impl ProfileOverlayStore for InMemoryOverlayStore {
                 actor,
                 |to, from, seq| async move {
                     let author = actor.author();
-                    let request = move_request(to, Some(from), actor, &author, Some(seq));
+                    let request = move_request(to, Some(from), actor, &author, Some(seq), None);
                     Ok(self.swap_now(kind, &request, actor))
                 },
             )
@@ -1615,7 +1671,32 @@ impl ProfileOverlayStore for SqliteOverlayStore {
         Box::pin(async move {
             activate_checked(self, &*self.validator, kind, version, &actor, || async {
                 let author = actor.author();
-                let request = move_request(version, expected_active, &actor, &author, None);
+                let request = move_request(version, expected_active, &actor, &author, None, None);
+                self.log.activate(kind, &request).map_err(backend)
+            })
+            .await
+        })
+    }
+
+    fn activate_guarded<'a>(
+        &'a self,
+        kind: &'a str,
+        version: OverlayVersion,
+        expected_active: Option<OverlayVersion>,
+        head: Option<u64>,
+        actor: Provenance,
+    ) -> BoxFuture<'a, Result<(), OverlayStoreError>> {
+        Box::pin(async move {
+            activate_checked(self, &*self.validator, kind, version, &actor, || async {
+                let author = actor.author();
+                let request = move_request(
+                    version,
+                    expected_active,
+                    &actor,
+                    &author,
+                    None,
+                    Some(ReadHead { seq: head }),
+                );
                 self.log.activate(kind, &request).map_err(backend)
             })
             .await
@@ -1636,7 +1717,7 @@ impl ProfileOverlayStore for SqliteOverlayStore {
                 actor,
                 |to, from, seq| async move {
                     let author = actor.author();
-                    let request = move_request(to, Some(from), actor, &author, Some(seq));
+                    let request = move_request(to, Some(from), actor, &author, Some(seq), None);
                     self.log.activate(kind, &request).map_err(backend)
                 },
             )
@@ -1887,7 +1968,32 @@ impl ProfileOverlayStore for PostgresOverlayStore {
         Box::pin(async move {
             activate_checked(self, &*self.validator, kind, version, &actor, || async {
                 let author = actor.author();
-                let request = move_request(version, expected_active, &actor, &author, None);
+                let request = move_request(version, expected_active, &actor, &author, None, None);
+                self.swap(kind, &request).await
+            })
+            .await
+        })
+    }
+
+    fn activate_guarded<'a>(
+        &'a self,
+        kind: &'a str,
+        version: OverlayVersion,
+        expected_active: Option<OverlayVersion>,
+        head: Option<u64>,
+        actor: Provenance,
+    ) -> BoxFuture<'a, Result<(), OverlayStoreError>> {
+        Box::pin(async move {
+            activate_checked(self, &*self.validator, kind, version, &actor, || async {
+                let author = actor.author();
+                let request = move_request(
+                    version,
+                    expected_active,
+                    &actor,
+                    &author,
+                    None,
+                    Some(ReadHead { seq: head }),
+                );
                 self.swap(kind, &request).await
             })
             .await
@@ -1908,7 +2014,7 @@ impl ProfileOverlayStore for PostgresOverlayStore {
                 actor,
                 |to, from, seq| async move {
                     let author = actor.author();
-                    let request = move_request(to, Some(from), actor, &author, Some(seq));
+                    let request = move_request(to, Some(from), actor, &author, Some(seq), None);
                     self.swap(kind, &request).await
                 },
             )
