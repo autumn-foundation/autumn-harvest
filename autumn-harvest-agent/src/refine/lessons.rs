@@ -143,7 +143,8 @@ pub const fn evictions(len: usize, max: usize) -> usize {
 }
 
 /// Whether a refine run that ended with `status` writes a lesson. Only an
-/// adoption does. Each status has its own arm, as in the Verus copy.
+/// adoption does. Each status has its own arm, as in the Verus copy in
+/// `formal/verus/src/refine_lessons.rs`.
 #[must_use]
 #[allow(clippy::match_same_arms)]
 pub const fn writes_lesson(status: RefineStatus) -> bool {
