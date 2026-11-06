@@ -1,0 +1,31 @@
+[package]
+name = "rhai-scripts"
+description = "Durable Rhai scripts on the embedded SQLite runtime, with smop for the shell and file steps"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[[bin]]
+name = "harvest-rhai"
+path = "src/main.rs"
+
+[dependencies]
+# The backend-neutral determinism core only: no Diesel, no Postgres.
+autumn-harvest = { version = "0.10.0", path = "../../autumn-harvest", default-features = false }
+autumn-harvest-sqlite = { version = "0.10.0", path = "../../autumn-harvest-sqlite" }
+chrono = { workspace = true }
+# `no_time` removes `timestamp()`, so a script body cannot read the clock.
+# `serde` converts script values to and from the JSON that history stores.
+rhai = { version = "1.27.0", default-features = false, features = ["std", "no_time", "serde"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# The shell and file helpers that the host activities call, and the CLI.
+smop = { version = "0.3.2", default-features = false, features = ["sh", "fs", "cli"] }
+tokio = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

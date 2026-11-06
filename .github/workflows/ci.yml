@@ -1351,6 +1351,12 @@ jobs:
       - name: "Run history-load-gate example tests (issue #2257)"
         if: needs.changes.outputs.code == 'true' && matrix.shard == 2
         run: cargo test -p history-load-gate --lib --bins
+      # The durable Rhai script example. Every suite runs offline on SQLite,
+      # including the binary test that sends SIGKILL to a run mid-step. Its
+      # `sh` step needs a POSIX shell, so Windows skips it.
+      - name: Run rhai-scripts example tests
+        if: runner.os != 'Windows' && needs.changes.outputs.code == 'true' && matrix.shard == 1
+        run: cargo test -p rhai-scripts
       # Issue #2258. The module tests of the owner disk cache need its
       # feature. The worker tests run from their `linux` manifest row.
       # Issue #2260 adds the entity SQL module tests.
@@ -2811,6 +2817,10 @@ jobs:
       # reason as the autoresearch step.
       - name: "Clippy agent-mesh example (issue #2276)"
         run: cargo clippy -p agent-mesh --all-targets --no-deps -- -D warnings
+      # The durable Rhai script example. `--no-deps` for the same reason as
+      # the daemon above: it uses `autumn-harvest` with no default features.
+      - name: Clippy rhai-scripts example
+        run: cargo clippy -p rhai-scripts --all-targets --no-deps -- -D warnings
 
   doc-snippets:
     name: Doc snippets compile

@@ -23,6 +23,7 @@ members = [
     "examples/claude-agent-daemon",
     "examples/quickstart",
     "examples/recall-eval",
+    "examples/rhai-scripts",
     "examples/saga-choreography",
     "examples/standalone-runner",
     "examples/standalone-quickstart",

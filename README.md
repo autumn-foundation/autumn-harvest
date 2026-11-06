@@ -81,6 +81,9 @@ Need a real reference instead of the tiny hello-world path? See:
   Docker. Each model call and tool call is an activity, a workspace write parks on an
   approval signal with a deadline, and killing the daemon mid-session resumes by replay instead
   of paying for completed turns twice. It runs with no API key (a scripted offline model).
+- [`examples/rhai-scripts/`](examples/rhai-scripts/) for durable scripts. A plain `.rhai` file
+  runs on the embedded SQLite backend, and each `sh`, file step, `sleep` and `wait_for` is saved.
+  A `kill -9` mid-run resumes after the last saved step. smop runs the shell steps.
 - [`examples/autoresearch/`](examples/autoresearch/) for Karpathy's autoresearch loop as durable
   workflows: an agent edits `train.py`, a trainer runs it, and a keep rule decides, all night. It is
   the capstone of the agent primitives and of most of the engine surface. It uses child workflows, a
