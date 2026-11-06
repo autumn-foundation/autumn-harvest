@@ -2,7 +2,7 @@
 
 use crate::schema::{harvest_schedules_ext, harvest_workflow_executions_ext};
 use crate::table_split::SetExt;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -1641,12 +1641,15 @@ pub async fn tick_once_sharded_with_backoff(
             Some(result) => result?,
             None => Vec::new(),
         };
-        // The move checks out a connection to another shard. The barrier
-        // drops first, so a wait on that pool cannot hold off a bump.
+        // The move checks out a connection to another shard, then fences
+        // both shards itself. The barrier drops first. So a wait on that pool
+        // cannot hold off a bump, and the move never opens a guard while it
+        // holds one.
         #[cfg(feature = "db")]
         drop(fence);
         if !single_pool {
-            carry_misplaced_overrides(&mut conn, shard, &misplaced, &pool, &router).await;
+            let source = (shard, shard_pool);
+            carry_misplaced_overrides(&mut conn, source, &misplaced, &pool, &router).await;
         }
     }
 
@@ -1683,17 +1686,30 @@ impl ShardPass<'_> {
 /// applies the override in the same tick. An owner earlier in shard order
 /// applies it on the next tick.
 ///
+/// `source` is this shard and its pool, and `conn` is a connection of that
+/// pool. The DAGs move in one group per owner. Each group runs under the DR
+/// fence of both shards. See [`carry_to_owner`]. A group whose pass stops
+/// ends the backend of `conn`, so the remaining groups wait for the next
+/// tick.
+///
 /// A failure is logged, and the next tick retries the move. Two shards of one
 /// pool share one table, so nothing moves between them.
 async fn carry_misplaced_overrides(
     conn: &mut AsyncPgConnection,
-    shard: ShardId,
+    source: (ShardId, &DbPool),
     misplaced: &[String],
     pool: &ShardedDbPool,
     router: &ShardRouter,
 ) {
+    let (shard, _) = source;
+    let mut by_owner: BTreeMap<ShardId, Vec<&str>> = BTreeMap::new();
     for dag_name in misplaced {
-        let owner = router.pick_for_dag(dag_name);
+        by_owner
+            .entry(router.pick_for_dag(dag_name))
+            .or_default()
+            .push(dag_name);
+    }
+    for (owner, dag_names) in by_owner {
         if pool.same_physical_pool(shard, owner)
             || crate::replication::shard_writes_held(Some(owner))
         {
@@ -1702,30 +1718,102 @@ async fn carry_misplaced_overrides(
         let Some(owner_pool) = pool.exact_pool_for(owner) else {
             continue;
         };
-        let moved = match crate::replication::fenced_checkout(owner_pool).await {
-            Ok(mut to) => {
-                crate::schedule_override::carry_dag_override(conn, &mut to, dag_name).await
-            }
-            Err(error) => Err(error),
-        };
-        match moved {
-            Ok(true) => tracing::info!(
-                dag_name = dag_name.as_str(),
-                from_shard = shard.as_i32(),
-                to_shard = owner.as_i32(),
-                "harvest: moved a DAG schedule override to the shard that now owns the DAG"
-            ),
-            Ok(false) => {}
-            Err(error) => tracing::warn!(
-                error = %error,
-                dag_name = dag_name.as_str(),
-                from_shard = shard.as_i32(),
-                to_shard = owner.as_i32(),
-                "harvest: could not move a DAG schedule override to its new shard; \
-                 the next tick retries"
-            ),
+        if !carry_to_owner(conn, source, (owner, owner_pool), &dag_names).await {
+            break;
         }
     }
+}
+
+/// Move the overrides of `dag_names` from `source` to `owner`, under the DR
+/// fence of both shards.
+///
+/// Both connections come first: `conn` is already held, and the function
+/// then checks out the owner connection. Then one operation opens the guards of
+/// both shards. So a wait on a pool never holds off a bump. A fenced or held
+/// shard skips the group, and the next tick tries again.
+///
+/// Both connections join the pass. A lost guard then ends their backends, so
+/// a statement in flight cannot commit after a bump. Each carry transaction
+/// also asserts the fence of its own shard.
+///
+/// Returns `false` when the pass stopped. `conn` then has no live backend,
+/// so the caller must not use it again.
+async fn carry_to_owner(
+    conn: &mut AsyncPgConnection,
+    source: (ShardId, &DbPool),
+    owner: (ShardId, &DbPool),
+    dag_names: &[&str],
+) -> bool {
+    let ((from_shard, from_pool), (to_shard, to_pool)) = (source, owner);
+    let mut to = match crate::replication::fenced_checkout(to_pool).await {
+        Ok(to) => to,
+        Err(error) => {
+            warn_carry_skipped(from_shard, to_shard, &error);
+            return true;
+        }
+    };
+    let fence = match crate::replication::begin_fenced_groups(&[
+        (from_pool, from_shard),
+        (to_pool, to_shard),
+    ])
+    .await
+    {
+        Ok(guards) => guards,
+        Err(error) => {
+            warn_carry_skipped(from_shard, to_shard, &error);
+            return true;
+        }
+    };
+    let pass = async {
+        let _from = crate::replication::join_fenced_pass(from_pool, conn).await;
+        let _to = crate::replication::join_fenced_pass(to_pool, &mut to).await;
+        for dag_name in dag_names {
+            let moved = crate::schedule_override::carry_dag_override(
+                conn, &mut to, from_shard, to_shard, dag_name,
+            )
+            .await;
+            log_carry(dag_name, from_shard, to_shard, moved);
+        }
+    };
+    match crate::replication::run_fenced_pass(&fence, Box::pin(pass)).await {
+        Ok(()) => true,
+        Err(error) => {
+            warn_carry_skipped(from_shard, to_shard, &error);
+            false
+        }
+    }
+}
+
+/// Log the result of the move of one DAG override.
+fn log_carry(dag_name: &str, from_shard: ShardId, to_shard: ShardId, moved: HarvestResult<bool>) {
+    match moved {
+        Ok(true) => tracing::info!(
+            dag_name,
+            from_shard = from_shard.as_i32(),
+            to_shard = to_shard.as_i32(),
+            "harvest: moved a DAG schedule override to the shard that now owns the DAG"
+        ),
+        Ok(false) => {}
+        Err(error) => tracing::warn!(
+            error = %error,
+            dag_name,
+            from_shard = from_shard.as_i32(),
+            to_shard = to_shard.as_i32(),
+            "harvest: could not move a DAG schedule override to its new shard; \
+             the next tick retries"
+        ),
+    }
+}
+
+/// Log a group of override moves that did not run or did not finish.
+fn warn_carry_skipped(from_shard: ShardId, to_shard: ShardId, error: &HarvestError) {
+    tracing::warn!(
+        error = %error,
+        from_shard = from_shard.as_i32(),
+        to_shard = to_shard.as_i32(),
+        "harvest: DAG schedule overrides did not move to their new shard; \
+         the next tick retries"
+    );
 }
 
 /// Register the schedules of one shard for one pass.
