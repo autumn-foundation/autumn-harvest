@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use autumn_harvest::event::WorkflowEvent;
+use autumn_harvest_agent::context_reset::{ContextReset, SAVE_PROGRESS_TOOL};
 use autumn_harvest_agent::model::BoxFuture;
 use autumn_harvest_agent::sampling::{
     InMemorySamplingPolicyStore, OpSample, SampleInput, SampleStrategy, SamplingPolicy,
@@ -573,4 +574,37 @@ async fn a_transcript_too_large_for_a_draw_is_refused_before_any_draw() {
     let error = state.last_error.unwrap();
     assert!(error.contains("too large"), "{error}");
     assert_eq!(state.failures, 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_draw_of_a_strategy_op_gets_no_context_reset() {
+    let (_dir, db) = fresh_db();
+    let model = by_draw(&["a", "b", "c"], "plain");
+    let policy = SamplingPolicy {
+        draw_effects: BTreeSet::from([
+            autumn_harvest_agent::ToolEffect::ReadOnly,
+            autumn_harvest_agent::ToolEffect::Internal,
+        ]),
+        ..best_of(3)
+    };
+    let profile = AgentProfile::new(KIND).context_reset(ContextReset::new(1, 90));
+    let mut rt = runtime(&db, harness(model.clone(), profile, &policy));
+    let agent = desk("thirteen");
+
+    let op = AgentOp::message("Pick a letter.").with_sample(best_of_three());
+    send(&mut rt, &agent, &op).await;
+
+    assert_eq!(draw_calls(&model), 3);
+    for request in model.requests().iter().filter(|r| r.draw.is_some()) {
+        assert!(
+            request
+                .tools
+                .iter()
+                .all(|tool| tool.name != SAVE_PROGRESS_TOOL),
+            "a draw keeps no progress notes"
+        );
+    }
+    let state = state(&rt, &agent).await;
+    assert_eq!(state.last_answer.as_deref(), Some("b"));
+    assert!(state.notes.is_none(), "{:?}", state.notes);
 }

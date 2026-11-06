@@ -2355,6 +2355,9 @@ impl AgentRun<'_> {
             task.read_only |= mandate.read_only;
             task.waiting = peer.waiting.to_vec();
         }
+        // A draw keeps no progress notes. Its notes would not reach the state,
+        // so the next op would restore stale ones.
+        task.context_reset = None;
         task.history.clone_from(&state.transcript);
         task.flow_labels = state
             .flow_labels
@@ -2424,6 +2427,7 @@ impl AgentRun<'_> {
         let run_id = format!("{}:s{}", state.incarnation, state.segments);
         state.segments = state.segments.saturating_add(1);
         let messages = crate::types::without_system(&selected.messages);
+        let messages = crate::context_reset::without_restored(messages);
         state.transcript = trim_window(messages, profile.window);
         let (stop, answer) = (selected.stop, selected.text);
         state.last_stop = Some(stop);
