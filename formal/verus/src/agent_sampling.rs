@@ -28,6 +28,13 @@
 //! each draw of a wave gets at least one token, and the shares sum to the
 //! tokens left.
 //!
+//! `cascade_step` gives the next tier of a cascade run. It skips each tier
+//! that the mandate forbids, and it never returns a tier before `next`.
+//! `spec_ran` is a spec model of the run. In it, each tier runs at most
+//! once and in order. Each tier that runs is one that the mandate allows.
+//! `cascade_order` is the loop of the engine over `cascade_step`. The
+//! proof shows that it asks exactly the tiers of `spec_ran`.
+//!
 //! `beam_draws` and `beam_slots` bound a beam run of `agent_sample`. The
 //! draws are the product `width × expansion × max_rounds`, saturated. A
 //! round keeps at most `width` less the complete beams. So a round has at
@@ -219,6 +226,189 @@ pub proof fn theorem_each_draw_of_a_wave_gets_a_token(left: int, width: int, ind
             width <= left,
     ;
     crate::agent_siblings::theorem_the_shares_sum_to_the_remainder(left, width);
+}
+
+/// The next step of a cascade run.
+pub enum CascadeStep {
+    Run { tier: usize },
+    Done,
+    BudgetExceeded,
+}
+
+/// The first tier at or after `next` that the mandate allows, or the tier
+/// count when no such tier is left.
+pub open spec fn spec_first_allowed(allowed: Seq<bool>, next: int) -> int
+    decreases allowed.len() - next,
+{
+    if next >= allowed.len() {
+        allowed.len() as int
+    } else if allowed[next] {
+        next
+    } else {
+        spec_first_allowed(allowed, next + 1)
+    }
+}
+
+// mirror: autumn-harvest-agent/src/sampling/admit.rs cascade_step
+pub fn cascade_step(allowed: &[bool], next: usize, budgeted: bool, tokens_left: u32) -> (r: CascadeStep)
+    ensures
+        r is Done <==> spec_first_allowed(allowed@, next as int) >= allowed@.len(),
+        r is BudgetExceeded <==> (spec_first_allowed(allowed@, next as int) < allowed@.len()
+            && budgeted && tokens_left == 0),
+        r is Run ==> r->Run_tier == spec_first_allowed(allowed@, next as int),
+        r is Run ==> next <= r->Run_tier < allowed@.len(),
+        r is Run ==> allowed@[r->Run_tier as int],
+        r is Run ==> forall|i: int| next <= i < r->Run_tier ==> !allowed@[i],
+        r is Run ==> !(budgeted && tokens_left == 0),
+        r is Done ==> forall|i: int| next <= i < allowed@.len() ==> !allowed@[i],
+{
+    let mut tier = next;
+    while tier < allowed.len() && !allowed[tier]
+        invariant
+            next <= tier,
+            spec_first_allowed(allowed@, next as int) == spec_first_allowed(allowed@, tier as int),
+            forall|i: int| next <= i < tier ==> !allowed@[i],
+        decreases allowed.len() - tier,
+    {
+        tier += 1;
+    }
+    if tier >= allowed.len() {
+        return CascadeStep::Done;
+    }
+    if budgeted && tokens_left == 0 {
+        return CascadeStep::BudgetExceeded;
+    }
+    CascadeStep::Run { tier }
+}
+
+/// The tiers that a cascade runs from `next` when no tier accepts and the
+/// budget holds: each tier that the mandate allows, in order.
+pub open spec fn spec_ran(allowed: Seq<bool>, next: int) -> Seq<int>
+    decreases allowed.len() - next,
+{
+    if next < 0 || next >= allowed.len() {
+        Seq::empty()
+    } else if allowed[next] {
+        seq![next] + spec_ran(allowed, next + 1)
+    } else {
+        spec_ran(allowed, next + 1)
+    }
+}
+
+/// Each tier of `spec_ran` is at or after `next`, is a real tier, and is a
+/// tier that the mandate allows.
+pub proof fn lemma_each_ran_tier_is_allowed(allowed: Seq<bool>, next: int)
+    requires
+        0 <= next,
+    ensures
+        forall|k: int|
+            0 <= k < spec_ran(allowed, next).len() ==> next <= #[trigger] spec_ran(allowed, next)[k]
+                < allowed.len() && allowed[spec_ran(allowed, next)[k]],
+    decreases allowed.len() - next,
+{
+    if next < allowed.len() {
+        lemma_each_ran_tier_is_allowed(allowed, next + 1);
+        if allowed[next] {
+            let rest = spec_ran(allowed, next + 1);
+            assert forall|k: int| 0 < k < 1 + rest.len() implies (seq![next] + rest)[k] == rest[k
+                - 1] by {}
+        }
+    }
+}
+
+/// A cascade runs each tier at most once, and in tier order.
+pub proof fn theorem_a_cascade_runs_each_tier_at_most_once(allowed: Seq<bool>, next: int)
+    requires
+        0 <= next,
+    ensures
+        forall|i: int, j: int|
+            0 <= i < j < spec_ran(allowed, next).len() ==> #[trigger] spec_ran(allowed, next)[i]
+                < #[trigger] spec_ran(allowed, next)[j],
+    decreases allowed.len() - next,
+{
+    if next < allowed.len() {
+        theorem_a_cascade_runs_each_tier_at_most_once(allowed, next + 1);
+        lemma_each_ran_tier_is_allowed(allowed, next + 1);
+        if allowed[next] {
+            let rest = spec_ran(allowed, next + 1);
+            assert forall|k: int| 0 < k < 1 + rest.len() implies (seq![next] + rest)[k] == rest[k
+                - 1] by {}
+        }
+    }
+}
+
+/// The tier of a `Run` step heads the rest of the run. So a loop that
+/// calls `cascade_step` and then moves `next` past the tier runs exactly
+/// `spec_ran(allowed, 0)`.
+pub proof fn theorem_the_step_tier_heads_the_run(allowed: Seq<bool>, next: int)
+    requires
+        0 <= next,
+    ensures
+        spec_first_allowed(allowed, next) >= allowed.len() ==> spec_ran(allowed, next).len() == 0,
+        spec_first_allowed(allowed, next) < allowed.len() ==> spec_ran(allowed, next) == seq![
+            spec_first_allowed(allowed, next),
+        ] + spec_ran(allowed, spec_first_allowed(allowed, next) + 1),
+    decreases allowed.len() - next,
+{
+    if next < allowed.len() && !allowed[next] {
+        theorem_the_step_tier_heads_the_run(allowed, next + 1);
+    }
+}
+
+/// The loop of `run_tiers` with no budget and no tier that accepts. It
+/// calls `cascade_step`, asks the tier, and moves `next` past it. The
+/// proof shows that it asks exactly the tiers of `spec_ran`, in order.
+pub fn cascade_order(allowed: &[bool]) -> (r: Vec<usize>)
+    ensures
+        r@.map_values(|t: usize| t as int) == spec_ran(allowed@, 0),
+{
+    let len = allowed.len();
+    let mut ran: Vec<usize> = Vec::new();
+    let mut next: usize = 0;
+    loop
+        invariant
+            len == allowed@.len(),
+            next <= len,
+            ran@.map_values(|t: usize| t as int) + spec_ran(allowed@, next as int) == spec_ran(
+                allowed@,
+                0,
+            ),
+        ensures
+            ran@.map_values(|t: usize| t as int) == spec_ran(allowed@, 0),
+        decreases len - next,
+    {
+        proof {
+            theorem_the_step_tier_heads_the_run(allowed@, next as int);
+        }
+        let step = cascade_step(allowed, next, false, 0);
+        match step {
+            CascadeStep::Run { tier } => {
+                proof {
+                    assert(tier < len);
+                    assert(tier as int == spec_first_allowed(allowed@, next as int));
+                    let before = ran@.map_values(|t: usize| t as int);
+                    let rest = spec_ran(allowed@, tier as int + 1);
+                    assert(ran@.push(tier).map_values(|t: usize| t as int) =~= before.push(
+                        tier as int,
+                    ));
+                    assert(before.push(tier as int) + rest =~= before + (seq![tier as int]
+                        + rest));
+                }
+                ran.push(tier);
+                next = tier + 1;
+            },
+            _ => {
+                proof {
+                    assert(spec_first_allowed(allowed@, next as int) >= allowed@.len());
+                    assert(spec_ran(allowed@, next as int).len() == 0);
+                    let before = ran@.map_values(|t: usize| t as int);
+                    assert(before + spec_ran(allowed@, next as int) =~= before);
+                }
+                break ;
+            },
+        }
+    }
+    ran
 }
 
 /// `next_policy_revision` as a spec.

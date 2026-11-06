@@ -245,7 +245,8 @@ pub struct SweepRow {
     /// score, else the first reject. `None` when no draw runs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verdict: Option<Verdict>,
-    /// Whether the item selected a draw.
+    /// Whether the item selected a draw that passed. A cascade that
+    /// escalates keeps an answer, but it is not accepted.
     pub accepted: bool,
     /// The answer of the selected draw, cut to [`MAX_SWEEP_ANSWER_BYTES`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -474,11 +475,11 @@ fn plan(policy: &SamplingPolicy, input: &SweepInput, total: u32) -> Result<Plan,
         .map_or_else(|| cap.min(total), NonZeroU32::get);
     // The most draws that one item can run at the same time. A beam
     // round runs `width * expansion` steps.
-    let wide = match input.strategy {
-        SampleStrategy::BestOfN { n } => n,
+    let wide = match &input.strategy {
+        SampleStrategy::BestOfN { n } => *n,
         SampleStrategy::Beam {
             width, expansion, ..
-        } => width.saturating_mul(expansion),
+        } => width.saturating_mul(*expansion),
         _ => 1,
     };
     let SweepPlan::Run { items, draws } = sweep_plan(policy.max_concurrent_draws, asked, wide)
@@ -497,7 +498,7 @@ fn item_input(input: &SweepInput, item: &SweepItem, draws: u32) -> SampleInput {
     let mut sample = SampleInput::new(
         input.kind.clone(),
         item.input.clone(),
-        input.strategy,
+        input.strategy.clone(),
         input.scorer.clone(),
     )
     .concurrency(draws);
@@ -691,7 +692,7 @@ fn row_verdict(report: &SampleReport) -> Option<Verdict> {
         .map(|draw| (draw.draw, draw.verdict.clone()))
         .collect();
     let chosen = match report.outcome {
-        SampleOutcome::Selected { draw } => Some(draw),
+        SampleOutcome::Selected { draw } | SampleOutcome::Escalated { draw } => Some(draw),
         SampleOutcome::NoAcceptedDraw => select(&all),
     };
     let verdict = chosen
@@ -992,6 +993,30 @@ mod tests {
         assert_eq!(
             row_verdict(&report(value)).map(|v| v.is_reject()),
             Some(false)
+        );
+    }
+
+    #[test]
+    fn an_escalated_cascade_keeps_its_answer_but_is_not_accepted() {
+        let mut value = sample(
+            "completed",
+            &serde_json::json!({"escalated": {"draw": 1}}),
+            &serde_json::json!([
+                draw(0, &serde_json::json!({"score": 0.2})),
+                draw(1, &serde_json::json!({"score": 0.4})),
+            ]),
+        );
+        value["selected"] = serde_json::json!({
+            "stop": "completed", "text": "maybe", "steps_used": 1, "tool_calls": 0,
+            "usage": {"input_tokens": 1, "output_tokens": 0}, "messages": [],
+        });
+        let (row, halted) = row_of(0, Ok(value));
+        assert!(!halted);
+        assert!(!row.accepted, "no tier passed its threshold");
+        assert_eq!(row.answer.as_deref(), Some("maybe"));
+        assert_eq!(
+            row.verdict.and_then(|verdict| verdict.as_score()),
+            FiniteF64::new(0.4).ok()
         );
     }
 

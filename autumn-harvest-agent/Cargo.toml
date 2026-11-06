@@ -235,6 +235,14 @@ name = "sample_crash"
 required-features = ["sqlite"]
 
 [[test]]
+name = "sample_cascade"
+required-features = ["sqlite"]
+
+[[test]]
+name = "sample_cascade_crash"
+required-features = ["sqlite"]
+
+[[test]]
 name = "sample_beam"
 required-features = ["sqlite"]
 

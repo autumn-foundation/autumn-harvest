@@ -3816,6 +3816,8 @@ fn agents_sampling_policy_maps_to_get_put_and_delete() {
         "small,large",
         "--max-answer-retries",
         "3",
+        "--cascade-models",
+        "cheap,strong",
     ]);
     assert_eq!(set.method, ApiMethod::Put);
     assert_eq!(set.path, "/admin/agents/researcher/sampling-policy");
@@ -3829,6 +3831,7 @@ fn agents_sampling_policy_maps_to_get_put_and_delete() {
             "scorers": {"only": ["exact_match", "judge"]},
             "judge_models": ["small", "large"],
             "max_answer_retries": 3,
+            "cascade_models": ["cheap", "strong"],
         }}))
     );
 }

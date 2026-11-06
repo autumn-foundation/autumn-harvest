@@ -7298,7 +7298,7 @@
       "path": "/admin/agents/{kind}/sampling-policy",
       "category": "admin",
       "read_only": true,
-      "description": "Read the sampling policy of one agent kind (issue #2439). policy is the full SamplingPolicy, with each default filled in: strategies, max_draws, max_concurrent_draws, draw_effects, scorers, judge_models and max_answer_retries. revision is 0 when no operator ever set or reset the policy. audit holds the newest 20 changes, the newest first. Each audit row has revision, action (set or reset), actor, old, new and at.",
+      "description": "Read the sampling policy of one agent kind (issue #2439). policy is the full SamplingPolicy, with each default filled in: strategies, max_draws, max_concurrent_draws, draw_effects, scorers, judge_models and max_answer_retries. cascade_models is left out when it is empty. revision is 0 when no operator ever set or reset the policy. audit holds the newest 20 changes, the newest first. Each audit row has revision, action (set or reset), actor, old, new and at.",
       "params": [
         {
           "name": "kind",
@@ -7357,7 +7357,7 @@
             "name": "policy",
             "type": "object",
             "required": true,
-            "description": "The SamplingPolicy. Keys: strategies (best_of_n, rejection, vote, cascade, beam), max_draws (1 to 256), max_concurrent_draws (1 to 16), draw_effects (read_only, internal, write, external), scorers (\"deterministic\" or {\"only\": [ids]}), judge_models and max_answer_retries (0 to 16)."
+            "description": "The SamplingPolicy. Keys: strategies (best_of_n, rejection, vote, cascade, beam), max_draws (1 to 256), max_concurrent_draws (1 to 16), draw_effects (read_only, internal, write, external), scorers (\"deterministic\" or {\"only\": [ids]}), judge_models, max_answer_retries (0 to 16) and cascade_models (the harness models that a cascade tier may name)."
           }
         ]
       },
