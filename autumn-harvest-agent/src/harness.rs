@@ -506,6 +506,11 @@ impl AgentHarness {
             .ok_or_else(crate::consolidate_all::directory_missing)
     }
 
+    /// The time budget of one store or hook call.
+    pub(crate) const fn hook_limit(&self) -> Duration {
+        self.hook_timeout
+    }
+
     /// The memory store, or a non-retryable error that names the fix.
     pub(crate) fn memory_store(&self) -> Result<&Arc<dyn MemoryStore>, String> {
         self.memory.as_ref().ok_or_else(|| {

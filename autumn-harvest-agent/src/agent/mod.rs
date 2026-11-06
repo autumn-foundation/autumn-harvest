@@ -99,6 +99,9 @@ pub const PROFILE_VERSION_ATTR: &str = "agent_profile_version";
 /// #2454). A run recorded before it replays with no reset activity.
 const EPISODE_RESET_PATCH: &str = "agent_episode_reset";
 
+/// The patch gate of the lesson erase in `Control::ResetMemory`.
+const LESSON_ERASE_PATCH: &str = "agent_lesson_erase";
+
 /// The signal that interrupts the op that an agent runs (issue #2265).
 ///
 /// Its payload is an [`Interrupt`]. An interrupt that arrives while no op
@@ -267,7 +270,8 @@ pub enum Control {
     },
     /// Run the held ops in order, then take new ones.
     Resume,
-    /// Clear the memory of the agent.
+    /// Clear the memory of the agent. Also remove each lesson of the kind
+    /// that names the agent, so a lesson that other agents share goes too.
     ResetMemory,
     /// Clear the transcript, its progress notes and its flow labels. The
     /// labels of the memory notes and of the workspace files stay.
@@ -1174,6 +1178,11 @@ pub struct AgentState {
     /// erase` reads them from the final state.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub episode_reset: Option<EpisodeReset>,
+    /// The lessons of the kind that the last memory reset removed. A lesson
+    /// goes when a run of the agent is one of its sources. `harvest agents
+    /// erase` reads the count from the final state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lessons_removed: Option<u64>,
     /// The episode appends since the last pass that the agent ran (issue
     /// #2454). `ConsolidationTrigger::Every` reads it.
     #[serde(skip_serializing_if = "is_zero_u32")]
@@ -1581,6 +1590,15 @@ impl AgentRun<'_> {
                         }
                     }
                 }
+                if self.ctx.patched(LESSON_ERASE_PATCH) {
+                    match self.erase_lessons().await {
+                        Ok(removed) => state.lessons_removed = removed,
+                        Err(err) => {
+                            state.lessons_removed = None;
+                            fail(&mut state, &err);
+                        }
+                    }
+                }
                 if let Err(err) = self.reset_memory().await {
                     fail(&mut state, &err);
                 }
@@ -1655,6 +1673,36 @@ impl AgentRun<'_> {
             .execute_activity(&agent_memory_reset_info(), scope)
             .await
             .map_err(|err| err.to_string())
+    }
+
+    /// Remove each lesson of the kind that names the agent, and count them.
+    /// Returns `None` when the harness has no memory store, or when the
+    /// agent id does not parse.
+    ///
+    /// The match step records the lessons first, so a retried removal
+    /// keeps the count.
+    async fn erase_lessons(&self) -> Result<Option<u64>, String> {
+        let Ok(id) = &self.id else {
+            return Ok(None);
+        };
+        let agent = id.as_str().to_owned();
+        let matched: Option<crate::refine::LessonMatch> = self
+            .ctx
+            .execute_activity(&crate::refine::agent_lesson_match_info(), agent.clone())
+            .await
+            .map_err(|err| format!("{err}"))?;
+        let Some(matched) = matched else {
+            return Ok(None);
+        };
+        let erase = crate::refine::LessonErase {
+            agent,
+            key: EditKey::new(format!("lessons:{}", self.ctx.new_uuid())),
+            matched,
+        };
+        self.ctx
+            .execute_activity(&crate::refine::agent_lesson_erase_info(), erase)
+            .await
+            .map_err(|err| format!("{err}"))
     }
 
     /// Clear the episode scope of the agent, and count what it held (issue

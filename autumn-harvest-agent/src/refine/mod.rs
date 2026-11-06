@@ -13,6 +13,8 @@
 //! `docs/design/DESIGN-2394.md`.
 //! [`gate`] waits for a person before a chosen overlay goes live. Its
 //! design is in `docs/design/DESIGN-2381.md`.
+//! [`lessons`] keeps a lesson for each adoption. Its design is in
+//! `docs/design/DESIGN-2382.md`.
 
 pub mod adopt;
 pub mod bundle;
@@ -20,6 +22,7 @@ pub mod bundle;
 pub mod compose;
 pub mod gate;
 pub mod ledger;
+pub mod lessons;
 pub mod meter;
 pub mod model_proposer;
 pub mod policy;
@@ -34,7 +37,7 @@ pub use adopt::{Adoption, RefineStatus, WaitReason, adopt, adopt_over};
 pub use bundle::{BundleFile, BundleManifest};
 #[cfg(feature = "eval")]
 pub use compose::{
-    ComposeCandidate, ComposeContext, ComposeRequest, Composition, OverlayComposer,
+    Choice, ComposeCandidate, ComposeContext, ComposeRequest, Composition, OverlayComposer,
     OverlaySelector, ProbedCandidate, SelectContext, SelectRequest, SelectedBy, Selection,
     agent_refine_compose, agent_refine_compose_info, agent_refine_select, agent_refine_select_info,
 };
@@ -45,6 +48,13 @@ pub use gate::{
     agent_refine_decide_info, gate_step, refine_approval_signal,
 };
 pub use ledger::{MAX_REFINE_K, MAX_SOURCE_RUNS, RefineError, RefineLedger, RefineMode};
+pub use lessons::{
+    LESSONS_BLOCK, Lesson, LessonErase, LessonMatch, LessonOutcome, LessonRequest,
+    MAX_LESSON_CHARS, MAX_SNAPSHOT_CHARS, MAX_WHY_CHARS, agent_lesson_erase,
+    agent_lesson_erase_info, agent_lesson_match, agent_lesson_match_info, agent_refine_lesson,
+    agent_refine_lesson_info, evictions, lesson_scope, lessons_block, names_agent, read_lessons,
+    writes_lesson,
+};
 pub use meter::{Charge, Meter};
 pub use model_proposer::{
     DEFAULT_PROPOSER_OUTPUT_TOKENS, KEEP_BASE, ModelProposer, OUTPUT_CONTRACT,

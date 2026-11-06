@@ -400,6 +400,27 @@ fn register_episodes(rt: &mut SqliteRuntime, harness: &Arc<AgentHarness>) {
         })
     });
     let h = Arc::clone(harness);
+    rt.register_activity_with_body(&crate::refine::agent_refine_lesson_info(), move |input| {
+        call(input, |request| {
+            let h = Arc::clone(&h);
+            async move { crate::refine::lessons::run_write(&h, request).await }
+        })
+    });
+    let h = Arc::clone(harness);
+    rt.register_activity_with_body(&crate::refine::agent_lesson_match_info(), move |input| {
+        call(input, |agent| {
+            let h = Arc::clone(&h);
+            async move { crate::refine::lessons::run_match(&h, agent).await }
+        })
+    });
+    let h = Arc::clone(harness);
+    rt.register_activity_with_body(&crate::refine::agent_lesson_erase_info(), move |input| {
+        call(input, |request| {
+            let h = Arc::clone(&h);
+            async move { crate::refine::lessons::run_erase(&h, request).await }
+        })
+    });
+    let h = Arc::clone(harness);
     rt.register_activity_with_body(&agent_consolidate_read_info(), move |input| {
         call(input, |agent: AgentId| {
             let h = Arc::clone(&h);

@@ -26,6 +26,7 @@ use crate::agent::overlay::{self, Ceilings, ProfileOverlay};
 use crate::bounds::json_len;
 use crate::error::{AgentError, ErrorKind};
 use crate::harness::{AgentHarness, DEFAULT_MODEL, truncate};
+use crate::memory::MemorySnapshot;
 use crate::message::TokenUsage;
 use crate::model::BoxFuture;
 use autumn_harvest::llm_ledger::LlmCall;
@@ -188,6 +189,10 @@ pub struct ProposeContext<'a> {
     /// Where [`charge`](Self::charge) records a model call. An app cannot
     /// read it, so a proposer cannot take back its own charges.
     pub(crate) meter: Option<&'a Meter>,
+    /// The lesson library of the kind, as the refine run read it at its
+    /// start. Its labels are the flow labels of the lessons. A run that the
+    /// proposer starts from this text must take them.
+    pub lessons: Option<&'a MemorySnapshot>,
 }
 
 impl<'a> ProposeContext<'a> {
@@ -219,6 +224,7 @@ impl<'a> ProposeContext<'a> {
             rejection: None,
             sample: 1,
             meter: None,
+            lessons: None,
         }
     }
 }
@@ -285,6 +291,10 @@ pub struct ProposeRequest {
     /// the kind (issue #2380). A valid reply applies to each of them too.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub others: Vec<AgentProfile>,
+    /// The lesson library of the kind, as the refine run read it. A request
+    /// recorded before the library decodes with none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lessons: Option<MemorySnapshot>,
 }
 
 /// The sample of a request that names none.
@@ -447,6 +457,7 @@ struct ProposeAsk<'a> {
     ceilings: &'a Ceilings,
     current: &'a ProfileOverlay,
     sample: u32,
+    lessons: Option<&'a MemorySnapshot>,
 }
 
 impl Ask for ProposeAsk<'_> {
@@ -462,6 +473,7 @@ impl Ask for ProposeAsk<'_> {
                 rejection,
                 sample: self.sample,
                 meter: Some(meter),
+                lessons: self.lessons,
                 ..ProposeContext::new(
                     self.dimension,
                     self.evidence,
@@ -518,6 +530,7 @@ pub(crate) async fn run_stage_metered(
         attempts,
         sample,
         others,
+        lessons,
     } = request;
     let ask = ProposeAsk {
         proposer: proposer.as_ref(),
@@ -527,6 +540,7 @@ pub(crate) async fn run_stage_metered(
         ceilings: &ceilings,
         current: &current,
         sample,
+        lessons: lessons.as_ref(),
     };
     let edit = Edit {
         profile: &profile,
@@ -880,6 +894,7 @@ mod tests {
             attempts: ProposalAttempts::new(attempts).unwrap(),
             sample: 1,
             others: Vec::new(),
+            lessons: None,
         }
     }
 

@@ -179,6 +179,40 @@ impl MemoryStore for FileMemoryStore {
         Box::pin(std::future::ready(self.apply_now(scope, &op, key, labels)))
     }
 
+    /// Add `block` to the file of the scope once. A new scope holds only
+    /// `block`.
+    fn ensure_block<'a>(
+        &'a self,
+        scope: &'a MemoryScope,
+        block: MemoryBlock,
+    ) -> BoxFuture<'a, Result<(), AgentError>> {
+        let added = (|| {
+            let _guard = self.lock.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut file = match read_regular(&self.path(scope)) {
+                Ok(None) => ScopeFile {
+                    blocks: Vec::new(),
+                    applied: BTreeMap::new(),
+                },
+                Ok(Some(_)) => self.read(scope)?,
+                Err(e) => {
+                    return Err(AgentError::new(
+                        ErrorKind::Unavailable,
+                        format!("memory read: {e}"),
+                    ));
+                }
+            };
+            if file.blocks.iter().any(|held| held.label == block.label) {
+                return Ok(());
+            }
+            file.blocks.push(block);
+            let bytes = serde_json::to_vec_pretty(&file)
+                .map_err(|e| AgentError::new(ErrorKind::Decode, format!("memory file: {e}")))?;
+            write_atomic(&self.path(scope), &bytes)
+                .map_err(|e| AgentError::new(ErrorKind::Unavailable, e))
+        })();
+        Box::pin(std::future::ready(added))
+    }
+
     /// Delete the file of the scope: its entries and its applied keys.
     fn clear<'a>(&'a self, scope: &'a MemoryScope) -> BoxFuture<'a, Result<(), AgentError>> {
         let cleared = {

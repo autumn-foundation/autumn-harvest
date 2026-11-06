@@ -481,6 +481,29 @@ pub trait MemoryStore: Send + Sync + std::fmt::Debug {
         ))))
     }
 
+    /// Add `block` to `scope` when the scope holds no block with its label.
+    /// A new scope then holds only `block`, with no default block.
+    ///
+    /// The call is idempotent. It matches a block by its label only, so a
+    /// held block keeps its description, limit and entries. The lesson
+    /// library of a kind calls it before each write. The default returns a
+    /// `Config` error.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the store cannot add the block.
+    fn ensure_block<'a>(
+        &'a self,
+        scope: &'a MemoryScope,
+        block: MemoryBlock,
+    ) -> BoxFuture<'a, Result<(), AgentError>> {
+        let _ = (scope, block);
+        Box::pin(std::future::ready(Err(AgentError::new(
+            ErrorKind::Config,
+            "this memory store cannot add a block: implement MemoryStore::ensure_block",
+        ))))
+    }
+
     /// Apply one edit from a run with the flow labels `labels`, and keep
     /// them with the entry (issue #2272). Call [`apply_labelled_op`] so the
     /// rules are the same in every store.
@@ -597,6 +620,20 @@ impl MemoryStore for InMemoryMemoryStore {
         labels: &'a BTreeSet<String>,
     ) -> BoxFuture<'a, Result<MemoryBlock, AgentError>> {
         Box::pin(std::future::ready(self.apply_now(scope, &op, key, labels)))
+    }
+
+    fn ensure_block<'a>(
+        &'a self,
+        scope: &'a MemoryScope,
+        block: MemoryBlock,
+    ) -> BoxFuture<'a, Result<(), AgentError>> {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let blocks = state.scopes.entry(scope.clone()).or_default();
+        if !blocks.iter().any(|held| held.label == block.label) {
+            blocks.push(block);
+        }
+        drop(state);
+        Box::pin(std::future::ready(Ok(())))
     }
 
     fn clear<'a>(&'a self, scope: &'a MemoryScope) -> BoxFuture<'a, Result<(), AgentError>> {
@@ -843,6 +880,73 @@ mod tests {
                 .contains("no entry")
         );
         assert!(apply_op(&mut b, &add("  ")).is_err());
+    }
+
+    #[tokio::test]
+    async fn ensure_block_adds_a_block_once_and_keeps_its_entries() {
+        let store = InMemoryMemoryStore::new();
+        let scope = MemoryScope::new("kind:support:lessons");
+        let block = MemoryBlock::new("lessons", "d", 100);
+        store.ensure_block(&scope, block.clone()).await.unwrap();
+        let add = MemoryOp::Add {
+            block: "lessons".to_owned(),
+            text: "one".to_owned(),
+        };
+        store.apply(&scope, add, &EditKey::new("k")).await.unwrap();
+        store.ensure_block(&scope, block).await.unwrap();
+        let blocks = store.load(&scope).await.unwrap();
+        let labels: Vec<&str> = blocks.iter().map(|b| b.label.as_str()).collect();
+        assert_eq!(labels, ["lessons"], "a new scope holds only the block");
+        assert_eq!(blocks[0].entries, ["one"]);
+        // A scope with its default blocks keeps them.
+        let agent = MemoryScope::new("agent:support/ada");
+        let note = MemoryOp::Add {
+            block: "memory".to_owned(),
+            text: "a note".to_owned(),
+        };
+        store.apply(&agent, note, &EditKey::new("n")).await.unwrap();
+        store
+            .ensure_block(&agent, MemoryBlock::new("lessons", "d", 1))
+            .await
+            .unwrap();
+        let labels: Vec<String> = store
+            .load(&agent)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|b| b.label)
+            .collect();
+        assert_eq!(labels, ["memory", "user", "lessons"]);
+    }
+
+    #[tokio::test]
+    async fn the_default_ensure_block_refuses() {
+        #[derive(Debug)]
+        struct Bare;
+        impl MemoryStore for Bare {
+            fn load<'a>(
+                &'a self,
+                _scope: &'a MemoryScope,
+            ) -> BoxFuture<'a, Result<Vec<MemoryBlock>, AgentError>> {
+                Box::pin(std::future::ready(Ok(Vec::new())))
+            }
+            fn apply<'a>(
+                &'a self,
+                _scope: &'a MemoryScope,
+                _op: MemoryOp,
+                _key: &'a EditKey,
+            ) -> BoxFuture<'a, Result<MemoryBlock, AgentError>> {
+                Box::pin(std::future::ready(Err(AgentError::new(
+                    ErrorKind::Tool,
+                    "unused",
+                ))))
+            }
+        }
+        let err = Bare
+            .ensure_block(&MemoryScope::new("s"), MemoryBlock::new("b", "d", 1))
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::Config);
     }
 
     #[tokio::test]

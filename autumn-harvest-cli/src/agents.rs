@@ -119,6 +119,8 @@ pub enum AgentCommand {
     /// report. `stores_reset` is `false` when a reset failed, and
     /// `stores_error` names the error. `episodes_erased` and
     /// `facts_erased` count the episode log and its derived facts.
+    /// `lessons_removed` counts the lessons of the kind that a run of the
+    /// agent is a source of.
     Erase {
         /// The agent id, `<kind>/<name>`.
         agent_id: String,
@@ -527,6 +529,9 @@ pub struct StoresOutcome {
     pub episodes_erased: u64,
     /// The derived facts that the memory reset removed (issue #2454).
     pub facts_erased: u64,
+    /// The lessons of the kind that the memory reset removed. A lesson goes
+    /// when a run of the agent is one of its sources.
+    pub lessons_removed: u64,
 }
 
 /// Compare the failure count of the agent before the resets with its final
@@ -541,6 +546,7 @@ pub fn stores_outcome(failures_before: u64, output: Option<&Value>) -> StoresOut
             error: Some("the deleted run has no final state".to_owned()),
             episodes_erased: 0,
             facts_erased: 0,
+            lessons_removed: 0,
         };
     };
     let count = |key: &str| {
@@ -551,6 +557,10 @@ pub fn stores_outcome(failures_before: u64, output: Option<&Value>) -> StoresOut
             .unwrap_or(0)
     };
     let (episodes_erased, facts_erased) = (count("episodes"), count("facts"));
+    let lessons_removed = state
+        .get("lessons_removed")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
     if failures(state) > failures_before {
         let error = state
             .get("last_error")
@@ -561,6 +571,7 @@ pub fn stores_outcome(failures_before: u64, output: Option<&Value>) -> StoresOut
             error: Some(error.to_owned()),
             episodes_erased,
             facts_erased,
+            lessons_removed,
         };
     }
     StoresOutcome {
@@ -568,6 +579,7 @@ pub fn stores_outcome(failures_before: u64, output: Option<&Value>) -> StoresOut
         error: None,
         episodes_erased,
         facts_erased,
+        lessons_removed,
     }
 }
 
@@ -700,6 +712,7 @@ pub fn erase_report(agent_id: &str, stores: &StoresOutcome, outcomes: &[Value]) 
     }
     report.insert("episodes_erased".to_owned(), json!(stores.episodes_erased));
     report.insert("facts_erased".to_owned(), json!(stores.facts_erased));
+    report.insert("lessons_removed".to_owned(), json!(stores.lessons_removed));
     report.insert("runs_erased".to_owned(), json!(runs));
     report.extend(totals);
     report.insert("skipped_children".to_owned(), Value::Array(skipped));
@@ -796,6 +809,7 @@ mod tests {
             error: None,
             episodes_erased: 0,
             facts_erased: 0,
+            lessons_removed: 0,
         };
         let report = erase_report("support/ada", &stores, &outcomes);
         assert_eq!(report["runs_erased"], 3);
@@ -824,6 +838,25 @@ mod tests {
     }
 
     #[test]
+    fn the_report_counts_the_removed_lessons() {
+        let state = json!({"failures": 0, "lessons_removed": 2});
+        let stores = stores_outcome(0, Some(&state));
+        assert_eq!(stores.lessons_removed, 2);
+        let report = erase_report("support/acct-42", &stores, &[]);
+        assert_eq!(report["lessons_removed"], 2);
+        // A state with no count removes no lesson.
+        let plain = stores_outcome(0, Some(&json!({"failures": 0})));
+        assert_eq!(plain.lessons_removed, 0);
+        assert_eq!(
+            erase_report("support/ada", &plain, &[])["lessons_removed"],
+            0
+        );
+        // A failed reset keeps the count that the state holds.
+        let failed = json!({"failures": 1, "last_error": "down", "lessons_removed": 1});
+        assert_eq!(stores_outcome(0, Some(&failed)).lessons_removed, 1);
+    }
+
+    #[test]
     fn a_running_pass_is_a_failure_and_a_closed_pass_is_erased() {
         let rows = [
             json!({"id": "p1", "state": "COMPLETED"}),
@@ -846,6 +879,7 @@ mod tests {
                 error: None,
                 episodes_erased: 0,
                 facts_erased: 0,
+                lessons_removed: 0,
             }
         );
         let failed = json!({"failures": 3, "last_error": "the store is down"});

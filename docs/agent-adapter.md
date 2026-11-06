@@ -1496,7 +1496,7 @@ idempotency key. An app without the module sends the same signal.
 | `user_message` | Runs one segment with the text as the user message. |
 | `control: pause` | Holds each later message in the state. |
 | `control: resume` | Runs the held messages in order, then takes new ones. |
-| `control: reset_memory` | Clears the memory: the scope `agent:<id>`, or the state memory. |
+| `control: reset_memory` | Clears the memory: the scope `agent:<id>`, or the state memory. It also removes each lesson of the kind that names the agent (section 24). |
 | `control: clear_transcript` | Clears the transcript. Only the labels of the memory and of the workspace files stay (issues #2272, #2274). |
 | `control: reset_workspace` | Deletes every workspace snapshot of the agent (issue #2274). |
 
@@ -1645,9 +1645,9 @@ app must clear those stores itself.
    A pass that still runs is a failure in the report.
 6. The report sums each count over every run and child:
    `events_scrubbed`, `stream_chunks_deleted`, `ledger_rows_deleted`,
-   `entity_states_scrubbed` and the rest. `episodes_erased` and
-   `facts_erased` come from the final state. It lists each skipped child
-   and each failure.
+   `entity_states_scrubbed` and the rest. `episodes_erased`,
+   `facts_erased` and `lessons_removed` come from the final state. It
+   lists each skipped child and each failure.
 
 The spend of an erased run leaves the LLM budget and mesh budget sums.
 
@@ -2253,9 +2253,9 @@ read, with no restart: the next op, or the next refine run.
 
 Today the store enforces `ceilings`, `auto_adopt.parts` and
 `auto_adopt.max_per_day`. The refine workflow of #2380 reads `ceilings`,
-`probe_effects` and `proposal_attempts` (section 22). The other settings
-are kernels for open issues: the adoption gate of #2381 and the lesson
-library of #2382. Those issues will read them.
+`probe_effects` and `proposal_attempts` (section 22). The adoption gate
+reads `auto_adopt` and `approval_timeout` (section 23). The lesson library
+reads `lessons.max_entries` at each write (section 24).
 
 | Setting | Meaning | Default | Range |
 |---|---|---|---|
@@ -2811,3 +2811,53 @@ server serves. The other commands take the execution id in any UUID
 spelling and send its canonical form. On SQLite, `sqlite::decide_refine`
 sends a decision, and `ExecutionFilter::search_attribute` lists the runs
 that wait. On Postgres, `postgres::decide_refine` sends it.
+
+## 24. The lesson library
+
+Each adoption adds one lesson to the library of its kind. The next refine
+of the kind reads the library. The design is in
+[`DESIGN-2382.md`](design/DESIGN-2382.md). The library needs a memory store
+on the harness that implements `MemoryStore::ensure_block` and
+`MemoryStore::apply_labelled`. `InMemoryMemoryStore` does.
+
+- **Scope.** The memory scope `kind:<kind>:lessons` holds one block,
+  `lessons`. Each entry is one lesson as one line of JSON. It holds the
+  adopted `version`, the `why` and `lesson` text of the select step, the
+  `sources` exec ids and the `agents` ids. `agents` holds each agent of
+  the kind that a source names: its workflow id, the agent of its memory
+  scope `agent:<id>`, and each agent of its mandate chain. It also holds
+  each agent of the lessons that the run read. `refine::read_lessons`
+  decodes a block.
+- **Write.** A run that ends `adopted` or `auto_adopted` runs
+  `agent_refine_lesson`. A rejected, timed-out or superseded run writes
+  none. The report holds the result in `lesson`: `written`, with the
+  version and the evicted count of the attempt that answered, or
+  `failed`, with the error. A failed write never undoes the adoption. A
+  cancel during the write still cancels the run.
+- **Taint.** The lesson keeps the flow labels of the run: each label of
+  each source and of the lessons that the run read. The report holds them
+  in `flow_labels`. A store that cannot keep labels refuses a labelled
+  write.
+- **Bound.** The write reads the current `lessons.max_entries`. It removes
+  the oldest lessons until the block holds at most that many. A change of
+  the bound applies to the next write.
+- **Read.** The start step records the library, cut to the newest lessons
+  that fit 32 768 rendered characters. A failed read gives no library and
+  a warning. Each proposer stage gets it in `ProposeContext::lessons`,
+  with its labels. `ModelProposer` puts it in its prompt as data.
+- **Why and lesson.** A selector gives the text with
+  `OverlaySelector::choose`. The default calls `select` and gives none. A
+  rule pick and a sequential run give none.
+- **Erase.** `Control::ResetMemory` removes each lesson of the kind whose
+  `agents` holds the agent id, also one that other agents share.
+  `agent_lesson_match` records the matches first, so a retried removal
+  keeps the count. The removal step fails while a match remains.
+  `AgentState::lessons_removed` counts them, and `harvest agents erase`
+  reports `lessons_removed`. History keeps copies of the text in each
+  refine run that read or wrote a lesson. Erase those runs too.
+- **Upgrade.** Upgrade each activity worker first: an older worker
+  refuses a `ProposeRequest` with `lessons`. A run that started on an
+  older release has no source labels, so it writes no lesson. Its report
+  notes why.
+- **Fleet.** `InMemoryMemoryStore` lives in one process. Each worker of a
+  fleet needs the same durable store.

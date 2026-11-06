@@ -433,6 +433,16 @@ pub proof fn theorem_no_activation_never_adopts(events: Seq < GateEvent >) requi
 pub proof fn theorem_an_end_is_final(events: Seq < GateEvent >, more: Seq < GateEvent >) requires ! (spec_gate(events) is Wait), ensures spec_gate(events + more) == spec_gate(events), decreases events.len(),
 pub proof fn theorem_a_deadline_never_adopts() ensures spec_gate_step(GateEvent::Deadline) is TimedOut,
 
+## formal/verus/src/refine_lessons.rs
+pub enum RefineStatus { AutoAdopted, AwaitingApproval, Unchanged, TimedOut, Chosen, BudgetExhausted, Adopted, Rejected, Superseded, }
+pub open spec fn spec_evictions(len: int, max: int) -> int { if len > max { len - max } else { 0 } }
+pub fn evictions(len: usize, max: usize) -> (r: usize) ensures r == spec_evictions(len as int, max as int), r <= len, len - r <= max, len <= max ==> r == 0, len > max ==> len - r == max,
+pub proof fn theorem_the_newest_entry_stays(len: int, max: int) requires 1 <= max, 1 <= len, ensures spec_evictions(len, max) < len,
+pub proof fn theorem_a_raised_bound_evicts_no_more(len: int, low: int, high: int) requires 0 <= low <= high, 0 <= len, ensures spec_evictions(len, high) <= spec_evictions(len, low),
+pub open spec fn spec_writes_lesson(status: RefineStatus) -> bool { status is Adopted || status is AutoAdopted }
+pub fn writes_lesson(status: RefineStatus) -> (r: bool) ensures r == spec_writes_lesson(status), r <==> (status is Adopted || status is AutoAdopted),
+pub proof fn theorem_an_end_with_no_adoption_writes_no_lesson() ensures ! spec_writes_lesson(RefineStatus::Rejected), ! spec_writes_lesson(RefineStatus::TimedOut), ! spec_writes_lesson(RefineStatus::Superseded), ! spec_writes_lesson(RefineStatus::Unchanged), ! spec_writes_lesson(RefineStatus::BudgetExhausted), ! spec_writes_lesson(RefineStatus::Chosen), ! spec_writes_lesson(RefineStatus::AwaitingApproval),
+
 ## formal/verus/src/refine_policy.rs
 pub enum AdoptDecision { Adopt, Unchanged, NeedsApproval, CapReached, }
 pub open spec fn spec_parts_allowed(changed: u8, allowed: u8) -> bool { changed &! allowed == 0 }
