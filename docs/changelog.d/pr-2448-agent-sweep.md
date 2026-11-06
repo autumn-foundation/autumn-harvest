@@ -2,7 +2,7 @@
 
 `agent_sweep` runs one strategy over a fixed set of inputs, durably, and
 returns one row for each item. The design is in
-`docs/design/DESIGN-2448.md`. The guide is section 25 of
+`docs/design/DESIGN-2448.md`. The guide is section 26 of
 `docs/agent-adapter.md`.
 
 - Each item runs as a child `agent_sample` run. History records the end of
