@@ -2349,6 +2349,7 @@ impl AgentRun<'_> {
                 return (state, Ok(None));
             }
         };
+        let stream = task.stream;
         draw_op_task(&mut task, &state, profile, peer.as_ref());
         // Each draw carries the task in its input. A task over the input cap
         // would fail the spawn after the policy read, so it fails here.
@@ -2404,6 +2405,7 @@ impl AgentRun<'_> {
         let messages = crate::types::without_system(&selected.messages);
         let messages = crate::context_reset::without_restored(messages);
         state.transcript = trim_window(messages, profile.window);
+        self.publish_selected(&mut state, stream, &task, &run_id, &selected);
         let (stop, answer) = (selected.stop, selected.text);
         state.last_stop = Some(stop);
         state.last_answer = Some(answer.clone());
@@ -2420,6 +2422,25 @@ impl AgentRun<'_> {
             self.keep_episode(&mut state, &run_id, stop, &answer).await;
         }
         (state, Ok(Some((stop, answer))))
+    }
+
+    /// Publish the selected answer of a strategy op on the durable stream
+    /// of the agent, when the op streams. The draws stream nothing, so a
+    /// reader sees only the answer that the run selected.
+    fn publish_selected(
+        &self,
+        state: &mut AgentState,
+        stream: bool,
+        task: &AgentTask,
+        run_id: &str,
+        selected: &crate::types::AgentReport,
+    ) {
+        let Some(record) = selected_turn(stream, task, run_id, selected) else {
+            return;
+        };
+        if let Err(err) = self.ctx.publish_durable_progress(record) {
+            fail(state, &format!("{err}"));
+        }
     }
 
     /// Send the answer of one segment to the delivery.
@@ -2477,6 +2498,9 @@ fn draw_op_task(
     // A draw saves no progress notes. Its notes would not reach the state,
     // so the next op would restore stale ones.
     task.context_reset = None;
+    // A draw streams nothing, because the run may not select its answer.
+    // The op publishes the selected answer itself.
+    task.stream = false;
     task.history.clone_from(&state.transcript);
     task.flow_labels = state
         .flow_labels
@@ -2501,6 +2525,29 @@ fn draw_op_task(
         task.flow_labels
             .extend(crate::memory::snapshot_labels(&state.memory));
     }
+}
+
+/// The durable record of the selected answer of a strategy op, or `None`
+/// when the op does not stream or the answer is empty.
+fn selected_turn(
+    stream: bool,
+    task: &AgentTask,
+    run_id: &str,
+    selected: &crate::types::AgentReport,
+) -> Option<crate::live::TurnText> {
+    if !stream || selected.text.is_empty() {
+        return None;
+    }
+    Some(crate::live::TurnText {
+        kind: "turn".to_owned(),
+        run_id: run_id.to_owned(),
+        step: selected.steps_used,
+        agent: task
+            .mandate
+            .as_ref()
+            .map(|mandate| mandate.holder().to_owned()),
+        text: selected.text.clone(),
+    })
 }
 
 /// The run tree of one segment of the agent `id`: the labels of the agent,
@@ -2923,6 +2970,32 @@ mod tests {
             "sample": {"strategy": {"best_of_n": {"n": 3}}, "scorer": {"id": "x"}, "max_drawz": 9},
         });
         assert!(serde_json::from_value::<AgentOp>(value).is_err());
+    }
+
+    #[test]
+    fn a_streaming_op_publishes_only_the_selected_answer() {
+        let selected: crate::types::AgentReport = serde_json::from_value(serde_json::json!({
+            "stop": "completed",
+            "text": "b",
+            "steps_used": 2,
+            "tool_calls": 0,
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+            "messages": [],
+        }))
+        .unwrap();
+        let task = AgentTask::new("x").mandate(Mandate::new("desk"));
+        let record = selected_turn(true, &task, "life:s4", &selected).unwrap();
+        assert_eq!(record.kind, "turn");
+        assert_eq!(record.run_id, "life:s4");
+        assert_eq!(record.step, 2);
+        assert_eq!(record.agent.as_deref(), Some("desk"));
+        assert_eq!(record.text, "b");
+        assert!(selected_turn(false, &task, "life:s4", &selected).is_none());
+        let empty = crate::types::AgentReport {
+            text: String::new(),
+            ..selected
+        };
+        assert!(selected_turn(true, &task, "life:s4", &empty).is_none());
     }
 
     #[test]

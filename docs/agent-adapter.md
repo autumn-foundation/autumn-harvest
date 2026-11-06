@@ -2069,6 +2069,8 @@ let op = AgentOp::message("Name a prime.").with_sample(sample);
   because each draw carries the transcript.
 - A steer message with a strategy runs as its own op. An interrupt, a
   pause or a delete does not stop the draws of a running strategy op.
+- With `AgentProfile::stream`, the op publishes the selected answer once
+  on the durable stream of the agent. A draw streams nothing.
 - A draw has no memory tool, no workspace, no follow-ups and no context
   reset. It reads the state memory in its system prompt and the progress
   notes in its window. It changes neither.

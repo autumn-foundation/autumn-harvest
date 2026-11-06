@@ -32,6 +32,8 @@ of a whole subtree. The design is in `docs/design/DESIGN-2449.md`.
   next draw. `AgentReport::parked_until_ms` and
   `SampleDraw::parked_until_ms` carry the period end. A strategy op then
   parks the agent. An op whose draws spent no token waits first in line.
+- A streaming agent publishes the selected answer of a strategy op on
+  its own durable stream. A draw streams nothing.
 - A judge model must be in `Mandate::models`. A transcript over the
   workflow input cap fails the op before any draw.
 - **Behavior change.** A new `agent_sample` run under a profile mandate
