@@ -138,6 +138,14 @@ pub async fn agent_draws(ctx: &WorkflowContext, input: DrawsInput) -> Result<Dra
         scorer: input.scorer.as_ref(),
     };
     let admission = admit(&read.policy, &ask).map_err(|refusal| refusal.error_text())?;
+    // A cascade asks a model per tier, one tier at a time. A plain fan-out
+    // of the profile model would skip each tier rule.
+    if input.strategy == Strategy::Cascade {
+        let refusal = Refusal::SampleOnly {
+            strategy: Strategy::Cascade,
+        };
+        return Err(refusal.error_text());
+    }
     let task = profile_task(&profile, &input.input);
     let draws = run_admitted(ctx, &task, &admission).await?;
     Ok(DrawsReport {

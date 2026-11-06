@@ -29,6 +29,7 @@ pub const SAMPLING_POLICY_FIELDS: &[&str] = &[
     "scorers",
     "judge_models",
     "max_answer_retries",
+    "cascade_models",
 ];
 
 /// A strategy that runs more than one draw (epic #2438).
@@ -185,6 +186,10 @@ pub struct SamplingPolicy {
     /// The cap of the in-loop answer check (issue #2442). 0 by default.
     #[serde(default)]
     pub max_answer_retries: u32,
+    /// The harness models that a cascade tier may name. None by default,
+    /// so the policy refuses each cascade.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub cascade_models: BTreeSet<String>,
 }
 
 const fn one() -> u32 {
@@ -205,6 +210,7 @@ impl Default for SamplingPolicy {
             scorers: Scorers::Deterministic,
             judge_models: BTreeSet::new(),
             max_answer_retries: 0,
+            cascade_models: BTreeSet::new(),
         }
     }
 }
@@ -237,6 +243,12 @@ pub enum PolicyError {
         "a judge model is empty, longer than {MAX_ITEM_LEN} bytes, or holds a control character"
     )]
     JudgeModel,
+    /// A cascade model is empty, longer than [`MAX_ITEM_LEN`] bytes, or
+    /// holds a control character.
+    #[error(
+        "a cascade model is empty, longer than {MAX_ITEM_LEN} bytes, or holds a control character"
+    )]
+    CascadeModel,
     /// A set has more than [`MAX_SET_LEN`] entries.
     #[error("{field} has more than {MAX_SET_LEN} entries")]
     TooMany {
@@ -272,6 +284,11 @@ impl SamplingPolicy {
                 field: "judge_models",
             });
         }
+        if self.cascade_models.len() > MAX_SET_LEN {
+            return Err(PolicyError::TooMany {
+                field: "cascade_models",
+            });
+        }
         if let Scorers::Only(ids) = &self.scorers
             && ids.len() > MAX_SET_LEN
         {
@@ -279,6 +296,9 @@ impl SamplingPolicy {
         }
         if !self.judge_models.iter().all(|model| valid_item(model)) {
             return Err(PolicyError::JudgeModel);
+        }
+        if !self.cascade_models.iter().all(|model| valid_item(model)) {
+            return Err(PolicyError::CascadeModel);
         }
         Ok(())
     }
@@ -393,6 +413,49 @@ mod tests {
         for case in cases {
             assert!(case.validate().is_err(), "{case:?}");
         }
+    }
+
+    #[test]
+    fn the_cascade_models_skip_their_default_on_encode() {
+        let value = serde_json::to_value(SamplingPolicy::default()).unwrap();
+        assert!(value.get("cascade_models").is_none());
+        let policy = SamplingPolicy {
+            cascade_models: BTreeSet::from(["cheap".to_owned()]),
+            ..SamplingPolicy::default()
+        };
+        let value = serde_json::to_value(&policy).unwrap();
+        assert_eq!(value["cascade_models"], serde_json::json!(["cheap"]));
+        assert_eq!(
+            serde_json::from_value::<SamplingPolicy>(value).unwrap(),
+            policy
+        );
+        assert!(SAMPLING_POLICY_FIELDS.contains(&"cascade_models"));
+    }
+
+    #[test]
+    fn validate_checks_each_cascade_model() {
+        let bad = [
+            BTreeSet::from([String::new()]),
+            BTreeSet::from(["a\u{7}b".to_owned()]),
+            BTreeSet::from(["m".repeat(MAX_ITEM_LEN + 1)]),
+        ];
+        for models in bad {
+            let policy = SamplingPolicy {
+                cascade_models: models,
+                ..SamplingPolicy::default()
+            };
+            assert_eq!(policy.validate(), Err(PolicyError::CascadeModel));
+        }
+        let many = SamplingPolicy {
+            cascade_models: (0..=MAX_SET_LEN).map(|i| format!("m{i}")).collect(),
+            ..SamplingPolicy::default()
+        };
+        assert_eq!(
+            many.validate(),
+            Err(PolicyError::TooMany {
+                field: "cascade_models"
+            })
+        );
     }
 
     #[test]
