@@ -23,11 +23,13 @@ Accepted (issue #2383, epic #2369).
    operator setting of `RefinePolicy`, with a safe default. A change takes
    effect at the next read, with no restart. Only an operator writes the
    policy, and no model output carries it. So the loop cannot change it
-   for itself. ADR 0014 holds the detail.
+   for itself. One floor is fixed: an overlay never clears `read_only`.
+   ADR 0014 holds the detail.
 2. **Offline, not inline.** The loop is the workflow `agent_refine`. It
-   reads ended runs only, and it never runs on the path of an op. A live
-   op reads only the active version. A replay probe costs no model call
-   for the base rollout, and runs no tool.
+   reads ended runs only, and it never runs on the path of an op. A
+   durable op reads the active version at its start, never a waiting
+   candidate. A replay probe costs no model call for the base rollout,
+   and runs no tool.
 3. **Overlays stay under operator ceilings.** Each stage, each probe, the
    store and the gate apply an overlay under the ceilings. The ceilings
    default to the profile values, so by default an overlay can only
@@ -38,8 +40,8 @@ Accepted (issue #2383, epic #2369).
 4. **A person adopts, and probes only read.** By default,
    `auto_adopt.parts` is empty, so each chosen overlay waits at the
    adoption gate for a person. No decision at the deadline counts as a
-   reject. By default, `probe_effects` holds `read_only` only, so a live
-   re-probe never writes.
+   reject. By default, `probe_effects` holds `read_only` only. So a live
+   re-probe runs no tool that declares a write.
 
 ## Consequences
 

@@ -28,7 +28,9 @@ ceilings and under operator policy.
    - `test = true` runs its tests in the crate test step. A test with a
      reject shows that op 2 then fails, so the check is not vacuous.
    - The refine workflow needs the `eval` feature. So the example needs
-     `sqlite` and `eval`, and CI runs it with both.
+     `sqlite` and `eval`. CI runs it with the features of the crate test
+     step, `sqlite,eval,sandbox`, so only the example links. A clippy
+     step checks the `sqlite,eval` set.
 2. **The guide.** `docs/agent-adapter.md` gets section 25, "Refine an
    agent". It explains the loop as one design and links each part
    section. It does not copy the settings table of section 18. It names
@@ -71,6 +73,7 @@ How can the example lie, or the docs drift? Each failure has a guard.
 | The approval goes in before the gate opens and is dropped. | The example waits for `refine_status = waiting_approval` first. |
 | The example needs a key or the network. | The models are scripted. The store is in memory. The database is a temp file. |
 | CI stops running the example. | The guard reads `ci.yml` for the `cargo run` line. |
+| A docs-only PR breaks a guard and merges green. | The `doc-snippets` job runs the guards on each PR. |
 | A guide fence stops compiling. | The guide adds no Rust fence. It links the example. |
 | The guide copies the settings table, and the copy drifts. | The section links section 18. |
 | A new ADR has no index row. | The guard lists `docs/adr/` and checks each row. |
@@ -83,11 +86,12 @@ How can the example lie, or the docs drift? Each failure has a guard.
   `sqlite::send`, `sqlite::drive` and `sqlite::state` exist. The refine
   run needs `eval` and a multi-thread runtime. `AgentState::last_answer`
   holds the answer of a durable op. ADR numbers 0014 and 0015 are taken.
-- **Red.** A reader wants to see the loop work before reading 800 lines
-  of guide. The output must show the change in a few lines.
+- **Red.** A reader wants to see the loop work before reading the part
+  sections of the guide. The output must show the change in a few lines.
 - **Black.** The issue command names `--features sqlite` only. The
   refine workflow needs `eval` too. The example cannot run without it.
-  The command in CI and in the docs names both.
+  The docs name both. CI adds `sandbox`, to reuse the build of the test
+  step.
 - **Yellow.** The example is a tested template for an app: install a
   proposer, a composer and a store, then refine, approve and serve.
 - **Green.** Later: a CLI walk-through on a Postgres server with

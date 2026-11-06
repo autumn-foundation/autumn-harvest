@@ -2,8 +2,9 @@
 
 An ADR records one decision, its context and its consequences. Name a new
 ADR `NNNN-<slug>.md`, with the next free number. Add one row to this
-index, in file order. The guard `autumn-harvest-agent/tests/refine_docs.rs`
-fails when an ADR has no row.
+index, in file order, with the title of the ADR. The guard
+`autumn-harvest-agent/tests/refine_docs.rs` fails when an ADR has no row,
+or when a row holds another title.
 
 Some numbers name more than one ADR. Those records predate the rule of
 one number per ADR, and they keep their names, because other pages link

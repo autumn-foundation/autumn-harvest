@@ -30,8 +30,8 @@ use autumn_harvest_agent::{
     AgentError, AgentHarness, AgentId, AgentModel, AgentOp, AgentProfile, AgentReport, AgentStop,
     AgentTask, ChatRequest, ChatResponse, ChatRole, ContentPart, ExactMatch, InMemoryMemoryStore,
     InMemoryOverlayStore, OverlayProposer, OverlayVersion, ProfileOverlay, ProfileOverlayStore,
-    ProposeContext, ProposerReply, ScoreContext, ScoreInput, Scorer, StopReason, TokenUsage,
-    Verdict, sqlite,
+    ProposeContext, ProposerReply, RefineStatus, ScoreContext, ScoreInput, Scorer, StopReason,
+    TokenUsage, Verdict, sqlite,
 };
 use autumn_harvest_sqlite::{ExecutionId, RunState, SqliteRuntime};
 
@@ -152,20 +152,21 @@ struct Outcome {
     after: Option<OverlayVersion>,
     /// The check of op 1.
     op1: Verdict,
-    /// The report of the refine run. `None` when the walk skips the run.
-    report: Option<RefineReport>,
+    /// The report of the refine run.
+    report: RefineReport,
     /// The answer of op 2.
     op2_answer: String,
     /// The check of op 2.
     op2: Verdict,
 }
 
-/// The pieces of one walk.
+/// The pieces of one walk. The runtime drops before the directory, so it
+/// closes the database file before the directory goes.
 struct Walk {
-    _dir: tempfile::TempDir,
     rt: SqliteRuntime,
     harness: AgentHarness,
     store: Arc<InMemoryOverlayStore>,
+    _dir: tempfile::TempDir,
 }
 
 /// A runtime on a new database file, with the scripted pieces.
@@ -184,10 +185,10 @@ fn walk() -> Result<Walk, Box<dyn Error>> {
     let mut rt = SqliteRuntime::open(&db)?;
     sqlite::register(&mut rt, Arc::new(harness.clone()));
     Ok(Walk {
-        _dir: dir,
         rt,
         harness,
         store,
+        _dir: dir,
     })
 }
 
@@ -196,16 +197,21 @@ async fn active(store: &InMemoryOverlayStore) -> Result<Option<OverlayVersion>, 
     Ok(store.active(KIND).await?.map(|s| s.version()))
 }
 
-/// Check one answer with the built-in `ExactMatch` scorer.
-async fn check(harness: &AgentHarness, answer: &str) -> Result<Verdict, Box<dyn Error>> {
-    let input = ScoreInput::new(TASK, answer, AgentStop::Completed);
+/// Check one op with the built-in `ExactMatch` scorer. A run that did not
+/// stop as `completed` fails.
+async fn check(
+    harness: &AgentHarness,
+    answer: &str,
+    stop: AgentStop,
+) -> Result<Verdict, Box<dyn Error>> {
+    let input = ScoreInput::new(TASK, answer, stop);
     let cx = ScoreContext::unmetered(harness);
     Ok(ExactMatch::new(PASS).score(&input, &cx).await?)
 }
 
 impl Walk {
     /// Op 1: a recorded `agent_loop` run of the kind, on the base prompt.
-    async fn op1(&mut self) -> Result<(ExecutionId, String), Box<dyn Error>> {
+    async fn op1(&mut self) -> Result<(ExecutionId, String, AgentStop), Box<dyn Error>> {
         // The run takes the prompt and the bound of the profile.
         let mut task = AgentTask::new(TASK).kind(KIND).max_steps(MAX_STEPS);
         task.system = Some(BASE.to_owned());
@@ -213,7 +219,7 @@ impl Walk {
         match self.rt.run_until_blocked(exec).await? {
             RunState::Completed(value) => {
                 let report: AgentReport = serde_json::from_value(value)?;
-                Ok((exec, report.text))
+                Ok((exec, report.text, report.stop))
             }
             other => Err(format!("op 1 did not complete: {other:?}").into()),
         }
@@ -224,7 +230,7 @@ impl Walk {
         &mut self,
         source: ExecutionId,
         decision: &RefineDecision,
-    ) -> Result<Option<RefineReport>, Box<dyn Error>> {
+    ) -> Result<RefineReport, Box<dyn Error>> {
         let input = RefineInput::new(KIND, vec![source], 1, RefineMode::Sequential, 7);
         let exec = sqlite::start_refine(&mut self.rt, &input)?;
         let state = self.rt.run_until_blocked(exec).await?;
@@ -232,12 +238,13 @@ impl Walk {
             return Err(format!("the refine run did not reach the gate: {state:?}").into());
         }
         // The gate drops a decision that arrives before its wait opens.
-        if self.status(exec)?.as_deref() != Some("waiting_approval") {
+        let waiting = RefineStatus::AwaitingApproval.as_str();
+        if self.status(exec)?.as_deref() != Some(waiting) {
             return Err("the refine run does not wait for approval".into());
         }
         sqlite::decide_refine(&mut self.rt, exec, decision)?;
         match self.rt.run_until_blocked(exec).await? {
-            RunState::Completed(value) => Ok(Some(serde_json::from_value(value)?)),
+            RunState::Completed(value) => Ok(serde_json::from_value(value)?),
             other => Err(format!("the refine run did not end: {other:?}").into()),
         }
     }
@@ -254,14 +261,15 @@ impl Walk {
 
     /// Op 2: an op of a durable agent of the kind. It reads the active
     /// version.
-    async fn op2(&mut self) -> Result<String, Box<dyn Error>> {
+    async fn op2(&mut self) -> Result<(String, AgentStop), Box<dyn Error>> {
         let id = AgentId::new(KIND, "customer-2")?;
         sqlite::send(&mut self.rt, &id, &AgentOp::message(TASK), Some("op-2"))?;
         sqlite::drive(&mut self.rt, &id).await?;
         let state = sqlite::state(&self.rt, &id).await?;
-        state
-            .and_then(|state| state.last_answer)
-            .ok_or_else(|| "op 2 gave no answer".into())
+        let state = state.ok_or("op 2 left no agent state")?;
+        let answer = state.last_answer.ok_or("op 2 gave no answer")?;
+        let stop = state.last_stop.ok_or("op 2 gave no stop")?;
+        Ok((answer, stop))
     }
 }
 
@@ -269,12 +277,12 @@ impl Walk {
 async fn run(decision: &RefineDecision) -> Result<Outcome, Box<dyn Error>> {
     let mut walk = walk()?;
     let before = active(&walk.store).await?;
-    let (op1_exec, op1_answer) = walk.op1().await?;
-    let op1 = check(&walk.harness, &op1_answer).await?;
+    let (op1_exec, op1_answer, op1_stop) = walk.op1().await?;
+    let op1 = check(&walk.harness, &op1_answer, op1_stop).await?;
     let report = walk.refine(op1_exec, decision).await?;
     let after = active(&walk.store).await?;
-    let op2_answer = walk.op2().await?;
-    let op2 = check(&walk.harness, &op2_answer).await?;
+    let (op2_answer, op2_stop) = walk.op2().await?;
+    let op2 = check(&walk.harness, &op2_answer, op2_stop).await?;
     Ok(Outcome {
         before,
         after,
@@ -295,21 +303,26 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let outcome = run(&RefineDecision::Approve).await?;
     println!("op 1 check: {:?}", outcome.op1);
     println!("version before: {}", show(outcome.before));
-    if let Some(report) = &outcome.report {
-        if let Some(gate) = &report.gate {
-            println!("approved version: {}", gate.version);
-        }
-        let chosen = report.chosen.as_ref().and_then(|o| o.system.as_deref());
-        println!("chosen prompt: {:?}", chosen.unwrap_or_default());
-        println!("refine status: {:?}", report.status);
-        println!("refine ledger: {:?}", report.ledger);
-        println!("lesson: {:?}", report.lesson);
+    let report = &outcome.report;
+    if let Some(gate) = &report.gate {
+        println!("approved version: {}", gate.version);
     }
+    let chosen = report.chosen.as_ref().and_then(|o| o.system.as_deref());
+    println!("chosen prompt: {:?}", chosen.unwrap_or_default());
+    println!("refine status: {:?}", report.status);
+    println!("refine ledger: {:?}", report.ledger);
+    println!("lesson: {:?}", report.lesson);
     println!("version after: {}", show(outcome.after));
     println!("op 2 answer: {}", outcome.op2_answer);
     println!("op 2 check: {:?}", outcome.op2);
     if !outcome.op1.is_reject() {
         return Err("op 1 passed on the base prompt, so the walk proves nothing".into());
+    }
+    if report.status != RefineStatus::Adopted || outcome.after == outcome.before {
+        return Err("the refine run adopted no new version".into());
+    }
+    if !chosen.unwrap_or_default().contains(RULE) {
+        return Err("the adopted prompt lacks the rule".into());
     }
     if outcome.op2.is_reject() {
         return Err("op 2 failed after the approval".into());
@@ -323,14 +336,13 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
-    use autumn_harvest_agent::RefineStatus;
 
     #[tokio::test(flavor = "multi_thread")]
     async fn op_two_passes_after_the_approval() {
         let outcome = run(&RefineDecision::Approve).await.unwrap();
         assert!(outcome.op1.is_reject(), "op 1 fails: {outcome:?}");
         assert_eq!(outcome.before, None);
-        let report = outcome.report.as_ref().expect("a refine report");
+        let report = &outcome.report;
         assert_eq!(report.status, RefineStatus::Adopted, "{report:?}");
         assert!(outcome.after.is_some(), "a version goes live");
         assert_eq!(outcome.op2_answer, PASS);
@@ -340,7 +352,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn the_run_keeps_its_budget_and_writes_a_lesson() {
         let outcome = run(&RefineDecision::Approve).await.unwrap();
-        let report = outcome.report.expect("a refine report");
+        let report = outcome.report;
         // Sequential with k = 1: one INV, one DOM and one composition. The
         // INV stage keeps its base, so it adds no probe.
         assert_eq!(report.ledger.sessions, 3, "{:?}", report.ledger);
@@ -364,7 +376,7 @@ mod tests {
             reason: "not now".to_owned(),
         };
         let outcome = run(&reject).await.unwrap();
-        let report = outcome.report.as_ref().expect("a refine report");
+        let report = &outcome.report;
         assert_eq!(report.status, RefineStatus::Rejected, "{report:?}");
         assert_eq!(outcome.after, None, "a reject activates nothing");
         assert_eq!(outcome.op2_answer, MISS);

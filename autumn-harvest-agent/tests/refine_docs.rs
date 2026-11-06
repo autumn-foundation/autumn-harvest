@@ -20,9 +20,23 @@ const ADR: &str = "docs/adr/0016-agent-refinement.md";
 /// The ADR index.
 const ADR_INDEX: &str = "docs/adr/README.md";
 
-/// The CI command that runs the example.
+/// The command of the guide that runs the example.
 const RUN_EXAMPLE: &str =
     "cargo run -p autumn-harvest-agent --features sqlite,eval --example agent_refine";
+
+/// The refine policy settings that shape the loop.
+const LOOP_SETTINGS: [&str; 10] = [
+    "auto_adopt.parts",
+    "auto_adopt.max_per_day",
+    "approval_timeout",
+    "probe_effects",
+    "ceilings.max_steps",
+    "ceilings.max_total_tokens",
+    "ceilings.max_output_tokens",
+    "ceilings.models",
+    "proposal_attempts",
+    "lessons.max_entries",
+];
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -51,21 +65,50 @@ fn section<'a>(text: &'a str, heading: &str) -> &'a str {
     &body[..end]
 }
 
-/// The first code span of each row of the first table in `text`.
-fn first_cells(text: &str) -> Vec<String> {
-    text.lines()
-        .skip_while(|line| !line.starts_with("| Setting"))
-        .skip(2)
-        .take_while(|line| line.starts_with('|'))
-        .flat_map(|line| {
-            let cell = line.split('|').nth(1).unwrap_or_default();
-            cell.split('`')
-                .skip(1)
-                .step_by(2)
-                .map(str::to_owned)
-                .collect::<Vec<_>>()
-        })
-        .collect()
+/// The GitHub anchor of each heading in `text`, outside code fences.
+///
+/// A repeated heading gets the suffix `-1`, `-2` and so on, as GitHub
+/// gives it.
+fn anchors(text: &str) -> Vec<String> {
+    let mut found: Vec<String> = Vec::new();
+    let mut bases: Vec<String> = Vec::new();
+    let mut fenced = false;
+    for line in text.lines() {
+        if line.trim_start().starts_with("```") {
+            fenced = !fenced;
+            continue;
+        }
+        let title = line.trim_start_matches('#');
+        if fenced || title.len() == line.len() || !title.starts_with(' ') {
+            continue;
+        }
+        let slug: String = title
+            .trim()
+            .to_lowercase()
+            .chars()
+            .filter_map(|c| match c {
+                ' ' => Some('-'),
+                c if c.is_alphanumeric() || c == '-' || c == '_' => Some(c),
+                _ => None,
+            })
+            .collect();
+        let repeats = bases.iter().filter(|base| **base == slug).count();
+        bases.push(slug.clone());
+        found.push(if repeats == 0 {
+            slug
+        } else {
+            format!("{slug}-{repeats}")
+        });
+    }
+    found
+}
+
+/// The text of a level-1 heading, without the ADR number.
+fn adr_title(text: &str) -> &str {
+    let heading = text.lines().next().unwrap_or_default();
+    let rest = heading.trim_start_matches("# ADR ");
+    let rest = rest.trim_start_matches(|c: char| c.is_ascii_digit());
+    rest.trim_start_matches([' ', ':', '-', '\u{2014}'])
 }
 
 /// The ADR files of `docs/adr/`, sorted.
@@ -91,7 +134,7 @@ fn the_guide_has_the_section() {
         "budget identity",
         "ceilings",
         "probe",
-        "read-only",
+        "`read_only`",
         "adoption gate",
         "lesson library",
         "RefinePolicy",
@@ -124,44 +167,37 @@ fn the_section_links_each_part_and_the_adr() {
 fn each_link_of_the_section_names_a_real_heading() {
     let guide = read(GUIDE);
     let text = section(&guide, SECTION);
-    let anchors: Vec<String> = guide
-        .lines()
-        .filter(|line| line.starts_with("## "))
-        .map(|line| {
-            line.trim_start_matches("## ")
-                .to_lowercase()
-                .chars()
-                .filter_map(|c| match c {
-                    ' ' => Some('-'),
-                    c if c.is_alphanumeric() || c == '-' || c == '_' => Some(c),
-                    _ => None,
-                })
-                .collect()
-        })
-        .collect();
+    let known = anchors(&guide);
     for link in text.split("](#").skip(1) {
         let anchor = link.split(')').next().unwrap_or_default();
         assert!(
-            anchors.iter().any(|known| known == anchor),
+            known.iter().any(|known| known == anchor),
             "{SECTION} links `#{anchor}`, and no heading has that anchor"
         );
     }
 }
 
 #[test]
-fn the_section_names_each_policy_setting() {
+fn the_anchor_scan_skips_fences_and_numbers_repeats() {
+    let text = "## A b\n```sh\n## Not a heading\n```\n### A b\n## A b c\n## C (d #1)\n";
+    assert_eq!(anchors(text), ["a-b", "a-b-1", "a-b-c", "c-d-1"]);
+}
+
+#[test]
+fn the_section_names_each_loop_setting() {
     let guide = read(GUIDE);
-    let table = section(&guide, POLICY_SECTION);
-    let settings = first_cells(table);
-    assert!(
-        settings.len() >= 7,
-        "{POLICY_SECTION} must hold the settings table: {settings:?}"
-    );
     let text = section(&guide, SECTION);
-    for setting in &settings {
+    for setting in LOOP_SETTINGS {
         assert!(
             text.contains(&format!("`{setting}`")),
             "{SECTION} must name the setting `{setting}`"
+        );
+    }
+    let table = section(&guide, POLICY_SECTION);
+    for setting in LOOP_SETTINGS {
+        assert!(
+            table.contains(&format!("`{setting}`")),
+            "{POLICY_SECTION} no longer has `{setting}`; update this guard"
         );
     }
 }
@@ -275,6 +311,23 @@ fn the_adr_index_lists_each_adr_in_file_order() {
 }
 
 #[test]
+fn each_row_of_the_adr_index_holds_the_title_of_its_file() {
+    let index = read(ADR_INDEX);
+    for name in adr_files() {
+        let row = index
+            .lines()
+            .find(|line| line.contains(&format!("]({name})")))
+            .unwrap_or_else(|| panic!("{ADR_INDEX} must link `{name}`"));
+        let adr = read(&format!("docs/adr/{name}"));
+        let title = adr_title(&adr);
+        assert!(
+            row.ends_with(&format!("| {title} |")),
+            "{ADR_INDEX} must hold the title `{title}` of `{name}`: {row}"
+        );
+    }
+}
+
+#[test]
 fn each_link_of_the_adr_index_resolves() {
     let index = read(ADR_INDEX);
     let dir = repo_root().join("docs/adr");
@@ -320,11 +373,59 @@ fn a_changelog_entry_names_the_example() {
     );
 }
 
+/// The text of the CI job `name`, up to the next job.
+fn job<'a>(ci: &'a str, name: &str) -> &'a str {
+    let header = format!("\n  {name}:\n");
+    let start = ci
+        .find(&header)
+        .unwrap_or_else(|| panic!("ci.yml lacks the job `{name}`"))
+        + 1;
+    let body = &ci[start..];
+    let end = body
+        .match_indices("\n  ")
+        .skip(1)
+        .find(|(at, _)| {
+            body[at + 3..]
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_lowercase())
+        })
+        .map_or(body.len(), |(at, _)| at);
+    &body[..end]
+}
+
 #[test]
 fn ci_runs_the_example() {
     let ci = read(".github/workflows/ci.yml");
+    let line = ci
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with("run: cargo run -p autumn-harvest-agent "))
+        .filter(|line| line.ends_with(" --example agent_refine"))
+        .unwrap_or_else(|| panic!("ci.yml must run the example agent_refine"));
+    let features = line
+        .split("--features ")
+        .nth(1)
+        .and_then(|rest| rest.split(' ').next())
+        .unwrap_or_default();
+    for feature in ["sqlite", "eval"] {
+        assert!(
+            features.split(',').any(|f| f == feature),
+            "the CI run of the example must enable `{feature}`: {line}"
+        );
+    }
+}
+
+#[test]
+fn ci_runs_these_guards_on_docs_only_changes() {
+    let ci = read(".github/workflows/ci.yml");
+    let snippets = job(&ci, "doc-snippets");
     assert!(
-        ci.contains(&format!("run: {RUN_EXAMPLE}")),
-        "ci.yml must run `{RUN_EXAMPLE}`"
+        !snippets.contains("outputs.code"),
+        "the job doc-snippets must run on docs-only changes"
+    );
+    assert!(
+        snippets.contains("--test refine_docs"),
+        "the job doc-snippets must run these guards"
     );
 }
