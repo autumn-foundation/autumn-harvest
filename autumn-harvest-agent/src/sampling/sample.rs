@@ -244,9 +244,10 @@ pub enum BeamFate {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct BeamStep {
-    /// The round of the step. Round 0 expands the user message.
+    /// The round of the step, from 0. The first round expands the user
+    /// message.
     pub round: u32,
-    /// The step that this step extends. `None` in round 0.
+    /// The step that this step extends. `None` in the first round.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<DrawId>,
     /// What the round did with the step.
@@ -346,9 +347,15 @@ pub async fn agent_sample(
     let budget = tree_budget(task.max_total_tokens, input.max_total_tokens);
     let (scored, stopped) = match input.strategy {
         SampleStrategy::Beam {
-            width, max_rounds, ..
+            width,
+            expansion,
+            max_rounds,
         } => {
-            let shape = BeamShape { width, max_rounds };
+            let shape = BeamShape {
+                width,
+                expansion,
+                max_rounds,
+            };
             run_beam(ctx, &input, &task, &admission, budget, shape).await?
         }
         _ => run_waves(ctx, &input, &task, &admission, budget).await?,
@@ -455,10 +462,11 @@ async fn run_waves(
     }
 }
 
-/// The bounds of a beam run that the admission does not hold.
+/// The bounds of a beam run.
 #[derive(Debug, Clone, Copy)]
 struct BeamShape {
     width: u32,
+    expansion: u32,
     max_rounds: u32,
 }
 
@@ -470,7 +478,7 @@ struct Beam {
 
 /// Run the rounds of a beam run, and score each step.
 ///
-/// Round 0 has one beam: the user message. Each round expands each live
+/// The first round has one beam: the user message. Each round expands each live
 /// beam `expansion` times, in the order of the live beams. Each step is a
 /// child run in step mode. It sends the beam as its history and asks for
 /// one new model turn. So a kept beam pays only for its new turn.
@@ -491,10 +499,6 @@ async fn run_beam(
     budget: Option<u32>,
     shape: BeamShape,
 ) -> Result<(Vec<Scored>, SampleStop), String> {
-    let expansion = match input.strategy {
-        SampleStrategy::Beam { expansion, .. } => expansion,
-        _ => 1,
-    };
     let mut scored: Vec<Scored> = Vec::new();
     let mut spent: u32 = 0;
     let mut complete: u32 = 0;
@@ -509,7 +513,7 @@ async fn run_beam(
         }
         let parents: Vec<&Beam> = live
             .iter()
-            .flat_map(|beam| std::iter::repeat_n(beam, expansion as usize))
+            .flat_map(|beam| std::iter::repeat_n(beam, shape.expansion as usize))
             .collect();
         let first = scored.len();
         let halt = Box::pin(run_steps(

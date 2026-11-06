@@ -204,7 +204,8 @@ async fn a_beam_of_width_two_finds_the_path_that_the_step_scorer_prefers() {
     );
     assert_eq!(report.stopped, SampleStop::Completed);
 
-    // Round 0 expands the root twice. Rounds 1 and 2 expand 2 beams twice.
+    // The first round expands the root twice. Each later round expands 2
+    // beams twice.
     assert_eq!(per_round(&report), [2, 4, 4]);
     let requests = model.requests();
     assert_eq!(
@@ -214,7 +215,7 @@ async fn a_beam_of_width_two_finds_the_path_that_the_step_scorer_prefers() {
     );
     assert_eq!(requests.len(), 10);
     // No turn is asked twice: each draw asks once, and the root prefix is
-    // asked only by the 2 expansions of round 0.
+    // asked only by the 2 expansions of the first round.
     let draws: BTreeSet<u32> = requests
         .iter()
         .map(|request| request.draw.expect("a draw id").get())
@@ -352,7 +353,7 @@ async fn a_token_budget_stops_the_beam_with_budget_exceeded() {
     let (_dir, db) = fresh_db();
     let model = walker();
     let mut rt = runtime(&db, harness(model.clone(), &policy(&[Strategy::Beam], 12)));
-    // Each step spends 5 tokens. Round 0 spends all 10, so round 1 starts
+    // Each step spends 5 tokens. The first round spends all 10, so the second round starts
     // no step.
     let input = beam_input(2, 2, 3).max_total_tokens(10);
     let report = sample_report(drive(&mut rt, &input).await);
@@ -380,8 +381,8 @@ async fn the_beam_history_replays_to_the_same_selection() {
         let exec = sqlite::start_sample(&mut rt, &beam_input(2, 2, 3)).unwrap();
         let report = sample_report(rt.run_until_blocked(exec).await.unwrap());
 
-        // Replay the recorded history. A different kept beam in round 1
-        // changes the child input of round 2, so it fails the replay.
+        // Replay the recorded history. A different kept beam in the second round
+        // changes the child input of the third round, so it fails the replay.
         let history = rt.load_history(exec).unwrap();
         let mut runs = vec![(exec, agent_sample_info(), history.clone())];
         for event in &history {

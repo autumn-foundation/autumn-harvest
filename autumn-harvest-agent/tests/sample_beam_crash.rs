@@ -255,7 +255,7 @@ async fn a_crash_in_round_two_resumes_in_round_two() {
         );
     }
     // Draw 2 has the path RL. Its verdict is in history, so the parent
-    // scores RL only for the 2 complete beams of round 3.
+    // scores RL only for the 2 complete beams of the third round.
     let rl = parent
         .iter()
         .filter(|line| **line == "parent score RL")
