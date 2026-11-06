@@ -31,8 +31,8 @@ The chosen option is in bold.
 | The mesh budget | a new check · **each draw carries the mesh of the profile, so the model-turn check applies** |
 | Old histories | no gate · **a patch marker gates the mandate check in `agent_sample`** |
 
-Why inline and not a child workflow: `agent_sample` takes no task, so a
-caller cannot borrow the policy of a kind for a task of its own. A child
+Why inline, and not a child workflow? `agent_sample` takes no task. So
+a caller cannot borrow the policy of a kind for a task of its own. A child
 workflow would need a task or a mandate in its input, which reopens that
 hole. Inline, the agent builds the task, and no new input reaches the
 public workflow.
@@ -54,6 +54,9 @@ answer gives a rule.
 | A mesh budget does not see the draws. | Each draw carries the mesh, so each model turn checks the budget. |
 | A draw that the run does not select hides its taint. | The report holds the union of the labels of each draw. The agent keeps it. |
 | A steer message with a strategy joins a running op. | A message with a strategy never sends a steer signal. It runs as its own op. |
+| A judge calls a model outside the mandate. | The mandate must allow the judge model, else `model_forbidden`. |
+| A spent mesh budget drops a message. | A mesh refusal parks the agent. An op whose draws spent no token waits first in line. |
+| A large transcript fails the spawn late. | The op checks the draw input against the workflow input cap first. |
 | The scorer reads the old transcript. | The score input holds only the messages after the history. |
 | An old `agent_sample` run replays into the new check. | A patch marker gates the check. An old run reads no marker and skips it. |
 
@@ -93,7 +96,7 @@ pub struct Mandate {
 }
 
 pub const fn meet_cap(left: Option<u32>, right: Option<u32>) -> Option<u32>;
-pub const fn draw_verdict(max_draws: Option<u32>, delegations_left: u32, draws: u32) -> DrawVerdict;
+pub const fn draw_verdict(max_draws: Option<u32>, room: u32, draws: u32) -> DrawVerdict;
 ```
 
 The op path:
@@ -113,8 +116,13 @@ A refused or failed op changes no transcript. A peer gets the refusal in
 
 ## 6. Limits
 
-- A strategy op does not park the agent on a spent mesh budget. It
-  answers with the draws that ran, or fails with `no_accepted_draw`.
+- A mesh refusal of a draw parks the agent. Only an op whose draws spent
+  no token waits for the next period. Any other op answers with the
+  draws that ran, or fails with `no_accepted_draw`.
+- A judge call does not check the mesh budget before the call.
+- An interrupt does not stop the draws of a running op.
+- A draw does not read the progress notes of the agent.
+- A worker that predates `max_draws` drops the field from a peer message.
 - The `delegate` tool cannot ask for a strategy. Only an op can.
 - A draw has no memory tool, no workspace and no follow-ups, as in
   `agent_sample`.

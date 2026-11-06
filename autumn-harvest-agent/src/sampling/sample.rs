@@ -32,7 +32,7 @@ use autumn_harvest::llm_budget::LlmBudgetExceeded;
 use crate::bounds::{exceeds_activity_input, sibling_cap};
 use crate::draw::{DrawId, run_draw_tasks};
 use crate::harness::cut_bytes;
-use crate::mesh::valid_name;
+use crate::mesh::{Mandate, Refusal as MeshRefusal, valid_name};
 use crate::message::TokenUsage;
 use crate::score::{
     FiniteF64, SampleScore, ScoreInput, ScoreRequest, Verdict, agent_sample_score_info, select,
@@ -228,6 +228,19 @@ pub enum SampleStop {
     ScoreFailed,
 }
 
+impl SampleStop {
+    /// The wire name, such as `budget_exceeded`.
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Accepted => "accepted",
+            Self::BudgetExceeded => "budget_exceeded",
+            Self::ScoreFailed => "score_failed",
+        }
+    }
+}
+
 /// The record of one draw.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
@@ -247,6 +260,10 @@ pub struct SampleDraw {
     /// US dollar. An unpriced call adds 0.
     #[serde(default, skip_serializing_if = "crate::agent::is_zero")]
     pub cost_usd_micros: u64,
+    /// The end of the period of a mesh budget that refused the draw, in
+    /// epoch milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parked_until_ms: Option<i64>,
 }
 
 /// The result of one `agent_sample` run.
@@ -290,7 +307,7 @@ const SAMPLE_MANDATE_PATCH: &str = "agent_sample_mandate";
 
 /// Why the sample core did not give a report.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum SampleFailure {
+pub enum SampleFailure {
     /// The policy or the mandate refused the run before its first draw.
     Refused(Refusal),
     /// A read failed for good, or a draw run failed in the engine.
@@ -299,7 +316,7 @@ pub(crate) enum SampleFailure {
 
 impl SampleFailure {
     /// The error text, such as `sampling refused (<code>): <reason>`.
-    pub(crate) fn text(&self) -> String {
+    pub fn text(&self) -> String {
         match self {
             Self::Refused(refusal) => refusal.error_text(),
             Self::Engine(err) => err.clone(),
@@ -357,7 +374,7 @@ pub async fn agent_sample(
 /// mandate or the policy refuses the run. Returns
 /// [`SampleFailure::Engine`] when a read fails for good, or when a draw run
 /// fails in the engine.
-pub(crate) async fn sample_task(
+pub async fn sample_task(
     ctx: &WorkflowContext,
     kind: &str,
     sample: &OpSample,
@@ -365,11 +382,7 @@ pub(crate) async fn sample_task(
     mandate_check: bool,
 ) -> Result<SampleReport, SampleFailure> {
     let delegations = match (&task.mandate, mandate_check) {
-        (Some(mandate), true) => Some(
-            mandate
-                .admit_draws(sample.strategy.draws(), 0)
-                .map_err(|refusal| SampleFailure::Refused(Refusal::Mandate { mandate: refusal }))?,
-        ),
+        (Some(mandate), true) => Some(mandate_admits(mandate, sample)?),
         _ => None,
     };
     let read = read_policy(ctx, kind)
@@ -404,6 +417,24 @@ pub(crate) async fn sample_task(
         scored,
         stopped,
     ))
+}
+
+/// Admit the draws of `sample` under `mandate`. Returns the delegations
+/// left for the draws to split.
+///
+/// A judge model must be a model that the mandate allows, as each model
+/// of the subtree must be.
+fn mandate_admits(mandate: &Mandate, sample: &OpSample) -> Result<u32, SampleFailure> {
+    let refused = |refusal| SampleFailure::Refused(Refusal::Mandate { mandate: refusal });
+    let left = mandate
+        .admit_draws(sample.strategy.draws(), 0)
+        .map_err(refused)?;
+    if let Some(judge) = &sample.scorer.judge_model
+        && !mandate.allows_model(Some(judge))
+    {
+        return Err(refused(MeshRefusal::ModelForbidden));
+    }
+    Ok(left)
 }
 
 /// The concurrency of a run that asks for none.
@@ -615,6 +646,7 @@ async fn score_draw(
         verdict,
         usage: report.usage.saturating_add(usage),
         cost_usd_micros: report.cost_usd_micros.saturating_add(cost),
+        parked_until_ms: report.parked_until_ms,
     };
     Ok((Scored { record, report }, stop))
 }
@@ -740,6 +772,64 @@ mod tests {
             request.admitted_judges,
             Some(std::collections::BTreeSet::new())
         );
+    }
+
+    #[test]
+    fn a_score_input_drops_the_tool_results_of_the_history() {
+        let turn = |id: &str, content: &str| {
+            serde_json::json!([
+                {"role": "assistant", "content": [
+                    {"tool_call": {"id": id, "name": "read", "arguments": {}}}
+                ]},
+                {"role": "user", "content": [
+                    {"tool_result": {"tool_call_id": id, "content": content}}
+                ]}
+            ])
+        };
+        let history: Vec<crate::message::ChatMessage> =
+            serde_json::from_value(turn("old", "old result")).unwrap();
+        let mut messages = history.clone();
+        messages.extend(
+            serde_json::from_value::<Vec<crate::message::ChatMessage>>(turn("new", "new result"))
+                .unwrap(),
+        );
+        let report: AgentReport = serde_json::from_value(serde_json::json!({
+            "stop": "completed",
+            "text": "done",
+            "steps_used": 1,
+            "tool_calls": 1,
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+            "messages": messages,
+        }))
+        .unwrap();
+        let sample = OpSample::new(
+            SampleStrategy::best_of_n(1),
+            ScorerRef::deterministic("exact_match").unwrap(),
+        );
+        let mut task = AgentTask::new("x");
+        task.history = history;
+        let request = score_request(&sample, &task, &report).unwrap();
+        let contents: Vec<&str> = request
+            .input
+            .tools
+            .iter()
+            .map(|tool| tool.content.as_str())
+            .collect();
+        assert_eq!(contents, ["new result"]);
+        let plain = score_request(&sample, &AgentTask::new("x"), &report).unwrap();
+        assert_eq!(plain.input.tools.len(), 2, "no history keeps each result");
+    }
+
+    #[test]
+    fn a_stop_code_is_its_wire_name() {
+        for stop in [
+            SampleStop::Completed,
+            SampleStop::Accepted,
+            SampleStop::BudgetExceeded,
+            SampleStop::ScoreFailed,
+        ] {
+            assert_eq!(serde_json::json!(stop), serde_json::json!(stop.code()));
+        }
     }
 
     #[test]

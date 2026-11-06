@@ -291,6 +291,7 @@ impl Progress {
             error: None,
             resets: self.reset.count,
             answer_rejections: self.rejections.clone(),
+            parked_until_ms: self.parked_until,
         }
     }
 

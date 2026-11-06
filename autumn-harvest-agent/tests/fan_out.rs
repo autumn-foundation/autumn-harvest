@@ -465,6 +465,7 @@ fn child_report(input: &Value) -> Value {
         error: None,
         resets: 0,
         answer_rejections: Vec::new(),
+        parked_until_ms: None,
     })
 }
 

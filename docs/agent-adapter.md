@@ -1427,6 +1427,8 @@ one strategy run in the subtree, and each draw counts as one delegation of
 its peer, so the cap only narrows. `outbound` and `accept` carry it. A
 mandate with no cap leaves the sampling policy as the only cap. Each draw
 carries the mesh of the profile, so a mesh budget stops the next draw.
+A worker that predates `max_draws` drops it from a peer message. Upgrade
+every worker before you set it.
 
 ## 15. Durable agents
 
@@ -2053,12 +2055,21 @@ let op = AgentOp::message("Name a prime.").with_sample(sample);
   `PeerReply::refusal`, and any other error in `PeerReply::error`.
 - The selected draw gives the answer and the new transcript. The tokens and
   the labels of each draw go into the state, selected or not.
-- With no accepted draw, the op fails. A strategy op does not park the
-  agent on a spent mesh budget. It answers with the draws that ran.
-- A steer message with a strategy runs as its own op. An interrupt does not
-  stop the draws of a running strategy op.
+- A mesh budget that refuses a draw parks the agent until the period
+  ends, as for a segment. When no draw spent a token, a message from a
+  person waits first in line. Else the op answers with the draws that ran.
+- With no accepted draw, the op fails with `no_accepted_draw`.
+- A judge model must be in `Mandate::models`, else the op gets
+  `model_forbidden`. A judge call does not check the mesh budget before
+  the call. Its tokens count after it.
+- A transcript over the workflow input cap fails the op before any draw,
+  because each draw carries the transcript.
+- A steer message with a strategy runs as its own op. An interrupt, a
+  pause or a delete does not stop the draws of a running strategy op.
 - A draw has no memory tool, no workspace, no follow-ups and no progress
   notes. It reads the state memory in its system prompt.
+- A worker that predates `OpSample` drops the field and runs a plain
+  segment. Upgrade every worker before a client sends a strategy op.
 
 The design is in [`DESIGN-2449.md`](design/DESIGN-2449.md).
 
@@ -2509,8 +2520,9 @@ let input = SampleInput::new(
 | `rejection { max_attempts, threshold }` | Runs draws until one scores at or above `threshold`, up to `max_attempts` draws. It runs one draw at a time unless the input asks for more. It stops after the wave that holds the pass. |
 
 The run reads the profile and the sampling policy of the kind once each,
-as `agent_draws` does (section 19). A profile mandate admits the draws
-first, as for a strategy op (section 15). The policy admits the strategy, the
+as `agent_draws` does (section 19). In a run that starts after this
+release, a profile mandate admits the draws first, as for a strategy op
+(section 15). The policy admits the strategy, the
 draw count (`n` or `max_attempts`), the concurrency and the scorer. Each
 draw gets `draw_effects`, so with the default `[read_only]` a draw that
 calls a `write` tool gets a refusal, and the tool body never runs.

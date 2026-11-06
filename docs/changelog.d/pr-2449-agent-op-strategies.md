@@ -27,14 +27,22 @@ of a whole subtree. The design is in `docs/design/DESIGN-2449.md`.
 - `SampleReport::flow_labels` holds the labels of each draw, selected or
   not. A score input drops the history of its task.
 - Each draw carries the mesh of the profile, so a mesh budget stops the
-  next draw. A strategy op does not park the agent.
+  next draw. `AgentReport::parked_until_ms` and
+  `SampleDraw::parked_until_ms` carry the period end. A strategy op then
+  parks the agent. An op whose draws spent no token waits first in line.
+- A judge model must be in `Mandate::models`. A transcript over the
+  workflow input cap fails the op before any draw.
+- **Behavior change.** A new `agent_sample` run under a profile mandate
+  counts each draw against `max_delegations` (16 by default). So
+  best-of-17 and more is refused with `fan_out_exhausted`.
 - `formal/verus/src/agent_mandate_draws.rs` proves `meet_cap` and
   `draw_verdict`: a meet never widens a cap, and admitted draws fit the cap
   and the room of the tree.
 
-Tests: `tests/agent_strategies.rs` (best-of-3 op, policy refusal, mandate
-and fan-out refusals, peer refusal and reply, mesh budget with the mesh
-ledger), property tests `delegate_never_widens_max_draws`,
+Tests: `tests/agent_strategies.rs` covers each acceptance line on
+SQLite. It also covers a rejection op, the judge and size refusals, and
+a parked agent. The property tests are `delegate_never_widens_max_draws`,
+`a_permitted_delegation_takes_the_smaller_draw_cap`,
 `accept_never_widens_max_draws` and
-`admitted_draws_fit_the_cap_and_the_fan_out`, and wire tests in `mesh.rs`
-and `agent/mod.rs`.
+`admitted_draws_fit_the_cap_and_the_fan_out`. Wire tests are in
+`mesh.rs` and `agent/mod.rs`.

@@ -1604,6 +1604,38 @@ mod tests {
         }
 
         #[test]
+        fn a_permitted_delegation_takes_the_smaller_draw_cap(
+            parent_cap in cap(),
+            peer_cap in cap(),
+            local_cap in cap(),
+            used in 0_u32..4,
+        ) {
+            let parent = Mandate {
+                max_draws: parent_cap,
+                ..Mandate::new("root").peers(["child"])
+            };
+            let role = Peer {
+                max_draws: peer_cap,
+                ..Peer::new("child", "C.")
+            };
+            let expected = match (parent_cap, peer_cap) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (one, None) | (None, one) => one,
+            };
+            let child = parent.delegate(&role, used).unwrap();
+            prop_assert_eq!(child.max_draws, expected);
+            let sent = parent.outbound(&role, used, &BTreeSet::new()).unwrap();
+            prop_assert_eq!(sent.max_draws, expected);
+            let local = Mandate {
+                max_draws: local_cap,
+                ..Mandate::new("child")
+            };
+            let merged = local.accept(&sent).unwrap();
+            prop_assert!(cap_within(merged.max_draws, expected));
+            prop_assert!(cap_within(merged.max_draws, local_cap));
+        }
+
+        #[test]
         fn accept_never_widens_max_draws(local in mandate(), inbound in mandate()) {
             if let Ok(merged) = local.accept(&inbound) {
                 prop_assert!(cap_within(merged.max_draws, local.max_draws));

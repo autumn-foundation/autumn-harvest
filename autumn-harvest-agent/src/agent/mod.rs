@@ -71,6 +71,7 @@ use crate::workflow::{
     Member, Outbox, Progress, Run, SteerBook, Tree, deliver, discover, harness, run_segment,
 };
 use crate::workspace::{WorkspaceMount, WorkspaceRef};
+use autumn_harvest::builder::DEFAULT_MAX_WORKFLOW_INPUT_BYTES;
 use dedupe::Inbound;
 use inbox::{Admit, InboxStatus, OpClass, admit};
 use overlay_store::OverlayVersion;
@@ -1942,10 +1943,18 @@ impl AgentRun<'_> {
                 if let Some(sample) = &message.sample {
                     // A person is present, so a new follow-up chain starts.
                     state.chain = 0;
-                    return self
+                    let (mut state, outcome) = self
                         .sampled(state, &message.text, sample, Mode::Attended, None)
-                        .await
-                        .0;
+                        .await;
+                    // A mesh budget refused each draw before it spent a
+                    // token. The message waits for the next period, first in
+                    // line.
+                    if matches!(outcome, Ok(Some((AgentStop::BudgetExceeded, ref answer))) if answer.is_empty())
+                        && matches!(state.status, AgentStatus::Parked { .. })
+                    {
+                        hold_first(&mut state, AgentOp::UserMessage(message));
+                    }
+                    return state;
                 }
                 if let (Urgency::Steer, Some(id)) = (message.urgency, message.message_id.clone()) {
                     // A running segment took the steer signal, so the op is done.
@@ -2363,6 +2372,15 @@ impl AgentRun<'_> {
             task.flow_labels
                 .extend(crate::memory::snapshot_labels(&state.memory));
         }
+        // Each draw carries the task in its input. A task over the input cap
+        // would fail the spawn after the policy read, so it fails here.
+        if crate::bounds::exceeds_bytes(&task, DEFAULT_MAX_WORKFLOW_INPUT_BYTES) {
+            let reason = format!(
+                "the transcript is too large for a strategy op: a draw input must fit {DEFAULT_MAX_WORKFLOW_INPUT_BYTES} bytes"
+            );
+            fail(&mut state, &reason);
+            return (state, Ok(None));
+        }
         let report = match sample_task(self.ctx, id.kind(), sample, &task, true).await {
             Ok(report) => report,
             Err(SampleFailure::Refused(crate::sampling::Refusal::Mandate { mandate }))
@@ -2379,10 +2397,26 @@ impl AgentRun<'_> {
             .tokens_used
             .saturating_add(u64::from(report.usage.total()));
         state.flow_labels.extend(report.flow_labels.iter().cloned());
+        // A mesh budget that refused a draw parks the agent, as it does for
+        // a segment. The latest period end wins.
+        let parked = report
+            .draws
+            .iter()
+            .filter_map(|draw| draw.parked_until_ms)
+            .max();
+        if let Some(until_ms) = parked {
+            state.status = AgentStatus::Parked { until_ms };
+        }
         let Some(selected) = report.selected else {
+            if parked.is_some() && report.usage.total() == 0 {
+                // No draw spent a token, so the op can wait for the next
+                // period. The caller holds a message from a person.
+                state.last_stop = Some(AgentStop::BudgetExceeded);
+                return (state, Ok(Some((AgentStop::BudgetExceeded, String::new()))));
+            }
             let reason = format!(
-                "no draw of the strategy passed the scorer; the run stopped: {:?}",
-                report.stopped
+                "no_accepted_draw: no draw of the strategy passed the scorer; the run stopped with {}",
+                report.stopped.code()
             );
             fail(&mut state, &reason);
             return (state, Ok(None));
@@ -2850,8 +2884,12 @@ mod tests {
         assert_eq!(serde_json::from_value::<AgentOp>(value).unwrap(), op);
         let plain = serde_json::to_value(AgentOp::message("hi")).unwrap();
         assert!(plain.get("sample").is_none(), "no sample sends no key");
-        let pause = AgentOp::Control(Control::Resume);
-        assert_eq!(pause.clone().with_sample(best_of(2)), pause);
+        let resume = AgentOp::Control(Control::Resume);
+        assert_eq!(resume.clone().with_sample(best_of(2)), resume);
+        let old: AgentOp =
+            serde_json::from_value(serde_json::json!({"type": "user_message", "text": "hi"}))
+                .unwrap();
+        assert_eq!(old, AgentOp::message("hi"), "an op with no sample decodes");
     }
 
     #[test]

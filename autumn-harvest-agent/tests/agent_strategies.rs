@@ -6,6 +6,7 @@
 //! - `Mandate::max_draws` and the fan-out of a mandate bound the draws.
 //! - Each draw carries the mesh, so a mesh budget stops the next draw.
 
+#![cfg(feature = "sqlite")]
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -22,15 +23,15 @@ use std::sync::Arc;
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest_agent::model::BoxFuture;
 use autumn_harvest_agent::sampling::{
-    InMemorySamplingPolicyStore, OpSample, SampleStrategy, SamplingPolicy, SamplingPolicyStore,
-    ScorerRef, Strategy,
+    InMemorySamplingPolicyStore, OpSample, SampleInput, SampleStrategy, SamplingPolicy,
+    SamplingPolicyStore, ScorerId, ScorerRef, Scorers, Strategy,
 };
 use autumn_harvest_agent::{
-    AgentError, AgentHarness, AgentId, AgentModel, AgentOp, AgentProfile, AgentState, ChatMessage,
-    ChatRequest, ChatRole, ContentPart, Mandate, MeshBudget, PeerEnvelope, ScoreContext,
-    ScoreInput, Scorer, Verdict, sqlite,
+    AgentError, AgentHarness, AgentId, AgentModel, AgentOp, AgentProfile, AgentState, AgentStatus,
+    ChatMessage, ChatRequest, ChatRole, ContentPart, FiniteF64, Mandate, MeshBudget, PeerEnvelope,
+    ScoreContext, ScoreInput, Scorer, Verdict, sqlite,
 };
-use autumn_harvest_sqlite::{ExecutionFilter, ExecutionId, SqliteReader, SqliteRuntime};
+use autumn_harvest_sqlite::{ExecutionFilter, ExecutionId, RunState, SqliteReader, SqliteRuntime};
 use common::{TryFnModel, answer, runtime};
 use futures::FutureExt as _;
 
@@ -102,12 +103,14 @@ fn best_of_three() -> OpSample {
     )
 }
 
-/// A model that answers draw `n` with `answers[n]` and a plain turn with
-/// `plain`. Each answer costs 5 tokens.
+/// A model that answers draw `n` with `answers[n % len]` and a plain turn
+/// with `plain`. Each answer costs 5 tokens.
 fn by_draw(answers: &'static [&'static str], plain: &'static str) -> Arc<TryFnModel> {
-    TryFnModel::new(move |request: &ChatRequest| match request.draw {
-        Some(draw) => answer(answers[draw.get() as usize % answers.len()], 5),
-        None => answer(plain, 5),
+    TryFnModel::new(move |request: &ChatRequest| {
+        request.draw.map_or_else(
+            || answer(plain, 5),
+            |draw| answer(answers[draw.get() as usize % answers.len()], 5),
+        )
     })
 }
 
@@ -130,8 +133,9 @@ fn harness(
         .sampling_policies(store_with(policy))
 }
 
-async fn state(rt: &SqliteRuntime, agent: &AgentId) -> AgentState {
-    sqlite::state(rt, agent).await.unwrap().unwrap()
+fn state(rt: &SqliteRuntime, agent: &AgentId) -> impl Future<Output = AgentState> + Send + 'static {
+    let query = Box::pin(sqlite::state(rt, agent));
+    async move { query.await.unwrap().unwrap() }
 }
 
 async fn send(rt: &mut SqliteRuntime, agent: &AgentId, op: &AgentOp) {
@@ -164,7 +168,7 @@ fn texts(messages: &[ChatMessage], role: ChatRole) -> Vec<String> {
 async fn a_best_of_three_op_runs_three_draws_and_keeps_the_selected_answer() {
     let (_dir, db) = fresh_db();
     let model = by_draw(&["a", "b", "c"], "hello");
-    let profile = AgentProfile::new(KIND);
+    let profile = AgentProfile::new(KIND).system("Be brief.");
     let mut rt = runtime(&db, harness(model.clone(), profile, &best_of(3)));
     let agent = desk("one");
 
@@ -309,7 +313,8 @@ async fn a_peer_under_a_mandate_with_two_draws_gets_draws_exceeded() {
     assert_eq!(replies.len(), 1, "{replies:?}");
     assert_eq!(replies[0]["outcome"], "resolved");
     assert_eq!(replies[0]["value"]["refusal"], "draws_exceeded");
-    assert!(state(&rt, &agent).await.transcript.is_empty());
+    let kept = state(&rt, &agent).await.transcript;
+    assert!(kept.is_empty(), "a refusal keeps no turn: {kept:?}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -383,7 +388,7 @@ async fn a_mesh_budget_that_admits_two_draws_stops_the_third() {
     let mut rt = runtime(&db, harness);
     let agent = desk("seven");
 
-    let op = AgentOp::message("Pick a letter.").with_sample(best_of_three());
+    let op = AgentOp::message("Pick a letter.").with_sample(best_of_three().concurrency(1));
     send(&mut rt, &agent, &op).await;
 
     assert_eq!(draw_calls(&model), 2, "the budget stops the third draw");
@@ -395,4 +400,177 @@ async fn a_mesh_budget_that_admits_two_draws_stops_the_third() {
     let state = state(&rt, &agent).await;
     assert_eq!(state.tokens_used, 10);
     assert_eq!(state.last_answer.as_deref(), Some("b"), "the best of two");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_spent_mesh_budget_parks_the_agent_and_holds_the_strategy_op() {
+    let (_dir, db) = fresh_db();
+    let model = TryFnModel::new(|request: &ChatRequest| {
+        answer(if request.draw.is_some() { "b" } else { "spend" }, 12)
+    });
+    let profile = AgentProfile::new(KIND).mesh("support");
+    let harness = harness(model.clone(), profile, &best_of(3))
+        .mesh_budget(MeshBudget::daily("support").max_tokens(10))
+        .mesh_spend(Arc::new(sqlite::LedgerSpend::open(&db)));
+    let mut rt = runtime(&db, harness);
+    let agent = desk("eight");
+
+    send(&mut rt, &agent, &AgentOp::message("spend")).await;
+    let op = AgentOp::message("Pick a letter.").with_sample(best_of_three());
+    send(&mut rt, &agent, &op).await;
+
+    assert_eq!(draw_calls(&model), 0, "the budget refuses each draw");
+    let state = state(&rt, &agent).await;
+    assert!(
+        matches!(state.status, AgentStatus::Parked { .. }),
+        "{:?}",
+        state.status
+    );
+    assert_eq!(state.failures, 0, "a refusal of the mesh is not a failure");
+    assert_eq!(state.held.len(), 1, "the op waits for the next period");
+    assert_eq!(state.held[0], op);
+    assert_eq!(
+        texts(&state.transcript, ChatRole::User),
+        ["spend"],
+        "the transcript stays as it was"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rejection_op_stops_at_the_first_pass() {
+    let (_dir, db) = fresh_db();
+    let model = by_draw(&["a", "b", "c"], "plain");
+    let policy = SamplingPolicy {
+        strategies: BTreeSet::from([Strategy::Rejection]),
+        max_draws: 3,
+        ..SamplingPolicy::default()
+    };
+    let mut rt = runtime(
+        &db,
+        harness(model.clone(), AgentProfile::new(KIND), &policy),
+    );
+    let agent = desk("nine");
+
+    let strategy = SampleStrategy::rejection(3, FiniteF64::new(0.8).unwrap());
+    let sample = OpSample::new(strategy, ScorerRef::deterministic("table").unwrap());
+    send(
+        &mut rt,
+        &agent,
+        &AgentOp::message("Pick.").with_sample(sample),
+    )
+    .await;
+
+    assert_eq!(draw_calls(&model), 2, "draw 1 passes, so draw 2 never runs");
+    assert_eq!(state(&rt, &agent).await.last_answer.as_deref(), Some("b"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_peer_op_that_the_policy_refuses_replies_with_the_error() {
+    let (_dir, db) = fresh_db();
+    let model = by_draw(&["a"], "plain");
+    let profile = AgentProfile::new(KIND).mandate(Mandate::new(KIND));
+    let mut rt = runtime(
+        &db,
+        harness(model.clone(), profile, &SamplingPolicy::default()),
+    );
+    let agent = desk("ten");
+
+    let envelope = PeerEnvelope {
+        from: "triage/x@life".into(),
+        sender: "triage".into(),
+        seq: 1,
+        text: "Pick a letter.".into(),
+        mandate: Mandate::new("triage"),
+        flow_labels: BTreeSet::new(),
+        reply_to: Some(format!("{}/reply-1", ExecutionId::new())),
+        waiting: Vec::new(),
+        mesh: None,
+        sample: Some(best_of_three()),
+    };
+    send(&mut rt, &agent, &AgentOp::peer(envelope)).await;
+
+    assert!(model.requests().is_empty(), "no draw runs");
+    let replies = sent_signals(&rt, &agent);
+    assert_eq!(replies.len(), 1, "{replies:?}");
+    let reply = &replies[0]["value"];
+    assert!(reply["refusal"].is_null(), "{reply}");
+    let error = reply["error"].as_str().unwrap();
+    assert!(error.contains("strategy_not_allowed"), "{error}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_judge_model_that_the_mandate_forbids_is_refused() {
+    let (_dir, db) = fresh_db();
+    let model = by_draw(&["a"], "plain");
+    let policy = SamplingPolicy {
+        strategies: BTreeSet::from([Strategy::BestOfN]),
+        max_draws: 3,
+        scorers: Scorers::Only(BTreeSet::from([ScorerId::new("table").unwrap()])),
+        judge_models: BTreeSet::from(["big".to_owned()]),
+        ..SamplingPolicy::default()
+    };
+    let mandate = Mandate::new(KIND).models([autumn_harvest_agent::DEFAULT_MODEL]);
+    let profile = AgentProfile::new(KIND).mandate(mandate);
+    let mut rt = runtime(&db, harness(model.clone(), profile, &policy));
+    let agent = desk("eleven");
+
+    let judge = ScorerRef::judge("table", "big").unwrap();
+    let sample = OpSample::new(SampleStrategy::best_of_n(2), judge);
+    send(
+        &mut rt,
+        &agent,
+        &AgentOp::message("Pick.").with_sample(sample),
+    )
+    .await;
+
+    assert!(model.requests().is_empty(), "no draw runs");
+    let error = state(&rt, &agent).await.last_error.unwrap();
+    assert!(error.contains("model_forbidden"), "{error}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn agent_sample_refuses_draws_over_the_profile_mandate() {
+    let (_dir, db) = fresh_db();
+    let model = by_draw(&["a"], "plain");
+    let profile = AgentProfile::new(KIND).mandate(Mandate::new(KIND).max_draws(2));
+    let mut rt = runtime(&db, harness(model.clone(), profile, &best_of(3)));
+
+    let input = SampleInput::new(
+        KIND,
+        "Pick.",
+        SampleStrategy::best_of_n(3),
+        ScorerRef::deterministic("table").unwrap(),
+    );
+    let exec = sqlite::start_sample(&mut rt, &input).unwrap();
+    match rt.run_until_blocked(exec).await.unwrap() {
+        RunState::Failed(error) => assert!(error.contains("draws_exceeded"), "{error}"),
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    assert!(model.requests().is_empty(), "no draw runs");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_transcript_too_large_for_a_draw_is_refused_before_any_draw() {
+    let (_dir, db) = fresh_db();
+    let big: &'static str = Box::leak("x".repeat(1_200_000).into_boxed_str());
+    let model = TryFnModel::new(move |request: &ChatRequest| {
+        answer(if request.draw.is_some() { "a" } else { big }, 5)
+    });
+    let mut rt = runtime(
+        &db,
+        harness(model.clone(), AgentProfile::new(KIND), &best_of(3)),
+    );
+    let agent = desk("twelve");
+
+    send(&mut rt, &agent, &AgentOp::message("one")).await;
+    send(&mut rt, &agent, &AgentOp::message("two")).await;
+    assert_eq!(state(&rt, &agent).await.failures, 0);
+    let op = AgentOp::message("Pick.").with_sample(best_of_three());
+    send(&mut rt, &agent, &op).await;
+
+    assert_eq!(draw_calls(&model), 0, "no draw runs");
+    let state = state(&rt, &agent).await;
+    let error = state.last_error.unwrap();
+    assert!(error.contains("too large"), "{error}");
+    assert_eq!(state.failures, 1);
 }
