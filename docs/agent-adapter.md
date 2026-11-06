@@ -2861,3 +2861,117 @@ on the harness that implements `MemoryStore::ensure_block` and
   notes why.
 - **Fleet.** `InMemoryMemoryStore` lives in one process. Each worker of a
   fleet needs the same durable store.
+
+## 25. Refine an agent
+
+The refine loop improves the setup of an agent kind from its recorded
+runs. Sections 16 to 24 describe each part. This section shows how the
+parts fit. [ADR 0016](adr/0016-agent-refinement.md) records the four
+decisions, and [ADR 0014](adr/0014-operator-refine-policy.md) records
+the policy rule.
+
+```sh
+cargo run -p autumn-harvest-agent --features sqlite,eval --example agent_refine
+```
+
+`autumn-harvest-agent/examples/agent_refine.rs` runs the loop on SQLite
+with scripted models. It needs no API key and no network. The refine
+workflow needs the `eval` feature.
+
+1. Op 1 is a recorded `agent_loop` run of the kind `support`. Its prompt
+   lacks a refund rule, so the `ExactMatch` scorer rejects its answer.
+2. `agent_refine` with k = 1 reads op 1. The proposer adds the rule, and
+   the probe replays op 1 under the candidate.
+3. The run waits at the adoption gate. The example approves it.
+4. Op 2 goes to the durable agent `support/customer-2`. It reads the
+   adopted version 1, so its answer passes. The example exits non-zero
+   when op 2 fails.
+
+Its tests also send a reject. Op 2 then fails, so the check is not
+vacuous.
+
+### The loop
+
+The loop runs offline. It reads ended runs only, and it never changes an
+op in flight. A live op reads only the active version, at its start.
+
+1. **Policy.** The run reads the `RefinePolicy` of the kind once, through
+   a recorded activity ([section 18](#18-the-refine-policy-issue-2394)).
+2. **Propose.** A proposer writes INV and DOM candidates from the
+   evidence of the source runs
+   ([section 16](#16-propose-an-overlay-issue-2379)). It tries
+   `proposal_attempts` times. Then the stage inherits its base.
+3. **Probe.** Each candidate replays against its source. A composer
+   combines the probed candidates, and a selector picks one
+   ([section 22](#22-refine-a-kind-issue-2380)).
+4. **Adopt.** The chosen overlay goes to the adoption gate
+   ([section 23](#23-the-adoption-gate)).
+5. **Learn.** An adoption adds one lesson to the lesson library of the
+   kind ([section 24](#24-the-lesson-library)).
+
+Run the loop from a schedule or by hand. Never run it on the path of an
+op.
+
+### The budget identity
+
+For each source, both modes run 3k sessions. Each candidate stage adds
+one probe. A `KeptBase` or `FellBack` stage adds none. A run that ran its
+whole plan checks the counts, and a mismatch fails it with
+`RefineBudgetIdentity`. In the example, k = 1 gives 3 sessions. The INV
+stage keeps its base, so the run makes 2 probes. A `MeshBudget` caps the
+spend of a run in tokens and cost.
+
+### Ceilings
+
+The operator sets the ceilings. Each stage, each probe, the store and the
+gate apply an overlay under them.
+
+- `ceilings.max_steps`, `ceilings.max_total_tokens` and
+  `ceilings.max_output_tokens` bound the three `max_*` fields.
+  `ceilings.models` lists the models that an overlay may name. The
+  default of each is `null`, the profile value, so an overlay can only
+  narrow.
+- An overlay cannot clear `read_only` unless the ceilings allow it.
+- An overlay holds a prompt, guardrails, tool guidance, skills, a model,
+  bounds and `read_only` only. It has no field for tools, tool rules,
+  flow rules, a mandate, scripts or plugins. It refuses an unknown key
+  when it decodes, so a model cannot add one.
+
+### Probes and their safety
+
+A probe replays the recorded source, so the base rollout costs nothing.
+No tool runs in a replay. The recorded outcome of the same call answers
+a tool call, and a call with no recorded outcome gets an error stub
+([section 12](#12-evaluate-a-candidate-overlay)). A probe with a stub
+asks for a live re-probe on a fork. The tool-call activity of that fork
+runs only the `ToolEffect`s of `probe_effects`. The default is
+read-only, so a probe never writes. SQLite has no fork, so a SQLite run
+skips the live re-probe and notes it.
+
+### Adoption
+
+By default, a person adopts each overlay. `auto_adopt.parts` is empty, so
+each candidate waits at the gate. A person approves, edits or rejects it
+before `approval_timeout`. No decision at the deadline counts as a
+reject. An operator can list parts in `auto_adopt.parts`. A candidate
+that changes only those parts then goes live without a person, under the
+daily cap `auto_adopt.max_per_day`.
+
+### The policy
+
+Each setting of `RefinePolicy` is a runtime operator setting with a safe
+default. The table in [section 18](#18-the-refine-policy-issue-2394)
+lists each one with its default and range: `auto_adopt.parts`,
+`auto_adopt.max_per_day`, `approval_timeout`, `probe_effects`,
+`ceilings.max_steps`, `ceilings.max_total_tokens`,
+`ceilings.max_output_tokens`, `ceilings.models`, `proposal_attempts` and
+`lessons.max_entries`. Only an operator writes the policy. No model
+output carries it, so the loop cannot widen its own gate.
+
+### The lesson library
+
+Each adoption adds one lesson to the library of the kind. The next run
+reads the library and gives it to each proposer as data, with its flow
+labels. `lessons.max_entries` bounds the library, and the oldest lesson
+goes first. The example installs an `InMemoryMemoryStore`, so its run
+writes one lesson.

@@ -275,6 +275,14 @@ name = "agent_session_entity"
 required-features = ["sqlite"]
 test = true
 
+# The refine loop of a kind, end to end: a failed op, a refine run, an
+# approval and a passed op. The refine workflow needs `eval`. `test = true`
+# runs its tests in the crate test step, and CI also runs `main`.
+[[example]]
+name = "agent_refine"
+required-features = ["sqlite", "eval"]
+test = true
+
 # Deterministic instruction-count harness for `AgentHarness::model_turn`, the
 # activity side of one model turn (issues #1973, #2264). Drive it under
 # valgrind. See `benches/agent_model_turn_profile.rs`.

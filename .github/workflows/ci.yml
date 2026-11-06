@@ -1284,6 +1284,19 @@ jobs:
       - name: Run autumn-harvest-agent tests (issues #1973, #2001)
         if: needs.changes.outputs.code == 'true' && matrix.shard == 3
         run: cargo test -p autumn-harvest-agent --features sqlite,eval,sandbox
+      # The refine example runs offline: scripted models, no key, no network.
+      # It exits non-zero when op 2 fails, so this step fails too. Its
+      # feature set differs from the test step, so the core crate builds
+      # again. The step first deletes the test binaries that already ran.
+      - name: Free runner disk before the refine example (Linux)
+        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true' && matrix.shard == 3
+        run: |
+          find target/debug/deps -maxdepth 1 -type f -perm -u+x \
+            ! -name '*.so' ! -name '*.d' -delete
+          df -h /
+      - name: Run the agent refine example
+        if: needs.changes.outputs.code == 'true' && matrix.shard == 3
+        run: cargo run -p autumn-harvest-agent --features sqlite,eval --example agent_refine
       # Sandboxed code activities. The tests need no KVM: a fake VMM, fake
       # `firecracker` and `jailer` scripts and a fake API server stand in. The
       # Linux backends compile on Linux only, so the other OSes run the
