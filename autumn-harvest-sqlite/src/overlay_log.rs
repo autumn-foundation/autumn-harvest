@@ -604,9 +604,10 @@ fn activate_in(
         return Ok(ActivateOutcome::UnknownVersion);
     };
     let actual = active.map(to_version).transpose()?;
-    let last_seq = match request.after_seq {
-        Some(_) => last_move(&tx, kind)?.map(|row| row.seq),
-        None => None,
+    let last_seq = if request.needs_last_seq() {
+        last_move(&tx, kind)?.map(|row| row.seq)
+    } else {
+        None
     };
     let outcome = match request.decide(known, actual, last_seq) {
         ActivateDecision::UnknownVersion => ActivateOutcome::UnknownVersion,

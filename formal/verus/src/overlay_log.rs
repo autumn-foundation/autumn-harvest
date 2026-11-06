@@ -343,6 +343,70 @@ pub fn decide_rollback(
     }
 }
 
+/// `decide_guarded` as a spec.
+pub open spec fn spec_decide_guarded(
+    known: bool,
+    expected: Option<u64>,
+    actual: Option<u64>,
+    read_seq: Option<u64>,
+    last_seq: Option<u64>,
+) -> ActivateDecision {
+    if spec_decide_activate(known, expected, actual) != ActivateDecision::Activate {
+        spec_decide_activate(known, expected, actual)
+    } else if last_seq == read_seq {
+        ActivateDecision::Activate
+    } else {
+        ActivateDecision::Conflict
+    }
+}
+
+// mirror: autumn-harvest/src/overlay_log.rs decide_guarded
+pub fn decide_guarded(
+    known: bool,
+    expected: Option<u64>,
+    actual: Option<u64>,
+    read_seq: Option<u64>,
+    last_seq: Option<u64>,
+) -> (r: ActivateDecision)
+    ensures
+        r == spec_decide_guarded(known, expected, actual, read_seq, last_seq),
+        r == ActivateDecision::Activate ==> last_seq == read_seq,
+        r == ActivateDecision::Activate ==> known && actual == expected,
+{
+    match decide_activate(known, expected, actual) {
+        ActivateDecision::Activate => {
+            let same = match (read_seq, last_seq) {
+                (None, None) => true,
+                (Some(read), Some(last)) => read == last,
+                _ => false,
+            };
+            if same {
+                ActivateDecision::Activate
+            } else {
+                ActivateDecision::Conflict
+            }
+        },
+        other => other,
+    }
+}
+
+/// A guarded move after any later move of the log never activates. So a
+/// pointer that moved away and back never passes the guard.
+pub proof fn theorem_a_moved_log_never_passes_the_guard(
+    known: bool,
+    expected: Option<u64>,
+    actual: Option<u64>,
+    read_seq: Option<u64>,
+    last_seq: Option<u64>,
+)
+    requires
+        last_seq != read_seq,
+    ensures
+        spec_decide_guarded(known, expected, actual, read_seq, last_seq)
+            != ActivateDecision::Activate,
+{
+}
+
 /// One move of the pointer: the pointer before it and the version after it.
 pub struct Move {
     pub from: Option<u64>,

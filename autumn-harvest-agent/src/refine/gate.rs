@@ -509,8 +509,9 @@ async fn edited(
 ///
 /// The step first reads the activation log. A move after the wait opened
 /// ends the decision with no move: [`DecideOutcome::Activated`] when the
-/// move is its own earlier attempt, else [`DecideOutcome::Conflict`]. So a
-/// retry never undoes a rollback.
+/// move is its own earlier attempt, else [`DecideOutcome::Conflict`]. The
+/// swap checks the log head again in its own transaction. So a retry never
+/// undoes a rollback, and a move away and back never passes.
 ///
 /// An `edit` must apply to the profile of the kind under the run ceilings.
 /// The store then checks it under its current policy. A retry finds the
@@ -540,8 +541,16 @@ pub(crate) async fn run_decide(
             Err(refused) => return Ok(refused),
         },
     };
+    // The swap also checks the log head, so a move between the read above
+    // and the swap never passes, also when the pointer came back.
     let refused = match store
-        .activate(&request.kind, target, request.expected, own.clone())
+        .activate_guarded(
+            &request.kind,
+            target,
+            request.expected,
+            request.seen,
+            own.clone(),
+        )
         .await
     {
         Ok(()) => return Ok(DecideOutcome::Activated { version: target }),
@@ -977,6 +986,50 @@ mod tests {
         );
         let after = store.last_activation("support").await.unwrap().unwrap();
         assert_eq!(after.seq(), moves.seq(), "the retry logs no move");
+    }
+
+    #[tokio::test]
+    async fn a_move_away_and_back_before_the_swap_moves_nothing() {
+        let (harness, request) = waiting().await;
+        let store = harness.overlays().unwrap();
+        let ops = || Provenance::operator("ops");
+        let other = ProfileOverlay {
+            system: Some("three".to_owned()),
+            ..ProfileOverlay::default()
+        };
+        let v3 = store.put("support", &other, ops()).await.unwrap();
+        // The pointer leaves v1 and comes back. Only the log head shows it.
+        store
+            .activate("support", v3, request.expected, ops())
+            .await
+            .unwrap();
+        store
+            .activate("support", request.expected.unwrap(), Some(v3), ops())
+            .await
+            .unwrap();
+        let swap = store
+            .activate_guarded(
+                "support",
+                request.version,
+                request.expected,
+                request.seen,
+                Provenance::refine(request.run),
+            )
+            .await;
+        assert_eq!(
+            swap,
+            Err(OverlayStoreError::Conflict {
+                actual: request.expected
+            })
+        );
+        let outcome = run_decide(&harness, request.clone()).await.unwrap();
+        assert_eq!(
+            outcome,
+            DecideOutcome::Conflict {
+                active: request.expected
+            }
+        );
+        assert_eq!(active(&harness), request.expected);
     }
 
     #[tokio::test]

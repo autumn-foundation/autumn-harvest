@@ -60,6 +60,7 @@ const fn mv(
         actor_kind: "operator",
         actor: "ops",
         after_seq: None,
+        head: None,
     }
 }
 

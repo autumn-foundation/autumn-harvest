@@ -78,6 +78,10 @@ stores nothing and opens no gate.
   the last move is its own `refine:<run>` move, the step reports
   `adopted`. Else it reports `superseded`. So a retry never undoes a
   rollback, and a lowered ceiling never hides its own move.
+- The swap of `agent_refine_decide` is `activate_guarded`. It checks the
+  log head `seen` in the same transaction as the pointer. So a move away
+  and back between the read and the swap never passes.
+  `overlay_log::decide_guarded` is the kernel, and Verus proves it.
 - `agent_refine_decide` finds its own `refine:<run>` version with the
   edited overlay before it puts.
 - The store refuses a stale pointer, so a move after refine start always
@@ -111,6 +115,7 @@ How can the gate put the wrong overlay live? Each failure has a guard.
 | An `edit` changes `auto_adopt` or another policy key. | `ProfileOverlay` is `deny_unknown_fields`. The payload does not decode. |
 | A retry puts a second version. | Each activity finds its own version first. |
 | A retry of `approve` undoes a rollback. | A move after `seen` ends the decision with no move. |
+| An operator moves the pointer away and back during the decision. | The swap checks `seen` under the lock. |
 | A retry of `approve` reports `superseded` or `refused`. | It reads the log first. A last move by `refine:<run>` is its own. |
 | An `approve` carries an overlay, and the candidate goes live. | A key that the verdict does not read fails the decode. |
 | A CLI run id in another spelling never reaches the gate. | The CLI sends the canonical UUID. |

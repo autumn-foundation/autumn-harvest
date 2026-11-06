@@ -13,6 +13,7 @@ const fn mv(version: u64, expected: Option<u64>, actor: &str) -> MoveRequest<'_>
         actor_kind: "operator",
         actor,
         after_seq: None,
+        head: None,
     }
 }
 use autumn_harvest_sqlite::SqliteOverlayLog;
@@ -273,6 +274,31 @@ fn sqlite_refuses_a_rollback_over_a_stale_move() {
     let fresh = MoveRequest {
         after_seq: Some(last.seq),
         ..mv(3, Some(2), "ops")
+    };
+    assert_eq!(
+        log.activate("support", &fresh).expect("swap"),
+        ActivateOutcome::Activated
+    );
+
+    // A guarded move needs the log head that it read. A move away and back
+    // keeps the pointer but moves the head, so the guarded swap refuses it.
+    let head = log.last_activation("support").expect("last").map(|m| m.seq);
+    let guarded = MoveRequest {
+        head: Some(head),
+        ..mv(1, Some(3), "run")
+    };
+    log.activate("support", &mv(2, Some(3), "ops"))
+        .expect("away");
+    log.activate("support", &mv(3, Some(2), "ops"))
+        .expect("back");
+    assert_eq!(
+        log.activate("support", &guarded).expect("swap"),
+        ActivateOutcome::Conflict { actual: Some(3) }
+    );
+    let head = log.last_activation("support").expect("last").map(|m| m.seq);
+    let fresh = MoveRequest {
+        head: Some(head),
+        ..mv(1, Some(3), "run")
     };
     assert_eq!(
         log.activate("support", &fresh).expect("swap"),

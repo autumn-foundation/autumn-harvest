@@ -17,6 +17,11 @@ overlay goes live. The design is in `docs/design/DESIGN-2381.md`.
   payload keep the wait until the same deadline.
 - A retry of a decision never moves the pointer again. So it never undoes
   a rollback, and a retry after its own move reports it.
+- `ProfileOverlayStore::activate_guarded` activates only when the log head
+  is the one that the caller read. Each store of this crate checks it in
+  the swap transaction, so a move away and back never passes. The kernel
+  is `overlay_log::decide_guarded`, and `MoveRequest` gets the field
+  `head`.
 - The run drops a decision that arrives before the wait opens, as eval
   does. A key that the verdict does not read fails the decode.
 - The run sets the search attributes `refine_kind` and `refine_status`:
