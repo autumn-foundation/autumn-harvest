@@ -2760,22 +2760,28 @@ async fn start_harvest_runtime(
                     .as_ref()
                     .map(|r| r.payload_codecs().clone())
                     .unwrap_or_default();
-                let (owner, runbook_url, severity, info_sla, info_retry_policy) = registry
-                    .and_then(|registry| {
-                        registry.workflows.get("webhook_delivery").map(|wf| {
-                            (
-                                wf.owner,
-                                wf.runbook_url,
-                                wf.severity,
-                                // Issue #2387: an operator SLA override wins.
-                                registry.apply_run_defaults(wf.name, None, wf.sla).1,
-                                wf.retry_policy.clone(),
-                            )
-                        })
+                let WebhookRunDefaults {
+                    owner,
+                    runbook_url,
+                    severity,
+                    execution_timeout,
+                    chain_execution_timeout,
+                    sla,
+                    retry_policy: webhook_retry_policy,
+                } = webhook_run_defaults(registry.as_deref().map(std::sync::Arc::as_ref));
+                // The start caps each value at its fleet ceiling. It clamps
+                // the SLA to the capped timeout. The chain ceiling is also
+                // the default chain cap.
+                let ceiling = |d: Option<std::time::Duration>| {
+                    d.map(|d| {
+                        autumn_harvest::chrono::Duration::from_std(d)
+                            .unwrap_or(autumn_harvest::chrono::Duration::MAX)
                     })
-                    .unwrap_or((None, None, None, None, None));
-                let sla = info_sla.and_then(|d| autumn_harvest::chrono::Duration::from_std(d).ok());
-                let webhook_retry_policy = info_retry_policy;
+                };
+                let max_execution_timeout_ceiling =
+                    ceiling(client.max_workflow_execution_timeout());
+                let max_workflow_chain_timeout_ceiling =
+                    ceiling(client.max_workflow_chain_timeout());
 
                 Box::pin(async move {
                     let workflow_id = format!("webhook-delivery-{}", log.id);
@@ -2830,6 +2836,10 @@ async fn start_harvest_runtime(
                         owner,
                         runbook_url,
                         severity,
+                        execution_timeout,
+                        max_execution_timeout_ceiling,
+                        chain_execution_timeout,
+                        max_workflow_chain_timeout_ceiling,
                         sla,
                         workflow_retry_policy: webhook_retry_policy,
                         max_workflow_attempts_ceiling: client.max_workflow_attempts(),
@@ -3321,6 +3331,106 @@ fn apply_migrations_for_profile(
     }
 
     Ok(())
+}
+
+/// The run values of a webhook-delivery start.
+#[cfg(feature = "webhooks")]
+#[derive(Debug, Default)]
+struct WebhookRunDefaults {
+    owner: Option<&'static str>,
+    runbook_url: Option<&'static str>,
+    severity: Option<&'static str>,
+    execution_timeout: Option<autumn_harvest::chrono::Duration>,
+    chain_execution_timeout: Option<autumn_harvest::chrono::Duration>,
+    sla: Option<autumn_harvest::chrono::Duration>,
+    retry_policy: Option<autumn_harvest::policy::RetryPolicy>,
+}
+
+/// Resolve the run values of the `webhook_delivery` type.
+///
+/// An operator override wins over the declared timeout, chain cap and SLA.
+/// The start then applies the fleet ceilings and clamps the SLA to the
+/// timeout. With no registry or no registered type, every value is `None`.
+#[cfg(feature = "webhooks")]
+fn webhook_run_defaults(
+    registry: Option<&autumn_harvest::worker::HandlerRegistry>,
+) -> WebhookRunDefaults {
+    let to_chrono = |d: Option<std::time::Duration>| {
+        d.and_then(|d| autumn_harvest::chrono::Duration::from_std(d).ok())
+    };
+    registry
+        .and_then(|registry| {
+            registry.workflows.get("webhook_delivery").map(|wf| {
+                let (execution_timeout, sla) =
+                    registry.apply_run_defaults(wf.name, wf.execution_timeout, wf.sla);
+                WebhookRunDefaults {
+                    owner: wf.owner,
+                    runbook_url: wf.runbook_url,
+                    severity: wf.severity,
+                    execution_timeout: to_chrono(execution_timeout),
+                    chain_execution_timeout: to_chrono(registry.chain_execution_timeout(wf.name)),
+                    sla: to_chrono(sla),
+                    retry_policy: wf.retry_policy.clone(),
+                }
+            })
+        })
+        .unwrap_or_default()
+}
+
+#[cfg(all(test, feature = "webhooks"))]
+mod webhook_run_defaults_tests {
+    use super::webhook_run_defaults;
+    use autumn_harvest::run_defaults::RunDefaultFields;
+    use autumn_harvest::worker::HandlerRegistry;
+    use std::time::Duration;
+
+    fn registry() -> HandlerRegistry {
+        let mut info = crate::webhook::__autumn_workflow_info_webhook_delivery();
+        info.execution_timeout = Some(Duration::from_hours(1));
+        info.chain_execution_timeout = Some(Duration::from_hours(2));
+        info.sla = Some(Duration::from_hours(3));
+        HandlerRegistry::new(vec![info], vec![])
+    }
+
+    const fn minutes(n: i64) -> Option<autumn_harvest::chrono::Duration> {
+        autumn_harvest::chrono::Duration::try_minutes(n)
+    }
+
+    /// With no override, the start takes the declared timeout and SLA.
+    #[test]
+    fn a_delivery_start_takes_the_declared_timeout() {
+        let got = webhook_run_defaults(Some(&registry()));
+        assert_eq!(got.execution_timeout, minutes(60));
+        assert_eq!(got.chain_execution_timeout, minutes(120));
+        assert_eq!(got.sla, minutes(180));
+    }
+
+    /// An operator override wins over the declared timeout and chain cap.
+    #[test]
+    fn a_delivery_start_takes_the_timeout_override() {
+        let registry = registry();
+        registry.run_defaults().write_through(
+            "webhook_delivery",
+            RunDefaultFields {
+                execution_timeout: Some(Duration::from_mins(10)),
+                chain_execution_timeout: Some(Duration::from_mins(30)),
+                ..RunDefaultFields::default()
+            },
+        );
+        let got = webhook_run_defaults(Some(&registry));
+        assert_eq!(got.execution_timeout, minutes(10));
+        assert_eq!(got.chain_execution_timeout, minutes(30));
+        assert_eq!(got.sla, minutes(180), "the start clamps the SLA later");
+    }
+
+    /// With no registry, no value applies.
+    #[test]
+    fn a_delivery_start_with_no_registry_takes_no_timeout() {
+        let got = webhook_run_defaults(None);
+        assert!(got.execution_timeout.is_none());
+        assert!(got.chain_execution_timeout.is_none());
+        assert!(got.sla.is_none());
+    }
 }
 
 #[cfg(test)]
