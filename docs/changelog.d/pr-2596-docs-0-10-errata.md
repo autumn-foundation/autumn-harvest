@@ -1,4 +1,4 @@
-## Documentation — 0.10.0 docs errata
+## Documentation — 0.10.0 docs errata (PR #2596)
 
 - `docs/sqlite-plugin.md` "Turn it on" pinned `autumn-web = "0.9"` next to the 0.10 Harvest crates. That pair builds two copies of `autumn-web`. It now pins `"0.10"`.
 - The published 0.9.0 crates declare MSRV 1.97.0, not 1.88.0. The 0.9.0 and 0.10.0 upgrade guides now say so. The `[0.9.0]` CHANGELOG entry still says 1.88.0; the next collation corrects it.
