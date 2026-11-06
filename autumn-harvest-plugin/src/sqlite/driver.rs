@@ -103,6 +103,9 @@ pub struct Registry {
     pub scheduler_enabled: bool,
     /// `HarvestPlugin::retention`. Each driver runs it on its own file.
     pub retention: RetentionConfig,
+    /// The plugin mounts MCP routes. Then an `mcp` workflow does not warn
+    /// (issue #2488).
+    pub mcp_served: bool,
 }
 
 impl Registry {
@@ -120,6 +123,7 @@ impl Registry {
             schedules: Vec::new(),
             scheduler_enabled: true,
             retention: RetentionConfig::default(),
+            mcp_served: false,
         }
     }
 }
@@ -580,11 +584,12 @@ impl Drop for OnExit {
 
 fn register(runtime: &mut SqliteRuntime, registry: &Registry) {
     for workflow in &registry.workflows {
-        // With the `mcp` feature the plugin serves the tools. Without it, warn (issue #2488).
-        #[cfg(feature = "mcp")]
-        runtime.register_workflow_mcp_served(workflow);
-        #[cfg(not(feature = "mcp"))]
-        runtime.register_workflow(workflow);
+        // Warn about an `mcp` workflow when no MCP route is mounted (issue #2488).
+        if registry.mcp_served {
+            runtime.register_workflow_mcp_served(workflow);
+        } else {
+            runtime.register_workflow(workflow);
+        }
     }
     for activity in &registry.activities {
         runtime.register_activity(activity);
@@ -1182,6 +1187,61 @@ mod tests {
             .list_executions(&autumn_harvest_sqlite::ExecutionFilter::new())
             .expect("runs");
         assert!(runs.executions.is_empty(), "no slot fires");
+    }
+
+    /// Run `f` and return what it logged at `WARN` or above.
+    fn warnings_during(f: impl FnOnce()) -> String {
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone, Default)]
+        struct Sink(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().expect("sink").extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Sink {
+            type Writer = Self;
+            fn make_writer(&'a self) -> Self {
+                self.clone()
+            }
+        }
+
+        let sink = Sink::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(sink.clone())
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        let bytes = sink.0.lock().expect("sink").clone();
+        String::from_utf8(bytes).expect("utf8")
+    }
+
+    /// An `mcp` workflow warns unless the plugin mounts MCP routes (issue #2488).
+    #[test]
+    fn an_mcp_workflow_warns_unless_mcp_routes_are_mounted() {
+        let mut info = once_info();
+        info.mcp = true;
+        let name = info.name;
+        for (mcp_served, warns) in [(false, true), (true, false)] {
+            let registry = Registry {
+                workflows: vec![info.clone()],
+                mcp_served,
+                ..Registry::empty()
+            };
+            let mut runtime = SqliteRuntime::open_in_memory().expect("open");
+            let logged = warnings_during(|| register(&mut runtime, &registry));
+            assert_eq!(
+                logged.contains(name),
+                warns,
+                "mcp_served={mcp_served}: {logged}"
+            );
+        }
     }
 
     /// An unknown workflow in a code schedule fails the open, and names it.

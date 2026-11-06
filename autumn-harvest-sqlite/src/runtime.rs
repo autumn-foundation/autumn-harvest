@@ -706,8 +706,8 @@ impl SqliteRuntime {
     /// Register a workflow for a caller that serves its `mcp` tools.
     ///
     /// This is [`register_workflow`](Self::register_workflow) without the
-    /// `mcp` warning. The `autumn-harvest-plugin` SQLite driver uses it when
-    /// its `mcp` feature is on (issue #2488).
+    /// `mcp` warning. The `autumn-harvest-plugin` SQLite driver uses it only when
+    /// the app mounts MCP routes (issue #2488).
     ///
     /// # Panics
     ///
@@ -734,8 +734,8 @@ impl SqliteRuntime {
                 backend = "sqlite",
                 "the `mcp` flag has no effect here, so this workflow exposes no MCP tools. \
                  This runtime has no HTTP edge. \
-                 To serve MCP tools, use the SQLite plugin with its `mcp` feature, \
-                 or the Postgres plugin. The workflow still runs."
+                 To serve MCP tools, use a Harvest plugin with its `mcp` feature \
+                 and `.mcp_tools()`. The workflow still runs."
             );
         }
         self.workflows.insert(info.name.to_string(), info.handler);

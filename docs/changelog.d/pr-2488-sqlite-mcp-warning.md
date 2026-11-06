@@ -9,8 +9,8 @@ What shipped:
   `mcp = true`. The message names the workflow and gives the reason. The
   workflow still registers and runs.
 - New `register_workflow_mcp_served` skips the warning. The SQLite plugin
-  driver uses it when its `mcp` feature is on, because the plugin serves the
-  tools. Without that feature, the driver still warns.
+  driver uses it only when the app mounts MCP routes with `.mcp_tools()` or
+  `.mcp_tasks()`. Otherwise the driver still warns.
 - The MCP tools guide now says that tool exposure needs the plugin.
 
 No migration. No new query.
