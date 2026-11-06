@@ -2022,9 +2022,18 @@ impl AgentRun<'_> {
                 );
                 let failures = state.failures;
                 let before = state.tokens_used;
+                // A cascade asks the model of each tier, never the model of
+                // the profile. The core checks the tier models.
+                let cascade = envelope.sample.as_ref().is_some_and(|sample| {
+                    matches!(
+                        sample.strategy,
+                        crate::sampling::SampleStrategy::Cascade { .. }
+                    )
+                });
                 let peer = PeerSegment {
                     member: &member,
                     waiting: &envelope.waiting,
+                    own_model: !cascade,
                 };
                 let (next, outcome) = match &envelope.sample {
                     Some(sample) => {
@@ -2156,7 +2165,7 @@ impl AgentRun<'_> {
         // Without a store, the run profile names the model, so the check
         // comes first, as before the op read.
         let forbids = |model: Option<&str>| {
-            peer.is_some_and(|peer| !peer.member.mandate().allows_model(model))
+            peer.is_some_and(|peer| peer.own_model && !peer.member.mandate().allows_model(model))
         };
         if !self.overlays {
             let model = self.profile.as_ref().ok().and_then(|p| p.model.as_deref());
@@ -2469,6 +2478,9 @@ struct PeerSegment<'a> {
     member: &'a Member,
     /// The workflow ids that wait on the message.
     waiting: &'a [String],
+    /// Whether the op asks the model of the profile. A cascade asks only
+    /// the models of its tiers.
+    own_model: bool,
 }
 
 /// The parts of one report.

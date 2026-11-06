@@ -764,3 +764,78 @@ async fn each_tier_of_a_cascade_op_counts_against_the_fan_out() {
     let error = state(&rt, &agent).await.last_error.unwrap_or_default();
     assert!(error.contains("fan_out_exhausted"), "{error}");
 }
+
+/// A peer message that asks for a cascade under `mandate`.
+fn cascade_envelope(mandate: Mandate, models: &[&str]) -> PeerEnvelope {
+    let pass = FiniteF64::new(0.8).unwrap();
+    let tiers = models
+        .iter()
+        .map(|model| autumn_harvest_agent::sampling::Tier::new(*model, pass));
+    let sample = OpSample::new(
+        SampleStrategy::cascade(tiers),
+        ScorerRef::deterministic("table").unwrap(),
+    );
+    PeerEnvelope {
+        from: "triage/x@life".into(),
+        sender: "triage".into(),
+        seq: 1,
+        text: "Pick a letter.".into(),
+        mandate,
+        flow_labels: BTreeSet::new(),
+        reply_to: Some(format!("{}/reply-1", ExecutionId::new())),
+        waiting: Vec::new(),
+        mesh: None,
+        sample: Some(sample),
+    }
+}
+
+fn cascade_harness(model: &Arc<TryFnModel>) -> AgentHarness {
+    let policy = SamplingPolicy {
+        strategies: BTreeSet::from([Strategy::Cascade]),
+        max_draws: 2,
+        cascade_models: BTreeSet::from(["cheap".to_owned(), "strong".to_owned()]),
+        ..SamplingPolicy::default()
+    };
+    AgentHarness::new(model.clone())
+        .model_named("cheap", model.clone())
+        .model_named("strong", model.clone())
+        .agent(AgentProfile::new(KIND).mandate(Mandate::new(KIND)))
+        .scorer(Arc::new(letters()))
+        .sampling_policies(store_with(&policy))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cascade_peer_op_checks_the_tier_models_not_the_profile_model() {
+    let (_dir, db) = fresh_db();
+    let model = by_draw(&["b"], "plain");
+    let mut rt = runtime(&db, cascade_harness(&model));
+    let agent = desk("eighteen");
+
+    // The caller allows the cheap tier only, not the default profile model.
+    let mandate = Mandate::new("triage").models(["cheap"]);
+    let envelope = cascade_envelope(mandate, &["cheap", "strong"]);
+    send(&mut rt, &agent, &AgentOp::peer(envelope)).await;
+
+    let replies = sent_signals(&rt, &agent);
+    assert_eq!(replies.len(), 1, "{replies:?}");
+    let reply = &replies[0]["value"];
+    assert!(reply["refusal"].is_null(), "{reply}");
+    assert_eq!(reply["answer"], "b");
+    assert_eq!(draw_calls(&model), 1, "only the cheap tier runs");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cascade_peer_op_with_no_allowed_tier_is_refused() {
+    let (_dir, db) = fresh_db();
+    let model = by_draw(&["b"], "plain");
+    let mut rt = runtime(&db, cascade_harness(&model));
+    let agent = desk("nineteen");
+
+    let mandate = Mandate::new("triage").models(["other"]);
+    let envelope = cascade_envelope(mandate, &["cheap", "strong"]);
+    send(&mut rt, &agent, &AgentOp::peer(envelope)).await;
+
+    assert!(model.requests().is_empty(), "no tier runs");
+    let replies = sent_signals(&rt, &agent);
+    assert_eq!(replies[0]["value"]["refusal"], "model_forbidden");
+}

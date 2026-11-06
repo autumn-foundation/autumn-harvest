@@ -2054,7 +2054,10 @@ let op = AgentOp::message("Name a prime.").with_sample(sample);
   continues the run of its beam, and the beam counts its delegations step
   by step.
 - Each tier of a cascade (section 20) is a run of its own, so it counts as
-  one delegation, as a draw of best-of-N does.
+  one delegation, as a draw of best-of-N does. A cascade peer op checks
+  the tier models against the accepted mandate, not the model of the
+  profile. It skips each forbidden tier, and with no tier left it gets
+  `model_forbidden`.
 - A refused or failed op is a failed op. The transcript stays as it was,
   and the next op runs. A peer gets a mandate refusal in
   `PeerReply::refusal`, and any other error in `PeerReply::error`.

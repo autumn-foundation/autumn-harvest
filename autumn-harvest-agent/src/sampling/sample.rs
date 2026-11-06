@@ -626,7 +626,8 @@ async fn run_strategy(ctx: &WorkflowContext, waves: &Waves<'_>) -> Result<Ended,
 /// as one delegation. A beam step continues the run of its beam, and the
 /// beam already counts its delegations step by step. So a beam checks
 /// `max_draws` only. A judge model must be a model that the mandate
-/// allows, as each model of the subtree must be.
+/// allows, as each model of the subtree must be. A cascade needs at least
+/// one tier whose model the mandate allows.
 fn mandate_admits(mandate: &Mandate, sample: &OpSample) -> Result<Option<u32>, SampleFailure> {
     let refused = |refusal| SampleFailure::Refused(Refusal::Mandate { mandate: refusal });
     let draws = sample.strategy.draws();
@@ -640,6 +641,15 @@ fn mandate_admits(mandate: &Mandate, sample: &OpSample) -> Result<Option<u32>, S
     };
     if let Some(judge) = &sample.scorer.judge_model
         && !mandate.allows_model(Some(judge))
+    {
+        return Err(refused(MeshRefusal::ModelForbidden));
+    }
+    // A cascade skips each tier that the mandate forbids. With no tier
+    // left, the run would ask no model, so the mandate refuses it.
+    if let SampleStrategy::Cascade { tiers } = &sample.strategy
+        && !tiers
+            .iter()
+            .any(|tier| mandate.allows_model(Some(&tier.model)))
     {
         return Err(refused(MeshRefusal::ModelForbidden));
     }
