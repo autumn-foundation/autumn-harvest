@@ -122,7 +122,9 @@ change the override, and clearing the override does not resume the DAG.
 - **A clear during a retried move (issue #2413).** The copy records the
   version that it delivered in `harvest_schedule_override_receipts` on the
   new owner. A retry after a failed source delete finds that record, so it
-  does not copy the row again. A clear on the new owner then stays.
+  does not copy the row again. A clear on the new owner then stays. Change
+  the routing again only after each move ends: issue #2602 covers a routing
+  change while a stale row stays on the old shard.
 
 ## Code-declared workflow schedules
 

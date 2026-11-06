@@ -428,8 +428,8 @@ const HARVEST_WRITE_PRIVILEGE_REQUIREMENTS: &[(&str, &[&str])] = &[
         &["SELECT", "INSERT", "UPDATE", "DELETE"],
     ),
     // A reshard carry records each copy, and the source delete removes the
-    // record. A missing grant fails each carry, so the override stays on its
-    // old shard.
+    // record. A missing grant fails each carry. Until the grant is in place,
+    // the new owner can run the code value, and each tick retries.
     (
         "harvest_schedule_override_receipts",
         &["SELECT", "INSERT", "UPDATE", "DELETE"],

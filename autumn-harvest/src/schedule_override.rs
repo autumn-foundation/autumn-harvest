@@ -1104,7 +1104,7 @@ pub async fn clear_dag_override(
 /// transaction. A retry that finds that record writes nothing on `to`. So
 /// when the delete fails and an operator then clears the override on `to`,
 /// the retry does not copy the stale row back. The `updated_at` is a version
-/// tag here. It is never compared with a clock.
+/// tag here. No code compares it with a clock.
 ///
 /// The delete matches the `updated_at` of the copied row. A write on `from`
 /// after the copy then keeps its row, and the next pass moves it again. The
@@ -1113,7 +1113,9 @@ pub async fn clear_dag_override(
 ///
 /// Each transaction asserts the DR fence of its own shard first. A process
 /// that lost authority on either shard then writes nothing there. The caller
-/// also runs the move under the pass guards of both shards.
+/// also runs the move under the pass guards of both shards. Each transaction
+/// waits at most [`CARRY_LOCK_TIMEOUT_SQL`] for a lock. The guards hold off a
+/// bump while the move waits, so a long wait would delay a promotion.
 ///
 /// Never pass two shards of one pool. They share one table, so the delete
 /// would remove the only copy.
@@ -1148,6 +1150,7 @@ pub async fn carry_dag_override(
     // Each write takes its fence first. It then takes the registration lock,
     // as every override writer does.
     Box::pin(to.transaction(async |conn| {
+        bound_carry_lock_waits(conn).await?;
         crate::replication::assert_fence(conn, to_shard).await?;
         crate::scheduler::wait_for_registration_lock(conn).await?;
         if copy_delivered(conn, KIND_DAG, dag_name, row.updated_at).await? {
@@ -1163,6 +1166,7 @@ pub async fn carry_dag_override(
     }))
     .await?;
     let deleted = Box::pin(from.transaction(async |conn| {
+        bound_carry_lock_waits(conn).await?;
         crate::replication::assert_fence(conn, from_shard).await?;
         crate::scheduler::wait_for_registration_lock(conn).await?;
         let deleted = diesel::delete(
@@ -1179,6 +1183,19 @@ pub async fn carry_dag_override(
     }))
     .await?;
     Ok(deleted > 0)
+}
+
+/// The longest wait of a carry transaction for one lock. It stays below the
+/// wait of a DR fence guard, so a move that meets a bump gives up first.
+const CARRY_LOCK_TIMEOUT_SQL: &str = "SET LOCAL lock_timeout = '1s'";
+
+/// Bound each lock wait of the carry transaction on `conn`.
+async fn bound_carry_lock_waits(conn: &mut AsyncPgConnection) -> HarvestResult<()> {
+    diesel::sql_query(CARRY_LOCK_TIMEOUT_SQL)
+        .execute(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+    Ok(())
 }
 
 /// Whether a carry already delivered the version `updated_at` of one

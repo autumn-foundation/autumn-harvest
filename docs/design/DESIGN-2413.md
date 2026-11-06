@@ -74,7 +74,7 @@ Decision: 2, 3 and 6.
 | The carry opens a guard while it holds the source pass guard. | The pass guard drops first. The group guard opens after. |
 | A lost guard leaves a statement running on the destination. | Both connections join the pass. Each transaction also asserts its fence. |
 | The receipt and the row commit apart. A crash between them leaves a copy with no receipt. | One transaction writes both. |
-| An operator writes on the new owner after the copy. The receipt then makes the carry skip a newer source write. | The receipt matches one version only. A newer source version is copied as before. The owner row still wins. |
+| An operator writes on the new owner after the copy. The receipt then makes the carry skip a newer source write. | The receipt matches one version only. A newer source version is not skipped. The insert still yields to a row on the owner. |
 | The receipt table grows without bound. | The key is `(kind, name)`. One row per DAG per shard. |
 | A worker role has no grant on the new table. Every carry then fails. | The startup preflight checks the grants. |
 
@@ -89,7 +89,8 @@ Decision: 2, 3 and 6.
   receipt can lose an override. The round trip is the risky case, so the
   model checks it.
 - **Yellow (value).** The carry becomes safe under DR, with the same
-  barrier as every other fenced writer. A clear on the new owner is final.
+  barrier as every other fenced writer. A clear on the new owner stays
+  across a retry, within the bound in "Limits".
 - **Green (ideas).** Group the misplaced DAGs by owner, so one guard covers
   all DAGs that move to that owner.
 - **Blue (process).** Spec first: a TLA+ model with a design config, three
@@ -131,34 +132,65 @@ version, and the receipt of the source for that DAG.
 
 ## Model
 
-`formal/tla/OverrideCarry.tla` models two shards, owner flips, operator
-sets and clears, a copy, a delete that can fail, and a promotion.
+`formal/tla/OverrideCarry.tla` models two or three shards, owner flips,
+operator sets and clears, a copy, a delete that can fail, and a promotion.
 
 | Config | Switch | Result |
 |---|---|---|
-| `OverrideCarry.cfg` | The design. | Pass. |
+| `OverrideCarry.cfg` | The design, two shards. | Pass. |
+| `OverrideCarryThreeShards.cfg` | The design, three shards. | Pass. |
 | `OverrideCarryNoReceipt.cfg` | No receipt. | Violates `ClearIsKept`. |
 | `OverrideCarryKeepSourceReceipt.cfg` | The delete keeps the source receipt. | Violates `NothingLostWithoutAClear`. |
 | `OverrideCarryUnfenced.cfg` | No fence check. | Violates `NoWriteAfterPromotion`. |
+| `OverrideCarryFlipAfterFailedDelete.cfg` | A flip while a stale row stays. A known limit. | Violates `ClearIsKept`. |
+| `OverrideCarryFlipMidCarry.cfg` | A flip between a copy and its delete. A known limit. | Violates `NothingLostWithoutAClear`. |
 | `OverrideCarryReach.cfg` | The design. | Violates `NoClearOfACopiedRow`. |
+
+`NothingLostWithoutAClear` asks that a quiet owner holds an override. It
+does not ask for the last set version. A row that the owner already holds
+wins over a copy, also when it is older. That rule predates this change.
 
 ## Tests
 
 - AC 1: `a_promotion_during_a_carry_stops_every_write_of_the_old_process`.
   The copy blocks on the destination. A test promotes the destination and
-  ends the guard session. It then frees the copy. Neither shard changes,
+  ends the guard sessions. It then frees the copy. Neither shard changes,
   and a later tick of the old process writes nothing.
 - AC 2: `an_operator_clear_survives_a_retried_carry`. The source delete
   fails. The operator clears the override on the new owner. The next tick
-  keeps it cleared and deletes the source row.
+  keeps it cleared while the delete still fails. The tick after that
+  deletes the source row, and the override stays cleared.
+- `a_promotion_of_the_source_during_a_carry_stops_its_delete`. The delete
+  blocks on the source, and a test promotes the source. The source keeps
+  its row.
+- `a_fenced_carry_writes_nothing`. With no pass guard, each carry
+  transaction refuses a write on a promoted shard.
 - Regression: `an_override_survives_a_round_trip_reshard`. The override
   moves out, back and out again.
+- `the_override_copy_records_are_covered_by_the_privilege_probe`. The
+  preflight checks the grants of the new table.
 
 ## Limits
 
-- The model allows an owner flip only when no carry is pending. A flip back
-  while a source delete keeps failing makes the stale source row live on
-  its old shard. The new owner cannot see that row. This predates the
-  change.
-- An operator write on the source after the copy still loses to the copy on
-  the owner, as before.
+The design holds when a routing change lands only while no carry runs and
+no shard but the owner holds a row. Two configs show what breaks without
+that. Both gaps predate this change. Issue #2602 tracks them.
+
+- **A routing change after a failed delete.** The stale row stays on the
+  source. When the routing returns the DAG to that shard, the stale row is
+  live there. A clear there can come back from the shard that holds the
+  copy, because the source holds no receipt for its own original row.
+- **A routing change between a copy and its delete.** Two carries can then
+  run in opposite directions. Each copy yields to the row that its
+  destination holds, and both sources delete. The override is lost.
+- **Three shards with two failed deletes.** One receipt per DAG holds one
+  version. A second carry into a shard replaces the receipt of the first.
+  This needs a routing change while a stale row stays, so the first limit
+  covers it.
+- **The owner row wins.** A copy never replaces a row on the owner, also
+  when that row is older. An operator write on the source after the copy
+  loses to the copy on the owner.
+
+A fix of the first two needs more than a receipt per version: the review
+of this change found that each extra mark exposes another interleaving.
+The follow-up issue holds the counterexamples.

@@ -1688,7 +1688,9 @@ impl ShardPass<'_> {
 ///
 /// `source` is this shard and its pool, and `conn` is a connection of that
 /// pool. The DAGs move in one group per owner. Each group runs under the DR
-/// fence of both shards. See [`carry_to_owner`].
+/// fence of both shards. See [`carry_to_owner`]. A group whose pass stops
+/// ends the backend of `conn`, so the remaining groups wait for the next
+/// tick.
 ///
 /// A failure is logged, and the next tick retries the move. Two shards of one
 /// pool share one table, so nothing moves between them.
@@ -1716,33 +1718,38 @@ async fn carry_misplaced_overrides(
         let Some(owner_pool) = pool.exact_pool_for(owner) else {
             continue;
         };
-        carry_to_owner(conn, source, (owner, owner_pool), &dag_names).await;
+        if !carry_to_owner(conn, source, (owner, owner_pool), &dag_names).await {
+            break;
+        }
     }
 }
 
 /// Move the overrides of `dag_names` from `source` to `owner`, under the DR
 /// fence of both shards.
 ///
-/// Both connections come first: `conn` is already held, and the owner
-/// connection is checked out next. Then one operation opens the guards of
+/// Both connections come first: `conn` is already held, and the function
+/// then checks out the owner connection. Then one operation opens the guards of
 /// both shards. So a wait on a pool never holds off a bump. A fenced or held
 /// shard skips the group, and the next tick tries again.
 ///
 /// Both connections join the pass. A lost guard then ends their backends, so
 /// a statement in flight cannot commit after a bump. Each carry transaction
 /// also asserts the fence of its own shard.
+///
+/// Returns `false` when the pass stopped. `conn` then has no live backend,
+/// so the caller must not use it again.
 async fn carry_to_owner(
     conn: &mut AsyncPgConnection,
     source: (ShardId, &DbPool),
     owner: (ShardId, &DbPool),
     dag_names: &[&str],
-) {
+) -> bool {
     let ((from_shard, from_pool), (to_shard, to_pool)) = (source, owner);
     let mut to = match crate::replication::fenced_checkout(to_pool).await {
         Ok(to) => to,
         Err(error) => {
             warn_carry_skipped(from_shard, to_shard, &error);
-            return;
+            return true;
         }
     };
     let fence = match crate::replication::begin_fenced_groups(&[
@@ -1754,7 +1761,7 @@ async fn carry_to_owner(
         Ok(guards) => guards,
         Err(error) => {
             warn_carry_skipped(from_shard, to_shard, &error);
-            return;
+            return true;
         }
     };
     let pass = async {
@@ -1768,8 +1775,12 @@ async fn carry_to_owner(
             log_carry(dag_name, from_shard, to_shard, moved);
         }
     };
-    if let Err(error) = crate::replication::run_fenced_pass(&fence, Box::pin(pass)).await {
-        warn_carry_skipped(from_shard, to_shard, &error);
+    match crate::replication::run_fenced_pass(&fence, Box::pin(pass)).await {
+        Ok(()) => true,
+        Err(error) => {
+            warn_carry_skipped(from_shard, to_shard, &error);
+            false
+        }
     }
 }
 

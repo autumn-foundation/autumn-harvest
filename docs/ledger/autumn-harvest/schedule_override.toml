@@ -1,5 +1,12 @@
 # Ledger profiles for `autumn-harvest/src/schedule_override.rs`. See `docs/ledger/README.md`.
 
+["bound_carry_lock_waits"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = []
+tables = []
+measured = "unmeasured"
+
 ["carry_dag_override"]
 driver = "per_tick"
 backend = ["postgres"]

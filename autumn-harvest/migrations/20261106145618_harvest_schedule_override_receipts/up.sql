@@ -7,15 +7,16 @@
 --
 -- An operator can clear the override on the new owner before that retry.
 -- Without a record, the retry finds no row there and copies the stale row
--- back. So the copy writes this row in its own transaction. It holds the
+-- back. So the copy transaction also writes this row. It holds the
 -- `updated_at` of the copied row, which is the version of that row. A
 -- retry that finds the same version here writes nothing.
 --
--- The source delete removes the row of the source too. A record that
--- outlives its row would make a later move of the same version skip.
+-- The source delete also removes the record on the source shard. A record
+-- that outlives its row would make a later move of the same version skip
+-- the copy.
 --
--- `row_updated_at` is a version tag. It is never compared with a clock.
--- One row per DAG, so the table stays small.
+-- `row_updated_at` is a version tag. No code compares it with a clock. The
+-- table holds at most one row per DAG, so it stays small.
 --
 -- The table is new, so no other session holds a lock on it.
 CREATE TABLE harvest_schedule_override_receipts (
