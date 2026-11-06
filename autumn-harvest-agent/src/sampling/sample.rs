@@ -421,19 +421,22 @@ async fn run_waves(
         let ended = run_draw_tasks(ctx, tasks).await?;
         let mut halt = None;
         let mut passed = false;
+        // The first stop names the halt. A refusal counts on its own, so a
+        // refusal after a failed score still stops a sweep.
+        let mut refused = false;
         for (id, report) in (started..).zip(ended) {
             let report = report?;
-            if report.stop == AgentStop::BudgetExceeded {
+            let draw_stop = report.stop;
+            if draw_stop == AgentStop::BudgetExceeded {
                 halt = halt.or(Some(SampleStop::BudgetExceeded));
             }
             let (one, halted) = score_draw(ctx, input, task, DrawId::new(id), report, halt).await?;
+            refused |= is_refusal(draw_stop, halted);
             halt = halt.or(halted);
             passed |= passes(input.strategy, &one.record.verdict);
             spent = spent.saturating_add(one.record.usage.total());
             scored.push(one);
         }
-        // Only an LLM budget refusal halts a wave with `BudgetExceeded`.
-        let refused = halt == Some(SampleStop::BudgetExceeded);
         if passed && matches!(input.strategy, SampleStrategy::Rejection { .. }) {
             return Ok((scored, SampleStop::Accepted, refused));
         }
@@ -441,6 +444,16 @@ async fn run_waves(
             return Ok((scored, stop, refused));
         }
     }
+}
+
+/// Whether an LLM budget refused the draw that ended with `draw_stop`, or
+/// its judge call. `halted` is the stop that its score gave.
+///
+/// Only an LLM budget ends a draw with `budget_exceeded`. A spent token
+/// cap ends it with `tokens_exhausted`.
+const fn is_refusal(draw_stop: AgentStop, halted: Option<SampleStop>) -> bool {
+    matches!(draw_stop, AgentStop::BudgetExceeded)
+        || matches!(halted, Some(SampleStop::BudgetExceeded))
 }
 
 /// The most bytes of one tool result that a score input keeps.
@@ -677,6 +690,29 @@ mod tests {
             SampleStrategy::single(),
             ScorerRef::deterministic(scorer).unwrap(),
         )
+    }
+
+    #[test]
+    fn a_refusal_counts_after_another_stop_in_its_wave() {
+        // A failed score halts the wave first. A later refused draw still
+        // counts, because the flag folds each draw on its own.
+        let draws = [
+            (AgentStop::Completed, Some(SampleStop::ScoreFailed)),
+            (AgentStop::BudgetExceeded, None),
+        ];
+        let refused = draws.iter().fold(false, |acc, (stop, halted)| {
+            acc | is_refusal(*stop, *halted)
+        });
+        assert!(refused);
+        assert!(is_refusal(
+            AgentStop::Completed,
+            Some(SampleStop::BudgetExceeded)
+        ));
+        assert!(!is_refusal(AgentStop::TokensExhausted, None));
+        assert!(!is_refusal(
+            AgentStop::Completed,
+            Some(SampleStop::ScoreFailed)
+        ));
     }
 
     #[test]
