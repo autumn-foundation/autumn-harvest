@@ -28,7 +28,7 @@ is [`DESIGN-2471.md`](design/DESIGN-2471.md).
 
 ```toml
 [dependencies]
-autumn-web = { version = "0.9", features = ["sqlite"] }
+autumn-web = { version = "0.10", features = ["sqlite"] }
 autumn-harvest = { version = "0.10", default-features = false }
 autumn-harvest-plugin = { version = "0.10", features = ["sqlite"] }
 ```
