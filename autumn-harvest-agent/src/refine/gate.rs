@@ -195,13 +195,11 @@ impl GateStep {
 /// The step of the gate after `event`.
 ///
 /// Only [`GateEvent::Activated`] gives [`GateStep::Adopted`]. A refused or
-/// unreadable decision keeps the wait. `formal/verus/src/refine_gate.rs`
+/// unreadable decision keeps the wait. Each event has its own arm, as in the
+/// Verus copy. `formal/verus/src/refine_gate.rs`
 /// proves it.
 #[must_use]
-#[allow(
-    clippy::match_same_arms,
-    reason = "one arm per event, as the Verus copy has"
-)]
+#[allow(clippy::match_same_arms)]
 pub const fn gate_step(event: GateEvent) -> GateStep {
     match event {
         GateEvent::Deadline => GateStep::TimedOut,
