@@ -136,6 +136,14 @@ impl OpSample {
         self.concurrency = NonZeroU32::new(n);
         self
     }
+
+    /// The concurrency that the run asks the policy for. A run with none
+    /// takes the default of its strategy.
+    #[must_use]
+    pub fn asked_concurrency(&self) -> u32 {
+        self.concurrency
+            .map_or_else(|| default_concurrency(self.strategy), NonZeroU32::get)
+    }
 }
 
 /// The input of one `agent_sample` run.
@@ -391,9 +399,7 @@ pub async fn sample_task(
     let ask = Ask {
         strategy: sample.strategy.policy_strategy(),
         draws: sample.strategy.draws(),
-        concurrency: sample
-            .concurrency
-            .map_or_else(|| default_concurrency(sample.strategy), NonZeroU32::get),
+        concurrency: sample.asked_concurrency(),
         scorer: Some(&sample.scorer),
     };
     let admission = admit(&read.policy, &ask).map_err(SampleFailure::Refused)?;
