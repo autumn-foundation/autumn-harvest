@@ -146,10 +146,14 @@ fn paths() -> ScorerRef {
 }
 
 fn harness(model: Arc<TryFnModel>, policy: &SamplingPolicy) -> AgentHarness {
+    harness_with(model, policy, prefers_rl())
+}
+
+fn harness_with(model: Arc<TryFnModel>, policy: &SamplingPolicy, scorer: Paths) -> AgentHarness {
     AgentHarness::new(model)
         .agent(AgentProfile::new(KIND))
         .tool(walk())
-        .scorer(Arc::new(prefers_rl()))
+        .scorer(Arc::new(scorer))
         .sampling_policies(store_with(policy))
 }
 
@@ -228,7 +232,7 @@ async fn a_beam_of_width_two_finds_the_path_that_the_step_scorer_prefers() {
     assert_eq!(from_root, 2, "a kept beam never asks for its prefix again");
 
     // Each round records its verdicts, its parents and its fates.
-    let round_one: Vec<_> = report
+    let second_round: Vec<_> = report
         .draws
         .iter()
         .filter(|draw| draw.beam.as_ref().unwrap().round == 1)
@@ -243,7 +247,7 @@ async fn a_beam_of_width_two_finds_the_path_that_the_step_scorer_prefers() {
         })
         .collect();
     assert_eq!(
-        round_one,
+        second_round,
         [
             (2, Some(1), BeamFate::Live, Some(0.9)),
             (3, Some(1), BeamFate::Live, Some(0.5)),
@@ -332,20 +336,38 @@ fn the_beam_strategy_maps_to_the_policy_strategy() {
 async fn a_default_step_gets_a_refusal_for_a_write_tool() {
     let (_dir, db) = fresh_db();
     let recorder = Arc::new(Recorder::default());
+    // The first step asks to publish. The next step answers.
     let model = TryFnModel::new(|request: &ChatRequest| {
-        let draw = request.draw.map_or(0, DrawId::get);
-        calls(&[(&format!("c{draw}"), "publish", json!({}))], 5)
+        if results(&request.messages).is_empty() {
+            let draw = request.draw.map_or(0, DrawId::get);
+            calls(&[(&format!("c{draw}"), "publish", json!({}))], 5)
+        } else {
+            answer("done", 5)
+        }
     });
     let harness = AgentHarness::new(model)
         .agent(AgentProfile::new(KIND))
         .tool(recorded_tool("publish", ToolEffect::Write, &recorder))
-        .scorer(Arc::new(prefers_rl()))
+        .scorer(Arc::new(Flat))
         .sampling_policies(store_with(&policy(&[Strategy::Beam], 4)));
     let mut rt = runtime(&db, harness);
-    let report = sample_report(drive(&mut rt, &beam_input(1, 2, 2)).await);
+    let input = SampleInput::new(
+        KIND,
+        "Post it.",
+        SampleStrategy::beam(1, 2, 2),
+        ScorerRef::deterministic("flat").unwrap(),
+    );
+    let report = sample_report(drive(&mut rt, &input).await);
 
     assert_eq!(recorder.runs().len(), 0, "the tool body never ran");
-    assert_eq!(report.outcome, SampleOutcome::NoAcceptedDraw);
+    assert_eq!(report.draws[0].stop, AgentStop::StepEnded);
+    let selected = report.selected.expect("the beam completes");
+    let results = tool_results(&selected);
+    assert_eq!(results.len(), 1, "{results:?}");
+    assert!(
+        results[0].contains("denied by policy: this run may not run a tool of effect write"),
+        "the step reads the effect refusal: {results:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -353,8 +375,8 @@ async fn a_token_budget_stops_the_beam_with_budget_exceeded() {
     let (_dir, db) = fresh_db();
     let model = walker();
     let mut rt = runtime(&db, harness(model.clone(), &policy(&[Strategy::Beam], 12)));
-    // Each step spends 5 tokens. The first round spends all 10, so the second round starts
-    // no step.
+    // Each step spends 5 tokens. The first round spends all 10, so the
+    // second round starts no step.
     let input = beam_input(2, 2, 3).max_total_tokens(10);
     let report = sample_report(drive(&mut rt, &input).await);
 
@@ -374,7 +396,22 @@ async fn the_beam_history_replays_to_the_same_selection() {
     use autumn_harvest_agent::sampling::agent_sample_info;
     use autumn_harvest_agent::workflow::agent_loop_info;
 
+    // The child inputs without the draw root, a fresh UUID per batch.
+    let step_inputs = |history: &[WorkflowEvent]| -> Vec<serde_json::Value> {
+        history
+            .iter()
+            .filter_map(|event| match event {
+                WorkflowEvent::ChildWorkflowStarted { input, .. } => {
+                    let mut input = input.clone();
+                    input["draw"].as_object_mut().unwrap().remove("root");
+                    Some(input)
+                }
+                _ => None,
+            })
+            .collect()
+    };
     let mut reports = Vec::new();
+    let mut inputs = Vec::new();
     for _ in 0..2 {
         let (_dir, db) = fresh_db();
         let mut rt = runtime(&db, harness(walker(), &policy(&[Strategy::Beam], 12)));
@@ -395,6 +432,13 @@ async fn the_beam_history_replays_to_the_same_selection() {
             }
         }
         assert_eq!(runs.len(), 11, "the parent and 10 steps");
+        // The recorded output is the report that the run returned.
+        let recorded = history.iter().find_map(|event| match event {
+            WorkflowEvent::WorkflowCompleted { output } => Some(output.clone()),
+            _ => None,
+        });
+        assert_eq!(recorded, Some(serde_json::to_value(&report).unwrap()));
+        inputs.push(step_inputs(&history));
         for (run, info, events) in runs {
             let replay = WorkflowReplayer::new()
                 .register(vec![info])
@@ -415,6 +459,7 @@ async fn the_beam_history_replays_to_the_same_selection() {
         )
     };
     assert_eq!(selected(&reports[0]), selected(&reports[1]));
+    assert_eq!(inputs[0], inputs[1], "both runs start the same steps");
     let verdicts = |report: &SampleReport| {
         report
             .draws
@@ -511,4 +556,112 @@ async fn a_beam_carries_its_flow_labels_into_the_next_step() {
     );
     let selected = report.selected.expect("the beam completes");
     assert!(selected.flow_labels.contains("secret"), "{selected:?}");
+}
+
+// ── review follow-ups ───────────────────────────────────────────────────────
+
+/// A model that walks one step, then answers `done`.
+fn one_step() -> Arc<TryFnModel> {
+    TryFnModel::new(|request: &ChatRequest| {
+        if results(&request.messages).is_empty() {
+            let draw = request.draw.map_or(0, DrawId::get);
+            calls(&[(&format!("c{draw}"), "walk", json!({"dir": "L"}))], 5)
+        } else {
+            answer("done", 5)
+        }
+    })
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_built_in_scorer_keeps_a_tool_step_and_checks_the_answer() {
+    let (_dir, db) = fresh_db();
+    let harness = AgentHarness::new(one_step())
+        .agent(AgentProfile::new(KIND))
+        .tool(walk())
+        .scorer(Arc::new(autumn_harvest_agent::ExactMatch::new("done")))
+        .sampling_policies(store_with(&policy(&[Strategy::Beam], 3)));
+    let mut rt = runtime(&db, harness);
+    let input = SampleInput::new(
+        KIND,
+        "Walk, then say done.",
+        SampleStrategy::beam(1, 1, 3),
+        ScorerRef::deterministic(autumn_harvest_agent::ExactMatch::ID).unwrap(),
+    );
+    let report = sample_report(drive(&mut rt, &input).await);
+
+    assert_eq!(report.draws[0].stop, AgentStop::StepEnded);
+    assert_eq!(
+        report.draws[0].verdict.as_score().map(FiniteF64::get),
+        Some(0.0),
+        "a partial beam has no answer to check yet"
+    );
+    assert_eq!(report.selected.expect("the beam completes").text, "done");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_beam_path_never_runs_more_tool_rounds_than_the_profile_allows() {
+    let (_dir, db) = fresh_db();
+    let walks = Arc::new(Recorder::default());
+    let mut profile = AgentProfile::new(KIND);
+    profile.max_steps = 1;
+    let harness = AgentHarness::new(walker())
+        .agent(profile)
+        .tool(labelled("walk", "path", &walks))
+        .scorer(Arc::new(Flat))
+        .sampling_policies(store_with(&policy(&[Strategy::Beam], 5)));
+    let mut rt = runtime(&db, harness);
+    let input = SampleInput::new(
+        KIND,
+        "Find the path.",
+        SampleStrategy::beam(1, 1, 5),
+        ScorerRef::deterministic("flat").unwrap(),
+    );
+    let report = sample_report(drive(&mut rt, &input).await);
+
+    assert_eq!(walks.runs().len(), 1, "the profile allows one tool round");
+    let stops: Vec<AgentStop> = report.draws.iter().map(|draw| draw.stop).collect();
+    assert_eq!(stops, [AgentStop::StepEnded, AgentStop::StepsExhausted]);
+    assert_eq!(report.outcome, SampleOutcome::NoAcceptedDraw);
+    assert_eq!(report.stopped, SampleStop::Completed, "no beam is live");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_round_keeps_by_score_not_by_draw_order() {
+    let (_dir, db) = fresh_db();
+    let model = walker();
+    // The root step L scores higher, but its child RL is the best path.
+    let scorer = Paths(BTreeMap::from([
+        ("L", 0.6),
+        ("R", 0.4),
+        ("LL", 0.1),
+        ("LR", 0.2),
+        ("RL", 0.9),
+        ("RR", 0.3),
+    ]));
+    let mut rt = runtime(
+        &db,
+        harness_with(model.clone(), &policy(&[Strategy::Beam], 12), scorer),
+    );
+    let report = sample_report(drive(&mut rt, &beam_input(2, 2, 3)).await);
+
+    let fates: Vec<(u32, Option<u32>, BeamFate)> = report
+        .draws
+        .iter()
+        .map(|draw| {
+            let beam = draw.beam.unwrap();
+            (draw.draw.get(), beam.parent.map(DrawId::get), beam.fate)
+        })
+        .collect();
+    assert_eq!(
+        &fates[2..6],
+        [
+            (2, Some(0), BeamFate::Pruned),
+            (3, Some(0), BeamFate::Pruned),
+            (4, Some(1), BeamFate::Live),
+            (5, Some(1), BeamFate::Live),
+        ],
+        "the round keeps the children of the lower root, by score"
+    );
+    assert_eq!(report.selected.unwrap().text, "RL");
+    assert_eq!(model.requests().len(), 10);
 }

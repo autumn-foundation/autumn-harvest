@@ -232,7 +232,8 @@ pub enum SampleStop {
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum BeamFate {
-    /// The round kept the step, and the next round expands it.
+    /// The round kept the step. The next round expands it, unless the run
+    /// stops after this round.
     Live,
     /// The round kept the step, and its turn is a final answer. It leaves
     /// the pool.
@@ -298,7 +299,8 @@ pub struct SampleReport {
     /// The draws that ran. For a beam, each step is a draw.
     pub attempts: u32,
     /// The report of the selected draw. For a beam, its transcript is the
-    /// whole path.
+    /// whole path, but its usage and counts cover its last step only. The
+    /// totals of the run are on this report.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected: Option<AgentReport>,
     /// Each draw, in draw order.
@@ -591,7 +593,7 @@ async fn run_steps(
         let tasks = (0..width)
             .zip(wave)
             .map(|(index, parent)| {
-                let mut one = step_task(steps.task, parent);
+                let mut one = step_task(steps.task, parent, steps.round);
                 if steps.budget.is_some() {
                     one.max_total_tokens = Some(sibling_cap(left, width, index));
                 }
@@ -624,17 +626,24 @@ async fn run_steps(
     }
 }
 
-/// The task of one beam step: `task` in step mode, with `beam` as its
-/// history.
+/// The task of one beam step in `round`: `task` in step mode, with `beam`
+/// as its history.
 ///
 /// A step continues the run of its beam, so it also continues its flow
-/// labels. A flow rule then sees each label of the beam, from each round.
-/// A step has no context reset, because a reset rewrites the beam.
-fn step_task(task: &AgentTask, beam: &Beam) -> AgentTask {
+/// labels and its step count. A beam of round `r` holds `r` tool rounds.
+/// So the step may run `max_steps - r` tool rounds, as one run of the task
+/// would. With none left, the model may still answer.
+///
+/// A step makes one model call. It has no context reset, because a reset
+/// rewrites the beam. It has no answer check, because a rejected answer
+/// asks the model again.
+fn step_task(task: &AgentTask, beam: &Beam, round: u32) -> AgentTask {
     AgentTask {
         history: beam.messages.clone(),
         flow_labels: beam.flow_labels.clone(),
+        max_steps: task.max_steps.saturating_sub(round),
         beam_step: true,
+        answer_check: None,
         context_reset: None,
         ..task.clone()
     }
@@ -965,6 +974,68 @@ mod tests {
                 .collect();
             proptest::prop_assert_eq!(ids(&beam_rank(&entries, keep)), want);
         }
+    }
+
+    /// A pruned step of the second round with `stop` and `verdict`.
+    fn step(draw: u32, stop: AgentStop, verdict: Verdict) -> Scored {
+        let report: AgentReport = serde_json::from_value(serde_json::json!({
+            "stop": stop,
+            "text": "",
+            "steps_used": 1,
+            "tool_calls": 1,
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+            "messages": [],
+            "flow_labels": ["seen"],
+        }))
+        .unwrap();
+        let record = SampleDraw {
+            draw: DrawId::new(draw),
+            run_id: None,
+            stop,
+            verdict,
+            usage: TokenUsage::default(),
+            cost_usd_micros: 0,
+            beam: Some(BeamStep {
+                round: 1,
+                parent: None,
+                fate: BeamFate::Pruned,
+            }),
+        };
+        Scored { record, report }
+    }
+
+    #[test]
+    fn keep_beams_fills_the_slots_by_score_and_counts_the_complete() {
+        let score = |value| Verdict::score(value).unwrap();
+        let mut round = vec![
+            step(0, AgentStop::StepEnded, score(0.2)),
+            step(1, AgentStop::Completed, score(0.9)),
+            step(2, AgentStop::StepEnded, score(0.5)),
+            step(3, AgentStop::StepsExhausted, score(1.0)),
+            step(4, AgentStop::Completed, Verdict::reject("no")),
+        ];
+        let mut complete = 1;
+        let live = keep_beams(&mut round, 2, &mut complete);
+
+        assert_eq!(complete, 2, "draw 1 completes");
+        let ids: Vec<Option<u32>> = live.iter().map(|beam| beam.draw.map(DrawId::get)).collect();
+        assert_eq!(ids, [Some(2)], "a step with another stop is never kept");
+        assert!(live[0].flow_labels.contains("seen"));
+        let fates: Vec<BeamFate> = round
+            .iter()
+            .map(|one| one.record.beam.unwrap().fate)
+            .collect();
+        assert_eq!(
+            fates,
+            [
+                BeamFate::Pruned,
+                BeamFate::Complete,
+                BeamFate::Live,
+                BeamFate::Pruned,
+                BeamFate::Pruned,
+            ]
+        );
+        assert!(keep_beams(&mut round, 0, &mut complete).is_empty());
     }
 
     #[test]

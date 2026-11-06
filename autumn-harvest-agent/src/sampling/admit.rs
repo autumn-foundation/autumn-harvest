@@ -720,14 +720,15 @@ mod tests {
         }
 
         #[test]
-        fn a_beam_never_runs_more_steps_than_its_draws(
+        fn a_model_beam_never_runs_more_steps_than_its_draws(
             width in 0_u32..=6,
             expansion in 0_u32..=6,
             rounds in 0_u32..=6,
             completes in proptest::collection::vec(0_u32..=6, 0..=6),
         ) {
-            // Each round expands at most the open slots. The draws bound
-            // each schedule that the completions allow.
+            // A model of the loop of `run_beam`. Each round expands at most
+            // the open slots. The draws bound each schedule that the
+            // completions allow. `keep_beams` has its own unit test.
             let mut complete = 0_u32;
             let mut live = 1_u32;
             let mut steps = 0_u32;

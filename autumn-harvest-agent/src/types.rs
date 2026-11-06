@@ -303,7 +303,9 @@ pub struct AgentTask {
     pub kind: Option<String>,
     /// Run one beam step: one model turn and its tool round. `history`
     /// holds the beam, so the run adds no user message for `input`. A tool
-    /// round ends the run with [`AgentStop::StepEnded`].
+    /// round ends the run with [`AgentStop::StepEnded`]. Only `agent_sample`
+    /// sets it. Its step has no follow-ups, no answer check and no context
+    /// reset.
     #[serde(default, skip_serializing_if = "is_false")]
     pub beam_step: bool,
 }

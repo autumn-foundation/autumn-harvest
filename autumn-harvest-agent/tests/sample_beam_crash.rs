@@ -5,6 +5,7 @@
 //! the model call of draw 3, the second step of the second round. The
 //! parent opens the same database and finishes the run. Both processes
 //! append to one log, so the test counts each model call and each score.
+//! The prose counts rounds from 1. `BeamStep::round` counts from 0.
 
 #![allow(
     clippy::unwrap_used,
@@ -127,6 +128,8 @@ fn harness(log_path: &Path, who: &'static str, abort_on: Option<u32>) -> AgentHa
     let policy = SamplingPolicy {
         strategies: std::collections::BTreeSet::from([Strategy::Beam]),
         max_draws: 12,
+        // One step at a time, so the log order is fixed.
+        max_concurrent_draws: 1,
         ..SamplingPolicy::default()
     };
     store
@@ -239,9 +242,16 @@ async fn a_crash_in_round_two_resumes_in_round_two() {
         .filter(|line| line.starts_with("parent"))
         .map(String::as_str)
         .collect();
+    let parent_models: Vec<&str> = parent
+        .iter()
+        .filter(|line| line.contains(" model "))
+        .copied()
+        .collect();
     assert_eq!(
-        parent.first(),
-        Some(&"parent model s3"),
+        parent_models,
+        (3..10)
+            .map(|n| format!("parent model s{n}"))
+            .collect::<Vec<_>>(),
         "the parent resumes in round 2, at the step in flight"
     );
     for draw in ["s0", "s1", "s2"] {
@@ -262,6 +272,19 @@ async fn a_crash_in_round_two_resumes_in_round_two() {
         .count();
     assert_eq!(rl, 2);
     assert_eq!(report.draws.len(), 10);
+    let first_round: Vec<Option<f64>> = report.draws[..2]
+        .iter()
+        .map(|draw| {
+            draw.verdict
+                .as_score()
+                .map(autumn_harvest_agent::FiniteF64::get)
+        })
+        .collect();
+    assert_eq!(
+        first_round,
+        [Some(0.4), Some(0.6)],
+        "the round 1 verdicts come from history"
+    );
     assert_eq!(
         report.outcome,
         SampleOutcome::Selected {

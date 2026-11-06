@@ -13,8 +13,9 @@
 //! - [`agent_draws`] reads the policy once, admits the request and runs the
 //!   draws.
 //! - [`agent_sample`] runs best-of-N or rejection sampling. It scores each
-//!   draw and selects one (issue #2443). It also runs step-level beam
-//!   search, which scores each model turn and keeps the best beams.
+//!   draw and selects one (issue #2443).
+//! - [`agent_sample`] also runs step-level beam search. It scores each model
+//!   turn and keeps the best beams with [`beam_rank`].
 //! - [`admit_answer_check`] caps the answer check of a run (issue #2442).
 //!
 //! A run never carries a policy field. [`AgentTask`](crate::AgentTask),
