@@ -30,8 +30,8 @@
 //!
 //! `cascade_step` gives the next tier of a cascade run. It skips each tier
 //! that the mandate forbids, and it never returns a tier before `next`.
-//! In `spec_ran`, a spec model of the run, each tier runs at most once and
-//! in order, and each tier that runs is one that the mandate allows.
+//! `spec_ran` is a spec model of the run. In it, each tier runs at most
+//! once and in order. Each tier that runs is one that the mandate allows.
 
 use vstd::arithmetic::div_mod::*;
 use vstd::prelude::*;
