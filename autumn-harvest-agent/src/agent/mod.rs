@@ -2349,32 +2349,7 @@ impl AgentRun<'_> {
                 return (state, Ok(None));
             }
         };
-        if let Some(peer) = &peer {
-            let mandate = peer.member.mandate();
-            task.mandate = Some(mandate.clone());
-            task.read_only |= mandate.read_only;
-            task.waiting = peer.waiting.to_vec();
-        }
-        // A draw keeps no progress notes. Its notes would not reach the state,
-        // so the next op would restore stale ones.
-        task.context_reset = None;
-        task.history.clone_from(&state.transcript);
-        task.flow_labels = state
-            .flow_labels
-            .iter()
-            .chain(profile.mandate.iter().flat_map(|m| &m.flow_labels))
-            .cloned()
-            .collect();
-        if task.memory_in_state && !state.memory.is_empty() {
-            // A draw reads the state memory but cannot edit it.
-            let snapshot = crate::memory::render_snapshot(&state.memory);
-            task.system = Some(match task.system.take() {
-                Some(system) => format!("{system}\n\n{snapshot}"),
-                None => snapshot,
-            });
-            task.flow_labels
-                .extend(crate::memory::snapshot_labels(&state.memory));
-        }
+        draw_op_task(&mut task, &state, profile, peer.as_ref());
         // Each draw carries the task in its input. A task over the input cap
         // would fail the spawn after the policy read, so it fails here.
         if crate::bounds::exceeds_bytes(&task, DEFAULT_MAX_WORKFLOW_INPUT_BYTES) {
@@ -2482,6 +2457,42 @@ struct Sent<'a> {
     run_id: &'a str,
     stop: AgentStop,
     answer: &'a str,
+}
+
+/// Give the task of a strategy op what each draw reads: the mandate of a
+/// peer message, the transcript, the labels and the state memory.
+fn draw_op_task(
+    task: &mut AgentTask,
+    state: &AgentState,
+    profile: &AgentProfile,
+    peer: Option<&PeerSegment<'_>>,
+) {
+    if let Some(peer) = peer {
+        let mandate = peer.member.mandate();
+        task.mandate = Some(mandate.clone());
+        task.read_only |= mandate.read_only;
+        task.waiting = peer.waiting.to_vec();
+    }
+    // A draw keeps no progress notes. Its notes would not reach the state,
+    // so the next op would restore stale ones.
+    task.context_reset = None;
+    task.history.clone_from(&state.transcript);
+    task.flow_labels = state
+        .flow_labels
+        .iter()
+        .chain(profile.mandate.iter().flat_map(|m| &m.flow_labels))
+        .cloned()
+        .collect();
+    if task.memory_in_state && !state.memory.is_empty() {
+        // A draw reads the state memory but cannot edit it.
+        let snapshot = crate::memory::render_snapshot(&state.memory);
+        task.system = Some(match task.system.take() {
+            Some(system) => format!("{system}\n\n{snapshot}"),
+            None => snapshot,
+        });
+        task.flow_labels
+            .extend(crate::memory::snapshot_labels(&state.memory));
+    }
 }
 
 /// The run tree of one segment of the agent `id`: the labels of the agent,
