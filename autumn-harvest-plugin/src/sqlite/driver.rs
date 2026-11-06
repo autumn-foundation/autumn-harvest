@@ -580,6 +580,10 @@ impl Drop for OnExit {
 
 fn register(runtime: &mut SqliteRuntime, registry: &Registry) {
     for workflow in &registry.workflows {
+        // With the `mcp` feature the plugin serves the tools. Without it, warn (issue #2488).
+        #[cfg(feature = "mcp")]
+        runtime.register_workflow_mcp_served(workflow);
+        #[cfg(not(feature = "mcp"))]
         runtime.register_workflow(workflow);
     }
     for activity in &registry.activities {

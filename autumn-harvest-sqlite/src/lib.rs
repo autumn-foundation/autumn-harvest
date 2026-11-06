@@ -463,11 +463,12 @@
 //!   is unaffected either way), `owner` / `runbook_url` / `severity` (#372),
 //!   `description` + `input_schema` / `output_schema` / `error_schema` (#373 —
 //!   HTTP-edge discovery/validation, and this backend has no HTTP edge), `mcp` (#597
-//!   — HTTP-edge MCP tool exposure; registration logs one `WARN`, issue #2488), `declared_activities` / `declared_children`
+//!   — HTTP-edge MCP tool exposure), `declared_activities` / `declared_children`
 //!   (#802 — an opt-in dependency declaration consumed only by the Postgres plugin's
 //!   `catalog_consistency` deploy-time preflight check and its `/workflows/registered`
 //!   discovery endpoint, neither of which this backend has; the core execution path
 //!   never reads either field), and `module` (diagnostics).
+//!   A bare runtime logs a `WARN` for `mcp` at registration (issue #2488).
 //! - **HONORED:** `name` (the registration key), `handler` (the dispatch fn),
 //!   `execution_timeout` (#243) and the workflow-level `retry_policy` (#523). See
 //!   [issue #2029](#timers-mutex-local-activities-timeout-and-retry-issue-2029).
