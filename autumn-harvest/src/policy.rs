@@ -162,7 +162,7 @@ pub fn compute_retry_delay_with_seed(
 /// let policy = RetryPolicy::exponential(3, Duration::from_secs(1));
 /// assert_eq!(policy.max_attempts, 3);
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "fuzzing", derive(arbitrary::Arbitrary))]
 pub struct RetryPolicy {
     /// Maximum number of attempts (including the first). 1 = no retries.

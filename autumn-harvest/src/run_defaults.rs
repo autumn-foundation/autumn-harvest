@@ -99,6 +99,7 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 
+use crate::activity_defaults::{ActivityDefaultFields, ActivityDefaultOverride, ActivityDefaults};
 use crate::concurrency::ConcurrencyPolicy;
 use crate::policy::RetryPolicy;
 use crate::quota::{QuotaLimits, QuotaLimitsPatch, QuotaPolicy};
@@ -304,6 +305,8 @@ pub struct RunDefaultOverride {
 struct Snapshot {
     loaded_at: Option<Instant>,
     overrides: Arc<HashMap<String, RunDefaultFields>>,
+    /// The activity overrides, keyed by the activity name.
+    activities: Arc<HashMap<String, ActivityDefaultFields>>,
 }
 
 /// The in-process copy of the overrides.
@@ -433,17 +436,66 @@ impl RunDefaultsCache {
             .and_then(|snapshot| snapshot.overrides.get(workflow_name).copied())
     }
 
-    /// Replace the snapshot with `overrides`, loaded now.
+    /// The effective defaults of one activity.
+    ///
+    /// `code` holds the code values. A poisoned lock returns them unchanged.
+    /// See [`ActivityDefaultFields::apply`].
+    #[must_use]
+    pub fn apply_activity(&self, activity_name: &str, code: ActivityDefaults) -> ActivityDefaults {
+        match self.activity(activity_name) {
+            Some(fields) => fields.apply(code),
+            None => code,
+        }
+    }
+
+    /// The override of one activity in the current snapshot, if any.
+    #[must_use]
+    pub fn activity(&self, activity_name: &str) -> Option<ActivityDefaultFields> {
+        self.snapshot
+            .read()
+            .ok()
+            .and_then(|snapshot| snapshot.activities.get(activity_name).copied())
+    }
+
+    /// Replace the activity overrides with `overrides`.
+    ///
+    /// The workflow overrides and the load time stay as they are.
+    pub fn replace_activities(&self, overrides: impl IntoIterator<Item = ActivityDefaultOverride>) {
+        let map = overrides
+            .into_iter()
+            .map(|value| (value.activity_name, value.fields))
+            .collect();
+        if let Ok(mut snapshot) = self.snapshot.write() {
+            snapshot.activities = Arc::new(map);
+        }
+    }
+
+    /// Write one activity change through to the snapshot.
+    ///
+    /// Empty `fields` remove the entry.
+    pub fn write_through_activity(&self, activity_name: &str, fields: ActivityDefaultFields) {
+        if let Ok(mut snapshot) = self.snapshot.write() {
+            let mut map = (*snapshot.activities).clone();
+            if fields.is_empty() {
+                map.remove(activity_name);
+            } else {
+                map.insert(activity_name.to_string(), fields);
+            }
+            snapshot.activities = Arc::new(map);
+        }
+    }
+
+    /// Replace the workflow overrides with `overrides`, loaded now.
+    ///
+    /// The activity overrides stay as they are.
     pub fn replace(&self, overrides: impl IntoIterator<Item = RunDefaultOverride>) {
         let map = overrides
             .into_iter()
             .map(|value| (value.workflow_name, value.fields))
             .collect();
         if let Ok(mut snapshot) = self.snapshot.write() {
-            *snapshot = Snapshot {
-                loaded_at: Some(Instant::now()),
-                overrides: Arc::new(map),
-            };
+            snapshot.loaded_at = Some(Instant::now());
+            snapshot.overrides = Arc::new(map);
         }
     }
 
@@ -854,7 +906,7 @@ mod db {
     /// a zero delay, as it refuses every other zero duration. The column holds
     /// whole milliseconds, so the write also refuses a delay under 1 ms. A
     /// delay above [`MAX_RETRY_INTERVAL`] would make the retry start fail.
-    fn check_retry_patch(retry: &RetryLimitsPatch) -> HarvestResult<()> {
+    pub(crate) fn check_retry_patch(retry: &RetryLimitsPatch) -> HarvestResult<()> {
         match retry.max_attempts.flatten() {
             Some(0) => {
                 return Err(HarvestError::Config(
@@ -891,7 +943,7 @@ mod db {
     /// `max_interval` caps each delay, so such a cap hides the first delay.
     /// The check runs on the merged row, because a patch can set one field
     /// and keep the stored value of the other.
-    fn check_retry_limits(retry: RetryLimits) -> HarvestResult<()> {
+    pub(crate) fn check_retry_limits(retry: RetryLimits) -> HarvestResult<()> {
         if let (Some(initial), Some(max)) = (retry.initial_interval, retry.max_interval)
             && max < initial
         {
@@ -985,15 +1037,21 @@ mod db {
     impl RunDefaultsCache {
         /// Reload the snapshot from the default shard.
         ///
-        /// A failed load keeps the last snapshot.
+        /// It loads the workflow overrides and the activity overrides. Each
+        /// failed load keeps its own map, so one bad table never blocks the
+        /// other.
         ///
         /// # Errors
         ///
-        /// As [`load_run_default_overrides`].
+        /// As [`load_run_default_overrides`] and
+        /// [`load_activity_default_overrides`](crate::activity_defaults::load_activity_default_overrides).
+        /// A failure of the workflow load wins.
         pub async fn refresh(&self, conn: &mut AsyncPgConnection) -> HarvestResult<()> {
-            let overrides = load_run_default_overrides(conn).await?;
-            self.replace(overrides);
-            Ok(())
+            let workflows = load_run_default_overrides(conn).await;
+            let activities = crate::activity_defaults::load_activity_default_overrides(conn).await;
+            let workflows = workflows.map(|overrides| self.replace(overrides));
+            let activities = activities.map(|overrides| self.replace_activities(overrides));
+            workflows.and(activities)
         }
 
         /// Reload the snapshot when it is older than [`RUN_DEFAULTS_TTL`].
@@ -1790,5 +1848,101 @@ mod tests {
             .merge(base)
             .is_empty()
         );
+    }
+
+    fn activity_code() -> ActivityDefaults {
+        ActivityDefaults {
+            retry_policy: Some(code_retry()),
+            start_to_close: Some(mins(1)),
+            heartbeat_timeout: Some(mins(1)),
+            schedule_to_start: None,
+            schedule_to_close: None,
+        }
+    }
+
+    fn activity_stored(name: &str, fields: ActivityDefaultFields) -> ActivityDefaultOverride {
+        ActivityDefaultOverride {
+            activity_name: name.to_string(),
+            fields,
+            reason: None,
+            updated_by: "ops".to_string(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    const LONGER: ActivityDefaultFields = ActivityDefaultFields {
+        retry: STOP,
+        start_to_close: Some(mins(9)),
+        heartbeat_timeout: None,
+        schedule_to_start: None,
+        schedule_to_close: None,
+    };
+
+    #[test]
+    fn an_activity_override_applies_by_activity_name() {
+        let cache = RunDefaultsCache::new();
+        cache.replace_activities([activity_stored("charge", LONGER)]);
+        let effective = cache.apply_activity("charge", activity_code());
+        assert_eq!(effective.start_to_close, Some(mins(9)));
+        assert_eq!(effective.retry_policy.map(|p| p.max_attempts), Some(1));
+        assert_eq!(effective.heartbeat_timeout, Some(mins(1)), "unset inherits");
+        assert_eq!(
+            cache.apply_activity("refund", activity_code()),
+            activity_code(),
+            "another activity keeps its code values"
+        );
+        assert_eq!(cache.activity("charge"), Some(LONGER));
+    }
+
+    /// An activity and a workflow can share a name. Each map keeps its own
+    /// override.
+    #[test]
+    fn an_activity_override_never_touches_a_workflow_of_the_same_name() {
+        let cache = RunDefaultsCache::new();
+        cache.write_through_activity("etl", LONGER);
+        assert_eq!(cache.get("etl"), None);
+        assert_eq!(
+            cache.apply("etl", Some(mins(60)), Some(mins(5))),
+            (Some(mins(60)), Some(mins(5)))
+        );
+        cache.write_through("etl", limit_only(3));
+        assert_eq!(cache.activity("etl"), Some(LONGER));
+    }
+
+    #[test]
+    fn activity_write_through_sets_and_removes_one_entry() {
+        let cache = RunDefaultsCache::new();
+        cache.write_through_activity("charge", LONGER);
+        assert_eq!(cache.activity("charge"), Some(LONGER));
+        cache.write_through_activity("charge", ActivityDefaultFields::default());
+        assert_eq!(cache.activity("charge"), None);
+        assert_eq!(
+            cache.apply_activity("charge", activity_code()),
+            activity_code()
+        );
+    }
+
+    /// A workflow reload keeps the activity map, and an activity reload keeps
+    /// the workflow map.
+    #[test]
+    fn each_replace_keeps_the_other_map() {
+        let cache = RunDefaultsCache::new();
+        cache.replace_activities([activity_stored("charge", LONGER)]);
+        cache.replace([stored("etl", limit_only(3))]);
+        assert_eq!(cache.activity("charge"), Some(LONGER));
+        cache.replace_activities([]);
+        assert_eq!(cache.activity("charge"), None);
+        assert_eq!(cache.get("etl"), Some(limit_only(3)));
+    }
+
+    #[test]
+    fn a_never_loaded_cache_returns_the_code_activity_values() {
+        let cache = RunDefaultsCache::new();
+        assert_eq!(
+            cache.apply_activity("charge", activity_code()),
+            activity_code()
+        );
+        assert_eq!(cache.activity("charge"), None);
     }
 }

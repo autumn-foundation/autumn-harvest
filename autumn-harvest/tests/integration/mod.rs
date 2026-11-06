@@ -5,6 +5,8 @@ mod active_workflow_gauge_tests;
 #[cfg(feature = "db")]
 mod activity_claim_epoch_tests;
 mod activity_default_floor_tests;
+#[cfg(feature = "testing")]
+mod activity_default_override_db_tests;
 #[cfg(feature = "db")]
 mod activity_default_timeout_tests;
 #[cfg(feature = "db")]

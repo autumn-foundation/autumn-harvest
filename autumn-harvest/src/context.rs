@@ -1815,12 +1815,13 @@ impl RaceBuilder<'_> {
         match serde_json::to_value(input) {
             Ok(json_input) => {
                 let queue = info.default_queue.unwrap_or("default").to_string();
+                let (retry, start_to_close) = self.ctx.activity_call_defaults(info);
                 self.push(RaceBranchKind::Activity {
                     name: info.name.to_string(),
                     input: json_input,
                     queue,
-                    retry: info.default_retry_policy.clone(),
-                    start_to_close: info.default_start_to_close,
+                    retry,
+                    start_to_close,
                 })
             }
             Err(err) => self.fail(err.into()),
@@ -2815,14 +2816,15 @@ impl Session<'_> {
     {
         let json_input = serde_json::to_value(input).map_err(HarvestError::Serialization)?;
         let queue = info.default_queue.unwrap_or(self.queue.as_str());
+        let (retry, start_to_close) = self.ctx.activity_call_defaults(info);
         let raw = self
             .ctx
             .execute_activity_raw_full(
                 info.name,
                 json_input,
                 queue,
-                info.default_retry_policy.clone(),
-                info.default_start_to_close,
+                retry,
+                start_to_close,
                 Some(self.id),
                 Some(self.host_worker_id.clone()),
                 None,
@@ -3332,6 +3334,8 @@ pub struct WorkflowContext {
     /// Builder-level default activity `start_to_close` (issue #620). Used by the
     /// LOCAL activity path (still clamped by the worker's local-STC cap). `None`.
     default_activity_start_to_close: Option<std::time::Duration>,
+    /// The operator overrides of the activity defaults. `None` applies none.
+    activity_overrides: Option<std::sync::Arc<crate::run_defaults::RunDefaultsCache>>,
     /// Per-activity input cap overrides: `activity_name → max_bytes`.
     /// When an entry exists, the effective cap is `max(global, override)`.
     activity_input_cap_overrides: HashMap<String, u64>,
@@ -3934,6 +3938,7 @@ impl WorkflowContext {
             payload_offload_threshold: None,
             default_activity_retry_policy: None,
             default_activity_start_to_close: None,
+            activity_overrides: None,
             activity_input_cap_overrides: HashMap::new(),
             deferred_nd_error: Mutex::new(None),
             current_details_cap: DEFAULT_CURRENT_DETAILS_CAP_BYTES,
@@ -4134,6 +4139,7 @@ impl WorkflowContext {
             payload_offload_threshold: None,
             default_activity_retry_policy: None,
             default_activity_start_to_close: None,
+            activity_overrides: None,
             activity_input_cap_overrides: HashMap::new(),
             deferred_nd_error: Mutex::new(None),
             current_details_cap: DEFAULT_CURRENT_DETAILS_CAP_BYTES,
@@ -4224,6 +4230,7 @@ impl WorkflowContext {
             payload_offload_threshold: None,
             default_activity_retry_policy: None,
             default_activity_start_to_close: None,
+            activity_overrides: None,
             activity_input_cap_overrides: HashMap::new(),
             deferred_nd_error: Mutex::new(None),
             current_details_cap: DEFAULT_CURRENT_DETAILS_CAP_BYTES,
@@ -4423,6 +4430,44 @@ impl WorkflowContext {
         self.default_activity_retry_policy = retry;
         self.default_activity_start_to_close = start_to_close;
         self
+    }
+
+    /// Install the operator overrides of the activity defaults.
+    ///
+    /// A typed call then resolves its retry policy and its `start_to_close`
+    /// as call site, then override, then code. A local activity does the
+    /// same, then takes the builder default. The worker freezes the result,
+    /// so a recovered or replayed activity keeps it.
+    #[must_use]
+    pub fn with_activity_overrides(
+        mut self,
+        cache: std::sync::Arc<crate::run_defaults::RunDefaultsCache>,
+    ) -> Self {
+        self.activity_overrides = Some(cache);
+        self
+    }
+
+    /// The retry policy and the `start_to_close` of a typed call of `info`.
+    ///
+    /// The code values, with the operator override applied. A call-site
+    /// option still wins over both, so each caller tries it first.
+    fn activity_call_defaults(
+        &self,
+        info: &crate::info::ActivityInfo,
+    ) -> (
+        Option<crate::policy::RetryPolicy>,
+        Option<std::time::Duration>,
+    ) {
+        let code = crate::activity_defaults::ActivityDefaults {
+            retry_policy: info.default_retry_policy.clone(),
+            start_to_close: info.default_start_to_close,
+            ..crate::activity_defaults::ActivityDefaults::default()
+        };
+        let effective = match &self.activity_overrides {
+            Some(cache) => cache.apply_activity(info.name, code),
+            None => code,
+        };
+        (effective.retry_policy, effective.start_to_close)
     }
 
     /// Whether a payload of `observed` bytes will be offloaded rather than stored
@@ -9456,8 +9501,9 @@ impl WorkflowContext {
     {
         let json_input = serde_json::to_value(input)?;
         let queue = queue_override.or(info.default_queue).unwrap_or("default");
-        let retry = retry_override.or_else(|| info.default_retry_policy.clone());
-        let timeout = timeout_override.or(info.default_start_to_close);
+        let (retry, timeout) = self.activity_call_defaults(info);
+        let retry = retry_override.or(retry);
+        let timeout = timeout_override.or(timeout);
         let raw = self
             .execute_activity_raw_with_opts(info.name, json_input, queue, retry, timeout)
             .await?;
@@ -9527,12 +9573,15 @@ impl WorkflowContext {
             )));
         }
         let json_input = serde_json::to_value(input)?;
-        let retry = retry_override.or_else(|| info.default_retry_policy.clone());
+        // Call site, then operator override, then code. The worker freezes
+        // the result in `LocalActivityScheduled`.
+        let (retry, start_to_close) = self.activity_call_defaults(info);
+        let retry = retry_override.or(retry);
         // Preserve subsecond precision: pass the resolved call → activity
         // `Duration` straight to the millis-carrying core (issue #620, Codex P2).
         // The old `.as_secs()` truncated a subsecond override/default to `0`,
         // instantly timing out every attempt.
-        let start_to_close = timeout_override.or(info.default_start_to_close);
+        let start_to_close = timeout_override.or(start_to_close);
         let raw = self
             .execute_local_activity_raw_resolved(info.name, json_input, retry, start_to_close)
             .await?;
@@ -12059,12 +12108,9 @@ impl WorkflowContext {
             })
             .collect::<Result<Vec<_>, serde_json::Error>>()?;
 
+        let (retry, start_to_close) = self.activity_call_defaults(info);
         let raw_results = self
-            .fan_out_raw_impl(
-                activities,
-                info.default_retry_policy.clone(),
-                info.default_start_to_close,
-            )
+            .fan_out_raw_impl(activities, retry, start_to_close)
             .await?;
         raw_results
             .into_iter()
@@ -12108,12 +12154,9 @@ impl WorkflowContext {
             })
             .collect::<Result<Vec<_>, serde_json::Error>>()?;
 
+        let (retry, start_to_close) = self.activity_call_defaults(info);
         let raw_results = self
-            .fan_out_collect_raw_impl(
-                activities,
-                info.default_retry_policy.clone(),
-                info.default_start_to_close,
-            )
+            .fan_out_collect_raw_impl(activities, retry, start_to_close)
             .await?;
         let typed: Vec<Result<O, String>> = raw_results
             .into_iter()
@@ -12446,13 +12489,9 @@ impl WorkflowContext {
             })
             .collect::<Result<Vec<_>, serde_json::Error>>()?;
 
+        let (retry, start_to_close) = self.activity_call_defaults(info);
         let raw_results = self
-            .fan_out_raw_windowed_impl(
-                activities,
-                max_in_flight,
-                info.default_retry_policy.clone(),
-                info.default_start_to_close,
-            )
+            .fan_out_raw_windowed_impl(activities, max_in_flight, retry, start_to_close)
             .await?;
         raw_results
             .into_iter()
@@ -12499,13 +12538,9 @@ impl WorkflowContext {
             })
             .collect::<Result<Vec<_>, serde_json::Error>>()?;
 
+        let (retry, start_to_close) = self.activity_call_defaults(info);
         let raw_results = self
-            .fan_out_collect_raw_windowed_impl(
-                activities,
-                max_in_flight,
-                info.default_retry_policy.clone(),
-                info.default_start_to_close,
-            )
+            .fan_out_collect_raw_windowed_impl(activities, max_in_flight, retry, start_to_close)
             .await?;
         let typed: Vec<Result<O, String>> = raw_results
             .into_iter()
@@ -12632,13 +12667,9 @@ impl WorkflowContext {
             })
             .collect::<Result<Vec<_>, serde_json::Error>>()?;
 
+        let (retry, start_to_close) = self.activity_call_defaults(info);
         let (slots, tolerated, writer) = self
-            .fan_out_with_impl(
-                activities,
-                options,
-                info.default_retry_policy.clone(),
-                info.default_start_to_close,
-            )
+            .fan_out_with_impl(activities, options, retry, start_to_close)
             .await?;
         let items = slots
             .into_iter()
@@ -34074,5 +34105,251 @@ mod payload_depth_tests {
         // The call parks on the child result. A depth refusal returns at once.
         assert!(res.is_err(), "a value at the cap must be accepted");
         assert_eq!(ctx.drain_commands().len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod activity_override_tests {
+    use super::*;
+    use crate::activity_defaults::ActivityDefaultFields;
+    use crate::info::ActivityInfo;
+    use crate::policy::RetryPolicy;
+    use crate::run_defaults::RunDefaultsCache;
+    use crate::workflow_retry::RetryLimits;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    const CODE_STC: Duration = Duration::from_secs(30);
+    const OVERRIDE_STC: Duration = Duration::from_secs(90);
+
+    fn info(name: &'static str, is_local: bool) -> ActivityInfo {
+        ActivityInfo {
+            name,
+            module: "activity_override_tests",
+            default_retry_policy: Some(RetryPolicy::fixed(4, Duration::from_millis(100))),
+            default_start_to_close: Some(CODE_STC),
+            default_heartbeat_timeout: None,
+            default_schedule_to_start: None,
+            default_schedule_to_close: None,
+            default_queue: None,
+            max_concurrent: None,
+            concurrency_key: None,
+            is_local,
+            max_input_bytes: None,
+            max_result_bytes: None,
+            rate_limit_rps: None,
+            rate_limit_burst: None,
+            rate_limit_key: None,
+            rate_limit_key_expr: None,
+            circuit_breaker: None,
+            requires: None,
+            handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            input_schema: None,
+            output_schema: None,
+        }
+    }
+
+    /// Stop the retries and allow a longer attempt.
+    const OVERRIDE: ActivityDefaultFields = ActivityDefaultFields {
+        retry: RetryLimits {
+            max_attempts: Some(1),
+            initial_interval: None,
+            max_interval: None,
+        },
+        start_to_close: Some(OVERRIDE_STC),
+        heartbeat_timeout: None,
+        schedule_to_start: None,
+        schedule_to_close: None,
+    };
+
+    fn cache(name: &str) -> Arc<RunDefaultsCache> {
+        let cache = Arc::new(RunDefaultsCache::new());
+        cache.write_through_activity(name, OVERRIDE);
+        cache
+    }
+
+    /// Poll `fut` until it suspends, then return the commands it emitted.
+    async fn commands_of<F: std::future::Future>(
+        ctx: &WorkflowContext,
+        fut: F,
+    ) -> Vec<WorkflowCommand> {
+        tokio::pin!(fut);
+        tokio::select! {
+            _ = &mut fut => panic!("the call must suspend on its command"),
+            () = tokio::time::sleep(Duration::from_millis(20)) => {}
+        }
+        ctx.drain_commands()
+    }
+
+    /// The activity commands of `commands`. A fan-out and a race also emit
+    /// a marker.
+    fn activities(commands: &[WorkflowCommand]) -> Vec<&WorkflowCommand> {
+        commands
+            .iter()
+            .filter(|c| {
+                matches!(
+                    c,
+                    WorkflowCommand::ScheduleActivity { .. }
+                        | WorkflowCommand::RunLocalActivity { .. }
+                )
+            })
+            .collect()
+    }
+
+    /// The retry `max_attempts` and `start_to_close` of a schedule command.
+    fn scheduled(command: &WorkflowCommand) -> (Option<u32>, Option<Duration>) {
+        match command {
+            WorkflowCommand::ScheduleActivity {
+                retry_policy_override,
+                start_to_close_override,
+                ..
+            } => (
+                retry_policy_override.as_ref().map(|p| p.max_attempts),
+                *start_to_close_override,
+            ),
+            WorkflowCommand::RunLocalActivity {
+                retry_policy,
+                start_to_close,
+                ..
+            } => (
+                retry_policy.as_ref().map(|p| p.max_attempts),
+                *start_to_close,
+            ),
+            other => panic!("expected an activity command, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_typed_call_takes_the_override() {
+        let ctx = WorkflowContext::new_test().with_activity_overrides(cache("charge"));
+        let info = info("charge", false);
+        let commands = commands_of(&ctx, ctx.execute_activity::<_, Value>(&info, 1_u32)).await;
+        assert_eq!(commands.len(), 1);
+        assert_eq!(scheduled(&commands[0]), (Some(1), Some(OVERRIDE_STC)));
+    }
+
+    #[tokio::test]
+    async fn a_call_site_option_wins_over_the_override() {
+        let ctx = WorkflowContext::new_test().with_activity_overrides(cache("charge"));
+        let info = info("charge", false);
+        let call = ctx.execute_activity_with_opts::<_, Value>(
+            &info,
+            1_u32,
+            None,
+            Some(RetryPolicy::fixed(7, Duration::from_millis(10))),
+            Some(Duration::from_secs(5)),
+        );
+        let commands = commands_of(&ctx, call).await;
+        assert_eq!(
+            scheduled(&commands[0]),
+            (Some(7), Some(Duration::from_secs(5)))
+        );
+    }
+
+    #[tokio::test]
+    async fn another_activity_and_a_bare_context_keep_the_code_values() {
+        let ctx = WorkflowContext::new_test().with_activity_overrides(cache("refund"));
+        let info = info("charge", false);
+        let commands = commands_of(&ctx, ctx.execute_activity::<_, Value>(&info, 1_u32)).await;
+        assert_eq!(scheduled(&commands[0]), (Some(4), Some(CODE_STC)));
+
+        let bare = WorkflowContext::new_test();
+        let commands = commands_of(&bare, bare.execute_activity::<_, Value>(&info, 1_u32)).await;
+        assert_eq!(scheduled(&commands[0]), (Some(4), Some(CODE_STC)));
+    }
+
+    #[tokio::test]
+    async fn a_typed_fan_out_takes_the_override() {
+        let ctx = WorkflowContext::new_test().with_activity_overrides(cache("charge"));
+        let info = info("charge", false);
+        let call = ctx.execute_activity_fan_out::<_, Value>(&info, vec![1_u32, 2_u32]);
+        let commands = commands_of(&ctx, call).await;
+        let scheduled_activities = activities(&commands);
+        assert_eq!(scheduled_activities.len(), 2);
+        for command in scheduled_activities {
+            assert_eq!(scheduled(command), (Some(1), Some(OVERRIDE_STC)));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_typed_race_branch_takes_the_override() {
+        let ctx = WorkflowContext::new_test().with_activity_overrides(cache("charge"));
+        let info = info("charge", false);
+        let race = ctx.race().activity(&info, 1_u32).run();
+        let commands = commands_of(&ctx, race).await;
+        let scheduled_activities = activities(&commands);
+        assert_eq!(scheduled_activities.len(), 1);
+        assert_eq!(
+            scheduled(scheduled_activities[0]),
+            (Some(1), Some(OVERRIDE_STC))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_local_activity_takes_the_override_and_a_call_site_option_wins() {
+        let ctx = WorkflowContext::new_test().with_activity_overrides(cache("checksum"));
+        let info = info("checksum", true);
+        let commands =
+            commands_of(&ctx, ctx.execute_local_activity::<_, Value>(&info, 1_u32)).await;
+        assert_eq!(scheduled(&commands[0]), (Some(1), Some(OVERRIDE_STC)));
+
+        let ctx = WorkflowContext::new_test().with_activity_overrides(cache("checksum"));
+        let call = ctx.execute_local_activity_with_opts::<_, Value>(
+            &info,
+            1_u32,
+            Some(RetryPolicy::fixed(6, Duration::from_millis(10))),
+            Some(Duration::from_secs(2)),
+        );
+        let commands = commands_of(&ctx, call).await;
+        assert_eq!(
+            scheduled(&commands[0]),
+            (Some(6), Some(Duration::from_secs(2)))
+        );
+    }
+
+    /// A local activity that recovers mid-retry keeps the values that its
+    /// event froze. An override with one attempt would end it at once.
+    #[tokio::test]
+    async fn a_recovered_local_activity_keeps_its_frozen_values() {
+        let activity_id = ActivityExecId::new();
+        let frozen = RetryPolicy::fixed(3, Duration::from_millis(10));
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::LocalActivityScheduled {
+                activity_id,
+                name: "checksum".into(),
+                input: serde_json::json!(1),
+                resolved: true,
+                retry_policy: Some(frozen),
+                start_to_close_nanos: Some(
+                    u64::try_from(CODE_STC.as_nanos()).expect("fits in u64"),
+                ),
+            },
+            WorkflowEvent::LocalActivityFailed {
+                activity_id,
+                error: "first attempt failed".into(),
+                attempt: 1,
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events)
+            .with_activity_overrides(cache("checksum"));
+        let info = info("checksum", true);
+        let commands =
+            commands_of(&ctx, ctx.execute_local_activity::<_, Value>(&info, 1_u32)).await;
+        assert_eq!(commands.len(), 1, "a retry remains under the frozen budget");
+        assert_eq!(scheduled(&commands[0]), (Some(3), Some(CODE_STC)));
+        assert!(matches!(
+            commands[0],
+            WorkflowCommand::RunLocalActivity {
+                already_scheduled: true,
+                ..
+            }
+        ));
     }
 }

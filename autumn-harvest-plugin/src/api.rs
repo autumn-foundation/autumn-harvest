@@ -5624,6 +5624,13 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<()> {
                 .patch(crate::run_defaults_api::patch_run_defaults)
                 .route_layer(require_admin.clone()),
         )
+        .route(
+            // Default overrides of an activity type.
+            "/admin/activity-types/{activity_name}/defaults",
+            get(crate::activity_defaults_api::get_activity_defaults)
+                .patch(crate::activity_defaults_api::patch_activity_defaults)
+                .route_layer(require_admin.clone()),
+        )
         // Agent profile overlays (issue #2374). Not in `ADMIN_SCOPE_ROUTES`,
         // so the `mutate` scope reaches the two writes.
         .route(
@@ -7715,6 +7722,8 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
             "PATCH",
             "/admin/workflow-types/{workflow_name}/run-defaults",
         ),
+        ("GET", "/admin/activity-types/{activity_name}/defaults"),
+        ("PATCH", "/admin/activity-types/{activity_name}/defaults"),
         ("GET", "/admin/agents/{kind}/sampling-policy"),
         ("PUT", "/admin/agents/{kind}/sampling-policy"),
         ("DELETE", "/admin/agents/{kind}/sampling-policy"),
@@ -8066,6 +8075,22 @@ pub const fn management_api_request_fields()
                 "clear_override",
                 "reason",
                 "recompute_in_flight",
+            ]),
+        ),
+        // Default overrides of an activity type.
+        (
+            "PATCH",
+            "/admin/activity-types/{activity_name}/defaults",
+            Some(&[
+                "retry_max_attempts",
+                "retry_initial_interval_ms",
+                "retry_max_interval_ms",
+                "start_to_close_ms",
+                "heartbeat_timeout_ms",
+                "schedule_to_start_ms",
+                "schedule_to_close_ms",
+                "clear_override",
+                "reason",
             ]),
         ),
         // The sampling policy of an agent kind (issue #2439).
@@ -9242,6 +9267,7 @@ pub const fn management_api_response_fields()
             Some(&[
                 "schedule_overrides",
                 "run_default_overrides",
+                "activity_default_overrides",
                 "unavailable_shards",
             ]),
         ),
@@ -9305,6 +9331,16 @@ pub const fn management_api_response_fields()
             "PATCH",
             "/admin/workflow-types/{workflow_name}/run-defaults",
             Some(&["workflow_name", "code", "override", "effective"]),
+        ),
+        (
+            "GET",
+            "/admin/activity-types/{activity_name}/defaults",
+            Some(&["activity_name", "local", "code", "override", "effective"]),
+        ),
+        (
+            "PATCH",
+            "/admin/activity-types/{activity_name}/defaults",
+            Some(&["activity_name", "local", "code", "override", "effective"]),
         ),
         // Issue #2439.
         (
