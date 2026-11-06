@@ -84,6 +84,7 @@ fails in these cases:
 | `AgentMesh` | Durable peer send between two agents (issue #2269) | design, three single-layer configs, four defects, reachability |
 | `AgentWorkspace` | Workspace head of a durable agent (issue #2274) | design, two defects, reachability |
 | `AgentWorkspaceRetention` | Workspace retention across the ops and lives of a durable agent (issue #2274) | design, three defects, reachability |
+| `OverrideCarry` | The carry of a DAG schedule override to its new shard (issue #2413) | design, three defects, reachability |
 
 **Ghost sequence numbers.** Each claim in the two claim models gets a ghost
 `seq`. The code has no such column. An invariant that compared
@@ -532,6 +533,41 @@ can read low, and the new life then reuses old generations. A late attempt
 of the old life deletes the new head. The design reads the floor from the
 store: the highest key, or the marker that a reset leaves at its bound.
 Without the marker, a reset that empties the store gives a floor of 0.
+
+#### `OverrideCarry` — model (i)
+
+`formal/tla/OverrideCarry.tla` models the carry of a DAG schedule override
+(issue #2413). Two shards hold the override table of one DAG. An operator
+sets or clears the override on the owner, and a routing change flips the
+owner. The carry copies the row to the owner, then deletes it on the
+source. The delete can fail, and the carry then starts again. A promotion
+of either shard can happen at any time.
+
+| Action | Code |
+|---|---|
+| `Set`, `Clear` | `update_dag_override`, `clear_dag_override` on the owner. |
+| `Flip` | A routing change. It happens only when no carry is pending. |
+| `Copy` | The copy transaction of `carry_dag_override` on the owner. |
+| `Delete` | The delete transaction of `carry_dag_override` on the source. |
+| `FailDelete` | A failed delete. The next tick runs the carry again. |
+| `Promote` | `bump_generation` in the new region. |
+
+| Config | Switch | Result |
+|---|---|---|
+| `OverrideCarry.cfg` | None: `Receipt`, `DropSourceReceipt` and `Fenced` are `TRUE`. | Pass. |
+| `OverrideCarryNoReceipt.cfg` | `Receipt = FALSE` | Violates `ClearIsKept`. |
+| `OverrideCarryKeepSourceReceipt.cfg` | `DropSourceReceipt = FALSE` | Violates `NothingLostWithoutAClear`. |
+| `OverrideCarryUnfenced.cfg` | `Fenced = FALSE` | Violates `NoWriteAfterPromotion`. |
+| `OverrideCarryReach.cfg` | None. | Violates `NoClearOfACopiedRow`. |
+
+Without a receipt, a retry after a failed delete cannot tell a clear from a
+lost copy. It copies the cleared row back. A receipt that stays on the
+source after the row moves away makes a later carry of the same version
+skip, so a round trip loses the override. The copy transaction writes the
+receipt, and the delete transaction removes the receipt of the source.
+
+The model allows an owner flip only when no carry is pending. See the
+limits in [`DESIGN-2413.md`](../design/DESIGN-2413.md).
 
 ### Extend a model
 

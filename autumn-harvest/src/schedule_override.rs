@@ -1090,18 +1090,30 @@ pub async fn clear_dag_override(
 
 /// Move the override of one DAG to the shard that now owns it (issue #2389).
 ///
-/// `from` holds the row, and `to` is the new owner. The copy commits on `to`
-/// before the delete runs on `from`. So a failure at either step leaves the
-/// override readable on at least one shard. The next scheduler pass retries
-/// the move.
+/// `from` holds the row on `from_shard`, and `to` is the new owner on
+/// `to_shard`. The copy commits on `to` before the delete runs on `from`. So
+/// a failure at either step leaves the override readable on at least one
+/// shard. The next scheduler pass retries the move.
 ///
 /// A row that `to` already holds wins. An operator who changes the DAG after
 /// the move writes to the new owner, and the move must not undo that change.
 /// The row moves as stored, with its reason, actor and timestamps. It is not
 /// decoded.
 ///
+/// The copy also records the `updated_at` of the row on `to`, in the same
+/// transaction. A retry that finds that record writes nothing on `to`. So
+/// when the delete fails and an operator then clears the override on `to`,
+/// the retry does not copy the stale row back. The `updated_at` is a version
+/// tag here. It is never compared with a clock.
+///
 /// The delete matches the `updated_at` of the copied row. A write on `from`
-/// after the copy then keeps its row, and the next pass moves it again.
+/// after the copy then keeps its row, and the next pass moves it again. The
+/// delete also removes the record of `from`. A record that outlives its row
+/// would make a later move of the same version skip the copy.
+///
+/// Each transaction asserts the DR fence of its own shard first. A process
+/// that lost authority on either shard then writes nothing there. The caller
+/// also runs the move under the pass guards of both shards.
 ///
 /// Never pass two shards of one pool. They share one table, so the delete
 /// would remove the only copy.
@@ -1110,10 +1122,13 @@ pub async fn clear_dag_override(
 ///
 /// # Errors
 ///
-/// Returns [`HarvestError::Database`] when a read or write fails.
+/// Returns [`HarvestError::ShardFenced`] when this process lost authority on
+/// either shard, and [`HarvestError::Database`] when a read or write fails.
 pub async fn carry_dag_override(
     from: &mut AsyncPgConnection,
     to: &mut AsyncPgConnection,
+    from_shard: crate::types::ShardId,
+    to_shard: crate::types::ShardId,
     dag_name: &str,
 ) -> HarvestResult<bool> {
     use crate::schema::harvest_schedule_overrides::dsl;
@@ -1130,21 +1145,27 @@ pub async fn carry_dag_override(
     let Some(row) = row else {
         return Ok(false);
     };
-    // Each write takes the registration lock first, as every override
-    // writer does (issue #2386).
+    // Each write takes its fence first. It then takes the registration lock,
+    // as every override writer does.
     Box::pin(to.transaction(async |conn| {
+        crate::replication::assert_fence(conn, to_shard).await?;
         crate::scheduler::wait_for_registration_lock(conn).await?;
+        if copy_delivered(conn, KIND_DAG, dag_name, row.updated_at).await? {
+            return Ok(());
+        }
         diesel::insert_into(dsl::harvest_schedule_overrides)
             .values(&row)
             .on_conflict_do_nothing()
             .execute(conn)
             .await
-            .map_err(crate::error::database_error)
+            .map_err(crate::error::database_error)?;
+        record_copy(conn, KIND_DAG, dag_name, row.updated_at).await
     }))
     .await?;
     let deleted = Box::pin(from.transaction(async |conn| {
+        crate::replication::assert_fence(conn, from_shard).await?;
         crate::scheduler::wait_for_registration_lock(conn).await?;
-        diesel::delete(
+        let deleted = diesel::delete(
             dsl::harvest_schedule_overrides
                 .filter(dsl::kind.eq(KIND_DAG))
                 .filter(dsl::name.eq(dag_name))
@@ -1152,10 +1173,81 @@ pub async fn carry_dag_override(
         )
         .execute(conn)
         .await
-        .map_err(crate::error::database_error)
+        .map_err(crate::error::database_error)?;
+        drop_copy_record(conn, KIND_DAG, dag_name).await?;
+        Ok::<_, HarvestError>(deleted)
     }))
     .await?;
     Ok(deleted > 0)
+}
+
+/// Whether a carry already delivered the version `updated_at` of one
+/// override row to this shard.
+async fn copy_delivered(
+    conn: &mut AsyncPgConnection,
+    kind: &str,
+    name: &str,
+    updated_at: DateTime<Utc>,
+) -> HarvestResult<bool> {
+    use crate::schema::harvest_schedule_override_receipts::dsl;
+
+    diesel::select(diesel::dsl::exists(
+        dsl::harvest_schedule_override_receipts
+            .filter(dsl::kind.eq(kind))
+            .filter(dsl::name.eq(name))
+            .filter(dsl::row_updated_at.eq(updated_at)),
+    ))
+    .get_result(conn)
+    .await
+    .map_err(crate::error::database_error)
+}
+
+/// Record that a carry delivered the version `updated_at` of one override
+/// row to this shard. A later version replaces the record.
+async fn record_copy(
+    conn: &mut AsyncPgConnection,
+    kind: &str,
+    name: &str,
+    updated_at: DateTime<Utc>,
+) -> HarvestResult<()> {
+    use crate::schema::harvest_schedule_override_receipts::dsl;
+
+    diesel::insert_into(dsl::harvest_schedule_override_receipts)
+        .values((
+            dsl::kind.eq(kind),
+            dsl::name.eq(name),
+            dsl::row_updated_at.eq(updated_at),
+            dsl::received_at.eq(diesel::dsl::now),
+        ))
+        .on_conflict((dsl::kind, dsl::name))
+        .do_update()
+        .set((
+            dsl::row_updated_at.eq(updated_at),
+            dsl::received_at.eq(diesel::dsl::now),
+        ))
+        .execute(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+    Ok(())
+}
+
+/// Delete the copy record of one override on this shard.
+async fn drop_copy_record(
+    conn: &mut AsyncPgConnection,
+    kind: &str,
+    name: &str,
+) -> HarvestResult<()> {
+    use crate::schema::harvest_schedule_override_receipts::dsl;
+
+    diesel::delete(
+        dsl::harvest_schedule_override_receipts
+            .filter(dsl::kind.eq(kind))
+            .filter(dsl::name.eq(name)),
+    )
+    .execute(conn)
+    .await
+    .map_err(crate::error::database_error)?;
+    Ok(())
 }
 
 /// Load the override of one code-declared workflow schedule, if any

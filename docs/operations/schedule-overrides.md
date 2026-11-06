@@ -116,6 +116,13 @@ change the override, and clearing the override does not resume the DAG.
   If the new owner comes later in shard order, it applies the override in the
   same tick. Otherwise it runs one tick on the code value first. Two shards on
   one pool share one table, so nothing moves between them.
+- **The move and DR (issue #2413).** The move holds the DR fence of both
+  shards. A process that loses authority mid-move writes nothing after the
+  promotion. A fenced shard skips the move, and the next tick tries again.
+- **A clear during a retried move (issue #2413).** The copy records the
+  version that it delivered in `harvest_schedule_override_receipts` on the
+  new owner. A retry after a failed source delete finds that record, so it
+  does not copy the row again. A clear on the new owner then stays.
 
 ## Code-declared workflow schedules
 

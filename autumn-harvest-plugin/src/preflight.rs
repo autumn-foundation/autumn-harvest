@@ -427,6 +427,13 @@ const HARVEST_WRITE_PRIVILEGE_REQUIREMENTS: &[(&str, &[&str])] = &[
         "harvest_schedule_overrides",
         &["SELECT", "INSERT", "UPDATE", "DELETE"],
     ),
+    // A reshard carry records each copy, and the source delete removes the
+    // record. A missing grant fails each carry, so the override stays on its
+    // old shard.
+    (
+        "harvest_schedule_override_receipts",
+        &["SELECT", "INSERT", "UPDATE", "DELETE"],
+    ),
     // Every refresh loop reads the run-default overrides (issue #2387). The
     // run-defaults PATCH writes and deletes rows.
     (
@@ -2529,6 +2536,17 @@ mod tests {
             .find(|(name, _)| *name == "harvest_partition_exports")
             .map(|(_, privileges)| *privileges);
         assert_eq!(log, Some(&["SELECT", "INSERT"][..]));
+    }
+
+    /// A reshard carry reads, writes and deletes its copy records. A missing
+    /// grant fails each carry.
+    #[test]
+    fn the_override_copy_records_are_covered_by_the_privilege_probe() {
+        let covered = HARVEST_WRITE_PRIVILEGE_REQUIREMENTS
+            .iter()
+            .find(|(name, _)| *name == "harvest_schedule_override_receipts")
+            .map(|(_, privileges)| *privileges);
+        assert_eq!(covered, Some(&["SELECT", "INSERT", "UPDATE", "DELETE"][..]));
     }
 
     #[test]
