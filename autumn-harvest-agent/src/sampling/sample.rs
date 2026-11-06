@@ -12,9 +12,13 @@
 //!   History records each verdict.
 //! - Best-of-N runs each draw, then calls [`select`]. Rejection stops after
 //!   the first wave that holds a pass.
+//! - A durable agent op that carries an [`OpSample`] runs the same core
+//!   with the task of the op. The mandate of that task bounds the draws.
 //!
-//! The design is in `docs/design/DESIGN-2443.md`.
+//! The designs are in `docs/design/DESIGN-2443.md` and
+//! `docs/design/DESIGN-2449.md`.
 
+use std::collections::BTreeSet;
 use std::num::NonZeroU32;
 
 use autumn_harvest::prelude::*;
@@ -93,6 +97,44 @@ impl SampleStrategy {
             Self::BestOfN { n } => n,
             Self::Rejection { max_attempts, .. } => max_attempts,
         }
+    }
+}
+
+/// A strategy that an agent op carries.
+///
+/// The agent runs the op through the core of [`agent_sample`]. The policy
+/// of the kind and the mandate of the op apply. It denies unknown keys, so
+/// it never carries a policy field.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OpSample {
+    /// The strategy.
+    pub strategy: SampleStrategy,
+    /// The scorer. The policy must allow it.
+    pub scorer: ScorerRef,
+    /// The most draws at the same time. `None` takes the default of the
+    /// strategy, as in [`SampleInput`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub concurrency: Option<NonZeroU32>,
+}
+
+impl OpSample {
+    /// A sample of `strategy`, scored with `scorer`.
+    #[must_use]
+    pub const fn new(strategy: SampleStrategy, scorer: ScorerRef) -> Self {
+        Self {
+            strategy,
+            scorer,
+            concurrency: None,
+        }
+    }
+
+    /// Run at most `n` draws at the same time. A value of 0 takes the
+    /// default of the strategy.
+    #[must_use]
+    pub const fn concurrency(mut self, n: u32) -> Self {
+        self.concurrency = NonZeroU32::new(n);
+        self
     }
 }
 
@@ -236,6 +278,33 @@ pub struct SampleReport {
     /// US dollar.
     #[serde(default, skip_serializing_if = "crate::agent::is_zero")]
     pub cost_usd_micros: u64,
+    /// The flow labels of each draw that ran, selected or not. A draw that
+    /// the run does not select still read what its tools returned.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub flow_labels: BTreeSet<String>,
+}
+
+/// The patch marker of the mandate check of [`agent_sample`]. A run that
+/// started before the check reads no marker, so its replay skips the check.
+const SAMPLE_MANDATE_PATCH: &str = "agent_sample_mandate";
+
+/// Why the sample core did not give a report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SampleFailure {
+    /// The policy or the mandate refused the run before its first draw.
+    Refused(Refusal),
+    /// A read failed for good, or a draw run failed in the engine.
+    Engine(String),
+}
+
+impl SampleFailure {
+    /// The error text, such as `sampling refused (<code>): <reason>`.
+    pub(crate) fn text(&self) -> String {
+        match self {
+            Self::Refused(refusal) => refusal.error_text(),
+            Self::Engine(err) => err.clone(),
+        }
+    }
 }
 
 /// Run one sample: draw, score and select.
@@ -258,24 +327,78 @@ pub async fn agent_sample(
     let Some(profile) = read_profile(ctx, &input.kind).await? else {
         return Err(Refusal::UnknownKind.error_text());
     };
-    let read = read_policy(ctx, &input.kind).await?;
-    let ask = Ask {
-        strategy: input.strategy.policy_strategy(),
-        draws: input.strategy.draws(),
-        concurrency: input
-            .concurrency
-            .map_or_else(|| default_concurrency(input.strategy), NonZeroU32::get),
-        scorer: Some(&input.scorer),
+    let mut task = profile_task(&profile, &input.input);
+    task.max_total_tokens = tree_budget(task.max_total_tokens, input.max_total_tokens);
+    let sample = OpSample {
+        strategy: input.strategy,
+        scorer: input.scorer,
+        concurrency: input.concurrency,
     };
-    let admission = admit(&read.policy, &ask).map_err(|refusal| refusal.error_text())?;
-    let task = draw_task(
-        &profile_task(&profile, &input.input),
-        &admission.draw_effects,
-    );
-    let budget = tree_budget(task.max_total_tokens, input.max_total_tokens);
-    let (scored, stopped) = run_waves(ctx, &input, &task, &admission, budget).await?;
+    let mandate_check = ctx.patched(SAMPLE_MANDATE_PATCH);
+    sample_task(ctx, &input.kind, &sample, &task, mandate_check)
+        .await
+        .map_err(|failure| failure.text())
+}
+
+/// The core of [`agent_sample`]: admit, draw, score and select.
+///
+/// `task` is the task of each draw before [`draw_task`]. Its token cap is
+/// the budget of the whole run. With `mandate_check`, the mandate of
+/// `task` admits the draws first. Each draw counts as one delegation, and
+/// the draws split the delegations left with `sibling_cap`.
+///
+/// A durable agent calls it for an op that carries an [`OpSample`]. That
+/// task holds the transcript, the labels and the narrowed mandate of the
+/// op.
+///
+/// # Errors
+///
+/// Returns [`SampleFailure::Refused`] before any model call when the
+/// mandate or the policy refuses the run. Returns
+/// [`SampleFailure::Engine`] when a read fails for good, or when a draw run
+/// fails in the engine.
+pub(crate) async fn sample_task(
+    ctx: &WorkflowContext,
+    kind: &str,
+    sample: &OpSample,
+    task: &AgentTask,
+    mandate_check: bool,
+) -> Result<SampleReport, SampleFailure> {
+    let delegations = match (&task.mandate, mandate_check) {
+        (Some(mandate), true) => Some(
+            mandate
+                .admit_draws(sample.strategy.draws(), 0)
+                .map_err(|refusal| SampleFailure::Refused(Refusal::Mandate { mandate: refusal }))?,
+        ),
+        _ => None,
+    };
+    let read = read_policy(ctx, kind)
+        .await
+        .map_err(SampleFailure::Engine)?;
+    let ask = Ask {
+        strategy: sample.strategy.policy_strategy(),
+        draws: sample.strategy.draws(),
+        concurrency: sample
+            .concurrency
+            .map_or_else(|| default_concurrency(sample.strategy), NonZeroU32::get),
+        scorer: Some(&sample.scorer),
+    };
+    let admission = admit(&read.policy, &ask).map_err(SampleFailure::Refused)?;
+    let budget = task.max_total_tokens;
+    let draw = draw_task(task, &admission.draw_effects);
+    let waves = Waves {
+        sample,
+        task: &draw,
+        admission: &admission,
+        budget,
+        delegations,
+    };
+    let (scored, stopped) = run_waves(ctx, &waves)
+        .await
+        .map_err(SampleFailure::Engine)?;
     Ok(report(
-        input,
+        kind,
+        sample.strategy,
         read.revision,
         admission.concurrency,
         scored,
@@ -310,11 +433,27 @@ struct Scored {
     report: AgentReport,
 }
 
+/// The fixed parts of the waves of one run.
+struct Waves<'a> {
+    /// The strategy and the scorer.
+    sample: &'a OpSample,
+    /// The task of each draw, after [`draw_task`].
+    task: &'a AgentTask,
+    /// What the policy admitted.
+    admission: &'a Admission,
+    /// The token budget of the run tree.
+    budget: Option<u32>,
+    /// The delegations that the draws split, when a mandate admitted them.
+    delegations: Option<u32>,
+}
+
 /// Run the waves of the run, and score each draw.
 ///
 /// [`sample_step`] gives the width of each wave. Draw `i` of a wave gets
 /// the token cap `sibling_cap(left, width, i)`. After the score, the spend
-/// of each draw and of its judge calls counts against the budget.
+/// of each draw and of its judge calls counts against the budget. With
+/// `delegations`, draw `n` of the run gets `sibling_cap(delegations, draws,
+/// n)` delegations, so the draws never pass the fan-out of the mandate.
 ///
 /// The run starts no more draws after a rejection wave with a pass. It
 /// also stops after a failed score, and when a budget refuses a draw or a
@@ -322,11 +461,15 @@ struct Scored {
 /// answer.
 async fn run_waves(
     ctx: &WorkflowContext,
-    input: &SampleInput,
-    task: &AgentTask,
-    admission: &Admission,
-    budget: Option<u32>,
+    waves: &Waves<'_>,
 ) -> Result<(Vec<Scored>, SampleStop), String> {
+    let Waves {
+        sample,
+        task,
+        admission,
+        budget,
+        delegations,
+    } = *waves;
     let mut scored: Vec<Scored> = Vec::new();
     let mut spent: u32 = 0;
     loop {
@@ -350,6 +493,9 @@ async fn run_waves(
                 if budget.is_some() {
                     draw.max_total_tokens = Some(sibling_cap(left, width, index));
                 }
+                if let (Some(rest), Some(mandate)) = (delegations, draw.mandate.as_mut()) {
+                    mandate.max_delegations = sibling_cap(rest, admission.draws, started + index);
+                }
                 (DrawId::new(started + index), draw)
             })
             .collect();
@@ -361,13 +507,14 @@ async fn run_waves(
             if report.stop == AgentStop::BudgetExceeded {
                 halt = halt.or(Some(SampleStop::BudgetExceeded));
             }
-            let (one, halted) = score_draw(ctx, input, task, DrawId::new(id), report, halt).await?;
+            let (one, halted) =
+                score_draw(ctx, sample, task, DrawId::new(id), report, halt).await?;
             halt = halt.or(halted);
-            passed |= passes(input.strategy, &one.record.verdict);
+            passed |= passes(sample.strategy, &one.record.verdict);
             spent = spent.saturating_add(one.record.usage.total());
             scored.push(one);
         }
-        if passed && matches!(input.strategy, SampleStrategy::Rejection { .. }) {
+        if passed && matches!(sample.strategy, SampleStrategy::Rejection { .. }) {
             return Ok((scored, SampleStop::Accepted));
         }
         if let Some(stop) = halt {
@@ -382,20 +529,29 @@ const MAX_SCORED_TOOL_BYTES: usize = 16 * 1024;
 /// The score request of one draw, or `None` when it does not fit the
 /// activity input cap.
 ///
-/// Each tool result is cut to [`MAX_SCORED_TOOL_BYTES`]. A request that
-/// still does not fit would fail the run after the draws were paid.
+/// The request holds the tool results of the draw only. A transcript that
+/// starts with the history of `task` drops the history first. Each tool
+/// result is cut to [`MAX_SCORED_TOOL_BYTES`]. A request that still does
+/// not fit would fail the run after the draws were paid.
 fn score_request(
-    input: &SampleInput,
+    sample: &OpSample,
     task: &AgentTask,
     report: &AgentReport,
 ) -> Option<ScoreRequest> {
     let mut score = ScoreInput::from_run(task, report);
+    if !task.history.is_empty() && report.messages.starts_with(&task.history) {
+        let fresh = report
+            .messages
+            .get(task.history.len()..)
+            .unwrap_or_default();
+        score.tools = crate::score::tool_records(fresh);
+    }
     for tool in &mut score.tools {
         let content = std::mem::take(&mut tool.content);
         tool.content = cut_bytes(content, MAX_SCORED_TOOL_BYTES);
     }
-    let request = ScoreRequest::new(input.scorer.id.as_str(), score)
-        .admitted_judges(input.scorer.judge_model.clone());
+    let request = ScoreRequest::new(sample.scorer.id.as_str(), score)
+        .admitted_judges(sample.scorer.judge_model.clone());
     (!exceeds_activity_input(&request)).then_some(request)
 }
 
@@ -417,7 +573,7 @@ fn score_request(
 /// Returns an engine error, such as a cancellation, as text.
 async fn score_draw(
     ctx: &WorkflowContext,
-    input: &SampleInput,
+    sample: &OpSample,
     task: &AgentTask,
     draw: DrawId,
     report: AgentReport,
@@ -431,7 +587,7 @@ async fn score_draw(
         unscored("a budget stopped the draw, so the run did not score it")
     } else if halt.is_some() {
         unscored("the run stopped before it scored the draw")
-    } else if let Some(request) = score_request(input, task, &report) {
+    } else if let Some(request) = score_request(sample, task, &report) {
         match ctx
             .execute_activity::<_, SampleScore>(&agent_sample_score_info(), request)
             .await
@@ -478,7 +634,8 @@ fn passes(strategy: SampleStrategy, verdict: &Verdict) -> bool {
 
 /// The report of the run: the selection, each draw and the totals.
 fn report(
-    input: SampleInput,
+    kind: &str,
+    strategy: SampleStrategy,
     revision: u64,
     concurrency: u32,
     scored: Vec<Scored>,
@@ -486,7 +643,7 @@ fn report(
 ) -> SampleReport {
     let passing: Vec<(DrawId, Verdict)> = scored
         .iter()
-        .filter(|one| passes(input.strategy, &one.record.verdict))
+        .filter(|one| passes(strategy, &one.record.verdict))
         .map(|one| (one.record.draw, one.record.verdict.clone()))
         .collect();
     let chosen = select(&passing);
@@ -499,6 +656,10 @@ fn report(
     let cost_usd_micros = scored.iter().fold(0_u64, |cost, one| {
         cost.saturating_add(one.record.cost_usd_micros)
     });
+    let flow_labels = scored
+        .iter()
+        .flat_map(|one| one.report.flow_labels.iter().cloned())
+        .collect();
     let attempts = u32::try_from(scored.len()).unwrap_or(u32::MAX);
     let mut selected = None;
     let mut draws = Vec::with_capacity(scored.len());
@@ -509,8 +670,8 @@ fn report(
         draws.push(one.record);
     }
     SampleReport {
-        kind: input.kind,
-        strategy: input.strategy,
+        kind: kind.to_owned(),
+        strategy,
         revision,
         concurrency,
         outcome,
@@ -520,6 +681,7 @@ fn report(
         draws,
         usage,
         cost_usd_micros,
+        flow_labels,
     }
 }
 
@@ -567,13 +729,11 @@ mod tests {
             ],
         }))
         .unwrap();
-        let input = SampleInput::new(
-            "k",
-            "x",
+        let sample = OpSample::new(
             SampleStrategy::best_of_n(1),
             ScorerRef::deterministic("exact_match").unwrap(),
         );
-        let request = score_request(&input, &AgentTask::new("x"), &report).unwrap();
+        let request = score_request(&sample, &AgentTask::new("x"), &report).unwrap();
         assert_eq!(request.input.tools.len(), 1);
         assert!(request.input.tools[0].content.len() <= MAX_SCORED_TOOL_BYTES);
         assert_eq!(

@@ -15,6 +15,8 @@
 //! - [`agent_sample`] runs best-of-N or rejection sampling. It scores each
 //!   draw and selects one (issue #2443).
 //! - [`admit_answer_check`] caps the answer check of a run (issue #2442).
+//! - [`OpSample`] lets a durable agent op run a strategy. The mandate of
+//!   the op caps its draws.
 //!
 //! A run never carries a policy field. [`AgentTask`](crate::AgentTask),
 //! [`AgentOp`](crate::AgentOp), [`DrawsInput`] and [`SampleInput`] refuse
@@ -41,9 +43,10 @@ pub use policy::{
     ScorerRef, Scorers, Strategy,
 };
 pub use sample::{
-    SAMPLE_WORKFLOW_NAME, SampleDraw, SampleInput, SampleOutcome, SampleReport, SampleStop,
-    SampleStrategy, agent_sample, agent_sample_info,
+    OpSample, SAMPLE_WORKFLOW_NAME, SampleDraw, SampleInput, SampleOutcome, SampleReport,
+    SampleStop, SampleStrategy, agent_sample, agent_sample_info,
 };
+pub(crate) use sample::{SampleFailure, sample_task};
 #[cfg(feature = "postgres")]
 pub use store::PostgresSamplingPolicyStore;
 #[cfg(feature = "sqlite")]

@@ -64,6 +64,7 @@ use crate::loop_guard::LoopGuard;
 use crate::memory::{EditKey, MemoryScope};
 use crate::mesh::{Mandate, Refusal};
 use crate::message::{ChatMessage, ChatRole, RunId, SessionId};
+use crate::sampling::{OpSample, SampleFailure, sample_task};
 use crate::skill::SkillText;
 use crate::types::{AgentStop, AgentTask, DEFAULT_APPROVAL_TIMEOUT_SECS, DEFAULT_MAX_STEPS};
 use crate::workflow::{
@@ -238,6 +239,11 @@ pub struct UserMessage {
     /// How the message treats the op that runs.
     #[serde(default, skip_serializing_if = "Urgency::is_queue")]
     pub urgency: Urgency,
+    /// The strategy of the op. With one, the op runs its draws through the
+    /// core of `agent_sample`. The policy of the kind and the mandate of
+    /// the agent apply. A steer message with a strategy runs as its own op.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sample: Option<OpSample>,
 }
 
 /// The payload of [`STEER_SIGNAL`].
@@ -484,6 +490,10 @@ pub struct PeerEnvelope {
     /// The mesh of the sender (issue #2272).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mesh: Option<String>,
+    /// The strategy of the op. The accepted mandate caps its draws, so a
+    /// receiver never runs more draws than its caller allows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sample: Option<OpSample>,
 }
 
 /// The reply to a [`PeerEnvelope`]. It settles the promise of the sender.
@@ -575,6 +585,7 @@ impl AgentOp {
             text: text.into(),
             message_id: None,
             urgency: Urgency::Queue,
+            sample: None,
         })
     }
 
@@ -585,6 +596,7 @@ impl AgentOp {
             text: text.into(),
             message_id: Some(message_id.into()),
             urgency: Urgency::Queue,
+            sample: None,
         })
     }
 
@@ -605,7 +617,27 @@ impl AgentOp {
             text: text.into(),
             message_id: Some(message_id.into()),
             urgency,
+            sample: None,
         })
+    }
+
+    /// Run the op with the strategy `sample`.
+    ///
+    /// Only a message from a person or a peer carries a strategy. Each
+    /// other op stays as it is.
+    #[must_use]
+    pub fn with_sample(self, sample: OpSample) -> Self {
+        match self {
+            Self::UserMessage(mut message) => {
+                message.sample = Some(sample);
+                Self::UserMessage(message)
+            }
+            Self::PeerMessage(mut envelope) => {
+                envelope.sample = Some(sample);
+                Self::PeerMessage(envelope)
+            }
+            other => other,
+        }
     }
 
     /// The class of the op for the inbox kernel.
@@ -1282,14 +1314,15 @@ impl Agent {
     /// The extra signal that goes before `op`, if its urgency needs one.
     ///
     /// Send the signal first, then the op. A [`Urgency::Steer`] message with
-    /// no id needs no signal: it runs as a queued message.
+    /// no id needs no signal: it runs as a queued message. So does a steer
+    /// message with a strategy, because its draws cannot join a running op.
     #[must_use]
     pub fn urgency_signal(op: &AgentOp) -> Option<(&'static str, serde_json::Value)> {
         let AgentOp::UserMessage(message) = op else {
             return None;
         };
         match (message.urgency, &message.message_id) {
-            (Urgency::Steer, Some(id)) => Some((
+            (Urgency::Steer, Some(id)) if message.sample.is_none() => Some((
                 STEER_SIGNAL,
                 serde_json::json!(Steer {
                     text: message.text.clone(),
@@ -1906,6 +1939,14 @@ impl AgentRun<'_> {
     async fn work(&self, mut state: AgentState, op: AgentOp) -> AgentState {
         match op {
             AgentOp::UserMessage(message) => {
+                if let Some(sample) = &message.sample {
+                    // A person is present, so a new follow-up chain starts.
+                    state.chain = 0;
+                    return self
+                        .sampled(state, &message.text, sample, Mode::Attended, None)
+                        .await
+                        .0;
+                }
                 if let (Urgency::Steer, Some(id)) = (message.urgency, message.message_id.clone()) {
                     // A running segment took the steer signal, so the op is done.
                     if SteerBook::take(&mut state.steer.steered, &id) {
@@ -1976,9 +2017,16 @@ impl AgentRun<'_> {
                     member: &member,
                     waiting: &envelope.waiting,
                 };
-                let (next, outcome) = self
-                    .run_segment_as(state, &input, Mode::Peer, Some(peer))
-                    .await;
+                let (next, outcome) = match &envelope.sample {
+                    Some(sample) => {
+                        self.sampled(state, &input, sample, Mode::Peer, Some(peer))
+                            .await
+                    }
+                    None => {
+                        self.run_segment_as(state, &input, Mode::Peer, Some(peer))
+                            .await
+                    }
+                };
                 state = next;
                 match outcome {
                     Err(refusal) => PeerReply {
@@ -2258,6 +2306,107 @@ impl AgentRun<'_> {
             state.steer.steered = steered_before;
         }
         (state, Ok(outcome))
+    }
+
+    /// Run one op with a strategy, and fold the selected draw into
+    /// `state`.
+    ///
+    /// The op builds its task as a segment does. The task takes the
+    /// transcript as its history, the labels of the agent, and the mandate
+    /// of a peer message. The core of `agent_sample` then admits the draws
+    /// under that mandate and under the policy of the kind, before any
+    /// model call. A refusal or a failure keeps the transcript as it was.
+    ///
+    /// The selected draw gives the answer and the new transcript. The
+    /// tokens and the labels of each draw go into the state, selected or
+    /// not. A peer message gets `Err` for a refusal of its mandate.
+    async fn sampled(
+        &self,
+        mut state: AgentState,
+        input: &str,
+        sample: &OpSample,
+        mode: Mode<'_>,
+        peer: Option<PeerSegment<'_>>,
+    ) -> (AgentState, Result<Option<(AgentStop, String)>, Refusal>) {
+        let mut task = match self.open_op(&mut state, input, mode, peer.as_ref()).await {
+            Ok(task) => task,
+            Err(Some(refusal)) => return (state, Err(refusal)),
+            Err(None) => return (state, Ok(None)),
+        };
+        let (id, profile) = match (&self.id, &self.profile) {
+            (Ok(id), Ok(profile)) => (id, profile),
+            (Err(err), _) | (_, Err(err)) => {
+                fail(&mut state, err);
+                return (state, Ok(None));
+            }
+        };
+        if let Some(peer) = &peer {
+            let mandate = peer.member.mandate();
+            task.mandate = Some(mandate.clone());
+            task.read_only |= mandate.read_only;
+            task.waiting = peer.waiting.to_vec();
+        }
+        task.history.clone_from(&state.transcript);
+        task.flow_labels = state
+            .flow_labels
+            .iter()
+            .chain(profile.mandate.iter().flat_map(|m| &m.flow_labels))
+            .cloned()
+            .collect();
+        if task.memory_in_state && !state.memory.is_empty() {
+            // A draw reads the state memory but cannot edit it.
+            let snapshot = crate::memory::render_snapshot(&state.memory);
+            task.system = Some(match task.system.take() {
+                Some(system) => format!("{system}\n\n{snapshot}"),
+                None => snapshot,
+            });
+            task.flow_labels
+                .extend(crate::memory::snapshot_labels(&state.memory));
+        }
+        let report = match sample_task(self.ctx, id.kind(), sample, &task, true).await {
+            Ok(report) => report,
+            Err(SampleFailure::Refused(crate::sampling::Refusal::Mandate { mandate }))
+                if peer.is_some() =>
+            {
+                return (state, Err(mandate));
+            }
+            Err(failure) => {
+                fail(&mut state, &failure.text());
+                return (state, Ok(None));
+            }
+        };
+        state.tokens_used = state
+            .tokens_used
+            .saturating_add(u64::from(report.usage.total()));
+        state.flow_labels.extend(report.flow_labels.iter().cloned());
+        let Some(selected) = report.selected else {
+            let reason = format!(
+                "no draw of the strategy passed the scorer; the run stopped: {:?}",
+                report.stopped
+            );
+            fail(&mut state, &reason);
+            return (state, Ok(None));
+        };
+        let run_id = format!("{}:s{}", state.incarnation, state.segments);
+        state.segments = state.segments.saturating_add(1);
+        let messages = crate::types::without_system(&selected.messages);
+        state.transcript = trim_window(messages, profile.window);
+        let (stop, answer) = (selected.stop, selected.text);
+        state.last_stop = Some(stop);
+        state.last_answer = Some(answer.clone());
+        if task.deliver {
+            let sent = Sent {
+                source: mode.source(),
+                run_id: &run_id,
+                stop,
+                answer: &answer,
+            };
+            self.deliver(&mut state, &task, sent).await;
+        }
+        if task.memory_writable() {
+            self.keep_episode(&mut state, &run_id, stop, &answer).await;
+        }
+        (state, Ok(Some((stop, answer))))
     }
 
     /// Send the answer of one segment to the delivery.
@@ -2677,6 +2826,53 @@ mod tests {
         let id: AgentId = serde_json::from_value(serde_json::json!("a/b")).unwrap();
         assert_eq!(id.as_str(), "a/b");
         assert!(serde_json::from_value::<AgentId>(serde_json::json!("nope")).is_err());
+    }
+
+    fn best_of(n: u32) -> crate::sampling::OpSample {
+        crate::sampling::OpSample::new(
+            crate::sampling::SampleStrategy::best_of_n(n),
+            crate::sampling::ScorerRef::deterministic("exact_match").unwrap(),
+        )
+    }
+
+    #[test]
+    fn a_message_carries_a_sample_on_the_wire() {
+        let op = AgentOp::message("hi").with_sample(best_of(3));
+        let value = serde_json::to_value(&op).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "type": "user_message",
+                "text": "hi",
+                "sample": {"strategy": {"best_of_n": {"n": 3}}, "scorer": {"id": "exact_match"}},
+            })
+        );
+        assert_eq!(serde_json::from_value::<AgentOp>(value).unwrap(), op);
+        let plain = serde_json::to_value(AgentOp::message("hi")).unwrap();
+        assert!(plain.get("sample").is_none(), "no sample sends no key");
+        let pause = AgentOp::Control(Control::Resume);
+        assert_eq!(pause.clone().with_sample(best_of(2)), pause);
+    }
+
+    #[test]
+    fn a_sample_with_an_unknown_key_does_not_decode() {
+        let value = serde_json::json!({
+            "type": "user_message",
+            "text": "hi",
+            "sample": {"strategy": {"best_of_n": {"n": 3}}, "scorer": {"id": "x"}, "max_drawz": 9},
+        });
+        assert!(serde_json::from_value::<AgentOp>(value).is_err());
+    }
+
+    #[test]
+    fn a_steer_message_with_a_sample_sends_no_steer_signal() {
+        let op = AgentOp::urgent("hi", "m-1", Urgency::Steer).with_sample(best_of(2));
+        assert!(
+            Agent::urgency_signal(&op).is_none(),
+            "it runs as its own op"
+        );
+        let interrupt = AgentOp::urgent("hi", "m-2", Urgency::Interrupt).with_sample(best_of(2));
+        assert!(Agent::urgency_signal(&interrupt).is_some());
     }
 
     #[test]

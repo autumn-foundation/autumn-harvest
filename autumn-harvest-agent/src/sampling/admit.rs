@@ -75,6 +75,13 @@ pub enum Refusal {
     InvalidKind,
     /// No agent profile has the kind, so no task can be built.
     UnknownKind,
+    /// The mandate of the run refuses the draws. Each draw counts against
+    /// `max_draws` and against the fan-out of the mandate.
+    Mandate {
+        /// The refusal of the mandate: `draws_exceeded` or
+        /// `fan_out_exhausted`.
+        mandate: crate::mesh::Refusal,
+    },
 }
 
 /// The prefix of the error of a refused run.
@@ -96,6 +103,7 @@ impl Refusal {
             Self::OtherTenant => "other_tenant",
             Self::InvalidKind => "invalid_kind",
             Self::UnknownKind => "unknown_kind",
+            Self::Mandate { mandate } => mandate.code(),
         }
     }
 
@@ -140,6 +148,13 @@ impl std::fmt::Display for Refusal {
             Self::OtherTenant => f.write_str("the profile of the kind belongs to another tenant"),
             Self::InvalidKind => f.write_str("the kind is not a valid agent kind"),
             Self::UnknownKind => f.write_str("no agent profile has the kind"),
+            Self::Mandate { mandate } => {
+                write!(
+                    f,
+                    "the mandate of the run refuses the draws ({})",
+                    mandate.code()
+                )
+            }
         }
     }
 }
@@ -536,6 +551,19 @@ mod tests {
         assert_eq!(
             text,
             "sampling refused (too_many_draws): the run asks for 5 draws; the policy allows 4"
+        );
+        let mandate = Refusal::Mandate {
+            mandate: crate::mesh::Refusal::DrawsExceeded,
+        };
+        assert_eq!(mandate.code(), "draws_exceeded");
+        assert_eq!(
+            serde_json::to_value(&mandate).unwrap(),
+            serde_json::json!({"refusal": "mandate", "mandate": "draws_exceeded"})
+        );
+        assert!(
+            mandate
+                .error_text()
+                .starts_with("sampling refused (draws_exceeded)")
         );
     }
 
