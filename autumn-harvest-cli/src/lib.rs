@@ -1241,7 +1241,8 @@ enum Commands {
         #[command(subcommand)]
         command: DagCommand,
     },
-    /// List the operator overrides of schedules and run defaults (issue #2388).
+    /// List the operator overrides of schedules, run defaults and activity
+    /// defaults (issue #2388).
     #[command(alias = "override")]
     Overrides {
         #[command(subcommand)]

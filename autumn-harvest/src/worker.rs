@@ -11992,9 +11992,20 @@ fn build_activity_enqueue_plan(
         } else {
             registry.default_activity_retry_policy()
         };
+        // The operator override replaces the code values of the activity. A
+        // value that the command carries still wins. An engine activity takes
+        // no override.
+        let code = crate::activity_defaults::ActivityDefaults::of(activity);
+        let defaults = if crate::activity_defaults::is_reserved_activity(&scheduled.name) {
+            code
+        } else {
+            registry
+                .run_defaults()
+                .apply_activity(&scheduled.name, code)
+        };
         let effective_retry = crate::policy::resolve_effective_retry(
             scheduled.retry_policy_override.clone(),
-            activity.default_retry_policy.clone(),
+            defaults.retry_policy.clone(),
             builder_retry_default,
         );
         if let Some(retry_policy) = effective_retry {
@@ -12007,7 +12018,7 @@ fn build_activity_enqueue_plan(
             params.retry_policy = Some(serde_json::to_value(retry_policy)?);
         }
 
-        if let Some(timeout) = activity.default_heartbeat_timeout {
+        if let Some(timeout) = defaults.heartbeat_timeout {
             params.heartbeat_timeout =
                 Some(chrono_duration_from_std(timeout, "heartbeat timeout")?);
         }
@@ -12017,14 +12028,14 @@ fn build_activity_enqueue_plan(
         // Issue #1808: an activity that declares its own attempt bound also
         // skips it. A `schedule_to_close` or a heartbeat timeout already stops
         // a hung attempt, so a 10-minute cap must not cut a long one short.
-        let builder_stc_default = if is_reserved || activity.declares_attempt_bound() {
+        let builder_stc_default = if is_reserved || defaults.declares_attempt_bound() {
             None
         } else {
             registry.default_activity_start_to_close()
         };
         let effective_stc = crate::policy::resolve_effective_start_to_close(
             scheduled.start_to_close_override,
-            activity.default_start_to_close,
+            defaults.start_to_close,
             builder_stc_default,
         );
         if let Some(timeout) = effective_stc {
@@ -12038,14 +12049,14 @@ fn build_activity_enqueue_plan(
         // start_to_close_override above. `None` for every ordinary activity.
         let effective_schedule_to_start = scheduled
             .schedule_to_start_override
-            .or(activity.default_schedule_to_start);
+            .or(defaults.schedule_to_start);
         if let Some(timeout) = effective_schedule_to_start {
             params.schedule_to_start = Some(chrono_duration_from_std(
                 timeout,
                 "schedule_to_start timeout",
             )?);
         }
-        if let Some(timeout) = activity.default_schedule_to_close {
+        if let Some(timeout) = defaults.schedule_to_close {
             let deadline = chrono::Utc::now()
                 + chrono_duration_from_std(timeout, "schedule_to_close timeout")?;
             params.schedule_to_close_at = Some(deadline);
@@ -27414,6 +27425,8 @@ async fn process_workflow_task(
                 registry.default_activity_retry_policy(),
                 registry.default_activity_start_to_close(),
             )
+            // A typed activity call resolves the operator override here.
+            .with_activity_overrides(Arc::clone(registry.run_defaults()))
             // Issue #2035: a live decision runs the admitted updates. A replay
             // gate does not, so it never runs a handler. The cut-off keeps the
             // dispatch inside the workflow-task budget.

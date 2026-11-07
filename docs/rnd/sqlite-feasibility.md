@@ -166,6 +166,7 @@ Classification rule:
 
 | Module | Coupling | Class | Substitute on SQLite / note |
 |---|---|---|---|
+| `activity_defaults` | advisory-lock, diesel, raw-pg-sql, raw-sql, row-lock | (b) | Operator overrides of the defaults of an activity type. Keyed reads, an upsert and a delete under `FOR UPDATE`. A per-activity `pg_advisory_xact_lock` serializes changes, which the single write lock subsumes. No interval arithmetic and no batched update. The SQLite runtime ships no override route, so it schedules with the code values. |
 | `activity_pause` | diesel, raw-sql | (b) | Claim-time gate on one activity type. The snapshot-window re-check and the two-pass resume credit exist only for READ COMMITTED; a single writer subsumes both. |
 | `activity_progress` | listen/notify | (c) | Live chunks from inside an activity (issue #2268). The Postgres sink sends them with `pg_notify` on the progress channel of the run. SQLite has no LISTEN/NOTIFY, so its runtime sets no sink and drops each chunk. An agent gets its live text from an in-process `LiveSink` instead. Nothing is stored, so replay loses nothing. |
 | `admission_gate` | diesel, advisory-lock, raw-sql | (b) | Advisory lock subsumed by the single write lock. |

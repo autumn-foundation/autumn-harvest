@@ -397,3 +397,5 @@ grant.
 
 - [`schedule-overrides.md`](schedule-overrides.md): the same idea for
   schedules.
+- [`activity-default-overrides.md`](activity-default-overrides.md): the same
+  idea for activity types.
