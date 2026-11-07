@@ -221,6 +221,23 @@ async fn claim_cost(conn: &mut AsyncPgConnection, queues: &[String]) -> ClaimCos
 
 /// [`claim_cost`] for one form of the claim query.
 async fn claim_cost_of(conn: &mut AsyncPgConnection, queues: &[String], sql: &str) -> ClaimCost {
+    let plan = claim_plan_of(conn, queues, sql).await;
+    let root = &plan[0]["Plan"];
+    let num = |key: &str| root[key].as_i64().unwrap_or(0);
+    ClaimCost {
+        buffers: num("Shared Hit Blocks") + num("Shared Read Blocks"),
+        temp_written: num("Temp Written Blocks"),
+        claimed: num("Actual Rows") == 1,
+        fallback_ran: cte_scanned_the_table(root, "legacy_candidate", false),
+    }
+}
+
+/// The `EXPLAIN (ANALYZE, BUFFERS)` plan of one claim, rolled back.
+async fn claim_plan_of(
+    conn: &mut AsyncPgConnection,
+    queues: &[String],
+    sql: &str,
+) -> serde_json::Value {
     #[derive(diesel::QueryableByName)]
     struct Plan {
         #[diesel(sql_type = diesel::sql_types::Json, column_name = "QUERY PLAN")]
@@ -245,14 +262,7 @@ async fn claim_cost_of(conn: &mut AsyncPgConnection, queues: &[String], sql: &st
     .await
     .expect("explain claim");
     exec(conn, "ROLLBACK; DEALLOCATE seek_probe;").await;
-    let root = &rows[0].plan[0]["Plan"];
-    let num = |key: &str| root[key].as_i64().unwrap_or(0);
-    ClaimCost {
-        buffers: num("Shared Hit Blocks") + num("Shared Read Blocks"),
-        temp_written: num("Temp Written Blocks"),
-        claimed: num("Actual Rows") == 1,
-        fallback_ran: cte_scanned_the_table(root, "legacy_candidate", false),
-    }
+    rows.into_iter().next().expect("one plan row").plan
 }
 
 /// Claim through the public API and return the claimed row id.
@@ -367,6 +377,140 @@ async fn a_large_activity_pause_array_does_not_spill_the_claim_at_100k() {
     assert!(cost.claimed, "the ballast pauses exclude no row");
     assert!(!cost.fallback_ran, "the window decides: {cost:?}");
     assert_eq!(cost.temp_written, 0, "the claim sort spills: {cost:?}");
+}
+
+// ── Refine cost (issue #2547) ────────────────────────────────────────────────
+
+/// The table scan of one candidate scan: its own buffers and its rows.
+#[derive(Debug, Clone, Copy)]
+struct RefineCost {
+    /// Shared buffers of the scan node, without the buffers of its subplans.
+    buffers: i64,
+    /// Rows the scan read: the rows it returned and the rows it filtered.
+    rows: i64,
+}
+
+impl RefineCost {
+    fn per_row(self) -> f64 {
+        self.buffers as f64 / self.rows.max(1) as f64
+    }
+}
+
+/// Shared buffers of one plan node and its subtree (hit plus read).
+fn plan_blocks(node: &serde_json::Value) -> i64 {
+    node["Shared Hit Blocks"].as_i64().unwrap_or(0)
+        + node["Shared Read Blocks"].as_i64().unwrap_or(0)
+}
+
+/// The child nodes of one plan node.
+fn plan_children(node: &serde_json::Value) -> &[serde_json::Value] {
+    node["Plans"].as_array().map_or(&[], Vec::as_slice)
+}
+
+/// The refine cost of the candidate scan in the CTE `name`.
+///
+/// A node counts the buffers of each subplan that runs inside it. The array
+/// of the guard is an init plan, and it can be the first reader of
+/// `seek_heads`. Each plan shape runs it inside a different node. So the
+/// cost is the whole CTE, less its init plans and the gate subplans of the
+/// scan. The rest is the scan, the sort and the row lock.
+fn refine_cost(plan: &serde_json::Value, name: &str) -> Option<RefineCost> {
+    if plan["Subplan Name"].as_str() != Some(&format!("CTE {name}")) {
+        return plan_children(plan)
+            .iter()
+            .find_map(|p| refine_cost(p, name));
+    }
+    let (init, body): (Vec<_>, Vec<_>) = plan_children(plan)
+        .iter()
+        .partition(|p| p["Parent Relationship"].as_str() == Some("InitPlan"));
+    let init: i64 = init.into_iter().map(plan_blocks).sum();
+    let scan = body.into_iter().find_map(table_scan)?;
+    let nested: i64 = plan_children(scan).iter().map(plan_blocks).sum();
+    Some(RefineCost {
+        buffers: plan_blocks(plan) - init - nested,
+        rows: scan["Actual Rows"].as_i64().unwrap_or(0)
+            + scan["Rows Removed by Filter"].as_i64().unwrap_or(0),
+    })
+}
+
+/// The first scan of `harvest_task_queue` that ran, in plan order.
+fn table_scan(plan: &serde_json::Value) -> Option<&serde_json::Value> {
+    if plan["Relation Name"].as_str() == Some("harvest_task_queue")
+        && plan["Actual Loops"].as_i64().unwrap_or(0) > 0
+    {
+        return Some(plan);
+    }
+    plan_children(plan).iter().find_map(table_scan)
+}
+
+/// The window refine reads about one buffer per row (issue #2547).
+///
+/// The refine reads each window row again, to apply every gate and to lock
+/// one row. A probe through the primary key walks the index from its root
+/// for each row. On the e2e bench that cost about 4.2 buffers per row and
+/// 84% of a claim. A probe by `ctid` reads the heap page only.
+///
+/// The depths are the shallow e2e queue (32 rows) and 1,000 rows. The
+/// ballast is the terminal rows of a busy table. With it the table is too
+/// large for a sequential scan, as on the e2e bench.
+#[tokio::test]
+async fn the_window_refine_reads_about_one_buffer_per_row() {
+    let (mut conn, _container) = setup_db().await;
+    let ballast = queues(1);
+    exec(
+        &mut conn,
+        &format!(
+            "INSERT INTO harvest_task_queue \
+               (queue_name, task_type, input, state, max_attempts, scheduled_at) \
+             SELECT '{}', 'workflow', '{{}}'::jsonb, 'COMPLETED', 3, \
+                    NOW() - INTERVAL '2 hours' \
+             FROM generate_series(1, 20000)",
+            ballast[0]
+        ),
+    )
+    .await;
+    let measured = AssertUnwindSafe(async {
+        let mut measured = Vec::new();
+        for depth in [32_i64, 1_000] {
+            let qs = queues(4);
+            seed_deep_backlog(&mut conn, &qs, depth).await;
+            let mut runs = Vec::new();
+            for _ in 0..3 {
+                let plan = claim_plan_of(&mut conn, &qs, queue::claim_task_query()).await;
+                let root = &plan[0]["Plan"];
+                assert_eq!(
+                    root["Actual Rows"].as_i64(),
+                    Some(1),
+                    "depth {depth}: claims"
+                );
+                assert!(
+                    !cte_scanned_the_table(root, "legacy_candidate", false),
+                    "depth {depth}: the window decides"
+                );
+                runs.push(refine_cost(root, "seek_candidate").expect("refine scan"));
+            }
+            delete_queues(&mut conn, &qs).await;
+            runs.sort_by(|a, b| a.per_row().total_cmp(&b.per_row()));
+            measured.push((depth, runs[1]));
+        }
+        measured
+    })
+    .catch_unwind()
+    .await;
+    delete_queues(&mut conn, &ballast).await;
+    let measured = measured.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+    eprintln!("window refine cost, median of 3: {measured:?}");
+    for (depth, cost) in &measured {
+        assert!(
+            cost.rows > 1,
+            "depth {depth}: the refine reads the window: {cost:?}"
+        );
+        assert!(
+            cost.per_row() <= 1.5,
+            "depth {depth}: the window refine reads {:.2} buffers per row: {cost:?}",
+            cost.per_row()
+        );
+    }
 }
 
 // ── Held claims (issue #2420) ────────────────────────────────────────────────
