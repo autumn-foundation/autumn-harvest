@@ -222,7 +222,11 @@ async fn claim_cost(conn: &mut AsyncPgConnection, queues: &[String]) -> ClaimCos
 /// [`claim_cost`] for one form of the claim query.
 async fn claim_cost_of(conn: &mut AsyncPgConnection, queues: &[String], sql: &str) -> ClaimCost {
     let plan = claim_plan_of(conn, queues, sql).await;
-    let root = &plan[0]["Plan"];
+    cost_of_plan(&plan[0]["Plan"])
+}
+
+/// The [`ClaimCost`] of the root node of one claim plan.
+fn cost_of_plan(root: &serde_json::Value) -> ClaimCost {
     let num = |key: &str| root[key].as_i64().unwrap_or(0);
     ClaimCost {
         buffers: num("Shared Hit Blocks") + num("Shared Read Blocks"),
@@ -381,17 +385,19 @@ async fn a_large_activity_pause_array_does_not_spill_the_claim_at_100k() {
 
 // ── Refine cost (issue #2547) ────────────────────────────────────────────────
 
-/// The table scan of one candidate scan: its own buffers and its rows.
-#[derive(Debug, Clone, Copy)]
+/// The table scan of one candidate scan: its plan node, buffers and rows.
+#[derive(Debug, Clone)]
 struct RefineCost {
-    /// Shared buffers of the scan node, without the buffers of its subplans.
+    /// The node type of the scan, for example `Tid Scan`.
+    node: String,
+    /// Shared buffers of the CTE, less its init plans and gate subplans.
     buffers: i64,
     /// Rows the scan read: the rows it returned and the rows it filtered.
     rows: i64,
 }
 
 impl RefineCost {
-    fn per_row(self) -> f64 {
+    fn per_row(&self) -> f64 {
         self.buffers as f64 / self.rows.max(1) as f64
     }
 }
@@ -427,6 +433,7 @@ fn refine_cost(plan: &serde_json::Value, name: &str) -> Option<RefineCost> {
     let scan = body.into_iter().find_map(table_scan)?;
     let nested: i64 = plan_children(scan).iter().map(plan_blocks).sum();
     Some(RefineCost {
+        node: scan["Node Type"].as_str().unwrap_or_default().to_owned(),
         buffers: plan_blocks(plan) - init - nested,
         rows: scan["Actual Rows"].as_i64().unwrap_or(0)
             + scan["Rows Removed by Filter"].as_i64().unwrap_or(0),
@@ -443,6 +450,43 @@ fn table_scan(plan: &serde_json::Value) -> Option<&serde_json::Value> {
     plan_children(plan).iter().find_map(table_scan)
 }
 
+/// The most rows a window refine can read on `queue_count` queues.
+///
+/// Each queue has four heads of [`queue::CLAIM_SEEK_WINDOW`] rows. The pin
+/// head adds one more window.
+const fn window_rows_max(queue_count: i64) -> i64 {
+    (4 * queue_count + 1) * queue::CLAIM_SEEK_WINDOW
+}
+
+/// Assert that a refine is a TID scan that reads about one buffer per row.
+///
+/// A scan of the whole table reads few buffers per row, because it reads
+/// many rows from each page. So the node type and the row bound are part of
+/// the check.
+fn assert_tid_refine(case: &str, cost: &RefineCost, rows_max: i64) {
+    assert_eq!(
+        cost.node, "Tid Scan",
+        "{case}: the refine reads by ctid: {cost:?}"
+    );
+    assert!(
+        cost.rows > 1 && cost.rows <= rows_max,
+        "{case}: the refine reads the window only, at most {rows_max} rows: {cost:?}"
+    );
+    assert!(
+        cost.per_row() <= 1.5,
+        "{case}: the refine reads {:.2} buffers per row: {cost:?}",
+        cost.per_row()
+    );
+}
+
+/// Roll back a claim probe that a panic left open, then delete `queues`.
+async fn clean_up_after_probe(conn: &mut AsyncPgConnection, queues: &[String]) {
+    // A panic between BEGIN and ROLLBACK leaves the transaction aborted.
+    let _ = conn.batch_execute("ROLLBACK").await;
+    let _ = conn.batch_execute("DEALLOCATE seek_probe").await;
+    delete_queues(conn, queues).await;
+}
+
 /// The window refine reads about one buffer per row (issue #2547).
 ///
 /// The refine reads each window row again, to apply every gate and to lock
@@ -453,63 +497,66 @@ fn table_scan(plan: &serde_json::Value) -> Option<&serde_json::Value> {
 /// The depths are the shallow e2e queue (32 rows) and 1,000 rows. The
 /// ballast is the terminal rows of a busy table. With it the table is too
 /// large for a sequential scan, as on the e2e bench.
+///
+/// The test collects every plan before it asserts. So a failed assertion
+/// never skips the cleanup of a seeded queue.
 #[tokio::test]
 async fn the_window_refine_reads_about_one_buffer_per_row() {
     let (mut conn, _container) = setup_db().await;
     let ballast = queues(1);
-    exec(
-        &mut conn,
-        &format!(
-            "INSERT INTO harvest_task_queue \
-               (queue_name, task_type, input, state, max_attempts, scheduled_at) \
-             SELECT '{}', 'workflow', '{{}}'::jsonb, 'COMPLETED', 3, \
-                    NOW() - INTERVAL '2 hours' \
-             FROM generate_series(1, 20000)",
-            ballast[0]
-        ),
-    )
-    .await;
+    let depths: Vec<(i64, Vec<String>)> = [32_i64, 1_000].map(|d| (d, queues(4))).into();
+    let seeded: Vec<String> = depths
+        .iter()
+        .flat_map(|(_, qs)| qs.clone())
+        .chain(ballast.clone())
+        .collect();
     let measured = AssertUnwindSafe(async {
+        exec(
+            &mut conn,
+            &format!(
+                "INSERT INTO harvest_task_queue \
+                   (queue_name, task_type, input, state, max_attempts, scheduled_at) \
+                 SELECT '{}', 'workflow', '{{}}'::jsonb, 'COMPLETED', 3, \
+                        NOW() - INTERVAL '2 hours' \
+                 FROM generate_series(1, 20000)",
+                ballast[0]
+            ),
+        )
+        .await;
         let mut measured = Vec::new();
-        for depth in [32_i64, 1_000] {
-            let qs = queues(4);
-            seed_deep_backlog(&mut conn, &qs, depth).await;
+        for (depth, qs) in &depths {
+            seed_deep_backlog(&mut conn, qs, *depth).await;
             let mut runs = Vec::new();
             for _ in 0..3 {
-                let plan = claim_plan_of(&mut conn, &qs, queue::claim_task_query()).await;
+                let plan = claim_plan_of(&mut conn, qs, queue::claim_task_query()).await;
                 let root = &plan[0]["Plan"];
-                assert_eq!(
-                    root["Actual Rows"].as_i64(),
-                    Some(1),
-                    "depth {depth}: claims"
-                );
-                assert!(
-                    !cte_scanned_the_table(root, "legacy_candidate", false),
-                    "depth {depth}: the window decides"
-                );
-                runs.push(refine_cost(root, "seek_candidate").expect("refine scan"));
+                runs.push((cost_of_plan(root), refine_cost(root, "seek_candidate")));
             }
-            delete_queues(&mut conn, &qs).await;
-            runs.sort_by(|a, b| a.per_row().total_cmp(&b.per_row()));
-            measured.push((depth, runs[1]));
+            delete_queues(&mut conn, qs).await;
+            measured.push((*depth, runs));
         }
         measured
     })
     .catch_unwind()
     .await;
-    delete_queues(&mut conn, &ballast).await;
+    clean_up_after_probe(&mut conn, &seeded).await;
     let measured = measured.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-    eprintln!("window refine cost, median of 3: {measured:?}");
-    for (depth, cost) in &measured {
-        assert!(
-            cost.rows > 1,
-            "depth {depth}: the refine reads the window: {cost:?}"
-        );
-        assert!(
-            cost.per_row() <= 1.5,
-            "depth {depth}: the window refine reads {:.2} buffers per row: {cost:?}",
-            cost.per_row()
-        );
+    eprintln!("window refine cost by depth: {measured:?}");
+    for (depth, runs) in measured {
+        let mut refines = Vec::new();
+        for (cost, refine) in runs {
+            assert!(
+                cost.claimed,
+                "depth {depth}: the claim takes a row: {cost:?}"
+            );
+            assert!(
+                !cost.fallback_ran,
+                "depth {depth}: the window decides: {cost:?}"
+            );
+            refines.push(refine.expect("the window refine ran"));
+        }
+        refines.sort_by(|a, b| a.per_row().total_cmp(&b.per_row()));
+        assert_tid_refine(&format!("depth {depth}"), &refines[1], window_rows_max(4));
     }
 }
 
@@ -600,13 +647,22 @@ async fn held_claims_on_one_head_keep_the_claim_off_the_full_scan() {
     for depth in [10_000_i64, 100_000] {
         let qs = queues(1);
         seed_deep_backlog(&mut conn, &qs, depth).await;
+        let mut deep = Vec::new();
         let result = AssertUnwindSafe(async {
             // Warm the index state once. See `claim_buffers_stay_flat_...`.
             claim_cost(&mut conn, &qs).await;
             let mut runs = vec![(0, claim_cost(&mut conn, &qs).await)];
             for k in [32_usize, 64] {
                 let holders = hold_claims(&url, &qs, k).await;
-                runs.push((k, claim_cost(&mut conn, &qs).await));
+                let plan = claim_plan_of(&mut conn, &qs, queue::claim_task_query()).await;
+                let root = &plan[0]["Plan"];
+                runs.push((k, cost_of_plan(root)));
+                deep.push((k, "seek_held", refine_cost(root, "seek_held")));
+                deep.push((
+                    k,
+                    "seek_deep_candidate",
+                    refine_cost(root, "seek_deep_candidate"),
+                ));
                 for holder in holders {
                     release(holder).await;
                 }
@@ -618,6 +674,16 @@ async fn held_claims_on_one_head_keep_the_claim_off_the_full_scan() {
         delete_queues(&mut conn, &qs).await;
         let runs = result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
         eprintln!("depth={depth} claim cost by held claims K: {runs:?}");
+        eprintln!("depth={depth} deep window refine by K: {deep:?}");
+        // Issue #2547: the held scans read their rows by ctid too.
+        for (k, name, refine) in &deep {
+            let refine = refine.as_ref().expect("the held scan ran");
+            assert_tid_refine(
+                &format!("depth {depth}, K={k}, {name}"),
+                refine,
+                window_rows_max(1) + queue::CLAIM_DEEP_SEEK_WINDOW,
+            );
+        }
         for (k, cost) in &runs {
             assert!(cost.claimed, "depth {depth}, K={k}: the claim takes a row");
             assert!(

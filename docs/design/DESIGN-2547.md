@@ -16,17 +16,26 @@ about 4.2 buffers per row. The claim takes one row of about 29.
   heap columns, so the scan cannot be index-only.
 - The refine must lock the table row with `FOR UPDATE SKIP LOCKED`. So any
   refine reads the heap page of each row it locks.
-- All the CTEs and the refine run in one statement and one snapshot. A
-  tuple that the snapshot sees cannot be pruned until the snapshot ends.
-  So a `ctid` read in `seek_heads` names the same tuple in the refine.
+- All the CTEs and the refine run in one statement and one snapshot.
+  Neither page pruning nor `VACUUM` removes a tuple that the snapshot
+  sees. So a `ctid` read in `seek_heads` names the same tuple in the
+  refine.
 - A TID scan reads the heap page only. It reads no index page.
 - `harvest_task_queue` is not partitioned. A `ctid` is unique in it.
-- Postgres plans `ctid = ANY(<array>)` as a TID scan. Harvest supports Postgres 12 and later.
+- Postgres plans `ctid = ANY(<array>)` as a TID scan. In PG 12,
+  `IsTidEqualAnyClause` in `tidpath.c` accepts the `ARRAY()` init plan.
+  Harvest supports Postgres 12 and later.
 - A peer can commit an update to a window row after the claim snapshot and
   before the claim locks the row. Postgres then rechecks the newest version
-  (EvalPlanQual). The new version has a new `ctid`. So a TID refine skips
-  the row. A primary-key refine rechecks it and can take it. PG 16.15 shows
-  this. Section 5 covers the effect.
+  (EvalPlanQual). The new version has a new `ctid`. `TidRecheck` in
+  `nodeTidscan.c` decides the result:
+  - 13.23, 14.20, 15.15, 16.11, 17.7 and later test the TID list. So the
+    TID refine skips the row. A run on PG 16.15 shows this.
+  - PG 12 and the older minor releases return `true`. So the refine
+    rechecks every other gate on the new version, as a primary-key refine
+    does.
+
+  Section 5 covers the effect.
 
 ## 3. Brainstorming
 
@@ -45,24 +54,32 @@ How can this change make the claim worse?
 | Way to fail | Guard |
 |---|---|
 | The `ctid` names another row | One snapshot. A visible tuple cannot be pruned. No partitions. |
-| The planner picks a sequential scan | A TID scan is cheaper than any index scan. A small table reads few pages either way. The RED test measures each depth. |
+| The planner picks a sequential scan | A TID scan is cheaper than any index scan. The RED test asserts a `Tid Scan` node and a bounded row count at each depth. |
 | A concurrent update hides a row | The row is skipped, as `SKIP LOCKED` skips a held row. See section 5. |
 | A gate or the order changes | Only the row source changes. Every gate and the sort stay in `claim_candidate_scan_sql!`. The order tests and the random drains run again. |
 | A splice anchor breaks | The kind, fence, owner and fair splices anchor on other text. Their shape tests run again. |
 | The `claimed` update or the lock set changes | `claimed` still joins on `id`. The refine locks the same rows. |
-| Postgres 12 lacks the plan | The TID scan has served `= ANY` for many releases before 12. |
+| Postgres 12 lacks the plan | PG 12 `tidpath.c` accepts `ctid = ANY` with a pseudoconstant array. |
 
 ## 5. A concurrent update to a pending row
 
 These writers update a `PENDING` row and keep it `PENDING`: a priority
-change, a sticky-pin release, a queue-pause shift and a signal re-pend.
-Each one is rare. Each one publishes the row again.
+change, a sticky-pin release, a queue-pause shift, a cap raise, an owner
+stamp, a shard move and a signal re-pend. Each one is rare. No writer
+updates one row again and again, so no row starves. Some writers rewrite
+many rows in one commit. Then each claim in flight on that head skips
+those rows once.
 
-When such an update commits inside the claim statement, the TID refine
-skips the row. The claim then takes the next window row, reads the deep
-window, or returns no task. A later poll reads the new version. The claim
-never hands out an ineligible row. Under contention the claim order was
-already best effort. See `docs/performance.md`, the fairness section.
+On a release that skips (section 2), the claim then takes the next window
+row, reads the deep window, or returns no task. It keeps its lock on the
+skipped row until its transaction ends. A later poll reads the new
+version. A priority change sends no notification, so the row can wait one
+poll interval. The claim never hands out an ineligible row. Under
+contention the claim order was already best effort. See
+`docs/performance.md`, the fairness section.
+
+A retry of an empty claim would close the gap. It costs a second claim
+statement on every empty poll, so this change does not add it.
 
 ## 6. Six thinking hats
 
@@ -95,7 +112,9 @@ batched claim do not change.
 1. On the issue #1956 fixture at 32 and 1,000 pending rows, the window
    refine reads at most 1.5 buffers per row that it reads.
 2. Every claim order, cap, held-claim and stale-statistics test passes.
-3. The deep window reads fewer buffers than before at K = 32.
+3. The deep window refine is a TID scan at about 1 buffer per row at
+   K = 32 and 64. `held_claims_on_one_head_keep_the_claim_off_the_full_scan`
+   asserts it.
 4. `docs/performance.md` records the before and after figures.
 
 ## 9. Not in scope

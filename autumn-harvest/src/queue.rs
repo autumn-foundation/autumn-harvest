@@ -1848,17 +1848,24 @@ macro_rules! claim_seek_guard_sql {
 /// not test the state. Only a TID scan and a scan of the whole table
 /// remain. A TID scan reads the heap page of each window row and no index
 /// page. A primary-key probe also walks the index from its root. On the e2e
-/// bench that cost about 4.2 buffers per row, against about 1 for a TID.
+/// bench a primary-key probe cost about 4.2 buffers per row. On the claim
+/// fixture a TID probe costs about 1.
 ///
 /// The `ctid` comes from a head scan of the same statement, so both read
-/// one snapshot. That snapshot sees the tuple, so `VACUUM` cannot remove
-/// it, and the `ctid` names the same row. `harvest_task_queue` is not
-/// partitioned, so a `ctid` is unique in it.
+/// one snapshot. That snapshot sees the tuple, so neither page pruning nor
+/// `VACUUM` can remove it. So the `ctid` names the same row.
+/// `harvest_task_queue` is not partitioned, so a `ctid` is unique in it.
 ///
 /// A peer can commit an update to a window row after the snapshot and
 /// before the row lock. The lock then rechecks the newest version, which
-/// has a new `ctid`. So the scan skips the row, as `SKIP LOCKED` skips a
-/// held row. A later claim reads the new version.
+/// has a new `ctid`. Postgres 13.23, 14.20, 15.15, 16.11, 17.7 and later
+/// then skip the row. Older releases recheck every other gate on the new
+/// version, as a primary-key probe does. Both outcomes are safe.
+///
+/// A skip acts like a `SKIP LOCKED` skip. The claim takes the next row, or
+/// it returns no task when the head holds no other row. The claim keeps
+/// its lock on the skipped row until its transaction ends. A later poll
+/// reads the new version.
 macro_rules! claim_seek_rows_sql {
     () => {
         "harvest_task_queue.state = (SELECT 'PENDING'::text) "
@@ -12708,39 +12715,49 @@ mod tests {
         );
     }
 
-    /// Each window scan reads its rows by `ctid`, not by primary key
-    /// (issue #2547).
+    /// Each window scan of each claim form reads its rows by `ctid`, not by
+    /// primary key (issue #2547).
     #[test]
     fn claim_query_window_scans_read_rows_by_ctid() {
         assert!(claim_seek_row_sql!().starts_with("id AS seek_id, ctid AS seek_ctid, "));
-        let sql = claim_task_query();
-        assert!(
-            cte(sql, "seek_heads", "seek_bounds").contains("SELECT h.seek_id, h.seek_ctid, "),
-            "the window carries the ctid of each row; got:\n{sql}"
-        );
-        assert_eq!(
-            cte(sql, "seek_deep_window", "seek_deep_bounds")
-                .matches("SELECT seek_id, seek_ctid, ")
-                .count(),
-            2,
-            "both arms of the deep window carry the ctid; got:\n{sql}"
-        );
-        for (from, to) in [
-            ("seek_candidate", "seek_held"),
-            ("seek_held", "seek_contended"),
-            ("seek_deep_candidate", "legacy_candidate"),
-        ] {
-            let scan = cte(sql, from, to);
-            assert_eq!(
-                scan.matches("AND harvest_task_queue.ctid = ANY(ARRAY( SELECT w.seek_ctid FROM ")
-                    .count(),
-                1,
-                "{from} reads its rows by ctid; got:\n{scan}"
-            );
+        let mut variants = Vec::new();
+        for kind in [None, Some(TaskType::Workflow), Some(TaskType::Activity)] {
+            for fenced in [false, true] {
+                variants.push(claim_query_for(kind, fenced, ClaimFairness::Off));
+                variants.push(owned_claim_query_for(kind, fenced, ClaimFairness::Off));
+            }
+        }
+        for sql in variants {
             assert!(
-                !scan.contains("harvest_task_queue.id = ANY"),
-                "{from} must not probe the primary key; got:\n{scan}"
+                cte(sql, "seek_heads", "seek_bounds").contains("SELECT h.seek_id, h.seek_ctid, "),
+                "the window carries the ctid of each row; got:\n{sql}"
             );
+            assert_eq!(
+                cte(sql, "seek_deep_window", "seek_deep_bounds")
+                    .matches("SELECT seek_id, seek_ctid, ")
+                    .count(),
+                2,
+                "both arms of the deep window carry the ctid; got:\n{sql}"
+            );
+            for (from, to) in [
+                ("seek_candidate", "seek_held"),
+                ("seek_held", "seek_contended"),
+                ("seek_deep_candidate", "legacy_candidate"),
+            ] {
+                let scan = cte(sql, from, to);
+                assert_eq!(
+                    scan.matches(
+                        "AND harvest_task_queue.ctid = ANY(ARRAY( SELECT w.seek_ctid FROM "
+                    )
+                    .count(),
+                    1,
+                    "{from} reads its rows by ctid; got:\n{scan}"
+                );
+                assert!(
+                    !scan.contains("harvest_task_queue.id = ANY"),
+                    "{from} must not probe the primary key; got:\n{scan}"
+                );
+            }
         }
     }
 

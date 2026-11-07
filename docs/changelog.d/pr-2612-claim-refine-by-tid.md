@@ -11,8 +11,9 @@ design is in `docs/design/DESIGN-2547.md`.
 - The claim order, the gates, the lock set and the indexes do not change.
   No migration.
 - A peer can commit an update to a window row inside the claim statement.
-  The TID scan then skips that row, as `SKIP LOCKED` skips a held row. A
-  later claim reads the new version.
+  Postgres 13.23, 14.20, 15.15, 16.11, 17.7 and later then skip that row,
+  as `SKIP LOCKED` skips a held row. The claim can then return no task for
+  one poll. Older releases recheck the new version, as before.
 - Evidence: `the_window_refine_reads_about_one_buffer_per_row` on the issue
   #1956 fixture. The refine fell from 2.55 to 1.09 buffers per row at 32
   pending rows, and from 3.03 to 1.04 at 1,000. With 32 held claims the

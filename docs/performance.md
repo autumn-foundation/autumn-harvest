@@ -1437,8 +1437,9 @@ spills: 109,321 buffers and a spill before, 535 buffers and no spill after.
 rows among 400K terminal rows. Then 30K rows arrived. The claim reads 479 to
 496 buffers, within 1% of the fresh plan. The window scan gives the planner
 no partial index on `PENDING` rows, so it probes the primary key. Since
-issue #2547 it reads each row by `ctid` instead. Before that fix, the same case read 11,704 buffers through a bitmap head scan, then
-30,278 through a partial index.
+issue #2547 it reads each row by `ctid`, with a TID scan. Before the issue
+#1971 window, the same case read 11,704 buffers through a bitmap head scan,
+then 30,278 through a partial index.
 
 ### Latency and throughput under contention
 
@@ -1586,8 +1587,8 @@ The held cost does not grow with K or with the backlog depth. Most of it is
 the deep candidate scan: one probe for each of the 256 deep rows. A
 primary-key probe read about 4 buffers. Since issue #2547 a TID probe reads
 about 1, and K = 32 reads about 780 buffers. See
-[the refine by TID](#the-refine-by-tid-issue-2547). A claim whose window finds a row pays nothing
-for the deep window. When the window finds no row, `seek_held` checks the
+[the refine by TID](#the-refine-by-tid-issue-2547). A claim whose window
+finds a row pays nothing for the deep window. When the window finds no row, `seek_held` checks the
 window rows once more. The deep window reads rows only for a held head.
 
 The guard still cuts the deep rows at the last row of every other full
@@ -1618,7 +1619,8 @@ scan. PG16, warm cache:
 | 32 | 33 | 84 buffers, 2.55 per row | 36 buffers, 1.09 per row |
 | 1,000 | 79 | 239 buffers, 3.03 per row | 82 buffers, 1.04 per row |
 
-The whole claim, from the other tests of the same suite:
+The whole claim, from the other tests of the same suite. These are new
+runs, so a figure can differ by a buffer from the tables above:
 
 | test | case | before | after |
 |:--|:--|--:|--:|
@@ -1635,13 +1637,24 @@ The whole claim, from the other tests of the same suite:
   refine.
 - **The deep window gains the most.** It probes up to 256 rows of a held
   head. Each probe now saves about 3 buffers.
+  `held_claims_on_one_head_keep_the_claim_off_the_full_scan` asserts a TID
+  scan at about 1 buffer per row there too.
 - **A concurrent update can make the claim skip a row.** A peer can commit
   an update to a window row after the claim snapshot and before the row
-  lock. The new version has a new `ctid`, so the TID scan skips it. A
-  primary-key probe rechecked the new version and could take it. Only rare
-  writers keep a row `PENDING` when they update it: a priority change, a
-  sticky-pin release, a queue-pause shift and a signal re-pend. The skip
-  acts like a `SKIP LOCKED` skip, and a later claim reads the new version.
+  lock. The new version has a new `ctid`.
+  - Postgres 13.23, 14.20, 15.15, 16.11, 17.7 and later skip the row. Their
+    TID recheck tests the TID list.
+  - Postgres 12 and the older minor releases recheck every other gate on
+    the new version, as the primary-key probe did.
+  - A skip acts like a `SKIP LOCKED` skip. The claim takes the next row, or
+    returns no task when the head holds no other row. It keeps its lock on
+    the skipped row until its transaction ends.
+  - Few writers keep a row `PENDING` when they update it. They are a
+    priority change, a sticky-pin release, a pause shift, a cap raise, an
+    owner stamp, a shard move and a signal re-pend. Some of them
+    rewrite many rows in one commit. Then each claim in flight on that head
+    skips those rows once. No writer updates one row again and again.
+  - A later poll reads the new version.
 - **Not measured: the e2e bench.** The issue #2547 profile was not run
   again. The figures above are from the claim fixture only.
 
@@ -1709,6 +1722,15 @@ The whole claim, from the other tests of the same suite:
 - **Future-dated rows in a higher band.** A head scan steps over the index
   entries of rows that are not yet due, inside a higher priority band.
   Those steps read index pages only.
+- **A generic plan cached on a nearly empty table.** With 10 rows or fewer
+  in the statistics, the planner can pick a sequential scan for the window
+  refine. Before issue #2547 it picked one below 5 rows. If the table then
+  grows before an `ANALYZE`, that cached plan reads the whole table. The
+  head scans already did this before the change. A review measured 41,024
+  buffers against 39,223 for the old plan, at 100K rows.
+- **The skip after a concurrent update (issue #2547).** No test drives
+  it. The scratch run that showed it used PG 16.15. See
+  [the refine by TID](#the-refine-by-tid-issue-2547).
 - **A held snapshot.** A long transaction, `pg_dump` or a standby with
   `hot_standby_feedback` keeps the index entries of claimed rows alive at
   the queue head. Each claim then reads them again. Every Postgres queue
