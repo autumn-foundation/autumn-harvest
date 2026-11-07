@@ -121,6 +121,20 @@ struct Slot {
     connector_loops: Vec<crate::plugin::ConnectorRuntimeHandle>,
 }
 
+/// Whether the app mounts MCP tool or task routes (issue #2488).
+#[cfg(feature = "mcp")]
+macro_rules! mcp_mounted {
+    ($mcp:ident) => {
+        $mcp.tools || $mcp.tasks
+    };
+}
+#[cfg(not(feature = "mcp"))]
+macro_rules! mcp_mounted {
+    ($mcp:ident) => {
+        false
+    };
+}
+
 struct StartParts {
     workflows: Vec<autumn_harvest::info::WorkflowInfo>,
     activities: Vec<autumn_harvest::info::ActivityInfo>,
@@ -137,8 +151,16 @@ struct StartParts {
     schedules: Vec<autumn_harvest::policy::WorkflowSchedule>,
     /// `HarvestPlugin::retention` (issue #2471).
     retention: autumn_harvest::retention::RetentionConfig,
+    /// The plugin mounts MCP tool or task routes (issue #2488).
+    mcp_served: bool,
     /// The `HarvestPlugin::state` values. The startup hook adds `AppState`.
     state: autumn_harvest::context::SharedStateMap,
+}
+
+/// Fail now on a bad `[harvest.sqlite]`, not at the first request.
+fn validate_config() {
+    HarvestSqliteConfig::load()
+        .unwrap_or_else(|error| panic!("cannot load the Harvest SQLite configuration: {error}"));
 }
 
 /// Build the plugin on the SQLite backend.
@@ -172,9 +194,7 @@ pub(crate) fn build(app: AppBuilder, parts: SqliteParts) -> AppBuilder {
     if let Some(message) = refusal_message(&refused) {
         panic!("{message}");
     }
-    // Fail now on a bad `[harvest.sqlite]`, not at the first request.
-    HarvestSqliteConfig::load()
-        .unwrap_or_else(|error| panic!("cannot load the Harvest SQLite configuration: {error}"));
+    validate_config();
 
     #[cfg(feature = "connectors")]
     crate::plugin::validate_connectors(&connectors, &builder);
@@ -192,6 +212,7 @@ pub(crate) fn build(app: AppBuilder, parts: SqliteParts) -> AppBuilder {
         audit_retention_days: audit_retention_days(builder.retention_config()),
         schedules: builder.workflow_schedules().to_vec(),
         retention: builder.retention_config().clone(),
+        mcp_served: mcp_mounted!(mcp),
     };
 
     // A login declares the boundary, as on Postgres.
@@ -636,6 +657,7 @@ async fn start(
         schedules: parts.schedules,
         scheduler_enabled: sqlite_scheduler(runtime_config.scheduler_enabled),
         retention: parts.retention,
+        mcp_served: parts.mcp_served,
     });
     let catalog = Arc::new(handle::Catalog::of(&registry));
     let tick = Duration::from_millis(sqlite_config.tick_ms);

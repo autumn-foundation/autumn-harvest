@@ -468,6 +468,7 @@
 //!   `catalog_consistency` deploy-time preflight check and its `/workflows/registered`
 //!   discovery endpoint, neither of which this backend has; the core execution path
 //!   never reads either field), and `module` (diagnostics).
+//!   A bare runtime logs a `WARN` for `mcp` at registration (issue #2488).
 //! - **HONORED:** `name` (the registration key), `handler` (the dispatch fn),
 //!   `execution_timeout` (#243) and the workflow-level `retry_policy` (#523). See
 //!   [issue #2029](#timers-mutex-local-activities-timeout-and-retry-issue-2029).
