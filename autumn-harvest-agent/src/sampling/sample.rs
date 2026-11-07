@@ -12,6 +12,8 @@
 //!   History records each verdict.
 //! - Best-of-N runs each draw, then calls [`select`]. Rejection stops after
 //!   the first wave that holds a pass.
+//! - A vote keys each draw with an [`AnswerKey`], and needs no scorer. It
+//!   stops after the first wave whose leader cannot lose.
 //! - A cascade asks one tier at a time, each with its own model. It stops
 //!   at the first tier that accepts. [`cascade_step`] skips each tier that
 //!   the mandate forbids.
@@ -21,9 +23,9 @@
 //! - A durable agent op that carries an [`OpSample`] runs the same core
 //!   with the task of the op. The mandate of that task bounds the draws.
 //!
-//! The designs are in `docs/design/DESIGN-2443.md`,
-//! `docs/design/DESIGN-2445.md`, `docs/design/DESIGN-2446.md` and
-//! `docs/design/DESIGN-2449.md`.
+//! The design is in `docs/design/DESIGN-2443.md`,
+//! `docs/design/DESIGN-2444.md`, `docs/design/DESIGN-2445.md`,
+//! `docs/design/DESIGN-2446.md` and `docs/design/DESIGN-2449.md`.
 
 use std::collections::BTreeSet;
 use std::num::NonZeroU32;
@@ -37,6 +39,9 @@ use super::admit::{
 };
 use super::draws::{draw_task, profile_task, read_policy, read_profile};
 use super::policy::{ScorerRef, Strategy};
+use super::vote::{
+    AnswerKey, Tally, VoteCount, VoteKeyReply, VoteKeyRequest, agent_vote_key_info, fit_key,
+};
 use autumn_harvest::llm_budget::LlmBudgetExceeded;
 
 use crate::bounds::{exceeds_activity_input, sibling_cap};
@@ -81,6 +86,7 @@ impl Tier {
 ///
 /// It encodes as `{"best_of_n": {"n": 3}}`,
 /// `{"rejection": {"max_attempts": 4, "threshold": 0.8}}` or
+/// `{"vote": {"n": 5, "key": "last_number"}}`,
 /// `{"cascade": {"tiers": [{"model": "small", "threshold": 0.8}]}}` or
 /// `{"beam": {"width": 2, "expansion": 2, "max_rounds": 3}}`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -99,6 +105,14 @@ pub enum SampleStrategy {
         max_attempts: u32,
         /// The lowest score that passes.
         threshold: FiniteF64,
+    },
+    /// Run up to `n` draws, key each answer, and select the most common
+    /// key. A tie goes to the key whose first vote has the lowest draw id.
+    Vote {
+        /// The most draws.
+        n: u32,
+        /// How each answer maps to its key.
+        key: AnswerKey,
     },
     /// Ask each tier in order, one draw per tier. Stop at the first answer
     /// that scores at or above the threshold of its tier.
@@ -135,6 +149,12 @@ impl SampleStrategy {
         }
     }
 
+    /// A vote of up to `n` draws under `key`.
+    #[must_use]
+    pub const fn vote(n: u32, key: AnswerKey) -> Self {
+        Self::Vote { n, key }
+    }
+
     /// A cascade over `tiers`, the cheapest first.
     #[must_use]
     pub fn cascade(tiers: impl IntoIterator<Item = Tier>) -> Self {
@@ -160,6 +180,7 @@ impl SampleStrategy {
         match self {
             Self::BestOfN { .. } => Strategy::BestOfN,
             Self::Rejection { .. } => Strategy::Rejection,
+            Self::Vote { .. } => Strategy::Vote,
             Self::Cascade { .. } => Strategy::Cascade,
             Self::Beam { .. } => Strategy::Beam,
         }
@@ -171,7 +192,7 @@ impl SampleStrategy {
     #[must_use]
     pub fn draws(&self) -> u32 {
         match self {
-            Self::BestOfN { n } => *n,
+            Self::BestOfN { n } | Self::Vote { n, .. } => *n,
             Self::Rejection { max_attempts, .. } => *max_attempts,
             Self::Cascade { tiers } => u32::try_from(tiers.len()).unwrap_or(u32::MAX),
             Self::Beam {
@@ -193,8 +214,9 @@ impl SampleStrategy {
 pub struct OpSample {
     /// The strategy.
     pub strategy: SampleStrategy,
-    /// The scorer. The policy must allow it.
-    pub scorer: ScorerRef,
+    /// The scorer. The policy must allow it. A vote takes none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scorer: Option<ScorerRef>,
     /// The most draws at the same time. `None` takes the default of the
     /// strategy, as in [`SampleInput`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -207,7 +229,17 @@ impl OpSample {
     pub const fn new(strategy: SampleStrategy, scorer: ScorerRef) -> Self {
         Self {
             strategy,
-            scorer,
+            scorer: Some(scorer),
+            concurrency: None,
+        }
+    }
+
+    /// A vote of up to `n` draws. Each answer maps to its key with `key`.
+    #[must_use]
+    pub const fn vote(n: u32, key: AnswerKey) -> Self {
+        Self {
+            strategy: SampleStrategy::vote(n, key),
+            scorer: None,
             concurrency: None,
         }
     }
@@ -242,11 +274,13 @@ pub struct SampleInput {
     pub input: String,
     /// The strategy.
     pub strategy: SampleStrategy,
-    /// The scorer. The policy must allow it.
-    pub scorer: ScorerRef,
+    /// The scorer. The policy must allow it. Best-of-N and rejection need
+    /// one. A vote takes none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scorer: Option<ScorerRef>,
     /// The most draws at the same time. `None` takes the cap of the policy
-    /// for best-of-N and beam search, and 1 for rejection and for a
-    /// cascade. A cascade refuses a value above 1.
+    /// for best-of-N, a vote and beam search, and 1 for rejection and for
+    /// a cascade. A cascade refuses a value above 1.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub concurrency: Option<NonZeroU32>,
     /// The token budget of the whole run tree. It narrows the cap of the
@@ -268,7 +302,21 @@ impl SampleInput {
             kind: kind.into(),
             input: input.into(),
             strategy,
-            scorer,
+            scorer: Some(scorer),
+            concurrency: None,
+            max_total_tokens: None,
+        }
+    }
+
+    /// A vote of up to `n` draws over `input` for the kind `kind`. Each
+    /// answer maps to its key with `key`.
+    #[must_use]
+    pub fn vote(kind: impl Into<String>, input: impl Into<String>, n: u32, key: AnswerKey) -> Self {
+        Self {
+            kind: kind.into(),
+            input: input.into(),
+            strategy: SampleStrategy::vote(n, key),
+            scorer: None,
             concurrency: None,
             max_total_tokens: None,
         }
@@ -297,7 +345,8 @@ impl SampleInput {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SampleOutcome {
-    /// The run selected this draw.
+    /// The run selected this draw. For a vote, it is the first draw of
+    /// the winning key.
     Selected {
         /// The draw.
         draw: DrawId,
@@ -308,7 +357,7 @@ pub enum SampleOutcome {
         /// The draw.
         draw: DrawId,
     },
-    /// No draw passed.
+    /// No draw passed. For a vote, no draw had a key.
     NoAcceptedDraw,
 }
 
@@ -335,9 +384,12 @@ pub enum SampleStop {
     Accepted,
     /// A budget refused the next draw.
     BudgetExceeded,
-    /// A score failed, so the run started no more draws. The verdict of
-    /// the draw names the error.
+    /// A score or a vote key failed, so the run started no more draws.
+    /// The verdict of the draw names the error.
     ScoreFailed,
+    /// The leader of a vote keeps the lead whatever the draws left vote,
+    /// so the run started no more draws.
+    Settled,
     /// A beam run ended its last round with a live beam. The run selects
     /// among the beams that are complete.
     RoundsExhausted,
@@ -352,6 +404,7 @@ impl SampleStop {
             Self::Accepted => "accepted",
             Self::BudgetExceeded => "budget_exceeded",
             Self::ScoreFailed => "score_failed",
+            Self::Settled => "settled",
             Self::RoundsExhausted => "rounds_exhausted",
         }
     }
@@ -401,8 +454,12 @@ pub struct SampleDraw {
     pub model: Option<String>,
     /// Why the draw run ended.
     pub stop: AgentStop,
-    /// The verdict of the scorer.
+    /// The verdict of the scorer. For a vote, a draw with a key gets a
+    /// score of 1, and a draw with no key gets a reject with the reason.
     pub verdict: Verdict,
+    /// The key of the answer, for a vote.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
     /// The tokens of the draw run and of its judge calls.
     pub usage: TokenUsage,
     /// The cost of the draw run and of its judge calls, in millionths of a
@@ -443,6 +500,10 @@ pub struct SampleReport {
     pub selected: Option<AgentReport>,
     /// Each draw, in draw order.
     pub draws: Vec<SampleDraw>,
+    /// The votes of each key, the winner first. Empty unless the run is a
+    /// vote.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tally: Vec<VoteCount>,
     /// Each cascade tier whose model the mandate forbids, in tier order.
     /// The run never asks such a tier. A skipped tier encodes as
     /// `{"tier": 0, "model": "m", "refusal": {"refusal": "not_permitted"}}`.
@@ -516,13 +577,14 @@ pub async fn agent_sample(
         .map_err(|failure| failure.text())
 }
 
-/// The core of [`agent_sample`]: admit, draw, score and select.
+/// The core of [`agent_sample`]: admit, draw, judge and select.
 ///
 /// `task` is the task of each draw before [`draw_task`]. Its token cap is
 /// the budget of the whole run. With `mandate_check`, the mandate of
-/// `task` admits the draws first. Each draw of best-of-N or rejection and
-/// each tier of a cascade counts as one delegation. The draws split the
-/// delegations left with `sibling_cap`. A beam checks `max_draws` only.
+/// `task` admits the draws first. Each draw of best-of-N, rejection or a
+/// vote, and each tier of a cascade, counts as one delegation. The draws
+/// split the delegations left with `sibling_cap`. A beam checks
+/// `max_draws` only.
 ///
 /// A durable agent calls it for an op that carries an [`OpSample`]. That
 /// task holds the transcript, the labels and the narrowed mandate of the
@@ -548,14 +610,20 @@ pub async fn sample_task(
     let read = read_policy(ctx, kind)
         .await
         .map_err(SampleFailure::Engine)?;
+    let voting = matches!(sample.strategy, SampleStrategy::Vote { .. });
     let concurrency = sample.asked_concurrency();
     let ask = Ask {
         strategy: sample.strategy.policy_strategy(),
         draws: sample.strategy.draws(),
         concurrency,
-        scorer: Some(&sample.scorer),
+        // A vote refuses a scorer below, so the policy never checks one.
+        scorer: if voting { None } else { sample.scorer.as_ref() },
     };
     let admission = admit(&read.policy, &ask).map_err(SampleFailure::Refused)?;
+    let judge = judge_of(sample).map_err(SampleFailure::Refused)?;
+    if let Judge::Vote(key @ AnswerKey::Custom(id)) = judge {
+        probe_key(ctx, key, id).await?;
+    }
     if let SampleStrategy::Cascade { tiers } = &sample.strategy {
         if concurrency > 1 {
             let refusal = Refusal::TooManyConcurrentDraws {
@@ -566,16 +634,15 @@ pub async fn sample_task(
         }
         admit_tiers(&read.policy, tiers).map_err(SampleFailure::Refused)?;
     }
-    let budget = task.max_total_tokens;
     let draw = draw_task(task, &admission.draw_effects);
-    let waves = Waves {
+    let parts = Parts {
         sample,
         task: &draw,
         admission: &admission,
-        budget,
+        budget: task.max_total_tokens,
         delegations,
     };
-    let ended = run_strategy(ctx, &waves)
+    let ended = run_strategy(ctx, judge, &parts)
         .await
         .map_err(SampleFailure::Engine)?;
     Ok(report(
@@ -587,47 +654,79 @@ pub async fn sample_task(
     ))
 }
 
-/// Run the draws of the strategy of `waves`.
-async fn run_strategy(ctx: &WorkflowContext, waves: &Waves<'_>) -> Result<Ended, String> {
-    match &waves.sample.strategy {
-        SampleStrategy::Cascade { tiers } => run_tiers(ctx, waves, tiers).await,
-        SampleStrategy::Beam {
-            width,
-            expansion,
-            max_rounds,
-        } => {
+/// The fixed parts of the draws of one run.
+#[derive(Clone, Copy)]
+struct Parts<'a> {
+    /// The strategy and the scorer.
+    sample: &'a OpSample,
+    /// The task of each draw, after [`draw_task`].
+    task: &'a AgentTask,
+    /// What the policy admitted.
+    admission: &'a Admission,
+    /// The token budget of the run tree.
+    budget: Option<u32>,
+    /// The delegations that the draws split, when a mandate admitted them.
+    delegations: Option<u32>,
+}
+
+/// Run the draws of the strategy of `parts`.
+async fn run_strategy(
+    ctx: &WorkflowContext,
+    judge: Judge<'_>,
+    parts: &Parts<'_>,
+) -> Result<Ended, String> {
+    let ended = match (&parts.sample.strategy, judge) {
+        (SampleStrategy::Cascade { tiers }, Judge::Score(rule)) => {
+            run_tiers(ctx, parts, rule, tiers).await?
+        }
+        (
+            SampleStrategy::Beam {
+                width,
+                expansion,
+                max_rounds,
+            },
+            Judge::Score(rule),
+        ) => {
             let shape = BeamShape {
                 width: *width,
                 expansion: *expansion,
                 max_rounds: *max_rounds,
             };
-            let (scored, stopped) = run_beam(ctx, waves, shape).await?;
-            Ok(Ended {
+            let run = BeamRun {
+                scorer: rule,
+                task: parts.task,
+                admission: parts.admission,
+                budget: parts.budget,
+            };
+            let (scored, stopped) = run_beam(ctx, run, shape).await?;
+            Ended {
                 scored,
                 skipped: Vec::new(),
                 stopped,
-            })
+            }
         }
         _ => {
-            let (scored, stopped) = run_waves(ctx, waves).await?;
-            Ok(Ended {
+            let (scored, stopped) = run_waves(ctx, judge, parts).await?;
+            Ended {
                 scored,
                 skipped: Vec::new(),
                 stopped,
-            })
+            }
         }
-    }
+    };
+    Ok(ended)
 }
 
 /// Admit the draws of `sample` under `mandate`. Returns the delegations
 /// left for the draws to split, or `None` for a beam.
 ///
-/// Each draw of best-of-N or rejection is a run of its own, so it counts
-/// as one delegation. A beam step continues the run of its beam, and the
-/// beam already counts its delegations step by step. So a beam checks
-/// `max_draws` only. A judge model must be a model that the mandate
-/// allows, as each model of the subtree must be. A cascade skips each
-/// tier that the mandate forbids, and reports it.
+/// Each draw of best-of-N, rejection or a vote is a run of its own, so it
+/// counts as one delegation. So does each tier of a cascade. A beam step
+/// continues the run of its beam, and the beam already counts its
+/// delegations step by step. So a beam checks `max_draws` only. A judge
+/// model must be a model that the mandate allows, as each model of the
+/// subtree must be. A cascade skips each tier that the mandate forbids, and
+/// reports it.
 fn mandate_admits(mandate: &Mandate, sample: &OpSample) -> Result<Option<u32>, SampleFailure> {
     let refused = |refusal| SampleFailure::Refused(Refusal::Mandate { mandate: refusal });
     let draws = sample.strategy.draws();
@@ -639,7 +738,11 @@ fn mandate_admits(mandate: &Mandate, sample: &OpSample) -> Result<Option<u32>, S
     } else {
         Some(mandate.admit_draws(draws, 0).map_err(refused)?)
     };
-    if let Some(judge) = &sample.scorer.judge_model
+    let judge = sample
+        .scorer
+        .as_ref()
+        .and_then(|scorer| scorer.judge_model.as_deref());
+    if let Some(judge) = judge
         && !mandate.allows_model(Some(judge))
     {
         return Err(refused(MeshRefusal::ModelForbidden));
@@ -655,14 +758,67 @@ fn draw_delegations(delegations: Option<u32>, draws: u32, n: u32) -> Option<u32>
 
 /// The concurrency of a run that asks for none.
 ///
-/// Best-of-N takes the cap of the policy (0). Rejection and a cascade stop
-/// at the first pass, so they run one draw at a time. A wider wave would
-/// pay for draws after the pass.
+/// Best-of-N, a vote and beam search take the cap of the policy (0).
+/// Rejection and a cascade stop at the first pass, so they run one draw at
+/// a time. A wider wave would pay for draws after the pass.
 const fn default_concurrency(strategy: &SampleStrategy) -> u32 {
     match strategy {
-        SampleStrategy::BestOfN { .. } | SampleStrategy::Beam { .. } => 0,
+        SampleStrategy::BestOfN { .. }
+        | SampleStrategy::Vote { .. }
+        | SampleStrategy::Beam { .. } => 0,
         SampleStrategy::Rejection { .. } | SampleStrategy::Cascade { .. } => 1,
     }
+}
+
+/// How the run judges each draw.
+#[derive(Debug, Clone, Copy)]
+enum Judge<'a> {
+    /// Score each draw with this scorer.
+    Score(&'a ScorerRef),
+    /// Key each draw for a vote.
+    Vote(&'a AnswerKey),
+}
+
+/// The judge of `sample`.
+///
+/// # Errors
+///
+/// Best-of-N and rejection with no scorer give `NoScorer`. A vote with a
+/// scorer gives `ScorerNotUsed`, and a vote with a bad key gives
+/// `InvalidAnswerKey`.
+fn judge_of(sample: &OpSample) -> Result<Judge<'_>, Refusal> {
+    match (&sample.strategy, &sample.scorer) {
+        (SampleStrategy::Vote { .. }, Some(_)) => Err(Refusal::ScorerNotUsed),
+        (SampleStrategy::Vote { key, .. }, None) if key.is_valid() => Ok(Judge::Vote(key)),
+        (SampleStrategy::Vote { .. }, None) => Err(Refusal::InvalidAnswerKey),
+        (_, Some(scorer)) => Ok(Judge::Score(scorer)),
+        (strategy, None) => Err(Refusal::NoScorer {
+            strategy: strategy.policy_strategy(),
+        }),
+    }
+}
+
+/// Check that the harness has the app key function `id`, before the first
+/// draw.
+///
+/// # Errors
+///
+/// Returns the `unknown_answer_key` refusal when the harness lacks it, and
+/// an engine error.
+async fn probe_key(ctx: &WorkflowContext, key: &AnswerKey, id: &str) -> Result<(), SampleFailure> {
+    let reply: VoteKeyReply = ctx
+        .execute_activity(
+            &agent_vote_key_info(),
+            VoteKeyRequest::new(key.clone(), None),
+        )
+        .await
+        .map_err(|err| SampleFailure::Engine(err.to_string()))?;
+    if reply.known {
+        return Ok(());
+    }
+    Err(SampleFailure::Refused(Refusal::UnknownAnswerKey {
+        key: crate::harness::truncate(id, crate::mesh::MAX_NAME_LEN),
+    }))
 }
 
 /// The token budget of the run tree: the smaller of the two caps.
@@ -689,20 +845,6 @@ struct Ended {
     stopped: SampleStop,
 }
 
-/// The fixed parts of the draws of one run.
-struct Waves<'a> {
-    /// The strategy and the scorer.
-    sample: &'a OpSample,
-    /// The task of each draw, after [`draw_task`].
-    task: &'a AgentTask,
-    /// What the policy admitted.
-    admission: &'a Admission,
-    /// The token budget of the run tree.
-    budget: Option<u32>,
-    /// The delegations that the draws split, when a mandate admitted them.
-    delegations: Option<u32>,
-}
-
 /// Run the waves of the run, and score each draw.
 ///
 /// [`sample_step`] gives the width of each wave. Draw `i` of a wave gets
@@ -711,21 +853,24 @@ struct Waves<'a> {
 /// `delegations`, draw `n` of the run gets `sibling_cap(delegations, draws,
 /// n)` delegations, so the draws never pass the fan-out of the mandate.
 ///
-/// The run starts no more draws after a rejection wave with a pass. It
-/// also stops after a failed score, and when a budget refuses a draw or a
-/// judge call. A pass wins over the other stops, because the run has its
-/// answer.
+/// The run starts no more draws after a rejection wave with a pass, and
+/// after a vote wave whose leader cannot lose. It also stops after a
+/// failed score, and when a budget refuses a draw or a judge call. A pass
+/// wins over the other stops, because the run has its answer. A settled
+/// vote wins over a budget stop. A failed key wins over a settled vote, so
+/// the stop names the broken key.
 async fn run_waves(
     ctx: &WorkflowContext,
-    waves: &Waves<'_>,
+    judge: Judge<'_>,
+    parts: &Parts<'_>,
 ) -> Result<(Vec<Scored>, SampleStop), String> {
-    let Waves {
+    let Parts {
         sample,
         task,
         admission,
         budget,
         delegations,
-    } = *waves;
+    } = *parts;
     let mut scored: Vec<Scored> = Vec::new();
     let mut spent: u32 = 0;
     loop {
@@ -764,9 +909,14 @@ async fn run_waves(
             if report.stop == AgentStop::BudgetExceeded {
                 halt = halt.or(Some(SampleStop::BudgetExceeded));
             }
-            let (one, halted) =
-                score_draw(ctx, sample, task, DrawId::new(id), report, halt).await?;
-            halt = halt.or(halted);
+            let draw = DrawId::new(id);
+            let (one, halted) = match judge {
+                Judge::Score(rule) => {
+                    score_draw(ctx, rule, false, task, draw, report, halt).await?
+                }
+                Judge::Vote(key) => vote_draw(ctx, key, draw, report).await?,
+            };
+            halt = merge_stop(halt, halted);
             passed |= passes(&sample.strategy, one.record.draw, &one.record.verdict);
             spent = spent.saturating_add(one.record.usage.total());
             scored.push(one);
@@ -774,9 +924,26 @@ async fn run_waves(
         if passed && matches!(sample.strategy, SampleStrategy::Rejection { .. }) {
             return Ok((scored, SampleStop::Accepted));
         }
+        let ran = u32::try_from(scored.len()).unwrap_or(u32::MAX);
+        let left = admission.draws.saturating_sub(ran);
+        let decided = matches!(judge, Judge::Vote(_)) && halt != Some(SampleStop::ScoreFailed);
+        if decided && left > 0 && tally_of(&scored).settled(left) {
+            return Ok((scored, SampleStop::Settled));
+        }
         if let Some(stop) = halt {
             return Ok((scored, stop));
         }
+    }
+}
+
+/// The stop of a wave after a draw adds the stop `next`.
+///
+/// The first stop holds, except that a failed score or key wins over each
+/// other stop. So a broken key is never hidden behind a budget stop.
+fn merge_stop(halt: Option<SampleStop>, next: Option<SampleStop>) -> Option<SampleStop> {
+    match next {
+        Some(SampleStop::ScoreFailed) => next,
+        _ => halt.or(next),
     }
 }
 
@@ -816,16 +983,17 @@ fn forbidden(tiers: &[Tier], allowed: &[bool]) -> Vec<SkippedTier> {
 /// that fails gets a reject, and the run asks the next tier.
 async fn run_tiers(
     ctx: &WorkflowContext,
-    waves: &Waves<'_>,
+    parts: &Parts<'_>,
+    rule: &ScorerRef,
     tiers: &[Tier],
 ) -> Result<Ended, String> {
-    let Waves {
+    let Parts {
         sample,
         task,
         admission,
         budget,
         delegations,
-    } = *waves;
+    } = *parts;
     let allowed: Vec<bool> = tiers
         .iter()
         .map(|tier| permits(task, &tier.model))
@@ -874,7 +1042,7 @@ async fn run_tiers(
         };
         let report = report?;
         let halt = (report.stop == AgentStop::BudgetExceeded).then_some(SampleStop::BudgetExceeded);
-        let (mut one, halted) = score_draw(ctx, sample, &draw, id, report, halt).await?;
+        let (mut one, halted) = score_draw(ctx, rule, false, &draw, id, report, halt).await?;
         one.record.model = Some(tier.model.clone());
         spent = spent.saturating_add(one.record.usage.total());
         let accepted = passes(&sample.strategy, id, &one.record.verdict);
@@ -905,6 +1073,16 @@ struct BeamShape {
     max_rounds: u32,
 }
 
+/// The fixed inputs of a beam run.
+#[derive(Clone, Copy)]
+struct BeamRun<'a> {
+    /// The step scorer.
+    scorer: &'a ScorerRef,
+    task: &'a AgentTask,
+    admission: &'a Admission,
+    budget: Option<u32>,
+}
+
 /// One live beam: the step that ends it, its transcript, the flow labels
 /// that it exercised and the delegations that it used.
 struct Beam {
@@ -931,10 +1109,10 @@ struct Beam {
 /// budget refusal or a failed score stops it after the round is ranked.
 async fn run_beam(
     ctx: &WorkflowContext,
-    waves: &Waves<'_>,
+    run: BeamRun<'_>,
     shape: BeamShape,
 ) -> Result<(Vec<Scored>, SampleStop), String> {
-    let task = waves.task;
+    let BeamRun { task, .. } = run;
     let mut scored: Vec<Scored> = Vec::new();
     let mut spent: u32 = 0;
     let mut complete: u32 = 0;
@@ -963,7 +1141,7 @@ async fn run_beam(
         let halt = Box::pin(run_steps(
             ctx,
             Steps {
-                waves,
+                run,
                 round,
                 parents: &parents,
             },
@@ -986,7 +1164,7 @@ async fn run_beam(
 
 /// The steps of one beam round.
 struct Steps<'a> {
-    waves: &'a Waves<'a>,
+    run: BeamRun<'a>,
     round: u32,
     /// The beam of each step, in step order.
     parents: &'a [&'a Beam],
@@ -1004,13 +1182,13 @@ async fn run_steps(
     scored: &mut Vec<Scored>,
     spent: &mut u32,
 ) -> Result<Option<SampleStop>, String> {
-    let Waves {
-        sample,
+    let BeamRun {
+        scorer,
         task,
         admission,
         budget,
         ..
-    } = *steps.waves;
+    } = steps.run;
     let planned = u32::try_from(steps.parents.len()).unwrap_or(u32::MAX);
     let mut started: u32 = 0;
     loop {
@@ -1047,7 +1225,7 @@ async fn run_steps(
                 halt = halt.or(Some(SampleStop::BudgetExceeded));
             }
             let draw = DrawId::new(id);
-            let (mut one, halted) = score_draw(ctx, sample, task, draw, report, halt).await?;
+            let (mut one, halted) = score_draw(ctx, scorer, true, task, draw, report, halt).await?;
             halt = halt.or(halted);
             one.parent_delegations = parent.delegations;
             one.record.beam = Some(BeamStep {
@@ -1172,7 +1350,7 @@ const MAX_SCORED_TOOL_BYTES: usize = 16 * 1024;
 /// result is cut to [`MAX_SCORED_TOOL_BYTES`]. A request that still does
 /// not fit would fail the run after the draws were paid.
 fn score_request(
-    sample: &OpSample,
+    scorer: &ScorerRef,
     task: &AgentTask,
     report: &AgentReport,
 ) -> Option<ScoreRequest> {
@@ -1188,8 +1366,8 @@ fn score_request(
         let content = std::mem::take(&mut tool.content);
         tool.content = cut_bytes(content, MAX_SCORED_TOOL_BYTES);
     }
-    let request = ScoreRequest::new(sample.scorer.id.as_str(), score)
-        .admitted_judges(sample.scorer.judge_model.clone());
+    let request =
+        ScoreRequest::new(scorer.id.as_str(), score).admitted_judges(scorer.judge_model.clone());
     (!exceeds_activity_input(&request)).then_some(request)
 }
 
@@ -1211,7 +1389,8 @@ fn score_request(
 /// Returns an engine error, such as a cancellation, as text.
 async fn score_draw(
     ctx: &WorkflowContext,
-    sample: &OpSample,
+    scorer: &ScorerRef,
+    beam: bool,
     task: &AgentTask,
     draw: DrawId,
     report: AgentReport,
@@ -1219,7 +1398,6 @@ async fn score_draw(
 ) -> Result<(Scored, Option<SampleStop>), String> {
     let unscored = |reason: &str| (Verdict::reject(reason), TokenUsage::default(), 0);
     let mut stop = None;
-    let beam = matches!(sample.strategy, SampleStrategy::Beam { .. });
     let (verdict, usage, cost) = if report.stop == AgentStop::Failed {
         unscored("the draw failed, so the run did not score it")
     } else if report.stop == AgentStop::BudgetExceeded {
@@ -1228,12 +1406,12 @@ async fn score_draw(
         unscored("the step did not end with an answer or a tool round")
     } else if halt.is_some() {
         unscored("the run stopped before it scored the draw")
-    } else if let Some(request) = score_request(sample, task, &report) {
+    } else if let Some(request) = score_request(scorer, task, &report) {
         match ctx
             .execute_activity::<_, SampleScore>(&agent_sample_score_info(), request)
             .await
         {
-            Ok(scored) => (scored.verdict, scored.usage, scored.cost_usd_micros),
+            Ok(result) => (result.verdict, result.usage, result.cost_usd_micros),
             Err(err) if LlmBudgetExceeded::is_refusal(&err) => {
                 stop = Some(SampleStop::BudgetExceeded);
                 unscored("the LLM budget refused the score")
@@ -1255,9 +1433,75 @@ async fn score_draw(
         model: None,
         stop: report.stop,
         verdict,
+        key: None,
         usage: report.usage.saturating_add(usage),
         cost_usd_micros: report.cost_usd_micros.saturating_add(cost),
         beam: None,
+        parked_until_ms: report.parked_until_ms,
+    };
+    let one = Scored {
+        record,
+        report,
+        parent_delegations: 0,
+    };
+    Ok((one, stop))
+}
+
+/// Key one draw for a vote.
+///
+/// Only a draw that completed casts a vote. The recorded `agent_vote_key`
+/// activity applies the key, so replay reads it. A draw with a key gets a
+/// score of 1. A draw with no key gets a reject that names the reason.
+///
+/// A failed key activity gives a reject and the stop `ScoreFailed`. So
+/// does a worker that has no function for an app key.
+///
+/// # Errors
+///
+/// Returns an engine error, such as a cancellation, as text.
+async fn vote_draw(
+    ctx: &WorkflowContext,
+    key: &AnswerKey,
+    draw: DrawId,
+    report: AgentReport,
+) -> Result<(Scored, Option<SampleStop>), String> {
+    let mut stop = None;
+    let request = VoteKeyRequest::new(key.clone(), Some(report.text.clone()));
+    let found = if report.stop != AgentStop::Completed {
+        Err("the draw did not complete, so it casts no vote".to_owned())
+    } else if exceeds_activity_input(&request) {
+        Err("the answer is too large to record, so it casts no vote".to_owned())
+    } else {
+        match ctx
+            .execute_activity::<_, VoteKeyReply>(&agent_vote_key_info(), request)
+            .await
+        {
+            Ok(reply) if !reply.known => {
+                stop = Some(SampleStop::ScoreFailed);
+                Err("the worker has no function for the answer key".to_owned())
+            }
+            Ok(reply) => reply.key.and_then(fit_key).ok_or_else(no_key),
+            Err(err @ HarvestError::ActivityFailed { .. }) => {
+                stop = Some(SampleStop::ScoreFailed);
+                Err(format!("the answer key failed: {err}"))
+            }
+            Err(err) => return Err(err.to_string()),
+        }
+    };
+    let (key, verdict) = match found {
+        Ok(key) => (Some(key), Verdict::Score(FiniteF64::ONE)),
+        Err(reason) => (None, Verdict::reject(reason)),
+    };
+    let record = SampleDraw {
+        draw,
+        run_id: report.run_id.clone(),
+        stop: report.stop,
+        verdict,
+        key,
+        usage: report.usage,
+        cost_usd_micros: report.cost_usd_micros,
+        beam: None,
+        model: None,
         parked_until_ms: report.parked_until_ms,
     };
     let scored = Scored {
@@ -1268,16 +1512,32 @@ async fn score_draw(
     Ok((scored, stop))
 }
 
+/// The reject reason of a draw whose answer has no key.
+fn no_key() -> String {
+    "the answer has no key, so the draw casts no vote".to_owned()
+}
+
+/// The votes of the draws in `scored`.
+fn tally_of(scored: &[Scored]) -> Tally {
+    let mut tally = Tally::new();
+    for one in scored {
+        tally.cast(one.record.draw, one.record.key.as_deref());
+    }
+    tally
+}
+
 /// Whether `verdict` of the draw `draw` passes the check of `strategy`.
 ///
-/// Best-of-N and beam search pass each score, and `select` never picks a
-/// reject. Rejection passes a score at or above the threshold. A cascade
+/// Best-of-N, a vote and beam search pass each score, and `select` never
+/// picks a reject. Rejection passes a score at or above the threshold. A cascade
 /// passes a score at or above the threshold of the tier of the draw.
 fn passes(strategy: &SampleStrategy, draw: DrawId, verdict: &Verdict) -> bool {
     let at_least =
         |threshold: FiniteF64| verdict.as_score().is_some_and(|score| score >= threshold);
     match strategy {
-        SampleStrategy::BestOfN { .. } | SampleStrategy::Beam { .. } => !verdict.is_reject(),
+        SampleStrategy::BestOfN { .. }
+        | SampleStrategy::Vote { .. }
+        | SampleStrategy::Beam { .. } => !verdict.is_reject(),
         SampleStrategy::Rejection { threshold, .. } => at_least(*threshold),
         SampleStrategy::Cascade { tiers } => usize::try_from(draw.get())
             .ok()
@@ -1296,9 +1556,17 @@ fn selectable(record: &SampleDraw) -> bool {
 
 /// The selection of a run.
 ///
-/// The run selects the best draw that passes. When no tier of a cascade
-/// accepts, it selects the best draw that has a score, as `escalated`.
+/// A vote selects the first draw of the winning key. Each other run
+/// selects the best draw that passes. When no tier of a cascade accepts,
+/// it selects the best draw that has a score, as `escalated`.
 fn outcome(strategy: &SampleStrategy, scored: &[Scored]) -> SampleOutcome {
+    if matches!(strategy, SampleStrategy::Vote { .. }) {
+        return tally_of(scored)
+            .winner()
+            .map_or(SampleOutcome::NoAcceptedDraw, |winner| {
+                SampleOutcome::Selected { draw: winner.first }
+            });
+    }
     if let Some(draw) = best(strategy, scored, true) {
         return SampleOutcome::Selected { draw };
     }
@@ -1330,6 +1598,9 @@ fn best(strategy: &SampleStrategy, scored: &[Scored], passing: bool) -> Option<D
 }
 
 /// The report of the run: the selection, each draw and the totals.
+///
+/// A vote selects the first draw of the winning key, and reports the full
+/// tally.
 fn report(
     kind: &str,
     strategy: &SampleStrategy,
@@ -1346,6 +1617,11 @@ fn report(
     let chosen = match outcome {
         SampleOutcome::Selected { draw } | SampleOutcome::Escalated { draw } => Some(draw),
         SampleOutcome::NoAcceptedDraw => None,
+    };
+    let tally = if matches!(strategy, SampleStrategy::Vote { .. }) {
+        tally_of(&scored).counts()
+    } else {
+        Vec::new()
     };
     let usage = scored.iter().fold(TokenUsage::default(), |usage, one| {
         usage.saturating_add(one.record.usage)
@@ -1376,6 +1652,7 @@ fn report(
         attempts,
         selected,
         draws,
+        tally,
         skipped,
         usage,
         cost_usd_micros,
@@ -1386,6 +1663,23 @@ fn report(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_failed_score_wins_over_each_other_stop() {
+        use SampleStop::{BudgetExceeded, ScoreFailed};
+        assert_eq!(merge_stop(None, None), None);
+        assert_eq!(merge_stop(None, Some(BudgetExceeded)), Some(BudgetExceeded));
+        assert_eq!(merge_stop(Some(BudgetExceeded), None), Some(BudgetExceeded));
+        assert_eq!(
+            merge_stop(Some(BudgetExceeded), Some(ScoreFailed)),
+            Some(ScoreFailed),
+            "a later failed key replaces an earlier budget stop"
+        );
+        assert_eq!(
+            merge_stop(Some(ScoreFailed), Some(BudgetExceeded)),
+            Some(ScoreFailed)
+        );
+    }
 
     #[test]
     fn the_tree_budget_is_the_smaller_cap() {
@@ -1407,6 +1701,9 @@ mod tests {
         let best = SampleStrategy::best_of_n(3);
         assert!(passes(&best, draw, &Verdict::score(-1e300).unwrap()));
         assert!(!passes(&best, draw, &Verdict::reject("no")));
+        let vote = SampleStrategy::vote(3, AnswerKey::Trimmed);
+        assert!(passes(&vote, draw, &Verdict::Score(FiniteF64::ONE)));
+        assert!(!passes(&vote, draw, &Verdict::reject("no key")));
     }
 
     #[test]
@@ -1461,11 +1758,18 @@ mod tests {
             ],
         }))
         .unwrap();
-        let sample = OpSample::new(
+        let input = SampleInput::new(
+            "k",
+            "x",
             SampleStrategy::best_of_n(1),
             ScorerRef::deterministic("exact_match").unwrap(),
         );
-        let request = score_request(&sample, &AgentTask::new("x"), &report).unwrap();
+        let request = score_request(
+            input.scorer.as_ref().unwrap(),
+            &AgentTask::new("x"),
+            &report,
+        )
+        .unwrap();
         assert_eq!(request.input.tools.len(), 1);
         assert!(request.input.tools[0].content.len() <= MAX_SCORED_TOOL_BYTES);
         assert_eq!(
@@ -1547,6 +1851,7 @@ mod tests {
             model: None,
             stop,
             verdict,
+            key: None,
             usage: TokenUsage::default(),
             cost_usd_micros: 0,
             beam: Some(BeamStep {
@@ -1630,13 +1935,10 @@ mod tests {
             "messages": messages,
         }))
         .unwrap();
-        let sample = OpSample::new(
-            SampleStrategy::best_of_n(1),
-            ScorerRef::deterministic("exact_match").unwrap(),
-        );
+        let scorer = ScorerRef::deterministic("exact_match").unwrap();
         let mut task = AgentTask::new("x");
         task.history = history;
-        let request = score_request(&sample, &task, &report).unwrap();
+        let request = score_request(&scorer, &task, &report).unwrap();
         let contents: Vec<&str> = request
             .input
             .tools
@@ -1644,7 +1946,7 @@ mod tests {
             .map(|tool| tool.content.as_str())
             .collect();
         assert_eq!(contents, ["new result"]);
-        let plain = score_request(&sample, &AgentTask::new("x"), &report).unwrap();
+        let plain = score_request(&scorer, &AgentTask::new("x"), &report).unwrap();
         assert_eq!(plain.input.tools.len(), 2, "no history keeps each result");
     }
 
@@ -1655,6 +1957,7 @@ mod tests {
             SampleStop::Accepted,
             SampleStop::BudgetExceeded,
             SampleStop::ScoreFailed,
+            SampleStop::Settled,
             SampleStop::RoundsExhausted,
         ] {
             assert_eq!(serde_json::json!(stop), serde_json::json!(stop.code()));

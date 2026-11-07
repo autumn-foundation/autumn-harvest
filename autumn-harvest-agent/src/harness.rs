@@ -32,7 +32,9 @@ use crate::policy::{
 };
 use crate::refine::{DEFAULT_PROPOSER_TIMEOUT, OverlayProposer};
 use crate::response_cache::{CacheKey, KeyTenant, ResponseCache};
-use crate::sampling::{PolicyRead, PolicyStoreError, SamplingPolicy, SamplingPolicyStore};
+use crate::sampling::{
+    AnswerKeyFn, PolicyRead, PolicyStoreError, SamplingPolicy, SamplingPolicyStore,
+};
 use crate::score::Scorer;
 use crate::skill::{LOAD_SKILL_TOOL, SkillTool};
 use crate::tool::{Tool, ToolContext, ToolEffect};
@@ -152,6 +154,7 @@ pub struct AgentHarness {
     selector: Option<Arc<dyn crate::refine::OverlaySelector>>,
     sampling: Option<Arc<dyn SamplingPolicyStore>>,
     scorers: BTreeMap<String, Arc<dyn Scorer>>,
+    answer_keys: BTreeMap<String, Arc<dyn AnswerKeyFn>>,
     score_timeout: Duration,
     overlays: Option<Arc<dyn ProfileOverlayStore>>,
 }
@@ -177,6 +180,7 @@ impl AgentHarness {
             selector: None,
             sampling: None,
             scorers: BTreeMap::new(),
+            answer_keys: BTreeMap::new(),
             score_timeout: DEFAULT_SCORE_TIMEOUT,
             overlays: None,
             tools: Vec::new(),
@@ -418,6 +422,35 @@ impl AgentHarness {
     /// The scorer with this id.
     pub(crate) fn scorer_of(&self, id: &str) -> Option<&Arc<dyn Scorer>> {
         self.scorers.get(id)
+    }
+
+    /// Add an app key function of the vote strategy under its id. The
+    /// `agent_vote_key` activity calls it.
+    ///
+    /// A later function with the same id replaces the earlier one. A vote
+    /// can name only an id that is an agent name, so the harness logs a
+    /// warning for any other id.
+    #[must_use]
+    pub fn answer_key(mut self, key: Arc<dyn AnswerKeyFn>) -> Self {
+        if !crate::mesh::valid_name(key.id()) {
+            tracing::warn!(
+                id = %truncate(key.id(), crate::mesh::MAX_NAME_LEN),
+                "an answer key id that is not an agent name: no vote can name it"
+            );
+        }
+        self.answer_keys.insert(key.id().to_owned(), key);
+        self
+    }
+
+    /// Whether the harness has an app key function with this id.
+    #[must_use]
+    pub fn has_answer_key(&self, id: &str) -> bool {
+        self.answer_keys.contains_key(id)
+    }
+
+    /// The app key function with this id.
+    pub(crate) fn answer_key_of(&self, id: &str) -> Option<&Arc<dyn AnswerKeyFn>> {
+        self.answer_keys.get(id)
     }
 
     /// Set the time budget of one score, judge calls included.

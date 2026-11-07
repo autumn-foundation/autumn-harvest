@@ -1,0 +1,29 @@
+# Ledger profiles for `autumn-harvest/src/activity_defaults.rs`. See `docs/ledger/README.md`.
+
+["db::load_activity_default_overrides"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_activity_default_overrides"]
+measured = "unmeasured"
+
+["db::lock_activity"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = []
+measured = "unmeasured"
+
+["db::select_override"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_activity_default_overrides"]
+measured = "unmeasured"
+
+["db::update_activity_default_override"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_activity_default_overrides"]
+measured = "unmeasured"

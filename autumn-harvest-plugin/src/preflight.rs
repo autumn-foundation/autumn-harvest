@@ -440,6 +440,12 @@ const HARVEST_WRITE_PRIVILEGE_REQUIREMENTS: &[(&str, &[&str])] = &[
         "harvest_run_default_overrides",
         &["SELECT", "INSERT", "UPDATE", "DELETE"],
     ),
+    // Every refresh loop reads the activity default overrides. The activity
+    // defaults PATCH writes and deletes rows.
+    (
+        "harvest_activity_default_overrides",
+        &["SELECT", "INSERT", "UPDATE", "DELETE"],
+    ),
     // The sampling policy routes read and write the policy of an agent kind
     // (issue #2439). A set or reset upserts the row and inserts its audit
     // row. A reset keeps the row, so no DELETE is needed.

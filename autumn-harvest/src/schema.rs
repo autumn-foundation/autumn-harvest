@@ -450,6 +450,27 @@ diesel::table! {
 diesel::table! {
     use diesel::sql_types::*;
 
+    /// Operator overrides for the defaults of an activity type. A NULL column
+    /// inherits the code value.
+    harvest_activity_default_overrides (activity_name) {
+        activity_name -> Text,
+        retry_max_attempts -> Nullable<Int4>,
+        retry_initial_interval_ms -> Nullable<Int8>,
+        retry_max_interval_ms -> Nullable<Int8>,
+        start_to_close_ms -> Nullable<Int8>,
+        heartbeat_timeout_ms -> Nullable<Int8>,
+        schedule_to_start_ms -> Nullable<Int8>,
+        schedule_to_close_ms -> Nullable<Int8>,
+        reason -> Nullable<Text>,
+        updated_by -> Text,
+        created_at -> Timestamptz,
+        updated_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
+    use diesel::sql_types::*;
+
     /// Operator overrides for per-type run defaults (issue #2387). A NULL
     /// column inherits the code value.
     harvest_run_default_overrides (workflow_name) {
@@ -1537,6 +1558,7 @@ diesel::allow_tables_to_appear_in_same_query!(
     harvest_calendar_exclusions,
     harvest_schedule_decisions,
     harvest_run_default_overrides,
+    harvest_activity_default_overrides,
     harvest_schedule_overrides,
     harvest_schedule_override_receipts,
     harvest_rate_limit_buckets,

@@ -1684,6 +1684,10 @@ path = "with_activity_defaults"
 receiver = "WorkflowContext"
 reason = "context.rs:3726; builder-style setter called by the worker/test harness before the workflow body runs. Emits no command and reads nothing ambient."
 [[non_sink]]
+path = "with_activity_overrides"
+receiver = "WorkflowContext"
+reason = "context.rs:4442; builder-style setter called by the worker before the workflow body runs. Emits no command. The cache it installs is read only at schedule time, and replay never compares the values it resolves."
+[[non_sink]]
 path = "with_activity_input_override"
 receiver = "WorkflowContext"
 reason = "context.rs:3747; builder-style setter called by the worker/test harness before the workflow body runs. Emits no command and reads nothing ambient."

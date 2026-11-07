@@ -843,3 +843,55 @@ async fn a_cascade_peer_op_with_no_allowed_tier_asks_no_model() {
     let error = reply["error"].as_str().unwrap_or_default();
     assert!(error.contains("no_accepted_draw"), "{reply}");
 }
+
+fn vote_policy() -> SamplingPolicy {
+    SamplingPolicy {
+        strategies: BTreeSet::from([Strategy::Vote]),
+        max_draws: 3,
+        ..SamplingPolicy::default()
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_vote_op_needs_no_scorer_and_keeps_the_most_common_answer() {
+    let (_dir, db) = fresh_db();
+    let model = by_draw(&["b", "a", "b"], "plain");
+    let mut rt = runtime(
+        &db,
+        harness(model.clone(), AgentProfile::new(KIND), &vote_policy()),
+    );
+    let agent = desk("twenty");
+
+    let vote = OpSample::vote(3, autumn_harvest_agent::sampling::AnswerKey::Trimmed);
+    send(
+        &mut rt,
+        &agent,
+        &AgentOp::message("Pick.").with_sample(vote),
+    )
+    .await;
+
+    let state = state(&rt, &agent).await;
+    assert_eq!(state.failures, 0, "{:?}", state.last_error);
+    assert_eq!(state.last_answer.as_deref(), Some("b"), "two of three");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn each_draw_of_a_vote_op_counts_against_the_fan_out() {
+    let (_dir, db) = fresh_db();
+    let model = by_draw(&["b"], "plain");
+    let profile = AgentProfile::new(KIND).mandate(Mandate::new(KIND).max_delegations(2));
+    let mut rt = runtime(&db, harness(model.clone(), profile, &vote_policy()));
+    let agent = desk("twenty-one");
+
+    let vote = OpSample::vote(3, autumn_harvest_agent::sampling::AnswerKey::Trimmed);
+    send(
+        &mut rt,
+        &agent,
+        &AgentOp::message("Pick.").with_sample(vote),
+    )
+    .await;
+
+    assert!(model.requests().is_empty(), "no draw runs");
+    let error = state(&rt, &agent).await.last_error.unwrap_or_default();
+    assert!(error.contains("fan_out_exhausted"), "{error}");
+}

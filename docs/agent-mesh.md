@@ -109,7 +109,7 @@ tokens. Keep the limit inside the context window of your model.
 A cut answer ends with `…[truncated]`. The result also has
 `"truncated": true`, the report sets `DelegationRecord::answer_truncated`,
 and the worker logs a warning. The peer lookup records the limit, so replay
-cuts each answer as the live run did. A run recorded before issue #2481
+cuts each answer as the live run did. A run recorded before 0.10.0
 keeps its old cut of 8 000 characters and has no `truncated` field.
 
 Tools key idempotency on `(run_id, step, call_id)`. A child has its own run
@@ -189,8 +189,8 @@ durable receiver returns `model_forbidden` when the accepted mandate does
 not allow its own model. Only a send to a durable peer returns `deadlock` or
 `peer_unavailable`.
 A strategy run returns `draws_exceeded`, then `fan_out_exhausted`, before
-its first draw. Each draw of best-of-N or rejection, and each tier of a
-cascade, counts as one delegation. The draws split the delegations left
+its first draw. Each draw of best-of-N, rejection or a vote, and each tier
+of a cascade, counts as one delegation. The draws split the delegations left
 with `sibling_cap`. A beam checks `max_draws` only, because it counts its
 delegations per path.
 `Refusal` implements `std::error::Error`.

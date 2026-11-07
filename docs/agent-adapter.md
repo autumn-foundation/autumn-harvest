@@ -1262,8 +1262,8 @@ also refuses an overlay that `agent::overlay::apply` refuses. A history with pay
 encrypted payloads needs decoding first. The model call blocks in place, so
 run the evaluation on a multi-thread Tokio runtime.
 
-The evaluation is an in-memory fork at the first event. The database fork of
-issue #2000 is a separate feature.
+The evaluation is an in-memory fork at the first event. A database fork is a
+separate feature.
 
 ### Anonymise a pool
 
@@ -2054,7 +2054,8 @@ let op = AgentOp::message("Name a prime.").with_sample(sample);
   continues the run of its beam, and the beam counts its delegations step
   by step.
 - Each tier of a cascade (section 20) is a run of its own, so it counts as
-  one delegation, as a draw of best-of-N does. A cascade peer op checks
+  one delegation, as a draw of best-of-N or of a vote does.
+  `OpSample::vote` runs a vote (section 26), which needs no scorer. A cascade peer op checks
   the tier models against the accepted mandate, not the model of the
   profile. It skips each forbidden tier. With no tier left, it ends with
   `no_accepted_draw`.
@@ -2318,7 +2319,7 @@ an overlay go live without a person. A change takes effect at the next
 read, with no restart: the next op, or the next refine run.
 
 Today the store enforces `ceilings`, `auto_adopt.parts` and
-`auto_adopt.max_per_day`. The refine workflow of #2380 reads `ceilings`,
+`auto_adopt.max_per_day`. The refine workflow reads `ceilings`,
 `probe_effects` and `proposal_attempts` (section 22). The adoption gate
 reads `auto_adopt` and `approval_timeout` (section 23). The lesson library
 reads `lessons.max_entries` at each write (section 24).
@@ -2365,7 +2366,7 @@ harvest agents profile policy support reset
   record. A change during the run never widens that run. A narrowing
   reaches its adoption at once, because the store also checks its current
   policy.
-- **Ceilings.** The store validator and the op read of #2372 apply each
+- **Ceilings.** The store validator and the op read apply each
   overlay under `policy.ceilings.resolve(profile)`. The op read takes the
   policy in the same recorded activity. A raised ceiling lets an overlay
   pass the profile bound. A lowered one fails the next op of a version
@@ -2386,7 +2387,7 @@ harvest agents profile policy support reset
 | `auto_adopted` | The candidate went live without a person. |
 | `awaiting_approval` | The candidate waits, with the reason. |
 | `unchanged` | The candidate changes no part. |
-| `timed_out` | The gate of #2381 waited for `approval_timeout`. It will use `RefinePolicy::gate_state`. |
+| `timed_out` | The adoption gate waited for `approval_timeout`. It will use `RefinePolicy::gate_state`. |
 
 - **Probes.** `eval::live_probe` takes the set of `probe_effects` (issue
   #2378). The tool-call activity of the probe refuses any other effect. A
@@ -2403,7 +2404,7 @@ proves that the auto moves of a day never pass the cap. The design is in [`DESIG
 
 ## 19. Sampling policy (issue #2439)
 
-Each strategy of epic #2438 runs more than one draw. A draw can call
+Each sampling strategy runs more than one draw. A draw can call
 tools. An operator sets the limits of each agent kind in one
 `SamplingPolicy`. A missing policy means every default, and each default
 is the safe value.
@@ -2531,13 +2532,15 @@ let input = SampleInput::new(
 |---|---|
 | `best_of_n { n }` | Runs `n` draws, scores each, and selects with `select` (section 17). A tie goes to the lowest draw id. |
 | `rejection { max_attempts, threshold }` | Runs draws until one scores at or above `threshold`, up to `max_attempts` draws. It runs one draw at a time unless the input asks for more. It stops after the wave that holds the pass. |
+| `vote { n, key }` | Keys each answer, and selects the most common key. It needs no scorer. See section 26. |
 | `cascade { tiers }` | Asks each tier in order, one draw per tier, and stops at the first answer at or above the threshold of its tier. See "Model cascade" below. |
 
 The run reads the profile and the sampling policy of the kind once each,
 as `agent_draws` does (section 19). In a run that starts after this
 release, a profile mandate admits the draws first, as for a strategy op
 (section 15). The policy admits the strategy, the
-draw count (`n` or `max_attempts`), the concurrency and the scorer. Each
+draw count (`n` or `max_attempts`), the concurrency and the scorer of
+best-of-N and rejection. Each
 draw gets `draw_effects`, so with the default `[read_only]` a draw that
 calls a `write` tool gets a refusal, and the tool body never runs.
 
@@ -2579,14 +2582,16 @@ model is not called.
   cascade accepted; or `no_accepted_draw` when no draw passed;
 - `selected`: the `AgentReport` of the selected draw;
 - `stopped`: `completed`, `accepted` (a rejection or cascade run found a
-  pass), `budget_exceeded`, `score_failed` or `rounds_exhausted` (a beam
-  run ended its last round with a live beam);
+  pass), `budget_exceeded`, `score_failed`, `settled` (a vote leader
+  cannot lose) or `rounds_exhausted` (a beam run ended its last round with
+  a live beam);
 - `attempts`: the draws that ran;
 - `draws`: for each draw, its stop, verdict, usage and cost. The usage and
   the cost include the judge calls of the draw. A cascade draw also holds
-  the `model` of its tier;
+  the `model` of its tier, and a vote draw its key (section 26);
 - `skipped`: each cascade tier whose model the mandate forbids, with its
   refusal;
+- `tally`: for a vote, the votes of each key, the winner first;
 - `usage` and `cost_usd_micros`: the totals. They equal the cost ledger
   rows of the run tree.
 - `flow_labels`: the labels of each draw, selected or not.
@@ -2959,7 +2964,7 @@ On Postgres, install `postgres::Sources::new(pg)` and start the workflow
   policy ceilings, as the stages do. SQLite has no fork, so the probe records
   `live re-probe skipped: SQLite has no fork` in the stage notes.
 - **Compose and select.** An `OverlayComposer` reads the probes under
-  opaque ids, with the anonymised pool of issue #2376. The pool redacts
+  opaque ids, with the anonymised pool. The pool redacts
   each route that a probe asked for, with its model id. So a route that a
   probe inherits from its source task, or the route of a recorded peer, is
   redacted too. With a workspace store, the composer also reads an
@@ -3220,3 +3225,67 @@ kind. The next run reads the library and gives it to each proposer as
 data, with its flow labels. `lessons.max_entries` bounds the library,
 and the oldest lesson goes first. The example installs an
 `InMemoryMemoryStore`, so its run writes one lesson.
+
+## 26. The vote strategy
+
+A vote runs a task many times, keys each final answer, and selects the
+most common key. This is self-consistency. It needs no scorer and no
+judge, so its only spend is the draws. It works when an answer has a
+canonical form, such as a number, a label or a tool name.
+
+```rust
+use autumn_harvest_agent::sampling::{AnswerKey, SampleInput};
+
+// The policy of `researcher` must list `vote`, with `max_draws >= 5`.
+
+let input = SampleInput::vote("researcher", "What is 17 * 23?", 5, AnswerKey::LastNumber)
+    .concurrency(1);
+// SQLite: autumn_harvest_agent::sqlite::start_sample(&mut rt, &input)
+```
+
+| Key | The key of an answer |
+|---|---|
+| `trimmed` | The answer with no white space at each end. |
+| `last_number` | The last decimal number, in canonical form: `1,200.50` gives `1200.5`, and `.5` gives `0.5`. Only ASCII digits count. An exponent is a number of its own, so `1e5` gives `5`. |
+| `{"json_field": "/a/b"}` | The field at a JSON pointer (RFC 6901) of the JSON answer. A string gives its trimmed text. A number gives its exact decimal form, so `1`, `1.0` and `1e0` all give `1`, and no digit is lost. `null` gives no key. Each other value gives its JSON text. |
+| `{"custom": "id"}` | The result of the app `AnswerKeyFn` with this id, which must be an agent name. Add it with `AgentHarness::answer_key`. Make it a fast, pure function: it runs inline, with no time budget. |
+
+- **Votes.** Only a draw that completed casts a vote. A draw with no key,
+  or with a key over 1 KiB as JSON text, casts no vote. Its verdict is a
+  reject that names the reason. A draw with a key gets a score of 1.
+- **Winner.** The key with the most votes wins. A tie goes to the key
+  whose first vote has the lowest draw id. The run selects that first
+  draw. With no vote at all, the outcome is `no_accepted_draw`.
+- **Early stop.** After each wave, let `lead` and `second` be the top two
+  counts, and `left` the draws not yet started. When draws are left and
+  `lead > second + left`, the run starts no more draws, and `stopped` is
+  `settled`. Each draw of the wave counts. When the last wave decides the
+  vote, `stopped` is `completed`. Verus proves that the winner and its
+  first draw are then those of the full run, for each way the left draws
+  could vote. It also proves that the order in which draws end does not
+  change the winner.
+- **Concurrency.** A vote takes the cap of the policy by default. A run
+  whose draws fit in one wave never stops early. A lower concurrency lets
+  the run stop after fewer draws.
+- **Failures.** A failed key activity gives the draw a reject, and the
+  run stops with `score_failed`. So does a worker that has no function
+  for an app key, so a fleet that is half upgraded never casts empty
+  votes. A failed key wins over a settled vote and over a budget stop. A
+  settled vote wins over a budget stop.
+- **Report.** `SampleReport::tally` holds the votes of each key, the
+  winner first. `SampleDraw::key` holds the key of each draw.
+- **Durability.** The recorded `agent_vote_key` activity applies each
+  key, built-in or app. So replay reads each key, and a later change to a
+  key rule never changes a recorded run. After a crash, replay rebuilds
+  the tally, and the run starts only the draws that are missing.
+- **Refusals.** Each one comes before any model call: a kind whose policy
+  does not list `vote` (`strategy_not_allowed`), a vote with a scorer
+  (`scorer_not_used`), a key that is not valid (`invalid_answer_key`) and
+  an app key that the harness lacks (`unknown_answer_key`). Best-of-N and
+  rejection with no scorer give `no_scorer`.
+- **The gate of an app key.** The policy does not list app keys. A vote
+  can name only a function that the app added to its harness, and the
+  function gets no model and no context.
+
+The draws share the token budget and the draw effects of section 20. The
+design is in [`DESIGN-2444.md`](design/DESIGN-2444.md).
