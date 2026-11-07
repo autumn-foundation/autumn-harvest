@@ -21,7 +21,7 @@ about 4.2 buffers per row. The claim takes one row of about 29.
   So a `ctid` read in `seek_heads` names the same tuple in the refine.
 - A TID scan reads the heap page only. It reads no index page.
 - `harvest_task_queue` is not partitioned. A `ctid` is unique in it.
-- Postgres plans `ctid = ANY(<array>)` as a TID scan from Postgres 8.3.
+- Postgres plans `ctid = ANY(<array>)` as a TID scan. Harvest supports Postgres 12 and later.
 - A peer can commit an update to a window row after the claim snapshot and
   before the claim locks the row. Postgres then rechecks the newest version
   (EvalPlanQual). The new version has a new `ctid`. So a TID refine skips
@@ -50,7 +50,7 @@ How can this change make the claim worse?
 | A gate or the order changes | Only the row source changes. Every gate and the sort stay in `claim_candidate_scan_sql!`. The order tests and the random drains run again. |
 | A splice anchor breaks | The kind, fence, owner and fair splices anchor on other text. Their shape tests run again. |
 | The `claimed` update or the lock set changes | `claimed` still joins on `id`. The refine locks the same rows. |
-| Postgres 12 lacks the plan | A TID scan on `= ANY` exists from 8.3. |
+| Postgres 12 lacks the plan | The TID scan has served `= ANY` for many releases before 12. |
 
 ## 5. A concurrent update to a pending row
 

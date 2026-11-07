@@ -1554,7 +1554,8 @@ macro_rules! claim_seek_ctes_sql {
     () => {
         concat!(
             "seek_heads AS MATERIALIZED ( \
-             SELECT h.seek_id, h.seek_rank, h.seek_priority, h.seek_due, h.seek_pinned, \
+             SELECT h.seek_id, h.seek_ctid, h.seek_rank, h.seek_priority, h.seek_due, \
+                    h.seek_pinned, \
                     h.seek_concurrency_key, h.seek_concurrency_cap, h.seek_task_type, \
                     h.head_queue, h.head_kind, h.head_new_start, \
                     row_number() OVER ( \
@@ -1627,11 +1628,13 @@ macro_rules! claim_seek_ctes_sql {
 /// The columns of one window row, read from the table row in a head scan.
 ///
 /// The rank and the due time are the claim key expressions of
-/// `claim_order_by_sql!`, without ageing.
+/// `claim_order_by_sql!`, without ageing. `seek_ctid` names the tuple that
+/// the head scan read. The candidate scans read the row again by it (issue
+/// #2547).
 macro_rules! claim_seek_row_sql {
     () => {
         concat!(
-            "id AS seek_id, \
+            "id AS seek_id, ctid AS seek_ctid, \
              CASE WHEN sticky_worker_id = $1 AND sticky_until > NOW() THEN 1 ELSE 0 END AS seek_rank, \
              priority AS seek_priority, ",
             claim_order_due_sql!(),
@@ -1737,11 +1740,11 @@ macro_rules! claim_deep_seek_ctes_sql {
             ") d \
          ), \
          seek_deep_window AS MATERIALIZED ( \
-             SELECT seek_id, seek_rank, seek_priority, seek_due, \
+             SELECT seek_id, seek_ctid, seek_rank, seek_priority, seek_due, \
                     seek_concurrency_key, seek_concurrency_cap, seek_task_type \
              FROM seek_heads \
              UNION ALL \
-             SELECT seek_id, seek_rank, seek_priority, seek_due, \
+             SELECT seek_id, seek_ctid, seek_rank, seek_priority, seek_due, \
                     seek_concurrency_key, seek_concurrency_cap, seek_task_type \
              FROM seek_deep_rows \
          ), \
@@ -1795,13 +1798,13 @@ macro_rules! claim_deep_seek_gate_sql {
 /// `$rows` names the window CTE and `$bounds` its bounds. The deep window
 /// passes its own pair (issue #2420).
 ///
-/// The candidate scan reads the table rows by primary key through the
-/// array. See `claim_seek_rows_sql!` for why no other index can serve it.
+/// The candidate scan reads the table rows by `ctid` through the array: a
+/// TID scan. See `claim_seek_rows_sql!` for why.
 macro_rules! claim_seek_guard_sql {
     ($rows:literal, $bounds:literal) => {
         concat!(
-            "AND harvest_task_queue.id = ANY(ARRAY( \
-                   SELECT w.seek_id FROM ",
+            "AND harvest_task_queue.ctid = ANY(ARRAY( \
+                   SELECT w.seek_ctid FROM ",
             $rows,
             " w \
                    WHERE NOT EXISTS (SELECT 1 FROM ",
@@ -1820,11 +1823,11 @@ macro_rules! claim_seek_guard_sql {
     };
 }
 
-/// The state test of the window candidate scan (issue #1971).
+/// The state test of the window candidate scan (issues #1971, #2547).
 ///
-/// The scan must read its rows by primary key. Any other plan reads the
-/// whole backlog. The planner guesses the size of the id array and the
-/// number of `PENDING` rows. With stale statistics it picked other plans:
+/// The scan must read its rows by `ctid`, with a TID scan. Any other plan
+/// reads the whole backlog. Before issue #2547 the scan read its rows by
+/// primary key. With stale statistics the planner picked other plans:
 ///
 /// - A partial index that holds `id`, such as `idx_harvest_tq_live_created`:
 ///   a full index scan with the id test, 17K buffers.
@@ -1842,8 +1845,20 @@ macro_rules! claim_seek_guard_sql {
 ///   matches. The row lock still rechecks the state.
 ///
 /// The other row tests prove none of the partial-index predicates that do
-/// not test the state. Only the primary key and a scan of the whole table
-/// remain. The primary key costs one probe per window row.
+/// not test the state. Only a TID scan and a scan of the whole table
+/// remain. A TID scan reads the heap page of each window row and no index
+/// page. A primary-key probe also walks the index from its root. On the e2e
+/// bench that cost about 4.2 buffers per row, against about 1 for a TID.
+///
+/// The `ctid` comes from a head scan of the same statement, so both read
+/// one snapshot. That snapshot sees the tuple, so `VACUUM` cannot remove
+/// it, and the `ctid` names the same row. `harvest_task_queue` is not
+/// partitioned, so a `ctid` is unique in it.
+///
+/// A peer can commit an update to a window row after the snapshot and
+/// before the row lock. The lock then rechecks the newest version, which
+/// has a new `ctid`. So the scan skips the row, as `SKIP LOCKED` skips a
+/// held row. A later claim reads the new version.
 macro_rules! claim_seek_rows_sql {
     () => {
         "harvest_task_queue.state = (SELECT 'PENDING'::text) "
@@ -2067,8 +2082,8 @@ const fn claim_task_full_scan_query() -> &'static str {
 /// a small backlog that is more than the claim costs to run. Postgres may
 /// keep a custom plan anyway,
 /// because it compares estimated costs, not planning time. The generic plan
-/// has the same shape: bounded head scans, a lookup by primary key and a
-/// gated full scan. An `ANALYZE` of the table invalidates it.
+/// has the same shape: bounded head scans, a TID lookup and a gated full
+/// scan. An `ANALYZE` of the table invalidates it.
 ///
 /// **No bitmap scans.** A head scan must read the index in claim order and
 /// stop at the window. A bitmap scan reads every due row of the head and
@@ -12680,7 +12695,7 @@ mod tests {
         );
         let seek = cte(sql, "seek_candidate", "seek_held");
         for clause in [
-            "AND harvest_task_queue.id = ANY(ARRAY( SELECT w.seek_id FROM seek_heads w",
+            "AND harvest_task_queue.ctid = ANY(ARRAY( SELECT w.seek_ctid FROM seek_heads w",
             "NOT EXISTS (SELECT 1 FROM seek_bounds b",
             "FROM seek_running_counts rc",
             "FOR UPDATE SKIP LOCKED",
@@ -12691,6 +12706,42 @@ mod tests {
             !seek.contains("concurrency_running_counts"),
             "the window must not read the backlog-wide count CTE; got:\n{seek}"
         );
+    }
+
+    /// Each window scan reads its rows by `ctid`, not by primary key
+    /// (issue #2547).
+    #[test]
+    fn claim_query_window_scans_read_rows_by_ctid() {
+        assert!(claim_seek_row_sql!().starts_with("id AS seek_id, ctid AS seek_ctid, "));
+        let sql = claim_task_query();
+        assert!(
+            cte(sql, "seek_heads", "seek_bounds").contains("SELECT h.seek_id, h.seek_ctid, "),
+            "the window carries the ctid of each row; got:\n{sql}"
+        );
+        assert_eq!(
+            cte(sql, "seek_deep_window", "seek_deep_bounds")
+                .matches("SELECT seek_id, seek_ctid, ")
+                .count(),
+            2,
+            "both arms of the deep window carry the ctid; got:\n{sql}"
+        );
+        for (from, to) in [
+            ("seek_candidate", "seek_held"),
+            ("seek_held", "seek_contended"),
+            ("seek_deep_candidate", "legacy_candidate"),
+        ] {
+            let scan = cte(sql, from, to);
+            assert_eq!(
+                scan.matches("AND harvest_task_queue.ctid = ANY(ARRAY( SELECT w.seek_ctid FROM ")
+                    .count(),
+                1,
+                "{from} reads its rows by ctid; got:\n{scan}"
+            );
+            assert!(
+                !scan.contains("harvest_task_queue.id = ANY"),
+                "{from} must not probe the primary key; got:\n{scan}"
+            );
+        }
     }
 
     /// The full scan runs only when the window cannot decide.
@@ -12734,7 +12785,7 @@ mod tests {
         let held = cte(sql, "seek_held", "seek_contended");
         for clause in [
             "seek_held AS MATERIALIZED",
-            "AND harvest_task_queue.id = ANY(ARRAY( SELECT w.seek_id FROM seek_heads w",
+            "AND harvest_task_queue.ctid = ANY(ARRAY( SELECT w.seek_ctid FROM seek_heads w",
             "NOT EXISTS (SELECT 1 FROM seek_bounds b",
             "AND NOT EXISTS (SELECT 1 FROM seek_candidate) ",
             "FROM seek_running_counts rc",
@@ -12772,7 +12823,7 @@ mod tests {
         }
         let deep = cte(sql, "seek_deep_candidate", "legacy_candidate");
         for clause in [
-            "SELECT w.seek_id FROM seek_deep_window w",
+            "AND harvest_task_queue.ctid = ANY(ARRAY( SELECT w.seek_ctid FROM seek_deep_window w",
             "NOT EXISTS (SELECT 1 FROM seek_deep_bounds b",
             "AND NOT EXISTS (SELECT 1 FROM seek_candidate) \
              AND EXISTS (SELECT 1 FROM seek_contended) ",

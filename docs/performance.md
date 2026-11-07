@@ -1348,11 +1348,12 @@ change. Design record: [`docs/design/DESIGN-1971.md`](design/DESIGN-1971.md).
   head. So a row must sort at or before the last row of each full head. A
   row pinned to this worker outranks the queue heads, and only a full pin
   head bounds it.
-- The window candidate scan reads the rows that pass the guard by primary
-  key and applies every gate. Its row test matches no partial index on
-  `PENDING` rows, and the claim turns bitmap scans off. So stale statistics
-  leave only a primary-key probe or a scan of the whole table. See the
-  stale-statistics result below.
+- The window candidate scan reads the rows that pass the guard by `ctid`
+  and applies every gate. Each window row carries the `ctid` that its head
+  scan read. Its row test matches no partial index on `PENDING` rows, and
+  the claim turns bitmap scans off. So stale statistics leave only a TID
+  scan or a scan of the whole table. See the stale-statistics result below
+  and [the refine by TID](#the-refine-by-tid-issue-2547).
 - When the window finds no candidate and a head is full, or when priority
   ageing is on, the same statement runs the full scan. A one-time filter
   gates it, and `EXPLAIN` shows it as `never executed` otherwise.
@@ -1435,8 +1436,8 @@ spills: 109,321 buffers and a spill before, 535 buffers and no spill after.
 **Stale statistics do not change the plan.** An `ANALYZE` saw 20 `PENDING`
 rows among 400K terminal rows. Then 30K rows arrived. The claim reads 479 to
 496 buffers, within 1% of the fresh plan. The window scan gives the planner
-no partial index on `PENDING` rows, so it probes the primary key. Before
-that fix, the same case read 11,704 buffers through a bitmap head scan, then
+no partial index on `PENDING` rows, so it probes the primary key. Since
+issue #2547 it reads each row by `ctid` instead. Before that fix, the same case read 11,704 buffers through a bitmap head scan, then
 30,278 through a partial index.
 
 ### Latency and throughput under contention
@@ -1582,14 +1583,67 @@ one more claim runs. PG16, warm cache:
 | 100,000 | 64 | 106,534 buffers, 2,259 temp blocks, full scan | 1,772 buffers |
 
 The held cost does not grow with K or with the backlog depth. Most of it is
-the deep candidate scan: one primary-key probe for each of the 256 deep
-rows, about 4 buffers each. A claim whose window finds a row pays nothing
+the deep candidate scan: one probe for each of the 256 deep rows. A
+primary-key probe read about 4 buffers. Since issue #2547 a TID probe reads
+about 1, and K = 32 reads about 780 buffers. See
+[the refine by TID](#the-refine-by-tid-issue-2547). A claim whose window finds a row pays nothing
 for the deep window. When the window finds no row, `seek_held` checks the
 window rows once more. The deep window reads rows only for a held head.
 
 The guard still cuts the deep rows at the last row of every other full
 head. When gates reject the rows of that head, fewer held claims can cause
 the fallback.
+
+### The refine by TID (issue #2547)
+
+On the e2e bench, the claim was 45.1% of shared buffers, at 141 buffers per
+call. The refine step was 84% of that. It read each window row again
+through `harvest_task_queue_pkey`, at about 4.2 buffers per row, to apply
+every gate and lock one row.
+
+The head scans already read each row from the heap. Since issue #2547 each
+window row carries the `ctid` of that tuple, and the refine reads the rows
+with a TID scan. A TID scan reads the heap page and no index page. The
+order, the gates, the lock set and the indexes do not change. Design
+record: [`docs/design/DESIGN-2547.md`](design/DESIGN-2547.md).
+
+`the_window_refine_reads_about_one_buffer_per_row` measures the refine on
+the issue #1956 fixture of `claim_seek_tests`, with 20,000 terminal rows as
+ballast. The figure is the median of three claims. It is the
+`seek_candidate` CTE, less its init plans and the gate subplans of the
+scan. PG16, warm cache:
+
+| pending rows | refined rows | before | after |
+|--:|--:|--:|--:|
+| 32 | 33 | 84 buffers, 2.55 per row | 36 buffers, 1.09 per row |
+| 1,000 | 79 | 239 buffers, 3.03 per row | 82 buffers, 1.04 per row |
+
+The whole claim, from the other tests of the same suite:
+
+| test | case | before | after |
+|:--|:--|--:|--:|
+| `claim_buffers_stay_flat_from_1k_to_100k_pending_rows` | 1,000 rows | 432 | 301 |
+| | 10,000 rows | 478 | 437 |
+| | 100,000 rows | 529 | 437 |
+| `held_claims_on_one_head_keep_the_claim_off_the_full_scan` | 100K rows, K = 0 | 263 | 171 |
+| | 100K rows, K = 32 | 1,726 | 781 |
+| | 100K rows, K = 64 | 1,769 | 816 |
+
+- **The refine now costs about 1 buffer per row.** The guard array is an
+  init plan. It can be the first reader of `seek_heads`, so the test
+  subtracts the init plans. Without that, the head scans count inside the
+  refine.
+- **The deep window gains the most.** It probes up to 256 rows of a held
+  head. Each probe now saves about 3 buffers.
+- **A concurrent update can make the claim skip a row.** A peer can commit
+  an update to a window row after the claim snapshot and before the row
+  lock. The new version has a new `ctid`, so the TID scan skips it. A
+  primary-key probe rechecked the new version and could take it. Only rare
+  writers keep a row `PENDING` when they update it: a priority change, a
+  sticky-pin release, a queue-pause shift and a signal re-pend. The skip
+  acts like a `SKIP LOCKED` skip, and a later claim reads the new version.
+- **Not measured: the e2e bench.** The issue #2547 profile was not run
+  again. The figures above are from the claim fixture only.
 
 ### Costs of the seek window
 
