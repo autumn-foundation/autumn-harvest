@@ -1,4 +1,4 @@
-## The claim window refines by TID (issue #2547)
+## The claim window refines by TID (issue #2547, PR #2612)
 
 The default claim reads its window rows again to apply every gate and to
 lock one row. That refine read each row through `harvest_task_queue_pkey`.
