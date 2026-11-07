@@ -2,8 +2,9 @@
 //!
 //! [`ActivityInfo`] declares five defaults in code: the retry policy,
 //! `start_to_close`, `heartbeat_timeout`, `schedule_to_start` and
-//! `schedule_to_close`. An override changes them at runtime, keyed by the
-//! activity name. The precedence is fixed:
+//! `schedule_to_close`. It also declares the `max_concurrent` cap. An
+//! override changes them at runtime, keyed by the activity name. The
+//! precedence is fixed:
 //!
 //! > call site, then override, then code, then builder default.
 //!
@@ -42,7 +43,21 @@
 //! A retry field applies only over a code retry policy. Code that declares no
 //! policy does not state that a retry is safe. A heartbeat
 //! timeout applies only over a code heartbeat timeout. An activity that does
-//! not heartbeat would time out on each attempt.
+//! not heartbeat would time out on each attempt. A cap applies only over a
+//! code cap. An activity with no code cap stores no concurrency key.
+//!
+//! ## The concurrency cap
+//!
+//! Each task row stores its cap as `concurrency_cap`. Each claim compares the
+//! running count of the key to the cap of the row. So a cap that applies to
+//! new rows only would leave the pending rows under the old cap.
+//! [`set_live_activity_caps`] sets the stored cap of each `PENDING` and
+//! `RUNNING` row of the activity. Call it on every shard after a change. A
+//! pending task then waits under the new cap. A running task runs on, and
+//! its retry waits under the new cap. The pass changes only the cap column.
+//!
+//! The key of the row stays the code key. Two activities that share a key
+//! declare one cap in code, so the route refuses an override for either.
 
 use std::time::Duration;
 
@@ -58,6 +73,11 @@ use crate::workflow_retry::{RetryLimits, RetryLimitsPatch};
 /// `chrono` panics, so the write refuses a value above this bound.
 pub const MAX_ACTIVITY_TIMEOUT: Duration = crate::run_defaults::MAX_RUN_DEFAULT;
 
+/// The largest cap that an override can set.
+///
+/// The task row stores the cap in an `INTEGER` column.
+pub const MAX_ACTIVITY_CAP: u32 = i32::MAX.unsigned_abs();
+
 /// Whether `name` is an engine activity that takes no override.
 ///
 /// The session activities and the liveness canary activity are engine
@@ -68,7 +88,7 @@ pub fn is_reserved_activity(name: &str) -> bool {
         || crate::canary::is_reserved_canary_name(name)
 }
 
-/// The five schedule-time values of one activity.
+/// The schedule-time values of one activity.
 ///
 /// `None` sets no value.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -83,6 +103,8 @@ pub struct ActivityDefaults {
     pub schedule_to_start: Option<Duration>,
     /// The bound on every attempt and every backoff together.
     pub schedule_to_close: Option<Duration>,
+    /// The cap on the running tasks of the concurrency key.
+    pub max_concurrent: Option<u32>,
 }
 
 impl ActivityDefaults {
@@ -95,6 +117,7 @@ impl ActivityDefaults {
             heartbeat_timeout: info.default_heartbeat_timeout,
             schedule_to_start: info.default_schedule_to_start,
             schedule_to_close: info.default_schedule_to_close,
+            max_concurrent: info.max_concurrent,
         }
     }
 
@@ -126,6 +149,8 @@ pub struct ActivityDefaultFields {
     pub schedule_to_start: Option<Duration>,
     /// The bound on every attempt and every backoff together.
     pub schedule_to_close: Option<Duration>,
+    /// The cap on the running tasks of the concurrency key.
+    pub max_concurrent: Option<u32>,
 }
 
 impl ActivityDefaultFields {
@@ -137,13 +162,14 @@ impl ActivityDefaultFields {
             && self.heartbeat_timeout.is_none()
             && self.schedule_to_start.is_none()
             && self.schedule_to_close.is_none()
+            && self.max_concurrent.is_none()
     }
 
     /// Apply this override to the code values of one activity.
     ///
     /// A set field replaces the code value. A retry field applies only over
     /// a code policy. A heartbeat timeout applies only over a code heartbeat
-    /// timeout.
+    /// timeout. A cap applies only over a code cap.
     #[must_use]
     pub fn apply(&self, code: ActivityDefaults) -> ActivityDefaults {
         ActivityDefaults {
@@ -154,6 +180,9 @@ impl ActivityDefaultFields {
                 .map(|declared| self.heartbeat_timeout.unwrap_or(declared)),
             schedule_to_start: self.schedule_to_start.or(code.schedule_to_start),
             schedule_to_close: self.schedule_to_close.or(code.schedule_to_close),
+            max_concurrent: code
+                .max_concurrent
+                .map(|declared| self.max_concurrent.unwrap_or(declared)),
         }
     }
 }
@@ -175,6 +204,8 @@ pub struct ActivityDefaultPatch {
     pub schedule_to_start: Option<Option<Duration>>,
     /// The bound on every attempt and every backoff together.
     pub schedule_to_close: Option<Option<Duration>>,
+    /// The cap on the running tasks of the concurrency key.
+    pub max_concurrent: Option<Option<u32>>,
 }
 
 impl ActivityDefaultPatch {
@@ -187,6 +218,7 @@ impl ActivityDefaultPatch {
             heartbeat_timeout: self.heartbeat_timeout.unwrap_or(stored.heartbeat_timeout),
             schedule_to_start: self.schedule_to_start.unwrap_or(stored.schedule_to_start),
             schedule_to_close: self.schedule_to_close.unwrap_or(stored.schedule_to_close),
+            max_concurrent: self.max_concurrent.unwrap_or(stored.max_concurrent),
         }
     }
 
@@ -198,6 +230,7 @@ impl ActivityDefaultPatch {
             && self.heartbeat_timeout.is_none()
             && self.schedule_to_start.is_none()
             && self.schedule_to_close.is_none()
+            && self.max_concurrent.is_none()
     }
 }
 
@@ -224,7 +257,8 @@ pub use db::*;
 #[cfg(feature = "db")]
 mod db {
     use super::{
-        ActivityDefaultFields, ActivityDefaultOverride, ActivityDefaultPatch, MAX_ACTIVITY_TIMEOUT,
+        ActivityDefaultFields, ActivityDefaultOverride, ActivityDefaultPatch, MAX_ACTIVITY_CAP,
+        MAX_ACTIVITY_TIMEOUT,
     };
     use std::time::Duration;
 
@@ -248,6 +282,7 @@ mod db {
         heartbeat_timeout_ms: Option<i64>,
         schedule_to_start_ms: Option<i64>,
         schedule_to_close_ms: Option<i64>,
+        max_concurrent: Option<i32>,
         reason: Option<String>,
         updated_by: String,
         created_at: DateTime<Utc>,
@@ -317,6 +352,15 @@ mod db {
                     self.schedule_to_close_ms,
                     MAX_ACTIVITY_TIMEOUT,
                 )?,
+                max_concurrent: self
+                    .max_concurrent
+                    .map(|n| {
+                        u32::try_from(n)
+                            .ok()
+                            .filter(|n| *n > 0)
+                            .ok_or_else(|| unreadable("max_concurrent", i64::from(n)))
+                    })
+                    .transpose()?,
             };
             Ok(ActivityDefaultOverride {
                 activity_name: self.activity_name,
@@ -463,6 +507,9 @@ mod db {
             let heartbeat_timeout_ms = merged.heartbeat_timeout.map(to_millis);
             let schedule_to_start_ms = merged.schedule_to_start.map(to_millis);
             let schedule_to_close_ms = merged.schedule_to_close.map(to_millis);
+            let max_concurrent = merged
+                .max_concurrent
+                .map(|n| i32::try_from(n).unwrap_or(i32::MAX));
             diesel::insert_into(dsl::harvest_activity_default_overrides)
                 .values((
                     dsl::activity_name.eq(change.activity_name),
@@ -473,6 +520,7 @@ mod db {
                     dsl::heartbeat_timeout_ms.eq(heartbeat_timeout_ms),
                     dsl::schedule_to_start_ms.eq(schedule_to_start_ms),
                     dsl::schedule_to_close_ms.eq(schedule_to_close_ms),
+                    dsl::max_concurrent.eq(max_concurrent),
                     dsl::reason.eq(change.reason),
                     dsl::updated_by.eq(change.actor),
                     dsl::created_at.eq(now),
@@ -488,6 +536,7 @@ mod db {
                     dsl::heartbeat_timeout_ms.eq(heartbeat_timeout_ms),
                     dsl::schedule_to_start_ms.eq(schedule_to_start_ms),
                     dsl::schedule_to_close_ms.eq(schedule_to_close_ms),
+                    dsl::max_concurrent.eq(max_concurrent),
                     dsl::reason.eq(change.reason),
                     dsl::updated_by.eq(change.actor),
                     dsl::updated_at.eq(now),
@@ -536,7 +585,146 @@ mod db {
                 )));
             }
         }
+        if let Some(cap) = patch.max_concurrent.flatten()
+            && !(1..=MAX_ACTIVITY_CAP).contains(&cap)
+        {
+            return Err(HarvestError::Config(format!(
+                "max_concurrent must be from 1 to {MAX_ACTIVITY_CAP}"
+            )));
+        }
         check_retry_patch(&patch.retry)
+    }
+
+    /// The result of [`set_live_activity_caps`].
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct CapRewrite {
+        /// The number of task rows whose cap changed.
+        pub rewritten: u64,
+        /// Whether a newer change replaced the cap, so the pass stopped.
+        pub superseded: bool,
+    }
+
+    /// The rows that one batch of [`set_live_activity_caps`] updates.
+    const CAP_REWRITE_BATCH: i64 = 500;
+
+    /// The update of one batch of [`set_live_activity_caps`].
+    ///
+    /// A row with no key takes no cap at claim, so the filter skips it. A
+    /// row that holds `$2` already is not counted.
+    const CAP_REWRITE_SQL: &str = "\
+        WITH batch AS ( \
+            SELECT id \
+            FROM harvest_task_queue \
+            WHERE activity_name = $1 \
+              AND task_type = 'activity' \
+              AND state IN ('PENDING', 'RUNNING') \
+              AND concurrency_key IS NOT NULL \
+              AND concurrency_cap IS DISTINCT FROM $2 \
+            ORDER BY id \
+            LIMIT $3 \
+            FOR UPDATE SKIP LOCKED \
+        ) \
+        UPDATE harvest_task_queue AS t \
+        SET concurrency_cap = $2 \
+        FROM batch \
+        WHERE t.id = batch.id";
+
+    /// Set the stored cap of the live task rows of one activity to `cap`.
+    /// Call it on every shard after a change.
+    ///
+    /// The claim compares the running count of a key to the cap that each
+    /// row stores. So this pass sets the cap of each `PENDING` and `RUNNING`
+    /// row of the activity. A pending task then waits under `cap`. A retry
+    /// sets its row back to `PENDING` with its stored cap, so the pass covers
+    /// a running row too. The pass changes the cap column only. A running
+    /// task keeps its state, its worker and its attempt.
+    ///
+    /// `code_cap` is the cap that code declares. Each batch takes the lock
+    /// of the activity on the default shard and reads the stored override
+    /// there. If the effective cap is no longer `cap`, a newer change
+    /// replaced it, and the pass stops.
+    ///
+    /// The update runs in batches of 500 rows, and it skips a row that
+    /// another transaction holds. A later pass sets a skipped row.
+    ///
+    /// `store` is the default shard. `None` means that `conn` is the default
+    /// shard, and one transaction holds the lock and the update. Otherwise a
+    /// transaction on `store` holds the lock until the batch on `conn`
+    /// commits. A change of the override takes the same lock. So a newer cap
+    /// cannot commit between the check and the update.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestError::Database`] when a read or an update fails, and
+    /// [`HarvestError::Config`] when the stored override does not decode.
+    pub async fn set_live_activity_caps(
+        conn: &mut AsyncPgConnection,
+        mut store: Option<&mut AsyncPgConnection>,
+        activity_name: &str,
+        code_cap: u32,
+        cap: u32,
+    ) -> HarvestResult<CapRewrite> {
+        use diesel::sql_types::{BigInt, Integer, Text};
+        use diesel_async::AsyncConnection;
+
+        let stored_cap = i32::try_from(cap).unwrap_or(i32::MAX);
+        let effective = |stored: Option<ActivityDefaultOverride>| {
+            stored
+                .and_then(|stored| stored.fields.max_concurrent)
+                .unwrap_or(code_cap)
+        };
+        let update = async |conn: &mut AsyncPgConnection| {
+            diesel::sql_query(CAP_REWRITE_SQL)
+                .bind::<Text, _>(activity_name)
+                .bind::<Integer, _>(stored_cap)
+                .bind::<BigInt, _>(CAP_REWRITE_BATCH)
+                .execute(conn)
+                .await
+                .map_err(crate::error::database_error)
+        };
+        let mut rewritten = 0_u64;
+        loop {
+            let batch = match store.as_deref_mut() {
+                None => {
+                    Box::pin(conn.transaction(async |conn| {
+                        lock_activity(conn, activity_name).await?;
+                        let stored = select_override(conn, activity_name, false).await?;
+                        if effective(stored) != cap {
+                            return Ok(None);
+                        }
+                        update(conn).await.map(Some)
+                    }))
+                    .await?
+                }
+                Some(store) => {
+                    let conn = &mut *conn;
+                    Box::pin(store.transaction(async |store| {
+                        lock_activity(store, activity_name).await?;
+                        let stored = select_override(store, activity_name, false).await?;
+                        if effective(stored) != cap {
+                            return Ok(None);
+                        }
+                        Box::pin(conn.transaction(async |conn| update(conn).await))
+                            .await
+                            .map(Some)
+                    }))
+                    .await?
+                }
+            };
+            let Some(updated) = batch else {
+                return Ok(CapRewrite {
+                    rewritten,
+                    superseded: true,
+                });
+            };
+            rewritten += u64::try_from(updated).unwrap_or(0);
+            if i64::try_from(updated).unwrap_or(i64::MAX) < CAP_REWRITE_BATCH {
+                return Ok(CapRewrite {
+                    rewritten,
+                    superseded: false,
+                });
+            }
+        }
     }
 }
 
@@ -567,6 +755,7 @@ mod tests {
             heartbeat_timeout: Some(secs(5)),
             schedule_to_start: Some(secs(60)),
             schedule_to_close: Some(secs(600)),
+            max_concurrent: Some(3),
         }
     }
 
@@ -604,6 +793,7 @@ mod tests {
         info.default_heartbeat_timeout = Some(secs(5));
         info.default_schedule_to_start = Some(secs(60));
         info.default_schedule_to_close = Some(secs(600));
+        info.max_concurrent = Some(3);
         info
     }
 
@@ -615,7 +805,7 @@ mod tests {
     }
 
     #[test]
-    fn of_reads_the_five_code_values() {
+    fn of_reads_the_code_values() {
         assert_eq!(ActivityDefaults::of(&info()), code());
     }
 
@@ -821,5 +1011,105 @@ mod tests {
             },
             ..ActivityDefaultFields::default()
         });
+    }
+
+    #[test]
+    fn a_cap_override_replaces_the_code_cap() {
+        let fields = ActivityDefaultFields {
+            max_concurrent: Some(1),
+            ..ActivityDefaultFields::default()
+        };
+        assert!(!fields.is_empty());
+        let effective = fields.apply(code());
+        assert_eq!(effective.max_concurrent, Some(1));
+        assert_eq!(effective.start_to_close, Some(secs(30)), "a timeout stays");
+        let raised = ActivityDefaultFields {
+            max_concurrent: Some(10),
+            ..ActivityDefaultFields::default()
+        };
+        assert_eq!(raised.apply(code()).max_concurrent, Some(10));
+    }
+
+    /// An activity with no code cap has no concurrency key on its rows.
+    #[test]
+    fn a_cap_override_never_adds_a_cap() {
+        let fields = ActivityDefaultFields {
+            max_concurrent: Some(2),
+            ..ActivityDefaultFields::default()
+        };
+        assert_eq!(
+            fields.apply(ActivityDefaults::default()).max_concurrent,
+            None
+        );
+    }
+
+    #[test]
+    fn an_unset_cap_inherits_the_code_cap() {
+        let fields = ActivityDefaultFields {
+            start_to_close: Some(secs(90)),
+            ..ActivityDefaultFields::default()
+        };
+        assert_eq!(fields.apply(code()).max_concurrent, Some(3));
+    }
+
+    #[test]
+    fn a_cap_patch_sets_clears_and_keeps() {
+        let stored = ActivityDefaultFields {
+            max_concurrent: Some(2),
+            start_to_close: Some(secs(90)),
+            ..ActivityDefaultFields::default()
+        };
+        let set = ActivityDefaultPatch {
+            max_concurrent: Some(Some(1)),
+            ..ActivityDefaultPatch::default()
+        };
+        assert!(!set.is_empty());
+        assert_eq!(set.merge(stored).max_concurrent, Some(1));
+        let clear = ActivityDefaultPatch {
+            max_concurrent: Some(None),
+            ..ActivityDefaultPatch::default()
+        };
+        assert!(!clear.is_empty());
+        assert_eq!(
+            clear.merge(stored),
+            ActivityDefaultFields {
+                max_concurrent: None,
+                ..stored
+            }
+        );
+        let other = ActivityDefaultPatch {
+            start_to_close: Some(None),
+            ..ActivityDefaultPatch::default()
+        };
+        assert_eq!(
+            other.merge(stored).max_concurrent,
+            Some(2),
+            "a patch that does not name the cap keeps it"
+        );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn check_patch_refuses_a_cap_that_no_row_can_store() {
+        let cap = |n: u32| ActivityDefaultPatch {
+            max_concurrent: Some(Some(n)),
+            ..ActivityDefaultPatch::default()
+        };
+        let zero = check_patch(&cap(0)).expect_err("zero");
+        assert!(zero.to_string().contains("max_concurrent"), "{zero}");
+        let wide = check_patch(&cap(u32::MAX)).expect_err("past INTEGER");
+        assert!(wide.to_string().contains("max_concurrent"), "{wide}");
+        check_patch(&cap(1)).expect("one");
+        check_patch(&cap(MAX_ACTIVITY_CAP)).expect("the bound");
+        let clear = ActivityDefaultPatch {
+            max_concurrent: Some(None),
+            ..ActivityDefaultPatch::default()
+        };
+        check_patch(&clear).expect("a clear");
+    }
+
+    #[test]
+    fn the_cap_bound_matches_the_integer_column() {
+        assert_eq!(i64::from(MAX_ACTIVITY_CAP), i64::from(i32::MAX));
     }
 }

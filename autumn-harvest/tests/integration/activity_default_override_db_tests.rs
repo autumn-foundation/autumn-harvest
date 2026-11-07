@@ -65,6 +65,7 @@ const OVERRIDE: ActivityDefaultFields = ActivityDefaultFields {
     heartbeat_timeout: Some(Duration::from_secs(45)),
     schedule_to_start: Some(Duration::from_secs(120)),
     schedule_to_close: Some(Duration::from_mins(20)),
+    max_concurrent: None,
 };
 
 /// A patch that sets each field of `fields`.
@@ -79,6 +80,7 @@ const fn set_all(fields: ActivityDefaultFields) -> ActivityDefaultPatch {
         heartbeat_timeout: Some(fields.heartbeat_timeout),
         schedule_to_start: Some(fields.schedule_to_start),
         schedule_to_close: Some(fields.schedule_to_close),
+        max_concurrent: Some(fields.max_concurrent),
     }
 }
 

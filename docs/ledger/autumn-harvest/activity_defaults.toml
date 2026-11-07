@@ -21,6 +21,13 @@ kind = ["read"]
 tables = ["harvest_activity_default_overrides"]
 measured = "unmeasured"
 
+["db::set_live_activity_caps"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_task_queue"]
+measured = "unmeasured"
+
 ["db::update_activity_default_override"]
 driver = "per_request"
 backend = ["postgres"]

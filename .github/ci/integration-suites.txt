@@ -87,6 +87,7 @@ compileonly  autumn-harvest-plugin  dev_runtime_managed              dev-runtime
 compileonly  autumn-harvest-plugin  status_summary_localpg           -                          -
 linux        agent-mesh             postgres                         -                          -
 linux        autumn-harvest         integration                      -                          active_workflow_gauge_tests
+linux        autumn-harvest         integration                      -                          activity_cap_override_db_tests
 linux        autumn-harvest         integration                      -                          activity_claim_epoch_tests
 linux        autumn-harvest         integration                      -                          activity_default_floor_tests
 linux        autumn-harvest         integration                      -                          activity_default_timeout_tests
@@ -322,6 +323,7 @@ linux        autumn-harvest-agent   sample_postgres                  postgres   
 linux        autumn-harvest-agent   sampling_policy_postgres         postgres                   -
 linux        autumn-harvest-agent   score_postgres                   postgres                   -
 linux        autumn-harvest-conformance  conformance                  -                          -
+linux        autumn-harvest-plugin  activity_cap_override_integration -                         -
 linux        autumn-harvest-plugin  activity_defaults_integration    -                          -
 linux        autumn-harvest-plugin  activity_info_api_integration    -                          -
 linux        autumn-harvest-plugin  admission_gate_authoritative_localpg  -                          -

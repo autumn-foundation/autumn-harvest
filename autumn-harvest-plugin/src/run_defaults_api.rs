@@ -34,6 +34,7 @@
 
 use std::time::Duration;
 
+use autumn_harvest::activity_defaults::set_live_activity_caps;
 use autumn_harvest::audit::{
     self, OP_WORKFLOW_TYPE_RUN_DEFAULTS, STATUS_FAILED, STATUS_SUCCEEDED, TARGET_WORKFLOW_TYPE,
 };
@@ -520,7 +521,7 @@ async fn audit_patch(
 
 /// A change that a `PATCH` applies to the rows of a type on every shard.
 #[derive(Debug, Clone, Copy)]
-enum ShardJob {
+pub enum ShardJob {
     /// Move the SLA of the in-flight runs (issue #2387).
     Recompute {
         code_sla: Option<Duration>,
@@ -528,11 +529,14 @@ enum ShardJob {
     },
     /// Raise the stored cap of the live workflow task rows (issue #2407).
     Raise { code: ConcurrencyPolicy, limit: u32 },
+    /// Set the stored cap of the live task rows of an activity.
+    ActivityCaps { code_cap: u32, cap: u32 },
 }
 
 impl ShardJob {
     /// Run the job on one shard. Returns the changed rows and whether a newer
-    /// change stopped the job.
+    /// change stopped the job. `workflow_name` is the activity name for an
+    /// activity job.
     async fn run(
         self,
         conn: &mut AsyncPgConnection,
@@ -550,16 +554,24 @@ impl ShardJob {
                     .await
                     .map(|done| (done.raised, done.superseded))
             }
+            Self::ActivityCaps { code_cap, cap } => {
+                set_live_activity_caps(conn, store, workflow_name, code_cap, cap)
+                    .await
+                    .map(|done| (done.rewritten, done.superseded))
+            }
         }
     }
 }
 
 /// The result of one [`ShardJob`] on every shard.
 #[derive(Debug, Default)]
-struct ShardPass {
-    changed: u64,
-    unavailable_shards: Vec<UnavailableShard>,
-    superseded: bool,
+pub struct ShardPass {
+    /// The rows that the job changed.
+    pub changed: u64,
+    /// The shards that the job could not reach.
+    pub unavailable_shards: Vec<UnavailableShard>,
+    /// Whether a newer change stopped the job.
+    pub superseded: bool,
 }
 
 /// Run `job` on every shard.
@@ -641,11 +653,6 @@ const SETTLE_MULTIPLES: [u32; 3] = [1, 6, 30];
 
 /// Raise the stored cap of the live rows of a type on every shard, now and
 /// again at each settle wait (issue #2407).
-///
-/// Each raise runs in its own task, so a client that disconnects stops none
-/// of them. The response reports the first raise. A settle raise logs a
-/// shard that it could not reach. A settle raise stops when a newer change
-/// replaced the limit.
 async fn raise_on_every_shard(
     api_state: &HarvestApiState,
     pool: &HarvestDbPool,
@@ -653,7 +660,34 @@ async fn raise_on_every_shard(
     code: ConcurrencyPolicy,
     limit: u32,
 ) -> Result<ConcurrencyRaiseReport, AutumnError> {
-    let job = ShardJob::Raise { code, limit };
+    let pass = settle_on_every_shard(
+        api_state,
+        pool,
+        workflow_name,
+        ShardJob::Raise { code, limit },
+    )
+    .await?;
+    Ok(ConcurrencyRaiseReport {
+        raised_tasks: pass.changed,
+        unavailable_shards: pass.unavailable_shards,
+        superseded: pass.superseded,
+    })
+}
+
+/// Run `job` on every shard, now and again at each settle wait.
+///
+/// Another process applies a change only after its cache reloads. A row
+/// that it stores before then takes the old value. A settle pass sets that
+/// row. Each pass runs in its own task, so a client that disconnects stops
+/// none of them. The result is the first pass. A settle pass logs a shard
+/// that it could not reach. A settle pass stops when a newer change replaced
+/// the value.
+pub async fn settle_on_every_shard(
+    api_state: &HarvestApiState,
+    pool: &HarvestDbPool,
+    workflow_name: &str,
+    job: ShardJob,
+) -> Result<ShardPass, AutumnError> {
     let first = {
         let pool = pool.clone();
         let workflow_name = workflow_name.to_string();
@@ -673,13 +707,8 @@ async fn raise_on_every_shard(
             }
         }
     });
-    let pass = first.await.map_err(|error| {
-        AutumnError::internal_server_error_msg(format!("concurrency raise failed: {error}"))
-    })?;
-    Ok(ConcurrencyRaiseReport {
-        raised_tasks: pass.changed,
-        unavailable_shards: pass.unavailable_shards,
-        superseded: pass.superseded,
+    first.await.map_err(|error| {
+        AutumnError::internal_server_error_msg(format!("shard pass failed: {error}"))
     })
 }
 

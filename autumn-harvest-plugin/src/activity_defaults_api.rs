@@ -1,14 +1,21 @@
 //! `GET` and `PATCH /admin/activity-types/{activity_name}/defaults`.
 //!
 //! The routes read and change the operator override of one activity type.
-//! It holds three retry fields and four timeouts. The override lives on the
-//! default shard. See [`autumn_harvest::activity_defaults`] for the
-//! precedence and the scope.
+//! It holds three retry fields, four timeouts and the `max_concurrent` cap.
+//! The override lives on the default shard. See
+//! [`autumn_harvest::activity_defaults`] for the precedence and the scope.
 //!
 //! A change reaches new schedules in this process at once, because the route
 //! writes it through to the cache. Other processes see it within their refresh period.
-//! An activity that is already scheduled keeps its values. So no change runs
-//! a pass over stored rows.
+//! An activity that is already scheduled keeps its retry fields and its
+//! timeouts.
+//!
+//! A change to the cap also applies to the tasks that are already
+//! scheduled. Each task row stores its cap, and the claim reads it. So a
+//! `PATCH` that names `max_concurrent` or `clear_override` sets the cap of
+//! each live row of the activity on every shard. It runs that pass again at
+//! each settle wait, for a row that a process with a stale cache stored. A
+//! running task runs on.
 //!
 //! The route refuses a field that cannot apply:
 //!
@@ -18,6 +25,10 @@
 //!   each attempt;
 //! - a heartbeat, `schedule_to_start` or `schedule_to_close` field for a
 //!   local activity, because a local activity has none of them;
+//! - a `max_concurrent` for a local activity, which has no task row, and for
+//!   an activity with no code cap, whose rows have no concurrency key;
+//! - a `max_concurrent` for an activity that shares its concurrency key with
+//!   another activity, because one key would then hold two caps;
 //! - any field for a reserved engine activity.
 
 use std::time::Duration;
@@ -30,6 +41,7 @@ use autumn_harvest::audit::{
     self, OP_ACTIVITY_TYPE_DEFAULTS, STATUS_FAILED, STATUS_SUCCEEDED, TARGET_ACTIVITY_TYPE,
 };
 use autumn_harvest::error::HarvestError;
+use autumn_harvest::info::ActivityInfo;
 use autumn_harvest::models::NewAuditRecord;
 use autumn_harvest::workflow_retry::RetryLimitsPatch;
 use autumn_web::AutumnError;
@@ -42,6 +54,8 @@ use crate::api::{
     HarvestApiRuntime, HarvestApiState, acquire_conn, audit_context, deserialize_tristate,
     map_error,
 };
+use crate::run_defaults_api::{ShardJob, settle_on_every_shard};
+use crate::shard_fanout::UnavailableShard;
 
 const ROUTE: &str = "PATCH /admin/activity-types/{activity_name}/defaults";
 
@@ -51,6 +65,8 @@ fn millis(value: Duration) -> u64 {
 }
 
 /// The activity defaults, durations in milliseconds. `None` sets no value.
+///
+/// `max_concurrent` is a count of tasks, not a duration.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct ActivityDefaultMs {
     /// The retry `max_attempts`.
@@ -67,6 +83,8 @@ pub struct ActivityDefaultMs {
     pub schedule_to_start_ms: Option<u64>,
     /// The bound on every attempt and every backoff together.
     pub schedule_to_close_ms: Option<u64>,
+    /// The cap on the running tasks of the concurrency key.
+    pub max_concurrent: Option<u32>,
 }
 
 impl From<ActivityDefaultFields> for ActivityDefaultMs {
@@ -79,6 +97,7 @@ impl From<ActivityDefaultFields> for ActivityDefaultMs {
             heartbeat_timeout_ms: fields.heartbeat_timeout.map(millis),
             schedule_to_start_ms: fields.schedule_to_start.map(millis),
             schedule_to_close_ms: fields.schedule_to_close.map(millis),
+            max_concurrent: fields.max_concurrent,
         }
     }
 }
@@ -94,6 +113,7 @@ impl From<&ActivityDefaults> for ActivityDefaultMs {
             heartbeat_timeout_ms: values.heartbeat_timeout.map(millis),
             schedule_to_start_ms: values.schedule_to_start.map(millis),
             schedule_to_close_ms: values.schedule_to_close.map(millis),
+            max_concurrent: values.max_concurrent,
         }
     }
 }
@@ -138,6 +158,22 @@ pub struct ActivityDefaultsView {
     /// The values that a new schedule takes, before a call-site option and
     /// the builder default.
     pub effective: ActivityDefaultMs,
+    /// The rewrite of the stored caps. Present only on a `PATCH` that names
+    /// `max_concurrent` or `clear_override`, for an activity with a code cap.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cap_rewrite: Option<CapRewriteReport>,
+}
+
+/// The first rewrite of the stored caps of the live task rows.
+#[derive(Debug, Clone, Serialize)]
+pub struct CapRewriteReport {
+    /// The number of live task rows whose stored cap changed.
+    pub rewritten_tasks: u64,
+    /// The shards that the rewrite could not reach. Their rows keep the old
+    /// cap until a settle pass reaches them. Send the request again to retry.
+    pub unavailable_shards: Vec<UnavailableShard>,
+    /// Whether a newer change to the cap stopped this rewrite.
+    pub superseded: bool,
 }
 
 /// The body of `PATCH /admin/activity-types/{activity_name}/defaults`.
@@ -165,6 +201,8 @@ pub struct ActivityDefaultsPatchRequest {
     schedule_to_start_ms: Option<Option<u64>>,
     #[serde(default, deserialize_with = "deserialize_tristate")]
     schedule_to_close_ms: Option<Option<u64>>,
+    #[serde(default, deserialize_with = "deserialize_tristate")]
+    max_concurrent: Option<Option<u32>>,
     #[serde(default)]
     clear_override: bool,
     reason: Option<String>,
@@ -192,7 +230,13 @@ impl ActivityDefaultsPatchRequest {
             heartbeat_timeout: ms(self.heartbeat_timeout_ms),
             schedule_to_start: ms(self.schedule_to_start_ms),
             schedule_to_close: ms(self.schedule_to_close_ms),
+            max_concurrent: self.max_concurrent,
         }
+    }
+
+    /// Whether this request can change the effective cap.
+    const fn touches_cap(&self) -> bool {
+        self.max_concurrent.is_some() || self.clear_override
     }
 
     fn is_empty(&self) -> bool {
@@ -200,7 +244,35 @@ impl ActivityDefaultsPatchRequest {
     }
 
     /// The reason to refuse this request for an activity, if any.
-    fn refusal(&self, code: &ActivityDefaults, local: bool) -> Option<String> {
+    ///
+    /// `sharer` names another registered activity with the same concurrency
+    /// key, if any.
+    fn refusal(
+        &self,
+        code: &ActivityDefaults,
+        local: bool,
+        sharer: Option<&str>,
+    ) -> Option<String> {
+        if sets(self.max_concurrent) {
+            if local {
+                return Some(
+                    "a local activity has no task row, so max_concurrent is refused".to_string(),
+                );
+            }
+            if code.max_concurrent.is_none() {
+                return Some(
+                    "the activity declares no max_concurrent, so max_concurrent is refused: \
+                     its tasks have no concurrency key"
+                        .to_string(),
+                );
+            }
+            if let Some(sharer) = sharer {
+                return Some(format!(
+                    "the activity shares its concurrency key with '{sharer}', so \
+                     max_concurrent is refused: one key would hold two caps"
+                ));
+            }
+        }
         if local
             && (sets(self.heartbeat_timeout_ms)
                 || sets(self.schedule_to_start_ms)
@@ -244,11 +316,39 @@ fn code_values(
         .map(|info| (ActivityDefaults::of(info), info.is_local))
 }
 
+/// The concurrency key of a capped activity. Code with a cap and no key uses
+/// the activity name.
+fn concurrency_key(info: &ActivityInfo) -> Option<&str> {
+    info.max_concurrent
+        .map(|_| info.concurrency_key.unwrap_or(info.name))
+}
+
+/// Another registered activity that shares the concurrency key of
+/// `activity_name`, if any. The first name in sort order wins, so the
+/// refusal text is stable.
+fn key_sharer<'a>(
+    activities: impl IntoIterator<Item = &'a ActivityInfo>,
+    activity_name: &str,
+) -> Option<String> {
+    let activities: Vec<&ActivityInfo> = activities.into_iter().collect();
+    let key = activities
+        .iter()
+        .find(|info| info.name == activity_name)
+        .and_then(|info| concurrency_key(info))?;
+    activities
+        .iter()
+        .filter(|info| info.name != activity_name && concurrency_key(info) == Some(key))
+        .map(|info| info.name)
+        .min()
+        .map(str::to_string)
+}
+
 fn view(
     activity_name: &str,
     code: &ActivityDefaults,
     local: bool,
     stored: Option<ActivityDefaultOverride>,
+    cap_rewrite: Option<CapRewriteReport>,
 ) -> ActivityDefaultsView {
     let effective = stored
         .as_ref()
@@ -259,6 +359,7 @@ fn view(
         code: code.into(),
         override_: stored.map(Into::into),
         effective: (&effective).into(),
+        cap_rewrite,
     }
 }
 
@@ -279,7 +380,7 @@ pub async fn get_activity_defaults(
     let stored = get_activity_default_override(&mut conn, &activity_name)
         .await
         .map_err(map_error)?;
-    Ok(Json(view(&activity_name, &code, local, stored)))
+    Ok(Json(view(&activity_name, &code, local, stored, None)))
 }
 
 /// One `activity_type.defaults` audit row. `error_summary` marks a failed
@@ -379,7 +480,7 @@ pub async fn patch_activity_defaults(
         Ok(Json(request)) if request.is_empty() => Err(String::from(
             "empty patch: set retry_max_attempts, retry_initial_interval_ms, \
              retry_max_interval_ms, start_to_close_ms, heartbeat_timeout_ms, \
-             schedule_to_start_ms, schedule_to_close_ms or clear_override",
+             schedule_to_start_ms, schedule_to_close_ms, max_concurrent or clear_override",
         )),
         Ok(Json(request)) => Ok(request),
         Err(rejection) => Err(format!("invalid request body: {}", rejection.body_text())),
@@ -406,7 +507,8 @@ pub async fn patch_activity_defaults(
         .await;
         return Err(not_registered(&activity_name));
     };
-    if let Some(summary) = request.refusal(&code, local) {
+    let sharer = key_sharer(runtime.registry().activities.values(), &activity_name);
+    if let Some(summary) = request.refusal(&code, local, sharer.as_deref()) {
         audit_refusal(&mut conn, ctx, &activity_name, &summary).await;
         return Err(AutumnError::bad_request_msg(summary));
     }
@@ -434,11 +536,32 @@ pub async fn patch_activity_defaults(
         Err(ChangeFailure::Audit(error)) => return Err(map_error(error)),
     };
     // Write through, so this process applies the change to its next schedule.
-    runtime.registry().run_defaults().write_through_activity(
+    let fields = stored.as_ref().map(|s| s.fields).unwrap_or_default();
+    runtime
+        .registry()
+        .run_defaults()
+        .write_through_activity(&activity_name, fields);
+    // The cap of a stored row changes too, so a pending task takes the cap.
+    let cap_rewrite = match code.max_concurrent {
+        Some(code_cap) if request.touches_cap() && !local => {
+            let cap = fields.max_concurrent.unwrap_or(code_cap);
+            let job = ShardJob::ActivityCaps { code_cap, cap };
+            let pass = settle_on_every_shard(&api_state, &pool, &activity_name, job).await?;
+            Some(CapRewriteReport {
+                rewritten_tasks: pass.changed,
+                unavailable_shards: pass.unavailable_shards,
+                superseded: pass.superseded,
+            })
+        }
+        _ => None,
+    };
+    Ok(Json(view(
         &activity_name,
-        stored.as_ref().map(|s| s.fields).unwrap_or_default(),
-    );
-    Ok(Json(view(&activity_name, &code, local, stored)))
+        &code,
+        local,
+        stored,
+        cap_rewrite,
+    )))
 }
 
 #[cfg(test)]
@@ -456,6 +579,7 @@ mod tests {
             heartbeat_timeout: Some(Duration::from_secs(1)),
             schedule_to_start: Some(Duration::from_secs(1)),
             schedule_to_close: Some(Duration::from_secs(1)),
+            max_concurrent: Some(3),
         }
     }
 
@@ -466,9 +590,10 @@ mod tests {
             "retry_max_attempts": null,
             "heartbeat_timeout_ms": null,
             "schedule_to_close_ms": null,
+            "max_concurrent": null,
         }));
         assert!(!nulls.is_empty());
-        assert_eq!(nulls.refusal(&bare, true), None);
+        assert_eq!(nulls.refusal(&bare, true, None), None);
     }
 
     #[test]
@@ -481,8 +606,9 @@ mod tests {
             "heartbeat_timeout_ms": 40,
             "schedule_to_start_ms": 50,
             "schedule_to_close_ms": 60,
+            "max_concurrent": 2,
         }));
-        assert_eq!(all.refusal(&full(), false), None);
+        assert_eq!(all.refusal(&full(), false, None), None);
         let patch = all.patch();
         assert_eq!(patch.start_to_close, Some(Some(Duration::from_millis(30))));
         assert_eq!(
@@ -496,5 +622,76 @@ mod tests {
         assert!(request(serde_json::json!({})).is_empty());
         assert!(request(serde_json::json!({ "reason": "x" })).is_empty());
         assert!(!request(serde_json::json!({ "clear_override": true })).is_empty());
+    }
+
+    #[test]
+    fn a_cap_is_refused_where_it_cannot_apply() {
+        let cap = request(serde_json::json!({ "max_concurrent": 1 }));
+        assert!(cap.touches_cap());
+        let local = cap.refusal(&full(), true, None).expect("local");
+        assert!(local.contains("local"), "{local}");
+        let uncapped = ActivityDefaults {
+            max_concurrent: None,
+            ..full()
+        };
+        let none = cap.refusal(&uncapped, false, None).expect("no code cap");
+        assert!(none.contains("declares no max_concurrent"), "{none}");
+        let shared = cap.refusal(&full(), false, Some("sync_b")).expect("shared");
+        assert!(shared.contains("sync_b"), "{shared}");
+        assert_eq!(cap.refusal(&full(), false, None), None);
+        let clear = request(serde_json::json!({ "max_concurrent": null }));
+        assert!(clear.touches_cap(), "a null returns to the code cap");
+        assert_eq!(clear.refusal(&full(), false, Some("sync_b")), None);
+        assert!(request(serde_json::json!({ "clear_override": true })).touches_cap());
+        assert!(!request(serde_json::json!({ "start_to_close_ms": 1 })).touches_cap());
+    }
+
+    fn capped(name: &'static str, cap: Option<u32>, key: Option<&'static str>) -> ActivityInfo {
+        ActivityInfo {
+            name,
+            module: "activity_defaults_api",
+            default_retry_policy: None,
+            default_start_to_close: None,
+            default_heartbeat_timeout: None,
+            default_schedule_to_start: None,
+            default_schedule_to_close: None,
+            default_queue: None,
+            max_concurrent: cap,
+            concurrency_key: key,
+            is_local: false,
+            max_input_bytes: None,
+            max_result_bytes: None,
+            rate_limit_rps: None,
+            rate_limit_burst: None,
+            rate_limit_key: None,
+            rate_limit_key_expr: None,
+            circuit_breaker: None,
+            requires: None,
+            handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            input_schema: None,
+            output_schema: None,
+        }
+    }
+
+    #[test]
+    fn a_sharer_has_the_same_key_and_a_cap() {
+        let all = [
+            capped("sync_c", Some(2), Some("partner")),
+            capped("sync_a", Some(2), Some("partner")),
+            capped("sync_b", Some(2), Some("partner")),
+            capped("own", Some(2), None),
+            capped("named_like_own", Some(2), Some("own")),
+            capped("plain", None, None),
+        ];
+        assert_eq!(key_sharer(&all, "sync_c").as_deref(), Some("sync_a"));
+        assert_eq!(key_sharer(&all, "sync_a").as_deref(), Some("sync_b"));
+        assert_eq!(
+            key_sharer(&all, "own").as_deref(),
+            Some("named_like_own"),
+            "a default key is the activity name"
+        );
+        assert_eq!(key_sharer(&all, "plain"), None, "no cap, no key");
+        assert_eq!(key_sharer(&all, "unknown"), None);
+        assert_eq!(key_sharer(&all[3..4], "own"), None);
     }
 }

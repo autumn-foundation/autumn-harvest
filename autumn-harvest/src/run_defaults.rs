@@ -1900,6 +1900,7 @@ mod tests {
             heartbeat_timeout: Some(mins(1)),
             schedule_to_start: None,
             schedule_to_close: None,
+            max_concurrent: Some(4),
         }
     }
 
@@ -1920,6 +1921,7 @@ mod tests {
         heartbeat_timeout: None,
         schedule_to_start: None,
         schedule_to_close: None,
+        max_concurrent: Some(2),
     };
 
     #[test]
@@ -1928,6 +1930,7 @@ mod tests {
         cache.replace_activities([activity_stored("charge", LONGER)]);
         let effective = cache.apply_activity("charge", activity_code());
         assert_eq!(effective.start_to_close, Some(mins(9)));
+        assert_eq!(effective.max_concurrent, Some(2), "the cap applies by name");
         assert_eq!(effective.retry_policy.map(|p| p.max_attempts), Some(1));
         assert_eq!(effective.heartbeat_timeout, Some(mins(1)), "unset inherits");
         assert_eq!(

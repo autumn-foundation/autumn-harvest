@@ -1181,6 +1181,35 @@ impl HandlerRegistry {
         )
     }
 
+    /// The concurrency key and the effective cap of a registered activity.
+    ///
+    /// The key is the declared `concurrency_key`, or the activity name when
+    /// code declares only a cap. An operator override of the cap wins over
+    /// the declared cap, and it applies only over a declared cap. An engine
+    /// activity takes no override. Each path that enqueues an activity task
+    /// resolves its key and cap here. The call reads memory only.
+    #[must_use]
+    pub fn activity_concurrency(&self, activity_name: &str) -> (Option<String>, Option<u32>) {
+        let Some(info) = self.activities.get(activity_name) else {
+            return (None, None);
+        };
+        let key = info
+            .concurrency_key
+            .or_else(|| info.max_concurrent.map(|_| info.name))
+            .map(str::to_string);
+        let cap = if crate::activity_defaults::is_reserved_activity(activity_name) {
+            info.max_concurrent
+        } else {
+            info.max_concurrent.map(|declared| {
+                self.run_defaults
+                    .activity(activity_name)
+                    .and_then(|fields| fields.max_concurrent)
+                    .unwrap_or(declared)
+            })
+        };
+        (key, cap)
+    }
+
     /// Apply the concurrency limit override to a declared policy
     /// (issue #2407).
     ///
@@ -12062,13 +12091,10 @@ fn build_activity_enqueue_plan(
             params.schedule_to_close_at = Some(deadline);
         }
 
-        let effective_key = activity
-            .concurrency_key
-            .map(ToString::to_string)
-            .or_else(|| activity.max_concurrent.map(|_| activity.name.to_string()));
-        if let Some(key) = effective_key {
+        // The key is the code key. The cap takes the override.
+        if let (Some(key), cap) = registry.activity_concurrency(&scheduled.name) {
             params.concurrency_key = Some(key);
-            params.max_concurrent = activity.max_concurrent;
+            params.max_concurrent = cap;
         }
 
         if let Some(expr) = activity.rate_limit_key_expr {
