@@ -109,6 +109,15 @@ pub proof fn theorem_an_open_inbox_has_run_every_op(ops: Seq < InboxOp >) ensure
 pub proof fn theorem_a_resume_runs_every_held_op(ops: Seq < InboxOp >) requires ops.len() > 0, ops.last() == InboxOp::Resume, ensures run(fresh(), ops).status == InboxStatus::Open, run(fresh(), ops).ran == work_ids(ops),
 proof fn lemma_run_ends_with_its_last_step(inbox: Inbox, ops: Seq < InboxOp >) requires ops.len() > 0, ensures run(inbox, ops) == step(run(inbox, ops.drop_last()), ops.last()), decreases ops.len(),
 
+## formal/verus/src/agent_mandate_draws.rs
+pub open spec fn within(child: Option < u32 >, parent: Option < u32 >) -> bool { match parent { None => true, Some(p) => match child { None => false, Some(c) => c <= p, }, } }
+pub open spec fn fits(max_draws: Option < u32 >, draws: u32) -> bool { match max_draws { None => true, Some(max) => draws <= max, } }
+pub fn meet_cap(left: Option < u32 >, right: Option < u32 >) -> (r: Option < u32 >) ensures within(r, left), within(r, right), r is None <==> (left is None && right is None), r is Some && left is Some && right is Some ==> (r -> 0 == left -> 0 || r -> 0 == right -> 0),
+pub enum DrawVerdict { Run { left: u32 }, DrawsExceeded, FanOutExhausted, }
+pub fn draw_verdict(max_draws: Option < u32 >, room: u32, draws: u32) -> (r: DrawVerdict) ensures r is DrawsExceeded <==>! fits(max_draws, draws), r is FanOutExhausted <==> (fits(max_draws, draws) && draws > room), r is Run <==> (fits(max_draws, draws) && draws <= room), r is Run ==> r -> Run_left + draws == room,
+pub proof fn theorem_within_is_transitive(a: Option < u32 >, b: Option < u32 >, top: Option < u32 >) requires within(a, b), within(b, top), ensures within(a, top),
+pub proof fn theorem_a_fit_holds_under_a_wider_cap(child: Option < u32 >, parent: Option < u32 >, draws: u32) requires within(child, parent), fits(child, draws), ensures fits(parent, draws),
+
 ## formal/verus/src/agent_overlay.rs
 pub open spec fn within(value: Option < u32 >, ceiling: Option < u32 >) -> bool { match ceiling { None => true, Some(cap) => value.is_some() && value.unwrap() <= cap, } }
 pub open spec fn spec_merged_bound(current: Option < u32 >, set: Option < u32 >, ceiling: Option < u32 >) -> Result < Option < u32 >, (), > { let next = if set.is_some() { set } else { current }; if within(next, ceiling) { Ok(next) } else { Err(()) } }

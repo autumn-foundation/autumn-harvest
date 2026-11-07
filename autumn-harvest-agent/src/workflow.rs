@@ -291,6 +291,7 @@ impl Progress {
             error: None,
             resets: self.reset.count,
             answer_rejections: self.rejections.clone(),
+            parked_until_ms: self.parked_until,
         }
     }
 
@@ -2796,6 +2797,7 @@ async fn durable_peer(
         reply_to: Some(promise.id().to_string()),
         waiting,
         mesh: tree.outbox.mesh.clone(),
+        sample: None,
     };
     let key = format!("{}:{seq}", envelope.from);
     let sent = ctx

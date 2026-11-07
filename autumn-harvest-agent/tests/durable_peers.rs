@@ -337,6 +337,7 @@ async fn a_duplicate_is_dropped_and_a_late_message_is_kept() {
         reply_to: None,
         waiting: Vec::new(),
         mesh: None,
+        sample: None,
     };
     // The outbox delivers 2 before 1, then 2 again under another key.
     for (seq, key) in [(2, "k2"), (1, "k1"), (2, "k2-again")] {
