@@ -571,7 +571,7 @@ fn to_host_clock(
 /// The dead letter stores no key and no cap. Without them the task would
 /// claim past the cap of its key. The cap is the effective cap, so an
 /// operator override applies. A process with no registry, or one that does
-/// not register the activity, leaves the task with no cap, as before.
+/// not register the activity, leaves the task with no key and no cap.
 fn restore_activity_concurrency(
     params: &mut EnqueueParams,
     task_type: TaskType,

@@ -9,8 +9,8 @@
 -- the live rows of the activity, so a pending task takes the new cap too.
 -- The row check now accepts a row that sets the cap alone.
 --
--- The table is small and only the API and the cache refresh read it. The
--- lock timeout still bounds the wait for its brief exclusive lock.
+-- The table is small. The API, its cap pass and the cache refresh read it.
+-- The lock timeout still bounds the wait for its brief exclusive lock.
 SET LOCAL lock_timeout = '5s';
 
 ALTER TABLE harvest_activity_default_overrides

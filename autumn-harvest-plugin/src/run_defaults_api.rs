@@ -534,30 +534,30 @@ pub enum ShardJob {
 }
 
 impl ShardJob {
-    /// Run the job on one shard. Returns the changed rows and whether a newer
-    /// change stopped the job. `workflow_name` is the activity name for an
+    /// Run the job on one shard. Returns the changed rows, the rows left
+    /// unresolved and whether a newer change stopped the job. `workflow_name` is the activity name for an
     /// activity job.
     async fn run(
         self,
         conn: &mut AsyncPgConnection,
         store: Option<&mut AsyncPgConnection>,
         workflow_name: &str,
-    ) -> Result<(u64, bool), HarvestError> {
+    ) -> Result<(u64, u64, bool), HarvestError> {
         match self {
             Self::Recompute { code_sla, sla } => {
                 recompute_in_flight_sla(conn, store, workflow_name, code_sla, sla)
                     .await
-                    .map(|done| (done.moved, done.superseded))
+                    .map(|done| (done.moved, 0, done.superseded))
             }
             Self::Raise { code, limit } => {
                 raise_waiting_concurrency_caps(conn, store, workflow_name, code, limit)
                     .await
-                    .map(|done| (done.raised, done.superseded))
+                    .map(|done| (done.raised, 0, done.superseded))
             }
             Self::ActivityCaps { code_cap, cap } => {
                 set_live_activity_caps(conn, store, workflow_name, code_cap, cap)
                     .await
-                    .map(|done| (done.rewritten, done.superseded))
+                    .map(|done| (done.rewritten, done.unresolved, done.superseded))
             }
         }
     }
@@ -568,6 +568,9 @@ impl ShardJob {
 pub struct ShardPass {
     /// The rows that the job changed.
     pub changed: u64,
+    /// The rows that the job could not change, because another transaction
+    /// held them.
+    pub unresolved: u64,
     /// The shards that the job could not reach.
     pub unavailable_shards: Vec<UnavailableShard>,
     /// Whether a newer change stopped the job.
@@ -606,8 +609,9 @@ async fn on_every_shard(pool: &HarvestDbPool, workflow_name: &str, job: ShardJob
         }
         .await;
         match outcome {
-            Ok((changed, superseded)) => {
+            Ok((changed, unresolved, superseded)) => {
                 pass.changed += changed;
+                pass.unresolved += unresolved;
                 if superseded {
                     pass.superseded = true;
                     break;
@@ -634,7 +638,7 @@ async fn on_every_shard(pool: &HarvestDbPool, workflow_name: &str, job: ShardJob
     pass
 }
 
-/// The base wait before the settle raises of the live rows (issue #2407).
+/// The base wait before the settle passes of the live rows (issue #2407).
 ///
 /// Another process applies the new limit only after its cache reloads,
 /// within [`RUN_DEFAULTS_TTL`] plus one refresh period. A start that it

@@ -88,6 +88,41 @@ pub fn is_reserved_activity(name: &str) -> bool {
         || crate::canary::is_reserved_canary_name(name)
 }
 
+/// The concurrency key of an activity with a code cap.
+///
+/// Code with a cap and no key uses the activity name. A local activity has
+/// no task row, so it has no key.
+#[must_use]
+pub fn concurrency_key(info: &ActivityInfo) -> Option<&str> {
+    if info.is_local {
+        return None;
+    }
+    info.max_concurrent
+        .map(|_| info.concurrency_key.unwrap_or(info.name))
+}
+
+/// Another activity in `activities` that shares the concurrency key of
+/// `activity_name`, if any.
+///
+/// Code declares one cap for each key. An override of one sharer would give
+/// the key two caps. The first name in sort order wins, so a refusal text
+/// is stable.
+pub fn key_sharer<'a>(
+    activities: impl IntoIterator<Item = &'a ActivityInfo>,
+    activity_name: &str,
+) -> Option<&'a str> {
+    let activities: Vec<&'a ActivityInfo> = activities.into_iter().collect();
+    let key = activities
+        .iter()
+        .find(|info| info.name == activity_name)
+        .and_then(|info| concurrency_key(info))?;
+    activities
+        .iter()
+        .filter(|info| info.name != activity_name && concurrency_key(info) == Some(key))
+        .map(|info| info.name)
+        .min()
+}
+
 /// The schedule-time values of one activity.
 ///
 /// `None` sets no value.
@@ -600,12 +635,34 @@ mod db {
     pub struct CapRewrite {
         /// The number of task rows whose cap changed.
         pub rewritten: u64,
+        /// The number of live rows that still hold another cap, because
+        /// another transaction held them through each retry. A settle pass
+        /// sets them.
+        pub unresolved: u64,
         /// Whether a newer change replaced the cap, so the pass stopped.
         pub superseded: bool,
     }
 
     /// The rows that one batch of [`set_live_activity_caps`] updates.
     const CAP_REWRITE_BATCH: i64 = 500;
+
+    /// The retries of [`set_live_activity_caps`] for rows that another
+    /// transaction held, and the wait before each one.
+    ///
+    /// A claim holds its rows for one short transaction. So a short wait
+    /// usually frees them.
+    const CAP_REWRITE_RETRIES: u32 = 5;
+    const CAP_REWRITE_RETRY_WAIT: Duration = Duration::from_millis(100);
+
+    /// The count of the live rows of one activity that hold another cap.
+    const CAP_REMAINING_SQL: &str = "\
+        SELECT COUNT(*) AS remaining \
+        FROM harvest_task_queue \
+        WHERE activity_name = $1 \
+          AND task_type = 'activity' \
+          AND state IN ('PENDING', 'RUNNING') \
+          AND concurrency_key IS NOT NULL \
+          AND concurrency_cap IS DISTINCT FROM $2";
 
     /// The update of one batch of [`set_live_activity_caps`].
     ///
@@ -645,7 +702,10 @@ mod db {
     /// replaced it, and the pass stops.
     ///
     /// The update runs in batches of 500 rows, and it skips a row that
-    /// another transaction holds. A later pass sets a skipped row.
+    /// another transaction holds. So it never waits on the hot task table.
+    /// After the last batch, it counts the rows that still hold another cap.
+    /// It retries them a few times after a short wait. The result reports
+    /// the rows that are left as `unresolved`, and a settle pass sets them.
     ///
     /// `store` is the default shard. `None` means that `conn` is the default
     /// shard, and one transaction holds the lock and the update. Otherwise a
@@ -682,7 +742,22 @@ mod db {
                 .await
                 .map_err(crate::error::database_error)
         };
+        let remaining = async |conn: &mut AsyncPgConnection| {
+            #[derive(QueryableByName)]
+            struct Remaining {
+                #[diesel(sql_type = BigInt)]
+                remaining: i64,
+            }
+            diesel::sql_query(CAP_REMAINING_SQL)
+                .bind::<Text, _>(activity_name)
+                .bind::<Integer, _>(stored_cap)
+                .get_result::<Remaining>(conn)
+                .await
+                .map(|row| u64::try_from(row.remaining).unwrap_or(0))
+                .map_err(crate::error::database_error)
+        };
         let mut rewritten = 0_u64;
+        let mut retries = 0_u32;
         loop {
             let batch = match store.as_deref_mut() {
                 None => {
@@ -714,15 +789,22 @@ mod db {
             let Some(updated) = batch else {
                 return Ok(CapRewrite {
                     rewritten,
+                    unresolved: 0,
                     superseded: true,
                 });
             };
             rewritten += u64::try_from(updated).unwrap_or(0);
             if i64::try_from(updated).unwrap_or(i64::MAX) < CAP_REWRITE_BATCH {
-                return Ok(CapRewrite {
-                    rewritten,
-                    superseded: false,
-                });
+                let unresolved = remaining(conn).await?;
+                if unresolved == 0 || retries == CAP_REWRITE_RETRIES {
+                    return Ok(CapRewrite {
+                        rewritten,
+                        unresolved,
+                        superseded: false,
+                    });
+                }
+                retries += 1;
+                tokio::time::sleep(CAP_REWRITE_RETRY_WAIT).await;
             }
         }
     }

@@ -309,6 +309,7 @@ async fn a_lower_cap_rewrites_the_live_rows_and_a_clear_restores_the_code_cap() 
     assert_eq!(body["effective"]["max_concurrent"], 1);
     assert_eq!(body["code"]["max_concurrent"], CODE_CAP);
     assert_eq!(body["cap_rewrite"]["rewritten_tasks"], 2, "{body}");
+    assert_eq!(body["cap_rewrite"]["unresolved_tasks"], 0, "{body}");
     assert_eq!(body["cap_rewrite"]["unavailable_shards"], json!([]));
     assert_eq!(body["cap_rewrite"]["superseded"], false);
     assert_eq!(
@@ -380,6 +381,13 @@ async fn only_a_change_that_names_the_cap_rewrites_rows() {
     );
     assert_eq!(body["cap_rewrite"]["rewritten_tasks"], 1, "{body}");
     assert_eq!(rows(&url, &[id]).await[0].1, Some(3));
+
+    // A clear when no cap is stored still runs the pass, which finds
+    // nothing to change.
+    let (status, body) = patch(&app, CAPPED, json!({ "clear_override": true })).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["cap_rewrite"]["rewritten_tasks"], 0, "{body}");
+    assert_eq!(rows(&url, &[id]).await[0].1, Some(3));
 }
 
 /// A settle pass rewrites a row that a process with a stale cache wrote
@@ -388,7 +396,7 @@ async fn only_a_change_that_names_the_cap_rewrites_rows() {
 async fn a_settle_pass_rewrites_a_row_stored_under_the_old_cap() {
     let (url, _guard) = setup_database().await;
     let (app, api_state, _registry) = build_app(&build_pool(&url));
-    api_state.set_concurrency_raise_settle_delay(Duration::from_millis(300));
+    api_state.set_concurrency_raise_settle_delay(Duration::from_secs(2));
     let (status, body) = patch(&app, CAPPED, json!({ "max_concurrent": 1 })).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["cap_rewrite"]["rewritten_tasks"], 0);
@@ -465,4 +473,33 @@ async fn the_override_list_shows_the_cap() {
     let entry = &body["activity_default_overrides"][0];
     assert_eq!(entry["activity_name"], CAPPED);
     assert_eq!(entry["max_concurrent"], 2);
+}
+
+/// The route frees its connection before the pass. The pass then takes the
+/// one connection of a pool of one, so the rewrite does not wait on it.
+#[tokio::test]
+async fn a_pool_of_one_connection_runs_the_rewrite() {
+    let (url, _guard) = setup_database().await;
+    let manager =
+        diesel_async::pooled_connection::AsyncDieselConnectionManager::<AsyncPgConnection>::new(
+            &url,
+        );
+    let pool: DbPool = deadpool::managed::Pool::builder(manager)
+        .max_size(1)
+        .build()
+        .expect("pool");
+    let (app, _state, _registry) = build_app(&pool);
+    let id = {
+        let mut conn = connect(&url).await;
+        enqueue(&mut conn).await
+    };
+    let (status, body) = tokio::time::timeout(
+        Duration::from_secs(20),
+        patch(&app, CAPPED, json!({ "max_concurrent": 1 })),
+    )
+    .await
+    .expect("the PATCH does not wait on its own connection");
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["cap_rewrite"]["rewritten_tasks"], 1, "{body}");
+    assert_eq!(rows(&url, &[id]).await[0].1, Some(1));
 }

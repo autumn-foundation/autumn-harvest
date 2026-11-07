@@ -1186,8 +1186,10 @@ impl HandlerRegistry {
     /// The key is the declared `concurrency_key`, or the activity name when
     /// code declares only a cap. An operator override of the cap wins over
     /// the declared cap, and it applies only over a declared cap. An engine
-    /// activity takes no override. Each path that enqueues an activity task
-    /// resolves its key and cap here. The call reads memory only.
+    /// activity takes no override. An activity that shares its key with
+    /// another registered activity takes no override either, so one key never
+    /// holds two caps. Each path that enqueues an activity task resolves its
+    /// key and cap here. The call reads memory only.
     #[must_use]
     pub fn activity_concurrency(&self, activity_name: &str) -> (Option<String>, Option<u32>) {
         let Some(info) = self.activities.get(activity_name) else {
@@ -1197,16 +1199,20 @@ impl HandlerRegistry {
             .concurrency_key
             .or_else(|| info.max_concurrent.map(|_| info.name))
             .map(str::to_string);
-        let cap = if crate::activity_defaults::is_reserved_activity(activity_name) {
-            info.max_concurrent
-        } else {
-            info.max_concurrent.map(|declared| {
-                self.run_defaults
-                    .activity(activity_name)
-                    .and_then(|fields| fields.max_concurrent)
-                    .unwrap_or(declared)
-            })
-        };
+        let cap = info.max_concurrent.map(|declared| {
+            if crate::activity_defaults::is_reserved_activity(activity_name) {
+                return declared;
+            }
+            // The sharer scan runs only when an override exists.
+            self.run_defaults
+                .activity(activity_name)
+                .and_then(|fields| fields.max_concurrent)
+                .filter(|_| {
+                    crate::activity_defaults::key_sharer(self.activities.values(), activity_name)
+                        .is_none()
+                })
+                .unwrap_or(declared)
+        });
         (key, cap)
     }
 

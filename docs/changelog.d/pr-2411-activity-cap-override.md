@@ -15,8 +15,11 @@ design is in `docs/design/DESIGN-2411.md`.
 - The pass runs again after 10 seconds, 1 minute and 5 minutes, for a row
   that a process with a stale cache stored. Each batch takes the activity
   lock of the default shard and stops when a newer change replaced the cap.
+  The pass skips a held row, retries it, and reports what is left as
+  `unresolved_tasks`.
 - The worker stores the effective cap on each new row. The key stays the
-  code key. `HandlerRegistry::activity_concurrency` resolves both.
+  code key. `HandlerRegistry::activity_concurrency` resolves both. It
+  ignores the override when another registered activity shares the key.
 - A dead-letter replay or redrive of an activity task now restores its key
   and the current cap. Before, a requeued activity task had no cap at all.
 - The route refuses `max_concurrent` for an activity with no code cap, for
@@ -30,8 +33,10 @@ adds `max_concurrent INTEGER CHECK (max_concurrent > 0)` to
 small, and `lock_timeout = '5s'` bounds its brief lock. No `WorkflowEvent`
 variant, no replay impact.
 
-**Tests.** Unit tests on the field, the merge, the bound, the refusals and
-the key sharer. DB tests on the store, the table check, the rewrite, a stale
-pass, a settle pass, the scope of the pass, the retry, the DLQ paths and each
-acceptance criterion at the claim and through a worker. HTTP tests on the
-route, each refusal, the audit rows, the settle pass and the override list.
+**Tests.** Unit tests cover the field, the merge, the bound, the refusals
+and the key sharer. DB tests cover the store, the table check, the rewrite,
+a stale pass, a settle pass, a held row, a pass past one batch, a raise on
+two queues, the lock on another shard, the resolver, the retry and the DLQ
+paths. They also check each acceptance criterion at the claim and through a
+worker. HTTP tests cover the route, each refusal, the audit rows, the settle
+pass, a pool of one connection and the override list.

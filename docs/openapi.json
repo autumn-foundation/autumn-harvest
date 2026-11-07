@@ -561,7 +561,7 @@
         "x-harvest-route-class": "read_only"
       },
       "patch": {
-        "description": "Set, change or clear the default override of one activity type. The override wins over the code value for every activity scheduled after the change, and survives a restart. A call-site value still wins over the override. It reaches this process at once and every other process within 5 seconds plus one refresh period (about 10 seconds). An activity that is already scheduled keeps the values of its task row, and a local activity keeps the values that its LocalActivityScheduled event froze, so replay is not affected. max_concurrent is the exception: each task row stores its cap and each claim reads it, so a PATCH that names max_concurrent or clear_override also sets the stored cap of each PENDING and RUNNING task row of the activity on every shard, and repeats that pass after 10 seconds, 1 minute and 5 minutes. A running task runs on. The response then holds cap_rewrite: rewritten_tasks, unavailable_shards and superseded for the first pass. Each field is tri-state: absent keeps the stored override, null returns the field to its code value, a value sets it. A merge that sets no field deletes the override. Each PATCH writes one activity_type.defaults audit row, refused or not. The response has the same shape as GET.",
+        "description": "Set, change or clear the default override of one activity type. The override wins over the code value for every activity scheduled after the change, and survives a restart. A call-site value still wins over the override. It reaches this process at once and every other process within 5 seconds plus one refresh period (about 10 seconds). An activity that is already scheduled keeps the values of its task row, and a local activity keeps the values that its LocalActivityScheduled event froze, so replay is not affected. max_concurrent is the exception. Each task row stores its cap, and each claim reads it. So a PATCH that names max_concurrent or clear_override also sets the stored cap of each PENDING and RUNNING task row of the activity, on every shard. The pass runs again after 10 seconds, 1 minute and 5 minutes. A running task runs on. The response then holds cap_rewrite for the first pass: rewritten_tasks, unresolved_tasks (rows that another transaction held through each retry), unavailable_shards and superseded. Each field is tri-state: absent keeps the stored override, null returns the field to its code value, a value sets it. A merge that sets no field deletes the override. Each PATCH writes one activity_type.defaults audit row, refused or not. The response has the same shape as GET.",
         "operationId": "patch_admin_activity_types_by_activity_name_defaults",
         "parameters": [
           {
@@ -648,7 +648,7 @@
         "tags": [
           "admin"
         ],
-        "x-harvest-idempotency": "Idempotent: applying the same override twice is a no-op.",
+        "x-harvest-idempotency": "Idempotent: the same override twice stores nothing new. A repeat that names max_concurrent or clear_override runs the cap pass again, and each PATCH writes an audit row.",
         "x-harvest-read-only": false,
         "x-harvest-route-class": "mutating"
       }

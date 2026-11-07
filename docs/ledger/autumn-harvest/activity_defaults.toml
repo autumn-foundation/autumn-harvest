@@ -25,7 +25,7 @@ measured = "unmeasured"
 driver = "per_request"
 backend = ["postgres"]
 kind = ["read", "write"]
-tables = ["harvest_task_queue"]
+tables = ["harvest_activity_default_overrides", "harvest_task_queue"]
 measured = "unmeasured"
 
 ["db::update_activity_default_override"]

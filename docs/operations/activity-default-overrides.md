@@ -134,30 +134,50 @@ of the activity, on every shard:
 
 - A pending task waits under the new cap. The next claim already uses it.
 - A running task runs on. The pass changes the cap column only, never the
-  state, the worker or the attempt. When its count is above a lower cap, no
-  new task of the key starts until enough tasks finish.
+  state, the worker or the attempt. When the running count of the key is
+  above a lower cap, no new task of the key starts until enough tasks
+  finish.
 - A retry of a running task waits under the new cap.
 
 The response reports the first pass in `cap_rewrite`:
 
 ```json
-"cap_rewrite": { "rewritten_tasks": 140, "unavailable_shards": [], "superseded": false }
+"cap_rewrite": {
+  "rewritten_tasks": 140,
+  "unresolved_tasks": 0,
+  "unavailable_shards": [],
+  "superseded": false
+}
 ```
+
+A pass never waits on a task row. It skips a row that another transaction
+holds, such as a claim in progress, and retries it a few times. A row that
+is still held after the retries counts in `unresolved_tasks`.
 
 The pass runs again after 10 seconds, 1 minute and 5 minutes. Another
 process applies a change only after its cache reloads. A task that it
-schedules before then stores the old cap, and a later pass sets it. A pass
-also sets a row that an earlier pass skipped because another transaction
-held it. A pass stops when a newer change replaced the cap. A shard in
-`unavailable_shards` keeps the old cap until a later pass reaches it. Send
-the request again to retry it at once.
+schedules before then stores the old cap, and a later pass sets it. A later
+pass also sets an unresolved row. A pass stops when a newer change replaced
+the cap. A shard in `unavailable_shards` keeps the old cap until a later
+pass reaches it. Send the request again to retry it at once.
+
+A process that cannot reload its cache for longer than 5 minutes keeps the
+old cap on the rows that it stores. So does a process whose code declares
+another cap during a rolling deploy. Send the request again after the roll
+to set those rows.
 
 A dead-letter replay or redrive also puts a task back under the current
 cap.
 
 The key stays as declared. The adaptive limit of each worker is separate,
-and it moves on its own. `GET /admin/concurrency` shows the cap that the
-live rows store.
+and it moves on its own. `GET /admin/concurrency` shows the highest cap that
+a live row of the key stores. A row that keeps the old cap shows until a
+pass sets it.
+
+The shared-key refusal sees the activities that the API process registers.
+A worker also ignores the cap override of an activity when its registry
+holds another activity with the same key. So register each sharer of a key
+in the API process too.
 
 ## Activities already scheduled
 
@@ -181,17 +201,17 @@ answers the route with a 404.
 
 To roll back, deploy the older release first. Then run the down migration of
 `20261107194243_harvest_activity_default_max_concurrent`, then the one of
-`20261106145707_harvest_activity_default_overrides`. The task rows keep the
-cap that the last pass stored, and each one drains under it. This release reads the
+`20261106145707_harvest_activity_default_overrides`. This release reads the
 table, so its activity refresh fails once the table is gone. The workflow
-overrides still load.
+overrides still load. The task rows keep the cap that the last pass stored.
+Each one drains under it.
 
 ## Grants
 
 The runtime role needs `SELECT`, `INSERT`, `UPDATE` and `DELETE` on
 `harvest_activity_default_overrides`. The cap pass updates
-`harvest_task_queue`, as the run-default concurrency raise does. `GET /admin/preflight` reports a
-missing grant.
+`harvest_task_queue`, as the run-default concurrency raise does.
+`GET /admin/preflight` reports a missing grant.
 
 ## See also
 

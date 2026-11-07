@@ -5,7 +5,10 @@
 //! rows and each acceptance criterion against Postgres. The claim tests
 //! drive the queue directly, so each claim is exact. The worker test drives
 //! a real worker, and its refresh loop loads the override from the table.
-//! Each test uses fresh names and its own queue.
+//! The store and claim tests use fresh names and their own queue. The
+//! worker and DLQ tests use fixed names, and the worker test scrubs its
+//! queue first. So run one copy of this module on a shared database at a
+//! time.
 //!
 //! Execution: set `HARVEST_TEST_DATABASE_URL` to a migrated Postgres to run
 //! these against a shared local cluster. Otherwise each test starts a fresh
@@ -32,7 +35,7 @@ use autumn_harvest::{
     start_or_load_workflow_execution,
 };
 use diesel::prelude::*;
-use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
@@ -300,6 +303,7 @@ async fn a_lower_cap_holds_for_each_claim_and_a_task_in_flight_runs_on() {
         done,
         CapRewrite {
             rewritten: 4,
+            unresolved: 0,
             superseded: false
         },
         "the pending and the running rows take the new cap"
@@ -434,6 +438,7 @@ async fn a_pass_for_a_replaced_cap_stops_and_changes_no_row() {
         done,
         CapRewrite {
             rewritten: 0,
+            unresolved: 0,
             superseded: true
         }
     );
@@ -501,13 +506,25 @@ const FAN_OUT: usize = 6;
 static RELEASE: AtomicBool = AtomicBool::new(false);
 /// The steps that run now.
 static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
-/// The most steps that ran at one time since the last reset.
+/// The most steps that ran at one time.
 static PEAK: AtomicUsize = AtomicUsize::new(0);
+/// Whether a step that starts after [`RELEASE`] counts as a late step.
+static TRACK_LATE: AtomicBool = AtomicBool::new(false);
+/// The late steps that started.
+static LATE_STARTS: AtomicUsize = AtomicUsize::new(0);
+/// The most steps in flight when a late step started, itself included.
+static LATE_PEAK: AtomicUsize = AtomicUsize::new(0);
 
 fn worker_step(_ctx: &ActivityContext, input: Value) -> BoxFut<'_> {
     Box::pin(async move {
         let now = IN_FLIGHT.fetch_add(1, Ordering::SeqCst) + 1;
         PEAK.fetch_max(now, Ordering::SeqCst);
+        if AtomicBool::load(&TRACK_LATE, Ordering::SeqCst)
+            && AtomicBool::load(&RELEASE, Ordering::SeqCst)
+        {
+            LATE_STARTS.fetch_add(1, Ordering::SeqCst);
+            LATE_PEAK.fetch_max(now, Ordering::SeqCst);
+        }
         if input["wait"] == json!(true) {
             while !AtomicBool::load(&RELEASE, Ordering::SeqCst) {
                 tokio::time::sleep(Duration::from_millis(20)).await;
@@ -679,6 +696,9 @@ async fn a_worker_runs_pending_tasks_under_a_lower_cap() {
     RELEASE.store(false, Ordering::SeqCst);
     IN_FLIGHT.store(0, Ordering::SeqCst);
     PEAK.store(0, Ordering::SeqCst);
+    TRACK_LATE.store(false, Ordering::SeqCst);
+    LATE_STARTS.store(0, Ordering::SeqCst);
+    LATE_PEAK.store(0, Ordering::SeqCst);
 
     let registry = Arc::new(HandlerRegistry::with_state_and_telemetry(
         vec![worker_wf_info()],
@@ -700,6 +720,14 @@ async fn a_worker_runs_pending_tasks_under_a_lower_cap() {
     })
     .await;
     assert_eq!(count(&rows, "PENDING"), 3, "the code cap of 3 holds");
+    // A row is RUNNING at its claim, a moment before its handler starts.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while AtomicUsize::load(&PEAK, Ordering::SeqCst) < 3 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the worker runs three steps at one time");
     assert!(rows.iter().all(|row| row.concurrency_cap == Some(3)));
 
     change(&mut conn, WORKER_STEP, cap_patch(Some(1)), false)
@@ -721,19 +749,14 @@ async fn a_worker_runs_pending_tasks_under_a_lower_cap() {
     assert_eq!(count(&rows, "RUNNING"), 3, "no step in flight stops");
     assert_eq!(count(&rows, "PENDING"), 3);
 
-    // Let the three in flight finish. Each later step must run alone.
+    // Let the three in flight finish. Each later step must run alone. A
+    // late step starts after the release, so no step in flight is late.
+    TRACK_LATE.store(true, Ordering::SeqCst);
     RELEASE.store(true, Ordering::SeqCst);
-    wait_for_rows(&url, first, "the three steps in flight to finish", |rows| {
-        count(rows, "RUNNING") == 0 && count(rows, "COMPLETED") >= 3
-    })
-    .await;
-    PEAK.store(
-        AtomicUsize::load(&IN_FLIGHT, Ordering::SeqCst),
-        Ordering::SeqCst,
-    );
     wait_for_execution_state_with_timeout(&url, first, "COMPLETED", Duration::from_secs(30)).await;
+    assert_eq!(AtomicUsize::load(&LATE_STARTS, Ordering::SeqCst), 3);
     assert_eq!(
-        AtomicUsize::load(&PEAK, Ordering::SeqCst),
+        AtomicUsize::load(&LATE_PEAK, Ordering::SeqCst),
         1,
         "AC1: the pending steps run one at a time"
     );
@@ -745,10 +768,15 @@ async fn a_worker_runs_pending_tasks_under_a_lower_cap() {
     assert_eq!(rows.len(), FAN_OUT);
     assert!(rows.iter().all(|row| row.concurrency_cap == Some(1)));
     assert_eq!(
-        AtomicUsize::load(&PEAK, Ordering::SeqCst),
+        AtomicUsize::load(&LATE_STARTS, Ordering::SeqCst),
+        3 + FAN_OUT
+    );
+    assert_eq!(
+        AtomicUsize::load(&LATE_PEAK, Ordering::SeqCst),
         1,
         "run two runs one at a time"
     );
+    TRACK_LATE.store(false, Ordering::SeqCst);
 
     // AC3: a clear restores the code cap.
     change(&mut conn, WORKER_STEP, empty_patch(), true)
@@ -863,4 +891,238 @@ async fn a_redriven_activity_task_waits_under_the_current_cap() {
     let redriven = row(&mut conn, task).await;
     assert_eq!(redriven.concurrency_key.as_deref(), Some("aco_dlq_redrive"));
     assert_eq!(redriven.concurrency_cap, Some(2));
+}
+
+// ---------------------------------------------------------------------------
+// Edges of the rewrite.
+// ---------------------------------------------------------------------------
+
+/// The pass runs past one batch of 500 rows.
+#[tokio::test]
+async fn a_rewrite_runs_past_one_batch() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let mut conn = connect(&url).await;
+    let name = unique("aco_batch");
+    let queue = unique_queue("aco-batch");
+    let exec_id = insert_execution(&mut conn).await;
+    let params: Vec<EnqueueParams> = (0..1001)
+        .map(|_| {
+            let mut params = EnqueueParams::new(&queue, TaskType::Activity, json!({}));
+            params.workflow_exec_id = Some(exec_id);
+            params.activity_name = Some(name.clone());
+            params.activity_id = Some(Uuid::new_v4());
+            params.concurrency_key = Some(name.clone());
+            params.max_concurrent = Some(CODE_CAP);
+            params
+        })
+        .collect();
+    queue::enqueue_batch(&mut conn, &params)
+        .await
+        .expect("enqueue");
+    change(&mut conn, &name, cap_patch(Some(1)), false)
+        .await
+        .expect("lower");
+    assert_eq!(
+        rewrite(&mut conn, &name, 1).await,
+        CapRewrite {
+            rewritten: 1001,
+            unresolved: 0,
+            superseded: false
+        }
+    );
+}
+
+/// A raise above the code cap admits more tasks. The pass covers each queue
+/// of the activity.
+#[tokio::test]
+async fn a_raise_above_the_code_cap_admits_more_tasks_on_each_queue() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let mut conn = connect(&url).await;
+    let name = unique("aco_raise");
+    let first = unique_queue("aco-raise-a");
+    let second = unique_queue("aco-raise-b");
+    for queue in [&first, &first, &first, &second, &second] {
+        enqueue(&mut conn, queue, &name, CODE_CAP).await;
+    }
+    change(&mut conn, &name, cap_patch(Some(5)), false)
+        .await
+        .expect("raise");
+    assert_eq!(rewrite(&mut conn, &name, 5).await.rewritten, 5);
+    let queues = [first.clone(), second.clone()];
+    for n in 0..5 {
+        let claimed = queue::claim_task(&mut conn, &queues, "w1", "", None, &[], &[])
+            .await
+            .expect("claim");
+        assert!(claimed.is_some(), "claim {n} fits under the cap of 5");
+    }
+}
+
+/// A row that another transaction holds through each retry is unresolved.
+/// The next pass sets it.
+#[tokio::test]
+async fn a_held_row_is_unresolved_and_the_next_pass_sets_it() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let mut conn = connect(&url).await;
+    let name = unique("aco_held");
+    let queue = unique_queue("aco-held");
+    let held = enqueue(&mut conn, &queue, &name, CODE_CAP).await;
+    let free = enqueue(&mut conn, &queue, &name, CODE_CAP).await;
+    change(&mut conn, &name, cap_patch(Some(1)), false)
+        .await
+        .expect("lower");
+
+    let mut holder = connect(&url).await;
+    holder
+        .batch_execute(&format!(
+            "BEGIN; SELECT 1 FROM harvest_task_queue WHERE id = '{held}' FOR UPDATE"
+        ))
+        .await
+        .expect("hold the row");
+    assert_eq!(
+        rewrite(&mut conn, &name, 1).await,
+        CapRewrite {
+            rewritten: 1,
+            unresolved: 1,
+            superseded: false
+        }
+    );
+    assert_eq!(caps(&mut conn, &[held, free]).await, vec![Some(3), Some(1)]);
+    holder.batch_execute("COMMIT").await.expect("release");
+    assert_eq!(
+        rewrite(&mut conn, &name, 1).await,
+        CapRewrite {
+            rewritten: 1,
+            unresolved: 0,
+            superseded: false
+        }
+    );
+}
+
+/// On another shard, each batch waits for the lock of the activity on the
+/// default shard. A change that commits under that lock stops the pass.
+#[tokio::test]
+async fn a_pass_on_another_shard_waits_for_the_override_lock() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let mut conn = connect(&url).await;
+    let name = unique("aco_lock");
+    let queue = unique_queue("aco-lock");
+    let id = enqueue(&mut conn, &queue, &name, CODE_CAP).await;
+    change(&mut conn, &name, cap_patch(Some(1)), false)
+        .await
+        .expect("lower");
+
+    let mut holder = connect(&url).await;
+    holder
+        .batch_execute(&format!(
+            "BEGIN; SELECT pg_advisory_xact_lock(hashtext('harvest:activity_defaults:{name}')::int8)"
+        ))
+        .await
+        .expect("hold the lock");
+    let pass = {
+        let url = url.clone();
+        let name = name.clone();
+        tokio::spawn(async move {
+            let mut shard = connect(&url).await;
+            let mut store = connect(&url).await;
+            set_live_activity_caps(&mut shard, Some(&mut store), &name, CODE_CAP, 1)
+                .await
+                .expect("pass")
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!pass.is_finished(), "the pass waits for the lock");
+    holder
+        .batch_execute(&format!(
+            "UPDATE harvest_activity_default_overrides SET max_concurrent = 2 \
+             WHERE activity_name = '{name}'; COMMIT"
+        ))
+        .await
+        .expect("a newer change commits");
+    assert_eq!(
+        pass.await.expect("join"),
+        CapRewrite {
+            rewritten: 0,
+            unresolved: 0,
+            superseded: true
+        }
+    );
+    assert_eq!(caps(&mut conn, &[id]).await, vec![Some(3)]);
+}
+
+/// The resolver of the key and the effective cap.
+#[test]
+fn the_resolver_applies_the_override_only_where_it_can() {
+    const CANARY: &str = autumn_harvest::canary::CANARY_ACTIVITY_NAME;
+    let named = |name: &'static str, cap: Option<u32>, key: Option<&'static str>| {
+        let mut info = worker_step_info();
+        info.name = name;
+        info.max_concurrent = cap;
+        info.concurrency_key = key;
+        info
+    };
+    let registry = HandlerRegistry::new(
+        vec![],
+        vec![
+            named("aco_r_own", Some(3), None),
+            named("aco_r_keyed", Some(3), Some("aco_r_partner")),
+            named("aco_r_plain", None, None),
+            named("aco_r_shared_a", Some(2), Some("aco_r_shared")),
+            named("aco_r_shared_b", Some(2), Some("aco_r_shared")),
+            named(CANARY, Some(4), None),
+        ],
+    );
+    let cap = |n| ActivityDefaultFields {
+        max_concurrent: Some(n),
+        ..ActivityDefaultFields::default()
+    };
+    for name in [
+        "aco_r_own",
+        "aco_r_keyed",
+        "aco_r_plain",
+        "aco_r_shared_a",
+        CANARY,
+    ] {
+        registry.run_defaults().write_through_activity(name, cap(1));
+    }
+    let own = |key: &str, cap: u32| (Some(key.to_string()), Some(cap));
+    assert_eq!(
+        registry.activity_concurrency("aco_r_own"),
+        own("aco_r_own", 1)
+    );
+    assert_eq!(
+        registry.activity_concurrency("aco_r_keyed"),
+        own("aco_r_partner", 1)
+    );
+    assert_eq!(
+        registry.activity_concurrency("aco_r_plain"),
+        (None, None),
+        "no code cap, no key and no cap"
+    );
+    assert_eq!(
+        registry.activity_concurrency("aco_r_shared_a"),
+        own("aco_r_shared", 2),
+        "a shared key keeps its one code cap"
+    );
+    assert_eq!(
+        registry.activity_concurrency(CANARY),
+        own(CANARY, 4),
+        "an engine activity takes no override"
+    );
+    assert_eq!(registry.activity_concurrency("aco_r_unknown"), (None, None));
+}
+
+/// A process that does not register the activity requeues it with no key
+/// and no cap.
+#[tokio::test]
+async fn a_replay_of_an_unregistered_activity_stores_no_cap() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let mut conn = connect(&url).await;
+    let registry = dlq_registry("aco_dlq_known", None);
+    let entry = dead_letter(&mut conn, "aco_dlq_unknown", "RUNNING").await;
+    let task = autumn_harvest::dlq::replay_dead_letter(&mut conn, entry, Some(&registry))
+        .await
+        .expect("replay");
+    let replayed = row(&mut conn, task).await;
+    assert_eq!(replayed.concurrency_key, None);
+    assert_eq!(replayed.concurrency_cap, None);
 }

@@ -25,8 +25,9 @@
 //!   each attempt;
 //! - a heartbeat, `schedule_to_start` or `schedule_to_close` field for a
 //!   local activity, because a local activity has none of them;
-//! - a `max_concurrent` for a local activity, which has no task row, and for
-//!   an activity with no code cap, whose rows have no concurrency key;
+//! - a `max_concurrent` for a local activity, which has no task row;
+//! - a `max_concurrent` for an activity with no code cap, whose rows have no
+//!   concurrency key;
 //! - a `max_concurrent` for an activity that shares its concurrency key with
 //!   another activity, because one key would then hold two caps;
 //! - any field for a reserved engine activity.
@@ -35,13 +36,12 @@ use std::time::Duration;
 
 use autumn_harvest::activity_defaults::{
     ActivityDefaultChange, ActivityDefaultFields, ActivityDefaultOverride, ActivityDefaultPatch,
-    ActivityDefaults, get_activity_default_override, update_activity_default_override,
+    ActivityDefaults, get_activity_default_override, key_sharer, update_activity_default_override,
 };
 use autumn_harvest::audit::{
     self, OP_ACTIVITY_TYPE_DEFAULTS, STATUS_FAILED, STATUS_SUCCEEDED, TARGET_ACTIVITY_TYPE,
 };
 use autumn_harvest::error::HarvestError;
-use autumn_harvest::info::ActivityInfo;
 use autumn_harvest::models::NewAuditRecord;
 use autumn_harvest::workflow_retry::RetryLimitsPatch;
 use autumn_web::AutumnError;
@@ -159,7 +159,8 @@ pub struct ActivityDefaultsView {
     /// the builder default.
     pub effective: ActivityDefaultMs,
     /// The rewrite of the stored caps. Present only on a `PATCH` that names
-    /// `max_concurrent` or `clear_override`, for an activity with a code cap.
+    /// `max_concurrent` or `clear_override`, for a remote activity with a
+    /// code cap.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cap_rewrite: Option<CapRewriteReport>,
 }
@@ -169,6 +170,9 @@ pub struct ActivityDefaultsView {
 pub struct CapRewriteReport {
     /// The number of live task rows whose stored cap changed.
     pub rewritten_tasks: u64,
+    /// The number of live task rows that still hold another cap, because
+    /// another transaction held them. A settle pass sets them.
+    pub unresolved_tasks: u64,
     /// The shards that the rewrite could not reach. Their rows keep the old
     /// cap until a settle pass reaches them. Send the request again to retry.
     pub unavailable_shards: Vec<UnavailableShard>,
@@ -314,33 +318,6 @@ fn code_values(
         .activities
         .get(activity_name)
         .map(|info| (ActivityDefaults::of(info), info.is_local))
-}
-
-/// The concurrency key of a capped activity. Code with a cap and no key uses
-/// the activity name.
-fn concurrency_key(info: &ActivityInfo) -> Option<&str> {
-    info.max_concurrent
-        .map(|_| info.concurrency_key.unwrap_or(info.name))
-}
-
-/// Another registered activity that shares the concurrency key of
-/// `activity_name`, if any. The first name in sort order wins, so the
-/// refusal text is stable.
-fn key_sharer<'a>(
-    activities: impl IntoIterator<Item = &'a ActivityInfo>,
-    activity_name: &str,
-) -> Option<String> {
-    let activities: Vec<&ActivityInfo> = activities.into_iter().collect();
-    let key = activities
-        .iter()
-        .find(|info| info.name == activity_name)
-        .and_then(|info| concurrency_key(info))?;
-    activities
-        .iter()
-        .filter(|info| info.name != activity_name && concurrency_key(info) == Some(key))
-        .map(|info| info.name)
-        .min()
-        .map(str::to_string)
 }
 
 fn view(
@@ -507,7 +484,8 @@ pub async fn patch_activity_defaults(
         .await;
         return Err(not_registered(&activity_name));
     };
-    let sharer = key_sharer(runtime.registry().activities.values(), &activity_name);
+    let sharer =
+        key_sharer(runtime.registry().activities.values(), &activity_name).map(str::to_string);
     if let Some(summary) = request.refusal(&code, local, sharer.as_deref()) {
         audit_refusal(&mut conn, ctx, &activity_name, &summary).await;
         return Err(AutumnError::bad_request_msg(summary));
@@ -541,7 +519,10 @@ pub async fn patch_activity_defaults(
         .registry()
         .run_defaults()
         .write_through_activity(&activity_name, fields);
-    // The cap of a stored row changes too, so a pending task takes the cap.
+    // The pass takes its own connections, the default shard among them.
+    // Holding this one would starve a small pool.
+    drop(conn);
+    // A stored row changes its cap too, so a pending task takes the new cap.
     let cap_rewrite = match code.max_concurrent {
         Some(code_cap) if request.touches_cap() && !local => {
             let cap = fields.max_concurrent.unwrap_or(code_cap);
@@ -549,6 +530,7 @@ pub async fn patch_activity_defaults(
             let pass = settle_on_every_shard(&api_state, &pool, &activity_name, job).await?;
             Some(CapRewriteReport {
                 rewritten_tasks: pass.changed,
+                unresolved_tasks: pass.unresolved,
                 unavailable_shards: pass.unavailable_shards,
                 superseded: pass.superseded,
             })
@@ -567,6 +549,7 @@ pub async fn patch_activity_defaults(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use autumn_harvest::info::ActivityInfo;
 
     fn request(body: serde_json::Value) -> ActivityDefaultsPatchRequest {
         serde_json::from_value(body).expect("body")
@@ -683,14 +666,23 @@ mod tests {
             capped("named_like_own", Some(2), Some("own")),
             capped("plain", None, None),
         ];
-        assert_eq!(key_sharer(&all, "sync_c").as_deref(), Some("sync_a"));
-        assert_eq!(key_sharer(&all, "sync_a").as_deref(), Some("sync_b"));
+        assert_eq!(key_sharer(&all, "sync_c"), Some("sync_a"));
+        assert_eq!(key_sharer(&all, "sync_a"), Some("sync_b"));
         assert_eq!(
-            key_sharer(&all, "own").as_deref(),
+            key_sharer(&all, "own"),
             Some("named_like_own"),
             "a default key is the activity name"
         );
         assert_eq!(key_sharer(&all, "plain"), None, "no cap, no key");
+        let mut local = capped("inline", Some(2), Some("partner_local"));
+        local.is_local = true;
+        let remote = capped("remote", Some(2), Some("partner_local"));
+        let pair = [local, remote];
+        assert_eq!(
+            key_sharer(&pair, "remote"),
+            None,
+            "a local activity has no task row, so it shares no key"
+        );
         assert_eq!(key_sharer(&all, "unknown"), None);
         assert_eq!(key_sharer(&all[3..4], "own"), None);
     }

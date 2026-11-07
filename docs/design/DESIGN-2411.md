@@ -72,14 +72,17 @@ Decision: 1, 4 and 9.
 | An override adds a cap to an activity with none. | The route refuses it. The resolver ignores it too. |
 | An override applies to a local activity, which has no row. | The route refuses it. |
 | A zero cap, or one past the `INTEGER` column. | The write and the decode refuse both. The table `CHECK` refuses zero. |
-| A rewrite holds many row locks on the hot task table. | It updates 500 rows per transaction, with `SKIP LOCKED`. A skipped row waits for a settle pass. |
+| A rewrite holds many row locks on the hot task table. | It updates 500 rows per transaction, with `SKIP LOCKED`. It retries a skipped row a few times, then reports it as unresolved for a settle pass. |
+| A claim holds a row through the pass, so the row keeps the old cap. | The retries wait for the short claim transaction. The response reports a row that stays held. |
+| The API process does not register a sharer of the key. | The worker resolver ignores the override when its registry holds a sharer. |
 | A client disconnects and the rewrite stops. | Each pass runs in its own task. |
 | Clearing the override drops the other fields of #2410. | The tri-state merge keeps each field that the patch does not name. |
 | A change is not audited. | Each `PATCH` writes one audit row in the same transaction as the change. A refusal writes a failed audit row. |
 
 ## Six thinking hats
 
-- **White (facts).** The cap lives on each row. One enqueue site sets it.
+- **White (facts).** The cap lives on each row. The worker and the
+  dead-letter replay and redrive set it.
   Each claim path compares the running count of the key to the row's cap.
 - **Red (feeling).** An operator wants to slow a downstream, not to stop
   it. A lower cap must not kill a task in flight.
@@ -100,13 +103,17 @@ Decision: 1, 4 and 9.
 - `ActivityDefaults` and `ActivityDefaultFields` get `max_concurrent`.
   `ActivityDefaultPatch` gets the tri-state field. The cap applies only
   over a code cap.
-- `build_activity_enqueue_plan` stores the effective cap. The key stays the
-  code key.
+- `HandlerRegistry::activity_concurrency` resolves the key and the
+  effective cap. The worker enqueue and the dead-letter replay and redrive
+  call it. It ignores the override when another registered activity shares
+  the key.
 - Migration `20261107194243_harvest_activity_default_max_concurrent` adds
-  `max_concurrent INTEGER CHECK (> 0)` and widens the row `CHECK`.
+  `max_concurrent INTEGER CHECK (max_concurrent > 0)` and widens the row
+  `CHECK`.
 - `activity_defaults::set_live_activity_caps` sets the cap of the live rows
   of one activity on one shard. It runs in batches under the activity lock
-  of the default shard.
+  of the default shard. It skips a held row and retries it a few times. A
+  row that stays held counts as unresolved, and a settle pass sets it.
 - `PATCH /admin/activity-types/{activity_name}/defaults` takes
   `max_concurrent`, from 1 to 2147483647. It refuses the field for a local
   activity, for an activity with no code cap and for a shared key. A
