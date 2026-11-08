@@ -3721,8 +3721,8 @@ pub struct WorkflowOverrideUpdate {
 /// and the `next_run_at` rules are those of [`update_workflow_schedule`].
 ///
 /// `codecs` encodes the input of the row and of the override, and decodes
-/// the stored override input (issue #2412). So the next fire takes the new
-/// input, and the stored input is ciphertext under an active codec.
+/// the stored override input. So the next fire takes the new input, and the
+/// stored input is ciphertext under an active codec.
 ///
 /// # Errors
 ///

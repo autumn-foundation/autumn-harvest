@@ -30217,7 +30217,7 @@ fn check_override_fields(
 /// A schedule declared in code converges to its code value on every tick.
 /// So a patch of one writes an operator override instead of a row edit
 /// (issue #2386). The tick applies the override before it converges the row.
-/// The override stores `input` under the write codec (issue #2412).
+/// The override stores `input` under the write codec.
 #[allow(clippy::too_many_lines)]
 async fn update_schedule_handler(
     Extension(api_state): Extension<HarvestApiState>,
