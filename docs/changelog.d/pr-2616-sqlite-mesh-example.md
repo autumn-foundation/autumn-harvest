@@ -1,4 +1,4 @@
-## A small runnable mesh example (issue #2486)
+## A small runnable mesh example (issue #2486, PR #2616)
 
 The agent mesh now has an on-ramp between `sqlite_agent` and the
 `examples/agent-mesh/` capstone.
