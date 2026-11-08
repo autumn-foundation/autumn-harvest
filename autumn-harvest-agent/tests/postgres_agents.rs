@@ -33,6 +33,7 @@ use std::time::Duration;
 use autumn_harvest::chrono::{DateTime, Utc};
 use autumn_harvest::entity::ENTITY_STATE_QUERY;
 use autumn_harvest::entity_state::ProjectedSnapshot;
+use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::shard::{ShardRouter, ShardedDbPool};
 use autumn_harvest::worker::{DbPool, Worker, WorkerRuntimeConfig};
 use autumn_harvest::{HarvestBuilder, ShardId, WorkerConfig, migrate};
@@ -839,21 +840,20 @@ async fn a_gated_call_on_a_durable_agent_sends_one_notice_that_decide_accepts() 
 
     let op = AgentOp::message_with_id("Save a note.", "m-1");
     postgres::send(&pg, &id, &op, Some("m-1")).await.unwrap();
-    let exec = loop {
-        if let Some(exec) = postgres::current_run(&pg, &id).await.unwrap() {
-            break exec;
+    // The notice is the push: the app waits for it, not for a poll.
+    let deadline = std::time::Instant::now() + LIMIT;
+    let seen = loop {
+        let seen = notices.0.lock().unwrap().clone();
+        if !seen.is_empty() || std::time::Instant::now() > deadline {
+            break seen;
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     };
-    let RunState::WaitingSignal(signal) = postgres::wait_run(&pg, exec, LIMIT).await.unwrap()
-    else {
-        panic!("the op should wait for an approval");
-    };
-    let seen = notices.0.lock().unwrap().clone();
     assert_eq!(seen.len(), 1, "one notice for one parked call");
     let notice = &seen[0].call;
-    assert_eq!(notice.signal, signal);
+    let exec = postgres::current_run(&pg, &id).await.unwrap().unwrap();
     assert_eq!(notice.execution_id, exec);
+    assert!(notice.signal.starts_with("tool_approval:"), "{notice:?}");
     assert_eq!(notice.agent_id.as_ref(), Some(&id));
     assert_eq!(notice.tool, "write");
     assert_eq!(notice.arguments, json!({"text": "hi"}));
@@ -936,12 +936,39 @@ async fn a_decision_sent_from_the_notice_releases_the_call_and_replays() {
     assert_eq!(auto.seen.lock().unwrap().len(), 1, "one notice");
 
     // The run replays with the decision that came before the wait opened.
+    // Replay reads a run that ended, so delete the agent first.
     let exec = postgres::current_run(&pg, &id).await.unwrap().unwrap();
+    postgres::delete(&pg, &id, None).await.unwrap();
+    let ended = postgres::wait_run(&pg, exec, LIMIT).await.unwrap();
+    assert!(!matches!(ended, RunState::Running), "{ended:?}");
     let mut conn = AsyncPgConnection::establish(&url).await.unwrap();
     let events = autumn_harvest::store::load_history(&mut conn, exec)
         .await
         .unwrap()
         .events;
+    // The decision lands before the approval race opens. So the race
+    // settles on its first poll: its winner marker follows its open marker,
+    // and it arms no timer.
+    let marker = |event: &WorkflowEvent| match event {
+        WorkflowEvent::MarkerRecorded { name, .. } => Some(name.clone()),
+        _ => None,
+    };
+    let decided = events
+        .iter()
+        .position(|event| {
+            matches!(event, WorkflowEvent::SignalReceived { signal_name, .. }
+                if signal_name.starts_with("tool_approval:"))
+        })
+        .expect("the decision is in history");
+    let opened = (decided..events.len())
+        .find(|&at| marker(&events[at]).is_some_and(|name| name.starts_with("race:")))
+        .expect("the approval race opens after the decision");
+    let seq = marker(&events[opened]).unwrap()["race:".len()..].to_owned();
+    assert_eq!(
+        marker(&events[opened + 1]),
+        Some(format!("race_winner:{seq}")),
+        "the race settles at once"
+    );
     let replay = WorkflowReplayer::new()
         .register(vec![autumn_harvest_agent::agent_info()])
         .with_execution_id(exec)
@@ -949,7 +976,7 @@ async fn a_decision_sent_from_the_notice_releases_the_call_and_replays() {
         .replay_from_events(events)
         .await;
     assert!(
-        !matches!(replay.status, ReplayStatus::NonDeterminismDetected { .. }),
+        matches!(replay.status, ReplayStatus::ReplaySucceeded),
         "{replay}"
     );
 }

@@ -136,7 +136,7 @@ fn stop_name(stop: AgentStop) -> String {
 
 /// One gated call that waits for an approval. It is the recorded input of
 /// the activity `agent_approval_notice`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ParkedCall {
     /// The run id that tools and the policy see.
     pub run_id: RunId,
@@ -189,7 +189,7 @@ impl ParkedCall {
 ///
 /// Show it to a person, and send the decision with `decide`: use
 /// `call.execution_id` and `call.signal`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApprovalNotice {
     /// The call that waits.
     #[serde(flatten)]

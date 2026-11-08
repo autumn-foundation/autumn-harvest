@@ -140,11 +140,10 @@ async fn park(rt: &mut SqliteRuntime, agent: &AgentId, text: &str) -> String {
     }
 }
 
-async fn state(rt: &SqliteRuntime, agent: &AgentId) -> AgentState {
-    sqlite::state(rt, agent)
-        .await
-        .unwrap()
-        .expect("the agent runs")
+/// The state of `agent`. The query holds no borrow of the runtime.
+fn state(rt: &SqliteRuntime, agent: &AgentId) -> impl Future<Output = AgentState> + Send + 'static {
+    let query = Box::pin(sqlite::state(rt, agent));
+    async move { query.await.unwrap().expect("the agent runs") }
 }
 
 /// Every event of the current run of `agent`.

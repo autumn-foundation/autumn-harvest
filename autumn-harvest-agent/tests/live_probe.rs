@@ -229,7 +229,7 @@ async fn a_probe_run_sends_no_approval_notice() {
         1,
         "a probe sends no notice"
     );
-    assert!(recorder.runs().is_empty());
+    assert_eq!(recorder.runs(), Vec::<Value>::new(), "nothing ran");
 }
 
 #[tokio::test(flavor = "multi_thread")]

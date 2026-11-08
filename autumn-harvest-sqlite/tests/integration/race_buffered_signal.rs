@@ -4,7 +4,10 @@
 //! race then opens and takes the buffered signal at once. Every later pass
 //! must replay that outcome.
 
-#![allow(clippy::used_underscore_binding)]
+// The `#[workflow]` and `#[activity]` macros read their input through a
+// binding. The `#[activity]` body is a stub that awaits nothing. The
+// registered closure runs in its place.
+#![allow(clippy::used_underscore_binding, clippy::unused_async)]
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
