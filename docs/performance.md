@@ -1685,8 +1685,47 @@ off remove it.
     rewrite many rows in one commit. Then each claim in flight on that head
     skips those rows once. No writer updates one row again and again.
   - A later poll reads the new version.
-- **Not measured: the e2e bench.** The issue #2547 profile was not run
-  again. The figures above are from the claim fixture only.
+
+#### The e2e profile, again
+
+The workload of issue #2547: `benches/e2e_bench.rs`, scenario
+`throughput`, 1 shard, with `HARVEST_BENCH_STATS_DIR` set. Each run
+captures the shard's `pg_stat_statements` for the scenario only. Postgres
+16.15 on a 4-core box. Run 2 also sampled 2% of plans with `auto_explain`
+(`ANALYZE`, `BUFFERS`). "Before" is `trunk-dev` at `373ec6f`.
+
+| run | claim, before | claim, after |
+|:--|--:|--:|
+| 1 | 141.1 buffers per call, 47.6% of buffers | 94.7 buffers per call, 38.9% |
+| 2 | 238.6 buffers per call, 51.1% | 101.2 buffers per call, 35.2% |
+
+The median of about 195 sampled claim plans in each half of run 2:
+
+| part | before | after |
+|:--|--:|--:|
+| `seek_heads` | 31 | 31 |
+| refine scan, own buffers | 105 for 27 rows, 3.89 per row | 27 for 27 rows, 1.00 per row |
+| `claimed` | 17 | 16 |
+| whole claim | 235 | 99 |
+
+- **The refine matches the fixture.** The primary-key refine read 3.89
+  buffers per row. Issue #2547 measured about 4.2. The TID refine reads 1.
+- **The heads do not change.** Every sampled plan read
+  `idx_harvest_tq_claim_seek` and `idx_harvest_tq_sticky_poll`, before and
+  after.
+- **The before figure varies.** It was 141 in run 1 and 239 in run 2. The
+  after figure stayed near 100.
+- **Throughput is not evidence.** It was 46.5 and 47.0 workflows/s before,
+  and 48.0 and 47.8 after. The bench is a closed loop with a shallow queue.
+- **A gate that reads many runs remains.** The PAUSED-run gate is a hashed
+  subplan. It scans `harvest_workflow_executions` once per claim to build
+  its hash. Before, that was a sequential scan. After, it was an index scan
+  on `idx_harvest_we_non_terminal_wf_name`. Each read about 27 buffers here,
+  and the cost grows with the number of runs. Issue #2547 does not change
+  it.
+- **Artifacts:** [`docs/perf-artifacts/claim-refine-tid/`](perf-artifacts/claim-refine-tid/)
+  holds the `pg_stat_statements` and `pg_stat_user_tables` files of the
+  four runs.
 
 ### Costs of the seek window
 

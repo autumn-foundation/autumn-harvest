@@ -26,3 +26,8 @@ design is in `docs/design/DESIGN-2547.md`.
   pending rows, and from 3.03 to 1.04 at 1,000. With 32 held claims the
   whole claim fell from 1,726 to 781 buffers. `docs/performance.md` has the
   tables.
+- The e2e profile of the issue, run again (`throughput`, 1 shard): the
+  claim fell from 141.1 to 94.7 buffers per call in one run, and from
+  238.6 to 101.2 in a second. Sampled plans show the refine at 3.89
+  buffers per row before and 1.00 after. Artifacts are in
+  `docs/perf-artifacts/claim-refine-tid/`.
