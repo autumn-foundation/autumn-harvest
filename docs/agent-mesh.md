@@ -79,6 +79,35 @@ The `stop` field tells the parent model how the child ended. The
 The parent model reads both and decides what to do. A durable peer result
 also has `error`.
 
+### Run a small mesh
+
+The example `sqlite_mesh` needs no API key and no network. A planner
+delegates a question to a read-only researcher. It then delegates to a
+publisher that its mandate does not name, and the delegation is refused.
+Last, it asks to write the plan and waits for approval. The process drops
+the runtime as a crash would, opens the file again, approves, and finishes:
+
+```sh
+cargo run -p autumn-harvest-agent --features sqlite --example sqlite_mesh
+```
+
+```text
+process 1: start the planner
+  waiting on tool_approval:3:0:write_1
+process 2: open the file again and approve
+  stop:   completed
+  answer: The plan is saved. Publishing is not allowed.
+model calls: 5 before the restart, 1 after it
+tool runs: lookup_fact 1, write_plan 1
+delegations:
+  planner -> researcher: completed, 40 tokens, 1 tool call(s)
+  planner -> publisher: refused, not_permitted
+```
+
+The restart sends one model call only. History answers the delegation, the
+refusal and each recorded turn. The last lines are `AgentReport::delegations`.
+A test of the example checks that this output stays true.
+
 ## 3. What the child gets
 
 The child sees nothing of the parent transcript. Put every fact it needs in

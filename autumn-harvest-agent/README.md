@@ -43,14 +43,16 @@ An app implements `AgentModel` for its provider.
 
 ```sh
 cargo run -p autumn-harvest-agent --features sqlite --example sqlite_agent
+cargo run -p autumn-harvest-agent --features sqlite --example sqlite_mesh
 cargo run -p autumn-harvest-agent --features sqlite --example agent_session_entity
 DATABASE_URL=postgres://localhost/harvest \
   cargo run -p autumn-harvest-agent --features postgres --example postgres_agent
 ```
 
-The first example runs the agent loop once. The second runs a chat session
-as a durable `Agent`. The third runs both on Postgres, with a worker in the
-process.
+The first example runs the agent loop once. The second runs a small mesh: a
+delegation, a refused delegation and a restart. The third runs a chat
+session as a durable `Agent`. The fourth runs the first and the third on
+Postgres, with a worker in the process.
 
 | Feature | Contents |
 |---|---|

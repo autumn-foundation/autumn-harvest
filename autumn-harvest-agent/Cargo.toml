@@ -295,6 +295,13 @@ workspace = true
 name = "sqlite_agent"
 required-features = ["sqlite"]
 
+# The smallest agent mesh: a delegation, a refusal and a restart. `test =
+# true` runs its tests in the crate test step, and CI also runs `main`.
+[[example]]
+name = "sqlite_mesh"
+required-features = ["sqlite"]
+test = true
+
 # The same story on Postgres, with a worker in the process.
 [[example]]
 name = "postgres_agent"
