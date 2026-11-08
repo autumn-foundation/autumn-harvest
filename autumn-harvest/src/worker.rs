@@ -349,8 +349,9 @@ impl WorkerRuntimeConfig {
     /// Returns [`HarvestError::Config`] if `queues` is empty, if
     /// `max_concurrent_claims` is 0, if `claim_slots_per_shard` exceeds
     /// [`crate::builder::MAX_CLAIM_SLOTS_PER_SHARD`], or if
-    /// `cancellation_grace_period` exceeds [`MAX_CANCELLATION_GRACE_PERIOD`]. With `fairness_keys` on, it
-    /// also rejects a queue name that the weight API does not accept.
+    /// `cancellation_grace_period` exceeds [`MAX_CANCELLATION_GRACE_PERIOD`].
+    /// With `fairness_keys` on, it also rejects a queue name that the weight
+    /// API does not accept.
     pub fn validate(&self) -> HarvestResult<()> {
         if self.queues.is_empty() {
             return Err(HarvestError::Config(
@@ -41586,11 +41587,12 @@ impl Worker {
         .await
     }
 
-    /// The claim slots of claim target `shard`, or `None` when the cap is off.
-    fn claim_slots(&self, shard: Option<crate::types::ShardId>) -> Option<queue::ClaimSlots> {
+    /// The claim slots of each claim, or `None` when the cap is off. The
+    /// slots belong to the task-queue table of the claim target.
+    fn claim_slots(&self) -> Option<queue::ClaimSlots> {
         self.config
             .claim_slots_per_shard
-            .map(|slots| queue::ClaimSlots::new(shard, slots))
+            .map(queue::ClaimSlots::new)
     }
 
     /// Record one claim on `shard` that got no claim slot. It sent no claim
@@ -42264,7 +42266,7 @@ impl Worker {
         let circuit_breakers = self.registry.circuit_breakers();
         let circuit_breaker_activities = circuit_breakers.tracked_activity_names();
         let exclusions = self.claim_exclusions();
-        let slots = self.claim_slots(shard);
+        let slots = self.claim_slots();
 
         // --- Weighted queue selection (issue #515) ---
         //

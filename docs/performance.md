@@ -2027,49 +2027,54 @@ by default. Design record:
 [`docs/operations/claim-slots.md`](operations/claim-slots.md).
 
 **Mechanism.** The claim transaction first takes one of N advisory locks of
-its shard, with `pg_try_advisory_xact_lock`. A claim that gets no slot sends
-no claim statement. Its loop tries its next shard. The lock ends with the
-transaction. With the cap on, each claim adds one short statement.
+its `harvest_task_queue` table, with `pg_try_advisory_xact_lock`. A claim
+that gets no slot sends no claim statement. Its loop tries its next shard.
+The lock ends with the transaction. With the cap on, each claim adds one
+short statement.
 
 **The cap holds.** `claim_slots_bound_the_claims_that_run_at_once` runs 3
-workers of 4 claim loops each against one shard, with a 150 ms claim. With 2
-slots, the largest overlap of claim statements is 2. With no cap, the same
+workers of 4 claim loops each against one table, with a 150 ms claim. With
+2 slots, the largest overlap of claim statements is 2. With no cap, the same
 fleet reaches 10.
 
-**Recovery after a stall.** `claim_throughput_recovers_after_a_stall_without_slots`
-and `claim_throughput_recovers_after_a_stall_with_slots` run 3 workers of 4
-claim loops each on one shard, with a backlog of 6,000 workflows. Each takes
-the claim rate before the stall as the best of three 1 s windows. One
-transaction then holds `ACCESS EXCLUSIVE` on `harvest_task_queue` for 3 s.
-After the lift, a 1 s window slides in 100 ms steps until it reaches 90% of
-the rate before the stall. The test fails if that takes more than 10 s.
+**Recovery after a stall.** `claim_throughput_recovers_after_a_stall` runs 3
+workers of 4 claim loops each on one table, with a backlog of 6,000
+workflows. It runs the cap off, then 4 slots, each on its own database. Each
+arm takes the claim rate before the stall as the median of three 1 s
+windows. One transaction then holds `ACCESS EXCLUSIVE` on
+`harvest_task_queue` for 3 s. After the lift, a 1 s window slides in 100 ms
+steps until it reaches 90% of the rate before the stall. The test fails if
+that takes more than 10 s.
 
 Host: 4 logical CPUs (Intel Xeon @ 2.10 GHz). PostgreSQL 16.15 at its
-defaults, except `max_connections=400`. A debug test build. Three runs of
-each arm on 2026-11-08:
+defaults, except `max_connections=400`. A debug test build. Four runs on
+2026-11-08:
 
-| Arm | Claims/s before | Claims/s at recovery | Time to recover | Slot misses |
-|---|--:|--:|--:|--:|
-| no cap | 42.9 / 35.6 / 37.9 | 43.5 / 40.2 / 45.2 | 1.10 / 1.09 / 1.02 s | 0 / 0 / 0 |
-| 4 slots | 23.5 / 22.9 / 15.7 | 33.6 / 25.0 / 26.2 | 1.07 / 1.00 / 1.11 s | 415 / 147 / 250 |
+| Run | No cap: claims/s before → at recovery | No cap: time | 4 slots: claims/s before → at recovery | 4 slots: time | 4 slots: misses |
+|--:|--:|--:|--:|--:|--:|
+| 1 | 52.5 → 66.1 | 1.06 s | 68.7 → 64.6 | 4.17 s | 313 |
+| 2 | 62.8 → 72.0 | 1.03 s | 54.8 → 50.9 | 1.46 s | 164 |
+| 3 | 113.8 → 108.2 | 1.04 s | 55.4 → 51.6 | 1.96 s | 307 |
+| 4 | 64.9 → 67.6 | 1.04 s | 81.8 → 81.8 | 1.05 s | 270 |
 
 What the table shows:
 
-- **Both arms recover in the first full window.** A window is 1 s wide, so
-  1.0 to 1.1 s is the earliest that the test can report.
-- **Four slots cut this fleet's rate by about 40%.** Twelve loops share four
-  slots, and a loop that misses waits for its next wake. The cap is a
-  limit, not a speed-up, on one uncontended shard.
-- **No arm overshoots into a slower state.** In each run the recovery
-  window ran at or above the rate before the stall.
+- **Both arms recover within the bound in every run.** A window is 1 s
+  wide, so about 1.0 s is the earliest that the test can report.
+- **With no cap, recovery is in the first window every time.** With 4
+  slots it took 1.05 to 4.17 s. Twelve loops share four slots, and a loop
+  that misses waits for its next wake.
+- **The rates do not separate the arms.** On this box, a debug build gives
+  52 to 114 claims per second from run to run. That spread is wider than
+  any difference between the arms.
 
 What the measurement does not establish:
 
-- **Metastability.** One shard on a local Postgres did not collapse with or
+- **Metastability.** One table on a local Postgres did not collapse with or
   without the cap. The DBOS collapse needed 8 to 16 shards under load. The
   capacity scenario of issue #2419 decides the default.
-- **A release build.** Absolute rates are those of a debug test build. Only
-  the two arms compare.
+- **A release build.** Absolute rates are those of a debug test build.
+
 
 ## Enqueue throughput
 

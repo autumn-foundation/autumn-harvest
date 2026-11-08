@@ -1,12 +1,15 @@
 #![cfg(feature = "db")]
-//! Claim slots: a fleet-wide cap on the claims that run at once per shard.
+//! Claim slots: a fleet-wide cap on the claims that run at once per table.
 //!
 //! See `docs/operations/claim-slots.md`. A test trigger makes each claim of one
 //! queue sleep and logs its interval. The largest overlap of those intervals
 //! is the number of claim statements that ran at once.
 //!
-//! Set `HARVEST_TEST_DATABASE_URL` to a migrated Postgres to run against it.
-//! Otherwise a testcontainers Postgres 16 starts.
+//! Each test owns its database. The slots belong to the task-queue table, so
+//! two tests on one table would share them. The stall test also locks the
+//! whole table. Set `HARVEST_TEST_DATABASE_URL` to a Postgres server, and
+//! each test creates and migrates its own database there. Otherwise each test
+//! starts a testcontainers Postgres 16.
 
 use std::collections::{BTreeMap, HashMap};
 use std::num::NonZeroU16;
@@ -40,26 +43,100 @@ use uuid::Uuid;
 // DB setup.
 // ---------------------------------------------------------------------------
 
-async fn setup_db() -> (String, Option<ContainerAsync<Postgres>>) {
-    if let Ok(url) = std::env::var("HARVEST_TEST_DATABASE_URL") {
-        return (url, None);
+/// A migrated database that one test owns.
+///
+/// A test that panics leaks its database. The `harvest_cs_` prefix names
+/// such a database.
+struct TestDb {
+    url: String,
+    /// The URL that creates and drops the databases of this test.
+    admin: String,
+    /// The databases that this test created.
+    owned: Vec<String>,
+    _container: Option<ContainerAsync<Postgres>>,
+}
+
+impl TestDb {
+    /// A database on `HARVEST_TEST_DATABASE_URL`, or a new container.
+    async fn new() -> Self {
+        if let Ok(admin) = std::env::var("HARVEST_TEST_DATABASE_URL") {
+            let (url, name) = create_database(&admin).await;
+            return Self {
+                url,
+                admin,
+                owned: vec![name],
+                _container: None,
+            };
+        }
+        let container = Postgres::default()
+            .with_init_sql(autumn_harvest::test_init_sql().as_bytes().to_vec())
+            .with_tag("16")
+            .start()
+            .await
+            .expect("failed to start Postgres container");
+        let host = container.get_host().await.expect("host");
+        let port = container.get_host_port_ipv4(5432).await.expect("port");
+        let url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
+        Self {
+            admin: url.clone(),
+            url,
+            owned: Vec::new(),
+            _container: Some(container),
+        }
     }
-    let container = Postgres::default()
-        .with_init_sql(autumn_harvest::test_init_sql().as_bytes().to_vec())
-        .with_tag("16")
-        .start()
-        .await
-        .expect("failed to start Postgres container");
-    let host = container.get_host().await.expect("host");
-    let port = container.get_host_port_ipv4(5432).await.expect("port");
-    let url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
-    (url, Some(container))
+
+    /// A second migrated database on the same server, owned by this test.
+    async fn sibling(&mut self) -> String {
+        let (url, name) = create_database(&self.admin).await;
+        self.owned.push(name);
+        url
+    }
+
+    /// Drop each database of this test. Close its pools first.
+    async fn drop(self) {
+        let mut admin = connect(&self.admin).await;
+        for name in &self.owned {
+            exec(
+                &mut admin,
+                &format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)"),
+            )
+            .await;
+        }
+    }
+}
+
+/// `url` with its database name set to `database`.
+fn with_database(url: &str, database: &str) -> String {
+    let (base, query) = url
+        .split_once('?')
+        .map_or((url, None), |(b, q)| (b, Some(q)));
+    let (prefix, _) = base.rsplit_once('/').expect("a database URL has a path");
+    query.map_or_else(
+        || format!("{prefix}/{database}"),
+        |query| format!("{prefix}/{database}?{query}"),
+    )
+}
+
+/// Create and migrate a database on the server of `admin`.
+async fn create_database(admin: &str) -> (String, String) {
+    let name = format!("harvest_cs_{}", Uuid::new_v4().simple());
+    let mut conn = connect(admin).await;
+    exec(&mut conn, &format!("CREATE DATABASE {name}")).await;
+    let url = with_database(admin, &name);
+    let mut fresh = connect(&url).await;
+    diesel_async::SimpleAsyncConnection::batch_execute(
+        &mut fresh,
+        &autumn_harvest::test_init_sql(),
+    )
+    .await
+    .expect("apply migrations");
+    (url, name)
 }
 
 fn build_pool(url: &str) -> DbPool {
     let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url);
     deadpool::managed::Pool::builder(manager)
-        .max_size(16)
+        .max_size(8)
         .build()
         .expect("pool build failed")
 }
@@ -96,7 +173,7 @@ fn as_count(n: usize) -> i64 {
     i64::try_from(n).expect("a test count fits in i64")
 }
 
-fn slots(n: u16) -> NonZeroU16 {
+const fn slots(n: u16) -> NonZeroU16 {
     NonZeroU16::new(n).expect("a test slot count is above 0")
 }
 
@@ -345,9 +422,21 @@ async fn stop(workers: Vec<(Arc<Worker>, tokio::task::JoinHandle<()>)>) {
     }
 }
 
+/// One claim sample or slot miss, in the order that workers record them.
+#[derive(Debug, Clone, Copy)]
+enum ClaimEvent {
+    /// A claim on `shard` that started at `at`. `task` is true when it
+    /// returned a task.
+    Claim { shard: u16, at: Instant, task: bool },
+    /// A slot miss on `shard`, recorded at `at`.
+    Miss { shard: u16, at: Instant },
+}
+
 /// Counts the claims and the slot misses that workers record, by shard.
 #[derive(Default)]
 struct ClaimCounter {
+    /// Each claim and miss, in order.
+    events: Mutex<Vec<ClaimEvent>>,
     /// Claims that returned a task.
     tasks: AtomicUsize,
     /// Every claim sample, by shard label.
@@ -385,7 +474,15 @@ impl ClaimCounter {
 }
 
 impl MetricsRecorder for ClaimCounter {
-    fn record_claim_duration(&self, kind: ClaimKind, shard: u16, _seconds: f64) {
+    fn record_claim_duration(&self, kind: ClaimKind, shard: u16, seconds: f64) {
+        let at = Instant::now()
+            .checked_sub(Duration::from_secs_f64(seconds))
+            .unwrap_or_else(Instant::now);
+        self.events.lock().expect("events").push(ClaimEvent::Claim {
+            shard,
+            at,
+            task: matches!(kind, ClaimKind::Workflow | ClaimKind::Activity),
+        });
         if matches!(kind, ClaimKind::Workflow | ClaimKind::Activity) {
             self.tasks.fetch_add(1, Ordering::Relaxed);
         }
@@ -398,6 +495,10 @@ impl MetricsRecorder for ClaimCounter {
     }
 
     fn record_db_claim_slot_miss(&self, shard: u16) {
+        self.events.lock().expect("events").push(ClaimEvent::Miss {
+            shard,
+            at: Instant::now(),
+        });
         *self
             .misses_by_shard
             .lock()
@@ -415,15 +516,16 @@ async fn seed_workflow(
     conn: &mut AsyncPgConnection,
     queue: &str,
     input: serde_json::Value,
+    shard: ShardId,
 ) -> ExecutionId {
-    let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+    let exec_id = ExecutionId::new_for_shard(shard);
     let row = NewWorkflowExecution {
         quota_key: None,
         id: exec_id.as_uuid(),
         workflow_name: "cs_workflow",
         workflow_id: &format!("wf-{}", exec_id.as_uuid()),
         run_id: Uuid::new_v4(),
-        shard_id: 0,
+        shard_id: shard.as_i32(),
         input: input.clone().into(),
         parent_id: None,
         queue_name: queue,
@@ -483,8 +585,14 @@ async fn seed_workflow(
     exec_id
 }
 
-/// Seed `n` workflows on `queue` over 8 connections.
-async fn seed(url: &str, queue: &str, n: usize, with_activity: bool) -> Vec<ExecutionId> {
+/// Seed `n` workflows of `shard` on `queue` over 8 connections.
+async fn seed(
+    url: &str,
+    queue: &str,
+    n: usize,
+    with_activity: bool,
+    shard: ShardId,
+) -> Vec<ExecutionId> {
     let input = serde_json::json!({ "activity": with_activity });
     let lanes = 8.min(n.max(1));
     let mut joins = Vec::with_capacity(lanes);
@@ -497,7 +605,7 @@ async fn seed(url: &str, queue: &str, n: usize, with_activity: bool) -> Vec<Exec
             let mut conn = connect(&url).await;
             let mut ids = Vec::with_capacity(count);
             for _ in 0..count {
-                ids.push(seed_workflow(&mut conn, &queue, input.clone()).await);
+                ids.push(seed_workflow(&mut conn, &queue, input.clone(), shard).await);
             }
             ids
         }));
@@ -570,24 +678,25 @@ fn start_fleet(
 /// Drain `n` no-activity workflows through a slow claim with 3 workers of 4
 /// claim loops each. Return the largest claim overlap and the slot misses.
 async fn fleet_overlap(cap: Option<NonZeroU16>, n: usize) -> (i64, usize) {
-    let (url, _container) = setup_db().await;
+    let db = TestDb::new().await;
     let queue = format!("cs-overlap-{}", Uuid::new_v4());
-    let probe = ClaimProbe::install(&url, &queue, 150).await;
-    seed(&url, &queue, n, false).await;
+    let probe = ClaimProbe::install(&db.url, &queue, 150).await;
+    seed(&db.url, &queue, n, false, ShardId::new(0)).await;
     let counter = Arc::new(ClaimCounter::default());
     let metrics: Arc<dyn MetricsRecorder> = Arc::clone(&counter) as Arc<dyn MetricsRecorder>;
-    let fleet = start_fleet(&url, &queue, 3, 4, cap, &metrics);
+    let fleet = start_fleet(&db.url, &queue, 3, 4, cap, &metrics);
 
-    let drained = wait_completed(&url, &queue, as_count(n), Duration::from_secs(90)).await;
+    let drained = wait_completed(&db.url, &queue, as_count(n), Duration::from_secs(90)).await;
     stop(fleet).await;
     let overlap = probe.max_overlap().await;
     probe.remove().await;
+    db.drop().await;
     assert!(drained, "every workflow completes");
     (overlap, counter.misses())
 }
 
 // ---------------------------------------------------------------------------
-// AC1: the cap bounds the claims that run at once on one shard.
+// AC1: the cap bounds the claims that run at once on one table.
 // ---------------------------------------------------------------------------
 
 /// Twelve claim loops share two slots. At most two claims run at once.
@@ -596,7 +705,7 @@ async fn claim_slots_bound_the_claims_that_run_at_once() {
     let (overlap, misses) = fleet_overlap(Some(slots(2)), 24).await;
     assert!(
         overlap <= 2,
-        "no more than 2 claims run at once on the shard; largest overlap {overlap}"
+        "no more than 2 claims run at once on the table; largest overlap {overlap}"
     );
     assert_eq!(overlap, 2, "both slots are in use at the peak");
     assert!(misses > 0, "some claims miss a slot, so the cap is tested");
@@ -618,67 +727,115 @@ async fn without_claim_slots_the_fleet_overlaps_past_two() {
 // AC2: a miss moves the claim to the next shard in the same poll.
 // ---------------------------------------------------------------------------
 
-/// Shard 0 has every slot held. The worker claims each task on shard 1.
+/// Take every slot of the table at `url`. Each slot stays held until its
+/// connection ends its transaction.
+async fn hold_every_slot(url: &str, cap: NonZeroU16) -> Vec<AsyncPgConnection> {
+    let mut holders = Vec::new();
+    for _ in 0..cap.get() {
+        let mut conn = connect(url).await;
+        exec(&mut conn, "BEGIN").await;
+        let taken = queue::take_claim_slot(&mut conn, ClaimSlots::new(cap))
+            .await
+            .expect("the slot statement runs");
+        assert!(taken.is_some(), "a free slot is taken");
+        holders.push(conn);
+    }
+    holders
+}
+
+/// How long each decision of the next-shard test takes.
+const SLOW_DECISION: Duration = Duration::from_secs(3);
+/// The window in which the next-shard test must claim every task.
+const BURST: Duration = Duration::from_millis(1500);
+
+/// Shard 0 and shard 1 are two databases. Every slot of shard 0 is held. The
+/// worker claims each task on shard 1.
 ///
-/// The poll interval is 30 s and no listener runs. A loop that waited after
-/// a miss would wait 30 s, so the drain inside 10 s shows that the loop
-/// went on to shard 1 in the same pass.
+/// The worker runs one claim loop, no listener and a 30 s poll interval. A
+/// trigger makes each decision commit take 3 s, so no decision wakes the
+/// loop for 3 s. The loop
+/// claims all 8 tasks inside 1.5 s, each after a miss on shard 0. A loop
+/// that waited after a miss could claim only one task in that time. So each
+/// miss moved the claim to shard 1 in the same pass.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_slot_miss_moves_the_claim_to_the_next_shard() {
-    let (url, _container) = setup_db().await;
+    let mut db = TestDb::new().await;
+    let shard_one = db.sibling().await;
     let queue = format!("cs-next-{}", Uuid::new_v4());
     let n = 8;
-    seed(&url, &queue, n, false).await;
+    seed(&shard_one, &queue, n, false, ShardId::new(1)).await;
+    let mut slow = connect(&shard_one).await;
+    exec(
+        &mut slow,
+        &format!(
+            "CREATE FUNCTION cs_slow_fn() RETURNS trigger AS $$
+             BEGIN
+                 PERFORM pg_sleep({});
+                 RETURN NEW;
+             END $$ LANGUAGE plpgsql",
+            SLOW_DECISION.as_secs()
+        ),
+    )
+    .await;
+    exec(
+        &mut slow,
+        "CREATE TRIGGER cs_slow_trg BEFORE UPDATE ON harvest_workflow_executions
+         FOR EACH ROW
+         WHEN (OLD.state <> 'COMPLETED' AND NEW.state = 'COMPLETED')
+         EXECUTE FUNCTION cs_slow_fn()",
+    )
+    .await;
+    drop(slow);
     let cap = slots(2);
+    let holders = hold_every_slot(&db.url, cap).await;
 
-    // Hold both slots of shard 0 for the whole test.
-    let mut holder = connect(&url).await;
-    let full = ClaimSlots::new(Some(ShardId::new(0)), cap);
-    for slot in 0..cap.get() {
-        exec(
-            &mut holder,
-            &format!("SELECT pg_advisory_lock({})", full.lock_key(slot)),
-        )
-        .await;
-    }
-
-    let pool = build_pool(&url);
+    let pool = build_pool(&db.url);
     let pools = BTreeMap::from([
         (ShardId::new(0), pool.clone()),
-        (ShardId::new(1), build_pool(&url)),
+        (ShardId::new(1), build_pool(&shard_one)),
     ]);
-    let mut config = runtime_config(&queue, &queue, 2, Some(cap));
+    let mut config = runtime_config(&queue, &queue, 1, Some(cap));
     config.poll_interval = Duration::from_secs(30);
     config.shard_assignments = vec![ShardId::new(0), ShardId::new(1)];
     config.sharded_pool = Some(ShardedDbPool::from_map(pools, ShardId::new(0)));
     let counter = Arc::new(ClaimCounter::default());
     let worker = build_worker(config, Arc::clone(&counter) as Arc<dyn MetricsRecorder>);
-    let started = Instant::now();
     let handle = spawn_worker(&worker, &pool);
 
-    let drained = wait_completed(&url, &queue, as_count(n), Duration::from_secs(10)).await;
-    let took = started.elapsed();
+    let drained = wait_completed(&shard_one, &queue, as_count(n), Duration::from_secs(30)).await;
     stop(vec![(worker, handle)]).await;
-    exec(&mut holder, "SELECT pg_advisory_unlock_all()").await;
+    drop(holders);
+    db.drop().await;
 
-    assert!(
-        drained,
-        "every workflow completes well inside one 30 s poll interval"
-    );
-    assert!(took < Duration::from_secs(10), "drain took {took:?}");
+    assert!(drained, "every workflow completes on shard 1");
     assert_eq!(
         counter.claims_on(0),
         0,
         "no claim statement runs on the shard with no free slot"
     );
+    let events = counter.events.lock().expect("events").clone();
+    let mut task_claims = Vec::new();
+    for (i, event) in events.iter().enumerate() {
+        let ClaimEvent::Claim { shard, at, task } = *event else {
+            continue;
+        };
+        assert_eq!(shard, 1, "every claim runs on shard 1");
+        if task {
+            assert!(
+                i > 0 && matches!(events[i - 1], ClaimEvent::Miss { shard: 0, .. }),
+                "each task claim follows a miss on shard 0: {:?}",
+                &events[..=i]
+            );
+            task_claims.push(at);
+        }
+    }
+    assert_eq!(task_claims.len(), n, "one claim per task");
+    let first = task_claims.iter().min().expect("a claim");
+    let last = task_claims.iter().max().expect("a claim");
+    let burst = last.duration_since(*first);
     assert!(
-        counter.misses_on(0) > 0,
-        "the claims on shard 0 miss a slot"
-    );
-    assert!(
-        counter.claims_on(1) >= n,
-        "shard 1 takes each claim: {} claims",
-        counter.claims_on(1)
+        burst < BURST,
+        "the loop claims all {n} tasks in {burst:?}, inside one decision of {SLOW_DECISION:?}"
     );
 }
 
@@ -688,20 +845,28 @@ async fn a_slot_miss_moves_the_claim_to_the_next_shard() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn every_task_runs_once_with_claim_slots() {
-    let (url, _container) = setup_db().await;
+    let db = TestDb::new().await;
     let queue = format!("cs-once-{}", Uuid::new_v4());
-    let probe = ClaimProbe::install(&url, &queue, 30).await;
+    let probe = ClaimProbe::install(&db.url, &queue, 30).await;
     let n = 24;
-    let ids = seed(&url, &queue, n, true).await;
+    let ids = seed(&db.url, &queue, n, true, ShardId::new(0)).await;
     let counter = Arc::new(ClaimCounter::default());
     let metrics: Arc<dyn MetricsRecorder> = Arc::clone(&counter) as Arc<dyn MetricsRecorder>;
     // Two workers, so claims race inside one worker and across workers.
-    let fleet = start_fleet(&url, &queue, 2, 4, Some(slots(2)), &metrics);
+    let fleet = start_fleet(&db.url, &queue, 2, 4, Some(slots(2)), &metrics);
 
-    let drained = wait_completed(&url, &queue, as_count(n), Duration::from_secs(90)).await;
+    let drained = wait_completed(&db.url, &queue, as_count(n), Duration::from_secs(90)).await;
     stop(fleet).await;
     let overlap = probe.max_overlap().await;
     probe.remove().await;
+    let left = count(
+        &db.url,
+        "SELECT count(*) AS v FROM harvest_task_queue
+          WHERE queue_name = $1 AND state <> 'COMPLETED'",
+        &queue,
+    )
+    .await;
+    db.drop().await;
     assert!(drained, "every workflow completes");
     assert!(overlap <= 2, "the cap holds; largest overlap {overlap}");
     assert!(counter.misses() > 0, "some claims miss a slot");
@@ -715,14 +880,7 @@ async fn every_task_runs_once_with_claim_slots() {
             "activity of {key} runs exactly once"
         );
     }
-    let running = count(
-        &url,
-        "SELECT count(*) AS v FROM harvest_task_queue
-          WHERE queue_name = $1 AND state <> 'COMPLETED'",
-        &queue,
-    )
-    .await;
-    assert_eq!(running, 0, "no task row is left behind");
+    assert_eq!(left, 0, "no task row is left behind");
 }
 
 // ---------------------------------------------------------------------------
@@ -732,7 +890,7 @@ async fn every_task_runs_once_with_claim_slots() {
 /// What one stall run measured.
 #[derive(Debug)]
 struct Recovery {
-    /// Claims per second before the stall.
+    /// Claims per second before the stall: the median of three windows.
     before: f64,
     /// Claims per second in the window that met the bar.
     after: f64,
@@ -751,6 +909,8 @@ const RECOVERY_LIMIT: Duration = Duration::from_secs(10);
 const STALL: Duration = Duration::from_secs(3);
 /// The width of one rate window.
 const WINDOW: Duration = Duration::from_secs(1);
+/// The backlog of each run.
+const STALL_BACKLOG: usize = 6000;
 
 /// Claims per second between two samples.
 fn rate(from: (Instant, usize), to: (Instant, usize)) -> f64 {
@@ -763,16 +923,15 @@ fn rate(from: (Instant, usize), to: (Instant, usize)) -> f64 {
 /// Stall the claims of a 3-worker fleet with an `ACCESS EXCLUSIVE` lock on
 /// `harvest_task_queue`, lift it, and measure the recovery.
 ///
-/// The rate before the stall is the best of three 1 s windows, so a slow
-/// window does not lower the bar.
+/// The run owns its database, so the stall blocks no other test. The rate
+/// before the stall is the median of three 1 s windows.
 async fn stall_and_recover(cap: Option<NonZeroU16>) -> Recovery {
-    let (url, _container) = setup_db().await;
+    let db = TestDb::new().await;
     let queue = format!("cs-stall-{}", Uuid::new_v4());
-    let n = 6000;
-    seed(&url, &queue, n, false).await;
+    seed(&db.url, &queue, STALL_BACKLOG, false, ShardId::new(0)).await;
     let counter = Arc::new(ClaimCounter::default());
     let metrics: Arc<dyn MetricsRecorder> = Arc::clone(&counter) as Arc<dyn MetricsRecorder>;
-    let fleet = start_fleet(&url, &queue, 3, 4, cap, &metrics);
+    let fleet = start_fleet(&db.url, &queue, 3, 4, cap, &metrics);
     // Fully qualified: diesel's `RunQueryDsl::load` shadows it.
     let sample = || {
         (
@@ -783,17 +942,30 @@ async fn stall_and_recover(cap: Option<NonZeroU16>) -> Recovery {
 
     // Warm up, then take the rate before the stall.
     tokio::time::sleep(Duration::from_secs(1)).await;
-    let mut before = 0.0_f64;
+    let mut windows = Vec::with_capacity(3);
     let mut last = sample();
     for _ in 0..3 {
         tokio::time::sleep(WINDOW).await;
         let now = sample();
-        before = before.max(rate(last, now));
+        windows.push(rate(last, now));
         last = now;
     }
+    windows.sort_by(f64::total_cmp);
+    let before = windows[1];
+
+    // The backlog must outlast the stall and the longest recovery.
+    let left = STALL_BACKLOG.saturating_sub(last.1);
+    #[allow(clippy::cast_precision_loss)]
+    let needed = before * (RECOVERY_LIMIT + Duration::from_secs(2)).as_secs_f64();
+    #[allow(clippy::cast_precision_loss)]
+    let enough = left as f64 >= needed;
+    assert!(
+        enough,
+        "{left} tasks left at {before:.0}/s cannot outlast the recovery; raise STALL_BACKLOG"
+    );
 
     // The stall: one transaction holds the table for `STALL`.
-    let mut staller = connect(&url).await;
+    let mut staller = connect(&db.url).await;
     exec(&mut staller, "BEGIN").await;
     exec(
         &mut staller,
@@ -807,6 +979,7 @@ async fn stall_and_recover(cap: Option<NonZeroU16>) -> Recovery {
     // Slide a 1 s window in 100 ms steps until it meets the bar.
     let mut samples = vec![sample()];
     let mut met = None;
+    let mut best = 0.0_f64;
     while lifted.elapsed() < RECOVERY_LIMIT {
         tokio::time::sleep(Duration::from_millis(100)).await;
         let now = sample();
@@ -817,25 +990,24 @@ async fn stall_and_recover(cap: Option<NonZeroU16>) -> Recovery {
             .find(|s| now.0.duration_since(s.0) >= WINDOW)
         {
             let r = rate(*start, now);
+            best = best.max(r);
             if r >= RECOVERY_BAR * before {
                 met = Some((now.0.duration_since(lifted), r));
                 break;
             }
         }
     }
-    let left = as_count(n) - completed(&url, &queue).await;
     stop(fleet).await;
+    drop(staller);
+    db.drop().await;
 
     let (recovered_in, after) = met.unwrap_or_else(|| {
         panic!(
             "claim throughput did not reach {RECOVERY_BAR} of {before:.0}/s within \
-             {RECOVERY_LIMIT:?} after the stall (cap {cap:?})"
+             {RECOVERY_LIMIT:?} after the stall (cap {cap:?}). The windows before: \
+             {windows:?}. The best window after: {best:.0}/s"
         )
     });
-    assert!(
-        left > 0,
-        "the backlog lasted past the recovery, so the rate measures claims"
-    );
     let recovery = Recovery {
         before,
         after,
@@ -846,60 +1018,80 @@ async fn stall_and_recover(cap: Option<NonZeroU16>) -> Recovery {
     recovery
 }
 
+/// The cap off, then the cap on, one after the other. Each run must recover
+/// to 90% of its rate before the stall within 10 s.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn claim_throughput_recovers_after_a_stall_without_slots() {
-    let recovery = stall_and_recover(None).await;
-    assert!(recovery.recovered_in <= RECOVERY_LIMIT);
-    assert_eq!(recovery.misses, 0, "a worker with no cap takes no slot");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn claim_throughput_recovers_after_a_stall_with_slots() {
-    let recovery = stall_and_recover(Some(slots(4))).await;
-    assert!(recovery.recovered_in <= RECOVERY_LIMIT);
-    assert!(recovery.misses > 0, "12 claim loops miss some of 4 slots");
+async fn claim_throughput_recovers_after_a_stall() {
+    let off = stall_and_recover(None).await;
+    assert_eq!(off.misses, 0, "a worker with no cap takes no slot");
+    let on = stall_and_recover(Some(slots(4))).await;
+    assert!(on.misses > 0, "12 claim loops miss some of 4 slots");
 }
 
 // ---------------------------------------------------------------------------
 // The slot statement.
 // ---------------------------------------------------------------------------
 
-/// The claim slot locks that this session holds.
-async fn slot_locks_held(conn: &mut AsyncPgConnection) -> i64 {
+/// The claim slot locks that this session holds, as `(table tag, slot)`.
+async fn slot_locks_held(conn: &mut AsyncPgConnection) -> Vec<(i64, i64)> {
+    #[derive(diesel::QueryableByName)]
+    struct Row {
+        #[diesel(sql_type = BigInt)]
+        table_tag: i64,
+        #[diesel(sql_type = BigInt)]
+        slot: i64,
+    }
+    let sql = format!(
+        "SELECT objid::bigint >> 16 AS table_tag, objid::bigint & 65535 AS slot
+           FROM pg_locks
+          WHERE locktype = 'advisory' AND objsubid = 1
+            AND classid::bigint = {}
+            AND pid = pg_backend_pid()",
+        queue::CLAIM_SLOT_LOCK_CLASS
+    );
+    diesel::sql_query(&sql)
+        .load::<Row>(conn)
+        .await
+        .unwrap_or_else(|e| panic!("{sql}: {e}"))
+        .into_iter()
+        .map(|row| (row.table_tag, row.slot))
+        .collect()
+}
+
+/// The table tag of `harvest_task_queue` on `conn`.
+async fn table_tag(conn: &mut AsyncPgConnection) -> i64 {
     scalar(
         conn,
-        &format!(
-            "SELECT count(*) AS v FROM pg_locks
-              WHERE locktype = 'advisory' AND objsubid = 1
-                AND classid::bigint = {}
-                AND pid = pg_backend_pid()",
-            queue::CLAIM_SLOT_LOCK_CLASS
-        ),
+        "SELECT to_regclass('harvest_task_queue')::oid::int8 & 65535 AS v",
     )
     .await
 }
 
 /// Each transaction takes one free slot and holds it until it ends. A
-/// transaction that finds every slot held takes none.
+/// transaction that finds every slot held takes none. The key in `pg_locks`
+/// is `claim_slot_lock_key` of the table tag and the slot.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_slot_statement_takes_one_slot_until_commit() {
-    let (url, _container) = setup_db().await;
-    // A shard id that no other test uses keeps these slots private.
-    let shard = ShardId::new(4242);
+    let db = TestDb::new().await;
     let cap = slots(3);
-    let full = ClaimSlots::new(Some(shard), cap);
+    let full = ClaimSlots::new(cap);
 
     let mut holders = Vec::new();
     let mut taken = Vec::new();
     for _ in 0..cap.get() {
-        let mut conn = connect(&url).await;
+        let mut conn = connect(&db.url).await;
         exec(&mut conn, "BEGIN").await;
         let slot = queue::take_claim_slot(&mut conn, full)
             .await
             .expect("the slot statement runs")
             .expect("a free slot is taken");
         assert!(slot < cap.get(), "slot {slot} is in range");
-        assert_eq!(slot_locks_held(&mut conn).await, 1, "one slot per claim");
+        let tag = table_tag(&mut conn).await;
+        assert_eq!(
+            slot_locks_held(&mut conn).await,
+            vec![(tag, i64::from(slot))],
+            "one slot per claim, keyed by the table tag and the slot"
+        );
         taken.push(slot);
         holders.push(conn);
     }
@@ -907,21 +1099,23 @@ async fn the_slot_statement_takes_one_slot_until_commit() {
     taken.sort_unstable();
     assert_eq!(taken, vec![0, 1, 2], "each claim gets its own slot");
 
-    let mut late = connect(&url).await;
+    let mut late = connect(&db.url).await;
     exec(&mut late, "BEGIN").await;
     let missed = queue::take_claim_slot(&mut late, full)
         .await
         .expect("the slot statement runs");
     assert_eq!(missed, None, "every slot is held");
-    assert_eq!(slot_locks_held(&mut late).await, 0, "a miss holds no slot");
+    assert!(
+        slot_locks_held(&mut late).await.is_empty(),
+        "a miss holds no slot"
+    );
     exec(&mut late, "COMMIT").await;
 
     // A commit frees the slot of its claim.
     let mut first = holders.remove(0);
     exec(&mut first, "COMMIT").await;
-    assert_eq!(
-        slot_locks_held(&mut first).await,
-        0,
+    assert!(
+        slot_locks_held(&mut first).await.is_empty(),
         "commit frees the slot"
     );
     exec(&mut late, "BEGIN").await;
@@ -930,41 +1124,40 @@ async fn the_slot_statement_takes_one_slot_until_commit() {
         .expect("the slot statement runs");
     assert_eq!(freed, Some(first_slot), "the freed slot is taken again");
     exec(&mut late, "ROLLBACK").await;
-    assert_eq!(
-        slot_locks_held(&mut late).await,
-        0,
+    assert!(
+        slot_locks_held(&mut late).await.is_empty(),
         "rollback frees the slot"
     );
     for mut conn in holders {
         exec(&mut conn, "ROLLBACK").await;
     }
+    drop((first, late));
+    db.drop().await;
 }
 
-/// Two shards on one database have separate slots.
+/// Two databases have separate slots.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_full_shard_leaves_the_slots_of_another_shard_free() {
-    let (url, _container) = setup_db().await;
+async fn a_full_database_leaves_the_slots_of_another_free() {
+    let mut db = TestDb::new().await;
+    let other = db.sibling().await;
     let cap = slots(1);
-    let full = ClaimSlots::new(Some(ShardId::new(4243)), cap);
-    let other = ClaimSlots::new(Some(ShardId::new(4244)), cap);
+    let holders = hold_every_slot(&db.url, cap).await;
 
-    let mut holder = connect(&url).await;
-    exec(&mut holder, "BEGIN").await;
-    let held = queue::take_claim_slot(&mut holder, full)
-        .await
-        .expect("the slot statement runs");
-    assert_eq!(held, Some(0));
-
-    let mut conn = connect(&url).await;
+    let mut conn = connect(&db.url).await;
     exec(&mut conn, "BEGIN").await;
-    let missed = queue::take_claim_slot(&mut conn, full)
+    let missed = queue::take_claim_slot(&mut conn, ClaimSlots::new(cap))
         .await
         .expect("the slot statement runs");
-    assert_eq!(missed, None, "the full shard has no slot");
-    let free = queue::take_claim_slot(&mut conn, other)
-        .await
-        .expect("the slot statement runs");
-    assert_eq!(free, Some(0), "the other shard has its own slot");
+    assert_eq!(missed, None, "the full database has no slot");
     exec(&mut conn, "ROLLBACK").await;
-    exec(&mut holder, "ROLLBACK").await;
+
+    let mut elsewhere = connect(&other).await;
+    exec(&mut elsewhere, "BEGIN").await;
+    let free = queue::take_claim_slot(&mut elsewhere, ClaimSlots::new(cap))
+        .await
+        .expect("the slot statement runs");
+    assert_eq!(free, Some(0), "the other database has its own slot");
+    exec(&mut elsewhere, "ROLLBACK").await;
+    drop((holders, conn, elsewhere));
+    db.drop().await;
 }

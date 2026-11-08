@@ -2500,30 +2500,26 @@ pub enum ClaimFairness {
     Keys,
 }
 
-/// The claim slots of one shard.
+/// The claim slots of one task-queue table.
 ///
 /// A claim with slots first takes one of `slots` advisory locks of its
-/// shard. It holds that lock until its transaction ends. A claim that gets
+/// table. It holds that lock until its transaction ends. A claim that gets
 /// no slot sends no claim statement. So at most `slots` claim statements run
-/// at once on one shard, across every worker.
+/// at once on one table, across every worker.
+///
+/// # Why the table, not the shard
+///
+/// Contention is on the `harvest_task_queue` table. Shards that share one
+/// database share that table, and a claim through any of them scans it. So
+/// the slots belong to the table. Every worker then keys one table the same
+/// way, whatever its shard assignments.
 ///
 /// # The lock key
 ///
-/// Each key uses the single-argument `bigint` form, because `queue_pause`
-/// owns the two-argument form. [`CLAIM_SLOT_LOCK_CLASS`] fills the high
-/// word. The low 16 bits of the shard id fill bits 16 to 31. The slot fills
-/// bits 0 to 15.
-///
-/// The concurrency-key locks use `hashtext(key)::bigint`, so they stay in
-/// the `int4` range. The high word puts every slot key outside that range.
-/// It also differs from the high word of each other tagged key. So a slot
-/// key cannot collide with another engine lock.
-///
-/// The key holds the shard id, so two shards on one database have separate
-/// slots. A claim target with no shard keys as shard 0, the default shard.
+/// See [`claim_slot_lock_key`]. Advisory locks belong to one database. The
+/// table tag separates two schemas in one database, each with its own table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClaimSlots {
-    base: i64,
     slots: std::num::NonZeroU16,
 }
 
@@ -2531,20 +2527,10 @@ pub struct ClaimSlots {
 pub const CLAIM_SLOT_LOCK_CLASS: i64 = 0x736C_6F74;
 
 impl ClaimSlots {
-    /// The `slots` claim slots of `shard`.
+    /// `slots` claim slots.
     #[must_use]
-    pub const fn new(shard: Option<crate::types::ShardId>, slots: std::num::NonZeroU16) -> Self {
-        let shard = match shard {
-            Some(shard) => shard.as_i32(),
-            None => 0,
-        };
-        // The mask keeps the shard id in 16 bits, so it cannot reach the
-        // high word.
-        let shard = (shard & 0xFFFF) as i64;
-        Self {
-            base: (CLAIM_SLOT_LOCK_CLASS << 32) | (shard << 16),
-            slots,
-        }
+    pub const fn new(slots: std::num::NonZeroU16) -> Self {
+        Self { slots }
     }
 
     /// The number of slots.
@@ -2552,12 +2538,24 @@ impl ClaimSlots {
     pub const fn slots(self) -> std::num::NonZeroU16 {
         self.slots
     }
+}
 
-    /// The advisory-lock key of slot `slot`.
-    #[must_use]
-    pub const fn lock_key(self, slot: u16) -> i64 {
-        self.base | slot as i64
-    }
+/// The advisory-lock key of slot `slot` of the table with tag `table`.
+///
+/// The key uses the single-argument `bigint` form, because `queue_pause`
+/// owns the two-argument form. [`CLAIM_SLOT_LOCK_CLASS`] fills the high
+/// word. `table` fills bits 16 to 31. The slot fills bits 0 to 15.
+/// [`take_claim_slot_query`] builds the same key in SQL. There, `table` is
+/// the low 16 bits of the oid of `harvest_task_queue`.
+///
+/// The concurrency-key locks use `hashtext(key)::bigint`, so they stay in
+/// the `int4` range. The high word puts every slot key outside that range.
+/// It also differs from the high word of each other tagged engine key. A
+/// `hashtextextended` key spans all 64 bits, so a collision with one is
+/// improbable but possible. Such a collision costs one slot miss.
+#[must_use]
+pub const fn claim_slot_lock_key(table: u16, slot: u16) -> i64 {
+    (CLAIM_SLOT_LOCK_CLASS << 32) | ((table as i64) << 16) | slot as i64
 }
 
 /// [`claim_task_of_kind_on_shard`] with a fairness mode (issue #1976).
@@ -2757,8 +2755,9 @@ pub async fn claim_task_with_slots(
 
 /// SQL for [`take_claim_slot`], exposed for shape tests.
 ///
-/// `$1` is the key of slot 0, `$2` the slot count and `$3` the first slot to
-/// try. The statement tries each slot once, from `$3`, and stops at the
+/// `$1` is [`CLAIM_SLOT_LOCK_CLASS`], `$2` the slot count and `$3` the
+/// first slot to try. The key is [`claim_slot_lock_key`]. The table tag is
+/// an uncorrelated subquery, so Postgres reads it once per statement. The statement tries each slot once, from `$3`, and stops at the
 /// first lock that it gets. So it holds at most one slot. It returns that
 /// slot.
 ///
@@ -2769,7 +2768,10 @@ pub async fn claim_task_with_slots(
 pub const fn take_claim_slot_query() -> &'static str {
     "SELECT ((s.slot + $3) % $2)::int4 AS slot \
      FROM generate_series(0, $2 - 1) AS s(slot) \
-     WHERE pg_try_advisory_xact_lock($1 + ((s.slot + $3) % $2)) \
+     WHERE pg_try_advisory_xact_lock( \
+         ($1::int8 << 32) \
+         | ((SELECT to_regclass('harvest_task_queue')::oid::int8 & 65535) << 16) \
+         | ((s.slot + $3) % $2)) \
      LIMIT 1"
 }
 
@@ -2799,7 +2801,7 @@ pub async fn take_claim_slot(
     let count = slots.slots().get();
     let start = rand::random_range(0..count);
     let taken: Option<Slot> = diesel::sql_query(take_claim_slot_query())
-        .bind::<diesel::sql_types::BigInt, _>(slots.lock_key(0))
+        .bind::<diesel::sql_types::BigInt, _>(CLAIM_SLOT_LOCK_CLASS)
         .bind::<diesel::sql_types::Integer, _>(i32::from(count))
         .bind::<diesel::sql_types::Integer, _>(i32::from(start))
         .get_result(conn)
@@ -2963,7 +2965,6 @@ async fn claim_task_one_statement(
     // against the row this transaction already locked. Competing claimers
     // `SKIP LOCKED` past that row regardless — it is `RUNNING` either way — so
     // the added contention is the duration of a single PK probe.
-
     //
     // # Claim slots
     //
@@ -12328,19 +12329,21 @@ mod tests {
     /// Each slot key sits outside the `int4` range of the `hashtext`
     /// concurrency keys, and away from each other tagged engine key.
     #[test]
-    fn claim_slot_keys_cannot_collide_with_other_advisory_keys() {
-        let max = std::num::NonZeroU16::new(crate::builder::MAX_CLAIM_SLOTS_PER_SHARD)
-            .expect("the bound is above 0");
+    fn claim_slot_keys_stay_outside_the_hashtext_range_and_other_tags() {
         let tagged = [
             954_i64 << 32,
             1823_i64 << 32,
             18_230_i64 << 32,
             crate::partition_archive::EXPORT_LOCK_KEY,
         ];
-        for shard in [None, Some(0), Some(1), Some(0xFFFE), Some(0xFFFF)] {
-            let slots = ClaimSlots::new(shard.map(crate::types::ShardId::new), max);
-            for slot in [0, 1, max.get() - 1, u16::MAX] {
-                let key = slots.lock_key(slot);
+        for table in [0, 1, 0x7FFF, u16::MAX] {
+            for slot in [
+                0,
+                1,
+                crate::builder::MAX_CLAIM_SLOTS_PER_SHARD - 1,
+                u16::MAX,
+            ] {
+                let key = claim_slot_lock_key(table, slot);
                 assert!(
                     key > i64::from(i32::MAX),
                     "slot key {key:#x} must be outside the hashtext range"
@@ -12353,21 +12356,20 @@ mod tests {
         }
     }
 
-    /// The shard id and the slot each have their own bits.
+    /// The table tag and the slot each have their own bits.
     #[test]
-    fn claim_slot_keys_separate_shards_and_slots() {
-        let n = std::num::NonZeroU16::new(4).expect("4 is above 0");
-        let zero = ClaimSlots::new(Some(crate::types::ShardId::new(0)), n);
-        let one = ClaimSlots::new(Some(crate::types::ShardId::new(1)), n);
-        assert_eq!(ClaimSlots::new(None, n), zero, "no shard keys as shard 0");
-        assert_eq!(zero.lock_key(0), CLAIM_SLOT_LOCK_CLASS << 32);
-        assert_eq!(zero.lock_key(3), (CLAIM_SLOT_LOCK_CLASS << 32) | 3);
-        assert_eq!(one.lock_key(0), (CLAIM_SLOT_LOCK_CLASS << 32) | (1 << 16));
-        let keys: std::collections::HashSet<i64> = [zero, one]
+    fn claim_slot_keys_separate_tables_and_slots() {
+        assert_eq!(claim_slot_lock_key(0, 0), CLAIM_SLOT_LOCK_CLASS << 32);
+        assert_eq!(claim_slot_lock_key(0, 3), (CLAIM_SLOT_LOCK_CLASS << 32) | 3);
+        assert_eq!(
+            claim_slot_lock_key(1, 0),
+            (CLAIM_SLOT_LOCK_CLASS << 32) | (1 << 16)
+        );
+        let keys: std::collections::HashSet<i64> = [0, 1]
             .iter()
-            .flat_map(|s| (0..4).map(|slot| s.lock_key(slot)))
+            .flat_map(|table| (0..4).map(move |slot| claim_slot_lock_key(*table, slot)))
             .collect();
-        assert_eq!(keys.len(), 8, "two shards of four slots give eight keys");
+        assert_eq!(keys.len(), 8, "two tables of four slots give eight keys");
     }
 
     /// The slot statement uses the single-argument try lock in `WHERE`, so
@@ -12375,9 +12377,12 @@ mod tests {
     #[test]
     fn the_claim_slot_statement_tries_each_slot_once_and_stops() {
         let sql = take_claim_slot_query();
+        assert!(sql.contains("WHERE pg_try_advisory_xact_lock( "), "{sql}");
         assert!(
-            sql.contains("WHERE pg_try_advisory_xact_lock($1 + "),
-            "{sql}"
+            sql.contains("($1::int8 << 32)")
+                && sql.contains("to_regclass('harvest_task_queue')::oid::int8 & 65535) << 16")
+                && sql.contains("| ((s.slot + $3) % $2))"),
+            "the SQL key follows claim_slot_lock_key: {sql}"
         );
         assert!(sql.trim_end().ends_with("LIMIT 1"), "{sql}");
         assert!(

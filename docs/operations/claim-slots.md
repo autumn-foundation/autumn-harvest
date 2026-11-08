@@ -20,21 +20,24 @@ let config = WorkerConfig::default().with_claim_slots_per_shard(8);
 
 ## How it works
 
-1. A claim transaction first takes one of N advisory locks of its shard,
-   with `pg_try_advisory_xact_lock`. It tries each slot once, from a random
+1. A claim transaction first takes one of N advisory locks with
+   `pg_try_advisory_xact_lock`. It tries each slot once, from a random
    start.
 2. A claim that gets no slot sends no claim statement. Its loop tries its
    next shard in the same pass. A worker on one shard waits for its next
    wake.
 3. The lock ends with the transaction, at commit or rollback.
 
-The cap applies to the claim that scans the backlog. A claim by id from a
-[Redis dispatch channel](redis-dispatch.md) and an owner take read one known
-row, so they take no slot.
+The slots belong to the `harvest_task_queue` table of the shard. Shards
+that share one database share that table, so they share the slots. Two
+schemas in one database each have their own table and their own slots.
 
-Each shard has its own slots, also when two shards share one database. The
-lock key holds the shard id. The lock never waits, so it cannot deadlock
-with the locks of the claim. See lock-order row 20 in
+The cap applies to the claim that scans the backlog. A claim by id from a
+[Redis dispatch channel](redis-dispatch.md) reads one known row. So does an
+owner take. Neither takes a slot.
+
+The lock never waits, so it cannot deadlock with the locks of the claim.
+See lock-order row 20 in
 [`docs/architecture.md`](../architecture.md#lock-order-table).
 
 ## Watch it
@@ -44,10 +47,12 @@ steady rate on one shard means that the fleet runs more claim loops than the
 shard has slots. That is the cap at work. Raise the slot count only if the
 claim latency of the shard stays low (`harvest_db_query_duration{op="claim"}`).
 
+A claim that misses still holds a pool connection for one short statement.
+Size the pool as before.
+
 ## Choose a value
 
 A cap below the claim loops of the fleet lowers the claim rate of an
-uncontended shard. On a local test fleet of 12 loops, 4 slots cut the claim
-rate by about 40%. See [`docs/performance.md`](../performance.md) §
-"Claim slots". Use the cap when claim latency rises with the number of
-claimers, for example after a `VACUUM` or a lock stall.
+uncontended shard. See [`docs/performance.md`](../performance.md) §
+"Claim slots" for a measurement. Use the cap when claim latency rises with
+the number of claimers, for example after a `VACUUM` or a lock stall.

@@ -3562,8 +3562,9 @@ that slow queries hold connections too long.
 
 - The worker pool size, `HarvestPoolConfig::worker_pool_size` per shard, is
   smaller than the worker's concurrency needs. Count the claim loops too:
-  `max_concurrent_claims`, 2 by default. In embedded mode the worker shares
-  the application pool.
+  `max_concurrent_claims`, 2 by default. Claim slots do not lower this need.
+  A claim that misses a slot still holds a connection for one short
+  statement. In embedded mode the worker shares the application pool.
 - Slow queries or lock waits hold connections for longer than usual.
 - A connection leak in an activity that calls `run_transactional` and does
   not finish.

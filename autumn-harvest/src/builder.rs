@@ -5231,9 +5231,13 @@ impl WorkerConfig {
     /// claim that gets no slot sends no claim statement. The claim loop then
     /// tries its next shard. The lock lives for the claim transaction only.
     ///
+    /// The slots belong to the `harvest_task_queue` table of the shard.
+    /// Shards that share one database share that table, so they share the
+    /// slots too.
+    ///
     /// The cap applies to the claim that scans the backlog. A claim by id
-    /// from a dispatch channel and an owner take read one known row, so
-    /// they take no slot.
+    /// from a dispatch channel reads one known row. So does an owner take.
+    /// Neither takes a slot.
     ///
     /// `0` turns the cap off, which is the default. A value above
     /// [`MAX_CLAIM_SLOTS_PER_SHARD`] fails worker validation. Set one value
@@ -5765,7 +5769,10 @@ mod tests {
     fn claim_slots_are_off_by_default_and_zero_turns_them_off() {
         assert_eq!(WorkerConfig::default().claim_slots_per_shard, None);
         let capped = WorkerConfig::default().with_claim_slots_per_shard(4);
-        assert_eq!(capped.claim_slots_per_shard.map(|n| n.get()), Some(4));
+        assert_eq!(
+            capped.claim_slots_per_shard.map(std::num::NonZeroU16::get),
+            Some(4)
+        );
         let off = capped.with_claim_slots_per_shard(0);
         assert_eq!(off.claim_slots_per_shard, None);
     }

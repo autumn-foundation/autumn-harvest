@@ -53,6 +53,9 @@ Walks through recorded `WorkflowEvent`s during replay:
 - Claims tasks via `SELECT ... FOR UPDATE SKIP LOCKED`
 - Runs up to `max_concurrent_claims` claims at once (default 2): a leader
   poll loop plus followers that claim only while claims return work
+- Optional `claim_slots_per_shard` caps the claims that run at once on one
+  shard, across the fleet. A claim that gets no slot tries its next shard.
+  See `docs/operations/claim-slots.md`
 - Dispatches via bounded Tokio tasks:
   - `max_concurrent_workflows` for workflow tasks
   - `max_concurrent_activities` for activity tasks

@@ -96,6 +96,7 @@ const DASHBOARD_PROMETHEUS_SERIES: &[&str] = &[
     "harvest_scanner_pass_total",
     "harvest_decision_owner_fenced_total",
     "harvest_decision_owner_woken_total",
+    "harvest_db_claim_slot_miss_total",
     "harvest_db_pool_acquire_timeout_total",
     "harvest_db_transaction_retry_total",
     "harvest_db_transaction_retry_exhausted_total",
