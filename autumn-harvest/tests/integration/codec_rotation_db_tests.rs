@@ -163,12 +163,7 @@ impl MetricsRecorder for CountingMetrics {
 ///
 /// The rotation census counts every `harvest_events` row on the shard — that is
 /// the point of it — so these tests cannot share a database with anything else.
-/// A test that leaves an encrypted row behind uses it too.
-///
-/// `codec_column_coverage_tests` reuses it. The `redundant_pub_crate` lint
-/// flags it only because this test module is private.
-#[allow(clippy::redundant_pub_crate)]
-pub(crate) async fn setup_isolated_db() -> (String, Option<ContainerAsync<Postgres>>) {
+async fn setup_isolated_db() -> (String, Option<ContainerAsync<Postgres>>) {
     if let Ok(admin_url) = std::env::var("HARVEST_TEST_DATABASE_URL") {
         let db_name = format!("harvest_codec_rot_{}", Uuid::new_v4().simple());
         let mut admin = <AsyncPgConnection as AsyncConnection>::establish(&admin_url)

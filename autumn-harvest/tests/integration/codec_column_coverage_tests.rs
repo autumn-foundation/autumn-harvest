@@ -4759,6 +4759,51 @@ async fn inline_delivery_leaves_a_signal_pending_when_the_codec_fails() {
 
 const OVERRIDE_SECRET: &str = "cc-override-input-ssn-888";
 
+/// A migrated Postgres that no other test shares.
+///
+/// With `HARVEST_TEST_DATABASE_URL` set, it makes a throwaway database there.
+/// Otherwise it starts a fresh container.
+async fn setup_isolated_db() -> (
+    String,
+    Option<testcontainers::ContainerAsync<testcontainers_modules::postgres::Postgres>>,
+) {
+    use diesel_async::SimpleAsyncConnection;
+    use testcontainers::ImageExt;
+    use testcontainers_modules::testcontainers::runners::AsyncRunner;
+
+    if let Ok(admin_url) = std::env::var("HARVEST_TEST_DATABASE_URL") {
+        let db_name = format!("harvest_cc_override_{}", Uuid::new_v4().simple());
+        let mut admin = connect(&admin_url).await;
+        admin
+            .batch_execute(&format!("CREATE DATABASE \"{db_name}\""))
+            .await
+            .expect("create throwaway database");
+        let (base, _) = admin_url
+            .split_once('?')
+            .unwrap_or((admin_url.as_str(), ""));
+        let cut = base.rfind('/').expect("a postgres URL has a database path");
+        let url = format!("{}/{db_name}", &base[..cut]);
+        connect(&url)
+            .await
+            .batch_execute(autumn_harvest::full_migrations_sql())
+            .await
+            .expect("apply migrations");
+        return (url, None);
+    }
+    let container = testcontainers_modules::postgres::Postgres::default()
+        .with_init_sql(autumn_harvest::full_migrations_sql().as_bytes().to_vec())
+        .with_tag("16")
+        .start()
+        .await
+        .expect("failed to start Postgres container");
+    let host = container.get_host().await.expect("get host");
+    let port = container.get_host_port_ipv4(5432).await.expect("get port");
+    (
+        format!("postgres://postgres:postgres@{host}:{port}/postgres"),
+        Some(container),
+    )
+}
+
 /// The stored override input of the workflow schedule `name`.
 async fn override_input_cell(conn: &mut AsyncPgConnection, name: &str) -> Option<Value> {
     #[derive(diesel::QueryableByName)]
@@ -4863,7 +4908,7 @@ async fn tick_with(url: &str, codecs: &PayloadCodecs, code: Vec<autumn_harvest::
 
 #[tokio::test]
 async fn a_schedule_input_override_is_ciphertext_and_the_fire_reads_plaintext() {
-    let (url, _c) = crate::codec_rotation_db_tests::setup_isolated_db().await;
+    let (url, _c) = setup_isolated_db().await;
     let codecs = aead_codecs(true);
     let mut conn = connect(&url).await;
     let name = format!("cc_sched_ovr_{}", Uuid::new_v4().simple());
@@ -4969,7 +5014,7 @@ async fn a_schedule_input_override_is_ciphertext_and_the_fire_reads_plaintext() 
 /// A patch that sets a new input replaces it, and a clear removes it.
 #[tokio::test]
 async fn an_override_input_that_cannot_decode_holds_back_its_own_schedule_only() {
-    let (url, _c) = crate::codec_rotation_db_tests::setup_isolated_db().await;
+    let (url, _c) = setup_isolated_db().await;
     let old_key = aead_codecs(true);
     let mut conn = connect(&url).await;
     let name = format!("cc_sched_ovr_stuck_{}", Uuid::new_v4().simple());
