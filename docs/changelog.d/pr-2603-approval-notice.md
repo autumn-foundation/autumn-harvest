@@ -14,9 +14,10 @@ design is in `docs/design/DESIGN-2603.md`. The guide is
 - New types `delivery::ParkedCall` (the activity input) and
   `delivery::ApprovalNotice` (what the app gets). The notice holds the run
   id, the execution id, the agent id, the session id, the signal, the tool,
-  the policy reason, the arguments cut to the tool result cap, the timeout
-  and the deadline. `ApprovalNotice::key` is `<run id>:<signal>`. A retry
-  keeps it.
+  the policy reason (cut to 256 bytes), the arguments cut to the tool
+  result cap, the timeout and the deadline. `ApprovalNotice::key` is
+  `<run id>:<execution id>:<signal>`. A retry keeps it. A reset or a fork
+  gets a new key.
 - A failed notice is recorded and ignored. It never fails the run and never
   releases the call.
 - A probe sends no notice. An evaluation stubs it.

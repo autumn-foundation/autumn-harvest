@@ -45,8 +45,8 @@ use crate::fan_out_plan::{Fit, Step, fan_out_plan};
 use crate::flow::Released;
 use crate::followup::{self, FOLLOWUP_TOOL, Planned};
 use crate::harness::{
-    AgentHarness, CacheTenant, TRUNCATED, cut_bytes, max_tool_result_bytes, truncate,
-    truncate_flagged,
+    AgentHarness, CacheTenant, REASON_CUT_BYTES, TRUNCATED, cut_bytes, max_tool_result_bytes,
+    truncate, truncate_flagged,
 };
 use crate::heartbeat::{HeartbeatTask, agent_heartbeat_info};
 use crate::loop_guard::{LoopTracker, LoopVerdict, warning_note};
@@ -2095,8 +2095,11 @@ async fn gated_call(
     }
 }
 
-/// The notice input of one gated call. The arguments and the reason are cut
-/// to the tool result cap.
+/// The notice input of one gated call.
+///
+/// The arguments are cut to the tool result cap. The reason is cut to the
+/// reason cut of a full turn. Each escaped byte of the reason grows the input
+/// up to six times, so a small cut keeps the whole input under the cap.
 fn parked_call(
     ctx: &WorkflowContext,
     run: Run<'_>,
@@ -2120,7 +2123,7 @@ fn parked_call(
         session_id: task.session_id.clone(),
         signal: signal.to_owned(),
         tool: call.name.clone(),
-        reason: cut_bytes(reason, max),
+        reason: cut_bytes(reason, REASON_CUT_BYTES.min(max)),
         arguments,
         arguments_truncated,
         timeout_secs: task.approval_timeout_secs,

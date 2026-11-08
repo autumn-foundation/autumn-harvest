@@ -152,7 +152,8 @@ pub struct ParkedCall {
     pub signal: String,
     /// The tool name.
     pub tool: String,
-    /// Why the policy asks for an approval.
+    /// Why the policy asks for an approval. A long reason is cut to 256
+    /// bytes.
     #[serde(default)]
     pub reason: String,
     /// The arguments of the call. A cut leaves a JSON string.
@@ -165,10 +166,20 @@ pub struct ParkedCall {
 }
 
 impl ParkedCall {
-    /// A key that is unique to this wait: the run id and the signal name.
+    /// A key that is unique to this wait: the run id, the execution id and
+    /// the signal name.
+    ///
+    /// A reset or a fork replays the run id into a new execution. The
+    /// execution id then keeps a notice of the new run apart from the old
+    /// one. A retry keeps all three parts.
     #[must_use]
     pub fn key(&self) -> String {
-        format!("{}:{}", self.run_id.as_str(), self.signal)
+        format!(
+            "{}:{}:{}",
+            self.run_id.as_str(),
+            self.execution_id,
+            self.signal
+        )
     }
 
     /// The notice for this call. The deadline is `now` plus the timeout.
@@ -254,11 +265,13 @@ fn log_notice(notice: &ApprovalNotice) {
     let call = &notice.call;
     tracing::info!(
         run_id = %call.run_id.as_str(),
+        execution_id = %call.execution_id,
         agent_id = call.agent_id.as_ref().map(AgentId::as_str),
         signal = %call.signal,
         tool = %call.tool,
         deadline = %notice.deadline,
         argument_bytes = call.arguments.to_string().len(),
+        arguments_truncated = call.arguments_truncated,
         "agent approval wait"
     );
 }
@@ -361,9 +374,17 @@ mod tests {
 
     #[test]
     fn the_notice_key_names_the_run_and_the_signal() {
-        let notice = parked(60).notice(Utc::now());
-        assert_eq!(notice.key(), "r:tool_approval:0:0:w1");
+        let call = parked(60);
+        let key = format!("r:{}:tool_approval:0:0:w1", call.execution_id);
+        let notice = call.clone().notice(Utc::now());
+        assert_eq!(notice.key(), key);
         assert_eq!(notice.key(), notice.call.key());
+        // A reset or a fork keeps the run id. The new execution gets a new key.
+        let forked = ParkedCall {
+            execution_id: ExecutionId::new(),
+            ..call
+        };
+        assert_ne!(forked.key(), key);
     }
 
     #[test]

@@ -136,8 +136,9 @@ Section 2 shows how `FnTool::shared` makes a tool such as `lookup`.
 `workflows()` returns `agent_loop`, `agent_heartbeat` and the durable
 `agent` (section 15). `activities()` returns `agent_model_turn`,
 `agent_tool_call`, `agent_memory_snapshot`, `agent_deliver`,
-`agent_approval_notice` (section 5), `agent_precheck`, `agent_discover_peers`, `agent_profile`,
-`agent_profile_overlay` (section 15), `agent_memory_reset`,
+`agent_approval_notice` (section 5), `agent_precheck`,
+`agent_discover_peers`, `agent_profile`, `agent_profile_overlay`
+(section 15), `agent_memory_reset`,
 `agent_workspace_retain`, `agent_workspace_reset`, `agent_workspace_floor`,
 `agent_refine_propose` (section 16) and `agent_score` (section 17).
 The test `the_engine_registration_builds` builds this
@@ -366,11 +367,11 @@ needs no poll. The send is the activity `agent_approval_notice`.
 | `call.session_id` | The session of the run, or `None` |
 | `call.signal` | The signal name. Pass it to `decide`. |
 | `call.tool` | The tool name |
-| `call.reason` | Why the policy asks |
+| `call.reason` | Why the policy asks. Over 256 bytes, a cut text. |
 | `call.arguments` | The arguments. Over the tool result cap, a cut JSON string. |
 | `call.arguments_truncated` | `true` when the arguments were cut |
 | `call.timeout_secs` | The time of the wait |
-| `deadline` | The worker clock plus the timeout. The wait ends at this time or a little later. |
+| `deadline` | The worker clock plus the timeout. The wait ends at this time or a little later. Clock skew between the worker and the engine can move it. |
 
 ```rust
 use autumn_harvest_agent::delivery::{ApprovalNotice, Delivery, Report};
@@ -397,7 +398,8 @@ impl Delivery for Chat {
 
 - The result is recorded. A restart during the wait sends no second notice.
 - A retry of the activity can send the notice again. It keeps the key
-  `ApprovalNotice::key`, `<run id>:<signal>`. Dedupe on it.
+  `ApprovalNotice::key`, `<run id>:<execution id>:<signal>`. Dedupe on it.
+  A reset or a fork starts a new execution, so its notice has a new key.
 - A failed notice never fails the run and never releases the call. The
   call still waits for a decision or its deadline.
 - The default writes the names to the `tracing` log. It never logs the

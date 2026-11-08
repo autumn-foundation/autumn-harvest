@@ -192,7 +192,7 @@ async fn a_gated_call_on_an_agent_sends_one_notice_that_decide_accepts() {
     assert_eq!(notice.call.execution_id, exec);
     assert_eq!(
         notice.key(),
-        format!("{}:{signal}", notice.call.run_id.as_str())
+        format!("{}:{exec}:{signal}", notice.call.run_id.as_str())
     );
     let window = autumn_harvest::chrono::Duration::seconds(600);
     assert!(notice.deadline >= before + window, "{notice:?}");
@@ -491,5 +491,5 @@ async fn an_interrupt_during_the_notice_ends_the_wait_as_a_rejection() {
         .collect();
     assert_eq!(results.len(), 1, "{results:?}");
     assert!(results[0].contains("interrupted"), "{results:?}");
-    assert_eq!(state.last_answer.as_deref(), Some("on it"));
+    assert_eq!(state.last_answer.as_deref(), Some("dropped the write"));
 }

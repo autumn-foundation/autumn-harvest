@@ -2174,7 +2174,7 @@ pub(crate) fn cut_bytes(text: String, max: usize) -> String {
 ///
 /// A policy writes a reason as free text. 256 bytes still tell the reviewer or
 /// the model why. A turn with many calls then stays small.
-const REASON_CUT_BYTES: usize = 256;
+pub(crate) const REASON_CUT_BYTES: usize = 256;
 
 /// The cost of one call of `client`, as the cost ledger records it.
 ///
