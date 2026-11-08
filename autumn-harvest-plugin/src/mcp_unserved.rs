@@ -5,7 +5,18 @@
 //! workflow runs and no tool appears. Both backends call this check once at
 //! build, so one app logs one message.
 
+use autumn_harvest::builder::HarvestBuilder;
 use autumn_harvest::{UpdateHandlerInfo, WorkflowInfo};
+
+/// Run [`warn_if_mcp_unserved`] over the definitions of `builder`.
+pub fn warn_for_builder(backend: &str, builder: &HarvestBuilder, mounted: bool) {
+    warn_if_mcp_unserved(
+        backend,
+        builder.workflow_infos(),
+        builder.update_handlers(),
+        mounted,
+    );
+}
 
 /// The most names the warning lists. A longer list shows a count only.
 const MAX_NAMES: usize = 10;
