@@ -396,7 +396,11 @@ for up to 5 worker processes per shard, not 6. The generator and the workers run
 on the bench host. A loopback database therefore shares its CPUs with
 them. The cell notes say so.
 
-Results: [`benchmarks/capacity-2026-11.md`](benchmarks/capacity-2026-11.md).
+**Results.** On the 4-core reference box, with the database on the same
+host as the workers, one shard sustains **190.7** `capacity_noop` and
+**39.1** `capacity_canonical` workflows/s. The closed-loop cell read 41.28
+on the same commit, inside the canonical arm's 39.1 to 48.8 interval. See
+[`benchmarks/capacity-2026-11.md`](benchmarks/capacity-2026-11.md).
 
 ## What the shard sweep can and cannot show
 

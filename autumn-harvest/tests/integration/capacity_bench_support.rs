@@ -639,12 +639,12 @@ pub const PUBLISHED_CAPACITY: &[PublishedCapacity] = &[
     PublishedCapacity {
         arm: CapacityArm::Noop,
         shards: 1,
-        sustainable_per_sec: 0.0,
+        sustainable_per_sec: 190.7,
     },
     PublishedCapacity {
         arm: CapacityArm::Canonical,
         shards: 1,
-        sustainable_per_sec: 0.0,
+        sustainable_per_sec: 39.1,
     },
 ];
 

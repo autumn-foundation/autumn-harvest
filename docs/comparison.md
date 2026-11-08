@@ -493,6 +493,25 @@ Temporal-style Schedule object.
 
 ## Related
 
+
+- **Capacity per shard: one external figure, on very different hardware.**
+  DBOS publishes a capacity figure measured with an offered enqueue rate and
+  no-op workflows. harvest's open-loop capacity scenario measures the same
+  kind of number
+  ([#2419](https://github.com/autumn-foundation/autumn-harvest/issues/2419)).
+  The figures sit side by side here only with the hardware of each:
+
+  | | workflow | sustainable rate | database | workers |
+  |:--|:--|--:|:--|:--|
+  | DBOS, as published ([post](https://www.dbos.dev/blog/one-million-workflows), [harness](https://github.com/dbos-inc/dbos-postgres-benchmark)) | no-op | 20K workflows/s on 1 shard; 1M workflows/s on 50 shards | one db.m7i.4xlarge RDS instance (16 vCPUs) per shard | 48 worker processes per shard |
+  | harvest [`capacity_noop`](benchmarks/capacity-2026-11.md) | zero activities | 190.7 workflows/s on 1 shard | one Postgres 16.15, `fsync=off`, on the bench host: 4 logical CPUs shared with the workers and the generator | 4 worker processes per shard, on the same 4 logical CPUs |
+  | harvest [`capacity_canonical`](benchmarks/capacity-2026-11.md) | 3 activities | 39.1 workflows/s on 1 shard | the same | the same |
+
+  This project has not re-run the DBOS harness. The DBOS figures are
+  quoted from the post as issue #2419 cites it. The table is not a
+  ranking. The DBOS database alone has four times the CPUs of the
+  whole harvest box. A fair comparison
+  runs both harnesses on the same hardware. That run does not exist yet.
 - **[README](../README.md)** — project overview and quick start.
 - **[Getting started](getting-started/README.md)** — the chapter-by-chapter guide.
 - **[Temporal migration guide](migrating-from-temporal.md)**
