@@ -199,9 +199,12 @@ as `harvest_schedules.workflow_input` stores the code input.
   active key. The census counts it, so a key that the cell needs does not
   retire.
 - **A key that is gone.** A cell that does not decode holds back its own
-  schedule only. The scheduler pass leaves that schedule out and logs a
-  warning with its name. Its row keeps its last value, and every other
-  schedule of the shard still runs. A PATCH of another field fails with 400,
+  schedule only. The scheduler pass leaves that schedule out of registration
+  and logs a warning with its name. Its row keeps its last value, and every
+  other schedule of the shard still runs. A PATCH writes the override and
+  the row in one transaction, so that row holds the latest override. The
+  schedule still fires on it when the process can decode the row input. A
+  code change does not reach the row until the cell decodes again. A PATCH of another field fails with 400,
   because the merge needs the stored input. Restore the key, send a new
   `input`, or send `clear_override: true`. Neither of the last two decodes
   the old cell.

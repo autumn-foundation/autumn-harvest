@@ -86,7 +86,8 @@ Decision: 1 with A.
 | A clear leaves the override input on the row. | A clear converges the row to the code value in the same transaction. |
 | A reshard carry copies a DAG row with an input. | A DAG row has no input, by `CHECK`. |
 | An older process converges the row back to the code input. | The upgrade note says to set an input override only after every process runs this release. |
-| A lost codec key makes the row unreadable, and the shard pass stops. | An input that does not decode holds back its own schedule only. The pass leaves that schedule out, so its row keeps its last value. A new input or a clear replaces the cell with no decode. |
+| A lost codec key makes the row unreadable, and the shard pass stops. | An input that does not decode holds back its own schedule only. The pass leaves that schedule out of registration, so its row keeps its last value. A new input or a clear replaces the cell with no decode. |
+| A held-back schedule fires on a stale value. | A PATCH converges the row in the same transaction as the override write. So the row holds the latest override, and a fire of it runs what the operator set. A fire of a row input that does not decode starts nothing, as before. |
 | An input stored while column encoding was off stays in clear. | The sweep converts ciphertext only, as for every codec column. The runbook says to send the input again after encoding is turned on. |
 
 ## Six thinking hats
