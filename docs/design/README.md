@@ -33,3 +33,6 @@ relative to that page. A link from a design record to another page in
 decision, and a design record holds its plan. For example,
 [ADR 0016](../adr/0016-agent-refinement.md) records why agent refinement
 is offline and operator-governed. `DESIGN-2383.md` holds its plan.
+[ADR 0017](../adr/0017-inference-strategies.md) records why inference
+strategies are workflows over durable child runs, scored by verifiers.
+`DESIGN-2450.md` holds its plan.

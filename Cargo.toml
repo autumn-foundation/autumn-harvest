@@ -17,6 +17,7 @@ members = [
     "autumn-harvest-verify/corpus/helpers-deep",
     "examples/agent-loop-hit-rate",
     "examples/agent-mesh",
+    "examples/agent-strategies",
     "examples/history-load-gate",
     "examples/autoresearch",
     "examples/billing-autumn-web",

@@ -34,3 +34,4 @@ them.
 | [0014](0014-operator-refine-policy.md) | Operators decide the refine policy |
 | [0015](0015-xtask-workspace-automation.md) | Workspace automation runs through `cargo xtask` |
 | [0016](0016-agent-refinement.md) | Agent refinement is offline and operator-governed |
+| [0017](0017-inference-strategies.md) | Inference strategies are workflows over durable child runs |

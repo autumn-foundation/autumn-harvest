@@ -1075,7 +1075,7 @@ impl AgentHarness {
         // workflow tool, so the workflow refuses it with a named verdict.
         let hidden_delegate = mandate && !builtins.iter().any(|tool| tool.name() == DELEGATE_TOOL);
         if hidden_delegate {
-            builtins.push(Arc::new(WorkflowTool(delegate_definition(&[]))));
+            builtins.push(Arc::new(WorkflowTool(delegate_definition(&[], None))));
         }
         let tools = self
             .permitted(&builtins, request.allowed_tools.as_ref())

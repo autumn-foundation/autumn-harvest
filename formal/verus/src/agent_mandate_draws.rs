@@ -3,7 +3,8 @@
 //!
 //! `meet_cap` meets the draw cap of a parent mandate with the cap of a
 //! peer, or of an inbound mandate. `draw_verdict` admits the draws of one
-//! strategy run. Each draw counts as one delegation. The copies below are
+//! strategy run. Each draw counts as one delegation. `delegated_verdict`
+//! admits the draws that a `delegate` call asks for. The copies below are
 //! the kernels in `mesh.rs` of the agent crate.
 //!
 //! The proofs show:
@@ -13,6 +14,9 @@
 //! - An admitted run passes no cap, and the draws and the delegations left
 //!   sum to the room of the tree. So the draws never pass the fan-out.
 //! - A refusal names the first bound that fails: the cap, then the room.
+//! - A `delegate` call with no cap gets one draw at most. An admitted call
+//!   takes one unit for the delegation and one unit for each draw that
+//!   counts against the fan-out. Its draws fit each cap above it.
 
 use vstd::prelude::*;
 
@@ -85,6 +89,61 @@ pub fn draw_verdict(max_draws: Option<u32>, room: u32, draws: u32) -> (r: DrawVe
         return DrawVerdict::FanOutExhausted;
     }
     DrawVerdict::Run { left: room - draws }
+}
+
+/// The cap of a delegated strategy. A missing cap admits one draw.
+pub open spec fn delegated_cap(max_draws: Option<u32>) -> u32 {
+    match max_draws {
+        None => 1,
+        Some(max) => max,
+    }
+}
+
+/// The fan-out units of the draws of a delegated strategy.
+pub open spec fn draw_units(draws: u32, fan_out: bool) -> int {
+    if fan_out {
+        draws as int
+    } else {
+        0
+    }
+}
+
+// mirror: autumn-harvest-agent/src/mesh.rs delegated_verdict
+pub fn delegated_verdict(max_draws: Option<u32>, room: u32, draws: u32, fan_out: bool) -> (r: DrawVerdict)
+    ensures
+        r is DrawsExceeded <==> draws > delegated_cap(max_draws),
+        r is FanOutExhausted <==> (draws <= delegated_cap(max_draws) && 1 + draw_units(draws, fan_out) > room),
+        r is Run <==> (draws <= delegated_cap(max_draws) && 1 + draw_units(draws, fan_out) <= room),
+        r is Run ==> fits(max_draws, draws),
+        r is Run && max_draws is None ==> draws <= 1,
+        r is Run ==> r->Run_left + 1 + draw_units(draws, fan_out) == room,
+{
+    let cap = match max_draws {
+        Some(max) => max,
+        None => 1,
+    };
+    if draws > cap {
+        return DrawVerdict::DrawsExceeded;
+    }
+    let units = if fan_out { draws } else { 0 };
+    if room == 0 || units > room - 1 {
+        return DrawVerdict::FanOutExhausted;
+    }
+    DrawVerdict::Run {
+        left: room - 1 - units,
+    }
+}
+
+/// A delegated run that the caller admits fits the cap of each mandate
+/// above the caller. So a model never gets more draws than any hop above
+/// it allows.
+pub proof fn theorem_a_delegated_run_fits_each_cap_above(child: Option<u32>, parent: Option<u32>, draws: u32)
+    requires
+        within(child, parent),
+        draws <= delegated_cap(child),
+    ensures
+        fits(parent, draws),
+{
 }
 
 /// A cap within a cap within `top` is within `top`. So a chain of meets

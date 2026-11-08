@@ -198,6 +198,17 @@ impl SampleStrategy {
         }
     }
 
+    /// Whether each draw counts as one delegation of the fan-out.
+    ///
+    /// Each draw of best-of-N, rejection or a vote is a run of its own. So
+    /// is each tier of a cascade. A beam step continues the run of its
+    /// beam, and the beam counts its delegations step by step. So a beam
+    /// meets `max_draws` only.
+    #[must_use]
+    pub const fn counts_fan_out(&self) -> bool {
+        !matches!(self, Self::Beam { .. })
+    }
+
     /// The most draws of the run. A cascade has one draw per tier. For a
     /// beam, it is `width × expansion × max_rounds`, saturated at
     /// `u32::MAX`.
@@ -811,13 +822,13 @@ async fn run_strategy(
 fn mandate_admits(mandate: &Mandate, sample: &OpSample) -> Result<Option<u32>, SampleFailure> {
     let refused = |refusal| SampleFailure::Refused(Refusal::Mandate { mandate: refusal });
     let draws = sample.strategy.draws();
-    let left = if matches!(sample.strategy, SampleStrategy::Beam { .. }) {
+    let left = if sample.strategy.counts_fan_out() {
+        Some(mandate.admit_draws(draws, 0).map_err(refused)?)
+    } else {
         if mandate.max_draws.is_some_and(|max| draws > max) {
             return Err(refused(MeshRefusal::DrawsExceeded));
         }
         None
-    } else {
-        Some(mandate.admit_draws(draws, 0).map_err(refused)?)
     };
     let judge = sample
         .scorer
@@ -1451,14 +1462,17 @@ fn keep_beams(round: &mut [Scored], slots: u32, complete: &mut u32) -> Vec<Beam>
     live
 }
 
-/// The delegations that `report` ran. A refused delegation uses none.
+/// The delegation units that `report` used. A refused delegation uses
+/// none. Each other delegation uses one, and one more for each draw unit
+/// of a delegated strategy.
 fn used_delegations(report: &AgentReport) -> u32 {
-    let used = report
+    report
         .delegations
         .iter()
         .filter(|record| record.refusal.is_none())
-        .count();
-    u32::try_from(used).unwrap_or(u32::MAX)
+        .fold(0_u32, |units, record| {
+            units.saturating_add(1).saturating_add(record.draws)
+        })
 }
 
 /// The best `keep` draws of `verdicts`, best first.
@@ -2213,5 +2227,33 @@ mod tests {
             AgentStop::Completed,
             Some(SampleStop::ScoreFailed)
         ));
+    }
+
+    #[test]
+    fn a_beam_step_counts_the_draw_units_of_a_delegated_strategy() {
+        let record = |draws: u32, refusal: Option<MeshRefusal>| {
+            serde_json::json!({
+                "chain": ["a", "b"],
+                "run_id": "r",
+                "stop": "completed",
+                "refusal": refusal,
+                "draws": draws,
+            })
+        };
+        let report: AgentReport = serde_json::from_value(serde_json::json!({
+            "stop": "completed",
+            "text": "",
+            "steps_used": 1,
+            "tool_calls": 3,
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+            "messages": [],
+            "delegations": [
+                record(0, None),
+                record(3, None),
+                record(3, Some(MeshRefusal::DrawsExceeded)),
+            ],
+        }))
+        .unwrap();
+        assert_eq!(used_delegations(&report), 1 + (1 + 3));
     }
 }

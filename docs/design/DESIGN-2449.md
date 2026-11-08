@@ -125,7 +125,6 @@ A refused or failed op changes no transcript. A peer gets the refusal in
 - An interrupt does not stop the draws of a running op.
 - A draw reads the progress notes of the agent, but saves none.
 - A worker that predates `max_draws` drops the field from a peer message.
-- The `delegate` tool cannot ask for a strategy. Only an op can. Issue
-  #2610 tracks it.
+  A worker with the strict envelope read of #2610 refuses an unknown key.
 - A draw has no memory tool, no workspace and no follow-ups, as in
   `agent_sample`.

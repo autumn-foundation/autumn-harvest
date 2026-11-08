@@ -540,6 +540,35 @@ fn mesh(model: Arc<dyn AgentModel>) -> Result<AgentHarness, AgentIdError> {
 - A durable peer runs on its own worker, in its own history, under its own
   profile budget. Its tokens are not added to the budget of the sender.
 
+### Ask a durable peer for a strategy
+
+The `delegate` call can carry a `sample`, an `OpSample`. The peer runs the
+message as a strategy op and replies with the selected answer.
+
+```json
+{
+  "agent": "researcher",
+  "task": "Name the year the treaty was signed.",
+  "sample": {
+    "strategy": {"best_of_n": {"n": 3}},
+    "scorer": {"id": "exact_match"}
+  }
+}
+```
+
+| Rule | What happens |
+|---|---|
+| Cap | The cap of a call is the smaller of the caller `max_draws` and the `Peer::max_draws` of the peer role. With neither, the call admits one draw. Each hop can only narrow a cap, so the caller holds the lowest cap of the chain above it. |
+| Tool | The tool shows `sample` only when a durable peer has a cap of 2 or more. |
+| Fan-out | The delegation takes one unit of `max_delegations`, and each draw takes one more once the message is out. A best-of-3 needs 4 units. A beam checks `max_draws` only. A fan-out parent and a beam count the draw units of each nested record. |
+| Order | The usual delegation checks run first. Then the caller checks `draws_exceeded`, then `fan_out_exhausted`, before the send. The tool result and `DelegationRecord::refusal` name each refusal. |
+| Receiver | The receiver checks its accepted mandate and the sampling policy of its kind again. A policy refusal comes back in the `error` of the tool result. |
+| Inline peer | An inline peer refuses a strategy with `strategy_needs_durable_peer`. No sampling policy covers a role. A call with `sample` never joins a batch. |
+| Strict mandate | The receiver decodes the envelope mandate strictly. An unknown key fails the op, so a receiver never drops a cap that a newer sender adds. The sender then waits for its reply deadline. A held message in the agent state reads the same way. |
+
+A worker from before strategies drops `sample` and runs one plain segment.
+The design is in [`DESIGN-2610.md`](design/DESIGN-2610.md).
+
 ## 14. A model per agent (issue #2271)
 
 The harness holds named models. A task, a peer, a profile or a heartbeat
