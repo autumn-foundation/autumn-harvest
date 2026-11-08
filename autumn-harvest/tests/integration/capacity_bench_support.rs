@@ -992,9 +992,9 @@ mod tests {
 
     #[test]
     fn the_sustainable_rate_stops_at_the_first_growing_backlog() {
-        // Each verdict comes from the real rule. A server that completes 45
-        // runs/s keeps up with 20 and 25, falls behind 50, and keeps up again
-        // with a lighter step after the knee.
+        // Each verdict comes from the real rule. The server completes 45
+        // runs/s. It keeps up with 20 and 25, and it falls behind 50. A
+        // lighter step after the knee passes again.
         let judged = |offered: f64| {
             let arrivals = if offered < 45.0 {
                 steady(offered, CAPACITY_STEP_SECS, 0.2)
