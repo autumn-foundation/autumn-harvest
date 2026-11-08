@@ -1131,12 +1131,12 @@ async fn wait_for_lock_wait(conn: &mut AsyncPgConnection) {
 /// Issue #2602, AC 3: two carries in opposite directions keep the override.
 ///
 /// One process routes the DAG to the new shard, and another routes it back.
-/// The outward carry stops before its source transaction runs. The test holds
-/// the generation row of the old shard, and only the outward carry pins it.
+/// The test holds the generation row of the old shard, and only the outward
+/// carry pins it. So the outward carry waits at the fence of the old shard.
 /// The return carry names the old database by an unpinned shard id, so it
-/// runs. Before #2602 the outward copy had committed, the return carry
-/// yielded to the old row and deleted the copy, and the outward delete then
-/// removed the old row.
+/// runs. Before #2602 the outward copy had committed at that point. The
+/// return carry then yielded to the old row and deleted the copy. The
+/// outward delete then removed the old row.
 #[tokio::test]
 async fn opposite_carries_keep_the_override() {
     use autumn_harvest::replication::{FenceRegistry, ensure_generation_row};
