@@ -106,6 +106,8 @@ pub struct StepEvidence {
     pub failed: usize,
     /// Start calls that returned an error or timed out.
     pub failed_starts: usize,
+    /// Arrivals that got no generator connection, so no start call ran.
+    pub failed_checkouts: usize,
 }
 
 /// Runs admitted at or before `t` that had not completed at `t`.
@@ -270,33 +272,9 @@ pub struct ShardJudgement {
 /// to admission, is judged on the generator side.
 #[must_use]
 pub fn judge_shard(evidence: &StepEvidence) -> ShardJudgement {
-    let mut generator = Vec::new();
+    let (generator, generator_wait_p99_ms) = generator_reasons(evidence);
     let mut engine = Vec::new();
-
     let offered = evidence.offered_per_sec;
-    if offered.is_nan()
-        || offered <= 0.0
-        || evidence.achieved_per_sec < offered * CAPACITY_PACING_HOLD_RATIO
-    {
-        generator.push(format!(
-            "the generator achieved {:.1} of {offered:.1} starts/s, under the {:.0}% hold ratio",
-            evidence.achieved_per_sec,
-            CAPACITY_PACING_HOLD_RATIO * 100.0,
-        ));
-    }
-    if evidence.arrivals.len() < CAPACITY_MIN_STEP_RUNS {
-        generator.push(format!(
-            "only {} runs started; a verdict needs at least {CAPACITY_MIN_STEP_RUNS} runs",
-            evidence.arrivals.len(),
-        ));
-    }
-    let generator_wait_p99_ms = generator_wait_p99_ms(&evidence.arrivals);
-    if let Some(wait) = generator_wait_p99_ms.filter(|w| *w > CAPACITY_MAX_GENERATOR_WAIT_MS) {
-        generator.push(format!(
-            "the generator wait p99 was {wait:.1} ms, over the \
-             {CAPACITY_MAX_GENERATOR_WAIT_MS:.0} ms limit"
-        ));
-    }
 
     let unfinished = evidence
         .arrivals
@@ -374,6 +352,43 @@ pub fn judge_shard(evidence: &StepEvidence) -> ShardJudgement {
         unfinished,
         retry_eligible,
     }
+}
+
+/// The generator side of a step: whether the load was offered. It also
+/// returns the p99 generator wait.
+fn generator_reasons(evidence: &StepEvidence) -> (Vec<String>, Option<f64>) {
+    let mut generator = Vec::new();
+    let offered = evidence.offered_per_sec;
+    if offered.is_nan()
+        || offered <= 0.0
+        || evidence.achieved_per_sec < offered * CAPACITY_PACING_HOLD_RATIO
+    {
+        generator.push(format!(
+            "the generator achieved {:.1} of {offered:.1} starts/s, under the {:.0}% hold ratio",
+            evidence.achieved_per_sec,
+            CAPACITY_PACING_HOLD_RATIO * 100.0,
+        ));
+    }
+    if evidence.arrivals.len() < CAPACITY_MIN_STEP_RUNS {
+        generator.push(format!(
+            "only {} runs started; a verdict needs at least {CAPACITY_MIN_STEP_RUNS} runs",
+            evidence.arrivals.len(),
+        ));
+    }
+    if evidence.failed_checkouts > 0 {
+        generator.push(format!(
+            "{} arrivals got no generator connection, so no start call ran",
+            evidence.failed_checkouts
+        ));
+    }
+    let generator_wait_p99_ms = generator_wait_p99_ms(&evidence.arrivals);
+    if let Some(wait) = generator_wait_p99_ms.filter(|w| *w > CAPACITY_MAX_GENERATOR_WAIT_MS) {
+        generator.push(format!(
+            "the generator wait p99 was {wait:.1} ms, over the \
+             {CAPACITY_MAX_GENERATOR_WAIT_MS:.0} ms limit"
+        ));
+    }
+    (generator, generator_wait_p99_ms)
 }
 
 /// p99 of the generator wait, from schedule to admission, in milliseconds.
@@ -835,6 +850,7 @@ mod tests {
             arrivals,
             failed: 0,
             failed_starts: 0,
+            failed_checkouts: 0,
         }
     }
 
@@ -1085,6 +1101,26 @@ mod tests {
             panic!("a step that earned a retry it cannot run is no knee");
         };
         assert!(reason.contains("budget"), "{reason}");
+    }
+
+    #[test]
+    fn a_failed_checkout_is_a_generator_failure() {
+        // No start call reached the engine, so the engine kept up.
+        let mut e = evidence(50.0, steady(50.0, CAPACITY_STEP_SECS, 0.2));
+        e.failed_checkouts = 3;
+        let judged = judge_shard(&e);
+        assert_eq!(judged.engine, Vec::<String>::new());
+        assert!(
+            judged
+                .generator
+                .iter()
+                .any(|r| r.contains("no generator connection")),
+            "{judged:?}"
+        );
+        assert!(matches!(
+            step_verdict(&[judged]),
+            StepVerdict::GeneratorBound(_)
+        ));
     }
 
     #[test]
@@ -1811,6 +1847,8 @@ pub mod db {
         done: Instant,
         /// Whether the start call returned a run.
         started: bool,
+        /// Whether the arrival got a generator connection.
+        checked_out: bool,
     }
 
     /// What the generator did on one shard during one step.
@@ -1821,6 +1859,8 @@ pub mod db {
         achieved_per_sec: f64,
         /// Start calls that failed. They count as engine failures.
         failed_starts: usize,
+        /// Arrivals that got no connection. They count as generator failures.
+        failed_checkouts: usize,
     }
 
     /// What one step measured.
@@ -1953,8 +1993,9 @@ pub mod db {
                     let _guard = guard;
                     tokio::time::sleep_until(at.into()).await;
                     // An overloaded step can time out a checkout or a start.
-                    // That is a failed start, not a reason to drop the cell.
-                    let (admitted, started) = match pool.get().await {
+                    // Neither drops the cell. A failed checkout never
+                    // reached the engine, so it is a generator failure.
+                    let (admitted, started, checked_out) = match pool.get().await {
                         Ok(mut conn) => {
                             let admitted = Instant::now();
                             let started = start_or_load_workflow_execution(
@@ -1968,9 +2009,9 @@ pub mod db {
                             )
                             .await
                             .is_ok();
-                            (admitted, started)
+                            (admitted, started, true)
                         }
-                        Err(_) => (Instant::now(), false),
+                        Err(_) => (Instant::now(), false, false),
                     };
                     let sent = Sent {
                         workflow_id,
@@ -1978,6 +2019,7 @@ pub mod db {
                         admitted_secs: admitted.saturating_duration_since(t0).as_secs_f64(),
                         done: Instant::now(),
                         started,
+                        checked_out,
                     };
                     (idx, sent)
                 });
@@ -1991,27 +2033,33 @@ pub mod db {
 
         let offers = per_shard
             .into_iter()
-            .map(|sent| {
-                let finished = sent.iter().map(|s| s.done).max().unwrap_or(t0);
-                let elapsed = finished
-                    .saturating_duration_since(t0)
-                    .as_secs_f64()
-                    .max(CAPACITY_STEP_SECS);
-                let failed_starts = sent.iter().filter(|s| !s.started).count();
-                #[allow(clippy::cast_precision_loss, reason = "run counts are far below 2^53")]
-                let achieved_per_sec = (sent.len() - failed_starts) as f64 / elapsed;
-                ShardOffer {
-                    sent: sent
-                        .into_iter()
-                        .filter(|s| s.started)
-                        .map(|s| (s.workflow_id, (s.scheduled_secs, s.admitted_secs)))
-                        .collect(),
-                    achieved_per_sec,
-                    failed_starts,
-                }
-            })
+            .map(|sent| summarize_offer(sent, t0))
             .collect();
         (t0_utc, offers)
+    }
+
+    /// One shard's sends as an offer. The achieved rate counts only the
+    /// runs that started, over at least the step length.
+    fn summarize_offer(sent: Vec<Sent>, t0: Instant) -> ShardOffer {
+        let finished = sent.iter().map(|s| s.done).max().unwrap_or(t0);
+        let elapsed = finished
+            .saturating_duration_since(t0)
+            .as_secs_f64()
+            .max(CAPACITY_STEP_SECS);
+        let failed_checkouts = sent.iter().filter(|s| !s.checked_out).count();
+        let failed_starts = sent.iter().filter(|s| s.checked_out && !s.started).count();
+        #[allow(clippy::cast_precision_loss, reason = "run counts are far below 2^53")]
+        let achieved_per_sec = (sent.len() - failed_starts - failed_checkouts) as f64 / elapsed;
+        ShardOffer {
+            sent: sent
+                .into_iter()
+                .filter(|s| s.started)
+                .map(|s| (s.workflow_id, (s.scheduled_secs, s.admitted_secs)))
+                .collect(),
+            achieved_per_sec,
+            failed_starts,
+            failed_checkouts,
+        }
     }
 
     /// Wait until every run of `cohort` is terminal on each shard, or the
@@ -2097,6 +2145,7 @@ pub mod db {
                 arrivals,
                 failed,
                 failed_starts: offer.failed_starts,
+                failed_checkouts: offer.failed_checkouts,
             }));
         }
         StepOutcome {

@@ -191,6 +191,11 @@ vote, and a reading of the code confirmed them.
 | A malformed child variable made a child run the benchmark. | `child_mode` exits the child instead. |
 | The DBOS bullet sat under Related, and the guards missed swapped rows, a bare "million", and the headline numbers in `benchmarks.md`. | The bullet moved. The guards check each row, need the engine name, and pin the headline. |
 
+A later Codex review found one more: a generator checkout that timed out
+counted as a failed start, so as an engine failure. No start call ran, so
+it is now a generator failure. The published sweep had no failed checkout,
+so its verdicts do not change.
+
 Not changed: the retry's p99 is the published p99, as the rule states. The
 admission and completion clocks are both on the bench host. A slow start
 path voids the cell as generator-bound, which never inflates a number.

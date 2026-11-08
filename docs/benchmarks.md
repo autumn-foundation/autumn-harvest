@@ -352,7 +352,8 @@ HARVEST_BENCH_SCENARIOS=capacity HARVEST_BENCH_SHARDS=1 cargo xtask bench run
   16-connection generator pool per shard. The instant it gets one is its
   **admission**. The generator wait runs from schedule to admission. A slow
   start call never moves a later schedule. A start call that fails or times
-  out fails the step. It does not stop the cell.
+  out fails the step. It does not stop the cell. An arrival that gets no
+  connection never reached the engine, so it is a generator failure.
 * A step lasts 20 s. The first step offers 50 starts/s per shard for
   `capacity_noop` and 25 for `capacity_canonical`, so each step starts at
   least 500 runs. Each next step offers
