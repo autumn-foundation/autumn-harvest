@@ -5921,8 +5921,12 @@ fn check_external_alone(commands: &[WorkflowCommand]) -> SqliteResult<()> {
     )))
 }
 
-/// True for a command that the Postgres solo rule ignores. Each one records
-/// a fact or tears down a loser, and parks nothing.
+/// True for a command that the solo rule ignores. Each one records a fact or
+/// tears down a loser, and parks nothing.
+///
+/// Postgres also ignores an `ArmTimer` for an await. This backend does not:
+/// a fired timer of that await sits between the external record and its
+/// result, and replay then waits forever.
 const fn is_batch_bookkeeping(cmd: &WorkflowCommand) -> bool {
     matches!(
         cmd,
@@ -5936,7 +5940,10 @@ const fn is_batch_bookkeeping(cmd: &WorkflowCommand) -> bool {
             | WorkflowCommand::RecordLog { .. }
             | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
             | WorkflowCommand::CancelRaceLosers { .. }
-            | WorkflowCommand::ArmTimer { .. }
+            | WorkflowCommand::ArmTimer {
+                for_await: false,
+                ..
+            }
             | WorkflowCommand::CancelTimer { .. }
             | WorkflowCommand::ReleaseMutex { .. }
     )

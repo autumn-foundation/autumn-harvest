@@ -563,6 +563,18 @@ async fn joins_external_and_timer(ctx: &WorkflowContext, _n: i64) -> Result<Valu
     reply.map_err(|e| e.to_string())
 }
 
+/// Joins an external activity and an awaited timer handle in one batch.
+#[workflow]
+async fn joins_external_and_timer_handle(ctx: &WorkflowContext, _n: i64) -> Result<Value, String> {
+    let nap = ctx.start_timer("nap", 5);
+    let (reply, fired) = tokio::join!(
+        ctx.execute_activity_external("a", json!({}), "camel", 60),
+        nap.await_fire(),
+    );
+    fired.map_err(|e| e.to_string())?;
+    reply.map_err(|e| e.to_string())
+}
+
 /// The run of `workflow` ends `FAILED`, typed, with the feature
 /// `ScheduleExternalActivity`, and leaves no handoff.
 async fn assert_external_batch_rejected(workflow: &str) {
@@ -570,6 +582,7 @@ async fn assert_external_batch_rejected(workflow: &str) {
     let mut rt = runtime(&clock);
     rt.register_workflow(&joins_two_externals_info());
     rt.register_workflow(&joins_external_and_timer_info());
+    rt.register_workflow(&joins_external_and_timer_handle_info());
     let exec = rt.start_workflow(workflow, json!(0)).unwrap();
 
     let err = rt.run_until_blocked(exec).await.unwrap_err();
@@ -611,6 +624,11 @@ async fn two_external_activities_in_one_batch_are_rejected() {
 #[tokio::test]
 async fn an_external_activity_beside_a_timer_is_rejected() {
     assert_external_batch_rejected("joins_external_and_timer").await;
+}
+
+#[tokio::test]
+async fn an_external_activity_beside_an_awaited_timer_handle_is_rejected() {
+    assert_external_batch_rejected("joins_external_and_timer_handle").await;
 }
 
 #[tokio::test]
