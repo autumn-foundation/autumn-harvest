@@ -64,6 +64,7 @@ pub mod embedding;
 #[cfg(all(test, any(feature = "aws-kms", feature = "vault-transit")))]
 mod kms_conformance;
 pub mod lineage;
+mod mcp_unserved;
 #[cfg(feature = "object-store")]
 pub mod object_store;
 /// OIDC login for Vantage and the management API (issue #1978).

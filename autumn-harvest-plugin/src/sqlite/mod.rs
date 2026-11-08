@@ -135,6 +135,8 @@ macro_rules! mcp_mounted {
     };
 }
 
+use crate::mcp_unserved::warn_if_mcp_unserved;
+
 struct StartParts {
     workflows: Vec<autumn_harvest::info::WorkflowInfo>,
     activities: Vec<autumn_harvest::info::ActivityInfo>,
@@ -151,8 +153,6 @@ struct StartParts {
     schedules: Vec<autumn_harvest::policy::WorkflowSchedule>,
     /// `HarvestPlugin::retention` (issue #2471).
     retention: autumn_harvest::retention::RetentionConfig,
-    /// The plugin mounts MCP tool or task routes (issue #2488).
-    mcp_served: bool,
     /// The `HarvestPlugin::state` values. The startup hook adds `AppState`.
     state: autumn_harvest::context::SharedStateMap,
 }
@@ -212,8 +212,12 @@ pub(crate) fn build(app: AppBuilder, parts: SqliteParts) -> AppBuilder {
         audit_retention_days: audit_retention_days(builder.retention_config()),
         schedules: builder.workflow_schedules().to_vec(),
         retention: builder.retention_config().clone(),
-        mcp_served: mcp_mounted!(mcp),
     };
+    warn_if_mcp_unserved(
+        &start_parts.workflows,
+        &start_parts.updates,
+        mcp_mounted!(mcp),
+    );
 
     // A login declares the boundary, as on Postgres.
     #[cfg(feature = "oidc")]
@@ -657,7 +661,6 @@ async fn start(
         schedules: parts.schedules,
         scheduler_enabled: sqlite_scheduler(runtime_config.scheduler_enabled),
         retention: parts.retention,
-        mcp_served: parts.mcp_served,
     });
     let catalog = Arc::new(handle::Catalog::of(&registry));
     let tick = Duration::from_millis(sqlite_config.tick_ms);

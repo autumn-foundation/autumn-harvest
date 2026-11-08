@@ -22,6 +22,13 @@ through the real, authenticated handler pipeline.
 edge. There `#[workflow(mcp)]` has no effect: the workflow runs, and no tools
 appear. Registration logs a `WARN` that names the workflow (issue #2488).
 
+**An unserved `mcp` flag logs one warning at build.** The plugin checks
+every registered workflow and update. If one sets `mcp` and no MCP route is
+mounted, the build logs one `WARN` that names them. Two cases trigger it: the
+`mcp` feature is off, or the app calls neither `.mcp_tools()` nor
+`.mcp_tasks()`. The workflows still run. Postgres and SQLite give the same
+message (issue #2609).
+
 Three pieces, each explicit:
 
 ```rust

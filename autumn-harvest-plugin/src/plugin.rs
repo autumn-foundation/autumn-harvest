@@ -1887,6 +1887,11 @@ impl HarvestPlugin {
             #[cfg(feature = "sqlite")]
                 sqlite_per_tenant: _,
         } = self;
+        crate::mcp_unserved::warn_if_mcp_unserved(
+            builder.workflow_infos(),
+            builder.update_handlers(),
+            mcp_tools_enabled || mcp_tasks_enabled,
+        );
         #[cfg(not(feature = "mcp"))]
         let _ = (
             mcp_tool_middleware,
