@@ -1191,6 +1191,8 @@ The rules match Postgres:
 | An unknown token | `SqliteError::ExternalTaskNotFound` |
 | An output nested past `MAX_PAYLOAD_DEPTH` | The activity fails instead |
 | No settle before `schedule_to_close_secs` | `ActivityTimedOut { ScheduleToClose }` |
+| A settle or an extension after the deadline | The token times out first. A settle returns `Ok(false)` |
+| An external activity beside another awaitable, such as a `join!` | The run ends `FAILED` with `UnsupportedFeature` |
 
 The read orders rows by deadline, then by the newest update, then by token.
 Unlike the Postgres operator row, a row carries the activity input, because
@@ -1305,9 +1307,10 @@ specific command/feature. The run then ends `FAILED` (see below):
   The token is `ContinueAsNew.new_workflow_type`. A same-type
   `continue_as_new` is supported (see [§7](#7-the-drive-model)).
 - **Worker sessions** (`create_session`).
-- **A batch that breaks a solo rule**: a mutex acquire beside another
-  awaitable, or a local activity beside a durable awaitable or a second
-  local activity. The token is `AcquireMutex` or `RunLocalActivity`.
+- **A batch that breaks a solo rule**: a mutex acquire or an external
+  activity beside another awaitable, or a local activity beside a durable
+  awaitable or a second local activity. The token is `AcquireMutex`,
+  `ScheduleExternalActivity` or `RunLocalActivity`.
 
 Search attributes are supported since issue #2027. See
 [§8](#list-describe-and-search-attributes-issue-2027).

@@ -2071,9 +2071,10 @@ impl SqliteRuntime {
     /// thus writes nothing, as on Postgres.
     ///
     /// A run past its `execution_timeout` ends `TIMED_OUT` first, and the
-    /// call returns `false`. An `output` nested past [`MAX_PAYLOAD_DEPTH`]
-    /// cannot be read back. The call fails the activity instead, as
-    /// [`fail_external`](Self::fail_external) with `retryable` off.
+    /// call returns `false`. A call after the deadline of the token times it
+    /// out first, and returns `false`. `serde_json` cannot read back an
+    /// `output` nested past [`MAX_PAYLOAD_DEPTH`]. The call fails the activity
+    /// instead, as [`fail_external`](Self::fail_external) with `retryable` off.
     ///
     /// # Errors
     ///
@@ -2101,8 +2102,8 @@ impl SqliteRuntime {
     /// Fail the external activity of `token` with `error`.
     ///
     /// The call appends `ActivityFailedExternally` to the waiting run. The
-    /// next drive returns the failure to the body. `retryable` is stored in
-    /// the event, as on Postgres. The return value and the refusals match
+    /// next drive returns the failure to the body. The event stores
+    /// `retryable`, as on Postgres. The return value and the refusals match
     /// [`complete_external`](Self::complete_external).
     ///
     /// # Errors
@@ -2145,6 +2146,11 @@ impl SqliteRuntime {
         if store::execution_state(&tx, task.exec)? != "RUNNING" {
             return Ok(false);
         }
+        // A reply after the deadline loses to the timeout.
+        if external_task::time_out_if_due(&tx, token, &task, now)? {
+            tx.commit()?;
+            return Ok(false);
+        }
         let settled =
             external_task::settle(&tx, token, &task, state, &event(task.activity_id), now)?;
         tx.commit()?;
@@ -2161,7 +2167,8 @@ impl SqliteRuntime {
     /// # Errors
     ///
     /// Returns [`SqliteError::ExternalTaskNotFound`] for an unknown token,
-    /// [`SqliteError::ExternalTaskNotPending`] for a settled token, and
+    /// [`SqliteError::ExternalTaskNotPending`] for a settled token or a
+    /// token past its deadline, and
     /// [`SqliteError::WorkflowNotRunning`] when the run has ended. Otherwise
     /// returns a persistence error.
     pub fn extend_external_deadline(
@@ -2181,6 +2188,14 @@ impl SqliteRuntime {
         self.refuse_past_deadline(task.exec, now)?;
         let deadline_at = now.saturating_add(duration_to_millis_saturating(extend_by));
         let tx = self.conn.transaction()?;
+        // An extension cannot revive a token whose deadline has passed.
+        if external_task::time_out_if_due(&tx, token, &task, now)? {
+            tx.commit()?;
+            return Err(SqliteError::ExternalTaskNotPending {
+                token,
+                state: ExternalTaskState::TimedOut,
+            });
+        }
         external_task::extend(&tx, token, &task, deadline_at, now)?;
         tx.commit()?;
         Ok(())
@@ -5838,6 +5853,7 @@ fn schedule_local_activity(
 ///
 /// The error names the offending commands and seals the run `FAILED`.
 fn check_batch_shape(commands: &[WorkflowCommand]) -> SqliteResult<()> {
+    check_external_alone(commands)?;
     let count = |want: fn(&WorkflowCommand) -> bool| commands.iter().filter(|c| want(c)).count();
     let acquires = count(|c| matches!(c, WorkflowCommand::AcquireMutex { .. }));
     let locals = count(|c| matches!(c, WorkflowCommand::RunLocalActivity { .. }));
@@ -5879,6 +5895,51 @@ fn check_batch_shape(commands: &[WorkflowCommand]) -> SqliteResult<()> {
         )
     };
     Err(SqliteError::Unsupported(message))
+}
+
+/// Refuse an external activity that shares its batch with another command
+/// that is not bookkeeping.
+///
+/// Postgres records an external activity only as the one suspending command
+/// of its batch, and refuses any other shape. The matcher reads the result
+/// of an external activity right after its own record. A second awaitable in
+/// the same batch puts its events between them, and replay then waits
+/// forever. So this backend refuses the same shapes.
+fn check_external_alone(commands: &[WorkflowCommand]) -> SqliteResult<()> {
+    let suspending: Vec<&'static str> = commands
+        .iter()
+        .filter(|c| !is_batch_bookkeeping(c))
+        .map(command_name)
+        .collect();
+    if suspending.len() < 2 || !suspending.contains(&"ScheduleExternalActivity") {
+        return Ok(());
+    }
+    Err(SqliteError::Unsupported(format!(
+        "ScheduleExternalActivity — an external activity must be the only awaitable in its \
+         batch; found {}. Await the external activity on its own.",
+        suspending.join(", ")
+    )))
+}
+
+/// True for a command that the Postgres solo rule ignores. Each one records
+/// a fact or tears down a loser, and parks nothing.
+const fn is_batch_bookkeeping(cmd: &WorkflowCommand) -> bool {
+    matches!(
+        cmd,
+        WorkflowCommand::RecordMarker { .. }
+            | WorkflowCommand::RecordSideEffect { .. }
+            | WorkflowCommand::RecordUpdateResult { .. }
+            | WorkflowCommand::UpsertSearchAttributes { .. }
+            | WorkflowCommand::SetCurrentDetails { .. }
+            | WorkflowCommand::PublishProgress { .. }
+            | WorkflowCommand::PublishDurableProgress { .. }
+            | WorkflowCommand::RecordLog { .. }
+            | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
+            | WorkflowCommand::CancelRaceLosers { .. }
+            | WorkflowCommand::ArmTimer { .. }
+            | WorkflowCommand::CancelTimer { .. }
+            | WorkflowCommand::ReleaseMutex { .. }
+    )
 }
 
 /// True for a command that parks the body on durable work (issue #2029).

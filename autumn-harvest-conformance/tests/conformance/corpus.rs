@@ -1268,3 +1268,27 @@ pub fn external_activity_times_out() -> Scenario {
     )
     .input(json!(1))
 }
+
+#[workflow]
+pub async fn joins_external_and_timer(ctx: &WorkflowContext, _n: i64) -> Result<Value, String> {
+    let (reply, nap) = tokio::join!(
+        ctx.execute_activity_external("bridge", json!({}), "default", 60),
+        ctx.timer("nap", 1),
+    );
+    nap.map_err(err)?;
+    reply.map_err(err)
+}
+
+/// An external activity that shares its batch with a timer.
+///
+/// Postgres refuses the batch too. The matcher reads the external result
+/// right after its record, so a timer event between them wedges replay.
+pub fn rejects_external_beside_timer() -> Scenario {
+    Scenario::new(
+        "rejects_external_beside_timer",
+        "joins_external_and_timer",
+        || vec![joins_external_and_timer_info()],
+        &[],
+    )
+    .rejected("ScheduleExternalActivity")
+}

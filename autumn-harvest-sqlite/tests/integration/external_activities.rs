@@ -538,3 +538,173 @@ async fn an_overdue_run_times_out_before_a_settle() {
         .unwrap();
     assert_eq!(row[0].state, ExternalTaskState::Cancelled);
 }
+
+/// Joins two external activities in one batch.
+#[workflow]
+async fn joins_two_externals(ctx: &WorkflowContext, _n: i64) -> Result<Value, String> {
+    let (a, b) = tokio::join!(
+        ctx.execute_activity_external("a", json!({}), "camel", 60),
+        ctx.execute_activity_external("b", json!({}), "camel", 60),
+    );
+    Ok(json!([
+        a.map_err(|e| e.to_string())?,
+        b.map_err(|e| e.to_string())?
+    ]))
+}
+
+/// Joins an external activity and a timer in one batch.
+#[workflow]
+async fn joins_external_and_timer(ctx: &WorkflowContext, _n: i64) -> Result<Value, String> {
+    let (reply, nap) = tokio::join!(
+        ctx.execute_activity_external("a", json!({}), "camel", 60),
+        ctx.timer("nap", 5),
+    );
+    nap.map_err(|e| e.to_string())?;
+    reply.map_err(|e| e.to_string())
+}
+
+/// The run of `workflow` ends `FAILED`, typed, with the feature
+/// `ScheduleExternalActivity`, and leaves no handoff.
+async fn assert_external_batch_rejected(workflow: &str) {
+    let clock = Clock::at(T0);
+    let mut rt = runtime(&clock);
+    rt.register_workflow(&joins_two_externals_info());
+    rt.register_workflow(&joins_external_and_timer_info());
+    let exec = rt.start_workflow(workflow, json!(0)).unwrap();
+
+    let err = rt.run_until_blocked(exec).await.unwrap_err();
+    assert!(
+        matches!(err, SqliteError::Unsupported(ref m) if m.starts_with("ScheduleExternalActivity — ")),
+        "{err:?}"
+    );
+    let failed = rt
+        .load_history(exec)
+        .unwrap()
+        .into_iter()
+        .find_map(|e| match e {
+            WorkflowEvent::WorkflowFailed {
+                error_type,
+                details,
+                ..
+            } => Some((error_type, details)),
+            _ => None,
+        });
+    let (error_type, details) = failed.expect("a typed WorkflowFailed");
+    assert_eq!(error_type.as_deref(), Some("UnsupportedFeature"));
+    assert_eq!(
+        details.unwrap()["feature"],
+        json!("ScheduleExternalActivity")
+    );
+    assert_eq!(
+        rt.list_external_handoffs(&ExternalHandoffFilter::new())
+            .unwrap(),
+        Vec::new(),
+        "the rolled-back cycle leaves no handoff"
+    );
+}
+
+#[tokio::test]
+async fn two_external_activities_in_one_batch_are_rejected() {
+    assert_external_batch_rejected("joins_two_externals").await;
+}
+
+#[tokio::test]
+async fn an_external_activity_beside_a_timer_is_rejected() {
+    assert_external_batch_rejected("joins_external_and_timer").await;
+}
+
+#[tokio::test]
+async fn a_settle_after_the_deadline_times_out_first() {
+    let clock = Clock::at(T0);
+    let mut rt = runtime(&clock);
+    let (exec, token) = parked(&mut rt, 10).await;
+
+    // No drive ran since the deadline passed. The late reply loses.
+    clock.set(T0 + 11);
+    assert!(!rt.complete_external(token, json!("late")).unwrap());
+    let row = rt
+        .list_external_handoffs(&ExternalHandoffFilter::new().token(token))
+        .unwrap();
+    assert_eq!(row[0].state, ExternalTaskState::TimedOut);
+    assert_eq!(row[0].updated_at, at(T0 + 10));
+    let state = rt.run_until_blocked(exec).await.unwrap();
+    assert!(
+        matches!(state, RunState::Completed(Value::String(ref s)) if s.starts_with("err:")),
+        "{state:?}"
+    );
+    assert_replays(rt.load_history(exec).unwrap()).await;
+}
+
+#[tokio::test]
+async fn an_extension_after_the_deadline_times_out_first() {
+    let clock = Clock::at(T0);
+    let mut rt = runtime(&clock);
+    let (_exec, token) = parked(&mut rt, 10).await;
+
+    clock.set(T0 + 10);
+    let late = rt.extend_external_deadline(token, Duration::from_secs(60));
+    assert!(
+        matches!(
+            late,
+            Err(SqliteError::ExternalTaskNotPending {
+                state: ExternalTaskState::TimedOut,
+                ..
+            })
+        ),
+        "{late:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_unbounded_deadline_stays_readable() {
+    let clock = Clock::at(T0);
+    let mut rt = runtime(&clock);
+    let (_exec, token) = parked(&mut rt, u64::MAX).await;
+    rt.extend_external_deadline(token, Duration::MAX).unwrap();
+
+    let rows = rt
+        .list_external_handoffs(&ExternalHandoffFilter::pending())
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0].deadline_at > at(T0 + 1_000_000_000));
+}
+
+#[tokio::test]
+async fn the_filter_clamps_its_limit_and_filters_by_state() {
+    let clock = Clock::at(T0);
+    let mut rt = runtime(&clock);
+    let (_, first) = parked(&mut rt, 10).await;
+    let (_, second) = parked(&mut rt, 20).await;
+
+    let zero = rt
+        .list_external_handoffs(&ExternalHandoffFilter::pending().limit(0))
+        .unwrap();
+    assert_eq!(zero.len(), 1, "a zero limit reads one row");
+
+    assert!(rt.complete_external(first, json!(1)).unwrap());
+    let done = rt
+        .list_external_handoffs(&ExternalHandoffFilter::new().state(ExternalTaskState::Completed))
+        .unwrap();
+    assert_eq!(done.len(), 1);
+    assert_eq!(done[0].token, first);
+    let all = rt
+        .list_external_handoffs(&ExternalHandoffFilter::new())
+        .unwrap();
+    assert_eq!(all.len(), 2);
+    assert!(all.iter().any(|r| r.token == second));
+}
+
+#[tokio::test]
+async fn pending_work_does_not_list_the_deadline_as_a_timer() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("harvest.sqlite3");
+    let clock = Clock::at(T0);
+    let mut rt = SqliteRuntime::open(&path).unwrap();
+    clock.install(&mut rt);
+    rt.register_workflow(&bridge_info());
+    let (exec, _token) = parked(&mut rt, 60).await;
+
+    let reader = autumn_harvest_sqlite::SqliteReader::open(&path).unwrap();
+    let work = reader.pending_work(exec).unwrap();
+    assert!(work.timers.is_empty(), "{work:?}");
+}

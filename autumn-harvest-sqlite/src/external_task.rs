@@ -19,7 +19,6 @@
 //! therefore never reads a handoff that no run waits on.
 
 use std::fmt;
-use std::str::FromStr;
 
 use autumn_harvest::{
     ActivityExecId, ExecutionId, ExternalActivityToken, TimeoutType, WorkflowEvent,
@@ -35,7 +34,11 @@ use crate::{queue, store};
 pub const DEADLINE_TIMER_PREFIX: &str = "__external_deadline:";
 
 /// The default row limit of [`ExternalHandoffFilter`], as on Postgres.
-pub const DEFAULT_HANDOFF_LIMIT: usize = 100;
+pub const DEFAULT_HANDOFF_LIMIT: u32 = 100;
+
+/// The largest row limit of [`ExternalHandoffFilter`]. A larger limit is cut
+/// to it.
+pub const MAX_HANDOFF_LIMIT: u32 = 1000;
 
 /// The state of one external activity handoff.
 ///
@@ -74,11 +77,10 @@ impl fmt::Display for ExternalTaskState {
     }
 }
 
-impl FromStr for ExternalTaskState {
-    type Err = SqliteError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
+impl ExternalTaskState {
+    /// The state of a stored name. Any other name is a damaged row.
+    fn parse(stored: &str) -> SqliteResult<Self> {
+        match stored {
             "PENDING" => Ok(Self::Pending),
             "COMPLETED" => Ok(Self::Completed),
             "FAILED" => Ok(Self::Failed),
@@ -91,10 +93,12 @@ impl FromStr for ExternalTaskState {
 
 /// The filter of [`SqliteRuntime::list_external_handoffs`](crate::SqliteRuntime::list_external_handoffs).
 ///
-/// Each set field narrows the read. [`Default`] reads every state, up to
+/// Each set field narrows the read. [`Self::new`] reads every state, up to
 /// [`DEFAULT_HANDOFF_LIMIT`] rows. [`Self::pending`] reads the `PENDING`
-/// rows, which is the dispatcher read.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// rows, which is the dispatcher read. The struct is `#[non_exhaustive]`, so
+/// build it with these functions.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ExternalHandoffFilter {
     /// Only rows in this state.
     pub state: Option<ExternalTaskState>,
@@ -104,30 +108,29 @@ pub struct ExternalHandoffFilter {
     pub execution_id: Option<ExecutionId>,
     /// Only the row of this token.
     pub token: Option<ExternalActivityToken>,
-    /// The most rows to return.
-    pub limit: usize,
-}
-
-impl Default for ExternalHandoffFilter {
-    fn default() -> Self {
-        Self {
-            state: None,
-            activity_name: None,
-            execution_id: None,
-            token: None,
-            limit: DEFAULT_HANDOFF_LIMIT,
-        }
-    }
+    /// The most rows to return. `None` reads [`DEFAULT_HANDOFF_LIMIT`]
+    /// rows. The read cuts a value to the range 1 to [`MAX_HANDOFF_LIMIT`].
+    pub limit: Option<u32>,
 }
 
 impl ExternalHandoffFilter {
+    /// A filter that reads every state.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
     /// The `PENDING` rows: the handoffs that wait for a result.
     #[must_use]
     pub fn pending() -> Self {
-        Self {
-            state: Some(ExternalTaskState::Pending),
-            ..Self::default()
-        }
+        Self::new().state(ExternalTaskState::Pending)
+    }
+
+    /// Keep only the rows in `state`.
+    #[must_use]
+    pub const fn state(mut self, state: ExternalTaskState) -> Self {
+        self.state = Some(state);
+        self
     }
 
     /// Keep only the rows of the activity `name`.
@@ -151,11 +154,19 @@ impl ExternalHandoffFilter {
         self
     }
 
-    /// Return at most `limit` rows.
+    /// Return at most `limit` rows. The read cuts it to the range 1 to
+    /// [`MAX_HANDOFF_LIMIT`].
     #[must_use]
-    pub const fn limit(mut self, limit: usize) -> Self {
-        self.limit = limit;
+    pub const fn limit(mut self, limit: u32) -> Self {
+        self.limit = Some(limit);
         self
+    }
+
+    /// The row limit of the read.
+    fn page_size(&self) -> u32 {
+        self.limit
+            .unwrap_or(DEFAULT_HANDOFF_LIMIT)
+            .clamp(1, MAX_HANDOFF_LIMIT)
     }
 }
 
@@ -165,6 +176,7 @@ impl ExternalHandoffFilter {
 /// with the reply. Unlike the Postgres operator row, this row carries the
 /// input, because a dispatcher on one file has no other read of it.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ExternalHandoff {
     /// The single-use token that settles the activity.
     pub token: ExternalActivityToken,
@@ -207,6 +219,21 @@ pub struct Task {
     pub exec: ExecutionId,
     pub activity_id: ActivityExecId,
     pub state: ExternalTaskState,
+    /// The deadline in epoch milliseconds.
+    pub deadline_at: i64,
+}
+
+/// The latest deadline that a handoff stores, in epoch milliseconds.
+///
+/// A longer deadline saturates to it. A later instant has no `DateTime`
+/// form, so the read of its row would fail.
+const fn latest_deadline() -> i64 {
+    DateTime::<Utc>::MAX_UTC.timestamp_millis()
+}
+
+/// `deadline_at`, cut to [`latest_deadline`].
+pub fn bounded_deadline(deadline_at: i64) -> i64 {
+    deadline_at.min(latest_deadline())
 }
 
 /// The timer id of the deadline of `token`.
@@ -237,6 +264,7 @@ pub fn record(
     now: i64,
     deadline_at: i64,
 ) -> SqliteResult<bool> {
+    let deadline_at = bounded_deadline(deadline_at);
     let recorded = history.iter().any(|event| {
         matches!(
             event,
@@ -283,14 +311,15 @@ const INSERT_SQL: &str = "INSERT OR IGNORE INTO harvest_external_tasks \
 
 /// The stored state of `token`, or `None` for an unknown token.
 pub fn find(conn: &Connection, token: ExternalActivityToken) -> SqliteResult<Option<Task>> {
-    let row: Option<(String, String, String)> = conn
+    let row: Option<(String, String, String, i64)> = conn
         .query_row(
-            "SELECT exec_id, activity_id, state FROM harvest_external_tasks WHERE token = ?1",
+            "SELECT exec_id, activity_id, state, deadline_at FROM harvest_external_tasks \
+             WHERE token = ?1",
             params![token.to_string()],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .optional()?;
-    row.map(|(exec, activity_id, state)| {
+    row.map(|(exec, activity_id, state, deadline_at)| {
         Ok(Task {
             exec: exec
                 .parse()
@@ -298,7 +327,8 @@ pub fn find(conn: &Connection, token: ExternalActivityToken) -> SqliteResult<Opt
             activity_id: activity_id
                 .parse()
                 .map_err(|_| SqliteError::corrupt("harvest_external_tasks.activity_id"))?,
-            state: state.parse()?,
+            state: ExternalTaskState::parse(&state)?,
+            deadline_at,
         })
     })
     .transpose()
@@ -341,6 +371,7 @@ pub fn extend(
     deadline_at: i64,
     now: i64,
 ) -> SqliteResult<()> {
+    let deadline_at = bounded_deadline(deadline_at);
     conn.execute(
         "UPDATE harvest_external_tasks SET deadline_at = ?2, updated_at = ?3 \
          WHERE token = ?1 AND state = 'PENDING'",
@@ -365,8 +396,8 @@ pub fn extend(
 ///
 /// A `PENDING` token times out: the run records
 /// `ActivityTimedOut { ScheduleToClose }`, and the row becomes `TIMED_OUT`.
-/// A settled token keeps its result, and the fire writes no event. Either
-/// way, the timer row is marked fired, so it never fires again.
+/// A settled token keeps its result, and the fire writes no event. In both
+/// cases, the fire marks the timer row fired, so it never fires again.
 pub fn fire_deadline(conn: &Connection, exec: ExecutionId, timer_id: &str) -> SqliteResult<()> {
     if let Some(token) = deadline_token(timer_id)
         && let Some(task) = find(conn, token)?
@@ -392,6 +423,25 @@ pub fn fire_deadline(conn: &Connection, exec: ExecutionId, timer_id: &str) -> Sq
     queue::mark_timer_fired(conn, exec, timer_id)
 }
 
+/// Time out `token` if its deadline has passed at `now`, in the caller's
+/// transaction. Returns `true` if the token timed out.
+///
+/// The deadline fires only when a drive runs the worker pass. A settle or an
+/// extension calls this first, so a reply after the deadline loses, as on
+/// Postgres, where a scanner times the row out.
+pub fn time_out_if_due(
+    conn: &Connection,
+    token: ExternalActivityToken,
+    task: &Task,
+    now: i64,
+) -> SqliteResult<bool> {
+    if task.state != ExternalTaskState::Pending || task.deadline_at > now {
+        return Ok(false);
+    }
+    fire_deadline(conn, task.exec, &deadline_timer_id(token))?;
+    Ok(true)
+}
+
 /// Set every `PENDING` token of `exec` `CANCELLED`, in the caller's
 /// transaction. Each terminal setter of a run calls it. A later settle of
 /// such a token returns `false`.
@@ -410,7 +460,7 @@ pub fn list(
     conn: &Connection,
     filter: &ExternalHandoffFilter,
 ) -> SqliteResult<Vec<ExternalHandoff>> {
-    let limit = i64::try_from(filter.limit).unwrap_or(i64::MAX);
+    let limit = i64::from(filter.page_size());
     let mut stmt = conn.prepare_cached(LIST_SQL)?;
     let rows = stmt.query_map(
         params![
@@ -453,7 +503,7 @@ const LIST_SQL: &str = "SELECT x.token, x.exec_id, e.workflow_id, e.workflow_nam
      ORDER BY x.deadline_at ASC, x.updated_at DESC, x.token ASC \
      LIMIT ?5";
 
-/// One stored row before it is decoded.
+/// One stored row before the decode.
 struct RawHandoff {
     token: String,
     exec_id: String,
@@ -492,7 +542,7 @@ impl RawHandoff {
             activity_name: self.name,
             queue: self.queue,
             input: serde_json::from_str(&self.input_json)?,
-            state: self.state.parse()?,
+            state: ExternalTaskState::parse(&self.state)?,
             created_at: time(self.created_at, "harvest_external_tasks.created_at")?,
             updated_at: time(self.updated_at, "harvest_external_tasks.updated_at")?,
             deadline_at: time(self.deadline_at, "harvest_external_tasks.deadline_at")?,
@@ -502,8 +552,30 @@ impl RawHandoff {
 
 #[cfg(test)]
 mod tests {
-    use super::{DEADLINE_TIMER_PREFIX, ExternalTaskState, deadline_timer_id, deadline_token};
+    use super::{
+        DEADLINE_TIMER_PREFIX, DEFAULT_HANDOFF_LIMIT, ExternalHandoffFilter, ExternalTaskState,
+        MAX_HANDOFF_LIMIT, bounded_deadline, deadline_timer_id, deadline_token, latest_deadline,
+    };
     use autumn_harvest::ExternalActivityToken;
+
+    #[test]
+    fn the_page_size_stays_in_its_range() {
+        let size = |filter: ExternalHandoffFilter| filter.page_size();
+        assert_eq!(size(ExternalHandoffFilter::new()), DEFAULT_HANDOFF_LIMIT);
+        assert_eq!(size(ExternalHandoffFilter::new().limit(0)), 1);
+        assert_eq!(size(ExternalHandoffFilter::new().limit(7)), 7);
+        assert_eq!(
+            size(ExternalHandoffFilter::new().limit(u32::MAX)),
+            MAX_HANDOFF_LIMIT
+        );
+    }
+
+    #[test]
+    fn a_deadline_stays_in_the_datetime_range() {
+        assert_eq!(bounded_deadline(i64::MAX), latest_deadline());
+        assert_eq!(bounded_deadline(5), 5);
+        assert!(chrono::DateTime::from_timestamp_millis(latest_deadline()).is_some());
+    }
 
     #[test]
     fn a_deadline_timer_id_round_trips_its_token() {
@@ -529,9 +601,9 @@ mod tests {
             ExternalTaskState::TimedOut,
             ExternalTaskState::Cancelled,
         ] {
-            assert_eq!(state.as_str().parse::<ExternalTaskState>().unwrap(), state);
+            assert_eq!(ExternalTaskState::parse(state.as_str()).unwrap(), state);
             assert_eq!(state.to_string(), state.as_str());
         }
-        assert!("RUNNING".parse::<ExternalTaskState>().is_err());
+        assert!(ExternalTaskState::parse("RUNNING").is_err());
     }
 }

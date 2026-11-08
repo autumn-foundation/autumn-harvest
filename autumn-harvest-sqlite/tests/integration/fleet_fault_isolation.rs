@@ -39,9 +39,9 @@ use serde_json::json;
 /// The stable token that names a rejected worker-session acquire.
 const SESSION_ACQUIRE: &str = "ScheduleActivity.schedule_to_start_override";
 
-// Reaches a worker-session acquire through ordinary dynamic control flow — not
-// a statically-declared `#[workflow(...)]` feature, so `register_workflow`'s
-// static audit cannot catch it up front.
+// This workflow reaches a worker-session acquire through ordinary control
+// flow. No `#[workflow(...)]` attribute declares it, so the static audit of
+// `register_workflow` cannot catch it first.
 #[workflow]
 async fn broken_wf(ctx: &WorkflowContext, _target: ExecutionId) -> Result<(), String> {
     ctx.create_session(SessionOptions::new("gpu"))

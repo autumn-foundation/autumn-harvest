@@ -16,9 +16,15 @@ is in `docs/design/DESIGN-2607.md`.
   second settle or a settle after the run ends returns `false`. An unknown
   token is `SqliteError::ExternalTaskNotFound`. An output nested past
   `MAX_PAYLOAD_DEPTH` fails the activity instead. A settle on an overdue run
-  seals it `TIMED_OUT` first.
+  seals it `TIMED_OUT` first. A settle or an extension after the deadline
+  of the token times the token out first.
+- An external activity must be the only awaitable in its batch, as on
+  Postgres. A `join!` with another awaitable ends the run `FAILED` with
+  `UnsupportedFeature` and the feature `ScheduleExternalActivity`.
 - `SqliteRuntime::list_external_handoffs(&ExternalHandoffFilter)` reads the
-  handoffs by state, activity name, run or token. Rows come by deadline, as
+  handoffs by state, activity name, run or token. The filter is
+  `#[non_exhaustive]`. Its limit is cut to the range 1 to
+  `MAX_HANDOFF_LIMIT`. A deadline saturates at the last `DateTime`. Rows come by deadline, as
   Postgres `list_external_handoffs` orders them. Each row carries the input.
 - The schedule-to-close deadline is a `harvest_timers` row with the id
   `__external_deadline:<token>`. Its fire records

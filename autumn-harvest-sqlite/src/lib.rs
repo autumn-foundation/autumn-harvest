@@ -268,7 +268,9 @@
 //! [`ExternalHandoffFilter::pending`]. It settles each token with
 //! [`SqliteRuntime::complete_external`] or [`SqliteRuntime::fail_external`].
 //! A settle returns `false` for a token that is no longer `PENDING`, or for a
-//! run that has ended. An unknown token is
+//! run that has ended. A settle after the deadline times the token out
+//! first, and returns `false`. An external activity must be the only
+//! awaitable in its batch, as on Postgres. An unknown token is
 //! [`SqliteError::ExternalTaskNotFound`]. These are the Postgres rules.
 //!
 //! The deadline fires through the timer path and records
@@ -375,7 +377,8 @@
 //!   carries the `session_id` / `schedule_to_start_override` `ScheduleActivity`
 //!   fields this single-writer backend cannot honor).
 //! - **A batch that breaks a solo rule.** A mutex acquire must be the only
-//!   awaitable in its batch (`AcquireMutex`). A local activity cannot share a
+//!   awaitable in its batch (`AcquireMutex`). So must an external activity
+//!   (`ScheduleExternalActivity`). A local activity cannot share a
 //!   batch with a durable awaitable (`RunLocalActivity`, issue #950). Postgres
 //!   rejects both shapes too. This backend also rejects a second local
 //!   activity in one batch.
@@ -836,6 +839,7 @@ pub use crate::auth::{
 pub use crate::error::{SqliteError, SqliteResult};
 pub use crate::external_task::{
     DEFAULT_HANDOFF_LIMIT, ExternalHandoff, ExternalHandoffFilter, ExternalTaskState,
+    MAX_HANDOFF_LIMIT,
 };
 pub use crate::history_cap::HistoryCapReason;
 pub use crate::history_page::{

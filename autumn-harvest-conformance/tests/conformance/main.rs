@@ -88,6 +88,7 @@ corpus! {
         rejects_worker_session,
         rejects_acquire_beside_timer,
         rejects_local_activity_beside_timer,
+        rejects_external_beside_timer,
         rejects_unawaited_activity_in_last_cycle,
         rejects_unawaited_timer_in_last_cycle,
         rejects_unawaited_signal_wait_in_last_cycle,

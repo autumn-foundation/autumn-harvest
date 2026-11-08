@@ -57,8 +57,8 @@ async fn child_typed_failure(ctx: &WorkflowContext, _n: i64) -> Result<i64, Work
         .with_details(json!({ "code": 51 })))
 }
 
-/// Acquires a worker session. This backend still rejects that, so the child
-/// is sealed with a typed failure.
+/// Acquires a worker session. This backend still rejects that, so the runtime
+/// seals the child with a typed failure.
 #[workflow]
 async fn child_unsupported(ctx: &WorkflowContext, n: i64) -> Result<i64, String> {
     ctx.create_session(SessionOptions::new("gpu"))

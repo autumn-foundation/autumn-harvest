@@ -67,6 +67,9 @@ How can the port fail? Each row names the guard.
 | The park reports `WaitingTimer`, because the deadline row exists. | The block check reads the external rows before the timers. |
 | A purge leaves orphan rows. | Retention lists the new table. |
 | An old file has no table. | `CREATE TABLE IF NOT EXISTS` adds it on open. |
+| A `join!` puts another awaitable between an external record and its result, and replay waits forever. | An external activity must be the only awaitable in its batch, as on Postgres. |
+| A reply after the deadline wins, because no drive fired the timer yet. | A settle or an extension times out a due token first. |
+| A huge deadline has no `DateTime` form, so the read fails. | The deadline saturates at the last `DateTime`. |
 
 ## 5. Six hats
 
