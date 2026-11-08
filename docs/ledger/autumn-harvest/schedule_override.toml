@@ -14,11 +14,18 @@ kind = ["read", "write"]
 tables = ["harvest_schedule_overrides"]
 measured = "unmeasured"
 
-["copy_delivered"]
+["copy_newest"]
 driver = "per_tick"
 backend = ["postgres"]
-kind = ["read"]
-tables = ["harvest_schedule_override_receipts"]
+kind = ["read", "write"]
+tables = ["harvest_schedule_overrides"]
+measured = "unmeasured"
+
+["delete_dag_override_returning"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_schedule_overrides"]
 measured = "unmeasured"
 
 ["delete_override"]
@@ -26,13 +33,6 @@ driver = "per_request"
 backend = ["postgres"]
 kind = ["write"]
 tables = ["harvest_schedule_overrides"]
-measured = "unmeasured"
-
-["drop_copy_record"]
-driver = "per_tick"
-backend = ["postgres"]
-kind = ["write"]
-tables = ["harvest_schedule_override_receipts"]
 measured = "unmeasured"
 
 ["get_dag_override"]
@@ -79,10 +79,17 @@ kind = ["read"]
 tables = ["harvest_schedule_overrides"]
 measured = "unmeasured"
 
-["record_copy"]
+["raise_floor"]
 driver = "per_tick"
 backend = ["postgres"]
-kind = ["write"]
+kind = ["read", "write"]
+tables = ["harvest_schedule_override_receipts"]
+measured = "unmeasured"
+
+["read_floor"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read"]
 tables = ["harvest_schedule_override_receipts"]
 measured = "unmeasured"
 
