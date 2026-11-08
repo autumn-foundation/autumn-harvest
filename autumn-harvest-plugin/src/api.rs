@@ -30181,9 +30181,8 @@ fn code_declared_schedule(
 
 /// Reject the fields that do not fit the kind of schedule (issue #2386).
 ///
-/// An override cannot change the input of a code-declared schedule, and a
-/// clear of its override takes no other field. An
-/// API-created schedule has no override, so `clear_override` and `reason`
+/// A clear of the override of a code-declared schedule takes no other field.
+/// An API-created schedule has no override, so `clear_override` and `reason`
 /// do not apply to it.
 fn check_override_fields(
     request: &UpdateWorkflowScheduleRequest,
@@ -30191,11 +30190,6 @@ fn check_override_fields(
     id: uuid::Uuid,
 ) -> Result<(), String> {
     match code {
-        Some(code) if request.input.is_some() => Err(format!(
-            "schedule {id} is declared in code for workflow '{}'; its input is set in code \
-             and an override cannot change it",
-            code.workflow_name
-        )),
         // `timezone` and `catchup_window_secs` resolve against the stored row.
         // That row still holds the old override, so a clear stands alone.
         Some(_) if request.clear_override && request.has_edit_fields() => Err(format!(
@@ -30223,7 +30217,7 @@ fn check_override_fields(
 /// A schedule declared in code converges to its code value on every tick.
 /// So a patch of one writes an operator override instead of a row edit
 /// (issue #2386). The tick applies the override before it converges the row.
-/// Such a patch cannot change `input`.
+/// The override stores `input` under the write codec.
 #[allow(clippy::too_many_lines)]
 async fn update_schedule_handler(
     Extension(api_state): Extension<HarvestApiState>,

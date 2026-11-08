@@ -4751,3 +4751,380 @@ async fn inline_delivery_leaves_a_signal_pending_when_the_codec_fails() {
         "a codec failure must not fail the signal for good: {types:?}"
     );
 }
+
+// ── schedule input override ──────────────────────────────────────────────────
+//
+// These tests leave encrypted override rows behind, so each one runs on a
+// database that no other test shares.
+
+const OVERRIDE_SECRET: &str = "cc-override-input-ssn-888";
+
+/// A migrated Postgres that no other test shares.
+///
+/// With `HARVEST_TEST_DATABASE_URL` set, it makes a throwaway database there.
+/// Otherwise it starts a fresh container.
+async fn setup_isolated_db() -> (
+    String,
+    Option<testcontainers::ContainerAsync<testcontainers_modules::postgres::Postgres>>,
+) {
+    use diesel_async::SimpleAsyncConnection;
+    use testcontainers::ImageExt;
+    use testcontainers_modules::testcontainers::runners::AsyncRunner;
+
+    if let Ok(admin_url) = std::env::var("HARVEST_TEST_DATABASE_URL") {
+        let db_name = format!("harvest_cc_override_{}", Uuid::new_v4().simple());
+        let mut admin = connect(&admin_url).await;
+        admin
+            .batch_execute(&format!("CREATE DATABASE \"{db_name}\""))
+            .await
+            .expect("create throwaway database");
+        let (base, _) = admin_url
+            .split_once('?')
+            .unwrap_or((admin_url.as_str(), ""));
+        let cut = base.rfind('/').expect("a postgres URL has a database path");
+        let url = format!("{}/{db_name}", &base[..cut]);
+        connect(&url)
+            .await
+            .batch_execute(autumn_harvest::full_migrations_sql())
+            .await
+            .expect("apply migrations");
+        return (url, None);
+    }
+    let container = testcontainers_modules::postgres::Postgres::default()
+        .with_init_sql(autumn_harvest::full_migrations_sql().as_bytes().to_vec())
+        .with_tag("16")
+        .start()
+        .await
+        .expect("failed to start Postgres container");
+    let host = container.get_host().await.expect("get host");
+    let port = container.get_host_port_ipv4(5432).await.expect("get port");
+    (
+        format!("postgres://postgres:postgres@{host}:{port}/postgres"),
+        Some(container),
+    )
+}
+
+/// The stored override input of the workflow schedule `name`.
+async fn override_input_cell(conn: &mut AsyncPgConnection, name: &str) -> Option<Value> {
+    #[derive(diesel::QueryableByName)]
+    struct Cell {
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Jsonb>)]
+        value: Option<Value>,
+    }
+    diesel::sql_query(
+        "SELECT workflow_input AS value FROM harvest_schedule_overrides \
+         WHERE kind = 'workflow' AND name = $1",
+    )
+    .bind::<diesel::sql_types::Text, _>(name)
+    .get_result::<Cell>(conn)
+    .await
+    .optional()
+    .expect("load the override row")
+    .and_then(|cell| cell.value)
+}
+
+/// The stored cadence of the schedule row of `name`.
+async fn schedule_expr_of(conn: &mut AsyncPgConnection, name: &str) -> Option<String> {
+    #[derive(diesel::QueryableByName)]
+    struct Expr {
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+        expr: Option<String>,
+    }
+    diesel::sql_query(
+        "SELECT schedule_expr AS expr FROM harvest_schedules WHERE workflow_name = $1",
+    )
+    .bind::<diesel::sql_types::Text, _>(name)
+    .get_result::<Expr>(conn)
+    .await
+    .expect("load the schedule row")
+    .expr
+}
+
+/// The operator path of `PATCH /admin/schedules/{id}` for the code-declared
+/// schedule `code`.
+async fn override_patch(
+    conn: &mut AsyncPgConnection,
+    code: &autumn_harvest::WorkflowSchedule,
+    patch: &autumn_harvest::scheduler::WorkflowSchedulePatch,
+    clear: bool,
+    codecs: &PayloadCodecs,
+) -> autumn_harvest::HarvestResult<autumn_harvest::scheduler::WorkflowOverrideUpdate> {
+    #[derive(diesel::QueryableByName)]
+    struct Id {
+        #[diesel(sql_type = diesel::sql_types::Uuid)]
+        id: Uuid,
+    }
+    let id: Id = diesel::sql_query("SELECT id FROM harvest_schedules WHERE workflow_name = $1")
+        .bind::<diesel::sql_types::Text, _>(&code.workflow_name)
+        .get_result(conn)
+        .await
+        .expect("schedule id");
+    let request = autumn_harvest::scheduler::WorkflowOverrideRequest {
+        schedule_id: id.id,
+        code,
+        patch,
+        clear,
+        actor: "ops",
+        reason: Some("rotate the account"),
+    };
+    autumn_harvest::scheduler::update_code_declared_workflow_schedule(conn, &request, codecs).await
+}
+
+fn override_input() -> Value {
+    json!({"ssn": OVERRIDE_SECRET})
+}
+
+fn input_patch(input: Value) -> autumn_harvest::scheduler::WorkflowSchedulePatch {
+    autumn_harvest::scheduler::WorkflowSchedulePatch {
+        input: Some(input),
+        ..Default::default()
+    }
+}
+
+/// An AES-256-GCM registry with column encoding on, under `key_id` only.
+fn aead_codecs_under(key_id: &str, byte: u8) -> PayloadCodecs {
+    let codecs = PayloadCodecs::default();
+    let key = DataKey::from_bytes(&[byte; 32]).expect("data key");
+    AeadCodec::new(key_id, &key)
+        .expect("aead codec")
+        .register_with(&codecs)
+        .expect("register");
+    codecs.set_column_encoding(true);
+    codecs
+}
+
+/// One scheduler tick over `code`, with the codecs of `codecs`.
+async fn tick_with(url: &str, codecs: &PayloadCodecs, code: Vec<autumn_harvest::WorkflowSchedule>) {
+    autumn_harvest::scheduler::tick_once(
+        build_pool(url),
+        registry(vec![], vec![], codecs),
+        Arc::new(autumn_harvest::DagCatalog::new()),
+        Arc::new(code),
+        autumn_harvest::SchedulerMonitor::offline(),
+    )
+    .await
+    .expect("a tick never fails on a bad override");
+}
+
+#[tokio::test]
+async fn a_schedule_input_override_is_ciphertext_and_the_fire_reads_plaintext() {
+    let (url, _c) = setup_isolated_db().await;
+    let codecs = aead_codecs(true);
+    let mut conn = connect(&url).await;
+    let name = format!("cc_sched_ovr_{}", Uuid::new_v4().simple());
+    let static_name: &'static str = Box::leak(name.clone().into_boxed_str());
+    let reg = registry(vec![wf_info(static_name, wf_noop, None)], vec![], &codecs);
+    let code = secret_schedule(&name);
+    autumn_harvest::register_workflow_schedules_with_codecs(
+        &mut conn,
+        std::slice::from_ref(&code),
+        &codecs,
+    )
+    .await
+    .expect("register");
+
+    override_patch(
+        &mut conn,
+        &code,
+        &input_patch(override_input()),
+        false,
+        &codecs,
+    )
+    .await
+    .expect("an input override is accepted");
+    let stored = override_input_cell(&mut conn, &name)
+        .await
+        .expect("the override stores the input");
+    assert_ciphertext(
+        &stored,
+        OVERRIDE_SECRET,
+        "schedule_overrides.workflow_input",
+    );
+    assert_eq!(
+        codecs.decode_column(&stored).expect("decode one layer"),
+        override_input()
+    );
+    let (row, row_updated) = schedule_cell(&mut conn, &name).await;
+    assert_ciphertext(&row, OVERRIDE_SECRET, "the converged schedule input");
+    assert_eq!(
+        codecs.decode_column(&row).expect("decode"),
+        override_input()
+    );
+
+    // With column encoding on, the listing shows the ciphertext.
+    let listed = autumn_harvest::schedule_override::list_overrides(&mut conn)
+        .await
+        .expect("list overrides");
+    let summary = listed
+        .iter()
+        .find(|summary| summary.name == name)
+        .expect("the override is listed");
+    assert_eq!(summary.fields["input"], stored);
+    assert!(
+        !serde_json::to_string(summary)
+            .expect("serialize")
+            .contains(OVERRIDE_SECRET),
+        "the listing must not hold the secret in clear"
+    );
+
+    // A tick finds the row converged. It writes nothing.
+    let tick = |reg: Arc<HandlerRegistry>, code: autumn_harvest::WorkflowSchedule| {
+        autumn_harvest::scheduler::tick_once(
+            build_pool(&url),
+            reg,
+            Arc::new(autumn_harvest::DagCatalog::new()),
+            Arc::new(vec![code]),
+            autumn_harvest::SchedulerMonitor::offline(),
+        )
+    };
+    tick(reg.clone(), code.clone()).await.expect("tick");
+    let (after_tick, after_tick_updated) = schedule_cell(&mut conn, &name).await;
+    assert_eq!(after_tick, row, "a converged row keeps its envelope");
+    assert_eq!(
+        after_tick_updated, row_updated,
+        "a converged row is not written"
+    );
+
+    diesel::sql_query(
+        "UPDATE harvest_schedules SET next_run_at = now() - interval '1 minute' \
+         WHERE workflow_name = $1",
+    )
+    .bind::<diesel::sql_types::Text, _>(&name)
+    .execute(&mut conn)
+    .await
+    .expect("make it due");
+    tick(reg, code).await.expect("tick");
+    use autumn_harvest::schema::harvest_workflow_executions;
+    let input: Value = harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::workflow_name.eq(&name))
+        .select(harvest_workflow_executions::input)
+        .first(&mut conn)
+        .await
+        .expect("the tick started a run");
+    assert_ciphertext(&input, OVERRIDE_SECRET, "the scheduled run input");
+    assert_eq!(
+        codecs.decode_column(&input).expect("decode one layer"),
+        override_input(),
+        "the run starts on the plaintext override input"
+    );
+}
+
+/// An override input under a key that the process does not hold holds back
+/// its own schedule only. Every other schedule of the shard still converges.
+/// A patch that sets a new input replaces it, and a clear removes it.
+#[tokio::test]
+async fn an_override_input_that_cannot_decode_holds_back_its_own_schedule_only() {
+    let (url, _c) = setup_isolated_db().await;
+    let old_key = aead_codecs(true);
+    let mut conn = connect(&url).await;
+    let name = format!("cc_sched_ovr_stuck_{}", Uuid::new_v4().simple());
+    let neighbour = format!("cc_sched_ovr_peer_{}", Uuid::new_v4().simple());
+    let code = secret_schedule(&name);
+    let peer = secret_schedule(&neighbour);
+    autumn_harvest::register_workflow_schedules_with_codecs(
+        &mut conn,
+        &[code.clone(), peer.clone()],
+        &old_key,
+    )
+    .await
+    .expect("register");
+    override_patch(
+        &mut conn,
+        &code,
+        &input_patch(override_input()),
+        false,
+        &old_key,
+    )
+    .await
+    .expect("an input override is accepted");
+    let (before, before_updated) = schedule_cell(&mut conn, &name).await;
+
+    // The process holds another key only. A redeploy moves both cadences.
+    let new_key = aead_codecs_under("cc-k9", 0x9a);
+    let minutely = |ws: &autumn_harvest::WorkflowSchedule| {
+        let mut ws = ws.clone();
+        ws.schedule = autumn_harvest::Schedule::Interval(Duration::from_secs(60));
+        ws
+    };
+    let (code_60, peer_60) = (minutely(&code), minutely(&peer));
+    tick_with(&url, &new_key, vec![code_60.clone(), peer_60.clone()]).await;
+    let (after, after_updated) = schedule_cell(&mut conn, &name).await;
+    assert_eq!(
+        after, before,
+        "the schedule with the bad input keeps its row"
+    );
+    assert_eq!(
+        after_updated, before_updated,
+        "the pass writes no row for it"
+    );
+    assert_eq!(
+        schedule_expr_of(&mut conn, &neighbour).await.as_deref(),
+        Some("interval:60"),
+        "every other schedule of the shard still converges"
+    );
+
+    // A patch of another field needs the stored input, so it fails.
+    let error = override_patch(
+        &mut conn,
+        &code_60,
+        &autumn_harvest::scheduler::WorkflowSchedulePatch {
+            max_runs: Some(Some(5)),
+            ..Default::default()
+        },
+        false,
+        &new_key,
+    )
+    .await
+    .expect_err("a patch that keeps an unreadable input fails");
+    assert!(
+        matches!(error, autumn_harvest::HarvestError::Config(_)),
+        "{error}"
+    );
+    assert!(
+        !error.to_string().contains(OVERRIDE_SECRET),
+        "the error never holds the input"
+    );
+
+    // A patch that sets a new input does not read the old one.
+    override_patch(
+        &mut conn,
+        &code_60,
+        &input_patch(json!({"ssn": "new"})),
+        false,
+        &new_key,
+    )
+    .await
+    .expect("a new input replaces an unreadable one");
+    let stored = override_input_cell(&mut conn, &name)
+        .await
+        .expect("the new input is stored");
+    assert_eq!(codec_envelope_key_id(&stored), Some("cc-k9"));
+    tick_with(&url, &new_key, vec![code_60.clone(), peer_60]).await;
+    assert_eq!(
+        schedule_expr_of(&mut conn, &name).await.as_deref(),
+        Some("interval:60"),
+        "the schedule converges again once its input decodes"
+    );
+
+    // A clear never decodes the row, so a process with no key removes it.
+    override_patch(
+        &mut conn,
+        &code_60,
+        &autumn_harvest::scheduler::WorkflowSchedulePatch::default(),
+        true,
+        &reader_without_the_key(),
+    )
+    .await
+    .expect("a clear needs no key");
+    assert_eq!(override_input_cell(&mut conn, &name).await, None);
+    assert_eq!(
+        count_rows(
+            &mut conn,
+            "SELECT COUNT(*)::BIGINT AS n FROM harvest_schedule_overrides \
+             WHERE kind = 'workflow' AND name = $1",
+            &name,
+        )
+        .await,
+        0
+    );
+}

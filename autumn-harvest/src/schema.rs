@@ -513,6 +513,10 @@ diesel::table! {
         updated_at -> Timestamptz,
         /// Workflow-only override fields as one JSON object (issue #2386).
         workflow_fields -> Jsonb,
+        /// The key of the codec rotation sweep.
+        id -> Uuid,
+        /// The input override of a workflow row, in the payload codec form.
+        workflow_input -> Nullable<Jsonb>,
     }
 }
 

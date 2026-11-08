@@ -1841,7 +1841,9 @@ async fn register_shard_pass<'a>(
     // Issue #2385: operator overrides win over code. Both registration
     // passes and the firing pass read the same effective values, or the
     // two registration passes would rewrite the same DAG row each tick.
-    let Some((overrides, override_fence)) = load_shard_overrides(conn, shard).await else {
+    let Some((overrides, override_fence)) =
+        load_shard_overrides(conn, shard, registry.payload_codecs()).await
+    else {
         return Ok(ShardPass::skipped());
     };
     let misplaced = overrides
@@ -1907,17 +1909,29 @@ async fn register_shard_pass<'a>(
 async fn load_shard_overrides(
     conn: &mut AsyncPgConnection,
     shard: ShardId,
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> Option<(crate::schedule_override::ScheduleOverrides, String)> {
     // The fingerprint is read first. A write between the two reads then only
     // makes the snapshot newer than its fence, and the pass skips its writes.
     let loaded = match crate::schedule_override::override_fingerprint(conn).await {
-        Ok(fence) => crate::schedule_override::load_overrides(conn)
+        Ok(fence) => crate::schedule_override::load_overrides(conn, codecs)
             .await
             .map(|overrides| (overrides, fence)),
         Err(error) => Err(error),
     };
     match loaded {
-        Ok(loaded) => Some(loaded),
+        Ok(loaded) => {
+            // No payload text: the name and the shard only.
+            for workflow_name in loaded.0.unreadable_inputs() {
+                tracing::warn!(
+                    shard_id = shard.as_i32(),
+                    workflow_name,
+                    "harvest: a schedule override input does not decode; this pass leaves \
+                     that schedule as it is. Restore the codec key or clear the override"
+                );
+            }
+            Some(loaded)
+        }
         Err(error) => {
             tracing::warn!(
                 error = %error,
@@ -3686,7 +3700,7 @@ pub struct WorkflowOverrideRequest<'a> {
     pub schedule_id: uuid::Uuid,
     /// The code value of the schedule, as the builder declares it.
     pub code: &'a WorkflowSchedule,
-    /// The fields to set. `input` must be `None`.
+    /// The fields to set. The store encodes `input` with the codecs.
     pub patch: &'a WorkflowSchedulePatch,
     /// Delete the stored override before `patch` merges.
     pub clear: bool,
@@ -3717,11 +3731,16 @@ pub struct WorkflowOverrideUpdate {
 /// validation, and nothing when a live fire claim holds the row. The guard
 /// and the `next_run_at` rules are those of [`update_workflow_schedule`].
 ///
+/// `codecs` encodes the input of the row and of the override, and decodes
+/// the stored override input. So the next fire takes the new input, and the
+/// stored input is ciphertext under an active codec.
+///
 /// # Errors
 ///
-/// Returns [`HarvestError::Config`] when the patch carries an input, when
-/// the row belongs to another workflow, or when the merged value is invalid.
-/// Returns [`HarvestError::Database`] on a failed read or write.
+/// Returns [`HarvestError::Config`] when the row belongs to another workflow,
+/// when the merged value is invalid, or when the stored override input does
+/// not decode. A clear never decodes it. Returns [`HarvestError::Database`]
+/// on a failed read or write.
 pub async fn update_code_declared_workflow_schedule(
     conn: &mut AsyncPgConnection,
     request: &WorkflowOverrideRequest<'_>,
@@ -3769,23 +3788,19 @@ pub async fn update_code_declared_workflow_schedule(
         // The row lock above already orders two patches of this schedule.
         // The override lock keeps the read-modify-write sound on its own.
         // A clear never decodes the stored row, so it also removes a row that
-        // no longer decodes.
+        // no longer decodes. A new input never decodes the old one.
         let stored = if request.clear {
             overrides::lock_workflow_override_row(conn, workflow_name).await?;
             None
+        } else if request.patch.input.is_some() {
+            overrides::lock_workflow_override_without_input(conn, workflow_name).await?
         } else {
-            overrides::lock_workflow_override(conn, workflow_name).await?
+            overrides::lock_workflow_override(conn, workflow_name, codecs).await?
         };
         let base = stored
             .as_ref()
             .map(|value| value.fields.clone())
             .unwrap_or_default();
-        if request.patch.input.is_some() {
-            return Err(HarvestError::Config(format!(
-                "schedule '{workflow_name}' is declared in code; an override cannot change \
-                 its input. Change the input in code"
-            )));
-        }
         let merged = overrides::merge_workflow_fields(request.patch, &base);
         let effective = overrides::validate_effective_workflow(request.code, &merged)?;
 
@@ -3800,9 +3815,10 @@ pub async fn update_code_declared_workflow_schedule(
                     &merged,
                     request.actor,
                     request.reason,
+                    codecs,
                 )
                 .await?;
-                let stored = overrides::get_workflow_override(conn, workflow_name).await?;
+                let stored = overrides::get_workflow_override(conn, workflow_name, codecs).await?;
                 Ok(WorkflowOverrideUpdate {
                     outcome: ScheduleUpdateOutcome::Updated(row),
                     stored,

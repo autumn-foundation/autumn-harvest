@@ -255,14 +255,15 @@ impl PatchBody {
 
     /// The Postgres `check_override_fields`, before any write.
     ///
-    /// A code schedule takes its input from code. A clear stands alone,
+    /// This backend has no payload codecs, so a code schedule takes its input
+    /// from code. Postgres takes an input override. A clear stands alone,
     /// because the other fields resolve against the stored override. An API
     /// schedule has no override, so a clear or a reason is a mistake.
     fn check_override_fields(&self, code: bool, id: uuid::Uuid) -> Result<(), AutumnError> {
         let refusal = if code && self.input.is_some() {
             Some(format!(
-                "schedule {id} is declared in code; its input is set in code and an override \
-                 cannot change it"
+                "schedule {id} is declared in code; the SQLite backend has no payload codecs, \
+                 so an override cannot change its input"
             ))
         } else if code && self.clear_override && self.has_edit_fields() {
             Some(format!(

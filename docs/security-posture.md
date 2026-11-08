@@ -1572,7 +1572,8 @@ a `JSONB` column has no row here. Each clear column has a reason.
 | `harvest_schedules.workflow_input` | Covered | The input of every scheduled run. Registration and the schedule API encode it. The reconciler compares the decoded value, so a new nonce is not drift. The tick decodes it before the start. |
 | `harvest_schedules.buffered_runs` | Clear | Fire times only. |
 | `harvest_schedules.retry_policy` | Clear | Engine configuration, not payload. |
-| `harvest_schedule_overrides.workflow_fields` | Clear | Operator schedule settings of a code-declared workflow schedule (#2386): cadence, policies and caps. An override never holds a run input. |
+| `harvest_schedule_overrides.workflow_fields` | Clear | Operator schedule settings of a code-declared workflow schedule (#2386): cadence, policies and caps. The run input is in `workflow_input`, not here. |
+| `harvest_schedule_overrides.workflow_input` | Covered | The operator input of a code-declared workflow schedule (#2412). The override API encodes it, and the scheduler decodes it before it converges the schedule row. A cell that does not decode holds back its own schedule only. A new input or a clear replaces it with no decode. A cell stored while column encoding was off stays in clear until the next PATCH. |
 | `harvest_agent_overlays.body` | Clear | An agent profile overlay (#2371): prompt text, bounds and a model name. `BYTEA`, not `JSONB`. A run reads it as configuration. Do not put secrets or PII in an overlay. |
 | `harvest_signals.payload` | Covered | The signal payload. Signal ingest decodes it before it records `SignalReceived`. |
 | `harvest_entity_state.snapshot` | Covered | The latest keyed-entity state (#2259). A trigger copies the encoded value of the snapshot event, so it holds the same envelope. Entity reads decode it. Erasure tombstones it. |

@@ -150,6 +150,12 @@ curl -X PATCH https://<host>/api/harvest/admin/schedules/<id> \
      -H 'X-Harvest-Actor: ops-team' \
      -d '{"schedule_expr": "interval:300", "reason": "INC-4821"}'
 
+# Change the input of each run.
+curl -X PATCH https://<host>/api/harvest/admin/schedules/<id> \
+     -H 'Content-Type: application/json' \
+     -H 'X-Harvest-Actor: ops-team' \
+     -d '{"input": {"account": "acme-2"}, "reason": "INC-4821"}'
+
 # Return it to its code value.
 curl -X PATCH https://<host>/api/harvest/admin/schedules/<id> \
      -H 'Content-Type: application/json' \
@@ -165,8 +171,9 @@ otherwise. Send the new values in a second request.
 
 Rules that differ from a row edit:
 
-- `input` returns 400. The input is a payload under the payload codecs, and an
-  override of it is out of scope. Change it in code.
+- `input` sets the input of each run (issue #2412). The next fire takes it.
+  A JSON `null` keeps the stored value, so use `clear_override: true` to
+  return to the code input.
 - `clear_override` and `reason` return 400 on a schedule made through the API,
   since it has no override.
 - A schedule with `all_writable_shards` has one row per shard. A request names
@@ -175,6 +182,36 @@ Rules that differ from a row edit:
   schedule treats it as API-made and edits the row, which the next tick of a
   process that does declare it reverts.
 
+### The input of an override
+
+The input is a payload. The override stores it in
+`harvest_schedule_overrides.workflow_input`, under the active payload codec,
+as `harvest_schedules.workflow_input` stores the code input.
+
+- **Encryption.** With column encoding on, the stored cell is ciphertext. The
+  listing of `GET /admin/overrides` shows the stored cell, so it shows
+  ciphertext too. The audit row holds no input.
+- **Encoding turned on later.** An input that was stored while column
+  encoding was off stays in clear. The sweep converts ciphertext only. After
+  you turn column encoding on, send each input override again. The PATCH
+  stores it encoded.
+- **Key rotation.** The codec rotation sweep re-encodes the cell under the
+  active key. The census counts it, so a key that the cell needs does not
+  retire.
+- **A key that is gone.** A cell that does not decode holds back its own
+  schedule only. The scheduler pass leaves that schedule out of registration
+  and logs a warning with its name. Its row keeps its last value, and every
+  other schedule of the shard still runs. A PATCH writes the override and
+  the row in one transaction, so that row holds the latest override. The
+  schedule still fires on it when the process can decode the row input. A
+  code change does not reach the row until the cell decodes again. A PATCH of another field fails with 400,
+  because the merge needs the stored input. Restore the key, send a new
+  `input`, or send `clear_override: true`. Neither of the last two decodes
+  the old cell.
+- **Mixed versions.** A process from before issue #2412 ignores the column.
+  Its tick converges the row back to the code input. Set an input override
+  only after every process runs this release.
+
 ## Limits of this slice
 
 - SLAs and execution timeouts are #2387.
@@ -182,6 +219,7 @@ Rules that differ from a row edit:
   shard does not move it. A DAG override does move (#2389).
 - The SQLite backend has no DAGs, so it has no DAG override. See
   [SQLite](#sqlite) for its workflow schedule overrides.
+- A DAG override has no input. A DAG run takes `run_conf`.
 
 ## SQLite
 
@@ -208,6 +246,7 @@ rt.clear_schedule_override("nightly_report")?;
 - The backend can override the cadence, `max_active_runs`, and the `skip`
   and `allow_all` overlap policies. Any other field returns
   `SqliteError::Unsupported`, which names the field, and writes nothing.
+  `input` is one of them, because the backend has no payload codecs.
   Catch-up is always off and jitter is ignored on SQLite, so an override
   of either is refused rather than dropped.
 - Deleting a schedule deletes its override.

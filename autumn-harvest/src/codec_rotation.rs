@@ -136,7 +136,8 @@ impl CodecColumn {
         self.table
     }
 
-    /// The primary-key column. It is a `UUID` in every listed table.
+    /// The `UUID` key column. It is the primary key of each listed table,
+    /// except `harvest_schedule_overrides`, where it is a unique key.
     #[must_use]
     pub const fn id_column(&self) -> &'static str {
         self.id_column
@@ -364,6 +365,14 @@ pub const CODEC_COLUMNS: &[CodecColumn] = &[
         table: "harvest_entity_state",
         id_column: "id",
         column: "snapshot",
+        rows: ALL_ROWS,
+        shape: CellShape::Cell,
+    },
+    // The input override of a code-declared workflow schedule.
+    CodecColumn {
+        table: "harvest_schedule_overrides",
+        id_column: "id",
+        column: "workflow_input",
         rows: ALL_ROWS,
         shape: CellShape::Cell,
     },
