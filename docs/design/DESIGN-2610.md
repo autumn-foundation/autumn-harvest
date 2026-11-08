@@ -25,12 +25,13 @@ The chosen option is in bold.
 | Question | Options |
 |---|---|
 | Where the call carries the strategy | a second tool · **an optional `sample` argument of `delegate`, an `OpSample`** |
-| When the tool shows `sample` | always · when `max_draws` is not 0 · **when the caller mandate sets `max_draws` to 2 or more, and a listed peer is durable** |
-| A caller mandate with no `max_draws` | the receiver policy alone · **a delegated strategy gets a cap of 1 draw** |
+| The cap of a call | the caller cap · **the meet of the caller cap and the cap of the peer role** |
+| When the tool shows `sample` | always · when `max_draws` is not 0 · **when a durable peer has a cap of 2 or more** |
+| A call with no cap on either side | the receiver policy alone · **a delegated strategy gets a cap of 1 draw** |
 | What the caller counts | the delegation only · **one unit for the delegation, and one unit for each draw** |
 | A beam | one unit for each draw · **the cap only, as the sample core does** |
 | An inline peer with a strategy | run the sample core in the caller · **refuse with `strategy_needs_durable_peer`** |
-| A fan-out batch with a strategy | batch it · **refuse each such call in the batch** |
+| A fan-out batch with a strategy | batch it · **a call that holds a `sample` key never joins a batch** |
 | The strict read | `deny_unknown_fields` on `Mandate` · **a strict field decoder on `PeerEnvelope::mandate`** |
 | The audit trail | the tool result only · **the tool result, `DelegationRecord::refusal` and `DelegationRecord::draws`** |
 
@@ -56,8 +57,12 @@ Each answer gives a rule.
 | A peer role or a hop above sets a lower cap. | `delegate`, `outbound` and `accept` take the smaller cap, so the caller cap is the lowest cap above it. |
 | The draws escape the fan-out. | The caller counts one unit for the delegation and one for each draw. |
 | A fan-out parent loses the draws of a nested call. | A parent counts `1 + draws` for each nested record that ran. |
+| A beam step spends draw units that the next step does not see. | A beam counts `1 + draws` for each record of a step. |
+| A send to a stopped peer burns draw units. | The draw units count only once the message is out. |
+| A peer role has a lower cap than the caller. | The caller meets both caps before the send. |
+| An old history with a `sample` key replays down the new branch. | The gate keys on the presence of the key, `null` included, and such a call plans no batch. |
 | An inline peer runs draws under no policy. | The caller refuses `strategy_needs_durable_peer` before any model call. |
-| A batch runs a strategy call as a plain child. | The batch refuses each call with a strategy. |
+| A batch runs a strategy call as a plain child. | A call with a `sample` key never joins a batch. The batch also refuses such a call. |
 | An old receiver drops a new mandate key. | The receiver decodes the envelope mandate strictly. An unknown key fails the op, so the receiver never runs it. |
 | A model hides a policy key in `sample`. | `DelegateArgs` and `OpSample` deny unknown keys, so the call is `invalid_arguments`. |
 | A refusal goes unseen. | The tool result names it, and `DelegationRecord::refusal` keeps it. |
@@ -126,13 +131,14 @@ The call path:
 3. An inline peer with a strategy gets `strategy_needs_durable_peer`.
 4. A durable peer keeps its checks: `peer_unavailable`, `not_permitted`,
    `deadlock`, then the outbound checks.
-5. `admit_delegated_draws` refuses `draws_exceeded`, then
-   `fan_out_exhausted`. A missing cap admits one draw. A beam needs no
-   fan-out room.
-6. The caller adds `1 + units` to its delegation count. The envelope
-   carries the strategy. The receiver checks its cap, its fan-out and its
-   policy again.
-7. The record keeps the draw units, and a fan-out parent counts them.
+5. `admit_delegated_draws` meets the caller cap with the cap of the peer
+   role. It refuses `draws_exceeded`, then `fan_out_exhausted`. A missing
+   cap admits one draw. A beam needs no fan-out room.
+6. The caller adds 1 to its delegation count, and the draw units once the
+   send succeeds. The envelope carries the strategy. The receiver checks
+   its cap, its fan-out and its policy again.
+7. The record keeps the draw units. A fan-out parent and a beam step
+   count them.
 
 The receiver reads `PeerEnvelope::mandate` with the wire keys of
 `from_meta`. An unknown key fails the decode of the op.
@@ -146,6 +152,16 @@ The receiver reads `PeerEnvelope::mandate` with the wire keys of
   ran. A rejection that stops early still counts its whole cap.
 - The receiver tokens reach the caller as `PeerReply::tokens`, as for a
   plain durable delegation.
+- The `sample` schema enlarges the next model request. It shows only
+  under a draw cap, and `max_draws` is not in a release before this
+  change, so no recorded run measures a different request. The
+  `invalid_arguments` text stays as it was for the same reason: replay
+  compares each model input.
+- A held peer message in the agent state reads strictly too. A state
+  that holds an unknown mandate key fails to load, and the agent stops.
+  That is the fail-closed path.
+- A call with a `sample` key never joins a batch, so its record has no
+  `SerialReason`.
 
 ## 7. Acceptance
 
@@ -157,3 +173,4 @@ The receiver reads `PeerEnvelope::mandate` with the wire keys of
 | An inline peer behaves as decided, and the record names it. | `a_delegated_strategy_to_an_inline_peer_is_refused` |
 | An unknown mandate key fails the envelope decode. | `a_peer_envelope_with_an_unknown_mandate_key_fails_to_decode` |
 | A property test bounds the draws by each cap above. | `a_delegated_strategy_never_passes_a_cap_above_it` |
+| The guide sections describe `sample`, and the limit is gone. | `the_mesh_and_adapter_sections_describe_sample` |

@@ -2085,7 +2085,7 @@ let op = AgentOp::message("Name a prime.").with_sample(sample);
 
 The design is in [`DESIGN-2449.md`](design/DESIGN-2449.md).
 
-### A strategy through `delegate`
+### A strategy through `delegate` (issue #2610)
 
 A delegating model can ask a durable peer for a strategy. The `delegate`
 tool takes an optional `sample` argument, an `OpSample`. The peer runs the
@@ -2093,14 +2093,15 @@ message as a strategy op. The caller reads the selected answer as the
 tool result. [`agent-mesh.md` section 13](agent-mesh.md#13-durable-peers-issue-2269)
 shows the call.
 
-- The tool shows `sample` only when the caller mandate sets `max_draws`
-  to 2 or more, and a listed peer is durable.
-- A caller mandate with no `max_draws` admits one draw. An operator opts
-  in to more draws with `Mandate::max_draws`.
-- The caller checks the draws before it sends anything:
-  `draws_exceeded`, then `fan_out_exhausted`. The delegation takes one
-  unit of `max_delegations`, and each draw takes one more. A beam checks
-  `max_draws` only.
+- The draw cap of a call is the smaller of the caller `max_draws` and
+  the `Peer::max_draws` of the peer role. With neither, the call admits
+  one draw. An operator opts in to more draws with either cap.
+- The tool shows `sample` only when a durable peer has a cap of 2 or
+  more.
+- The usual delegation checks run first. Then the caller checks the draws
+  before it sends anything: `draws_exceeded`, then `fan_out_exhausted`.
+  The delegation takes one unit of `max_delegations`, and each draw takes
+  one more once the message is out. A beam checks `max_draws` only.
 - The receiver checks its accepted mandate and its sampling policy again.
 - An inline peer refuses a strategy with `strategy_needs_durable_peer`.
   An inline peer is a role, not a kind, so no sampling policy covers it.
@@ -3499,9 +3500,9 @@ cargo run -p agent-strategies
 ```
 
 It prints the selected answer, each draw and the cost of each run. The
-cheap model misses on its first draw. So the single draw finds nothing,
-best-of-3 and the vote find the answer for 3 and 4 cheap draws, and the
-cascade pays for the strong model once.
+cheap model misses on its first draw, so the single draw finds nothing.
+Best-of-3 finds the answer with 3 cheap draws. The vote stops after 4 of
+5. The cascade pays for the strong model once.
 
 | Strategy | Draws | It pays off when | Policy setting |
 |---|---|---|---|
@@ -3509,7 +3510,7 @@ cascade pays for the strong model once.
 | `best_of_n` | `n` | A scorer can rank answers, and draws differ. | `best_of_n` in `strategies`, `max_draws` ≥ `n` |
 | `rejection` | up to `max_attempts` | A check passes or fails, and a pass is common. It stops at the first pass. | `rejection` in `strategies`, `max_draws` ≥ `max_attempts` |
 | `vote` | up to `n` | Answers have a short key, such as a number, and no scorer exists. It stops when the leader cannot lose. | `vote` in `strategies`, `max_draws` ≥ `n` |
-| `cascade` | one per tier | A cheap model is often right, and a check can tell when it is not. | `cascade` in `strategies`, each tier model in `cascade_models` |
+| `cascade` | up to one per tier | A cheap model is often right, and a check can tell when it is not. It stops at the first tier that passes. | `cascade` in `strategies`, each tier model in `cascade_models`, `max_draws` ≥ the tiers |
 | `beam` | `width × expansion × max_rounds` | A task takes many model turns, and a step scorer can rank partial work. | `beam` in `strategies`, `max_draws` ≥ the draws |
 
 - Section 19 holds each [policy setting](#19-sampling-policy-issue-2439).
@@ -3519,7 +3520,8 @@ cascade pays for the strong model once.
 - A draw that the run does not select runs `ReadOnly` tools only, by
   default. An operator widens `draw_effects` per kind.
 - Each draw counts against the LLM budgets and the cost ledger. A durable
-  agent and a mesh also count each draw against the mandate (section 15).
+  agent and a mesh also count each draw against the mandate
+  ([section 15](#15-durable-agents)).
 - Section 27 compares strategies over a fixed input set with
   [a dataset sweep](#27-dataset-sweep-issue-2448).
 

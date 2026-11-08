@@ -1412,8 +1412,8 @@ jobs:
           grep -qF "2 open tickets" "$RUNNER_TEMP/desk.txt"
           grep -qF "I filed the reply to T-1" "$RUNNER_TEMP/desk.txt"
           test "$(wc -l < "$desk/filed.log")" -eq 1
-      # The inference strategies example. It runs offline on
-      # SQLite with a scripted model, and its features match agent-mesh.
+      # The inference strategies example runs offline on SQLite with a
+      # scripted model. Its features match agent-mesh, so CI builds them once.
       - name: "Run agent-strategies example tests (issue #2450)"
         if: needs.changes.outputs.code == 'true' && matrix.shard == 0
         run: cargo test -p agent-strategies

@@ -95,7 +95,6 @@ version = "0.10.0"
 dependencies = [
  "autumn-harvest-agent",
  "autumn-harvest-sqlite",
- "futures",
  "serde_json",
  "tempfile",
  "tokio",

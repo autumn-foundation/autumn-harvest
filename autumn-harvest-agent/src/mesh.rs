@@ -451,8 +451,10 @@ impl Mandate {
     /// after `used` delegations of the tree. Returns the units of the draws
     /// that the tree must count, next to the unit of the delegation.
     ///
-    /// See [`delegated_verdict`]. A mandate with no `max_draws` admits one
-    /// draw only.
+    /// `cap` is the draw cap of the delegation: the cap of this mandate met
+    /// with the cap of the peer, as [`Mandate::delegate`] gives it. This
+    /// mandate gives the room. See [`delegated_verdict`]. A missing cap
+    /// admits one draw only.
     ///
     /// # Errors
     ///
@@ -461,12 +463,13 @@ impl Mandate {
     /// draws pass the delegations left.
     pub const fn admit_delegated_draws(
         &self,
+        cap: Option<u32>,
         draws: u32,
         fan_out: bool,
         used: u32,
     ) -> Result<u32, Refusal> {
         let room = self.max_delegations.saturating_sub(used);
-        match delegated_verdict(self.max_draws, room, draws, fan_out) {
+        match delegated_verdict(meet_cap(self.max_draws, cap), room, draws, fan_out) {
             DrawVerdict::Run { .. } => Ok(if fan_out { draws } else { 0 }),
             DrawVerdict::DrawsExceeded => Err(Refusal::DrawsExceeded),
             DrawVerdict::FanOutExhausted => Err(Refusal::FanOutExhausted),
@@ -789,7 +792,9 @@ impl Mandate {
 ///
 /// A peer envelope is the one path where a mandate crosses from another
 /// worker. A stored task or profile keeps the typed read, so a rolling
-/// upgrade can still read it.
+/// upgrade can still read it. A held peer message in the agent state is an
+/// envelope too. So a state that holds an unknown key fails to load, and no
+/// worker drops the cap.
 ///
 /// # Errors
 ///
@@ -808,6 +813,11 @@ where
 /// `InvalidArguments` to `BudgetExhausted`. Only [`Mandate::accept`] returns
 /// `InvalidMandate`. A strategy run checks `DrawsExceeded`, then
 /// `FanOutExhausted`, before its first draw.
+///
+/// A `delegate` call with a strategy runs those checks first. An inline
+/// peer then gets `StrategyNeedsDurablePeer`. A durable peer checks
+/// `PeerUnavailable`, `NotPermitted` and `Deadlock`, then the outbound
+/// mandate. Last, it checks `DrawsExceeded`, then `FanOutExhausted`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
 #[serde(rename_all = "snake_case")]
 #[error("the delegation is refused: {}", self.code())]
@@ -872,8 +882,7 @@ impl Refusal {
         let peer = crate::harness::truncate(peer, MAX_NAME_LEN);
         match self {
             Self::InvalidArguments => {
-                "the delegate call needs the arguments agent and task, and an optional valid sample"
-                    .to_owned()
+                "the delegate call needs exactly the arguments agent and task".to_owned()
             }
             Self::NotPermitted => format!("this agent may not delegate to {peer:?}"),
             Self::UnknownPeer => format!("no agent named {peer:?} is known"),
@@ -995,11 +1004,16 @@ pub(crate) fn delegate_definition(peers: &[Peer], sample_cap: Option<u32>) -> To
 /// The cap that the `delegate` tool shows with its `sample` argument, or
 /// `None` to hide it.
 ///
-/// The tool shows it when the mandate sets `max_draws` to 2 or more, and a
-/// peer is durable. An inline peer refuses a strategy.
+/// The cap of one durable peer is the meet of the mandate cap and the cap
+/// of the peer. The tool shows the largest such cap when it is 2 or more.
+/// An inline peer refuses a strategy, so it does not count.
 pub(crate) fn sample_cap(mandate: &Mandate, peers: &[Peer]) -> Option<u32> {
-    let durable = peers.iter().any(|peer| peer.agent.is_some());
-    mandate.max_draws.filter(|max| *max > 1 && durable)
+    peers
+        .iter()
+        .filter(|peer| peer.agent.is_some())
+        .filter_map(|peer| meet_cap(mandate.max_draws, peer.max_draws))
+        .max()
+        .filter(|max| *max > 1)
 }
 
 /// One delegation of a run tree, as the report lists it.
@@ -1618,22 +1632,34 @@ mod tests {
     #[test]
     fn a_delegated_strategy_counts_the_delegation_and_each_draw() {
         let mandate = Mandate::new("a").max_draws(3).max_delegations(4);
-        assert_eq!(mandate.admit_delegated_draws(3, true, 0), Ok(3));
+        assert_eq!(mandate.admit_delegated_draws(None, 3, true, 0), Ok(3));
         assert_eq!(
-            mandate.admit_delegated_draws(3, true, 1),
+            mandate.admit_delegated_draws(None, 3, true, 1),
             Err(Refusal::FanOutExhausted)
         );
         assert_eq!(
-            mandate.admit_delegated_draws(4, true, 0),
+            mandate.admit_delegated_draws(None, 4, true, 0),
             Err(Refusal::DrawsExceeded)
         );
-        assert_eq!(mandate.admit_delegated_draws(3, false, 3), Ok(0));
-        let open = Mandate::new("a");
-        assert_eq!(open.admit_delegated_draws(1, true, 0), Ok(1));
+        assert_eq!(mandate.admit_delegated_draws(None, 3, false, 3), Ok(0));
+        // The cap of the peer narrows the cap of the caller.
         assert_eq!(
-            open.admit_delegated_draws(2, true, 0),
+            mandate.admit_delegated_draws(Some(2), 3, true, 0),
             Err(Refusal::DrawsExceeded)
         );
+        assert_eq!(mandate.admit_delegated_draws(Some(9), 3, true, 0), Ok(3));
+        // Both checks fail: the cap check comes first.
+        assert_eq!(
+            mandate.admit_delegated_draws(None, 4, true, 4),
+            Err(Refusal::DrawsExceeded)
+        );
+        let open = Mandate::new("a");
+        assert_eq!(open.admit_delegated_draws(None, 1, true, 0), Ok(1));
+        assert_eq!(
+            open.admit_delegated_draws(None, 2, true, 0),
+            Err(Refusal::DrawsExceeded)
+        );
+        assert_eq!(open.admit_delegated_draws(Some(3), 3, true, 0), Ok(3));
     }
 
     #[test]
@@ -1903,35 +1929,57 @@ mod tests {
 
         #[test]
         fn a_delegated_strategy_never_passes_a_cap_above_it(
-            root in mandate(),
-            roles in prop::collection::vec(peer(), 1..4),
-            locals in prop::collection::vec(cap(), 1..4),
+            root_cap in cap(),
+            hops in prop::collection::vec((cap(), cap()), 0..4),
+            asked_cap in cap(),
             draws in 0_u32..8,
             fan_out in any::<bool>(),
             used in 0_u32..4,
         ) {
-            // Walk a chain of hops. Each hop is a delegation, or a send
-            // to another process that the receiver accepts.
-            let mut above = vec![root.max_draws];
-            let mut holder = root;
-            for (role, local) in roles.iter().zip(&locals) {
+            // Build a chain in which each hop passes. Each hop sends to
+            // another process, and its receiver accepts.
+            let names: Vec<String> = (0..hops.len()).map(|i| format!("h{i}")).collect();
+            let everyone = names.iter().cloned().chain(["asked".to_owned()]);
+            let everyone: BTreeSet<String> = everyone.collect();
+            let mut holder = Mandate {
+                max_draws: root_cap,
+                ..Mandate::new("root")
+                    .peers(everyone.clone())
+                    .max_depth(8)
+                    .max_delegations(32)
+            };
+            let mut above = vec![root_cap];
+            for (name, (role_cap, local_cap)) in names.iter().zip(&hops) {
+                let role = Peer {
+                    peers: everyone.clone(),
+                    max_draws: *role_cap,
+                    ..Peer::new(name.clone(), "A hop.")
+                };
                 let receiver = Mandate {
-                    max_draws: *local,
-                    ..Mandate::new(role.name.clone())
+                    max_draws: *local_cap,
+                    ..Mandate::new(name.clone())
+                        .peers(everyone.clone())
+                        .max_depth(8)
+                        .max_delegations(32)
                 };
                 let next = holder
-                    .outbound(role, 0, &BTreeSet::new())
+                    .outbound(&role, 0, &BTreeSet::new())
                     .and_then(|sent| receiver.accept(&sent));
-                // A refused hop ends the chain, so its caps are not above.
-                let Ok(next) = next else { break };
-                above.extend([role.max_draws, *local]);
-                holder = next;
+                prop_assert!(next.is_ok(), "each hop of the chain passes: {next:?}");
+                if let Ok(next) = next {
+                    holder = next;
+                }
+                above.extend([*role_cap, *local_cap]);
             }
-            if let Ok(units) = holder.admit_delegated_draws(draws, fan_out, used) {
+            // The caller asks the last peer, with a cap of its own.
+            above.push(asked_cap);
+            if let Ok(units) = holder.admit_delegated_draws(asked_cap, draws, fan_out, used) {
                 for cap in &above {
                     prop_assert!(cap_within(Some(draws), *cap));
                 }
-                prop_assert!(draws <= holder.max_draws.unwrap_or(1));
+                if above.iter().all(Option::is_none) {
+                    prop_assert!(draws <= 1, "no cap admits one draw");
+                }
                 prop_assert_eq!(units, if fan_out { draws } else { 0 });
                 prop_assert!(used + 1 + units <= holder.max_delegations);
             }

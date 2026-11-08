@@ -20,7 +20,7 @@ run. The cheap model costs 5 µ$ a draw, and the strong model 300 µ$.
 
 - Each draw is a durable child run, so a crash costs one draw.
 - The sampling policy of the kind allows each strategy. By default a kind
-  has none, and each run is one draw.
+  allows no strategy, so each run is one draw.
 - `cargo test -p agent-strategies` checks each selected answer, and that
   the best-of-3 cost is the sum of its three draws.
 

@@ -3,7 +3,8 @@
 //!
 //! `meet_cap` meets the draw cap of a parent mandate with the cap of a
 //! peer, or of an inbound mandate. `draw_verdict` admits the draws of one
-//! strategy run. Each draw counts as one delegation. The copies below are
+//! strategy run. Each draw counts as one delegation. `delegated_verdict`
+//! admits the draws that a `delegate` call asks for. The copies below are
 //! the kernels in `mesh.rs` of the agent crate.
 //!
 //! The proofs show:

@@ -27,8 +27,9 @@ Accepted (issue #2450, epic #2438).
    both, and a crash would still cost every draw.
 2. **Scores come from verifiers.** A `Scorer` is a pure check, a test run
    or a judge model. The run records each verdict. Harvest does not weight
-   draws by log-probabilities, because its providers do not supply them.
-3. **Draws that are not selected only read.** By default, a draw runs
+   draws by log-probabilities. `ChatResponse` carries none, and several
+   providers do not return them.
+3. **A draw that the run does not select only reads.** By default, a draw runs
    `ReadOnly` tools only. An operator widens `draw_effects` per kind in
    the `SamplingPolicy`. A run can never widen it.
 4. **What is not adopted.** Likelihood weighting and importance sampling

@@ -1462,14 +1462,17 @@ fn keep_beams(round: &mut [Scored], slots: u32, complete: &mut u32) -> Vec<Beam>
     live
 }
 
-/// The delegations that `report` ran. A refused delegation uses none.
+/// The delegation units that `report` used. A refused delegation uses
+/// none. Each other delegation uses one, and one more for each draw unit
+/// of a delegated strategy.
 fn used_delegations(report: &AgentReport) -> u32 {
-    let used = report
+    report
         .delegations
         .iter()
         .filter(|record| record.refusal.is_none())
-        .count();
-    u32::try_from(used).unwrap_or(u32::MAX)
+        .fold(0_u32, |units, record| {
+            units.saturating_add(1).saturating_add(record.draws)
+        })
 }
 
 /// The best `keep` draws of `verdicts`, best first.
@@ -2224,5 +2227,33 @@ mod tests {
             AgentStop::Completed,
             Some(SampleStop::ScoreFailed)
         ));
+    }
+
+    #[test]
+    fn a_beam_step_counts_the_draw_units_of_a_delegated_strategy() {
+        let record = |draws: u32, refusal: Option<MeshRefusal>| {
+            serde_json::json!({
+                "chain": ["a", "b"],
+                "run_id": "r",
+                "stop": "completed",
+                "refusal": refusal,
+                "draws": draws,
+            })
+        };
+        let report: AgentReport = serde_json::from_value(serde_json::json!({
+            "stop": "completed",
+            "text": "",
+            "steps_used": 1,
+            "tool_calls": 3,
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+            "messages": [],
+            "delegations": [
+                record(0, None),
+                record(3, None),
+                record(3, Some(MeshRefusal::DrawsExceeded)),
+            ],
+        }))
+        .unwrap();
+        assert_eq!(used_delegations(&report), 1 + (1 + 3));
     }
 }

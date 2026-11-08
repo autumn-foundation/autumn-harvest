@@ -525,13 +525,13 @@ message as a strategy op and replies with the selected answer.
 
 | Rule | What happens |
 |---|---|
-| Tool | The tool shows `sample` only when the caller mandate sets `max_draws` to 2 or more, and a listed peer is durable. |
-| Cap | The caller checks the draws against its own `max_draws`. A mandate with no `max_draws` admits one draw. The cap only narrows down the tree, so it is the lowest cap above the caller. |
-| Fan-out | The delegation takes one unit of `max_delegations`, and each draw takes one more. A best-of-3 needs 4 units. A beam checks `max_draws` only. A fan-out parent counts the draw units of each nested record. |
-| Order | A refusal comes before the send: `draws_exceeded`, then `fan_out_exhausted`. The tool result and `DelegationRecord::refusal` name it. |
+| Cap | The cap of a call is the smaller of the caller `max_draws` and the `Peer::max_draws` of the peer role. With neither, the call admits one draw. Each hop can only narrow a cap, so the caller holds the lowest cap of the chain above it. |
+| Tool | The tool shows `sample` only when a durable peer has a cap of 2 or more. |
+| Fan-out | The delegation takes one unit of `max_delegations`, and each draw takes one more once the message is out. A best-of-3 needs 4 units. A beam checks `max_draws` only. A fan-out parent and a beam count the draw units of each nested record. |
+| Order | The usual delegation checks run first. Then the caller checks `draws_exceeded`, then `fan_out_exhausted`, before the send. The tool result and `DelegationRecord::refusal` name each refusal. |
 | Receiver | The receiver checks its accepted mandate and the sampling policy of its kind again. A policy refusal comes back in the `error` of the tool result. |
-| Inline peer | An inline peer refuses a strategy with `strategy_needs_durable_peer`, also inside a batch. No sampling policy covers a role. |
-| Strict mandate | The receiver decodes the envelope mandate strictly. An unknown key fails the op, so a receiver never drops a cap that a newer sender adds. The sender then waits for its reply deadline. |
+| Inline peer | An inline peer refuses a strategy with `strategy_needs_durable_peer`. No sampling policy covers a role. A call with `sample` never joins a batch. |
+| Strict mandate | The receiver decodes the envelope mandate strictly. An unknown key fails the op, so a receiver never drops a cap that a newer sender adds. The sender then waits for its reply deadline. A held message in the agent state reads the same way. |
 
 A worker from before strategies drops `sample` and runs one plain segment.
 The design is in [`DESIGN-2610.md`](design/DESIGN-2610.md).

@@ -477,7 +477,8 @@ pub struct PeerEnvelope {
     pub text: String,
     /// The authority of the receiver, from `Mandate::outbound`. The receiver
     /// can only narrow it. It decodes strictly: an unknown key fails the
-    /// op, so a receiver never drops a cap that a newer sender adds.
+    /// op, so a receiver never drops a cap that a newer sender adds. A held
+    /// message in the agent state reads the same way.
     #[serde(deserialize_with = "crate::mesh::strict_mandate")]
     pub mandate: Mandate,
     /// The flow labels of the sender. They taint the receiver.

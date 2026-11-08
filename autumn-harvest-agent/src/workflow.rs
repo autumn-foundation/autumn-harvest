@@ -1855,6 +1855,11 @@ fn fit(call: &ToolCall, decision: Option<&ToolDecision>, agent: &Member) -> Fit 
         Some(ToolDecision::RequireApproval { .. }) => return Fit::Gated,
         Some(ToolDecision::Allow) => {}
     }
+    // A call with a sample never joins a batch. Before the patch gate it
+    // did not decode, so an old history plans the same round.
+    if holds_sample(&call.arguments) {
+        return Fit::Other;
+    }
     let Some(peer) = delegate_args(&call.arguments)
         .and_then(|args| agent.peers.iter().find(|peer| peer.name == args.agent))
     else {
@@ -2291,17 +2296,26 @@ fn delegate_args(arguments: &serde_json::Value) -> Option<DelegateArgs> {
         .flatten()
 }
 
-/// The arguments of a `delegate` call that the workflow runs.
-///
-/// A call with a `sample` passes the patch gate first. A history from
-/// before the gate reads `None`, as it did then.
-fn sampled_args(ctx: &WorkflowContext, arguments: &serde_json::Value) -> Option<DelegateArgs> {
-    delegate_args(arguments)
-        .filter(|args| args.sample.is_none() || ctx.patched(DELEGATE_SAMPLE_PATCH))
+/// Whether the arguments of a `delegate` call hold the key `sample`,
+/// whatever its value. Before the patch gate, such a call never decoded.
+fn holds_sample(arguments: &serde_json::Value) -> bool {
+    arguments.get("sample").is_some()
 }
 
-/// The units of the nested delegations that ran: one for each, and its
-/// draw units.
+/// The arguments of a `delegate` call that the workflow runs.
+///
+/// A call that holds the key `sample` passes the patch gate first, also
+/// with a `null` value. A history from before the gate reads `None`, as it
+/// did then.
+fn sampled_args(ctx: &WorkflowContext, arguments: &serde_json::Value) -> Option<DelegateArgs> {
+    if holds_sample(arguments) && !ctx.patched(DELEGATE_SAMPLE_PATCH) {
+        return None;
+    }
+    delegate_args(arguments)
+}
+
+/// The units of the nested delegations that ran: one for each delegation,
+/// plus its draw units.
 fn nested_units(records: &[DelegationRecord]) -> u32 {
     records
         .iter()
@@ -2815,12 +2829,13 @@ async fn durable_peer(
     // A read-only segment sends a read-only mandate, as an inline child
     // inherits it (issue #2319).
     mandate.read_only |= run.task.read_only;
-    // The caller counts the draws of a strategy against its own tree,
-    // before it sends anything.
+    // The caller admits the draws of a strategy under its own tree before
+    // it sends anything. The cap of the peer role narrows its cap.
     let draws = match &ask.sample {
         Some(sample) => {
             let strategy = &sample.strategy;
             let admitted = agent.mandate.admit_delegated_draws(
+                peer.max_draws,
                 strategy.draws(),
                 strategy.counts_fan_out(),
                 tree.delegations,
@@ -2832,7 +2847,7 @@ async fn durable_peer(
         }
         None => 0,
     };
-    tree.delegations = tree.delegations.saturating_add(1).saturating_add(draws);
+    tree.delegations = tree.delegations.saturating_add(1);
     let seq = tree.outbox.next_seq(target_id);
     let mut promise = ctx.new_promise().map_err(|err| err.to_string())?;
     let mut waiting = tree.outbox.waiting.clone();
@@ -2860,7 +2875,9 @@ async fn durable_peer(
         )
         .await;
     match sent {
-        Ok(()) => {}
+        // The draw units count once the message is out. A refused send
+        // runs no draw, and its record keeps no unit.
+        Ok(()) => tree.delegations = tree.delegations.saturating_add(draws),
         Err(HarvestError::ExternalSignalFailed { .. }) => {
             return Ok(refuse(agent, tree, Refusal::PeerUnavailable, &peer.name));
         }
@@ -4144,6 +4161,16 @@ mod tests {
         ));
         assert!(!shows_sample(Mandate::new("a"), vec![durable()]));
         assert!(!shows_sample(Mandate::new("a").max_draws(3), vec![inline]));
+        // The cap of a durable peer role counts, met with the mandate cap.
+        let capped = |max| Peer {
+            max_draws: Some(max),
+            ..durable()
+        };
+        assert!(shows_sample(Mandate::new("a"), vec![capped(3)]));
+        assert!(!shows_sample(
+            Mandate::new("a").max_draws(5),
+            vec![capped(1)]
+        ));
         let member = Member {
             mandate: Mandate::new("a").max_draws(4),
             peers: vec![durable()],
@@ -4176,6 +4203,30 @@ mod tests {
             delegate_args(&json!({"agent": "a", "task": "t", "n": 3})),
             None
         );
+    }
+
+    #[test]
+    fn a_call_that_holds_a_sample_key_never_joins_a_batch() {
+        let member = Member {
+            mandate: Mandate::new("a").peers(["helper"]).max_draws(3),
+            peers: vec![Peer::new("helper", "Helps.")],
+        };
+        let delegate = |arguments: serde_json::Value| ToolCall {
+            id: "c".into(),
+            name: DELEGATE_TOOL.into(),
+            arguments,
+        };
+        let allow = ToolDecision::Allow;
+        let plain = delegate(json!({"agent": "helper", "task": "t"}));
+        assert_eq!(fit(&plain, Some(&allow), &member), Fit::Batchable);
+        // Before the patch gate, each of these failed to decode. So an old
+        // history plans the same round.
+        for sample in [json!(null), json!({"strategy": "single"})] {
+            let call = delegate(json!({"agent": "helper", "task": "t", "sample": sample}));
+            assert!(holds_sample(&call.arguments));
+            assert_eq!(fit(&call, Some(&allow), &member), Fit::Other);
+        }
+        assert!(!holds_sample(&json!({"agent": "helper", "task": "t"})));
     }
 
     fn ran(draws: u32) -> DelegationRecord {

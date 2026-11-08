@@ -110,7 +110,7 @@ fn the_adr_records_the_four_decisions_in_order() {
     let marks = [
         "1. **Strategies are workflows over child runs.**",
         "2. **Scores come from verifiers.**",
-        "3. **Draws that are not selected only read.**",
+        "3. **A draw that the run does not select only reads.**",
         "4. **What is not adopted.**",
     ];
     let mut from = 0;
@@ -181,5 +181,32 @@ fn ci_runs_these_guards_on_docs_only_changes() {
     assert!(
         ci.contains("--test strategies_docs"),
         "the job doc-snippets must run these guards"
+    );
+}
+
+#[test]
+fn the_mesh_and_adapter_sections_describe_sample() {
+    let mesh = read("docs/agent-mesh.md");
+    let durable = section(&mesh, "## 13. Durable peers (issue #2269)");
+    for needle in [
+        "\"sample\"",
+        "`max_draws`",
+        "`draws_exceeded`",
+        "`fan_out_exhausted`",
+        "`strategy_needs_durable_peer`",
+    ] {
+        assert!(
+            durable.contains(needle),
+            "mesh section 13 must name {needle}"
+        );
+    }
+    let guide = read(GUIDE);
+    let agents = section(&guide, "## 15. Durable agents");
+    assert!(agents.contains("### A strategy through `delegate`"));
+    assert!(agents.contains("`strategy_needs_durable_peer`"));
+    let design = read("docs/design/DESIGN-2449.md");
+    assert!(
+        !design.contains("cannot ask for a strategy"),
+        "the limit of DESIGN-2449 is gone"
     );
 }

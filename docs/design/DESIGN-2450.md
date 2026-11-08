@@ -44,14 +44,14 @@ rule.
 ## 4. Six thinking hats
 
 - **White (facts).** `sweep_compare` and `agent_refine` show the pattern
-  of an offline example: a scripted model with a price per token, an
-  in-memory policy store and a temporary SQLite file. `SampleReport`
+  of an offline example. Each has a scripted model with a price per
+  token, an in-memory policy store and a temporary SQLite file. `SampleReport`
   holds each draw with its cost, and the cost of the run tree.
 - **Red (feelings).** A reader wants to see the cost next to the gain.
   A table with one row per strategy gives that at a glance.
 - **Black (risks).** A new workspace member adds build time to CI. The
-  example has the same dependencies as the agent crate, so the cache
-  covers it.
+  example uses the agent features of the agent-mesh example, so the CI
+  cache covers it.
 - **Yellow (benefits).** One command shows each strategy, and the ADR
   gives one place for the reasons.
 - **Green (ideas).** A later example can delegate a strategy to a peer
@@ -66,7 +66,8 @@ rule.
   returns one `Outcome` per strategy, and `main` prints them.
 - The task is one question with an expected answer. The cheap model
   answers it right on some draws only. The strong model always answers it
-  right, at ten times the price.
+  right. It costs 10 times as much per token, and 60 times as much per
+  draw.
 - The policy of the kind allows `best_of_n`, `vote` and `cascade`, with
   both models in `cascade_models`.
 - Guide section 28, "Inference strategies", holds the table.

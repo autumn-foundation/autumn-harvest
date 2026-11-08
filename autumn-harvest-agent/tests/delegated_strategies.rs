@@ -161,10 +161,17 @@ fn ask(agent: &str, sample: Option<&OpSample>) -> Value {
 }
 
 fn harness(model: &Arc<TryFnModel>) -> AgentHarness {
+    let researcher = Peer::agent("researcher", "Finds facts.", &research());
+    harness_with(model, researcher, Mandate::new("researcher"))
+}
+
+/// A harness with the peer role `researcher` and the local mandate
+/// `receiver` of the durable researcher.
+fn harness_with(model: &Arc<TryFnModel>, researcher: Peer, receiver: Mandate) -> AgentHarness {
     AgentHarness::new(model.clone())
-        .peer(Peer::agent("researcher", "Finds facts.", &research()))
+        .peer(researcher)
         .peer(Peer::new("helper", "Helps inline."))
-        .agent(AgentProfile::new(RECEIVER_KIND).mandate(Mandate::new("researcher")))
+        .agent(AgentProfile::new(RECEIVER_KIND).mandate(receiver))
         .scorer(Arc::new(Table))
         .sampling_policies(policies())
 }
@@ -208,7 +215,7 @@ fn peer_messages(rt: &SqliteRuntime) -> Vec<PeerEnvelope> {
             WorkflowEvent::SignalReceived { payload, .. }
                 if payload["op"]["type"] == "peer_message" =>
             {
-                serde_json::from_value(payload["op"].clone()).ok()
+                Some(serde_json::from_value(payload["op"].clone()).expect("the envelope decodes"))
             }
             _ => None,
         })
@@ -309,6 +316,9 @@ async fn a_delegated_best_of_three_needs_four_units_of_fan_out() {
     assert!(peer_messages(&rt).is_empty(), "nothing is sent");
     let results = caller_results(&done);
     assert_eq!(results[0]["verdict"], "fan_out_exhausted", "{results:?}");
+    let record = done.delegations.last().unwrap();
+    assert_eq!(refusal_code(record), "fan_out_exhausted");
+    assert_eq!(record.draws, 0, "a refused call counts no draw");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -344,6 +354,7 @@ async fn a_caller_with_no_draw_cap_sees_no_sample_and_gets_one_draw() {
         "no cap hides the argument"
     );
     assert_eq!(draw_calls(&model), 0, "no draw runs");
+    assert!(peer_messages(&rt).is_empty(), "nothing is sent");
     assert_eq!(caller_results(&done)[0]["verdict"], "draws_exceeded");
 }
 
@@ -432,4 +443,140 @@ async fn a_batch_refuses_each_call_with_a_strategy_and_runs_the_rest() {
     assert_eq!(results[0]["verdict"], "strategy_needs_durable_peer");
     assert_eq!(results[1]["stop"], "completed", "{results:?}");
     assert_eq!(draw_calls(&model), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_peer_cap_under_the_strategy_is_refused_before_the_send() {
+    let (_dir, db) = fresh_db();
+    let model = mesh_model(vec![ask("researcher", Some(&best_of_three()))]);
+    let researcher = Peer::agent("researcher", "Finds facts.", &research()).max_draws(2);
+    let mut rt = runtime(
+        &db,
+        harness_with(&model, researcher, Mandate::new("researcher")),
+    );
+    start(&mut rt).await;
+    let mandate = Mandate::new("triage").peers(["researcher"]).max_draws(3);
+    let done = run_caller(&mut rt, caller(mandate)).await;
+
+    assert!(peer_messages(&rt).is_empty(), "nothing is sent");
+    assert_eq!(draw_calls(&model), 0);
+    assert_eq!(caller_results(&done)[0]["verdict"], "draws_exceeded");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_tighter_receiver_refuses_and_the_draw_units_stay_spent() {
+    let (_dir, db) = fresh_db();
+    // The second call needs one unit, and the first call spent all 4.
+    let model = mesh_model(vec![
+        ask("researcher", Some(&best_of_three())),
+        ask("researcher", None),
+    ]);
+    let researcher = Peer::agent("researcher", "Finds facts.", &research());
+    let receiver = Mandate::new("researcher").max_draws(2);
+    let mut rt = runtime(&db, harness_with(&model, researcher, receiver));
+    start(&mut rt).await;
+    let mandate = Mandate::new("triage")
+        .peers(["researcher"])
+        .max_draws(3)
+        .max_delegations(4);
+    let done = run_caller(&mut rt, caller(mandate)).await;
+
+    assert_eq!(
+        draw_calls(&model),
+        0,
+        "the receiver refuses before any draw"
+    );
+    let results = caller_results(&done);
+    assert_eq!(results[0]["verdict"], "draws_exceeded", "{results:?}");
+    assert_eq!(results[1]["verdict"], "fan_out_exhausted", "{results:?}");
+    let sent = &done.delegations[0];
+    assert!(sent.run_id.is_some(), "the message was sent");
+    assert_eq!(refusal_code(sent), "draws_exceeded");
+    assert_eq!(sent.draws, 3, "the caller counted the draw units");
+    assert_eq!(peer_messages(&rt).len(), 1, "only the first call is sent");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_send_to_a_stopped_peer_counts_no_draw_unit() {
+    let (_dir, db) = fresh_db();
+    // The researcher never starts, so each send fails. The second call
+    // still finds room, because the first one spent no draw unit.
+    let model = mesh_model(vec![
+        ask("researcher", Some(&best_of_three())),
+        ask("researcher", Some(&best_of_three())),
+    ]);
+    let mut rt = runtime(&db, harness(&model));
+    let mandate = Mandate::new("triage")
+        .peers(["researcher"])
+        .max_draws(3)
+        .max_delegations(5);
+    let exec = sqlite::start(&mut rt, &caller(mandate)).unwrap();
+    let done = report(rt.run_until_blocked(exec).await.unwrap());
+
+    let results = caller_results(&done);
+    assert_eq!(results[0]["verdict"], "peer_unavailable", "{results:?}");
+    assert_eq!(results[1]["verdict"], "peer_unavailable", "{results:?}");
+    assert!(done.delegations.iter().all(|record| record.draws == 0));
+}
+
+#[cfg(feature = "eval")]
+#[tokio::test(flavor = "multi_thread")]
+async fn the_sample_gate_records_one_marker_and_selects_the_branch_on_replay() {
+    use autumn_harvest::testing::{ReplayStatus, WorkflowReplayer};
+    use autumn_harvest_agent::workflow::agent_loop_info;
+
+    const MARKER: &str = "patch:agent_delegate_sample";
+    let is_marker = |event: &WorkflowEvent| matches!(event, WorkflowEvent::MarkerRecorded { name, .. } if name == MARKER);
+    let (_dir, db) = fresh_db();
+    let model = mesh_model(vec![ask("helper", Some(&best_of_three()))]);
+    let mut rt = runtime(&db, harness(&model));
+    let mandate = Mandate::new("triage").peers(["helper"]).max_draws(3);
+    let exec = sqlite::start(&mut rt, &caller(mandate)).unwrap();
+    report(rt.run_until_blocked(exec).await.unwrap());
+    let events = rt.load_history(exec).unwrap();
+    assert_eq!(events.iter().filter(|event| is_marker(event)).count(), 1);
+    let replay = WorkflowReplayer::new()
+        .register(vec![agent_loop_info()])
+        .with_execution_id(exec)
+        .replay_from_events(events.clone())
+        .await;
+    assert!(
+        matches!(replay.status, ReplayStatus::ReplaySucceeded),
+        "{replay}"
+    );
+
+    // With no marker, replay takes the old branch: the call is refused as
+    // invalid arguments, as before the gate. That branch sends another
+    // model input than this history holds, so replay names the mismatch.
+    let old: Vec<WorkflowEvent> = events
+        .into_iter()
+        .filter(|event| !is_marker(event))
+        .collect();
+    let replay = WorkflowReplayer::new()
+        .register(vec![agent_loop_info()])
+        .with_execution_id(exec)
+        .replay_from_events(old)
+        .await;
+    assert!(
+        matches!(replay.status, ReplayStatus::NonDeterminismDetected { .. }),
+        "{replay}"
+    );
+    let shown = replay.to_string();
+    let actual = &shown[shown
+        .find("actual=")
+        .expect("the report names the replayed input")..];
+    assert!(
+        actual.contains(r#"\"verdict\":\"invalid_arguments\""#),
+        "{shown}"
+    );
+
+    // A plain call records no marker.
+    drop(rt);
+    let model = mesh_model(vec![ask("helper", None)]);
+    let mut rt = runtime(&db, harness(&model));
+    let plain = caller(Mandate::new("triage").peers(["helper"]));
+    let exec = sqlite::start(&mut rt, &plain).unwrap();
+    report(rt.run_until_blocked(exec).await.unwrap());
+    let events = rt.load_history(exec).unwrap();
+    assert!(!events.iter().any(is_marker));
 }
