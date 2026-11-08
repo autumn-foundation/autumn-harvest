@@ -175,5 +175,5 @@ another server.
   with that handle as its result. A Harvest server also reports a refused
   start, such as a quota refusal, as a tool error. The call then completes
   with `is_error: true`.
-- The SQLite backend has no external activities, so it has no remote task
-  calls.
+- The SQLite backend runs external activities, but `RemoteTaskPoller`
+  reads Postgres only. So SQLite has no remote task calls.

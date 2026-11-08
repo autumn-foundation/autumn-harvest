@@ -38,6 +38,8 @@
 //!   order of `received_at` and `fires_at`. An optional `idempotency_key` is
 //!   unique per execution (issue #2028). A seal keeps a keyed row, so the key
 //!   still dedupes a retry.
+//! - `harvest_external_tasks` — the handoffs of external (task-token)
+//!   activities. One row per token. See [`external_task`](crate::external_task).
 //! - `harvest_activity_attempts` — a per-attempt audit log. **Retryable** activity
 //!   failures live here, not in `harvest_events`, mirroring the Postgres engine's
 //!   `requeue_for_retry` (which stores the attempt error on the task-queue row,
@@ -356,6 +358,33 @@ CREATE TABLE IF NOT EXISTS harvest_schedule_overrides (
     created_at    INTEGER NOT NULL,        -- epoch milliseconds
     updated_at    INTEGER NOT NULL         -- epoch milliseconds
 );
+
+-- External (task-token) activity handoffs. One row per token. A dispatcher
+-- reads the `PENDING` rows and settles each token. The deadline also lives in
+-- `harvest_timers`, so it fires through the timer path. The table is new, so
+-- `CREATE TABLE IF NOT EXISTS` adds it to an older file.
+CREATE TABLE IF NOT EXISTS harvest_external_tasks (
+    token       TEXT PRIMARY KEY,
+    exec_id     TEXT NOT NULL,
+    activity_id TEXT NOT NULL,
+    name        TEXT NOT NULL,             -- the activity name
+    queue       TEXT NOT NULL,
+    input_json  TEXT NOT NULL,
+    state       TEXT NOT NULL,             -- PENDING | COMPLETED | FAILED |
+                                           -- TIMED_OUT | CANCELLED
+    created_at  INTEGER NOT NULL,          -- epoch milliseconds
+    updated_at  INTEGER NOT NULL,          -- epoch milliseconds
+    deadline_at INTEGER NOT NULL           -- the schedule-to-close deadline in
+                                           -- epoch milliseconds
+);
+
+-- The dispatcher read: pending rows of one activity, by deadline.
+CREATE INDEX IF NOT EXISTS idx_harvest_external_tasks_pending
+    ON harvest_external_tasks (state, name, deadline_at);
+
+-- A terminal write and a purge find the rows of one run.
+CREATE INDEX IF NOT EXISTS idx_harvest_external_tasks_exec
+    ON harvest_external_tasks (exec_id);
 
 CREATE TABLE IF NOT EXISTS harvest_activity_attempts (
     attempt_seq INTEGER PRIMARY KEY AUTOINCREMENT,

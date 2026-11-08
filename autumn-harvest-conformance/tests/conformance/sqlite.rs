@@ -8,7 +8,9 @@ use std::time::{Duration, Instant};
 
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::types::ExecutionId;
-use autumn_harvest_sqlite::{ExecutionOutcome, RunState, SqliteError, SqliteRuntime};
+use autumn_harvest_sqlite::{
+    ExecutionOutcome, ExternalHandoffFilter, RunState, SqliteError, SqliteRuntime,
+};
 
 use crate::compare::{Execution, Outcome, Run, children, event_type};
 use crate::scenario::{Scenario, Step};
@@ -34,7 +36,8 @@ enum Drive {
 /// Whether `events` hold work that the clock alone can finish.
 ///
 /// That is a timer that has not fired or been cancelled, or an activity with
-/// no result yet, such as one in retry backoff.
+/// no result yet, such as one in retry backoff. An external activity counts
+/// too, because its deadline can fire.
 fn has_pending_work(events: &[WorkflowEvent]) -> bool {
     let mut timers = HashSet::new();
     let mut activities = HashSet::new();
@@ -47,12 +50,15 @@ fn has_pending_work(events: &[WorkflowEvent]) -> bool {
             | WorkflowEvent::TimerCancelled { timer_id, .. } => {
                 timers.remove(timer_id);
             }
-            WorkflowEvent::ActivityScheduled { activity_id, .. } => {
+            WorkflowEvent::ActivityScheduled { activity_id, .. }
+            | WorkflowEvent::ActivityAwaitingExternal { activity_id, .. } => {
                 activities.insert(*activity_id);
             }
             WorkflowEvent::ActivityCompleted { activity_id, .. }
             | WorkflowEvent::ActivityFailed { activity_id, .. }
-            | WorkflowEvent::ActivityTimedOut { activity_id, .. } => {
+            | WorkflowEvent::ActivityTimedOut { activity_id, .. }
+            | WorkflowEvent::ActivityCompletedExternally { activity_id, .. }
+            | WorkflowEvent::ActivityFailedExternally { activity_id, .. } => {
                 activities.remove(activity_id);
             }
             _ => {}
@@ -80,7 +86,11 @@ impl Driver {
                 Drive::Again
             }
             // A wait can race a deadline timer or a retry. The clock moves it.
-            Ok(RunState::WaitingSignal(_) | RunState::WaitingMutex(_)) => {
+            Ok(
+                RunState::WaitingSignal(_)
+                | RunState::WaitingMutex(_)
+                | RunState::WaitingExternal(_),
+            ) => {
                 let events = self.rt.load_history(exec).unwrap_or_default();
                 if has_pending_work(&events) {
                     Drive::Again
@@ -101,6 +111,16 @@ impl Driver {
             | Err(SqliteError::Unsupported(_)) => Drive::Ended(None),
             Err(other) => Drive::Error(other.to_string()),
         }
+    }
+
+    /// The token of the one pending external activity named `activity`.
+    fn pending_token(&self, activity: &str) -> autumn_harvest::types::ExternalActivityToken {
+        let rows = self
+            .rt
+            .list_external_handoffs(&ExternalHandoffFilter::pending().activity_name(activity))
+            .expect("read the pending handoffs");
+        assert_eq!(rows.len(), 1, "sqlite: expected one pending {activity}");
+        rows[0].token
     }
 
     fn count(&self, exec: ExecutionId, event: &str) -> usize {
@@ -227,6 +247,26 @@ impl Driver {
                     update_results.push(result);
                 }
                 Step::Run(hook) => hook(),
+                Step::CompleteExternal { activity, output } => {
+                    let token = self.pending_token(activity);
+                    let settled = self
+                        .rt
+                        .complete_external(token, output.clone())
+                        .expect("complete the external activity");
+                    assert!(settled, "sqlite: the token of {activity} is not pending");
+                }
+                Step::FailExternal {
+                    activity,
+                    error,
+                    retryable,
+                } => {
+                    let token = self.pending_token(activity);
+                    let settled = self
+                        .rt
+                        .fail_external(token, *error, *retryable)
+                        .expect("fail the external activity");
+                    assert!(settled, "sqlite: the token of {activity} is not pending");
+                }
                 Step::Cancel(reason) => self.rt.cancel(root, reason).expect("cancel the run"),
                 Step::Terminate(reason) => {
                     self.rt.terminate(root, reason).expect("terminate the run");

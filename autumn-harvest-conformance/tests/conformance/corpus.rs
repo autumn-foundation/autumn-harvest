@@ -955,24 +955,6 @@ pub fn terminate_parked_run() -> Scenario {
 // ── Primitives that SQLite rejects ───────────────────────────────────────────
 
 #[workflow]
-pub async fn runs_external(ctx: &WorkflowContext, _n: i64) -> Result<Value, String> {
-    ctx.execute_activity_external("external", json!({}), "default", 60)
-        .await
-        .map_err(err)
-}
-
-/// An external (task-token) activity.
-pub fn rejects_external_activity() -> Scenario {
-    Scenario::new(
-        "rejects_external_activity",
-        "runs_external",
-        || vec![runs_external_info()],
-        &[K::ScheduleExternalActivity],
-    )
-    .rejected("ScheduleExternalActivity")
-}
-
-#[workflow]
 pub async fn continues_as_other_type(ctx: &WorkflowContext, n: i64) -> Result<(), String> {
     ctx.continue_as_new_as_type("runs_one_activity", json!(n))
         .await
@@ -1220,4 +1202,69 @@ pub fn same_cycle_cancel_of_new_child() -> Scenario {
         || vec![cancels_child_in_spawn_cycle_info(), waits_for_go_info()],
         &[],
     )
+}
+
+// ── External (task-token) activities ─────────────────────────────────────────
+
+/// Awaits one external activity. The input is its deadline in seconds. Each
+/// result becomes the output, so the outcome shows how the wait ended.
+#[workflow]
+pub async fn awaits_external(ctx: &WorkflowContext, secs: u64) -> Result<String, String> {
+    match ctx
+        .execute_activity_external("bridge", json!({ "secs": secs }), "default", secs)
+        .await
+    {
+        Ok(reply) => Ok(format!("reply: {reply}")),
+        Err(e) => Ok(format!("no reply: {e}")),
+    }
+}
+
+/// A dispatcher completes an external activity.
+pub fn external_activity_completes() -> Scenario {
+    Scenario::new(
+        "external_activity_completes",
+        "awaits_external",
+        || vec![awaits_external_info()],
+        &[K::ScheduleExternalActivity],
+    )
+    .input(json!(60))
+    .step(Step::AwaitEvent {
+        event: "ActivityAwaitingExternal",
+        count: 1,
+    })
+    .step(Step::CompleteExternal {
+        activity: "bridge",
+        output: json!({ "status": 200 }),
+    })
+}
+
+/// A dispatcher fails an external activity.
+pub fn external_activity_fails() -> Scenario {
+    Scenario::new(
+        "external_activity_fails",
+        "awaits_external",
+        || vec![awaits_external_info()],
+        &[K::ScheduleExternalActivity],
+    )
+    .input(json!(60))
+    .step(Step::AwaitEvent {
+        event: "ActivityAwaitingExternal",
+        count: 1,
+    })
+    .step(Step::FailExternal {
+        activity: "bridge",
+        error: "route unavailable",
+        retryable: false,
+    })
+}
+
+/// No reply comes, so the schedule-to-close deadline ends the wait.
+pub fn external_activity_times_out() -> Scenario {
+    Scenario::new(
+        "external_activity_times_out",
+        "awaits_external",
+        || vec![awaits_external_info()],
+        &[K::ScheduleExternalActivity],
+    )
+    .input(json!(1))
 }

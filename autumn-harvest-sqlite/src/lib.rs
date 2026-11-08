@@ -257,6 +257,25 @@
 //! [`SqliteRuntime::outcome`] reads the child's result. A drive of a run that
 //! another run cancelled returns [`RunState::Cancelled`] with the reason.
 //!
+//! # External activities
+//!
+//! `ctx.execute_activity_external(...)` waits for a result from outside the
+//! runtime. The decision cycle records the handoff in one transaction: the
+//! `ActivityAwaitingExternal` event, a `harvest_external_tasks` row and a
+//! deadline timer. The drive returns [`RunState::WaitingExternal`].
+//!
+//! A dispatcher reads [`SqliteRuntime::list_external_handoffs`] with
+//! [`ExternalHandoffFilter::pending`]. It settles each token with
+//! [`SqliteRuntime::complete_external`] or [`SqliteRuntime::fail_external`].
+//! A settle returns `false` for a token that is no longer `PENDING`, or for a
+//! run that has ended. An unknown token is
+//! [`SqliteError::ExternalTaskNotFound`]. These are the Postgres rules.
+//!
+//! The deadline fires through the timer path and records
+//! `ActivityTimedOut { ScheduleToClose }`, as the Postgres scanner does.
+//! [`SqliteRuntime::extend_external_deadline`] moves it. When a run ends,
+//! its `PENDING` tokens become `CANCELLED`.
+//!
 //! # Non-goals (see issue #1068 follow-ups)
 //!
 //! Out of scope for this backend: distributed / multi-writer workers, `LISTEN`/
@@ -349,7 +368,6 @@
 //! not run the handler again. The full v0.1 non-goal set, and the command each
 //! emits:
 //!
-//! - **External activities** — task-token activities (`ScheduleExternalActivity`).
 //! - **A cross-type continue-as-new** — `ctx.continue_as_new_as_type(...)`
 //!   (`ContinueAsNew.new_workflow_type`). A same-type `continue_as_new` is
 //!   supported (issue #2023): see [Long-lived runs](#long-lived-runs-issue-2023).
@@ -786,6 +804,7 @@ pub mod append_only;
 mod auth;
 mod composition;
 mod error;
+mod external_task;
 mod history_cap;
 mod history_page;
 mod llm_ledger;
@@ -806,7 +825,7 @@ mod worker;
 mod workflow_log;
 
 pub use autumn_harvest::llm_ledger::LlmCall;
-pub use autumn_harvest::{ExecutionId, WorkflowEvent};
+pub use autumn_harvest::{ExecutionId, ExternalActivityToken, WorkflowEvent};
 
 #[doc(hidden)]
 pub use crate::agent_policy_log::SqlitePolicyLog;
@@ -815,6 +834,9 @@ pub use crate::auth::{
     StoredToken,
 };
 pub use crate::error::{SqliteError, SqliteResult};
+pub use crate::external_task::{
+    DEFAULT_HANDOFF_LIMIT, ExternalHandoff, ExternalHandoffFilter, ExternalTaskState,
+};
 pub use crate::history_cap::HistoryCapReason;
 pub use crate::history_page::{
     DEFAULT_HISTORY_PAGE, HistoryFilter, HistoryPage, MAX_HISTORY_PAGE, PagedEvent,

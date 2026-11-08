@@ -23,15 +23,17 @@ use autumn_harvest::payload_depth::{
 };
 use autumn_harvest::policy::{OverlapPolicy, WorkflowSchedule};
 use autumn_harvest::{
-    ActivityExecId, ActivityHandlerFn, ActivityInfo, ExecutionId, NoOpMetrics, QueryHandlerInfo,
-    SignalHandlerInfo, TimerId, UpdateHandlerInfo, UpdateId, WorkflowCommand, WorkflowEvent,
-    WorkflowHandlerFn, WorkflowHistoryPolicy, WorkflowIdReusePolicy, WorkflowInfo, WorkflowOutcome,
+    ActivityExecId, ActivityHandlerFn, ActivityInfo, ExecutionId, ExternalActivityToken,
+    NoOpMetrics, QueryHandlerInfo, SignalHandlerInfo, TimerId, UpdateHandlerInfo, UpdateId,
+    WorkflowCommand, WorkflowEvent, WorkflowHandlerFn, WorkflowHistoryPolicy,
+    WorkflowIdReusePolicy, WorkflowInfo, WorkflowOutcome,
 };
 use chrono::{DateTime, Utc};
 use rusqlite::Connection;
 use serde_json::Value;
 
 use crate::error::{SqliteError, SqliteResult};
+use crate::external_task::{ExternalHandoff, ExternalHandoffFilter, ExternalTaskState};
 use crate::history_cap::{CapCheck, HistoryCapReason};
 use crate::llm_ledger::LlmLedgerRow;
 use crate::lock::WriterLock;
@@ -40,8 +42,8 @@ use crate::retention::{PurgePolicy, PurgeReport};
 use crate::schedule::{ScheduleOverride, ScheduleSummary, ScheduleTrigger};
 use crate::visibility::{ExecutionDescription, ExecutionFilter, ExecutionPage, ListCursor};
 use crate::{
-    composition, llm_ledger, lock, mutex, queue, retention, schedule, schema, store, update,
-    visibility, worker, workflow_log,
+    composition, external_task, llm_ledger, lock, mutex, queue, retention, schedule, schema, store,
+    update, visibility, worker, workflow_log,
 };
 
 /// A synchronous activity body, keyed by name.
@@ -198,6 +200,12 @@ pub enum RunState {
     WaitingSignal(String),
     /// Blocked awaiting a durable timer that has not yet fired.
     WaitingTimer,
+    /// Blocked awaiting the result of an external activity. The token names
+    /// one that the body awaits. Settle it with
+    /// [`SqliteRuntime::complete_external`] or [`SqliteRuntime::fail_external`],
+    /// then drive the run again. Its deadline can also end the wait, so a
+    /// later drive can time it out.
+    WaitingExternal(ExternalActivityToken),
     /// Blocked awaiting the named workflow mutex (issue #2029). Another run
     /// holds the key, or is ahead in its queue. A drive after the release
     /// grants it.
@@ -2054,6 +2062,147 @@ impl SqliteRuntime {
         Ok((ctx, input, history_bytes))
     }
 
+    /// Complete the external activity of `token` with `output`.
+    ///
+    /// The call appends `ActivityCompletedExternally` to the waiting run, and
+    /// the next drive resumes the body with `output`. Returns `true` when the
+    /// call settles the token. Returns `false` when the token is no longer
+    /// `PENDING`, or when its run is not `RUNNING`. A late or repeated call
+    /// thus writes nothing, as on Postgres.
+    ///
+    /// A run past its `execution_timeout` ends `TIMED_OUT` first, and the
+    /// call returns `false`. An `output` nested past [`MAX_PAYLOAD_DEPTH`]
+    /// cannot be read back. The call fails the activity instead, as
+    /// [`fail_external`](Self::fail_external) with `retryable` off.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqliteError::ExternalTaskNotFound`] for an unknown token, or
+    /// a persistence error.
+    pub fn complete_external(
+        &mut self,
+        token: ExternalActivityToken,
+        output: Value,
+    ) -> SqliteResult<bool> {
+        if nests_past_cap(&output) {
+            let message =
+                format!("external activity result nests more than {MAX_PAYLOAD_DEPTH} levels");
+            return self.fail_external(token, message, false);
+        }
+        self.settle_external(token, ExternalTaskState::Completed, |activity_id| {
+            WorkflowEvent::ActivityCompletedExternally {
+                activity_id,
+                token,
+                output,
+            }
+        })
+    }
+
+    /// Fail the external activity of `token` with `error`.
+    ///
+    /// The call appends `ActivityFailedExternally` to the waiting run. The
+    /// next drive returns the failure to the body. `retryable` is stored in
+    /// the event, as on Postgres. The return value and the refusals match
+    /// [`complete_external`](Self::complete_external).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqliteError::ExternalTaskNotFound`] for an unknown token, or
+    /// a persistence error.
+    pub fn fail_external(
+        &mut self,
+        token: ExternalActivityToken,
+        error: impl Into<String>,
+        retryable: bool,
+    ) -> SqliteResult<bool> {
+        let error = error.into();
+        self.settle_external(token, ExternalTaskState::Failed, |activity_id| {
+            WorkflowEvent::ActivityFailedExternally {
+                activity_id,
+                token,
+                error,
+                retryable,
+            }
+        })
+    }
+
+    /// Settle `token` with the event that `event` builds, in one transaction.
+    fn settle_external(
+        &mut self,
+        token: ExternalActivityToken,
+        state: ExternalTaskState,
+        event: impl FnOnce(ActivityExecId) -> WorkflowEvent,
+    ) -> SqliteResult<bool> {
+        let task = external_task::find(&self.conn, token)?
+            .ok_or(SqliteError::ExternalTaskNotFound(token))?;
+        if task.state != ExternalTaskState::Pending {
+            return Ok(false);
+        }
+        let now = (self.now_fn)().timestamp_millis();
+        // An overdue run ends first. Its terminal setter cancels the token.
+        self.seal_if_overdue_at(task.exec, now)?;
+        let tx = self.conn.transaction()?;
+        if store::execution_state(&tx, task.exec)? != "RUNNING" {
+            return Ok(false);
+        }
+        let settled =
+            external_task::settle(&tx, token, &task, state, &event(task.activity_id), now)?;
+        tx.commit()?;
+        Ok(settled)
+    }
+
+    /// Move the deadline of the external activity of `token` to `extend_by`
+    /// from now.
+    ///
+    /// The run records `ActivityExternalDeadlineExtended`, and the deadline
+    /// timer moves. This is the heartbeat of a slow external system, as the
+    /// Postgres `extend_deadline`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqliteError::ExternalTaskNotFound`] for an unknown token,
+    /// [`SqliteError::ExternalTaskNotPending`] for a settled token, and
+    /// [`SqliteError::WorkflowNotRunning`] when the run has ended. Otherwise
+    /// returns a persistence error.
+    pub fn extend_external_deadline(
+        &mut self,
+        token: ExternalActivityToken,
+        extend_by: std::time::Duration,
+    ) -> SqliteResult<()> {
+        let task = external_task::find(&self.conn, token)?
+            .ok_or(SqliteError::ExternalTaskNotFound(token))?;
+        if task.state != ExternalTaskState::Pending {
+            return Err(SqliteError::ExternalTaskNotPending {
+                token,
+                state: task.state,
+            });
+        }
+        let now = (self.now_fn)().timestamp_millis();
+        self.refuse_past_deadline(task.exec, now)?;
+        let deadline_at = now.saturating_add(duration_to_millis_saturating(extend_by));
+        let tx = self.conn.transaction()?;
+        external_task::extend(&tx, token, &task, deadline_at, now)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The external activity handoffs that `filter` selects.
+    ///
+    /// A dispatcher polls [`ExternalHandoffFilter::pending`], narrowed to its
+    /// activity name. Rows come by deadline first, then by the newest update,
+    /// then by token, as on Postgres. Each row carries the activity input.
+    ///
+    /// # Errors
+    ///
+    /// Returns a persistence error, or [`SqliteError::Corrupt`] for a row
+    /// that does not decode.
+    pub fn list_external_handoffs(
+        &self,
+        filter: &ExternalHandoffFilter,
+    ) -> SqliteResult<Vec<ExternalHandoff>> {
+        external_task::list(&self.conn, filter)
+    }
+
     /// The run that `exec` continued as, or the retry that it started, if
     /// any (issues #2023 and #2029).
     ///
@@ -2890,6 +3039,7 @@ impl SqliteRuntime {
                 Ok(
                     RunState::WaitingSignal(_)
                     | RunState::WaitingTimer
+                    | RunState::WaitingExternal(_)
                     | RunState::WaitingWorkflow(_)
                     | RunState::WaitingMutex(_),
                 ) => {}
@@ -2926,6 +3076,7 @@ impl SqliteRuntime {
                 Ok(
                     RunState::WaitingSignal(_)
                     | RunState::WaitingTimer
+                    | RunState::WaitingExternal(_)
                     | RunState::WaitingWorkflow(_)
                     | RunState::WaitingMutex(_),
                 ) => {}
@@ -4102,6 +4253,30 @@ impl SqliteRuntime {
                         produced = true;
                     }
                 }
+                // An external activity records its handoff once. A re-park
+                // emits the same token and writes nothing.
+                WorkflowCommand::ScheduleExternalActivity {
+                    activity_id,
+                    token,
+                    name,
+                    input,
+                    queue,
+                    schedule_to_close_secs,
+                    ..
+                } => {
+                    let handoff = external_task::Handoff {
+                        activity_id: *activity_id,
+                        token: *token,
+                        name,
+                        input,
+                        queue,
+                        schedule_to_close_secs: *schedule_to_close_secs,
+                    };
+                    let deadline_at = fire_at(now, *schedule_to_close_secs);
+                    if external_task::record(&tx, exec, history, &handoff, now, deadline_at)? {
+                        produced = true;
+                    }
+                }
                 // Benign bookkeeping the single-writer backend has no surface for
                 // yet, but which is safe to DROP (never an error): each is
                 // replay-suppressed in the core, appends no `WorkflowEvent`, and
@@ -4399,6 +4574,16 @@ impl SqliteRuntime {
                     return Ok(RunState::WaitingMutex(key.clone()));
                 }
                 _ => {}
+            }
+        }
+        // The deadline of an external activity is a timer row too. So read
+        // the external wait first, or the park reports `WaitingTimer`.
+        for cmd in commands {
+            if let WorkflowCommand::ScheduleExternalActivity { token, .. } = cmd
+                && external_task::find(&self.conn, *token)?
+                    .is_some_and(|task| task.state == ExternalTaskState::Pending)
+            {
+                return Ok(RunState::WaitingExternal(*token));
             }
         }
         if queue::has_unfired_timer(&self.conn, exec)? {
@@ -5430,6 +5615,7 @@ const fn is_dispatch(cmd: &WorkflowCommand) -> bool {
     matches!(
         cmd,
         WorkflowCommand::ScheduleActivity { .. }
+            | WorkflowCommand::ScheduleExternalActivity { .. }
             | WorkflowCommand::StartTimer { .. }
             | WorkflowCommand::WaitForSignal { .. }
     )
@@ -5967,7 +6153,11 @@ fn persist_terminal_pending_commands<'c>(
             // that the body did not await records nothing, as on Postgres.
             | WorkflowCommand::ReleaseMutex { .. }
             | WorkflowCommand::AcquireMutex { .. }
-            | WorkflowCommand::RunLocalActivity { .. } => {}
+            | WorkflowCommand::RunLocalActivity { .. }
+            // An external activity that the last cycle does not await records
+            // nothing, as Postgres. A recorded handoff of the run becomes
+            // `CANCELLED` when the terminal setter runs.
+            | WorkflowCommand::ScheduleExternalActivity { .. } => {}
             // Issue #2029: a fresh arm records `TimerStarted`, and a cancel
             // records `TimerCancelled`. An await arm needs no row, because the
             // run ends. This is the Postgres terminal policy.
@@ -7291,7 +7481,7 @@ mod panic_strike_tests {
     }
 
     /// Spawns `always_panics` detached under `request_cancel`, waits for
-    /// `go`, then schedules an unsupported external activity.
+    /// `go`, then opens a worker session, which is outside the subset.
     #[workflow]
     async fn spawns_then_unsupported(ctx: &WorkflowContext, _n: i64) -> Result<Value, String> {
         ctx.spawn_child_workflow_detached_raw(
@@ -7301,9 +7491,10 @@ mod panic_strike_tests {
         )
         .map_err(|e| e.to_string())?;
         ctx.wait_for_signal("go").await.map_err(|e| e.to_string())?;
-        ctx.execute_activity_external("external", json!(0), "default", 60)
+        ctx.create_session(autumn_harvest::SessionOptions::new("gpu"))
             .await
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
+        Ok(Value::Null)
     }
 
     #[tokio::test]

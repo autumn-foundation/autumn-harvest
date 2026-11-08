@@ -1,6 +1,6 @@
 //! Typed error surface for the `SQLite` backend.
 
-use autumn_harvest::ExecutionId;
+use autumn_harvest::{ExecutionId, ExternalActivityToken};
 
 /// Errors surfaced by [`SqliteRuntime`](crate::SqliteRuntime) and its
 /// persistence layer.
@@ -59,6 +59,22 @@ pub enum SqliteError {
     /// an unknown id.
     #[error("execution not found: {0}")]
     ExecutionNotFound(ExecutionId),
+
+    /// No external activity holds this token in this database.
+    ///
+    /// A settle or a deadline extension of an unknown token returns it, as
+    /// Postgres returns `NotFound`.
+    #[error("external task not found: {0}")]
+    ExternalTaskNotFound(ExternalActivityToken),
+
+    /// A deadline extension targeted a token that is no longer `PENDING`.
+    #[error("external task {token} is already terminal ({state}); cannot extend its deadline")]
+    ExternalTaskNotPending {
+        /// The token of the external activity.
+        token: ExternalActivityToken,
+        /// The stored state of the token.
+        state: crate::ExternalTaskState,
+    },
 
     /// A signal, update, cancel or terminate targeted an execution in a
     /// terminal state (`COMPLETED`, `FAILED`, `CANCELLED`, `TERMINATED` or

@@ -1613,6 +1613,10 @@ pub fn fire_timer_within_tx(
     exec_id: ExecutionId,
     timer_id: &str,
 ) -> SqliteResult<()> {
+    // An external activity deadline writes its timeout, not `TimerFired`.
+    if timer_id.starts_with(crate::external_task::DEADLINE_TIMER_PREFIX) {
+        return crate::external_task::fire_deadline(conn, exec_id, timer_id);
+    }
     store::append_event(
         conn,
         exec_id,
