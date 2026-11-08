@@ -35,9 +35,10 @@
 //! ## What a workflow override can change
 //!
 //! A workflow override uses the field set of the #771 patch,
-//! [`WorkflowSchedulePatch`], except `input`. The input is a payload. It is
-//! stored through the payload codecs, and a codec key rotation rewrites it.
-//! An override of it would need the same treatment, so it is out of scope.
+//! [`WorkflowSchedulePatch`]. The input is a payload, so the store writes it
+//! through the payload codecs, as the schedule row stores its own input. The
+//! codec rotation sweep re-encodes it. The loaders take the codecs and return
+//! the plaintext.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -49,6 +50,7 @@ use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{HarvestError, HarvestResult};
+use crate::payload_codec::PayloadCodecs;
 use crate::policy::{
     CatchupPolicy, OverlapPolicy, RetryPolicy, Schedule, SkipPolicy, WorkflowSchedule,
 };
@@ -190,8 +192,7 @@ pub struct DagScheduleOverride {
 /// One stored override of a code-declared workflow schedule (issue #2386).
 ///
 /// `fields` uses the #771 patch shape. A field that is `None` inherits the
-/// code value. Its `input` is always `None`, because an override does not
-/// change the input.
+/// code value. Its `input` holds the decoded plaintext.
 #[derive(Debug, Clone)]
 pub struct WorkflowScheduleOverride {
     /// The workflow name of the schedule.
@@ -294,10 +295,14 @@ impl WorkflowFieldsJson {
         }
     }
 
-    fn into_fields(self, common: ScheduleOverrideFields) -> WorkflowSchedulePatch {
+    fn into_fields(
+        self,
+        common: ScheduleOverrideFields,
+        input: Option<serde_json::Value>,
+    ) -> WorkflowSchedulePatch {
         WorkflowSchedulePatch {
             schedule: common.schedule,
-            input: None,
+            input,
             queue_name: self.queue_name,
             catchup: common.catchup,
             max_active_runs: common.max_active_runs,
@@ -636,6 +641,7 @@ struct OverrideRow {
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
     workflow_fields: serde_json::Value,
+    workflow_input: Option<serde_json::Value>,
 }
 
 /// A decoded override row of either kind.
@@ -659,23 +665,45 @@ impl OverrideRow {
         ))
     }
 
+    /// A config error for a stored input that does not decode.
+    ///
+    /// The message names the column only. It never holds the payload.
+    fn undecodable_input(&self) -> HarvestError {
+        HarvestError::Config(format!(
+            "schedule override for workflow schedule '{}' holds a workflow_input that the \
+             registered payload codecs cannot decode; clear it through PATCH /schedules/{{id}}",
+            self.name
+        ))
+    }
+
     /// Decode a stored row of either kind.
-    fn decode_any(self) -> HarvestResult<DecodedOverride> {
+    fn decode_any(self, codecs: &PayloadCodecs) -> HarvestResult<DecodedOverride> {
         match self.kind.as_str() {
             KIND_DAG => self.decode().map(DecodedOverride::Dag),
-            KIND_WORKFLOW => self.decode_workflow().map(DecodedOverride::Workflow),
+            KIND_WORKFLOW => self.decode_workflow(codecs).map(DecodedOverride::Workflow),
             other => Err(self.corrupt("kind", &other)),
         }
     }
 
     /// Decode a stored workflow row (issue #2386).
-    fn decode_workflow(self) -> HarvestResult<WorkflowScheduleOverride> {
+    ///
+    /// `codecs` decodes the stored input to its plaintext.
+    fn decode_workflow(self, codecs: &PayloadCodecs) -> HarvestResult<WorkflowScheduleOverride> {
         let extra: WorkflowFieldsJson = serde_json::from_value(self.workflow_fields.clone())
             .map_err(|error| self.corrupt("workflow_fields", &error.to_string()))?;
         let common = self.decode_common()?;
+        let input = self
+            .workflow_input
+            .as_ref()
+            .map(|stored| {
+                codecs
+                    .decode_column(stored)
+                    .map_err(|_| self.undecodable_input())
+            })
+            .transpose()?;
         Ok(WorkflowScheduleOverride {
             workflow_name: self.name,
-            fields: extra.into_fields(common),
+            fields: extra.into_fields(common, input),
             reason: self.reason,
             updated_by: self.updated_by,
             created_at: self.created_at,
@@ -742,14 +770,18 @@ impl OverrideRow {
 /// Load every override stored on this shard, of both kinds.
 ///
 /// The scheduler calls this once per shard pass. The table holds one row per
-/// overridden schedule, so the read is small.
+/// overridden schedule, so the read is small. `codecs` decodes each stored
+/// input.
 ///
 /// # Errors
 ///
 /// Returns [`HarvestError::Database`] when the read fails, and
 /// [`HarvestError::Config`] when a stored row does not decode. The caller
 /// skips the pass on either error. It never falls back to code values.
-pub async fn load_overrides(conn: &mut AsyncPgConnection) -> HarvestResult<ScheduleOverrides> {
+pub async fn load_overrides(
+    conn: &mut AsyncPgConnection,
+    codecs: &PayloadCodecs,
+) -> HarvestResult<ScheduleOverrides> {
     use crate::schema::harvest_schedule_overrides::dsl;
 
     let rows: Vec<OverrideRow> = dsl::harvest_schedule_overrides
@@ -760,7 +792,7 @@ pub async fn load_overrides(conn: &mut AsyncPgConnection) -> HarvestResult<Sched
     let mut dags = Vec::new();
     let mut workflows = Vec::new();
     for row in rows {
-        match row.decode_any()? {
+        match row.decode_any(codecs)? {
             DecodedOverride::Dag(value) => dags.push(value),
             DecodedOverride::Workflow(value) => workflows.push(value),
         }
@@ -807,6 +839,8 @@ impl OverrideRow {
         set("jitter_secs", self.jitter_secs.map(Into::into));
         set("overlap_policy", self.overlap_policy.map(Into::into));
         set("buffer_all_max", self.buffer_all_max.map(Into::into));
+        // The stored form. Under an active codec it is ciphertext.
+        set("input", self.workflow_input);
         OverrideSummary {
             kind: self.kind,
             name: self.name,
@@ -924,6 +958,7 @@ async fn store_dag_override(
         name: dag_name,
         fields,
         workflow_fields: serde_json::json!({}),
+        workflow_input: None,
         actor,
         reason,
     };
@@ -936,6 +971,8 @@ struct StoredOverride<'a> {
     name: &'a str,
     fields: &'a ScheduleOverrideFields,
     workflow_fields: serde_json::Value,
+    /// The input in its stored form. Only a workflow row sets it.
+    workflow_input: Option<serde_json::Value>,
     actor: &'a str,
     reason: Option<&'a str>,
 }
@@ -991,6 +1028,7 @@ async fn upsert_override(
             dsl::created_at.eq(now),
             dsl::updated_at.eq(now),
             dsl::workflow_fields.eq(&row.workflow_fields),
+            dsl::workflow_input.eq(row.workflow_input.as_ref()),
         ))
         .on_conflict((dsl::kind, dsl::name))
         .do_update()
@@ -1005,6 +1043,7 @@ async fn upsert_override(
             dsl::updated_by.eq(actor),
             dsl::updated_at.eq(now),
             dsl::workflow_fields.eq(&row.workflow_fields),
+            dsl::workflow_input.eq(row.workflow_input.as_ref()),
         ))
         .execute(conn)
         .await
@@ -1268,7 +1307,7 @@ async fn drop_copy_record(
 }
 
 /// Load the override of one code-declared workflow schedule, if any
-/// (issue #2386).
+/// (issue #2386). `codecs` decodes its stored input.
 ///
 /// # Errors
 ///
@@ -1276,8 +1315,9 @@ async fn drop_copy_record(
 pub async fn get_workflow_override(
     conn: &mut AsyncPgConnection,
     workflow_name: &str,
+    codecs: &PayloadCodecs,
 ) -> HarvestResult<Option<WorkflowScheduleOverride>> {
-    select_workflow_override(conn, workflow_name, false).await
+    select_workflow_override(conn, workflow_name, false, codecs).await
 }
 
 /// Lock and load the override of one workflow schedule, for a
@@ -1285,8 +1325,9 @@ pub async fn get_workflow_override(
 pub(crate) async fn lock_workflow_override(
     conn: &mut AsyncPgConnection,
     workflow_name: &str,
+    codecs: &PayloadCodecs,
 ) -> HarvestResult<Option<WorkflowScheduleOverride>> {
-    select_workflow_override(conn, workflow_name, true).await
+    select_workflow_override(conn, workflow_name, true, codecs).await
 }
 
 /// Lock the override row of one workflow schedule without decoding it.
@@ -1315,6 +1356,7 @@ async fn select_workflow_override(
     conn: &mut AsyncPgConnection,
     workflow_name: &str,
     for_update: bool,
+    codecs: &PayloadCodecs,
 ) -> HarvestResult<Option<WorkflowScheduleOverride>> {
     use crate::schema::harvest_schedule_overrides::dsl;
 
@@ -1329,17 +1371,21 @@ async fn select_workflow_override(
     }
     .optional()
     .map_err(crate::error::database_error)?;
-    row.map(OverrideRow::decode_workflow).transpose()
+    row.map(|row| row.decode_workflow(codecs)).transpose()
 }
 
 /// Write the merged fields of one workflow override, or delete the row when
 /// the merge sets no field.
+///
+/// `codecs` encodes the input, as for `harvest_schedules.workflow_input`.
+/// With column encoding on, the stored input is ciphertext.
 pub(crate) async fn store_workflow_override(
     conn: &mut AsyncPgConnection,
     workflow_name: &str,
     fields: &WorkflowSchedulePatch,
     actor: &str,
     reason: Option<&str>,
+    codecs: &PayloadCodecs,
 ) -> HarvestResult<()> {
     if workflow_fields_are_empty(fields) {
         delete_override(conn, KIND_WORKFLOW, workflow_name).await?;
@@ -1347,12 +1393,14 @@ pub(crate) async fn store_workflow_override(
     }
     let workflow_fields = serde_json::to_value(WorkflowFieldsJson::from_fields(fields))
         .map_err(|error| HarvestError::Config(format!("workflow override fields: {error}")))?;
+    let workflow_input = codecs.encode_column_opt(fields.input.as_ref())?;
     let common = common_fields(fields);
     let row = StoredOverride {
         kind: KIND_WORKFLOW,
         name: workflow_name,
         fields: &common,
         workflow_fields,
+        workflow_input,
         actor,
         reason,
     };
@@ -1653,10 +1701,11 @@ mod tests {
     }
 
     #[test]
-    fn workflow_merge_keeps_stored_fields_and_drops_input() {
+    fn workflow_merge_keeps_stored_fields_and_carries_the_input() {
         let stored = WorkflowSchedulePatch {
             schedule: Some(minutely()),
             calendar: Some(Some("holidays".to_string())),
+            input: Some(serde_json::json!({"env": "A"})),
             ..WorkflowSchedulePatch::default()
         };
         let patch = WorkflowSchedulePatch {
@@ -1669,9 +1718,55 @@ mod tests {
         assert_eq!(merged.schedule, Some(minutely()));
         assert_eq!(merged.calendar, Some(None));
         assert_eq!(merged.max_runs, Some(Some(5)));
-        assert!(merged.input.is_none());
+        assert_eq!(merged.input, Some(serde_json::json!({"env": "B"})));
         assert!(workflow_fields_are_empty(&WorkflowSchedulePatch::default()));
         assert!(!workflow_fields_are_empty(&merged));
+
+        // A patch that sets no input keeps the stored input.
+        let kept = merge_workflow_fields(&WorkflowSchedulePatch::default(), &stored);
+        assert_eq!(kept.input, Some(serde_json::json!({"env": "A"})));
+
+        // An input alone is an override.
+        let input_only = WorkflowSchedulePatch {
+            input: Some(serde_json::json!({"env": "B"})),
+            ..WorkflowSchedulePatch::default()
+        };
+        assert!(!workflow_fields_are_empty(&input_only));
+    }
+
+    #[test]
+    fn an_input_override_replaces_the_code_input_only() {
+        let mut code = WorkflowSchedule::new("nightly", hourly());
+        code.input = serde_json::json!({"env": "A"});
+        code.max_active_runs = 2;
+        let fields = WorkflowSchedulePatch {
+            input: Some(serde_json::json!({"env": "B"})),
+            ..WorkflowSchedulePatch::default()
+        };
+        let effective = effective_workflow_schedule(&code, &fields);
+        assert_eq!(effective.input, serde_json::json!({"env": "B"}));
+        assert_eq!(effective.schedule, code.schedule);
+        assert_eq!(effective.max_active_runs, 2);
+        let unset = effective_workflow_schedule(&code, &WorkflowSchedulePatch::default());
+        assert_eq!(unset.input, code.input, "no override keeps the code input");
+    }
+
+    #[test]
+    fn the_tick_applies_an_input_override_to_its_schedule() {
+        let catalog = DagCatalog::new();
+        let mut code = WorkflowSchedule::new("nightly", hourly());
+        code.input = serde_json::json!({"env": "A"});
+        let schedules = vec![code, WorkflowSchedule::new("hourly", hourly())];
+        let overrides = ScheduleOverrides::none().with_workflow_overrides([workflow_override(
+            "nightly",
+            WorkflowSchedulePatch {
+                input: Some(serde_json::json!({"env": "B"})),
+                ..WorkflowSchedulePatch::default()
+            },
+        )]);
+        let effective = overrides.apply_to_workflow_schedules(&schedules, &catalog);
+        assert_eq!(effective[0].input, serde_json::json!({"env": "B"}));
+        assert_eq!(effective[1].input, serde_json::Value::Null);
     }
 
     #[test]
@@ -1686,13 +1781,14 @@ mod tests {
     }
 
     #[test]
-    fn workflow_validation_rejects_an_input_and_a_bad_cadence() {
+    fn workflow_validation_accepts_an_input_and_rejects_a_bad_cadence() {
         let code = WorkflowSchedule::new("nightly", hourly());
         let with_input = WorkflowSchedulePatch {
-            input: Some(serde_json::Value::Null),
+            input: Some(serde_json::json!({"env": "B"})),
             ..WorkflowSchedulePatch::default()
         };
-        assert!(validate_effective_workflow(&code, &with_input).is_err());
+        let effective = validate_effective_workflow(&code, &with_input).expect("an input is valid");
+        assert_eq!(effective.input, serde_json::json!({"env": "B"}));
         let zero = WorkflowSchedulePatch {
             schedule: Some(Schedule::Interval(Duration::ZERO)),
             ..WorkflowSchedulePatch::default()
@@ -1720,7 +1816,7 @@ mod tests {
             "an absent field is not stored"
         );
         let back: WorkflowFieldsJson = serde_json::from_value(stored).expect("deserialize");
-        let back = back.into_fields(ScheduleOverrideFields::default());
+        let back = back.into_fields(ScheduleOverrideFields::default(), None);
         assert_eq!(back.calendar, Some(None));
         assert_eq!(back.max_runs, None);
         assert_eq!(back.end_at, fields.end_at);

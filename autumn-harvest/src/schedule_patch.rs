@@ -80,7 +80,7 @@ pub const fn workflow_fields_are_empty(fields: &WorkflowSchedulePatch) -> bool {
 /// Merge `patch` over the `stored` fields of a workflow override.
 ///
 /// A field that the patch sets wins. A field that it leaves out keeps the
-/// stored value. The merge never carries an input.
+/// stored value.
 #[must_use]
 pub fn merge_workflow_fields(
     patch: &WorkflowSchedulePatch,
@@ -91,7 +91,7 @@ pub fn merge_workflow_fields(
     }
     WorkflowSchedulePatch {
         schedule: pick(patch.schedule.as_ref(), stored.schedule.as_ref()),
-        input: None,
+        input: pick(patch.input.as_ref(), stored.input.as_ref()),
         queue_name: pick(patch.queue_name.as_ref(), stored.queue_name.as_ref()),
         catchup: pick(patch.catchup.as_ref(), stored.catchup.as_ref()),
         max_active_runs: pick(
@@ -135,6 +135,9 @@ pub fn effective_workflow_schedule(
     let mut ws = code.clone();
     if let Some(schedule) = &fields.schedule {
         ws.schedule = schedule.clone();
+    }
+    if let Some(input) = &fields.input {
+        ws.input.clone_from(input);
     }
     if let Some(queue_name) = &fields.queue_name {
         ws.queue_name.clone_from(queue_name);
@@ -183,19 +186,12 @@ pub fn effective_workflow_schedule(
 ///
 /// # Errors
 ///
-/// Returns [`HarvestError::Config`] when the fields carry an input, for an
-/// invalid cadence, or for a jitter that the effective cadence cannot hold.
+/// Returns [`HarvestError::Config`] for an invalid cadence, or for a jitter
+/// that the effective cadence cannot hold.
 pub fn validate_effective_workflow(
     code: &WorkflowSchedule,
     fields: &WorkflowSchedulePatch,
 ) -> HarvestResult<WorkflowSchedule> {
-    if fields.input.is_some() {
-        return Err(HarvestError::Config(format!(
-            "schedule '{}' is declared in code; an override cannot change its input. \
-             Change the input in code",
-            code.workflow_name
-        )));
-    }
     let effective = effective_workflow_schedule(code, fields);
     crate::policy::validate_schedule(&effective.schedule).map_err(HarvestError::Config)?;
     crate::policy::validate_jitter(&effective.schedule, effective.jitter)

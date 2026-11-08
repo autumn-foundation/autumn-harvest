@@ -3762,13 +3762,14 @@ const COLUMN_START_HEADERS: &str = "column-start-headers";
 const COLUMN_START_MEMO: &str = "column-start-memo";
 const COLUMN_TASK_HEADERS: &str = "column-task-headers";
 const COLUMN_ENTITY_STATE: &str = "column-entity-state";
+const COLUMN_SCHEDULE_OVERRIDE: &str = "column-schedule-override";
 
 /// The cells one [`seed_codec_columns`] call writes. A workflow task row and
 /// an activity task row each hold an input and an output. The activity row
 /// also holds a heartbeat. The event batch buffer holds one element, and the
 /// census counts its row once. Every other swept column holds one cell.
 /// `the_seed_covers_every_codec_column` pins this to `CODEC_COLUMNS`.
-const CELLS_PER_SEED: usize = 28;
+const CELLS_PER_SEED: usize = 29;
 
 /// Write one envelope under `key_id` into every swept codec column.
 async fn seed_codec_columns(
@@ -3986,6 +3987,17 @@ async fn seed_short_lived_columns(
     .execute(conn)
     .await
     .expect("insert entity state");
+
+    // The input of a schedule override.
+    diesel::sql_query(
+        "INSERT INTO harvest_schedule_overrides (kind, name, workflow_input, updated_by) \
+         VALUES ('workflow', $1, $2, 'test')",
+    )
+    .bind::<Text, _>(format!("column_rotation_{}", Uuid::new_v4().simple()))
+    .bind::<Jsonb, _>(cell(COLUMN_SCHEDULE_OVERRIDE))
+    .execute(conn)
+    .await
+    .expect("insert schedule override");
 }
 
 /// Insert one event batch row that buffers `elements` (issue #2043).
@@ -4069,6 +4081,8 @@ async fn codec_cells(conn: &mut AsyncPgConnection) -> Vec<(String, Value)> {
            UNION ALL SELECT 25, id::TEXT, 'batch_memo', start_options -> 'memo' \
              FROM harvest_event_batches WHERE start_options -> 'memo' IS NOT NULL \
            UNION ALL SELECT 26, id::TEXT, 'entity_state', snapshot FROM harvest_entity_state \
+           UNION ALL SELECT 27, id::TEXT, 'schedule_override', workflow_input \
+             FROM harvest_schedule_overrides WHERE workflow_input IS NOT NULL \
          ) c ORDER BY ord, row_id",
     )
     .load(conn)
@@ -4770,5 +4784,133 @@ async fn two_schemas_in_one_database_keep_separate_column_cursors() {
         total_b,
         2 * CELLS_PER_SEED,
         "schema tenant_b converts every cell"
+    );
+}
+
+/// AC2 of the schedule input override: a rotation moves the stored override
+/// input onto the active key. The plaintext stays the same, and the next fire
+/// still starts on it.
+#[tokio::test]
+async fn a_rotated_schedule_override_input_keeps_its_plaintext() {
+    use autumn_harvest::scheduler::{
+        WorkflowOverrideRequest, WorkflowSchedulePatch, update_code_declared_workflow_schedule,
+    };
+
+    #[derive(diesel::QueryableByName)]
+    struct Cell {
+        #[diesel(sql_type = diesel::sql_types::Jsonb)]
+        value: Value,
+    }
+    #[derive(diesel::QueryableByName)]
+    struct Id {
+        #[diesel(sql_type = diesel::sql_types::Uuid)]
+        id: Uuid,
+    }
+
+    let (url, _c) = setup_isolated_db().await;
+    let mut conn = connect(&url).await;
+    let codecs = two_aead_key_registry();
+    codecs.set_column_encoding(true);
+    let name = "rotated_override";
+    let mut code = autumn_harvest::WorkflowSchedule::new(
+        name,
+        autumn_harvest::Schedule::Interval(Duration::from_secs(3600)),
+    );
+    code.input = json!({"env": "A"});
+    autumn_harvest::register_workflow_schedules_with_codecs(
+        &mut conn,
+        std::slice::from_ref(&code),
+        &codecs,
+    )
+    .await
+    .expect("register");
+    let id: Id = diesel::sql_query("SELECT id FROM harvest_schedules WHERE workflow_name = $1")
+        .bind::<diesel::sql_types::Text, _>(name)
+        .get_result(&mut conn)
+        .await
+        .expect("schedule id");
+    let plaintext = json!({"env": "B"});
+    let patch = WorkflowSchedulePatch {
+        input: Some(plaintext.clone()),
+        ..WorkflowSchedulePatch::default()
+    };
+    let request = WorkflowOverrideRequest {
+        schedule_id: id.id,
+        code: &code,
+        patch: &patch,
+        clear: false,
+        actor: "ops",
+        reason: None,
+    };
+    update_code_declared_workflow_schedule(&mut conn, &request, &codecs)
+        .await
+        .expect("an input override is accepted");
+    let override_cell = async |conn: &mut AsyncPgConnection| -> Value {
+        let cell: Cell = diesel::sql_query(
+            "SELECT workflow_input AS value FROM harvest_schedule_overrides WHERE name = $1",
+        )
+        .bind::<diesel::sql_types::Text, _>(name)
+        .get_result(conn)
+        .await
+        .expect("override cell");
+        cell.value
+    };
+    let before = override_cell(&mut conn).await;
+    assert_eq!(
+        autumn_harvest::payload_codec::codec_envelope_key_id(&before),
+        Some("k1")
+    );
+
+    codecs.set_active_key("k2").expect("flip");
+    sweep_codec_reencryption_once(&mut conn, 0, &codecs, 100, &NoOpMetrics)
+        .await
+        .expect("sweep");
+    let after = override_cell(&mut conn).await;
+    assert_eq!(
+        autumn_harvest::payload_codec::codec_envelope_key_id(&after),
+        Some("k2"),
+        "the sweep moves the override input onto the active key"
+    );
+    assert_eq!(codecs.decode_column(&after).expect("decode"), plaintext);
+
+    diesel::sql_query(
+        "UPDATE harvest_schedules SET next_run_at = now() - interval '1 minute' \
+         WHERE workflow_name = $1",
+    )
+    .bind::<diesel::sql_types::Text, _>(name)
+    .execute(&mut conn)
+    .await
+    .expect("make it due");
+    let pool = deadpool::managed::Pool::builder(
+        diesel_async::pooled_connection::AsyncDieselConnectionManager::<AsyncPgConnection>::new(
+            &url,
+        ),
+    )
+    .max_size(4)
+    .build()
+    .expect("pool");
+    autumn_harvest::scheduler::tick_once(
+        pool,
+        Arc::new(
+            autumn_harvest::worker::HandlerRegistry::new(vec![], vec![])
+                .with_payload_codecs(codecs.clone()),
+        ),
+        Arc::new(autumn_harvest::DagCatalog::new()),
+        Arc::new(vec![code]),
+        autumn_harvest::SchedulerMonitor::offline(),
+    )
+    .await
+    .expect("tick");
+    let run: Cell = diesel::sql_query(
+        "SELECT input AS value FROM harvest_workflow_executions WHERE workflow_name = $1",
+    )
+    .bind::<diesel::sql_types::Text, _>(name)
+    .get_result(&mut conn)
+    .await
+    .expect("the tick started a run");
+    assert_eq!(
+        codecs.decode_column(&run.value).expect("decode"),
+        plaintext,
+        "the next fire starts on the rotated override input"
     );
 }

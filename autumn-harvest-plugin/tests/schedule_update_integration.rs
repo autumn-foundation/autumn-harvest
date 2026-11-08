@@ -1244,7 +1244,6 @@ async fn code_declared_schedule_patch_writes_an_override_that_the_tick_keeps() {
     );
 
     for bad in [
-        json!({ "input": { "env": "B" } }),
         json!({ "schedule_expr": "interval:0" }),
         // A clear stands alone: `timezone` would resolve against the override.
         json!({ "clear_override": true, "timezone": "Europe/Berlin" }),
@@ -1262,6 +1261,104 @@ async fn code_declared_schedule_patch_writes_an_override_that_the_tick_keeps() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["schedule_expr"], "interval:3600");
     assert_eq!(override_count(&url).await, 0);
+}
+
+/// The `schedule.update` audit rows of schedule `id`, as `(status, error)`,
+/// oldest first.
+async fn schedule_audit_rows(url: &str, id: Uuid) -> Vec<(String, Option<String>)> {
+    let mut conn = connect(url).await;
+    harvest_audit_log::table
+        .filter(harvest_audit_log::dsl::operation.eq("schedule.update"))
+        .filter(harvest_audit_log::dsl::target_id.eq(id.to_string()))
+        .order(harvest_audit_log::dsl::occurred_at.asc())
+        .select((
+            harvest_audit_log::dsl::status,
+            harvest_audit_log::dsl::error_summary,
+        ))
+        .load(&mut conn)
+        .await
+        .expect("load audit rows")
+}
+
+/// The stored input of the override of workflow schedule `wf_name`.
+async fn stored_override_input(url: &str, wf_name: &str) -> Option<Value> {
+    use autumn_harvest::schema::harvest_schedule_overrides::dsl;
+    let mut conn = connect(url).await;
+    dsl::harvest_schedule_overrides
+        .filter(dsl::kind.eq("workflow"))
+        .filter(dsl::name.eq(wf_name))
+        .select(dsl::workflow_input)
+        .first::<Option<Value>>(&mut conn)
+        .await
+        .optional()
+        .expect("load the override input")
+        .flatten()
+}
+
+/// The input override of a code-declared schedule, over HTTP. The patch
+/// takes the input, the tick keeps it, and a clear restores the code input.
+/// Each change writes one audit row.
+#[tokio::test]
+async fn code_declared_schedule_takes_an_input_override() {
+    let (url, _container) = setup_test_database_url().await;
+    let pool = build_test_pool(&url);
+    let wf_name = "sched_override_input_wf";
+    let registry = etl_registry(wf_name);
+    let mut code_schedule = autumn_harvest::policy::WorkflowSchedule::new(
+        wf_name,
+        autumn_harvest::policy::Schedule::Interval(Duration::from_secs(3600)),
+    );
+    code_schedule.input = json!({ "env": "A" });
+    let code = vec![code_schedule];
+    let app = build_app_with_code_schedules(&pool, registry.clone(), code.clone());
+    tick_with_code(&pool, &registry, &code).await;
+    let id = schedule_id_for(&url, wf_name).await;
+    let route = format!("/admin/schedules/{id}");
+
+    let (status, body) = patch_json(
+        &app,
+        route.clone(),
+        json!({ "input": { "env": "B" }, "reason": "INC-4821" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["workflow_input"], json!({ "env": "B" }));
+    assert_eq!(
+        stored_override_input(&url, wf_name).await,
+        Some(json!({ "env": "B" })),
+        "the identity codec stores the input as it is"
+    );
+
+    for _ in 0..2 {
+        tick_with_code(&pool, &registry, &code).await;
+    }
+    assert_eq!(
+        load_schedule_row(&url, id).await.workflow_input,
+        Some(json!({ "env": "B" })),
+        "the tick keeps the override input"
+    );
+
+    let (status, body) = patch_json(&app, route.clone(), json!({ "clear_override": true })).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["workflow_input"], json!({ "env": "A" }));
+    assert_eq!(override_count(&url).await, 0);
+    assert_eq!(stored_override_input(&url, wf_name).await, None);
+
+    let audit = schedule_audit_rows(&url, id).await;
+    assert_eq!(
+        audit
+            .iter()
+            .map(|(status, _)| status.as_str())
+            .collect::<Vec<_>>(),
+        vec!["succeeded", "succeeded"],
+        "the set and the clear each write one audit row: {audit:?}"
+    );
+    assert!(
+        audit
+            .iter()
+            .all(|(_, error)| !error.as_deref().unwrap_or("").contains("env")),
+        "an audit row never holds the input: {audit:?}"
+    );
 }
 
 /// Issue #2386 AC4: a schedule made through the API keeps the row edit.

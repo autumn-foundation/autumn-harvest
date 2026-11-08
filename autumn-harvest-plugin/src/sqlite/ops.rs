@@ -255,7 +255,8 @@ impl PatchBody {
 
     /// The Postgres `check_override_fields`, before any write.
     ///
-    /// A code schedule takes its input from code. A clear stands alone,
+    /// This backend has no payload codecs, so a code schedule takes its input
+    /// from code. Postgres takes an input override. A clear stands alone,
     /// because the other fields resolve against the stored override. An API
     /// schedule has no override, so a clear or a reason is a mistake.
     fn check_override_fields(&self, code: bool, id: uuid::Uuid) -> Result<(), AutumnError> {

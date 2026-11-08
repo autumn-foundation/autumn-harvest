@@ -308,7 +308,7 @@ async fn a_second_patch_merges_over_the_first() {
     assert_eq!(stored.fields.calendar, Some(None), "a JSON null is kept");
 
     // The stored form reads back the same, through the scheduler's loader.
-    let reread = get_workflow_override(&mut conn, "nightly")
+    let reread = get_workflow_override(&mut conn, "nightly", &PayloadCodecs::default())
         .await
         .expect("read")
         .expect("row");
@@ -329,10 +329,6 @@ async fn an_invalid_override_writes_nothing() {
 
     for bad in [
         set_cadence(Schedule::Interval(Duration::ZERO)),
-        WorkflowSchedulePatch {
-            input: Some(serde_json::json!({"env": "B"})),
-            ..WorkflowSchedulePatch::default()
-        },
         // A jitter must be shorter than the interval that holds it.
         WorkflowSchedulePatch {
             jitter: Some(Duration::from_secs(7200)),
@@ -492,5 +488,204 @@ async fn a_patch_waits_for_a_pass_and_changes_the_fingerprint() {
         override_fingerprint(&mut conn).await.expect("fingerprint"),
         before,
         "a committed override write changes the fingerprint"
+    );
+}
+
+/// The code value of a schedule with an input.
+fn code_with_input(name: &str, input: serde_json::Value) -> WorkflowSchedule {
+    let mut ws = code_schedule(name, hourly());
+    ws.input = input;
+    ws
+}
+
+fn set_input(input: serde_json::Value) -> WorkflowSchedulePatch {
+    WorkflowSchedulePatch {
+        input: Some(input),
+        ..WorkflowSchedulePatch::default()
+    }
+}
+
+/// The stored input of the schedule row of `workflow_name`.
+async fn row_input(conn: &mut AsyncPgConnection, workflow_name: &str) -> serde_json::Value {
+    #[derive(diesel::QueryableByName)]
+    struct Cell {
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Jsonb>)]
+        value: Option<serde_json::Value>,
+    }
+    let cell: Cell = diesel::sql_query(
+        "SELECT workflow_input AS value FROM harvest_schedules WHERE workflow_name = $1",
+    )
+    .bind::<diesel::sql_types::Text, _>(workflow_name)
+    .get_result(conn)
+    .await
+    .expect("schedule input");
+    cell.value.unwrap_or(serde_json::Value::Null)
+}
+
+/// Make the schedule row of `workflow_name` due now.
+async fn make_due(conn: &mut AsyncPgConnection, workflow_name: &str) {
+    diesel::sql_query(
+        "UPDATE harvest_schedules SET next_run_at = NOW() - INTERVAL '1 minute' \
+         WHERE workflow_name = $1",
+    )
+    .bind::<diesel::sql_types::Text, _>(workflow_name)
+    .execute(conn)
+    .await
+    .expect("make the schedule due");
+}
+
+/// The inputs of the runs of `workflow_name`, oldest first.
+async fn run_inputs(conn: &mut AsyncPgConnection, workflow_name: &str) -> Vec<serde_json::Value> {
+    #[derive(diesel::QueryableByName)]
+    struct Cell {
+        #[diesel(sql_type = diesel::sql_types::Jsonb)]
+        value: serde_json::Value,
+    }
+    let cells: Vec<Cell> = diesel::sql_query(
+        "SELECT input AS value FROM harvest_workflow_executions \
+         WHERE workflow_name = $1 ORDER BY created_at",
+    )
+    .bind::<diesel::sql_types::Text, _>(workflow_name)
+    .load(conn)
+    .await
+    .expect("run inputs");
+    cells.into_iter().map(|cell| cell.value).collect()
+}
+
+/// AC1: the next fire after an input override takes the overridden input.
+///
+/// The patch converges the row at once. The tick keeps the row, and a later
+/// patch of another field keeps the input.
+#[tokio::test]
+async fn the_next_fire_takes_the_overridden_input() {
+    let (mut conn, db) = setup_db().await;
+    let code = code_with_input("nightly", serde_json::json!({"env": "A"}));
+    tick(&db.url, std::slice::from_ref(&code)).await;
+    let id = workflow_row(&mut conn, "nightly").await.id;
+    assert_eq!(
+        row_input(&mut conn, "nightly").await,
+        serde_json::json!({"env": "A"})
+    );
+
+    let update = patch(
+        &mut conn,
+        id,
+        &code,
+        &set_input(serde_json::json!({"env": "B"})),
+        false,
+    )
+    .await
+    .expect("an input override is accepted");
+    assert!(matches!(update.outcome, ScheduleUpdateOutcome::Updated(_)));
+    let stored = update.stored.expect("an override row");
+    assert_eq!(stored.fields.input, Some(serde_json::json!({"env": "B"})));
+    assert_eq!(
+        row_input(&mut conn, "nightly").await,
+        serde_json::json!({"env": "B"}),
+        "the patch converges the row in its own transaction"
+    );
+
+    // A later patch of another field keeps the input.
+    patch(&mut conn, id, &code, &set_cadence(minutely()), false)
+        .await
+        .expect("cadence patch");
+    for _ in 0..2 {
+        tick(&db.url, std::slice::from_ref(&code)).await;
+    }
+    assert_eq!(
+        row_input(&mut conn, "nightly").await,
+        serde_json::json!({"env": "B"}),
+        "the tick keeps the override input"
+    );
+
+    make_due(&mut conn, "nightly").await;
+    tick(&db.url, std::slice::from_ref(&code)).await;
+    assert_eq!(
+        run_inputs(&mut conn, "nightly").await,
+        vec![serde_json::json!({"env": "B"})],
+        "the fire starts its run on the override input"
+    );
+}
+
+/// AC3: a clear restores the code input, and the next fire takes it.
+#[tokio::test]
+async fn clearing_an_input_override_restores_the_code_input() {
+    let (mut conn, db) = setup_db().await;
+    let code = code_with_input("nightly", serde_json::json!({"env": "A"}));
+    tick(&db.url, std::slice::from_ref(&code)).await;
+    let id = workflow_row(&mut conn, "nightly").await.id;
+    patch(
+        &mut conn,
+        id,
+        &code,
+        &set_input(serde_json::json!({"env": "B"})),
+        false,
+    )
+    .await
+    .expect("input patch");
+
+    let cleared = patch(
+        &mut conn,
+        id,
+        &code,
+        &WorkflowSchedulePatch::default(),
+        true,
+    )
+    .await
+    .expect("clear");
+    assert!(cleared.stored.is_none());
+    assert_eq!(override_rows(&mut conn).await, 0);
+    assert_eq!(
+        row_input(&mut conn, "nightly").await,
+        serde_json::json!({"env": "A"}),
+        "the clear converges the row to the code input at once"
+    );
+
+    make_due(&mut conn, "nightly").await;
+    tick(&db.url, std::slice::from_ref(&code)).await;
+    assert_eq!(
+        run_inputs(&mut conn, "nightly").await,
+        vec![serde_json::json!({"env": "A"})]
+    );
+}
+
+/// A new code input does not reach a schedule whose input an override sets.
+#[tokio::test]
+async fn an_input_override_wins_over_a_redeploy() {
+    let (mut conn, db) = setup_db().await;
+    let code = code_with_input("nightly", serde_json::json!({"env": "A"}));
+    tick(&db.url, std::slice::from_ref(&code)).await;
+    let id = workflow_row(&mut conn, "nightly").await.id;
+    patch(
+        &mut conn,
+        id,
+        &code,
+        &set_input(serde_json::json!({"env": "B"})),
+        false,
+    )
+    .await
+    .expect("input patch");
+
+    let redeployed = code_with_input("nightly", serde_json::json!({"env": "C"}));
+    tick(&db.url, std::slice::from_ref(&redeployed)).await;
+    assert_eq!(
+        row_input(&mut conn, "nightly").await,
+        serde_json::json!({"env": "B"})
+    );
+}
+
+/// The database keeps an input off a DAG override row.
+#[tokio::test]
+async fn the_database_refuses_an_input_on_a_dag_row() {
+    let (mut conn, _db) = setup_db().await;
+    let result = diesel::sql_query(
+        "INSERT INTO harvest_schedule_overrides (kind, name, workflow_input, updated_by) \
+         VALUES ('dag', 'etl', '{\"env\": \"B\"}', 'test')",
+    )
+    .execute(&mut conn)
+    .await;
+    assert!(
+        result.is_err(),
+        "the check must refuse an input on a dag row"
     );
 }

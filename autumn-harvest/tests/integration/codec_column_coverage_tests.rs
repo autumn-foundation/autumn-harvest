@@ -4751,3 +4751,234 @@ async fn inline_delivery_leaves_a_signal_pending_when_the_codec_fails() {
         "a codec failure must not fail the signal for good: {types:?}"
     );
 }
+
+// ── schedule input override ──────────────────────────────────────────────────
+
+const OVERRIDE_SECRET: &str = "cc-override-input-ssn-888";
+
+/// The stored override input of the workflow schedule `name`.
+async fn override_input_cell(conn: &mut AsyncPgConnection, name: &str) -> Option<Value> {
+    #[derive(diesel::QueryableByName)]
+    struct Cell {
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Jsonb>)]
+        value: Option<Value>,
+    }
+    diesel::sql_query(
+        "SELECT workflow_input AS value FROM harvest_schedule_overrides \
+         WHERE kind = 'workflow' AND name = $1",
+    )
+    .bind::<diesel::sql_types::Text, _>(name)
+    .get_result::<Cell>(conn)
+    .await
+    .optional()
+    .expect("load the override row")
+    .and_then(|cell| cell.value)
+}
+
+/// The operator path of `PATCH /admin/schedules/{id}` for the code-declared
+/// schedule `code`.
+async fn override_patch(
+    conn: &mut AsyncPgConnection,
+    code: &autumn_harvest::WorkflowSchedule,
+    patch: &autumn_harvest::scheduler::WorkflowSchedulePatch,
+    clear: bool,
+    codecs: &PayloadCodecs,
+) -> autumn_harvest::HarvestResult<autumn_harvest::scheduler::WorkflowOverrideUpdate> {
+    #[derive(diesel::QueryableByName)]
+    struct Id {
+        #[diesel(sql_type = diesel::sql_types::Uuid)]
+        id: Uuid,
+    }
+    let id: Id = diesel::sql_query("SELECT id FROM harvest_schedules WHERE workflow_name = $1")
+        .bind::<diesel::sql_types::Text, _>(&code.workflow_name)
+        .get_result(conn)
+        .await
+        .expect("schedule id");
+    let request = autumn_harvest::scheduler::WorkflowOverrideRequest {
+        schedule_id: id.id,
+        code,
+        patch,
+        clear,
+        actor: "ops",
+        reason: Some("rotate the account"),
+    };
+    autumn_harvest::scheduler::update_code_declared_workflow_schedule(conn, &request, codecs).await
+}
+
+fn override_input() -> Value {
+    json!({"ssn": OVERRIDE_SECRET})
+}
+
+fn input_patch(input: Value) -> autumn_harvest::scheduler::WorkflowSchedulePatch {
+    autumn_harvest::scheduler::WorkflowSchedulePatch {
+        input: Some(input),
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn a_schedule_input_override_is_ciphertext_and_the_fire_reads_plaintext() {
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let codecs = aead_codecs(true);
+    let mut conn = connect(&url).await;
+    let name = format!("cc_sched_ovr_{}", Uuid::new_v4().simple());
+    let static_name: &'static str = Box::leak(name.clone().into_boxed_str());
+    let reg = registry(vec![wf_info(static_name, wf_noop, None)], vec![], &codecs);
+    let code = secret_schedule(&name);
+    autumn_harvest::register_workflow_schedules_with_codecs(
+        &mut conn,
+        std::slice::from_ref(&code),
+        &codecs,
+    )
+    .await
+    .expect("register");
+
+    override_patch(
+        &mut conn,
+        &code,
+        &input_patch(override_input()),
+        false,
+        &codecs,
+    )
+    .await
+    .expect("an input override is accepted");
+    let stored = override_input_cell(&mut conn, &name)
+        .await
+        .expect("the override stores the input");
+    assert_ciphertext(
+        &stored,
+        OVERRIDE_SECRET,
+        "schedule_overrides.workflow_input",
+    );
+    assert_eq!(
+        codecs.decode_column(&stored).expect("decode one layer"),
+        override_input()
+    );
+    let (row, row_updated) = schedule_cell(&mut conn, &name).await;
+    assert_ciphertext(&row, OVERRIDE_SECRET, "the converged schedule input");
+    assert_eq!(
+        codecs.decode_column(&row).expect("decode"),
+        override_input()
+    );
+
+    // The listing shows the stored cell, never the plaintext.
+    let listed = autumn_harvest::schedule_override::list_overrides(&mut conn)
+        .await
+        .expect("list overrides");
+    let summary = listed
+        .iter()
+        .find(|summary| summary.name == name)
+        .expect("the override is listed");
+    assert_eq!(summary.fields["input"], stored);
+    assert!(
+        !serde_json::to_string(summary)
+            .expect("serialize")
+            .contains(OVERRIDE_SECRET),
+        "the listing must not hold the secret in clear"
+    );
+
+    // A tick finds the row converged. It writes nothing.
+    let tick = |reg: Arc<HandlerRegistry>, code: autumn_harvest::WorkflowSchedule| {
+        autumn_harvest::scheduler::tick_once(
+            build_pool(&url),
+            reg,
+            Arc::new(autumn_harvest::DagCatalog::new()),
+            Arc::new(vec![code]),
+            autumn_harvest::SchedulerMonitor::offline(),
+        )
+    };
+    tick(reg.clone(), code.clone()).await.expect("tick");
+    let (after_tick, after_tick_updated) = schedule_cell(&mut conn, &name).await;
+    assert_eq!(after_tick, row, "a converged row keeps its envelope");
+    assert_eq!(
+        after_tick_updated, row_updated,
+        "a converged row is not written"
+    );
+
+    diesel::sql_query(
+        "UPDATE harvest_schedules SET next_run_at = now() - interval '1 minute' \
+         WHERE workflow_name = $1",
+    )
+    .bind::<diesel::sql_types::Text, _>(&name)
+    .execute(&mut conn)
+    .await
+    .expect("make it due");
+    tick(reg, code).await.expect("tick");
+    use autumn_harvest::schema::harvest_workflow_executions;
+    let input: Value = harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::workflow_name.eq(&name))
+        .select(harvest_workflow_executions::input)
+        .first(&mut conn)
+        .await
+        .expect("the tick started a run");
+    assert_ciphertext(&input, OVERRIDE_SECRET, "the scheduled run input");
+    assert_eq!(
+        codecs.decode_column(&input).expect("decode one layer"),
+        override_input(),
+        "the run starts on the plaintext override input"
+    );
+}
+
+#[tokio::test]
+async fn an_override_input_that_cannot_decode_skips_the_pass_until_a_clear() {
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let codecs = aead_codecs(true);
+    let mut conn = connect(&url).await;
+    let name = format!("cc_sched_ovr_stuck_{}", Uuid::new_v4().simple());
+    let code = secret_schedule(&name);
+    autumn_harvest::register_workflow_schedules_with_codecs(
+        &mut conn,
+        std::slice::from_ref(&code),
+        &codecs,
+    )
+    .await
+    .expect("register");
+    override_patch(
+        &mut conn,
+        &code,
+        &input_patch(override_input()),
+        false,
+        &codecs,
+    )
+    .await
+    .expect("an input override is accepted");
+    let (before, before_updated) = schedule_cell(&mut conn, &name).await;
+
+    // The reader has no key. A new code cadence must not reach the row.
+    let keyless = reader_without_the_key();
+    let mut redeployed = secret_schedule(&name);
+    redeployed.schedule = autumn_harvest::Schedule::Interval(Duration::from_secs(60));
+    autumn_harvest::scheduler::tick_once(
+        build_pool(&url),
+        registry(vec![], vec![], &keyless),
+        Arc::new(autumn_harvest::DagCatalog::new()),
+        Arc::new(vec![redeployed.clone()]),
+        autumn_harvest::SchedulerMonitor::offline(),
+    )
+    .await
+    .expect("a bad override never fails the tick");
+    let (after, after_updated) = schedule_cell(&mut conn, &name).await;
+    assert_eq!(after, before, "the pass skips its shard");
+    assert_eq!(after_updated, before_updated, "the pass writes no row");
+
+    // A clear never decodes the row, so it removes it.
+    override_patch(
+        &mut conn,
+        &redeployed,
+        &autumn_harvest::scheduler::WorkflowSchedulePatch::default(),
+        true,
+        &keyless,
+    )
+    .await
+    .expect("a clear removes an override that does not decode");
+    assert_eq!(
+        count_rows(
+            &mut conn,
+            "SELECT COUNT(*)::BIGINT AS n FROM harvest_schedule_overrides \
+             WHERE kind = 'workflow' AND name = $1",
+            &name,
+        )
+        .await,
+        0
+    );
+}
