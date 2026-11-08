@@ -14,6 +14,13 @@ design is in `docs/design/DESIGN-2547.md`.
   Postgres 13.23, 14.20, 15.15, 16.11, 17.7 and later then skip that row,
   as `SKIP LOCKED` skips a held row. The claim can then return no task for
   one poll. Older releases recheck the new version, as before.
+- The claim now turns sorts off (`SET LOCAL enable_sort = off`), and the
+  pin head reads its pins in the key order of `idx_harvest_tq_sticky_poll`.
+  After a backlog drained, `ANALYZE` saw no `PENDING` row, and each head
+  scan sorted all of `idx_harvest_tq_live_created`. The claim read 197,266
+  buffers at 30K pending rows, against 244. It now reads 245.
+  `stale_statistics_keep_the_window_bounded` failed at random on that
+  case. It now owns its database and fails every time on the old code.
 - Evidence: `the_window_refine_reads_about_one_buffer_per_row` on the issue
   #1956 fixture. The refine fell from 2.55 to 1.09 buffers per row at 32
   pending rows, and from 3.03 to 1.04 at 1,000. With 32 held claims the

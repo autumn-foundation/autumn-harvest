@@ -121,3 +121,62 @@ batched claim do not change.
 
 - Mechanisms 1, 2 and 3 of the issue.
 - The `INSERT harvest_events` cost and the FK `FOR KEY SHARE` probe.
+
+## 10. Follow-up: a drained backlog
+
+Review found that `stale_statistics_keep_the_window_bounded` failed at
+random. It failed on `trunk-dev` too.
+
+### 10.1 Facts
+
+- The test seeds 20 `PENDING` rows among 400K. `ANALYZE` samples 30,000
+  rows, so it misses all 20 in about one run of five.
+- When it misses them, the statistics show no `PENDING` row. A drained
+  backlog gives the same statistics every time.
+- The partial indexes keep the pages of the drained backlog. `VACUUM` sets
+  their row count to 0. A later `VACUUM` with no dead rows does not scan
+  them, so the count stays 0.
+- The planner then estimates each head as empty. Each queue head sorted
+  all of `idx_harvest_tq_live_created`. The pin head read it once more.
+- The claim read 197,266 buffers at 30K pending rows, against 244. The
+  cost grows with the backlog.
+
+### 10.2 Brainstorming
+
+| Option | Verdict |
+|---|---|
+| **`SET LOCAL enable_sort = off` in the claim** | Chosen. Each queue head then has one plan without a sort. `bounded_queue_depths` does the same (issue #2356). |
+| **Read pins in `idx_harvest_tq_sticky_poll` order** | Chosen. The pin head sorts on every plan, so sorts off alone do not fix it. |
+| A state test that proves no other partial index | Not possible. `state = 'PENDING'` proves `state IN ('PENDING', 'RUNNING')`. |
+| Keep the statistics fresh | Not in the claim's control. An operator owns `ANALYZE`. |
+| `enable_seqscan = off` | Rejected. It also changes the full-scan fallback, and no fixture here measures that. |
+
+### 10.3 Reverse brainstorming
+
+| Way to fail | Guard |
+|---|---|
+| A sort that the claim needs disappears | Every plan of that step has the sort, so its cost does not change. The claim order tests and the random drains pass. |
+| Another step gets worse | With fresh statistics, only two small aggregates change: they hash instead of sort. Every scan and join is the same. The plan has no merge join. `claim_seek_tests` and 25 claim suites pass. |
+| The pin head returns other rows | It reads every live pin, as before. The outer `ORDER BY ... LIMIT` is the same. |
+| Postgres 18 counts disabled nodes, not costs | A plan with fewer disabled sorts still wins, so the result is the same. |
+
+### 10.4 Six thinking hats
+
+- **White.** 197,266 against 245 buffers with the fix.
+- **Red.** One setting, plus one subquery, both with a precedent.
+- **Black.** A cached plan from a table of 10 rows or fewer can still pick
+  a sequential scan for the refine. The first autoanalyze ends it.
+- **Yellow.** The drained case reads 245 buffers. The issue #1956 fixture
+  with 20K terminal rows falls from 202 to 134 buffers.
+- **Green.** A pin index ordered by the due time would let the pin head
+  stop at 32 rows.
+- **Blue.** RED: the test owns its database, turns autovacuum off and
+  asserts the head plans. GREEN: the setting and the pin subquery.
+
+### 10.5 Acceptance criteria
+
+1. The test passes on each run, and asserts that the statistics show no
+   `PENDING` row.
+2. Each head scan reads `idx_harvest_tq_claim_seek` or
+   `idx_harvest_tq_sticky_poll`.
+3. Every `claim_seek_tests` case passes.

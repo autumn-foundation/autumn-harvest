@@ -1532,6 +1532,13 @@ macro_rules! claim_trailing_ctes_sql {
 /// applies the row-local gates of `claim_head_gates_sql!`, so a row that
 /// this claim cannot take does not use a window slot.
 ///
+/// The pin head reads its pins in the key order of
+/// `idx_harvest_tq_sticky_poll`, inside a subquery that `OFFSET 0` keeps
+/// apart. Only that index gives the order without a sort. The claim turns
+/// sorts off, so the planner cannot pick a scan of another partial index
+/// instead (issue #2547). The outer sort then keeps the best rows, as
+/// before.
+///
 /// Inside one queue head the due time follows `scheduled_at`. So each head
 /// is in claim order, `priority DESC, due ASC`. A row outside a head sorts at
 /// or after the last row of that head. `seek_bounds` keeps that last row for
@@ -1585,6 +1592,7 @@ macro_rules! claim_seek_ctes_sql {
                  FROM paused_queues \
                  CROSS JOIN paused_activities \
                  CROSS JOIN LATERAL ( \
+                     SELECT * FROM ( \
                      SELECT ",
             claim_seek_row_sql!(),
             " \
@@ -1596,7 +1604,9 @@ macro_rules! claim_seek_ctes_sql {
                        AND scheduled_at <= NOW() \
                        AND NOT (queue_name = ANY(paused_queues.names)) ",
             claim_head_gates_sql!(),
-            "ORDER BY priority DESC, seek_due ASC \
+            "ORDER BY queue_name, priority DESC, scheduled_at OFFSET 0 \
+                     ) pins \
+                     ORDER BY seek_priority DESC, seek_due ASC \
                      LIMIT ",
             claim_seek_window_sql!(),
             " \
@@ -2100,6 +2110,16 @@ const fn claim_task_full_scan_query() -> &'static str {
 /// buffers at 10K pending rows. With stale statistics it read 11,704. The
 /// ordered scan does not depend on the estimate.
 ///
+/// **No sorts that an index can replace (issue #2547).** After a backlog
+/// drains, an `ANALYZE` sees no `PENDING` row. The partial indexes keep
+/// their pages with a row count of 0. The planner then estimates each head
+/// as empty. A head scan that sorts all of `idx_harvest_tq_live_created`
+/// then costs less than the ordered scan. It reads the whole backlog on
+/// each claim: 197,266 buffers at 30K pending rows, against 244. With sorts
+/// off, the ordered head scan is the plan left. A sort that no index can
+/// replace stays, because every plan has it. Examples are the candidate
+/// sort on the claim key and the window ranks.
+///
 /// The full scan reads the whole backlog with or without bitmap scans. A
 /// bitmap scan helps it, though: at 100K pending rows with ageing on, it
 /// read 16K buffers with bitmap scans and 46K without. Ageing skips the
@@ -2114,7 +2134,8 @@ const fn claim_task_full_scan_query() -> &'static str {
 /// so they cost one round trip.
 pub const CLAIM_PLAN_SETTINGS_SQL: &str = "SET LOCAL jit = off; \
      SET LOCAL plan_cache_mode = force_generic_plan; \
-     SET LOCAL enable_bitmapscan = off";
+     SET LOCAL enable_bitmapscan = off; \
+     SET LOCAL enable_sort = off";
 
 /// The planner settings of a claim with priority ageing on (issue #1971).
 ///
@@ -12675,7 +12696,8 @@ mod tests {
             "AND (new_start AND attempt = 0) = k.new_start_head",
             "ORDER BY priority DESC, scheduled_at ASC",
             "WHERE sticky_worker_id = $1",
-            "ORDER BY priority DESC, seek_due ASC",
+            "ORDER BY queue_name, priority DESC, scheduled_at OFFSET 0 ) pins",
+            "ORDER BY seek_priority DESC, seek_due ASC",
             "WHERE NOT (q.name = ANY(paused_queues.names))",
         ] {
             assert!(heads.contains(clause), "missing {clause:?} in:\n{heads}");
@@ -12984,6 +13006,10 @@ mod tests {
         assert!(CLAIM_PLAN_SETTINGS_SQL.contains("jit = off"));
         assert!(CLAIM_PLAN_SETTINGS_SQL.contains("plan_cache_mode = force_generic_plan"));
         assert!(CLAIM_PLAN_SETTINGS_SQL.contains("enable_bitmapscan = off"));
+        assert!(
+            CLAIM_PLAN_SETTINGS_SQL.contains("enable_sort = off"),
+            "a head scan must not sort a partial index (issue #2547)"
+        );
         for setting in CLAIM_AGEING_PLAN_SETTINGS_SQL.split("; ") {
             assert!(setting.starts_with("SET LOCAL "), "{setting}");
         }

@@ -1441,6 +1441,28 @@ issue #2547 it reads each row by `ctid`, with a TID scan. Before the issue
 #1971 window, the same case read 11,704 buffers through a bitmap head scan,
 then 30,278 through a partial index.
 
+**A drained backlog (issue #2547).** The case above held only when the
+`ANALYZE` sample caught one of the 20 `PENDING` rows. The sample of 30,000
+rows missed all 20 in about one run of five. A drained backlog is the same
+case with certainty:
+
+- The backlog drains, and an `ANALYZE` sees no `PENDING` row.
+- The partial indexes keep the pages of the drained backlog, with a row
+  count of 0.
+- A burst arrives below the autoanalyze threshold.
+
+The planner then estimates each head as empty. Each head scan sorted all
+of `idx_harvest_tq_live_created`, and the pin head scanned it once more.
+The claim read 197,266 buffers at 30K pending rows, against 244 with fresh
+statistics. The cost grew with the backlog: 1,566 buffers at 3K and 46,310
+at 100K, 379 ms per claim.
+
+The claim now turns sorts off (`SET LOCAL enable_sort = off`), and the pin
+head reads its pins in the key order of `idx_harvest_tq_sticky_poll`. Each
+head then has one plan without a sort: its ordered index. The same case
+reads 245 buffers. `stale_statistics_keep_the_window_bounded` owns its
+database, turns autovacuum off and asserts the plan of each head.
+
 ### Latency and throughput under contention
 
 `pgbench` with 8 concurrent claimers on the 4-core box, each claim its own
@@ -1624,12 +1646,20 @@ runs, so a figure can differ by a buffer from the tables above:
 
 | test | case | before | after |
 |:--|:--|--:|--:|
-| `claim_buffers_stay_flat_from_1k_to_100k_pending_rows` | 1,000 rows | 432 | 301 |
-| | 10,000 rows | 478 | 437 |
-| | 100,000 rows | 529 | 437 |
-| `held_claims_on_one_head_keep_the_claim_off_the_full_scan` | 100K rows, K = 0 | 263 | 171 |
-| | 100K rows, K = 32 | 1,726 | 781 |
-| | 100K rows, K = 64 | 1,769 | 816 |
+| `claim_buffers_stay_flat_from_1k_to_100k_pending_rows` | 1,000 rows | 432 | 291 |
+| | 10,000 rows | 478 | 427 |
+| | 100,000 rows | 529 | 427 |
+| `held_claims_on_one_head_keep_the_claim_off_the_full_scan` | 100K rows, K = 0 | 263 | 168 |
+| | 100K rows, K = 32 | 1,726 | 778 |
+| | 100K rows, K = 64 | 1,769 | 813 |
+| `the_window_refine_reads_about_one_buffer_per_row` | 32 rows, 20K terminal | 202 | 134 |
+
+"After" includes both changes of issue #2547: the TID refine and sorts
+off. The TID refine alone read 1,690 buffers in the last row. Its 20K
+terminal rows gave statistics with almost no `PENDING` row. The TID scan
+changed the costs, and a head scan then sorted a partial index. That is
+the plan of [a drained backlog](#claim-cost-against-backlog-depth). Sorts
+off remove it.
 
 - **The refine now costs about 1 buffer per row.** The guard array is an
   init plan. It can be the first reader of `seek_heads`, so the test
@@ -1722,12 +1752,16 @@ runs, so a figure can differ by a buffer from the tables above:
 - **Future-dated rows in a higher band.** A head scan steps over the index
   entries of rows that are not yet due, inside a higher priority band.
   Those steps read index pages only.
-- **A generic plan cached on a nearly empty table.** With 10 rows or fewer
-  in the statistics, the planner can pick a sequential scan for the window
-  refine. Before issue #2547 it picked one below 5 rows. If the table then
-  grows before an `ANALYZE`, that cached plan reads the whole table. The
-  head scans already did this before the change. A review measured 41,024
-  buffers against 39,223 for the old plan, at 100K rows.
+- **A generic plan cached on a nearly empty table.** A connection can
+  cache the claim plan when the table holds 10 rows or fewer. If the table
+  then grows before an `ANALYZE`, that plan reads the whole table.
+  - The head scans no longer do this, since issue #2547 turned sorts off.
+  - The window refine still does. With so few rows the planner picks a
+    sequential scan over a TID scan.
+  - At 8 rows grown to 100K, the claim read 40,952 buffers before issue
+    #2547 and 2,473 after. The refine read 2,443 of them.
+  - The first autoanalyze ends it, because it makes each connection plan
+    the claim again. The task queue analyzes after 50 rows plus 2%.
 - **The skip after a concurrent update (issue #2547).** No test drives
   it. The scratch run that showed it used PG 16.15. See
   [the refine by TID](#the-refine-by-tid-issue-2547).
