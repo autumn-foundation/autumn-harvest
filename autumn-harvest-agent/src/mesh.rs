@@ -147,6 +147,38 @@ pub const fn draw_verdict(max_draws: Option<u32>, room: u32, draws: u32) -> Draw
     DrawVerdict::Run { left: room - draws }
 }
 
+/// Admit the `draws` of a strategy that a `delegate` call asks for.
+///
+/// `room` is the delegations left before the call. The delegation takes
+/// one unit. With `fan_out`, each draw takes one unit more. A beam has no
+/// `fan_out`, because the receiver counts its steps per path.
+///
+/// A missing cap admits one draw only. So a model gets more draws only
+/// under a cap that an operator sets. The cap check comes first.
+/// `formal/verus/src/agent_mandate_draws.rs` proves it.
+#[must_use]
+pub const fn delegated_verdict(
+    max_draws: Option<u32>,
+    room: u32,
+    draws: u32,
+    fan_out: bool,
+) -> DrawVerdict {
+    let cap = match max_draws {
+        Some(max) => max,
+        None => 1,
+    };
+    if draws > cap {
+        return DrawVerdict::DrawsExceeded;
+    }
+    let units = if fan_out { draws } else { 0 };
+    if room == 0 || units > room - 1 {
+        return DrawVerdict::FanOutExhausted;
+    }
+    DrawVerdict::Run {
+        left: room - 1 - units,
+    }
+}
+
 #[allow(clippy::trivially_copy_pass_by_ref)]
 const fn is_false(value: &bool) -> bool {
     !*value
@@ -410,6 +442,32 @@ impl Mandate {
         let room = self.max_delegations.saturating_sub(used);
         match draw_verdict(self.max_draws, room, draws) {
             DrawVerdict::Run { left } => Ok(left),
+            DrawVerdict::DrawsExceeded => Err(Refusal::DrawsExceeded),
+            DrawVerdict::FanOutExhausted => Err(Refusal::FanOutExhausted),
+        }
+    }
+
+    /// Admit a strategy of `draws` draws that a `delegate` call asks for,
+    /// after `used` delegations of the tree. Returns the units of the draws
+    /// that the tree must count, next to the unit of the delegation.
+    ///
+    /// See [`delegated_verdict`]. A mandate with no `max_draws` admits one
+    /// draw only.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Refusal::DrawsExceeded`] when `draws` passes the cap.
+    /// Returns [`Refusal::FanOutExhausted`] when the delegation and its
+    /// draws pass the delegations left.
+    pub const fn admit_delegated_draws(
+        &self,
+        draws: u32,
+        fan_out: bool,
+        used: u32,
+    ) -> Result<u32, Refusal> {
+        let room = self.max_delegations.saturating_sub(used);
+        match delegated_verdict(self.max_draws, room, draws, fan_out) {
+            DrawVerdict::Run { .. } => Ok(if fan_out { draws } else { 0 }),
             DrawVerdict::DrawsExceeded => Err(Refusal::DrawsExceeded),
             DrawVerdict::FanOutExhausted => Err(Refusal::FanOutExhausted),
         }
@@ -698,6 +756,21 @@ impl Mandate {
         let Some(value) = meta.get(MANDATE_META_KEY) else {
             return Ok(None);
         };
+        let mandate = Self::from_wire(value)?;
+        mandate.validate()?;
+        Ok(Some(mandate))
+    }
+
+    /// Read a mandate that another process sent, strictly.
+    ///
+    /// An unknown key fails the read, so a receiver never drops a field
+    /// that a newer sender adds to narrow the run. The read does not
+    /// validate. [`Mandate::accept`] does that and names the refusal.
+    ///
+    /// # Errors
+    ///
+    /// Returns why `value` is not a mandate.
+    pub fn from_wire(value: &Value) -> Result<Self, String> {
         let Some(fields) = value.as_object() else {
             return Err("the mandate is not a JSON object".to_owned());
         };
@@ -707,11 +780,26 @@ impl Mandate {
                 crate::harness::truncate(unknown, MAX_NAME_LEN)
             ));
         }
-        let mandate: Self = serde_json::from_value(value.clone())
-            .map_err(|err| format!("the mandate does not decode: {err}"))?;
-        mandate.validate()?;
-        Ok(Some(mandate))
+        serde_json::from_value(value.clone())
+            .map_err(|err| format!("the mandate does not decode: {err}"))
     }
+}
+
+/// Decode the mandate of a peer envelope with [`Mandate::from_wire`].
+///
+/// A peer envelope is the one path where a mandate crosses from another
+/// worker. A stored task or profile keeps the typed read, so a rolling
+/// upgrade can still read it.
+///
+/// # Errors
+///
+/// Returns why the value is not a mandate.
+pub(crate) fn strict_mandate<'de, D>(deserializer: D) -> Result<Mandate, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    Mandate::from_wire(&value).map_err(serde::de::Error::custom)
 }
 
 /// Why a delegation did not run.
@@ -751,6 +839,9 @@ pub enum Refusal {
     PeerUnavailable,
     /// A strategy run asks for more draws than `max_draws` of its mandate.
     DrawsExceeded,
+    /// A `delegate` call asks an inline peer for a strategy. Only a durable
+    /// agent has a kind, and so a sampling policy.
+    StrategyNeedsDurablePeer,
 }
 
 impl Refusal {
@@ -770,6 +861,7 @@ impl Refusal {
             Self::Deadlock => "deadlock",
             Self::PeerUnavailable => "peer_unavailable",
             Self::DrawsExceeded => "draws_exceeded",
+            Self::StrategyNeedsDurablePeer => "strategy_needs_durable_peer",
         }
     }
 
@@ -780,7 +872,8 @@ impl Refusal {
         let peer = crate::harness::truncate(peer, MAX_NAME_LEN);
         match self {
             Self::InvalidArguments => {
-                "the delegate call needs exactly the arguments agent and task".to_owned()
+                "the delegate call needs the arguments agent and task, and an optional valid sample"
+                    .to_owned()
             }
             Self::NotPermitted => format!("this agent may not delegate to {peer:?}"),
             Self::UnknownPeer => format!("no agent named {peer:?} is known"),
@@ -799,6 +892,9 @@ impl Refusal {
             Self::DrawsExceeded => {
                 format!("the mandate of {peer:?} allows fewer draws than the strategy asks for")
             }
+            Self::StrategyNeedsDurablePeer => {
+                format!("{peer:?} is not a durable agent, so it cannot run a strategy")
+            }
         }
     }
 }
@@ -811,10 +907,53 @@ pub(crate) struct DelegateArgs {
     pub agent: String,
     /// The task for the peer.
     pub task: String,
+    /// The strategy for a durable peer. `OpSample` denies unknown keys, so
+    /// the call cannot carry a policy field.
+    #[serde(default)]
+    pub sample: Option<crate::sampling::OpSample>,
+}
+
+/// The `sample` argument of the `delegate` tool, under a cap of
+/// `max_draws` draws.
+fn sample_schema(max_draws: u32) -> Value {
+    serde_json::json!({
+        "type": "object",
+        "description": format!(
+            "Optional. Ask a durable agent to answer with a strategy: it runs \
+             several draws and returns the selected answer. At most {max_draws} \
+             draws. An inline agent refuses it."
+        ),
+        "properties": {
+            "strategy": {
+                "description": "\"single\", {\"best_of_n\": {\"n\": 3}}, \
+                    {\"rejection\": {\"max_attempts\": 3, \"threshold\": 0.8}} or \
+                    {\"vote\": {\"n\": 3, \"key\": \"last_number\"}}.",
+            },
+            "scorer": {
+                "type": "object",
+                "description": "The scorer of each draw. A vote takes none.",
+                "properties": {
+                    "id": {"type": "string"},
+                    "judge_model": {"type": "string"},
+                },
+                "required": ["id"],
+                "additionalProperties": false,
+            },
+            "expected": {
+                "type": "string",
+                "description": "The expected answer, if the scorer compares with one.",
+            },
+        },
+        "required": ["strategy"],
+        "additionalProperties": false,
+    })
 }
 
 /// The `delegate` tool that one agent sees, with each peer it may ask.
-pub(crate) fn delegate_definition(peers: &[Peer]) -> ToolDefinition {
+///
+/// With `sample_cap`, the tool also shows the `sample` argument, under
+/// that cap of draws.
+pub(crate) fn delegate_definition(peers: &[Peer], sample_cap: Option<u32>) -> ToolDefinition {
     let mut description = String::from(
         "Ask another agent to do a task. The agent works alone, with its own tools, \
          and returns its final answer. It does not see this conversation, so put \
@@ -827,26 +966,40 @@ pub(crate) fn delegate_definition(peers: &[Peer]) -> ToolDefinition {
         description.push_str(&peer.description);
     }
     let names: Vec<&str> = peers.iter().map(|peer| peer.name.as_str()).collect();
+    let mut input_schema = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "agent": {
+                "type": "string",
+                "enum": names,
+                "description": "The agent to ask.",
+            },
+            "task": {
+                "type": "string",
+                "description": "The task, with every fact the agent needs.",
+            },
+        },
+        "required": ["agent", "task"],
+        "additionalProperties": false,
+    });
+    if let Some(cap) = sample_cap {
+        input_schema["properties"]["sample"] = sample_schema(cap);
+    }
     ToolDefinition {
         name: DELEGATE_TOOL.to_owned(),
         description,
-        input_schema: serde_json::json!({
-            "type": "object",
-            "properties": {
-                "agent": {
-                    "type": "string",
-                    "enum": names,
-                    "description": "The agent to ask.",
-                },
-                "task": {
-                    "type": "string",
-                    "description": "The task, with every fact the agent needs.",
-                },
-            },
-            "required": ["agent", "task"],
-            "additionalProperties": false,
-        }),
+        input_schema,
     }
+}
+
+/// The cap that the `delegate` tool shows with its `sample` argument, or
+/// `None` to hide it.
+///
+/// The tool shows it when the mandate sets `max_draws` to 2 or more, and a
+/// peer is durable. An inline peer refuses a strategy.
+pub(crate) fn sample_cap(mandate: &Mandate, peers: &[Peer]) -> Option<u32> {
+    let durable = peers.iter().any(|peer| peer.agent.is_some());
+    mandate.max_draws.filter(|max| *max > 1 && durable)
 }
 
 /// One delegation of a run tree, as the report lists it.
@@ -885,6 +1038,11 @@ pub struct DelegationRecord {
     /// refused, or when the bound is under 2.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub serial: Option<SerialReason>,
+    /// The draw units of a strategy that the caller asked for. The tree
+    /// counts them next to the unit of the delegation. 0 for a plain
+    /// delegation.
+    #[serde(default, skip_serializing_if = "crate::types::is_zero")]
+    pub draws: u32,
 }
 
 /// Why a delegation ran alone, when [`AgentTask::parallel_children`] is 2 or
@@ -1420,6 +1578,87 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_delegated_verdict_needs_a_cap_for_more_than_one_draw() {
+        // The room counts the delegation itself, then one unit for each draw.
+        assert_eq!(
+            delegated_verdict(None, 5, 1, true),
+            DrawVerdict::Run { left: 3 }
+        );
+        assert_eq!(
+            delegated_verdict(None, 5, 2, true),
+            DrawVerdict::DrawsExceeded
+        );
+        assert_eq!(
+            delegated_verdict(Some(3), 4, 3, true),
+            DrawVerdict::Run { left: 0 }
+        );
+        assert_eq!(
+            delegated_verdict(Some(3), 3, 3, true),
+            DrawVerdict::FanOutExhausted
+        );
+        assert_eq!(
+            delegated_verdict(Some(2), 9, 3, true),
+            DrawVerdict::DrawsExceeded
+        );
+        assert_eq!(
+            delegated_verdict(Some(8), 1, 8, false),
+            DrawVerdict::Run { left: 0 }
+        );
+        assert_eq!(
+            delegated_verdict(Some(8), 0, 8, false),
+            DrawVerdict::FanOutExhausted
+        );
+        assert_eq!(
+            delegated_verdict(Some(0), 5, 0, true),
+            DrawVerdict::Run { left: 4 }
+        );
+    }
+
+    #[test]
+    fn a_delegated_strategy_counts_the_delegation_and_each_draw() {
+        let mandate = Mandate::new("a").max_draws(3).max_delegations(4);
+        assert_eq!(mandate.admit_delegated_draws(3, true, 0), Ok(3));
+        assert_eq!(
+            mandate.admit_delegated_draws(3, true, 1),
+            Err(Refusal::FanOutExhausted)
+        );
+        assert_eq!(
+            mandate.admit_delegated_draws(4, true, 0),
+            Err(Refusal::DrawsExceeded)
+        );
+        assert_eq!(mandate.admit_delegated_draws(3, false, 3), Ok(0));
+        let open = Mandate::new("a");
+        assert_eq!(open.admit_delegated_draws(1, true, 0), Ok(1));
+        assert_eq!(
+            open.admit_delegated_draws(2, true, 0),
+            Err(Refusal::DrawsExceeded)
+        );
+    }
+
+    #[test]
+    fn the_inline_strategy_refusal_has_a_stable_code_and_names_the_peer() {
+        let refusal = Refusal::StrategyNeedsDurablePeer;
+        assert_eq!(refusal.code(), "strategy_needs_durable_peer");
+        assert_eq!(
+            serde_json::to_value(refusal).unwrap(),
+            json!("strategy_needs_durable_peer")
+        );
+        assert!(refusal.message("helper").contains("helper"));
+    }
+
+    #[test]
+    fn a_strict_wire_mandate_refuses_an_unknown_key() {
+        let mandate = Mandate::new("a").max_draws(2);
+        let value = serde_json::to_value(&mandate).unwrap();
+        assert_eq!(Mandate::from_wire(&value), Ok(mandate));
+        let mut extra = value;
+        extra["max_drawz"] = json!(1);
+        let err = Mandate::from_wire(&extra).unwrap_err();
+        assert!(err.contains("max_drawz"), "{err}");
+        assert!(Mandate::from_wire(&json!([])).is_err());
+    }
+
     fn name() -> impl Strategy<Value = String> {
         prop::sample::select(vec!["a", "b", "c", "d", "e"]).prop_map(str::to_owned)
     }
@@ -1659,6 +1898,42 @@ mod tests {
                     prop_assert!(draws > mandate.max_delegations.saturating_sub(used));
                 }
                 Err(other) => prop_assert!(false, "unexpected refusal {other:?}"),
+            }
+        }
+
+        #[test]
+        fn a_delegated_strategy_never_passes_a_cap_above_it(
+            root in mandate(),
+            roles in prop::collection::vec(peer(), 1..4),
+            locals in prop::collection::vec(cap(), 1..4),
+            draws in 0_u32..8,
+            fan_out in any::<bool>(),
+            used in 0_u32..4,
+        ) {
+            // Walk a chain of hops. Each hop is a delegation, or a send
+            // to another process that the receiver accepts.
+            let mut above = vec![root.max_draws];
+            let mut holder = root;
+            for (role, local) in roles.iter().zip(&locals) {
+                let receiver = Mandate {
+                    max_draws: *local,
+                    ..Mandate::new(role.name.clone())
+                };
+                let next = holder
+                    .outbound(role, 0, &BTreeSet::new())
+                    .and_then(|sent| receiver.accept(&sent));
+                // A refused hop ends the chain, so its caps are not above.
+                let Ok(next) = next else { break };
+                above.extend([role.max_draws, *local]);
+                holder = next;
+            }
+            if let Ok(units) = holder.admit_delegated_draws(draws, fan_out, used) {
+                for cap in &above {
+                    prop_assert!(cap_within(Some(draws), *cap));
+                }
+                prop_assert!(draws <= holder.max_draws.unwrap_or(1));
+                prop_assert_eq!(units, if fan_out { draws } else { 0 });
+                prop_assert!(used + 1 + units <= holder.max_delegations);
             }
         }
 

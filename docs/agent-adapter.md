@@ -2085,6 +2085,31 @@ let op = AgentOp::message("Name a prime.").with_sample(sample);
 
 The design is in [`DESIGN-2449.md`](design/DESIGN-2449.md).
 
+### A strategy through `delegate`
+
+A delegating model can ask a durable peer for a strategy. The `delegate`
+tool takes an optional `sample` argument, an `OpSample`. The peer runs the
+message as a strategy op. The caller reads the selected answer as the
+tool result. [`agent-mesh.md` section 13](agent-mesh.md#13-durable-peers-issue-2269)
+shows the call.
+
+- The tool shows `sample` only when the caller mandate sets `max_draws`
+  to 2 or more, and a listed peer is durable.
+- A caller mandate with no `max_draws` admits one draw. An operator opts
+  in to more draws with `Mandate::max_draws`.
+- The caller checks the draws before it sends anything:
+  `draws_exceeded`, then `fan_out_exhausted`. The delegation takes one
+  unit of `max_delegations`, and each draw takes one more. A beam checks
+  `max_draws` only.
+- The receiver checks its accepted mandate and its sampling policy again.
+- An inline peer refuses a strategy with `strategy_needs_durable_peer`.
+  An inline peer is a role, not a kind, so no sampling policy covers it.
+- `DelegationRecord::draws` keeps the draw units that the caller counted.
+- A receiver decodes the envelope mandate strictly. An unknown key fails
+  the op, so the receiver never drops a cap that a newer sender adds.
+
+The design is in [`DESIGN-2610.md`](design/DESIGN-2610.md).
+
 ### Profile overlays (issue #2372)
 
 An activated overlay changes the next op only, because each op reads it
@@ -3460,3 +3485,43 @@ history holds no transcript. The sweep does not use continue-as-new.
 `MAX_SWEEP_ITEMS` (1000) bounds its history. Nothing in the policy caps
 the draws of one sweep: set `max_total_tokens` to bound its spend. The
 design is in [`DESIGN-2448.md`](design/DESIGN-2448.md).
+
+## 28. Inference strategies
+
+A strategy runs more than one draw of one task, scores each draw and
+selects one answer. Each draw is a durable child run, so a crash costs one
+draw. A strategy pays off when one draw is often wrong and a check can
+tell a right answer from a wrong one. The example runs one task under
+four strategies, with a scripted model and no API key:
+
+```sh
+cargo run -p agent-strategies
+```
+
+It prints the selected answer, each draw and the cost of each run. The
+cheap model misses on its first draw. So the single draw finds nothing,
+best-of-3 and the vote find the answer for 3 and 4 cheap draws, and the
+cascade pays for the strong model once.
+
+| Strategy | Draws | It pays off when | Policy setting |
+|---|---|---|---|
+| `single` | 1 | One draw is usually right, or no check exists. | none |
+| `best_of_n` | `n` | A scorer can rank answers, and draws differ. | `best_of_n` in `strategies`, `max_draws` ≥ `n` |
+| `rejection` | up to `max_attempts` | A check passes or fails, and a pass is common. It stops at the first pass. | `rejection` in `strategies`, `max_draws` ≥ `max_attempts` |
+| `vote` | up to `n` | Answers have a short key, such as a number, and no scorer exists. It stops when the leader cannot lose. | `vote` in `strategies`, `max_draws` ≥ `n` |
+| `cascade` | one per tier | A cheap model is often right, and a check can tell when it is not. | `cascade` in `strategies`, each tier model in `cascade_models` |
+| `beam` | `width × expansion × max_rounds` | A task takes many model turns, and a step scorer can rank partial work. | `beam` in `strategies`, `max_draws` ≥ the draws |
+
+- Section 19 holds each [policy setting](#19-sampling-policy-issue-2439).
+  By default a kind has no strategy, so each run is one draw.
+- A score comes from a `Scorer`: a pure check, a test run or a judge
+  model. Section 17 shows [how to score a run](#17-score-a-run-issue-2441).
+- A draw that the run does not select runs `ReadOnly` tools only, by
+  default. An operator widens `draw_effects` per kind.
+- Each draw counts against the LLM budgets and the cost ledger. A durable
+  agent and a mesh also count each draw against the mandate (section 15).
+- Section 27 compares strategies over a fixed input set with
+  [a dataset sweep](#27-dataset-sweep-issue-2448).
+
+[ADR 0017](adr/0017-inference-strategies.md) records the design choices.
+The plan is in [`DESIGN-2450.md`](design/DESIGN-2450.md).

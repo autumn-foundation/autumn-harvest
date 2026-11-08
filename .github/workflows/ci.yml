@@ -1412,6 +1412,20 @@ jobs:
           grep -qF "2 open tickets" "$RUNNER_TEMP/desk.txt"
           grep -qF "I filed the reply to T-1" "$RUNNER_TEMP/desk.txt"
           test "$(wc -l < "$desk/filed.log")" -eq 1
+      # The inference strategies example. It runs offline on
+      # SQLite with a scripted model, and its features match agent-mesh.
+      - name: "Run agent-strategies example tests (issue #2450)"
+        if: needs.changes.outputs.code == 'true' && matrix.shard == 0
+        run: cargo test -p agent-strategies
+      - name: "Run the agent-strategies example offline (issue #2450)"
+        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true' && matrix.shard == 0
+        run: |
+          set -euo pipefail
+          cargo run -p agent-strategies | tee "$RUNNER_TEMP/strategies.txt"
+          grep -qF "single draw: answer" "$RUNNER_TEMP/strategies.txt"
+          grep -qF "best-of-3: answer" "$RUNNER_TEMP/strategies.txt"
+          grep -qF "vote: answer" "$RUNNER_TEMP/strategies.txt"
+          grep -qF "cascade: answer" "$RUNNER_TEMP/strategies.txt"
       - name: Run business_metrics example tests (issue #758)
         if: needs.changes.outputs.code == 'true' && matrix.shard == 0
         run: cargo test -p autumn-harvest --no-default-features --features testing --example business_metrics
@@ -2824,6 +2838,8 @@ jobs:
       # reason as the autoresearch step.
       - name: "Clippy agent-mesh example (issue #2276)"
         run: cargo clippy -p agent-mesh --all-targets --no-deps -- -D warnings
+      - name: "Clippy agent-strategies example (issue #2450)"
+        run: cargo clippy -p agent-strategies --all-targets --no-deps -- -D warnings
       # The durable Rhai script example. `--no-deps` for the same reason as
       # the daemon above: it uses `autumn-harvest` with no default features.
       - name: Clippy rhai-scripts example
@@ -2997,6 +3013,10 @@ jobs:
         # changelog entry and the CI step of the refine example. A docs-only
         # PR can break each of them, so this job runs them.
         run: "cargo test -p autumn-harvest-agent --features sqlite,eval,sandbox,postgres --test refine_docs"
+      - name: Run strategies docs guards (also on docs-only PRs)
+        # The guards check guide section 28, ADR 0017, both indexes, the
+        # changelog entry and the CI steps of the strategies example.
+        run: "cargo test -p autumn-harvest-agent --features sqlite,eval,sandbox,postgres --test strategies_docs"
       - name: "Check agent guide snippets compile (issue #2482)"
         # Each Rust fence of docs/agent-adapter.md and docs/agent-mesh.md
         # compiles as a doctest through `guide_snippets` in src/lib.rs. The

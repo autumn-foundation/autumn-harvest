@@ -115,6 +115,10 @@ pub open spec fn fits(max_draws: Option < u32 >, draws: u32) -> bool { match max
 pub fn meet_cap(left: Option < u32 >, right: Option < u32 >) -> (r: Option < u32 >) ensures within(r, left), within(r, right), r is None <==> (left is None && right is None), r is Some && left is Some && right is Some ==> (r -> 0 == left -> 0 || r -> 0 == right -> 0),
 pub enum DrawVerdict { Run { left: u32 }, DrawsExceeded, FanOutExhausted, }
 pub fn draw_verdict(max_draws: Option < u32 >, room: u32, draws: u32) -> (r: DrawVerdict) ensures r is DrawsExceeded <==>! fits(max_draws, draws), r is FanOutExhausted <==> (fits(max_draws, draws) && draws > room), r is Run <==> (fits(max_draws, draws) && draws <= room), r is Run ==> r -> Run_left + draws == room,
+pub open spec fn delegated_cap(max_draws: Option < u32 >) -> u32 { match max_draws { None => 1, Some(max) => max, } }
+pub open spec fn draw_units(draws: u32, fan_out: bool) -> int { if fan_out { draws as int } else { 0 } }
+pub fn delegated_verdict(max_draws: Option < u32 >, room: u32, draws: u32, fan_out: bool) -> (r: DrawVerdict) ensures r is DrawsExceeded <==> draws > delegated_cap(max_draws), r is FanOutExhausted <==> (draws <= delegated_cap(max_draws) && 1 + draw_units(draws, fan_out) > room), r is Run <==> (draws <= delegated_cap(max_draws) && 1 + draw_units(draws, fan_out) <= room), r is Run ==> fits(max_draws, draws), r is Run && max_draws is None ==> draws <= 1, r is Run ==> r -> Run_left + 1 + draw_units(draws, fan_out) == room,
+pub proof fn theorem_a_delegated_run_fits_each_cap_above(child: Option < u32 >, parent: Option < u32 >, draws: u32) requires within(child, parent), draws <= delegated_cap(child), ensures fits(parent, draws),
 pub proof fn theorem_within_is_transitive(a: Option < u32 >, b: Option < u32 >, top: Option < u32 >) requires within(a, b), within(b, top), ensures within(a, top),
 pub proof fn theorem_a_fit_holds_under_a_wider_cap(child: Option < u32 >, parent: Option < u32 >, draws: u32) requires within(child, parent), fits(child, draws), ensures fits(parent, draws),
 

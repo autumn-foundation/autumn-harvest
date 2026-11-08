@@ -198,6 +198,17 @@ impl SampleStrategy {
         }
     }
 
+    /// Whether each draw counts as one delegation of the fan-out.
+    ///
+    /// Each draw of best-of-N, rejection or a vote is a run of its own. So
+    /// is each tier of a cascade. A beam step continues the run of its
+    /// beam, and the beam counts its delegations step by step. So a beam
+    /// meets `max_draws` only.
+    #[must_use]
+    pub const fn counts_fan_out(&self) -> bool {
+        !matches!(self, Self::Beam { .. })
+    }
+
     /// The most draws of the run. A cascade has one draw per tier. For a
     /// beam, it is `width × expansion × max_rounds`, saturated at
     /// `u32::MAX`.
@@ -811,13 +822,13 @@ async fn run_strategy(
 fn mandate_admits(mandate: &Mandate, sample: &OpSample) -> Result<Option<u32>, SampleFailure> {
     let refused = |refusal| SampleFailure::Refused(Refusal::Mandate { mandate: refusal });
     let draws = sample.strategy.draws();
-    let left = if matches!(sample.strategy, SampleStrategy::Beam { .. }) {
+    let left = if sample.strategy.counts_fan_out() {
+        Some(mandate.admit_draws(draws, 0).map_err(refused)?)
+    } else {
         if mandate.max_draws.is_some_and(|max| draws > max) {
             return Err(refused(MeshRefusal::DrawsExceeded));
         }
         None
-    } else {
-        Some(mandate.admit_draws(draws, 0).map_err(refused)?)
     };
     let judge = sample
         .scorer

@@ -476,7 +476,9 @@ pub struct PeerEnvelope {
     /// The task for the receiver.
     pub text: String,
     /// The authority of the receiver, from `Mandate::outbound`. The receiver
-    /// can only narrow it.
+    /// can only narrow it. It decodes strictly: an unknown key fails the
+    /// op, so a receiver never drops a cap that a newer sender adds.
+    #[serde(deserialize_with = "crate::mesh::strict_mandate")]
     pub mandate: Mandate,
     /// The flow labels of the sender. They taint the receiver.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
@@ -2982,6 +2984,37 @@ mod tests {
             "sample": {"strategy": {"best_of_n": {"n": 3}}, "scorer": {"id": "x"}, "max_drawz": 9},
         });
         assert!(serde_json::from_value::<AgentOp>(value).is_err());
+    }
+
+    fn envelope_value() -> serde_json::Value {
+        serde_json::json!({
+            "type": "peer_message",
+            "from": "triage/t1@life",
+            "sender": "triage",
+            "seq": 1,
+            "text": "hi",
+            "mandate": {"chain": ["triage"], "max_depth": 3, "max_delegations": 4, "max_draws": 2},
+        })
+    }
+
+    #[test]
+    fn a_peer_envelope_with_an_unknown_mandate_key_fails_to_decode() {
+        let op: AgentOp = serde_json::from_value(envelope_value()).unwrap();
+        let AgentOp::PeerMessage(envelope) = op else {
+            panic!("a peer message decodes as one");
+        };
+        assert_eq!(envelope.mandate.max_draws, Some(2));
+        let mut value = envelope_value();
+        value["mandate"]["max_fan"] = serde_json::json!(1);
+        let err = serde_json::from_value::<AgentOp>(value).unwrap_err();
+        assert!(err.to_string().contains("max_fan"), "{err}");
+        // The strict read covers the envelope only. A typed mandate still
+        // drops an unknown key, so a stored task or profile reads.
+        let typed: Mandate = serde_json::from_value(serde_json::json!({
+            "chain": ["triage"], "max_depth": 3, "max_delegations": 4, "max_fan": 1,
+        }))
+        .unwrap();
+        assert_eq!(typed.chain, ["triage"]);
     }
 
     #[test]

@@ -54,7 +54,7 @@ use crate::memory::{
 };
 use crate::mesh::{
     DELEGATE_TOOL, DelegateArgs, DelegationRecord, INVALID_NAME, Mandate, Peer, Refusal,
-    SerialReason, delegate_definition, valid_name,
+    SerialReason, delegate_definition, sample_cap, valid_name,
 };
 use crate::mesh_control::{MESH_ATTR, MESH_BUDGET_EXCEEDED, MeshBudgetExceeded};
 use crate::message::{
@@ -78,6 +78,12 @@ const FINAL_TURN_PATCH: &str = "agent_final_turn_rules";
 /// part of the recorded child input. A history from before the gate replays
 /// with the old input.
 const CHILD_FAILURE_REPORT_PATCH: &str = "agent_child_failure_report";
+
+/// The gate of the `sample` argument of `delegate`. A history from before
+/// the gate refused such a call as `invalid_arguments`, so its replay still
+/// does. The gate runs only for a call with a sample, so a plain call
+/// records no marker.
+const DELEGATE_SAMPLE_PATCH: &str = "agent_delegate_sample";
 
 /// The cut of a delegation answer in a history from before issue #2481.
 ///
@@ -399,7 +405,8 @@ impl Member {
 
     /// The `delegate` tool, when the agent has a peer to ask.
     fn delegate_tool(&self) -> Option<crate::message::ToolDefinition> {
-        (!self.peers.is_empty()).then(|| delegate_definition(&self.peers))
+        (!self.peers.is_empty())
+            .then(|| delegate_definition(&self.peers, sample_cap(&self.mandate, &self.peers)))
     }
 }
 
@@ -2284,6 +2291,26 @@ fn delegate_args(arguments: &serde_json::Value) -> Option<DelegateArgs> {
         .flatten()
 }
 
+/// The arguments of a `delegate` call that the workflow runs.
+///
+/// A call with a `sample` passes the patch gate first. A history from
+/// before the gate reads `None`, as it did then.
+fn sampled_args(ctx: &WorkflowContext, arguments: &serde_json::Value) -> Option<DelegateArgs> {
+    delegate_args(arguments)
+        .filter(|args| args.sample.is_none() || ctx.patched(DELEGATE_SAMPLE_PATCH))
+}
+
+/// The units of the nested delegations that ran: one for each, and its
+/// draw units.
+fn nested_units(records: &[DelegationRecord]) -> u32 {
+    records
+        .iter()
+        .filter(|record| record.run_id.is_some())
+        .fold(0_u32, |units, record| {
+            units.saturating_add(1).saturating_add(record.draws)
+        })
+}
+
 /// Run one `delegate` call: refuse it with a named verdict, or run the peer
 /// inline as a sub-agent.
 ///
@@ -2300,14 +2327,14 @@ async fn delegate(
     call: &ToolCall,
 ) -> Result<ToolOutcome, String> {
     let task = run.task;
-    let admitted = delegate_args(&call.arguments)
+    let admitted = sampled_args(ctx, &call.arguments)
         .ok_or((Refusal::InvalidArguments, String::new()))
         .and_then(|args| {
             admit(agent, task, progress, tree, &args.agent)
-                .map(|child| (child, args.task))
+                .map(|child| (child, args.task, args.sample))
                 .map_err(|refusal| (refusal, args.agent))
         });
-    let (child, child_input) = match admitted {
+    let (child, child_input, sample) = match admitted {
         Ok(admitted) => admitted,
         Err((refusal, name)) => return Ok(refuse_delegation(agent, tree, refusal, &name)),
     };
@@ -2317,16 +2344,17 @@ async fn delegate(
         max_total_tokens,
     } = child;
     if peer.agent.is_some() {
-        return Box::pin(durable_peer(
-            ctx,
-            run,
-            agent,
-            progress,
-            tree,
-            peer,
-            child_input,
-        ))
-        .await;
+        let ask = Ask {
+            text: child_input,
+            sample,
+        };
+        return Box::pin(durable_peer(ctx, run, agent, progress, tree, peer, ask)).await;
+    }
+    // An inline peer is a role, not a kind, so no sampling policy admits
+    // its draws.
+    if sample.is_some() {
+        let refusal = Refusal::StrategyNeedsDurablePeer;
+        return Ok(refuse_delegation(agent, tree, refusal, &peer.name));
     }
     tree.delegations = tree.delegations.saturating_add(1);
     let run_id = format!("{}:d{}", tree.root, tree.delegations);
@@ -2375,6 +2403,7 @@ async fn delegate(
         resets: child.reset.count,
         answer_truncated: false,
         serial: None,
+        draws: 0,
     });
     let mut outcome = serde_json::json!({
         "agent": peer.name,
@@ -2518,6 +2547,7 @@ fn refuse_delegation(agent: &Member, tree: &mut Tree, refusal: Refusal, name: &s
         resets: 0,
         answer_truncated: false,
         serial: None,
+        draws: 0,
     });
     refused(refusal, name)
 }
@@ -2560,10 +2590,17 @@ async fn fan_out(
     for (position, call) in calls.iter().enumerate() {
         let taken = u32::try_from(siblings.len()).unwrap_or(u32::MAX);
         let used = tree.delegations.saturating_add(taken);
-        let admitted = delegate_args(&call.arguments)
+        let admitted = sampled_args(ctx, &call.arguments)
             .ok_or((Refusal::InvalidArguments, String::new()))
             .and_then(|args| {
+                // A batch holds inline peers only, and an inline peer runs
+                // no strategy.
+                let refusal = args
+                    .sample
+                    .is_some()
+                    .then_some(Refusal::StrategyNeedsDurablePeer);
                 sibling(agent, used, &args.agent)
+                    .and_then(|admitted| refusal.map_or(Ok(admitted), Err))
                     .map(|(mandate, peer)| Sibling {
                         position,
                         mandate,
@@ -2707,14 +2744,9 @@ fn merge_child(
         .delegated_tool_calls
         .saturating_add(report.tool_calls);
     tree.exercised.extend(report.flow_labels.iter().cloned());
-    let nested = report
-        .delegations
-        .iter()
-        .filter(|record| record.run_id.is_some())
-        .count();
     tree.delegations = tree
         .delegations
-        .saturating_add(u32::try_from(nested).unwrap_or(u32::MAX));
+        .saturating_add(nested_units(&report.delegations));
     tree.records.extend(report.delegations.iter().cloned());
     tree.records.push(DelegationRecord {
         chain: child
@@ -2730,6 +2762,7 @@ fn merge_child(
         resets: report.resets,
         answer_truncated: false,
         serial: None,
+        draws: 0,
     });
     let mut outcome = serde_json::json!({
         "agent": peer.name,
@@ -2756,7 +2789,7 @@ async fn durable_peer(
     progress: &mut Progress,
     tree: &mut Tree,
     peer: &Peer,
-    text: String,
+    ask: Ask,
 ) -> Result<ToolOutcome, String> {
     let target = peer.agent.as_deref().and_then(|id| AgentId::parse(id).ok());
     let Some(target) = target else {
@@ -2782,7 +2815,24 @@ async fn durable_peer(
     // A read-only segment sends a read-only mandate, as an inline child
     // inherits it (issue #2319).
     mandate.read_only |= run.task.read_only;
-    tree.delegations = tree.delegations.saturating_add(1);
+    // The caller counts the draws of a strategy against its own tree,
+    // before it sends anything.
+    let draws = match &ask.sample {
+        Some(sample) => {
+            let strategy = &sample.strategy;
+            let admitted = agent.mandate.admit_delegated_draws(
+                strategy.draws(),
+                strategy.counts_fan_out(),
+                tree.delegations,
+            );
+            match admitted {
+                Ok(units) => units,
+                Err(refusal) => return Ok(refuse(agent, tree, refusal, &peer.name)),
+            }
+        }
+        None => 0,
+    };
+    tree.delegations = tree.delegations.saturating_add(1).saturating_add(draws);
     let seq = tree.outbox.next_seq(target_id);
     let mut promise = ctx.new_promise().map_err(|err| err.to_string())?;
     let mut waiting = tree.outbox.waiting.clone();
@@ -2791,13 +2841,13 @@ async fn durable_peer(
         from: tree.outbox.from.clone(),
         sender: agent.mandate.holder().to_owned(),
         seq,
-        text,
+        text: ask.text,
         mandate: mandate.clone(),
         flow_labels: tree.exercised.clone(),
         reply_to: Some(promise.id().to_string()),
         waiting,
         mesh: tree.outbox.mesh.clone(),
-        sample: None,
+        sample: ask.sample,
     };
     let key = format!("{}:{seq}", envelope.from);
     let sent = ctx
@@ -2826,7 +2876,30 @@ async fn durable_peer(
         chain.push(peer.name.clone());
     }
     let room = AnswerRoom::of(ctx, run.task);
-    Ok(peer_outcome(room, tree, peer, target_id, chain, outcome))
+    let sent = PeerSent {
+        target_id,
+        chain,
+        draws,
+    };
+    Ok(peer_outcome(room, tree, peer, sent, outcome))
+}
+
+/// What a `delegate` call asks a durable peer.
+struct Ask {
+    /// The task text.
+    text: String,
+    /// The strategy, if the call asks for one.
+    sample: Option<crate::sampling::OpSample>,
+}
+
+/// One message that a caller sent to a durable peer.
+struct PeerSent<'a> {
+    /// The workflow id of the peer.
+    target_id: &'a str,
+    /// The chain of the record.
+    chain: Vec<String>,
+    /// The draw units that the caller counted.
+    draws: u32,
 }
 
 /// Record one exchange with a durable peer and answer the model.
@@ -2834,10 +2907,14 @@ fn peer_outcome(
     room: AnswerRoom<'_>,
     tree: &mut Tree,
     peer: &Peer,
-    target_id: &str,
-    chain: Vec<String>,
+    sent: PeerSent<'_>,
     outcome: Result<PeerReply, String>,
 ) -> ToolOutcome {
+    let PeerSent {
+        target_id,
+        chain,
+        draws,
+    } = sent;
     match outcome {
         Ok(reply) => {
             // The answer enters this context, so the labels of the peer count.
@@ -2853,6 +2930,7 @@ fn peer_outcome(
                 resets: 0,
                 answer_truncated: false,
                 serial: None,
+                draws,
             });
             if let Some(refusal) = reply.refusal {
                 refused(refusal, &peer.name)
@@ -2888,6 +2966,7 @@ fn peer_outcome(
                 resets: 0,
                 answer_truncated: false,
                 serial: None,
+                draws,
             });
             ToolOutcome::error(&format!(
                 "the durable agent {:?} gave no answer: {error}",
@@ -2954,6 +3033,7 @@ fn refuse(agent: &Member, tree: &mut Tree, refusal: Refusal, name: &str) -> Tool
         resets: 0,
         answer_truncated: false,
         serial: None,
+        draws: 0,
     });
     refused(refusal, name)
 }
@@ -4034,5 +4114,95 @@ mod tests {
     fn a_failed_read_skips_the_cache() {
         let failed = Err("the pool is down".to_owned());
         assert_eq!(resolve_tenant(failed, Some("a")), CacheTenant::Skip);
+    }
+
+    fn durable() -> Peer {
+        Peer::agent(
+            "researcher",
+            "Finds facts.",
+            &AgentId::new("research", "r1").unwrap(),
+        )
+    }
+
+    /// Whether the `delegate` tool of a member shows the `sample` argument.
+    fn shows_sample(mandate: Mandate, peers: Vec<Peer>) -> bool {
+        let member = Member { mandate, peers };
+        let tool = member.delegate_tool().unwrap();
+        tool.input_schema["properties"].get("sample").is_some()
+    }
+
+    #[test]
+    fn the_delegate_tool_shows_sample_only_under_a_cap_of_two_and_a_durable_peer() {
+        let inline = Peer::new("helper", "Helps.");
+        assert!(shows_sample(
+            Mandate::new("a").max_draws(2),
+            vec![inline.clone(), durable()]
+        ));
+        assert!(!shows_sample(
+            Mandate::new("a").max_draws(1),
+            vec![durable()]
+        ));
+        assert!(!shows_sample(Mandate::new("a"), vec![durable()]));
+        assert!(!shows_sample(Mandate::new("a").max_draws(3), vec![inline]));
+        let member = Member {
+            mandate: Mandate::new("a").max_draws(4),
+            peers: vec![durable()],
+        };
+        let tool = member.delegate_tool().unwrap();
+        assert_eq!(tool.input_schema["additionalProperties"], json!(false));
+        let sample = &tool.input_schema["properties"]["sample"];
+        assert!(sample["description"].as_str().unwrap().contains('4'));
+        assert_eq!(tool.input_schema["required"], json!(["agent", "task"]));
+    }
+
+    #[test]
+    fn delegate_args_take_an_optional_sample() {
+        let plain = delegate_args(&json!({"agent": "a", "task": "t"})).unwrap();
+        assert_eq!(plain.sample, None);
+        let sampled = delegate_args(&json!({
+            "agent": "a",
+            "task": "t",
+            "sample": {"strategy": {"best_of_n": {"n": 3}}, "scorer": {"id": "table"}},
+        }))
+        .unwrap();
+        assert_eq!(sampled.sample.unwrap().strategy.draws(), 3);
+        let policy_key = json!({
+            "agent": "a",
+            "task": "t",
+            "sample": {"strategy": "single", "max_draws": 9},
+        });
+        assert_eq!(delegate_args(&policy_key), None);
+        assert_eq!(
+            delegate_args(&json!({"agent": "a", "task": "t", "n": 3})),
+            None
+        );
+    }
+
+    fn ran(draws: u32) -> DelegationRecord {
+        DelegationRecord {
+            chain: vec!["a".into(), "b".into()],
+            run_id: Some("r".into()),
+            stop: Some(AgentStop::Completed),
+            refusal: None,
+            usage: TokenUsage::default(),
+            steps_used: 0,
+            tool_calls: 0,
+            resets: 0,
+            answer_truncated: false,
+            serial: None,
+            draws,
+        }
+    }
+
+    #[test]
+    fn a_parent_counts_each_nested_delegation_and_its_draw_units() {
+        let refused = DelegationRecord {
+            run_id: None,
+            refusal: Some(Refusal::DrawsExceeded),
+            ..ran(0)
+        };
+        assert_eq!(nested_units(&[ran(0), ran(3), refused]), 1 + 4);
+        assert_eq!(nested_units(&[]), 0);
+        assert_eq!(nested_units(&[ran(u32::MAX), ran(1)]), u32::MAX);
     }
 }

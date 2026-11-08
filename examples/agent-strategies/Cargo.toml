@@ -1,0 +1,27 @@
+[package]
+name = "agent-strategies"
+description = "One task under four inference strategies, on SQLite with a scripted model"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "agent-strategies"
+path = "src/main.rs"
+
+[dependencies]
+# The backend-neutral core only: the example runs on the embedded SQLite
+# backend. The features match the agent-mesh example, so CI builds them once.
+autumn-harvest-sqlite = { version = "0.10.0", path = "../../autumn-harvest-sqlite" }
+autumn-harvest-agent = { version = "0.10.0", path = "../../autumn-harvest-agent", features = ["sqlite"] }
+futures = { workspace = true }
+serde_json = { workspace = true }
+tempfile = "3"
+tokio = { workspace = true }
+
+[lints]
+workspace = true

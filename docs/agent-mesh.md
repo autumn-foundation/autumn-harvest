@@ -507,6 +507,35 @@ fn mesh(model: Arc<dyn AgentModel>) -> Result<AgentHarness, AgentIdError> {
 - A durable peer runs on its own worker, in its own history, under its own
   profile budget. Its tokens are not added to the budget of the sender.
 
+### Ask a durable peer for a strategy
+
+The `delegate` call can carry a `sample`, an `OpSample`. The peer runs the
+message as a strategy op and replies with the selected answer.
+
+```json
+{
+  "agent": "researcher",
+  "task": "Name the year the treaty was signed.",
+  "sample": {
+    "strategy": {"best_of_n": {"n": 3}},
+    "scorer": {"id": "exact_match"}
+  }
+}
+```
+
+| Rule | What happens |
+|---|---|
+| Tool | The tool shows `sample` only when the caller mandate sets `max_draws` to 2 or more, and a listed peer is durable. |
+| Cap | The caller checks the draws against its own `max_draws`. A mandate with no `max_draws` admits one draw. The cap only narrows down the tree, so it is the lowest cap above the caller. |
+| Fan-out | The delegation takes one unit of `max_delegations`, and each draw takes one more. A best-of-3 needs 4 units. A beam checks `max_draws` only. A fan-out parent counts the draw units of each nested record. |
+| Order | A refusal comes before the send: `draws_exceeded`, then `fan_out_exhausted`. The tool result and `DelegationRecord::refusal` name it. |
+| Receiver | The receiver checks its accepted mandate and the sampling policy of its kind again. A policy refusal comes back in the `error` of the tool result. |
+| Inline peer | An inline peer refuses a strategy with `strategy_needs_durable_peer`, also inside a batch. No sampling policy covers a role. |
+| Strict mandate | The receiver decodes the envelope mandate strictly. An unknown key fails the op, so a receiver never drops a cap that a newer sender adds. The sender then waits for its reply deadline. |
+
+A worker from before strategies drops `sample` and runs one plain segment.
+The design is in [`DESIGN-2610.md`](design/DESIGN-2610.md).
+
 ## 14. A model per agent (issue #2271)
 
 The harness holds named models. A task, a peer, a profile or a heartbeat
