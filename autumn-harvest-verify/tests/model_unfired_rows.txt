@@ -238,6 +238,10 @@ source:Uuid::new_v1@Uuid
 source:Uuid::new_v4@Uuid
 source:Uuid::now_v6@Uuid
 source:Uuid::now_v7@Uuid
+# The agent loop reads this cap check only inside the closure of
+# `side_effect`, which the analyzer treats as opaque. No corpus workflow calls
+# it outside such a closure, so the row has no witness.
+source:activity_input_fits@WorkflowContext
 source:args
 source:args_os
 source:available_parallelism
