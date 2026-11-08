@@ -951,3 +951,87 @@ async fn an_extension_of_an_ended_run_is_refused() {
         "{late:?}"
     );
 }
+
+/// Starts a cancellable timer, then awaits an external activity.
+#[workflow]
+async fn timer_handle_then_external(ctx: &WorkflowContext, _n: i64) -> Result<Value, String> {
+    let _nap = ctx.start_timer("nap", 5);
+    ctx.execute_activity_external("bridge", json!({}), "camel", 60)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tokio::test]
+async fn an_unawaited_timer_handle_does_not_fire_during_the_wait() {
+    let clock = Clock::at(T0);
+    let mut rt = runtime(&clock);
+    rt.register_workflow(&timer_handle_then_external_info());
+    let exec = rt
+        .start_workflow("timer_handle_then_external", json!(0))
+        .unwrap();
+    let RunState::WaitingExternal(token) = rt.run_until_blocked(exec).await.unwrap() else {
+        panic!("expected a park");
+    };
+
+    // Past the timer duration, nothing fires. The handle has no row.
+    clock.set(T0 + 10);
+    assert!(matches!(
+        rt.run_until_blocked(exec).await.unwrap(),
+        RunState::WaitingExternal(_)
+    ));
+    assert!(rt.complete_external(token, json!("pong")).unwrap());
+    let state = rt.run_until_blocked(exec).await.unwrap();
+    assert!(
+        matches!(state, RunState::Completed(ref v) if v == &json!("pong")),
+        "{state:?}"
+    );
+}
+
+/// Polls a durable timer once and drops it, waits for a signal, then awaits
+/// an external activity. The dropped timer keeps its unfired row.
+#[workflow]
+async fn stray_timer_then_external(ctx: &WorkflowContext, _n: i64) -> Result<Value, String> {
+    {
+        let mut nap = std::pin::pin!(ctx.timer("stray", 5));
+        let _ = std::future::Future::poll(
+            nap.as_mut(),
+            &mut std::task::Context::from_waker(std::task::Waker::noop()),
+        );
+    }
+    ctx.wait_for_signal("go").await.map_err(|e| e.to_string())?;
+    ctx.execute_activity_external("bridge", json!({}), "camel", 60)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tokio::test]
+async fn an_external_activity_with_a_stray_timer_is_rejected() {
+    let clock = Clock::at(T0);
+    let mut rt = runtime(&clock);
+    rt.register_workflow(&stray_timer_then_external_info());
+    let exec = rt
+        .start_workflow("stray_timer_then_external", json!(0))
+        .unwrap();
+    assert!(matches!(
+        rt.run_until_blocked(exec).await.unwrap(),
+        RunState::WaitingSignal(_)
+    ));
+    rt.send_signal(exec, "go", json!(1)).unwrap();
+
+    // The pending timer emits its command again in this batch, so the solo
+    // rule refuses the batch before the timer can fire during the wait.
+    let err = rt.run_until_blocked(exec).await.unwrap_err();
+    assert!(
+        matches!(
+            err,
+            SqliteError::Unsupported(ref m)
+                if m.starts_with("ScheduleExternalActivity — ") && m.contains("StartTimer")
+        ),
+        "{err:?}"
+    );
+    assert_eq!(
+        rt.list_external_handoffs(&ExternalHandoffFilter::new())
+            .unwrap(),
+        Vec::new()
+    );
+}
