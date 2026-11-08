@@ -405,8 +405,8 @@ them. The cell notes say so.
 
 **Results.** On the 4-core reference box, with the database on the same
 host as the workers, one shard sustains **190.7** `capacity_noop` and
-**39.1** `capacity_canonical` workflows/s. The closed-loop cell read 41.28
-on the same commit, inside the canonical arm's 39.1 to 48.8 interval. See
+**48.8** `capacity_canonical` workflows/s. An earlier sweep reproduced the
+no-op rate and put the canonical rate one ladder step lower. See
 [`benchmarks/capacity-2026-11.md`](benchmarks/capacity-2026-11.md).
 
 ## What the shard sweep can and cannot show

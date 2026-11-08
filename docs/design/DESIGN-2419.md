@@ -146,7 +146,7 @@ the bench host today, so no multi-shard capacity cell gives a ratio yet.
 |----|----------|
 | The scenario exists in `e2e_bench.rs` with both arms. Its soundness check fails a step whose backlog grows. | `BenchScenario::Capacity`, `capacity_bench_support.rs`, `a_step_whose_backlog_grows_is_not_sustainable` |
 | A unit test pins the sustainable-rate rule. | `the_sustainable_rate_stops_at_the_first_growing_backlog`, which builds each verdict from `judge_shard` |
-| One measured run on the reference box, 1 shard, both arms. | `docs/benchmarks/capacity-2026-11.md` |
+| One measured run on the reference box, 1 shard, both arms. | `docs/benchmarks/capacity-2026-11.md`: 190.7 no-op and 48.8 canonical workflows/s, both sound |
 | `benchmarks.md` states that the closed-loop cell is latency-bound, and that co-located shard cells are not a scaling result. | `benchmarks_docs.rs` guards |
 | `comparison.md` cites the DBOS figure only next to a Harvest number from this scenario, with the hardware of each. | `capacity_docs` guards |
 

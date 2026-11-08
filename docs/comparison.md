@@ -455,7 +455,7 @@ where one exists.
   |:--|:--|--:|:--|:--|
   | DBOS, as published ([post](https://www.dbos.dev/blog/one-million-workflows), [harness](https://github.com/dbos-inc/dbos-postgres-benchmark)) | no-op | 20K workflows/s on 1 shard; 1M workflows/s on 50 shards | one db.m7i.4xlarge RDS instance (16 vCPUs) per shard | 48 worker processes per shard |
   | harvest [`capacity_noop`](benchmarks/capacity-2026-11.md) | zero activities | 190.7 workflows/s on 1 shard | one Postgres 16.15, `fsync=off`, on the bench host: 4 logical CPUs shared with the workers and the generator | 4 worker processes per shard, on the same 4 logical CPUs |
-  | harvest [`capacity_canonical`](benchmarks/capacity-2026-11.md) | 3 activities | 39.1 workflows/s on 1 shard | the same | the same |
+  | harvest [`capacity_canonical`](benchmarks/capacity-2026-11.md) | 3 activities | 48.8 workflows/s on 1 shard | the same | the same |
 
   This project has not re-run the DBOS harness. The DBOS figures are
   quoted from the post as issue #2419 cites it. The table is not a
