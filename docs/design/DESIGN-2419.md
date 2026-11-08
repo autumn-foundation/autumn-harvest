@@ -31,17 +31,17 @@ change is in the bench harness and the docs only.
 
 | # | How to make the number wrong | Mitigation |
 |---|------------------------------|------------|
-| R1 | Measure latency from the actual send. A slow generator then hides the queue (coordinated omission). | Latency starts at the scheduled arrival, not the send. |
+| R1 | Measure latency from the actual send. A slow generator then hides the queue (coordinated omission). | Each run records its schedule and its admission. The generator wait, from schedule to admission, has its own p99 limit. A late generator is never silent. |
 | R2 | Let the generator fall behind, and report the offered rate anyway. | Each step checks the achieved rate. A step below 95% of its offer, where the engine kept up, is generator-bound. The ladder stops, and the cell is unsound. |
 | R2a | Call a saturated box "generator-bound" and void a real knee. | A saturated database also slows the start calls. When the engine fell behind too, the engine reason wins. The smoke run found this case at 186 starts/s. |
-| R3 | Count a step as sustainable while its backlog grows. | The least-squares slope of the backlog must stay under 5% of the offer, with a floor of 1 run/s. |
+| R3 | Count a step as sustainable while its backlog grows. | The least-squares slope of the engine backlog must stay under 5% of the offer. There is no absolute floor, so a low rate gets no wider margin. The median latency must also grow at most 5 ms/s. |
 | R4 | Let a slow run escape the p99 because it never completed. | A run that does not complete within the drain grace fails the step. |
 | R5 | Report the last step of the ladder as the maximum when no step failed. | The cell is unsound with "the ladder ended before a step failed". |
 | R6 | Let one step's tail run into the next step. | Every step drains to zero before the next step starts. |
-| R7 | Put a co-located multi-shard cell into a scaling claim. | Each cell reports its host layout. The scaling section refuses a claim when any multi-shard cell shares a host. |
-| R8 | Mix host and database clocks in one latency. | The scheduled arrival and `completed_at` both come from the bench host clock. |
-| R9 | Leave child processes running after a panic or a timeout. | `kill_on_drop` kills each child. A child also exits on stdin EOF. |
-| R10 | Accept a noisy late-window spike as a failure, and stop the ladder early. | The p99 rule allows 2x growth plus 100 ms. A spurious failure only lowers the reported rate. It never raises it. |
+| R7 | Put a co-located multi-shard cell into a scaling claim. | Each cell reports its host layout. The scaling section judges each multi-shard cell. It prints no ratio for a cell whose shards share a database host, or whose workers share the bench host. |
+| R8 | Mix host and database clocks in one latency. | The admission and `completed_at` both come from the bench host clock. |
+| R9 | Leave child processes running after a panic or a timeout. | `kill_on_drop` kills each child. A child also exits on stdin EOF. Each child holds a census guard until it exits. |
+| R10 | Accept a noisy late-window spike as a failure, and stop the ladder early. | Each judged window holds at least 100 runs. A step that fails only on the p99 rule runs once more. |
 
 ### 0.3 Six thinking hats
 
@@ -81,25 +81,41 @@ matrix. `HARVEST_BENCH_SCENARIOS=capacity` selects both arms.
 
 ### 1.2 The step protocol
 
-1. Start `N` worker processes per shard. Wait for each one to say `ready`.
-2. Run one discarded warmup step at the first rate.
-3. For each step `k`, offer `start x 1.25^k` starts/s per shard for 20 s.
-4. Drain the step. Wait until every run completes, or 20 s pass.
-5. Load `workflow_id` and `completed_at` for the step's runs.
-6. Judge the step. Stop the ladder at the first step that is not
-   sustainable.
+1. Check that each server can hold the cell's connections.
+2. Start `N` worker processes per shard. Each one says `ready` after its
+   first pool checkout.
+3. Run one discarded warmup step at the first rate. A warmup that leaves
+   runs unfinished voids the cell.
+4. For each step `k`, offer `start x 1.25^k` starts/s per shard for 20 s.
+   Each arrival is its own task. It takes a connection from a
+   16-connection generator pool at its scheduled instant. That instant is
+   its admission.
+5. Drain the step. Wait until every run is terminal, or 20 s pass.
+6. Load `workflow_id`, `state` and `completed_at` for the step's runs.
+7. Judge the step. A step that fails only on the p99 rule runs once more.
+   Stop the ladder at the first step that is not sustainable.
 
 ### 1.3 The sustainable-rate rule
 
-A step is **sustainable** when each of these holds on every shard:
+A step splits into four equal windows by admission. The first window is
+settle time. A step is **sustainable** when each of these holds on every
+shard:
 
 * The generator held 95% or more of the offered rate.
-* The step started 200 runs or more.
+* The p99 generator wait is at most 100 ms.
+* The step started 400 runs or more, so each judged window holds 100.
 * Every run completed within the drain grace, and none failed.
-* The least-squares backlog slope over the last three quarters of the step
-  is at most `max(5% of the offer, 1 run/s)`.
-* The p99 latency of the last quarter is at most 2x the p99 of the second
-  quarter, plus 100 ms.
+* The least-squares slope of the engine backlog over the judged windows is
+  at most 5% of the offer.
+* The median latency grows at most 5 ms/s from the second window to the
+  last.
+* The p99 latency of the last window is at most 2x the p99 of the second
+  window, plus 100 ms.
+
+The engine backlog counts runs admitted and not yet complete. A run that
+waits in the generator does not count. The median rule catches a steady
+overload that stays under the slope limit. A least-squares fit of the mean
+latency would also fire on a short tail spike, so the median is used.
 
 An engine reason wins over a generator reason. A step is **generator-bound**
 only when the engine kept up and the generator missed its rate.
@@ -112,10 +128,12 @@ unsound too.
 ### 1.4 Host layout
 
 Each database cell reports its host layout. The layout counts the distinct
-hosts in the shard URLs and notes a loopback host. A cell with fewer hosts
-than shards says that its shards share a host and that it is not a scaling
-result. The run's scaling section prints no ratio when any multi-shard
-capacity cell shares a host.
+hosts in the shard URLs. Every loopback spelling counts as one host. A cell
+with fewer hosts than shards says that its shards share a host and that it
+is not a scaling result. The scaling section judges each multi-shard
+capacity cell. It prints no ratio when the cell's shards share a database
+host, or when its workers share a worker host. Every worker process runs on
+the bench host today, so no multi-shard capacity cell gives a ratio yet.
 
 ---
 
@@ -124,7 +142,30 @@ capacity cell shares a host.
 | AC | Evidence |
 |----|----------|
 | The scenario exists in `e2e_bench.rs` with both arms. Its soundness check fails a step whose backlog grows. | `BenchScenario::Capacity`, `capacity_bench_support.rs`, `a_step_whose_backlog_grows_is_not_sustainable` |
-| A unit test pins the sustainable-rate rule. | `the_sustainable_rate_stops_at_the_first_growing_backlog` |
+| A unit test pins the sustainable-rate rule. | `the_sustainable_rate_stops_at_the_first_growing_backlog`, which builds each verdict from `judge_shard` |
 | One measured run on the reference box, 1 shard, both arms. | `docs/benchmarks/capacity-2026-11.md` |
 | `benchmarks.md` states that the closed-loop cell is latency-bound, and that co-located shard cells are not a scaling result. | `benchmarks_docs.rs` guards |
 | `comparison.md` cites the DBOS figure only next to a Harvest number from this scenario, with the hardware of each. | `capacity_docs` guards |
+
+---
+
+## 3. Review round 1
+
+Three read-only reviews ran against the first commit: measurement
+soundness, process safety, and docs and guards. The first measured run used
+the first rule, so it was stopped and is not published.
+
+| Finding | Fix |
+|---------|-----|
+| A run the generator had scheduled but not sent counted as engine backlog. A slow generator then read as an engine limit. | Backlog and latency start at admission. The generator wait has its own limit. |
+| The p99 rule cannot catch a linear overload: the ratio of two windows stays under 2. | The median-growth rule. |
+| The 1 run/s floor let a 10% overload pass at 10 starts/s. | No floor. The start rates are 40 and 20. |
+| A window of 50 runs makes the p99 its maximum. | 400 runs per step. One retry for a tail-only failure. |
+| Warmup leftovers ran inside step 0. | A warmup that leaves runs unfinished voids the cell. |
+| The scaling check saw database hosts only. | It also needs one worker host per shard. |
+| `localhost` and `127.0.0.1` counted as two hosts. | Every loopback spelling is one host. |
+| A worker that died inside a live child went unnoticed. | The child selects on stdin and on the worker. It exits non-zero when the worker stops. It says `ready` after a pool checkout. |
+| A shared server could run out of connections. | The cell checks `max_connections` first. |
+| Children were not in the task census. | Each child holds a census guard until it exits. |
+| Children inherited the commit probe, and a stdout write could block. | `env_remove` for the probe, and the parent drains stdout. |
+| The comparison guard could pass on a stray number or a whole table. | Exact numbers, the arm id, the results link and case-insensitive hardware in the same block. |

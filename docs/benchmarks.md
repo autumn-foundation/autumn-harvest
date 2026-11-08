@@ -219,7 +219,7 @@ HARVEST_BENCH_SCENARIOS=signal_roundtrip HARVEST_BENCH_SHARDS=1 cargo xtask benc
 | `HARVEST_BENCH_INFLIGHT` | closed-loop in-flight workflows per shard — the load level. `throughput` only |
 | `HARVEST_BENCH_WORKFLOWS` | measured completions per shard. `throughput` only |
 | `HARVEST_BENCH_CLAIM_LOOPS` | claim loops per worker; unset keeps the worker default. The [resident hit-rate record](rnd/2026-10-11-resident-hit-rate.md) compares `1` against the default |
-| `HARVEST_BENCH_WORKER_PROCESSES` | worker processes per shard. Capacity arms only; the default is 4 |
+| `HARVEST_BENCH_WORKER_PROCESSES` | worker processes per shard. Capacity arms only; the default is 4. Each process adds 33 connections per shard, and a cell refuses to run past `max_connections` |
 | `HARVEST_BENCH_CHECK` | also print the reproduction verdict |
 | `HARVEST_BENCH_KEEP` | leave the containers running afterwards |
 | `HARVEST_BENCH_OUT` | write the report somewhere other than `benchmarks/results/` |
@@ -345,42 +345,56 @@ HARVEST_BENCH_SCENARIOS=capacity HARVEST_BENCH_SHARDS=1 cargo xtask bench run
 
 * Each shard has 4 worker processes. Each process is the bench binary run
   again as one worker, with its own runtime and its own pool. So the claim
-  path sees fleet contention.
-* Four generator connections per shard start runs on an open loop. Run `k`
-  of a step is scheduled at `k / rate` seconds. A late start call does not
-  move its schedule.
-* A step lasts 20 s. The first step offers 20 starts/s per shard for
-  `capacity_noop` and 10 for `capacity_canonical`. Each next step offers
-  1.25 times more. One discarded warmup step runs first.
-* After its arrivals, a step drains for up to 20 s. The next step starts
-  from an empty backlog.
-* Latency runs from the scheduled arrival to `completed_at`. Both come from
-  the bench host clock. A slow generator therefore adds latency. It never
-  hides a queue.
+  path sees fleet contention. A process that loses its worker exits, and
+  the cell is then not published.
+* Each arrival is its own task. Run `k` of a step is scheduled at
+  `k / rate` seconds. At that instant it takes a connection from a
+  16-connection generator pool per shard. That instant is its
+  **admission**. A slow start call never moves a later schedule.
+* A step lasts 20 s. The first step offers 40 starts/s per shard for
+  `capacity_noop` and 20 for `capacity_canonical`. Each next step offers
+  1.25 times more. One discarded warmup step runs first. A warmup that
+  leaves runs unfinished voids the cell.
+* After its arrivals, a step drains for up to 20 s. A run that does not
+  finish in that time fails the step.
+* Engine latency runs from admission to `completed_at`. The engine backlog
+  counts runs admitted and not yet complete. Both times come from the
+  bench host clock. The generator wait, from schedule to admission, is
+  judged on its own.
 
-**The rule.** A step is sustainable when, on every shard:
+**The rule.** The rule judges each step in four equal windows. The first
+window is settle time. A step is sustainable when, on every shard:
 
 * the generator achieved at least 95% of the offered rate,
-* the step started at least 200 runs,
+* the p99 generator wait is at most 100 ms,
+* the step started at least 400 runs, so each judged window holds at least
+  100,
 * every run completed within the drain grace, and none failed,
-* the least-squares slope of the backlog over the last three quarters of
-  the step is at most 5% of the offered rate, with a floor of 1 run/s, and
-* the p99 of the last quarter is at most 2 times the p99 of the second
-  quarter, plus 100 ms.
+* the least-squares slope of the engine backlog over the judged windows is
+  at most 5% of the offered rate,
+* the median latency grows at most 5 ms per second from the second window
+  to the last, and
+* the p99 of the last window is at most 2 times the p99 of the second
+  window, plus 100 ms.
 
-A saturated database also slows the start calls. So when the engine falls
-behind and the generator misses its rate in one step, the engine failure
-wins. A step is generator-bound only when the engine kept up.
+A failed generator check makes the step generator-bound only when the
+engine kept up. A saturated database also slows the start calls, so an
+engine failure in the same step wins. A step that fails only on the p99
+check runs once more at the same rate, and the second verdict counts. One
+pause in a small window then cannot stop the ladder.
 
 The ladder stops at the first step that is not sustainable. The sustainable
 rate is the step before it. The cell is not published when the first step
 fails, when the generator stops the ladder, or when the ladder ends with no
 failed step. In the last case the rate is only a lower bound.
 
-**Hardware.** A cell needs about 140 connections per shard. The compose
-services allow 200. The generator and the workers run on the bench host. A
-loopback database therefore shares its CPUs with them. The cell notes say
-so.
+**Hardware.** Each worker process opens a 32-connection pool and one
+listener. So one shard needs 4 x 33 + 16 + 4 = 152 connections. A cell
+checks `max_connections` before it starts and refuses to run when the
+server cannot hold it. The compose services allow 200, which leaves room
+for up to 5 worker processes per shard, not 6. The generator and the workers run
+on the bench host. A loopback database therefore shares its CPUs with
+them. The cell notes say so.
 
 Results: [`benchmarks/capacity-2026-11.md`](benchmarks/capacity-2026-11.md).
 
@@ -402,7 +416,8 @@ shard scaling. Each database cell prints its host layout: the number of
 distinct database hosts in its shard URLs. A cell with fewer hosts than
 shards says that its shards share a host. The run's shard-scaling section
 prints no ratio for such a cell. A scaling claim needs one database host
-per shard.
+per shard. The workers of every capacity cell also run on the bench host,
+so that section prints no ratio for any multi-shard cell yet.
 
 ## Known limitations
 

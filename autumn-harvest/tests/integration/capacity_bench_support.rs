@@ -9,7 +9,7 @@
 
 #![allow(dead_code)]
 
-use super::e2e_bench_support::{BenchScenario, CapacityArm, ScenarioReport};
+use super::e2e_bench_support::{BenchScenario, CapacityArm, POOL_SIZE_PER_SHARD, ScenarioReport};
 
 // ---------------------------------------------------------------------------
 // Pure section. No database and no `db` feature.
@@ -23,27 +23,35 @@ pub const CAPACITY_RATE_MULTIPLIER: f64 = 1.25;
 pub const CAPACITY_MAX_STEPS: usize = 20;
 /// Time a step's runs get to complete after its last arrival.
 pub const CAPACITY_DRAIN_GRACE_SECS: u64 = 20;
-/// Fewest runs a step must start before a verdict can rest on it.
-pub const CAPACITY_MIN_STEP_RUNS: usize = 200;
+/// Fewest runs a step must start before a verdict can rest on it. Each
+/// judged window then holds at least 100 runs, so its p99 is not its maximum.
+pub const CAPACITY_MIN_STEP_RUNS: usize = 400;
+// Each judged window holds at least 100 runs, so its p99 is not its maximum.
+const _: () = assert!(CAPACITY_MIN_STEP_RUNS / CAPACITY_WINDOWS >= 100);
+
 /// Fraction of the offered rate the generator must achieve.
 pub const CAPACITY_PACING_HOLD_RATIO: f64 = 0.95;
-/// Largest backlog slope, as a fraction of the offered rate.
+/// Largest backlog slope, as a fraction of the offered rate. It has no
+/// absolute floor, so a low rate gets no wider margin.
 pub const CAPACITY_MAX_BACKLOG_GROWTH_FRACTION: f64 = 0.05;
-/// Floor of the backlog-slope limit, in runs per second.
-pub const CAPACITY_MIN_BACKLOG_GROWTH_PER_SEC: f64 = 1.0;
 /// Largest growth of the p99 from the first judged window to the last.
 pub const CAPACITY_MAX_P99_GROWTH_RATIO: f64 = 2.0;
 /// Absolute slack added to the p99 growth limit, in milliseconds.
 pub const CAPACITY_P99_GROWTH_SLACK_MS: f64 = 100.0;
-/// Equal windows a step is split into by scheduled arrival. The first one is
-/// settle time and is not judged.
+/// Equal windows of a step, by admission. The first window is settle time.
+/// The rule does not judge it.
 pub const CAPACITY_WINDOWS: usize = 4;
 /// Interval of the derived backlog series, in seconds.
 pub const CAPACITY_BACKLOG_SAMPLE_SECS: f64 = 0.1;
+/// Largest growth of the median latency across the judged windows, in ms per
+/// second of step.
+pub const CAPACITY_MAX_LATENCY_GROWTH_MS_PER_SEC: f64 = 5.0;
+/// Largest p99 generator wait, from schedule to admission, in milliseconds.
+pub const CAPACITY_MAX_GENERATOR_WAIT_MS: f64 = 100.0;
+/// Connections in the generator pool of each shard.
+pub const CAPACITY_GENERATOR_CONNECTIONS_PER_SHARD: usize = 16;
 /// Worker processes started per shard.
 pub const CAPACITY_WORKER_PROCESSES_PER_SHARD: usize = 4;
-/// Connections the generator starts runs over, per shard.
-pub const CAPACITY_GENERATOR_LANES_PER_SHARD: usize = 4;
 /// Override of [`CAPACITY_WORKER_PROCESSES_PER_SHARD`].
 pub const WORKER_PROCESSES_ENV_VAR: &str = "HARVEST_BENCH_WORKER_PROCESSES";
 
@@ -53,8 +61,8 @@ pub const WORKER_PROCESSES_ENV_VAR: &str = "HARVEST_BENCH_WORKER_PROCESSES";
 #[must_use]
 pub const fn start_rate_per_shard(arm: CapacityArm) -> f64 {
     match arm {
-        CapacityArm::Noop => 20.0,
-        CapacityArm::Canonical => 10.0,
+        CapacityArm::Noop => 40.0,
+        CapacityArm::Canonical => 20.0,
     }
 }
 
@@ -66,10 +74,16 @@ pub fn ladder_rate(start: f64, step: usize) -> f64 {
 }
 
 /// One run of a step, in seconds after the step began.
+#[allow(
+    clippy::struct_field_names,
+    reason = "each field is an instant, and the suffix names its unit"
+)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Arrival {
     /// The instant the open loop scheduled the start.
     pub scheduled_secs: f64,
+    /// The instant the generator began the start call on a connection.
+    pub admitted_secs: f64,
     /// The instant the run completed, or `None` when it did not complete
     /// within the drain grace.
     pub completed_secs: Option<f64>,
@@ -90,12 +104,15 @@ pub struct StepEvidence {
     pub failed: usize,
 }
 
-/// Runs scheduled at or before `t` that had not completed at `t`.
+/// Runs admitted at or before `t` that had not completed at `t`.
+///
+/// This is the engine's backlog. A run the generator has scheduled but not
+/// yet admitted waits in the generator, so it does not count here.
 #[must_use]
 pub fn backlog_at(arrivals: &[Arrival], t: f64) -> usize {
     arrivals
         .iter()
-        .filter(|a| a.scheduled_secs <= t && a.completed_secs.is_none_or(|done| done > t))
+        .filter(|a| a.admitted_secs <= t && a.completed_secs.is_none_or(|done| done > t))
         .count()
 }
 
@@ -150,7 +167,14 @@ pub fn least_squares_slope(points: &[(f64, f64)]) -> Option<f64> {
 /// never completed, so it ranks above every finite latency.
 #[must_use]
 pub fn p99_ms(latencies_secs: &[Option<f64>]) -> Option<f64> {
-    if latencies_secs.is_empty() {
+    percentile_ms(latencies_secs, 0.99)
+}
+
+/// The nearest-rank `quantile` of `latencies_secs`, in milliseconds. A `None`
+/// entry ranks above every finite latency.
+#[must_use]
+pub fn percentile_ms(latencies_secs: &[Option<f64>], quantile: f64) -> Option<f64> {
+    if latencies_secs.is_empty() || !(0.0..=1.0).contains(&quantile) {
         return None;
     }
     let mut ranked: Vec<f64> = latencies_secs
@@ -158,26 +182,44 @@ pub fn p99_ms(latencies_secs: &[Option<f64>]) -> Option<f64> {
         .map(|l| l.map_or(f64::INFINITY, |secs| secs * 1000.0))
         .collect();
     ranked.sort_by(f64::total_cmp);
-    // Nearest rank: the smallest value with 99% of the set at or below it.
+    // Nearest rank: the smallest value with the quantile at or below it.
     #[allow(
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
         clippy::cast_precision_loss,
         reason = "the rank is positive and at most the set size"
     )]
-    let rank = (0.99 * ranked.len() as f64).ceil() as usize;
+    let rank = (quantile * ranked.len() as f64).ceil() as usize;
     ranked.get(rank.saturating_sub(1)).copied()
 }
 
 /// The p99 latency of each window of a step, in milliseconds.
 ///
-/// A step splits into [`CAPACITY_WINDOWS`] equal windows by scheduled
-/// arrival. A window with no arrival has no p99.
+/// A step splits into [`CAPACITY_WINDOWS`] equal windows by admission.
+/// Latency runs from admission to completion. A window with no run has no
+/// p99.
 #[must_use]
 pub fn window_p99_ms(arrivals: &[Arrival], step_secs: f64) -> Vec<Option<f64>> {
+    window_latencies(arrivals, step_secs)
+        .iter()
+        .map(|w| p99_ms(w))
+        .collect()
+}
+
+/// The median latency of each window of a step, in milliseconds.
+#[must_use]
+pub fn window_p50_ms(arrivals: &[Arrival], step_secs: f64) -> Vec<Option<f64>> {
+    window_latencies(arrivals, step_secs)
+        .iter()
+        .map(|w| percentile_ms(w, 0.5))
+        .collect()
+}
+
+/// The latencies of each window, grouped by admission.
+fn window_latencies(arrivals: &[Arrival], step_secs: f64) -> Vec<Vec<Option<f64>>> {
     let mut windows: Vec<Vec<Option<f64>>> = vec![Vec::new(); CAPACITY_WINDOWS];
     if step_secs.is_nan() || step_secs <= 0.0 {
-        return vec![None; CAPACITY_WINDOWS];
+        return windows;
     }
     #[allow(clippy::cast_precision_loss, reason = "the window count is small")]
     let width = step_secs / CAPACITY_WINDOWS as f64;
@@ -187,11 +229,10 @@ pub fn window_p99_ms(arrivals: &[Arrival], step_secs: f64) -> Vec<Option<f64>> {
             clippy::cast_sign_loss,
             reason = "the quotient is clamped to the window range"
         )]
-        let index =
-            ((a.scheduled_secs / width).floor().max(0.0) as usize).min(CAPACITY_WINDOWS - 1);
-        windows[index].push(a.completed_secs.map(|done| done - a.scheduled_secs));
+        let index = ((a.admitted_secs / width).floor().max(0.0) as usize).min(CAPACITY_WINDOWS - 1);
+        windows[index].push(a.completed_secs.map(|done| done - a.admitted_secs));
     }
-    windows.iter().map(|w| p99_ms(w)).collect()
+    windows
 }
 
 /// What one shard's evidence shows for one step.
@@ -205,9 +246,23 @@ pub struct ShardJudgement {
     pub engine: Vec<String>,
     /// Reasons the generator did not offer the load.
     pub generator: Vec<String>,
+    /// Growth of the median latency across the judged windows, in ms per
+    /// second.
+    pub median_growth: Option<f64>,
+    /// p99 of the generator wait, from schedule to admission, in ms.
+    pub generator_wait_p99_ms: Option<f64>,
+    /// Runs that did not complete within the drain grace.
+    pub unfinished: usize,
+    /// Whether the only engine reason is the p99 growth rule.
+    pub tail_only: bool,
 }
 
 /// Judge one shard's evidence for one step.
+///
+/// The generator side asks whether the load was offered. The engine side
+/// asks whether the engine kept up with the load it was given. Engine
+/// latency and backlog start at admission. The generator wait, from schedule
+/// to admission, is judged on the generator side.
 #[must_use]
 pub fn judge_shard(evidence: &StepEvidence) -> ShardJudgement {
     let mut generator = Vec::new();
@@ -230,6 +285,13 @@ pub fn judge_shard(evidence: &StepEvidence) -> ShardJudgement {
             evidence.arrivals.len(),
         ));
     }
+    let generator_wait_p99_ms = generator_wait_p99_ms(&evidence.arrivals);
+    if let Some(wait) = generator_wait_p99_ms.filter(|w| *w > CAPACITY_MAX_GENERATOR_WAIT_MS) {
+        generator.push(format!(
+            "the generator wait p99 was {wait:.1} ms, over the \
+             {CAPACITY_MAX_GENERATOR_WAIT_MS:.0} ms limit"
+        ));
+    }
 
     let unfinished = evidence
         .arrivals
@@ -247,16 +309,15 @@ pub fn judge_shard(evidence: &StepEvidence) -> ShardJudgement {
 
     // The first window is settle time. The judged span is the rest.
     #[allow(clippy::cast_precision_loss, reason = "the window count is small")]
-    let settle = evidence.step_secs / CAPACITY_WINDOWS as f64;
+    let width = evidence.step_secs / CAPACITY_WINDOWS as f64;
     let series = backlog_series(
         &evidence.arrivals,
-        settle,
+        width,
         evidence.step_secs,
         CAPACITY_BACKLOG_SAMPLE_SECS,
     );
     let backlog_slope = least_squares_slope(&series);
-    let limit =
-        (offered * CAPACITY_MAX_BACKLOG_GROWTH_FRACTION).max(CAPACITY_MIN_BACKLOG_GROWTH_PER_SEC);
+    let limit = offered * CAPACITY_MAX_BACKLOG_GROWTH_FRACTION;
     match backlog_slope {
         Some(slope) if slope > limit => engine.push(format!(
             "the backlog grew {slope:.2} runs/s, over the {limit:.2} runs/s limit"
@@ -265,22 +326,106 @@ pub fn judge_shard(evidence: &StepEvidence) -> ShardJudgement {
         None => engine.push("the backlog series has too few samples for a slope".to_owned()),
     }
 
+    let medians = window_p50_ms(&evidence.arrivals, evidence.step_secs);
+    #[allow(clippy::cast_precision_loss, reason = "the window count is small")]
+    let spacing = width * (CAPACITY_WINDOWS - 2) as f64;
+    let median_growth = match (medians.get(1), medians.last()) {
+        (Some(Some(first)), Some(Some(last))) if spacing > 0.0 => Some((last - first) / spacing),
+        _ => None,
+    };
+    if let Some(growth) = median_growth.filter(|g| *g > CAPACITY_MAX_LATENCY_GROWTH_MS_PER_SEC) {
+        engine.push(format!(
+            "the median latency grew {growth:.1} ms/s, over the \
+             {CAPACITY_MAX_LATENCY_GROWTH_MS_PER_SEC:.0} ms/s limit"
+        ));
+    }
+
     let windows = window_p99_ms(&evidence.arrivals, evidence.step_secs);
+    let mut tail_failed = false;
     if let (Some(Some(first)), Some(Some(last))) = (windows.get(1), windows.last()) {
-        let ceiling = first * CAPACITY_MAX_P99_GROWTH_RATIO + CAPACITY_P99_GROWTH_SLACK_MS;
+        let ceiling = first.mul_add(CAPACITY_MAX_P99_GROWTH_RATIO, CAPACITY_P99_GROWTH_SLACK_MS);
         if *last > ceiling {
+            tail_failed = true;
             engine.push(format!(
                 "the p99 grew from {first:.1} ms to {last:.1} ms, over the {ceiling:.1} ms limit"
             ));
         }
     }
+    let tail_only = tail_failed && engine.len() == 1;
 
     ShardJudgement {
         backlog_slope,
         window_p99_ms: windows,
         engine,
         generator,
+        median_growth,
+        generator_wait_p99_ms,
+        unfinished,
+        tail_only,
     }
+}
+
+/// p99 of the generator wait, from schedule to admission, in milliseconds.
+#[must_use]
+pub fn generator_wait_p99_ms(arrivals: &[Arrival]) -> Option<f64> {
+    let waits: Vec<Option<f64>> = arrivals
+        .iter()
+        .map(|a| Some((a.admitted_secs - a.scheduled_secs).max(0.0)))
+        .collect();
+    p99_ms(&waits)
+}
+
+/// Whether a failed step runs once more at the same rate.
+///
+/// A step whose only failure is the p99 rule can be one pause in a small
+/// window. It runs once more, and the second verdict counts. A backlog or
+/// median failure never earns a retry.
+#[must_use]
+pub fn step_retryable(judgements: &[ShardJudgement]) -> bool {
+    let failing: Vec<&ShardJudgement> =
+        judgements.iter().filter(|j| !j.engine.is_empty()).collect();
+    !failing.is_empty() && failing.iter().all(|j| j.tail_only)
+}
+
+/// Reasons a warmup step leaves the cell unsound.
+#[must_use]
+pub fn warmup_drain_reasons(judgements: &[ShardJudgement]) -> Vec<String> {
+    let unfinished: usize = judgements.iter().map(|j| j.unfinished).sum();
+    if unfinished == 0 {
+        return Vec::new();
+    }
+    vec![format!(
+        "the warmup left {unfinished} runs unfinished, so they ran inside the first step"
+    )]
+}
+
+/// Connections one shard of a capacity cell needs.
+///
+/// Each worker process has a full pool and one listener. The generator has
+/// its own pool. Four more cover the lease, the drain and the load.
+#[must_use]
+pub const fn connection_need_per_shard(processes: usize) -> usize {
+    processes * (POOL_SIZE_PER_SHARD + 1) + CAPACITY_GENERATOR_CONNECTIONS_PER_SHARD + 4
+}
+
+/// Reasons a server cannot hold a cell's connections.
+///
+/// A pool that cannot open a connection stalls its workers. The ladder would
+/// then publish a starved rate, so the cell refuses to run.
+#[must_use]
+pub fn connection_budget_reasons(
+    need: usize,
+    max_connections: usize,
+    reserved: usize,
+) -> Vec<String> {
+    let usable = max_connections.saturating_sub(reserved);
+    if need <= usable {
+        return Vec::new();
+    }
+    vec![format!(
+        "the cell needs {need} connections on one server, over the {usable} that \
+         max_connections leaves; raise max_connections or lower {WORKER_PROCESSES_ENV_VAR}"
+    )]
 }
 
 /// The verdict on one step.
@@ -365,8 +510,8 @@ pub struct LadderResult {
 /// The sustainable rate of a ladder.
 ///
 /// It is the offer of the last step in the leading run of sustainable steps.
-/// A sustainable step after the first failure does not count: a ladder is
-/// judged in order, and a noisy pass above the knee is not capacity.
+/// The ladder judges steps in order. A sustainable step after the first
+/// failure does not count. A noisy pass above the knee is not capacity.
 #[must_use]
 pub fn sustainable_rate(steps: &[StepRecord], max_steps: usize) -> LadderResult {
     let mut last_sustainable = None;
@@ -422,12 +567,14 @@ pub fn ladder_soundness(result: &LadderResult) -> Vec<String> {
 pub const SUSTAINABLE_METRIC: &str = "sustainable_per_sec";
 /// Metric key of the distinct database hosts of a capacity cell.
 pub const DATABASE_HOSTS_METRIC: &str = "database_hosts";
+/// Metric key of the distinct worker hosts of a capacity cell.
+pub const WORKER_HOSTS_METRIC: &str = "worker_hosts";
 
 /// The shard-scaling lines of a run.
 ///
-/// A ratio is printed only for sound capacity cells. A multi-shard cell whose
-/// shards share a host gives no ratio, so it never appears in a scaling
-/// claim.
+/// A ratio is printed only for sound capacity cells. A multi-shard cell gives
+/// no ratio when its shards share a database host, or its workers share a
+/// worker host. So a co-located cell never appears in a scaling claim.
 #[must_use]
 pub fn scaling_lines(reports: &[ScenarioReport]) -> Vec<String> {
     let mut lines = Vec::new();
@@ -441,6 +588,7 @@ pub fn scaling_lines(reports: &[ScenarioReport]) -> Vec<String> {
         for cell in cells.iter().filter(|r| r.shards > 1) {
             let shards = cell.shards;
             let hosts = cell.metric(DATABASE_HOSTS_METRIC).unwrap_or(0.0);
+            let worker_hosts = cell.metric(WORKER_HOSTS_METRIC).unwrap_or(0.0);
             let rate = cell.metric(SUSTAINABLE_METRIC);
             let line = match (base, rate) {
                 _ if !cell.is_sound() => {
@@ -449,6 +597,10 @@ pub fn scaling_lines(reports: &[ScenarioReport]) -> Vec<String> {
                 _ if hosts < f64::from(shards) => {
                     format!("{id}: no scaling claim at {shards} shards: the shards share a host")
                 }
+                _ if worker_hosts < f64::from(shards) => format!(
+                    "{id}: no scaling claim at {shards} shards: the workers of every shard share \
+                     the bench host"
+                ),
                 (None, _) => format!(
                     "{id}: no scaling claim at {shards} shards: the 1-shard cell has no sound rate"
                 ),
@@ -564,6 +716,7 @@ mod tests {
                 let at = k as f64 / rate;
                 Arrival {
                     scheduled_secs: at,
+                    admitted_secs: at,
                     completed_secs: Some(at + latency),
                 }
             })
@@ -582,7 +735,26 @@ mod tests {
                 free_at = done;
                 Arrival {
                     scheduled_secs: at,
+                    admitted_secs: at,
                     completed_secs: Some(done),
+                }
+            })
+            .collect()
+    }
+
+    /// Arrivals offered at `offered` per second that the generator admits at
+    /// only `ratio` of that rate. The engine completes each run `latency`
+    /// seconds after its admission.
+    fn lagging_generator(offered: f64, ratio: f64, secs: f64, latency: f64) -> Vec<Arrival> {
+        let n = (offered * secs).round() as usize;
+        (0..n)
+            .map(|k| {
+                let at = k as f64 / offered;
+                let admitted = k as f64 / (offered * ratio);
+                Arrival {
+                    scheduled_secs: at,
+                    admitted_secs: admitted,
+                    completed_secs: Some(admitted + latency),
                 }
             })
             .collect()
@@ -705,8 +877,99 @@ mod tests {
     }
 
     #[test]
+    fn a_queue_in_the_generator_is_not_engine_backlog() {
+        // The generator admits only 90% of the offer. The engine completes
+        // every admitted run in 0.2 s, so the engine kept up.
+        let mut e = evidence(50.0, lagging_generator(50.0, 0.9, CAPACITY_STEP_SECS, 0.2));
+        e.achieved_per_sec = 45.0;
+        let judged = judge_shard(&e);
+        assert_eq!(judged.engine, Vec::<String>::new());
+        assert!(
+            judged.generator.iter().any(|r| r.contains("wait")),
+            "{judged:?}"
+        );
+        assert!(matches!(
+            step_verdict(&[judged]),
+            StepVerdict::GeneratorBound(_)
+        ));
+    }
+
+    #[test]
+    fn a_five_percent_overload_fails_on_the_median_growth() {
+        // A 5% overload stays just under the backlog-slope limit.
+        let judged = judge_shard(&evidence(50.0, overloaded(50.0, 47.7, CAPACITY_STEP_SECS)));
+        let growth = judged.median_growth.expect("a median growth");
+        assert!(growth > CAPACITY_MAX_LATENCY_GROWTH_MS_PER_SEC, "{growth}");
+        assert!(
+            judged.engine.iter().any(|r| r.contains("latency grew")),
+            "{judged:?}"
+        );
+    }
+
+    #[test]
+    fn a_ten_percent_overload_at_the_lowest_start_rate_fails() {
+        let offered = start_rate_per_shard(CapacityArm::Canonical);
+        let judged = judge_shard(&evidence(
+            offered,
+            overloaded(offered, offered / 1.1, CAPACITY_STEP_SECS),
+        ));
+        assert!(
+            judged.engine.iter().any(|r| r.contains("backlog grew")),
+            "{judged:?}"
+        );
+    }
+
+    #[test]
+    fn a_tail_spike_alone_earns_one_retry_and_an_overload_does_not() {
+        let mut arrivals = steady(50.0, CAPACITY_STEP_SECS, 0.2);
+        for a in arrivals.iter_mut().rev().take(15) {
+            a.completed_secs = a.completed_secs.map(|c| c + 2.0);
+        }
+        let spike = judge_shard(&evidence(50.0, arrivals));
+        assert!(spike.tail_only, "{spike:?}");
+        assert!(step_retryable(&[spike]));
+        let overload = judge_shard(&evidence(50.0, overloaded(50.0, 40.0, CAPACITY_STEP_SECS)));
+        assert!(!overload.tail_only);
+        assert!(!step_retryable(&[overload]));
+        let sound = judge_shard(&evidence(50.0, steady(50.0, CAPACITY_STEP_SECS, 0.2)));
+        assert!(
+            !step_retryable(&[sound]),
+            "a sustainable step needs no retry"
+        );
+    }
+
+    #[test]
+    fn a_warmup_that_did_not_drain_voids_the_cell() {
+        let mut arrivals = steady(50.0, CAPACITY_STEP_SECS, 0.2);
+        arrivals[3].completed_secs = None;
+        let judged = judge_shard(&evidence(50.0, arrivals));
+        let reasons = warmup_drain_reasons(&[judged]);
+        assert!(reasons.iter().any(|r| r.contains("warmup")), "{reasons:?}");
+        let clean = judge_shard(&evidence(50.0, steady(50.0, CAPACITY_STEP_SECS, 0.2)));
+        assert_eq!(warmup_drain_reasons(&[clean]), Vec::<String>::new());
+    }
+
+    #[test]
+    fn the_connection_need_counts_every_process_pool_and_the_generator() {
+        let need = connection_need_per_shard(4);
+        assert_eq!(
+            need,
+            4 * (POOL_SIZE_PER_SHARD + 1) + CAPACITY_GENERATOR_CONNECTIONS_PER_SHARD + 4
+        );
+        assert_eq!(
+            connection_budget_reasons(need, 200, 3),
+            Vec::<String>::new()
+        );
+        let reasons = connection_budget_reasons(2 * need, 200, 3);
+        assert!(
+            reasons.iter().any(|r| r.contains("max_connections")),
+            "{reasons:?}"
+        );
+    }
+
+    #[test]
     fn a_thin_step_is_generator_bound() {
-        let e = evidence(5.0, steady(5.0, CAPACITY_STEP_SECS, 0.2));
+        let e = evidence(10.0, steady(10.0, CAPACITY_STEP_SECS, 0.2));
         let judged = judge_shard(&e);
         assert!(
             judged.generator.iter().any(|r| r.contains("runs")),
@@ -729,14 +992,24 @@ mod tests {
 
     #[test]
     fn the_sustainable_rate_stops_at_the_first_growing_backlog() {
-        let steps = [
-            record(10.0, StepVerdict::Sustainable),
-            record(12.5, StepVerdict::Sustainable),
-            record(15.6, engine_fail()),
-            record(19.5, StepVerdict::Sustainable),
-        ];
+        // Each verdict comes from the real rule. A server that completes 45
+        // runs/s keeps up with 20 and 25, falls behind 50, and keeps up again
+        // with a lighter step after the knee.
+        let judged = |offered: f64| {
+            let arrivals = if offered < 45.0 {
+                steady(offered, CAPACITY_STEP_SECS, 0.2)
+            } else {
+                overloaded(offered, 45.0, CAPACITY_STEP_SECS)
+            };
+            record(
+                offered,
+                step_verdict(&[judge_shard(&evidence(offered, arrivals))]),
+            )
+        };
+        let steps = [judged(20.0), judged(25.0), judged(50.0), judged(30.0)];
+        assert!(matches!(steps[2].verdict, StepVerdict::Unsustainable(_)));
         let result = sustainable_rate(&steps, CAPACITY_MAX_STEPS);
-        assert_eq!(result.sustainable_per_shard, Some(12.5));
+        assert_eq!(result.sustainable_per_shard, Some(25.0));
         assert_eq!(result.stop, LadderStop::EngineBound);
         assert_eq!(ladder_soundness(&result), Vec::<String>::new());
     }
@@ -809,14 +1082,17 @@ mod tests {
         let arrivals = [
             Arrival {
                 scheduled_secs: 0.0,
+                admitted_secs: 0.0,
                 completed_secs: Some(1.0),
             },
             Arrival {
                 scheduled_secs: 0.5,
+                admitted_secs: 0.5,
                 completed_secs: None,
             },
             Arrival {
                 scheduled_secs: 2.0,
+                admitted_secs: 2.0,
                 completed_secs: Some(2.5),
             },
         ];
@@ -864,6 +1140,13 @@ mod tests {
     }
 
     fn capacity_cell(shards: u32, rate: f64, hosts: f64) -> ScenarioReport {
+        let mut cell = capacity_cell_on(shards, rate, hosts);
+        cell.metrics
+            .push(Metric::new(WORKER_HOSTS_METRIC, Some(f64::from(shards))));
+        cell
+    }
+
+    fn capacity_cell_on(shards: u32, rate: f64, hosts: f64) -> ScenarioReport {
         ScenarioReport {
             scenario: BenchScenario::Capacity(CapacityArm::Noop),
             shards,
@@ -890,6 +1173,17 @@ mod tests {
     fn cells_on_their_own_hosts_give_a_ratio() {
         let lines = scaling_lines(&[capacity_cell(1, 100.0, 1.0), capacity_cell(2, 190.0, 2.0)]);
         assert!(lines.iter().any(|l| l.contains("1.90x")), "{lines:?}");
+    }
+
+    #[test]
+    fn a_cell_whose_workers_share_the_bench_host_gives_no_ratio() {
+        let mut shared = capacity_cell_on(2, 190.0, 2.0);
+        shared
+            .metrics
+            .push(Metric::new(WORKER_HOSTS_METRIC, Some(1.0)));
+        let lines = scaling_lines(&[capacity_cell(1, 100.0, 1.0), shared]);
+        assert!(lines.iter().all(|l| !l.contains("x the")), "{lines:?}");
+        assert!(lines.iter().any(|l| l.contains("workers")), "{lines:?}");
     }
 
     #[test]
@@ -962,40 +1256,45 @@ pub mod db {
 
     use chrono::{DateTime, Utc};
     use diesel::QueryableByName;
-    use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+    use diesel_async::{AsyncPgConnection, RunQueryDsl};
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
     use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
+    use autumn_harvest::lifecycle::WorkflowState;
     use autumn_harvest::start_or_load_workflow_execution;
     use autumn_harvest::types::{ExecutionId, ShardId};
 
     use super::super::e2e_bench_support::db::{
-        self as e2e, ShardCluster, SkipReason, budget_note, scenario_deadline, start_params,
-        with_teardown_note,
+        self as e2e, ShardCluster, SkipReason, Topology, budget_note, scenario_deadline,
+        start_params, with_teardown_note,
     };
     use super::super::e2e_bench_support::{
-        BENCH_NOOP_WORKFLOW, BENCH_WORKFLOW, BenchScenario, CapacityArm, Metric, ScenarioReport,
-        TaskCensus, positive_override,
+        BENCH_NOOP_WORKFLOW, BENCH_WORKFLOW, BenchScenario, COMMIT_PROBE_ENV_VAR, CapacityArm,
+        CensusGuard, Metric, ScenarioReport, TaskCensus, positive_override,
     };
     use super::{
-        Arrival, CAPACITY_DRAIN_GRACE_SECS, CAPACITY_GENERATOR_LANES_PER_SHARD, CAPACITY_MAX_STEPS,
-        CAPACITY_STEP_SECS, CAPACITY_WORKER_PROCESSES_PER_SHARD, CHILD_ENV_VAR, CHILD_READY_LINE,
-        CHILD_URLS_ENV_VAR, DATABASE_HOSTS_METRIC, SUSTAINABLE_METRIC, ShardJudgement,
-        StepEvidence, StepRecord, StepVerdict, WORKER_PROCESSES_ENV_VAR, encode_child_spec,
-        encode_child_urls, judge_shard, ladder_rate, ladder_soundness, p99_ms, parse_child_spec,
-        parse_child_urls, start_rate_per_shard, step_verdict, sustainable_rate,
+        Arrival, CAPACITY_DRAIN_GRACE_SECS, CAPACITY_GENERATOR_CONNECTIONS_PER_SHARD,
+        CAPACITY_MAX_STEPS, CAPACITY_STEP_SECS, CAPACITY_WORKER_PROCESSES_PER_SHARD, CHILD_ENV_VAR,
+        CHILD_READY_LINE, CHILD_URLS_ENV_VAR, DATABASE_HOSTS_METRIC, SUSTAINABLE_METRIC,
+        ShardJudgement, StepEvidence, StepRecord, StepVerdict, WORKER_HOSTS_METRIC,
+        WORKER_PROCESSES_ENV_VAR, connection_budget_reasons, connection_need_per_shard,
+        encode_child_spec, encode_child_urls, judge_shard, ladder_rate, ladder_soundness, p99_ms,
+        parse_child_spec, parse_child_urls, start_rate_per_shard, step_retryable, step_verdict,
+        sustainable_rate, warmup_drain_reasons,
     };
 
     /// Time a worker process gets to print [`CHILD_READY_LINE`].
     const READY_TIMEOUT: Duration = Duration::from_secs(60);
     /// Time a worker process gets to stop after its stdin closes.
     const STOP_TIMEOUT: Duration = Duration::from_secs(15);
-    /// Lead time between opening the generator lanes and the first arrival.
+    /// Lead time between filling the generator pool and the first arrival.
     const STEP_LEAD: Duration = Duration::from_millis(200);
     /// Interval of the drain poll.
     const DRAIN_POLL: Duration = Duration::from_millis(250);
     /// Extra time a step needs beyond its arrivals and its drain grace.
     const STEP_OVERHEAD_SECS: f64 = 10.0;
+    /// Exit code of a worker process whose worker stopped before stdin closed.
+    const WORKER_LOST_EXIT: i32 = 3;
 
     // ── Worker processes ──────────────────────────────────────────────────
 
@@ -1021,11 +1320,14 @@ pub mod db {
         })
     }
 
-    /// Run one worker until stdin closes.
+    /// Run one worker until stdin closes, and return the exit code.
     ///
-    /// The parent closes stdin to stop the worker. A parent that dies also
-    /// closes it, so a worker process never outlives its bench run.
-    pub async fn run_worker_child(spec: ChildSpec) {
+    /// The child prints [`CHILD_READY_LINE`] only after a pool checkout
+    /// succeeds. The parent closes stdin to stop the worker. A parent that
+    /// dies also closes it, so a worker process never outlives its run. A
+    /// worker that stops first gives a non-zero exit code, so the parent
+    /// sees the loss.
+    pub async fn run_worker_child(spec: ChildSpec) -> i32 {
         let urls: BTreeMap<ShardId, String> = spec
             .urls
             .into_iter()
@@ -1043,36 +1345,53 @@ pub mod db {
             &registry,
             spec.worker_id,
         );
-        let pool = sharded
-            .exact_pool_for(shard)
-            .expect("the worker's shard has a pool")
-            .clone();
+        let Some(pool) = sharded.exact_pool_for(shard).cloned() else {
+            eprintln!("worker process: shard {} has no pool", spec.shard);
+            return WORKER_LOST_EXIT;
+        };
+        if let Err(e) = pool.get().await {
+            eprintln!("worker process: the first pool checkout failed: {e}");
+            return WORKER_LOST_EXIT;
+        }
         let runner = Arc::clone(&worker);
-        let handle = tokio::spawn(async move { runner.run(&pool).await });
+        let mut handle = tokio::spawn(async move { runner.run(&pool).await });
         println!("{CHILD_READY_LINE}");
 
-        let mut stdin = tokio::io::stdin();
-        let mut buf = [0_u8; 64];
-        while let Ok(n) = stdin.read(&mut buf).await {
-            if n == 0 {
-                break;
+        let stdin_closed = async {
+            let mut stdin = tokio::io::stdin();
+            let mut buf = [0_u8; 64];
+            while let Ok(n) = stdin.read(&mut buf).await {
+                if n == 0 {
+                    break;
+                }
+            }
+        };
+        tokio::select! {
+            () = stdin_closed => {
+                worker.shutdown();
+                let _ = tokio::time::timeout(STOP_TIMEOUT, handle).await;
+                0
+            }
+            joined = &mut handle => {
+                eprintln!("worker process: the worker stopped before stdin closed ({joined:?})");
+                WORKER_LOST_EXIT
             }
         }
-        worker.shutdown();
-        let _ = tokio::time::timeout(STOP_TIMEOUT, handle).await;
     }
 
     struct WorkerProcess {
         label: String,
         child: Child,
         stdin: Option<ChildStdin>,
-        stdout: BufReader<ChildStdout>,
+        guard: Option<CensusGuard>,
     }
 
     /// The worker processes of one capacity cell.
     ///
-    /// Each child is spawned with `kill_on_drop`, so a panic or an aborted
-    /// cell kills every child.
+    /// Each child holds a census guard. When the fleet drops without
+    /// [`ProcessFleet::stop`], a task kills each child and holds its guard
+    /// until the child exits. So a forced abort waits for the child's
+    /// connections to close.
     pub struct ProcessFleet {
         children: Vec<WorkerProcess>,
     }
@@ -1115,12 +1434,29 @@ pub mod db {
             for process in &mut self.children {
                 drop(process.stdin.take());
             }
-            for process in &mut self.children {
+            for mut process in std::mem::take(&mut self.children) {
                 if tokio::time::timeout(STOP_TIMEOUT, process.child.wait())
                     .await
                     .is_err()
                 {
                     let _ = process.child.kill().await;
+                }
+                drop(process.guard.take());
+            }
+        }
+    }
+
+    impl Drop for ProcessFleet {
+        fn drop(&mut self) {
+            let runtime = tokio::runtime::Handle::try_current().ok();
+            for mut process in std::mem::take(&mut self.children) {
+                let _ = process.child.start_kill();
+                let guard = process.guard.take();
+                if let Some(runtime) = &runtime {
+                    runtime.spawn(async move {
+                        let _guard = guard;
+                        let _ = process.child.wait().await;
+                    });
                 }
             }
         }
@@ -1136,6 +1472,7 @@ pub mod db {
     pub async fn start_process_fleet(
         cluster: &ShardCluster,
         per_shard: usize,
+        census: &TaskCensus,
     ) -> Result<ProcessFleet, String> {
         let exe = std::env::current_exe().map_err(|e| format!("locate the bench binary: {e}"))?;
         let urls = encode_child_urls(
@@ -1147,12 +1484,16 @@ pub mod db {
         let mut fleet = ProcessFleet {
             children: Vec::new(),
         };
+        let mut stdouts: Vec<(String, BufReader<ChildStdout>)> = Vec::new();
         for shard in cluster.shard_ids() {
             for index in 0..per_shard {
                 let label = format!("cap-s{}-p{index}", shard.as_i32());
+                // A child must not record commit-probe samples that no one
+                // reads.
                 let mut child = Command::new(&exe)
                     .env(CHILD_ENV_VAR, encode_child_spec(shard.as_i32(), &label))
                     .env(CHILD_URLS_ENV_VAR, &urls)
+                    .env_remove(COMMIT_PROBE_ENV_VAR)
                     .stdin(Stdio::piped())
                     .stdout(Stdio::piped())
                     .stderr(Stdio::inherit())
@@ -1164,49 +1505,105 @@ pub mod db {
                     .stdout
                     .take()
                     .ok_or_else(|| format!("worker process {label} has no stdout"))?;
+                stdouts.push((label.clone(), BufReader::new(stdout)));
                 fleet.children.push(WorkerProcess {
                     label,
                     child,
                     stdin,
-                    stdout: BufReader::new(stdout),
+                    guard: Some(census.enter()),
                 });
             }
         }
-        for process in &mut fleet.children {
+        for (label, mut stdout) in stdouts {
             let mut line = String::new();
-            let read = tokio::time::timeout(READY_TIMEOUT, process.stdout.read_line(&mut line))
+            let read = tokio::time::timeout(READY_TIMEOUT, stdout.read_line(&mut line))
                 .await
-                .map_err(|_| format!("worker process {} was not ready in time", process.label))?;
+                .map_err(|_| format!("worker process {label} was not ready in time"))?;
             match read {
                 Ok(_) if line.trim() == CHILD_READY_LINE => {}
                 Ok(_) => {
                     return Err(format!(
-                        "worker process {} printed {line:?} instead of {CHILD_READY_LINE:?}",
-                        process.label
+                        "worker process {label} printed {line:?} instead of {CHILD_READY_LINE:?}"
                     ));
                 }
-                Err(e) => return Err(format!("read worker process {}: {e}", process.label)),
+                Err(e) => return Err(format!("read worker process {label}: {e}")),
             }
+            // Read the rest of stdout, so a later write never blocks the child.
+            tokio::spawn(async move {
+                let mut sink = tokio::io::sink();
+                let _ = tokio::io::copy(&mut stdout, &mut sink).await;
+            });
         }
         Ok(fleet)
     }
 
+    // ── Connection budget ─────────────────────────────────────────────────
+
+    #[derive(QueryableByName)]
+    struct SettingRow {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        setting: String,
+    }
+
+    async fn integer_setting(conn: &mut AsyncPgConnection, name: &str) -> Option<usize> {
+        let row: SettingRow = diesel::sql_query("SELECT setting FROM pg_settings WHERE name = $1")
+            .bind::<diesel::sql_types::Text, _>(name)
+            .get_result(conn)
+            .await
+            .ok()?;
+        row.setting.parse().ok()
+    }
+
+    /// Reasons the cell's servers cannot hold its connections.
+    async fn connection_reasons(cluster: &ShardCluster, processes: usize) -> Vec<String> {
+        let per_shard = connection_need_per_shard(processes);
+        // On a shared server every shard of the cell lands on one server.
+        let sharing = match cluster.topology {
+            Topology::SharedServer => cluster.shard_ids().len(),
+            Topology::IndependentServers => 1,
+        };
+        let need = per_shard * sharing;
+        let mut reasons = Vec::new();
+        for shard in cluster.shard_ids() {
+            let mut conn = cluster.connect(shard).await;
+            let max = integer_setting(&mut conn, "max_connections").await;
+            let reserved = integer_setting(&mut conn, "superuser_reserved_connections")
+                .await
+                .unwrap_or(3);
+            match max {
+                Some(max) => reasons.extend(
+                    connection_budget_reasons(need, max, reserved)
+                        .into_iter()
+                        .map(|r| format!("shard {}: {r}", shard.as_i32())),
+                ),
+                None => reasons.push(format!(
+                    "shard {}: max_connections could not be read",
+                    shard.as_i32()
+                )),
+            }
+            if sharing > 1 {
+                break;
+            }
+        }
+        reasons
+    }
+
     // ── One step ──────────────────────────────────────────────────────────
+
+    /// One run the generator started.
+    struct Sent {
+        workflow_id: String,
+        scheduled_secs: f64,
+        admitted_secs: f64,
+        done: Instant,
+    }
 
     /// What the generator did on one shard during one step.
     struct ShardOffer {
-        /// Workflow id to scheduled arrival, in seconds after the step began.
-        scheduled: HashMap<String, f64>,
+        /// Workflow id to `(scheduled, admitted)`, in seconds after the step
+        /// began.
+        sent: HashMap<String, (f64, f64)>,
         achieved_per_sec: f64,
-        /// Largest delay of a start call past its scheduled arrival.
-        max_lag_ms: f64,
-    }
-
-    /// One lane's sends.
-    struct LaneOutcome {
-        sent: Vec<(String, f64)>,
-        finished: Instant,
-        max_lag_ms: f64,
     }
 
     /// What one step measured.
@@ -1214,8 +1611,7 @@ pub mod db {
         judgements: Vec<ShardJudgement>,
         achieved: Vec<f64>,
         runs: Vec<usize>,
-        max_lag_ms: Vec<f64>,
-        /// p99 latency over every run of the step, pooled across shards.
+        /// p99 latency from admission over every run, pooled across shards.
         pooled_p99_ms: Option<f64>,
     }
 
@@ -1235,12 +1631,30 @@ pub mod db {
         completed_at: Option<DateTime<Utc>>,
     }
 
+    /// Whether a stored state is terminal. An unknown state is not.
+    fn is_terminal(state: &str) -> bool {
+        WorkflowState::ALL
+            .iter()
+            .any(|s| s.as_str() == state && s.is_terminal())
+    }
+
+    /// The SQL list of every terminal state.
+    fn terminal_state_list() -> String {
+        WorkflowState::ALL
+            .iter()
+            .filter(|s| s.is_terminal())
+            .map(|s| format!("'{}'", s.as_str()))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
     /// Runs of `cohort` in a terminal state.
     async fn terminal_count(conn: &mut AsyncPgConnection, cohort: &str) -> usize {
-        let row: CountRow = diesel::sql_query(
+        let row: CountRow = diesel::sql_query(format!(
             "SELECT COUNT(*) AS n FROM harvest_workflow_executions \
-             WHERE workflow_id LIKE $1 AND state NOT IN ('RUNNING', 'PAUSED', 'MIGRATING')",
-        )
+             WHERE workflow_id LIKE $1 AND state IN ({})",
+            terminal_state_list()
+        ))
         .bind::<diesel::sql_types::Text, _>(format!("{cohort}-%"))
         .get_result(conn)
         .await
@@ -1261,8 +1675,10 @@ pub mod db {
 
     /// Offer `rate` starts per second on each shard for one step.
     ///
-    /// The open loop schedules arrival `k` at `k / rate` seconds. A late
-    /// lane sends at once, so lag shows as latency and never hides a queue.
+    /// Each arrival is its own task. It waits for its scheduled instant,
+    /// then for a connection from the generator pool. The instant it gets
+    /// one is its admission. So a slow start call never delays the schedule
+    /// of a later arrival.
     async fn offer_step(
         cluster: &ShardCluster,
         workflow: &'static str,
@@ -1280,14 +1696,19 @@ pub mod db {
         let period = 1.0 / rate;
         let shards = cluster.shard_ids();
 
-        let mut lanes = Vec::new();
-        for (idx, shard) in shards.iter().enumerate() {
-            for lane in 0..CAPACITY_GENERATOR_LANES_PER_SHARD {
-                let conn = <AsyncPgConnection as AsyncConnection>::establish(&cluster.urls[shard])
-                    .await
-                    .expect("connect a capacity generator lane");
-                lanes.push((idx, *shard, lane, conn));
+        let mut pools = Vec::new();
+        for shard in &shards {
+            let pool = e2e::build_pool_sized(
+                &cluster.urls[shard],
+                CAPACITY_GENERATOR_CONNECTIONS_PER_SHARD,
+            );
+            // Fill the pool before the step, so no arrival pays a connect.
+            let mut held = Vec::new();
+            for _ in 0..CAPACITY_GENERATOR_CONNECTIONS_PER_SHARD {
+                held.push(pool.get().await.expect("fill the generator pool"));
             }
+            drop(held);
+            pools.push(pool);
         }
 
         // One instant on both clocks. Arrivals are scheduled on the
@@ -1296,30 +1717,26 @@ pub mod db {
         let t0_utc = Utc::now()
             + chrono::Duration::from_std(STEP_LEAD).unwrap_or_else(|_| chrono::Duration::zero());
 
-        // A `JoinSet` aborts every lane if one panics. Each lane holds a
-        // census guard, so a forced abort can wait for its connection.
+        // A `JoinSet` aborts every arrival if one panics. Each arrival holds
+        // a census guard, so a forced abort can wait for its connection.
         let mut tasks = tokio::task::JoinSet::new();
-        for (idx, shard, lane, mut conn) in lanes {
-            let cohort = cohort.to_owned();
-            let guard = census.enter();
-            tasks.spawn(async move {
-                let _guard = guard;
-                let mut outcome = LaneOutcome {
-                    sent: Vec::new(),
-                    finished: t0,
-                    max_lag_ms: 0.0,
-                };
-                for k in (lane..total).step_by(CAPACITY_GENERATOR_LANES_PER_SHARD) {
-                    if Instant::now() >= deadline {
-                        break;
-                    }
-                    #[allow(clippy::cast_precision_loss, reason = "arrival indexes are small")]
-                    let at_secs = k as f64 * period;
-                    let at = t0 + Duration::from_secs_f64(at_secs);
+        for (idx, shard) in shards.iter().enumerate() {
+            for k in 0..total {
+                #[allow(clippy::cast_precision_loss, reason = "arrival indexes are small")]
+                let at_secs = k as f64 * period;
+                let at = t0 + Duration::from_secs_f64(at_secs);
+                if at >= deadline {
+                    break;
+                }
+                let pool = pools[idx].clone();
+                let shard = *shard;
+                let workflow_id = format!("{cohort}-s{}-{k}", shard.as_i32());
+                let guard = census.enter();
+                tasks.spawn(async move {
+                    let _guard = guard;
                     tokio::time::sleep_until(at.into()).await;
-                    let lag = Instant::now().saturating_duration_since(at);
-                    outcome.max_lag_ms = outcome.max_lag_ms.max(lag.as_secs_f64() * 1000.0);
-                    let workflow_id = format!("{cohort}-s{}-{k}", shard.as_i32());
+                    let mut conn = pool.get().await.expect("a generator connection");
+                    let admitted = Instant::now();
                     start_or_load_workflow_execution(
                         &mut conn,
                         start_params(ExecutionId::new_for_shard(shard), workflow, &workflow_id),
@@ -1327,35 +1744,38 @@ pub mod db {
                     )
                     .await
                     .expect("capacity start");
-                    outcome.sent.push((workflow_id, at_secs));
-                }
-                outcome.finished = Instant::now();
-                (idx, outcome)
-            });
+                    let sent = Sent {
+                        workflow_id,
+                        scheduled_secs: at_secs,
+                        admitted_secs: admitted.saturating_duration_since(t0).as_secs_f64(),
+                        done: Instant::now(),
+                    };
+                    (idx, sent)
+                });
+            }
         }
-        let mut per_shard: Vec<Vec<LaneOutcome>> = shards.iter().map(|_| Vec::new()).collect();
+        let mut per_shard: Vec<Vec<Sent>> = shards.iter().map(|_| Vec::new()).collect();
         while let Some(joined) = tasks.join_next().await {
-            let (idx, outcome) = joined.expect("capacity generator lane");
-            per_shard[idx].push(outcome);
+            let (idx, sent) = joined.expect("capacity arrival");
+            per_shard[idx].push(sent);
         }
 
         let offers = per_shard
             .into_iter()
-            .map(|lanes| {
-                let finished = lanes.iter().map(|l| l.finished).max().unwrap_or(t0);
+            .map(|sent| {
+                let finished = sent.iter().map(|s| s.done).max().unwrap_or(t0);
                 let elapsed = finished
                     .saturating_duration_since(t0)
                     .as_secs_f64()
                     .max(CAPACITY_STEP_SECS);
-                let max_lag_ms = lanes.iter().map(|l| l.max_lag_ms).fold(0.0, f64::max);
-                let scheduled: HashMap<String, f64> =
-                    lanes.into_iter().flat_map(|l| l.sent).collect();
                 #[allow(clippy::cast_precision_loss, reason = "run counts are far below 2^53")]
-                let achieved_per_sec = scheduled.len() as f64 / elapsed;
+                let achieved_per_sec = sent.len() as f64 / elapsed;
                 ShardOffer {
-                    scheduled,
+                    sent: sent
+                        .into_iter()
+                        .map(|s| (s.workflow_id, (s.scheduled_secs, s.admitted_secs)))
+                        .collect(),
                     achieved_per_sec,
-                    max_lag_ms,
                 }
             })
             .collect();
@@ -1395,7 +1815,7 @@ pub mod db {
         census: &TaskCensus,
     ) -> StepOutcome {
         let (t0_utc, offers) = offer_step(cluster, workflow, cohort, rate, deadline, census).await;
-        let expected: Vec<usize> = offers.iter().map(|o| o.scheduled.len()).collect();
+        let expected: Vec<usize> = offers.iter().map(|o| o.sent.len()).collect();
         drain(cluster, cohort, &expected).await;
 
         let mut judgements = Vec::new();
@@ -1409,13 +1829,12 @@ pub mod db {
                 .collect();
             let mut failed = 0;
             let arrivals: Vec<Arrival> = offer
-                .scheduled
+                .sent
                 .iter()
-                .map(|(workflow_id, scheduled_secs)| {
+                .map(|(workflow_id, (scheduled_secs, admitted_secs))| {
                     let completed_secs = rows.get(workflow_id).and_then(|row| {
-                        let terminal =
-                            !matches!(row.state.as_str(), "RUNNING" | "PAUSED" | "MIGRATING");
-                        if terminal && row.state != "COMPLETED" {
+                        let terminal = is_terminal(&row.state);
+                        if terminal && row.state != WorkflowState::Completed.as_str() {
                             failed += 1;
                         }
                         let at = row.completed_at.filter(|_| terminal)?;
@@ -1429,6 +1848,7 @@ pub mod db {
                     });
                     Arrival {
                         scheduled_secs: *scheduled_secs,
+                        admitted_secs: *admitted_secs,
                         completed_secs,
                     }
                 })
@@ -1436,7 +1856,7 @@ pub mod db {
             pooled.extend(
                 arrivals
                     .iter()
-                    .map(|a| a.completed_secs.map(|done| done - a.scheduled_secs)),
+                    .map(|a| a.completed_secs.map(|done| done - a.admitted_secs)),
             );
             judgements.push(judge_shard(&StepEvidence {
                 offered_per_sec: rate,
@@ -1450,7 +1870,6 @@ pub mod db {
             judgements,
             achieved: offers.iter().map(|o| o.achieved_per_sec).collect(),
             runs: expected,
-            max_lag_ms: offers.iter().map(|o| o.max_lag_ms).collect(),
             pooled_p99_ms: p99_ms(&pooled),
         }
     }
@@ -1465,10 +1884,9 @@ pub mod db {
 
     /// One line per step for the cell's notes.
     fn step_note(label: &str, rate: f64, outcome: &StepOutcome, verdict: &StepVerdict) -> String {
-        let slopes = join_values(outcome.judgements.iter().map(|j| {
-            j.backlog_slope
-                .map_or_else(|| "n/a".to_owned(), |s| format!("{s:+.2}"))
-        }));
+        let per_shard = |pick: fn(&ShardJudgement) -> Option<f64>| {
+            join_values(outcome.judgements.iter().map(|j| ms(pick(j))))
+        };
         let windows = join_values(outcome.judgements.iter().map(|j| {
             j.window_p99_ms
                 .iter()
@@ -1484,13 +1902,15 @@ pub mod db {
         };
         format!(
             "{label}: offered {rate:.1}/s per shard; achieved {}; runs {}; backlog slope {} \
-             runs/s; judged-window p99 {} ms; step p99 {} ms; max generator lag {} ms; {verdict}",
+             runs/s; median growth {} ms/s; judged-window p99 {} ms; step p99 {} ms; generator \
+             wait p99 {} ms; {verdict}",
             join_values(outcome.achieved.iter().map(|a| format!("{a:.1}"))),
             join_values(outcome.runs.iter().map(ToString::to_string)),
-            slopes,
+            per_shard(|j| j.backlog_slope),
+            per_shard(|j| j.median_growth),
             windows,
             ms(outcome.pooled_p99_ms),
-            join_values(outcome.max_lag_ms.iter().map(|l| format!("{l:.1}"))),
+            per_shard(|j| j.generator_wait_p99_ms),
         )
     }
 
@@ -1503,23 +1923,106 @@ pub mod db {
         )
     }
 
+    /// What a ladder found.
+    struct Ladder {
+        steps: Vec<StepRecord>,
+        sustainable_p99: Option<f64>,
+        notes: Vec<String>,
+        unsound: Vec<String>,
+    }
+
+    /// Warm up, then climb the ladder until a step is not sustainable.
+    async fn climb(
+        cluster: &ShardCluster,
+        workflow: &'static str,
+        start: f64,
+        deadline: Instant,
+        census: &TaskCensus,
+    ) -> Ladder {
+        let mut ladder = Ladder {
+            steps: Vec::new(),
+            sustainable_p99: None,
+            notes: Vec::new(),
+            unsound: Vec::new(),
+        };
+        let warm = run_step(cluster, workflow, "capwm", start, deadline, census).await;
+        let warm_verdict = step_verdict(&warm.judgements);
+        ladder
+            .notes
+            .push(step_note("warmup (discarded)", start, &warm, &warm_verdict));
+        ladder
+            .unsound
+            .extend(warmup_drain_reasons(&warm.judgements));
+
+        let needed = Duration::from_secs_f64(
+            CAPACITY_STEP_SECS
+                + Duration::from_secs(CAPACITY_DRAIN_GRACE_SECS).as_secs_f64()
+                + STEP_OVERHEAD_SECS,
+        );
+        for k in 0..CAPACITY_MAX_STEPS {
+            if Instant::now() + needed >= deadline {
+                break;
+            }
+            let rate = ladder_rate(start, k);
+            let label = format!("step {k}");
+            let mut outcome = run_step(
+                cluster,
+                workflow,
+                &format!("cap{k:02}"),
+                rate,
+                deadline,
+                census,
+            )
+            .await;
+            let mut verdict = step_verdict(&outcome.judgements);
+            if step_retryable(&outcome.judgements) && Instant::now() + needed < deadline {
+                ladder.notes.push(step_note(
+                    &format!("{label} (tail only, retried)"),
+                    rate,
+                    &outcome,
+                    &verdict,
+                ));
+                outcome = run_step(
+                    cluster,
+                    workflow,
+                    &format!("cap{k:02}r"),
+                    rate,
+                    deadline,
+                    census,
+                )
+                .await;
+                verdict = step_verdict(&outcome.judgements);
+            }
+            ladder
+                .notes
+                .push(step_note(&label, rate, &outcome, &verdict));
+            let stop = !matches!(verdict, StepVerdict::Sustainable);
+            if !stop {
+                ladder.sustainable_p99 = outcome.pooled_p99_ms;
+            }
+            ladder.steps.push(StepRecord {
+                offered_per_shard: rate,
+                verdict,
+            });
+            if stop {
+                break;
+            }
+        }
+        ladder
+    }
+
     // ── The scenario ──────────────────────────────────────────────────────
 
     /// **Capacity.** The highest offered start rate each shard sustains.
     ///
     /// The ladder offers `start x 1.25^k` starts per second per shard. Each
-    /// step drains to zero before the next one starts, so the steps are
-    /// independent. The ladder stops at the first step that is not
-    /// sustainable. `docs/design/DESIGN-2419.md` states the rule.
+    /// step drains before the next one starts. The ladder stops at the first
+    /// step that is not sustainable. `docs/design/DESIGN-2419.md` states the
+    /// rule.
     ///
     /// # Errors
     ///
     /// Returns [`SkipReason`] when no Postgres could be provisioned.
-    #[allow(
-        clippy::too_many_lines,
-        reason = "one measurement protocol, read top to bottom: provision, start the fleet, \
-                  warm up, climb the ladder, judge, tear down"
-    )]
     pub async fn run_capacity(
         arm: CapacityArm,
         shard_count: u32,
@@ -1539,67 +2042,45 @@ pub mod db {
         let mut notes = vec![
             format!("topology: {}", cluster.topology.as_str()),
             layout.note(),
+            "worker layout: every worker process runs on the bench host".to_owned(),
             format!(
-                "open loop: {processes} worker process(es) per shard, \
-                 {CAPACITY_GENERATOR_LANES_PER_SHARD} generator lanes per shard, \
-                 {CAPACITY_STEP_SECS:.0}s steps from {start:.1} starts/s per shard"
+                "open loop: {processes} worker process(es) per shard, a \
+                 {CAPACITY_GENERATOR_CONNECTIONS_PER_SHARD}-connection generator pool per \
+                 shard, {CAPACITY_STEP_SECS:.0}s steps from {start:.1} starts/s per shard"
             ),
         ];
-        let mut unsound = Vec::new();
-        let mut steps: Vec<StepRecord> = Vec::new();
-        let mut sustainable_p99 = None;
         let deadline = scenario_deadline();
-
-        match start_process_fleet(&cluster, processes).await {
-            Ok(mut fleet) => {
-                let warm = run_step(&cluster, workflow, "capwm", start, deadline, &census).await;
-                let warm_verdict = step_verdict(&warm.judgements);
-                notes.push(step_note("warmup (discarded)", start, &warm, &warm_verdict));
-
-                for k in 0..CAPACITY_MAX_STEPS {
-                    let needed = Duration::from_secs_f64(
-                        CAPACITY_STEP_SECS
-                            + Duration::from_secs(CAPACITY_DRAIN_GRACE_SECS).as_secs_f64()
-                            + STEP_OVERHEAD_SECS,
-                    );
-                    if Instant::now() + needed >= deadline {
-                        break;
-                    }
-                    let rate = ladder_rate(start, k);
-                    let cohort = format!("cap{k:02}");
-                    let outcome =
-                        run_step(&cluster, workflow, &cohort, rate, deadline, &census).await;
-                    let verdict = step_verdict(&outcome.judgements);
-                    notes.push(step_note(&format!("step {k}"), rate, &outcome, &verdict));
-                    let stop = !matches!(verdict, StepVerdict::Sustainable);
-                    if !stop {
-                        sustainable_p99 = outcome.pooled_p99_ms;
-                    }
-                    steps.push(StepRecord {
-                        offered_per_shard: rate,
-                        verdict,
-                    });
-                    if stop {
-                        break;
-                    }
+        let mut unsound = connection_reasons(&cluster, processes).await;
+        let mut ladder = Ladder {
+            steps: Vec::new(),
+            sustainable_p99: None,
+            notes: Vec::new(),
+            unsound: Vec::new(),
+        };
+        if unsound.is_empty() {
+            match start_process_fleet(&cluster, processes, &census).await {
+                Ok(mut fleet) => {
+                    ladder = climb(&cluster, workflow, start, deadline, &census).await;
+                    unsound.extend(fleet.exited());
+                    fleet.stop().await;
                 }
-                unsound.extend(fleet.exited());
-                fleet.stop().await;
+                Err(reason) => unsound.push(format!("the worker fleet did not start: {reason}")),
             }
-            Err(reason) => unsound.push(format!("the worker fleet did not start: {reason}")),
         }
+        notes.append(&mut ladder.notes);
+        unsound.append(&mut ladder.unsound);
 
-        let result = sustainable_rate(&steps, CAPACITY_MAX_STEPS);
+        let result = sustainable_rate(&ladder.steps, CAPACITY_MAX_STEPS);
         unsound.extend(ladder_soundness(&result));
         notes.push(format!(
             "ladder: {} step(s), stopped {:?}; sustainable {} starts/s per shard",
-            steps.len(),
+            ladder.steps.len(),
             result.stop,
             ms(result.sustainable_per_shard),
         ));
         notes.push(
-            "latency runs from the scheduled arrival to `completed_at`, both on the bench host \
-             clock, so a late generator adds to latency and never hides a queue"
+            "engine latency runs from admission to `completed_at`, both on the bench host \
+             clock; the generator wait, from schedule to admission, is judged separately"
                 .to_owned(),
         );
         let teardown = cluster.teardown_with_stats(scenario).await;
@@ -1614,9 +2095,14 @@ pub mod db {
                 per_shard.map(|r| r * f64::from(shard_count)),
             ),
             Metric::new("sustainable_per_shard_per_sec", per_shard),
-            Metric::new("p99_ms_at_sustainable", sustainable_p99.filter(|_| sound)),
-            Metric::new("steps", Some(steps.len() as f64)),
+            Metric::new(
+                "p99_ms_at_sustainable",
+                ladder.sustainable_p99.filter(|_| sound),
+            ),
+            Metric::new("steps", Some(ladder.steps.len() as f64)),
             Metric::new(DATABASE_HOSTS_METRIC, Some(layout.hosts.len() as f64)),
+            // Every worker process runs on the bench host.
+            Metric::new(WORKER_HOSTS_METRIC, Some(1.0)),
         ];
         Ok(ScenarioReport {
             scenario,

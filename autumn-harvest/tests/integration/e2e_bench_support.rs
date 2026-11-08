@@ -1203,11 +1203,18 @@ pub fn is_loopback(host: &str) -> bool {
 pub fn host_layout<'a>(urls: impl IntoIterator<Item = &'a str>) -> HostLayout {
     let mut shards = 0;
     let mut hosts = std::collections::BTreeSet::new();
+    let mut loopback = false;
     for url in urls {
         shards += 1;
-        hosts.insert(database_host(url));
+        let host = database_host(url);
+        // Every spelling of the bench host is one host.
+        if is_loopback(&host) {
+            loopback = true;
+            hosts.insert("localhost".to_owned());
+        } else {
+            hosts.insert(host);
+        }
     }
-    let loopback = hosts.iter().any(|h| is_loopback(h));
     HostLayout {
         shards,
         hosts: hosts.into_iter().collect(),
@@ -2966,6 +2973,17 @@ mod tests {
     }
 
     #[test]
+    fn every_spelling_of_the_bench_host_is_one_host() {
+        let layout = host_layout([
+            "postgres://localhost:55432/a",
+            "postgres://127.0.0.1:55433/b",
+            "postgres://[::1]:55434/c",
+        ]);
+        assert_eq!(layout.hosts, vec!["localhost".to_owned()]);
+        assert!(layout.shares_a_host());
+    }
+
+    #[test]
     fn one_shard_never_shares_a_host() {
         let layout = host_layout(["postgres://127.0.0.1:5432/x"]);
         assert!(!layout.shares_a_host());
@@ -3490,9 +3508,15 @@ pub mod db {
     /// Build the bench pool of one shard.
     #[must_use]
     pub fn build_pool(url: &str) -> DbPool {
+        build_pool_sized(url, POOL_SIZE_PER_SHARD)
+    }
+
+    /// Build a bench pool of `size` connections.
+    #[must_use]
+    pub fn build_pool_sized(url: &str, size: usize) -> DbPool {
         let manager = autumn_harvest::pool::engine_manager(url);
         autumn_harvest::pool::with_engine_timeouts(
-            deadpool::managed::Pool::builder(manager).max_size(POOL_SIZE_PER_SHARD),
+            deadpool::managed::Pool::builder(manager).max_size(size),
             autumn_harvest::pool::DbRole::Hot,
             &autumn_harvest::pool::EngineDbTimeouts::default(),
         )

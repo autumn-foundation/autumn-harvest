@@ -98,9 +98,9 @@ fn main() {
         .expect("build the benchmark runtime");
     // A capacity cell runs this binary again as a worker process.
     if let Some(spec) = capacity_bench_support::db::child_spec_from_env() {
-        runtime.block_on(capacity_bench_support::db::run_worker_child(spec));
+        let code = runtime.block_on(capacity_bench_support::db::run_worker_child(spec));
         // Exit at once. A blocked stdin reader must not hold the process.
-        std::process::exit(0);
+        std::process::exit(code);
     }
     runtime.block_on(run());
 }
@@ -350,10 +350,10 @@ fn print_environment(capacity_ran: bool) {
     );
     if capacity_ran {
         println!(
-            "| Capacity | {} worker process(es) per shard, {} generator lanes per shard, {:.0}s \
-             steps x{} |",
+            "| Capacity | {} worker process(es) per shard, {} generator connections per shard, \
+             {:.0}s steps x{} |",
             capacity_bench_support::db::worker_processes_per_shard(),
-            capacity_bench_support::CAPACITY_GENERATOR_LANES_PER_SHARD,
+            capacity_bench_support::CAPACITY_GENERATOR_CONNECTIONS_PER_SHARD,
             capacity_bench_support::CAPACITY_STEP_SECS,
             capacity_bench_support::CAPACITY_RATE_MULTIPLIER,
         );
