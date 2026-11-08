@@ -298,8 +298,9 @@ async fn agent_loop_resumes_every_sequential_turn_and_replays_after_a_gate() {
     .await
     .expect("start the agent loop");
 
-    // Turns 1 and 2 call a tool each. Turn 3 asks for the gated call.
-    wait_for_gate(&mut conn, exec_id, &log, 6).await;
+    // Turns 1 and 2 call a tool each. Turn 3 asks for the gated call, which
+    // sends its approval notice before it waits.
+    wait_for_gate(&mut conn, exec_id, &log, 7).await;
     let approval = serde_json::to_value(Approval::Approve).expect("approval encodes");
     autumn_harvest::signal::send_signal(&mut conn, exec_id, &approval_signal(2, 0, "c3"), approval)
         .await
@@ -322,11 +323,12 @@ async fn agent_loop_resumes_every_sequential_turn_and_replays_after_a_gate() {
             "hit",
             "hit",
             "hit",
+            "hit",
             "multi_await",
             "unsupported",
             "unsupported",
         ],
-        "each single-await turn resumes until the gate; after it, each replay re-issues the teardown"
+        "each single-await step resumes until the gate, the approval notice included; after it, each replay re-issues the teardown"
     );
 
     worker.shutdown();
