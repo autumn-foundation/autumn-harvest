@@ -9,8 +9,8 @@ is in `docs/design/DESIGN-2607.md`.
   `harvest_external_tasks` table and a deadline timer. A re-park writes
   nothing, so the deadline counts from the first record.
 - A drive returns the new `RunState::WaitingExternal(token)`. The fleet
-  drivers count it as blocked. **Breaking:** a `match` on `RunState` with no
-  wildcard arm needs the new arm.
+  drivers count it as blocked. **Breaking:** a `match` on `RunState` or
+  `SqliteError` with no wildcard arm needs the new arms.
 - `SqliteRuntime::complete_external(token, output)` and
   `fail_external(token, error, retryable)` settle a token. As on Postgres, a
   second settle or a settle after the run ends returns `false`. An unknown
@@ -26,15 +26,17 @@ is in `docs/design/DESIGN-2607.md`.
   `extend_external_deadline` moves it and records
   `ActivityExternalDeadlineExtended`.
 - Each terminal setter sets the `PENDING` tokens of its run `CANCELLED`.
-  Retention purges the new table with the run.
+  Postgres leaves them `PENDING`. Retention purges the new table with the
+  run. `HarvestPlugin` on SQLite does not serve the external routes.
 - No new `WorkflowEvent` variant. No Postgres migration. The SQLite table is
   new, so an older file gains it on open.
 
-Tests: 15 integration tests in
-`autumn-harvest-sqlite/tests/integration/external_activities.rs` (park,
-complete, fail, idempotent settle, unknown token, deadline fire, settle
-removes the deadline, re-park, list order and filters, ended run, cancel,
-fleet drivers, extension, deep output, reopen, overdue run). Three
+Tests: `autumn-harvest-sqlite/tests/integration/external_activities.rs`
+has 15 integration tests. They cover the park, a complete with an
+idempotent second settle, a fail and an unknown token. They also cover
+the deadline fire, a settle that removes the deadline, and a re-park. The
+rest cover the list order and filters, an ended run, a cancel, the fleet
+drivers, an extension, a deep output, a reopen and an overdue run. Three
 conformance scenarios compare a completed, a failed and a timed-out
 external activity with Postgres. `ScheduleExternalActivity` moves from the
 rejected to the accepted command kinds. The SQLite tests that used it as

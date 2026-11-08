@@ -36,9 +36,9 @@ const TERMINAL_ACQUIRE: &str = "ScheduleActivity";
 /// in this binary, so they use `acquires_session` and never touch this counter.
 static COUNTED_RUNS: AtomicU32 = AtomicU32::new(0);
 
-/// A worker session is still outside the subset. Child workflows (issue
-/// #2026), local activities (issue #2029) and external activities are
-/// supported, so none of them serves as the example.
+/// A worker session is still outside the subset. This backend runs child
+/// workflows, local activities and external activities, so none of them
+/// serves as the example.
 #[workflow]
 async fn acquires_session_counted(ctx: &WorkflowContext, _n: i64) -> Result<(), String> {
     COUNTED_RUNS.fetch_add(1, Ordering::SeqCst);
@@ -78,9 +78,9 @@ async fn uses_a_session(ctx: &WorkflowContext, _n: i64) -> Result<(), String> {
 }
 
 /// Completes, but its last cycle also starts a worker-session acquire. The
-/// terminal drain rejects that command. A search-attribute upsert (issue
-/// #2027), a detached spawn (issue #2026) and an external activity were the
-/// examples until each became supported.
+/// terminal drain rejects that command. A search-attribute upsert, a
+/// detached spawn and an external activity were the examples until this
+/// backend ran each one.
 #[workflow]
 async fn acquires_session_then_completes(ctx: &WorkflowContext, n: i64) -> Result<i64, String> {
     // Poll the session acquire once, so its command joins the last batch,

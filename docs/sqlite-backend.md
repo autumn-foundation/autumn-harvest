@@ -26,7 +26,7 @@ R&D decision record [`docs/rnd/sqlite-feasibility.md`](rnd/sqlite-feasibility.md
 7. [The drive model](#7-the-drive-model)
 8. [Signals, queries and updates](#8-signals-queries-and-updates)
 9. [Child workflows and commands between runs](#9-child-workflows-and-commands-between-runs)
-9a. [External activities](#9a-external-activities)
+   - [9a. External activities](#9a-external-activities)
 10. [Durability and crash recovery](#10-durability-and-crash-recovery)
 11. [The single-writer / single-server contract](#11-the-single-writer--single-server-contract)
 12. [v0.1 non-goals and follow-ups](#12-v01-non-goals-and-follow-ups)
@@ -1164,7 +1164,9 @@ body calls `ctx.execute_activity_external(name, input, queue, secs)`.
    arms a deadline timer.
 2. The drive returns `RunState::WaitingExternal(token)`. The fleet drivers
    count the park as blocked, not as progress.
-3. A dispatcher reads the pending handoffs and sends each input out:
+3. A dispatcher reads the pending handoffs and sends each input out. A
+   pending row returns on each read until a settle. Keep the tokens in
+   flight, and send each input once.
 
    ```rust
    use autumn_harvest_sqlite::ExternalHandoffFilter;
@@ -1176,9 +1178,9 @@ body calls `ctx.execute_activity_external(name, input, queue, secs)`.
    ```
 
 4. The reply settles the token. `rt.complete_external(token, output)`
-   appends `ActivityCompletedExternally`. `rt.fail_external(token, error,
-   retryable)` appends `ActivityFailedExternally`. The next drive resumes
-   the body.
+   appends `ActivityCompletedExternally`, as Postgres
+   `complete_externally` does. `rt.fail_external(token, error, retryable)`
+   appends `ActivityFailedExternally`. The next drive resumes the body.
 
 The rules match Postgres:
 
@@ -1201,7 +1203,13 @@ the timer. `rt.extend_external_deadline(token, by)` moves it, and appends
 `ActivityExternalDeadlineExtended`.
 
 When a run ends, its `PENDING` tokens become `CANCELLED`. A dispatcher then
-never reads a handoff that no run waits on.
+never reads a handoff that no run waits on. This differs from Postgres,
+which leaves such a token `PENDING`.
+
+`HarvestPlugin` on SQLite does not serve the external activity routes.
+Call the runtime methods.
+
+---
 
 ## 10. Durability and crash recovery
 

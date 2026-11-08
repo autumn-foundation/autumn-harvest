@@ -619,7 +619,10 @@ stay off. The pages hold no form that writes.
 - A run chain gives each run its execution id as `run_id`. This backend
   has no separate run id. A key with more than 256 runs answers the queried
   run alone, with `head_unknown: true`. Postgres reads the whole chain.
-- A stack has no external handoff and no worker id. A task stores no
+- The plugin does not serve the external activity routes, such as
+  `/activities/external/{token}/complete`. Call the `SqliteRuntime`
+  methods instead (issue #2607).
+- A stack lists no external handoff and has no worker id. A task stores no
   attempt start and no heartbeat time, so `start_to_close_deadline`,
   `heartbeat_deadline` and `last_heartbeat_at` are `null`. `scheduled_at`
   is the time that the next attempt may run, as on Postgres. For the same

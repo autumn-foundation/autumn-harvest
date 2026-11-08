@@ -73,7 +73,8 @@ How can the port fail? Each row names the guard.
 - **White.** The facts are in section 2. The conformance suite needs
   Docker or `HARVEST_TEST_DATABASE_URL`.
 - **Red.** Many SQLite tests use the external activity as their stock
-  unsupported command. They need a new one: the worker session acquire.
+  unsupported command. They need a new one: the worker session acquire, or
+  a cross-type continue-as-new.
 - **Black.** A new `RunState` variant breaks an exhaustive match outside
   the crate. The crate is pre-1.0, and the changelog names the change. A
   timeout scenario depends on the wall clock, so it uses a one-second
