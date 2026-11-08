@@ -49,10 +49,10 @@ DATABASE_URL=postgres://localhost/harvest \
   cargo run -p autumn-harvest-agent --features postgres --example postgres_agent
 ```
 
-The first example runs the agent loop once. The second runs a small mesh: a
-delegation, a refused delegation and a restart. The third runs a chat
-session as a durable `Agent`. The fourth runs the first and the third on
-Postgres, with a worker in the process.
+`sqlite_agent` runs the agent loop once. `sqlite_mesh` runs a small mesh: a
+delegation, a refused delegation and a restart. `agent_session_entity` runs
+a chat session as a durable `Agent`. `postgres_agent` runs the loop and a
+durable agent on Postgres, with a worker in the process.
 
 | Feature | Contents |
 |---|---|

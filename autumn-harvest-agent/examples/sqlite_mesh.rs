@@ -1,26 +1,27 @@
 //! A small agent mesh on SQLite, with no API key and no network.
 //!
 //! A planner agent holds a mandate that names one peer, a researcher. The
-//! researcher has one read-only tool. The planner has one write tool, and a
-//! person must approve each write.
+//! harness holds two tools, `lookup_fact` and `write_plan`. The roster entry
+//! of the researcher limits it to `lookup_fact` and makes it read-only. Only
+//! the planner calls `write_plan`, and a person must approve each write.
 //!
 //! 1. The planner delegates a question to the researcher. The researcher
 //!    reads a fact and answers.
 //! 2. The planner delegates to the publisher. The roster has a publisher,
-//!    but the mandate does not name it, so the delegation is refused.
+//!    but the mandate does not name it. The harness refuses the delegation.
 //! 3. The planner asks to write the plan, and the run waits for approval.
-//! 4. The process "restarts". It drops the runtime and opens the file again.
-//!    The approval goes to the new runtime, and the run finishes.
+//! 4. The example stands in for a restart. It drops the runtime and opens
+//!    the file again. The approval goes to the new runtime, and the run
+//!    finishes.
 //!
 //! The example prints the delegations of the report at the end. It exits
-//! non-zero when a claim fails. The claims are that one delegation runs, one
-//! is refused, and the restart sends one model call and no tool call again.
+//! non-zero when a claim of `Outcome::check` fails.
 //!
 //! ```sh
 //! cargo run -p autumn-harvest-agent --features sqlite --example sqlite_mesh
 //! ```
 //!
-//! The guide is section 2 of `docs/agent-mesh.md`.
+//! The guide is "Run a small mesh", in section 2 of `docs/agent-mesh.md`.
 
 use std::error::Error;
 use std::future::Future;
@@ -32,16 +33,14 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use autumn_harvest_agent::mesh::DELEGATE_TOOL;
 use autumn_harvest_agent::{
     AgentError, AgentHarness, AgentModel, AgentReport, AgentStop, AgentTask, Approval, ChatRequest,
-    ChatResponse, ChatRole, ContentPart, DelegationRecord, FnTool, Mandate, Peer, Rule, StopReason,
-    TokenUsage, ToolEffect, ToolRules, sqlite,
+    ChatResponse, ChatRole, ContentPart, DelegationRecord, FnTool, Mandate, Peer, Refusal, Rule,
+    StopReason, TokenUsage, ToolEffect, ToolRules, sqlite,
 };
 use autumn_harvest_sqlite::{RunState, SqliteRuntime};
 use serde_json::{Value, json};
 
-/// The system prompt of the planner.
-const PLANNER: &str = "You plan trips.";
-
-/// The system prompt of the researcher. The model reads it to know its role.
+/// The system prompt of the researcher. `OfflineModel` looks for it to find
+/// the researcher.
 const RESEARCHER: &str = "You research. Use lookup_fact.";
 
 /// The fact that the read tool returns.
@@ -49,9 +48,9 @@ const FACT: &str = "The ferry leaves at 9.";
 
 /// A stand-in model for each agent of the mesh.
 ///
-/// It reads the system prompt to know the agent, and it counts the tool
-/// results to know the step. It keeps no other state, so a new process
-/// gives the same answers.
+/// It reads the system prompt to find the agent. It counts the tool results
+/// to find the step. Its answer depends on the request only, so a new
+/// process gets the same answers.
 #[derive(Debug, Default)]
 struct OfflineModel {
     calls: AtomicUsize,
@@ -199,6 +198,8 @@ fn harness(model: Arc<OfflineModel>, runs: &Arc<ToolRuns>) -> AgentHarness {
         .policy(Arc::new(
             ToolRules::new().effect(ToolEffect::Write, Rule::Ask),
         ))
+        // `tools` limits the researcher to the read tool. `read_only` refuses
+        // each write, also when the list grows.
         .peer(
             Peer::new("researcher", "Finds facts.")
                 .system(RESEARCHER)
@@ -212,7 +213,7 @@ fn harness(model: Arc<OfflineModel>, runs: &Arc<ToolRuns>) -> AgentHarness {
 /// The planner task. Its mandate names the researcher only.
 fn task() -> AgentTask {
     AgentTask::new("Plan a day trip to the island.")
-        .system(PLANNER)
+        .system("You plan trips.")
         .mandate(Mandate::new("planner").peers(["researcher"]))
 }
 
@@ -220,14 +221,14 @@ fn task() -> AgentTask {
 #[derive(Debug)]
 struct Outcome {
     report: AgentReport,
+    /// Model calls before the restart.
+    before: usize,
     /// Model calls after the restart.
     after: usize,
     /// Runs of the read tool.
     lookups: usize,
     /// Runs of the write tool.
     writes: usize,
-    /// The text that `main` prints.
-    lines: Vec<String>,
 }
 
 /// The wire name of a stop, as the parent model reads it.
@@ -250,14 +251,23 @@ fn roll_up(record: &DelegationRecord) -> String {
                 record.tool_calls
             )
         },
-        |refusal| format!("  {chain}: refused, {}", refusal.code()),
+        |refusal| {
+            let peer = record.chain.last().map_or("", String::as_str);
+            format!(
+                "  {chain}: refused, {} ({})",
+                refusal.code(),
+                refusal.message(peer)
+            )
+        },
     )
 }
 
-/// Run the mesh in two processes on the database file `db`.
-async fn run(db: &Path) -> Result<Outcome, Box<dyn Error>> {
+/// Run the mesh on the database file `db`, with a restart between two
+/// runtimes. Each step adds its text to `lines`, also when a later step
+/// fails.
+async fn run(db: &Path, lines: &mut Vec<String>) -> Result<Outcome, Box<dyn Error>> {
     let runs = Arc::new(ToolRuns::default());
-    let mut lines = vec!["process 1: start the planner".to_owned()];
+    lines.push("process 1: start the planner".to_owned());
 
     // Process one: delegate, get a refusal, and stop at the approval wait.
     let first = Arc::new(OfflineModel::default());
@@ -283,53 +293,69 @@ async fn run(db: &Path) -> Result<Outcome, Box<dyn Error>> {
     };
     let report: AgentReport = serde_json::from_value(value)?;
 
-    let (before, after) = (
-        first.calls.load(Ordering::SeqCst),
-        second.calls.load(Ordering::SeqCst),
-    );
-    let (lookups, writes) = (
-        runs.lookups.load(Ordering::SeqCst),
-        runs.writes.load(Ordering::SeqCst),
-    );
+    let outcome = Outcome {
+        before: first.calls.load(Ordering::SeqCst),
+        after: second.calls.load(Ordering::SeqCst),
+        lookups: runs.lookups.load(Ordering::SeqCst),
+        writes: runs.writes.load(Ordering::SeqCst),
+        report,
+    };
     lines.extend([
-        format!("  stop:   {}", wire(Some(report.stop))),
-        format!("  answer: {}", report.text),
-        format!("model calls: {before} before the restart, {after} after it"),
-        format!("tool runs: lookup_fact {lookups}, write_plan {writes}"),
+        format!("  stop:   {}", wire(Some(outcome.report.stop))),
+        format!("  answer: {}", outcome.report.text),
+        format!(
+            "model calls: {} before the restart, {} after it",
+            outcome.before, outcome.after
+        ),
+        format!(
+            "tool runs: lookup_fact {}, write_plan {}",
+            outcome.lookups, outcome.writes
+        ),
         "delegations:".to_owned(),
     ]);
-    lines.extend(report.delegations.iter().map(roll_up));
-    Ok(Outcome {
-        report,
-        after,
-        lookups,
-        writes,
-        lines,
-    })
+    lines.extend(outcome.report.delegations.iter().map(roll_up));
+    Ok(outcome)
 }
 
+/// The chain, stop and refusal of each delegation.
+type Shape = Vec<(String, Option<AgentStop>, Option<Refusal>)>;
+
 impl Outcome {
-    /// Check the claims of the example.
-    ///
-    /// # Errors
-    ///
-    /// Returns the first claim that does not hold.
-    fn check(&self) -> Result<(), &'static str> {
-        let delegations = &self.report.delegations;
-        if !delegations
+    /// Check the claims of the example. The delegation to the researcher
+    /// completes, and the harness refuses the delegation to the publisher.
+    /// History answers each turn before the restart, so each tool runs once.
+    /// The error names the first claim that fails, with both values.
+    fn check(&self) -> Result<(), String> {
+        let shape: Shape = self
+            .report
+            .delegations
             .iter()
-            .any(|record| record.stop == Some(AgentStop::Completed))
-        {
-            return Err("no delegation ran to completion");
+            .map(|record| (record.chain.join(" -> "), record.stop, record.refusal))
+            .collect();
+        let expected: Shape = vec![
+            (
+                "planner -> researcher".to_owned(),
+                Some(AgentStop::Completed),
+                None,
+            ),
+            (
+                "planner -> publisher".to_owned(),
+                None,
+                Some(Refusal::NotPermitted),
+            ),
+        ];
+        if shape != expected {
+            return Err(format!("delegations: expected {expected:?}, got {shape:?}"));
         }
-        if !delegations.iter().any(|record| record.refusal.is_some()) {
-            return Err("no delegation was refused");
-        }
-        if self.after != 1 {
-            return Err("the restart sent a recorded model turn again");
-        }
-        if self.lookups != 1 || self.writes != 1 {
-            return Err("a tool ran more than once");
+        for (what, got, want) in [
+            ("model calls before the restart", self.before, 5),
+            ("model calls after the restart", self.after, 1),
+            ("runs of lookup_fact", self.lookups, 1),
+            ("runs of write_plan", self.writes, 1),
+        ] {
+            if got != want {
+                return Err(format!("{what}: expected {want}, got {got}"));
+            }
         }
         Ok(())
     }
@@ -337,66 +363,65 @@ impl Outcome {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    let db = std::env::temp_dir().join(format!("sqlite-mesh-{}.db", std::process::id()));
-    let outcome = run(&db).await;
-    for suffix in ["", "-wal", "-shm", ".lock"] {
-        let _ = std::fs::remove_file(format!("{}{suffix}", db.display()));
-    }
-    let outcome = outcome?;
-    for line in &outcome.lines {
+    // The directory and the database files go away when `dir` drops.
+    let dir = tempfile::tempdir()?;
+    let mut lines = Vec::new();
+    let outcome = run(&dir.path().join("mesh.db"), &mut lines).await;
+    for line in &lines {
         println!("{line}");
     }
-    Ok(outcome.check()?)
+    Ok(outcome?.check()?)
 }
 
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
 
-    use autumn_harvest_agent::Refusal;
-
     use super::*;
 
-    async fn outcome() -> Outcome {
+    async fn outcome() -> (Outcome, Vec<String>) {
         let dir = tempfile::tempdir().unwrap();
-        run(&dir.path().join("mesh.db")).await.unwrap()
+        let mut lines = Vec::new();
+        let outcome = run(&dir.path().join("mesh.db"), &mut lines).await.unwrap();
+        (outcome, lines)
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn one_delegation_runs_and_one_is_refused() {
-        let outcome = outcome().await;
-        let report = &outcome.report;
-        assert_eq!(report.stop, AgentStop::Completed);
-        assert_eq!(report.delegations.len(), 2);
-        let ran = &report.delegations[0];
-        assert_eq!(ran.chain, ["planner", "researcher"]);
-        assert_eq!(ran.stop, Some(AgentStop::Completed));
-        assert_eq!(ran.refusal, None);
-        assert_eq!(ran.tool_calls, 1);
-        let refused = &report.delegations[1];
-        assert_eq!(refused.chain, ["planner", "publisher"]);
-        assert_eq!(refused.refusal, Some(Refusal::NotPermitted));
-        assert_eq!(refused.run_id, None);
+        let (outcome, _) = outcome().await;
+        assert_eq!(outcome.report.stop, AgentStop::Completed);
+        assert_eq!(outcome.check(), Ok(()));
+        let [ran, refused] = outcome.report.delegations.as_slice() else {
+            panic!("expected two delegations");
+        };
+        assert!(ran.run_id.is_some(), "the researcher runs as a child");
+        assert_eq!(ran.tool_calls, 1, "the researcher reads once");
+        assert_eq!(refused.run_id, None, "a refused delegation does not run");
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn the_restart_sends_only_the_last_turn() {
-        let outcome = outcome().await;
-        assert_eq!(outcome.check(), Ok(()));
-        assert_eq!(outcome.after, 1, "history answers each recorded turn");
-        assert_eq!(outcome.lookups, 1, "the read tool runs once");
-        assert_eq!(outcome.writes, 1, "the approved write runs once");
+    async fn the_check_names_a_claim_that_fails() {
+        let (mut outcome, _) = outcome().await;
+        outcome.after = 2;
+        assert_eq!(
+            outcome.check(),
+            Err("model calls after the restart: expected 1, got 2".to_owned())
+        );
+        outcome.report.delegations.pop();
+        assert!(outcome.check().unwrap_err().starts_with("delegations:"));
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn the_guide_shows_the_real_output() {
-        let outcome = outcome().await;
+        let (_, lines) = outcome().await;
+        // A Windows checkout can hold CRLF line ends.
         let guide = std::fs::read_to_string(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../docs/agent-mesh.md"
         ))
-        .unwrap();
-        let output = outcome.lines.join("\n");
+        .unwrap()
+        .replace("\r\n", "\n");
+        let output = lines.join("\n");
         assert!(
             guide.contains(&format!("```text\n{output}\n```")),
             "docs/agent-mesh.md shows this output:\n{output}"

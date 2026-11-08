@@ -296,7 +296,7 @@ name = "sqlite_agent"
 required-features = ["sqlite"]
 
 # The smallest agent mesh: a delegation, a refusal and a restart. `test =
-# true` runs its tests in the crate test step, and CI also runs `main`.
+# true` runs its tests in the crate test step. CI also runs `main`.
 [[example]]
 name = "sqlite_mesh"
 required-features = ["sqlite"]

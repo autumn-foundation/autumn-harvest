@@ -103,8 +103,8 @@ captures the harness in synchronous closures. Each closure runs its async
 body with `block_in_place`, so use a multi-thread Tokio runtime.
 
 The next step is a mesh of agents. The example `sqlite_mesh` adds a peer, a
-mandate and a refused delegation to this story. Read "Run a small mesh" in
-[`agent-mesh.md`](agent-mesh.md).
+mandate and a refused delegation to the `sqlite_agent` story. Read
+["Run a small mesh"](agent-mesh.md#run-a-small-mesh).
 
 ## 3. Run it on Postgres
 

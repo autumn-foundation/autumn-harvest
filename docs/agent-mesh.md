@@ -83,9 +83,10 @@ also has `error`.
 
 The example `sqlite_mesh` needs no API key and no network. A planner
 delegates a question to a read-only researcher. It then delegates to a
-publisher that its mandate does not name, and the delegation is refused.
-Last, it asks to write the plan and waits for approval. The process drops
-the runtime as a crash would, opens the file again, approves, and finishes:
+publisher. Its mandate does not name the publisher, so the harness refuses
+the delegation. Last, the planner asks to write the plan and waits for
+approval. The example then stands in for a restart. It drops the runtime
+and opens the file again. It approves the write, and the run finishes:
 
 ```sh
 cargo run -p autumn-harvest-agent --features sqlite --example sqlite_mesh
@@ -101,12 +102,15 @@ model calls: 5 before the restart, 1 after it
 tool runs: lookup_fact 1, write_plan 1
 delegations:
   planner -> researcher: completed, 40 tokens, 1 tool call(s)
-  planner -> publisher: refused, not_permitted
+  planner -> publisher: refused, not_permitted (this agent may not delegate to "publisher")
 ```
 
-The restart sends one model call only. History answers the delegation, the
-refusal and each recorded turn. The last lines are `AgentReport::delegations`.
-A test of the example checks that this output stays true.
+The wait name holds `write_1`, the call id of `write_plan`. Before the
+restart, the run sends five model calls: three for the planner and two for
+the researcher. After the restart, the run sends one model call only.
+History answers the delegation, the refusal and each recorded turn. The last three lines show
+`AgentReport::delegations`. A test of the example fails when this block
+differs from the real output.
 
 ## 3. What the child gets
 
