@@ -1,16 +1,16 @@
 -- Issue #2602: each receipt row becomes the floor of its DAG on its shard.
 --
--- The floor is the newest override version that the shard retired: the
--- `updated_at` of a row that an operator cleared or replaced, or that a
--- newer copy replaced. A carry skips a version at or below the floor of
--- its destination. So a cleared version never comes back, also after a
--- routing change.
+-- The floor is the newest override version that the shard retired. A
+-- replace raises it to the old row. A clear raises it to a new version. A
+-- carry skips a version at or below the floor of its destination. A carry
+-- also moves the floor to the owner. So a cleared version never comes back,
+-- also after a routing change.
 --
 -- Issue #2413 wrote a receipt for each delivered copy. A receipt at or
--- above the live row of its shard is such a receipt: the row is still
+-- above the live row of its shard is such a receipt. Its row is still
 -- there, or the copy yielded to an older row. As a floor, it would make a
--- later carry skip a live version. This statement deletes it. Each other
--- receipt is a version that its shard cleared or replaced, so it stays.
+-- later carry skip a live version, so this statement deletes it. Each
+-- other receipt is a version that its shard cleared or replaced.
 --
 -- No hot table is touched, and each table here has one row per DAG.
 SET LOCAL lock_timeout = '5s';

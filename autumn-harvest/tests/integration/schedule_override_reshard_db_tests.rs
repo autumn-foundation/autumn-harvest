@@ -1166,43 +1166,129 @@ async fn opposite_carries_keep_the_override() {
         .await
         .expect("hold the generation row");
 
+    // The return connections open first. So the return carry fits in the
+    // 1 s lock wait of the outward carry.
+    let (mut back_from, mut back_to) = (shards.conn(DR_NEW).await, shards.conn(DR_OLD).await);
     let outward = {
         let (mut from, mut to) = (shards.conn(DR_OLD).await, shards.conn(DR_NEW).await);
         let name = dag.name.clone();
-        tokio::spawn(
-            async move { carry_dag_override(&mut from, &mut to, DR_OLD, DR_NEW, &name).await },
-        )
+        tokio::spawn(async move {
+            let moved = carry_dag_override(&mut from, &mut to, DR_OLD, DR_NEW, &name).await;
+            (moved, from, to)
+        })
     };
     wait_for_lock_wait(&mut old).await;
-    let (mut from, mut to) = (shards.conn(DR_NEW).await, shards.conn(DR_OLD).await);
-    let back = carry_dag_override(&mut from, &mut to, DR_NEW, OLD_ALIAS, &dag.name).await;
+    let back = carry_dag_override(&mut back_from, &mut back_to, DR_NEW, OLD_ALIAS, &dag.name).await;
     holder
         .batch_execute("COMMIT")
         .await
         .expect("free the generation row");
-    let outward = outward.await.expect("the outward carry joins");
+    let (moved, mut from, mut to) = outward.await.expect("the outward carry joins");
+    // A slow host can pass the lock wait of the outward carry. It then wrote
+    // nothing, so one more try is the next tick of that process.
+    let moved = match moved {
+        Err(error) if autumn_harvest::partition::is_lock_timeout(&error.to_string()) => {
+            carry_dag_override(&mut from, &mut to, DR_OLD, DR_NEW, &dag.name).await
+        }
+        other => other,
+    };
     FenceRegistry::clear();
 
     back.expect("the return carry runs");
-    outward.expect("the outward carry runs");
-    let held = [
-        override_schedule(&mut old, &dag.name).await,
-        override_schedule(&mut new, &dag.name).await,
-    ];
+    moved.expect("the outward carry runs");
     assert_eq!(
-        held.iter()
-            .filter(|schedule| **schedule == MINUTELY)
-            .count(),
-        1,
-        "one shard keeps the override: {held:?}"
+        override_schedule(&mut new, &dag.name).await,
+        MINUTELY,
+        "the new shard keeps the override"
     );
+    assert_eq!(override_schedule(&mut old, &dag.name).await, None);
+}
+
+/// Issue #2602: a carry holds the locks of both shards until its delete.
+///
+/// The delete of the outward carry sleeps after its copy commits. A sleep is
+/// not a lock wait, so the bound of 1 s does not end it. The return carry
+/// runs during that sleep. It must wait for the outward carry. Without the
+/// two locks, it reads the copy, yields to the old row and deletes the copy.
+/// The outward delete then removes the old row, and no shard holds the
+/// override.
+#[tokio::test]
+async fn a_carry_waits_for_the_opposite_carry_to_end() {
+    use autumn_harvest::schedule_override::carry_dag_override;
+
+    let shards = setup_shards().await;
+    let dag = code_dag("serial_carries");
+    let mut old = shards.conn(OLD).await;
+    let mut new = shards.conn(NEW).await;
+    update_dag_override(&mut old, &dag, &every_minute(), "ops", None)
+        .await
+        .expect("set override");
+    old.batch_execute(
+        "CREATE FUNCTION h2602_sleep() RETURNS trigger LANGUAGE plpgsql AS \
+         $$ BEGIN PERFORM pg_sleep(2); RETURN OLD; END $$; \
+         CREATE TRIGGER h2602_sleep BEFORE DELETE ON harvest_schedule_overrides \
+         FOR EACH ROW EXECUTE FUNCTION h2602_sleep();",
+    )
+    .await
+    .expect("install the sleep");
+    let (mut back_from, mut back_to) = (shards.conn(NEW).await, shards.conn(OLD).await);
+    let outward = {
+        let (mut from, mut to) = (shards.conn(OLD).await, shards.conn(NEW).await);
+        let name = dag.name.clone();
+        tokio::spawn(async move { carry_dag_override(&mut from, &mut to, OLD, NEW, &name).await })
+    };
+    wait_for_sleeping_delete(&mut old).await;
+
+    let back = carry_dag_override(&mut back_from, &mut back_to, NEW, OLD, &dag.name).await;
+
+    let moved = outward.await.expect("the outward carry joins");
+    assert!(
+        moved.expect("the outward carry runs"),
+        "the outward carry deletes"
+    );
+    match back {
+        Ok(moved) => assert!(!moved, "the return carry ran after the outward one"),
+        Err(error) => assert!(
+            autumn_harvest::partition::is_lock_timeout(&error.to_string()),
+            "the return carry waits for a lock: {error}"
+        ),
+    }
+    assert_eq!(override_schedule(&mut new, &dag.name).await, MINUTELY);
+    assert_eq!(override_schedule(&mut old, &dag.name).await, None);
+}
+
+/// Wait until a session of this database sleeps in a trigger.
+async fn wait_for_sleeping_delete(conn: &mut AsyncPgConnection) {
+    #[derive(diesel::QueryableByName)]
+    struct Count {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        n: i64,
+    }
+    let probe = "SELECT count(*) AS n FROM pg_stat_activity \
+                 WHERE datname = current_database() AND wait_event = 'PgSleep'";
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let sleeping = diesel::sql_query(probe)
+            .get_result::<Count>(conn)
+            .await
+            .expect("read the session table")
+            .n;
+        if sleeping > 0 {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the outward delete never slept"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 /// Issue #2602: a newer source row replaces an older row on the owner.
 ///
-/// The new owner holds an older override. The operator then sets a newer one
-/// on the old shard, under a router that still sends the DAG there. Before
-/// #2602 the row on the owner always won, so the newer set was lost.
+/// The new owner holds an older override. An operator then sets a newer one
+/// on the old shard, as a process with the old router does. Before #2602 the
+/// row on the owner always won, so the newer set was lost.
 #[tokio::test]
 async fn a_newer_source_row_replaces_an_older_row_on_the_owner() {
     let shards = setup_shards().await;
@@ -1269,7 +1355,90 @@ async fn a_replace_and_a_clear_raise_the_floor() {
             .await
             .expect("clear")
     );
-    assert_eq!(floor_of(&mut conn, &dag.name).await, Some(second));
+    let cleared = floor_of(&mut conn, &dag.name).await.expect("a floor");
+    assert!(
+        cleared > second,
+        "a clear takes a new version: {cleared} > {second}"
+    );
+}
+
+/// Issue #2602: a clear of no row still raises the floor.
+///
+/// The operator clears on the new owner before the move lands. The move must
+/// not then bring the old override in.
+#[tokio::test]
+async fn a_clear_on_the_new_owner_before_the_move_stays() {
+    let shards = setup_shards().await;
+    let pool = shards.pool();
+    let dag = code_dag(&moving_dag_name());
+    seed_on_old_shard(&shards, &pool, &dag).await;
+    let mut old = shards.conn(OLD).await;
+    let mut new = shards.conn(NEW).await;
+    let set = version(&mut old, &dag.name).await.expect("a version");
+
+    let cleared = clear_dag_override(&mut new, &dag.name)
+        .await
+        .expect("clear on the new owner");
+    assert!(!cleared, "the new owner held no row");
+    let floor = floor_of(&mut new, &dag.name).await.expect("a floor");
+    assert!(floor > set, "{floor} > {set}");
+    tick(&pool, router_after(), &dag).await;
+
+    assert_eq!(
+        override_schedule(&mut new, &dag.name).await,
+        None,
+        "the clear on the new owner stays"
+    );
+    assert_eq!(
+        override_schedule(&mut old, &dag.name).await,
+        None,
+        "the move deletes the old row"
+    );
+}
+
+/// Issue #2602: a clear on the new owner survives a route back.
+///
+/// The old shard carries its row to the new owner, and its delete fails. The
+/// operator clears the override on the new owner. The route then returns to
+/// the old shard, which still holds the stale row. The new shard carries its
+/// floor there, and the floor removes the stale row.
+#[tokio::test]
+async fn a_clear_on_the_new_owner_survives_a_route_back() {
+    let shards = setup_shards().await;
+    let pool = shards.pool();
+    let dag = code_dag(&moving_dag_name());
+    seed_on_old_shard(&shards, &pool, &dag).await;
+    let mut old = shards.conn(OLD).await;
+    let mut new = shards.conn(NEW).await;
+    refuse(&mut old, "DELETE").await;
+    tick(&pool, router_after(), &dag).await;
+    allow(&mut old).await;
+    assert!(
+        clear_dag_override(&mut new, &dag.name)
+            .await
+            .expect("clear on the new owner")
+    );
+    let floor = floor_of(&mut new, &dag.name).await.expect("a floor");
+
+    tick(&pool, router_before(), &dag).await;
+
+    assert_eq!(
+        override_schedule(&mut old, &dag.name).await,
+        None,
+        "the floor removes the stale row"
+    );
+    assert_eq!(floor_of(&mut old, &dag.name).await, Some(floor));
+    assert_eq!(
+        floor_of(&mut new, &dag.name).await,
+        None,
+        "the floor moves with the carry"
+    );
+    tick(&pool, router_before(), &dag).await;
+    assert_eq!(
+        schedule_expr(&mut old, &dag.name).await.as_deref(),
+        Some("interval:3600"),
+        "the old shard runs the code value"
+    );
 }
 
 /// Issue #2602: a set takes a version above the floor of its shard.
@@ -1291,6 +1460,36 @@ async fn a_set_takes_a_version_above_the_floor() {
 
     let set = version(&mut conn, &dag.name).await.expect("a version");
     assert!(set > floor, "{set} > {floor}");
+
+    // A replace retires `set`. The floor never falls, so it keeps the higher
+    // of the two.
+    let hourly = ScheduleOverridePatch {
+        schedule: Some(Some(Schedule::Interval(Duration::from_secs(3600)))),
+        ..ScheduleOverridePatch::default()
+    };
+    put_floor_over(&mut conn, &dag.name, floor + chrono::Duration::hours(1)).await;
+    update_dag_override(&mut conn, &dag, &hourly, "ops", None)
+        .await
+        .expect("replace");
+    assert_eq!(
+        floor_of(&mut conn, &dag.name).await,
+        Some(floor + chrono::Duration::hours(1)),
+        "the floor keeps its higher value"
+    );
+}
+
+/// Replace the floor of `dag_name` on this database with `at`.
+async fn put_floor_over(conn: &mut AsyncPgConnection, dag_name: &str, at: DateTime<Utc>) {
+    use autumn_harvest::schema::harvest_schedule_override_receipts::dsl;
+    diesel::update(
+        dsl::harvest_schedule_override_receipts
+            .filter(dsl::kind.eq("dag"))
+            .filter(dsl::name.eq(dag_name)),
+    )
+    .set(dsl::row_updated_at.eq(at))
+    .execute(conn)
+    .await
+    .expect("replace the floor");
 }
 
 /// Issue #2602: the floor migration deletes each #2413 delivery receipt.

@@ -122,11 +122,16 @@ change the override, and clearing the override does not resume the DAG.
   promotion. A fenced shard skips the move, and the next tick tries again.
 - **A clear stays (issues #2413, #2602).** The `updated_at` of an override
   is its version. Each shard keeps a floor in
-  `harvest_schedule_override_receipts`: the newest version that it cleared
-  or replaced. A move skips a version at or below the floor of the new
-  owner. So a stale copy never brings back a clear, also after a routing
-  change. A set takes a version above the floor, so a skewed clock cannot
-  hide a new override.
+  `harvest_schedule_override_receipts`. A replace raises it to the old
+  version. A clear raises it to a new version, also when no row is there.
+  A move skips a version at or below the floor of the new owner. A move
+  also carries the floor to the owner, and there it removes an older row.
+  So a stale copy never brings back a clear, also after a routing change.
+  Until the floor arrives, the owner can run the stale row for one tick.
+- **Clock skew.** A set or a clear takes a version above all that its own
+  shard knows. Two writes on two shards are ordered by their clocks. A set
+  that comes later than a clear on another shard, but by less than the
+  clock skew, can lose to that clear.
 - **Routing changes at any time (issue #2602).** A move holds the
   registration lock of both shards from its read to its delete. So two
   moves in opposite directions, for example from two processes with two

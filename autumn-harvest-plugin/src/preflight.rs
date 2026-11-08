@@ -427,9 +427,9 @@ const HARVEST_WRITE_PRIVILEGE_REQUIREMENTS: &[(&str, &[&str])] = &[
         "harvest_schedule_overrides",
         &["SELECT", "INSERT", "UPDATE", "DELETE"],
     ),
-    // A reshard carry records each copy, and the source delete removes the
-    // record. A missing grant fails each carry. Until the grant is in place,
-    // the new owner can run the code value, and each tick retries.
+    // Each row is the floor of a DAG override (issue #2602). An operator
+    // write raises it, and a reshard carry moves it to the owner. A missing
+    // grant fails each carry and each override write.
     (
         "harvest_schedule_override_receipts",
         &["SELECT", "INSERT", "UPDATE", "DELETE"],
@@ -2544,8 +2544,8 @@ mod tests {
         assert_eq!(log, Some(&["SELECT", "INSERT"][..]));
     }
 
-    /// A reshard carry reads, writes and deletes its copy records. A missing
-    /// grant fails each carry.
+    /// A reshard carry reads, writes and deletes the override floors. A
+    /// missing grant fails each carry.
     #[test]
     fn the_override_copy_records_are_covered_by_the_privilege_probe() {
         let covered = HARVEST_WRITE_PRIVILEGE_REQUIREMENTS

@@ -1153,6 +1153,10 @@ pub async fn update_dag_override(
         // lies above the floor, so a carry never skips it.
         let floor = raise_floor(conn, KIND_DAG, &dag_name, retired).await?;
         let version = next_version(Utc::now(), floor);
+        if merged.is_empty() {
+            // A merge with no field is a clear. It takes a version too.
+            raise_floor(conn, KIND_DAG, &dag_name, Some(version)).await?;
+        }
         store_dag_override(conn, &dag_name, &merged, (actor, reason), version).await?;
         let stored = get_dag_override(conn, &dag_name).await?;
         Ok(DagOverrideUpdate { stored, effective })
@@ -1162,9 +1166,10 @@ pub async fn update_dag_override(
 
 /// Delete the override of one DAG. Returns whether a row was deleted.
 ///
-/// The delete raises the floor of this shard to the deleted version (issue
-/// #2602). A stale copy of that version on another shard then never comes
-/// back here.
+/// The clear takes a new version, as a set does, and raises the floor of
+/// this shard to it (issue #2602). A clear of no row counts too. So no copy
+/// of an older version lands here later. A carry moves the floor to the
+/// owner, and there it removes an older row.
 ///
 /// # Errors
 ///
@@ -1179,7 +1184,9 @@ pub async fn clear_dag_override(
         // As in `update_dag_override`.
         crate::scheduler::wait_for_registration_lock(conn).await?;
         let retired = delete_dag_override_returning(conn, dag_name).await?;
-        raise_floor(conn, KIND_DAG, dag_name, retired).await?;
+        let floor = raise_floor(conn, KIND_DAG, dag_name, retired).await?;
+        let version = next_version(Utc::now(), floor);
+        raise_floor(conn, KIND_DAG, dag_name, Some(version)).await?;
         Ok(retired.is_some())
     }))
     .await
@@ -1225,8 +1232,10 @@ async fn delete_dag_override_returning(
 /// or an equal row of `to` stays. The row moves as stored, with its reason,
 /// actor and timestamps. It is not decoded.
 ///
-/// The delete matches the version of the copied row. It keeps the floor of
-/// `from`, so a version that `from` retired never comes back to it.
+/// The floor of `from` moves too. It raises the floor of `to`, and it removes
+/// a row of `to` at or below it. So a clear on a shard that lost the DAG
+/// still reaches the owner. The delete matches the version of the copied row
+/// and of the moved floor.
 ///
 /// Each transaction asserts the DR fence of its own shard before any lock or
 /// write. A process that lost authority on either shard then writes nothing.
@@ -1238,7 +1247,7 @@ async fn delete_dag_override_returning(
 /// Never pass two shards of one pool. They share one table, so the delete
 /// would remove the only copy.
 ///
-/// Returns whether the row on `from` was deleted.
+/// Returns whether the row or the floor on `from` was deleted.
 ///
 /// # Errors
 ///
@@ -1275,25 +1284,37 @@ pub async fn carry_dag_override(
                 .await
                 .optional()
                 .map_err(crate::error::database_error)?;
-            let Some(row) = row else {
+            let floor = read_floor(from, KIND_DAG, dag_name).await?;
+            if row.is_none() && floor.is_none() {
                 return Ok(None);
-            };
-            copy_newest(to, &row).await?;
-            Ok::<_, HarvestError>(Some(row.updated_at))
+            }
+            if floor.is_some() {
+                apply_floor(to, KIND_DAG, dag_name, floor).await?;
+            }
+            if let Some(row) = &row {
+                copy_newest(to, row).await?;
+            }
+            Ok::<_, HarvestError>(Some((row.map(|row| row.updated_at), floor)))
         }))
         .await?;
-        let Some(version) = copied else {
+        let Some((version, floor)) = copied else {
             return Ok(false);
         };
-        let deleted = diesel::delete(
-            dsl::harvest_schedule_overrides
-                .filter(dsl::kind.eq(KIND_DAG))
-                .filter(dsl::name.eq(dag_name))
-                .filter(dsl::updated_at.eq(version)),
-        )
-        .execute(from)
-        .await
-        .map_err(crate::error::database_error)?;
+        let mut deleted = 0;
+        if let Some(version) = version {
+            deleted += diesel::delete(
+                dsl::harvest_schedule_overrides
+                    .filter(dsl::kind.eq(KIND_DAG))
+                    .filter(dsl::name.eq(dag_name))
+                    .filter(dsl::updated_at.eq(version)),
+            )
+            .execute(from)
+            .await
+            .map_err(crate::error::database_error)?;
+        }
+        if let Some(floor) = floor {
+            deleted += drop_floor(from, KIND_DAG, dag_name, floor).await?;
+        }
         Ok(deleted > 0)
     }))
     .await
@@ -1336,7 +1357,9 @@ async fn copy_newest(conn: &mut AsyncPgConnection, row: &OverrideRow) -> Harvest
 }
 
 /// The longest wait of a carry transaction for one lock. It stays below the
-/// wait of a DR fence guard, so a move that meets a bump gives up first.
+/// wait of a DR fence guard, so a move that meets a bump gives up first. A
+/// carry waits at four locks at most. A timeout stops its group, so the
+/// guards hold off a bump for one carry at most.
 const CARRY_LOCK_TIMEOUT_SQL: &str = "SET LOCAL lock_timeout = '1s'";
 
 /// Bound each lock wait of the carry transaction on `conn`.
@@ -1415,6 +1438,69 @@ async fn raise_floor(
         .get_result(conn)
         .await
         .map(Some)
+        .map_err(crate::error::database_error)
+}
+
+/// Raise the floor of one override on this shard to `floor`, and delete a
+/// row at or below the new floor. The caller holds the registration lock.
+async fn apply_floor(
+    conn: &mut AsyncPgConnection,
+    kind: &str,
+    name: &str,
+    floor: Option<DateTime<Utc>>,
+) -> HarvestResult<()> {
+    use crate::schema::harvest_schedule_overrides::dsl;
+
+    let Some(floor) = raise_floor(conn, kind, name, floor).await? else {
+        return Ok(());
+    };
+    diesel::delete(
+        dsl::harvest_schedule_overrides
+            .filter(dsl::kind.eq(kind))
+            .filter(dsl::name.eq(name))
+            .filter(dsl::updated_at.le(floor)),
+    )
+    .execute(conn)
+    .await
+    .map_err(crate::error::database_error)?;
+    Ok(())
+}
+
+/// Delete the floor of one override on this shard when it still equals
+/// `floor`. Returns the deleted row count.
+async fn drop_floor(
+    conn: &mut AsyncPgConnection,
+    kind: &str,
+    name: &str,
+    floor: DateTime<Utc>,
+) -> HarvestResult<usize> {
+    use crate::schema::harvest_schedule_override_receipts::dsl;
+
+    diesel::delete(
+        dsl::harvest_schedule_override_receipts
+            .filter(dsl::kind.eq(kind))
+            .filter(dsl::name.eq(name))
+            .filter(dsl::row_updated_at.eq(floor)),
+    )
+    .execute(conn)
+    .await
+    .map_err(crate::error::database_error)
+}
+
+/// The DAG names that hold a floor on this shard (issue #2602). The
+/// scheduler carries the floor of each DAG that this shard does not own.
+///
+/// # Errors
+///
+/// Returns [`HarvestError::Database`] when the read fails.
+pub(crate) async fn dag_floor_names(conn: &mut AsyncPgConnection) -> HarvestResult<Vec<String>> {
+    use crate::schema::harvest_schedule_override_receipts::dsl;
+
+    dsl::harvest_schedule_override_receipts
+        .filter(dsl::kind.eq(KIND_DAG))
+        .select(dsl::name)
+        .load(conn)
+        .await
         .map_err(crate::error::database_error)
 }
 
@@ -2003,5 +2089,34 @@ mod tests {
             assert_eq!(schedule_from_storage(&stored), Some(schedule), "{stored}");
         }
         assert_eq!(schedule_from_storage("bogus"), None);
+    }
+
+    fn at(micros: i64, nanos: u32) -> DateTime<Utc> {
+        DateTime::from_timestamp_micros(micros).expect("a valid time")
+            + chrono::Duration::nanoseconds(i64::from(nanos))
+    }
+
+    /// Issue #2602: with no floor, a version is the clock in whole
+    /// microseconds.
+    #[test]
+    fn a_version_with_no_floor_is_the_clock_in_microseconds() {
+        assert_eq!(next_version(at(1_000, 999), None), at(1_000, 0));
+    }
+
+    /// Issue #2602: a clock above the floor gives the clock.
+    #[test]
+    fn a_version_follows_a_clock_above_the_floor() {
+        assert_eq!(next_version(at(1_000, 0), Some(at(10, 0))), at(1_000, 0));
+    }
+
+    /// Issue #2602: a clock at or below the floor gives one microsecond above
+    /// the floor.
+    #[test]
+    fn a_version_lies_above_a_floor_that_the_clock_does_not_pass() {
+        let floor = at(1_000, 0);
+        let above = at(1_001, 0);
+        assert_eq!(next_version(at(10, 0), Some(floor)), above);
+        assert_eq!(next_version(floor, Some(floor)), above);
+        assert_eq!(next_version(at(1_000, 500), Some(floor)), above);
     }
 }

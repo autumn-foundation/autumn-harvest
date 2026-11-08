@@ -84,7 +84,7 @@ fails in these cases:
 | `AgentMesh` | Durable peer send between two agents (issue #2269) | design, three single-layer configs, four defects, reachability |
 | `AgentWorkspace` | Workspace head of a durable agent (issue #2274) | design, two defects, reachability |
 | `AgentWorkspaceRetention` | Workspace retention across the ops and lives of a durable agent (issue #2274) | design, three defects, reachability |
-| `OverrideCarry` | The carry of a DAG schedule override to its new shard (issues #2413, #2602) | design, three shards, two routing configs, five defects, reachability |
+| `OverrideCarry` | The carry of a DAG schedule override to its new shard (issues #2413, #2602) | design, three shards, two routing configs, skew, one limit, six defects, reachability |
 
 **Ghost sequence numbers.** Each claim in the two claim models gets a ghost
 `seq`. The code has no such column. An invariant that compared
@@ -544,9 +544,10 @@ the DAG copies the row to the owner, then deletes it on the source. The
 delete can fail, and the carry then starts again. A promotion of any shard
 can happen at any time.
 
-A version is the `updated_at` of a row. Each shard keeps a floor: the
-newest version that it cleared or replaced. A copy skips a version at or
-below the floor of its destination.
+A version is the `updated_at` of a row. Each shard keeps a floor. A
+replace raises it to the old row, and a clear raises it to a new version.
+A copy skips a version at or below the floor of its destination. A carry
+also moves the floor of its source to the owner.
 
 | Action | Code |
 |---|---|
@@ -565,18 +566,23 @@ below the floor of its destination.
 | `OverrideCarryThreeShards.cfg` | Three shards. | Pass. |
 | `OverrideCarryFlipAfterFailedDelete.cfg` | `FlipWhen = "idle"`. | Pass. |
 | `OverrideCarryFlipMidCarry.cfg` | A deeper bound. | Pass. |
+| `OverrideCarrySkew.cfg` | `Fresh = FALSE` | Pass. |
+| `OverrideCarrySkewLimit.cfg` | `Fresh = FALSE`. A known limit. | Violates `LastWriteWins`. |
 | `OverrideCarryNoFloor.cfg` | `Floor = FALSE` | Violates `ClearIsKept`. |
-| `OverrideCarryWallClock.cfg` | `Hlc = FALSE` | Violates `ClearIsKept`. |
-| `OverrideCarryOwnerRowWins.cfg` | `Newest = FALSE` | Violates `NothingLostWithoutAClear`. |
+| `OverrideCarryNoFloorCarry.cfg` | `CarryFloor = FALSE` | Violates `ClearIsKept`. |
+| `OverrideCarryWallClock.cfg` | `Hlc = FALSE` | Violates `NothingLostWithoutAClear`. |
+| `OverrideCarryOwnerRowWins.cfg` | `Newest = FALSE` | Violates `LastWriteWins`. |
 | `OverrideCarryUnserialized.cfg` | `Serial = FALSE` | Violates `NothingLostWithoutAClear`. |
 | `OverrideCarryUnfenced.cfg` | `Fenced = FALSE` | Violates `NoWriteAfterPromotion`. |
 | `OverrideCarryReach.cfg` | None. | Violates `NoClearOfACopiedRow`. |
 
-Without a floor, a stale copy brings back a cleared version. A set with a
-skewed clock can take a version at or below the floor. A copy that always
-yields to the row of its destination lets a stale older row shadow a newer
-one. Without the lock of both shards, two carries in opposite directions
-both delete. See [`DESIGN-2602.md`](../design/DESIGN-2602.md).
+Without a floor, a stale copy brings back a cleared version. A floor that
+stays on its shard lets a route back serve a stale row. A write that does
+not take a version above its shard can land below a floor. A copy that
+always yields to the row of its destination lets a stale older row win.
+Without the lock of both shards, two carries in opposite directions both
+delete. With skewed clocks, a set within the skew of a clear on another
+shard can lose. See [`DESIGN-2602.md`](../design/DESIGN-2602.md).
 
 ### Extend a model
 

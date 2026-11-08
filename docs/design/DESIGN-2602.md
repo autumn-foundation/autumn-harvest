@@ -48,9 +48,10 @@ and no shard but the owner holds a row. Without that bound, three gaps open.
 8. A hybrid logical clock for `updated_at`: a set takes the larger of the
    clock and one microsecond above each version that its shard knows.
 9. A lease per DAG on the default shard.
-10. Copy the source tombstones with the row.
+10. Carry the floor of the source with the row.
+11. A clear takes a new version, as a set does.
 
-Decision: 3, 6 and 8, and a newer copy replaces an older row (2).
+Decision: 3, 6, 8, 10 and 11, and a newer copy replaces an older row (2).
 
 - Option 1 needs a new shared coordination point. A process with an old
   router does not read it. It also contradicts acceptance criterion 1.
@@ -67,7 +68,12 @@ Decision: 3, 6 and 8, and a newer copy replaces an older row (2).
 - Option 7 is wrong under any routing change. TLC finds a run: a copy
   yields to a newer row and still records its version. A later real copy
   of that version is then skipped, and the override is lost.
-- Option 10 is not needed. The floor and the order cover it.
+- Option 10 is needed. A floor stays on the shard that cleared. A route
+  back to a shard with a stale row then serves that row. TLC finds this run
+  (`OverrideCarryNoFloorCarry.cfg`). The carry moves the floor, and on the
+  owner the floor removes an older row.
+- Option 11 is needed. A clear of no row writes no floor otherwise. A clear
+  on the new owner before the move lands is then undone.
 - "The owner row wins" (#2413) is wrong under any routing change. A stale
   older row can shadow a newer row. A floor then removes the stale row, and
   the override is lost. So a newer copy replaces an older row.
@@ -80,8 +86,9 @@ Decision: 3, 6 and 8, and a newer copy replaces an older row (2).
 | A set gets a version at or below the floor. Its round trip is then skipped. | The set takes one microsecond above the floor and the row. `OverrideCarryWallClock.cfg` shows the loss without it. |
 | A copy raises the floor when it lands on an empty shard. A round trip is then skipped. | A copy raises the floor only when it replaces a row. |
 | A legacy delivery receipt becomes a floor. A round trip is then skipped. | The migration deletes each receipt at or above the live row of its shard. |
-| The source delete drops the floor of the source. A cleared version comes back. | The delete keeps the floor. |
-| The carry holds the source lock while it waits on the destination. A bump waits too. | Each wait is at most 1 s. The DR guards hold off a bump only for that time. |
+| The source delete drops a floor that the copy did not move. A cleared version comes back. | The delete matches the moved floor. Both run under the locks of both shards. |
+| A floor never leaves a shard that lost the DAG. Each tick carries it again. | The source delete drops the moved floor. |
+| The carry holds the source lock while it waits on the destination. A bump waits too. | Each wait is at most 1 s. A timeout stops the group, so the DR guards hold off a bump for one carry at most. |
 | A copy compares versions with nanoseconds. Postgres stores microseconds. | Each version is truncated to microseconds before a compare or a write. |
 | A newer copy replaces a row on the owner that an operator set later in real time. | Within the clock skew between two processes, that is the order of the two writes. Each write takes a version above all that its shard knows. |
 
@@ -123,17 +130,19 @@ delete.
 `row_updated_at` is now the floor: the newest version that the shard
 retired for the DAG.
 
-- `update_dag_override` raises the floor to the version of the row that it
-  replaces or clears.
-- `clear_dag_override` raises the floor to the version of the row that it
-  deletes.
+- A replace raises the floor to the version of the old row.
+- A clear takes a new version and raises the floor to it. A clear of no
+  row does the same. `update_dag_override` with an empty merge is a clear.
 - The copy writes nothing when the source version is at or below the floor
   of the destination.
+- The carry moves the floor of the source. On the destination it raises the
+  floor and deletes a row at or below it. The source delete then drops the
+  moved floor. `carry_misplaced_overrides` also carries a floor with no row.
 
 ### Version order
 
-- A set takes `max(now, floor + 1 µs, row + 1 µs)`, truncated to
-  microseconds.
+- A set or a clear takes `max(now, floor + 1 µs, row + 1 µs)`, truncated
+  to microseconds.
 - A copy into an empty shard inserts the row.
 - A copy replaces an older row, and that row raises the floor.
 - A copy keeps a newer or an equal row.
@@ -147,7 +156,14 @@ cleared or replaced, so it is a valid floor.
 
 ## Model
 
-`formal/tla/OverrideCarry.tla` lets a routing change land at any time.
+`formal/tla/OverrideCarry.tla` lets a routing change land at any time. With
+`Fresh`, each write takes a version above all versions so far, as
+synchronized clocks give.
+
+- `ClearIsKept`: a settled owner holds no version that an operator cleared
+  or replaced on any shard.
+- `LastWriteWins`: a settled owner holds the result of the last write.
+- `NothingLostWithoutAClear`: the weak form. It holds with skewed clocks.
 
 | Config | Switch | Result |
 |---|---|---|
@@ -155,15 +171,15 @@ cleared or replaced, so it is a valid floor.
 | `OverrideCarryThreeShards.cfg` | Three shards. | Pass. |
 | `OverrideCarryFlipAfterFailedDelete.cfg` | `FlipWhen = "idle"`. | Pass. |
 | `OverrideCarryFlipMidCarry.cfg` | `FlipWhen = "any"`, a deeper bound. | Pass. |
+| `OverrideCarrySkew.cfg` | `Fresh = FALSE` | Pass. |
+| `OverrideCarrySkewLimit.cfg` | `Fresh = FALSE`. A known limit. | Violates `LastWriteWins`. |
 | `OverrideCarryNoFloor.cfg` | `Floor = FALSE` | Violates `ClearIsKept`. |
-| `OverrideCarryWallClock.cfg` | `Hlc = FALSE` | Violates `ClearIsKept`. |
-| `OverrideCarryOwnerRowWins.cfg` | `Newest = FALSE` | Violates `NothingLostWithoutAClear`. |
+| `OverrideCarryNoFloorCarry.cfg` | `CarryFloor = FALSE` | Violates `ClearIsKept`. |
+| `OverrideCarryWallClock.cfg` | `Hlc = FALSE` | Violates `NothingLostWithoutAClear`. |
+| `OverrideCarryOwnerRowWins.cfg` | `Newest = FALSE` | Violates `LastWriteWins`. |
 | `OverrideCarryUnserialized.cfg` | `Serial = FALSE` | Violates `NothingLostWithoutAClear`. |
 | `OverrideCarryUnfenced.cfg` | `Fenced = FALSE` | Violates `NoWriteAfterPromotion`. |
 | `OverrideCarryReach.cfg` | The design. | Violates `NoClearOfACopiedRow`. |
-
-`ClearIsKept` now also covers a replaced version. An operator who replaces
-v1 with v2 and then clears v2 must not see v1 come back.
 
 The #2413 configs `OverrideCarryNoReceipt.cfg` and
 `OverrideCarryKeepSourceReceipt.cfg` model the delivery receipt, which is
@@ -175,14 +191,25 @@ gone. `OverrideCarryNoFloor.cfg` replaces them.
   scheduler: a failed delete, a route back, a clear on the old shard.
 - AC 3: `opposite_carries_keep_the_override`. Gap 2: the delete of one
   carry waits after its copy, and the opposite carry runs.
+- `a_carry_waits_for_the_opposite_carry_to_end`. The delete of one carry
+  sleeps, and the opposite carry must wait for its locks.
+- `a_clear_on_the_new_owner_survives_a_route_back`. The floor moves to the
+  old shard and removes its stale row.
+- `a_clear_on_the_new_owner_before_the_move_stays`. A clear of no row.
 - `a_newer_source_row_replaces_an_older_row_on_the_owner`.
-- `a_set_takes_a_version_above_the_floor`.
+- `a_replace_and_a_clear_raise_the_floor`.
+- `a_set_takes_a_version_above_the_floor`. The floor also never falls.
 - `the_floor_migration_keeps_only_retired_versions`.
+- Unit tests of `next_version`.
 
 ## Limits
 
-- **Concurrent sets.** Two operators who set the same DAG on two shards
-  under two routers write concurrently. The newer version wins. Clock skew
-  can order two writes that are closer than the skew.
+- **Clock skew.** Each write takes a version above all that its own shard
+  knows. Two writes on two shards are ordered by their clocks. A set that
+  comes after a clear on another shard, but by less than the skew, can lose
+  to the clear. `OverrideCarrySkewLimit.cfg` shows the run.
+- **One tick on a stale row.** After a route back, the owner can run a
+  stale row until the floor of the other shard arrives. That is one tick,
+  or two when the owner comes first in shard order.
 - **Two shards of one pool** share one table, so nothing moves between
   them. That rule is unchanged (#2405).
