@@ -54,7 +54,7 @@ change is in the bench harness and the docs only.
 * **Black (risks).** Four worker processes, Postgres and the generator
   share 4 cores. The number is a host limit as much as an engine limit.
   Each worker process opens up to 33 connections, so a shard needs
-  `max_connections` of about 140.
+  152 connections at 4 processes.
 * **Yellow (benefits).** The first Harvest number that has the same shape
   as a published capacity figure. The pure rule is unit-tested, so the
   soundness logic is fixed before a run.
@@ -92,8 +92,9 @@ matrix. `HARVEST_BENCH_SCENARIOS=capacity` selects both arms.
    its admission.
 5. Drain the step. Wait until every run is terminal, or 20 s pass.
 6. Load `workflow_id`, `state` and `completed_at` for the step's runs.
-7. Judge the step. A step that fails only on the p99 rule runs once more.
-   Stop the ladder at the first step that is not sustainable.
+7. Judge the step. A step that fails only on the median or p99 rule runs
+   once more. With no budget for that retry, the cell is void. Stop the
+   ladder at the first step that is not sustainable.
 
 ### 1.3 The sustainable-rate rule
 
@@ -103,8 +104,10 @@ shard:
 
 * The generator held 95% or more of the offered rate.
 * The p99 generator wait is at most 100 ms.
-* The step started 400 runs or more, so each judged window holds 100.
-* Every run completed within the drain grace, and none failed.
+* The step started 400 runs or more, so each judged window holds 100. The
+  start rates, 50 and 25, give 500 runs, which leaves a margin.
+* Every run completed within the drain grace. No run and no start call
+  failed.
 * The least-squares slope of the engine backlog over the judged windows is
   at most 5% of the offer.
 * The median latency grows at most 5 ms/s from the second window to the
@@ -169,3 +172,25 @@ the first rule, so it was stopped and is not published.
 | Children were not in the task census. | Each child holds a census guard until it exits. |
 | Children inherited the commit probe, and a stdout write could block. | `env_remove` for the probe, and the parent drains stdout. |
 | The comparison guard could pass on a stray number or a whole table. | Exact numbers, the arm id, the results link and case-insensitive hardware in the same block. |
+
+## 4. Review round 2
+
+A workflow ran five reviewers over the branch. Two skeptics then tried to
+refute each finding. One finding survived both. Several more held with one
+vote, and a reading of the code confirmed them.
+
+| Finding | Fix |
+|---------|-----|
+| The results file blamed the closed-loop change on worker count. Both closed-loop cells ran one worker. | The text now says both ran one in-process worker with 8 slots. |
+| A noise-only failure with no budget for its retry became a sound knee. | `after_failure` voids the cell. |
+| A start that timed out in an overloaded step panicked the whole cell. | A failed start fails the step instead. |
+| The median limit sits near the noise of healthy canonical steps. | A median-only failure also earns the one retry. |
+| A window could hold 99 runs, with no margin. | Start rates 50 and 25: 500 runs per step, on the same ladder rates. |
+| The connection check ignored connections in use and `reserved_connections`. | It reads both. |
+| `ProcessFleet::stop` dropped census guards before it reaped the children. | Each child stays in the fleet until it is reaped. |
+| A malformed child variable made a child run the benchmark. | `child_mode` exits the child instead. |
+| The DBOS bullet sat under Related, and the guards missed swapped rows, a bare "million", and the headline numbers in `benchmarks.md`. | The bullet moved. The guards check each row, need the engine name, and pin the headline. |
+
+Not changed: the retry's p99 is the published p99, as the rule states. The
+admission and completion clocks are both on the bench host. A slow start
+path voids the cell as generator-bound, which never inflates a number.

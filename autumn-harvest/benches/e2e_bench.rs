@@ -97,7 +97,15 @@ fn main() {
         .build()
         .expect("build the benchmark runtime");
     // A capacity cell runs this binary again as a worker process.
-    if let Some(spec) = capacity_bench_support::db::child_spec_from_env() {
+    let spec = match capacity_bench_support::db::child_spec_from_env() {
+        Ok(spec) => spec,
+        Err(reason) => {
+            // A broken child must never run the benchmark itself.
+            eprintln!("worker process: {reason}");
+            std::process::exit(2);
+        }
+    };
+    if let Some(spec) = spec {
         let code = runtime.block_on(capacity_bench_support::db::run_worker_child(spec));
         // Exit at once. A blocked stdin reader must not hold the process.
         std::process::exit(code);
@@ -304,8 +312,8 @@ async fn run_scenario(
 
 /// Print the shard-scaling lines of the capacity cells.
 ///
-/// A ratio appears only for sound cells whose shards each have their own
-/// database host. A co-located cell never enters a scaling claim.
+/// A ratio appears only for a sound cell with one database host and one
+/// worker host per shard. A co-located cell never enters a scaling claim.
 fn print_shard_scaling(reports: &[ScenarioReport]) {
     let lines = capacity_bench_support::scaling_lines(reports);
     if lines.is_empty() {
@@ -335,7 +343,8 @@ fn print_environment(capacity_ran: bool) {
     println!("| Profile | `bench` (release) |");
     println!("| Harness | `autumn-harvest/tests/integration/e2e_bench_support.rs` |");
     println!(
-        "| Workers | {} per shard, {} concurrent workflows, {} concurrent activities |",
+        "| Workers | {} per shard in the matrix cells, {} concurrent workflows, {} concurrent \
+         activities |",
         e2e_bench_support::WORKERS_PER_SHARD,
         e2e_bench_support::MAX_CONCURRENT_WORKFLOWS,
         e2e_bench_support::MAX_CONCURRENT_ACTIVITIES,
@@ -345,7 +354,7 @@ fn print_environment(capacity_ran: bool) {
         e2e_bench_support::POLL_INTERVAL_MS
     );
     println!(
-        "| Pool size | {} per shard |",
+        "| Pool size | {} per shard, and per worker process in a capacity cell |",
         e2e_bench_support::POOL_SIZE_PER_SHARD
     );
     if capacity_ran {

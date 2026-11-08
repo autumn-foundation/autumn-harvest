@@ -57,12 +57,14 @@ pub const WORKER_PROCESSES_ENV_VAR: &str = "HARVEST_BENCH_WORKER_PROCESSES";
 
 /// First offered rate of an arm, in starts per second per shard.
 ///
-/// Each start rate gives [`CAPACITY_MIN_STEP_RUNS`] runs in one step.
+/// Each start rate gives 1.25 times [`CAPACITY_MIN_STEP_RUNS`] runs in one
+/// step. A run admitted late can move to the next window, so a window needs
+/// that margin. One step lower still gives a valid step.
 #[must_use]
 pub const fn start_rate_per_shard(arm: CapacityArm) -> f64 {
     match arm {
-        CapacityArm::Noop => 40.0,
-        CapacityArm::Canonical => 20.0,
+        CapacityArm::Noop => 50.0,
+        CapacityArm::Canonical => 25.0,
     }
 }
 
@@ -102,6 +104,8 @@ pub struct StepEvidence {
     pub arrivals: Vec<Arrival>,
     /// Runs that ended in a state other than completed.
     pub failed: usize,
+    /// Start calls that returned an error or timed out.
+    pub failed_starts: usize,
 }
 
 /// Runs admitted at or before `t` that had not completed at `t`.
@@ -253,8 +257,9 @@ pub struct ShardJudgement {
     pub generator_wait_p99_ms: Option<f64>,
     /// Runs that did not complete within the drain grace.
     pub unfinished: usize,
-    /// Whether the only engine reason is the p99 growth rule.
-    pub tail_only: bool,
+    /// Whether every engine reason is one that noise can cause: the median
+    /// rule or the p99 rule.
+    pub retry_eligible: bool,
 }
 
 /// Judge one shard's evidence for one step.
@@ -306,6 +311,9 @@ pub fn judge_shard(evidence: &StepEvidence) -> ShardJudgement {
     if evidence.failed > 0 {
         engine.push(format!("{} runs failed", evidence.failed));
     }
+    if evidence.failed_starts > 0 {
+        engine.push(format!("{} start calls failed", evidence.failed_starts));
+    }
 
     // The first window is settle time. The judged span is the rest.
     #[allow(clippy::cast_precision_loss, reason = "the window count is small")]
@@ -333,7 +341,9 @@ pub fn judge_shard(evidence: &StepEvidence) -> ShardJudgement {
         (Some(Some(first)), Some(Some(last))) if spacing > 0.0 => Some((last - first) / spacing),
         _ => None,
     };
+    let mut noise_reasons = 0;
     if let Some(growth) = median_growth.filter(|g| *g > CAPACITY_MAX_LATENCY_GROWTH_MS_PER_SEC) {
+        noise_reasons += 1;
         engine.push(format!(
             "the median latency grew {growth:.1} ms/s, over the \
              {CAPACITY_MAX_LATENCY_GROWTH_MS_PER_SEC:.0} ms/s limit"
@@ -341,17 +351,18 @@ pub fn judge_shard(evidence: &StepEvidence) -> ShardJudgement {
     }
 
     let windows = window_p99_ms(&evidence.arrivals, evidence.step_secs);
-    let mut tail_failed = false;
     if let (Some(Some(first)), Some(Some(last))) = (windows.get(1), windows.last()) {
         let ceiling = first.mul_add(CAPACITY_MAX_P99_GROWTH_RATIO, CAPACITY_P99_GROWTH_SLACK_MS);
         if *last > ceiling {
-            tail_failed = true;
+            noise_reasons += 1;
             engine.push(format!(
                 "the p99 grew from {first:.1} ms to {last:.1} ms, over the {ceiling:.1} ms limit"
             ));
         }
     }
-    let tail_only = tail_failed && engine.len() == 1;
+    // Noise can move a median or a p99. It cannot grow a backlog or fail a
+    // run, so only those two rules earn a retry.
+    let retry_eligible = !engine.is_empty() && engine.len() == noise_reasons;
 
     ShardJudgement {
         backlog_slope,
@@ -361,7 +372,7 @@ pub fn judge_shard(evidence: &StepEvidence) -> ShardJudgement {
         median_growth,
         generator_wait_p99_ms,
         unfinished,
-        tail_only,
+        retry_eligible,
     }
 }
 
@@ -377,14 +388,39 @@ pub fn generator_wait_p99_ms(arrivals: &[Arrival]) -> Option<f64> {
 
 /// Whether a failed step runs once more at the same rate.
 ///
-/// A step whose only failure is the p99 rule can be one pause in a small
-/// window. It runs once more, and the second verdict counts. A backlog or
-/// median failure never earns a retry.
+/// A step that fails only on the median or the p99 rule can be one pause in a
+/// small window. It runs once more, and the second verdict counts. A backlog,
+/// a failed run or a failed start never earns a retry. A real overload fails
+/// the retry too, so the retry can only remove noise.
 #[must_use]
 pub fn step_retryable(judgements: &[ShardJudgement]) -> bool {
     let failing: Vec<&ShardJudgement> =
         judgements.iter().filter(|j| !j.engine.is_empty()).collect();
-    !failing.is_empty() && failing.iter().all(|j| j.tail_only)
+    !failing.is_empty() && failing.iter().all(|j| j.retry_eligible)
+}
+
+/// What the ladder does after a step fails.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AfterFailure {
+    /// Run the step once more. The second verdict counts.
+    Retry,
+    /// Stop the ladder. The failure is the knee.
+    Stop,
+    /// Stop the ladder, and void the cell with this reason.
+    Void(String),
+}
+
+/// Decide what follows a failed step.
+#[must_use]
+pub fn after_failure(retryable: bool, budget_left: bool, rate: f64) -> AfterFailure {
+    match (retryable, budget_left) {
+        (false, _) => AfterFailure::Stop,
+        (true, true) => AfterFailure::Retry,
+        (true, false) => AfterFailure::Void(format!(
+            "the step at {rate:.1} starts/s earned a retry, but the budget had no room for it, \
+             so its failure is no knee"
+        )),
+    }
 }
 
 /// Reasons a warmup step leaves the cell unsound.
@@ -417,14 +453,18 @@ pub fn connection_budget_reasons(
     need: usize,
     max_connections: usize,
     reserved: usize,
+    in_use: usize,
 ) -> Vec<String> {
-    let usable = max_connections.saturating_sub(reserved);
+    let usable = max_connections
+        .saturating_sub(reserved)
+        .saturating_sub(in_use);
     if need <= usable {
         return Vec::new();
     }
     vec![format!(
         "the cell needs {need} connections on one server, over the {usable} that \
-         max_connections leaves; raise max_connections or lower {WORKER_PROCESSES_ENV_VAR}"
+         max_connections leaves with {in_use} connections in use; raise max_connections or \
+         lower {WORKER_PROCESSES_ENV_VAR}"
     )]
 }
 
@@ -657,6 +697,33 @@ pub const CHILD_URLS_ENV_VAR: &str = "HARVEST_BENCH_CAPACITY_CHILD_URLS";
 /// The line a worker process prints once its worker runs.
 pub const CHILD_READY_LINE: &str = "ready";
 
+/// How this process should run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChildMode {
+    /// No child variable is set: run the benchmark.
+    NotChild,
+    /// Run one worker: `(shard, worker id, shard URLs)`.
+    Child(i32, String, Vec<(i32, String)>),
+    /// A child variable is set but does not parse: exit with this reason.
+    Malformed(String),
+}
+
+/// Read the child variables. A set but malformed variable never falls back
+/// to a benchmark run.
+#[must_use]
+pub fn child_mode(spec: Option<&str>, urls: Option<&str>) -> ChildMode {
+    let Some(spec) = spec else {
+        return ChildMode::NotChild;
+    };
+    let Some((shard, worker_id)) = parse_child_spec(spec) else {
+        return ChildMode::Malformed(format!("{CHILD_ENV_VAR} does not parse: {spec:?}"));
+    };
+    let Some(urls) = urls.and_then(parse_child_urls) else {
+        return ChildMode::Malformed(format!("{CHILD_URLS_ENV_VAR} is missing or does not parse"));
+    };
+    ChildMode::Child(shard, worker_id, urls)
+}
+
 /// Encode the shard and worker id of one worker process.
 #[must_use]
 pub fn encode_child_spec(shard: i32, worker_id: &str) -> String {
@@ -767,6 +834,7 @@ mod tests {
             step_secs: CAPACITY_STEP_SECS,
             arrivals,
             failed: 0,
+            failed_starts: 0,
         }
     }
 
@@ -926,10 +994,10 @@ mod tests {
             a.completed_secs = a.completed_secs.map(|c| c + 2.0);
         }
         let spike = judge_shard(&evidence(50.0, arrivals));
-        assert!(spike.tail_only, "{spike:?}");
+        assert!(spike.retry_eligible, "{spike:?}");
         assert!(step_retryable(&[spike]));
         let overload = judge_shard(&evidence(50.0, overloaded(50.0, 40.0, CAPACITY_STEP_SECS)));
-        assert!(!overload.tail_only);
+        assert!(!overload.retry_eligible);
         assert!(!step_retryable(&[overload]));
         let sound = judge_shard(&evidence(50.0, steady(50.0, CAPACITY_STEP_SECS, 0.2)));
         assert!(
@@ -957,14 +1025,117 @@ mod tests {
             4 * (POOL_SIZE_PER_SHARD + 1) + CAPACITY_GENERATOR_CONNECTIONS_PER_SHARD + 4
         );
         assert_eq!(
-            connection_budget_reasons(need, 200, 3),
+            connection_budget_reasons(need, 200, 3, 0),
             Vec::<String>::new()
         );
-        let reasons = connection_budget_reasons(2 * need, 200, 3);
+        let reasons = connection_budget_reasons(2 * need, 200, 3, 0);
         assert!(
             reasons.iter().any(|r| r.contains("max_connections")),
             "{reasons:?}"
         );
+    }
+
+    #[test]
+    fn windows_and_backlog_follow_admission_not_schedule() {
+        // Every run is scheduled in the first 5 s, but admitted from 10 s.
+        let arrivals: Vec<Arrival> = (0..100)
+            .map(|k| {
+                let at = f64::from(k) * 0.05;
+                Arrival {
+                    scheduled_secs: at,
+                    admitted_secs: 10.0 + at,
+                    completed_secs: Some(10.0 + at + 0.1),
+                }
+            })
+            .collect();
+        assert_eq!(backlog_at(&arrivals, 1.0), 0, "no run was admitted yet");
+        let windows = window_p99_ms(&arrivals, 20.0);
+        assert_eq!(windows[0], None);
+        assert_eq!(windows[1], None);
+        let p99 = windows[2].expect("the admitted runs fall in window 2");
+        assert!(
+            (p99 - 100.0).abs() < 1e-6,
+            "latency runs from admission: {p99}"
+        );
+    }
+
+    #[test]
+    fn a_median_only_failure_earns_one_retry() {
+        // Every run in the last window takes 100 ms longer. The median grows
+        // 10 ms/s, while the backlog slope and the p99 stay under their limits.
+        let mut arrivals = steady(50.0, CAPACITY_STEP_SECS, 0.2);
+        for a in &mut arrivals {
+            if a.admitted_secs >= 15.0 {
+                a.completed_secs = a.completed_secs.map(|c| c + 0.1);
+            }
+        }
+        let judged = judge_shard(&evidence(50.0, arrivals));
+        assert_eq!(judged.engine.len(), 1, "{judged:?}");
+        assert!(judged.engine[0].contains("median"), "{judged:?}");
+        assert!(judged.retry_eligible);
+        assert!(step_retryable(&[judged]));
+    }
+
+    #[test]
+    fn a_failed_retry_with_no_budget_voids_the_cell() {
+        assert_eq!(after_failure(true, true, 50.0), AfterFailure::Retry);
+        assert_eq!(after_failure(false, true, 50.0), AfterFailure::Stop);
+        assert_eq!(after_failure(false, false, 50.0), AfterFailure::Stop);
+        let AfterFailure::Void(reason) = after_failure(true, false, 50.0) else {
+            panic!("a step that earned a retry it cannot run is no knee");
+        };
+        assert!(reason.contains("budget"), "{reason}");
+    }
+
+    #[test]
+    fn a_failed_start_call_fails_the_step() {
+        let mut e = evidence(50.0, steady(50.0, CAPACITY_STEP_SECS, 0.2));
+        e.failed_starts = 3;
+        let judged = judge_shard(&e);
+        assert!(
+            judged
+                .engine
+                .iter()
+                .any(|r| r.contains("start calls failed")),
+            "{judged:?}"
+        );
+        assert!(!judged.retry_eligible);
+    }
+
+    #[test]
+    fn connections_already_in_use_count_against_the_budget() {
+        let need = connection_need_per_shard(4);
+        assert_eq!(
+            connection_budget_reasons(need, 200, 3, 10),
+            Vec::<String>::new()
+        );
+        let reasons = connection_budget_reasons(need, 200, 3, 60);
+        assert!(reasons.iter().any(|r| r.contains("in use")), "{reasons:?}");
+    }
+
+    #[test]
+    fn a_malformed_child_variable_never_runs_the_benchmark() {
+        assert_eq!(child_mode(None, None), ChildMode::NotChild);
+        assert_eq!(
+            child_mode(Some("0|cap-s0-p0"), Some("0=postgres://h/a")),
+            ChildMode::Child(
+                0,
+                "cap-s0-p0".to_owned(),
+                vec![(0, "postgres://h/a".to_owned())]
+            )
+        );
+        assert!(matches!(
+            child_mode(Some("junk"), Some("0=postgres://h/a")),
+            ChildMode::Malformed(_)
+        ));
+        assert!(matches!(
+            child_mode(Some("0|id"), None),
+            ChildMode::Malformed(_)
+        ));
+        assert!(matches!(
+            child_mode(Some("0|id"), Some("x")),
+            ChildMode::Malformed(_)
+        ));
     }
 
     #[test]
@@ -1070,15 +1241,29 @@ mod tests {
     }
 
     #[test]
-    fn each_start_rate_fills_a_step_with_enough_runs() {
+    fn each_start_rate_fills_a_step_with_a_margin_over_the_minimum() {
+        // A run admitted late can move to the next window, so each window
+        // needs a margin over 100 runs. A lower start rate must stay valid.
         for arm in [CapacityArm::Noop, CapacityArm::Canonical] {
             let runs = start_rate_per_shard(arm) * CAPACITY_STEP_SECS;
-            assert!(runs >= CAPACITY_MIN_STEP_RUNS as f64, "{arm:?}: {runs}");
+            assert!(
+                runs >= 1.25 * CAPACITY_MIN_STEP_RUNS as f64,
+                "{arm:?}: {runs}"
+            );
         }
     }
 
     #[test]
-    fn the_backlog_counts_scheduled_runs_that_have_not_completed() {
+    fn the_ladder_rates_stay_on_the_published_grid() {
+        // The start rates moved up one step. The ladder visits the same rates.
+        let canonical = ladder_rate(start_rate_per_shard(CapacityArm::Canonical), 2);
+        assert!((canonical - 39.1).abs() < 1e-9, "{canonical}");
+        let noop = ladder_rate(start_rate_per_shard(CapacityArm::Noop), 6);
+        assert!((noop - 190.7).abs() < 1e-9, "{noop}");
+    }
+
+    #[test]
+    fn the_backlog_counts_admitted_runs_that_have_not_completed() {
         let arrivals = [
             Arrival {
                 scheduled_secs: 0.0,
@@ -1129,7 +1314,7 @@ mod tests {
     }
 
     #[test]
-    fn the_windows_split_the_step_by_scheduled_arrival() {
+    fn the_windows_split_a_steady_step_evenly() {
         let arrivals = steady(10.0, 20.0, 0.1);
         let windows = window_p99_ms(&arrivals, 20.0);
         assert_eq!(windows.len(), CAPACITY_WINDOWS);
@@ -1273,13 +1458,13 @@ pub mod db {
         CensusGuard, Metric, ScenarioReport, TaskCensus, positive_override,
     };
     use super::{
-        Arrival, CAPACITY_DRAIN_GRACE_SECS, CAPACITY_GENERATOR_CONNECTIONS_PER_SHARD,
+        AfterFailure, Arrival, CAPACITY_DRAIN_GRACE_SECS, CAPACITY_GENERATOR_CONNECTIONS_PER_SHARD,
         CAPACITY_MAX_STEPS, CAPACITY_STEP_SECS, CAPACITY_WORKER_PROCESSES_PER_SHARD, CHILD_ENV_VAR,
-        CHILD_READY_LINE, CHILD_URLS_ENV_VAR, DATABASE_HOSTS_METRIC, SUSTAINABLE_METRIC,
+        CHILD_READY_LINE, CHILD_URLS_ENV_VAR, ChildMode, DATABASE_HOSTS_METRIC, SUSTAINABLE_METRIC,
         ShardJudgement, StepEvidence, StepRecord, StepVerdict, WORKER_HOSTS_METRIC,
-        WORKER_PROCESSES_ENV_VAR, connection_budget_reasons, connection_need_per_shard,
-        encode_child_spec, encode_child_urls, judge_shard, ladder_rate, ladder_soundness, p99_ms,
-        parse_child_spec, parse_child_urls, start_rate_per_shard, step_retryable, step_verdict,
+        WORKER_PROCESSES_ENV_VAR, after_failure, child_mode, connection_budget_reasons,
+        connection_need_per_shard, encode_child_spec, encode_child_urls, judge_shard, ladder_rate,
+        ladder_soundness, p99_ms, start_rate_per_shard, step_retryable, step_verdict,
         sustainable_rate, warmup_drain_reasons,
     };
 
@@ -1309,15 +1494,23 @@ pub mod db {
     }
 
     /// The worker-process spec of this process, when the parent set one.
-    #[must_use]
-    pub fn child_spec_from_env() -> Option<ChildSpec> {
-        let (shard, worker_id) = parse_child_spec(&std::env::var(CHILD_ENV_VAR).ok()?)?;
-        let urls = parse_child_urls(&std::env::var(CHILD_URLS_ENV_VAR).ok()?)?;
-        Some(ChildSpec {
-            shard,
-            worker_id,
-            urls,
-        })
+    ///
+    /// # Errors
+    ///
+    /// Returns a reason when a child variable is set but does not parse.
+    /// The caller exits, so a broken child never runs the benchmark.
+    pub fn child_spec_from_env() -> Result<Option<ChildSpec>, String> {
+        let spec = std::env::var(CHILD_ENV_VAR).ok();
+        let urls = std::env::var(CHILD_URLS_ENV_VAR).ok();
+        match child_mode(spec.as_deref(), urls.as_deref()) {
+            ChildMode::NotChild => Ok(None),
+            ChildMode::Child(shard, worker_id, urls) => Ok(Some(ChildSpec {
+                shard,
+                worker_id,
+                urls,
+            })),
+            ChildMode::Malformed(reason) => Err(reason),
+        }
     }
 
     /// Run one worker until stdin closes, and return the exit code.
@@ -1434,15 +1627,17 @@ pub mod db {
             for process in &mut self.children {
                 drop(process.stdin.take());
             }
-            for mut process in std::mem::take(&mut self.children) {
+            // Each child stays in the fleet until it is reaped. An abort
+            // mid-loop then leaves the rest to `Drop`, which still reaps them.
+            for process in &mut self.children {
                 if tokio::time::timeout(STOP_TIMEOUT, process.child.wait())
                     .await
                     .is_err()
                 {
                     let _ = process.child.kill().await;
                 }
-                drop(process.guard.take());
             }
+            self.children.clear();
         }
     }
 
@@ -1554,6 +1749,20 @@ pub mod db {
         row.setting.parse().ok()
     }
 
+    #[derive(QueryableByName)]
+    struct InUseRow {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        n: i64,
+    }
+
+    /// Connections the server holds now, from every client.
+    async fn connections_in_use(conn: &mut AsyncPgConnection) -> usize {
+        diesel::sql_query("SELECT count(*)::bigint AS n FROM pg_stat_activity WHERE backend_type = 'client backend'")
+            .get_result::<InUseRow>(conn)
+            .await
+            .map_or(0, |row| usize::try_from(row.n).unwrap_or(0))
+    }
+
     /// Reasons the cell's servers cannot hold its connections.
     async fn connection_reasons(cluster: &ShardCluster, processes: usize) -> Vec<String> {
         let per_shard = connection_need_per_shard(processes);
@@ -1569,10 +1778,14 @@ pub mod db {
             let max = integer_setting(&mut conn, "max_connections").await;
             let reserved = integer_setting(&mut conn, "superuser_reserved_connections")
                 .await
-                .unwrap_or(3);
+                .unwrap_or(3)
+                + integer_setting(&mut conn, "reserved_connections")
+                    .await
+                    .unwrap_or(0);
+            let in_use = connections_in_use(&mut conn).await;
             match max {
                 Some(max) => reasons.extend(
-                    connection_budget_reasons(need, max, reserved)
+                    connection_budget_reasons(need, max, reserved, in_use)
                         .into_iter()
                         .map(|r| format!("shard {}: {r}", shard.as_i32())),
                 ),
@@ -1596,6 +1809,8 @@ pub mod db {
         scheduled_secs: f64,
         admitted_secs: f64,
         done: Instant,
+        /// Whether the start call returned a run.
+        started: bool,
     }
 
     /// What the generator did on one shard during one step.
@@ -1604,6 +1819,8 @@ pub mod db {
         /// began.
         sent: HashMap<String, (f64, f64)>,
         achieved_per_sec: f64,
+        /// Start calls that failed. They count as engine failures.
+        failed_starts: usize,
     }
 
     /// What one step measured.
@@ -1735,20 +1952,32 @@ pub mod db {
                 tasks.spawn(async move {
                     let _guard = guard;
                     tokio::time::sleep_until(at.into()).await;
-                    let mut conn = pool.get().await.expect("a generator connection");
-                    let admitted = Instant::now();
-                    start_or_load_workflow_execution(
-                        &mut conn,
-                        start_params(ExecutionId::new_for_shard(shard), workflow, &workflow_id),
-                        None,
-                    )
-                    .await
-                    .expect("capacity start");
+                    // An overloaded step can time out a checkout or a start.
+                    // That is a failed start, not a reason to drop the cell.
+                    let (admitted, started) = match pool.get().await {
+                        Ok(mut conn) => {
+                            let admitted = Instant::now();
+                            let started = start_or_load_workflow_execution(
+                                &mut conn,
+                                start_params(
+                                    ExecutionId::new_for_shard(shard),
+                                    workflow,
+                                    &workflow_id,
+                                ),
+                                None,
+                            )
+                            .await
+                            .is_ok();
+                            (admitted, started)
+                        }
+                        Err(_) => (Instant::now(), false),
+                    };
                     let sent = Sent {
                         workflow_id,
                         scheduled_secs: at_secs,
                         admitted_secs: admitted.saturating_duration_since(t0).as_secs_f64(),
                         done: Instant::now(),
+                        started,
                     };
                     (idx, sent)
                 });
@@ -1768,14 +1997,17 @@ pub mod db {
                     .saturating_duration_since(t0)
                     .as_secs_f64()
                     .max(CAPACITY_STEP_SECS);
+                let failed_starts = sent.iter().filter(|s| !s.started).count();
                 #[allow(clippy::cast_precision_loss, reason = "run counts are far below 2^53")]
-                let achieved_per_sec = sent.len() as f64 / elapsed;
+                let achieved_per_sec = (sent.len() - failed_starts) as f64 / elapsed;
                 ShardOffer {
                     sent: sent
                         .into_iter()
+                        .filter(|s| s.started)
                         .map(|s| (s.workflow_id, (s.scheduled_secs, s.admitted_secs)))
                         .collect(),
                     achieved_per_sec,
+                    failed_starts,
                 }
             })
             .collect();
@@ -1864,6 +2096,7 @@ pub mod db {
                 step_secs: CAPACITY_STEP_SECS,
                 arrivals,
                 failed,
+                failed_starts: offer.failed_starts,
             }));
         }
         StepOutcome {
@@ -1975,9 +2208,18 @@ pub mod db {
             )
             .await;
             let mut verdict = step_verdict(&outcome.judgements);
-            if step_retryable(&outcome.judgements) && Instant::now() + needed < deadline {
+            let failed = !matches!(verdict, StepVerdict::Sustainable);
+            let plan = after_failure(
+                failed && step_retryable(&outcome.judgements),
+                Instant::now() + needed < deadline,
+                rate,
+            );
+            if let AfterFailure::Void(reason) = &plan {
+                ladder.unsound.push(reason.clone());
+            }
+            if plan == AfterFailure::Retry {
                 ladder.notes.push(step_note(
-                    &format!("{label} (tail only, retried)"),
+                    &format!("{label} (noise only, retried)"),
                     rate,
                     &outcome,
                     &verdict,

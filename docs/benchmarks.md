@@ -348,11 +348,14 @@ HARVEST_BENCH_SCENARIOS=capacity HARVEST_BENCH_SHARDS=1 cargo xtask bench run
   path sees fleet contention. A process that loses its worker exits, and
   the cell is then not published.
 * Each arrival is its own task. Run `k` of a step is scheduled at
-  `k / rate` seconds. At that instant it takes a connection from a
-  16-connection generator pool per shard. That instant is its
-  **admission**. A slow start call never moves a later schedule.
-* A step lasts 20 s. The first step offers 40 starts/s per shard for
-  `capacity_noop` and 20 for `capacity_canonical`. Each next step offers
+  `k / rate` seconds. At that instant it asks for a connection from a
+  16-connection generator pool per shard. The instant it gets one is its
+  **admission**. The generator wait runs from schedule to admission. A slow
+  start call never moves a later schedule. A start call that fails or times
+  out fails the step. It does not stop the cell.
+* A step lasts 20 s. The first step offers 50 starts/s per shard for
+  `capacity_noop` and 25 for `capacity_canonical`, so each step starts at
+  least 500 runs. Each next step offers
   1.25 times more. One discarded warmup step runs first. A warmup that
   leaves runs unfinished voids the cell.
 * After its arrivals, a step drains for up to 20 s. A run that does not
@@ -369,7 +372,8 @@ window is settle time. A step is sustainable when, on every shard:
 * the p99 generator wait is at most 100 ms,
 * the step started at least 400 runs, so each judged window holds at least
   100,
-* every run completed within the drain grace, and none failed,
+* every run completed within the drain grace, and no run or start call
+  failed,
 * the least-squares slope of the engine backlog over the judged windows is
   at most 5% of the offered rate,
 * the median latency grows at most 5 ms per second from the second window
@@ -379,9 +383,11 @@ window is settle time. A step is sustainable when, on every shard:
 
 A failed generator check makes the step generator-bound only when the
 engine kept up. A saturated database also slows the start calls, so an
-engine failure in the same step wins. A step that fails only on the p99
-check runs once more at the same rate, and the second verdict counts. One
-pause in a small window then cannot stop the ladder.
+engine failure in the same step wins. A step that fails only on the median or
+the p99 check runs once more at the same rate, and the second verdict
+counts. One pause in a small window then cannot stop the ladder. A real
+overload fails the retry too. A step that earns a retry with no budget left
+for it voids the cell.
 
 The ladder stops at the first step that is not sustainable. The sustainable
 rate is the step before it. The cell is not published when the first step
@@ -390,8 +396,9 @@ failed step. In the last case the rate is only a lower bound.
 
 **Hardware.** Each worker process opens a 32-connection pool and one
 listener. So one shard needs 4 x 33 + 16 + 4 = 152 connections. A cell
-checks `max_connections` before it starts and refuses to run when the
-server cannot hold it. The compose services allow 200, which leaves room
+checks `max_connections`, less the reserved slots and the connections
+already in use, before it starts. It refuses to run when the server cannot
+hold it. The compose services allow 200, which leaves room
 for up to 5 worker processes per shard, not 6. The generator and the workers run
 on the bench host. A loopback database therefore shares its CPUs with
 them. The cell notes say so.

@@ -79,6 +79,14 @@ fn contains_number(text: &str, number: &str) -> bool {
     })
 }
 
+/// Whether a block cites the external figure: it names the engine and one of
+/// its figures. A bare "20k" or "million" elsewhere on the page is no
+/// citation.
+fn is_external_citation(block: &str) -> bool {
+    let lower = block.to_lowercase();
+    lower.contains("dbos") && EXTERNAL_FIGURES.iter().any(|f| lower.contains(f))
+}
+
 /// How the comparison page writes a published rate.
 fn comparison_number(rate: f64) -> String {
     format!("{rate:.1}")
@@ -132,10 +140,7 @@ fn the_comparison_cites_the_external_figure_only_next_to_a_harvest_capacity_numb
     let page = read("docs/comparison.md");
     let cited: Vec<String> = blocks(&page)
         .into_iter()
-        .filter(|b| {
-            let lower = b.to_lowercase();
-            EXTERNAL_FIGURES.iter().any(|f| lower.contains(f))
-        })
+        .filter(|b| is_external_citation(b))
         .collect();
     assert!(
         !cited.is_empty(),
@@ -146,8 +151,12 @@ fn the_comparison_cites_the_external_figure_only_next_to_a_harvest_capacity_numb
         for cell in PUBLISHED_CAPACITY {
             let number = comparison_number(cell.sustainable_per_sec);
             let arm = format!("`{}`", BenchScenario::Capacity(cell.arm).as_str());
+            // The number must sit on the arm's own line, so two swapped
+            // rows fail.
             assert!(
-                contains_number(&block, &number) && block.contains(&arm),
+                block
+                    .lines()
+                    .any(|line| line.contains(&arm) && contains_number(line, &number)),
                 "a block that cites the external figure must carry the Harvest number {number} \
                  of {arm}:\n{block}"
             );
@@ -175,6 +184,35 @@ fn a_number_matches_only_as_a_whole_number() {
     assert!(!contains_number("149.00", "149.0"));
     assert!(!contains_number("1149.0", "149.0"));
     assert!(!contains_number("10.00", "0.00"));
+}
+
+#[test]
+fn only_a_block_that_names_the_engine_and_a_figure_is_a_citation() {
+    assert!(is_external_citation("DBOS reports 20K workflows/s."));
+    assert!(!is_external_citation(
+        "Temporal Cloud handles millions of actions."
+    ));
+    assert!(!is_external_citation("A 20kB payload limit."));
+    assert!(!is_external_citation("Choose DBOS if you want TypeScript."));
+}
+
+#[test]
+fn the_benchmarks_page_states_each_published_rate() {
+    let page = read("docs/benchmarks.md");
+    for cell in PUBLISHED_CAPACITY {
+        let stated = format!(
+            "**{}** `{}`",
+            comparison_number(cell.sustainable_per_sec),
+            BenchScenario::Capacity(cell.arm).as_str()
+        );
+        assert!(
+            page.split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .contains(&stated),
+            "docs/benchmarks.md must state {stated}, the published rate"
+        );
+    }
 }
 
 #[test]
