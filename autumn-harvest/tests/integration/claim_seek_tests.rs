@@ -60,6 +60,47 @@ async fn setup_db_with_url() -> (AsyncPgConnection, String, Option<ContainerAsyn
     (conn, url, Some(container))
 }
 
+/// A migrated database that one test owns, and its name for the drop.
+///
+/// A test that needs its own planner statistics cannot share a database. A
+/// sibling test adds rows to the same table, and so to the `ANALYZE` sample.
+/// With `HARVEST_TEST_DATABASE_URL` set, this creates a new database. Without
+/// it, each test starts its own container, which is isolated already.
+async fn setup_isolated_db() -> (
+    AsyncPgConnection,
+    Option<ContainerAsync<Postgres>>,
+    Option<String>,
+) {
+    let Ok(shared) = std::env::var("HARVEST_TEST_DATABASE_URL") else {
+        let (conn, container) = setup_db().await;
+        return (conn, container, None);
+    };
+    let name = format!("harvest_seek_{}", Uuid::new_v4().simple());
+    connect(&shared)
+        .await
+        .batch_execute(&format!("CREATE DATABASE {name}"))
+        .await
+        .expect("create the isolated database");
+    let (base, _) = shared.rsplit_once('/').expect("a database URL has a path");
+    let mut conn = connect(&format!("{base}/{name}")).await;
+    conn.batch_execute(&autumn_harvest::test_init_sql())
+        .await
+        .expect("apply migrations");
+    (conn, None, Some(name))
+}
+
+/// Drop a database of [`setup_isolated_db`]. A container needs no drop.
+async fn drop_isolated_db(conn: AsyncPgConnection, name: Option<String>) {
+    drop(conn);
+    let (Some(name), Ok(shared)) = (name, std::env::var("HARVEST_TEST_DATABASE_URL")) else {
+        return;
+    };
+    let _ = connect(&shared)
+        .await
+        .batch_execute(&format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)"))
+        .await;
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 /// The worker that claims in every test.
@@ -1111,68 +1152,129 @@ async fn a_single_activity_type_backlog_keeps_the_window_bounded() {
     );
 }
 
-/// Stale statistics do not make the claim read the backlog (issue #1971).
+/// The index of each table scan that ran in the plan subtree of CTE `name`.
+fn cte_scan_indexes(plan: &serde_json::Value, name: &str, inside: bool) -> Vec<String> {
+    let inside = inside || plan["Subplan Name"].as_str() == Some(&format!("CTE {name}"));
+    let mut found = Vec::new();
+    if inside
+        && plan["Relation Name"].as_str() == Some("harvest_task_queue")
+        && plan["Actual Loops"].as_i64().unwrap_or(0) > 0
+    {
+        found.push(plan["Index Name"].as_str().unwrap_or("none").to_owned());
+    }
+    for child in plan_children(plan) {
+        found.extend(cte_scan_indexes(child, name, inside));
+    }
+    found
+}
+
+/// Stale statistics do not make the claim read the backlog (issues #1971,
+/// #2547).
 ///
 /// A drained system keeps its terminal rows for a while. An `ANALYZE` then
-/// sees almost no `PENDING` row. A burst below the autoanalyze threshold
-/// leaves those statistics in place. The claim plan must stay bounded
-/// anyway: a join to the window once put the table on the outer side.
+/// sees no `PENDING` row. The partial indexes keep the pages of the drained
+/// backlog, but their row count is 0. A burst below the autoanalyze
+/// threshold leaves those statistics in place. The planner then estimates
+/// each head as empty. A head scan that sorts a whole partial index then
+/// looks as cheap as the ordered scan, and each claim reads the backlog.
+///
+/// Before issue #2547 this test seeded 20 `PENDING` rows among 400K
+/// terminal rows. The sample of 30,000 rows missed all 20 in about one run
+/// of five. Only those runs read the backlog, so the test failed at random.
+/// It now owns its database, with autovacuum off, so the statistics are
+/// stale on every run.
 #[tokio::test]
 async fn stale_statistics_keep_the_window_bounded() {
-    let (mut conn, _container) = setup_db().await;
+    let (mut conn, _container, db) = setup_isolated_db().await;
     let qs = queues(4);
     let q = text_array(&qs);
-    exec(
-        &mut conn,
-        &format!(
-            "INSERT INTO harvest_task_queue \
-               (queue_name, task_type, activity_name, input, state, max_attempts, \
-                scheduled_at, completed_at) \
-             SELECT ({q})[1 + (i % 4)], 'activity', 'noop', '{{}}'::jsonb, 'COMPLETED', 3, \
-                    NOW() - INTERVAL '1 day', NOW() \
-             FROM generate_series(1, 400000) AS i; \
-             INSERT INTO harvest_task_queue \
-               (queue_name, task_type, activity_name, input, state, max_attempts, scheduled_at) \
-             SELECT ({q})[1 + (i % 4)], 'activity', 'noop', '{{}}'::jsonb, 'PENDING', 3, \
-                    NOW() - INTERVAL '1 hour' \
-             FROM generate_series(1, 20) AS i"
-        ),
-    )
+    let measured = AssertUnwindSafe(async {
+        exec(
+            &mut conn,
+            &format!(
+                "ALTER TABLE harvest_task_queue SET (autovacuum_enabled = off); \
+                 INSERT INTO harvest_task_queue \
+                   (queue_name, task_type, activity_name, input, state, max_attempts, \
+                    scheduled_at, completed_at) \
+                 SELECT ({q})[1 + (i % 4)], 'activity', 'noop', '{{}}'::jsonb, 'COMPLETED', 3, \
+                        NOW() - INTERVAL '1 day', NOW() \
+                 FROM generate_series(1, 400000) AS i; \
+                 INSERT INTO harvest_task_queue \
+                   (queue_name, task_type, activity_name, input, state, max_attempts, \
+                    scheduled_at) \
+                 SELECT ({q})[1 + (i % 4)], 'activity', 'drained', '{{}}'::jsonb, 'PENDING', 3, \
+                        NOW() - INTERVAL '2 hours' \
+                 FROM generate_series(1, 30000) AS i"
+            ),
+        )
+        .await;
+        // The backlog drains. Its index pages stay, with a row count of 0.
+        exec(&mut conn, "VACUUM ANALYZE harvest_task_queue").await;
+        exec(
+            &mut conn,
+            "UPDATE harvest_task_queue SET state = 'COMPLETED', completed_at = NOW() \
+             WHERE state = 'PENDING'",
+        )
+        .await;
+        exec(&mut conn, "VACUUM ANALYZE harvest_task_queue").await;
+        #[derive(diesel::QueryableByName)]
+        struct Mcv {
+            #[diesel(sql_type = diesel::sql_types::Text)]
+            vals: String,
+        }
+        let mcv: Mcv = diesel::sql_query(
+            "SELECT COALESCE(most_common_vals::text, '') AS vals FROM pg_stats \
+             WHERE tablename = 'harvest_task_queue' AND attname = 'state'",
+        )
+        .get_result(&mut conn)
+        .await
+        .expect("read the state statistics");
+        exec(
+            &mut conn,
+            &format!(
+                "INSERT INTO harvest_task_queue \
+                   (queue_name, task_type, activity_name, input, state, max_attempts, \
+                    scheduled_at, new_start) \
+                 SELECT ({q})[1 + (i % 4)], \
+                        CASE WHEN i % 2 = 0 THEN 'workflow' ELSE 'activity' END, \
+                        CASE WHEN i % 2 = 0 THEN NULL ELSE 'noop' END, \
+                        '{{}}'::jsonb, 'PENDING', 3, \
+                        NOW() - make_interval(secs => i % 3600), i % 2 = 0 \
+                 FROM generate_series(1, 30000) AS i"
+            ),
+        )
+        .await;
+        exec(&mut conn, "VACUUM harvest_task_queue").await;
+        let plan = claim_plan_of(&mut conn, &qs, queue::claim_task_query()).await;
+        let stale = cost_of_plan(&plan[0]["Plan"]);
+        let heads = cte_scan_indexes(&plan[0]["Plan"], "seek_heads", false);
+        exec(&mut conn, "ANALYZE harvest_task_queue").await;
+        let fresh = claim_cost(&mut conn, &qs).await;
+        (mcv.vals, stale, heads, fresh)
+    })
+    .catch_unwind()
     .await;
-    exec(&mut conn, "VACUUM ANALYZE harvest_task_queue").await;
-    exec(
-        &mut conn,
-        &format!(
-            "INSERT INTO harvest_task_queue \
-               (queue_name, task_type, activity_name, input, state, max_attempts, \
-                scheduled_at, new_start) \
-             SELECT ({q})[1 + (i % 4)], \
-                    CASE WHEN i % 2 = 0 THEN 'workflow' ELSE 'activity' END, \
-                    CASE WHEN i % 2 = 0 THEN NULL ELSE 'noop' END, \
-                    '{{}}'::jsonb, 'PENDING', 3, \
-                    NOW() - make_interval(secs => i % 3600), i % 2 = 0 \
-             FROM generate_series(1, 30000) AS i"
-        ),
-    )
-    .await;
-    exec(&mut conn, "VACUUM harvest_task_queue").await;
-    let stale = claim_cost(&mut conn, &qs).await;
-    exec(&mut conn, "ANALYZE harvest_task_queue").await;
-    let fresh = claim_cost(&mut conn, &qs).await;
-    delete_queues(&mut conn, &qs).await;
-    eprintln!("stale statistics: {stale:?}, fresh: {fresh:?}");
+    drop_isolated_db(conn, db).await;
+    let (mcv, stale, heads, fresh) =
+        measured.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+    eprintln!("stale statistics: {stale:?}, head scans {heads:?}, fresh: {fresh:?}");
+    assert!(
+        !mcv.contains("PENDING"),
+        "the case needs statistics that show no PENDING row: {mcv}"
+    );
     assert!(stale.claimed && !stale.fallback_ran, "{stale:?}");
+    for index in &heads {
+        assert!(
+            index == "idx_harvest_tq_claim_seek" || index == "idx_harvest_tq_sticky_poll",
+            "a head scan reads {index}, not its ordered index: {heads:?}"
+        );
+    }
     assert!(
         stale.buffers <= 3 * fresh.buffers.max(1),
         "stale statistics change the claim plan: {stale:?} against {fresh:?}"
     );
 }
 
-/// A kind-filtered claim stays flat behind a deep run of the other kind
-/// (issues #1787, #1971).
-///
-/// A saturated worker claims for one kind only. The index keys the heads by
-/// task type, so the claim never walks the rows of the other kind.
 #[tokio::test]
 async fn a_kind_filtered_claim_stays_flat_behind_the_other_kind() {
     let (mut conn, _container) = setup_db().await;
