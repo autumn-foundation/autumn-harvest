@@ -2018,6 +2018,64 @@ whole 50 to 75 ms settle.
   A hot concurrency key or a rate-limited activity gains less, because the
   loops contend for one advisory lock or one bucket row.
 
+### Claim slots (issue #2421)
+
+`max_concurrent_claims` caps the claims of one worker. `claim_slots_per_shard`
+caps the claims that run at once on one shard, across the fleet. It is off
+by default. Design record:
+[`docs/design/DESIGN-2421.md`](design/DESIGN-2421.md). Operator guide:
+[`docs/operations/claim-slots.md`](operations/claim-slots.md).
+
+**Mechanism.** The claim transaction first takes one of N advisory locks of
+its `harvest_task_queue` table, with `pg_try_advisory_xact_lock`. A claim
+that gets no slot sends no claim statement. Its loop tries its next shard.
+The lock ends with the transaction. With the cap on, each claim adds one
+short statement.
+
+**The cap holds.** `claim_slots_bound_the_claims_that_run_at_once` runs 3
+workers of 4 claim loops each against one table, with a 150 ms claim. With
+2 slots, the largest overlap of claim statements is 2. With no cap, the same
+fleet reaches 10.
+
+**Recovery after a stall.** `claim_throughput_recovers_after_a_stall` runs 3
+workers of 4 claim loops each on one table, with a backlog of 6,000
+workflows. It runs the cap off, then 4 slots, each on its own database. Each
+arm takes the claim rate before the stall as the median of three 1 s
+windows. One transaction then holds `ACCESS EXCLUSIVE` on
+`harvest_task_queue` for 3 s. After the lift, a 1 s window slides in 100 ms
+steps until it reaches 90% of the rate before the stall. The test fails if
+that takes more than 10 s.
+
+Host: 4 logical CPUs (Intel Xeon @ 2.10 GHz). PostgreSQL 16.15 at its
+defaults, except `max_connections=400`. A debug test build. Four runs on
+2026-11-08:
+
+| Run | No cap: claims/s before → at recovery | No cap: time | 4 slots: claims/s before → at recovery | 4 slots: time | 4 slots: misses |
+|--:|--:|--:|--:|--:|--:|
+| 1 | 52.5 → 66.1 | 1.06 s | 68.7 → 64.6 | 4.17 s | 313 |
+| 2 | 62.8 → 72.0 | 1.03 s | 54.8 → 50.9 | 1.46 s | 164 |
+| 3 | 113.8 → 108.2 | 1.04 s | 55.4 → 51.6 | 1.96 s | 307 |
+| 4 | 64.9 → 67.6 | 1.04 s | 81.8 → 81.8 | 1.05 s | 270 |
+
+What the table shows:
+
+- **Both arms recover within the bound in every run.** A window is 1 s
+  wide, so about 1.0 s is the earliest that the test can report.
+- **With no cap, recovery is in the first window every time.** With 4
+  slots it took 1.05 to 4.17 s. Twelve loops share four slots, and a loop
+  that misses waits for its next wake.
+- **The rates do not separate the arms.** On this box, a debug build gives
+  52 to 114 claims per second from run to run. That spread is wider than
+  any difference between the arms.
+
+What the measurement does not establish:
+
+- **Metastability.** One table on a local Postgres did not collapse with or
+  without the cap. The DBOS collapse needed 8 to 16 shards under load. The
+  capacity scenario of issue #2419 decides the default.
+- **A release build.** Absolute rates are those of a debug test build.
+
+
 ## Enqueue throughput
 
 8 concurrent writers enqueueing into an already-populated queue:

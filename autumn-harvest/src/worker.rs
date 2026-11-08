@@ -188,6 +188,10 @@ pub struct WorkerRuntimeConfig {
     /// loop. Must be at least 1. See
     /// [`crate::builder::WorkerConfig::max_concurrent_claims`].
     pub max_concurrent_claims: usize,
+    /// The most claims that run at once on one shard, across the fleet.
+    /// `None` takes no slot. See
+    /// [`crate::builder::WorkerConfig::with_claim_slots_per_shard`].
+    pub claim_slots_per_shard: Option<std::num::NonZeroU16>,
     /// Interval between queue poll attempts when idle.
     pub poll_interval: Duration,
     /// Maximum time to wait for in-flight tasks during shutdown.
@@ -343,9 +347,11 @@ impl WorkerRuntimeConfig {
     /// # Errors
     ///
     /// Returns [`HarvestError::Config`] if `queues` is empty, if
-    /// `max_concurrent_claims` is 0, or if `cancellation_grace_period`
-    /// exceeds [`MAX_CANCELLATION_GRACE_PERIOD`]. With `fairness_keys` on, it
-    /// also rejects a queue name that the weight API does not accept.
+    /// `max_concurrent_claims` is 0, if `claim_slots_per_shard` exceeds
+    /// [`crate::builder::MAX_CLAIM_SLOTS_PER_SHARD`], or if
+    /// `cancellation_grace_period` exceeds [`MAX_CANCELLATION_GRACE_PERIOD`].
+    /// With `fairness_keys` on, it also rejects a queue name that the weight
+    /// API does not accept.
     pub fn validate(&self) -> HarvestResult<()> {
         if self.queues.is_empty() {
             return Err(HarvestError::Config(
@@ -356,6 +362,14 @@ impl WorkerRuntimeConfig {
             return Err(HarvestError::Config(
                 "max_concurrent_claims is 0; a worker needs at least one claim loop".into(),
             ));
+        }
+        if let Some(slots) = self.claim_slots_per_shard
+            && slots.get() > crate::builder::MAX_CLAIM_SLOTS_PER_SHARD
+        {
+            return Err(HarvestError::Config(format!(
+                "claim_slots_per_shard of {slots} exceeds the maximum of {}",
+                crate::builder::MAX_CLAIM_SLOTS_PER_SHARD
+            )));
         }
         if self.cancellation_grace_period > MAX_CANCELLATION_GRACE_PERIOD {
             return Err(HarvestError::Config(format!(
@@ -488,6 +502,7 @@ impl From<WorkerConfig> for WorkerRuntimeConfig {
             max_concurrent_workflows: cfg.max_concurrent_workflows,
             max_concurrent_activities: cfg.max_concurrent_activities,
             max_concurrent_claims: cfg.max_concurrent_claims,
+            claim_slots_per_shard: cfg.claim_slots_per_shard,
             poll_interval: DEFAULT_WORKER_POLL_INTERVAL,
             shutdown_timeout: cfg.shutdown_timeout,
             cancellation_grace_period: cfg.cancellation_grace_period,
@@ -41529,23 +41544,38 @@ impl Worker {
         }
     }
 
+    /// Map a slotted claim to the plain claim result. A miss records
+    /// `harvest.db.claim_slot_miss` and returns `None`.
+    fn slotted(
+        &self,
+        shard: Option<crate::types::ShardId>,
+        claimed: HarvestResult<queue::SlottedClaim>,
+    ) -> Option<HarvestResult<Option<TaskQueueItem>>> {
+        match claimed {
+            Ok(queue::SlottedClaim::NoSlot) => {
+                self.record_claim_slot_miss(shard);
+                None
+            }
+            Ok(claim) => Some(Ok(claim.into_task())),
+            Err(error) => Some(Err(error)),
+        }
+    }
+
     /// Run one claim transaction and run it again after a conflict abort.
     ///
     /// Each claim function opens and commits its own transaction. A
     /// rolled-back claim leaves its row `PENDING`, so a re-run is safe.
     /// See [`crate::tx_retry`] (issue #1822).
-    async fn claim_with_conflict_retry<F>(
+    async fn claim_with_conflict_retry<T, F>(
         &self,
         conn: &mut AsyncPgConnection,
         claim: F,
-    ) -> HarvestResult<Option<TaskQueueItem>>
+    ) -> HarvestResult<T>
     where
-        for<'r> F: AsyncFnMut(&'r mut AsyncPgConnection) -> HarvestResult<Option<TaskQueueItem>>
-            + crate::tx_retry::TxAttempt<
-                &'r mut AsyncPgConnection,
-                HarvestResult<Option<TaskQueueItem>>,
-                Fut: Send,
-            > + Send,
+        for<'r> F: AsyncFnMut(&'r mut AsyncPgConnection) -> HarvestResult<T>
+            + crate::tx_retry::TxAttempt<&'r mut AsyncPgConnection, HarvestResult<T>, Fut: Send>
+            + Send,
+        T: Send,
     {
         crate::tx_retry::run_with_conflict_retry(
             conn,
@@ -41555,6 +41585,25 @@ impl Worker {
             claim,
         )
         .await
+    }
+
+    /// The claim slots of each claim, or `None` when the cap is off. The
+    /// slots belong to the task-queue table of the claim target.
+    fn claim_slots(&self) -> Option<queue::ClaimSlots> {
+        self.config
+            .claim_slots_per_shard
+            .map(queue::ClaimSlots::new)
+    }
+
+    /// Record one claim on `shard` that got no claim slot. It sent no claim
+    /// statement, so it adds no claim sample.
+    fn record_claim_slot_miss(&self, shard: Option<crate::types::ShardId>) {
+        for label in self.pool_labels(shard).iter() {
+            self.registry
+                .telemetry()
+                .metrics
+                .record_db_claim_slot_miss(*label);
+        }
     }
 
     /// The claim's fairness mode, from [`WorkerRuntimeConfig::fairness_keys`]
@@ -42217,6 +42266,7 @@ impl Worker {
         let circuit_breakers = self.registry.circuit_breakers();
         let circuit_breaker_activities = circuit_breakers.tracked_activity_names();
         let exclusions = self.claim_exclusions();
+        let slots = self.claim_slots();
 
         // --- Weighted queue selection (issue #515) ---
         //
@@ -42249,7 +42299,7 @@ impl Worker {
                 let claim_started = std::time::Instant::now();
                 let claimed = self
                     .claim_with_conflict_retry(&mut conn, async |conn| {
-                        queue::claim_task_with_owner(
+                        queue::claim_task_with_slots(
                             conn,
                             &single_queue,
                             &self.config.worker_id,
@@ -42261,10 +42311,16 @@ impl Worker {
                             kind,
                             self.claim_fairness(),
                             owned.as_ref(),
+                            slots,
                         )
                         .await
                     })
                     .await;
+                // Every queue shares the slots of the shard. So a miss on one
+                // queue ends the poll, and the loop tries its next target.
+                let Some(claimed) = self.slotted(shard, claimed) else {
+                    return false;
+                };
                 self.record_claim(shard, claim_started, &claimed);
                 match claimed {
                     Ok(Some(task)) => {
@@ -42303,7 +42359,7 @@ impl Worker {
         let claim_started = std::time::Instant::now();
         let claimed = self
             .claim_with_conflict_retry(&mut conn, async |conn| {
-                queue::claim_task_with_owner(
+                queue::claim_task_with_slots(
                     conn,
                     &self.config.queues,
                     &self.config.worker_id,
@@ -42315,10 +42371,16 @@ impl Worker {
                     kind,
                     self.claim_fairness(),
                     owned.as_ref(),
+                    slots,
                 )
                 .await
             })
             .await;
+        // A miss returns `false` with no throttle check. The caller then
+        // tries its next claim target.
+        let Some(claimed) = self.slotted(shard, claimed) else {
+            return false;
+        };
         self.record_claim(shard, claim_started, &claimed);
         match claimed {
             Ok(Some(task)) => {
@@ -46277,6 +46339,7 @@ mod tests {
             max_concurrent_workflows: 10,
             max_concurrent_activities: 20,
             max_concurrent_claims: DEFAULT_MAX_CONCURRENT_CLAIMS,
+            claim_slots_per_shard: None,
             poll_interval: Duration::from_millis(100),
             shutdown_timeout: Duration::from_secs(5),
             cancellation_grace_period: Duration::from_secs(5),
@@ -46419,6 +46482,19 @@ mod tests {
         assert!(err.to_string().contains("max_concurrent_claims is 0"));
         cfg.max_concurrent_claims = 1;
         assert!(cfg.validate().is_ok(), "one serial claim loop is valid");
+    }
+
+    #[test]
+    fn runtime_config_validate_bounds_the_claim_slots() {
+        let mut cfg = default_runtime_config();
+        let max = crate::builder::MAX_CLAIM_SLOTS_PER_SHARD;
+        cfg.claim_slots_per_shard = std::num::NonZeroU16::new(max);
+        assert!(cfg.validate().is_ok(), "the largest slot count is valid");
+        cfg.claim_slots_per_shard = std::num::NonZeroU16::new(max + 1);
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("claim_slots_per_shard"), "{err}");
+        cfg.claim_slots_per_shard = None;
+        assert!(cfg.validate().is_ok(), "no cap is valid");
     }
 
     #[test]
@@ -47235,6 +47311,7 @@ mod tests {
             max_concurrent_workflows: 5,
             max_concurrent_activities: 15,
             max_concurrent_claims: 3,
+            claim_slots_per_shard: None,
             shutdown_timeout: Duration::from_secs(60),
             workflow_cache_size: 500,
             resident_workflows: true,

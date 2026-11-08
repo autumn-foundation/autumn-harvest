@@ -187,6 +187,7 @@ fn worker(queue: &str, registry: Arc<HandlerRegistry>) -> Arc<Worker> {
                 max_concurrent_workflows: 4,
                 max_concurrent_activities: 4,
                 max_concurrent_claims: autumn_harvest::worker::DEFAULT_MAX_CONCURRENT_CLAIMS,
+                claim_slots_per_shard: None,
                 poll_interval: Duration::from_millis(25),
                 shutdown_timeout: Duration::from_secs(2),
                 cancellation_grace_period: Duration::from_secs(1),

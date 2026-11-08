@@ -248,6 +248,7 @@ fn make_worker(build_id: &str, info: WorkflowInfo, metrics: Arc<RecordingMetrics
             max_concurrent_workflows: 10,
             max_concurrent_activities: 10,
             max_concurrent_claims: autumn_harvest::worker::DEFAULT_MAX_CONCURRENT_CLAIMS,
+            claim_slots_per_shard: None,
             poll_interval: Duration::from_millis(50),
             shutdown_timeout: Duration::from_secs(2),
             cancellation_grace_period: Duration::from_secs(2),

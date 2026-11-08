@@ -83,6 +83,12 @@ pub const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(25);
 /// [`WorkerConfig::with_max_concurrent_claims`].
 pub const DEFAULT_MAX_CONCURRENT_CLAIMS: usize = 2;
 
+/// The largest valid [`WorkerConfig::claim_slots_per_shard`]: 1024.
+///
+/// A claim that misses tries each slot once in one statement. This bound
+/// keeps that statement short.
+pub const MAX_CLAIM_SLOTS_PER_SHARD: u16 = 1024;
+
 /// Default sticky routing window (issue #1798): 5 seconds.
 ///
 /// A follow-up task of a suspended execution waits up to this long for the
@@ -3983,6 +3989,10 @@ pub struct WorkerConfig {
     /// one serial claim loop. Must be at least 1. See
     /// [`Self::with_max_concurrent_claims`].
     pub max_concurrent_claims: usize,
+    /// The most claims that run at once on one shard, across the fleet.
+    ///
+    /// Default: `None`, no cap. See [`Self::with_claim_slots_per_shard`].
+    pub claim_slots_per_shard: Option<std::num::NonZeroU16>,
     /// The drain budget on shutdown or on a remote drain without a deadline.
     ///
     /// Default: [`DEFAULT_SHUTDOWN_TIMEOUT`] (25 s). Keep it at least 5 s
@@ -4564,6 +4574,7 @@ impl Default for WorkerConfig {
             max_concurrent_workflows: 20,
             max_concurrent_activities: 50,
             max_concurrent_claims: DEFAULT_MAX_CONCURRENT_CLAIMS,
+            claim_slots_per_shard: None,
             shutdown_timeout: DEFAULT_SHUTDOWN_TIMEOUT,
             workflow_cache_size: 1000,
             resident_workflows: true,
@@ -5214,6 +5225,40 @@ impl WorkerConfig {
         self
     }
 
+    /// Cap the claims that run at once on one shard, across the fleet.
+    ///
+    /// Each claim first takes one of `slots` advisory locks of its shard. A
+    /// claim that gets no slot sends no claim statement. The claim loop then
+    /// tries its next shard. The lock lives for the claim transaction only.
+    ///
+    /// The slots belong to the `harvest_task_queue` table of the shard.
+    /// Shards that share one database share that table, so they share the
+    /// slots too.
+    ///
+    /// The cap applies to the claim that scans the backlog. A claim by id
+    /// from a dispatch channel reads one known row. So does an owner take.
+    /// Neither takes a slot.
+    ///
+    /// `0` turns the cap off, which is the default. A value above
+    /// [`MAX_CLAIM_SLOTS_PER_SHARD`] fails worker validation. Set one value
+    /// on every worker of a fleet. A worker with no cap takes no slot.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use autumn_harvest::builder::WorkerConfig;
+    ///
+    /// let config = WorkerConfig::default().with_claim_slots_per_shard(8);
+    /// assert_eq!(config.claim_slots_per_shard.map(|n| n.get()), Some(8));
+    /// let off = config.with_claim_slots_per_shard(0);
+    /// assert_eq!(off.claim_slots_per_shard, None);
+    /// ```
+    #[must_use]
+    pub const fn with_claim_slots_per_shard(mut self, slots: u16) -> Self {
+        self.claim_slots_per_shard = std::num::NonZeroU16::new(slots);
+        self
+    }
+
     /// Attach a key-value capability label (issue #382).
     #[must_use]
     pub fn with_label(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
@@ -5718,6 +5763,18 @@ mod tests {
         );
         let serial = WorkerConfig::default().with_max_concurrent_claims(1);
         assert_eq!(serial.max_concurrent_claims, 1);
+    }
+
+    #[test]
+    fn claim_slots_are_off_by_default_and_zero_turns_them_off() {
+        assert_eq!(WorkerConfig::default().claim_slots_per_shard, None);
+        let capped = WorkerConfig::default().with_claim_slots_per_shard(4);
+        assert_eq!(
+            capped.claim_slots_per_shard.map(std::num::NonZeroU16::get),
+            Some(4)
+        );
+        let off = capped.with_claim_slots_per_shard(0);
+        assert_eq!(off.claim_slots_per_shard, None);
     }
 
     #[test]

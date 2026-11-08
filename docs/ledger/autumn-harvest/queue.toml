@@ -525,6 +525,13 @@ tables = ["harvest_task_queue"]
 measured = "unmeasured"
 plan = "docs/ledger/plans/autumn-harvest/queue.md"
 
+["take_claim_slot"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_task_queue"]
+measured = "unmeasured"
+
 ["take_timed_out_claim"]
 driver = "per_task"
 backend = ["postgres"]

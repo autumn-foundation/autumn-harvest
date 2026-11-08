@@ -149,6 +149,9 @@ pub struct WorkerConfigView {
     pub max_concurrent_activities: usize,
     /// The most claims this worker runs at once.
     pub max_concurrent_claims: usize,
+    /// The most claims that run at once on one shard, across the fleet.
+    /// `None` when the cap is off.
+    pub claim_slots_per_shard: Option<u16>,
     /// Worker poll interval, milliseconds.
     pub poll_interval_ms: u64,
     /// Graceful shutdown timeout, milliseconds.
@@ -430,6 +433,7 @@ impl WorkerConfigView {
             max_concurrent_workflows,
             max_concurrent_activities,
             max_concurrent_claims,
+            claim_slots_per_shard,
             shutdown_timeout,
             workflow_cache_size,
             resident_workflows,
@@ -489,6 +493,7 @@ impl WorkerConfigView {
             max_concurrent_workflows: *max_concurrent_workflows,
             max_concurrent_activities: *max_concurrent_activities,
             max_concurrent_claims: *max_concurrent_claims,
+            claim_slots_per_shard: claim_slots_per_shard.map(std::num::NonZeroU16::get),
             poll_interval_ms: dur_ms(poll_interval),
             shutdown_timeout_ms: dur_ms(*shutdown_timeout),
             workflow_cache_size: *workflow_cache_size,
@@ -1128,6 +1133,20 @@ mod tests {
             Duration::from_millis(500),
         );
         assert_eq!(view.max_concurrent_claims, 4);
+    }
+
+    #[test]
+    fn view_reports_the_claim_slot_cap() {
+        let off = WorkerConfigView::from_worker_config(
+            &WorkerConfig::default(),
+            Duration::from_millis(500),
+        );
+        assert_eq!(off.claim_slots_per_shard, None);
+        let on = WorkerConfigView::from_worker_config(
+            &WorkerConfig::default().with_claim_slots_per_shard(6),
+            Duration::from_millis(500),
+        );
+        assert_eq!(on.claim_slots_per_shard, Some(6));
     }
 
     #[test]
