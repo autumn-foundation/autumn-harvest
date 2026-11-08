@@ -1035,3 +1035,59 @@ async fn an_external_activity_with_a_stray_timer_is_rejected() {
         Vec::new()
     );
 }
+
+#[tokio::test]
+async fn heartbeats_stop_at_the_history_event_cap() {
+    let clock = Clock::at(T0);
+    let mut rt = runtime(&clock);
+    let (exec, token) = parked(&mut rt, 60).await;
+    let parked_len = rt.load_history(exec).unwrap().len() as u64;
+    rt.set_history_event_hard_cap(Some(parked_len + 3));
+
+    let mut extended = 0;
+    let err = loop {
+        match rt.extend_external_deadline(token, Duration::from_secs(60)) {
+            Ok(()) => extended += 1,
+            Err(err) => break err,
+        }
+        assert!(extended < 10, "the cap never stops the heartbeats");
+    };
+    assert!(
+        matches!(err, SqliteError::ExternalHistoryCapReached { token: t, .. } if t == token),
+        "{err:?}"
+    );
+    assert!(rt.load_history(exec).unwrap().len() as u64 <= parked_len + 3);
+    assert!(matches!(
+        rt.run_until_blocked(exec).await.unwrap(),
+        RunState::Failed(_)
+    ));
+    let row = rt
+        .list_external_handoffs(&ExternalHandoffFilter::new().token(token))
+        .unwrap();
+    assert_eq!(row[0].state, ExternalTaskState::Cancelled);
+}
+
+#[tokio::test]
+async fn a_settle_past_the_history_byte_cap_ends_the_run() {
+    let clock = Clock::at(T0);
+    let mut rt = runtime(&clock);
+    let (exec, token) = parked(&mut rt, 60).await;
+    rt.set_history_byte_hard_cap(Some(4096));
+
+    let big = json!("x".repeat(8192));
+    let err = rt.complete_external(token, big).unwrap_err();
+    assert!(
+        matches!(err, SqliteError::ExternalHistoryCapReached { token: t, .. } if t == token),
+        "{err:?}"
+    );
+    assert!(
+        !rt.load_history(exec)
+            .unwrap()
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::ActivityCompletedExternally { .. }))
+    );
+    assert!(matches!(
+        rt.run_until_blocked(exec).await.unwrap(),
+        RunState::Failed(_)
+    ));
+}

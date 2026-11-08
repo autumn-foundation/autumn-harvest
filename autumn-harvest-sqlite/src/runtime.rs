@@ -2078,8 +2078,10 @@ impl SqliteRuntime {
     ///
     /// # Errors
     ///
-    /// Returns [`SqliteError::ExternalTaskNotFound`] for an unknown token, or
-    /// a persistence error.
+    /// Returns [`SqliteError::ExternalTaskNotFound`] for an unknown token, and
+    /// [`SqliteError::ExternalHistoryCapReached`] when the event would reach a
+    /// history cap. The run then ends at the cap. Otherwise returns a
+    /// persistence error.
     pub fn complete_external(
         &mut self,
         token: ExternalActivityToken,
@@ -2108,8 +2110,7 @@ impl SqliteRuntime {
     ///
     /// # Errors
     ///
-    /// Returns [`SqliteError::ExternalTaskNotFound`] for an unknown token, or
-    /// a persistence error.
+    /// As [`complete_external`](Self::complete_external).
     pub fn fail_external(
         &mut self,
         token: ExternalActivityToken,
@@ -2142,19 +2143,64 @@ impl SqliteRuntime {
         let now = (self.now_fn)().timestamp_millis();
         // An overdue run ends first. Its terminal setter cancels the token.
         self.seal_if_overdue_at(task.exec, now)?;
-        let tx = self.conn.transaction()?;
-        if store::execution_state(&tx, task.exec)? != "RUNNING" {
+        if store::execution_state(&self.conn, task.exec)? != "RUNNING" {
             return Ok(false);
         }
+        let event = event(task.activity_id);
+        let (policy, start_bytes, workflow_type) = self.external_caps(task.exec, &event)?;
+        let caps = CapCheck {
+            policy,
+            start_bytes,
+            workflow_type: &workflow_type,
+        };
+        let tx = self.conn.transaction()?;
         // A reply after the deadline loses to the timeout.
         if external_task::time_out_if_due(&tx, token, &task, now)? {
             tx.commit()?;
             return Ok(false);
         }
-        let settled =
-            external_task::settle(&tx, token, &task, state, &event(task.activity_id), now)?;
+        let settled = external_task::settle(&tx, token, &task, state, &event, now)?;
+        if let Some(reason) = caps.reached(&tx, task.exec)? {
+            drop(tx);
+            return self.end_external_at_cap(token, task.exec, reason, now);
+        }
         tx.commit()?;
         Ok(settled)
+    }
+
+    /// The caps of a write outside a drive that appends `event` to `exec`.
+    /// It returns the policy, the stored bytes with the event, and the
+    /// workflow type.
+    ///
+    /// The caps bound history whether or not a drive follows, as for an
+    /// update. Under a pending cancel, the cleanup budget is one more cap.
+    fn external_caps(
+        &self,
+        exec: ExecutionId,
+        event: &WorkflowEvent,
+    ) -> SqliteResult<(WorkflowHistoryPolicy, u64, String)> {
+        let (_, history_bytes) = store::load_history_sized(&self.conn, exec)?;
+        let added = serde_json::to_string(event)?.len() as u64;
+        let budget_end = store::cancel_request(&self.conn, exec)?
+            .map(|(_, from)| from.saturating_add(CANCEL_CLEANUP_EVENT_BUDGET));
+        Ok((
+            self.cancel_policy(budget_end),
+            history_bytes.saturating_add(added),
+            store::workflow_name_of(&self.conn, exec)?,
+        ))
+    }
+
+    /// End `exec` at a history cap that an external write would reach. The
+    /// write has rolled back. The terminal setter cancels the token.
+    fn end_external_at_cap<T>(
+        &mut self,
+        token: ExternalActivityToken,
+        exec: ExecutionId,
+        reason: HistoryCapReason,
+        now: i64,
+    ) -> SqliteResult<T> {
+        self.end_run_at_cap(exec, &reason, now)?;
+        Err(SqliteError::ExternalHistoryCapReached { token, reason })
     }
 
     /// Move the deadline of the external activity of `token` to `extend_by`
@@ -2168,9 +2214,10 @@ impl SqliteRuntime {
     ///
     /// Returns [`SqliteError::ExternalTaskNotFound`] for an unknown token,
     /// [`SqliteError::ExternalTaskNotPending`] for a settled token or a
-    /// token past its deadline, and
-    /// [`SqliteError::WorkflowNotRunning`] when the run has ended. Otherwise
-    /// returns a persistence error.
+    /// token past its deadline. Returns [`SqliteError::WorkflowNotRunning`]
+    /// when the run has ended. Returns
+    /// [`SqliteError::ExternalHistoryCapReached`] when the event would reach
+    /// a history cap. Otherwise returns a persistence error.
     pub fn extend_external_deadline(
         &mut self,
         token: ExternalActivityToken,
@@ -2187,6 +2234,13 @@ impl SqliteRuntime {
         let now = (self.now_fn)().timestamp_millis();
         self.refuse_past_deadline(task.exec, now)?;
         let deadline_at = now.saturating_add(duration_to_millis_saturating(extend_by));
+        let (policy, start_bytes, workflow_type) =
+            self.external_caps(task.exec, &external_task::extended_event(token, &task))?;
+        let caps = CapCheck {
+            policy,
+            start_bytes,
+            workflow_type: &workflow_type,
+        };
         let tx = self.conn.transaction()?;
         // An extension cannot revive a token whose deadline has passed.
         if external_task::time_out_if_due(&tx, token, &task, now)? {
@@ -2197,6 +2251,10 @@ impl SqliteRuntime {
             });
         }
         external_task::extend(&tx, token, &task, deadline_at, now)?;
+        if let Some(reason) = caps.reached(&tx, task.exec)? {
+            drop(tx);
+            return self.end_external_at_cap(token, task.exec, reason, now);
+        }
         tx.commit()?;
         Ok(())
     }

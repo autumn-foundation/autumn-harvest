@@ -1192,6 +1192,7 @@ The rules match Postgres:
 | An output nested past `MAX_PAYLOAD_DEPTH` | The activity fails instead |
 | No settle before `schedule_to_close_secs` | `ActivityTimedOut { ScheduleToClose }` |
 | A settle or an extension after the deadline | The token times out first. A settle returns `Ok(false)` |
+| A settle or an extension that would reach a history cap | `SqliteError::ExternalHistoryCapReached`. The run ends at the cap, as for an update |
 | An external activity beside another awaitable, such as a `join!` | The run ends `FAILED` with `UnsupportedFeature` |
 | A marker, side effect or timer change recorded after a pending external activity | The run ends `FAILED` with `UnsupportedFeature`. Replay cannot read past the event |
 

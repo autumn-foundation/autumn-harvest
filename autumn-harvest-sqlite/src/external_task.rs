@@ -382,14 +382,15 @@ pub fn extend(
          WHERE exec_id = ?1 AND timer_id = ?2 AND fired = 0",
         params![task.exec.to_string(), deadline_timer_id(token), deadline_at],
     )?;
-    store::append_event(
-        conn,
-        task.exec,
-        &WorkflowEvent::ActivityExternalDeadlineExtended {
-            activity_id: task.activity_id,
-            token,
-        },
-    )
+    store::append_event(conn, task.exec, &extended_event(token, task))
+}
+
+/// The event that an extension of `token` appends.
+pub const fn extended_event(token: ExternalActivityToken, task: &Task) -> WorkflowEvent {
+    WorkflowEvent::ActivityExternalDeadlineExtended {
+        activity_id: task.activity_id,
+        token,
+    }
 }
 
 /// Fire the deadline timer `timer_id` of `exec`, in the caller's transaction.

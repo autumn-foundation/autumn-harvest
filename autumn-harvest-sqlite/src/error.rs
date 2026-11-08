@@ -67,6 +67,19 @@ pub enum SqliteError {
     #[error("external task not found: {0}")]
     ExternalTaskNotFound(ExternalActivityToken),
 
+    /// A settle or a deadline extension would reach a history cap.
+    ///
+    /// The call writes no event. It seals the run `FAILED` with the cap
+    /// reason, as a drive that reaches the cap does. The token then becomes
+    /// `CANCELLED`.
+    #[error("external task {token} reached a history cap: {reason}")]
+    ExternalHistoryCapReached {
+        /// The token of the external activity.
+        token: ExternalActivityToken,
+        /// The cap that the write would reach.
+        reason: crate::HistoryCapReason,
+    },
+
     /// A deadline extension targeted a token that is no longer `PENDING`.
     #[error("external task {token} is already terminal ({state}); cannot extend its deadline")]
     ExternalTaskNotPending {

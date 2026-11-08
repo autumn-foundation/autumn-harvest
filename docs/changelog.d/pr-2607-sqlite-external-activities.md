@@ -17,7 +17,9 @@ is in `docs/design/DESIGN-2607.md`.
   token is `SqliteError::ExternalTaskNotFound`. An output nested past
   `MAX_PAYLOAD_DEPTH` fails the activity instead. A settle on an overdue run
   seals it `TIMED_OUT` first. A settle or an extension after the deadline
-  of the token times the token out first.
+  of the token times the token out first. A settle or an extension that
+  would reach a history cap writes nothing, ends the run at the cap, and
+  returns `SqliteError::ExternalHistoryCapReached`, as an update does.
 - An external activity must be the only awaitable in its batch, as on
   Postgres. A `join!` with another awaitable ends the run `FAILED` with
   `UnsupportedFeature` and the feature `ScheduleExternalActivity`. So does a
