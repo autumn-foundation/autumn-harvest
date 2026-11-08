@@ -45,7 +45,7 @@ pub const INVALID_NAME: &str = "_invalid";
 
 /// The keys of a mandate on the wire. [`Mandate::from_meta`] refuses any
 /// other key, because a newer sender can add a field that narrows the run.
-const WIRE_KEYS: [&str; 8] = [
+const WIRE_KEYS: [&str; 9] = [
     "chain",
     "max_depth",
     "peers",
@@ -54,6 +54,7 @@ const WIRE_KEYS: [&str; 8] = [
     "read_only",
     "flow_labels",
     "models",
+    "max_draws",
 ];
 
 /// Whether `item` is a valid tool name or flow label: 1 to
@@ -87,6 +88,63 @@ fn meet_allowlists(
         (Some(only), None) | (None, Some(only)) => Some(only.clone()),
         (Some(left), Some(right)) => Some(left.intersection(right).cloned().collect()),
     }
+}
+
+/// The meet of two caps. `None` means no cap.
+///
+/// The result is never above a cap of either side. It is `None` only when
+/// both sides are `None`. `formal/verus/src/agent_mandate_draws.rs` proves
+/// it.
+#[must_use]
+pub const fn meet_cap(left: Option<u32>, right: Option<u32>) -> Option<u32> {
+    match (left, right) {
+        (Some(a), Some(b)) => {
+            if a < b {
+                Some(a)
+            } else {
+                Some(b)
+            }
+        }
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
+}
+
+/// The verdict of [`draw_verdict`] on the draws of one strategy run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DrawVerdict {
+    /// Run the draws. `left` delegations stay for the draws to split.
+    Run {
+        /// The delegations left after the draws.
+        left: u32,
+    },
+    /// The draws pass `max_draws`.
+    DrawsExceeded,
+    /// The draws pass the delegations left.
+    FanOutExhausted,
+}
+
+/// Admit `draws` draws under the cap `max_draws` and the `room` of
+/// delegations left in the tree.
+///
+/// Each draw counts as one delegation. The cap check comes first. An
+/// admitted run leaves `room - draws` delegations. A `None` cap admits any
+/// count that fits the room. `formal/verus/src/agent_mandate_draws.rs`
+/// proves it.
+#[must_use]
+pub const fn draw_verdict(max_draws: Option<u32>, room: u32, draws: u32) -> DrawVerdict {
+    let over = match max_draws {
+        Some(max) => draws > max,
+        None => false,
+    };
+    if over {
+        return DrawVerdict::DrawsExceeded;
+    }
+    if draws > room {
+        return DrawVerdict::FanOutExhausted;
+    }
+    DrawVerdict::Run { left: room - draws }
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)]
@@ -144,6 +202,11 @@ pub struct Peer {
     /// caller also cuts the answer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub answer_limit: Option<usize>,
+    /// The most draws of one strategy run of the peer. A child mandate takes
+    /// the smaller of this value and the value of its parent. `None` adds no
+    /// cap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_draws: Option<u32>,
 }
 
 /// The default time a caller waits for the reply of a durable peer: ten
@@ -168,6 +231,7 @@ impl Peer {
             reply_timeout_secs: None,
             model: None,
             answer_limit: None,
+            max_draws: None,
         }
     }
 
@@ -258,6 +322,13 @@ impl Peer {
         self.answer_limit = Some(chars);
         self
     }
+
+    /// Cap the draws of one strategy run of the peer.
+    #[must_use]
+    pub const fn max_draws(mut self, max: u32) -> Self {
+        self.max_draws = Some(max);
+        self
+    }
 }
 
 /// The authority of one agent in a delegation tree.
@@ -295,6 +366,11 @@ pub struct Mandate {
     /// model of [`AgentHarness::new`](crate::AgentHarness::new).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub models: Option<BTreeSet<String>>,
+    /// The most draws of one strategy run in the subtree. `None` leaves the
+    /// cap to the sampling policy alone. Each draw also counts as one
+    /// delegation, so `max_delegations` bounds the draws too.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_draws: Option<u32>,
 }
 
 impl Mandate {
@@ -311,6 +387,31 @@ impl Mandate {
             read_only: false,
             flow_labels: BTreeSet::new(),
             models: None,
+            max_draws: None,
+        }
+    }
+
+    /// Cap the draws of one strategy run in the subtree.
+    #[must_use]
+    pub const fn max_draws(mut self, max: u32) -> Self {
+        self.max_draws = Some(max);
+        self
+    }
+
+    /// Admit a strategy run of `draws` draws, after `used` delegations of
+    /// the tree. Returns the delegations left for the draws to split.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Refusal::DrawsExceeded`] when `draws` passes `max_draws`.
+    /// Returns [`Refusal::FanOutExhausted`] when `draws` passes the
+    /// delegations left.
+    pub const fn admit_draws(&self, draws: u32, used: u32) -> Result<u32, Refusal> {
+        let room = self.max_delegations.saturating_sub(used);
+        match draw_verdict(self.max_draws, room, draws) {
+            DrawVerdict::Run { left } => Ok(left),
+            DrawVerdict::DrawsExceeded => Err(Refusal::DrawsExceeded),
+            DrawVerdict::FanOutExhausted => Err(Refusal::FanOutExhausted),
         }
     }
 
@@ -495,6 +596,7 @@ impl Mandate {
             read_only: self.read_only || peer.read_only,
             flow_labels: self.flow_labels.clone(),
             models: self.models.clone(),
+            max_draws: meet_cap(self.max_draws, peer.max_draws),
         })
     }
 
@@ -565,6 +667,7 @@ impl Mandate {
                 .cloned()
                 .collect(),
             models: meet_allowlists(self.models.as_ref(), inbound.models.as_ref()),
+            max_draws: meet_cap(self.max_draws, inbound.max_draws),
         };
         if merged.depth() > merged.max_depth {
             return Err(Refusal::DepthExceeded);
@@ -615,7 +718,8 @@ impl Mandate {
 ///
 /// A delegation runs the checks in the order of the variants, from
 /// `InvalidArguments` to `BudgetExhausted`. Only [`Mandate::accept`] returns
-/// `InvalidMandate`.
+/// `InvalidMandate`. A strategy run checks `DrawsExceeded`, then
+/// `FanOutExhausted`, before its first draw.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
 #[serde(rename_all = "snake_case")]
 #[error("the delegation is refused: {}", self.code())]
@@ -645,6 +749,8 @@ pub enum Refusal {
     /// The durable peer has no running run, or the roster names no valid
     /// agent id for it (issue #2269).
     PeerUnavailable,
+    /// A strategy run asks for more draws than `max_draws` of its mandate.
+    DrawsExceeded,
 }
 
 impl Refusal {
@@ -663,6 +769,7 @@ impl Refusal {
             Self::InvalidMandate => "invalid_mandate",
             Self::Deadlock => "deadlock",
             Self::PeerUnavailable => "peer_unavailable",
+            Self::DrawsExceeded => "draws_exceeded",
         }
     }
 
@@ -689,6 +796,9 @@ impl Refusal {
                 format!("{peer:?} waits on this agent; a request would wait for ever")
             }
             Self::PeerUnavailable => format!("the durable agent {peer:?} is not running"),
+            Self::DrawsExceeded => {
+                format!("the mandate of {peer:?} allows fewer draws than the strategy asks for")
+            }
         }
     }
 }
@@ -957,6 +1067,7 @@ mod tests {
             Refusal::InvalidMandate,
             Refusal::Deadlock,
             Refusal::PeerUnavailable,
+            Refusal::DrawsExceeded,
         ];
         let codes: BTreeSet<&str> = all.iter().map(|refusal| refusal.code()).collect();
         assert_eq!(codes.len(), all.len());
@@ -1181,6 +1292,7 @@ mod tests {
             read_only: true,
             flow_labels: BTreeSet::new(),
             models: None,
+            max_draws: None,
         };
         let merged = local.accept(&inbound).unwrap();
         assert_eq!(merged.chain, vec!["planner", "researcher"]);
@@ -1230,6 +1342,84 @@ mod tests {
         assert_eq!(local.accept(&twice), Err(Refusal::InvalidMandate));
     }
 
+    #[test]
+    fn the_meet_of_two_caps_is_the_smaller_one() {
+        assert_eq!(meet_cap(None, None), None);
+        assert_eq!(meet_cap(Some(4), None), Some(4));
+        assert_eq!(meet_cap(None, Some(2)), Some(2));
+        assert_eq!(meet_cap(Some(4), Some(2)), Some(2));
+        assert_eq!(meet_cap(Some(0), Some(9)), Some(0));
+    }
+
+    #[test]
+    fn a_child_takes_the_smaller_draw_cap() {
+        let parent = Mandate::new("planner").peers(["a"]).max_draws(4);
+        let child = parent.delegate(&Peer::new("a", "A."), 0).unwrap();
+        assert_eq!(child.max_draws, Some(4), "the parent cap stays");
+        let tight = Peer::new("a", "A.").max_draws(2);
+        assert_eq!(parent.delegate(&tight, 0).unwrap().max_draws, Some(2));
+        let open = Mandate::new("planner").peers(["a"]);
+        assert_eq!(open.delegate(&tight, 0).unwrap().max_draws, Some(2));
+        assert_eq!(
+            open.delegate(&Peer::new("a", "A."), 0).unwrap().max_draws,
+            None
+        );
+    }
+
+    #[test]
+    fn outbound_then_accept_keeps_max_draws() {
+        let parent = Mandate::new("planner").peers(["researcher"]).max_draws(2);
+        let sent = parent
+            .outbound(&Peer::new("researcher", "R."), 0, &BTreeSet::new())
+            .unwrap();
+        let mut meta = Map::new();
+        sent.insert_into(&mut meta);
+        assert_eq!(meta[MANDATE_META_KEY]["max_draws"], json!(2));
+        let inbound = Mandate::from_meta(&meta).unwrap().unwrap();
+        assert_eq!(inbound.max_draws, Some(2));
+        let merged = Mandate::new("researcher").accept(&inbound).unwrap();
+        assert_eq!(merged.max_draws, Some(2));
+        let local = Mandate::new("researcher").max_draws(1);
+        assert_eq!(local.accept(&inbound).unwrap().max_draws, Some(1));
+    }
+
+    #[test]
+    fn a_mandate_with_no_draw_cap_round_trips() {
+        let old = json!({"chain": ["planner"], "max_depth": 3, "max_delegations": 16});
+        let mut meta = Map::new();
+        meta.insert(MANDATE_META_KEY.into(), old.clone());
+        let decoded = Mandate::from_meta(&meta).unwrap().unwrap();
+        assert_eq!(
+            decoded.max_draws, None,
+            "a missing cap is the policy cap alone"
+        );
+        assert_eq!(decoded, Mandate::new("planner"));
+        let mut again = Map::new();
+        decoded.insert_into(&mut again);
+        assert_eq!(again[MANDATE_META_KEY], old, "no cap sends no key");
+        let typed: Mandate = serde_json::from_value(old).unwrap();
+        assert_eq!(typed.max_draws, None);
+    }
+
+    #[test]
+    fn admit_draws_names_the_bound_that_refuses() {
+        let mandate = Mandate::new("a").max_draws(2).max_delegations(5);
+        assert_eq!(mandate.admit_draws(2, 0), Ok(3));
+        assert_eq!(mandate.admit_draws(3, 0), Err(Refusal::DrawsExceeded));
+        assert_eq!(mandate.admit_draws(2, 4), Err(Refusal::FanOutExhausted));
+        assert_eq!(Mandate::new("a").admit_draws(16, 0), Ok(0));
+        assert_eq!(
+            Mandate::new("a").admit_draws(17, 0),
+            Err(Refusal::FanOutExhausted)
+        );
+        assert_eq!(Refusal::DrawsExceeded.code(), "draws_exceeded");
+        assert!(
+            Refusal::DrawsExceeded
+                .message("researcher")
+                .contains("researcher")
+        );
+    }
+
     fn name() -> impl Strategy<Value = String> {
         prop::sample::select(vec!["a", "b", "c", "d", "e"]).prop_map(str::to_owned)
     }
@@ -1263,6 +1453,7 @@ mod tests {
             any::<bool>(),
             names(),
             models(),
+            cap(),
         )
             .prop_map(
                 |(
@@ -1274,6 +1465,7 @@ mod tests {
                     read_only,
                     flow_labels,
                     models,
+                    max_draws,
                 )| {
                     Mandate {
                         chain: chain.into_iter().collect(),
@@ -1284,9 +1476,14 @@ mod tests {
                         read_only,
                         flow_labels,
                         models,
+                        max_draws,
                     }
                 },
             )
+    }
+
+    fn cap() -> impl Strategy<Value = Option<u32>> {
+        prop::option::of(prop_oneof![0_u32..6, Just(u32::MAX)])
     }
 
     fn peer() -> impl Strategy<Value = Peer> {
@@ -1296,14 +1493,25 @@ mod tests {
             tools(),
             any::<bool>(),
             prop::option::of(model()),
+            cap(),
         )
-            .prop_map(|(name, peers, tools, read_only, model)| Peer {
+            .prop_map(|(name, peers, tools, read_only, model, max_draws)| Peer {
                 tools,
                 peers,
                 read_only,
                 model,
+                max_draws,
                 ..Peer::new(name, "A peer.")
             })
+    }
+
+    /// Whether the cap `child` is no wider than the cap `parent`.
+    fn cap_within(child: Option<u32>, parent: Option<u32>) -> bool {
+        match (child, parent) {
+            (_, None) => true,
+            (None, Some(_)) => false,
+            (Some(c), Some(p)) => c <= p,
+        }
     }
 
     /// Whether `child` grants nothing that `parent` does not.
@@ -1320,6 +1528,7 @@ mod tests {
         };
         tools
             && models
+            && cap_within(child.max_draws, parent.max_draws)
             && child.peers.is_subset(&parent.peers)
             && child.max_depth <= parent.max_depth
             && child.max_delegations <= parent.max_delegations
@@ -1378,6 +1587,78 @@ mod tests {
             if let Ok(child) = parent.outbound(&role, used, &BTreeSet::new()) {
                 prop_assert!(narrower(&child, &parent));
                 prop_assert!(child.max_delegations < parent.max_delegations);
+            }
+        }
+
+        #[test]
+        fn delegate_never_widens_max_draws(parent in mandate(), role in peer(), used in 0_u32..5) {
+            if let Ok(child) = parent.delegate(&role, used) {
+                prop_assert!(cap_within(child.max_draws, parent.max_draws));
+                prop_assert!(cap_within(child.max_draws, role.max_draws));
+                prop_assert_eq!(child.max_draws.is_none(), parent.max_draws.is_none() && role.max_draws.is_none());
+            }
+            if let Ok(child) = parent.outbound(&role, used, &BTreeSet::new()) {
+                prop_assert!(cap_within(child.max_draws, parent.max_draws));
+                prop_assert!(cap_within(child.max_draws, role.max_draws));
+            }
+        }
+
+        #[test]
+        fn a_permitted_delegation_takes_the_smaller_draw_cap(
+            parent_cap in cap(),
+            peer_cap in cap(),
+            local_cap in cap(),
+            used in 0_u32..4,
+        ) {
+            let parent = Mandate {
+                max_draws: parent_cap,
+                ..Mandate::new("root").peers(["child"])
+            };
+            let role = Peer {
+                max_draws: peer_cap,
+                ..Peer::new("child", "C.")
+            };
+            let expected = match (parent_cap, peer_cap) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (one, None) | (None, one) => one,
+            };
+            let child = parent.delegate(&role, used).unwrap();
+            prop_assert_eq!(child.max_draws, expected);
+            let sent = parent.outbound(&role, used, &BTreeSet::new()).unwrap();
+            prop_assert_eq!(sent.max_draws, expected);
+            let local = Mandate {
+                max_draws: local_cap,
+                ..Mandate::new("child")
+            };
+            let merged = local.accept(&sent).unwrap();
+            prop_assert!(cap_within(merged.max_draws, expected));
+            prop_assert!(cap_within(merged.max_draws, local_cap));
+        }
+
+        #[test]
+        fn accept_never_widens_max_draws(local in mandate(), inbound in mandate()) {
+            if let Ok(merged) = local.accept(&inbound) {
+                prop_assert!(cap_within(merged.max_draws, local.max_draws));
+                prop_assert!(cap_within(merged.max_draws, inbound.max_draws));
+            }
+        }
+
+        #[test]
+        fn admitted_draws_fit_the_cap_and_the_fan_out(mandate in mandate(), draws in 0_u32..8, used in 0_u32..6) {
+            match mandate.admit_draws(draws, used) {
+                Ok(left) => {
+                    prop_assert!(cap_within(Some(draws), mandate.max_draws));
+                    let room = mandate.max_delegations.saturating_sub(used);
+                    prop_assert_eq!(left + draws, room);
+                }
+                Err(Refusal::DrawsExceeded) => {
+                    prop_assert!(mandate.max_draws.is_some_and(|max| draws > max));
+                }
+                Err(Refusal::FanOutExhausted) => {
+                    prop_assert!(cap_within(Some(draws), mandate.max_draws));
+                    prop_assert!(draws > mandate.max_delegations.saturating_sub(used));
+                }
+                Err(other) => prop_assert!(false, "unexpected refusal {other:?}"),
             }
         }
 

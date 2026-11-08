@@ -1236,6 +1236,7 @@ mod tests {
             error: None,
             resets: 0,
             answer_rejections: Vec::new(),
+            parked_until_ms: None,
         };
         let input = ScoreInput::from_run(&task, &report);
         assert_eq!(

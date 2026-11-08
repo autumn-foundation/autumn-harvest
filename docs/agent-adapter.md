@@ -1421,6 +1421,15 @@ as a child run. They split the token remainder with `bounds::sibling_cap`.
 A mandate bounds the delegation tree. Flow rules gate a dangerous sequence
 of tool calls across the tree. Read [`agent-mesh.md`](agent-mesh.md).
 
+A mandate also bounds strategies. `Mandate::max_draws` caps the draws of
+one strategy run in the subtree, and each draw counts as one delegation of
+`max_delegations`. A child mandate takes the smaller cap of its parent and
+its peer, so the cap only narrows. `outbound` and `accept` carry it. A
+mandate with no cap leaves the sampling policy as the only cap. Each draw
+carries the mesh of the profile, so a mesh budget stops the next draw.
+A worker that predates `max_draws` drops it from a peer message. Upgrade
+every worker before you set it.
+
 ## 15. Durable agents
 
 An `Agent` (issue #2263) is a named, long-lived actor. It owns its state,
@@ -2018,6 +2027,64 @@ the answer of each model turn in two layers:
 - The live text is a preview. The `TurnText` and the run result are the
   answer.
 
+### Strategies in an op
+
+A message op can carry an `OpSample`: a `SampleStrategy`, a `ScorerRef` and
+an optional concurrency. The agent then runs the op through the core of
+`agent_sample` (section 20), not as one segment.
+
+```rust
+use autumn_harvest_agent::AgentOp;
+use autumn_harvest_agent::sampling::{OpSample, SampleStrategy, ScorerRef};
+
+let sample = OpSample::new(
+    SampleStrategy::best_of_n(3),
+    ScorerRef::deterministic("exact_match").unwrap(),
+);
+let op = AgentOp::message("Name a prime.").with_sample(sample);
+```
+
+- The op builds its task as a segment does. Each draw gets the
+  transcript as its history, the labels of the agent and the mandate of
+  the op. A peer message uses the accepted mandate.
+- The mandate admits the draws first: `draws_exceeded`, then
+  `fan_out_exhausted`. The sampling policy of the kind then admits the
+  strategy. A refusal comes before any model call.
+- A beam (section 20) checks `max_draws` against its steps only. A step
+  continues the run of its beam, and the beam counts its delegations step
+  by step.
+- Each tier of a cascade (section 20) is a run of its own, so it counts as
+  one delegation, as a draw of best-of-N or of a vote does.
+  `OpSample::vote` runs a vote (section 26), which needs no scorer. A cascade peer op checks
+  the tier models against the accepted mandate, not the model of the
+  profile. It skips each forbidden tier. With no tier left, it ends with
+  `no_accepted_draw`.
+- A refused or failed op is a failed op. The transcript stays as it was,
+  and the next op runs. A peer gets a mandate refusal in
+  `PeerReply::refusal`, and any other error in `PeerReply::error`.
+- The selected draw gives the answer and the new transcript. The tokens and
+  the labels of each draw go into the state, selected or not.
+- A mesh budget that refuses a draw parks the agent until the period
+  ends, as for a segment. When no draw spent a token, a message from a
+  person waits first in line. Else the op answers with the draws that ran.
+- With no accepted draw, the op fails with `no_accepted_draw`.
+- A judge model must be in `Mandate::models`, else the op gets
+  `model_forbidden`. A judge call does not check the mesh budget before
+  the call. Its tokens count after it.
+- A transcript over the workflow input cap fails the op before any draw,
+  because each draw carries the transcript.
+- A steer message with a strategy runs as its own op. An interrupt, a
+  pause or a delete does not stop the draws of a running strategy op.
+- With `AgentProfile::stream`, the op publishes the selected answer once
+  on the durable stream of the agent. A draw streams nothing.
+- A draw has no memory tool, no workspace, no follow-ups and no context
+  reset. It reads the state memory in its system prompt and the progress
+  notes in its window. It changes neither.
+- A worker that predates `OpSample` drops the field and runs a plain
+  segment. Upgrade every worker before a client sends a strategy op.
+
+The design is in [`DESIGN-2449.md`](design/DESIGN-2449.md).
+
 ### Profile overlays (issue #2372)
 
 An activated overlay changes the next op only, because each op reads it
@@ -2469,7 +2536,9 @@ let input = SampleInput::new(
 | `cascade { tiers }` | Asks each tier in order, one draw per tier, and stops at the first answer at or above the threshold of its tier. See "Model cascade" below. |
 
 The run reads the profile and the sampling policy of the kind once each,
-as `agent_draws` does (section 19). The policy admits the strategy, the
+as `agent_draws` does (section 19). In a run that starts after this
+release, a profile mandate admits the draws first, as for a strategy op
+(section 15). The policy admits the strategy, the
 draw count (`n` or `max_attempts`), the concurrency and the scorer of
 best-of-N and rejection. Each
 draw gets `draw_effects`, so with the default `[read_only]` a draw that
@@ -2525,6 +2594,7 @@ model is not called.
 - `tally`: for a vote, the votes of each key, the winner first;
 - `usage` and `cost_usd_micros`: the totals. They equal the cost ledger
   rows of the run tree.
+- `flow_labels`: the labels of each draw, selected or not.
 
 Each `ModelTurn` carries the cost that the ledger recorded for it, and
 `AgentReport::cost_usd_micros` sums it, as `usage` sums the tokens.

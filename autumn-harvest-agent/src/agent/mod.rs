@@ -64,12 +64,14 @@ use crate::loop_guard::LoopGuard;
 use crate::memory::{EditKey, MemoryScope};
 use crate::mesh::{Mandate, Refusal};
 use crate::message::{ChatMessage, ChatRole, RunId, SessionId};
+use crate::sampling::{OpSample, SampleFailure, sample_task};
 use crate::skill::SkillText;
 use crate::types::{AgentStop, AgentTask, DEFAULT_APPROVAL_TIMEOUT_SECS, DEFAULT_MAX_STEPS};
 use crate::workflow::{
     Member, Outbox, Progress, Run, SteerBook, Tree, deliver, discover, harness, run_segment,
 };
 use crate::workspace::{WorkspaceMount, WorkspaceRef};
+use autumn_harvest::builder::DEFAULT_MAX_WORKFLOW_INPUT_BYTES;
 use dedupe::Inbound;
 use inbox::{Admit, InboxStatus, OpClass, admit};
 use overlay_store::OverlayVersion;
@@ -238,6 +240,11 @@ pub struct UserMessage {
     /// How the message treats the op that runs.
     #[serde(default, skip_serializing_if = "Urgency::is_queue")]
     pub urgency: Urgency,
+    /// The strategy of the op. With one, the op runs its draws through the
+    /// core of `agent_sample`. The policy of the kind and the mandate of
+    /// the agent apply. A steer message with a strategy runs as its own op.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sample: Option<OpSample>,
 }
 
 /// The payload of [`STEER_SIGNAL`].
@@ -484,6 +491,10 @@ pub struct PeerEnvelope {
     /// The mesh of the sender (issue #2272).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mesh: Option<String>,
+    /// The strategy of the op. The accepted mandate caps its draws, so a
+    /// receiver never runs more draws than its caller allows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sample: Option<OpSample>,
 }
 
 /// The reply to a [`PeerEnvelope`]. It settles the promise of the sender.
@@ -575,6 +586,7 @@ impl AgentOp {
             text: text.into(),
             message_id: None,
             urgency: Urgency::Queue,
+            sample: None,
         })
     }
 
@@ -585,6 +597,7 @@ impl AgentOp {
             text: text.into(),
             message_id: Some(message_id.into()),
             urgency: Urgency::Queue,
+            sample: None,
         })
     }
 
@@ -605,7 +618,27 @@ impl AgentOp {
             text: text.into(),
             message_id: Some(message_id.into()),
             urgency,
+            sample: None,
         })
+    }
+
+    /// Run the op with the strategy `sample`.
+    ///
+    /// Only a message from a person or a peer carries a strategy. Each
+    /// other op stays as it is.
+    #[must_use]
+    pub fn with_sample(self, sample: OpSample) -> Self {
+        match self {
+            Self::UserMessage(mut message) => {
+                message.sample = Some(sample);
+                Self::UserMessage(message)
+            }
+            Self::PeerMessage(mut envelope) => {
+                envelope.sample = Some(sample);
+                Self::PeerMessage(envelope)
+            }
+            other => other,
+        }
     }
 
     /// The class of the op for the inbox kernel.
@@ -1282,14 +1315,15 @@ impl Agent {
     /// The extra signal that goes before `op`, if its urgency needs one.
     ///
     /// Send the signal first, then the op. A [`Urgency::Steer`] message with
-    /// no id needs no signal: it runs as a queued message.
+    /// no id needs no signal: it runs as a queued message. So does a steer
+    /// message with a strategy, because its draws cannot join a running op.
     #[must_use]
     pub fn urgency_signal(op: &AgentOp) -> Option<(&'static str, serde_json::Value)> {
         let AgentOp::UserMessage(message) = op else {
             return None;
         };
         match (message.urgency, &message.message_id) {
-            (Urgency::Steer, Some(id)) => Some((
+            (Urgency::Steer, Some(id)) if message.sample.is_none() => Some((
                 STEER_SIGNAL,
                 serde_json::json!(Steer {
                     text: message.text.clone(),
@@ -1906,6 +1940,22 @@ impl AgentRun<'_> {
     async fn work(&self, mut state: AgentState, op: AgentOp) -> AgentState {
         match op {
             AgentOp::UserMessage(message) => {
+                if let Some(sample) = &message.sample {
+                    // A person is present, so a new follow-up chain starts.
+                    state.chain = 0;
+                    let (mut state, outcome) = self
+                        .sampled(state, &message.text, sample, Mode::Attended, None)
+                        .await;
+                    // A mesh budget refused each draw before it spent a
+                    // token. The message waits for the next period, first in
+                    // line.
+                    if matches!(outcome, Ok(Some((AgentStop::BudgetExceeded, ref answer))) if answer.is_empty())
+                        && matches!(state.status, AgentStatus::Parked { .. })
+                    {
+                        hold_first(&mut state, AgentOp::UserMessage(message));
+                    }
+                    return state;
+                }
                 if let (Urgency::Steer, Some(id)) = (message.urgency, message.message_id.clone()) {
                     // A running segment took the steer signal, so the op is done.
                     if SteerBook::take(&mut state.steer.steered, &id) {
@@ -1972,13 +2022,29 @@ impl AgentRun<'_> {
                 );
                 let failures = state.failures;
                 let before = state.tokens_used;
+                // A cascade asks the model of each tier, never the model of
+                // the profile. The core checks the tier models.
+                let cascade = envelope.sample.as_ref().is_some_and(|sample| {
+                    matches!(
+                        sample.strategy,
+                        crate::sampling::SampleStrategy::Cascade { .. }
+                    )
+                });
                 let peer = PeerSegment {
                     member: &member,
                     waiting: &envelope.waiting,
+                    own_model: !cascade,
                 };
-                let (next, outcome) = self
-                    .run_segment_as(state, &input, Mode::Peer, Some(peer))
-                    .await;
+                let (next, outcome) = match &envelope.sample {
+                    Some(sample) => {
+                        self.sampled(state, &input, sample, Mode::Peer, Some(peer))
+                            .await
+                    }
+                    None => {
+                        self.run_segment_as(state, &input, Mode::Peer, Some(peer))
+                            .await
+                    }
+                };
                 state = next;
                 match outcome {
                     Err(refusal) => PeerReply {
@@ -2099,7 +2165,7 @@ impl AgentRun<'_> {
         // Without a store, the run profile names the model, so the check
         // comes first, as before the op read.
         let forbids = |model: Option<&str>| {
-            peer.is_some_and(|peer| !peer.member.mandate().allows_model(model))
+            peer.is_some_and(|peer| peer.own_model && !peer.member.mandate().allows_model(model))
         };
         if !self.overlays {
             let model = self.profile.as_ref().ok().and_then(|p| p.model.as_deref());
@@ -2260,6 +2326,132 @@ impl AgentRun<'_> {
         (state, Ok(outcome))
     }
 
+    /// Run one op with a strategy, and fold the selected draw into
+    /// `state`.
+    ///
+    /// The op builds its task as a segment does. The task takes the
+    /// transcript as its history, the labels of the agent, and the mandate
+    /// of a peer message. The core of `agent_sample` then admits the draws
+    /// under that mandate and under the policy of the kind, before any
+    /// model call. A refusal or a failure keeps the transcript as it was.
+    ///
+    /// The selected draw gives the answer and the new transcript. The
+    /// tokens and the labels of each draw go into the state, selected or
+    /// not. A peer message gets `Err` for a refusal of its mandate.
+    async fn sampled(
+        &self,
+        mut state: AgentState,
+        input: &str,
+        sample: &OpSample,
+        mode: Mode<'_>,
+        peer: Option<PeerSegment<'_>>,
+    ) -> (AgentState, Result<Option<(AgentStop, String)>, Refusal>) {
+        let mut task = match self.open_op(&mut state, input, mode, peer.as_ref()).await {
+            Ok(task) => task,
+            Err(Some(refusal)) => return (state, Err(refusal)),
+            Err(None) => return (state, Ok(None)),
+        };
+        let (id, profile) = match (&self.id, &self.profile) {
+            (Ok(id), Ok(profile)) => (id, profile),
+            (Err(err), _) | (_, Err(err)) => {
+                fail(&mut state, err);
+                return (state, Ok(None));
+            }
+        };
+        let stream = task.stream;
+        draw_op_task(&mut task, &state, profile, peer.as_ref());
+        // Each draw carries the task in its input. A task over the input cap
+        // would fail the spawn after the policy read, so it fails here.
+        if crate::bounds::exceeds_bytes(&task, DEFAULT_MAX_WORKFLOW_INPUT_BYTES) {
+            let reason = format!(
+                "the transcript is too large for a strategy op: a draw input must fit {DEFAULT_MAX_WORKFLOW_INPUT_BYTES} bytes"
+            );
+            fail(&mut state, &reason);
+            return (state, Ok(None));
+        }
+        let report = match sample_task(self.ctx, id.kind(), sample, &task, true).await {
+            Ok(report) => report,
+            Err(SampleFailure::Refused(crate::sampling::Refusal::Mandate { mandate }))
+                if peer.is_some() =>
+            {
+                return (state, Err(mandate));
+            }
+            Err(failure) => {
+                fail(&mut state, &failure.text());
+                return (state, Ok(None));
+            }
+        };
+        state.tokens_used = state
+            .tokens_used
+            .saturating_add(u64::from(report.usage.total()));
+        state.flow_labels.extend(report.flow_labels.iter().cloned());
+        // A mesh budget that refused a draw parks the agent, as it does for
+        // a segment. The latest period end wins.
+        let parked = report
+            .draws
+            .iter()
+            .filter_map(|draw| draw.parked_until_ms)
+            .max();
+        if let Some(until_ms) = parked {
+            state.status = AgentStatus::Parked { until_ms };
+        }
+        let Some(selected) = report.selected else {
+            if parked.is_some() && report.usage.total() == 0 {
+                // No draw spent a token, so the op can wait for the next
+                // period. The caller holds a message from a person.
+                state.last_stop = Some(AgentStop::BudgetExceeded);
+                return (state, Ok(Some((AgentStop::BudgetExceeded, String::new()))));
+            }
+            let reason = format!(
+                "no_accepted_draw: no draw of the strategy passed the scorer; the run stopped with {}",
+                report.stopped.code()
+            );
+            fail(&mut state, &reason);
+            return (state, Ok(None));
+        };
+        let run_id = format!("{}:s{}", state.incarnation, state.segments);
+        state.segments = state.segments.saturating_add(1);
+        let messages = crate::types::without_system(&selected.messages);
+        let messages = crate::context_reset::without_restored(messages);
+        state.transcript = trim_window(messages, profile.window);
+        self.publish_selected(&mut state, stream, &task, &run_id, &selected);
+        let (stop, answer) = (selected.stop, selected.text);
+        state.last_stop = Some(stop);
+        state.last_answer = Some(answer.clone());
+        if task.deliver {
+            let sent = Sent {
+                source: mode.source(),
+                run_id: &run_id,
+                stop,
+                answer: &answer,
+            };
+            self.deliver(&mut state, &task, sent).await;
+        }
+        if task.memory_writable() {
+            self.keep_episode(&mut state, &run_id, stop, &answer).await;
+        }
+        (state, Ok(Some((stop, answer))))
+    }
+
+    /// Publish the selected answer of a strategy op on the durable stream
+    /// of the agent, when the op streams. The draws stream nothing, so a
+    /// reader sees only the answer that the run selected.
+    fn publish_selected(
+        &self,
+        state: &mut AgentState,
+        stream: bool,
+        task: &AgentTask,
+        run_id: &str,
+        selected: &crate::types::AgentReport,
+    ) {
+        let Some(record) = selected_turn(stream, task, run_id, selected) else {
+            return;
+        };
+        if let Err(err) = self.ctx.publish_durable_progress(record) {
+            fail(state, &format!("{err}"));
+        }
+    }
+
     /// Send the answer of one segment to the delivery.
     async fn deliver(&self, state: &mut AgentState, task: &AgentTask, sent: Sent<'_>) {
         let Some(text) = report_text(sent.source, sent.stop, sent.answer) else {
@@ -2286,6 +2478,9 @@ struct PeerSegment<'a> {
     member: &'a Member,
     /// The workflow ids that wait on the message.
     waiting: &'a [String],
+    /// Whether the op asks the model of the profile. A cascade asks only
+    /// the models of its tiers.
+    own_model: bool,
 }
 
 /// The parts of one report.
@@ -2295,6 +2490,76 @@ struct Sent<'a> {
     run_id: &'a str,
     stop: AgentStop,
     answer: &'a str,
+}
+
+/// Give the task of a strategy op what each draw reads. That is the
+/// mandate of a peer message, the transcript and the progress notes. It is
+/// also the labels and the state memory.
+fn draw_op_task(
+    task: &mut AgentTask,
+    state: &AgentState,
+    profile: &AgentProfile,
+    peer: Option<&PeerSegment<'_>>,
+) {
+    if let Some(peer) = peer {
+        let mandate = peer.member.mandate();
+        task.mandate = Some(mandate.clone());
+        task.read_only |= mandate.read_only;
+        task.waiting = peer.waiting.to_vec();
+    }
+    // A draw saves no progress notes. Its notes would not reach the state,
+    // so the next op would restore stale ones.
+    task.context_reset = None;
+    // A draw streams nothing, because the run may not select its answer.
+    // The op publishes the selected answer itself.
+    task.stream = false;
+    task.history.clone_from(&state.transcript);
+    task.flow_labels = state
+        .flow_labels
+        .iter()
+        .chain(profile.mandate.iter().flat_map(|m| &m.flow_labels))
+        .cloned()
+        .collect();
+    // A draw reads the notes of the agent, as a segment does. The kept
+    // transcript drops the restored pair, and the state keeps its notes.
+    if let Some(notes) = &state.notes {
+        task.history
+            .extend(crate::context_reset::restored(&notes.text));
+        task.flow_labels.extend(notes.labels.iter().cloned());
+    }
+    if task.memory_in_state && !state.memory.is_empty() {
+        // A draw reads the state memory but cannot edit it.
+        let snapshot = crate::memory::render_snapshot(&state.memory);
+        task.system = Some(match task.system.take() {
+            Some(system) => format!("{system}\n\n{snapshot}"),
+            None => snapshot,
+        });
+        task.flow_labels
+            .extend(crate::memory::snapshot_labels(&state.memory));
+    }
+}
+
+/// The durable record of the selected answer of a strategy op, or `None`
+/// when the op does not stream or the answer is empty.
+fn selected_turn(
+    stream: bool,
+    task: &AgentTask,
+    run_id: &str,
+    selected: &crate::types::AgentReport,
+) -> Option<crate::live::TurnText> {
+    if !stream || selected.text.is_empty() {
+        return None;
+    }
+    Some(crate::live::TurnText {
+        kind: "turn".to_owned(),
+        run_id: run_id.to_owned(),
+        step: selected.steps_used,
+        agent: task
+            .mandate
+            .as_ref()
+            .map(|mandate| mandate.holder().to_owned()),
+        text: selected.text.clone(),
+    })
 }
 
 /// The run tree of one segment of the agent `id`: the labels of the agent,
@@ -2677,6 +2942,83 @@ mod tests {
         let id: AgentId = serde_json::from_value(serde_json::json!("a/b")).unwrap();
         assert_eq!(id.as_str(), "a/b");
         assert!(serde_json::from_value::<AgentId>(serde_json::json!("nope")).is_err());
+    }
+
+    fn best_of(n: u32) -> crate::sampling::OpSample {
+        crate::sampling::OpSample::new(
+            crate::sampling::SampleStrategy::best_of_n(n),
+            crate::sampling::ScorerRef::deterministic("exact_match").unwrap(),
+        )
+    }
+
+    #[test]
+    fn a_message_carries_a_sample_on_the_wire() {
+        let op = AgentOp::message("hi").with_sample(best_of(3));
+        let value = serde_json::to_value(&op).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "type": "user_message",
+                "text": "hi",
+                "sample": {"strategy": {"best_of_n": {"n": 3}}, "scorer": {"id": "exact_match"}},
+            })
+        );
+        assert_eq!(serde_json::from_value::<AgentOp>(value).unwrap(), op);
+        let plain = serde_json::to_value(AgentOp::message("hi")).unwrap();
+        assert!(plain.get("sample").is_none(), "no sample sends no key");
+        let resume = AgentOp::Control(Control::Resume);
+        assert_eq!(resume.clone().with_sample(best_of(2)), resume);
+        let old: AgentOp =
+            serde_json::from_value(serde_json::json!({"type": "user_message", "text": "hi"}))
+                .unwrap();
+        assert_eq!(old, AgentOp::message("hi"), "an op with no sample decodes");
+    }
+
+    #[test]
+    fn a_sample_with_an_unknown_key_does_not_decode() {
+        let value = serde_json::json!({
+            "type": "user_message",
+            "text": "hi",
+            "sample": {"strategy": {"best_of_n": {"n": 3}}, "scorer": {"id": "x"}, "max_drawz": 9},
+        });
+        assert!(serde_json::from_value::<AgentOp>(value).is_err());
+    }
+
+    #[test]
+    fn a_streaming_op_publishes_only_the_selected_answer() {
+        let selected: crate::types::AgentReport = serde_json::from_value(serde_json::json!({
+            "stop": "completed",
+            "text": "b",
+            "steps_used": 2,
+            "tool_calls": 0,
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+            "messages": [],
+        }))
+        .unwrap();
+        let task = AgentTask::new("x").mandate(Mandate::new("desk"));
+        let record = selected_turn(true, &task, "life:s4", &selected).unwrap();
+        assert_eq!(record.kind, "turn");
+        assert_eq!(record.run_id, "life:s4");
+        assert_eq!(record.step, 2);
+        assert_eq!(record.agent.as_deref(), Some("desk"));
+        assert_eq!(record.text, "b");
+        assert!(selected_turn(false, &task, "life:s4", &selected).is_none());
+        let empty = crate::types::AgentReport {
+            text: String::new(),
+            ..selected
+        };
+        assert!(selected_turn(true, &task, "life:s4", &empty).is_none());
+    }
+
+    #[test]
+    fn a_steer_message_with_a_sample_sends_no_steer_signal() {
+        let op = AgentOp::urgent("hi", "m-1", Urgency::Steer).with_sample(best_of(2));
+        assert!(
+            Agent::urgency_signal(&op).is_none(),
+            "it runs as its own op"
+        );
+        let interrupt = AgentOp::urgent("hi", "m-2", Urgency::Interrupt).with_sample(best_of(2));
+        assert!(Agent::urgency_signal(&interrupt).is_some());
     }
 
     #[test]

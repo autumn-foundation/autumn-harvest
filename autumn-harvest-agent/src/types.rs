@@ -1041,6 +1041,10 @@ pub struct AgentReport {
     /// (issue #2442).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub answer_rejections: Vec<String>,
+    /// The end of the period of a mesh budget that refused a model turn of
+    /// the run, in epoch milliseconds. A durable agent parks until then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parked_until_ms: Option<i64>,
 }
 
 /// The transcript without system messages.
