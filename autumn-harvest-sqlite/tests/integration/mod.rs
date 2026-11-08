@@ -20,6 +20,7 @@ mod docs_start_contract;
 mod drive_clock_refresh;
 mod durability;
 mod execution_timeout;
+mod external_activities;
 mod fleet_fault_isolation;
 mod freeze_activity_defaults;
 mod history_caps;

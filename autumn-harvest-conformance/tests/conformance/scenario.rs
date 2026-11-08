@@ -25,6 +25,20 @@ pub enum Step {
     Run(fn()),
     /// Run a declarative update and record its result.
     Update { name: &'static str, input: Value },
+    /// Complete the pending external activity of this name.
+    ///
+    /// The driver reads the pending handoff by its activity name, as a
+    /// dispatcher does. A scenario awaits `ActivityAwaitingExternal` first.
+    CompleteExternal {
+        activity: &'static str,
+        output: Value,
+    },
+    /// Fail the pending external activity of this name.
+    FailExternal {
+        activity: &'static str,
+        error: &'static str,
+        retryable: bool,
+    },
     /// Request a cancel with this reason.
     Cancel(&'static str),
     /// Terminate with this reason.

@@ -10,9 +10,11 @@ use std::time::Duration;
 
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::execution::{self, StartWorkflowParams};
+use autumn_harvest::external_task::{self, ExternalHandoffFilters};
 use autumn_harvest::models::WorkflowExecution;
 use autumn_harvest::schema::harvest_workflow_executions;
 use autumn_harvest::telemetry::NoOpMetrics;
+use autumn_harvest::types::ExternalActivityToken;
 use autumn_harvest::types::{ExecutionId, ShardId, UpdateId};
 use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig};
 use autumn_harvest::{queue, signal, store};
@@ -235,6 +237,30 @@ async fn await_event(conn: &mut AsyncPgConnection, root: ExecutionId, event: &st
     }
 }
 
+/// The token of the one pending external activity named `activity` of
+/// `root`.
+///
+/// The decision transaction writes the row with its event. A scenario awaits
+/// the event first, so one read finds the row. The run filter keeps a row
+/// of an earlier run on a shared database out of the read.
+async fn pending_token(
+    conn: &mut AsyncPgConnection,
+    root: ExecutionId,
+    activity: &str,
+) -> ExternalActivityToken {
+    let filters = ExternalHandoffFilters {
+        states: vec!["PENDING".to_owned()],
+        activity_name: Some(activity.to_owned()),
+        execution_id: Some(root),
+        ..ExternalHandoffFilters::default()
+    };
+    let rows = external_task::list_external_handoffs(conn, &filters)
+        .await
+        .expect("read the pending handoffs");
+    assert_eq!(rows.len(), 1, "postgres: expected one pending {activity}");
+    rows[0].token
+}
+
 /// Run the script against `root`. Return the result of each update.
 async fn run_steps(conn: &mut AsyncPgConnection, root: ExecutionId, steps: &[Step]) -> Vec<Value> {
     let mut update_results = Vec::new();
@@ -243,6 +269,25 @@ async fn run_steps(conn: &mut AsyncPgConnection, root: ExecutionId, steps: &[Ste
             Step::Signals(batch) => send_batch(conn, root, batch).await,
             Step::AwaitEvent { event, count } => await_event(conn, root, event, *count).await,
             Step::Run(hook) => hook(),
+            Step::CompleteExternal { activity, output } => {
+                let token = pending_token(conn, root, activity).await;
+                let settled = external_task::complete_externally(conn, token, output.clone())
+                    .await
+                    .expect("complete the external activity");
+                assert!(settled, "postgres: the token of {activity} is not pending");
+            }
+            Step::FailExternal {
+                activity,
+                error,
+                retryable,
+            } => {
+                let token = pending_token(conn, root, activity).await;
+                let settled =
+                    external_task::fail_externally(conn, token, (*error).to_owned(), *retryable)
+                        .await
+                        .expect("fail the external activity");
+                assert!(settled, "postgres: the token of {activity} is not pending");
+            }
             Step::Update { name, input } => {
                 update_results.push(update(conn, root, name, input.clone()).await);
             }

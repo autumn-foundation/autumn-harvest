@@ -23,15 +23,17 @@ use autumn_harvest::payload_depth::{
 };
 use autumn_harvest::policy::{OverlapPolicy, WorkflowSchedule};
 use autumn_harvest::{
-    ActivityExecId, ActivityHandlerFn, ActivityInfo, ExecutionId, NoOpMetrics, QueryHandlerInfo,
-    SignalHandlerInfo, TimerId, UpdateHandlerInfo, UpdateId, WorkflowCommand, WorkflowEvent,
-    WorkflowHandlerFn, WorkflowHistoryPolicy, WorkflowIdReusePolicy, WorkflowInfo, WorkflowOutcome,
+    ActivityExecId, ActivityHandlerFn, ActivityInfo, ExecutionId, ExternalActivityToken,
+    NoOpMetrics, QueryHandlerInfo, SignalHandlerInfo, TimerId, UpdateHandlerInfo, UpdateId,
+    WorkflowCommand, WorkflowEvent, WorkflowHandlerFn, WorkflowHistoryPolicy,
+    WorkflowIdReusePolicy, WorkflowInfo, WorkflowOutcome,
 };
 use chrono::{DateTime, Utc};
 use rusqlite::Connection;
 use serde_json::Value;
 
 use crate::error::{SqliteError, SqliteResult};
+use crate::external_task::{ExternalHandoff, ExternalHandoffFilter, ExternalTaskState};
 use crate::history_cap::{CapCheck, HistoryCapReason};
 use crate::llm_ledger::LlmLedgerRow;
 use crate::lock::WriterLock;
@@ -40,8 +42,8 @@ use crate::retention::{PurgePolicy, PurgeReport};
 use crate::schedule::{ScheduleOverride, ScheduleSummary, ScheduleTrigger};
 use crate::visibility::{ExecutionDescription, ExecutionFilter, ExecutionPage, ListCursor};
 use crate::{
-    composition, llm_ledger, lock, mutex, queue, retention, schedule, schema, store, update,
-    visibility, worker, workflow_log,
+    composition, external_task, llm_ledger, lock, mutex, queue, retention, schedule, schema, store,
+    update, visibility, worker, workflow_log,
 };
 
 /// A synchronous activity body, keyed by name.
@@ -198,6 +200,12 @@ pub enum RunState {
     WaitingSignal(String),
     /// Blocked awaiting a durable timer that has not yet fired.
     WaitingTimer,
+    /// Blocked awaiting the result of an external activity. The token names
+    /// one that the body awaits. Settle it with
+    /// [`SqliteRuntime::complete_external`] or [`SqliteRuntime::fail_external`],
+    /// then drive the run again. Its deadline can also end the wait, so a
+    /// later drive can time it out.
+    WaitingExternal(ExternalActivityToken),
     /// Blocked awaiting the named workflow mutex (issue #2029). Another run
     /// holds the key, or is ahead in its queue. A drive after the release
     /// grants it.
@@ -2054,6 +2062,220 @@ impl SqliteRuntime {
         Ok((ctx, input, history_bytes))
     }
 
+    /// Complete the external activity of `token` with `output`.
+    ///
+    /// The call appends `ActivityCompletedExternally` to the waiting run, and
+    /// the next drive resumes the body with `output`. Returns `true` when the
+    /// call settles the token. Returns `false` when the token is no longer
+    /// `PENDING`, or when its run is not `RUNNING`. A late or repeated call
+    /// thus writes nothing, as on Postgres.
+    ///
+    /// A run past its `execution_timeout` ends `TIMED_OUT` first, and the
+    /// call returns `false`. A call after the deadline of the token times it
+    /// out first, and returns `false`. `serde_json` cannot read back an
+    /// `output` nested past [`MAX_PAYLOAD_DEPTH`]. The call fails the activity
+    /// instead, as [`fail_external`](Self::fail_external) with `retryable` off.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqliteError::ExternalTaskNotFound`] for an unknown token, and
+    /// [`SqliteError::ExternalHistoryCapReached`] when the event would reach a
+    /// history cap. The run then ends at the cap. Otherwise returns a
+    /// persistence error.
+    pub fn complete_external(
+        &mut self,
+        token: ExternalActivityToken,
+        output: Value,
+    ) -> SqliteResult<bool> {
+        if nests_past_cap(&output) {
+            let message =
+                format!("external activity result nests more than {MAX_PAYLOAD_DEPTH} levels");
+            return self.fail_external(token, message, false);
+        }
+        self.settle_external(token, ExternalTaskState::Completed, |activity_id| {
+            WorkflowEvent::ActivityCompletedExternally {
+                activity_id,
+                token,
+                output,
+            }
+        })
+    }
+
+    /// Fail the external activity of `token` with `error`.
+    ///
+    /// The call appends `ActivityFailedExternally` to the waiting run. The
+    /// next drive returns the failure to the body. The event stores
+    /// `retryable`, as on Postgres. The return value and the refusals match
+    /// [`complete_external`](Self::complete_external).
+    ///
+    /// # Errors
+    ///
+    /// As [`complete_external`](Self::complete_external).
+    pub fn fail_external(
+        &mut self,
+        token: ExternalActivityToken,
+        error: impl Into<String>,
+        retryable: bool,
+    ) -> SqliteResult<bool> {
+        let error = error.into();
+        self.settle_external(token, ExternalTaskState::Failed, |activity_id| {
+            WorkflowEvent::ActivityFailedExternally {
+                activity_id,
+                token,
+                error,
+                retryable,
+            }
+        })
+    }
+
+    /// Settle `token` with the event that `event` builds, in one transaction.
+    fn settle_external(
+        &mut self,
+        token: ExternalActivityToken,
+        state: ExternalTaskState,
+        event: impl FnOnce(ActivityExecId) -> WorkflowEvent,
+    ) -> SqliteResult<bool> {
+        let task = external_task::find(&self.conn, token)?
+            .ok_or(SqliteError::ExternalTaskNotFound(token))?;
+        if task.state != ExternalTaskState::Pending {
+            return Ok(false);
+        }
+        let now = (self.now_fn)().timestamp_millis();
+        // An overdue run ends first. Its terminal setter cancels the token.
+        self.seal_if_overdue_at(task.exec, now)?;
+        if store::execution_state(&self.conn, task.exec)? != "RUNNING" {
+            return Ok(false);
+        }
+        let event = event(task.activity_id);
+        let (policy, start_bytes, workflow_type) = self.external_caps(task.exec, &event)?;
+        let caps = CapCheck {
+            policy,
+            start_bytes,
+            workflow_type: &workflow_type,
+        };
+        let tx = self.conn.transaction()?;
+        // A reply after the deadline loses to the timeout.
+        if external_task::time_out_if_due(&tx, token, &task, now)? {
+            tx.commit()?;
+            return Ok(false);
+        }
+        let settled = external_task::settle(&tx, token, &task, state, &event, now)?;
+        if let Some(reason) = caps.reached(&tx, task.exec)? {
+            drop(tx);
+            return self.end_external_at_cap(token, task.exec, reason, now);
+        }
+        tx.commit()?;
+        Ok(settled)
+    }
+
+    /// The caps of a write outside a drive that appends `event` to `exec`.
+    /// It returns the policy, the stored bytes with the event, and the
+    /// workflow type.
+    ///
+    /// The caps bound history whether or not a drive follows, as for an
+    /// update. Under a pending cancel, the cleanup budget is one more cap.
+    fn external_caps(
+        &self,
+        exec: ExecutionId,
+        event: &WorkflowEvent,
+    ) -> SqliteResult<(WorkflowHistoryPolicy, u64, String)> {
+        let (_, history_bytes) = store::load_history_sized(&self.conn, exec)?;
+        let added = serde_json::to_string(event)?.len() as u64;
+        let budget_end = store::cancel_request(&self.conn, exec)?
+            .map(|(_, from)| from.saturating_add(CANCEL_CLEANUP_EVENT_BUDGET));
+        Ok((
+            self.cancel_policy(budget_end),
+            history_bytes.saturating_add(added),
+            store::workflow_name_of(&self.conn, exec)?,
+        ))
+    }
+
+    /// End `exec` at a history cap that an external write would reach. The
+    /// write has rolled back. The terminal setter cancels the token.
+    fn end_external_at_cap<T>(
+        &mut self,
+        token: ExternalActivityToken,
+        exec: ExecutionId,
+        reason: HistoryCapReason,
+        now: i64,
+    ) -> SqliteResult<T> {
+        self.end_run_at_cap(exec, &reason, now)?;
+        Err(SqliteError::ExternalHistoryCapReached { token, reason })
+    }
+
+    /// Move the deadline of the external activity of `token` to `extend_by`
+    /// from now.
+    ///
+    /// The run records `ActivityExternalDeadlineExtended`, and the deadline
+    /// timer moves. This is the heartbeat of a slow external system, as the
+    /// Postgres `extend_deadline`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqliteError::ExternalTaskNotFound`] for an unknown token,
+    /// [`SqliteError::ExternalTaskNotPending`] for a settled token or a
+    /// token past its deadline. Returns [`SqliteError::WorkflowNotRunning`]
+    /// when the run has ended. Returns
+    /// [`SqliteError::ExternalHistoryCapReached`] when the event would reach
+    /// a history cap. Otherwise returns a persistence error.
+    pub fn extend_external_deadline(
+        &mut self,
+        token: ExternalActivityToken,
+        extend_by: std::time::Duration,
+    ) -> SqliteResult<()> {
+        let task = external_task::find(&self.conn, token)?
+            .ok_or(SqliteError::ExternalTaskNotFound(token))?;
+        if task.state != ExternalTaskState::Pending {
+            return Err(SqliteError::ExternalTaskNotPending {
+                token,
+                state: task.state,
+            });
+        }
+        let now = (self.now_fn)().timestamp_millis();
+        self.refuse_past_deadline(task.exec, now)?;
+        let deadline_at = now.saturating_add(duration_to_millis_saturating(extend_by));
+        let (policy, start_bytes, workflow_type) =
+            self.external_caps(task.exec, &external_task::extended_event(token, &task))?;
+        let caps = CapCheck {
+            policy,
+            start_bytes,
+            workflow_type: &workflow_type,
+        };
+        let tx = self.conn.transaction()?;
+        // An extension cannot revive a token whose deadline has passed.
+        if external_task::time_out_if_due(&tx, token, &task, now)? {
+            tx.commit()?;
+            return Err(SqliteError::ExternalTaskNotPending {
+                token,
+                state: ExternalTaskState::TimedOut,
+            });
+        }
+        external_task::extend(&tx, token, &task, deadline_at, now)?;
+        if let Some(reason) = caps.reached(&tx, task.exec)? {
+            drop(tx);
+            return self.end_external_at_cap(token, task.exec, reason, now);
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The external activity handoffs that `filter` selects.
+    ///
+    /// A dispatcher polls [`ExternalHandoffFilter::pending`], narrowed to its
+    /// activity name. Rows come by deadline first, then by the newest update,
+    /// then by token, as on Postgres. Each row carries the activity input.
+    ///
+    /// # Errors
+    ///
+    /// Returns a persistence error, or [`SqliteError::Corrupt`] for a row
+    /// that does not decode.
+    pub fn list_external_handoffs(
+        &self,
+        filter: &ExternalHandoffFilter,
+    ) -> SqliteResult<Vec<ExternalHandoff>> {
+        external_task::list(&self.conn, filter)
+    }
+
     /// The run that `exec` continued as, or the retry that it started, if
     /// any (issues #2023 and #2029).
     ///
@@ -2890,6 +3112,7 @@ impl SqliteRuntime {
                 Ok(
                     RunState::WaitingSignal(_)
                     | RunState::WaitingTimer
+                    | RunState::WaitingExternal(_)
                     | RunState::WaitingWorkflow(_)
                     | RunState::WaitingMutex(_),
                 ) => {}
@@ -2926,6 +3149,7 @@ impl SqliteRuntime {
                 Ok(
                     RunState::WaitingSignal(_)
                     | RunState::WaitingTimer
+                    | RunState::WaitingExternal(_)
                     | RunState::WaitingWorkflow(_)
                     | RunState::WaitingMutex(_),
                 ) => {}
@@ -4036,6 +4260,7 @@ impl SqliteRuntime {
     ) -> SqliteResult<Applied> {
         let now = clock.now;
         check_batch_shape(commands)?;
+        check_external_order(commands, history)?;
         let log_policy = self.log_policy;
         let tx = self.conn.transaction()?;
         // A body that no longer awaits a key gives up its queue place.
@@ -4099,6 +4324,30 @@ impl SqliteRuntime {
                         // panicking or overflowing.
                         let fire_at = fire_at(now, *duration_secs);
                         persist_started_timer(&tx, exec, timer_id, *duration_secs, fire_at)?;
+                        produced = true;
+                    }
+                }
+                // An external activity records its handoff once. A re-park
+                // emits the same token and writes nothing.
+                WorkflowCommand::ScheduleExternalActivity {
+                    activity_id,
+                    token,
+                    name,
+                    input,
+                    queue,
+                    schedule_to_close_secs,
+                    ..
+                } => {
+                    let handoff = external_task::Handoff {
+                        activity_id: *activity_id,
+                        token: *token,
+                        name,
+                        input,
+                        queue,
+                        schedule_to_close_secs: *schedule_to_close_secs,
+                    };
+                    let deadline_at = fire_at(now, *schedule_to_close_secs);
+                    if external_task::record(&tx, exec, history, &handoff, now, deadline_at)? {
                         produced = true;
                     }
                 }
@@ -4399,6 +4648,16 @@ impl SqliteRuntime {
                     return Ok(RunState::WaitingMutex(key.clone()));
                 }
                 _ => {}
+            }
+        }
+        // The deadline of an external activity is a timer row too. So read
+        // the external wait first, or the park reports `WaitingTimer`.
+        for cmd in commands {
+            if let WorkflowCommand::ScheduleExternalActivity { token, .. } = cmd
+                && external_task::find(&self.conn, *token)?
+                    .is_some_and(|task| task.state == ExternalTaskState::Pending)
+            {
+                return Ok(RunState::WaitingExternal(*token));
             }
         }
         if queue::has_unfired_timer(&self.conn, exec)? {
@@ -5430,6 +5689,7 @@ const fn is_dispatch(cmd: &WorkflowCommand) -> bool {
     matches!(
         cmd,
         WorkflowCommand::ScheduleActivity { .. }
+            | WorkflowCommand::ScheduleExternalActivity { .. }
             | WorkflowCommand::StartTimer { .. }
             | WorkflowCommand::WaitForSignal { .. }
     )
@@ -5652,6 +5912,7 @@ fn schedule_local_activity(
 ///
 /// The error names the offending commands and seals the run `FAILED`.
 fn check_batch_shape(commands: &[WorkflowCommand]) -> SqliteResult<()> {
+    check_external_alone(commands)?;
     let count = |want: fn(&WorkflowCommand) -> bool| commands.iter().filter(|c| want(c)).count();
     let acquires = count(|c| matches!(c, WorkflowCommand::AcquireMutex { .. }));
     let locals = count(|c| matches!(c, WorkflowCommand::RunLocalActivity { .. }));
@@ -5693,6 +5954,117 @@ fn check_batch_shape(commands: &[WorkflowCommand]) -> SqliteResult<()> {
         )
     };
     Err(SqliteError::Unsupported(message))
+}
+
+/// Refuse an external activity that shares its batch with another command
+/// that is not bookkeeping.
+///
+/// Postgres records an external activity only as the one suspending command
+/// of its batch, and refuses any other shape. The matcher reads the result
+/// of an external activity right after its own record. A second awaitable in
+/// the same batch puts its events between them, and replay then waits
+/// forever. So this backend refuses the same shapes.
+fn check_external_alone(commands: &[WorkflowCommand]) -> SqliteResult<()> {
+    let suspending: Vec<&'static str> = commands
+        .iter()
+        .filter(|c| !is_batch_bookkeeping(c))
+        .map(command_name)
+        .collect();
+    if suspending.len() < 2 || !suspending.contains(&"ScheduleExternalActivity") {
+        return Ok(());
+    }
+    Err(SqliteError::Unsupported(format!(
+        "ScheduleExternalActivity — an external activity must be the only awaitable in its \
+         batch; found {}. Await the external activity on its own.",
+        suspending.join(", ")
+    )))
+}
+
+/// Refuse a batch that would record an event that the external matcher cannot
+/// skip after the record of an external activity.
+///
+/// The matcher reads the result of an external activity after its record. It
+/// skips signals, updates and a few command events, but it stops at a
+/// marker, a side effect or a timer change. Replay then waits forever, even
+/// after the result arrives. Such an event lands after the record in two
+/// cases. The command follows a fresh external activity in its batch. Or
+/// the external activity was already recorded, so every new event follows it.
+/// A side effect before a fresh external activity is safe.
+fn check_external_order(
+    commands: &[WorkflowCommand],
+    history: &[WorkflowEvent],
+) -> SqliteResult<()> {
+    let recorded = |token: &ExternalActivityToken| {
+        history.iter().any(|event| {
+            matches!(
+                event,
+                WorkflowEvent::ActivityAwaitingExternal { token: t, .. } if t == token
+            )
+        })
+    };
+    let mut external_first = commands.iter().any(|cmd| {
+        matches!(cmd, WorkflowCommand::ScheduleExternalActivity { token, .. } if recorded(token))
+    });
+    let mut late: Vec<&'static str> = Vec::new();
+    for cmd in commands {
+        if matches!(cmd, WorkflowCommand::ScheduleExternalActivity { .. }) {
+            external_first = true;
+        } else if external_first && records_opaque_event(cmd) {
+            late.push(command_name(cmd));
+        }
+    }
+    if late.is_empty() {
+        return Ok(());
+    }
+    late.dedup();
+    Err(SqliteError::Unsupported(format!(
+        "ScheduleExternalActivity — {} would follow the record of an external activity, and \
+         replay cannot read past it. Record it before the external activity, or after its \
+         result.",
+        late.join(", ")
+    )))
+}
+
+/// True for a bookkeeping command whose event stops the external matcher.
+const fn records_opaque_event(cmd: &WorkflowCommand) -> bool {
+    matches!(
+        cmd,
+        WorkflowCommand::RecordMarker { .. }
+            | WorkflowCommand::RecordSideEffect { .. }
+            | WorkflowCommand::ArmTimer {
+                for_await: false,
+                ..
+            }
+            | WorkflowCommand::CancelTimer { .. }
+    )
+}
+
+/// True for a command that the solo rule ignores. Each one records a fact or
+/// tears down a loser, and parks nothing.
+///
+/// Postgres also ignores an `ArmTimer` for an await. This backend does not:
+/// a fired timer of that await sits between the external record and its
+/// result, and replay then waits forever.
+const fn is_batch_bookkeeping(cmd: &WorkflowCommand) -> bool {
+    matches!(
+        cmd,
+        WorkflowCommand::RecordMarker { .. }
+            | WorkflowCommand::RecordSideEffect { .. }
+            | WorkflowCommand::RecordUpdateResult { .. }
+            | WorkflowCommand::UpsertSearchAttributes { .. }
+            | WorkflowCommand::SetCurrentDetails { .. }
+            | WorkflowCommand::PublishProgress { .. }
+            | WorkflowCommand::PublishDurableProgress { .. }
+            | WorkflowCommand::RecordLog { .. }
+            | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
+            | WorkflowCommand::CancelRaceLosers { .. }
+            | WorkflowCommand::ArmTimer {
+                for_await: false,
+                ..
+            }
+            | WorkflowCommand::CancelTimer { .. }
+            | WorkflowCommand::ReleaseMutex { .. }
+    )
 }
 
 /// True for a command that parks the body on durable work (issue #2029).
@@ -5967,7 +6339,11 @@ fn persist_terminal_pending_commands<'c>(
             // that the body did not await records nothing, as on Postgres.
             | WorkflowCommand::ReleaseMutex { .. }
             | WorkflowCommand::AcquireMutex { .. }
-            | WorkflowCommand::RunLocalActivity { .. } => {}
+            | WorkflowCommand::RunLocalActivity { .. }
+            // An external activity that the last cycle does not await records
+            // nothing, as Postgres. A recorded handoff of the run becomes
+            // `CANCELLED` when the terminal setter runs.
+            | WorkflowCommand::ScheduleExternalActivity { .. } => {}
             // Issue #2029: a fresh arm records `TimerStarted`, and a cancel
             // records `TimerCancelled`. An await arm needs no row, because the
             // run ends. This is the Postgres terminal policy.
@@ -7291,7 +7667,7 @@ mod panic_strike_tests {
     }
 
     /// Spawns `always_panics` detached under `request_cancel`, waits for
-    /// `go`, then schedules an unsupported external activity.
+    /// `go`, then opens a worker session, which is outside the subset.
     #[workflow]
     async fn spawns_then_unsupported(ctx: &WorkflowContext, _n: i64) -> Result<Value, String> {
         ctx.spawn_child_workflow_detached_raw(
@@ -7301,9 +7677,10 @@ mod panic_strike_tests {
         )
         .map_err(|e| e.to_string())?;
         ctx.wait_for_signal("go").await.map_err(|e| e.to_string())?;
-        ctx.execute_activity_external("external", json!(0), "default", 60)
+        ctx.create_session(autumn_harvest::SessionOptions::new("gpu"))
             .await
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
+        Ok(Value::Null)
     }
 
     #[tokio::test]

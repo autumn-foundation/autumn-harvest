@@ -1,0 +1,50 @@
+# Ledger profiles for `autumn-harvest-sqlite/src/external_task.rs`. See `docs/ledger/README.md`.
+
+["cancel_pending"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["write"]
+tables = ["harvest_external_tasks"]
+measured = "unmeasured"
+
+["extend"]
+driver = "per_request"
+backend = ["sqlite"]
+kind = ["write"]
+tables = ["harvest_events", "harvest_external_tasks", "harvest_timers"]
+measured = "unmeasured"
+
+["find"]
+driver = "per_request"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_external_tasks"]
+measured = "unmeasured"
+
+["fire_deadline"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["read", "write"]
+tables = ["harvest_events", "harvest_external_tasks", "harvest_timers"]
+measured = "unmeasured"
+
+["list"]
+driver = "per_request"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_executions", "harvest_external_tasks"]
+measured = "unmeasured"
+
+["record"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["write"]
+tables = ["harvest_events", "harvest_external_tasks", "harvest_timers"]
+measured = "unmeasured"
+
+["settle"]
+driver = "per_request"
+backend = ["sqlite"]
+kind = ["write"]
+tables = ["harvest_events", "harvest_external_tasks", "harvest_timers"]
+measured = "unmeasured"

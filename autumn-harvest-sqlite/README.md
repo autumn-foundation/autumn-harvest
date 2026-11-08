@@ -164,13 +164,18 @@ Out of scope for this backend (tracked as issue #1068 follow-ups):
 - `LISTEN`/`NOTIFY` push wake-ups.
 - The full management API (`HarvestPlugin` serves the core routes, issue
   #2467), DAGs, worker sessions, sharding.
-- External activities and a continue-as-new to a different workflow type
-  (`continue_as_new_as_type`) — a workflow reaching one of these is rejected
+- A continue-as-new to a different workflow type
+  (`continue_as_new_as_type`) — a workflow reaching it is rejected
   **loudly, by name**, never silently dropped. The run then ends
   `FAILED` with `error_type = "UnsupportedFeature"` (issue #1834).
 - A batch that breaks a solo rule (issue #2029): a mutex acquire beside
   another awaitable, or a local activity beside a durable awaitable or a
   second local activity. It is rejected the same way.
+
+Since issue #2607, the backend runs external (task-token) activities. A
+dispatcher reads `list_external_handoffs`, then settles each token with
+`complete_external` or `fail_external`. See
+[§9a of the docs guide](../docs/sqlite-backend.md#9a-external-activities).
 
 Since issue #2026, the backend supports child workflows and signal, cancel and
 await between runs. See

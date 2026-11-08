@@ -156,6 +156,9 @@ pub async fn drive_report(rt: &mut SqliteRuntime, run: &str) -> Result<(), Strin
             RunState::WaitingSignal(signal) => {
                 return Err(format!("the report {run} waits on {signal}"));
             }
+            RunState::WaitingExternal(token) => {
+                return Err(format!("the report {run} waits on external token {token}"));
+            }
             RunState::Failed(why)
             | RunState::Cancelled(why)
             | RunState::TimedOut(why)

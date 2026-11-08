@@ -129,8 +129,8 @@ pub const fn support(kind: CommandKind) -> Support {
         | K::ArmTimer
         | K::CancelTimer
         | K::AcquireMutex
-        | K::ReleaseMutex => Support::Accepted,
-        K::ScheduleExternalActivity => Support::Rejected,
+        | K::ReleaseMutex
+        | K::ScheduleExternalActivity => Support::Accepted,
         K::Complete | K::Fail => Support::NotEmitted,
     }
 }

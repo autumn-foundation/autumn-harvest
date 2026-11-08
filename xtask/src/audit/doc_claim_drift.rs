@@ -152,6 +152,11 @@ pub const STALE_CLAIMS: &[(&str, &str, &str)] = &[
         r"external\s+signals/cancels,\s+local\s+activities",
         "the SQLite backend runs local activities (issue #2029)",
     ),
+    (
+        "docs/sqlite-backend.md",
+        r"External\s+/\s+task-token\s+activities",
+        "the SQLite backend runs external activities (issue #2607)",
+    ),
 ];
 
 /// The compiled patterns of the audit.

@@ -483,7 +483,7 @@ pub fn seal_execution(
          WHERE exec_id = ?1",
         params![exec_id.to_string(), sealed_state, now_micros()],
     )?;
-    crate::mutex::release_all(conn, exec_id)
+    release_run(conn, exec_id)
 }
 
 /// Store a cooperative cancel request on a `RUNNING` row (issue #2021).
@@ -531,7 +531,7 @@ pub fn set_terminal_with_reason(
          WHERE exec_id = ?1",
         params![exec_id.to_string(), state, reason, now_micros()],
     )?;
-    crate::mutex::release_all(conn, exec_id)
+    release_run(conn, exec_id)
 }
 
 pub fn set_completed(conn: &Connection, exec_id: ExecutionId, output: &Value) -> SqliteResult<()> {
@@ -544,7 +544,7 @@ pub fn set_completed(conn: &Connection, exec_id: ExecutionId, output: &Value) ->
             now_micros()
         ],
     )?;
-    crate::mutex::release_all(conn, exec_id)
+    release_run(conn, exec_id)
 }
 
 /// Move a run to `CANCELLED` and store the reason in `error` (issue #2026).
@@ -558,7 +558,7 @@ pub fn set_cancelled(conn: &Connection, exec_id: ExecutionId, reason: &str) -> S
          WHERE exec_id = ?1",
         params![exec_id.to_string(), reason, now_micros()],
     )?;
-    crate::mutex::release_all(conn, exec_id)
+    release_run(conn, exec_id)
 }
 
 pub fn set_failed(conn: &Connection, exec_id: ExecutionId, error: &str) -> SqliteResult<()> {
@@ -567,7 +567,15 @@ pub fn set_failed(conn: &Connection, exec_id: ExecutionId, error: &str) -> Sqlit
          WHERE exec_id = ?1",
         params![exec_id.to_string(), error, now_micros()],
     )?;
-    crate::mutex::release_all(conn, exec_id)
+    release_run(conn, exec_id)
+}
+
+/// Release what a run holds once it ends, in the caller's transaction. Each
+/// terminal setter calls it. The run gives up its mutex locks and waits, and
+/// each `PENDING` external activity token of the run becomes `CANCELLED`.
+fn release_run(conn: &Connection, exec_id: ExecutionId) -> SqliteResult<()> {
+    crate::mutex::release_all(conn, exec_id)?;
+    crate::external_task::cancel_pending(conn, exec_id)
 }
 
 /// The wall clock in epoch microseconds. A terminal write stores it as

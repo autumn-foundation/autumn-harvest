@@ -57,19 +57,14 @@ async fn child_typed_failure(ctx: &WorkflowContext, _n: i64) -> Result<i64, Work
         .with_details(json!({ "code": 51 })))
 }
 
-/// Completes, but its last cycle schedules an external activity. This
-/// backend still rejects that, so the child is sealed with a typed failure.
+/// Acquires a worker session. This backend still rejects that, so the runtime
+/// seals the child with a typed failure.
 #[workflow]
 async fn child_unsupported(ctx: &WorkflowContext, n: i64) -> Result<i64, String> {
-    // Poll the external activity once, so its command joins the last batch,
-    // then return without awaiting it.
-    let mut external =
-        std::pin::pin!(ctx.execute_activity_external("external", json!({}), "default", 60));
-    let _ = std::future::Future::poll(
-        external.as_mut(),
-        &mut std::task::Context::from_waker(std::task::Waker::noop()),
-    );
-    Ok(n)
+    ctx.create_session(SessionOptions::new("gpu"))
+        .await
+        .map(|_| n)
+        .map_err(|e| e.to_string())
 }
 
 /// Spawns the named child and reports the typed failure it observes.
@@ -1054,7 +1049,10 @@ async fn an_unsupported_child_surfaces_as_a_typed_failure() {
     rt.run_until_blocked(parent).await.unwrap();
     let out = completed(&rt, parent);
     assert_eq!(out["error_type"], json!(UNSUPPORTED_FEATURE_ERROR_TYPE));
-    assert_eq!(out["details"]["feature"], json!("ScheduleExternalActivity"));
+    assert_eq!(
+        out["details"]["feature"],
+        json!("ScheduleActivity.schedule_to_start_override")
+    );
     assert_eq!(out["non_retryable"], json!(true));
     assert_replays(&rt, parent, "parent_reports_child_failure").await;
 }

@@ -247,20 +247,19 @@ async fn direct_error_return_fails_terminally() {
 
 // ── B4: an unsupported command mid-batch rolls the WHOLE cycle back ────────────
 
-/// Records a side effect (supported) and then schedules an external activity
+/// Records a side effect (supported) and then acquires a worker session
 /// (unsupported) in the SAME suspending batch. The whole `apply_commands`
 /// transaction must roll back — the side-effect event must NOT persist.
 #[workflow]
-async fn side_effect_then_external(
+async fn side_effect_then_session(
     ctx: &WorkflowContext,
     _n: i64,
 ) -> Result<serde_json::Value, String> {
     let _id = ctx.new_uuid().to_string();
-    let r = ctx
-        .execute_activity_external("external", json!({}), "default", 60)
+    ctx.create_session(SessionOptions::new("gpu"))
         .await
         .map_err(|e| e.to_string())?;
-    Ok(r)
+    Ok(serde_json::Value::Null)
 }
 
 #[tokio::test]
@@ -269,15 +268,19 @@ async fn unsupported_command_rolls_the_whole_cycle_back() {
     let exec;
     {
         let mut rt = SqliteRuntime::open(&path).unwrap();
-        rt.register_workflow(&side_effect_then_external_info());
+        rt.register_workflow(&side_effect_then_session_info());
         exec = rt
-            .start_workflow("side_effect_then_external", json!(0))
+            .start_workflow("side_effect_then_session", json!(0))
             .unwrap();
 
         let err = rt.run_until_blocked(exec).await.unwrap_err();
         assert!(
-            matches!(err, SqliteError::Unsupported(ref c) if c == "ScheduleExternalActivity"),
-            "expected Unsupported(ScheduleExternalActivity), got {err}"
+            matches!(
+                err,
+                SqliteError::Unsupported(ref c)
+                    if c.starts_with("ScheduleActivity.schedule_to_start_override")
+            ),
+            "expected Unsupported(ScheduleActivity.schedule_to_start_override), got {err}"
         );
     } // "crash".
 

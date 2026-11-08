@@ -1803,6 +1803,16 @@ async fn drive_one(
         Ok(RunState::WaitingWorkflow(other)) => {
             note(blocked, exec, format!("waiting for run {other}"), None);
         }
+        // A session sends no external activity, but the match must stay
+        // exhaustive. A settle of the token wakes it.
+        Ok(RunState::WaitingExternal(token)) => {
+            note(
+                blocked,
+                exec,
+                format!("waiting for external token {token}"),
+                None,
+            );
+        }
         // Issue #2029: another run holds the mutex. A later tick retries.
         Ok(RunState::WaitingMutex(key)) => {
             note(

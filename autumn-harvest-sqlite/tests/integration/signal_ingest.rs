@@ -573,8 +573,8 @@ async fn a_panic_seal_past_the_cap_leaves_no_staged_signal() {
     assert_eq!(undelivered(&path, exec), 0, "no row stays on a sealed run");
 }
 
-/// Runs a local activity, which this backend does not support, when it reads
-/// `spawn`.
+/// Acquires a worker session, which this backend does not support, when it
+/// reads `spawn`.
 #[workflow]
 async fn spawn_on_signal(ctx: &WorkflowContext, _n: i64) -> Result<Value, String> {
     if ctx
@@ -584,8 +584,9 @@ async fn spawn_on_signal(ctx: &WorkflowContext, _n: i64) -> Result<Value, String
     {
         return Ok(Value::Null);
     }
-    ctx.execute_activity_external("external", json!({}), "default", 60)
+    ctx.create_session(SessionOptions::new("gpu"))
         .await
+        .map(|_| Value::Null)
         .map_err(|e| e.to_string())
 }
 

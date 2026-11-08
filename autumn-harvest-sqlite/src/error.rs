@@ -1,6 +1,6 @@
 //! Typed error surface for the `SQLite` backend.
 
-use autumn_harvest::ExecutionId;
+use autumn_harvest::{ExecutionId, ExternalActivityToken};
 
 /// Errors surfaced by [`SqliteRuntime`](crate::SqliteRuntime) and its
 /// persistence layer.
@@ -59,6 +59,35 @@ pub enum SqliteError {
     /// an unknown id.
     #[error("execution not found: {0}")]
     ExecutionNotFound(ExecutionId),
+
+    /// No external activity holds this token in this database.
+    ///
+    /// A settle or a deadline extension of an unknown token returns it, as
+    /// Postgres returns `NotFound`.
+    #[error("external task not found: {0}")]
+    ExternalTaskNotFound(ExternalActivityToken),
+
+    /// A settle or a deadline extension would reach a history cap.
+    ///
+    /// The call writes no event. It seals the run `FAILED` with the cap
+    /// reason, as a drive that reaches the cap does. The token then becomes
+    /// `CANCELLED`.
+    #[error("external task {token} reached a history cap: {reason}")]
+    ExternalHistoryCapReached {
+        /// The token of the external activity.
+        token: ExternalActivityToken,
+        /// The cap that the write would reach.
+        reason: crate::HistoryCapReason,
+    },
+
+    /// A deadline extension targeted a token that is no longer `PENDING`.
+    #[error("external task {token} is already terminal ({state}); cannot extend its deadline")]
+    ExternalTaskNotPending {
+        /// The token of the external activity.
+        token: ExternalActivityToken,
+        /// The stored state of the token.
+        state: crate::ExternalTaskState,
+    },
 
     /// A signal, update, cancel or terminate targeted an execution in a
     /// terminal state (`COMPLETED`, `FAILED`, `CANCELLED`, `TERMINATED` or

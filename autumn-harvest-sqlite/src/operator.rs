@@ -350,11 +350,15 @@ fn pending_tasks(conn: &Connection, id: &str) -> SqliteResult<Vec<PendingTask>> 
         .collect()
 }
 
-/// The unfired timers of the run `id`, in arm order.
+/// The unfired timers of the run `id`, in arm order. The deadline of an
+/// external activity is a timer row too, but the body armed no such timer.
+/// So the read leaves it out.
 fn pending_timers(conn: &Connection, id: &str) -> SqliteResult<Vec<PendingTimer>> {
     let mut timers = conn.prepare_cached(
         "SELECT timer_id, fire_at FROM harvest_timers \
-         WHERE exec_id = ?1 AND fired = 0 ORDER BY arm_seq",
+         WHERE exec_id = ?1 AND fired = 0 \
+           AND timer_id NOT GLOB '__external_deadline:*' \
+         ORDER BY arm_seq",
     )?;
     timers
         .query_map([id], |row| {
