@@ -101,7 +101,8 @@ Start with [Chapter 1 →](01-project-skeleton.md)
   policy of a workflow type at runtime.
 - **Activity default overrides.**
   [`activity-default-overrides.md`](../operations/activity-default-overrides.md)
-  changes the retry policy and the timeouts of an activity type at runtime.
+  changes the retry policy, the timeouts and the cap of an activity type at
+  runtime.
 - **Cost-aware deferral.** [`cost-deferral.md`](../cost-deferral.md) holds
   named activity types while the autumn-web cost signal is high.
 - **Runbooks.**

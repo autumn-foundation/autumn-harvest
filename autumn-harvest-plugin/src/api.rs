@@ -8089,6 +8089,7 @@ pub const fn management_api_request_fields()
                 "heartbeat_timeout_ms",
                 "schedule_to_start_ms",
                 "schedule_to_close_ms",
+                "max_concurrent",
                 "clear_override",
                 "reason",
             ]),

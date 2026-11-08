@@ -34192,6 +34192,7 @@ mod activity_override_tests {
         heartbeat_timeout: None,
         schedule_to_start: None,
         schedule_to_close: None,
+        max_concurrent: None,
     };
 
     fn cache(name: &str) -> Arc<RunDefaultsCache> {

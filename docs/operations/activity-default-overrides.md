@@ -2,11 +2,12 @@
 
 An activity type declares five defaults in code, through
 `#[activity(retry = ..., start_to_close = ..., heartbeat_timeout = ...,
-schedule_to_start = ..., schedule_to_close = ...)]`. An operator override
-changes them at runtime, with no restart and no deploy (epic #2384).
+schedule_to_start = ..., schedule_to_close = ...)]`. It can also declare
+a fleet-wide cap with `max_concurrent = ...`. An operator override changes
+them at runtime, with no restart and no deploy (epic #2384).
 
 Use it when a downstream slows down. Give its activity a longer timeout,
-or stop its retries, now.
+stop its retries, or lower its cap, now.
 
 ## Quick reference
 
@@ -21,6 +22,11 @@ curl -X PATCH https://<host>/api/harvest/admin/activity-types/charge_card/defaul
 curl -X PATCH https://<host>/api/harvest/admin/activity-types/charge_card/defaults \
      -H 'Content-Type: application/json' \
      -d '{"retry_max_attempts": null, "retry_initial_interval_ms": 30000}'
+
+# A partner API throttles: run at most 2 tasks of the activity at a time.
+curl -X PATCH https://<host>/api/harvest/admin/activity-types/call_partner/defaults \
+     -H 'Content-Type: application/json' \
+     -d '{"max_concurrent": 2, "reason": "INC-5121"}'
 
 # Return start_to_close to its code value, and keep the other fields.
 curl -X PATCH https://<host>/api/harvest/admin/activity-types/charge_card/defaults \
@@ -53,6 +59,7 @@ returns the field to the code value. A number sets the override.
 | `heartbeat_timeout_ms` | ms | `default_heartbeat_timeout` |
 | `schedule_to_start_ms` | ms | `default_schedule_to_start` |
 | `schedule_to_close_ms` | ms | `default_schedule_to_close` |
+| `max_concurrent` | count of running tasks | `max_concurrent` |
 | `clear_override` | bool | Deletes the stored fields before the others merge. |
 | `reason` | text | Stored with the override and shown in the list. |
 
@@ -62,7 +69,7 @@ declared. Use `retry_max_attempts = 1` to stop the retries.
 The write refuses these values:
 
 - a zero value;
-- a `retry_max_attempts` over 2147483647;
+- a `retry_max_attempts` or a `max_concurrent` over 2147483647;
 - a timeout over 100 years;
 - a retry interval over 365 days;
 - a merged `retry_max_interval_ms` below `retry_initial_interval_ms`.
@@ -76,6 +83,11 @@ The route also refuses a field that cannot apply:
   attempt;
 - `heartbeat_timeout_ms`, `schedule_to_start_ms` or `schedule_to_close_ms`
   for a local activity, because a local activity has none of them;
+- `max_concurrent` when the activity declares no cap, because its tasks
+  have no concurrency key;
+- `max_concurrent` for a local activity, because it has no task row;
+- `max_concurrent` when another activity shares the concurrency key,
+  because one key would then hold two caps;
 - any field of a reserved engine activity.
 
 Each `PATCH` writes one `activity_type.defaults` audit row, refused or not.
@@ -112,10 +124,65 @@ The process that serves the `PATCH` applies it at its next schedule. Each
 other process reloads the overrides within five seconds plus one refresh
 period. The workflow run-default overrides share that cache and its refresh.
 
+## The concurrency cap
+
+The cap is the one field that also applies to tasks that are already
+scheduled. Each task row stores its cap, and each claim compares the
+running count of the key to that stored cap. So a `PATCH` that names
+`max_concurrent` or `clear_override` sets the stored cap of each live row
+of the activity, on every shard:
+
+- A pending task waits under the new cap. The next claim already uses it.
+- A running task runs on. The pass changes the cap column only, never the
+  state, the worker or the attempt. When the running count of the key is
+  above a lower cap, no new task of the key starts until enough tasks
+  finish.
+- A retry of a running task waits under the new cap.
+
+The response reports the first pass in `cap_rewrite`:
+
+```json
+"cap_rewrite": {
+  "rewritten_tasks": 140,
+  "unresolved_tasks": 0,
+  "unavailable_shards": [],
+  "superseded": false
+}
+```
+
+A pass never waits on a task row. It skips a row that another transaction
+holds, such as a claim in progress, and retries it a few times. A row that
+is still held after the retries counts in `unresolved_tasks`.
+
+The pass runs again after 10 seconds, 1 minute and 5 minutes. Another
+process applies a change only after its cache reloads. A task that it
+schedules before then stores the old cap, and a later pass sets it. A later
+pass also sets an unresolved row. A pass stops when a newer change replaced
+the cap. A shard in `unavailable_shards` keeps the old cap until a later
+pass reaches it. Send the request again to retry it at once.
+
+A process that cannot reload its cache for longer than 5 minutes keeps the
+old cap on the rows that it stores. So does a process whose code declares
+another cap during a rolling deploy. Send the request again after the roll
+to set those rows.
+
+A dead-letter replay or redrive also puts a task back under the current
+cap.
+
+The key stays as declared. The adaptive limit of each worker is separate,
+and it moves on its own. `GET /admin/concurrency` shows the highest cap that
+a live row of the key stores. A row that keeps the old cap shows until a
+pass sets it.
+
+The shared-key refusal sees the activities that the API process registers.
+A worker also ignores the cap override of an activity when its registry
+holds another activity with the same key. So register each sharer of a key
+in the API process too.
+
 ## Activities already scheduled
 
-A change applies to the activities scheduled after it. An activity that is
-already scheduled keeps its values:
+A change to any other field applies to the activities scheduled after it.
+An activity that is already scheduled keeps its values:
 
 - The task row stores the resolved retry policy and timeouts. A retry reuses
   the row. So a running or waiting activity keeps its budget and its bounds.
@@ -133,15 +200,18 @@ ignores the table, and it schedules with the code values. An older process
 answers the route with a 404.
 
 To roll back, deploy the older release first. Then run the down migration of
+`20261107194243_harvest_activity_default_max_concurrent`, then the one of
 `20261106145707_harvest_activity_default_overrides`. This release reads the
 table, so its activity refresh fails once the table is gone. The workflow
-overrides still load.
+overrides still load. The task rows keep the cap that the last pass stored.
+Each one drains under it.
 
 ## Grants
 
 The runtime role needs `SELECT`, `INSERT`, `UPDATE` and `DELETE` on
-`harvest_activity_default_overrides`. `GET /admin/preflight` reports a
-missing grant.
+`harvest_activity_default_overrides`. The cap pass updates
+`harvest_task_queue`, as the run-default concurrency raise does.
+`GET /admin/preflight` reports a missing grant.
 
 ## See also
 

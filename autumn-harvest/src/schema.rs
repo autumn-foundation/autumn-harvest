@@ -465,6 +465,7 @@ diesel::table! {
         updated_by -> Text,
         created_at -> Timestamptz,
         updated_at -> Timestamptz,
+        max_concurrent -> Nullable<Int4>,
     }
 }
 

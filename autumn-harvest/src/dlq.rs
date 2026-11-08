@@ -565,6 +565,30 @@ fn to_host_clock(
     host_now + (at - db_now)
 }
 
+/// Give a requeued activity task the key and the current cap of its
+/// activity.
+///
+/// The dead letter stores no key and no cap. Without them the task would
+/// claim past the cap of its key. The cap is the effective cap, so an
+/// operator override applies. A process with no registry, or one that does
+/// not register the activity, leaves the task with no key and no cap.
+fn restore_activity_concurrency(
+    params: &mut EnqueueParams,
+    task_type: TaskType,
+    registry: Option<&HandlerRegistry>,
+) {
+    if task_type != TaskType::Activity {
+        return;
+    }
+    let (Some(registry), Some(name)) = (registry, params.activity_name.as_deref()) else {
+        return;
+    };
+    if let (Some(key), cap) = registry.activity_concurrency(name) {
+        params.concurrency_key = Some(key);
+        params.max_concurrent = cap;
+    }
+}
+
 /// The enqueue parameters that put `entry` back on its queue.
 ///
 /// Set `max_attempts` to the recorded attempt count, with a minimum of one.
@@ -966,6 +990,7 @@ pub async fn replay_dead_letter_at(
                     }
                 }
             }
+            restore_activity_concurrency(&mut params, task_type, registry);
 
             seal_requeued_input(&mut params, decoded, codecs)?;
             let task_id = crate::queue::enqueue(conn, &params).await?;
@@ -1606,6 +1631,7 @@ pub async fn redrive_dead_letter_at(
                     params.max_concurrent = Some(policy.limit);
                 }
             }
+            restore_activity_concurrency(&mut params, task_type, registry);
 
             seal_requeued_input(&mut params, decoded, codecs)?;
             let task_id = crate::queue::enqueue(conn, &params).await?;

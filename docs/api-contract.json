@@ -6946,7 +6946,7 @@
       "path": "/admin/overrides",
       "category": "admin",
       "read_only": true,
-      "description": "List every operator override (issue #2388). schedule_overrides holds each DAG and workflow schedule override (issues #2385 and #2386), read from every shard pool: kind, name, fields (the stored override fields by their PATCH names), reason, updated_by, created_at, updated_at and shard_ids. run_default_overrides holds each run-default override (issues #2387, #2406, #2407, #2408 and #2409) from the default shard: workflow_name, sla_secs, execution_timeout_secs, chain_execution_timeout_secs, concurrency_limit, quota_max_active_executions, quota_max_history_bytes, quota_max_dead_letters, retry_max_attempts, retry_initial_interval_ms, retry_max_interval_ms, reason, updated_by and updated_at. activity_default_overrides holds each activity default override from the default shard: activity_name, retry_max_attempts, retry_initial_interval_ms, retry_max_interval_ms, start_to_close_ms, heartbeat_timeout_ms, schedule_to_start_ms, schedule_to_close_ms, reason, updated_by and updated_at. unavailable_shards names each shard that could not be read; its overrides are absent from the list.",
+      "description": "List every operator override (issue #2388). schedule_overrides holds each DAG and workflow schedule override (issues #2385 and #2386), read from every shard pool: kind, name, fields (the stored override fields by their PATCH names), reason, updated_by, created_at, updated_at and shard_ids. run_default_overrides holds each run-default override (issues #2387, #2406, #2407, #2408 and #2409) from the default shard: workflow_name, sla_secs, execution_timeout_secs, chain_execution_timeout_secs, concurrency_limit, quota_max_active_executions, quota_max_history_bytes, quota_max_dead_letters, retry_max_attempts, retry_initial_interval_ms, retry_max_interval_ms, reason, updated_by and updated_at. activity_default_overrides holds each activity default override from the default shard: activity_name, retry_max_attempts, retry_initial_interval_ms, retry_max_interval_ms, start_to_close_ms, heartbeat_timeout_ms, schedule_to_start_ms, schedule_to_close_ms, max_concurrent, reason, updated_by and updated_at. unavailable_shards names each shard that could not be read; its overrides are absent from the list.",
       "params": [],
       "request_body": null,
       "success_response": {
@@ -7299,7 +7299,7 @@
       "path": "/admin/activity-types/{activity_name}/defaults",
       "category": "admin",
       "read_only": true,
-      "description": "Read the defaults of one activity type. code holds the retry_max_attempts, retry_initial_interval_ms, retry_max_interval_ms, start_to_close_ms, heartbeat_timeout_ms, schedule_to_start_ms and schedule_to_close_ms declared in code. override holds the stored operator override (the same seven fields, reason, updated_by, updated_at), or null. effective holds the values that a new schedule takes: the override, then code. A call-site value and the builder default still apply after it. local is true for a local activity.",
+      "description": "Read the defaults of one activity type. code holds the retry_max_attempts, retry_initial_interval_ms, retry_max_interval_ms, start_to_close_ms, heartbeat_timeout_ms, schedule_to_start_ms, schedule_to_close_ms and max_concurrent declared in code. override holds the stored operator override (the same eight fields, reason, updated_by, updated_at), or null. effective holds the values that a new schedule takes: the override, then code. A call-site value and the builder default still apply after it. local is true for a local activity.",
       "params": [
         {
           "name": "activity_name",
@@ -7336,8 +7336,8 @@
       "path": "/admin/activity-types/{activity_name}/defaults",
       "category": "admin",
       "read_only": false,
-      "description": "Set, change or clear the default override of one activity type. The override wins over the code value for every activity scheduled after the change, and survives a restart. A call-site value still wins over the override. It reaches this process at once and every other process within 5 seconds plus one refresh period (about 10 seconds). An activity that is already scheduled keeps the values of its task row, and a local activity keeps the values that its LocalActivityScheduled event froze, so replay is not affected. Each field is tri-state: absent keeps the stored override, null returns the field to its code value, a value sets it. A merge that sets no field deletes the override. Each PATCH writes one activity_type.defaults audit row, refused or not. The response has the same shape as GET.",
-      "idempotency": "Idempotent: applying the same override twice is a no-op.",
+      "description": "Set, change or clear the default override of one activity type. The override wins over the code value for every activity scheduled after the change, and survives a restart. A call-site value still wins over the override. It reaches this process at once and every other process within 5 seconds plus one refresh period (about 10 seconds). An activity that is already scheduled keeps the values of its task row, and a local activity keeps the values that its LocalActivityScheduled event froze, so replay is not affected. max_concurrent is the exception. Each task row stores its cap, and each claim reads it. So a PATCH that names max_concurrent or clear_override also sets the stored cap of each PENDING and RUNNING task row of the activity, on every shard. The pass runs again after 10 seconds, 1 minute and 5 minutes. A running task runs on. The response then holds cap_rewrite for the first pass: rewritten_tasks, unresolved_tasks (rows that another transaction held through each retry), unavailable_shards and superseded. Each field is tri-state: absent keeps the stored override, null returns the field to its code value, a value sets it. A merge that sets no field deletes the override. Each PATCH writes one activity_type.defaults audit row, refused or not. The response has the same shape as GET.",
+      "idempotency": "Idempotent: the same override twice stores nothing new. A repeat that names max_concurrent or clear_override runs the cap pass again, and each PATCH writes an audit row.",
       "params": [
         {
           "name": "activity_name",
@@ -7387,6 +7387,11 @@
             "description": "Override the bound on every attempt and every backoff together in whole milliseconds, from 1 to 3153600000000 (100 years). null returns to code. Refused for a local activity."
           },
           {
+            "name": "max_concurrent",
+            "required": false,
+            "description": "Override the fleet-wide cap on the running tasks of the activity's concurrency key, from 1 to 2147483647. Applies to the pending and running task rows too. null returns to code. Refused for an activity with no code max_concurrent, for a local activity, and for an activity that shares its concurrency key with another activity."
+          },
+          {
             "name": "clear_override",
             "required": false,
             "description": "Delete the stored override before the other fields merge."
@@ -7411,7 +7416,7 @@
       "error_responses": [
         {
           "status": 400,
-          "description": "Empty patch, unknown field, a reserved engine activity, a timeout of zero or past 100 years, a retry_* value for an activity with no retry_policy, a heartbeat_timeout_ms for an activity with no code heartbeat_timeout, a heartbeat_timeout_ms, schedule_to_start_ms or schedule_to_close_ms for a local activity, a retry_max_attempts of zero or past 2147483647, a retry interval of zero or past 365 days, or a merged retry_max_interval_ms below retry_initial_interval_ms."
+          "description": "Empty patch, unknown field, a reserved engine activity, a timeout of zero or past 100 years, a retry_* value for an activity with no retry_policy, a heartbeat_timeout_ms for an activity with no code heartbeat_timeout, a heartbeat_timeout_ms, schedule_to_start_ms or schedule_to_close_ms for a local activity, a retry_max_attempts of zero or past 2147483647, a retry interval of zero or past 365 days, a merged retry_max_interval_ms below retry_initial_interval_ms, a max_concurrent of zero or past 2147483647, or a max_concurrent for an activity with no code cap, for a local activity or for an activity that shares its concurrency key."
         },
         {
           "status": 404,
