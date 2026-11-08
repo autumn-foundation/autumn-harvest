@@ -10,6 +10,17 @@
 //! | `signal_roundtrip` | HTTP signal -> the workflow observes it, p50/p99 |
 //! | `replay_throughput` | events/sec over the issue #135 10 001-event history |
 //!
+//! Two opt-in capacity arms run only when `HARVEST_BENCH_SCENARIOS` names
+//! them, or names `capacity` for both:
+//!
+//! | scenario | headline |
+//! |:--|:--|
+//! | `capacity_noop` | the highest offered start rate a shard sustains, zero-activity workflow |
+//! | `capacity_canonical` | the same, for the canonical 3-activity workflow |
+//!
+//! A capacity cell starts worker processes. Each one is this binary again,
+//! run with `HARVEST_BENCH_CAPACITY_CHILD` set.
+//!
 //! # Running
 //!
 //! ```text
@@ -62,6 +73,8 @@
 // the doc can never be produced by three different definitions of the same
 // thing. It lives under `tests/` because that is where a shared harness lives in
 // this repo (see `claim_bench_support.rs`, issue #786).
+#[path = "../tests/integration/capacity_bench_support.rs"]
+mod capacity_bench_support;
 #[path = "../tests/integration/claim_bench_support.rs"]
 mod claim_bench_support;
 #[path = "../tests/integration/e2e_bench_support.rs"]
@@ -83,6 +96,12 @@ fn main() {
         .enable_all()
         .build()
         .expect("build the benchmark runtime");
+    // A capacity cell runs this binary again as a worker process.
+    if let Some(spec) = capacity_bench_support::db::child_spec_from_env() {
+        runtime.block_on(capacity_bench_support::db::run_worker_child(spec));
+        // Exit at once. A blocked stdin reader must not hold the process.
+        std::process::exit(0);
+    }
     runtime.block_on(run());
 }
 
@@ -96,7 +115,7 @@ async fn run() {
         println!(
             "\n> `{SCENARIO_FILTER_ENV_VAR}` names no such scenario: {}. Known scenarios: {}.\n",
             unknown.join(", "),
-            BenchScenario::all()
+            BenchScenario::known()
                 .iter()
                 .map(|s| s.as_str())
                 .collect::<Vec<_>>()
@@ -140,7 +159,11 @@ async fn run() {
     // After the sweep, not before: the Postgres version is only known once
     // something has been provisioned, and on the testcontainer path there is no
     // environment variable to read it from ahead of time.
-    print_environment();
+    print_environment(
+        reports
+            .iter()
+            .any(|r| matches!(r.scenario, BenchScenario::Capacity(_))),
+    );
 
     println!("\n## Results\n");
     println!("{}", render_matrix(&reports));
@@ -170,6 +193,7 @@ async fn run() {
     }
 
     print_replay_control(&reports);
+    print_shard_scaling(&reports);
 
     let unsound: Vec<String> = reports
         .iter()
@@ -272,10 +296,29 @@ async fn run_scenario(
         BenchScenario::ReplayThroughput => {
             Ok(e2e_bench_support::run_replay_throughput(shards).await)
         }
+        BenchScenario::Capacity(arm) => {
+            capacity_bench_support::db::run_capacity(arm, shards, census).await
+        }
     }
 }
 
-fn print_environment() {
+/// Print the shard-scaling lines of the capacity cells.
+///
+/// A ratio appears only for sound cells whose shards each have their own
+/// database host. A co-located cell never enters a scaling claim.
+fn print_shard_scaling(reports: &[ScenarioReport]) {
+    let lines = capacity_bench_support::scaling_lines(reports);
+    if lines.is_empty() {
+        return;
+    }
+    println!("\n## Shard scaling\n");
+    for line in lines {
+        println!("* {line}");
+    }
+    println!();
+}
+
+fn print_environment(capacity_ran: bool) {
     println!("## Environment\n");
     println!("| | |");
     println!("|:--|:--|");
@@ -305,6 +348,16 @@ fn print_environment() {
         "| Pool size | {} per shard |",
         e2e_bench_support::POOL_SIZE_PER_SHARD
     );
+    if capacity_ran {
+        println!(
+            "| Capacity | {} worker process(es) per shard, {} generator lanes per shard, {:.0}s \
+             steps x{} |",
+            capacity_bench_support::db::worker_processes_per_shard(),
+            capacity_bench_support::CAPACITY_GENERATOR_LANES_PER_SHARD,
+            capacity_bench_support::CAPACITY_STEP_SECS,
+            capacity_bench_support::CAPACITY_RATE_MULTIPLIER,
+        );
+    }
     println!(
         "| Postgres | {} |",
         e2e_bench_support::db::provisioned_postgres_version()

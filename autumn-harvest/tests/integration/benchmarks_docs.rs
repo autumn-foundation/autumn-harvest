@@ -19,6 +19,7 @@
 
 use std::path::{Path, PathBuf};
 
+use super::capacity_bench_support::{PUBLISHED_CAPACITY_FILE, WORKER_PROCESSES_ENV_VAR};
 use super::e2e_bench_support::{
     BenchScenario, CHECK_ENV_VAR, CLAIM_LOOPS_ENV_VAR, COMMIT_PROBE_ENV_VAR,
     DISPATCHES_PER_WORKFLOW, INFLIGHT_ENV_VAR, MAX_CONCURRENT_ACTIVITIES, MAX_CONCURRENT_WORKFLOWS,
@@ -224,6 +225,47 @@ fn the_doc_carries_a_comparison_reading_note_at_the_headline_table() {
         note.contains(&rendered),
         "the note must state the dispatches-per-workflow multiplier as `{rendered}`, pinned to \
          the workflow's real shape, not a number typed by hand"
+    );
+}
+
+#[test]
+fn the_doc_states_that_the_closed_loop_cell_is_latency_bound() {
+    let doc = benchmarks_doc();
+    assert!(
+        doc.contains("**The closed-loop `throughput` cell is latency-bound.**"),
+        "docs/benchmarks.md must say that the closed-loop cell is not a capacity figure"
+    );
+}
+
+#[test]
+fn the_doc_states_that_a_co_located_shard_cell_is_not_a_scaling_result() {
+    let doc = benchmarks_doc();
+    assert!(
+        doc.contains("**A co-located shard cell is not a scaling result.**"),
+        "docs/benchmarks.md must say that shards on one host give no scaling result"
+    );
+}
+
+#[test]
+fn the_doc_covers_each_capacity_arm_its_knob_and_its_results() {
+    let doc = benchmarks_doc();
+    for arm in BenchScenario::capacity() {
+        assert!(
+            doc.contains(&format!("`{}`", arm.as_str())),
+            "docs/benchmarks.md never names the `{}` arm",
+            arm.as_str()
+        );
+    }
+    assert!(
+        doc.contains(WORKER_PROCESSES_ENV_VAR),
+        "docs/benchmarks.md must document `{WORKER_PROCESSES_ENV_VAR}`"
+    );
+    let link = PUBLISHED_CAPACITY_FILE
+        .strip_prefix("docs/")
+        .expect("the capacity results live under docs/");
+    assert!(
+        doc.contains(&format!("]({link})")),
+        "docs/benchmarks.md must link the capacity results file {link}"
     );
 }
 

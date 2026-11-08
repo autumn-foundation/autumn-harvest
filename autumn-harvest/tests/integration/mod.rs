@@ -72,6 +72,8 @@ mod cancellation_scope_tests;
 mod cancellation_tests;
 #[cfg(feature = "db")]
 mod capability_miss_tests;
+mod capacity_bench_support;
+mod capacity_docs;
 #[cfg(feature = "db")]
 mod census_scan_index_tests;
 #[cfg(feature = "db")]
