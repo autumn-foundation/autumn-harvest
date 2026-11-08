@@ -22,8 +22,9 @@ These are the last two parts of epic #2438. The designs are in
     a beam step count them.
   - A receiver decodes `PeerEnvelope::mandate` strictly with
     `Mandate::from_wire`. An unknown key fails the op.
-  - A patch marker gates each call that holds a `sample` key, so a
-    history from before it replays as it ran.
+  - A patch marker gates each call that holds a `sample` key. A second
+    marker gates the `sample` schema of the tool, once per member. So a
+    history from before them replays as it ran.
 - **Example (#2450).** `examples/agent-strategies` runs one task as a
   single draw, best-of-3, a vote and a two-tier cascade, on SQLite with a
   scripted model and no key. It prints the selected answer, each draw and

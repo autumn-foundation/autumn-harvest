@@ -580,3 +580,35 @@ async fn the_sample_gate_records_one_marker_and_selects_the_branch_on_replay() {
     let events = rt.load_history(exec).unwrap();
     assert!(!events.iter().any(is_marker));
 }
+
+/// The count of the marker `name` in the history of `exec`.
+fn markers(rt: &SqliteRuntime, exec: autumn_harvest_sqlite::ExecutionId, name: &str) -> usize {
+    rt.load_history(exec)
+        .unwrap()
+        .iter()
+        .filter(|event| matches!(event, WorkflowEvent::MarkerRecorded { name: n, .. } if n == name))
+        .count()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_schema_gate_records_a_marker_only_for_a_member_that_can_offer_draws() {
+    const SCHEMA: &str = "patch:agent_delegate_sample_schema";
+    let (_dir, db) = fresh_db();
+    let model = mesh_model(vec![ask("researcher", None)]);
+    let mut rt = runtime(&db, harness(&model));
+    start(&mut rt).await;
+    let offers = Mandate::new("triage").peers(["researcher"]).max_draws(3);
+    let exec = sqlite::start(&mut rt, &caller(offers)).unwrap();
+    rt.run_until_blocked(exec).await.unwrap();
+    sqlite::drive(&mut rt, &research()).await.unwrap();
+    report(rt.run_until_blocked(exec).await.unwrap());
+    assert_eq!(markers(&rt, exec, SCHEMA), 1, "one marker for the member");
+    assert!(sample_property(&model).is_some());
+
+    let plain = Mandate::new("triage").peers(["researcher"]);
+    let exec = sqlite::start(&mut rt, &caller(plain)).unwrap();
+    rt.run_until_blocked(exec).await.unwrap();
+    sqlite::drive(&mut rt, &research()).await.unwrap();
+    report(rt.run_until_blocked(exec).await.unwrap());
+    assert_eq!(markers(&rt, exec, SCHEMA), 0, "no cap records no marker");
+}

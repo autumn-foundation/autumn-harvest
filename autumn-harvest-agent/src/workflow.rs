@@ -85,6 +85,11 @@ const CHILD_FAILURE_REPORT_PATCH: &str = "agent_child_failure_report";
 /// records no marker.
 const DELEGATE_SAMPLE_PATCH: &str = "agent_delegate_sample";
 
+/// The gate of the `sample` argument in the schema of the `delegate` tool.
+/// A history from before the gate recorded each model input with the old
+/// schema, so its replay keeps it.
+const DELEGATE_SAMPLE_SCHEMA_PATCH: &str = "agent_delegate_sample_schema";
+
 /// The cut of a delegation answer in a history from before issue #2481.
 ///
 /// Such a history recorded its peer lookup with no `answer_limit`. Its run
@@ -375,6 +380,10 @@ impl Outbox {
 pub(crate) struct Member {
     mandate: Mandate,
     peers: Vec<Peer>,
+    /// Whether the `delegate` tool may show the `sample` argument. The patch
+    /// gate decides it once per member, so a history from before the gate
+    /// keeps the old tool schema in each model input.
+    sample_schema: bool,
 }
 
 impl Member {
@@ -383,6 +392,7 @@ impl Member {
         Self {
             mandate,
             peers: Vec::new(),
+            sample_schema: false,
         }
     }
 
@@ -395,7 +405,11 @@ impl Member {
             .filter(|peer| mandate.peers.contains(&peer.name))
             .cloned()
             .collect();
-        Self { mandate, peers }
+        Self {
+            mandate,
+            peers,
+            sample_schema: self.sample_schema,
+        }
     }
 
     /// The mandate of the member.
@@ -405,8 +419,11 @@ impl Member {
 
     /// The `delegate` tool, when the agent has a peer to ask.
     fn delegate_tool(&self) -> Option<crate::message::ToolDefinition> {
-        (!self.peers.is_empty())
-            .then(|| delegate_definition(&self.peers, sample_cap(&self.mandate, &self.peers)))
+        let cap = self
+            .sample_schema
+            .then(|| sample_cap(&self.mandate, &self.peers))
+            .flatten();
+        (!self.peers.is_empty()).then(|| delegate_definition(&self.peers, cap))
     }
 }
 
@@ -678,10 +695,17 @@ pub(crate) async fn discover(ctx: &WorkflowContext, mandate: &Mandate) -> Result
             .await
             .map_err(|e| e.to_string())?
     };
-    Ok(Member {
+    let mut member = Member {
         mandate: mandate.clone(),
         peers,
-    })
+        sample_schema: false,
+    };
+    // The gate runs only for a member that can offer a strategy, so each
+    // other run records no marker.
+    if sample_cap(&member.mandate, &member.peers).is_some() {
+        member.sample_schema = ctx.patched(DELEGATE_SAMPLE_SCHEMA_PATCH);
+    }
+    Ok(member)
 }
 
 /// Send one report.
@@ -3571,6 +3595,7 @@ mod tests {
                     Peer::new("inline", "Inline."),
                     Peer::agent("durable", "Durable.", &id),
                 ],
+                sample_schema: false,
             };
             let agent = mandated.then_some(&agent);
             let plan = round_plan(&calls, &decisions, agent, bound);
@@ -4143,7 +4168,11 @@ mod tests {
 
     /// Whether the `delegate` tool of a member shows the `sample` argument.
     fn shows_sample(mandate: Mandate, peers: Vec<Peer>) -> bool {
-        let member = Member { mandate, peers };
+        let member = Member {
+            mandate,
+            peers,
+            sample_schema: true,
+        };
         let tool = member.delegate_tool().unwrap();
         tool.input_schema["properties"].get("sample").is_some()
     }
@@ -4171,10 +4200,17 @@ mod tests {
             Mandate::new("a").max_draws(5),
             vec![capped(1)]
         ));
-        let member = Member {
+        let mut member = Member {
             mandate: Mandate::new("a").max_draws(4),
             peers: vec![durable()],
+            sample_schema: false,
         };
+        let old = member.delegate_tool().unwrap();
+        assert!(
+            old.input_schema["properties"].get("sample").is_none(),
+            "a member before the gate keeps the old schema"
+        );
+        member.sample_schema = true;
         let tool = member.delegate_tool().unwrap();
         assert_eq!(tool.input_schema["additionalProperties"], json!(false));
         let sample = &tool.input_schema["properties"]["sample"];
@@ -4210,6 +4246,7 @@ mod tests {
         let member = Member {
             mandate: Mandate::new("a").peers(["helper"]).max_draws(3),
             peers: vec![Peer::new("helper", "Helps.")],
+            sample_schema: true,
         };
         let delegate = |arguments: serde_json::Value| ToolCall {
             id: "c".into(),

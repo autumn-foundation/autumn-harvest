@@ -61,6 +61,7 @@ Each answer gives a rule.
 | A send to a stopped peer burns draw units. | The draw units count only once the message is out. |
 | A peer role has a lower cap than the caller. | The caller meets both caps before the send. |
 | An old history with a `sample` key replays down the new branch. | The gate keys on the presence of the key, `null` included, and such a call plans no batch. |
+| An old history replays with a new tool schema in its model input. | A second marker gates the schema, once per member. |
 | An inline peer runs draws under no policy. | The caller refuses `strategy_needs_durable_peer` before any model call. |
 | A batch runs a strategy call as a plain child. | A call with a `sample` key never joins a batch. The batch also refuses such a call. |
 | An old receiver drops a new mandate key. | The receiver decodes the envelope mandate strictly. An unknown key fails the op, so the receiver never runs it. |
@@ -152,11 +153,11 @@ The receiver reads `PeerEnvelope::mandate` with the wire keys of
   ran. A rejection that stops early still counts its whole cap.
 - The receiver tokens reach the caller as `PeerReply::tokens`, as for a
   plain durable delegation.
-- The `sample` schema enlarges the next model request. It shows only
-  under a draw cap, and `max_draws` is not in a release before this
-  change, so no recorded run measures a different request. The
-  `invalid_arguments` text stays as it was for the same reason: replay
-  compares each model input.
+- Replay compares each model input. So a second patch marker,
+  `agent_delegate_sample_schema`, gates the `sample` schema. `discover`
+  reads it once per member, and only when a durable peer has a cap of 2
+  or more. A narrowed member keeps the decision of its parent. The
+  `invalid_arguments` text stays as it was for the same reason.
 - A held peer message in the agent state reads strictly too. A state
   that holds an unknown mandate key fails to load, and the agent stops.
   That is the fail-closed path.
