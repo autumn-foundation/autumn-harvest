@@ -1291,6 +1291,12 @@ jobs:
       - name: Run the agent refine example
         if: needs.changes.outputs.code == 'true' && matrix.shard == 3
         run: cargo run -p autumn-harvest-agent --features sqlite,eval,sandbox --example agent_refine
+      # The mesh example runs offline: a scripted model, no key, no network.
+      # It exits non-zero when one of its claims fails. It takes the features
+      # of the test step above, so only the example links.
+      - name: Run the agent mesh example
+        if: needs.changes.outputs.code == 'true' && matrix.shard == 3
+        run: cargo run -p autumn-harvest-agent --features sqlite,eval,sandbox --example sqlite_mesh
       # Sandboxed code activities. The tests need no KVM: a fake VMM, fake
       # `firecracker` and `jailer` scripts and a fake API server stand in. The
       # Linux backends compile on Linux only, so the other OSes run the
