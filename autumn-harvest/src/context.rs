@@ -4478,6 +4478,28 @@ impl WorkflowContext {
         matches!(self.payload_offload_threshold, Some(t) if observed > t)
     }
 
+    /// Would a schedule of the activity `name` take `input` now?
+    ///
+    /// It applies the depth cap, the input cap and its override, and the
+    /// offload threshold, as a schedule does. A refused schedule records
+    /// nothing. So a workflow that must not depend on the caps records this
+    /// answer with [`Self::side_effect`]. A replay then takes the same branch
+    /// after a cap change.
+    #[must_use]
+    pub fn activity_input_fits(&self, name: &str, input: &Value) -> bool {
+        if crate::payload_depth::nests_past_cap(input) {
+            return false;
+        }
+        let global = self.payload_max_activity_input;
+        let cap = self
+            .activity_input_cap_overrides
+            .get(name)
+            .copied()
+            .map_or(global, |over| global.max(over));
+        let observed = serde_json::to_string(input).map_or(0, |s| s.len() as u64);
+        cap == 0 || observed <= cap || self.offload_will_apply(observed)
+    }
+
     /// The history policy this run runs under.
     pub(crate) const fn history_policy(&self) -> WorkflowHistoryPolicy {
         self.history_policy

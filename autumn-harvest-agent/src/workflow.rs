@@ -119,6 +119,13 @@ const APPROVAL_NOTICE_PATCH: &str = "agent_approval_notice";
 /// real end of history.
 const APPROVAL_NOTICE_PROBE: &str = "agent.approval_notice.probe";
 
+/// The side effect that records whether the notice input fits the caps.
+///
+/// A schedule over a cap records nothing. The wait after it would then meet a
+/// replay that expects the notice. The recorded answer keeps the choice the
+/// same on each replay, also after a cap change.
+const APPROVAL_NOTICE_FITS: &str = "agent.approval_notice.fits";
+
 /// The registered workflow name.
 pub const WORKFLOW_NAME: &str = "agent_loop";
 
@@ -740,8 +747,7 @@ pub(crate) async fn deliver(ctx: &WorkflowContext, report: Report) -> Result<boo
 ///
 /// A failed notice never fails the run and never releases the call. A failed
 /// or timed-out send is recorded, so replay gives the same answer. An input
-/// over the cap records nothing, so [`parked_call`] cuts the input well under
-/// the cap.
+/// over the cap records nothing, so [`notice_fits`] records the check first.
 ///
 /// # Errors
 ///
@@ -2070,7 +2076,9 @@ async fn gated_call(
     if task.probe.is_none() && notice_gate(ctx)? {
         let parked = parked_call(ctx, run, progress, &name, &call, reason);
         // The result changes nothing. Only a decision releases the call.
-        notify(ctx, parked).await?;
+        if notice_fits(ctx, &parked)? {
+            notify(ctx, parked).await?;
+        }
     }
     let decision = if run.live {
         let Some(decision) = live_decision(ctx, &name, timeout).await? else {
@@ -2111,6 +2119,17 @@ fn notice_gate(ctx: &WorkflowContext) -> Result<bool, String> {
     ctx.try_wait_for_signal(APPROVAL_NOTICE_PROBE)
         .map_err(|err| err.to_string())?;
     Ok(ctx.patched(APPROVAL_NOTICE_PATCH))
+}
+
+/// Record whether the notice input fits the caps. See
+/// [`APPROVAL_NOTICE_FITS`].
+fn notice_fits(ctx: &WorkflowContext, parked: &ParkedCall) -> Result<bool, String> {
+    let input = serde_json::to_value(parked).map_err(|err| err.to_string())?;
+    let name = agent_approval_notice_info().name;
+    ctx.side_effect(APPROVAL_NOTICE_FITS, || {
+        ctx.activity_input_fits(name, &input)
+    })
+    .map_err(|err| err.to_string())
 }
 
 /// The notice input of one gated call.

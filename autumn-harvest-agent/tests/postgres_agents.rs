@@ -1114,3 +1114,79 @@ async fn a_failed_notice_keeps_the_call_parked_on_postgres() {
     assert_eq!(writes.runs(), vec![json!({"text": "hi"})]);
     assert_eq!(*broken.0.lock().unwrap(), 1, "a refusal is not retried");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_notice_over_the_worker_cap_is_skipped_and_the_run_fails_cleanly() {
+    use autumn_harvest::testing::{ReplayStatus, WorkflowReplayer};
+
+    let (url, _container) = database().await;
+    let queue = unique("pg-cap");
+    let writes = Arc::new(Recorder::default());
+    let notices = Arc::new(Notices::default());
+    // The task declares no cap, so the arguments are not cut. The worker
+    // takes 6 000 bytes of activity input, so the notice does not fit. The
+    // next model turn holds the same arguments, so it cannot fit either.
+    let big = "x".repeat(8_000);
+    let model = ScriptedModel::new(vec![
+        calls(&[("w1", "write", json!({"text": big}))], 3),
+        answer("not saved", 2),
+    ]);
+    let harness = AgentHarness::new(model)
+        .tool(recorded_tool("write", ToolEffect::Write, &writes))
+        .policy(Arc::new(
+            ToolRules::new().effect(ToolEffect::Write, Rule::Ask),
+        ))
+        .delivery(Arc::clone(&notices) as Arc<dyn Delivery>);
+    let pg = PostgresAgents::single(pool(&url)).with_queue(&queue);
+    let _worker = run_worker_with(&url, &queue, harness, &[ShardId::new(0)], |builder| {
+        builder.max_activity_input_bytes(6_000)
+    });
+    let task = AgentTask::new("Save a note.")
+        .max_request_bytes(0)
+        .approval_timeout(Duration::from_secs(1));
+    let exec = postgres::start(&pg, &task).await.unwrap();
+
+    // Nobody decides. The deadline denies the call. The next model turn is
+    // over the cap, so the run fails with the cause. A notice whose skip
+    // left no record would wedge the run on a replay divergence instead.
+    let deadline = std::time::Instant::now() + LIMIT;
+    let state = loop {
+        let state = postgres::run_state(&pg, exec).await.unwrap();
+        if matches!(state, RunState::Completed(_) | RunState::Failed(_)) {
+            break state;
+        }
+        assert!(std::time::Instant::now() < deadline, "{state:?}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    let RunState::Failed(error) = state else {
+        panic!("the run fails on the next model turn: {state:?}");
+    };
+    assert!(error.contains("payload too large"), "{error}");
+    assert!(
+        notices.0.lock().unwrap().is_empty(),
+        "no notice over the cap"
+    );
+    assert_eq!(writes.runs(), Vec::<serde_json::Value>::new());
+
+    let mut conn = AsyncPgConnection::establish(&url).await.unwrap();
+    let events = autumn_harvest::store::load_history(&mut conn, exec)
+        .await
+        .unwrap()
+        .events;
+    let skipped = events.iter().any(|event| {
+        matches!(event, WorkflowEvent::SideEffectRecorded { name: Some(name), value, .. }
+            if name == "agent.approval_notice.fits" && value == &json!(false))
+    });
+    assert!(skipped, "the skip is recorded");
+    // A replay under the default, larger cap takes the recorded branch. It
+    // then meets no notice, as the run did.
+    let replay = WorkflowReplayer::new()
+        .register(vec![autumn_harvest_agent::agent_loop_info()])
+        .with_execution_id(exec)
+        .replay_from_events(events)
+        .await;
+    assert!(
+        !matches!(replay.status, ReplayStatus::NonDeterminismDetected { .. }),
+        "{replay}"
+    );
+}

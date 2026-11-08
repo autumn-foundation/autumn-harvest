@@ -37,6 +37,13 @@ design is in `docs/design/DESIGN-2603.md`. The guide is
   replay. A timer, activity or child branch that meets the winner marker of
   its own race now reads as not armed. Suite `race_buffered_signal` in
   `autumn-harvest-sqlite`.
+- A notice over the input cap of the worker is skipped. The side effect
+  `agent.approval_notice.fits` records the check first, so a replay takes
+  the same branch after a cap change. New `WorkflowContext::activity_input_fits`
+  applies the same depth and size rules as a schedule.
+- `a_queued_signal_that_wins_a_race_leaves_no_loser_terminal` now asserts
+  that the race replays. `docs/testing/workflow-simulation.md` drops it from
+  its list of engine behaviours.
 - No migration. No new `WorkflowEvent` variant.
 - Tests: `tests/approval_notices.rs` (SQLite), four notice tests in
   `tests/postgres_agents.rs`, `no_approval_notice_is_sent_during_evaluation`

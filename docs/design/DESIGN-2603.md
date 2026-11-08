@@ -61,6 +61,7 @@ The chosen option is in bold.
 | A failed notice lets the call run. | The wait runs after the notice in every case. Only a decision releases the call. A test proves it. |
 | The log leaks the arguments. | The default logs only names and sizes. |
 | Huge arguments or a huge reason break the activity input cap. | The arguments are cut to the tool result cap. The reason is cut to 256 bytes. |
+| A worker cap below the task cap refuses the notice. A refused schedule records nothing, so the next replay diverges and wedges the run. | A recorded side effect holds the result of `WorkflowContext::activity_input_fits`. An oversized notice is skipped, and each replay takes the same branch. A Postgres test proves it. |
 | The deadline in the notice is too late, so a person approves too late. | The activity reads its clock before the wait starts. The real deadline is at that time or later. |
 | An evaluation pings a person. | The evaluation mocks the activity. A test proves it. |
 | A probe pings a person. | A probe skips the notice. |
