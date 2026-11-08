@@ -509,9 +509,9 @@ pub fn stats_label(scenario: BenchScenario, shards: usize, shard: usize) -> Stri
 /// Parse a comma-separated scenario filter into the scenarios it selects.
 ///
 /// An empty or absent filter selects the published matrix, [`BenchScenario::all`].
-/// A capacity arm runs only when a filter names it. An unrecognised id selects
-/// nothing *for that entry* and is reported by [`unknown_scenario_ids`], so a
-/// typo produces a named complaint rather than a silently empty run.
+/// A capacity arm runs only when a filter names it. An unknown id selects
+/// nothing for that entry. [`unknown_scenario_ids`] reports it, so a typo
+/// gives a named complaint and not a silently empty run.
 #[must_use]
 pub fn selected_scenarios(filter: Option<&str>) -> Vec<BenchScenario> {
     let Some(filter) = filter.map(str::trim).filter(|f| !f.is_empty()) else {
