@@ -4202,6 +4202,7 @@ impl SqliteRuntime {
     ) -> SqliteResult<Applied> {
         let now = clock.now;
         check_batch_shape(commands)?;
+        check_external_order(commands, history)?;
         let log_policy = self.log_policy;
         let tx = self.conn.transaction()?;
         // A body that no longer awaits a key gives up its queue place.
@@ -5919,6 +5920,65 @@ fn check_external_alone(commands: &[WorkflowCommand]) -> SqliteResult<()> {
          batch; found {}. Await the external activity on its own.",
         suspending.join(", ")
     )))
+}
+
+/// Refuse a batch that would record an event that the external matcher cannot
+/// skip after the record of an external activity.
+///
+/// The matcher reads the result of an external activity after its record. It
+/// skips signals, updates and a few command events, but it stops at a
+/// marker, a side effect or a timer change. Replay then waits forever, even
+/// after the result arrives. Such an event lands after the record in two
+/// cases. The command follows a fresh external activity in its batch. Or
+/// the external activity was already recorded, so every new event follows it.
+/// A side effect before a fresh external activity is safe.
+fn check_external_order(
+    commands: &[WorkflowCommand],
+    history: &[WorkflowEvent],
+) -> SqliteResult<()> {
+    let recorded = |token: &ExternalActivityToken| {
+        history.iter().any(|event| {
+            matches!(
+                event,
+                WorkflowEvent::ActivityAwaitingExternal { token: t, .. } if t == token
+            )
+        })
+    };
+    let mut external_first = commands.iter().any(|cmd| {
+        matches!(cmd, WorkflowCommand::ScheduleExternalActivity { token, .. } if recorded(token))
+    });
+    let mut late: Vec<&'static str> = Vec::new();
+    for cmd in commands {
+        if matches!(cmd, WorkflowCommand::ScheduleExternalActivity { .. }) {
+            external_first = true;
+        } else if external_first && records_opaque_event(cmd) {
+            late.push(command_name(cmd));
+        }
+    }
+    if late.is_empty() {
+        return Ok(());
+    }
+    late.dedup();
+    Err(SqliteError::Unsupported(format!(
+        "ScheduleExternalActivity — {} would follow the record of an external activity, and \
+         replay cannot read past it. Record it before the external activity, or after its \
+         result.",
+        late.join(", ")
+    )))
+}
+
+/// True for a bookkeeping command whose event stops the external matcher.
+const fn records_opaque_event(cmd: &WorkflowCommand) -> bool {
+    matches!(
+        cmd,
+        WorkflowCommand::RecordMarker { .. }
+            | WorkflowCommand::RecordSideEffect { .. }
+            | WorkflowCommand::ArmTimer {
+                for_await: false,
+                ..
+            }
+            | WorkflowCommand::CancelTimer { .. }
+    )
 }
 
 /// True for a command that the solo rule ignores. Each one records a fact or

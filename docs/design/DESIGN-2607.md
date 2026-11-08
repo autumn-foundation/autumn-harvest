@@ -70,6 +70,7 @@ How can the port fail? Each row names the guard.
 | A `join!` puts another awaitable between an external record and its result, and replay waits forever. | An external activity must be the only awaitable in its batch, as on Postgres. |
 | A reply after the deadline wins, because no drive fired the timer yet. | A settle or an extension times out a due token first. |
 | A huge deadline has no `DateTime` form, so the read fails. | The deadline saturates at the last `DateTime`. |
+| A side effect or marker lands after the external record, and the matcher stops at it. | A batch that would record one after a pending external activity is refused. |
 
 ## 5. Six hats
 

@@ -20,7 +20,9 @@ is in `docs/design/DESIGN-2607.md`.
   of the token times the token out first.
 - An external activity must be the only awaitable in its batch, as on
   Postgres. A `join!` with another awaitable ends the run `FAILED` with
-  `UnsupportedFeature` and the feature `ScheduleExternalActivity`.
+  `UnsupportedFeature` and the feature `ScheduleExternalActivity`. So does a
+  marker, a side effect or a timer change that would land after a pending
+  external activity, because the matcher stops at that event.
 - `SqliteRuntime::list_external_handoffs(&ExternalHandoffFilter)` reads the
   handoffs by state, activity name, run or token. The filter is
   `#[non_exhaustive]`. Its limit is cut to the range 1 to

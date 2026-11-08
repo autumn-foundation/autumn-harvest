@@ -575,6 +575,27 @@ async fn joins_external_and_timer_handle(ctx: &WorkflowContext, _n: i64) -> Resu
     reply.map_err(|e| e.to_string())
 }
 
+/// Records a side effect in the same batch, after the external activity.
+#[workflow]
+async fn side_effect_after_external(ctx: &WorkflowContext, _n: i64) -> Result<Value, String> {
+    let (reply, id) = tokio::join!(
+        ctx.execute_activity_external("a", json!({}), "camel", 60),
+        async { ctx.new_uuid() },
+    );
+    Ok(json!([reply.map_err(|e| e.to_string())?, id.to_string()]))
+}
+
+/// Records a side effect before the external activity, then awaits it.
+#[workflow]
+async fn side_effect_then_external(ctx: &WorkflowContext, _n: i64) -> Result<String, String> {
+    let id = ctx.new_uuid();
+    let reply = ctx
+        .execute_activity_external("bridge", json!({}), "camel", 60)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(format!("{id}:{reply}"))
+}
+
 /// The run of `workflow` ends `FAILED`, typed, with the feature
 /// `ScheduleExternalActivity`, and leaves no handoff.
 async fn assert_external_batch_rejected(workflow: &str) {
@@ -583,6 +604,7 @@ async fn assert_external_batch_rejected(workflow: &str) {
     rt.register_workflow(&joins_two_externals_info());
     rt.register_workflow(&joins_external_and_timer_info());
     rt.register_workflow(&joins_external_and_timer_handle_info());
+    rt.register_workflow(&side_effect_after_external_info());
     let exec = rt.start_workflow(workflow, json!(0)).unwrap();
 
     let err = rt.run_until_blocked(exec).await.unwrap_err();
@@ -629,6 +651,36 @@ async fn an_external_activity_beside_a_timer_is_rejected() {
 #[tokio::test]
 async fn an_external_activity_beside_an_awaited_timer_handle_is_rejected() {
     assert_external_batch_rejected("joins_external_and_timer_handle").await;
+}
+
+#[tokio::test]
+async fn a_side_effect_after_the_external_activity_is_rejected() {
+    assert_external_batch_rejected("side_effect_after_external").await;
+}
+
+#[tokio::test]
+async fn a_side_effect_before_the_external_activity_replays() {
+    let clock = Clock::at(T0);
+    let mut rt = runtime(&clock);
+    rt.register_workflow(&side_effect_then_external_info());
+    let exec = rt
+        .start_workflow("side_effect_then_external", json!(0))
+        .unwrap();
+    let RunState::WaitingExternal(token) = rt.run_until_blocked(exec).await.unwrap() else {
+        panic!("expected a park");
+    };
+    assert!(rt.complete_external(token, json!("pong")).unwrap());
+    let state = rt.run_until_blocked(exec).await.unwrap();
+    assert!(matches!(state, RunState::Completed(_)), "{state:?}");
+    let report = WorkflowReplayer::new()
+        .register(vec![side_effect_then_external_info()])
+        .replay_from_events(rt.load_history(exec).unwrap())
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "{:?}",
+        report.status
+    );
 }
 
 #[tokio::test]

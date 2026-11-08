@@ -1193,6 +1193,7 @@ The rules match Postgres:
 | No settle before `schedule_to_close_secs` | `ActivityTimedOut { ScheduleToClose }` |
 | A settle or an extension after the deadline | The token times out first. A settle returns `Ok(false)` |
 | An external activity beside another awaitable, such as a `join!` | The run ends `FAILED` with `UnsupportedFeature` |
+| A marker, side effect or timer change recorded after a pending external activity | The run ends `FAILED` with `UnsupportedFeature`. Replay cannot read past the event |
 
 The read orders rows by deadline, then by the newest update, then by token.
 Unlike the Postgres operator row, a row carries the activity input, because
