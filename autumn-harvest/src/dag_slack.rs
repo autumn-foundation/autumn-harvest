@@ -207,7 +207,7 @@ mod tests {
         let dag = DagBuilder::new().build().unwrap();
         let report = SlackAnalyzer::new(dag).analyze();
         assert_eq!(report.total_duration, Duration::ZERO);
-        assert!(report.tasks.is_empty());
+        assert_eq!(report.tasks, [] as [TaskSlack; 0]);
         assert!(report.most_flexible().is_none());
     }
 
