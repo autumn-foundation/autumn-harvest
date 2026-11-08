@@ -129,14 +129,18 @@ async fn drop_database(shared: &str, name: &str) {
         return;
     };
     // `WITH (FORCE)` needs Postgres 13. Postgres 12 takes the plain form.
+    // `DROP DATABASE` refuses a batch of statements, because the batch is
+    // an implicit transaction. So each statement goes on its own.
     let forced = format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)");
     if admin.batch_execute(&forced).await.is_err() {
         let _ = admin
             .batch_execute(&format!(
                 "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
-                 WHERE datname = '{name}' AND pid <> pg_backend_pid(); \
-                 DROP DATABASE IF EXISTS {name}"
+                 WHERE datname = '{name}' AND pid <> pg_backend_pid()"
             ))
+            .await;
+        let _ = admin
+            .batch_execute(&format!("DROP DATABASE IF EXISTS {name}"))
             .await;
     }
 }
