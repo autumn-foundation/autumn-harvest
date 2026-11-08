@@ -4753,6 +4753,9 @@ async fn inline_delivery_leaves_a_signal_pending_when_the_codec_fails() {
 }
 
 // ── schedule input override ──────────────────────────────────────────────────
+//
+// These tests leave encrypted override rows behind, so each one runs on a
+// database that no other test shares.
 
 const OVERRIDE_SECRET: &str = "cc-override-input-ssn-888";
 
@@ -4773,6 +4776,23 @@ async fn override_input_cell(conn: &mut AsyncPgConnection, name: &str) -> Option
     .optional()
     .expect("load the override row")
     .and_then(|cell| cell.value)
+}
+
+/// The stored cadence of the schedule row of `name`.
+async fn schedule_expr_of(conn: &mut AsyncPgConnection, name: &str) -> Option<String> {
+    #[derive(diesel::QueryableByName)]
+    struct Expr {
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+        expr: Option<String>,
+    }
+    diesel::sql_query(
+        "SELECT schedule_expr AS expr FROM harvest_schedules WHERE workflow_name = $1",
+    )
+    .bind::<diesel::sql_types::Text, _>(name)
+    .get_result::<Expr>(conn)
+    .await
+    .expect("load the schedule row")
+    .expr
 }
 
 /// The operator path of `PATCH /admin/schedules/{id}` for the code-declared
@@ -4816,9 +4836,34 @@ fn input_patch(input: Value) -> autumn_harvest::scheduler::WorkflowSchedulePatch
     }
 }
 
+/// An AES-256-GCM registry with column encoding on, under `key_id` only.
+fn aead_codecs_under(key_id: &str, byte: u8) -> PayloadCodecs {
+    let codecs = PayloadCodecs::default();
+    let key = DataKey::from_bytes(&[byte; 32]).expect("data key");
+    AeadCodec::new(key_id, &key)
+        .expect("aead codec")
+        .register_with(&codecs)
+        .expect("register");
+    codecs.set_column_encoding(true);
+    codecs
+}
+
+/// One scheduler tick over `code`, with the codecs of `codecs`.
+async fn tick_with(url: &str, codecs: &PayloadCodecs, code: Vec<autumn_harvest::WorkflowSchedule>) {
+    autumn_harvest::scheduler::tick_once(
+        build_pool(url),
+        registry(vec![], vec![], codecs),
+        Arc::new(autumn_harvest::DagCatalog::new()),
+        Arc::new(code),
+        autumn_harvest::SchedulerMonitor::offline(),
+    )
+    .await
+    .expect("a tick never fails on a bad override");
+}
+
 #[tokio::test]
 async fn a_schedule_input_override_is_ciphertext_and_the_fire_reads_plaintext() {
-    let (url, _c) = setup_test_database_url_or_env().await;
+    let (url, _c) = crate::codec_rotation_db_tests::setup_isolated_db().await;
     let codecs = aead_codecs(true);
     let mut conn = connect(&url).await;
     let name = format!("cc_sched_ovr_{}", Uuid::new_v4().simple());
@@ -4861,7 +4906,7 @@ async fn a_schedule_input_override_is_ciphertext_and_the_fire_reads_plaintext() 
         override_input()
     );
 
-    // The listing shows the stored cell, never the plaintext.
+    // With column encoding on, the listing shows the ciphertext.
     let listed = autumn_harvest::schedule_override::list_overrides(&mut conn)
         .await
         .expect("list overrides");
@@ -4919,17 +4964,22 @@ async fn a_schedule_input_override_is_ciphertext_and_the_fire_reads_plaintext() 
     );
 }
 
+/// An override input under a key that the process does not hold holds back
+/// its own schedule only. Every other schedule of the shard still converges.
+/// A patch that sets a new input replaces it, and a clear removes it.
 #[tokio::test]
-async fn an_override_input_that_cannot_decode_skips_the_pass_until_a_clear() {
-    let (url, _c) = setup_test_database_url_or_env().await;
-    let codecs = aead_codecs(true);
+async fn an_override_input_that_cannot_decode_holds_back_its_own_schedule_only() {
+    let (url, _c) = crate::codec_rotation_db_tests::setup_isolated_db().await;
+    let old_key = aead_codecs(true);
     let mut conn = connect(&url).await;
     let name = format!("cc_sched_ovr_stuck_{}", Uuid::new_v4().simple());
+    let neighbour = format!("cc_sched_ovr_peer_{}", Uuid::new_v4().simple());
     let code = secret_schedule(&name);
+    let peer = secret_schedule(&neighbour);
     autumn_harvest::register_workflow_schedules_with_codecs(
         &mut conn,
-        std::slice::from_ref(&code),
-        &codecs,
+        &[code.clone(), peer.clone()],
+        &old_key,
     )
     .await
     .expect("register");
@@ -4938,39 +4988,90 @@ async fn an_override_input_that_cannot_decode_skips_the_pass_until_a_clear() {
         &code,
         &input_patch(override_input()),
         false,
-        &codecs,
+        &old_key,
     )
     .await
     .expect("an input override is accepted");
     let (before, before_updated) = schedule_cell(&mut conn, &name).await;
 
-    // The reader has no key. A new code cadence must not reach the row.
-    let keyless = reader_without_the_key();
-    let mut redeployed = secret_schedule(&name);
-    redeployed.schedule = autumn_harvest::Schedule::Interval(Duration::from_secs(60));
-    autumn_harvest::scheduler::tick_once(
-        build_pool(&url),
-        registry(vec![], vec![], &keyless),
-        Arc::new(autumn_harvest::DagCatalog::new()),
-        Arc::new(vec![redeployed.clone()]),
-        autumn_harvest::SchedulerMonitor::offline(),
+    // The process holds another key only. A redeploy moves both cadences.
+    let new_key = aead_codecs_under("cc-k9", 0x9a);
+    let minutely = |ws: &autumn_harvest::WorkflowSchedule| {
+        let mut ws = ws.clone();
+        ws.schedule = autumn_harvest::Schedule::Interval(Duration::from_secs(60));
+        ws
+    };
+    let (code_60, peer_60) = (minutely(&code), minutely(&peer));
+    tick_with(&url, &new_key, vec![code_60.clone(), peer_60.clone()]).await;
+    let (after, after_updated) = schedule_cell(&mut conn, &name).await;
+    assert_eq!(
+        after, before,
+        "the schedule with the bad input keeps its row"
+    );
+    assert_eq!(
+        after_updated, before_updated,
+        "the pass writes no row for it"
+    );
+    assert_eq!(
+        schedule_expr_of(&mut conn, &neighbour).await.as_deref(),
+        Some("interval:60"),
+        "every other schedule of the shard still converges"
+    );
+
+    // A patch of another field needs the stored input, so it fails.
+    let error = override_patch(
+        &mut conn,
+        &code_60,
+        &autumn_harvest::scheduler::WorkflowSchedulePatch {
+            max_runs: Some(Some(5)),
+            ..Default::default()
+        },
+        false,
+        &new_key,
     )
     .await
-    .expect("a bad override never fails the tick");
-    let (after, after_updated) = schedule_cell(&mut conn, &name).await;
-    assert_eq!(after, before, "the pass skips its shard");
-    assert_eq!(after_updated, before_updated, "the pass writes no row");
+    .expect_err("a patch that keeps an unreadable input fails");
+    assert!(
+        matches!(error, autumn_harvest::HarvestError::Config(_)),
+        "{error}"
+    );
+    assert!(
+        !error.to_string().contains(OVERRIDE_SECRET),
+        "the error never holds the input"
+    );
 
-    // A clear never decodes the row, so it removes it.
+    // A patch that sets a new input does not read the old one.
     override_patch(
         &mut conn,
-        &redeployed,
-        &autumn_harvest::scheduler::WorkflowSchedulePatch::default(),
-        true,
-        &keyless,
+        &code_60,
+        &input_patch(json!({"ssn": "new"})),
+        false,
+        &new_key,
     )
     .await
-    .expect("a clear removes an override that does not decode");
+    .expect("a new input replaces an unreadable one");
+    let stored = override_input_cell(&mut conn, &name)
+        .await
+        .expect("the new input is stored");
+    assert_eq!(codec_envelope_key_id(&stored), Some("cc-k9"));
+    tick_with(&url, &new_key, vec![code_60.clone(), peer_60]).await;
+    assert_eq!(
+        schedule_expr_of(&mut conn, &name).await.as_deref(),
+        Some("interval:60"),
+        "the schedule converges again once its input decodes"
+    );
+
+    // A clear never decodes the row, so a process with no key removes it.
+    override_patch(
+        &mut conn,
+        &code_60,
+        &autumn_harvest::scheduler::WorkflowSchedulePatch::default(),
+        true,
+        &reader_without_the_key(),
+    )
+    .await
+    .expect("a clear needs no key");
+    assert_eq!(override_input_cell(&mut conn, &name).await, None);
     assert_eq!(
         count_rows(
             &mut conn,

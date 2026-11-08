@@ -1,9 +1,8 @@
 -- The input override of a code-declared workflow schedule.
 --
--- An override of a code-declared workflow schedule could not change the
--- input, because the table stored plain JSON. The input is a payload, so this
--- column holds it in the stored form of `harvest_schedules.workflow_input`:
--- written through the payload codecs. A NULL inherits the code input.
+-- The input of a scheduled run is a payload. This column holds the operator
+-- input in the stored form of `harvest_schedules.workflow_input`: written
+-- through the payload codecs. A NULL inherits the code input.
 --
 -- The codec rotation sweep pages by a UUID key and matches it in its
 -- compare-and-swap. The primary key is `(kind, name)`, so `id` gives the
@@ -14,8 +13,8 @@
 -- keeps the column NULL on a DAG row. A reshard carry then never moves an
 -- input.
 --
--- The table is small and only the API, the scheduler pass and the sweep read
--- it. The lock timeout still bounds the wait for its exclusive lock.
+-- The table is small. The API, the scheduler pass, the reshard carry and the
+-- sweep use it. The lock timeout still bounds the wait for its exclusive lock.
 SET LOCAL lock_timeout = '5s';
 
 ALTER TABLE harvest_schedule_overrides

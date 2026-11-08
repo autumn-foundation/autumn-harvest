@@ -262,8 +262,8 @@ impl PatchBody {
     fn check_override_fields(&self, code: bool, id: uuid::Uuid) -> Result<(), AutumnError> {
         let refusal = if code && self.input.is_some() {
             Some(format!(
-                "schedule {id} is declared in code; its input is set in code and an override \
-                 cannot change it"
+                "schedule {id} is declared in code; the SQLite backend has no payload codecs, \
+                 so an override cannot change its input"
             ))
         } else if code && self.clear_override && self.has_edit_fields() {
             Some(format!(

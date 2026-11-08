@@ -86,7 +86,8 @@ Decision: 1 with A.
 | A clear leaves the override input on the row. | A clear converges the row to the code value in the same transaction. |
 | A reshard carry copies a DAG row with an input. | A DAG row has no input, by `CHECK`. |
 | An older process converges the row back to the code input. | The upgrade note says to set an input override only after every process runs this release. |
-| A lost codec key makes the row unreadable, and the shard pass stops. | This is the existing fail-closed rule. A clear removes the row without a decode. The runbook says so. |
+| A lost codec key makes the row unreadable, and the shard pass stops. | An input that does not decode holds back its own schedule only. The pass leaves that schedule out, so its row keeps its last value. A new input or a clear replaces the cell with no decode. |
+| An input stored while column encoding was off stays in clear. | The sweep converts ciphertext only, as for every codec column. The runbook says to send the input again after encoding is turned on. |
 
 ## Six thinking hats
 
@@ -121,8 +122,10 @@ Migration `20261108003205_harvest_schedule_override_input`:
   `effective_workflow_schedule` applies it.
   `validate_effective_workflow` no longer refuses it.
 - `store_workflow_override` encodes the input with `encode_column`.
-- The loaders decode it with the codecs that the caller passes. A cell that
-  does not decode is a corrupt row.
+- The loaders decode it with the codecs that the caller passes. In the
+  scheduler pass, a cell that does not decode marks its workflow name. The
+  pass leaves that schedule out and runs the others. A PATCH that sets a new
+  input does not decode the old cell.
 - `list_overrides` shows the stored cell under `input`.
 
 ### Scheduler
@@ -154,8 +157,12 @@ audit rows stay as they are.
 | AC | Test |
 |---|---|
 | 1 | `workflow_schedule_override_db_tests::the_next_fire_takes_the_overridden_input` |
+| 1 | `workflow_schedule_override_db_tests::an_input_override_wins_over_a_redeploy` |
 | 1 | `schedule_update_integration::code_declared_schedule_takes_an_input_override` |
 | 2 | `codec_column_coverage_tests::a_schedule_input_override_is_ciphertext_and_the_fire_reads_plaintext` |
+| 2 | `codec_rotation_db_tests::a_rotated_schedule_override_input_keeps_its_plaintext` |
 | 2 | `codec_rotation_db_tests::the_sweep_re_encrypts_every_codec_column_without_changing_plaintext` |
+| 2 | `codec_column_coverage_tests::an_override_input_that_cannot_decode_holds_back_its_own_schedule_only` |
 | 3 | `workflow_schedule_override_db_tests::clearing_an_input_override_restores_the_code_input` |
 | 3 | `schedule_update_integration::code_declared_schedule_takes_an_input_override` |
+| - | `workflow_schedule_override_db_tests::the_database_refuses_an_input_on_a_dag_row` |

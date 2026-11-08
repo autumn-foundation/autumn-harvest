@@ -1338,6 +1338,31 @@ async fn code_declared_schedule_takes_an_input_override() {
         "the tick keeps the override input"
     );
 
+    // A JSON null is an absent field. It keeps the stored input.
+    let (status, body) = patch_json(
+        &app,
+        route.clone(),
+        json!({ "input": null, "max_active_runs": 2 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["workflow_input"], json!({ "env": "B" }));
+    assert_eq!(body["max_active_runs"], 2);
+
+    // A refused patch writes nothing, and its audit row holds no input.
+    let (status, body) = patch_json(
+        &app,
+        route.clone(),
+        json!({ "input": { "secret": "AUDIT-LEAK-PROBE" }, "schedule_expr": "interval:0" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(
+        stored_override_input(&url, wf_name).await,
+        Some(json!({ "env": "B" })),
+        "a refused patch keeps the stored input"
+    );
+
     let (status, body) = patch_json(&app, route.clone(), json!({ "clear_override": true })).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["workflow_input"], json!({ "env": "A" }));
@@ -1350,13 +1375,13 @@ async fn code_declared_schedule_takes_an_input_override() {
             .iter()
             .map(|(status, _)| status.as_str())
             .collect::<Vec<_>>(),
-        vec!["succeeded", "succeeded"],
-        "the set and the clear each write one audit row: {audit:?}"
+        vec!["succeeded", "succeeded", "failed", "succeeded"],
+        "each change writes one audit row: {audit:?}"
     );
     assert!(
         audit
             .iter()
-            .all(|(_, error)| !error.as_deref().unwrap_or("").contains("env")),
+            .all(|(_, error)| !error.as_deref().unwrap_or("").contains("AUDIT-LEAK-PROBE")),
         "an audit row never holds the input: {audit:?}"
     );
 }

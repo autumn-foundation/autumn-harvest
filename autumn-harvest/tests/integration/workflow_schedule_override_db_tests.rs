@@ -678,14 +678,25 @@ async fn an_input_override_wins_over_a_redeploy() {
 #[tokio::test]
 async fn the_database_refuses_an_input_on_a_dag_row() {
     let (mut conn, _db) = setup_db().await;
-    let result = diesel::sql_query(
-        "INSERT INTO harvest_schedule_overrides (kind, name, workflow_input, updated_by) \
-         VALUES ('dag', 'etl', '{\"env\": \"B\"}', 'test')",
-    )
-    .execute(&mut conn)
-    .await;
+    let insert = |kind: &'static str| {
+        diesel::sql_query(
+            "INSERT INTO harvest_schedule_overrides (kind, name, workflow_input, updated_by) \
+             VALUES ($1, 'etl', '{\"env\": \"B\"}', 'test')",
+        )
+        .bind::<diesel::sql_types::Text, _>(kind)
+    };
+    let error = insert("dag")
+        .execute(&mut conn)
+        .await
+        .expect_err("the check must refuse an input on a dag row");
     assert!(
-        result.is_err(),
-        "the check must refuse an input on a dag row"
+        error
+            .to_string()
+            .contains("harvest_schedule_overrides_workflow_input_check"),
+        "{error}"
     );
+    insert("workflow")
+        .execute(&mut conn)
+        .await
+        .expect("a workflow row takes an input");
 }

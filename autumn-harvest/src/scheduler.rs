@@ -1920,7 +1920,18 @@ async fn load_shard_overrides(
         Err(error) => Err(error),
     };
     match loaded {
-        Ok(loaded) => Some(loaded),
+        Ok(loaded) => {
+            // No payload text: the name and the shard only.
+            for workflow_name in loaded.0.unreadable_inputs() {
+                tracing::warn!(
+                    shard_id = shard.as_i32(),
+                    workflow_name,
+                    "harvest: a schedule override input does not decode; this pass leaves \
+                     that schedule as it is. Restore the codec key or clear the override"
+                );
+            }
+            Some(loaded)
+        }
         Err(error) => {
             tracing::warn!(
                 error = %error,
@@ -3777,10 +3788,12 @@ pub async fn update_code_declared_workflow_schedule(
         // The row lock above already orders two patches of this schedule.
         // The override lock keeps the read-modify-write sound on its own.
         // A clear never decodes the stored row, so it also removes a row that
-        // no longer decodes.
+        // no longer decodes. A new input never decodes the old one.
         let stored = if request.clear {
             overrides::lock_workflow_override_row(conn, workflow_name).await?;
             None
+        } else if request.patch.input.is_some() {
+            overrides::lock_workflow_override_without_input(conn, workflow_name).await?
         } else {
             overrides::lock_workflow_override(conn, workflow_name, codecs).await?
         };

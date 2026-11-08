@@ -189,15 +189,22 @@ The input is a payload. The override stores it in
 as `harvest_schedules.workflow_input` stores the code input.
 
 - **Encryption.** With column encoding on, the stored cell is ciphertext. The
-  listing of `GET /admin/overrides` shows the stored cell, not the plaintext.
-  The audit row holds no input.
+  listing of `GET /admin/overrides` shows the stored cell, so it shows
+  ciphertext too. The audit row holds no input.
+- **Encoding turned on later.** An input that was stored while column
+  encoding was off stays in clear. The sweep converts ciphertext only. After
+  you turn column encoding on, send each input override again. The PATCH
+  stores it encoded.
 - **Key rotation.** The codec rotation sweep re-encodes the cell under the
   active key. The census counts it, so a key that the cell needs does not
   retire.
-- **A key that is gone.** A cell that does not decode is an unreadable
-  override. The scheduler pass of its shard skips, as for any unreadable
-  override. Send `clear_override: true` for the schedule. A clear does not
-  decode the row, so it removes it, and the pass resumes.
+- **A key that is gone.** A cell that does not decode holds back its own
+  schedule only. The scheduler pass leaves that schedule out and logs a
+  warning with its name. Its row keeps its last value, and every other
+  schedule of the shard still runs. A PATCH of another field fails with 400,
+  because the merge needs the stored input. Restore the key, send a new
+  `input`, or send `clear_override: true`. Neither of the last two decodes
+  the old cell.
 - **Mixed versions.** A process from before issue #2412 ignores the column.
   Its tick converges the row back to the code input. Set an input override
   only after every process runs this release.
