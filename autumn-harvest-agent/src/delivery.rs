@@ -398,6 +398,10 @@ mod tests {
         // A huge timeout saturates. It never wraps to an early deadline.
         let notice = parked(u64::MAX).notice(now);
         assert_eq!(notice.deadline, DateTime::<Utc>::MAX_UTC);
+        // A timeout that is a valid duration but passes the last date
+        // saturates too.
+        let notice = parked(1_000_000_000_000_000).notice(now);
+        assert_eq!(notice.deadline, DateTime::<Utc>::MAX_UTC);
     }
 
     #[test]

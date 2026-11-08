@@ -50,8 +50,9 @@
 //! - Any other activity has no mock, so it fails the candidate run.
 //!
 //! The harness sends again each approval for a wait that the source opened,
-//! when it arrived before the deadline. It drops every other signal. A late or
-//! unsolicited approval therefore cannot release a call.
+//! when it arrived before the deadline. A wait opens with its approval notice
+//! or its deadline timer. It drops every other signal. A late or unsolicited
+//! approval therefore cannot release a call.
 //!
 //! # The fork rules
 //!
@@ -1416,6 +1417,9 @@ impl Recording {
                             decode(input.clone()).map_err(EvalError::Undecodable)?;
                         run_id = Some(request.run_id);
                     }
+                    if let Some(signal) = noticed_wait(name, input) {
+                        opened.insert(signal);
+                    }
                     scheduled.insert(*activity_id, (name.as_str(), input));
                 }
                 WorkflowEvent::ActivityFailed {
@@ -1474,9 +1478,9 @@ impl Recording {
             effects.failed(scheduled, error, run_id.as_deref())?;
         }
         // Only a signal for a wait that the source opened is sent again. A
-        // wait opens with its deadline timer. A signal that arrived before
-        // its wait opened leaves no timer, so it is dropped too. The candidate
-        // then times out, which shows as a divergence.
+        // wait opens with its notice or its deadline timer. A signal that
+        // arrived before both is dropped too. The candidate then times out,
+        // which shows as a divergence.
         signals.retain(|(name, _)| opened.contains(name.as_str()));
         let turns = model_turns(history)?;
         let turn_agents = model_turn_agents(history, run_id.as_deref())?;
@@ -1494,6 +1498,16 @@ impl Recording {
             end: end.ok_or(EvalError::InFlightSource)?,
         })
     }
+}
+
+/// The wait that a scheduled approval notice names, if `name` is the notice.
+///
+/// A notice opens its wait. An app can decide before the deadline timer
+/// starts.
+fn noticed_wait<'a>(name: &str, input: &'a Value) -> Option<&'a str> {
+    (name == agent_approval_notice_info().name)
+        .then(|| input.get("signal").and_then(Value::as_str))
+        .flatten()
 }
 
 /// Name the agent of each recorded tool call from the model turns of its

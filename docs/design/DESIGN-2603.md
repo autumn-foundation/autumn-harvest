@@ -64,6 +64,8 @@ The chosen option is in bold.
 | The deadline in the notice is too late, so a person approves too late. | The activity reads its clock before the wait starts. The real deadline is at that time or later. |
 | An evaluation pings a person. | The evaluation mocks the activity. A test proves it. |
 | A probe pings a person. | A probe skips the notice. |
+| A decision left over from an earlier wait hides the next notice. The patch gate reads a gate with only signals after it as an old position. | A signal probe of a name that no client sends runs first. It moves each waiting signal into the buffer, so the gate sees the real end of history. A test proves it. |
+| An evaluation drops an approval that came during the notice, and reports a false divergence. | A scheduled notice opens its wait for the evaluation. A test proves it. |
 
 ## 5. Six thinking hats
 
@@ -98,7 +100,8 @@ The chosen option is in bold.
 - `AgentHarness::notify_approval` reads the clock, adds the timeout, and
   calls the delivery under the hook timeout.
 - `gated_call` sends the notice before the wait, on both paths. It skips a
-  probe. The patch `agent_approval_notice` gates it.
+  probe. The patch `agent_approval_notice` gates it. A signal probe runs
+  before the gate.
 - A failed, timed-out or too-large notice is recorded. The wait goes on.
 - The activity is in `workflow::activities()`, in the SQLite registration
   and in the evaluation mocks.

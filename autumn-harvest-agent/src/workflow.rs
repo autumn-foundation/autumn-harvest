@@ -110,6 +110,15 @@ const RESET_ON_FULL_PATCH: &str = "agent_reset_on_full_round";
 /// the gate only for a gated call, so each other run records no marker.
 const APPROVAL_NOTICE_PATCH: &str = "agent_approval_notice";
 
+/// A signal name that no client sends. A probe of it claims nothing.
+///
+/// The probe moves each signal that waits at the end of history into the
+/// signal buffer. The patch gate reads a gate with only signals after it as a
+/// recorded position, and takes the old branch. A decision left over from an
+/// earlier wait would then hide the notice. After the probe, the gate sees the
+/// real end of history.
+const APPROVAL_NOTICE_PROBE: &str = "agent.approval_notice.probe";
+
 /// The registered workflow name.
 pub const WORKFLOW_NAME: &str = "agent_loop";
 
@@ -729,8 +738,10 @@ pub(crate) async fn deliver(ctx: &WorkflowContext, report: Report) -> Result<boo
 
 /// Send the notice of one parked call.
 ///
-/// A failed notice never fails the run and never releases the call. Its
-/// failure is recorded, so replay gives the same answer.
+/// A failed notice never fails the run and never releases the call. A failed
+/// or timed-out send is recorded, so replay gives the same answer. An input
+/// over the cap records nothing, so [`parked_call`] cuts the input well under
+/// the cap.
 ///
 /// # Errors
 ///
@@ -2055,8 +2066,8 @@ async fn gated_call(
     let task = run.task;
     let name = approval_signal(slot.round, slot.position, &call.id);
     let timeout = Duration::from_secs(task.approval_timeout_secs);
-    // A probe sends no notice. Nobody answers it.
-    if task.probe.is_none() && ctx.patched(APPROVAL_NOTICE_PATCH) {
+    // A probe run sends no notice. Nobody answers it.
+    if task.probe.is_none() && notice_gate(ctx)? {
         let parked = parked_call(ctx, run, progress, &name, &call, reason);
         // The result changes nothing. Only a decision releases the call.
         notify(ctx, parked).await?;
@@ -2093,6 +2104,13 @@ async fn gated_call(
             task.approval_timeout_secs
         ))),
     }
+}
+
+/// Ask the patch gate of the notice. See [`APPROVAL_NOTICE_PROBE`].
+fn notice_gate(ctx: &WorkflowContext) -> Result<bool, String> {
+    ctx.try_wait_for_signal(APPROVAL_NOTICE_PROBE)
+        .map_err(|err| err.to_string())?;
+    Ok(ctx.patched(APPROVAL_NOTICE_PATCH))
 }
 
 /// The notice input of one gated call.

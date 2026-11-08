@@ -10,7 +10,8 @@
 //! - `LedgerSpend` sums the tokens of the runs of one mesh.
 //! - A heartbeat tick runs and reports.
 //! - A gated call of a durable agent sends one approval notice. `decide`
-//!   takes its signal.
+//!   takes its signal. A worker restart sends no second notice, and a failed
+//!   notice keeps the call parked.
 //! - One consolidation firing serves each agent of a scheduled kind, and
 //!   skips an idle agent and an agent whose pass still runs.
 //! - A two-shard target finds the run on the shard that the router picked.
@@ -979,4 +980,137 @@ async fn a_decision_sent_from_the_notice_releases_the_call_and_replays() {
         matches!(replay.status, ReplayStatus::ReplaySucceeded),
         "{replay}"
     );
+}
+
+/// A delivery whose every approval notice fails with an outage.
+#[derive(Debug, Default)]
+struct BrokenNotices(std::sync::Mutex<usize>);
+
+impl Delivery for BrokenNotices {
+    fn deliver<'a>(&'a self, _report: &'a Report) -> BoxFuture<'a, Result<(), AgentError>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn notify_approval<'a>(
+        &'a self,
+        _notice: &'a ApprovalNotice,
+    ) -> BoxFuture<'a, Result<(), AgentError>> {
+        *self.0.lock().unwrap() += 1;
+        let err = AgentError::new(autumn_harvest_agent::ErrorKind::Provider, "chat is down");
+        Box::pin(async move { Err(err) })
+    }
+}
+
+/// A harness whose `write` tool needs an approval, with `delivery`.
+fn gated(
+    model: Arc<ScriptedModel>,
+    writes: &Arc<Recorder>,
+    delivery: Arc<dyn Delivery>,
+    kind: &str,
+) -> AgentHarness {
+    AgentHarness::new(model)
+        .tool(recorded_tool("write", ToolEffect::Write, writes))
+        .policy(Arc::new(
+            ToolRules::new().effect(ToolEffect::Write, Rule::Ask),
+        ))
+        .delivery(delivery)
+        .agent(AgentProfile::new(kind))
+}
+
+/// Wait until `seen` reports at least one item. Fails the test after `LIMIT`.
+async fn first_notice(seen: impl Fn() -> usize) {
+    let deadline = std::time::Instant::now() + LIMIT;
+    while seen() == 0 {
+        assert!(std::time::Instant::now() < deadline, "no notice arrived");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_worker_restart_during_the_wait_sends_no_second_notice() {
+    let (url, _container) = database().await;
+    let queue = unique("pg-restart");
+    let kind = unique("support");
+    let writes = Arc::new(Recorder::default());
+    let pg = PostgresAgents::single(pool(&url)).with_queue(&queue);
+    let id = AgentId::new(&kind, "acct-3").unwrap();
+    let first = Arc::new(Notices::default());
+    let model = ScriptedModel::new(vec![
+        calls(&[("w1", "write", json!({"text": "hi"}))], 3),
+        answer("saved", 2),
+    ]);
+    let worker = run_worker(
+        &url,
+        &queue,
+        gated(model.clone(), &writes, first.clone(), &kind),
+        &[ShardId::new(0)],
+    );
+    let op = AgentOp::message_with_id("Save a note.", "m-1");
+    postgres::send(&pg, &id, &op, Some("m-1")).await.unwrap();
+    first_notice(|| first.0.lock().unwrap().len()).await;
+    let notice = first.0.lock().unwrap()[0].call.clone();
+    drop(worker);
+
+    // A new worker with a new delivery takes the run over.
+    let second = Arc::new(Notices::default());
+    let _worker = run_worker(
+        &url,
+        &queue,
+        gated(model.clone(), &writes, second.clone(), &kind),
+        &[ShardId::new(0)],
+    );
+    postgres::decide(&pg, notice.execution_id, &notice.signal, &Approval::Approve)
+        .await
+        .unwrap();
+    let state = settled(&pg, &id, |state| state.last_answer.is_some()).await;
+    assert_eq!(state.last_answer.as_deref(), Some("saved"));
+    assert_eq!(writes.runs(), vec![json!({"text": "hi"})]);
+    assert!(second.0.lock().unwrap().is_empty(), "no second notice");
+    assert_eq!(first.0.lock().unwrap().len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_notice_keeps_the_call_parked_on_postgres() {
+    let (url, _container) = database().await;
+    let queue = unique("pg-broken");
+    let kind = unique("support");
+    let writes = Arc::new(Recorder::default());
+    let pg = PostgresAgents::single(pool(&url)).with_queue(&queue);
+    let id = AgentId::new(&kind, "acct-4").unwrap();
+    let broken = Arc::new(BrokenNotices::default());
+    let model = ScriptedModel::new(vec![
+        calls(&[("w1", "write", json!({"text": "hi"}))], 3),
+        answer("saved", 2),
+    ]);
+    let _worker = run_worker(
+        &url,
+        &queue,
+        gated(model, &writes, broken.clone(), &kind),
+        &[ShardId::new(0)],
+    );
+    let op = AgentOp::message_with_id("Save a note.", "m-1");
+    postgres::send(&pg, &id, &op, Some("m-1")).await.unwrap();
+    first_notice(|| *broken.0.lock().unwrap()).await;
+
+    // The op stays parked. The failed notice released nothing.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let state = postgres::state(&pg, &id).await.unwrap().unwrap();
+    assert_eq!(state.last_answer, None, "the op still waits");
+    assert_eq!(state.failures, 0, "a failed notice fails nothing");
+    assert_eq!(
+        writes.runs(),
+        Vec::<serde_json::Value>::new(),
+        "nothing ran"
+    );
+
+    // The run waits on the signal of the first call of the first tool step.
+    let exec = postgres::current_run(&pg, &id).await.unwrap().unwrap();
+    let signal = autumn_harvest_agent::approval::approval_signal(0, 0, "w1");
+    postgres::decide(&pg, exec, &signal, &Approval::Approve)
+        .await
+        .unwrap();
+    let state = settled(&pg, &id, |state| state.last_answer.is_some()).await;
+    assert_eq!(state.last_answer.as_deref(), Some("saved"));
+    assert_eq!(writes.runs(), vec![json!({"text": "hi"})]);
+    assert_eq!(*broken.0.lock().unwrap(), 1, "a refusal is not retried");
 }

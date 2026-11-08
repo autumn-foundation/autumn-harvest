@@ -13726,8 +13726,11 @@ impl WorkflowContext {
         // Issue #1984: a scope that replays its cancel holds these dispatches.
         // The caps applied when the cancelling cycle made them.
         let replays_a_scope_cancel = self.replays_a_scope_cancel();
+        // A recorded winner means the race is decided. A branch that it never
+        // armed dispatches nothing, so a later cap change must not fail it.
+        let decided = self.has_unconsumed_marker(&winner_marker_name);
         for dispatch in &to_dispatch {
-            if !dispatch.is_new || replays_a_scope_cancel {
+            if !dispatch.is_new || replays_a_scope_cancel || decided {
                 continue;
             }
             match &branches[dispatch.index].kind {

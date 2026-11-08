@@ -13,6 +13,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::prelude::*;
 use autumn_harvest::testing::{ReplayStatus, WorkflowReplayer};
 use autumn_harvest_sqlite::{ActivitySpec, RunState, SqliteRuntime};
@@ -88,14 +89,56 @@ async fn run_case(signal: &str, expected_index: i64) {
     assert_eq!(output, json!(expected_index));
 
     let events = rt.load_history(exec).unwrap();
+    assert_settles_at_once(&events);
     let replay = WorkflowReplayer::new()
         .register(vec![notice_then_race_info()])
         .with_execution_id(exec)
-        .replay_from_events(events)
+        .replay_from_events(events.clone())
         .await;
     assert!(
         matches!(replay.status, ReplayStatus::ReplaySucceeded),
         "{replay}"
+    );
+
+    // A recorded winner that names the timer, which never armed, still
+    // diverges. The fix reads only an unarmed branch as not dispatched.
+    let mut forged = events;
+    for event in &mut forged {
+        if let WorkflowEvent::MarkerRecorded { name, details } = event
+            && name == "race_winner:1"
+        {
+            *details = json!(2);
+        }
+    }
+    let replay = WorkflowReplayer::new()
+        .register(vec![notice_then_race_info()])
+        .with_execution_id(exec)
+        .replay_from_events(forged)
+        .await;
+    assert!(
+        matches!(replay.status, ReplayStatus::NonDeterminismDetected { .. }),
+        "{replay}"
+    );
+}
+
+/// The race settles on its first poll: its winner marker follows its open
+/// marker, and its timer branch records no start.
+fn assert_settles_at_once(events: &[WorkflowEvent]) {
+    let opened = events
+        .iter()
+        .position(
+            |event| matches!(event, WorkflowEvent::MarkerRecorded { name, .. } if name == "race:1"),
+        )
+        .expect("the race opens");
+    assert!(
+        matches!(&events[opened + 1], WorkflowEvent::MarkerRecorded { name, .. } if name == "race_winner:1"),
+        "{:?}",
+        events.get(opened + 1)
+    );
+    assert!(
+        !events.iter().any(|event| matches!(event,
+            WorkflowEvent::TimerStarted { timer_id, .. } if timer_id.as_str().starts_with("__race:1:"))),
+        "the timer branch never arms"
     );
 }
 
@@ -179,6 +222,11 @@ async fn an_activity_branch_beside_a_buffered_signal_replays() {
     );
 
     let events = rt.load_history(exec).unwrap();
+    assert!(
+        !events.iter().any(|event| matches!(event,
+            WorkflowEvent::ActivityScheduled { name, .. } if name == "slow")),
+        "the activity branch never arms"
+    );
     let replay = WorkflowReplayer::new()
         .register(vec![notice_then_race_activity_info()])
         .with_execution_id(exec)

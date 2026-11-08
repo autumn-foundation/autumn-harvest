@@ -20,10 +20,17 @@ design is in `docs/design/DESIGN-2603.md`. The guide is
   gets a new key.
 - A failed notice is recorded and ignored. It never fails the run and never
   releases the call.
-- A probe sends no notice. An evaluation stubs it.
+- A probe sends no notice. An evaluation stubs it. An evaluation also sends
+  again an approval for a wait that a notice opened, so a fast approval is
+  not a divergence.
+- An app that lists the agent activities by hand must add
+  `agent_approval_notice`. `workflow::activities()` and `sqlite::register`
+  hold it.
 - The patch `agent_approval_notice` gates the notice. A run that parked
   before the upgrade replays with no notice. The fixture
-  `tests/fixtures/pre_notice_history.json` proves it.
+  `tests/fixtures/pre_notice_history.json` proves it. A signal probe runs
+  before the gate, so a leftover decision cannot make the gate read a new
+  run as an old one.
 - **Engine fix.** A `ctx.race()` that a signal settles on its first poll
   arms no other branch. Its replay diverged at the winner marker, so a
   durable agent whose decision came before its wait opened failed its next
@@ -31,9 +38,7 @@ design is in `docs/design/DESIGN-2603.md`. The guide is
   its own race now reads as not armed. Suite `race_buffered_signal` in
   `autumn-harvest-sqlite`.
 - No migration. No new `WorkflowEvent` variant.
-- Tests: `tests/approval_notices.rs` (SQLite),
-  `a_gated_call_on_a_durable_agent_sends_one_notice_that_decide_accepts`
-  and `a_decision_sent_from_the_notice_releases_the_call_and_replays` in
+- Tests: `tests/approval_notices.rs` (SQLite), four notice tests in
   `tests/postgres_agents.rs`, `no_approval_notice_is_sent_during_evaluation`
-  in `tests/eval.rs` and `a_probe_run_sends_no_approval_notice` in
-  `tests/live_probe.rs`.
+  and `an_approval_sent_during_the_notice_is_sent_again` in `tests/eval.rs`,
+  and `a_probe_run_sends_no_approval_notice` in `tests/live_probe.rs`.

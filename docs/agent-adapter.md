@@ -404,7 +404,10 @@ impl Delivery for Chat {
   call still waits for a decision or its deadline.
 - The default writes the names to the `tracing` log. It never logs the
   arguments or the reason.
-- A probe sends no notice. An evaluation stubs it (section 12).
+- A notice is never withdrawn. An interrupt, a deadline or a reset can end
+  the wait first. A decision for an ended wait changes nothing.
+- A probe sends no notice. An evaluation stubs it (section 12). An
+  evaluation sends again an approval for a wait that its notice opened.
 - A run that parked before this release replays with no notice. The patch
   `agent_approval_notice` gates it.
 
@@ -1105,8 +1108,9 @@ id, so the recorded approvals stay valid. Any other call gets a new `eval_`
 id, so no recorded approval can release it. That id holds the turn and the
 position, not the provider id. The harness sends again only an
 approval for a wait that the source opened, when it arrived before the
-deadline. An approval sent before its wait opened leaves no deadline timer,
-so the harness drops it, and the candidate times out at that wait.
+deadline. A wait opens with its approval notice or its deadline timer. An
+approval sent before both is dropped, and the candidate times out at that
+wait.
 
 The report holds one `TurnDiff` per model turn. A turn diverges when the
 calls, the arguments, the policy decisions or the stop reason differ. Two

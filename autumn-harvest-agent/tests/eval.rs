@@ -386,6 +386,84 @@ async fn no_approval_notice_is_sent_during_evaluation() {
     assert!(pager.0.lock().unwrap().is_empty(), "no notice leaves");
 }
 
+/// A delivery that fails its first approval notice, then takes each one.
+#[derive(Debug, Default)]
+struct FlakyPager {
+    seen: Mutex<Vec<autumn_harvest_agent::delivery::ApprovalNotice>>,
+    failed: std::sync::atomic::AtomicBool,
+}
+
+impl Delivery for FlakyPager {
+    fn deliver<'a>(&'a self, _report: &'a Report) -> BoxFuture<'a, Result<(), AgentError>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn notify_approval<'a>(
+        &'a self,
+        notice: &'a autumn_harvest_agent::delivery::ApprovalNotice,
+    ) -> BoxFuture<'a, Result<(), AgentError>> {
+        self.seen.lock().unwrap().push(notice.clone());
+        let first = !self.failed.swap(true, Ordering::SeqCst);
+        Box::pin(async move {
+            if first {
+                Err(AgentError::new(
+                    ErrorKind::Unavailable,
+                    "the chat API is down",
+                ))
+            } else {
+                Ok(())
+            }
+        })
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_approval_sent_during_the_notice_is_sent_again() {
+    // The source parks one gated `pay` call. The app approves from the
+    // first notice, before the wait opens, so the source records no
+    // deadline timer for that wait.
+    let (_dir, db) = fresh_db();
+    let gate = || Arc::new(ToolRules::new().effect(ToolEffect::Write, Rule::Ask));
+    let replies = || {
+        vec![
+            calls(&[("p1", "pay", json!({"amount": 5}))], 1),
+            answer("paid", 1),
+        ]
+    };
+    let pager = Arc::new(FlakyPager::default());
+    let source_tools = Arc::new(Recorder::default());
+    let harness = AgentHarness::new(ScriptedModel::new(replies()))
+        .tool(recorded_tool("pay", ToolEffect::Write, &source_tools))
+        .policy(gate())
+        .delivery(pager.clone());
+    let mut rt = runtime(&db, harness);
+    let exec = sqlite::start(&mut rt, &AgentTask::new("pay it")).unwrap();
+    let start = chrono::Utc::now();
+    let mut state = rt.run_until_blocked_as_of(exec, start).await.unwrap();
+    assert!(matches!(state, RunState::WaitingTimer), "{state:?}");
+    let signal = pager.seen.lock().unwrap()[0].call.signal.clone();
+    sqlite::decide(&mut rt, exec, &signal, &Approval::Approve).unwrap();
+    for pass in 1..=10 {
+        if !matches!(state, RunState::WaitingTimer) {
+            break;
+        }
+        let at = start + chrono::Duration::seconds(pass * 5);
+        state = rt.run_until_blocked_as_of(exec, at).await.unwrap();
+    }
+    assert_eq!(report(state).text, "paid");
+    assert_eq!(source_tools.runs().len(), 1);
+    let source = rt.load_history(exec).unwrap();
+
+    let (harness, recorder) = candidate(ScriptedModel::new(replies()));
+    let evaluation = evaluate(&source, &Candidate::new(harness.policy(gate())))
+        .await
+        .unwrap();
+
+    assert!(!evaluation.diverged(), "{evaluation:#?}");
+    assert_eq!(evaluation.replayed_tool_calls, 1, "{evaluation:#?}");
+    assert_eq!(recorder.runs(), Vec::<Value>::new(), "no tool runs live");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn an_erased_source_is_refused() {
     let mut source = one_lookup().await;
