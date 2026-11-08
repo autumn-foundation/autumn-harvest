@@ -814,3 +814,58 @@ async fn a_leftover_decision_does_not_hide_the_next_notice() {
     // No strict replay here. The extra answer stays unread, and a strict
     // replay reports an unread decision. See `approval.rs`.
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_delegated_call_names_the_run_that_waits() {
+    use autumn_harvest_agent::mesh::DELEGATE_TOOL;
+    use autumn_harvest_agent::{Mandate, Peer};
+
+    let (_dir, db) = fresh_db();
+    let (recorder, notices) = (Arc::new(Recorder::default()), Notices::new());
+    let model = ScriptedModel::new(vec![
+        calls(
+            &[(
+                "d1",
+                DELEGATE_TOOL,
+                json!({"agent": "researcher", "task": "save it"}),
+            )],
+            1,
+        ),
+        calls(&[("w1", "write", json!({"n": 1}))], 1),
+        answer("saved", 1),
+        answer("the researcher saved it", 1),
+    ]);
+    let harness = AgentHarness::new(model)
+        .tool(recorded_tool("write", ToolEffect::Write, &recorder))
+        .policy(Arc::new(
+            ToolRules::new().effect(ToolEffect::Write, Rule::Ask),
+        ))
+        .delivery(Arc::clone(&notices) as Arc<dyn Delivery>)
+        .peer(Peer::new("researcher", "Saves notes."));
+    let mut rt = runtime(&db, harness);
+    let task = AgentTask::new("plan").mandate(Mandate::new("planner").peers(["researcher"]));
+    let exec = sqlite::start(&mut rt, &task).unwrap();
+    let RunState::WaitingSignal(signal) = rt.run_until_blocked(exec).await.unwrap() else {
+        panic!("the child call parks");
+    };
+
+    // The child runs inline, so the parent run waits. The notice names it.
+    let notice = notices.seen().remove(0).call;
+    assert_eq!(notice.signal, signal);
+    assert_eq!(notice.execution_id, exec);
+    assert_eq!(notice.agent_id, None);
+    assert_ne!(notice.run_id.as_str(), exec.to_string(), "the child run id");
+    sqlite::decide(
+        &mut rt,
+        notice.execution_id,
+        &notice.signal,
+        &Approval::Approve,
+    )
+    .unwrap();
+    assert!(matches!(
+        rt.run_until_blocked(exec).await.unwrap(),
+        RunState::Completed(_)
+    ));
+    assert_eq!(recorder.runs(), vec![json!({"n": 1})]);
+    assert_eq!(notices.seen().len(), 1);
+}
