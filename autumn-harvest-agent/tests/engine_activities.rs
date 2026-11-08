@@ -263,7 +263,7 @@ fn the_engine_registration_builds() {
         .build();
     // The `eval` feature adds the refine run `agent_refine` (issue #2380).
     let refine = usize::from(cfg!(feature = "eval"));
-    assert_eq!(built.workflow_count(), 7 + refine);
+    assert_eq!(built.workflow_count(), 8 + refine);
     assert!(built.state::<AgentHarness>().is_some());
     let names: Vec<&str> = activities().iter().map(|a| a.name).collect();
     let refine_steps = [
@@ -297,6 +297,7 @@ fn the_engine_registration_builds() {
             "agent_score",
             "agent_answer_check",
             "agent_sample_score",
+            "agent_sweep_items",
             "agent_vote_key",
             "agent_consolidate_read",
             "agent_consolidate_turn",
@@ -320,6 +321,7 @@ fn the_engine_registration_builds() {
             autumn_harvest_agent::AGENT_WORKFLOW_NAME,
             autumn_harvest_agent::sampling::DRAWS_WORKFLOW_NAME,
             autumn_harvest_agent::sampling::SAMPLE_WORKFLOW_NAME,
+            autumn_harvest_agent::sampling::SWEEP_WORKFLOW_NAME,
             autumn_harvest_agent::CONSOLIDATE_WORKFLOW_NAME,
             autumn_harvest_agent::CONSOLIDATE_ALL_WORKFLOW_NAME,
         ]

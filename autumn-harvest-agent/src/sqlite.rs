@@ -50,8 +50,9 @@ use crate::model::BoxFuture;
 use crate::refine::agent_refine_propose_info;
 use crate::refine::propose::run_stage_metered;
 use crate::sampling::{
-    DRAWS_WORKFLOW_NAME, DrawsInput, SAMPLE_WORKFLOW_NAME, SampleInput, VoteKeyRequest,
-    agent_draws_info, agent_sample_info, agent_sampling_policy_info, agent_vote_key_info,
+    DRAWS_WORKFLOW_NAME, DrawsInput, SAMPLE_WORKFLOW_NAME, SWEEP_WORKFLOW_NAME, SampleInput,
+    SweepInput, SweepPage, VoteKeyRequest, agent_draws_info, agent_sample_info,
+    agent_sampling_policy_info, agent_sweep_info, agent_sweep_items_info, agent_vote_key_info,
     run_vote_key,
 };
 use crate::score::{SampleScore, agent_sample_score_info, agent_score_info, run_score};
@@ -138,6 +139,14 @@ pub fn register(rt: &mut SqliteRuntime, harness: Arc<AgentHarness>) {
 fn register_sampling(rt: &mut SqliteRuntime, harness: &Arc<AgentHarness>) {
     rt.register_workflow(&agent_draws_info());
     rt.register_workflow(&agent_sample_info());
+    rt.register_workflow(&agent_sweep_info());
+    let h = Arc::clone(harness);
+    rt.register_activity_with_body(&agent_sweep_items_info(), move |input| {
+        call(input, |page: SweepPage| {
+            let h = Arc::clone(&h);
+            async move { h.sweep_page(&page).await }
+        })
+    });
     let h = Arc::clone(harness);
     rt.register_activity_with_body(&agent_sampling_policy_info(), move |input| {
         call(input, |kind: String| {
@@ -512,6 +521,15 @@ pub fn start_draws(rt: &mut SqliteRuntime, input: &DrawsInput) -> SqliteResult<E
 /// Returns an error when the runtime cannot record the start.
 pub fn start_sample(rt: &mut SqliteRuntime, input: &SampleInput) -> SqliteResult<ExecutionId> {
     rt.start_workflow(SAMPLE_WORKFLOW_NAME, serde_json::to_value(input)?)
+}
+
+/// Start one `agent_sweep` run. Returns its execution id.
+///
+/// # Errors
+///
+/// Returns an error when the runtime cannot record the start.
+pub fn start_sweep(rt: &mut SqliteRuntime, input: &SweepInput) -> SqliteResult<ExecutionId> {
+    rt.start_workflow(SWEEP_WORKFLOW_NAME, serde_json::to_value(input)?)
 }
 
 /// Start one heartbeat tick. Returns its execution id.

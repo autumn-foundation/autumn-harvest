@@ -255,6 +255,14 @@ name = "sample_postgres"
 required-features = ["postgres"]
 
 [[test]]
+name = "sweep"
+required-features = ["sqlite"]
+
+[[test]]
+name = "sweep_crash"
+required-features = ["sqlite"]
+
+[[test]]
 name = "vote"
 required-features = ["sqlite"]
 
@@ -296,6 +304,13 @@ required-features = ["postgres"]
 # embedded tests in the crate's own `cargo test` step.
 [[example]]
 name = "agent_session_entity"
+required-features = ["sqlite"]
+test = true
+
+# Two strategies over one fixed set of inputs, with a table of each sweep.
+# `test = true` runs its embedded test in the crate's own `cargo test` step.
+[[example]]
+name = "sweep_compare"
 required-features = ["sqlite"]
 test = true
 

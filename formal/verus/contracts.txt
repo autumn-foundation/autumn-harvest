@@ -256,6 +256,14 @@ pub proof fn theorem_the_shares_sum_to_the_remainder(remaining: int, siblings: i
 pub proof fn theorem_no_first_children_pass_the_cap(remaining: int, siblings: int, n: int) requires 0 <= remaining, 0 < siblings, 0 <= n <= siblings, ensures total(remaining, siblings, n) <= remaining,
 pub proof fn theorem_each_share_is_the_base_or_one_more(remaining: int, siblings: int, i: int, j: int,) requires 0 <= remaining, 0 < siblings, ensures share(remaining, siblings, i) == remaining / siblings || share(remaining, siblings, i) == remaining / siblings + 1, i <= j ==> share(remaining, siblings, i) >= share(remaining, siblings, j),
 
+## formal/verus/src/agent_sweep.rs
+pub const MAX_PARALLEL_CHILDREN: u32 = 16;
+pub enum SweepPlan { Run { items: u32, draws: u32 }, TooManyConcurrent, }
+pub open spec fn spec_cap(max_concurrent: u32) -> int { if max_concurrent > MAX_PARALLEL_CHILDREN { MAX_PARALLEL_CHILDREN as int } else if max_concurrent == 0 { 1 } else { max_concurrent as int } }
+proof fn lemma_the_share_fits(cap: int, items: int) requires 1 <= items <= cap, ensures 1 <= cap / items, items * (cap / items) <= cap,
+proof fn lemma_a_smaller_share_fits(cap: int, items: int, draws: int) requires 1 <= items <= cap, 1 <= draws <= cap / items, ensures items * draws <= cap,
+pub fn sweep_plan(max_concurrent: u32, asked: u32, wide: u32) -> (r: SweepPlan) ensures r is TooManyConcurrent <==> asked > spec_cap(max_concurrent), r is Run ==> 1 <= r -> Run_items, r is Run ==> 1 <= r -> Run_draws, r is Run ==> r -> Run_items <= spec_cap(max_concurrent), r is Run ==> r -> Run_items * r -> Run_draws <= spec_cap(max_concurrent), r is Run && asked > 0 ==> r -> Run_items == asked, r is Run && wide > 0 ==> r -> Run_draws <= wide,
+
 ## formal/verus/src/agent_vote.rs
 pub open spec fn votes_of(s: Seq < (u32, Option < u32 >) >, key: u32) -> nat decreases s.len(), { if s.len() == 0 { 0 } else { votes_of(s.drop_last(), key) + if s.last().1 == Some(key) { 1nat } else { 0nat } } }
 pub open spec fn first_step(f: u32, e: (u32, Option < u32 >), key: u32) -> u32 { if e.1 == Some(key) && e.0 < f { e.0 } else { f } }

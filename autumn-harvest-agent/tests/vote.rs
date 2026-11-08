@@ -354,7 +354,7 @@ fn a_vote_strategy_has_a_snake_case_wire_form() {
     let value = json!({"vote": {"n": 3, "key": "last_number"}});
     let strategy: SampleStrategy = serde_json::from_value(value).unwrap();
     assert_eq!(strategy, SampleStrategy::vote(3, AnswerKey::LastNumber));
-    assert_eq!(strategy.policy_strategy(), Strategy::Vote);
+    assert_eq!(strategy.policy_strategy(), Some(Strategy::Vote));
     assert_eq!(strategy.draws(), 3);
 
     let field = SampleStrategy::vote(2, AnswerKey::json_field("/a"));

@@ -17,6 +17,7 @@ mod agent_propose;
 mod agent_refine;
 mod agent_sampling;
 mod agent_mandate_draws;
+mod agent_sweep;
 mod agent_select;
 mod agent_profile_read;
 mod agent_anonymise;
