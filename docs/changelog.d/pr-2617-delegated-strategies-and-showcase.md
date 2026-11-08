@@ -1,4 +1,4 @@
-## Delegated strategies, the strategies example, guide section and ADR (issues #2610 and #2450)
+## Delegated strategies, the strategies example, guide section and ADR (issues #2610 and #2450, PR #2617)
 
 The last two parts of epic #2438. The designs are in
 `docs/design/DESIGN-2610.md` and `docs/design/DESIGN-2450.md`.
