@@ -636,6 +636,18 @@ jobs:
           cargo xtask audit libpq-keyword-sync --self-test
           cargo xtask audit libpq-keyword-sync
 
+      # Issue #2625: autumn-harvest/src/lib.rs and
+      # autumn-harvest-macros/src/lib.rs each parse the same human-readable
+      # byte-size format. Two copies are below the rule-of-three merge bar,
+      # and autumn-harvest-macros is a proc-macro crate that cannot depend on
+      # autumn-harvest, so the code links them and does not merge them. This
+      # step fails when one copy's parsing logic changes and the other does
+      # not.
+      - name: Byte-size-parse sync (cargo xtask audit byte-size-parse-sync)
+        run: |
+          cargo xtask audit byte-size-parse-sync --self-test
+          cargo xtask audit byte-size-parse-sync
+
       # Issue #2492: every diesel table! keeps 32 columns or fewer, so the
       # workspace and every embedder build diesel at its default tier. A wider
       # table splits over two declarations (autumn-harvest/src/table_split.rs).

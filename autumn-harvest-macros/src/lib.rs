@@ -25,6 +25,10 @@ mod workflow;
 /// as a `u64` literal in the generated `WorkflowInfo`/`ActivityInfo`.
 ///
 /// Returns `None` for empty strings or strings with unrecognised suffixes.
+///
+/// This body is a sibling of `autumn_harvest::parse_byte_size` (issue
+/// #2625). Change both copies the same way. `cargo xtask audit
+/// byte-size-parse-sync` checks that in CI.
 #[allow(clippy::option_if_let_else)]
 pub(crate) fn parse_byte_size_macro(s: &str) -> Option<u64> {
     let s = s.trim();
