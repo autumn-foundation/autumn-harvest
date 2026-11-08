@@ -385,6 +385,7 @@ fn all_adr_0001_span_kinds_are_emitted() {
                         max_concurrent_activities: 4,
                         max_concurrent_claims:
                             autumn_harvest::worker::DEFAULT_MAX_CONCURRENT_CLAIMS,
+                        claim_slots_per_shard: None,
                         poll_interval: Duration::from_millis(25),
                         shutdown_timeout: Duration::from_secs(2),
                         cancellation_grace_period: Duration::from_secs(1),

@@ -1651,6 +1651,14 @@ pub const METRIC_DECISION_OWNER_WOKEN: &str = "harvest.decision_owner.woken";
 /// `docs/operations/postgres-timeouts.md`.
 pub const METRIC_DB_POOL_ACQUIRE_TIMEOUT: &str = "harvest.db.pool_acquire_timeout";
 
+/// Counter: a claim got no claim slot of its shard, so it sent no claim
+/// statement.
+///
+/// Labelled `{shard}`. It counts only while
+/// `WorkerConfig::claim_slots_per_shard` is set. A steady rate on one shard
+/// means that the fleet runs more claim loops than the shard has slots.
+pub const METRIC_DB_CLAIM_SLOT_MISS: &str = "harvest.db.claim_slot_miss";
+
 /// Counter: Postgres aborted a transaction and the engine ran it again
 /// (issue #1822).
 ///
@@ -3521,6 +3529,13 @@ pub trait MetricsRecorder: Send + Sync {
     /// `site` is `claim` or `heartbeat_flush`. Additive with a no-op default.
     fn record_db_pool_acquire_timeout(&self, site: &str) {
         let _ = site;
+    }
+
+    /// A claim on `shard` got no claim slot, so it sent no claim statement.
+    ///
+    /// Additive with a no-op default.
+    fn record_db_claim_slot_miss(&self, shard: u16) {
+        let _ = shard;
     }
 
     /// Postgres aborted a transaction and the engine runs it again

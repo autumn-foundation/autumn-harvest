@@ -370,6 +370,7 @@ const SERIES_LABELS: &[(&str, &[&str])] = &[
     ("harvest_scanner_pass", &["scanner", "shard", "role"]),
     ("harvest_decision_owner_fenced", &["shard"]),
     ("harvest_decision_owner_woken", &["shard", "kind"]),
+    ("harvest_db_claim_slot_miss", &["shard"]),
     ("harvest_db_pool_acquire_timeout", &["site"]),
     ("harvest_db_transaction_retry", &["site", "reason"]),
     (

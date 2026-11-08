@@ -415,6 +415,7 @@ fn build_worker_polling(
                 max_concurrent_workflows: 8,
                 max_concurrent_activities: 32,
                 max_concurrent_claims: autumn_harvest::worker::DEFAULT_MAX_CONCURRENT_CLAIMS,
+                claim_slots_per_shard: None,
                 poll_interval,
                 shutdown_timeout: Duration::from_secs(5),
                 cancellation_grace_period: Duration::from_secs(1),

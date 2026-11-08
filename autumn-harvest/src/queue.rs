@@ -2500,6 +2500,66 @@ pub enum ClaimFairness {
     Keys,
 }
 
+/// The claim slots of one shard.
+///
+/// A claim with slots first takes one of `slots` advisory locks of its
+/// shard. It holds that lock until its transaction ends. A claim that gets
+/// no slot sends no claim statement. So at most `slots` claim statements run
+/// at once on one shard, across every worker.
+///
+/// # The lock key
+///
+/// Each key uses the single-argument `bigint` form, because `queue_pause`
+/// owns the two-argument form. [`CLAIM_SLOT_LOCK_CLASS`] fills the high
+/// word. The low 16 bits of the shard id fill bits 16 to 31. The slot fills
+/// bits 0 to 15.
+///
+/// The concurrency-key locks use `hashtext(key)::bigint`, so they stay in
+/// the `int4` range. The high word puts every slot key outside that range.
+/// It also differs from the high word of each other tagged key. So a slot
+/// key cannot collide with another engine lock.
+///
+/// The key holds the shard id, so two shards on one database have separate
+/// slots. A claim target with no shard keys as shard 0, the default shard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClaimSlots {
+    base: i64,
+    slots: std::num::NonZeroU16,
+}
+
+/// The high word of each claim slot key: ASCII `slot`.
+pub const CLAIM_SLOT_LOCK_CLASS: i64 = 0x736C_6F74;
+
+impl ClaimSlots {
+    /// The `slots` claim slots of `shard`.
+    #[must_use]
+    pub const fn new(shard: Option<crate::types::ShardId>, slots: std::num::NonZeroU16) -> Self {
+        let shard = match shard {
+            Some(shard) => shard.as_i32(),
+            None => 0,
+        };
+        // The mask keeps the shard id in 16 bits, so it cannot reach the
+        // high word.
+        let shard = (shard & 0xFFFF) as i64;
+        Self {
+            base: (CLAIM_SLOT_LOCK_CLASS << 32) | (shard << 16),
+            slots,
+        }
+    }
+
+    /// The number of slots.
+    #[must_use]
+    pub const fn slots(self) -> std::num::NonZeroU16 {
+        self.slots
+    }
+
+    /// The advisory-lock key of slot `slot`.
+    #[must_use]
+    pub const fn lock_key(self, slot: u16) -> i64 {
+        self.base | slot as i64
+    }
+}
+
 /// [`claim_task_of_kind_on_shard`] with a fairness mode (issue #1976).
 ///
 /// [`ClaimFairness::Off`] issues the unchanged statement.
@@ -2580,6 +2640,73 @@ pub async fn claim_task_with_owner(
     fairness: ClaimFairness,
     owned: Option<&OwnedClaim>,
 ) -> HarvestResult<Option<TaskQueueItem>> {
+    claim_task_with_slots(
+        conn,
+        queues,
+        worker_id,
+        worker_build_id,
+        priority_aging_secs,
+        circuit_breaker_activities,
+        ineligible_activities,
+        shard,
+        kind,
+        fairness,
+        owned,
+        None,
+    )
+    .await
+    .map(SlottedClaim::into_task)
+}
+
+/// What a claim with claim slots returned.
+#[derive(Debug)]
+pub enum SlottedClaim {
+    /// The claim took a task. The box keeps the variant small.
+    Claimed(Box<TaskQueueItem>),
+    /// The claim found no task.
+    Empty,
+    /// Every slot of the shard was held, so no claim statement ran.
+    NoSlot,
+}
+
+impl SlottedClaim {
+    /// The claimed task, or `None` for an empty claim or a miss.
+    #[must_use]
+    pub fn into_task(self) -> Option<TaskQueueItem> {
+        match self {
+            Self::Claimed(task) => Some(*task),
+            Self::Empty | Self::NoSlot => None,
+        }
+    }
+}
+
+/// [`claim_task_with_owner`] with the claim slots of the shard of `conn`.
+///
+/// `None` takes no slot and issues the unchanged statements. `Some` first
+/// takes one slot in each claim transaction, with [`take_claim_slot`]. A
+/// transaction that gets no slot sends no claim statement and returns
+/// [`SlottedClaim::NoSlot`]. A fair claim over several queues runs one
+/// transaction per queue. It stops at the first miss, because every queue
+/// shares the slots of the shard.
+///
+/// # Errors
+///
+/// As [`claim_task_with_fairness`].
+#[allow(clippy::too_many_arguments)]
+pub async fn claim_task_with_slots(
+    conn: &mut AsyncPgConnection,
+    queues: &[String],
+    worker_id: &str,
+    worker_build_id: &str,
+    priority_aging_secs: Option<u32>,
+    circuit_breaker_activities: &[String],
+    ineligible_activities: &[String],
+    shard: Option<crate::types::ShardId>,
+    kind: Option<TaskType>,
+    fairness: ClaimFairness,
+    owned: Option<&OwnedClaim>,
+    slots: Option<ClaimSlots>,
+) -> HarvestResult<SlottedClaim> {
     if fairness == ClaimFairness::Keys {
         for queue in queues {
             crate::queue_fairness::validate_fairness_queue_name(queue)?;
@@ -2602,13 +2729,14 @@ pub async fn claim_task_with_owner(
                 kind,
                 fairness,
                 owned,
+                slots,
             )
             .await?;
-            if claimed.is_some() {
+            if !matches!(claimed, SlottedClaim::Empty) {
                 return Ok(claimed);
             }
         }
-        return Ok(None);
+        return Ok(SlottedClaim::Empty);
     }
     claim_task_one_statement(
         conn,
@@ -2622,8 +2750,72 @@ pub async fn claim_task_with_owner(
         kind,
         fairness,
         owned,
+        slots,
     )
     .await
+}
+
+/// SQL for [`take_claim_slot`], exposed for shape tests.
+///
+/// `$1` is the key of slot 0, `$2` the slot count and `$3` the first slot to
+/// try. The statement tries each slot once, from `$3`, and stops at the
+/// first lock that it gets. So it holds at most one slot. It returns that
+/// slot.
+///
+/// The lock call is in `WHERE`, with `LIMIT 1` and no `ORDER BY`. The
+/// executor then tests rows one at a time and stops after the first match.
+/// A lock call in the select list would run before the limit applies.
+#[must_use]
+pub const fn take_claim_slot_query() -> &'static str {
+    "SELECT ((s.slot + $3) % $2)::int4 AS slot \
+     FROM generate_series(0, $2 - 1) AS s(slot) \
+     WHERE pg_try_advisory_xact_lock($1 + ((s.slot + $3) % $2)) \
+     LIMIT 1"
+}
+
+/// Take one claim slot of `slots` in the open transaction of `conn`.
+///
+/// Returns the slot, or `None` when every slot is held. The lock is
+/// transaction-scoped, so commit and rollback both free it. The first slot
+/// to try is random, so the claimers spread over the slots.
+///
+/// The lock never waits, and no path waits for it. So it adds no wait edge
+/// to the claim transaction. See the lock-order table in
+/// `docs/architecture.md`.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on query failure.
+pub async fn take_claim_slot(
+    conn: &mut AsyncPgConnection,
+    slots: ClaimSlots,
+) -> HarvestResult<Option<u16>> {
+    #[derive(diesel::QueryableByName)]
+    struct Slot {
+        #[diesel(sql_type = diesel::sql_types::Integer)]
+        slot: i32,
+    }
+
+    let count = slots.slots().get();
+    let start = rand::random_range(0..count);
+    let taken: Option<Slot> = diesel::sql_query(take_claim_slot_query())
+        .bind::<diesel::sql_types::BigInt, _>(slots.lock_key(0))
+        .bind::<diesel::sql_types::Integer, _>(i32::from(count))
+        .bind::<diesel::sql_types::Integer, _>(i32::from(start))
+        .get_result(conn)
+        .await
+        .optional()
+        .map_err(crate::error::database_error)?;
+    taken
+        .map(|row| {
+            u16::try_from(row.slot).map_err(|_| {
+                crate::error::HarvestError::Database(format!(
+                    "the claim slot statement returned slot {}",
+                    row.slot
+                ))
+            })
+        })
+        .transpose()
 }
 
 /// One claim statement over `queues`, then the rechecks and the charge.
@@ -2640,7 +2832,8 @@ async fn claim_task_one_statement(
     kind: Option<TaskType>,
     fairness: ClaimFairness,
     owned: Option<&OwnedClaim>,
-) -> HarvestResult<Option<TaskQueueItem>> {
+    slots: Option<ClaimSlots>,
+) -> HarvestResult<SlottedClaim> {
     // Two-phase claim using a CTE to avoid holding advisory locks during
     // broad WHERE filtering.
     //
@@ -2771,10 +2964,21 @@ async fn claim_task_one_statement(
     // `SKIP LOCKED` past that row regardless — it is `RUNNING` either way — so
     // the added contention is the duration of a single PK probe.
 
+    //
+    // # Claim slots
+    //
+    // With `slots`, the transaction first takes one claim slot of the shard.
+    // A miss ends the transaction before any claim statement. `None` from
+    // the transaction body is that miss. See [`ClaimSlots`].
     let mut tx = conn.build_transaction().read_committed();
-    let outcome: ClaimOutcome = tx
+    let outcome: Option<ClaimOutcome> = tx
         .run(
-            async |conn: &mut AsyncPgConnection| -> HarvestResult<ClaimOutcome> {
+            async |conn: &mut AsyncPgConnection| -> HarvestResult<Option<ClaimOutcome>> {
+                if let Some(slots) = slots
+                    && take_claim_slot(conn, slots).await?.is_none()
+                {
+                    return Ok(None);
+                }
                 let ageing = aging_secs_i64.is_some_and(|secs| secs > 0);
                 // A fair claim skips the seek window and always runs the full
                 // scan, as ageing does (issue #1976). It takes the same plan
@@ -2818,25 +3022,30 @@ async fn claim_task_one_statement(
                 .map_err(crate::error::database_error)?;
 
                 let Some(task) = result.into_iter().next() else {
-                    return Ok(ClaimOutcome::Empty);
+                    return Ok(Some(ClaimOutcome::Empty));
                 };
 
-                recheck_and_charge(conn, task, worker_id, fairness).await
+                recheck_and_charge(conn, task, worker_id, fairness)
+                    .await
+                    .map(Some)
             },
         )
         .await?;
 
+    let Some(outcome) = outcome else {
+        return Ok(SlottedClaim::NoSlot);
+    };
     match outcome {
-        ClaimOutcome::Claimed(task) => Ok(Some(*task)),
+        ClaimOutcome::Claimed(task) => Ok(SlottedClaim::Claimed(task)),
         // A released row is `PENDING` again now that this transaction has
         // committed, and no dispatch reference names it, so hint it (issue
         // #1312). The by-id path below deliberately does not: its caller still
         // holds the reference and releases it with backoff.
         ClaimOutcome::Released(task_id) => {
             record_pending_hints(conn, &[task_id]).await;
-            Ok(None)
+            Ok(SlottedClaim::Empty)
         }
-        ClaimOutcome::Empty => Ok(None),
+        ClaimOutcome::Empty => Ok(SlottedClaim::Empty),
     }
 }
 
@@ -12114,6 +12323,76 @@ mod tests {
         // Each gated scan of the seek claim joins the fence (issues #1971,
         // #2420).
         assert_eq!(unspliced, claim_task_query());
+    }
+
+    /// Each slot key sits outside the `int4` range of the `hashtext`
+    /// concurrency keys, and away from each other tagged engine key.
+    #[test]
+    fn claim_slot_keys_cannot_collide_with_other_advisory_keys() {
+        let max = std::num::NonZeroU16::new(crate::builder::MAX_CLAIM_SLOTS_PER_SHARD)
+            .expect("the bound is above 0");
+        let tagged = [
+            954_i64 << 32,
+            1823_i64 << 32,
+            18_230_i64 << 32,
+            crate::partition_archive::EXPORT_LOCK_KEY,
+        ];
+        for shard in [None, Some(0), Some(1), Some(0xFFFE), Some(0xFFFF)] {
+            let slots = ClaimSlots::new(shard.map(crate::types::ShardId::new), max);
+            for slot in [0, 1, max.get() - 1, u16::MAX] {
+                let key = slots.lock_key(slot);
+                assert!(
+                    key > i64::from(i32::MAX),
+                    "slot key {key:#x} must be outside the hashtext range"
+                );
+                assert_eq!(key >> 32, CLAIM_SLOT_LOCK_CLASS, "the high word is the tag");
+                for other in tagged {
+                    assert_ne!(key >> 32, other >> 32, "the tag differs from {other:#x}");
+                }
+            }
+        }
+    }
+
+    /// The shard id and the slot each have their own bits.
+    #[test]
+    fn claim_slot_keys_separate_shards_and_slots() {
+        let n = std::num::NonZeroU16::new(4).expect("4 is above 0");
+        let zero = ClaimSlots::new(Some(crate::types::ShardId::new(0)), n);
+        let one = ClaimSlots::new(Some(crate::types::ShardId::new(1)), n);
+        assert_eq!(ClaimSlots::new(None, n), zero, "no shard keys as shard 0");
+        assert_eq!(zero.lock_key(0), CLAIM_SLOT_LOCK_CLASS << 32);
+        assert_eq!(zero.lock_key(3), (CLAIM_SLOT_LOCK_CLASS << 32) | 3);
+        assert_eq!(one.lock_key(0), (CLAIM_SLOT_LOCK_CLASS << 32) | (1 << 16));
+        let keys: std::collections::HashSet<i64> = [zero, one]
+            .iter()
+            .flat_map(|s| (0..4).map(|slot| s.lock_key(slot)))
+            .collect();
+        assert_eq!(keys.len(), 8, "two shards of four slots give eight keys");
+    }
+
+    /// The slot statement uses the single-argument try lock in `WHERE`, so
+    /// it never waits and takes at most one slot.
+    #[test]
+    fn the_claim_slot_statement_tries_each_slot_once_and_stops() {
+        let sql = take_claim_slot_query();
+        assert!(
+            sql.contains("WHERE pg_try_advisory_xact_lock($1 + "),
+            "{sql}"
+        );
+        assert!(sql.trim_end().ends_with("LIMIT 1"), "{sql}");
+        assert!(
+            !sql.contains("ORDER BY"),
+            "an order would test every row: {sql}"
+        );
+        assert!(
+            !sql.contains("pg_advisory_xact_lock("),
+            "never a waiting lock: {sql}"
+        );
+        let select_list = &sql[..sql.find("FROM").expect("the statement has a FROM")];
+        assert!(
+            !select_list.contains("advisory"),
+            "a lock in the select list runs before the limit: {sql}"
+        );
     }
 
     /// Every public claim entry point applies the DR fence (issue #1823).
