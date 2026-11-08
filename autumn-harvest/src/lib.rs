@@ -304,6 +304,8 @@ pub mod dag_linter;
 pub mod dag_profiler;
 #[cfg(any(test, feature = "testing"))]
 pub mod dag_simulator;
+/// Per-task slack of a DAG: how late each task can run before it delays the whole.
+pub mod dag_slack;
 /// Debounced workflow starts — collapse trigger bursts into one run (issue #499).
 pub mod debounce;
 /// Time-travel replay debugger for recorded workflow histories (issue #949).
