@@ -129,8 +129,8 @@ random. It failed on `trunk-dev` too.
 
 ### 10.1 Facts
 
-- The test seeds 20 `PENDING` rows among 400K. `ANALYZE` samples 30,000
-  rows, so it misses all 20 in about one run of five.
+- The test seeded 20 `PENDING` rows among 400K. `ANALYZE` samples 30,000
+  rows, so it missed all 20 in about one run of five.
 - When it misses them, the statistics show no `PENDING` row. A drained
   backlog gives the same statistics every time.
 - The partial indexes keep the pages of the drained backlog. `VACUUM` sets
@@ -138,16 +138,23 @@ random. It failed on `trunk-dev` too.
   them, so the count stays 0.
 - The planner then estimates each head as empty. Each queue head sorted
   all of `idx_harvest_tq_live_created`. The pin head read it once more.
-- The claim read 197,266 buffers at 30K pending rows, against 244. The
-  cost grows with the backlog.
+- On the test fixture, `trunk-dev` read 18,576 buffers, against 405 with
+  fresh statistics. The cost grows with the backlog.
+- A review of the first fix found a second plan. An equality on the kind
+  and the new-start flag makes both columns constant. So
+  `idx_harvest_tq_poll` gives a head its order with no sort, and filters
+  those columns. On a scratch fixture of 64 queues of one kind each, it
+  read 274,301 buffers with sorts off.
 
 ### 10.2 Brainstorming
 
 | Option | Verdict |
 |---|---|
-| **`SET LOCAL enable_sort = off` in the claim** | Chosen. Each queue head then has one plan without a sort. `bounded_queue_depths` does the same (issue #2356). |
-| **Read pins in `idx_harvest_tq_sticky_poll` order** | Chosen. The pin head sorts on every plan, so sorts off alone do not fix it. |
+| **`SET LOCAL enable_sort = off` in the claim** | Chosen. A head can then only use an index that gives its order. `bounded_queue_depths` does the same (issue #2356). |
+| **A range on the new-start flag, first in the head order** | Chosen. Only `idx_harvest_tq_claim_seek` holds that column after the queue and the kind. |
+| **Pins in a subquery, a range on the worker, first in its order** | Chosen. Only `idx_harvest_tq_sticky_poll` leads with the worker. |
 | A state test that proves no other partial index | Not possible. `state = 'PENDING'` proves `state IN ('PENDING', 'RUNNING')`. |
+| Change or drop `idx_harvest_tq_poll` | Rejected. It needs a migration on a hot table, and the full scan uses it. |
 | Keep the statistics fresh | Not in the claim's control. An operator owns `ANALYZE`. |
 | `enable_seqscan = off` | Rejected. It also changes the full-scan fallback, and no fixture here measures that. |
 
@@ -155,28 +162,33 @@ random. It failed on `trunk-dev` too.
 
 | Way to fail | Guard |
 |---|---|
+| Another index gives a head its order | `only_the_ordered_index_gives_a_head_its_order` drops both ordered indexes, and each head scan must then sort. It does not depend on costs. |
+| A range selects other rows than the equality | Both columns are `NOT NULL`, so `x >= v AND x <= v` is `x = v`. |
 | A sort that the claim needs disappears | Every plan of that step has the sort, so its cost does not change. The claim order tests and the random drains pass. |
 | Another step gets worse | With fresh statistics, only two small aggregates change: they hash instead of sort. Every scan and join is the same. The plan has no merge join. `claim_seek_tests` and 25 claim suites pass. |
-| The pin head returns other rows | It reads every live pin, as before. The outer `ORDER BY ... LIMIT` is the same. |
+| The pin head returns other rows | It reads every live pin, as before. The outer `ORDER BY ... LIMIT` is the same. A review compared 80 seeded runs. |
 | Postgres 18 counts disabled nodes, not costs | A plan with fewer disabled sorts still wins, so the result is the same. |
 
 ### 10.4 Six thinking hats
 
-- **White.** 197,266 against 245 buffers with the fix.
-- **Red.** One setting, plus one subquery, both with a precedent.
+- **White.** On the test fixture, `trunk-dev` read 18,576 buffers and the
+  fix reads 247. On its 64 queues of one kind each, 974,412 against 4,097.
+- **Red.** One setting and three changes of text, each with a test.
 - **Black.** A cached plan from a table of 10 rows or fewer can still pick
   a sequential scan for the refine. The first autoanalyze ends it.
-- **Yellow.** The drained case reads 245 buffers. The issue #1956 fixture
-  with 20K terminal rows falls from 202 to 134 buffers.
+- **Yellow.** No plan of a head depends on costs any more. The issue
+  #1956 fixture with 20K terminal rows falls from 202 to 125 buffers.
 - **Green.** A pin index ordered by the due time would let the pin head
   stop at 32 rows.
 - **Blue.** RED: the test owns its database, turns autovacuum off and
-  asserts the head plans. GREEN: the setting and the pin subquery.
+  asserts the head plans. A second test drops the ordered indexes. GREEN:
+  the setting, the ranges and the pin subquery.
 
 ### 10.5 Acceptance criteria
 
 1. The test passes on each run, and asserts that the statistics show no
    `PENDING` row.
 2. Each head scan reads `idx_harvest_tq_claim_seek` or
-   `idx_harvest_tq_sticky_poll`.
-3. Every `claim_seek_tests` case passes.
+   `idx_harvest_tq_sticky_poll`, in both layouts of the test.
+3. With both indexes dropped, each head scan sorts.
+4. Every `claim_seek_tests` case passes.

@@ -7,8 +7,8 @@ drops the database.
 
 - `before1`, `before2`: `trunk-dev` at `373ec6f`.
 - `after1`, `after2`: this change.
-- Run 2 sampled 2% of plans with `auto_explain`. The plans are not
-  committed. `docs/performance.md` gives their medians.
+- Run 2 sampled 2% of plans with `auto_explain`. This change does not
+  commit the plans. `docs/performance.md` gives their medians.
 
 Reproduce:
 

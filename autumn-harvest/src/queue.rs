@@ -1534,10 +1534,12 @@ macro_rules! claim_trailing_ctes_sql {
 ///
 /// The pin head reads its pins in the key order of
 /// `idx_harvest_tq_sticky_poll`, inside a subquery that `OFFSET 0` keeps
-/// apart. Only that index gives the order without a sort. The claim turns
-/// sorts off, so the planner cannot pick a scan of another partial index
-/// instead (issue #2547). The outer sort then keeps the best rows, as
-/// before.
+/// apart. The worker test is a range, so `sticky_worker_id` stays in that
+/// order. Only that index leads with the column, so only it gives the order
+/// without a sort. The claim turns sorts off, so the planner cannot pick a
+/// scan of another partial index instead (issue #2547). The outer sort then
+/// keeps the best rows, as before. See `claim_queue_head_scan_sql!` for the
+/// same argument on the queue heads.
 ///
 /// Inside one queue head the due time follows `scheduled_at`. So each head
 /// is in claim order, `priority DESC, due ASC`. A row outside a head sorts at
@@ -1597,14 +1599,14 @@ macro_rules! claim_seek_ctes_sql {
             claim_seek_row_sql!(),
             " \
                      FROM harvest_task_queue \
-                     WHERE sticky_worker_id = $1 \
+                     WHERE sticky_worker_id >= $1 AND sticky_worker_id <= $1 \
                        AND harvest_task_queue.state = 'PENDING' \
                        AND queue_name = ANY($2) \
                        AND sticky_until > NOW() \
                        AND scheduled_at <= NOW() \
                        AND NOT (queue_name = ANY(paused_queues.names)) ",
             claim_head_gates_sql!(),
-            "ORDER BY queue_name, priority DESC, scheduled_at OFFSET 0 \
+            "ORDER BY sticky_worker_id, queue_name, priority DESC, scheduled_at OFFSET 0 \
                      ) pins \
                      ORDER BY seek_priority DESC, seek_due ASC \
                      LIMIT ",
@@ -1663,6 +1665,15 @@ macro_rules! claim_seek_row_sql {
 /// of rows to read. The window and the deep window both read their queue
 /// heads through this text. So each head is a prefix of its head in claim
 /// order.
+///
+/// The new-start test is a range, `>=` and `<=`, not an equality. Both
+/// columns are `NOT NULL`, so the rows are the same. An equality makes a
+/// column constant, so the planner drops it from the sort. Then
+/// `idx_harvest_tq_poll` also gives the head order without a sort. It reads
+/// every row of the queue, because it filters the kind and the new-start
+/// flag. A range keeps the new-start flag in the sort. Only
+/// `idx_harvest_tq_claim_seek` holds that column after the queue and the
+/// kind. So with sorts off, it is the one plan left (issue #2547).
 macro_rules! claim_queue_head_scan_sql {
     ($queue:literal, $kind:literal, $new_start:literal, [$($limit:tt)*]) => {
         concat!(
@@ -1675,11 +1686,13 @@ macro_rules! claim_queue_head_scan_sql {
             " AND task_type = ",
             $kind,
             " AND state = 'PENDING' \
-               AND (new_start AND attempt = 0) = ",
+               AND (new_start AND attempt = 0) >= ",
+            $new_start,
+            " AND (new_start AND attempt = 0) <= ",
             $new_start,
             " AND scheduled_at <= NOW() ",
             claim_head_gates_sql!(),
-            "ORDER BY priority DESC, scheduled_at ASC \
+            "ORDER BY (new_start AND attempt = 0), priority DESC, scheduled_at ASC \
              LIMIT ",
             $($limit)*,
             " "
@@ -2114,11 +2127,12 @@ const fn claim_task_full_scan_query() -> &'static str {
 /// drains, an `ANALYZE` sees no `PENDING` row. The partial indexes keep
 /// their pages with a row count of 0. The planner then estimates each head
 /// as empty. A head scan that sorts all of `idx_harvest_tq_live_created`
-/// then costs less than the ordered scan. It reads the whole backlog on
-/// each claim: 197,266 buffers at 30K pending rows, against 244. With sorts
-/// off, the ordered head scan is the plan left. A sort that no index can
-/// replace stays, because every plan has it. Examples are the candidate
-/// sort on the claim key and the window ranks.
+/// then costs less than the ordered scan, and it reads the whole backlog.
+/// With sorts off, a head can only use an index that gives its order. Each
+/// head scan writes its order so that one index alone gives it. See
+/// `claim_queue_head_scan_sql!` and the pin head in `claim_seek_ctes_sql!`.
+/// A sort that no index can replace stays, because every plan has it.
+/// Examples are the candidate sort on the claim key and the window ranks.
 ///
 /// The full scan reads the whole backlog with or without bitmap scans. A
 /// bitmap scan helps it, though: at 100K pending rows with ageing on, it
@@ -12693,10 +12707,11 @@ mod tests {
             "FROM (SELECT DISTINCT name FROM unnest($2::text[]) AS u(name)) AS q",
             "CROSS JOIN LATERAL",
             "WHERE queue_name = q.name",
-            "AND (new_start AND attempt = 0) = k.new_start_head",
-            "ORDER BY priority DESC, scheduled_at ASC",
-            "WHERE sticky_worker_id = $1",
-            "ORDER BY queue_name, priority DESC, scheduled_at OFFSET 0 ) pins",
+            "AND (new_start AND attempt = 0) >= k.new_start_head \
+             AND (new_start AND attempt = 0) <= k.new_start_head",
+            "ORDER BY (new_start AND attempt = 0), priority DESC, scheduled_at ASC",
+            "WHERE sticky_worker_id >= $1 AND sticky_worker_id <= $1",
+            "ORDER BY sticky_worker_id, queue_name, priority DESC, scheduled_at OFFSET 0 ) pins",
             "ORDER BY seek_priority DESC, seek_due ASC",
             "WHERE NOT (q.name = ANY(paused_queues.names))",
         ] {
@@ -12840,8 +12855,9 @@ mod tests {
         for clause in [
             "FROM seek_contended c",
             "WHERE queue_name = c.head_queue AND task_type = c.head_kind",
-            "AND (new_start AND attempt = 0) = c.head_new_start",
-            "ORDER BY priority DESC, scheduled_at ASC",
+            "AND (new_start AND attempt = 0) >= c.head_new_start \
+             AND (new_start AND attempt = 0) <= c.head_new_start",
+            "ORDER BY (new_start AND attempt = 0), priority DESC, scheduled_at ASC",
             "PARTITION BY c.head_queue, c.head_kind, c.head_new_start",
         ] {
             assert!(rows.contains(clause), "missing {clause:?} in:\n{rows}");
@@ -12989,8 +13005,9 @@ mod tests {
             "WHERE queue_name = q.name",
             "AND task_type = k.head_kind",
             "AND state = 'PENDING'",
-            "AND (new_start AND attempt = 0) = k.new_start_head",
-            "ORDER BY priority DESC, scheduled_at ASC",
+            "AND (new_start AND attempt = 0) >= k.new_start_head \
+             AND (new_start AND attempt = 0) <= k.new_start_head",
+            "ORDER BY (new_start AND attempt = 0), priority DESC, scheduled_at ASC",
         ] {
             assert!(heads.contains(key), "missing {key:?} in:\n{heads}");
         }

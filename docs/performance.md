@@ -1449,19 +1449,47 @@ case with certainty:
 - The backlog drains, and an `ANALYZE` sees no `PENDING` row.
 - The partial indexes keep the pages of the drained backlog, with a row
   count of 0.
-- A burst arrives below the autoanalyze threshold.
+- A burst arrives. Until the next autoanalyze, those statistics stay.
 
-The planner then estimates each head as empty. Each head scan sorted all
-of `idx_harvest_tq_live_created`, and the pin head scanned it once more.
-The claim read 197,266 buffers at 30K pending rows, against 244 with fresh
-statistics. The cost grew with the backlog: 1,566 buffers at 3K and 46,310
-at 100K, 379 ms per claim.
+The planner then estimates each head as empty, so a plan that reads the
+whole backlog can look as cheap as the ordered head scan. Two such plans
+were found:
 
-The claim now turns sorts off (`SET LOCAL enable_sort = off`), and the pin
-head reads its pins in the key order of `idx_harvest_tq_sticky_poll`. Each
-head then has one plan without a sort: its ordered index. The same case
-reads 245 buffers. `stale_statistics_keep_the_window_bounded` owns its
-database, turns autovacuum off and asserts the plan of each head.
+- Each queue head sorted all of `idx_harvest_tq_live_created`, and the pin
+  head scanned it once more. On the fixture of
+  `stale_statistics_keep_the_window_bounded` (4 queues, 400K terminal rows,
+  a drained backlog and a burst of 30K), `trunk-dev` read 18,576 buffers,
+  against 405 with fresh statistics. On a scratch fixture the cost grew
+  with the burst: 1,566 buffers at 3K, 14,308 at 30K and 46,310 at 100K,
+  379 ms per claim.
+- `idx_harvest_tq_poll` also gives a head its order with no sort, because
+  an equality makes the kind and the new-start flag constant. It filters
+  those columns instead, so each empty head walks its whole queue. A
+  review found this on a scratch fixture of 64 queues with one kind each,
+  after sorts were turned off: 274,301 buffers, against 4,110 with fresh
+  statistics.
+
+The claim now turns sorts off (`SET LOCAL enable_sort = off`). Each head
+writes its order so that one index alone gives it:
+
+- A queue head tests the new-start flag with a range, `>=` and `<=`, and
+  sorts on it first. Only `idx_harvest_tq_claim_seek` holds that column
+  after the queue and the kind.
+- The pin head reads its pins in a subquery that `OFFSET 0` keeps apart. It
+  tests the worker with a range and sorts on it first. Only
+  `idx_harvest_tq_sticky_poll` leads with that column.
+
+The rows do not change: both columns are `NOT NULL`, so each range selects
+the same rows as the equality. The test runs two layouts:
+
+| layout | `trunk-dev`, stale | now, stale | now, fresh |
+|:--|--:|--:|--:|
+| 4 queues of both kinds, 400K terminal rows, 30K burst | 18,576 | 247 | 243 |
+| 64 queues of one kind each, 90K burst | 974,412 | 4,097 | 4,093 |
+
+`only_the_ordered_index_gives_a_head_its_order` drops both ordered indexes
+in a transaction and asserts that each head scan must then sort. That
+result does not depend on costs or data.
 
 ### Latency and throughput under contention
 
@@ -1608,7 +1636,7 @@ one more claim runs. PG16, warm cache:
 The held cost does not grow with K or with the backlog depth. Most of it is
 the deep candidate scan: one probe for each of the 256 deep rows. A
 primary-key probe read about 4 buffers. Since issue #2547 a TID probe reads
-about 1, and K = 32 reads about 780 buffers. See
+about 1, and K = 32 reads 779 buffers. See
 [the refine by TID](#the-refine-by-tid-issue-2547). A claim whose window
 finds a row pays nothing for the deep window. When the window finds no row, `seek_held` checks the
 window rows once more. The deep window reads rows only for a held head.
@@ -1646,16 +1674,16 @@ runs, so a figure can differ by a buffer from the tables above:
 
 | test | case | before | after |
 |:--|:--|--:|--:|
-| `claim_buffers_stay_flat_from_1k_to_100k_pending_rows` | 1,000 rows | 432 | 291 |
-| | 10,000 rows | 478 | 427 |
-| | 100,000 rows | 529 | 427 |
-| `held_claims_on_one_head_keep_the_claim_off_the_full_scan` | 100K rows, K = 0 | 263 | 168 |
-| | 100K rows, K = 32 | 1,726 | 778 |
-| | 100K rows, K = 64 | 1,769 | 813 |
-| `the_window_refine_reads_about_one_buffer_per_row` | 32 rows, 20K terminal | 202 | 134 |
+| `claim_buffers_stay_flat_from_1k_to_100k_pending_rows` | 1,000 rows | 432 | 300 |
+| | 10,000 rows | 478 | 416 |
+| | 100,000 rows | 529 | 430 |
+| `held_claims_on_one_head_keep_the_claim_off_the_full_scan` | 100K rows, K = 0 | 263 | 171 |
+| | 100K rows, K = 32 | 1,726 | 779 |
+| | 100K rows, K = 64 | 1,769 | 814 |
+| `the_window_refine_reads_about_one_buffer_per_row` | 32 rows, 20K terminal | 202 | 125 |
 
-"After" includes both changes of issue #2547: the TID refine and sorts
-off. The TID refine alone read 1,690 buffers in the last row. Its 20K
+"After" includes all changes of issue #2547: the TID refine, sorts off
+and the head order that one index alone gives. The TID refine alone read 1,690 buffers in the last row. Its 20K
 terminal rows gave statistics with almost no `PENDING` row. The TID scan
 changed the costs, and a head scan then sorted a partial index. That is
 the plan of [a drained backlog](#claim-cost-against-backlog-depth). Sorts
