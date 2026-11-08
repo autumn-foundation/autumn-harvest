@@ -36,6 +36,8 @@ autumn-harvest = { version = "0.10.0", path = "../autumn-harvest", default-featu
 # Used directly by the orphan-reclaim test to inspect raw `harvest_tasks` state.
 rusqlite = { workspace = true }
 tempfile = "3"
+# Captures the registration warning in a unit test (issue #2488).
+tracing-subscriber = "0.3"
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
 
 # Single consolidated integration-test binary. Cargo compiles each top-level

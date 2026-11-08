@@ -3,6 +3,7 @@
 //! Best-of-3 picks the answer that the scorer prefers. The usage of each
 //! draw sums to the `harvest_llm_ledger` rows of the run tree. A two-tier
 //! cascade writes one ledger row per tier, with the model id of the tier.
+//! A vote with an app key runs its key in the `agent_vote_key` activity.
 //!
 //! The tests use `HARVEST_TEST_DATABASE_URL` when it is set. Point it at a
 //! dedicated database. Without it, each test starts a Postgres container.
@@ -21,8 +22,9 @@ use autumn_harvest::{
     ExecutionId, HarvestBuilder, ShardId, StartWorkflowParams, WorkerConfig, migrate,
 };
 use autumn_harvest_agent::sampling::{
-    PostgresSamplingPolicyStore, SAMPLE_WORKFLOW_NAME, SampleInput, SampleOutcome, SampleReport,
-    SampleStrategy, SamplingPolicy, SamplingPolicyStore, ScorerRef, Strategy, Tier,
+    AnswerKey, AnswerKeyFn, PostgresSamplingPolicyStore, SAMPLE_WORKFLOW_NAME, SampleInput,
+    SampleOutcome, SampleReport, SampleStop, SampleStrategy, SamplingPolicy, SamplingPolicyStore,
+    ScorerRef, Strategy, Tier, VoteCount,
 };
 use autumn_harvest_agent::{
     AgentError, AgentHarness, AgentModel, AgentProfile, BoxFuture, ChatRequest, ChatResponse,
@@ -411,4 +413,78 @@ async fn a_two_tier_cascade_on_postgres_writes_one_ledger_row_per_tier() {
         "one row per tier, with the model id and the cost of the tier"
     );
     assert_eq!(report.cost_usd_micros, 147);
+}
+
+/// A key function that maps `a` to `vowel` and each other answer to
+/// `consonant`.
+#[derive(Debug)]
+struct Vowel;
+
+impl AnswerKeyFn for Vowel {
+    fn id(&self) -> &'static str {
+        "vowel"
+    }
+
+    fn key(&self, answer: &str) -> Option<String> {
+        let key = if answer.trim() == "a" {
+            "vowel"
+        } else {
+            "consonant"
+        };
+        Some(key.to_owned())
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_vote_on_postgres_keys_each_answer_with_the_app_key() {
+    let (url, _container) = database().await;
+    let kind = unique("vote");
+    let store = Arc::new(PostgresSamplingPolicyStore::new(pool(&url)));
+    let policy = SamplingPolicy {
+        strategies: BTreeSet::from([Strategy::Vote]),
+        max_draws: 3,
+        max_concurrent_draws: 3,
+        ..SamplingPolicy::default()
+    };
+    store.set(&kind, &policy, "ops@example.com").await.unwrap();
+    let harness = AgentHarness::new(Arc::new(Letters {
+        marker: kind.clone(),
+    }))
+    .agent(AgentProfile::new(&kind))
+    .answer_key(Arc::new(Vowel))
+    .sampling_policies(store);
+    let input = SampleInput::vote(
+        &kind,
+        format!("Pick a letter ({kind})."),
+        3,
+        AnswerKey::custom("vowel"),
+    );
+    let queue = unique("vote-q");
+    let exec = start(&url, &queue, &input).await;
+    let worker = worker(&queue, harness);
+    let handle = tokio::spawn({
+        let worker = Arc::clone(&worker);
+        let pool = pool(&url);
+        async move { worker.run(&pool).await }
+    });
+    let report = outcome(&url, exec).await;
+    worker.shutdown();
+    handle.abort();
+
+    assert_eq!(
+        report.tally,
+        [
+            VoteCount::new("consonant", 2, DrawId::new(1)),
+            VoteCount::new("vowel", 1, DrawId::new(0)),
+        ]
+    );
+    assert_eq!(
+        report.outcome,
+        SampleOutcome::Selected {
+            draw: DrawId::new(1)
+        }
+    );
+    assert_eq!(report.stopped, SampleStop::Completed);
+    let ledger = ledger_of_tree(&url, exec).await;
+    assert_eq!(ledger.calls, 3, "one model call per draw, and no judge");
 }

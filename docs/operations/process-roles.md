@@ -1,4 +1,4 @@
-# Split web and worker replicas with `AUTUMN_ROLE` (issue #2477)
+# Split web and worker replicas with `AUTUMN_ROLE`
 
 Harvest follows the Autumn process role. Set `AUTUMN_ROLE` on each replica.
 Set no Harvest switch.
@@ -40,7 +40,7 @@ shared `autumn.toml`:
 backend = "postgres"
 ```
 
-## Background runtimes (issue #2478)
+## Background runtimes
 
 Each role runs these Harvest runtimes. No switch is set, and retention
 is on.
@@ -60,8 +60,8 @@ The test `each_role_places_each_runtime` in `runner.rs` pins this table.
 - **Retention runs where the scheduler runs.** That is the default,
   `run_on = "scheduler"`. An explicit `scheduler_enabled` moves retention
   with it.
-- **`run_on = "all"` runs retention on each process**, as before issue
-  #2478. Row leases keep concurrent janitors correct. Set it in
+- **`run_on = "all"` runs retention on each process**, as in 0.9.0.
+  Row leases keep concurrent janitors correct. Set it in
   `autumn.toml`, or with `AUTUMN_HARVEST_RETENTION__RUN_ON=all`:
 
   ```toml
@@ -99,7 +99,7 @@ To trigger a sweep from the API, set `run_on = "all"` on the `web`
 replicas. Otherwise the next tick on a `worker` replica runs the sweep.
 Read the retention metrics of the `worker` replicas for its results.
 
-## Worker queues (issue #2479)
+## Worker queues
 
 Code declares the full set of queues with `WorkerConfig::with_queues`.
 Config can narrow the queues that the worker of one process polls. Config
@@ -127,8 +127,8 @@ comma. The variable wins over the file.
   not follow the form of other Harvest sections, such as
   `AUTUMN_HARVEST_RETENTION__RUN_ON`. `AUTUMN_HARVEST_WORKER__QUEUES` stops the boot and names the
   right variable.
-- **Deploy order.** Set the list only after each process runs a release
-  with issue #2479. An older process ignores `[harvest.worker]` and polls
+- **Deploy order.** Set the list only after each process runs
+  0.10.0 or later. An older process ignores `[harvest.worker]` and polls
   each queue.
 
 ### The role pin
@@ -151,12 +151,12 @@ pin and the fix. An explicit list always wins over the pin.
 Harvest reads the `pin` of a `[roles.<name>]` preset only. It does not
 read `jobs.pin` or `AUTUMN_JOBS__PIN`. A built-in role has no pin.
 
-Harvest follows only the `base` of a preset, as for issue #2477. A preset
+Harvest follows only the `base` of a preset. A preset
 that turns off `job_workers`, `scheduler` or `retention` does not stop the
 Harvest worker, the scheduler or the janitor. `pin = []` turns off
 `job_workers`, so it does not stop the Harvest worker either. Harvest logs
 one `warn!` for such a preset. Set `harvest.worker_enabled` and
-`harvest.scheduler_enabled` to match. Issue #2480 maps each capability.
+`harvest.scheduler_enabled` to match. A later release maps each capability.
 
 ### Route groups
 
@@ -196,8 +196,7 @@ Each queue needs a tier that polls it. Otherwise a run on it waits.
   runtime is installed, or a writable shard gave no answer.
 - `harvest queue coverage --strict` exits `2` when that list is not empty,
   `null` or missing. An older server omits it, so the gate fails closed.
-- The `autumn doctor --strict` hook waits for autumn#3545. Issue #2480
-  tracks it.
+- The `autumn doctor --strict` hook waits for a change in Autumn.
 
 With the `webhooks` feature, the built-in `webhooks` queue is a declared
 queue too. Narrow it out only when another tier polls it.
@@ -346,7 +345,7 @@ See [`kubernetes-probes.md`](kubernetes-probes.md).
 
 ## Upgrade note
 
-Before issue #2477, a `web` replica ran the Harvest worker and scheduler.
+Before 0.10.0, a `web` replica ran the Harvest worker and scheduler.
 It no longer does. A fleet with only `web` replicas then claims no task.
 Do one of these before the upgrade:
 
@@ -364,7 +363,7 @@ Harvest now logs a warning for that override. To remove the warning, set
 - Autumn's own `#[job]` workers and cron tasks stop on those replicas too.
 - Autumn refuses the boot with no shared jobs backend. See [Rules](#rules).
 
-Issue #2478 moves the retention janitor off `web` replicas. A fleet with
+0.10.0 moves the retention janitor off `web` replicas. A fleet with
 `worker` replicas keeps retention. A fleet that turns the scheduler off on
 every process runs no retention. Set `run_on = "all"` on one group, or
-turn the scheduler on. See [Background runtimes](#background-runtimes-issue-2478).
+turn the scheduler on. See [Background runtimes](#background-runtimes).

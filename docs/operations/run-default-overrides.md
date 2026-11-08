@@ -7,24 +7,23 @@ them through
 A DAG declares `sla` and `execution_timeout` through `#[dag(...)]` or
 `DagInfo`, and its runs take them through its shadow workflow type of the
 same name. A DAG declares no chain cap. An operator override changes these
-values at runtime, with no restart and no deploy (issues #2387 and #2406,
-epic #2384).
+values at runtime, with no restart and no deploy.
 
 A workflow type can also declare a concurrency policy through
 `#[workflow(concurrency(key = ..., limit = ...))]`. An operator override
-changes its `limit` at runtime (issue #2407). The key and `on_conflict` stay
+changes its `limit` at runtime. The key and `on_conflict` stay
 as declared.
 
 A workflow type can also declare a per-tenant quota through
 `#[workflow(quota(key = ..., max_active_executions = ..., ...))]`. An operator
-override changes its three admission caps at runtime (issue #2408). The key
+override changes its three admission caps at runtime. The key
 and the LLM caps stay as declared.
 
 A workflow type can also declare a workflow retry policy in
 `WorkflowInfo::retry_policy`, for example through
 `WorkflowInfo::with_retry_policy`. An operator override changes three of
 its fields at runtime: `max_attempts`, `initial_interval` and
-`max_interval` (issue #2409). The backoff coefficient, the jitter and
+`max_interval`. The backoff coefficient, the jitter and
 `non_retryable_errors` stay as declared.
 
 ## Quick reference
@@ -273,8 +272,8 @@ can differ from `effective_limit` until the older rows finish.
 
 Each admission reads the quota caps again. No row stores a cap. So:
 
-- **A lower cap** refuses the next admission of a key over it, with the `429`
-  of issue #946. Admission is the only place where a cap applies. A run in
+- **A lower cap** refuses the next admission of a key over it, with the quota
+  `429`. Admission is the only place where a cap applies. A run in
   flight continues, and no run ends. A workflow retry is still exempt. A
   continue-as-new successor has no quota check. A child spawn that the cap
   refuses defers its parent with a backoff, as before. The parent waits, and
@@ -398,3 +397,5 @@ grant.
 
 - [`schedule-overrides.md`](schedule-overrides.md): the same idea for
   schedules.
+- [`activity-default-overrides.md`](activity-default-overrides.md): the same
+  idea for activity types.

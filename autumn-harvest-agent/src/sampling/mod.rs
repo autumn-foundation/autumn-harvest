@@ -13,10 +13,13 @@
 //! - [`agent_draws`] reads the policy once, admits the request and runs the
 //!   draws.
 //! - [`agent_sample`] runs best-of-N, rejection sampling or a model
-//!   cascade. It scores each draw and selects one.
+//!   cascade. It scores each draw and selects one. It also runs a vote: it
+//!   keys each answer with an [`AnswerKey`], and the most common key wins.
 //! - [`agent_sample`] also runs step-level beam search. It scores each model
 //!   turn and keeps the best beams with [`beam_rank`].
 //! - [`admit_answer_check`] caps the answer check of a run (issue #2442).
+//! - [`OpSample`] lets a durable agent op run a strategy. The mandate of
+//!   the op caps its draws.
 //! - [`agent_sweep`] runs one strategy over a fixed set of inputs, and
 //!   keeps one row for each item.
 //!
@@ -24,7 +27,8 @@
 //! [`AgentOp`](crate::AgentOp), [`DrawsInput`] and [`SampleInput`] refuse
 //! each name in [`SAMPLING_POLICY_FIELDS`]. The design is in
 //! `docs/design/DESIGN-2439.md`, `docs/design/DESIGN-2443.md`,
-//! `docs/design/DESIGN-2446.md` and `docs/design/DESIGN-2448.md`.
+//! `docs/design/DESIGN-2444.md`, `docs/design/DESIGN-2446.md` and
+//! `docs/design/DESIGN-2448.md`.
 
 mod admit;
 mod draws;
@@ -32,6 +36,7 @@ mod policy;
 mod sample;
 mod store;
 mod sweep;
+mod vote;
 
 pub use admit::{
     Admission, Ask, CascadeStep, DrawPlan, REFUSED_PREFIX, Refusal, SampleStep, SweepPlan, admit,
@@ -48,9 +53,11 @@ pub use policy::{
     ScorerRef, Scorers, Strategy,
 };
 pub use sample::{
-    BeamFate, BeamStep, SAMPLE_WORKFLOW_NAME, SampleDraw, SampleInput, SampleOutcome, SampleReport,
-    SampleStop, SampleStrategy, SkippedTier, Tier, agent_sample, agent_sample_info, beam_rank,
+    BeamFate, BeamStep, OpSample, SAMPLE_WORKFLOW_NAME, SampleDraw, SampleInput, SampleOutcome,
+    SampleReport, SampleStop, SampleStrategy, SkippedTier, Tier, agent_sample, agent_sample_info,
+    beam_rank,
 };
+pub(crate) use sample::{SampleFailure, sample_task};
 #[cfg(feature = "postgres")]
 pub use store::PostgresSamplingPolicyStore;
 #[cfg(feature = "sqlite")]
@@ -65,4 +72,8 @@ pub use sweep::{
     SweepItemStatus, SweepItemStore, SweepItems, SweepItemsRef, SweepPage, SweepReport, SweepRow,
     SweepStop, SweepTotals, agent_sweep, agent_sweep_info, agent_sweep_items,
     agent_sweep_items_info,
+};
+pub use vote::{
+    AnswerKey, AnswerKeyFn, MAX_KEY_BYTES, Tally, VoteCount, VoteKeyReply, VoteKeyRequest,
+    agent_vote_key, agent_vote_key_info, run_vote_key, vote_settled,
 };

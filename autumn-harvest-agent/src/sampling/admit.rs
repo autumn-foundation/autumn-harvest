@@ -90,6 +90,20 @@ pub enum Refusal {
         /// The cap, in bytes.
         max: u64,
     },
+    /// The strategy needs a scorer, and the run names none.
+    NoScorer {
+        /// The strategy that the run asked for.
+        strategy: Strategy,
+    },
+    /// A vote names a scorer. A vote uses no scorer.
+    ScorerNotUsed,
+    /// The answer key of a vote is not valid.
+    InvalidAnswerKey,
+    /// The harness has no app key function with the id of the vote.
+    UnknownAnswerKey {
+        /// The id, cut to 64 bytes.
+        key: String,
+    },
     /// A cascade tier names a model outside `cascade_models`.
     TierModelNotAllowed {
         /// The model that the tier names.
@@ -107,6 +121,13 @@ pub enum Refusal {
     InvalidKind,
     /// No agent profile has the kind, so no task can be built.
     UnknownKind,
+    /// The mandate of the run refuses the draws. Each draw counts against
+    /// `max_draws` and against the fan-out of the mandate.
+    Mandate {
+        /// The refusal of the mandate: `draws_exceeded` or
+        /// `fan_out_exhausted`.
+        mandate: crate::mesh::Refusal,
+    },
 }
 
 /// The prefix of the error of a refused run.
@@ -129,11 +150,16 @@ impl Refusal {
             Self::NoItems => "no_items",
             Self::TooManyItems { .. } => "too_many_items",
             Self::ItemTooLarge { .. } => "item_too_large",
+            Self::NoScorer { .. } => "no_scorer",
+            Self::ScorerNotUsed => "scorer_not_used",
+            Self::InvalidAnswerKey => "invalid_answer_key",
+            Self::UnknownAnswerKey { .. } => "unknown_answer_key",
             Self::TierModelNotAllowed { .. } => "tier_model_not_allowed",
             Self::NotPermitted => "not_permitted",
             Self::SampleOnly { .. } => "sample_only",
             Self::InvalidKind => "invalid_kind",
             Self::UnknownKind => "unknown_kind",
+            Self::Mandate { mandate } => mandate.code(),
         }
     }
 
@@ -183,6 +209,12 @@ impl std::fmt::Display for Refusal {
             Self::ItemTooLarge { item, max } => {
                 write!(f, "item {item} is larger than {max} bytes")
             }
+            Self::NoScorer { strategy } => write!(f, "{strategy} needs a scorer"),
+            Self::ScorerNotUsed => f.write_str("a vote uses no scorer"),
+            Self::InvalidAnswerKey => f.write_str("the answer key of the vote is not valid"),
+            Self::UnknownAnswerKey { key } => {
+                write!(f, "the harness has no answer key function {key}")
+            }
             Self::TierModelNotAllowed { model } => write!(
                 f,
                 "the policy of this kind does not allow the tier model {model:?}"
@@ -195,6 +227,13 @@ impl std::fmt::Display for Refusal {
             }
             Self::InvalidKind => f.write_str("the kind is not a valid agent kind"),
             Self::UnknownKind => f.write_str("no agent profile has the kind"),
+            Self::Mandate { mandate } => {
+                write!(
+                    f,
+                    "the mandate of the run refuses the draws ({})",
+                    mandate.code()
+                )
+            }
         }
     }
 }
@@ -774,6 +813,19 @@ mod tests {
         assert_eq!(
             text,
             "sampling refused (too_many_draws): the run asks for 5 draws; the policy allows 4"
+        );
+        let mandate = Refusal::Mandate {
+            mandate: crate::mesh::Refusal::DrawsExceeded,
+        };
+        assert_eq!(mandate.code(), "draws_exceeded");
+        assert_eq!(
+            serde_json::to_value(&mandate).unwrap(),
+            serde_json::json!({"refusal": "mandate", "mandate": "draws_exceeded"})
+        );
+        assert!(
+            mandate
+                .error_text()
+                .starts_with("sampling refused (draws_exceeded)")
         );
     }
 

@@ -51,8 +51,9 @@ use crate::refine::agent_refine_propose_info;
 use crate::refine::propose::run_stage_metered;
 use crate::sampling::{
     DRAWS_WORKFLOW_NAME, DrawsInput, SAMPLE_WORKFLOW_NAME, SWEEP_WORKFLOW_NAME, SampleInput,
-    SweepInput, SweepPage, agent_draws_info, agent_sample_info, agent_sampling_policy_info,
-    agent_sweep_info, agent_sweep_items_info,
+    SweepInput, SweepPage, VoteKeyRequest, agent_draws_info, agent_sample_info,
+    agent_sampling_policy_info, agent_sweep_info, agent_sweep_items_info, agent_vote_key_info,
+    run_vote_key,
 };
 use crate::score::{SampleScore, agent_sample_score_info, agent_score_info, run_score};
 use crate::types::{AgentTask, ModelTurnRequest};
@@ -134,7 +135,7 @@ pub fn register(rt: &mut SqliteRuntime, harness: Arc<AgentHarness>) {
     });
 }
 
-/// Register the strategy run and its policy read (issue #2439).
+/// Register the strategy runs, their policy read and the key of a vote.
 fn register_sampling(rt: &mut SqliteRuntime, harness: &Arc<AgentHarness>) {
     rt.register_workflow(&agent_draws_info());
     rt.register_workflow(&agent_sample_info());
@@ -151,6 +152,12 @@ fn register_sampling(rt: &mut SqliteRuntime, harness: &Arc<AgentHarness>) {
         call(input, |kind: String| {
             let h = Arc::clone(&h);
             async move { h.sampling_policy(&kind).await }
+        })
+    });
+    let h = Arc::clone(harness);
+    rt.register_activity_with_body(&agent_vote_key_info(), move |input| {
+        call(input, |request: VoteKeyRequest| {
+            std::future::ready(run_vote_key(&h, &request))
         })
     });
     // SQLite keeps no run tenant, so the task tenant applies (issue #2442).

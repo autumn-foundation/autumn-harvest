@@ -1181,6 +1181,41 @@ impl HandlerRegistry {
         )
     }
 
+    /// The concurrency key and the effective cap of a registered activity.
+    ///
+    /// The key is the declared `concurrency_key`, or the activity name when
+    /// code declares only a cap. An operator override of the cap wins over
+    /// the declared cap, and it applies only over a declared cap. An engine
+    /// activity takes no override. An activity that shares its key with
+    /// another registered activity takes no override either, so one key never
+    /// holds two caps. Each path that enqueues an activity task resolves its
+    /// key and cap here. The call reads memory only.
+    #[must_use]
+    pub fn activity_concurrency(&self, activity_name: &str) -> (Option<String>, Option<u32>) {
+        let Some(info) = self.activities.get(activity_name) else {
+            return (None, None);
+        };
+        let key = info
+            .concurrency_key
+            .or_else(|| info.max_concurrent.map(|_| info.name))
+            .map(str::to_string);
+        let cap = info.max_concurrent.map(|declared| {
+            if crate::activity_defaults::is_reserved_activity(activity_name) {
+                return declared;
+            }
+            // The sharer scan runs only when an override exists.
+            self.run_defaults
+                .activity(activity_name)
+                .and_then(|fields| fields.max_concurrent)
+                .filter(|_| {
+                    crate::activity_defaults::key_sharer(self.activities.values(), activity_name)
+                        .is_none()
+                })
+                .unwrap_or(declared)
+        });
+        (key, cap)
+    }
+
     /// Apply the concurrency limit override to a declared policy
     /// (issue #2407).
     ///
@@ -11992,9 +12027,20 @@ fn build_activity_enqueue_plan(
         } else {
             registry.default_activity_retry_policy()
         };
+        // The operator override replaces the code values of the activity. A
+        // value that the command carries still wins. An engine activity takes
+        // no override.
+        let code = crate::activity_defaults::ActivityDefaults::of(activity);
+        let defaults = if crate::activity_defaults::is_reserved_activity(&scheduled.name) {
+            code
+        } else {
+            registry
+                .run_defaults()
+                .apply_activity(&scheduled.name, code)
+        };
         let effective_retry = crate::policy::resolve_effective_retry(
             scheduled.retry_policy_override.clone(),
-            activity.default_retry_policy.clone(),
+            defaults.retry_policy.clone(),
             builder_retry_default,
         );
         if let Some(retry_policy) = effective_retry {
@@ -12007,7 +12053,7 @@ fn build_activity_enqueue_plan(
             params.retry_policy = Some(serde_json::to_value(retry_policy)?);
         }
 
-        if let Some(timeout) = activity.default_heartbeat_timeout {
+        if let Some(timeout) = defaults.heartbeat_timeout {
             params.heartbeat_timeout =
                 Some(chrono_duration_from_std(timeout, "heartbeat timeout")?);
         }
@@ -12017,14 +12063,14 @@ fn build_activity_enqueue_plan(
         // Issue #1808: an activity that declares its own attempt bound also
         // skips it. A `schedule_to_close` or a heartbeat timeout already stops
         // a hung attempt, so a 10-minute cap must not cut a long one short.
-        let builder_stc_default = if is_reserved || activity.declares_attempt_bound() {
+        let builder_stc_default = if is_reserved || defaults.declares_attempt_bound() {
             None
         } else {
             registry.default_activity_start_to_close()
         };
         let effective_stc = crate::policy::resolve_effective_start_to_close(
             scheduled.start_to_close_override,
-            activity.default_start_to_close,
+            defaults.start_to_close,
             builder_stc_default,
         );
         if let Some(timeout) = effective_stc {
@@ -12038,26 +12084,23 @@ fn build_activity_enqueue_plan(
         // start_to_close_override above. `None` for every ordinary activity.
         let effective_schedule_to_start = scheduled
             .schedule_to_start_override
-            .or(activity.default_schedule_to_start);
+            .or(defaults.schedule_to_start);
         if let Some(timeout) = effective_schedule_to_start {
             params.schedule_to_start = Some(chrono_duration_from_std(
                 timeout,
                 "schedule_to_start timeout",
             )?);
         }
-        if let Some(timeout) = activity.default_schedule_to_close {
+        if let Some(timeout) = defaults.schedule_to_close {
             let deadline = chrono::Utc::now()
                 + chrono_duration_from_std(timeout, "schedule_to_close timeout")?;
             params.schedule_to_close_at = Some(deadline);
         }
 
-        let effective_key = activity
-            .concurrency_key
-            .map(ToString::to_string)
-            .or_else(|| activity.max_concurrent.map(|_| activity.name.to_string()));
-        if let Some(key) = effective_key {
+        // The key is the code key. The cap takes the override.
+        if let (Some(key), cap) = registry.activity_concurrency(&scheduled.name) {
             params.concurrency_key = Some(key);
-            params.max_concurrent = activity.max_concurrent;
+            params.max_concurrent = cap;
         }
 
         if let Some(expr) = activity.rate_limit_key_expr {
@@ -27414,6 +27457,8 @@ async fn process_workflow_task(
                 registry.default_activity_retry_policy(),
                 registry.default_activity_start_to_close(),
             )
+            // A typed activity call resolves the operator override here.
+            .with_activity_overrides(Arc::clone(registry.run_defaults()))
             // Issue #2035: a live decision runs the admitted updates. A replay
             // gate does not, so it never runs a handler. The cut-off keeps the
             // dispatch inside the workflow-task budget.

@@ -291,6 +291,7 @@ impl Progress {
             error: None,
             resets: self.reset.count,
             answer_rejections: self.rejections.clone(),
+            parked_until_ms: self.parked_until,
         }
     }
 
@@ -2796,6 +2797,7 @@ async fn durable_peer(
         reply_to: Some(promise.id().to_string()),
         waiting,
         mesh: tree.outbox.mesh.clone(),
+        sample: None,
     };
     let key = format!("{}:{seq}", envelope.from);
     let sent = ctx
@@ -3353,6 +3355,7 @@ pub fn activities() -> Vec<ActivityInfo> {
         crate::answer_check::agent_answer_check_info(),
         crate::score::agent_sample_score_info(),
         crate::sampling::agent_sweep_items_info(),
+        crate::sampling::agent_vote_key_info(),
         crate::consolidate::agent_consolidate_read_info(),
         crate::consolidate::agent_consolidate_turn_info(),
         crate::consolidate::agent_consolidate_write_info(),

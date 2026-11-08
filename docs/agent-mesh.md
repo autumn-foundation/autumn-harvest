@@ -109,7 +109,7 @@ tokens. Keep the limit inside the context window of your model.
 A cut answer ends with `…[truncated]`. The result also has
 `"truncated": true`, the report sets `DelegationRecord::answer_truncated`,
 and the worker logs a warning. The peer lookup records the limit, so replay
-cuts each answer as the live run did. A run recorded before issue #2481
+cuts each answer as the live run did. A run recorded before 0.10.0
 keeps its old cut of 8 000 characters and has no `truncated` field.
 
 Tools key idempotency on `(run_id, step, call_id)`. A child has its own run
@@ -130,6 +130,7 @@ A mandate holds the authority of one agent:
 | `read_only` | Refuse every write and external call. | off |
 | `flow_labels` | The labels that a caller in another process sends. | none |
 | `models` | The harness models that the subtree may use. `None` means every model. | `None` |
+| `max_draws` | The most draws of one strategy run in the subtree. `None` leaves the cap to the sampling policy. | `None` |
 
 A mandate bounds its holder too. A root mandate with `tools(["lookup"])`
 gives the root agent only `lookup`.
@@ -141,6 +142,9 @@ gives the root agent only `lookup`.
 - `tools` is the meet of the parent tools and `Peer::tools`.
 - `max_depth` and `max_delegations` stay the same. They never grow.
 - `models` stays the same. `Mandate::accept` takes the meet of both lists.
+- `max_draws` is the smaller of the parent cap and `Peer::max_draws`.
+  `Mandate::accept` takes the smaller of both caps. No cap on both sides is
+  no cap.
 - `read_only` stays on once it is on.
 
 Property tests prove each rule (`a_delegation_never_widens_authority`).
@@ -177,12 +181,18 @@ verdict, and the report lists it:
 | `invalid_mandate` | `Mandate::accept` got a malformed mandate. |
 | `deadlock` | The durable peer waits on this agent, so it would never reply (section 13). |
 | `peer_unavailable` | The durable peer has no running run, or the roster names no valid agent id for it. |
+| `draws_exceeded` | A strategy run asks for more draws than `max_draws`. |
 
 A delegation runs the first eight checks in the order of the table.
 `Mandate::accept` returns `invalid_mandate`, `cycle` or `depth_exceeded`. A
 durable receiver returns `model_forbidden` when the accepted mandate does
 not allow its own model. Only a send to a durable peer returns `deadlock` or
 `peer_unavailable`.
+A strategy run returns `draws_exceeded`, then `fan_out_exhausted`, before
+its first draw. Each draw of best-of-N, rejection or a vote, and each tier
+of a cascade, counts as one delegation. The draws split the delegations left
+with `sibling_cap`. A beam checks `max_draws` only, because it counts its
+delegations per path.
 `Refusal` implements `std::error::Error`.
 
 The report keeps a peer name only when it is a valid agent name. Any other

@@ -35,8 +35,8 @@ use super::admit::{Refusal, SampleStep, SweepPlan, sample_step, sweep_plan};
 use super::draws::{read_policy, read_profile_versioned};
 use super::policy::{SamplingPolicy, ScorerRef};
 use super::sample::{
-    SAMPLE_WORKFLOW_NAME, SampleInput, SampleOutcome, SampleReport, SampleStop, SampleStrategy,
-    admit_sample,
+    OpSample, SAMPLE_WORKFLOW_NAME, SampleInput, SampleOutcome, SampleReport, SampleStop,
+    SampleStrategy, admit_sample, check_judge,
 };
 use crate::agent::overlay_store::OverlayVersion;
 use crate::bounds::{json_len, sibling_cap};
@@ -489,7 +489,14 @@ fn plan(policy: &SamplingPolicy, input: &SweepInput, total: u32) -> Result<Plan,
             max: policy.max_concurrent_draws.min(MAX_PARALLEL_CHILDREN),
         });
     };
-    admit_sample(policy, &item_input(input, &SweepItem::new(""), draws))?;
+    let probe = OpSample {
+        concurrency: NonZeroU32::new(draws),
+        ..OpSample::new(input.strategy.clone(), input.scorer.clone())
+    };
+    admit_sample(policy, &probe)?;
+    // A vote takes no scorer, and a sweep row needs one. So a sweep refuses
+    // a vote here, before its first item.
+    check_judge(&probe)?;
     Ok(Plan { items, draws })
 }
 

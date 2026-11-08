@@ -74,6 +74,9 @@ pub const OP_DAG_PATCH: &str = "dag.patch";
 /// Audit operation: Set, changed or cleared the run-default override of a
 /// workflow type (issue #2387).
 pub const OP_WORKFLOW_TYPE_RUN_DEFAULTS: &str = "workflow_type.run_defaults";
+/// Audit operation: Set, changed or cleared the default override of an
+/// activity type.
+pub const OP_ACTIVITY_TYPE_DEFAULTS: &str = "activity_type.defaults";
 /// Audit operation: Set the sampling policy of an agent kind (issue #2439).
 pub const OP_AGENT_SAMPLING_POLICY_SET: &str = "agent.sampling_policy.set";
 /// Audit operation: Reset the sampling policy of an agent kind to every
@@ -339,6 +342,8 @@ pub const TARGET_AUDIT_EXPORT: &str = "audit_export";
 pub const TARGET_ROUTE: &str = "route";
 /// Audit target type: a registered workflow type (issue #2387).
 pub const TARGET_WORKFLOW_TYPE: &str = "workflow_type";
+/// Audit target type: a registered activity type.
+pub const TARGET_ACTIVITY_TYPE: &str = "activity_type";
 /// Audit target type: an agent kind (issue #2439).
 pub const TARGET_AGENT_KIND: &str = "agent_kind";
 /// Audit target type: the overlay pointer of one agent kind (issue #2374).
@@ -583,6 +588,15 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
     ),
     (
         "PATCH /admin/workflow-types/{workflow_name}/run-defaults",
+        RouteClass::Mutating,
+    ),
+    // Default overrides of an activity type.
+    (
+        "GET /admin/activity-types/{activity_name}/defaults",
+        RouteClass::ReadOnly,
+    ),
+    (
+        "PATCH /admin/activity-types/{activity_name}/defaults",
         RouteClass::Mutating,
     ),
     // The sampling policy of an agent kind (issue #2439). Only an operator
@@ -1005,6 +1019,7 @@ pub const AUDITED_OPERATIONS: &[&str] = &[
     OP_DAG_TRIGGER,
     OP_DAG_PATCH,
     OP_WORKFLOW_TYPE_RUN_DEFAULTS,
+    OP_ACTIVITY_TYPE_DEFAULTS,
     OP_AGENT_SAMPLING_POLICY_SET,
     OP_AGENT_SAMPLING_POLICY_RESET,
     OP_AGENT_PROFILE_ACTIVATE,
@@ -1376,6 +1391,12 @@ pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
     (
         "PATCH /admin/workflow-types/{workflow_name}/run-defaults",
         Some(OP_WORKFLOW_TYPE_RUN_DEFAULTS),
+    ),
+    // Default overrides of an activity type.
+    ("GET /admin/activity-types/{activity_name}/defaults", None),
+    (
+        "PATCH /admin/activity-types/{activity_name}/defaults",
+        Some(OP_ACTIVITY_TYPE_DEFAULTS),
     ),
     // The sampling policy of an agent kind (issue #2439).
     ("GET /admin/agents/{kind}/sampling-policy", None),

@@ -28,7 +28,7 @@ is [`DESIGN-2471.md`](design/DESIGN-2471.md).
 
 ```toml
 [dependencies]
-autumn-web = { version = "0.9", features = ["sqlite"] }
+autumn-web = { version = "0.10", features = ["sqlite"] }
 autumn-harvest = { version = "0.10", default-features = false }
 autumn-harvest-plugin = { version = "0.10", features = ["sqlite"] }
 ```
@@ -547,6 +547,9 @@ ones.
   100 ms, because SQLite has no `LISTEN`. It sends a progress frame on each
   change of state. This backend stores no `current_details`, so a frame
   names the state, and `status` reads `current_details: null`.
+  The plugin needs its `mcp` feature and `.mcp_tools()`. Without them, the
+  plugin serves no tools and logs a `WARN` for each `mcp` workflow
+  (issue #2488).
 - **MCP tasks.** A task reads its live run and its open signal waits from
   the file. An answer is delivered with its input key as the signal key, so
   a retried answer is a no-op. A start key in `Idempotency-Key` or the task

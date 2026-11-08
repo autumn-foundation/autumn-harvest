@@ -197,6 +197,8 @@ pub fn test_partitioned_layout_requested() -> bool {
     })
 }
 
+/// Operator overrides for the defaults of an activity type.
+pub mod activity_defaults;
 /// Per-activity-type pause/resume for surgical outage containment (issue #807).
 pub mod activity_pause;
 /// Live progress from inside an activity (issue #2268).

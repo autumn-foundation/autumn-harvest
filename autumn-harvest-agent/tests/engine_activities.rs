@@ -298,6 +298,7 @@ fn the_engine_registration_builds() {
             "agent_answer_check",
             "agent_sample_score",
             "agent_sweep_items",
+            "agent_vote_key",
             "agent_consolidate_read",
             "agent_consolidate_turn",
             "agent_consolidate_write",

@@ -6,6 +6,8 @@
 // attribute with its reason.
 #![warn(clippy::expect_used, clippy::unwrap_used)]
 
+/// `GET` and `PATCH /admin/activity-types/{activity_name}/defaults`.
+mod activity_defaults_api;
 pub mod api;
 /// Optional per-client rate limiting for the management API (issue #1827).
 pub mod api_rate_limit;
