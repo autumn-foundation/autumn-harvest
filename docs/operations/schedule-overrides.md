@@ -112,19 +112,30 @@ change the override, and clearing the override does not resume the DAG.
   that owns the DAG. When a routing change moves the DAG, the old shard's pass
   copies the override to the new owner, then deletes its own row. The copy
   commits first, so a failure leaves the override on at least one shard, and
-  the next tick retries. An override that the new owner already holds wins.
-  If the new owner comes later in shard order, it applies the override in the
+  the next tick retries. The newer override wins (issue #2602): a copy
+  replaces an older row on the new owner and keeps a newer one. If the new
+  owner comes later in shard order, it applies the override in the
   same tick. Otherwise it runs one tick on the code value first. Two shards on
   one pool share one table, so nothing moves between them.
 - **The move and DR (issue #2413).** The move holds the DR fence of both
   shards. A process that loses authority mid-move writes nothing after the
   promotion. A fenced shard skips the move, and the next tick tries again.
-- **A clear during a retried move (issue #2413).** The copy records the
-  version that it delivered in `harvest_schedule_override_receipts` on the
-  new owner. A retry after a failed source delete finds that record, so it
-  does not copy the row again. A clear on the new owner then stays. Change
-  the routing again only after each move ends: issue #2602 covers a routing
-  change while a stale row stays on the old shard.
+- **A clear stays (issues #2413, #2602).** The `updated_at` of an override
+  is its version. Each shard keeps a floor in
+  `harvest_schedule_override_receipts`. A replace raises it to the old
+  version. A clear raises it to a new version, also when no row is there.
+  A move skips a version at or below the floor of the new owner. A move
+  also carries the floor to the owner, and there it removes an older row.
+  So a stale copy never brings back a clear, also after a routing change.
+  Until the floor arrives, the owner can run the stale row for one tick.
+- **Clock skew.** A set or a clear takes a version above all that its own
+  shard knows. Two writes on two shards are ordered by their clocks. A set
+  that comes later than a clear on another shard, but by less than the
+  clock skew, can lose to that clear.
+- **Routing changes at any time (issue #2602).** A move holds the
+  registration lock of both shards from its read to its delete. So two
+  moves in opposite directions, for example from two processes with two
+  routers, wait for each other. The override stays on one shard.
 
 ## Code-declared workflow schedules
 

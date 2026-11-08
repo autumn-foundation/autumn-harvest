@@ -1678,7 +1678,8 @@ impl ShardPass<'_> {
 }
 
 /// Move each DAG override that this shard holds for another shard to its new
-/// owner (issue #2389).
+/// owner (issue #2389). A floor of such a DAG moves too, also with no row
+/// (issue #2602).
 ///
 /// A routing change moves a DAG's schedule row to a new shard. Its override
 /// must move too, or the new owner reconciles the row to the code value. The
@@ -1690,7 +1691,7 @@ impl ShardPass<'_> {
 /// pool. The DAGs move in one group per owner. Each group runs under the DR
 /// fence of both shards. See [`carry_to_owner`]. A group whose pass stops
 /// ends the backend of `conn`, so the remaining groups wait for the next
-/// tick.
+/// tick. A lock wait that times out stops its group too.
 ///
 /// A failure is logged, and the next tick retries the move. Two shards of one
 /// pool share one table, so nothing moves between them.
@@ -1702,8 +1703,22 @@ async fn carry_misplaced_overrides(
     router: &ShardRouter,
 ) {
     let (shard, _) = source;
+    // Issue #2602: a floor moves to the owner too, also with no row.
+    let mut names: BTreeSet<String> = misplaced.iter().cloned().collect();
+    match crate::schedule_override::dag_floor_names(conn).await {
+        Ok(floors) => names.extend(
+            floors
+                .into_iter()
+                .filter(|dag_name| router.pick_for_dag(dag_name) != shard),
+        ),
+        Err(error) => tracing::warn!(
+            error = %error,
+            shard_id = shard.as_i32(),
+            "harvest: could not read the override floors; the next tick retries"
+        ),
+    }
     let mut by_owner: BTreeMap<ShardId, Vec<&str>> = BTreeMap::new();
-    for dag_name in misplaced {
+    for dag_name in &names {
         by_owner
             .entry(router.pick_for_dag(dag_name))
             .or_default()
@@ -1772,7 +1787,16 @@ async fn carry_to_owner(
                 conn, &mut to, from_shard, to_shard, dag_name,
             )
             .await;
+            // A lock wait that timed out stops the group. So the guards hold
+            // off a bump for one carry at most.
+            let timed_out = matches!(
+                &moved,
+                Err(error) if crate::partition::is_lock_timeout(&error.to_string())
+            );
             log_carry(dag_name, from_shard, to_shard, moved);
+            if timed_out {
+                break;
+            }
         }
     };
     match crate::replication::run_fenced_pass(&fence, Box::pin(pass)).await {

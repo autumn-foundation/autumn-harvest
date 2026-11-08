@@ -172,6 +172,10 @@ wins over a copy, also when it is older. That rule predates this change.
 
 ## Limits
 
+Issue #2602 closes the first three limits below and replaces "the owner row
+wins". See `docs/design/DESIGN-2602.md`. The text below is the record of
+this design.
+
 The design holds when a routing change lands only while no carry runs and
 no shard but the owner holds a row. Two configs show what breaks without
 that. Both gaps predate this change. Issue #2602 tracks them.
