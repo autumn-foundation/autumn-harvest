@@ -5,8 +5,9 @@
 //! `complete_external` or `fail_external`. The deadline fires through the
 //! durable timer path. Each test runs on a controlled clock, so no test sleeps.
 
-// The `#[workflow]` macro references its input through the expansion.
-#![allow(clippy::used_underscore_binding)]
+// The `#[workflow]` macro references its input through the expansion. One
+// test workflow polls a future once and never awaits.
+#![allow(clippy::used_underscore_binding, clippy::unused_async)]
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -777,4 +778,176 @@ async fn pending_work_does_not_list_the_deadline_as_a_timer() {
     let reader = autumn_harvest_sqlite::SqliteReader::open(&path).unwrap();
     let work = reader.pending_work(exec).unwrap();
     assert!(work.timers.is_empty(), "{work:?}");
+}
+
+/// Counts the rows of `exec` in `table`, with an optional extra condition.
+fn count_rows(path: &std::path::Path, table: &str, exec: ExecutionId, extra: &str) -> i64 {
+    let conn = rusqlite::Connection::open(path).unwrap();
+    conn.query_row(
+        &format!("SELECT COUNT(*) FROM {table} WHERE exec_id = ?1 {extra}"),
+        [exec.to_string()],
+        |row| row.get(0),
+    )
+    .unwrap()
+}
+
+/// A runtime on a file, so a raw connection can read its rows.
+fn file_runtime(path: &std::path::Path, clock: &Clock) -> SqliteRuntime {
+    let mut rt = SqliteRuntime::open(path).unwrap();
+    clock.install(&mut rt);
+    rt.register_workflow(&bridge_info());
+    rt
+}
+
+#[tokio::test]
+async fn a_settle_leaves_no_unfired_deadline_timer() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("harvest.sqlite3");
+    let clock = Clock::at(T0);
+    let mut rt = file_runtime(&path, &clock);
+    let (exec, token) = parked(&mut rt, 60).await;
+    assert_eq!(
+        count_rows(&path, "harvest_timers", exec, "AND fired = 0"),
+        1
+    );
+
+    assert!(rt.fail_external(token, "busy", true).unwrap());
+    assert_eq!(
+        count_rows(&path, "harvest_timers", exec, "AND fired = 0"),
+        0
+    );
+    assert!(rt.load_history(exec).unwrap().iter().any(|e| matches!(
+        e,
+        WorkflowEvent::ActivityFailedExternally {
+            retryable: true,
+            ..
+        }
+    )));
+}
+
+#[tokio::test]
+async fn a_purge_removes_the_handoff_rows_of_a_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("harvest.sqlite3");
+    let clock = Clock::at(T0);
+    let mut rt = file_runtime(&path, &clock);
+    let (exec, token) = parked(&mut rt, 60).await;
+    assert!(rt.complete_external(token, json!(1)).unwrap());
+    assert!(matches!(
+        rt.run_until_blocked(exec).await.unwrap(),
+        RunState::Completed(_)
+    ));
+    assert_eq!(count_rows(&path, "harvest_external_tasks", exec, ""), 1);
+
+    let purged = rt
+        .purge_terminal_as_of(
+            Utc::now() + chrono::Duration::hours(2),
+            Duration::from_secs(3600),
+        )
+        .unwrap();
+    assert_eq!(purged, 1);
+    assert_eq!(count_rows(&path, "harvest_external_tasks", exec, ""), 0);
+}
+
+#[tokio::test]
+async fn a_file_without_the_table_gains_it_on_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("harvest.sqlite3");
+    drop(SqliteRuntime::open(&path).unwrap());
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute_batch("DROP TABLE harvest_external_tasks;")
+        .unwrap();
+
+    let clock = Clock::at(T0);
+    let mut rt = file_runtime(&path, &clock);
+    let (_exec, token) = parked(&mut rt, 60).await;
+    assert!(rt.complete_external(token, json!(1)).unwrap());
+}
+
+/// Polls an external activity once, then returns without its result.
+#[workflow]
+async fn drops_external(ctx: &WorkflowContext, _n: i64) -> Result<i64, String> {
+    let mut reply = std::pin::pin!(ctx.execute_activity_external("a", json!({}), "camel", 60));
+    let _ = std::future::Future::poll(
+        reply.as_mut(),
+        &mut std::task::Context::from_waker(std::task::Waker::noop()),
+    );
+    Ok(7)
+}
+
+#[tokio::test]
+async fn an_unawaited_external_in_the_last_cycle_records_nothing() {
+    let clock = Clock::at(T0);
+    let mut rt = runtime(&clock);
+    rt.register_workflow(&drops_external_info());
+    let exec = rt.start_workflow("drops_external", json!(0)).unwrap();
+    assert!(matches!(
+        rt.run_until_blocked(exec).await.unwrap(),
+        RunState::Completed(ref v) if v == &json!(7)
+    ));
+    assert!(
+        !rt.load_history(exec)
+            .unwrap()
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::ActivityAwaitingExternal { .. }))
+    );
+    assert_eq!(
+        rt.list_external_handoffs(&ExternalHandoffFilter::new())
+            .unwrap(),
+        Vec::new()
+    );
+}
+
+/// Awaits a child that awaits an external activity.
+#[workflow]
+async fn awaits_bridging_child(ctx: &WorkflowContext, _n: i64) -> Result<Value, String> {
+    ctx.spawn_child_workflow_raw("bridge", json!(60))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tokio::test]
+async fn a_child_that_waits_on_an_external_activity_resumes_its_parent() {
+    let clock = Clock::at(T0);
+    let mut rt = runtime(&clock);
+    rt.register_workflow(&awaits_bridging_child_info());
+    let parent = rt
+        .start_workflow("awaits_bridging_child", json!(0))
+        .unwrap();
+
+    let RunState::WaitingWorkflow(child) = rt.run_until_blocked(parent).await.unwrap() else {
+        panic!("expected the parent to wait on its child");
+    };
+    let rows = rt
+        .list_external_handoffs(&ExternalHandoffFilter::pending())
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].execution_id, child);
+
+    assert!(rt.complete_external(rows[0].token, json!("pong")).unwrap());
+    let state = rt.run_until_blocked(parent).await.unwrap();
+    assert!(
+        matches!(state, RunState::Completed(ref v) if v == &json!("ok:\"pong\"")),
+        "{state:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_extension_of_an_ended_run_is_refused() {
+    let clock = Clock::at(T0);
+    let mut rt = runtime(&clock);
+    let (exec, token) = parked(&mut rt, 60).await;
+    rt.terminate(exec, "stop").unwrap();
+    let late = rt.extend_external_deadline(token, Duration::from_secs(5));
+    assert!(
+        matches!(
+            late,
+            Err(SqliteError::ExternalTaskNotPending {
+                state: ExternalTaskState::Cancelled,
+                ..
+            })
+        ),
+        "{late:?}"
+    );
 }

@@ -237,14 +237,21 @@ async fn await_event(conn: &mut AsyncPgConnection, root: ExecutionId, event: &st
     }
 }
 
-/// The token of the one pending external activity named `activity`.
+/// The token of the one pending external activity named `activity` of
+/// `root`.
 ///
 /// The decision transaction writes the row with its event. A scenario awaits
-/// the event first, so one read finds the row.
-async fn pending_token(conn: &mut AsyncPgConnection, activity: &str) -> ExternalActivityToken {
+/// the event first, so one read finds the row. The run filter keeps a row
+/// of an earlier run on a shared database out of the read.
+async fn pending_token(
+    conn: &mut AsyncPgConnection,
+    root: ExecutionId,
+    activity: &str,
+) -> ExternalActivityToken {
     let filters = ExternalHandoffFilters {
         states: vec!["PENDING".to_owned()],
         activity_name: Some(activity.to_owned()),
+        execution_id: Some(root),
         ..ExternalHandoffFilters::default()
     };
     let rows = external_task::list_external_handoffs(conn, &filters)
@@ -263,7 +270,7 @@ async fn run_steps(conn: &mut AsyncPgConnection, root: ExecutionId, steps: &[Ste
             Step::AwaitEvent { event, count } => await_event(conn, root, event, *count).await,
             Step::Run(hook) => hook(),
             Step::CompleteExternal { activity, output } => {
-                let token = pending_token(conn, activity).await;
+                let token = pending_token(conn, root, activity).await;
                 let settled = external_task::complete_externally(conn, token, output.clone())
                     .await
                     .expect("complete the external activity");
@@ -274,7 +281,7 @@ async fn run_steps(conn: &mut AsyncPgConnection, root: ExecutionId, steps: &[Ste
                 error,
                 retryable,
             } => {
-                let token = pending_token(conn, activity).await;
+                let token = pending_token(conn, root, activity).await;
                 let settled =
                     external_task::fail_externally(conn, token, (*error).to_owned(), *retryable)
                         .await

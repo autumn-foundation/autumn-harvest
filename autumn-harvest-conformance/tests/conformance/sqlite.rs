@@ -113,11 +113,19 @@ impl Driver {
         }
     }
 
-    /// The token of the one pending external activity named `activity`.
-    fn pending_token(&self, activity: &str) -> autumn_harvest::types::ExternalActivityToken {
+    /// The token of the one pending external activity named `activity` of
+    /// `root`.
+    fn pending_token(
+        &self,
+        root: ExecutionId,
+        activity: &str,
+    ) -> autumn_harvest::types::ExternalActivityToken {
+        let filter = ExternalHandoffFilter::pending()
+            .activity_name(activity)
+            .execution_id(root);
         let rows = self
             .rt
-            .list_external_handoffs(&ExternalHandoffFilter::pending().activity_name(activity))
+            .list_external_handoffs(&filter)
             .expect("read the pending handoffs");
         assert_eq!(rows.len(), 1, "sqlite: expected one pending {activity}");
         rows[0].token
@@ -248,7 +256,7 @@ impl Driver {
                 }
                 Step::Run(hook) => hook(),
                 Step::CompleteExternal { activity, output } => {
-                    let token = self.pending_token(activity);
+                    let token = self.pending_token(root, activity);
                     let settled = self
                         .rt
                         .complete_external(token, output.clone())
@@ -260,7 +268,7 @@ impl Driver {
                     error,
                     retryable,
                 } => {
-                    let token = self.pending_token(activity);
+                    let token = self.pending_token(root, activity);
                     let settled = self
                         .rt
                         .fail_external(token, *error, *retryable)
