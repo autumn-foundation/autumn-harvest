@@ -65,6 +65,7 @@ pub use autumn_harvest_sqlite::{
 
 use crate::api::HarvestApiState;
 use crate::config::{HarvestMode, HarvestRuntimeConfig, HarvestSqliteConfig};
+use crate::mcp_unserved::warn_if_mcp_unserved;
 use driver::{Driver, Registry, Retention};
 
 /// The epic that tracks every surface this slice does not port.
@@ -134,8 +135,6 @@ macro_rules! mcp_mounted {
         false
     };
 }
-
-use crate::mcp_unserved::warn_if_mcp_unserved;
 
 struct StartParts {
     workflows: Vec<autumn_harvest::info::WorkflowInfo>,
@@ -214,6 +213,7 @@ pub(crate) fn build(app: AppBuilder, parts: SqliteParts) -> AppBuilder {
         retention: builder.retention_config().clone(),
     };
     warn_if_mcp_unserved(
+        "sqlite",
         &start_parts.workflows,
         &start_parts.updates,
         mcp_mounted!(mcp),

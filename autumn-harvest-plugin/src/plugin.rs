@@ -1888,6 +1888,7 @@ impl HarvestPlugin {
                 sqlite_per_tenant: _,
         } = self;
         crate::mcp_unserved::warn_if_mcp_unserved(
+            "postgres",
             builder.workflow_infos(),
             builder.update_handlers(),
             mcp_tools_enabled || mcp_tasks_enabled,

@@ -7,10 +7,16 @@
 
 use autumn_harvest::{UpdateHandlerInfo, WorkflowInfo};
 
+/// The most names the warning lists. A longer list shows a count only.
+const MAX_NAMES: usize = 10;
+
 /// Log one `WARN` when a registered `mcp` flag has no mounted MCP route.
 ///
 /// `mounted` is true when the plugin mounts MCP tool or task routes.
+/// An update counts only when its workflow sets `mcp`, as the tool
+/// generator requires. `backend` names the store in the log line.
 pub fn warn_if_mcp_unserved(
+    backend: &str,
     workflows: &[WorkflowInfo],
     updates: &[UpdateHandlerInfo],
     mounted: bool,
@@ -18,22 +24,26 @@ pub fn warn_if_mcp_unserved(
     if mounted {
         return;
     }
-    let flows: Vec<&str> = workflows
+    let mut names: Vec<String> = workflows
         .iter()
         .filter(|info| info.mcp)
-        .map(|info| info.name)
+        .map(|info| info.name.to_owned())
         .collect();
-    let upds: Vec<String> = updates
-        .iter()
-        .filter(|info| info.mcp)
-        .map(|info| format!("{}::{}", info.workflow, info.name))
-        .collect();
-    if flows.is_empty() && upds.is_empty() {
+    names.extend(
+        updates
+            .iter()
+            .filter(|info| info.mcp && workflows.iter().any(|w| w.mcp && w.name == info.workflow))
+            .map(|info| format!("{}::{}", info.workflow, info.name)),
+    );
+    if names.is_empty() {
         return;
     }
+    let total = names.len();
+    names.truncate(MAX_NAMES);
     tracing::warn!(
-        workflows = %flows.join(","),
-        updates = %upds.join(","),
+        backend,
+        total,
+        names = %names.join(","),
         "these `mcp` workflows and updates expose no MCP tools, because no MCP route is mounted. \
          Enable the `mcp` feature of autumn-harvest-plugin. \
          Then call `HarvestPlugin::mcp_tools()` or `HarvestPlugin::mcp_tasks()`. \
@@ -125,7 +135,7 @@ mod tests {
     #[test]
     fn an_mcp_workflow_with_no_route_warns_once_and_names_it() {
         let flows = [workflow("review", true), workflow("audit", true)];
-        let logged = warnings_during(|| warn_if_mcp_unserved(&flows, &[], false));
+        let logged = warnings_during(|| warn_if_mcp_unserved("test", &flows, &[], false));
         assert_eq!(logged.matches("WARN").count(), 1, "{logged}");
         assert!(
             logged.contains("review") && logged.contains("audit"),
@@ -143,7 +153,7 @@ mod tests {
     fn a_mounted_route_does_not_warn() {
         let flows = [workflow("review", true)];
         let updates = [update("approve", "review", true)];
-        let logged = warnings_during(|| warn_if_mcp_unserved(&flows, &updates, true));
+        let logged = warnings_during(|| warn_if_mcp_unserved("test", &flows, &updates, true));
         assert!(logged.is_empty(), "{logged}");
     }
 
@@ -152,17 +162,42 @@ mod tests {
     fn a_workflow_without_mcp_does_not_warn() {
         let flows = [workflow("plain", false)];
         let updates = [update("poke", "plain", false)];
-        let logged = warnings_during(|| warn_if_mcp_unserved(&flows, &updates, false));
+        let logged = warnings_during(|| warn_if_mcp_unserved("test", &flows, &updates, false));
         assert!(logged.is_empty(), "{logged}");
     }
 
-    /// An `mcp` update alone also warns, and the message names it.
+    /// An `mcp` update of an `mcp` workflow is named as `workflow::update`.
     #[test]
-    fn an_mcp_update_with_no_route_warns() {
+    fn an_mcp_update_of_an_mcp_workflow_is_named() {
+        let flows = [workflow("review", true)];
+        let updates = [update("approve", "review", true)];
+        let logged = warnings_during(|| warn_if_mcp_unserved("test", &flows, &updates, false));
+        assert_eq!(logged.matches("WARN").count(), 1, "{logged}");
+        assert!(logged.contains("names=review,review::approve"), "{logged}");
+        assert!(logged.contains("total=2"), "{logged}");
+    }
+
+    /// An `mcp` update of a plain workflow exposes nothing, so it is silent.
+    #[test]
+    fn an_mcp_update_of_a_plain_workflow_does_not_warn() {
         let flows = [workflow("plain", false)];
         let updates = [update("approve", "plain", true)];
-        let logged = warnings_during(|| warn_if_mcp_unserved(&flows, &updates, false));
-        assert_eq!(logged.matches("WARN").count(), 1, "{logged}");
-        assert!(logged.contains("plain::approve"), "{logged}");
+        let logged = warnings_during(|| warn_if_mcp_unserved("test", &flows, &updates, false));
+        assert!(logged.is_empty(), "{logged}");
+    }
+
+    /// A long list shows the first names and the full count.
+    #[test]
+    fn a_long_list_is_capped_with_the_full_count() {
+        const NAMES: [&str; 12] = [
+            "w00", "w01", "w02", "w03", "w04", "w05", "w06", "w07", "w08", "w09", "w10", "w11",
+        ];
+        let flows: Vec<_> = NAMES.iter().map(|name| workflow(name, true)).collect();
+        let logged = warnings_during(|| warn_if_mcp_unserved("test", &flows, &[], false));
+        assert!(logged.contains("total=12"), "{logged}");
+        assert!(
+            logged.contains("w09") && !logged.contains("w10"),
+            "{logged}"
+        );
     }
 }

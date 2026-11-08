@@ -20,10 +20,11 @@ through the real, authenticated handler pipeline.
 **MCP tool exposure needs the plugin.** Use `autumn-harvest-plugin` with its
 `mcp` feature, on Postgres or on SQLite. A bare `SqliteRuntime` has no HTTP
 edge. There `#[workflow(mcp)]` has no effect: the workflow runs, and no tools
-appear. Registration logs a `WARN` that names the workflow (issue #2488).
+appear. A bare runtime logs a `WARN` at registration that names the workflow
+(issue #2488). The plugin warns at build instead, as the next paragraph says.
 
 **An unserved `mcp` flag logs one warning at build.** The plugin checks
-every registered workflow and update. If one sets `mcp` and no MCP route is
+every registered workflow, and each update of an `mcp` workflow. If one sets `mcp` and no MCP route is
 mounted, the build logs one `WARN` that names them. Two cases trigger it: the
 `mcp` feature is off, or the app calls neither `.mcp_tools()` nor
 `.mcp_tasks()`. The workflows still run. Postgres and SQLite give the same
