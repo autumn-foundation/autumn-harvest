@@ -4708,6 +4708,24 @@ impl HistoryMatcher {
         self.match_signal_inner(signal_name, Some(settle_marker), None)
     }
 
+    /// Is the event at `index` the marker `name`?
+    ///
+    /// A race can settle on its first poll from a signal that arrived before
+    /// it opened. It then arms no other branch, so its winner marker follows
+    /// its open marker. On replay, a timer, activity or child branch meets
+    /// that marker where its own start event would be.
+    pub(crate) fn is_marker_at(&self, index: Option<i32>, name: &str) -> bool {
+        index
+            .and_then(|index| usize::try_from(index).ok())
+            .and_then(|index| self.events.get(index))
+            .is_some_and(|event| {
+                matches!(
+                    event,
+                    WorkflowEvent::MarkerRecorded { name: recorded, .. } if recorded == name
+                )
+            })
+    }
+
     /// `tolerate_interleaved` carries the race's settlement-marker name when the
     /// caller is a `ctx.race()` branch, and is `None` for a solo
     /// `wait_for_signal`.

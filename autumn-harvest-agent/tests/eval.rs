@@ -56,6 +56,24 @@ impl Delivery for Inbox {
     }
 }
 
+/// A delivery that keeps every approval notice.
+#[derive(Debug, Default)]
+struct Pager(Mutex<Vec<autumn_harvest_agent::delivery::ApprovalNotice>>);
+
+impl Delivery for Pager {
+    fn deliver<'a>(&'a self, _report: &'a Report) -> BoxFuture<'a, Result<(), AgentError>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn notify_approval<'a>(
+        &'a self,
+        notice: &'a autumn_harvest_agent::delivery::ApprovalNotice,
+    ) -> BoxFuture<'a, Result<(), AgentError>> {
+        self.0.lock().unwrap().push(notice.clone());
+        Box::pin(async { Ok(()) })
+    }
+}
+
 /// Run `task` to its end on SQLite with the scripted `replies` and a
 /// read-only `lookup` tool. Returns the recorded history.
 async fn record(task: &AgentTask, replies: Vec<Reply>) -> Vec<WorkflowEvent> {
@@ -344,6 +362,28 @@ async fn no_report_is_delivered_during_evaluation() {
 
     assert!(!evaluation.diverged());
     assert!(inbox.0.lock().unwrap().is_empty(), "nothing is delivered");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn no_approval_notice_is_sent_during_evaluation() {
+    let source = one_lookup().await;
+    // The candidate policy gates every read, so its call parks.
+    let model = ScriptedModel::new(vec![
+        calls(&[("c1", "lookup", json!({"q": "x"}))], 5),
+        answer("done", 5),
+    ]);
+    let (harness, _) = candidate(model);
+    let pager = Arc::new(Pager::default());
+    let gate = ToolRules::new().effect(ToolEffect::ReadOnly, Rule::Ask);
+    let harness = harness.policy(Arc::new(gate)).delivery(pager.clone());
+
+    let evaluation = evaluate(&source, &Candidate::new(harness)).await.unwrap();
+
+    let RunEnd::Completed(report) = &evaluation.candidate else {
+        panic!("the candidate completes: {:?}", evaluation.candidate);
+    };
+    assert!(tool_results(report)[0].contains("no approval arrived"));
+    assert!(pager.0.lock().unwrap().is_empty(), "no notice leaves");
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -4,7 +4,8 @@
 //! before any write, so the source history stays the same.
 //!
 //! The other tests start a run with a probe mark. They check the gate of
-//! the tool-call activity, the delivery and the durable peer refusal.
+//! the tool-call activity, the delivery, the approval notice and the
+//! durable peer refusal.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -176,6 +177,59 @@ async fn a_probe_run_sends_no_report() {
         1,
         "a probe delivers nothing"
     );
+}
+
+/// A delivery that counts approval notices.
+#[derive(Debug, Default)]
+struct CountingNotices(AtomicUsize);
+
+impl Delivery for CountingNotices {
+    fn deliver<'a>(&'a self, _report: &'a Report) -> BoxFuture<'a, Result<(), AgentError>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn notify_approval<'a>(
+        &'a self,
+        _notice: &'a autumn_harvest_agent::ApprovalNotice,
+    ) -> BoxFuture<'a, Result<(), AgentError>> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async { Ok(()) })
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_probe_run_sends_no_approval_notice() {
+    use autumn_harvest_agent::{Rule, ToolRules};
+    use autumn_harvest_sqlite::RunState;
+
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let notices = Arc::new(CountingNotices::default());
+    let recorder = Arc::new(Recorder::default());
+    let lookup = || calls(&[("c1", "lookup", json!({}))], 2);
+    let harness = AgentHarness::new(ScriptedModel::new(vec![lookup(), lookup()]))
+        .tool(recorded_tool("lookup", ToolEffect::ReadOnly, &recorder))
+        .policy(Arc::new(
+            ToolRules::new().effect(ToolEffect::ReadOnly, Rule::Ask),
+        ))
+        .delivery(Arc::clone(&notices) as Arc<dyn Delivery>);
+    let mut rt = runtime(&dir.path().join("agent.db"), harness);
+    let mut task = AgentTask::new("Check the account.");
+
+    let plain = sqlite::start(&mut rt, &task).unwrap();
+    let parked = rt.run_until_blocked(plain).await.unwrap();
+    assert!(matches!(parked, RunState::WaitingSignal(_)), "{parked:?}");
+    assert_eq!(notices.0.load(Ordering::SeqCst), 1, "a plain run notifies");
+
+    task.probe = Some(mark());
+    let probe = sqlite::start(&mut rt, &task).unwrap();
+    let parked = rt.run_until_blocked(probe).await.unwrap();
+    assert!(matches!(parked, RunState::WaitingSignal(_)), "{parked:?}");
+    assert_eq!(
+        notices.0.load(Ordering::SeqCst),
+        1,
+        "a probe sends no notice"
+    );
+    assert!(recorder.runs().is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread")]

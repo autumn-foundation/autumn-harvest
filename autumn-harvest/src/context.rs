@@ -13456,7 +13456,7 @@ impl WorkflowContext {
                     } else {
                         self.match_history(|m| m.match_activity(name))
                     };
-                    match history_match {
+                    match self.unarmed_branch(history_match, &winner_marker_name) {
                         HistoryMatch::Matched { output } => resolved.push((index, Ok(output))),
                         HistoryMatch::Failed {
                             error,
@@ -13523,7 +13523,7 @@ impl WorkflowContext {
                 } => {
                     let history_match =
                         self.match_history(|m| m.match_child_workflow(workflow_name, input));
-                    match history_match {
+                    match self.unarmed_branch(history_match, &winner_marker_name) {
                         HistoryMatch::Matched { output } => resolved.push((index, Ok(output))),
                         HistoryMatch::Failed {
                             error,
@@ -13602,7 +13602,7 @@ impl WorkflowContext {
                     let timer_id = race_timer_id(seq, index);
                     let history_match = self
                         .match_history(|m| m.match_timer_strict(&timer_id, Some(*duration_secs)));
-                    match history_match {
+                    match self.unarmed_branch(history_match, &winner_marker_name) {
                         HistoryMatch::Matched { .. } => {
                             // Keep ctx.now() in step with the recorded fire.
                             // `_to` (max), not `advance_timer_clock` (sum):
@@ -13933,6 +13933,27 @@ impl WorkflowContext {
             vec![(winner_index, winner_result)],
             &to_dispatch,
         )
+    }
+
+    /// Read a race branch that met the winner marker of its own race as
+    /// `NoMatch`.
+    ///
+    /// A race can settle on its first poll from a signal that arrived before
+    /// it opened. That poll arms no timer, activity or child branch, so the
+    /// winner marker follows the open marker. Replay then meets the marker
+    /// where such a branch looks for its start event. That branch was never
+    /// armed, so `NoMatch` repeats the first poll. Any other mismatch stays a
+    /// divergence. If no branch resolves, the marker stays unconsumed, and the
+    /// end-of-cycle drift guard still fails the cycle.
+    fn unarmed_branch(&self, matched: HistoryMatch, winner_marker: &str) -> HistoryMatch {
+        match matched {
+            HistoryMatch::Diverged { event_index, .. }
+                if self.match_history(|m| m.is_marker_at(event_index, winner_marker)) =>
+            {
+                HistoryMatch::NoMatch
+            }
+            other => other,
+        }
     }
 
     /// Decide (and, on the first cycle a winner is known, durably record) the

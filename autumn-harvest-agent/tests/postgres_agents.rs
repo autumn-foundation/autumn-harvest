@@ -9,6 +9,8 @@
 //! - `pause_mesh` pauses each running agent of one mesh, and no other.
 //! - `LedgerSpend` sums the tokens of the runs of one mesh.
 //! - A heartbeat tick runs and reports.
+//! - A gated call of a durable agent sends one approval notice. `decide`
+//!   takes its signal.
 //! - One consolidation firing serves each agent of a scheduled kind, and
 //!   skips an idle agent and an agent whose pass still runs.
 //! - A two-shard target finds the run on the shard that the router picked.
@@ -36,7 +38,7 @@ use autumn_harvest::worker::{DbPool, Worker, WorkerRuntimeConfig};
 use autumn_harvest::{HarvestBuilder, ShardId, WorkerConfig, migrate};
 use autumn_harvest_agent::consolidate::ConsolidationStop;
 use autumn_harvest_agent::consolidate_all::{AgentDirectory, ConsolidateAll, DispatchReport};
-use autumn_harvest_agent::delivery::HEARTBEAT_OK;
+use autumn_harvest_agent::delivery::{ApprovalNotice, Delivery, HEARTBEAT_OK, Report};
 use autumn_harvest_agent::episode::{EpisodeSettings, EpisodeStore, InMemoryEpisodeStore};
 use autumn_harvest_agent::heartbeat::{HeartbeatReport, HeartbeatTask};
 use autumn_harvest_agent::mesh_control::MeshSpend;
@@ -793,4 +795,161 @@ async fn a_sharded_target_finds_the_run_on_the_picked_shard() {
     let exec = postgres::current_run(&pg, &id).await.unwrap().unwrap();
     assert_eq!(exec.shard(), shards[1]);
     settled(&pg, &id, |state| state.segments >= 1).await;
+}
+
+/// A delivery that keeps each approval notice.
+#[derive(Debug, Default)]
+struct Notices(std::sync::Mutex<Vec<ApprovalNotice>>);
+
+impl Delivery for Notices {
+    fn deliver<'a>(&'a self, _report: &'a Report) -> BoxFuture<'a, Result<(), AgentError>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn notify_approval<'a>(
+        &'a self,
+        notice: &'a ApprovalNotice,
+    ) -> BoxFuture<'a, Result<(), AgentError>> {
+        self.0.lock().unwrap().push(notice.clone());
+        Box::pin(async { Ok(()) })
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_gated_call_on_a_durable_agent_sends_one_notice_that_decide_accepts() {
+    let (url, _container) = database().await;
+    let queue = unique("pg-notice");
+    let kind = unique("support");
+    let writes = Arc::new(Recorder::default());
+    let notices = Arc::new(Notices::default());
+    let model = ScriptedModel::new(vec![
+        calls(&[("w1", "write", json!({"text": "hi"}))], 3),
+        answer("saved", 2),
+    ]);
+    let harness = AgentHarness::new(model.clone())
+        .tool(recorded_tool("write", ToolEffect::Write, &writes))
+        .policy(Arc::new(
+            ToolRules::new().effect(ToolEffect::Write, Rule::Ask),
+        ))
+        .delivery(Arc::clone(&notices) as Arc<dyn Delivery>)
+        .agent(AgentProfile::new(&kind));
+    let pg = PostgresAgents::single(pool(&url)).with_queue(&queue);
+    let _worker = run_worker(&url, &queue, harness, &[ShardId::new(0)]);
+    let id = AgentId::new(&kind, "acct-1").unwrap();
+
+    let op = AgentOp::message_with_id("Save a note.", "m-1");
+    postgres::send(&pg, &id, &op, Some("m-1")).await.unwrap();
+    let exec = loop {
+        if let Some(exec) = postgres::current_run(&pg, &id).await.unwrap() {
+            break exec;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
+    let RunState::WaitingSignal(signal) = postgres::wait_run(&pg, exec, LIMIT).await.unwrap()
+    else {
+        panic!("the op should wait for an approval");
+    };
+    let seen = notices.0.lock().unwrap().clone();
+    assert_eq!(seen.len(), 1, "one notice for one parked call");
+    let notice = &seen[0].call;
+    assert_eq!(notice.signal, signal);
+    assert_eq!(notice.execution_id, exec);
+    assert_eq!(notice.agent_id.as_ref(), Some(&id));
+    assert_eq!(notice.tool, "write");
+    assert_eq!(notice.arguments, json!({"text": "hi"}));
+    assert!(writes.runs().is_empty(), "the notice releases nothing");
+
+    postgres::decide(&pg, notice.execution_id, &notice.signal, &Approval::Approve)
+        .await
+        .unwrap();
+    let state = settled(&pg, &id, |state| state.last_answer.is_some()).await;
+    assert_eq!(state.last_answer.as_deref(), Some("saved"));
+    assert_eq!(writes.runs(), vec![json!({"text": "hi"})]);
+    assert_eq!(notices.0.lock().unwrap().len(), 1, "no second notice");
+}
+
+/// A delivery that approves each call from inside the notice, as a bot does.
+/// The decision lands before the notice activity completes.
+#[derive(Debug)]
+struct AutoApprove {
+    pg: PostgresAgents,
+    seen: std::sync::Mutex<Vec<ApprovalNotice>>,
+}
+
+impl Delivery for AutoApprove {
+    fn deliver<'a>(&'a self, _report: &'a Report) -> BoxFuture<'a, Result<(), AgentError>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn notify_approval<'a>(
+        &'a self,
+        notice: &'a ApprovalNotice,
+    ) -> BoxFuture<'a, Result<(), AgentError>> {
+        self.seen.lock().unwrap().push(notice.clone());
+        Box::pin(async move {
+            postgres::decide(
+                &self.pg,
+                notice.call.execution_id,
+                &notice.call.signal,
+                &Approval::Approve,
+            )
+            .await
+            .map_err(|err| {
+                AgentError::new(autumn_harvest_agent::ErrorKind::Transport, err.to_string())
+            })
+        })
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_decision_sent_from_the_notice_releases_the_call_and_replays() {
+    use autumn_harvest::testing::{ReplayStatus, WorkflowReplayer};
+
+    let (url, _container) = database().await;
+    let queue = unique("pg-auto");
+    let kind = unique("support");
+    let writes = Arc::new(Recorder::default());
+    let pg = PostgresAgents::single(pool(&url)).with_queue(&queue);
+    let auto = Arc::new(AutoApprove {
+        pg: pg.clone(),
+        seen: std::sync::Mutex::new(Vec::new()),
+    });
+    let model = ScriptedModel::new(vec![
+        calls(&[("w1", "write", json!({"text": "hi"}))], 3),
+        answer("saved", 2),
+    ]);
+    let harness = AgentHarness::new(model.clone())
+        .tool(recorded_tool("write", ToolEffect::Write, &writes))
+        .policy(Arc::new(
+            ToolRules::new().effect(ToolEffect::Write, Rule::Ask),
+        ))
+        .delivery(Arc::clone(&auto) as Arc<dyn Delivery>)
+        .agent(AgentProfile::new(&kind));
+    let _worker = run_worker(&url, &queue, harness, &[ShardId::new(0)]);
+    let id = AgentId::new(&kind, "acct-2").unwrap();
+
+    let op = AgentOp::message_with_id("Save a note.", "m-1");
+    postgres::send(&pg, &id, &op, Some("m-1")).await.unwrap();
+    let state = settled(&pg, &id, |state| state.last_answer.is_some()).await;
+    assert_eq!(state.last_answer.as_deref(), Some("saved"));
+    assert_eq!(writes.runs(), vec![json!({"text": "hi"})]);
+    assert_eq!(auto.seen.lock().unwrap().len(), 1, "one notice");
+
+    // The run replays with the decision that came before the wait opened.
+    let exec = postgres::current_run(&pg, &id).await.unwrap().unwrap();
+    let mut conn = AsyncPgConnection::establish(&url).await.unwrap();
+    let events = autumn_harvest::store::load_history(&mut conn, exec)
+        .await
+        .unwrap()
+        .events;
+    let replay = WorkflowReplayer::new()
+        .register(vec![autumn_harvest_agent::agent_info()])
+        .with_execution_id(exec)
+        .with_workflow_id(id.as_str())
+        .replay_from_events(events)
+        .await;
+    assert!(
+        !matches!(replay.status, ReplayStatus::NonDeterminismDetected { .. }),
+        "{replay}"
+    );
 }

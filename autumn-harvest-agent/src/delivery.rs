@@ -9,12 +9,23 @@
 //! Delivery is therefore at least once. A [`Delivery`] that must not repeat a
 //! message dedupes on [`Report::key`].
 //!
+//! A gated tool call sends one [`ApprovalNotice`] before it parks. The send
+//! is the activity `agent_approval_notice`, before the wait. Its result is
+//! recorded too, so a restart during the wait sends no second notice. A
+//! retry can send it again, so dedupe on [`ApprovalNotice::key`]. A failed
+//! notice is recorded and ignored. Only a decision releases the call.
+//!
 //! The crate speaks no chat or mail protocol. The app implements
 //! [`Delivery`]. [`LogDelivery`] is the default.
 
+use autumn_harvest::ExecutionId;
+use autumn_harvest::chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
+use crate::agent::AgentId;
 use crate::error::AgentError;
+use crate::harness::cut_bytes;
 use crate::message::{RunId, SessionId};
 use crate::model::BoxFuture;
 use crate::types::AgentStop;
@@ -123,6 +134,91 @@ fn stop_name(stop: AgentStop) -> String {
         .unwrap_or_else(|| format!("{stop:?}"))
 }
 
+/// One gated call that waits for an approval. It is the recorded input of
+/// the activity `agent_approval_notice`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ParkedCall {
+    /// The run id that tools and the policy see.
+    pub run_id: RunId,
+    /// The run that waits. Send the decision to it.
+    pub execution_id: ExecutionId,
+    /// The durable agent that waits, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<AgentId>,
+    /// The session of the run, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<SessionId>,
+    /// The approval signal that releases the call.
+    pub signal: String,
+    /// The tool name.
+    pub tool: String,
+    /// Why the policy asks for an approval.
+    #[serde(default)]
+    pub reason: String,
+    /// The arguments of the call. A cut leaves a JSON string.
+    pub arguments: Value,
+    /// The arguments were cut to the tool result cap.
+    #[serde(default)]
+    pub arguments_truncated: bool,
+    /// The time of the wait, in seconds.
+    pub timeout_secs: u64,
+}
+
+impl ParkedCall {
+    /// A key that is unique to this wait: the run id and the signal name.
+    #[must_use]
+    pub fn key(&self) -> String {
+        format!("{}:{}", self.run_id.as_str(), self.signal)
+    }
+
+    /// The notice for this call. The deadline is `now` plus the timeout.
+    #[must_use]
+    pub fn notice(self, now: DateTime<Utc>) -> ApprovalNotice {
+        let secs = i64::try_from(self.timeout_secs).unwrap_or(i64::MAX);
+        let deadline = autumn_harvest::chrono::Duration::try_seconds(secs)
+            .and_then(|timeout| now.checked_add_signed(timeout))
+            .unwrap_or(DateTime::<Utc>::MAX_UTC);
+        ApprovalNotice {
+            call: self,
+            deadline,
+        }
+    }
+}
+
+/// The notice that a gated call waits for an approval.
+///
+/// Show it to a person, and send the decision with `decide`: use
+/// `call.execution_id` and `call.signal`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ApprovalNotice {
+    /// The call that waits.
+    #[serde(flatten)]
+    pub call: ParkedCall,
+    /// The earliest time that the wait can end with no decision. The worker
+    /// reads its clock before the wait starts, so the wait ends at this time
+    /// or a little later.
+    pub deadline: DateTime<Utc>,
+}
+
+impl ApprovalNotice {
+    /// A key that is unique to this wait. A retry keeps it. See
+    /// [`ParkedCall::key`].
+    #[must_use]
+    pub fn key(&self) -> String {
+        self.call.key()
+    }
+}
+
+/// Cut `arguments` to `max` bytes of JSON text. The flag is `true` when the
+/// cut drops a byte. A cut value is a JSON string.
+pub(crate) fn cut_arguments(arguments: Value, max: usize) -> (Value, bool) {
+    let text = arguments.to_string();
+    if text.len() <= max {
+        return (arguments, false);
+    }
+    (Value::String(cut_bytes(text, max)), true)
+}
+
 /// Sends reports to people: mail, chat, push, or an in-app inbox.
 pub trait Delivery: Send + Sync + std::fmt::Debug {
     /// Send one report.
@@ -132,6 +228,39 @@ pub trait Delivery: Send + Sync + std::fmt::Debug {
     /// Returns an error when the send fails. A retryable kind retries. The
     /// run does not fail on a failed delivery.
     fn deliver<'a>(&'a self, report: &'a Report) -> BoxFuture<'a, Result<(), AgentError>>;
+
+    /// Tell a person that a gated call waits for an approval.
+    ///
+    /// The default writes the names to the `tracing` log. It never logs the
+    /// arguments or the reason.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the send fails. A retryable kind retries. A
+    /// failed notice never fails the run and never releases the call.
+    fn notify_approval<'a>(
+        &'a self,
+        notice: &'a ApprovalNotice,
+    ) -> BoxFuture<'a, Result<(), AgentError>> {
+        log_notice(notice);
+        Box::pin(std::future::ready(Ok(())))
+    }
+}
+
+/// Write the names of `notice` to the `tracing` log. The arguments and the
+/// reason can hold private data, so only the size of the arguments is
+/// logged.
+fn log_notice(notice: &ApprovalNotice) {
+    let call = &notice.call;
+    tracing::info!(
+        run_id = %call.run_id.as_str(),
+        agent_id = call.agent_id.as_ref().map(AgentId::as_str),
+        signal = %call.signal,
+        tool = %call.tool,
+        deadline = %notice.deadline,
+        argument_bytes = call.arguments.to_string().len(),
+        "agent approval wait"
+    );
 }
 
 /// Writes each report to the `tracing` log. The default delivery.
@@ -213,6 +342,103 @@ mod tests {
             stop: AgentStop::Completed,
         };
         assert_eq!(report.key(), "r:2");
+    }
+
+    fn parked(timeout_secs: u64) -> ParkedCall {
+        ParkedCall {
+            run_id: RunId::new("r"),
+            execution_id: ExecutionId::new(),
+            agent_id: Some(AgentId::new("support", "acct-1").unwrap()),
+            session_id: None,
+            signal: "tool_approval:0:0:w1".into(),
+            tool: "write".into(),
+            reason: "a secret reason".into(),
+            arguments: serde_json::json!({"card": "4111-1111"}),
+            arguments_truncated: false,
+            timeout_secs,
+        }
+    }
+
+    #[test]
+    fn the_notice_key_names_the_run_and_the_signal() {
+        let notice = parked(60).notice(Utc::now());
+        assert_eq!(notice.key(), "r:tool_approval:0:0:w1");
+        assert_eq!(notice.key(), notice.call.key());
+    }
+
+    #[test]
+    fn the_deadline_is_now_plus_the_timeout() {
+        let now = Utc::now();
+        let notice = parked(90).notice(now);
+        assert_eq!(
+            notice.deadline,
+            now + autumn_harvest::chrono::Duration::seconds(90)
+        );
+        // A huge timeout saturates. It never wraps to an early deadline.
+        let notice = parked(u64::MAX).notice(now);
+        assert_eq!(notice.deadline, DateTime::<Utc>::MAX_UTC);
+    }
+
+    #[test]
+    fn the_notice_round_trips_as_flat_json() {
+        let notice = parked(60).notice(Utc::now());
+        let value = serde_json::to_value(&notice).unwrap();
+        assert_eq!(value["signal"], "tool_approval:0:0:w1");
+        assert!(value.get("deadline").is_some(), "{value}");
+        assert!(value.get("call").is_none(), "{value}");
+        let back: ApprovalNotice = serde_json::from_value(value).unwrap();
+        assert_eq!(back, notice);
+    }
+
+    #[test]
+    fn arguments_over_the_cap_are_cut_to_a_string() {
+        let small = serde_json::json!({"n": 1});
+        assert_eq!(cut_arguments(small.clone(), 100), (small, false));
+        let big = serde_json::json!({"text": "x".repeat(500)});
+        let (cut, flagged) = cut_arguments(big, 100);
+        assert!(flagged);
+        let Value::String(text) = cut else {
+            panic!("a cut value is a string: {cut}");
+        };
+        assert!(text.len() <= 100, "{}", text.len());
+        assert!(text.ends_with(crate::harness::TRUNCATED), "{text}");
+        // No cap keeps the value.
+        let big = serde_json::json!({"text": "x".repeat(500)});
+        assert_eq!(cut_arguments(big.clone(), usize::MAX), (big, false));
+    }
+
+    /// A `tracing` writer that keeps each line.
+    #[derive(Clone, Default)]
+    struct Lines(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Lines {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn the_default_notice_logs_names_and_never_the_arguments() {
+        let lines = Lines::default();
+        let writer = lines.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish();
+        let notice = parked(60).notice(Utc::now());
+        let _guard = tracing::subscriber::set_default(subscriber);
+        LogDelivery.notify_approval(&notice).await.unwrap();
+        let text = String::from_utf8(lines.0.lock().unwrap().clone()).unwrap();
+        assert!(text.contains("tool_approval:0:0:w1"), "{text}");
+        assert!(text.contains("write"), "{text}");
+        assert!(text.contains("support/acct-1"), "{text}");
+        assert!(!text.contains("4111"), "the arguments leak: {text}");
+        assert!(!text.contains("secret"), "the reason leaks: {text}");
     }
 
     #[tokio::test]

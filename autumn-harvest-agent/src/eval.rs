@@ -46,6 +46,7 @@
 //! - A tool, snapshot or peer-lookup activity that failed the source fails
 //!   the candidate at the same activity.
 //! - `agent_deliver` is a stub. No report leaves the harness.
+//! - `agent_approval_notice` is a stub. No notice leaves the harness.
 //! - Any other activity has no mock, so it fails the candidate run.
 //!
 //! The harness sends again each approval for a wait that the source opened,
@@ -172,8 +173,8 @@ pub use anonymise::{
 };
 
 use crate::workflow::{
-    WORKFLOW_NAME, agent_deliver_info, agent_discover_peers_info, agent_loop_info,
-    agent_memory_snapshot_info, agent_model_turn_info, agent_tool_call_info,
+    WORKFLOW_NAME, agent_approval_notice_info, agent_deliver_info, agent_discover_peers_info,
+    agent_loop_info, agent_memory_snapshot_info, agent_model_turn_info, agent_tool_call_info,
 };
 
 /// The error text of the stub outcome. A candidate call with no recorded
@@ -1049,7 +1050,8 @@ async fn run_with_routes(
         .mock_activity(agent_model_turn_info().name, model)
         .mock_activity(agent_tool_call_info().name, tool)
         .mock_activity(agent_memory_snapshot_info().name, snapshot)
-        .mock_activity(agent_deliver_info().name, |_report| Ok(Value::Null));
+        .mock_activity(agent_deliver_info().name, |_report| Ok(Value::Null))
+        .mock_activity(agent_approval_notice_info().name, |_call| Ok(Value::Null));
     for (name, payload) in &recording.signals {
         env = env.queue_signal(name.clone(), payload.clone());
     }

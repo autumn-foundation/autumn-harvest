@@ -15,7 +15,7 @@ use crate::agent::AgentProfile;
 use crate::agent::overlay_store::ProfileOverlayStore;
 use crate::bounds::{exceeds_bytes, json_len};
 use crate::consolidate_all::AgentDirectory;
-use crate::delivery::{Delivery, LogDelivery, Report};
+use crate::delivery::{Delivery, LogDelivery, ParkedCall, Report};
 use crate::episode::EpisodeStore;
 use crate::error::{AgentError, ErrorKind};
 use crate::flow::{FlowRules, Released, call_labels};
@@ -86,8 +86,8 @@ pub const DEFAULT_TOOL_TIMEOUT: Duration = Duration::from_mins(9);
 /// the model turn, and SQLite cannot end the turn from outside.
 pub const DEFAULT_POLICY_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// The default time budget of one memory read, delivery or precheck: 30
-/// seconds.
+/// The default time budget of one memory read, delivery, approval notice or
+/// precheck: 30 seconds.
 ///
 /// It is below the one-minute `start_to_close` of the shortest of those
 /// activities. SQLite cannot end a stalled call from outside.
@@ -539,7 +539,8 @@ impl AgentHarness {
         self
     }
 
-    /// Set the time budget of one memory read, delivery or precheck.
+    /// Set the time budget of one memory read, delivery, approval notice or
+    /// precheck.
     #[must_use]
     pub const fn hook_timeout(mut self, timeout: Duration) -> Self {
         self.hook_timeout = timeout;
@@ -1804,6 +1805,22 @@ impl AgentHarness {
         tokio::time::timeout(self.hook_timeout, self.delivery.deliver(&report))
             .await
             .map_err(|_| self.hook_timed_out("DeliveryTimeout", "the delivery"))?
+            .map_err(|err| model_failure(&err))
+    }
+
+    /// Send the notice of one parked call to the delivery.
+    ///
+    /// The deadline is the clock of this worker plus the timeout of the call.
+    ///
+    /// # Errors
+    ///
+    /// Returns the delivery error. A retryable kind retries, and so does a
+    /// send over its time budget.
+    pub async fn notify_approval(&self, call: ParkedCall) -> Result<(), String> {
+        let notice = call.notice(autumn_harvest::chrono::Utc::now());
+        tokio::time::timeout(self.hook_timeout, self.delivery.notify_approval(&notice))
+            .await
+            .map_err(|_| self.hook_timed_out("ApprovalNoticeTimeout", "the approval notice"))?
             .map_err(|err| model_failure(&err))
     }
 
