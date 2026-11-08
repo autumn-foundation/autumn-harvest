@@ -3347,7 +3347,8 @@ Before the first model call, the sweep checks these, in order:
 4. The policy cap covers the item concurrency
    (`too_many_concurrent_draws`).
 5. The policy admits the strategy, the draws and the scorer of one item,
-   as `agent_sample` does.
+   as `agent_sample` does. A sweep needs a scorer, so it refuses a vote
+   (section 26) with `scorer_not_used`.
 6. A stored list matches its reference. The first page read checks it.
 
 The items and their draws share the `max_concurrent_draws` cap of the
