@@ -1532,6 +1532,15 @@ macro_rules! claim_trailing_ctes_sql {
 /// applies the row-local gates of `claim_head_gates_sql!`, so a row that
 /// this claim cannot take does not use a window slot.
 ///
+/// The pin head reads its pins in the key order of
+/// `idx_harvest_tq_sticky_poll`, inside a subquery that `OFFSET 0` keeps
+/// apart. The worker test is a range, so `sticky_worker_id` stays in that
+/// order. Only that index leads with the column, so only it gives the order
+/// without a sort. The claim turns sorts off, so the planner cannot pick a
+/// scan of another partial index instead (issue #2547). The outer sort then
+/// keeps the best rows, as before. See `claim_queue_head_scan_sql!` for the
+/// same argument on the queue heads.
+///
 /// Inside one queue head the due time follows `scheduled_at`. So each head
 /// is in claim order, `priority DESC, due ASC`. A row outside a head sorts at
 /// or after the last row of that head. `seek_bounds` keeps that last row for
@@ -1554,7 +1563,8 @@ macro_rules! claim_seek_ctes_sql {
     () => {
         concat!(
             "seek_heads AS MATERIALIZED ( \
-             SELECT h.seek_id, h.seek_rank, h.seek_priority, h.seek_due, h.seek_pinned, \
+             SELECT h.seek_id, h.seek_ctid, h.seek_rank, h.seek_priority, h.seek_due, \
+                    h.seek_pinned, \
                     h.seek_concurrency_key, h.seek_concurrency_cap, h.seek_task_type, \
                     h.head_queue, h.head_kind, h.head_new_start, \
                     row_number() OVER ( \
@@ -1584,18 +1594,21 @@ macro_rules! claim_seek_ctes_sql {
                  FROM paused_queues \
                  CROSS JOIN paused_activities \
                  CROSS JOIN LATERAL ( \
+                     SELECT * FROM ( \
                      SELECT ",
             claim_seek_row_sql!(),
             " \
                      FROM harvest_task_queue \
-                     WHERE sticky_worker_id = $1 \
+                     WHERE sticky_worker_id >= $1 AND sticky_worker_id <= $1 \
                        AND harvest_task_queue.state = 'PENDING' \
                        AND queue_name = ANY($2) \
                        AND sticky_until > NOW() \
                        AND scheduled_at <= NOW() \
                        AND NOT (queue_name = ANY(paused_queues.names)) ",
             claim_head_gates_sql!(),
-            "ORDER BY priority DESC, seek_due ASC \
+            "ORDER BY sticky_worker_id, queue_name, priority DESC, scheduled_at OFFSET 0 \
+                     ) pins \
+                     ORDER BY seek_priority DESC, seek_due ASC \
                      LIMIT ",
             claim_seek_window_sql!(),
             " \
@@ -1627,11 +1640,13 @@ macro_rules! claim_seek_ctes_sql {
 /// The columns of one window row, read from the table row in a head scan.
 ///
 /// The rank and the due time are the claim key expressions of
-/// `claim_order_by_sql!`, without ageing.
+/// `claim_order_by_sql!`, without ageing. `seek_ctid` names the tuple that
+/// the head scan read. The candidate scans read the row again by it (issue
+/// #2547).
 macro_rules! claim_seek_row_sql {
     () => {
         concat!(
-            "id AS seek_id, \
+            "id AS seek_id, ctid AS seek_ctid, \
              CASE WHEN sticky_worker_id = $1 AND sticky_until > NOW() THEN 1 ELSE 0 END AS seek_rank, \
              priority AS seek_priority, ",
             claim_order_due_sql!(),
@@ -1650,6 +1665,15 @@ macro_rules! claim_seek_row_sql {
 /// of rows to read. The window and the deep window both read their queue
 /// heads through this text. So each head is a prefix of its head in claim
 /// order.
+///
+/// The new-start test is a range, `>=` and `<=`, not an equality. Both
+/// columns are `NOT NULL`, so the rows are the same. An equality makes a
+/// column constant, so the planner drops it from the sort. Then
+/// `idx_harvest_tq_poll` also gives the head order without a sort. It reads
+/// every row of the queue, because it filters the kind and the new-start
+/// flag. A range keeps the new-start flag in the sort. Only
+/// `idx_harvest_tq_claim_seek` holds that column after the queue and the
+/// kind. So with sorts off, it is the one plan left (issue #2547).
 macro_rules! claim_queue_head_scan_sql {
     ($queue:literal, $kind:literal, $new_start:literal, [$($limit:tt)*]) => {
         concat!(
@@ -1662,11 +1686,13 @@ macro_rules! claim_queue_head_scan_sql {
             " AND task_type = ",
             $kind,
             " AND state = 'PENDING' \
-               AND (new_start AND attempt = 0) = ",
+               AND (new_start AND attempt = 0) >= ",
+            $new_start,
+            " AND (new_start AND attempt = 0) <= ",
             $new_start,
             " AND scheduled_at <= NOW() ",
             claim_head_gates_sql!(),
-            "ORDER BY priority DESC, scheduled_at ASC \
+            "ORDER BY (new_start AND attempt = 0), priority DESC, scheduled_at ASC \
              LIMIT ",
             $($limit)*,
             " "
@@ -1737,11 +1763,11 @@ macro_rules! claim_deep_seek_ctes_sql {
             ") d \
          ), \
          seek_deep_window AS MATERIALIZED ( \
-             SELECT seek_id, seek_rank, seek_priority, seek_due, \
+             SELECT seek_id, seek_ctid, seek_rank, seek_priority, seek_due, \
                     seek_concurrency_key, seek_concurrency_cap, seek_task_type \
              FROM seek_heads \
              UNION ALL \
-             SELECT seek_id, seek_rank, seek_priority, seek_due, \
+             SELECT seek_id, seek_ctid, seek_rank, seek_priority, seek_due, \
                     seek_concurrency_key, seek_concurrency_cap, seek_task_type \
              FROM seek_deep_rows \
          ), \
@@ -1795,13 +1821,13 @@ macro_rules! claim_deep_seek_gate_sql {
 /// `$rows` names the window CTE and `$bounds` its bounds. The deep window
 /// passes its own pair (issue #2420).
 ///
-/// The candidate scan reads the table rows by primary key through the
-/// array. See `claim_seek_rows_sql!` for why no other index can serve it.
+/// The candidate scan reads the table rows by `ctid` through the array: a
+/// TID scan. See `claim_seek_rows_sql!` for why.
 macro_rules! claim_seek_guard_sql {
     ($rows:literal, $bounds:literal) => {
         concat!(
-            "AND harvest_task_queue.id = ANY(ARRAY( \
-                   SELECT w.seek_id FROM ",
+            "AND harvest_task_queue.ctid = ANY(ARRAY( \
+                   SELECT w.seek_ctid FROM ",
             $rows,
             " w \
                    WHERE NOT EXISTS (SELECT 1 FROM ",
@@ -1820,11 +1846,11 @@ macro_rules! claim_seek_guard_sql {
     };
 }
 
-/// The state test of the window candidate scan (issue #1971).
+/// The state test of the window candidate scan (issues #1971, #2547).
 ///
-/// The scan must read its rows by primary key. Any other plan reads the
-/// whole backlog. The planner guesses the size of the id array and the
-/// number of `PENDING` rows. With stale statistics it picked other plans:
+/// The scan must read its rows by `ctid`, with a TID scan. Any other plan
+/// reads the whole backlog. Before issue #2547 the scan read its rows by
+/// primary key. With stale statistics the planner picked other plans:
 ///
 /// - A partial index that holds `id`, such as `idx_harvest_tq_live_created`:
 ///   a full index scan with the id test, 17K buffers.
@@ -1842,8 +1868,27 @@ macro_rules! claim_seek_guard_sql {
 ///   matches. The row lock still rechecks the state.
 ///
 /// The other row tests prove none of the partial-index predicates that do
-/// not test the state. Only the primary key and a scan of the whole table
-/// remain. The primary key costs one probe per window row.
+/// not test the state. Only a TID scan and a scan of the whole table
+/// remain. A TID scan reads the heap page of each window row and no index
+/// page. A primary-key probe also walks the index from its root. On the e2e
+/// bench a primary-key probe cost about 4.2 buffers per row. On the claim
+/// fixture a TID probe costs about 1.
+///
+/// The `ctid` comes from a head scan of the same statement, so both read
+/// one snapshot. That snapshot sees the tuple, so neither page pruning nor
+/// `VACUUM` can remove it. So the `ctid` names the same row.
+/// `harvest_task_queue` is not partitioned, so a `ctid` is unique in it.
+///
+/// A peer can commit an update to a window row after the snapshot and
+/// before the row lock. The lock then rechecks the newest version, which
+/// has a new `ctid`. Postgres 13.23, 14.20, 15.15, 16.11, 17.7 and later
+/// then skip the row. Older releases recheck every other gate on the new
+/// version, as a primary-key probe does. Both outcomes are safe.
+///
+/// A skip acts like a `SKIP LOCKED` skip. The claim takes the next row, or
+/// it returns no task when the head holds no other row. The claim keeps
+/// its lock on the skipped row until its transaction ends. A later poll
+/// reads the new version.
 macro_rules! claim_seek_rows_sql {
     () => {
         "harvest_task_queue.state = (SELECT 'PENDING'::text) "
@@ -2067,8 +2112,8 @@ const fn claim_task_full_scan_query() -> &'static str {
 /// a small backlog that is more than the claim costs to run. Postgres may
 /// keep a custom plan anyway,
 /// because it compares estimated costs, not planning time. The generic plan
-/// has the same shape: bounded head scans, a lookup by primary key and a
-/// gated full scan. An `ANALYZE` of the table invalidates it.
+/// has the same shape: bounded head scans, a TID lookup and a gated full
+/// scan. An `ANALYZE` of the table invalidates it.
 ///
 /// **No bitmap scans.** A head scan must read the index in claim order and
 /// stop at the window. A bitmap scan reads every due row of the head and
@@ -2077,6 +2122,17 @@ const fn claim_task_full_scan_query() -> &'static str {
 /// that estimate. On the issue #1956 fixture, the bitmap form read 2,515
 /// buffers at 10K pending rows. With stale statistics it read 11,704. The
 /// ordered scan does not depend on the estimate.
+///
+/// **No sorts that an index can replace (issue #2547).** After a backlog
+/// drains, an `ANALYZE` sees no `PENDING` row. The partial indexes keep
+/// their pages with a row count of 0. The planner then estimates each head
+/// as empty. A head scan that sorts all of `idx_harvest_tq_live_created`
+/// then costs less than the ordered scan, and it reads the whole backlog.
+/// With sorts off, a head can only use an index that gives its order. Each
+/// head scan writes its order so that one index alone gives it. See
+/// `claim_queue_head_scan_sql!` and the pin head in `claim_seek_ctes_sql!`.
+/// A sort that no index can replace stays, because every plan has it.
+/// Examples are the candidate sort on the claim key and the window ranks.
 ///
 /// The full scan reads the whole backlog with or without bitmap scans. A
 /// bitmap scan helps it, though: at 100K pending rows with ageing on, it
@@ -2092,7 +2148,8 @@ const fn claim_task_full_scan_query() -> &'static str {
 /// so they cost one round trip.
 pub const CLAIM_PLAN_SETTINGS_SQL: &str = "SET LOCAL jit = off; \
      SET LOCAL plan_cache_mode = force_generic_plan; \
-     SET LOCAL enable_bitmapscan = off";
+     SET LOCAL enable_bitmapscan = off; \
+     SET LOCAL enable_sort = off";
 
 /// The planner settings of a claim with priority ageing on (issue #1971).
 ///
@@ -12650,10 +12707,12 @@ mod tests {
             "FROM (SELECT DISTINCT name FROM unnest($2::text[]) AS u(name)) AS q",
             "CROSS JOIN LATERAL",
             "WHERE queue_name = q.name",
-            "AND (new_start AND attempt = 0) = k.new_start_head",
-            "ORDER BY priority DESC, scheduled_at ASC",
-            "WHERE sticky_worker_id = $1",
-            "ORDER BY priority DESC, seek_due ASC",
+            "AND (new_start AND attempt = 0) >= k.new_start_head \
+             AND (new_start AND attempt = 0) <= k.new_start_head",
+            "ORDER BY (new_start AND attempt = 0), priority DESC, scheduled_at ASC",
+            "WHERE sticky_worker_id >= $1 AND sticky_worker_id <= $1",
+            "ORDER BY sticky_worker_id, queue_name, priority DESC, scheduled_at OFFSET 0 ) pins",
+            "ORDER BY seek_priority DESC, seek_due ASC",
             "WHERE NOT (q.name = ANY(paused_queues.names))",
         ] {
             assert!(heads.contains(clause), "missing {clause:?} in:\n{heads}");
@@ -12680,7 +12739,7 @@ mod tests {
         );
         let seek = cte(sql, "seek_candidate", "seek_held");
         for clause in [
-            "AND harvest_task_queue.id = ANY(ARRAY( SELECT w.seek_id FROM seek_heads w",
+            "AND harvest_task_queue.ctid = ANY(ARRAY( SELECT w.seek_ctid FROM seek_heads w",
             "NOT EXISTS (SELECT 1 FROM seek_bounds b",
             "FROM seek_running_counts rc",
             "FOR UPDATE SKIP LOCKED",
@@ -12691,6 +12750,52 @@ mod tests {
             !seek.contains("concurrency_running_counts"),
             "the window must not read the backlog-wide count CTE; got:\n{seek}"
         );
+    }
+
+    /// Each window scan of each claim form reads its rows by `ctid`, not by
+    /// primary key (issue #2547).
+    #[test]
+    fn claim_query_window_scans_read_rows_by_ctid() {
+        assert!(claim_seek_row_sql!().starts_with("id AS seek_id, ctid AS seek_ctid, "));
+        let mut variants = Vec::new();
+        for kind in [None, Some(TaskType::Workflow), Some(TaskType::Activity)] {
+            for fenced in [false, true] {
+                variants.push(claim_query_for(kind, fenced, ClaimFairness::Off));
+                variants.push(owned_claim_query_for(kind, fenced, ClaimFairness::Off));
+            }
+        }
+        for sql in variants {
+            assert!(
+                cte(sql, "seek_heads", "seek_bounds").contains("SELECT h.seek_id, h.seek_ctid, "),
+                "the window carries the ctid of each row; got:\n{sql}"
+            );
+            assert_eq!(
+                cte(sql, "seek_deep_window", "seek_deep_bounds")
+                    .matches("SELECT seek_id, seek_ctid, ")
+                    .count(),
+                2,
+                "both arms of the deep window carry the ctid; got:\n{sql}"
+            );
+            for (from, to) in [
+                ("seek_candidate", "seek_held"),
+                ("seek_held", "seek_contended"),
+                ("seek_deep_candidate", "legacy_candidate"),
+            ] {
+                let scan = cte(sql, from, to);
+                assert_eq!(
+                    scan.matches(
+                        "AND harvest_task_queue.ctid = ANY(ARRAY( SELECT w.seek_ctid FROM "
+                    )
+                    .count(),
+                    1,
+                    "{from} reads its rows by ctid; got:\n{scan}"
+                );
+                assert!(
+                    !scan.contains("harvest_task_queue.id = ANY"),
+                    "{from} must not probe the primary key; got:\n{scan}"
+                );
+            }
+        }
     }
 
     /// The full scan runs only when the window cannot decide.
@@ -12734,7 +12839,7 @@ mod tests {
         let held = cte(sql, "seek_held", "seek_contended");
         for clause in [
             "seek_held AS MATERIALIZED",
-            "AND harvest_task_queue.id = ANY(ARRAY( SELECT w.seek_id FROM seek_heads w",
+            "AND harvest_task_queue.ctid = ANY(ARRAY( SELECT w.seek_ctid FROM seek_heads w",
             "NOT EXISTS (SELECT 1 FROM seek_bounds b",
             "AND NOT EXISTS (SELECT 1 FROM seek_candidate) ",
             "FROM seek_running_counts rc",
@@ -12750,8 +12855,9 @@ mod tests {
         for clause in [
             "FROM seek_contended c",
             "WHERE queue_name = c.head_queue AND task_type = c.head_kind",
-            "AND (new_start AND attempt = 0) = c.head_new_start",
-            "ORDER BY priority DESC, scheduled_at ASC",
+            "AND (new_start AND attempt = 0) >= c.head_new_start \
+             AND (new_start AND attempt = 0) <= c.head_new_start",
+            "ORDER BY (new_start AND attempt = 0), priority DESC, scheduled_at ASC",
             "PARTITION BY c.head_queue, c.head_kind, c.head_new_start",
         ] {
             assert!(rows.contains(clause), "missing {clause:?} in:\n{rows}");
@@ -12772,7 +12878,7 @@ mod tests {
         }
         let deep = cte(sql, "seek_deep_candidate", "legacy_candidate");
         for clause in [
-            "SELECT w.seek_id FROM seek_deep_window w",
+            "AND harvest_task_queue.ctid = ANY(ARRAY( SELECT w.seek_ctid FROM seek_deep_window w",
             "NOT EXISTS (SELECT 1 FROM seek_deep_bounds b",
             "AND NOT EXISTS (SELECT 1 FROM seek_candidate) \
              AND EXISTS (SELECT 1 FROM seek_contended) ",
@@ -12899,8 +13005,9 @@ mod tests {
             "WHERE queue_name = q.name",
             "AND task_type = k.head_kind",
             "AND state = 'PENDING'",
-            "AND (new_start AND attempt = 0) = k.new_start_head",
-            "ORDER BY priority DESC, scheduled_at ASC",
+            "AND (new_start AND attempt = 0) >= k.new_start_head \
+             AND (new_start AND attempt = 0) <= k.new_start_head",
+            "ORDER BY (new_start AND attempt = 0), priority DESC, scheduled_at ASC",
         ] {
             assert!(heads.contains(key), "missing {key:?} in:\n{heads}");
         }
@@ -12916,6 +13023,10 @@ mod tests {
         assert!(CLAIM_PLAN_SETTINGS_SQL.contains("jit = off"));
         assert!(CLAIM_PLAN_SETTINGS_SQL.contains("plan_cache_mode = force_generic_plan"));
         assert!(CLAIM_PLAN_SETTINGS_SQL.contains("enable_bitmapscan = off"));
+        assert!(
+            CLAIM_PLAN_SETTINGS_SQL.contains("enable_sort = off"),
+            "a head scan must not sort a partial index (issue #2547)"
+        );
         for setting in CLAIM_AGEING_PLAN_SETTINGS_SQL.split("; ") {
             assert!(setting.starts_with("SET LOCAL "), "{setting}");
         }

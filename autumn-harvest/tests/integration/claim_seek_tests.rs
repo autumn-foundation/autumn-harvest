@@ -60,6 +60,91 @@ async fn setup_db_with_url() -> (AsyncPgConnection, String, Option<ContainerAsyn
     (conn, url, Some(container))
 }
 
+/// `url` with its database set to `database`. A query string stays.
+fn with_database(url: &str, database: &str) -> String {
+    let (base, query) = url
+        .split_once('?')
+        .map_or((url, None), |(b, q)| (b, Some(q)));
+    let (prefix, _) = base.rsplit_once('/').expect("a database URL has a path");
+    query.map_or_else(
+        || format!("{prefix}/{database}"),
+        |query| format!("{prefix}/{database}?{query}"),
+    )
+}
+
+/// A migrated database that one test owns, and its name for the drop.
+///
+/// A test that needs its own planner statistics cannot share a database. A
+/// sibling test adds rows to the same table, and so to the `ANALYZE` sample.
+/// With `HARVEST_TEST_DATABASE_URL` set, this creates a new database. Without
+/// it, each test starts its own container, so no other test shares it.
+async fn setup_isolated_db() -> (
+    AsyncPgConnection,
+    Option<ContainerAsync<Postgres>>,
+    Option<String>,
+) {
+    let Ok(shared) = std::env::var("HARVEST_TEST_DATABASE_URL") else {
+        let (conn, container) = setup_db().await;
+        return (conn, container, None);
+    };
+    let name = format!("harvest_seek_{}", Uuid::new_v4().simple());
+    connect(&shared)
+        .await
+        .batch_execute(&format!("CREATE DATABASE {name}"))
+        .await
+        .expect("create the isolated database");
+    let url = with_database(&shared, &name);
+    let migrated = AssertUnwindSafe(async {
+        let mut conn = connect(&url).await;
+        conn.batch_execute(&autumn_harvest::test_init_sql())
+            .await
+            .expect("apply migrations");
+        conn
+    })
+    .catch_unwind()
+    .await;
+    match migrated {
+        Ok(conn) => (conn, None, Some(name)),
+        Err(panic) => {
+            drop_database(&shared, &name).await;
+            std::panic::resume_unwind(panic)
+        }
+    }
+}
+
+/// Drop a database of [`setup_isolated_db`]. A container needs no drop.
+async fn drop_isolated_db(conn: AsyncPgConnection, name: Option<String>) {
+    drop(conn);
+    let (Some(name), Ok(shared)) = (name, std::env::var("HARVEST_TEST_DATABASE_URL")) else {
+        return;
+    };
+    drop_database(&shared, &name).await;
+}
+
+/// Drop `name` on the server of `shared`, best effort.
+async fn drop_database(shared: &str, name: &str) {
+    let Ok(mut admin) =
+        <AsyncPgConnection as diesel_async::AsyncConnection>::establish(shared).await
+    else {
+        return;
+    };
+    // `WITH (FORCE)` needs Postgres 13. Postgres 12 takes the plain form.
+    // `DROP DATABASE` refuses a batch of statements, because the batch is
+    // an implicit transaction. So each statement goes on its own.
+    let forced = format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)");
+    if admin.batch_execute(&forced).await.is_err() {
+        let _ = admin
+            .batch_execute(&format!(
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+                 WHERE datname = '{name}' AND pid <> pg_backend_pid()"
+            ))
+            .await;
+        let _ = admin
+            .batch_execute(&format!("DROP DATABASE IF EXISTS {name}"))
+            .await;
+    }
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 /// The worker that claims in every test.
@@ -221,6 +306,27 @@ async fn claim_cost(conn: &mut AsyncPgConnection, queues: &[String]) -> ClaimCos
 
 /// [`claim_cost`] for one form of the claim query.
 async fn claim_cost_of(conn: &mut AsyncPgConnection, queues: &[String], sql: &str) -> ClaimCost {
+    let plan = claim_plan_of(conn, queues, sql).await;
+    cost_of_plan(&plan[0]["Plan"])
+}
+
+/// The [`ClaimCost`] of the root node of one claim plan.
+fn cost_of_plan(root: &serde_json::Value) -> ClaimCost {
+    let num = |key: &str| root[key].as_i64().unwrap_or(0);
+    ClaimCost {
+        buffers: num("Shared Hit Blocks") + num("Shared Read Blocks"),
+        temp_written: num("Temp Written Blocks"),
+        claimed: num("Actual Rows") == 1,
+        fallback_ran: cte_scanned_the_table(root, "legacy_candidate", false),
+    }
+}
+
+/// The `EXPLAIN (ANALYZE, BUFFERS)` plan of one claim, rolled back.
+async fn claim_plan_of(
+    conn: &mut AsyncPgConnection,
+    queues: &[String],
+    sql: &str,
+) -> serde_json::Value {
     #[derive(diesel::QueryableByName)]
     struct Plan {
         #[diesel(sql_type = diesel::sql_types::Json, column_name = "QUERY PLAN")]
@@ -245,14 +351,7 @@ async fn claim_cost_of(conn: &mut AsyncPgConnection, queues: &[String], sql: &st
     .await
     .expect("explain claim");
     exec(conn, "ROLLBACK; DEALLOCATE seek_probe;").await;
-    let root = &rows[0].plan[0]["Plan"];
-    let num = |key: &str| root[key].as_i64().unwrap_or(0);
-    ClaimCost {
-        buffers: num("Shared Hit Blocks") + num("Shared Read Blocks"),
-        temp_written: num("Temp Written Blocks"),
-        claimed: num("Actual Rows") == 1,
-        fallback_ran: cte_scanned_the_table(root, "legacy_candidate", false),
-    }
+    rows.into_iter().next().expect("one plan row").plan
 }
 
 /// Claim through the public API and return the claimed row id.
@@ -369,6 +468,183 @@ async fn a_large_activity_pause_array_does_not_spill_the_claim_at_100k() {
     assert_eq!(cost.temp_written, 0, "the claim sort spills: {cost:?}");
 }
 
+// ── Refine cost (issue #2547) ────────────────────────────────────────────────
+
+/// The table scan of one candidate scan: its plan node, buffers and rows.
+#[derive(Debug, Clone)]
+struct RefineCost {
+    /// The node type of the scan, for example `Tid Scan`.
+    node: String,
+    /// Shared buffers of the CTE, less its init plans and gate subplans.
+    buffers: i64,
+    /// Rows the scan read: the rows it returned and the rows it filtered.
+    rows: i64,
+}
+
+impl RefineCost {
+    fn per_row(&self) -> f64 {
+        self.buffers as f64 / self.rows.max(1) as f64
+    }
+}
+
+/// Shared buffers of one plan node and its subtree (hit plus read).
+fn plan_blocks(node: &serde_json::Value) -> i64 {
+    node["Shared Hit Blocks"].as_i64().unwrap_or(0)
+        + node["Shared Read Blocks"].as_i64().unwrap_or(0)
+}
+
+/// The child nodes of one plan node.
+fn plan_children(node: &serde_json::Value) -> &[serde_json::Value] {
+    node["Plans"].as_array().map_or(&[], Vec::as_slice)
+}
+
+/// The refine cost of the candidate scan in the CTE `name`.
+///
+/// A node counts the buffers of each subplan that runs inside it. The array
+/// of the guard is an init plan, and it can be the first reader of
+/// `seek_heads`. Each plan shape runs it inside a different node. So the
+/// cost is the whole CTE, less its init plans and the gate subplans of the
+/// scan. The rest is the scan, the sort and the row lock.
+fn refine_cost(plan: &serde_json::Value, name: &str) -> Option<RefineCost> {
+    if plan["Subplan Name"].as_str() != Some(&format!("CTE {name}")) {
+        return plan_children(plan)
+            .iter()
+            .find_map(|p| refine_cost(p, name));
+    }
+    let (init, body): (Vec<_>, Vec<_>) = plan_children(plan)
+        .iter()
+        .partition(|p| p["Parent Relationship"].as_str() == Some("InitPlan"));
+    let init: i64 = init.into_iter().map(plan_blocks).sum();
+    let scan = body.into_iter().find_map(table_scan)?;
+    let nested: i64 = plan_children(scan).iter().map(plan_blocks).sum();
+    Some(RefineCost {
+        node: scan["Node Type"].as_str().unwrap_or_default().to_owned(),
+        buffers: plan_blocks(plan) - init - nested,
+        rows: scan["Actual Rows"].as_i64().unwrap_or(0)
+            + scan["Rows Removed by Filter"].as_i64().unwrap_or(0),
+    })
+}
+
+/// The first scan of `harvest_task_queue` that ran, in plan order.
+fn table_scan(plan: &serde_json::Value) -> Option<&serde_json::Value> {
+    if plan["Relation Name"].as_str() == Some("harvest_task_queue")
+        && plan["Actual Loops"].as_i64().unwrap_or(0) > 0
+    {
+        return Some(plan);
+    }
+    plan_children(plan).iter().find_map(table_scan)
+}
+
+/// The most rows a window refine can read on `queue_count` queues.
+///
+/// Each queue has four heads of [`queue::CLAIM_SEEK_WINDOW`] rows. The pin
+/// head adds one more window.
+const fn window_rows_max(queue_count: i64) -> i64 {
+    (4 * queue_count + 1) * queue::CLAIM_SEEK_WINDOW
+}
+
+/// Assert that a refine is a TID scan that reads about one buffer per row.
+///
+/// A scan of the whole table reads few buffers per row, because it reads
+/// many rows from each page. So the node type and the row bound are part of
+/// the check.
+fn assert_tid_refine(case: &str, cost: &RefineCost, rows_max: i64) {
+    assert_eq!(
+        cost.node, "Tid Scan",
+        "{case}: the refine reads by ctid: {cost:?}"
+    );
+    assert!(
+        cost.rows > 1 && cost.rows <= rows_max,
+        "{case}: the refine reads the window only, at most {rows_max} rows: {cost:?}"
+    );
+    assert!(
+        cost.per_row() <= 1.5,
+        "{case}: the refine reads {:.2} buffers per row: {cost:?}",
+        cost.per_row()
+    );
+}
+
+/// Roll back a claim probe that a panic left open, then delete `queues`.
+async fn clean_up_after_probe(conn: &mut AsyncPgConnection, queues: &[String]) {
+    // A panic between BEGIN and ROLLBACK leaves the transaction aborted.
+    let _ = conn.batch_execute("ROLLBACK").await;
+    let _ = conn.batch_execute("DEALLOCATE seek_probe").await;
+    delete_queues(conn, queues).await;
+}
+
+/// The window refine reads about one buffer per row (issue #2547).
+///
+/// The refine reads each window row again, to apply every gate and to lock
+/// one row. A probe through the primary key walks the index from its root
+/// for each row. On the e2e bench that cost about 4.2 buffers per row and
+/// 84% of a claim. A probe by `ctid` reads the heap page only.
+///
+/// The depths are the shallow e2e queue (32 rows) and 1,000 rows. The
+/// ballast is the terminal rows of a busy table. With it the table is too
+/// large for a sequential scan, as on the e2e bench.
+///
+/// The test collects every plan before it asserts. So a failed assertion
+/// never skips the cleanup of a seeded queue.
+#[tokio::test]
+async fn the_window_refine_reads_about_one_buffer_per_row() {
+    let (mut conn, _container) = setup_db().await;
+    let ballast = queues(1);
+    let depths: Vec<(i64, Vec<String>)> = [32_i64, 1_000].map(|d| (d, queues(4))).into();
+    let seeded: Vec<String> = depths
+        .iter()
+        .flat_map(|(_, qs)| qs.clone())
+        .chain(ballast.clone())
+        .collect();
+    let measured = AssertUnwindSafe(async {
+        exec(
+            &mut conn,
+            &format!(
+                "INSERT INTO harvest_task_queue \
+                   (queue_name, task_type, input, state, max_attempts, scheduled_at) \
+                 SELECT '{}', 'workflow', '{{}}'::jsonb, 'COMPLETED', 3, \
+                        NOW() - INTERVAL '2 hours' \
+                 FROM generate_series(1, 20000)",
+                ballast[0]
+            ),
+        )
+        .await;
+        let mut measured = Vec::new();
+        for (depth, qs) in &depths {
+            seed_deep_backlog(&mut conn, qs, *depth).await;
+            let mut runs = Vec::new();
+            for _ in 0..3 {
+                let plan = claim_plan_of(&mut conn, qs, queue::claim_task_query()).await;
+                let root = &plan[0]["Plan"];
+                runs.push((cost_of_plan(root), refine_cost(root, "seek_candidate")));
+            }
+            delete_queues(&mut conn, qs).await;
+            measured.push((*depth, runs));
+        }
+        measured
+    })
+    .catch_unwind()
+    .await;
+    clean_up_after_probe(&mut conn, &seeded).await;
+    let measured = measured.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+    eprintln!("window refine cost by depth: {measured:?}");
+    for (depth, runs) in measured {
+        let mut refines = Vec::new();
+        for (cost, refine) in runs {
+            assert!(
+                cost.claimed,
+                "depth {depth}: the claim takes a row: {cost:?}"
+            );
+            assert!(
+                !cost.fallback_ran,
+                "depth {depth}: the window decides: {cost:?}"
+            );
+            refines.push(refine.expect("the window refine ran"));
+        }
+        refines.sort_by(|a, b| a.per_row().total_cmp(&b.per_row()));
+        assert_tid_refine(&format!("depth {depth}"), &refines[1], window_rows_max(4));
+    }
+}
+
 // ── Held claims (issue #2420) ────────────────────────────────────────────────
 
 /// Open `k` claim transactions on `queues` and keep them open.
@@ -456,13 +732,22 @@ async fn held_claims_on_one_head_keep_the_claim_off_the_full_scan() {
     for depth in [10_000_i64, 100_000] {
         let qs = queues(1);
         seed_deep_backlog(&mut conn, &qs, depth).await;
+        let mut deep = Vec::new();
         let result = AssertUnwindSafe(async {
             // Warm the index state once. See `claim_buffers_stay_flat_...`.
             claim_cost(&mut conn, &qs).await;
             let mut runs = vec![(0, claim_cost(&mut conn, &qs).await)];
             for k in [32_usize, 64] {
                 let holders = hold_claims(&url, &qs, k).await;
-                runs.push((k, claim_cost(&mut conn, &qs).await));
+                let plan = claim_plan_of(&mut conn, &qs, queue::claim_task_query()).await;
+                let root = &plan[0]["Plan"];
+                runs.push((k, cost_of_plan(root)));
+                deep.push((k, "seek_held", refine_cost(root, "seek_held")));
+                deep.push((
+                    k,
+                    "seek_deep_candidate",
+                    refine_cost(root, "seek_deep_candidate"),
+                ));
                 for holder in holders {
                     release(holder).await;
                 }
@@ -474,6 +759,16 @@ async fn held_claims_on_one_head_keep_the_claim_off_the_full_scan() {
         delete_queues(&mut conn, &qs).await;
         let runs = result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
         eprintln!("depth={depth} claim cost by held claims K: {runs:?}");
+        eprintln!("depth={depth} deep window refine by K: {deep:?}");
+        // Issue #2547: the held scans read their rows by ctid too.
+        for (k, name, refine) in &deep {
+            let refine = refine.as_ref().expect("the held scan ran");
+            assert_tid_refine(
+                &format!("depth {depth}, K={k}, {name}"),
+                refine,
+                window_rows_max(1) + queue::CLAIM_DEEP_SEEK_WINDOW,
+            );
+        }
         for (k, cost) in &runs {
             assert!(cost.claimed, "depth {depth}, K={k}: the claim takes a row");
             assert!(
@@ -901,61 +1196,279 @@ async fn a_single_activity_type_backlog_keeps_the_window_bounded() {
     );
 }
 
-/// Stale statistics do not make the claim read the backlog (issue #1971).
+/// The index of each table scan that ran in the plan subtree of CTE `name`.
+fn cte_scan_indexes(plan: &serde_json::Value, name: &str, inside: bool) -> Vec<String> {
+    let inside = inside || plan["Subplan Name"].as_str() == Some(&format!("CTE {name}"));
+    let mut found = Vec::new();
+    if inside
+        && plan["Relation Name"].as_str() == Some("harvest_task_queue")
+        && plan["Actual Loops"].as_i64().unwrap_or(0) > 0
+    {
+        found.push(plan["Index Name"].as_str().unwrap_or("none").to_owned());
+    }
+    for child in plan_children(plan) {
+        found.extend(cte_scan_indexes(child, name, inside));
+    }
+    found
+}
+
+/// One drained backlog of [`stale_statistics_keep_the_window_bounded`].
+#[derive(Debug)]
+struct DrainedCase {
+    /// The most common `state` values in the stale statistics.
+    mcv: String,
+    /// The claim with the stale statistics.
+    stale: ClaimCost,
+    /// The index of each head scan that ran in the stale claim.
+    heads: Vec<String>,
+    /// The same claim after a fresh `ANALYZE`.
+    fresh: ClaimCost,
+}
+
+/// `INSERT` of `rows` rows in `state` on `qs`.
+///
+/// With `one_kind`, each queue holds one task kind and one new-start flag.
+/// So three of its four heads are empty. Otherwise each queue holds both.
+fn queue_rows_sql(qs: &[String], rows: i64, state: &str, one_kind: bool) -> String {
+    let q = text_array(qs);
+    let n = qs.len();
+    let (kind, new_start) = if one_kind {
+        (format!("(i % {n}) % 4 < 2"), format!("(i % {n}) % 2 = 0"))
+    } else {
+        ("i % 2 = 0".to_owned(), "i % 2 = 0".to_owned())
+    };
+    format!(
+        "INSERT INTO harvest_task_queue \
+           (queue_name, task_type, activity_name, input, state, max_attempts, \
+            scheduled_at, new_start) \
+         SELECT ({q})[1 + (i % {n})], \
+                CASE WHEN {kind} THEN 'workflow' ELSE 'activity' END, \
+                CASE WHEN {kind} THEN NULL ELSE 'noop' END, \
+                '{{}}'::jsonb, '{state}', 3, \
+                NOW() - make_interval(secs => i % 3600), {new_start} \
+         FROM generate_series(1, {rows}) AS i"
+    )
+}
+
+/// Seed a drained backlog on `qs`, then claim with stale and fresh
+/// statistics.
+///
+/// The backlog drains, and `VACUUM ANALYZE` sees no `PENDING` row. The
+/// partial indexes keep the pages of the drained backlog, with a row count
+/// of 0. A burst arrives, and a `VACUUM` with no dead rows keeps that count.
+async fn drained_backlog_case(
+    conn: &mut AsyncPgConnection,
+    qs: &[String],
+    terminal: i64,
+    backlog: i64,
+    one_kind: bool,
+) -> DrainedCase {
+    exec(
+        conn,
+        &format!(
+            "TRUNCATE harvest_task_queue CASCADE; \
+             ALTER TABLE harvest_task_queue SET (autovacuum_enabled = off); \
+             {}; {}",
+            queue_rows_sql(qs, terminal, "COMPLETED", one_kind),
+            queue_rows_sql(qs, backlog, "PENDING", one_kind)
+        ),
+    )
+    .await;
+    exec(conn, "VACUUM ANALYZE harvest_task_queue").await;
+    exec(
+        conn,
+        "UPDATE harvest_task_queue SET state = 'COMPLETED', completed_at = NOW() \
+         WHERE state = 'PENDING'",
+    )
+    .await;
+    exec(conn, "VACUUM ANALYZE harvest_task_queue").await;
+    #[derive(diesel::QueryableByName)]
+    struct Mcv {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        vals: String,
+    }
+    let mcv: Mcv = diesel::sql_query(
+        "SELECT COALESCE(most_common_vals::text, '') AS vals FROM pg_stats \
+         WHERE tablename = 'harvest_task_queue' AND attname = 'state'",
+    )
+    .get_result(conn)
+    .await
+    .expect("read the state statistics");
+    exec(conn, &queue_rows_sql(qs, backlog, "PENDING", one_kind)).await;
+    exec(conn, "VACUUM harvest_task_queue").await;
+    let plan = claim_plan_of(conn, qs, queue::claim_task_query()).await;
+    let stale = cost_of_plan(&plan[0]["Plan"]);
+    let heads = cte_scan_indexes(&plan[0]["Plan"], "seek_heads", false);
+    exec(conn, "ANALYZE harvest_task_queue").await;
+    let fresh = claim_cost(conn, qs).await;
+    DrainedCase {
+        mcv: mcv.vals,
+        stale,
+        heads,
+        fresh,
+    }
+}
+
+/// Stale statistics do not make the claim read the backlog (issues #1971,
+/// #2547).
 ///
 /// A drained system keeps its terminal rows for a while. An `ANALYZE` then
-/// sees almost no `PENDING` row. A burst below the autoanalyze threshold
-/// leaves those statistics in place. The claim plan must stay bounded
-/// anyway: a join to the window once put the table on the outer side.
+/// sees no `PENDING` row. The partial indexes keep the pages of the drained
+/// backlog, but their row count is 0. Until the next `ANALYZE`, the planner
+/// estimates each head as empty. Then a plan that reads the whole backlog
+/// can look as cheap as the ordered head scan:
+///
+/// - A head scan that sorts all of `idx_harvest_tq_live_created`.
+/// - A head scan on `idx_harvest_tq_poll`, which gives the head order but
+///   filters the kind and the new-start flag. With one kind on each queue,
+///   three of four heads are empty, and each walks its whole queue.
+///
+/// Before issue #2547 this test seeded 20 `PENDING` rows among 400K
+/// terminal rows. The sample of 30,000 rows missed all 20 in about one run
+/// of five. Only those runs read the backlog, so the test failed at random.
+/// It now owns its database, with autovacuum off, so the statistics stay
+/// stale on every run. Production holds that state until the next
+/// autoanalyze.
 #[tokio::test]
 async fn stale_statistics_keep_the_window_bounded() {
-    let (mut conn, _container) = setup_db().await;
+    let (mut conn, _container, db) = setup_isolated_db().await;
+    let mixed = queues(4);
+    let one_kind = queues(64);
+    let measured = AssertUnwindSafe(async {
+        vec![
+            (
+                "4 queues of both kinds",
+                drained_backlog_case(&mut conn, &mixed, 400_000, 30_000, false).await,
+            ),
+            (
+                "64 queues of one kind each",
+                drained_backlog_case(&mut conn, &one_kind, 0, 90_000, true).await,
+            ),
+        ]
+    })
+    .catch_unwind()
+    .await;
+    drop_isolated_db(conn, db).await;
+    let measured = measured.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+    for (layout, case) in &measured {
+        eprintln!("stale statistics, {layout}: {case:?}");
+    }
+    for (layout, case) in &measured {
+        assert!(
+            !case.mcv.contains("PENDING"),
+            "{layout}: the case needs statistics that show no PENDING row: {case:?}"
+        );
+        assert!(
+            case.stale.claimed && !case.stale.fallback_ran,
+            "{layout}: {case:?}"
+        );
+        assert!(
+            case.heads
+                .iter()
+                .any(|index| index == "idx_harvest_tq_claim_seek"),
+            "{layout}: the queue heads read their ordered index: {case:?}"
+        );
+        for index in &case.heads {
+            assert!(
+                index == "idx_harvest_tq_claim_seek" || index == "idx_harvest_tq_sticky_poll",
+                "{layout}: a head scan reads {index}, not its ordered index: {case:?}"
+            );
+        }
+        assert!(
+            case.stale.buffers <= 3 * case.fresh.buffers.max(1),
+            "{layout}: stale statistics change the claim plan: {case:?}"
+        );
+    }
+}
+
+/// Each head scan in the plan subtree of CTE `name`, and whether a sort sits
+/// between it and its nearest `Limit` or subquery.
+fn head_scans_sorted(plan: &serde_json::Value, inside: bool, sorted: bool) -> Vec<(String, bool)> {
+    let inside = inside || plan["Subplan Name"].as_str() == Some("CTE seek_heads");
+    let node = plan["Node Type"].as_str().unwrap_or_default();
+    let sorted = match node {
+        "Limit" | "Subquery Scan" => false,
+        "Sort" | "Incremental Sort" => true,
+        _ => sorted,
+    };
+    let mut found = Vec::new();
+    if inside && plan["Relation Name"].as_str() == Some("harvest_task_queue") {
+        let index = plan["Index Name"].as_str().unwrap_or(node);
+        found.push((index.to_owned(), sorted));
+    }
+    for child in plan_children(plan) {
+        found.extend(head_scans_sorted(child, inside, sorted));
+    }
+    found
+}
+
+/// Only its ordered index gives a head its order without a sort (issue
+/// #2547).
+///
+/// The claim turns sorts off, so the planner takes a plan with no sort when
+/// one exists. A head scan must have one such plan only: its ordered index.
+/// Any other index that gives the order can read the whole backlog when
+/// stale statistics make it look as cheap. `idx_harvest_tq_poll` is one.
+/// With an equality on the new-start flag, it gives the queue head order,
+/// and it gives the pin order with an equality on the worker.
+///
+/// The test drops both ordered indexes in a transaction that it rolls back.
+/// Every head scan must then sort. The result does not depend on costs, so
+/// it holds for any data.
+#[tokio::test]
+async fn only_the_ordered_index_gives_a_head_its_order() {
+    #[derive(diesel::QueryableByName)]
+    struct Plan {
+        #[diesel(sql_type = diesel::sql_types::Json, column_name = "QUERY PLAN")]
+        plan: serde_json::Value,
+    }
+    let (mut conn, _container, db) = setup_isolated_db().await;
     let qs = queues(4);
-    let q = text_array(&qs);
-    exec(
-        &mut conn,
-        &format!(
-            "INSERT INTO harvest_task_queue \
-               (queue_name, task_type, activity_name, input, state, max_attempts, \
-                scheduled_at, completed_at) \
-             SELECT ({q})[1 + (i % 4)], 'activity', 'noop', '{{}}'::jsonb, 'COMPLETED', 3, \
-                    NOW() - INTERVAL '1 day', NOW() \
-             FROM generate_series(1, 400000) AS i; \
-             INSERT INTO harvest_task_queue \
-               (queue_name, task_type, activity_name, input, state, max_attempts, scheduled_at) \
-             SELECT ({q})[1 + (i % 4)], 'activity', 'noop', '{{}}'::jsonb, 'PENDING', 3, \
-                    NOW() - INTERVAL '1 hour' \
-             FROM generate_series(1, 20) AS i"
-        ),
-    )
+    let scans = AssertUnwindSafe(async {
+        exec(
+            &mut conn,
+            &format!(
+                "{}; ANALYZE harvest_task_queue",
+                queue_rows_sql(&qs, 1_000, "PENDING", false)
+            ),
+        )
+        .await;
+        exec(
+            &mut conn,
+            &format!(
+                "BEGIN; \
+                 DROP INDEX idx_harvest_tq_claim_seek; \
+                 DROP INDEX idx_harvest_tq_sticky_poll; \
+                 {}; \
+                 PREPARE seek_probe(text, text[], text, bigint, text[], text[]) AS {}",
+                queue::CLAIM_PLAN_SETTINGS_SQL,
+                queue::claim_task_query()
+            ),
+        )
+        .await;
+        let rows: Vec<Plan> = diesel::sql_query(format!(
+            "EXPLAIN (FORMAT JSON) EXECUTE seek_probe(\
+             '{WORKER}', {}, '', NULL, ARRAY[]::text[], ARRAY[]::text[])",
+            text_array(&qs)
+        ))
+        .load(&mut conn)
+        .await
+        .expect("explain claim");
+        exec(&mut conn, "ROLLBACK; DEALLOCATE seek_probe;").await;
+        head_scans_sorted(&rows[0].plan[0]["Plan"], false, false)
+    })
+    .catch_unwind()
     .await;
-    exec(&mut conn, "VACUUM ANALYZE harvest_task_queue").await;
-    exec(
-        &mut conn,
-        &format!(
-            "INSERT INTO harvest_task_queue \
-               (queue_name, task_type, activity_name, input, state, max_attempts, \
-                scheduled_at, new_start) \
-             SELECT ({q})[1 + (i % 4)], \
-                    CASE WHEN i % 2 = 0 THEN 'workflow' ELSE 'activity' END, \
-                    CASE WHEN i % 2 = 0 THEN NULL ELSE 'noop' END, \
-                    '{{}}'::jsonb, 'PENDING', 3, \
-                    NOW() - make_interval(secs => i % 3600), i % 2 = 0 \
-             FROM generate_series(1, 30000) AS i"
-        ),
-    )
-    .await;
-    exec(&mut conn, "VACUUM harvest_task_queue").await;
-    let stale = claim_cost(&mut conn, &qs).await;
-    exec(&mut conn, "ANALYZE harvest_task_queue").await;
-    let fresh = claim_cost(&mut conn, &qs).await;
-    delete_queues(&mut conn, &qs).await;
-    eprintln!("stale statistics: {stale:?}, fresh: {fresh:?}");
-    assert!(stale.claimed && !stale.fallback_ran, "{stale:?}");
-    assert!(
-        stale.buffers <= 3 * fresh.buffers.max(1),
-        "stale statistics change the claim plan: {stale:?} against {fresh:?}"
-    );
+    drop_isolated_db(conn, db).await;
+    let scans = scans.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+    eprintln!("head scans without the ordered indexes: {scans:?}");
+    assert_eq!(scans.len(), 2, "a queue head and the pin head: {scans:?}");
+    for (index, sorted) in &scans {
+        assert!(
+            *sorted,
+            "{index} gives a head its order without a sort, so the claim can pick it: {scans:?}"
+        );
+    }
 }
 
 /// A kind-filtered claim stays flat behind a deep run of the other kind

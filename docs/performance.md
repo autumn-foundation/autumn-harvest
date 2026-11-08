@@ -1348,11 +1348,12 @@ change. Design record: [`docs/design/DESIGN-1971.md`](design/DESIGN-1971.md).
   head. So a row must sort at or before the last row of each full head. A
   row pinned to this worker outranks the queue heads, and only a full pin
   head bounds it.
-- The window candidate scan reads the rows that pass the guard by primary
-  key and applies every gate. Its row test matches no partial index on
-  `PENDING` rows, and the claim turns bitmap scans off. So stale statistics
-  leave only a primary-key probe or a scan of the whole table. See the
-  stale-statistics result below.
+- The window candidate scan reads the rows that pass the guard by `ctid`
+  and applies every gate. Each window row carries the `ctid` that its head
+  scan read. Its row test matches no partial index on `PENDING` rows, and
+  the claim turns bitmap scans off. So stale statistics leave only a TID
+  scan or a scan of the whole table. See the stale-statistics result below
+  and [the refine by TID](#the-refine-by-tid-issue-2547).
 - When the window finds no candidate and a head is full, or when priority
   ageing is on, the same statement runs the full scan. A one-time filter
   gates it, and `EXPLAIN` shows it as `never executed` otherwise.
@@ -1435,9 +1436,60 @@ spills: 109,321 buffers and a spill before, 535 buffers and no spill after.
 **Stale statistics do not change the plan.** An `ANALYZE` saw 20 `PENDING`
 rows among 400K terminal rows. Then 30K rows arrived. The claim reads 479 to
 496 buffers, within 1% of the fresh plan. The window scan gives the planner
-no partial index on `PENDING` rows, so it probes the primary key. Before
-that fix, the same case read 11,704 buffers through a bitmap head scan, then
-30,278 through a partial index.
+no partial index on `PENDING` rows, so it probes the primary key. Since
+issue #2547 it reads each row by `ctid`, with a TID scan. Before the issue
+#1971 window, the same case read 11,704 buffers through a bitmap head scan,
+then 30,278 through a partial index.
+
+**A drained backlog (issue #2547).** The case above held only when the
+`ANALYZE` sample caught one of the 20 `PENDING` rows. The sample of 30,000
+rows missed all 20 in about one run of five. A drained backlog is the same
+case with certainty:
+
+- The backlog drains, and an `ANALYZE` sees no `PENDING` row.
+- The partial indexes keep the pages of the drained backlog, with a row
+  count of 0.
+- A burst arrives. Until the next autoanalyze, those statistics stay.
+
+The planner then estimates each head as empty, so a plan that reads the
+whole backlog can look as cheap as the ordered head scan. Two such plans
+were found:
+
+- Each queue head sorted all of `idx_harvest_tq_live_created`, and the pin
+  head scanned it once more. On the fixture of
+  `stale_statistics_keep_the_window_bounded` (4 queues, 400K terminal rows,
+  a drained backlog and a burst of 30K), `trunk-dev` read 18,576 buffers,
+  against 405 with fresh statistics. On a scratch fixture the cost grew
+  with the burst: 1,566 buffers at 3K, 14,308 at 30K and 46,310 at 100K,
+  379 ms per claim.
+- `idx_harvest_tq_poll` also gives a head its order with no sort, because
+  an equality makes the kind and the new-start flag constant. It filters
+  those columns instead, so each empty head walks its whole queue. A
+  review found this on a scratch fixture of 64 queues with one kind each,
+  after sorts were turned off: 274,301 buffers, against 4,110 with fresh
+  statistics.
+
+The claim now turns sorts off (`SET LOCAL enable_sort = off`). Each head
+writes its order so that one index alone gives it:
+
+- A queue head tests the new-start flag with a range, `>=` and `<=`, and
+  sorts on it first. Only `idx_harvest_tq_claim_seek` holds that column
+  after the queue and the kind.
+- The pin head reads its pins in a subquery that `OFFSET 0` keeps apart. It
+  tests the worker with a range and sorts on it first. Only
+  `idx_harvest_tq_sticky_poll` leads with that column.
+
+The rows do not change: both columns are `NOT NULL`, so each range selects
+the same rows as the equality. The test runs two layouts:
+
+| layout | `trunk-dev`, stale | now, stale | now, fresh |
+|:--|--:|--:|--:|
+| 4 queues of both kinds, 400K terminal rows, 30K burst | 18,576 | 247 | 243 |
+| 64 queues of one kind each, 90K burst | 974,412 | 4,097 | 4,093 |
+
+`only_the_ordered_index_gives_a_head_its_order` drops both ordered indexes
+in a transaction and asserts that each head scan must then sort. That
+result does not depend on costs or data.
 
 ### Latency and throughput under contention
 
@@ -1582,14 +1634,126 @@ one more claim runs. PG16, warm cache:
 | 100,000 | 64 | 106,534 buffers, 2,259 temp blocks, full scan | 1,772 buffers |
 
 The held cost does not grow with K or with the backlog depth. Most of it is
-the deep candidate scan: one primary-key probe for each of the 256 deep
-rows, about 4 buffers each. A claim whose window finds a row pays nothing
-for the deep window. When the window finds no row, `seek_held` checks the
+the deep candidate scan: one probe for each of the 256 deep rows. A
+primary-key probe read about 4 buffers. Since issue #2547 a TID probe reads
+about 1, and K = 32 reads 779 buffers. See
+[the refine by TID](#the-refine-by-tid-issue-2547). A claim whose window
+finds a row pays nothing for the deep window. When the window finds no row, `seek_held` checks the
 window rows once more. The deep window reads rows only for a held head.
 
 The guard still cuts the deep rows at the last row of every other full
 head. When gates reject the rows of that head, fewer held claims can cause
 the fallback.
+
+### The refine by TID (issue #2547)
+
+On the e2e bench, the claim was 45.1% of shared buffers, at 141 buffers per
+call. The refine step was 84% of that. It read each window row again
+through `harvest_task_queue_pkey`, at about 4.2 buffers per row, to apply
+every gate and lock one row.
+
+The head scans already read each row from the heap. Since issue #2547 each
+window row carries the `ctid` of that tuple, and the refine reads the rows
+with a TID scan. A TID scan reads the heap page and no index page. The
+order, the gates, the lock set and the indexes do not change. Design
+record: [`docs/design/DESIGN-2547.md`](design/DESIGN-2547.md).
+
+`the_window_refine_reads_about_one_buffer_per_row` measures the refine on
+the issue #1956 fixture of `claim_seek_tests`, with 20,000 terminal rows as
+ballast. The figure is the median of three claims. It is the
+`seek_candidate` CTE, less its init plans and the gate subplans of the
+scan. PG16, warm cache:
+
+| pending rows | refined rows | before | after |
+|--:|--:|--:|--:|
+| 32 | 33 | 84 buffers, 2.55 per row | 36 buffers, 1.09 per row |
+| 1,000 | 79 | 239 buffers, 3.03 per row | 82 buffers, 1.04 per row |
+
+The whole claim, from the other tests of the same suite. These are new
+runs, so a figure can differ by a buffer from the tables above:
+
+| test | case | before | after |
+|:--|:--|--:|--:|
+| `claim_buffers_stay_flat_from_1k_to_100k_pending_rows` | 1,000 rows | 432 | 300 |
+| | 10,000 rows | 478 | 416 |
+| | 100,000 rows | 529 | 430 |
+| `held_claims_on_one_head_keep_the_claim_off_the_full_scan` | 100K rows, K = 0 | 263 | 171 |
+| | 100K rows, K = 32 | 1,726 | 779 |
+| | 100K rows, K = 64 | 1,769 | 814 |
+| `the_window_refine_reads_about_one_buffer_per_row` | 32 rows, 20K terminal | 202 | 125 |
+
+"After" includes all changes of issue #2547: the TID refine, sorts off
+and the head order that one index alone gives. The TID refine alone read 1,690 buffers in the last row. Its 20K
+terminal rows gave statistics with almost no `PENDING` row. The TID scan
+changed the costs, and a head scan then sorted a partial index. That is
+the plan of [a drained backlog](#claim-cost-against-backlog-depth). Sorts
+off remove it.
+
+- **The refine now costs about 1 buffer per row.** The guard array is an
+  init plan. It can be the first reader of `seek_heads`, so the test
+  subtracts the init plans. Without that, the head scans count inside the
+  refine.
+- **The deep window gains the most.** It probes up to 256 rows of a held
+  head. Each probe now saves about 3 buffers.
+  `held_claims_on_one_head_keep_the_claim_off_the_full_scan` asserts a TID
+  scan at about 1 buffer per row there too.
+- **A concurrent update can make the claim skip a row.** A peer can commit
+  an update to a window row after the claim snapshot and before the row
+  lock. The new version has a new `ctid`.
+  - Postgres 13.23, 14.20, 15.15, 16.11, 17.7 and later skip the row. Their
+    TID recheck tests the TID list.
+  - Postgres 12 and the older minor releases recheck every other gate on
+    the new version, as the primary-key probe did.
+  - A skip acts like a `SKIP LOCKED` skip. The claim takes the next row, or
+    returns no task when the head holds no other row. It keeps its lock on
+    the skipped row until its transaction ends.
+  - Few writers keep a row `PENDING` when they update it. They are a
+    priority change, a sticky-pin release, a pause shift, a cap raise, an
+    owner stamp, a shard move and a signal re-pend. Some of them
+    rewrite many rows in one commit. Then each claim in flight on that head
+    skips those rows once. No writer updates one row again and again.
+  - A later poll reads the new version.
+
+#### The e2e profile, again
+
+The workload of issue #2547: `benches/e2e_bench.rs`, scenario
+`throughput`, 1 shard, with `HARVEST_BENCH_STATS_DIR` set. Each run
+captures the shard's `pg_stat_statements` for the scenario only. Postgres
+16.15 on a 4-core box. Run 2 also sampled 2% of plans with `auto_explain`
+(`ANALYZE`, `BUFFERS`). "Before" is `trunk-dev` at `373ec6f`.
+
+| run | claim, before | claim, after |
+|:--|--:|--:|
+| 1 | 141.1 buffers per call, 47.6% of buffers | 94.7 buffers per call, 38.9% |
+| 2 | 238.6 buffers per call, 51.1% | 101.2 buffers per call, 35.2% |
+
+The median of about 195 sampled claim plans in each half of run 2:
+
+| part | before | after |
+|:--|--:|--:|
+| `seek_heads` | 31 | 31 |
+| refine scan, own buffers | 105 for 27 rows, 3.89 per row | 27 for 27 rows, 1.00 per row |
+| `claimed` | 17 | 16 |
+| whole claim | 235 | 99 |
+
+- **The refine matches the fixture.** The primary-key refine read 3.89
+  buffers per row. Issue #2547 measured about 4.2. The TID refine reads 1.
+- **The heads do not change.** Every sampled plan read
+  `idx_harvest_tq_claim_seek` and `idx_harvest_tq_sticky_poll`, before and
+  after.
+- **The before figure varies.** It was 141 in run 1 and 239 in run 2. The
+  after figure stayed near 100.
+- **Throughput is not evidence.** It was 46.5 and 47.0 workflows/s before,
+  and 48.0 and 47.8 after. The bench is a closed loop with a shallow queue.
+- **A gate that reads many runs remains.** The PAUSED-run gate is a hashed
+  subplan. It scans `harvest_workflow_executions` once per claim to build
+  its hash. Before, that was a sequential scan. After, it was an index scan
+  on `idx_harvest_we_non_terminal_wf_name`. Each read about 27 buffers here,
+  and the cost grows with the number of runs. Issue #2547 does not change
+  it.
+- **Artifacts:** [`docs/perf-artifacts/claim-refine-tid/`](perf-artifacts/claim-refine-tid/)
+  holds the `pg_stat_statements` and `pg_stat_user_tables` files of the
+  four runs.
 
 ### Costs of the seek window
 
@@ -1655,6 +1819,19 @@ the fallback.
 - **Future-dated rows in a higher band.** A head scan steps over the index
   entries of rows that are not yet due, inside a higher priority band.
   Those steps read index pages only.
+- **A generic plan cached on a nearly empty table.** A connection can
+  cache the claim plan when the table holds 10 rows or fewer. If the table
+  then grows before an `ANALYZE`, that plan reads the whole table.
+  - The head scans no longer do this, since issue #2547 turned sorts off.
+  - The window refine still does. With so few rows the planner picks a
+    sequential scan over a TID scan.
+  - At 8 rows grown to 100K, the claim read 40,952 buffers before issue
+    #2547 and 2,473 after. The refine read 2,443 of them.
+  - The first autoanalyze ends it, because it makes each connection plan
+    the claim again. The task queue analyzes after 50 rows plus 2%.
+- **The skip after a concurrent update (issue #2547).** No test drives
+  it. The scratch run that showed it used PG 16.15. See
+  [the refine by TID](#the-refine-by-tid-issue-2547).
 - **A held snapshot.** A long transaction, `pg_dump` or a standby with
   `hot_standby_feedback` keeps the index entries of claimed rows alive at
   the queue head. Each claim then reads them again. Every Postgres queue

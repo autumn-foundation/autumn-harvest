@@ -132,6 +132,10 @@ through `id = ANY(ARRAY(...))`. Its row test gives the planner no partial
 index on `PENDING` rows. So stale statistics leave only the primary-key
 probe or a scan of the whole table. See §1.8.
 
+> **Follow-up (issue #2547):** the scan now reads each row by its `ctid`,
+> through `ctid = ANY(ARRAY(...))`. A TID scan reads no index page. See
+> `docs/design/DESIGN-2547.md`.
+
 ### 1.4 The fallback
 
 `legacy_candidate` is the full candidate scan, unchanged. It has a one-time
