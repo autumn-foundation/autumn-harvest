@@ -34,6 +34,10 @@ Four scenarios, each run at **1 shard**, **2 shards** and **4 shards**.
 | `signal_roundtrip` | signal round-trip p50/p99 | an HTTP signal request leaving the client → the workflow's own code resuming past `wait_for_signal` |
 | `replay_throughput` | replay events/sec | the issue #135 history (10 001 events), in memory |
 
+Two opt-in arms measure capacity under an open loop: `capacity_noop` and
+`capacity_canonical`. They are not part of the matrix above. See
+[Capacity under an open loop](#capacity-under-an-open-loop).
+
 ### Headline numbers, v0.8.0
 
 Four logical CPUs, Postgres 16.15, durability off, one worker per shard. The
@@ -48,6 +52,11 @@ full environment, the per-cell notes and the verbatim run output are in
 | `signal_roundtrip` | p50 ms | 11.36 | 15.55 | 25.69 |
 | `signal_roundtrip` | p99 ms | 80.38 | 81.96 | 85.03 |
 | `replay_throughput` | events/sec | 9 571 608.09 | 9 591 638.46 | 9 058 597.83 |
+
+**The closed-loop `throughput` cell is latency-bound.** It holds 32
+workflows in flight per shard. Its rate is that population divided by the
+workflow latency. It does not say how many workflows one Postgres can run.
+[Capacity under an open loop](#capacity-under-an-open-loop) measures that.
 
 Read these four points with the table:
 
@@ -205,11 +214,12 @@ HARVEST_BENCH_SCENARIOS=signal_roundtrip HARVEST_BENCH_SHARDS=1 cargo xtask benc
 
 | variable | effect |
 |:--|:--|
-| `HARVEST_BENCH_SCENARIOS` | comma-separated scenario ids; unset runs all four |
+| `HARVEST_BENCH_SCENARIOS` | comma-separated scenario ids; unset runs all four. `capacity` selects both capacity arms |
 | `HARVEST_BENCH_SHARDS` | comma-separated shard counts; unset runs 1, 2 and 4 |
 | `HARVEST_BENCH_INFLIGHT` | closed-loop in-flight workflows per shard — the load level. `throughput` only |
 | `HARVEST_BENCH_WORKFLOWS` | measured completions per shard. `throughput` only |
 | `HARVEST_BENCH_CLAIM_LOOPS` | claim loops per worker; unset keeps the worker default. The [resident hit-rate record](rnd/2026-10-11-resident-hit-rate.md) compares `1` against the default |
+| `HARVEST_BENCH_WORKER_PROCESSES` | worker processes per shard. Capacity arms only; the default is 4. Each process adds 33 connections per shard, and a cell refuses to run past `max_connections` |
 | `HARVEST_BENCH_CHECK` | also print the reproduction verdict |
 | `HARVEST_BENCH_KEEP` | leave the containers running afterwards |
 | `HARVEST_BENCH_OUT` | write the report somewhere other than `benchmarks/results/` |
@@ -314,6 +324,92 @@ move with shard count. It is run at all three counts anyway: drift across those
 three runs bounds how loaded the box was while the other nine cells were
 measured.
 
+## Capacity under an open loop
+
+The capacity arms offer a fixed start rate and step it up. They report the
+**sustainable rate**: the highest step at which the pending backlog and the
+p99 start-to-complete latency stay bounded for the whole step.
+
+| arm | workflow |
+|:--|:--|
+| `capacity_noop` | zero activities |
+| `capacity_canonical` | the canonical 3-activity workflow |
+
+Run both arms at one shard:
+
+```bash
+HARVEST_BENCH_SCENARIOS=capacity HARVEST_BENCH_SHARDS=1 cargo xtask bench run
+```
+
+**Method.**
+
+* Each shard has 4 worker processes. Each process is the bench binary run
+  again as one worker, with its own runtime and its own pool. So the claim
+  path sees fleet contention. A process that loses its worker exits, and
+  the cell is then not published.
+* Each arrival is its own task. Run `k` of a step is scheduled at
+  `k / rate` seconds. At that instant it asks for a connection from a
+  16-connection generator pool per shard. The instant it gets one is its
+  **admission**. The generator wait runs from schedule to admission. A slow
+  start call never moves a later schedule. A start call that fails or times
+  out fails the step. It does not stop the cell. An arrival that gets no
+  connection never reached the engine, so it is a generator failure.
+* A step lasts 20 s. The first step offers 50 starts/s per shard for
+  `capacity_noop` and 25 for `capacity_canonical`, so each step starts at
+  least 500 runs. Each next step offers
+  1.25 times more. One discarded warmup step runs first. A warmup that
+  leaves runs unfinished voids the cell.
+* After its arrivals, a step drains for up to 20 s. A run that does not
+  finish in that time fails the step.
+* Engine latency runs from admission to `completed_at`. The engine backlog
+  counts runs admitted and not yet complete. Both times come from the
+  bench host clock. The generator wait, from schedule to admission, is
+  judged on its own.
+
+**The rule.** The rule judges each step in four equal windows. The first
+window is settle time. A step is sustainable when, on every shard:
+
+* the generator achieved at least 95% of the offered rate,
+* the p99 generator wait is at most 100 ms,
+* the step started at least 400 runs, so each judged window holds at least
+  100,
+* every run completed within the drain grace, and no run or start call
+  failed,
+* the least-squares slope of the engine backlog over the judged windows is
+  at most 5% of the offered rate,
+* the median latency grows at most 5 ms per second from the second window
+  to the last, and
+* the p99 of the last window is at most 2 times the p99 of the second
+  window, plus 100 ms.
+
+A failed generator check makes the step generator-bound only when the
+engine kept up. A saturated database also slows the start calls, so an
+engine failure in the same step wins. A step that fails only on the median or
+the p99 check runs once more at the same rate, and the second verdict
+counts. One pause in a small window then cannot stop the ladder. A real
+overload fails the retry too. A step that earns a retry with no budget left
+for it voids the cell.
+
+The ladder stops at the first step that is not sustainable. The sustainable
+rate is the step before it. The cell is not published when the first step
+fails, when the generator stops the ladder, or when the ladder ends with no
+failed step. In the last case the rate is only a lower bound.
+
+**Hardware.** Each worker process opens a 32-connection pool and one
+listener. So one shard needs 4 x 33 + 16 + 4 = 152 connections. A cell
+checks `max_connections`, less the reserved slots and the connections
+already in use, before it starts. It refuses to run when the server cannot
+hold it. The compose services allow 200, which leaves room
+for up to 5 worker processes per shard, not 6. The generator and the workers run
+on the bench host. A loopback database therefore shares its CPUs with
+them. The cell notes say so.
+
+**Results.** On the 4-core reference box, with the database on the same
+host as the workers, one shard sustains **190.7** `capacity_noop` and
+**48.8** `capacity_canonical` workflows/s. An earlier sweep reproduced the
+no-op rate and put the canonical rate one ladder step lower. See
+[`benchmarks/capacity-2026-11.md`](benchmarks/capacity-2026-11.md).
+
 ## What the shard sweep can and cannot show
 
 The sweep holds **hardware fixed** and varies the number of shards on it. On the
@@ -324,6 +420,16 @@ scales out across shards on a fixed machine. It says nothing about what a
 did. Issue #941 asks for the sweep to be published "or honestly failing to
 demonstrate" scaling; the per-release results file reports what actually
 happened.
+
+**A co-located shard cell is not a scaling result.** The published sweep
+runs four Postgres clusters on one 4-core host. Its 1 → 4 shard curve
+therefore shows a CPU limit of that host. It is no evidence for or against
+shard scaling. Each database cell prints its host layout: the number of
+distinct database hosts in its shard URLs. A cell with fewer hosts than
+shards says that its shards share a host. The run's shard-scaling section
+prints no ratio for such a cell. A scaling claim needs one database host
+per shard. The workers of every capacity cell also run on the bench host,
+so that section prints no ratio for any multi-shard cell yet.
 
 ## Known limitations
 

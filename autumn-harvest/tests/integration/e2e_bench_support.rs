@@ -88,7 +88,24 @@ pub enum BenchScenario {
     /// Replay throughput over the #135 history. Shard-invariant by
     /// construction, so it doubles as the run's noise control.
     ReplayThroughput,
+    /// The highest offered start rate a shard sustains, under an open loop.
+    ///
+    /// Opt-in. It is not part of the published matrix, see
+    /// [`BenchScenario::capacity`].
+    Capacity(CapacityArm),
 }
+
+/// The workflow shape of one capacity arm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapacityArm {
+    /// A workflow with zero activities.
+    Noop,
+    /// The canonical 3-activity workflow.
+    Canonical,
+}
+
+/// Filter alias that selects every capacity arm.
+pub const CAPACITY_FILTER_ALIAS: &str = "capacity";
 
 /// Shard counts every scenario is run at (issue #941 AC2).
 pub const SHARD_COUNTS: [u32; 3] = [1, 2, 4];
@@ -143,6 +160,9 @@ pub const REPLAY_EVENT_COUNT: usize = 2 * REPLAY_ACTIVITY_COUNT + 1;
 
 /// Workflow type name used by every database scenario.
 pub const BENCH_WORKFLOW: &str = "harvest_e2e_bench_wf";
+
+/// The zero-activity workflow of the `capacity_noop` arm.
+pub const BENCH_NOOP_WORKFLOW: &str = "harvest_e2e_bench_noop_wf";
 
 /// The workflow the signal scenario parks on `wait_for_signal`.
 pub const BENCH_SIGNAL_WORKFLOW: &str = "harvest_e2e_bench_signal_wf";
@@ -488,9 +508,10 @@ pub fn stats_label(scenario: BenchScenario, shards: usize, shard: usize) -> Stri
 
 /// Parse a comma-separated scenario filter into the scenarios it selects.
 ///
-/// An empty or absent filter selects everything; an unrecognised id selects
-/// nothing *for that entry* and is reported by [`unknown_scenario_ids`], so a
-/// typo produces a named complaint rather than a silently empty run.
+/// An empty or absent filter selects the published matrix, [`BenchScenario::all`].
+/// A capacity arm runs only when a filter names it. An unknown id selects
+/// nothing for that entry. [`unknown_scenario_ids`] reports it, so a typo
+/// gives a named complaint and not a silently empty run.
 #[must_use]
 pub fn selected_scenarios(filter: Option<&str>) -> Vec<BenchScenario> {
     let Some(filter) = filter.map(str::trim).filter(|f| !f.is_empty()) else {
@@ -501,9 +522,9 @@ pub fn selected_scenarios(filter: Option<&str>) -> Vec<BenchScenario> {
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .collect();
-    BenchScenario::all()
+    BenchScenario::known()
         .into_iter()
-        .filter(|s| wanted.contains(&s.as_str()))
+        .filter(|s| wanted.iter().any(|entry| s.matches_filter_entry(entry)))
         .collect()
 }
 
@@ -513,12 +534,15 @@ pub fn unknown_scenario_ids(filter: Option<&str>) -> Vec<String> {
     let Some(filter) = filter.map(str::trim).filter(|f| !f.is_empty()) else {
         return Vec::new();
     };
-    let known: Vec<&str> = BenchScenario::all().iter().map(|s| s.as_str()).collect();
     filter
         .split(',')
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .filter(|s| !known.contains(s))
+        .filter(|s| {
+            !BenchScenario::known()
+                .iter()
+                .any(|known| known.matches_filter_entry(s))
+        })
         .map(str::to_owned)
         .collect()
 }
@@ -571,6 +595,8 @@ impl BenchScenario {
             Self::DispatchLatency => "dispatch_latency",
             Self::SignalRoundtrip => "signal_roundtrip",
             Self::ReplayThroughput => "replay_throughput",
+            Self::Capacity(CapacityArm::Noop) => "capacity_noop",
+            Self::Capacity(CapacityArm::Canonical) => "capacity_canonical",
         }
     }
 
@@ -587,6 +613,37 @@ impl BenchScenario {
         ]
     }
 
+    /// The opt-in capacity arms, in report order.
+    ///
+    /// They stay out of [`Self::all`]. A capacity ladder takes minutes per
+    /// cell, and it has no published baseline at every shard count.
+    #[must_use]
+    pub const fn capacity() -> [Self; 2] {
+        [
+            Self::Capacity(CapacityArm::Noop),
+            Self::Capacity(CapacityArm::Canonical),
+        ]
+    }
+
+    /// Every scenario a filter can name: the published matrix, then the
+    /// capacity arms.
+    #[must_use]
+    pub const fn known() -> [Self; 6] {
+        let [throughput, dispatch, signal, replay] = Self::all();
+        let [noop, canonical] = Self::capacity();
+        [throughput, dispatch, signal, replay, noop, canonical]
+    }
+
+    /// Whether a filter entry selects this scenario.
+    ///
+    /// An entry matches its own id. [`CAPACITY_FILTER_ALIAS`] also matches
+    /// each capacity arm.
+    #[must_use]
+    pub fn matches_filter_entry(self, entry: &str) -> bool {
+        entry == self.as_str()
+            || (entry == CAPACITY_FILTER_ALIAS && matches!(self, Self::Capacity(_)))
+    }
+
     /// Whether the scenario needs a live Postgres. Replay is in-memory.
     #[must_use]
     pub const fn needs_database(self) -> bool {
@@ -601,7 +658,10 @@ impl BenchScenario {
     /// how deep the queue happened to be.
     #[must_use]
     pub const fn is_paced(self) -> bool {
-        matches!(self, Self::DispatchLatency | Self::SignalRoundtrip)
+        matches!(
+            self,
+            Self::DispatchLatency | Self::SignalRoundtrip | Self::Capacity(_)
+        )
     }
 }
 
@@ -1070,6 +1130,96 @@ pub fn inflight_soundness(target: usize, mean: Option<f64>) -> Vec<String> {
         )];
     }
     Vec::new()
+}
+
+// ── Host layout (pure) ─────────────────────────────────────────────────────
+
+/// Where a cell's shard databases run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostLayout {
+    /// Shards in the cell.
+    pub shards: usize,
+    /// Distinct database hosts, sorted.
+    pub hosts: Vec<String>,
+    /// Whether a database host is the bench host itself.
+    pub loopback: bool,
+}
+
+impl HostLayout {
+    /// Whether two or more shards share one database host.
+    #[must_use]
+    pub const fn shares_a_host(&self) -> bool {
+        self.hosts.len() < self.shards
+    }
+
+    /// The host-layout note a cell prints.
+    #[must_use]
+    pub fn note(&self) -> String {
+        let mut note = format!(
+            "host layout: {} shard(s) on {} database host(s) ({})",
+            self.shards,
+            self.hosts.len(),
+            self.hosts.join(", "),
+        );
+        if self.loopback {
+            note.push_str("; a database shares the bench host with the workers and the generator");
+        }
+        if self.shares_a_host() {
+            note.push_str("; the shards share a host, so this cell is not a scaling result");
+        }
+        note
+    }
+}
+
+/// The lowercase host of a Postgres URL. A URL with no host is a local
+/// socket and reads as `localhost`.
+#[must_use]
+pub fn database_host(url: &str) -> String {
+    let rest = url.split_once("://").map_or("", |(_, rest)| rest);
+    let authority = rest.split(['/', '?']).next().unwrap_or_default();
+    let host_port = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    let host = if host_port.starts_with('[') {
+        host_port
+            .split_once(']')
+            .map_or(host_port, |(inner, _)| &host_port[..=inner.len()])
+    } else {
+        host_port.split(':').next().unwrap_or_default()
+    };
+    if host.is_empty() {
+        "localhost".to_owned()
+    } else {
+        host.to_ascii_lowercase()
+    }
+}
+
+/// Whether `host` names the bench host itself.
+#[must_use]
+pub fn is_loopback(host: &str) -> bool {
+    host == "localhost" || host == "[::1]" || host.starts_with("127.")
+}
+
+/// The host layout of a set of shard URLs.
+#[must_use]
+pub fn host_layout<'a>(urls: impl IntoIterator<Item = &'a str>) -> HostLayout {
+    let mut shards = 0;
+    let mut hosts = std::collections::BTreeSet::new();
+    let mut loopback = false;
+    for url in urls {
+        shards += 1;
+        let host = database_host(url);
+        // Every spelling of the bench host is one host.
+        if is_loopback(&host) {
+            loopback = true;
+            hosts.insert("localhost".to_owned());
+        } else {
+            hosts.insert(host);
+        }
+    }
+    HostLayout {
+        shards,
+        hosts: hosts.into_iter().collect(),
+        loopback,
+    }
 }
 
 // ── Report model (pure) ────────────────────────────────────────────────────
@@ -2783,6 +2933,62 @@ mod tests {
             assert_eq!(sweep_step(name), SweepStep::Skip, "{name}");
         }
     }
+
+    #[test]
+    fn a_url_host_is_parsed_without_credentials_or_port() {
+        assert_eq!(
+            database_host("postgres://u:p@DB-1.example:5432/postgres"),
+            "db-1.example"
+        );
+        assert_eq!(
+            database_host("postgresql://db2/postgres?sslmode=disable"),
+            "db2"
+        );
+        assert_eq!(database_host("postgres://u@[::1]:55432/x"), "[::1]");
+        assert_eq!(database_host("postgres:///postgres"), "localhost");
+        assert_eq!(database_host("postgres://u:p@:5432/x"), "localhost");
+    }
+
+    #[test]
+    fn shards_on_one_host_share_it_and_say_so() {
+        let layout = host_layout([
+            "postgres://u:p@localhost:55432/a",
+            "postgres://u:p@localhost:55433/b",
+        ]);
+        assert_eq!(layout.shards, 2);
+        assert_eq!(layout.hosts, vec!["localhost".to_owned()]);
+        assert!(layout.loopback);
+        assert!(layout.shares_a_host());
+        let note = layout.note();
+        assert!(note.contains("not a scaling result"), "{note}");
+        assert!(note.contains("bench host"), "{note}");
+    }
+
+    #[test]
+    fn shards_on_distinct_hosts_do_not_share_one() {
+        let layout = host_layout(["postgres://a.db/x", "postgres://b.db/x"]);
+        assert!(!layout.shares_a_host());
+        assert!(!layout.loopback);
+        assert!(!layout.note().contains("not a scaling result"));
+    }
+
+    #[test]
+    fn every_spelling_of_the_bench_host_is_one_host() {
+        let layout = host_layout([
+            "postgres://localhost:55432/a",
+            "postgres://127.0.0.1:55433/b",
+            "postgres://[::1]:55434/c",
+        ]);
+        assert_eq!(layout.hosts, vec!["localhost".to_owned()]);
+        assert!(layout.shares_a_host());
+    }
+
+    #[test]
+    fn one_shard_never_shares_a_host() {
+        let layout = host_layout(["postgres://127.0.0.1:5432/x"]);
+        assert!(!layout.shares_a_host());
+        assert!(layout.loopback, "127.0.0.1 is the bench host");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2827,8 +3033,8 @@ pub mod db {
     use super::super::claim_bench_support::LatencyStats;
     use super::super::pg_stats_snapshot::ResetOutcome;
     use super::{
-        BENCH_ACTIVITIES, BENCH_QUEUE, BENCH_SIGNAL, BENCH_SIGNAL_WORKFLOW, BENCH_WORKFLOW,
-        BenchScenario, DISPATCH_WORKFLOWS_PER_SHARD, FEEDER_CONNECTIONS_PER_SHARD,
+        BENCH_ACTIVITIES, BENCH_NOOP_WORKFLOW, BENCH_QUEUE, BENCH_SIGNAL, BENCH_SIGNAL_WORKFLOW,
+        BENCH_WORKFLOW, BenchScenario, DISPATCH_WORKFLOWS_PER_SHARD, FEEDER_CONNECTIONS_PER_SHARD,
         MAX_CONCURRENT_ACTIVITIES, MAX_CONCURRENT_WORKFLOWS, Metric,
         PACED_STARTS_PER_SEC_PER_SHARD, POLL_INTERVAL_MS, POOL_SIZE_PER_SHARD, Pacing,
         SCENARIO_BUDGET_SECS, SHARD_URLS_ENV_VAR, SIGNAL_PARK_SETTLE, SIGNAL_SOCKET_TIMEOUT,
@@ -3299,16 +3505,35 @@ pub mod db {
         })
     }
 
-    fn build_pool(url: &str) -> DbPool {
+    /// Build the bench pool of one shard.
+    #[must_use]
+    pub fn build_pool(url: &str) -> DbPool {
+        build_pool_sized(url, POOL_SIZE_PER_SHARD)
+    }
+
+    /// Build a bench pool of `size` connections.
+    #[must_use]
+    pub fn build_pool_sized(url: &str, size: usize) -> DbPool {
         let manager = autumn_harvest::pool::engine_manager(url);
         autumn_harvest::pool::with_engine_timeouts(
-            deadpool::managed::Pool::builder(manager).max_size(POOL_SIZE_PER_SHARD),
+            deadpool::managed::Pool::builder(manager).max_size(size),
             autumn_harvest::pool::DbRole::Hot,
             &autumn_harvest::pool::EngineDbTimeouts::default(),
         )
         .expect("bench pool timeouts are valid")
         .build()
         .expect("bench pool build failed")
+    }
+
+    /// One lazy pool per shard URL. A pool opens no connection until a
+    /// caller checks one out.
+    #[must_use]
+    pub fn sharded_pool_from(urls: &BTreeMap<ShardId, String>) -> ShardedDbPool {
+        let pools: BTreeMap<ShardId, DbPool> = urls
+            .iter()
+            .map(|(shard, url)| (*shard, build_pool(url)))
+            .collect();
+        ShardedDbPool::from_map(pools, ShardId::new(0))
     }
 
     impl ShardCluster {
@@ -3319,12 +3544,13 @@ pub mod db {
 
         #[must_use]
         pub fn sharded_pool(&self) -> ShardedDbPool {
-            let pools: BTreeMap<ShardId, DbPool> = self
-                .urls
-                .iter()
-                .map(|(shard, url)| (*shard, build_pool(url)))
-                .collect();
-            ShardedDbPool::from_map(pools, ShardId::new(0))
+            sharded_pool_from(&self.urls)
+        }
+
+        /// Where this cell's shard databases run.
+        #[must_use]
+        pub fn host_layout(&self) -> super::HostLayout {
+            super::host_layout(self.urls.values().map(String::as_str))
         }
 
         #[must_use]
@@ -3530,6 +3756,12 @@ pub mod db {
             }
             Ok(serde_json::json!({ "ok": true }))
         })
+    }
+
+    /// The zero-activity workflow. It returns at once, so a run costs only the
+    /// engine's own start, claim and completion.
+    fn bench_noop_workflow(_ctx: &WorkflowContext, _input: serde_json::Value) -> BoxFut<'_> {
+        Box::pin(async move { Ok(serde_json::json!({ "ok": true })) })
     }
 
     /// Parks on a signal, then records the instant its own code resumed.
@@ -3966,6 +4198,7 @@ pub mod db {
             vec![
                 workflow_info(BENCH_WORKFLOW, bench_workflow),
                 workflow_info(BENCH_SIGNAL_WORKFLOW, bench_signal_workflow),
+                workflow_info(BENCH_NOOP_WORKFLOW, bench_noop_workflow),
             ],
             BENCH_ACTIVITIES.iter().map(|n| activity_info(n)).collect(),
             Arc::new(state),
@@ -4053,6 +4286,37 @@ pub mod db {
         }
     }
 
+    /// Build one bench worker pinned to `shard`.
+    ///
+    /// The in-process fleet and each capacity worker process build their
+    /// workers here, so both run the same configuration.
+    #[must_use]
+    pub fn build_worker(
+        shard: ShardId,
+        notification_urls: &[(ShardId, String)],
+        sharded: &ShardedDbPool,
+        registry: &Arc<HandlerRegistry>,
+        worker_id: String,
+    ) -> Arc<Worker> {
+        let worker_config = WorkerConfig::default()
+            .with_queues([BENCH_QUEUE])
+            .with_shard_assignments([shard])
+            .with_shard_notification_database_urls(notification_urls.to_vec());
+        let mut runtime: WorkerRuntimeConfig = worker_config.into();
+        runtime.worker_id = worker_id;
+        runtime.poll_interval = std::time::Duration::from_millis(POLL_INTERVAL_MS);
+        runtime.shutdown_timeout = std::time::Duration::from_secs(5);
+        runtime.max_concurrent_workflows = MAX_CONCURRENT_WORKFLOWS;
+        runtime.max_concurrent_activities = MAX_CONCURRENT_ACTIVITIES;
+        if let Some(loops) =
+            super::claim_loops_override(std::env::var(super::CLAIM_LOOPS_ENV_VAR).ok().as_deref())
+        {
+            runtime.max_concurrent_claims = loops;
+        }
+        runtime.sharded_pool = Some(sharded.clone());
+        Arc::new(Worker::new(runtime, Arc::clone(registry)).expect("bench worker should build"))
+    }
+
     /// Start [`WORKERS_PER_SHARD`] workers per shard, each pinned to its shard
     /// and listening on that shard's own database.
     ///
@@ -4076,24 +4340,12 @@ pub mod db {
         let mut handles = Vec::new();
         for shard in cluster.shard_ids() {
             for replica in 0..WORKERS_PER_SHARD {
-                let worker_config = WorkerConfig::default()
-                    .with_queues([BENCH_QUEUE])
-                    .with_shard_assignments([shard])
-                    .with_shard_notification_database_urls(notification_urls.clone());
-                let mut runtime: WorkerRuntimeConfig = worker_config.into();
-                runtime.worker_id = format!("bench-s{}-{replica}", shard.as_i32());
-                runtime.poll_interval = std::time::Duration::from_millis(POLL_INTERVAL_MS);
-                runtime.shutdown_timeout = std::time::Duration::from_secs(5);
-                runtime.max_concurrent_workflows = MAX_CONCURRENT_WORKFLOWS;
-                runtime.max_concurrent_activities = MAX_CONCURRENT_ACTIVITIES;
-                if let Some(loops) = super::claim_loops_override(
-                    std::env::var(super::CLAIM_LOOPS_ENV_VAR).ok().as_deref(),
-                ) {
-                    runtime.max_concurrent_claims = loops;
-                }
-                runtime.sharded_pool = Some(sharded.clone());
-                let worker = Arc::new(
-                    Worker::new(runtime, Arc::clone(registry)).expect("bench worker should build"),
+                let worker = build_worker(
+                    shard,
+                    &notification_urls,
+                    sharded,
+                    registry,
+                    format!("bench-s{}-{replica}", shard.as_i32()),
                 );
                 let pool = sharded
                     .exact_pool_for(shard)
@@ -4113,7 +4365,9 @@ pub mod db {
 
     // ── Seeding ───────────────────────────────────────────────────────────
 
-    fn start_params<'a>(
+    /// The start parameters every bench seeder and generator uses.
+    #[must_use]
+    pub fn start_params<'a>(
         exec_id: ExecutionId,
         workflow_name: &'a str,
         workflow_id: &'a str,
@@ -4527,14 +4781,16 @@ pub mod db {
 
     // ── Scenario runners ──────────────────────────────────────────────────
 
-    fn scenario_deadline() -> Instant {
+    /// The cooperative deadline of one scenario, from now.
+    #[must_use]
+    pub fn scenario_deadline() -> Instant {
         Instant::now() + std::time::Duration::from_secs(SCENARIO_BUDGET_SECS)
     }
 
     /// Note the wall clock one cell took, and complain when it exhausted its
     /// budget — a cell that ran out of time reported whatever it had collected,
     /// which is not a published number.
-    fn budget_note(started: Instant, deadline: Instant, unsound: &mut Vec<String>) -> String {
+    pub fn budget_note(started: Instant, deadline: Instant, unsound: &mut Vec<String>) -> String {
         let elapsed = started.elapsed();
         // Against the deadline itself, not against elapsed-since-the-cell-began:
         // the deadline starts after provisioning, so a cell whose provisioning
@@ -4583,7 +4839,7 @@ pub mod db {
     /// Append a note when the run could not drop its own databases, so an
     /// operator who supplied a shared server learns about the leftovers from
     /// the report rather than from `\\l` a week later.
-    fn with_teardown_note(mut notes: Vec<String>, report: &TeardownReport) -> Vec<String> {
+    pub fn with_teardown_note(mut notes: Vec<String>, report: &TeardownReport) -> Vec<String> {
         notes.extend(teardown_notes(report));
         notes
     }
@@ -4773,6 +5029,7 @@ pub mod db {
         );
         fleet.stop().await;
         let topology = cluster.topology;
+        let host_note = cluster.host_layout().note();
         drop(sharded);
         let teardown = cluster.teardown_with_stats(BenchScenario::Throughput).await;
         let wall_clock_note = budget_note(scenario_started, deadline, &mut unsound);
@@ -4798,6 +5055,7 @@ pub mod db {
                 vec![
                     shard_note(&per_shard),
                     format!("topology: {}", topology.as_str()),
+                    host_note,
                     resident_note,
                     decision_note,
                     format!("owner mode: {}", if owner_mode { "on" } else { "off" }),
@@ -4820,6 +5078,10 @@ pub mod db {
                     "the headline is the middle-half rate: the ramp-up and the drain-down tails \
                      are excluded, so it is a sustained rate rather than an average over a \
                      changing queue depth"
+                        .to_owned(),
+                    "a closed loop is latency-bound: this rate is the in-flight population \
+                     divided by the workflow latency, not the shard's capacity. The capacity \
+                     scenario measures capacity"
                         .to_owned(),
                     wall_clock_note,
                 ],
@@ -5183,6 +5445,7 @@ pub mod db {
         let probe_notes = commit_probe_report(&cluster, "meas").await;
         fleet.stop().await;
         let topology = cluster.topology;
+        let host_note = cluster.host_layout().note();
         drop(sharded);
         let teardown = cluster
             .teardown_with_stats(BenchScenario::DispatchLatency)
@@ -5215,6 +5478,7 @@ pub mod db {
                 vec![
                     shard_note(&per_shard),
                     format!("topology: {}", topology.as_str()),
+                    host_note,
                     format!("target pace: {target:.1} workflow starts/s"),
                     format!(
                         "host-to-database clock offset before the window: {} ms (per shard, \
@@ -5486,6 +5750,7 @@ pub mod db {
         server.stop();
         fleet.stop().await;
         let topology = cluster.topology;
+        let host_note = cluster.host_layout().note();
         drop(sharded);
         let teardown = cluster
             .teardown_with_stats(BenchScenario::SignalRoundtrip)
@@ -5511,6 +5776,7 @@ pub mod db {
                 vec![
                     shard_note(&per_shard),
                     format!("topology: {}", topology.as_str()),
+                    host_note,
                     format!(
                         "target pace: {PACED_STARTS_PER_SEC_PER_SHARD:.1} signals/s per shard, \
                          one paced sender per shard running concurrently; achieved {}/s",
