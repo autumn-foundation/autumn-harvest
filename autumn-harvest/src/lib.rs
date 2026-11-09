@@ -301,6 +301,7 @@ pub mod cross_shard_child;
 pub mod dag;
 /// Export format types for Directed Acyclic Graphs (DAGs) representing workflows.
 pub mod dag_export;
+pub mod dag_leverage;
 pub mod dag_linter;
 #[cfg(any(test, feature = "testing"))]
 pub mod dag_profiler;
@@ -728,6 +729,7 @@ pub use dag::{
 #[cfg(feature = "testing")]
 pub use dag_export::export_profile_mermaid_gantt;
 pub use dag_export::{export_dot, export_mermaid, export_mermaid_with_critical_path};
+pub use dag_leverage::{DagLeverage, TaskLeverage};
 pub use dag_linter::{
     DagLinter, DagRule, DagWarning, DuplicateNodeNameRule, ExcessiveParallelismRule,
     MissingRetryPolicyRule, MissingTimeoutRule,
