@@ -1,4 +1,4 @@
-## An OpenAI-compatible `AgentModel`, and one provider layer
+## An OpenAI-compatible `AgentModel`, and one provider layer (PR #2633)
 
 The `openai` feature of `autumn-harvest-agent` adds `openai::OpenAiModel`.
 It speaks the Chat Completions API at a base URL that the app sets, so one
