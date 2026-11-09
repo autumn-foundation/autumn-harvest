@@ -205,6 +205,11 @@ async fn an_erase_removes_the_rows_of_the_agent_and_counts_them() {
         state.transcripts_erased,
         Some(u64::try_from(windows).unwrap())
     );
+    // `harvest agents erase` reads these keys from the final state.
+    let wire = serde_json::to_value(&state).unwrap();
+    assert_eq!(wire["memory_entries_erased"], 3);
+    assert_eq!(wire["transcripts_erased"], windows);
+    assert_eq!(wire["episode_reset"]["episodes"], 3);
 
     assert_eq!(
         count(&path, "harvest_agent_transcripts", "session", "desk/d1"),
