@@ -558,3 +558,63 @@ async fn a_reset_in_a_new_life_deletes_the_keys_of_an_old_life_on_a_fast_clock()
         "the reset deleted the key of the first life"
     );
 }
+
+// Issue #2485: a delegated child has no workspace, so siblings never race on
+// one head. A workspace tool in the child sees none. The parent sees its own.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_child_gets_no_workspace() {
+    use autumn_harvest_agent::mesh::DELEGATE_TOOL;
+    use autumn_harvest_agent::{Mandate, Peer};
+
+    let (_dir, db) = fresh_db();
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let probe = {
+        let seen = seen.clone();
+        FnTool::with_context(
+            "probe",
+            "Tell whether a workspace is mounted.",
+            json!({"type": "object"}),
+            move |_input, ctx| {
+                seen.lock().unwrap().push(ctx.workspace.is_some());
+                async move { Ok(json!({})) }
+            },
+        )
+        .effect(ToolEffect::ReadOnly)
+        .uses_workspace()
+        .shared()
+    };
+    let model = ScriptedModel::new(vec![
+        calls(&[("p1", "probe", json!({}))], 1),
+        calls(
+            &[(
+                "d1",
+                DELEGATE_TOOL,
+                json!({"agent": "helper", "task": "probe it"}),
+            )],
+            1,
+        ),
+        calls(&[("p1", "probe", json!({}))], 1),
+        answer("child done", 1),
+        answer("done", 1),
+    ]);
+    let store = WorkspaceStore::new(
+        Arc::new(InMemoryWorkspaceBlobs::default()),
+        PayloadCodecs::default(),
+    );
+    let harness = AgentHarness::new(model)
+        .tool(probe)
+        .workspace(store)
+        .peer(Peer::new("helper", "Helps.").tools(["probe"]))
+        .agent(
+            AgentProfile::new("coder")
+                .workspace()
+                .mandate(Mandate::new("coder").peers(["helper"])),
+        );
+    let mut rt = runtime(&db, harness);
+    let agent = AgentId::new("coder", "ada").unwrap();
+
+    let ended = say(&mut rt, &agent, "go").await;
+
+    assert_eq!(ended.last_answer.as_deref(), Some("done"));
+    assert_eq!(*seen.lock().unwrap(), [true, false]);
+}

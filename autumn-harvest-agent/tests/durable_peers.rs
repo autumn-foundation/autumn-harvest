@@ -1813,3 +1813,32 @@ async fn an_interrupted_wait_for_a_reply_is_a_named_verdict() {
         "{replay}"
     );
 }
+
+// Issue #2485: a durable peer runs the first eight checks of the refusal
+// table before its own checks. The researcher never started, so its own
+// check would refuse it as `peer_unavailable`. The mandate check of the
+// model comes first.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_durable_peer_runs_the_mandate_checks_before_its_own() {
+    use autumn_harvest_agent::{DEFAULT_MODEL, Refusal};
+
+    let refusal_of = |forbid: bool| async move {
+        let (_dir, db) = fresh_db();
+        let harness = AgentHarness::new(mesh_model())
+            .peer(Peer::agent("researcher", "Finds facts.", &research()).model("strong"));
+        let mut mandate = Mandate::new("triage").peers(["researcher"]);
+        if forbid {
+            mandate = mandate.models([DEFAULT_MODEL]);
+        }
+        let mut rt = runtime(&db, harness);
+        let exec = sqlite::start(&mut rt, &AgentTask::new("what is it?").mandate(mandate)).unwrap();
+        let ended = report(rt.run_until_blocked(exec).await.unwrap());
+        let [record] = ended.delegations.as_slice() else {
+            panic!("one record: {:?}", ended.delegations);
+        };
+        record.refusal
+    };
+
+    assert_eq!(refusal_of(false).await, Some(Refusal::PeerUnavailable));
+    assert_eq!(refusal_of(true).await, Some(Refusal::ModelForbidden));
+}

@@ -1752,14 +1752,22 @@ mod tests {
         }
     }
 
-    // Issue #2484: the guide lists each verdict.
+    // Issues #2484 and #2485: the refusal table lists each verdict once, in
+    // the order of the variants. The guide says that a delegation runs the
+    // checks in the order of the table, so this order is a fact of the guide.
     #[test]
-    fn the_guide_lists_every_verdict() {
+    fn the_guide_lists_every_verdict_in_variant_order() {
         let guide = include_str!("../../docs/agent-mesh.md");
-        for refusal in every_refusal() {
-            let row = format!("| `{}` |", refusal.code());
-            assert!(guide.contains(&row), "docs/agent-mesh.md has no row {row}");
-        }
+        let start = guide.find("\n## 5. Refusals\n").expect("section 5");
+        let section = &guide[start + 1..];
+        let section = &section[..section.find("\n## 6.").expect("section 6")];
+        let listed: Vec<&str> = section
+            .lines()
+            .filter_map(|line| line.strip_prefix("| `"))
+            .filter_map(|rest| rest.split_once("` |").map(|(code, _)| code))
+            .collect();
+        let codes: Vec<&str> = every_refusal().into_iter().map(Refusal::code).collect();
+        assert_eq!(listed, codes, "docs/agent-mesh.md section 5");
     }
 
     // Issue #2484: a record keeps the key of its message, and an old
