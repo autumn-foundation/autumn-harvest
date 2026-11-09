@@ -87,21 +87,9 @@ pub fn model_id(model: &str, fallbacks: bool) -> String {
     id
 }
 
-/// The error kind of an HTTP status.
-///
-/// The table is the retry table of the Anthropic SDKs. A timeout, a
-/// conflict, a rate limit and a server fault retry. `529` is an overload,
-/// so it retries too. A request that is too large is a `Budget` error.
-#[must_use]
-pub const fn error_kind(status: u16) -> ErrorKind {
-    match status {
-        429 => ErrorKind::RateLimited,
-        401 | 403 => ErrorKind::Authentication,
-        413 => ErrorKind::Budget,
-        408 | 409 | 500..=599 => ErrorKind::Unavailable,
-        _ => ErrorKind::Provider,
-    }
-}
+/// The error kind of an HTTP status: the shared table of the provider
+/// models.
+pub use crate::provider::error_kind;
 
 /// The error kind of an API error `type`, as an `error` stream event names
 /// it.
@@ -193,32 +181,16 @@ pub fn usage(body: &Value) -> TokenUsage {
 }
 
 /// The price of one model, in billionths of a US dollar per token.
-///
-/// A price per million tokens in US dollars is the same number in millionths
-/// of a dollar per token. This unit is a thousand times smaller again. So a
-/// cache read of `$0.01` per million tokens is a whole number.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Price {
-    /// One uncached prompt token.
-    pub input: u64,
-    /// One output token.
-    pub output: u64,
-    /// One prompt token read from the cache.
-    pub cache_read: u64,
-    /// One prompt token written to the cache, at the five-minute rate.
-    pub cache_write: u64,
-}
+pub use crate::provider::Price;
 
-impl Price {
-    /// A price from the input and output rates, the cache read rate, and a
-    /// cache write at 1.25 times the input rate.
-    const fn of(input: u64, output: u64, cache_read: u64) -> Self {
-        Self {
-            input,
-            output,
-            cache_read,
-            cache_write: input * 5 / 4,
-        }
+/// A price from the input and output rates, the cache read rate, and a cache
+/// write at 1.25 times the input rate: the five-minute rate.
+const fn five_minute(input: u64, output: u64, cache_read: u64) -> Price {
+    Price {
+        input,
+        output,
+        cache_read,
+        cache_write: input * 5 / 4,
     }
 }
 
@@ -234,15 +206,15 @@ pub const HAIKU_LONG_PROMPT_TOKENS: u32 = 100_000;
 #[must_use]
 pub const fn price(model: &str, prompt_tokens: u32) -> Option<Price> {
     let price = match model.as_bytes() {
-        b"claude-fable-5-1" => Price::of(10_000, 50_000, 250),
-        b"claude-fable-5" => Price::of(10_000, 50_000, 1_000),
-        b"claude-opus-5-5" => Price::of(4_000, 20_000, 200),
-        b"claude-opus-5" => Price::of(5_000, 25_000, 500),
-        b"claude-sonnet-5-5" | b"claude-sonnet-5" => Price::of(2_000, 10_000, 200),
+        b"claude-fable-5-1" => five_minute(10_000, 50_000, 250),
+        b"claude-fable-5" => five_minute(10_000, 50_000, 1_000),
+        b"claude-opus-5-5" => five_minute(4_000, 20_000, 200),
+        b"claude-opus-5" => five_minute(5_000, 25_000, 500),
+        b"claude-sonnet-5-5" | b"claude-sonnet-5" => five_minute(2_000, 10_000, 200),
         b"claude-haiku-5-5" if prompt_tokens > HAIKU_LONG_PROMPT_TOKENS => {
-            Price::of(500, 2_500, 50)
+            five_minute(500, 2_500, 50)
         }
-        b"claude-haiku-5-5" => Price::of(100, 500, 10),
+        b"claude-haiku-5-5" => five_minute(100, 500, 10),
         _ => return None,
     };
     Some(price)
@@ -254,16 +226,7 @@ pub const fn price(model: &str, prompt_tokens: u32) -> Option<Price> {
 /// `model` is not known.
 #[must_use]
 pub fn cost_usd_micros(model: &str, usage: &TokenUsage) -> Option<u64> {
-    let price = price(model, usage.input_tokens)?;
-    let uncached = usage
-        .input_tokens
-        .saturating_sub(usage.cache_read_tokens)
-        .saturating_sub(usage.cache_write_tokens);
-    let nanos = u128::from(uncached) * u128::from(price.input)
-        + u128::from(usage.cache_read_tokens) * u128::from(price.cache_read)
-        + u128::from(usage.cache_write_tokens) * u128::from(price.cache_write)
-        + u128::from(usage.output_tokens) * u128::from(price.output);
-    Some(u64::try_from(nanos.saturating_add(500) / 1_000).unwrap_or(u64::MAX))
+    Some(price(model, usage.input_tokens)?.cost_usd_micros(usage))
 }
 
 #[cfg(test)]

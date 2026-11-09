@@ -43,7 +43,10 @@
 //! has no Autumn plugin dependency.
 //! An app implements [`AgentModel`] for its provider, or bridges a framework
 //! it already uses. The `anthropic` feature adds the `anthropic` module. Its
-//! `ClaudeModel` is an [`AgentModel`] over the Anthropic Messages API.
+//! `ClaudeModel` is an [`AgentModel`] over the Anthropic Messages API. The
+//! `openai` feature adds the `openai` module. Its `OpenAiModel` is an
+//! [`AgentModel`] over any OpenAI-compatible Chat Completions API, at a base
+//! URL that the app sets.
 //!
 //! # Use it on SQLite
 //!
@@ -116,9 +119,13 @@ pub mod mesh;
 pub mod mesh_control;
 pub mod message;
 pub mod model;
+#[cfg(feature = "openai")]
+pub mod openai;
 pub mod policy;
 #[cfg(feature = "postgres")]
 pub mod postgres;
+#[cfg(any(feature = "anthropic", feature = "openai"))]
+pub mod provider;
 pub mod recall;
 pub mod refine;
 pub mod response_cache;

@@ -151,6 +151,10 @@ spends no tokens, so it records no call. See
 Its id passes the ledger check. Its price is the sum of four parts: the
 uncached input, the cache reads, the cache writes and the output, each at
 its own rate. `input_tokens` holds the whole prompt, cache parts included.
+`anthropic::ClaudeModel` is one such model. `openai::OpenAiModel` reports
+`{model}@{host}` as its id. It prices a call only when the app sets a
+`Price`, because each provider has its own rates.
+
 `examples/claude-agent-daemon` writes a row with the same id form for each
 live turn. A billed turn that the daemon refuses writes no row, because the
 runtime writes rows only with a completed attempt. Section 6 lists this
