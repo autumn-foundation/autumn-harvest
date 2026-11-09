@@ -330,8 +330,10 @@ A status maps to an `ErrorKind` as the Anthropic SDKs retry it:
 A thinking block has no place in a `ChatMessage`, and the API wants it back
 in a tool loop. So the model keeps each raw assistant turn by a hash key.
 `turn_store(store)` adds a durable `TurnStore`, so a restarted process can
-replay the turns. The memory copy keeps the newest 4096 turns. Each call of
-`model(name)` starts an empty memory copy.
+replay the turns. With a store, the memory copy keeps the newest 4096 turns.
+With no store, it is the only copy, so it keeps every turn. A long-lived
+worker should set a store. Each call of `model(name)` starts an empty memory
+copy.
 
 An app with its own transcript format can use `Client` and `wire` alone.
 `examples/claude-agent-daemon` does that.

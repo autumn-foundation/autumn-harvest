@@ -37,11 +37,12 @@ pub trait TurnStore: Send + Sync + fmt::Debug {
     fn put(&self, key: &str, raw: &[Value]) -> Result<(), AgentError>;
 }
 
-/// The most raw turns that one model keeps in memory.
+/// The most raw turns that one model keeps in memory, with a durable store.
 ///
 /// A worker shares one model across its runs, so the copy must not grow
-/// for the life of the process. The oldest turn goes first. A durable store
-/// still holds it.
+/// for the life of the process. The oldest turn goes first, and the store
+/// still holds it. With no store, the memory copy is the only copy. A run
+/// that waits on a tool still needs its turn, so nothing goes.
 pub const MAX_MEMORY_TURNS: usize = 4096;
 
 /// The raw turns of one model: a memory copy and an optional durable store.
@@ -59,12 +60,13 @@ struct Memory {
 }
 
 impl Memory {
-    /// Keep `raw` under `key`, and drop the oldest turns past the bound.
-    fn insert(&mut self, key: String, raw: Vec<Value>) {
+    /// Keep `raw` under `key`. With `bounded`, drop the oldest turns past
+    /// the bound.
+    fn insert(&mut self, key: String, raw: Vec<Value>, bounded: bool) {
         if self.turns.insert(key.clone(), raw).is_none() {
             self.order.push_back(key);
         }
-        while self.order.len() > MAX_MEMORY_TURNS {
+        while bounded && self.order.len() > MAX_MEMORY_TURNS {
             if let Some(oldest) = self.order.pop_front() {
                 self.turns.remove(&oldest);
             }
@@ -86,10 +88,12 @@ impl Turns {
         if let Some(store) = &self.store {
             store.put(&key, &raw)?;
         }
+        // Only a turn that the store holds can leave memory.
+        let bounded = self.store.is_some();
         self.memory
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .insert(key, raw);
+            .insert(key, raw, bounded);
         Ok(())
     }
 
@@ -591,25 +595,38 @@ mod tests {
     }
 
     #[test]
-    fn the_memory_copy_keeps_the_newest_turns_only() {
+    fn with_a_store_the_memory_copy_keeps_the_newest_turns_only() {
+        let store: Arc<dyn TurnStore> = Arc::new(MapStore::default());
+        let turns = Turns {
+            store: Some(store),
+            ..Turns::default()
+        };
+        let shown = |n: usize| vec![json!({"type": "text", "text": n.to_string()})];
+        for n in 0..=MAX_MEMORY_TURNS {
+            turns.put(turn_key(&[], &shown(n)), vec![json!(n)]).unwrap();
+        }
+        let memory = turns.memory.lock().unwrap();
+        assert_eq!(memory.turns.len(), MAX_MEMORY_TURNS, "the copy is bounded");
+        assert!(!memory.turns.contains_key(&turn_key(&[], &shown(0))));
+        drop(memory);
+        // The oldest turn left memory, and the store still holds it.
+        assert_eq!(turns.get(&[], &shown(0)), Some(vec![json!(0)]));
+        assert!(
+            turns.fresh().memory.lock().unwrap().turns.is_empty(),
+            "a fresh copy is empty"
+        );
+    }
+
+    /// With no store, the memory copy is the only copy. An evicted turn of
+    /// a run that waits on a tool would lose its thinking blocks.
+    #[test]
+    fn with_no_store_no_turn_leaves_memory() {
         let turns = Turns::default();
         let shown = |n: usize| vec![json!({"type": "text", "text": n.to_string()})];
         for n in 0..=MAX_MEMORY_TURNS {
             turns.put(turn_key(&[], &shown(n)), vec![json!(n)]).unwrap();
         }
-        assert_eq!(
-            turns.get(&[], &shown(0)),
-            None,
-            "the oldest turn went first"
-        );
-        assert_eq!(
-            turns.get(&[], &shown(MAX_MEMORY_TURNS)),
-            Some(vec![json!(MAX_MEMORY_TURNS)])
-        );
-        assert!(
-            turns.fresh().get(&[], &shown(1)).is_none(),
-            "a fresh copy is empty"
-        );
+        assert_eq!(turns.get(&[], &shown(0)), Some(vec![json!(0)]));
     }
 
     #[test]
