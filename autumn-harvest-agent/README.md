@@ -41,6 +41,11 @@ A crash costs at most the one step that was in flight. The crate depends on
 the core engine only. It has no Autumn plugin and no `autumn-web` dependency.
 An app implements `AgentModel` for its provider.
 
+The `anthropic` feature adds `anthropic::ClaudeModel`, an `AgentModel` over
+the Anthropic Messages API. It is off by default, so the crate without it has
+no HTTP client. The model reports a ledger id and a price for each call. See
+[The Claude model](../docs/agent-adapter.md#the-claude-model).
+
 ```sh
 cargo run -p autumn-harvest-agent --features sqlite --example sqlite_agent
 cargo run -p autumn-harvest-agent --features sqlite --example sqlite_mesh

@@ -42,7 +42,8 @@
 //! The crate depends on the core engine only, with no default features. It
 //! has no Autumn plugin dependency.
 //! An app implements [`AgentModel`] for its provider, or bridges a framework
-//! it already uses.
+//! it already uses. The `anthropic` feature adds the `anthropic` module. Its
+//! `ClaudeModel` is an [`AgentModel`] over the Anthropic Messages API.
 //!
 //! # Use it on SQLite
 //!
@@ -90,6 +91,8 @@
 
 pub mod agent;
 pub mod answer_check;
+#[cfg(feature = "anthropic")]
+pub mod anthropic;
 pub mod approval;
 pub mod bounds;
 pub mod consolidate;

@@ -6,8 +6,8 @@ use std::sync::Arc;
 use agent_mesh::desk::Desk;
 use agent_mesh::mesh::{self, DeskDelivery, MESH, MeshConfig, PrintSink};
 use agent_mesh::scripted::ScriptedDesk;
-use autoresearch::claude::{ClaudeModel, DEFAULT_MODEL};
 use autumn_harvest::chrono::{DateTime, Duration, Utc};
+use autumn_harvest_agent::anthropic::{ClaudeModel, DEFAULT_MODEL};
 use autumn_harvest_agent::{AgentModel, AgentOp, Approval, Control, sqlite};
 use autumn_harvest_sqlite::SqliteRuntime;
 use clap::{Parser, Subcommand, ValueEnum};
@@ -104,7 +104,7 @@ fn model(cli: &Cli) -> Result<Arc<dyn AgentModel>, Error> {
         ModelKind::Claude => {
             let key = std::env::var("ANTHROPIC_API_KEY")
                 .map_err(|_| "set ANTHROPIC_API_KEY to use --model claude")?;
-            Arc::new(ClaudeModel::new(key).model(&cli.claude_model))
+            Arc::new(ClaudeModel::new(&key)?.model(&cli.claude_model))
         }
     })
 }

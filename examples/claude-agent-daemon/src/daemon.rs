@@ -165,6 +165,17 @@ pub type Parked = HashMap<ExecutionId, ParkedState>;
 /// history.
 type Live = Vec<ExecutionId>;
 
+/// Register the session workflow and its two activities on `runtime`.
+///
+/// The model turn returns its cost ledger call with its reply, so the
+/// runtime writes the row with the completion.
+fn register(runtime: &mut SqliteRuntime, model: ModelConfig, workspace: PathBuf) {
+    runtime.register_workflow(&session::agent_session_info());
+    runtime
+        .register_activity_with_ledger(&session::claude_turn_info(), claude::activity_body(model));
+    runtime.register_activity_with_body(&session::run_tool_info(), tools::activity_body(workspace));
+}
+
 /// Run the daemon until `Ctrl-C`.
 ///
 /// # Errors
@@ -230,12 +241,7 @@ pub async fn serve(options: Options) -> Result<(), String> {
     // catches a swap that landed inside it. The one above keeps the reclaim
     // off another daemon's file in every slower case.
     lock.still_names(&options.db)?;
-    runtime.register_workflow(&session::agent_session_info());
-    runtime.register_activity_with_body(&session::claude_turn_info(), claude::activity_body(model));
-    runtime.register_activity_with_body(
-        &session::run_tool_info(),
-        tools::activity_body(options.workspace.clone()),
-    );
+    register(&mut runtime, model, options.workspace.clone());
 
     let reader = inspect::open(&options.db)?;
     // Check the sessions already in the file BEFORE anything drives them. A

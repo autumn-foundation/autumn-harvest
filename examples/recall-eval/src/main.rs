@@ -8,7 +8,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use autoresearch::claude::{ClaudeModel, DEFAULT_MODEL};
+use autumn_harvest_agent::anthropic::{ClaudeModel, DEFAULT_MODEL};
 use autumn_harvest_agent::recall::{
     self, EPISODES, MEMORY, NOTES, ReaderModel, RecallFixture, WINDOW,
 };
@@ -53,7 +53,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .api_key
             .clone()
             .ok_or("a real-model run needs ANTHROPIC_API_KEY, or pass --scripted")?;
-        let model = ClaudeModel::new(key).model(args.model.clone());
+        let model = ClaudeModel::new(&key)?.model(args.model.clone());
         (Arc::new(model), args.model.clone())
     };
     let temp = tempfile::tempdir()?;

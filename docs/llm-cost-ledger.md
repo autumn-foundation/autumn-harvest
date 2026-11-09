@@ -147,6 +147,12 @@ The response cache also keys on `model_id`. A cache hit calls no model and
 spends no tokens, so it records no call. See
 [the agent adapter](agent-adapter.md).
 
+`anthropic::ClaudeModel`, behind the `anthropic` feature, implements both.
+Its id passes the ledger check. Its price is the sum of four parts: the
+uncached input, the cache reads, the cache writes and the output, each at
+its own rate. `input_tokens` holds the whole prompt, cache parts included.
+`examples/claude-agent-daemon` writes the same row for each live turn.
+
 ## 5. Lifecycle
 
 - **Retention.** The rows cascade with the execution row. The history

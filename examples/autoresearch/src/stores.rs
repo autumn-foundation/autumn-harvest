@@ -11,12 +11,14 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use autumn_harvest::payload_store::{PayloadStore, PayloadStoreError, PayloadStoreFuture};
+use autumn_harvest_agent::anthropic::TurnStore;
 use autumn_harvest_agent::memory::{MemoryOp, apply_labelled_op};
 use autumn_harvest_agent::{
     AgentError, BoxFuture, CacheIndex, CacheKey, Delivery, EditKey, ErrorKind, HeartbeatTask,
     MemoryBlock, MemoryScope, MemoryStore, Precheck, Report, ReportSource, SessionId,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::lab::Lab;
@@ -716,6 +718,41 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
+/// The raw turns of a Claude model, one JSON file per turn in `dir`.
+///
+/// A restarted process reads them, so a resumed run sends each thinking
+/// block back. The file name is the turn key, which is a SHA-256 in hex.
+#[derive(Debug, Clone)]
+pub struct TurnDir {
+    dir: PathBuf,
+}
+
+impl TurnDir {
+    /// A store over `dir`. The first write makes the directory.
+    #[must_use]
+    pub fn new(dir: impl Into<PathBuf>) -> Self {
+        Self { dir: dir.into() }
+    }
+
+    fn path(&self, key: &str) -> PathBuf {
+        self.dir.join(format!("{key}.json"))
+    }
+}
+
+impl TurnStore for TurnDir {
+    fn get(&self, key: &str) -> Option<Vec<Value>> {
+        let bytes = read_regular(&self.path(key)).ok()??;
+        serde_json::from_slice(&bytes).ok()
+    }
+
+    fn put(&self, key: &str, raw: &[Value]) -> Result<(), AgentError> {
+        let failed = |e: String| AgentError::new(ErrorKind::Unavailable, e);
+        std::fs::create_dir_all(&self.dir).map_err(|e| failed(e.to_string()))?;
+        let bytes = serde_json::to_vec(raw).map_err(|e| failed(e.to_string()))?;
+        write_atomic(&self.path(key), &bytes).map_err(failed)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
@@ -764,6 +801,18 @@ mod tests {
                 usage: TokenUsage::new(10, 5),
             },
         )
+    }
+
+    #[test]
+    fn a_turn_survives_in_the_turn_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let raw = vec![serde_json::json!({"type": "thinking", "thinking": "", "signature": "s"})];
+        TurnDir::new(dir.path().join("turns"))
+            .put("k", &raw)
+            .unwrap();
+        let restarted = TurnDir::new(dir.path().join("turns"));
+        assert_eq!(restarted.get("k"), Some(raw));
+        assert_eq!(restarted.get("missing"), None);
     }
 
     /// A model call whose result a crash lost runs again in a new process.
