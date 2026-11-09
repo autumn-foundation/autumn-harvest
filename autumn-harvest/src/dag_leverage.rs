@@ -186,7 +186,7 @@ mod tests {
     fn empty_dag_ranks_nothing() {
         let dag = DagBuilder::new().build().unwrap();
         let report = DagSlackAnalyzer::new(dag.clone()).analyze();
-        assert!(DagLeverage::new(&dag, &report).rank().is_empty());
+        assert_eq!(DagLeverage::new(&dag, &report).rank(), Vec::new());
     }
 
     #[test]
