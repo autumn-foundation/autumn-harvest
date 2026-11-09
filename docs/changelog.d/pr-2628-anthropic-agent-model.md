@@ -1,4 +1,4 @@
-## One Anthropic `AgentModel` for every example (issue #2605)
+## One Anthropic `AgentModel` for every example (issue #2605, PR #2628)
 
 The `anthropic` feature of `autumn-harvest-agent` adds the `anthropic`
 module. It is off by default, so the crate without it gains no dependency.
