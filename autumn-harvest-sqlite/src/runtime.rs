@@ -714,8 +714,8 @@ impl SqliteRuntime {
     /// Register a workflow for a caller that serves its `mcp` tools.
     ///
     /// This is [`register_workflow`](Self::register_workflow) without the
-    /// `mcp` warning. The `autumn-harvest-plugin` SQLite driver uses it only when
-    /// the app mounts MCP routes (issue #2488).
+    /// `mcp` warning. The `autumn-harvest-plugin` SQLite driver always uses it.
+    /// The plugin build logs one warning instead (issue #2609).
     ///
     /// # Panics
     ///
