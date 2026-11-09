@@ -349,3 +349,7 @@ harness = false
 [[bench]]
 name = "durable_agent_replay_profile"
 harness = false
+
+[[test]]
+name = "approval_notices"
+required-features = ["sqlite"]

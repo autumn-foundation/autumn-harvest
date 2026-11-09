@@ -168,7 +168,7 @@ pub use consolidate_all::{
     agent_consolidate_all, agent_consolidate_all_info,
 };
 pub use context_reset::{ContextReset, ProgressNotes};
-pub use delivery::{Delivery, LogDelivery, Report, ReportSource};
+pub use delivery::{ApprovalNotice, Delivery, LogDelivery, ParkedCall, Report, ReportSource};
 pub use draw::{Draw, DrawId, run_draws};
 pub use episode::{
     Appended, Cleared, ConsolidationTrigger, Episode, EpisodeLog, EpisodeReset, EpisodeSettings,
@@ -221,10 +221,11 @@ pub use types::{
     PROBE_EFFECT_REFUSED, Probe, RunIdSource, ToolCallRequest, ToolOutcome,
 };
 pub use workflow::{
-    WORKFLOW_NAME, activities, agent_deliver, agent_deliver_info, agent_discover_peers,
-    agent_discover_peers_info, agent_loop, agent_loop_info, agent_memory_snapshot,
-    agent_memory_snapshot_info, agent_model_turn, agent_model_turn_info, agent_precheck,
-    agent_precheck_info, agent_tool_call, agent_tool_call_info, workflows,
+    WORKFLOW_NAME, activities, agent_approval_notice, agent_approval_notice_info, agent_deliver,
+    agent_deliver_info, agent_discover_peers, agent_discover_peers_info, agent_loop,
+    agent_loop_info, agent_memory_snapshot, agent_memory_snapshot_info, agent_model_turn,
+    agent_model_turn_info, agent_precheck, agent_precheck_info, agent_tool_call,
+    agent_tool_call_info, workflows,
 };
 pub use workspace::{
     DirWorkspaceBlobs, InMemoryWorkspaceBlobs, Workspace, WorkspaceBlobs, WorkspaceFile,

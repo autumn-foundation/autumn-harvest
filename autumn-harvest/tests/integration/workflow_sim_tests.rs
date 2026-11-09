@@ -1114,17 +1114,16 @@ async fn a_queued_signal_that_wins_a_race_leaves_no_loser_terminal() {
         "no terminal for an undispatched loser"
     );
 
-    // The history is legal, but strict replay of this race shape diverges,
-    // in the default env too. That is engine behaviour, and the guide
-    // records it. The sweep reports it as a replay failure.
-    let failure = env
+    // The race arms no other branch, so its winner marker follows its open
+    // marker. Strict replay reads the unarmed activity branch as not
+    // dispatched, so every seed replays.
+    let report = env
         .simulation()
         .seeds(SeedPlan { first: 0, count: 4 })
         .sweep(wf, json!(null), |_| {})
         .await
-        .expect_err("strict replay of this race shape diverges");
-    assert!(failure.reason.contains("does not replay"), "{failure}");
-    assert!(!failure.reason.contains("illegal"), "{failure}");
+        .unwrap_or_else(|failure| panic!("{failure}"));
+    assert_eq!(report.replayed, 4, "{report:?}");
 }
 
 #[tokio::test]

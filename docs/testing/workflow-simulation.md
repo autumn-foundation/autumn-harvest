@@ -290,10 +290,6 @@ sends signals, injects faults, and names its `sometimes!` targets with
   event, so `join!(activity, timer.await_fire())` can report a false
   non-determinism once the activity runs. This is engine behaviour, and the
   simulation shows it.
-- **A race that a queued signal wins at once.** When the signal is in
-  history before the first task, the race never dispatches its other
-  branches. A strict replay of that history then reports a divergence, in
-  the default env too. This is engine behaviour, and the simulation shows it.
 - **In-flight starts in a replay.** A canary replay of an unfinished history
   leaves out the `ActivityStarted` of each activity with no terminal. The
   matcher does not consume such an event at the frontier.

@@ -4478,6 +4478,28 @@ impl WorkflowContext {
         matches!(self.payload_offload_threshold, Some(t) if observed > t)
     }
 
+    /// Would a schedule of the activity `name` take `input` now?
+    ///
+    /// It applies the depth cap, the input cap and its override, and the
+    /// offload threshold, as a schedule does. A refused schedule records
+    /// nothing. So a workflow that must not depend on the caps records this
+    /// answer with [`Self::side_effect`]. A replay then takes the same branch
+    /// after a cap change.
+    #[must_use]
+    pub fn activity_input_fits(&self, name: &str, input: &Value) -> bool {
+        if crate::payload_depth::nests_past_cap(input) {
+            return false;
+        }
+        let global = self.payload_max_activity_input;
+        let cap = self
+            .activity_input_cap_overrides
+            .get(name)
+            .copied()
+            .map_or(global, |over| global.max(over));
+        let observed = serde_json::to_string(input).map_or(0, |s| s.len() as u64);
+        cap == 0 || observed <= cap || self.offload_will_apply(observed)
+    }
+
     /// The history policy this run runs under.
     pub(crate) const fn history_policy(&self) -> WorkflowHistoryPolicy {
         self.history_policy
@@ -13456,7 +13478,7 @@ impl WorkflowContext {
                     } else {
                         self.match_history(|m| m.match_activity(name))
                     };
-                    match history_match {
+                    match self.unarmed_branch(history_match, &winner_marker_name) {
                         HistoryMatch::Matched { output } => resolved.push((index, Ok(output))),
                         HistoryMatch::Failed {
                             error,
@@ -13523,7 +13545,7 @@ impl WorkflowContext {
                 } => {
                     let history_match =
                         self.match_history(|m| m.match_child_workflow(workflow_name, input));
-                    match history_match {
+                    match self.unarmed_branch(history_match, &winner_marker_name) {
                         HistoryMatch::Matched { output } => resolved.push((index, Ok(output))),
                         HistoryMatch::Failed {
                             error,
@@ -13602,7 +13624,7 @@ impl WorkflowContext {
                     let timer_id = race_timer_id(seq, index);
                     let history_match = self
                         .match_history(|m| m.match_timer_strict(&timer_id, Some(*duration_secs)));
-                    match history_match {
+                    match self.unarmed_branch(history_match, &winner_marker_name) {
                         HistoryMatch::Matched { .. } => {
                             // Keep ctx.now() in step with the recorded fire.
                             // `_to` (max), not `advance_timer_clock` (sum):
@@ -13726,8 +13748,11 @@ impl WorkflowContext {
         // Issue #1984: a scope that replays its cancel holds these dispatches.
         // The caps applied when the cancelling cycle made them.
         let replays_a_scope_cancel = self.replays_a_scope_cancel();
+        // A recorded winner means the race is decided. A branch that it never
+        // armed dispatches nothing, so a later cap change must not fail it.
+        let decided = self.has_unconsumed_marker(&winner_marker_name);
         for dispatch in &to_dispatch {
-            if !dispatch.is_new || replays_a_scope_cancel {
+            if !dispatch.is_new || replays_a_scope_cancel || decided {
                 continue;
             }
             match &branches[dispatch.index].kind {
@@ -13933,6 +13958,27 @@ impl WorkflowContext {
             vec![(winner_index, winner_result)],
             &to_dispatch,
         )
+    }
+
+    /// Read a race branch that met the winner marker of its own race as
+    /// `NoMatch`.
+    ///
+    /// A race can settle on its first poll from a signal that arrived before
+    /// it opened. That poll arms no timer, activity or child branch, so the
+    /// winner marker follows the open marker. Replay then meets the marker
+    /// where such a branch looks for its start event. That branch was never
+    /// armed, so `NoMatch` repeats the first poll. Any other mismatch stays a
+    /// divergence. If no branch resolves, the marker stays unconsumed, and the
+    /// end-of-cycle drift guard still fails the cycle.
+    fn unarmed_branch(&self, matched: HistoryMatch, winner_marker: &str) -> HistoryMatch {
+        match matched {
+            HistoryMatch::Diverged { event_index, .. }
+                if self.match_history(|m| m.is_marker_at(event_index, winner_marker)) =>
+            {
+                HistoryMatch::NoMatch
+            }
+            other => other,
+        }
     }
 
     /// Decide (and, on the first cycle a winner is known, durably record) the

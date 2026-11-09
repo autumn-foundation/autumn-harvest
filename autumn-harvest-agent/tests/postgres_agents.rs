@@ -9,6 +9,9 @@
 //! - `pause_mesh` pauses each running agent of one mesh, and no other.
 //! - `LedgerSpend` sums the tokens of the runs of one mesh.
 //! - A heartbeat tick runs and reports.
+//! - A gated call of a durable agent sends one approval notice. `decide`
+//!   takes its signal. A worker restart sends no second notice, and a failed
+//!   notice keeps the call parked.
 //! - One consolidation firing serves each agent of a scheduled kind, and
 //!   skips an idle agent and an agent whose pass still runs.
 //! - A two-shard target finds the run on the shard that the router picked.
@@ -31,12 +34,13 @@ use std::time::Duration;
 use autumn_harvest::chrono::{DateTime, Utc};
 use autumn_harvest::entity::ENTITY_STATE_QUERY;
 use autumn_harvest::entity_state::ProjectedSnapshot;
+use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::shard::{ShardRouter, ShardedDbPool};
 use autumn_harvest::worker::{DbPool, Worker, WorkerRuntimeConfig};
 use autumn_harvest::{HarvestBuilder, ShardId, WorkerConfig, migrate};
 use autumn_harvest_agent::consolidate::ConsolidationStop;
 use autumn_harvest_agent::consolidate_all::{AgentDirectory, ConsolidateAll, DispatchReport};
-use autumn_harvest_agent::delivery::HEARTBEAT_OK;
+use autumn_harvest_agent::delivery::{ApprovalNotice, Delivery, HEARTBEAT_OK, Report};
 use autumn_harvest_agent::episode::{EpisodeSettings, EpisodeStore, InMemoryEpisodeStore};
 use autumn_harvest_agent::heartbeat::{HeartbeatReport, HeartbeatTask};
 use autumn_harvest_agent::mesh_control::MeshSpend;
@@ -793,4 +797,396 @@ async fn a_sharded_target_finds_the_run_on_the_picked_shard() {
     let exec = postgres::current_run(&pg, &id).await.unwrap().unwrap();
     assert_eq!(exec.shard(), shards[1]);
     settled(&pg, &id, |state| state.segments >= 1).await;
+}
+
+/// A delivery that keeps each approval notice.
+#[derive(Debug, Default)]
+struct Notices(std::sync::Mutex<Vec<ApprovalNotice>>);
+
+impl Delivery for Notices {
+    fn deliver<'a>(&'a self, _report: &'a Report) -> BoxFuture<'a, Result<(), AgentError>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn notify_approval<'a>(
+        &'a self,
+        notice: &'a ApprovalNotice,
+    ) -> BoxFuture<'a, Result<(), AgentError>> {
+        self.0.lock().unwrap().push(notice.clone());
+        Box::pin(async { Ok(()) })
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_gated_call_on_a_durable_agent_sends_one_notice_that_decide_accepts() {
+    let (url, _container) = database().await;
+    let queue = unique("pg-notice");
+    let kind = unique("support");
+    let writes = Arc::new(Recorder::default());
+    let notices = Arc::new(Notices::default());
+    let model = ScriptedModel::new(vec![
+        calls(&[("w1", "write", json!({"text": "hi"}))], 3),
+        answer("saved", 2),
+    ]);
+    let harness = AgentHarness::new(model.clone())
+        .tool(recorded_tool("write", ToolEffect::Write, &writes))
+        .policy(Arc::new(
+            ToolRules::new().effect(ToolEffect::Write, Rule::Ask),
+        ))
+        .delivery(Arc::clone(&notices) as Arc<dyn Delivery>)
+        .agent(AgentProfile::new(&kind));
+    let pg = PostgresAgents::single(pool(&url)).with_queue(&queue);
+    let _worker = run_worker(&url, &queue, harness, &[ShardId::new(0)]);
+    let id = AgentId::new(&kind, "acct-1").unwrap();
+
+    let op = AgentOp::message_with_id("Save a note.", "m-1");
+    postgres::send(&pg, &id, &op, Some("m-1")).await.unwrap();
+    // The notice is the push: the app waits for it, not for a poll.
+    let deadline = std::time::Instant::now() + LIMIT;
+    let seen = loop {
+        let seen = notices.0.lock().unwrap().clone();
+        if !seen.is_empty() || std::time::Instant::now() > deadline {
+            break seen;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
+    assert_eq!(seen.len(), 1, "one notice for one parked call");
+    let notice = &seen[0].call;
+    let exec = postgres::current_run(&pg, &id).await.unwrap().unwrap();
+    assert_eq!(notice.execution_id, exec);
+    assert!(notice.signal.starts_with("tool_approval:"), "{notice:?}");
+    assert_eq!(notice.agent_id.as_ref(), Some(&id));
+    assert_eq!(notice.tool, "write");
+    assert_eq!(notice.arguments, json!({"text": "hi"}));
+    assert!(writes.runs().is_empty(), "the notice releases nothing");
+
+    postgres::decide(&pg, notice.execution_id, &notice.signal, &Approval::Approve)
+        .await
+        .unwrap();
+    let state = settled(&pg, &id, |state| state.last_answer.is_some()).await;
+    assert_eq!(state.last_answer.as_deref(), Some("saved"));
+    assert_eq!(writes.runs(), vec![json!({"text": "hi"})]);
+    assert_eq!(notices.0.lock().unwrap().len(), 1, "no second notice");
+}
+
+/// A delivery that approves each call from inside the notice, as a bot does.
+/// The decision lands before the notice activity completes.
+#[derive(Debug)]
+struct AutoApprove {
+    pg: PostgresAgents,
+    seen: std::sync::Mutex<Vec<ApprovalNotice>>,
+}
+
+impl Delivery for AutoApprove {
+    fn deliver<'a>(&'a self, _report: &'a Report) -> BoxFuture<'a, Result<(), AgentError>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn notify_approval<'a>(
+        &'a self,
+        notice: &'a ApprovalNotice,
+    ) -> BoxFuture<'a, Result<(), AgentError>> {
+        self.seen.lock().unwrap().push(notice.clone());
+        Box::pin(async move {
+            postgres::decide(
+                &self.pg,
+                notice.call.execution_id,
+                &notice.call.signal,
+                &Approval::Approve,
+            )
+            .await
+            .map_err(|err| {
+                AgentError::new(autumn_harvest_agent::ErrorKind::Transport, err.to_string())
+            })
+        })
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_decision_sent_from_the_notice_releases_the_call_and_replays() {
+    use autumn_harvest::testing::{ReplayStatus, WorkflowReplayer};
+
+    let (url, _container) = database().await;
+    let queue = unique("pg-auto");
+    let kind = unique("support");
+    let writes = Arc::new(Recorder::default());
+    let pg = PostgresAgents::single(pool(&url)).with_queue(&queue);
+    let auto = Arc::new(AutoApprove {
+        pg: pg.clone(),
+        seen: std::sync::Mutex::new(Vec::new()),
+    });
+    let model = ScriptedModel::new(vec![
+        calls(&[("w1", "write", json!({"text": "hi"}))], 3),
+        answer("saved", 2),
+    ]);
+    let harness = AgentHarness::new(model.clone())
+        .tool(recorded_tool("write", ToolEffect::Write, &writes))
+        .policy(Arc::new(
+            ToolRules::new().effect(ToolEffect::Write, Rule::Ask),
+        ))
+        .delivery(Arc::clone(&auto) as Arc<dyn Delivery>)
+        .agent(AgentProfile::new(&kind));
+    let _worker = run_worker(&url, &queue, harness, &[ShardId::new(0)]);
+    let id = AgentId::new(&kind, "acct-2").unwrap();
+
+    let op = AgentOp::message_with_id("Save a note.", "m-1");
+    postgres::send(&pg, &id, &op, Some("m-1")).await.unwrap();
+    let state = settled(&pg, &id, |state| state.last_answer.is_some()).await;
+    assert_eq!(state.last_answer.as_deref(), Some("saved"));
+    assert_eq!(writes.runs(), vec![json!({"text": "hi"})]);
+    assert_eq!(auto.seen.lock().unwrap().len(), 1, "one notice");
+
+    // The run replays with the decision that came before the wait opened.
+    // Replay reads a run that ended, so delete the agent first.
+    let exec = postgres::current_run(&pg, &id).await.unwrap().unwrap();
+    postgres::delete(&pg, &id, None).await.unwrap();
+    let ended = postgres::wait_run(&pg, exec, LIMIT).await.unwrap();
+    assert!(!matches!(ended, RunState::Running), "{ended:?}");
+    let mut conn = AsyncPgConnection::establish(&url).await.unwrap();
+    let events = autumn_harvest::store::load_history(&mut conn, exec)
+        .await
+        .unwrap()
+        .events;
+    // The decision lands before the approval race opens. So the race
+    // settles on its first poll: its winner marker follows its open marker,
+    // and it arms no timer.
+    let marker = |event: &WorkflowEvent| match event {
+        WorkflowEvent::MarkerRecorded { name, .. } => Some(name.clone()),
+        _ => None,
+    };
+    let decided = events
+        .iter()
+        .position(|event| {
+            matches!(event, WorkflowEvent::SignalReceived { signal_name, .. }
+                if signal_name.starts_with("tool_approval:"))
+        })
+        .expect("the decision is in history");
+    let opened = (decided..events.len())
+        .find(|&at| marker(&events[at]).is_some_and(|name| name.starts_with("race:")))
+        .expect("the approval race opens after the decision");
+    let seq = marker(&events[opened]).unwrap()["race:".len()..].to_owned();
+    assert_eq!(
+        marker(&events[opened + 1]),
+        Some(format!("race_winner:{seq}")),
+        "the race settles at once"
+    );
+    let replay = WorkflowReplayer::new()
+        .register(vec![autumn_harvest_agent::agent_info()])
+        .with_execution_id(exec)
+        .with_workflow_id(id.as_str())
+        .replay_from_events(events)
+        .await;
+    assert!(
+        matches!(replay.status, ReplayStatus::ReplaySucceeded),
+        "{replay}"
+    );
+}
+
+/// A delivery whose every approval notice fails with an outage.
+#[derive(Debug, Default)]
+struct BrokenNotices(std::sync::Mutex<usize>);
+
+impl Delivery for BrokenNotices {
+    fn deliver<'a>(&'a self, _report: &'a Report) -> BoxFuture<'a, Result<(), AgentError>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn notify_approval<'a>(
+        &'a self,
+        _notice: &'a ApprovalNotice,
+    ) -> BoxFuture<'a, Result<(), AgentError>> {
+        *self.0.lock().unwrap() += 1;
+        let err = AgentError::new(autumn_harvest_agent::ErrorKind::Provider, "chat is down");
+        Box::pin(async move { Err(err) })
+    }
+}
+
+/// A harness whose `write` tool needs an approval, with `delivery`.
+fn gated(
+    model: Arc<ScriptedModel>,
+    writes: &Arc<Recorder>,
+    delivery: Arc<dyn Delivery>,
+    kind: &str,
+) -> AgentHarness {
+    AgentHarness::new(model)
+        .tool(recorded_tool("write", ToolEffect::Write, writes))
+        .policy(Arc::new(
+            ToolRules::new().effect(ToolEffect::Write, Rule::Ask),
+        ))
+        .delivery(delivery)
+        .agent(AgentProfile::new(kind))
+}
+
+/// Wait until `seen` reports at least one item. Fails the test after `LIMIT`.
+async fn first_notice(seen: impl Fn() -> usize) {
+    let deadline = std::time::Instant::now() + LIMIT;
+    while seen() == 0 {
+        assert!(std::time::Instant::now() < deadline, "no notice arrived");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_worker_restart_during_the_wait_sends_no_second_notice() {
+    let (url, _container) = database().await;
+    let queue = unique("pg-restart");
+    let kind = unique("support");
+    let writes = Arc::new(Recorder::default());
+    let pg = PostgresAgents::single(pool(&url)).with_queue(&queue);
+    let id = AgentId::new(&kind, "acct-3").unwrap();
+    let first = Arc::new(Notices::default());
+    let model = ScriptedModel::new(vec![
+        calls(&[("w1", "write", json!({"text": "hi"}))], 3),
+        answer("saved", 2),
+    ]);
+    let worker = run_worker(
+        &url,
+        &queue,
+        gated(model.clone(), &writes, first.clone(), &kind),
+        &[ShardId::new(0)],
+    );
+    let op = AgentOp::message_with_id("Save a note.", "m-1");
+    postgres::send(&pg, &id, &op, Some("m-1")).await.unwrap();
+    first_notice(|| first.0.lock().unwrap().len()).await;
+    let notice = first.0.lock().unwrap()[0].call.clone();
+    drop(worker);
+
+    // A new worker with a new delivery takes the run over.
+    let second = Arc::new(Notices::default());
+    let _worker = run_worker(
+        &url,
+        &queue,
+        gated(model.clone(), &writes, second.clone(), &kind),
+        &[ShardId::new(0)],
+    );
+    postgres::decide(&pg, notice.execution_id, &notice.signal, &Approval::Approve)
+        .await
+        .unwrap();
+    let state = settled(&pg, &id, |state| state.last_answer.is_some()).await;
+    assert_eq!(state.last_answer.as_deref(), Some("saved"));
+    assert_eq!(writes.runs(), vec![json!({"text": "hi"})]);
+    assert!(second.0.lock().unwrap().is_empty(), "no second notice");
+    assert_eq!(first.0.lock().unwrap().len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_notice_keeps_the_call_parked_on_postgres() {
+    let (url, _container) = database().await;
+    let queue = unique("pg-broken");
+    let kind = unique("support");
+    let writes = Arc::new(Recorder::default());
+    let pg = PostgresAgents::single(pool(&url)).with_queue(&queue);
+    let id = AgentId::new(&kind, "acct-4").unwrap();
+    let broken = Arc::new(BrokenNotices::default());
+    let model = ScriptedModel::new(vec![
+        calls(&[("w1", "write", json!({"text": "hi"}))], 3),
+        answer("saved", 2),
+    ]);
+    let _worker = run_worker(
+        &url,
+        &queue,
+        gated(model, &writes, broken.clone(), &kind),
+        &[ShardId::new(0)],
+    );
+    let op = AgentOp::message_with_id("Save a note.", "m-1");
+    postgres::send(&pg, &id, &op, Some("m-1")).await.unwrap();
+    first_notice(|| *broken.0.lock().unwrap()).await;
+
+    // The op stays parked. The failed notice released nothing.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let state = postgres::state(&pg, &id).await.unwrap().unwrap();
+    assert_eq!(state.last_answer, None, "the op still waits");
+    assert_eq!(state.failures, 0, "a failed notice fails nothing");
+    assert_eq!(
+        writes.runs(),
+        Vec::<serde_json::Value>::new(),
+        "nothing ran"
+    );
+
+    // The run waits on the signal of the first call of the first tool step.
+    let exec = postgres::current_run(&pg, &id).await.unwrap().unwrap();
+    let signal = autumn_harvest_agent::approval::approval_signal(0, 0, "w1");
+    postgres::decide(&pg, exec, &signal, &Approval::Approve)
+        .await
+        .unwrap();
+    let state = settled(&pg, &id, |state| state.last_answer.is_some()).await;
+    assert_eq!(state.last_answer.as_deref(), Some("saved"));
+    assert_eq!(writes.runs(), vec![json!({"text": "hi"})]);
+    assert_eq!(*broken.0.lock().unwrap(), 1, "a refusal is not retried");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_notice_over_the_worker_cap_is_skipped_and_the_run_fails_cleanly() {
+    use autumn_harvest::testing::{ReplayStatus, WorkflowReplayer};
+
+    let (url, _container) = database().await;
+    let queue = unique("pg-cap");
+    let writes = Arc::new(Recorder::default());
+    let notices = Arc::new(Notices::default());
+    // The task declares no cap, so the arguments are not cut. The worker
+    // takes 6 000 bytes of activity input, so the notice does not fit. The
+    // next model turn holds the same arguments, so it cannot fit either.
+    let big = "x".repeat(8_000);
+    let model = ScriptedModel::new(vec![
+        calls(&[("w1", "write", json!({"text": big}))], 3),
+        answer("not saved", 2),
+    ]);
+    let harness = AgentHarness::new(model)
+        .tool(recorded_tool("write", ToolEffect::Write, &writes))
+        .policy(Arc::new(
+            ToolRules::new().effect(ToolEffect::Write, Rule::Ask),
+        ))
+        .delivery(Arc::clone(&notices) as Arc<dyn Delivery>);
+    let pg = PostgresAgents::single(pool(&url)).with_queue(&queue);
+    let _worker = run_worker_with(&url, &queue, harness, &[ShardId::new(0)], |builder| {
+        builder.max_activity_input_bytes(6_000)
+    });
+    let task = AgentTask::new("Save a note.")
+        .max_request_bytes(0)
+        .approval_timeout(Duration::from_secs(1));
+    let exec = postgres::start(&pg, &task).await.unwrap();
+
+    // Nobody decides. The deadline denies the call. The next model turn is
+    // over the cap, so the run fails with the cause. A notice whose skip
+    // left no record would wedge the run on a replay divergence instead.
+    let deadline = std::time::Instant::now() + LIMIT;
+    let state = loop {
+        let state = postgres::run_state(&pg, exec).await.unwrap();
+        if matches!(state, RunState::Completed(_) | RunState::Failed(_)) {
+            break state;
+        }
+        assert!(std::time::Instant::now() < deadline, "{state:?}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    let RunState::Failed(error) = state else {
+        panic!("the run fails on the next model turn: {state:?}");
+    };
+    assert!(error.contains("payload too large"), "{error}");
+    assert!(
+        notices.0.lock().unwrap().is_empty(),
+        "no notice over the cap"
+    );
+    assert_eq!(writes.runs(), Vec::<serde_json::Value>::new());
+
+    let mut conn = AsyncPgConnection::establish(&url).await.unwrap();
+    let events = autumn_harvest::store::load_history(&mut conn, exec)
+        .await
+        .unwrap()
+        .events;
+    let skipped = events.iter().any(|event| {
+        matches!(event, WorkflowEvent::SideEffectRecorded { name: Some(name), value, .. }
+            if name == "agent.approval_notice.fits" && value == &json!(false))
+    });
+    assert!(skipped, "the skip is recorded");
+    // A replay under the default, larger cap takes the recorded branch. It
+    // then meets no notice, as the run did.
+    let replay = WorkflowReplayer::new()
+        .register(vec![autumn_harvest_agent::agent_loop_info()])
+        .with_execution_id(exec)
+        .replay_from_events(events)
+        .await;
+    assert!(
+        !matches!(replay.status, ReplayStatus::NonDeterminismDetected { .. }),
+        "{replay}"
+    );
 }

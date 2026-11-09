@@ -136,8 +136,9 @@ Section 2 shows how `FnTool::shared` makes a tool such as `lookup`.
 `workflows()` returns `agent_loop`, `agent_heartbeat` and the durable
 `agent` (section 15). `activities()` returns `agent_model_turn`,
 `agent_tool_call`, `agent_memory_snapshot`, `agent_deliver`,
-`agent_precheck`, `agent_discover_peers`, `agent_profile`,
-`agent_profile_overlay` (section 15), `agent_memory_reset`,
+`agent_approval_notice` (section 5), `agent_precheck`,
+`agent_discover_peers`, `agent_profile`, `agent_profile_overlay`
+(section 15), `agent_memory_reset`,
 `agent_workspace_retain`, `agent_workspace_reset`, `agent_workspace_floor`,
 `agent_refine_propose` (section 16) and `agent_score` (section 17).
 The test `the_engine_registration_builds` builds this
@@ -351,6 +352,64 @@ run.
 | `Approval::Reject { reason }` | The call does not run. The model reads the reason. |
 | No decision before the deadline | The call does not run. The model reads that no approval arrived. |
 | A payload that is not an `Approval` | The call does not run. The model reads that the decision was not readable. The run goes on. |
+
+### The approval notice
+
+Before the wait, the call sends one notice to the harness delivery:
+`Delivery::notify_approval`. A chat app shows "Approve this?" with it, and
+needs no poll. The send is the activity `agent_approval_notice`.
+
+| Field | Content |
+|---|---|
+| `call.run_id` | The run id that tools see |
+| `call.execution_id` | The run that waits. Pass it to `decide`. |
+| `call.agent_id` | The durable agent, or `None` |
+| `call.session_id` | The session of the run, or `None` |
+| `call.signal` | The signal name. Pass it to `decide`. |
+| `call.tool` | The tool name |
+| `call.reason` | Why the policy asks. Over 256 bytes, a cut text. |
+| `call.arguments` | The arguments. Over the tool result cap, a cut JSON string. |
+| `call.arguments_truncated` | `true` when the arguments were cut |
+| `call.timeout_secs` | The time of the wait |
+| `deadline` | The worker clock plus the timeout. The wait ends at this time or a little later. Clock skew between the worker and the engine can move it. |
+
+```rust
+use autumn_harvest_agent::delivery::{ApprovalNotice, Delivery, Report};
+use autumn_harvest_agent::{AgentError, BoxFuture};
+
+#[derive(Debug)]
+struct Chat;
+
+impl Delivery for Chat {
+    fn deliver<'a>(&'a self, _report: &'a Report) -> BoxFuture<'a, Result<(), AgentError>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn notify_approval<'a>(
+        &'a self,
+        notice: &'a ApprovalNotice,
+    ) -> BoxFuture<'a, Result<(), AgentError>> {
+        // Send "Approve `tool`?" to the chat. Keep `key()` to drop a repeat.
+        let _ = (notice.key(), &notice.call.tool, notice.deadline);
+        Box::pin(async { Ok(()) })
+    }
+}
+```
+
+- The result is recorded. A restart during the wait sends no second notice.
+- A retry of the activity can send the notice again. It keeps the key
+  `ApprovalNotice::key`, `<run id>:<execution id>:<signal>`. Dedupe on it.
+  A reset or a fork starts a new execution, so its notice has a new key.
+- A failed notice never fails the run and never releases the call. The
+  call still waits for a decision or its deadline.
+- The default writes the names to the `tracing` log. It never logs the
+  arguments or the reason.
+- A notice is never withdrawn. An interrupt, a deadline or a reset can end
+  the wait first. A decision for an ended wait changes nothing.
+- A probe sends no notice. An evaluation stubs it (section 12). An
+  evaluation sends again an approval for a wait that its notice opened.
+- A run that parked before this release replays with no notice. The patch
+  `agent_approval_notice` gates it.
 
 Each name belongs to one wait. A decision that arrives after its deadline
 stays unread in history. It never releases a later call, even when the model
@@ -606,6 +665,7 @@ it does in a plain run.
 | Heartbeat | Workflow `agent_heartbeat`: one tick per run | `heartbeat::schedule`, `postgres::start_heartbeat`, `sqlite::start_heartbeat` |
 | Follow-up | A durable timer, then a new segment in the same workflow | `AgentTask::followups` |
 | Delivery | Activity `agent_deliver` | `AgentTask::deliver`, `AgentHarness::delivery` |
+| Approval notice | Activity `agent_approval_notice`, before each approval wait (section 5) | `Delivery::notify_approval` |
 | Memory | Activity `agent_memory_snapshot`, once per segment | `AgentTask::memory`, `AgentHarness::memory` |
 | Loop guard | A fingerprint of each recorded call, in the workflow | On by default: `AgentTask::loop_guard` |
 
@@ -1027,6 +1087,7 @@ change.
 | `agent_tool_call` | The recorded outcome of the same call, or an error stub. No tool runs. |
 | `agent_memory_snapshot` | The recorded snapshot, or an empty one. |
 | `agent_deliver` | A stub. No report leaves the harness. |
+| `agent_approval_notice` | A stub. No notice leaves the harness. |
 | `agent_discover_peers` | The recorded peers for the same names, or none. The candidate needs no roster. |
 | A child run of a fan-out | The recorded report of an unused child run with the same delegation chain and task text. With no match, the candidate run fails. No child runs live. |
 | Any other activity, such as `agent_precheck` | No mock. The candidate run fails. |
@@ -1047,8 +1108,9 @@ id, so the recorded approvals stay valid. Any other call gets a new `eval_`
 id, so no recorded approval can release it. That id holds the turn and the
 position, not the provider id. The harness sends again only an
 approval for a wait that the source opened, when it arrived before the
-deadline. An approval sent before its wait opened leaves no deadline timer,
-so the harness drops it, and the candidate times out at that wait.
+deadline. A wait opens with its approval notice or its deadline timer. An
+approval sent before both is dropped, and the candidate times out at that
+wait.
 
 The report holds one `TurnDiff` per model turn. A turn diverges when the
 calls, the arguments, the policy decisions or the stop reason differ. Two
@@ -1140,6 +1202,7 @@ fork names the source. A worker that holds the same tools runs the fork.
 | The `memory` tool | Refused. A note would show in each later run of the scope. |
 | The policy | Runs as in the source. Nobody answers a probe, so the approval wait is one second. A gated call times out to a deny. |
 | `agent_deliver` | Never runs. The probe input also sets `deliver` to `false`. |
+| `agent_approval_notice` | Never runs. Nobody answers a probe. |
 | A delegated child | Runs inline, as a probe with the same set. A fan-out child would be a separate run that notifies on its end. |
 | A durable peer | The delegation is refused. The peer runs its own effects. |
 | The workspace | A probe reads it and never moves its head. |
@@ -1533,6 +1596,10 @@ A control op applies at once, also while the agent is paused. The kernel
   approval names never repeat.
 - The transcript keeps at most `AgentProfile::window` messages. The cut
   lands on a user message.
+- A gated call sends one approval notice before it waits (section 5). The
+  notice holds the agent id, the execution id and the signal. Pass the last
+  two to `decide`. A restart during the wait sends no second notice, so a
+  chat app needs no poll of `agent_status`.
 
 ### Heartbeats and follow-ups (issue #2266)
 
@@ -1684,6 +1751,7 @@ What an interrupt does to the work in flight:
 | A tool call whose tool opts in (`Tool::interruptible`) | The race cancels it. The call answers that it was cancelled. |
 | Any other tool call | It runs to its end. No later call of the round runs. |
 | An approval wait | It ends as a rejection. The tool does not run. |
+| An approval notice | It runs to its end. The wait then ends at once as a rejection. |
 
 The race records its winner, so replay takes the same branch and asks no
 model again. An interrupt that arrives while no op runs is stale, and the

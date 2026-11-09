@@ -283,6 +283,7 @@ fn the_engine_registration_builds() {
             "agent_tool_call",
             "agent_memory_snapshot",
             "agent_deliver",
+            "agent_approval_notice",
             "agent_precheck",
             "agent_discover_peers",
             "agent_profile",

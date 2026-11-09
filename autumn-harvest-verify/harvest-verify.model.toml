@@ -729,6 +729,11 @@ receiver = "WorkflowContext"
 kind = "value"
 reason = "context.rs:4545, doc 4519-4544: \"Observability-only: use it to gate side effects, never to derive workflow commands. Branching command-affecting logic on it records different commands live vs replay and triggers non-determinism.\" The doc's own example (`if !ctx.is_replaying() { println!(..) }`) is the clean use; a command inside that branch is the finding."
 [[source]]
+path = "activity_input_fits"
+receiver = "WorkflowContext"
+kind = "value"
+reason = "context.rs `activity_input_fits` reads the payload caps, the cap overrides and the offload threshold of the worker. A deploy can change each one, so a replay on another build can get another answer at the same program point. Its doc says to record the answer with `side_effect`, whose closure is opaque. The agent loop does that in `notice_fits`."
+[[source]]
 path = "history_event_count"
 receiver = "WorkflowContext"
 kind = "value"

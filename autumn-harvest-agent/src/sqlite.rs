@@ -58,8 +58,9 @@ use crate::sampling::{
 use crate::score::{SampleScore, agent_sample_score_info, agent_score_info, run_score};
 use crate::types::{AgentTask, ModelTurnRequest};
 use crate::workflow::{
-    WORKFLOW_NAME, agent_deliver_info, agent_discover_peers_info, agent_loop_info,
-    agent_memory_snapshot_info, agent_model_turn_info, agent_precheck_info, agent_tool_call_info,
+    WORKFLOW_NAME, agent_approval_notice_info, agent_deliver_info, agent_discover_peers_info,
+    agent_loop_info, agent_memory_snapshot_info, agent_model_turn_info, agent_precheck_info,
+    agent_tool_call_info,
 };
 use autumn_harvest::chrono::{DateTime, Utc};
 
@@ -122,6 +123,10 @@ pub fn register(rt: &mut SqliteRuntime, harness: Arc<AgentHarness>) {
     let h = Arc::clone(&harness);
     rt.register_activity_with_body(&agent_deliver_info(), move |input| {
         call(input, |report| h.deliver(report))
+    });
+    let h = Arc::clone(&harness);
+    rt.register_activity_with_body(&agent_approval_notice_info(), move |input| {
+        call(input, |parked| h.notify_approval(parked))
     });
     let h = Arc::clone(&harness);
     rt.register_activity_with_body(&agent_discover_peers_info(), move |input| {

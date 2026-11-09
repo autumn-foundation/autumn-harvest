@@ -4,6 +4,7 @@
 //!
 //! - [`agent_model_turn`] — one model call and the policy decisions.
 //! - [`agent_tool_call`] — one tool call.
+//! - [`agent_approval_notice`] — one notice before an approval wait.
 //! - an approval signal with a deadline, for a call the policy gates.
 //! - [`agent_memory_snapshot`] — the frozen memory of a segment.
 //! - [`agent_deliver`] — one report to the delivery.
@@ -38,13 +39,14 @@ use crate::bounds::{
     RoundBudget, full_round_resets, json_len, reaches_percent, reset_due, sibling_cap,
 };
 use crate::context_reset::{self, ProgressNotes, SAVE_PROGRESS_TOOL};
-use crate::delivery::{Report, ReportSource, report_text};
+use crate::delivery::{ParkedCall, Report, ReportSource, cut_arguments, report_text};
 use crate::draw::Draw;
 use crate::fan_out_plan::{Fit, Step, fan_out_plan};
 use crate::flow::Released;
 use crate::followup::{self, FOLLOWUP_TOOL, Planned};
 use crate::harness::{
-    AgentHarness, CacheTenant, TRUNCATED, max_tool_result_bytes, truncate, truncate_flagged,
+    AgentHarness, CacheTenant, REASON_CUT_BYTES, TRUNCATED, cut_bytes, max_tool_result_bytes,
+    truncate, truncate_flagged,
 };
 use crate::heartbeat::{HeartbeatTask, agent_heartbeat_info};
 use crate::loop_guard::{LoopTracker, LoopVerdict, warning_note};
@@ -102,6 +104,27 @@ const LEGACY_ANSWER_LIMIT: usize = 8_000;
 /// resets, and a stopped save round. A history recorded before the gate
 /// holds no marker there, so it replays as it ran.
 const RESET_ON_FULL_PATCH: &str = "agent_reset_on_full_round";
+
+/// The gate of the approval notice. A history from before the gate holds no
+/// notice before its approval waits, so its replay sends none. The loop asks
+/// the gate only for a gated call, so each other run records no marker.
+const APPROVAL_NOTICE_PATCH: &str = "agent_approval_notice";
+
+/// A signal name that no client sends. A probe of it claims nothing.
+///
+/// The probe moves each signal that waits at the end of history into the
+/// signal buffer. The patch gate reads a gate with only signals after it as a
+/// recorded position, and takes the old branch. A decision left over from an
+/// earlier wait would then hide the notice. After the probe, the gate sees the
+/// real end of history.
+const APPROVAL_NOTICE_PROBE: &str = "agent.approval_notice.probe";
+
+/// The side effect that records whether the notice input fits the caps.
+///
+/// A schedule over a cap records nothing. The wait after it would then meet a
+/// replay that expects the notice. The recorded answer keeps the choice the
+/// same on each replay, also after a cap change.
+const APPROVAL_NOTICE_FITS: &str = "agent.approval_notice.fits";
 
 /// The registered workflow name.
 pub const WORKFLOW_NAME: &str = "agent_loop";
@@ -717,7 +740,28 @@ pub(crate) async fn discover(ctx: &WorkflowContext, mandate: &Mandate) -> Result
 ///
 /// Returns an engine error that is not a failed send, such as a cancel.
 pub(crate) async fn deliver(ctx: &WorkflowContext, report: Report) -> Result<bool, String> {
-    let sent: HarvestResult<()> = ctx.execute_activity(&agent_deliver_info(), report).await;
+    tolerate(ctx.execute_activity(&agent_deliver_info(), report).await)
+}
+
+/// Send the notice of one parked call.
+///
+/// A failed notice never fails the run and never releases the call. A failed
+/// or timed-out send is recorded, so replay gives the same answer. An input
+/// over the cap records nothing, so [`notice_fits`] records the check first.
+///
+/// # Errors
+///
+/// Returns an engine error that is not a failed send, such as a cancel.
+async fn notify(ctx: &WorkflowContext, call: ParkedCall) -> Result<bool, String> {
+    tolerate(
+        ctx.execute_activity(&agent_approval_notice_info(), call)
+            .await,
+    )
+}
+
+/// Read the result of one send. A failed send is `false`. Any other engine
+/// error goes on.
+fn tolerate(sent: HarvestResult<()>) -> Result<bool, String> {
     match sent {
         Ok(()) => Ok(true),
         Err(
@@ -2004,18 +2048,18 @@ async fn decide(
         ToolDecision::Deny { reason } => {
             Ok(ToolOutcome::error(&format!("denied by policy: {reason}")))
         }
-        ToolDecision::RequireApproval { .. } => {
-            gated_call(ctx, run, progress, tree, slot, call).await
+        ToolDecision::RequireApproval { reason } => {
+            gated_call(ctx, run, progress, tree, slot, call, reason).await
         }
     }
 }
 
 /// Wait for a decision on one gated call, then run it or refuse it.
 ///
-/// The wait races the call's own approval signal against a durable deadline.
-/// A missing decision denies the call, so an unattended run keeps moving. A
-/// payload that is not an `Approval` denies the call too. It never fails the
-/// run.
+/// The call first sends one notice. The wait then races the call's own
+/// approval signal against a durable deadline. A missing decision denies the
+/// call, so an unattended run keeps moving. A payload that is not an
+/// `Approval` denies the call too. It never fails the run.
 async fn gated_call(
     ctx: &WorkflowContext,
     run: Run<'_>,
@@ -2023,10 +2067,19 @@ async fn gated_call(
     tree: &mut Tree,
     slot: Slot<'_>,
     mut call: ToolCall,
+    reason: String,
 ) -> Result<ToolOutcome, String> {
     let task = run.task;
     let name = approval_signal(slot.round, slot.position, &call.id);
     let timeout = Duration::from_secs(task.approval_timeout_secs);
+    // A probe run sends no notice. Nobody answers it.
+    if task.probe.is_none() && notice_gate(ctx)? {
+        let parked = parked_call(ctx, run, progress, &name, &call, reason);
+        // The result changes nothing. Only a decision releases the call.
+        if notice_fits(ctx, &parked)? {
+            notify(ctx, parked).await?;
+        }
+    }
     let decision = if run.live {
         let Some(decision) = live_decision(ctx, &name, timeout).await? else {
             progress.interrupted = true;
@@ -2058,6 +2111,59 @@ async fn gated_call(
             "denied: no approval arrived within {}s",
             task.approval_timeout_secs
         ))),
+    }
+}
+
+/// Ask the patch gate of the notice. See [`APPROVAL_NOTICE_PROBE`].
+fn notice_gate(ctx: &WorkflowContext) -> Result<bool, String> {
+    ctx.try_wait_for_signal(APPROVAL_NOTICE_PROBE)
+        .map_err(|err| err.to_string())?;
+    Ok(ctx.patched(APPROVAL_NOTICE_PATCH))
+}
+
+/// Record whether the notice input fits the caps. See
+/// [`APPROVAL_NOTICE_FITS`].
+fn notice_fits(ctx: &WorkflowContext, parked: &ParkedCall) -> Result<bool, String> {
+    let input = serde_json::to_value(parked).map_err(|err| err.to_string())?;
+    let name = agent_approval_notice_info().name;
+    ctx.side_effect(APPROVAL_NOTICE_FITS, || {
+        ctx.activity_input_fits(name, &input)
+    })
+    .map_err(|err| err.to_string())
+}
+
+/// The notice input of one gated call.
+///
+/// The arguments are cut to the tool result cap. The reason is cut to the
+/// reason cut of a full turn. Each escaped byte of the reason grows the input
+/// up to six times, so a small cut keeps the whole input under the cap.
+fn parked_call(
+    ctx: &WorkflowContext,
+    run: Run<'_>,
+    progress: &Progress,
+    signal: &str,
+    call: &ToolCall,
+    reason: String,
+) -> ParkedCall {
+    let task = run.task;
+    let max = max_tool_result_bytes(task.request_cap());
+    let (arguments, arguments_truncated) = cut_arguments(call.arguments.clone(), max);
+    // The workflow id of a durable agent is its agent id. An inline child of
+    // the agent runs in the same workflow, so it names the agent too.
+    let agent_id = (ctx.workflow_type() == AGENT_WORKFLOW_NAME)
+        .then(|| AgentId::parse(ctx.workflow_id()).ok())
+        .flatten();
+    ParkedCall {
+        run_id: RunId::new(progress.run_id.clone()),
+        execution_id: ctx.execution_id(),
+        agent_id,
+        session_id: task.session_id.clone(),
+        signal: signal.to_owned(),
+        tool: call.name.clone(),
+        reason: cut_bytes(reason, REASON_CUT_BYTES.min(max)),
+        arguments,
+        arguments_truncated,
+        timeout_secs: task.approval_timeout_secs,
     }
 }
 
@@ -3399,6 +3505,19 @@ pub async fn agent_deliver(ctx: &ActivityContext, report: Report) -> Result<(), 
     harness(ctx)?.deliver(report).await
 }
 
+/// The notice of one parked call, as an activity.
+///
+/// # Errors
+///
+/// Returns the delivery error. The loop records it and waits as before.
+#[activity(
+    start_to_close = "1m",
+    retry = RetryPolicy::exponential(3, Duration::from_secs(1))
+)]
+pub async fn agent_approval_notice(ctx: &ActivityContext, call: ParkedCall) -> Result<(), String> {
+    harness(ctx)?.notify_approval(call).await
+}
+
 /// The heartbeat precheck, as an activity.
 ///
 /// # Errors
@@ -3461,6 +3580,7 @@ pub fn activities() -> Vec<ActivityInfo> {
         agent_tool_call_info(),
         agent_memory_snapshot_info(),
         agent_deliver_info(),
+        agent_approval_notice_info(),
         agent_precheck_info(),
         agent_discover_peers_info(),
         agent_profile_info(),

@@ -34,6 +34,7 @@ mod payload_depth;
 mod portable_activity;
 mod portable_fixture;
 mod race_activities;
+mod race_buffered_signal;
 mod race_fairness;
 mod reopen_consistency;
 mod retention;
