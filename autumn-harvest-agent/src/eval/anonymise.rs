@@ -363,6 +363,8 @@ fn scrub_end(end: RunEnd, scrub: &Scrub) -> RunEnd {
                 report.run_id = None;
                 for delegation in &mut report.delegations {
                     delegation.run_id = None;
+                    // A key holds the run id of its sender (issue #2484).
+                    delegation.idempotency_key = None;
                 }
             }
             RunEnd::Completed(report)
@@ -646,6 +648,43 @@ mod tests {
             end_text(&RunEnd::Failed("a\nb".into())),
             "failed, error \"a\\nb\""
         );
+    }
+
+    // Issue #2484: a key holds the run id of its sender, so the scrub
+    // clears it with the run ids.
+    #[test]
+    fn a_scrub_that_clears_run_ids_clears_each_key() {
+        let mut report: crate::AgentReport = serde_json::from_value(serde_json::json!({
+            "stop": "completed",
+            "text": "",
+            "steps_used": 0,
+            "tool_calls": 0,
+            "usage": crate::message::TokenUsage::default(),
+            "messages": [],
+            "run_id": "e1",
+            "delegations": [{
+                "chain": ["a", "b"],
+                "run_id": "agent:b:1",
+                "refusal": "reply_timeout",
+                "idempotency_key": "e1:1",
+            }],
+        }))
+        .expect("a report");
+        let scrub = |clear_run_ids| Scrub {
+            identities: Vec::new(),
+            clear_run_ids,
+        };
+        let kept = scrub_end(RunEnd::Completed(report.clone()), &scrub(false));
+        let RunEnd::Completed(kept) = kept else {
+            panic!("the end stays a report");
+        };
+        assert_eq!(kept.delegations[0].idempotency_key.as_deref(), Some("e1:1"));
+        report = match scrub_end(RunEnd::Completed(report), &scrub(true)) {
+            RunEnd::Completed(report) => report,
+            RunEnd::Failed(error) => panic!("{error}"),
+        };
+        assert_eq!(report.delegations[0].run_id, None);
+        assert_eq!(report.delegations[0].idempotency_key, None);
     }
 
     /// A copy of `digests` in an order that `shuffle` picks.

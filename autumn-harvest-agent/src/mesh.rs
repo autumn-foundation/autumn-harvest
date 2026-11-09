@@ -807,7 +807,7 @@ where
     Mandate::from_wire(&value).map_err(serde::de::Error::custom)
 }
 
-/// Why a delegation did not run.
+/// Why a delegation did not run, or why its durable peer sent no reply.
 ///
 /// A delegation runs the checks in the order of the variants, from
 /// `InvalidArguments` to `BudgetExhausted`. Only [`Mandate::accept`] returns
@@ -818,6 +818,13 @@ where
 /// peer then gets `StrategyNeedsDurablePeer`. A durable peer checks
 /// `PeerUnavailable`, `NotPermitted` and `Deadlock`, then the outbound
 /// mandate. Last, it checks `DrawsExceeded`, then `FanOutExhausted`.
+///
+/// The last three variants mean that the message went out, but no reply
+/// came (issue #2484). See [`Refusal::unanswered`].
+///
+/// A report carries each verdict to its parent. A worker that does not
+/// know a variant cannot decode that report. So upgrade every worker before
+/// a run can record a new variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
 #[serde(rename_all = "snake_case")]
 #[error("the delegation is refused: {}", self.code())]
@@ -852,6 +859,12 @@ pub enum Refusal {
     /// A `delegate` call asks an inline peer for a strategy. Only a durable
     /// agent has a kind, and so a sampling policy.
     StrategyNeedsDurablePeer,
+    /// The message went out, but no reply came before the deadline.
+    ReplyTimeout,
+    /// The message went out, but a caller rejected the reply promise.
+    ReplyRejected,
+    /// The message went out, but a person interrupted the wait.
+    ReplyInterrupted,
 }
 
 impl Refusal {
@@ -872,7 +885,22 @@ impl Refusal {
             Self::PeerUnavailable => "peer_unavailable",
             Self::DrawsExceeded => "draws_exceeded",
             Self::StrategyNeedsDurablePeer => "strategy_needs_durable_peer",
+            Self::ReplyTimeout => "reply_timeout",
+            Self::ReplyRejected => "reply_rejected",
+            Self::ReplyInterrupted => "reply_interrupted",
         }
+    }
+
+    /// `true` when the message went out, but no reply came back.
+    ///
+    /// The durable peer can still apply the message. A new ask has a new
+    /// key, so the peer can run the task twice.
+    #[must_use]
+    pub const fn unanswered(self) -> bool {
+        matches!(
+            self,
+            Self::ReplyTimeout | Self::ReplyRejected | Self::ReplyInterrupted
+        )
     }
 
     /// The text that the delegating model reads. The peer name is cut to
@@ -904,6 +932,18 @@ impl Refusal {
             Self::StrategyNeedsDurablePeer => {
                 format!("{peer:?} is not a durable agent, so it cannot run a strategy")
             }
+            Self::ReplyTimeout => format!(
+                "no reply from {peer:?} came in time; the peer can still do the \
+                 task, so a new ask can run it twice"
+            ),
+            Self::ReplyRejected => format!(
+                "a caller rejected the wait for {peer:?}; the peer can still do \
+                 the task, so a new ask can run it twice"
+            ),
+            Self::ReplyInterrupted => format!(
+                "a person interrupted the wait for {peer:?}; the peer can still \
+                 do the task, so a new ask can run it twice"
+            ),
         }
     }
 }
@@ -1029,7 +1069,8 @@ pub struct DelegationRecord {
     /// How the child ended. `None` when the delegation did not run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop: Option<AgentStop>,
-    /// Why the delegation did not run.
+    /// Why the delegation did not run, or why its durable peer sent no
+    /// reply.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refusal: Option<Refusal>,
     /// Tokens of the child and of every agent under it.
@@ -1057,6 +1098,12 @@ pub struct DelegationRecord {
     /// delegation.
     #[serde(default, skip_serializing_if = "crate::types::is_zero")]
     pub draws: u32,
+    /// The idempotency key `<from>:<seq>` of the message to a durable peer
+    /// (issue #2484). `None` when no message went out. A new ask gets a
+    /// new key. So before you ask again, check this key on the state of the
+    /// peer that `run_id` names. The key does not name the peer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
 }
 
 /// Why a delegation ran alone, when [`AgentTask::parallel_children`] is 2 or
@@ -1225,22 +1272,42 @@ mod tests {
         );
     }
 
+    /// The verdict after `refusal`, in the order of the variants.
+    ///
+    /// The match is exhaustive, so a new variant does not compile until it
+    /// is in the chain.
+    const fn next_refusal(refusal: Refusal) -> Option<Refusal> {
+        match refusal {
+            Refusal::InvalidArguments => Some(Refusal::NotPermitted),
+            Refusal::NotPermitted => Some(Refusal::UnknownPeer),
+            Refusal::UnknownPeer => Some(Refusal::Cycle),
+            Refusal::Cycle => Some(Refusal::DepthExceeded),
+            Refusal::DepthExceeded => Some(Refusal::FanOutExhausted),
+            Refusal::FanOutExhausted => Some(Refusal::ModelForbidden),
+            Refusal::ModelForbidden => Some(Refusal::BudgetExhausted),
+            Refusal::BudgetExhausted => Some(Refusal::InvalidMandate),
+            Refusal::InvalidMandate => Some(Refusal::Deadlock),
+            Refusal::Deadlock => Some(Refusal::PeerUnavailable),
+            Refusal::PeerUnavailable => Some(Refusal::DrawsExceeded),
+            Refusal::DrawsExceeded => Some(Refusal::StrategyNeedsDurablePeer),
+            Refusal::StrategyNeedsDurablePeer => Some(Refusal::ReplyTimeout),
+            Refusal::ReplyTimeout => Some(Refusal::ReplyRejected),
+            Refusal::ReplyRejected => Some(Refusal::ReplyInterrupted),
+            Refusal::ReplyInterrupted => None,
+        }
+    }
+
+    /// Every verdict, in the order of the variants.
+    fn every_refusal() -> Vec<Refusal> {
+        std::iter::successors(Some(Refusal::InvalidArguments), |refusal| {
+            next_refusal(*refusal)
+        })
+        .collect()
+    }
+
     #[test]
     fn verdict_codes_are_stable_and_distinct() {
-        let all = [
-            Refusal::InvalidArguments,
-            Refusal::NotPermitted,
-            Refusal::UnknownPeer,
-            Refusal::Cycle,
-            Refusal::DepthExceeded,
-            Refusal::FanOutExhausted,
-            Refusal::ModelForbidden,
-            Refusal::BudgetExhausted,
-            Refusal::InvalidMandate,
-            Refusal::Deadlock,
-            Refusal::PeerUnavailable,
-            Refusal::DrawsExceeded,
-        ];
+        let all = every_refusal();
         let codes: BTreeSet<&str> = all.iter().map(|refusal| refusal.code()).collect();
         assert_eq!(codes.len(), all.len());
         for refusal in all {
@@ -1660,6 +1727,76 @@ mod tests {
             Err(Refusal::DrawsExceeded)
         );
         assert_eq!(open.admit_delegated_draws(Some(3), 3, true, 0), Ok(3));
+    }
+
+    // Issue #2484: a sent message that gets no reply has a named verdict.
+    #[test]
+    fn only_a_sent_message_with_no_reply_is_unanswered() {
+        let unanswered = [
+            Refusal::ReplyTimeout,
+            Refusal::ReplyRejected,
+            Refusal::ReplyInterrupted,
+        ];
+        assert_eq!(
+            unanswered.map(Refusal::code),
+            ["reply_timeout", "reply_rejected", "reply_interrupted"]
+        );
+        for refusal in every_refusal() {
+            assert_eq!(refusal.unanswered(), unanswered.contains(&refusal));
+            if refusal.unanswered() {
+                // The model reads that a new ask can run the task twice.
+                let text = refusal.message("researcher");
+                assert!(text.contains("\"researcher\""), "{text}");
+                assert!(text.contains("twice"), "{text}");
+            }
+        }
+    }
+
+    // Issue #2484: the guide lists each verdict.
+    #[test]
+    fn the_guide_lists_every_verdict() {
+        let guide = include_str!("../../docs/agent-mesh.md");
+        for refusal in every_refusal() {
+            let row = format!("| `{}` |", refusal.code());
+            assert!(guide.contains(&row), "docs/agent-mesh.md has no row {row}");
+        }
+    }
+
+    // Issue #2484: a record keeps the key of its message, and an old
+    // record with no key still decodes.
+    #[test]
+    fn a_record_keeps_its_idempotency_key() {
+        let record = DelegationRecord {
+            chain: vec!["triage".to_owned(), "researcher".to_owned()],
+            run_id: Some("agent:research:r1".to_owned()),
+            stop: None,
+            refusal: Some(Refusal::ReplyTimeout),
+            usage: TokenUsage::default(),
+            steps_used: 0,
+            tool_calls: 0,
+            resets: 0,
+            answer_truncated: false,
+            serial: None,
+            draws: 0,
+            idempotency_key: Some("run-1:1".to_owned()),
+        };
+        let value = serde_json::to_value(&record).unwrap();
+        assert_eq!(value["idempotency_key"], "run-1:1");
+        assert_eq!(value["refusal"], "reply_timeout");
+        assert_eq!(
+            serde_json::from_value::<DelegationRecord>(value).unwrap(),
+            record
+        );
+        let old = DelegationRecord {
+            idempotency_key: None,
+            ..record
+        };
+        let value = serde_json::to_value(&old).unwrap();
+        assert!(value.get("idempotency_key").is_none());
+        assert_eq!(
+            serde_json::from_value::<DelegationRecord>(value).unwrap(),
+            old
+        );
     }
 
     #[test]

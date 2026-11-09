@@ -1465,11 +1465,15 @@ fn keep_beams(round: &mut [Scored], slots: u32, complete: &mut u32) -> Vec<Beam>
 /// The delegation units that `report` used. A refused delegation uses
 /// none. Each other delegation uses one, and one more for each draw unit
 /// of a delegated strategy.
+///
+/// A message to a durable peer with no reply went out, so it uses its
+/// units (issue #2484). Before that issue, its record had no verdict, so
+/// the count of an old history stays the same.
 fn used_delegations(report: &AgentReport) -> u32 {
     report
         .delegations
         .iter()
-        .filter(|record| record.refusal.is_none())
+        .filter(|record| record.refusal.is_none_or(MeshRefusal::unanswered))
         .fold(0_u32, |units, record| {
             units.saturating_add(1).saturating_add(record.draws)
         })
@@ -2251,9 +2255,11 @@ mod tests {
                 record(0, None),
                 record(3, None),
                 record(3, Some(MeshRefusal::DrawsExceeded)),
+                // Issue #2484: the message went out, so it still counts.
+                record(2, Some(MeshRefusal::ReplyTimeout)),
             ],
         }))
         .unwrap();
-        assert_eq!(used_delegations(&report), 1 + (1 + 3));
+        assert_eq!(used_delegations(&report), 1 + (1 + 3) + (1 + 2));
     }
 }
