@@ -363,7 +363,7 @@ many servers:
 - `header(name, value)` adds a header, such as the `HTTP-Referer` and
   `X-Title` of OpenRouter. The headers that the client sets are refused:
   the key, the body type and the framing.
-- `model_id()` is `{model}@{host}`, so two servers do not share cache
+- `model_id()` is `{model}@{host}{path}`, so two endpoints do not share cache
   entries. `id(name)` sets another id.
 - `price(Price)` prices each call. The default is unpriced, because each
   provider has its own rates. A local server costs nothing.

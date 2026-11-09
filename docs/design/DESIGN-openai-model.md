@@ -46,7 +46,7 @@ one HTTP path.
 | R1 | Break a public path of the `anthropic` module, which the daemon uses. | Re-export each moved item from `anthropic`. Its tests and the daemon suite stay green. |
 | R2 | Send the key to a redirect target, or over plain `http` by mistake. | No redirect, as in the Claude client. The docs say to use `https` for a remote host. |
 | R3 | Run a tool with an input that the model did not send. | Strict UTF-8 on the stream. Strict JSON on each argument string. |
-| R4 | Mix cache entries of two servers that use one model name. | The model id names the host: `{model}@{host}`. |
+| R4 | Mix cache entries of two servers that use one model name. | The model id names the host and the path: `{model}@{host}{path}`. |
 | R5 | Count a stream that broke off as complete, with no usage. | A stream needs a finish reason, and the end marker or the usage. |
 | R6 | Price a call with a guess. | No built-in price. An unset price is unpriced. |
 | R7 | Lose a tool call id, so a result cannot find its call. | A missing id becomes `call_{index}`, the same on each read of one response. |
@@ -76,7 +76,7 @@ flowchart TD
   `openai::OPENROUTER_BASE_URL`. `api_key(key)` adds the bearer key.
   `header(name, value)` adds a header.
 - `chat` sends one request. `chat_stream` streams it.
-- `model_id` is `{model}@{host}` unless the app sets one.
+- `model_id` is `{model}@{host}{path}` unless the app sets one.
 - `price(Price)` prices each call. The default is unpriced.
 - With a draw, the request sends `seed` = the draw number.
 

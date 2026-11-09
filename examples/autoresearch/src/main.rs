@@ -435,7 +435,7 @@ fn model_label(args: &ModelArgs) -> String {
         ModelKind::Openai => format!(
             "openai:{}@{}",
             args.openai_model.trim(),
-            openai::wire::host(&args.base_url).unwrap_or_default()
+            openai::wire::origin(&args.base_url).unwrap_or_default()
         ),
     }
 }

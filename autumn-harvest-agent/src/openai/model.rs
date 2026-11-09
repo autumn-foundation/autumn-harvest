@@ -76,7 +76,8 @@ impl OpenAiModel {
         }
     }
 
-    /// `model` behind `client`. The id names the host of the client.
+    /// `model` behind `client`. The id names the host and the base path of
+    /// the client, so two endpoints never share an id.
     #[must_use]
     pub fn with_client(client: Client, model: impl Into<String>) -> Self {
         let model = model.into();
@@ -88,8 +89,13 @@ impl OpenAiModel {
         } else {
             TokenField::MaxTokens
         };
+        // The id names the endpoint: the host and the path of the base URL.
+        let endpoint = wire::origin(client.url()).unwrap_or_default();
+        let base = endpoint
+            .strip_suffix("/chat/completions")
+            .unwrap_or(&endpoint);
         Self {
-            id: format!("{model}@{host}"),
+            id: format!("{model}@{base}"),
             client,
             model,
             settings: Settings {
@@ -120,8 +126,8 @@ impl OpenAiModel {
         Ok(self)
     }
 
-    /// Report `id` in place of `{model}@{host}`, for the response cache and
-    /// the cost ledger.
+    /// Report `id` in place of `{model}@{host}{path}`, for the response cache
+    /// and the cost ledger.
     #[must_use]
     pub fn id(mut self, id: impl Into<String>) -> Self {
         self.id = id.into();
@@ -313,9 +319,21 @@ mod tests {
     #[test]
     fn the_id_names_the_model_and_the_host_and_passes_the_ledger() {
         let ollama = OpenAiModel::new(OLLAMA_BASE_URL, "llama3.1:8b").unwrap();
-        assert_eq!(ollama.model_id(), Some("llama3.1:8b@localhost:11434"));
+        assert_eq!(ollama.model_id(), Some("llama3.1:8b@localhost:11434/v1"));
         let router = OpenAiModel::new(OPENROUTER_BASE_URL, "openai/gpt-5-mini").unwrap();
-        assert_eq!(router.model_id(), Some("openai/gpt-5-mini@openrouter.ai"));
+        assert_eq!(
+            router.model_id(),
+            Some("openai/gpt-5-mini@openrouter.ai/api/v1")
+        );
+        // Two gateways on one host get two ids, so they share no cache entry.
+        let team = |path: &str| {
+            OpenAiModel::new(&format!("https://gateway.example.test/{path}/v1"), "m")
+                .unwrap()
+                .model_id()
+                .unwrap()
+                .to_owned()
+        };
+        assert_ne!(team("team-a"), team("team-b"));
         for model in [&ollama, &router] {
             LlmCall::new(model.model_id().unwrap(), 1, 1)
                 .validate()

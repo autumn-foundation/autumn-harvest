@@ -23,6 +23,7 @@ const MAX_CALLS: u64 = 1024;
 #[derive(Debug, Default)]
 pub struct ChunkAssembler {
     text: String,
+    refusal: String,
     /// Each call with its stream index, in the order the calls began.
     calls: Vec<(u64, Call)>,
     finish: Option<String>,
@@ -58,7 +59,15 @@ impl ChunkAssembler {
         }
         let mut piece = "";
         if let Some(choice) = chunk["choices"].as_array().and_then(|c| c.first()) {
+            // `OpenRouter` puts an upstream error in the choice.
+            if choice.get("error").is_some_and(|error| !error.is_null()) {
+                return Err(error_of(&choice["error"]));
+            }
             let delta = &choice["delta"];
+            // A refusal comes in pieces. The parse refuses the whole of it.
+            if let Some(piece) = delta["refusal"].as_str() {
+                self.refusal.push_str(piece);
+            }
             if let Some(text) = delta["content"].as_str() {
                 self.text.push_str(text);
                 piece = text;
@@ -161,6 +170,9 @@ impl ChunkAssembler {
         let mut message = json!({"role": "assistant", "content": self.text});
         if !calls.is_empty() {
             message["tool_calls"] = json!(calls);
+        }
+        if !self.refusal.is_empty() {
+            message["refusal"] = json!(self.refusal);
         }
         Ok(json!({
             "choices": [{"index": 0, "message": message, "finish_reason": self.finish}],
@@ -315,6 +327,29 @@ mod tests {
         let (body, _) = streamed(&refs).unwrap();
         assert!(matches!(&parse_response(&body).unwrap().content[0],
             ContentPart::ToolCall { name, .. } if name == "search"));
+    }
+
+    #[test]
+    fn a_streamed_refusal_is_a_provider_error() {
+        let events = [
+            chunk(&json!({"refusal": "I cannot "}), None),
+            chunk(&json!({"refusal": "help."}), Some("stop")),
+            "[DONE]".to_owned(),
+        ];
+        let refs: Vec<&str> = events.iter().map(String::as_str).collect();
+        let (body, _) = streamed(&refs).unwrap();
+        let error = parse_response(&body).unwrap_err();
+        assert_eq!(error.kind(), crate::ErrorKind::Provider);
+        assert!(error.message().contains("I cannot help."), "{error}");
+    }
+
+    #[test]
+    fn an_error_in_a_streamed_choice_is_an_error() {
+        let event = json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "error",
+            "error": {"code": 502, "message": "upstream"}}]})
+        .to_string();
+        let error = streamed(&[&event, "[DONE]"]).unwrap_err();
+        assert_eq!(error.kind(), crate::ErrorKind::Unavailable);
     }
 
     #[test]

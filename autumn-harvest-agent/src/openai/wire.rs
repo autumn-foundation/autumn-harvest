@@ -85,6 +85,20 @@ pub fn host(base_url: &str) -> Result<String, AgentError> {
         .map_or_else(|| name.to_owned(), |port| format!("{name}:{port}")))
 }
 
+/// The host of `base_url` with its port and its path, with no trailing
+/// slash: `localhost:11434/v1`.
+///
+/// It names the endpoint in a model id. Two gateways on one host with two
+/// paths are two endpoints, so they get two ids and share no cache entry.
+///
+/// # Errors
+///
+/// As [`endpoint`].
+pub fn origin(base_url: &str) -> Result<String, AgentError> {
+    let path = parse(base_url)?.path().trim_end_matches('/').to_owned();
+    Ok(format!("{}{path}", host(base_url)?))
+}
+
 /// `base_url` as a URL with a host, or a `Config` error.
 fn parse(base_url: &str) -> Result<reqwest::Url, AgentError> {
     let refused = || {
@@ -535,6 +549,10 @@ mod tests {
         }
         // An IPv6 host has no brackets in the id, so the ledger takes it.
         assert_eq!(host("http://[::1]:8000/v1").unwrap(), "::1:8000");
+        assert_eq!(
+            origin("http://localhost:11434/v1/").unwrap(),
+            "localhost:11434/v1"
+        );
     }
 
     #[test]
@@ -827,7 +845,7 @@ mod tests {
         let body = json!({"usage": {"prompt_tokens": 10, "completion_tokens": 2}});
         assert_eq!(usage(&body), TokenUsage::new(10, 2));
         assert_eq!(usage(&json!({})), TokenUsage::new(0, 0));
-        let id = "openai/gpt-5-mini@openrouter.ai";
+        let id = "openai/gpt-5-mini@openrouter.ai/api/v1";
         LlmCall::new(id, 1, 1).validate().unwrap();
     }
 }

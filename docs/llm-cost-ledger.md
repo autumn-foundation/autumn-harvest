@@ -152,7 +152,7 @@ Its id passes the ledger check. Its price is the sum of four parts: the
 uncached input, the cache reads, the cache writes and the output, each at
 its own rate. `input_tokens` holds the whole prompt, cache parts included.
 `anthropic::ClaudeModel` is one such model. `openai::OpenAiModel` reports
-`{model}@{host}` as its id. It prices a call only when the app sets a
+`{model}@{host}{path}` as its id. It prices a call only when the app sets a
 `Price`, because each provider has its own rates.
 
 `examples/claude-agent-daemon` writes a row with the same id form for each

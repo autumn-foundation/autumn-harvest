@@ -22,7 +22,7 @@ proxy. The design is in `docs/design/DESIGN-openai-model.md`. The guide is
 - Tool calls go out with their arguments as a JSON string. A string that is
   not JSON is a `Decode` error, so no tool runs on a value that the model
   did not send.
-- `model_id` is `{model}@{host}`, so two servers do not share cache entries.
+- `model_id` is `{model}@{host}{path}`, so two endpoints do not share cache entries.
   It passes the cost ledger check. `price(Price)` prices each call. The
   default is unpriced.
 - A draw goes as `seed`, so each draw is its own sample.
