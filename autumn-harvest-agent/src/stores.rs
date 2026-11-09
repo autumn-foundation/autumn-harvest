@@ -334,9 +334,9 @@ impl<D: AgentStoreDb> EpisodeStore for DbEpisodeStore<D> {
     }
 }
 
-/// The parts of an episode document that do not decode in full: an empty
-/// log with its generation, and the number of episodes that it held. A
-/// clear then keeps the generation, so a stale pass still marks nothing.
+/// What a clear keeps of an episode document that does not decode in
+/// full. That is an empty log with the old generation, and the number of
+/// episodes that the log held. So a stale pass still marks nothing.
 fn lenient_episode_doc(body: &[u8]) -> (EpisodeDoc, Option<u64>) {
     tracing::warn!("an episode document does not decode, so the clear keeps only its generation");
     let value: serde_json::Value = serde_json::from_slice(body).unwrap_or_default();
