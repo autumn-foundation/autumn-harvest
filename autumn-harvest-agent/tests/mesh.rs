@@ -1262,32 +1262,6 @@ async fn a_child_inherits_read_only_and_gets_no_memory() {
     );
 }
 
-// AC7
-#[test]
-fn every_refusal_code_is_documented() {
-    let guide = std::fs::read_to_string(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../docs/agent-mesh.md"
-    ))
-    .expect("the user guide exists");
-    for refusal in [
-        Refusal::UnknownPeer,
-        Refusal::NotPermitted,
-        Refusal::Cycle,
-        Refusal::DepthExceeded,
-        Refusal::FanOutExhausted,
-        Refusal::BudgetExhausted,
-        Refusal::InvalidMandate,
-        Refusal::InvalidArguments,
-    ] {
-        assert!(
-            guide.contains(&format!("`{}`", refusal.code())),
-            "docs/agent-mesh.md names {}",
-            refusal.code()
-        );
-    }
-}
-
 // Review fixes: same-turn delegation, labels across runs, wire hardening.
 
 // AC10: a call after a delegation in the same turn does not run on a

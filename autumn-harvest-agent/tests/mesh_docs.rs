@@ -51,6 +51,12 @@ fn section<'a>(text: &'a str, heading: &str) -> &'a str {
     &body[..end]
 }
 
+/// `text` with each run of white space as one space, so a line wrap does not
+/// hide a phrase.
+fn flat(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 /// The table row of `text` whose first cell starts with `name`.
 fn row<'a>(text: &'a str, name: &str) -> &'a str {
     text.lines()
@@ -78,7 +84,7 @@ fn the_crash_table_reads_a_finished_lookup_from_history() {
 #[test]
 fn the_refusals_state_the_durable_checks() {
     let guide = read(MESH);
-    let refusals = section(&guide, "## 5. Refusals");
+    let refusals = flat(section(&guide, "## 5. Refusals"));
     assert!(
         refusals.contains("A durable peer then checks"),
         "section 5 lacks the durable checks"
@@ -98,11 +104,11 @@ fn the_child_table_names_every_child_setting() {
 // Item 4: the approval helper takes the tree round, not the child step.
 #[test]
 fn the_guides_name_the_tree_round_of_an_approval() {
-    let adapter = read(ADAPTER);
+    let adapter = flat(&read(ADAPTER));
     assert!(adapter.contains("approval_signal(round, position, call_id)"));
     assert!(!adapter.contains("approval_signal(step"));
     let guide = read(MESH);
-    let approvals = section(&guide, "## 8. Approvals in a child");
+    let approvals = flat(section(&guide, "## 8. Approvals in a child"));
     assert!(
         approvals.contains("not the step of the child"),
         "section 8 lacks the warning"
@@ -126,7 +132,7 @@ fn the_guide_states_the_run_id_of_each_mode() {
 #[test]
 fn the_guide_states_the_roster_rules() {
     let guide = read(MESH);
-    let delegate = section(&guide, "## 2. Delegate to a peer");
+    let delegate = flat(section(&guide, "## 2. Delegate to a peer"));
     assert!(delegate.contains("the later one wins"), "duplicate rule");
     assert!(delegate.contains("invalid name"), "invalid-name rule");
 }

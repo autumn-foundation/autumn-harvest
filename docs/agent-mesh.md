@@ -60,6 +60,11 @@ fn planner(
 A harness takes each tool as an `Arc<dyn Tool>`. `FnTool::new` wraps an async
 function, and `shared` returns it as an `Arc<dyn Tool>`. Section 7 shows both.
 
+The roster keys each peer by its name. When two peers share a name, the later
+one wins. A peer needs a valid agent name (section 4). The lookup leaves out
+a peer with an invalid name and logs a warning. A mandate that names such a
+peer fails its run at the start, so no run reaches the peer.
+
 The planner sees one more tool, `delegate`. Its input is `agent`, one of the
 peer names, and `task`, the text for the peer. The tool description lists
 each peer with its description. A run with a mandate reserves the name
@@ -122,15 +127,22 @@ the task.
 | System prompt | `Peer::system` |
 | Input | The `task` argument |
 | Transcript | Fresh |
-| Run id | `{root run id}:d{n}`. `n` counts the delegations that ran in the tree, from 1. A refusal takes no number. |
+| Run id | One form for each mode. See [Run ids](#run-ids). |
 | Tools | The meet of the parent mandate and `Peer::tools` |
 | Steps | `Peer::max_steps` (default `DEFAULT_MAX_STEPS`) |
 | Model | `Peer::model`, else the model of the parent (section 14) |
 | Token cap | The smaller of `Peer::max_total_tokens` and the parent remainder |
 | Read-only | On when the parent, the peer or the mandate is read-only |
-| Memory, follow-ups, delivery | Off |
+| Memory, follow-ups, delivery | Off. A child never edits the memory of its parent. |
+| Workspace | None. A workspace tool in a child gets no workspace, so siblings never race on one head. |
+| Tool guidance, skills | None. The peer has its own prompt. |
+| Answer check | Off. Only the answer of the root is checked. |
+| Kind | None. A peer is not of the kind of its parent. |
+| Flow labels | None on the child task. The tree holds one label set (section 7). |
+| Failure report | Off. A fan-out child turns it on, so the parent keeps the usage of a failed child. |
 | Session, tenant, output cap, unattended flag | As the parent |
 | Loop guard, approval timeout, request cap | As the parent |
+| Effect allowlist, probe, context reset, mesh | As the parent |
 | Answer | Cut to `Peer::answer_limit`, else to `AgentHarness::tool_output_limit` (default 8 000 characters). |
 
 The same limit applies to an inline child, a fan-out child (section 15) and
@@ -148,6 +160,24 @@ keeps its old cut of 8 000 characters and has no `truncated` field.
 Tools key idempotency on `(run_id, step, call_id)`. A child has its own run
 id, so its keys never collide with the parent keys. A child of a run whose
 run id is the workflow id skips the response cache, as its parent does.
+
+### Run ids
+
+The run id of a child depends on how it runs:
+
+| Mode | Run id of the child |
+|---|---|
+| Inline child | `{root run id}:d{n}`. The root run id is the run id of the root agent, usually its execution id. |
+| Fan-out child (section 15) | The execution id of the child run. That run is a new root, so its inline children get `{its execution id}:d{n}`. |
+| Durable peer (section 13) | The workflow id of the peer, its `AgentId`, such as `research/r1`. |
+
+`n` is the delegation count of the tree after the delegation. A fan-out
+child, a message to a durable peer and each draw of its strategy also add
+to the count. So `n` can skip a number. A refusal before a child run or a
+send adds nothing.
+
+`DelegationRecord::run_id` holds the run id. Do not parse it to find the
+agent. Read `DelegationRecord::chain`.
 
 ## 4. Mandates
 
@@ -221,7 +251,13 @@ the report lists it:
 | `reply_rejected` | The message to a durable peer went out, but a caller rejected the reply promise, or resolved it with a value that is not a reply. |
 | `reply_interrupted` | The message to a durable peer went out, but a person interrupted the wait. |
 
-A delegation runs the first eight checks in the order of the table.
+A delegation runs the first eight checks in the order of the table. A
+durable peer then checks `peer_unavailable`, `not_permitted`, `deadlock` and
+`invalid_mandate`, in this order. This `peer_unavailable` means that the
+roster names no valid agent id. This `not_permitted` refuses a run with an
+effect allowlist or a probe. A send that finds no running peer also returns
+`peer_unavailable`. `a_durable_peer_runs_the_mandate_checks_before_its_own`
+proves the order.
 `Mandate::accept` returns `invalid_mandate`, `cycle` or `depth_exceeded`. A
 durable receiver returns `model_forbidden` when the accepted mandate does
 not allow its own model. Only a send to a durable peer returns `deadlock` or
@@ -264,7 +300,7 @@ order each ended:
 | Field | Meaning |
 |---|---|
 | `chain` | The agents from the root to the delegate |
-| `run_id` | The child run id. `None` for a refusal. |
+| `run_id` | The child run id (section 3). `None` for a refusal before a send. An unanswered durable peer keeps its run id. |
 | `stop` | How the child ended. `None` for a refusal. |
 | `refusal` | The verdict of a refused delegation |
 | `usage` | Tokens of the child and of every agent under it |
@@ -412,6 +448,10 @@ A gated call in a child waits on a signal, as in a root run. The name is
 of the whole tree, so a parent and a child never share a name. A run with no
 delegation keeps the names it had before.
 
+In a child, `round` is not the step of the child. A child at its first step
+can wait on `tool_approval:1:0:c1`. So do not build the name from the steps
+of a child. `a_gated_call_in_a_child_waits_on_a_tree_unique_name` proves this.
+
 Read the name from the wait. On SQLite, `RunState::WaitingSignal` holds it.
 On Postgres, the deadline timer of the wait is
 `__signal_timeout:<seq>:<signal name>`.
@@ -465,7 +505,7 @@ fn receive(meta: &Map<String, Value>, text: &str)
 
 | In flight at the crash | On resume |
 |---|---|
-| A peer lookup | That lookup runs again. |
+| A peer lookup | That lookup runs again. A finished lookup does not run again: replay reads its answer from history. |
 | A child model call | The worker sends that one call again. |
 | A child tool call | That one call runs again, with the same idempotency key. |
 | A child approval wait | The wait resumes. Its deadline is durable. |

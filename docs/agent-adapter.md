@@ -26,7 +26,7 @@ flowchart LR
   W -->|ModelTurnRequest| M["activity agent_model_turn\nAgentModel::chat + ToolPolicy::decide"]
   M -->|ModelTurn: reply + one decision per call| W
   W -->|Allow| X["activity agent_tool_call\nTool::execute"]
-  W -->|RequireApproval| S["signal tool_approval:step:position:call_id\nwith a deadline"]
+  W -->|RequireApproval| S["signal tool_approval:round:position:call_id\nwith a deadline"]
   S -->|Approve or Edit| X
   S -->|Reject or timeout| W
   W -->|Deny| W
@@ -233,8 +233,10 @@ To start a run without the module, start the name `agent_loop` with an
 with a serialised `Approval` as the payload. Read the signal name from the wait: the
 deadline timer of the wait is `__signal_timeout:<seq>:<signal name>`. On
 SQLite, `RunState::WaitingSignal` holds the name. For a run with no
-delegation, `approval::approval_signal(step, position, call_id)` also builds
-it from the recorded `ModelTurn`. A worker with
+delegation, `approval::approval_signal(round, position, call_id)` also builds
+it from the recorded `ModelTurn`. There, `round` is the step of the run. A
+delegation makes `round` count the tool rounds of the whole tree. Then read
+the name from the wait. A worker with
 no harness fails the call as `AgentHarnessMissing`, which is not retryable.
 
 A worker with a payload cap other than the default must say so. Set
