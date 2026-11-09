@@ -21,9 +21,8 @@
 //! use autumn_harvest_agent::openai::{OPENROUTER_BASE_URL, OpenAiModel};
 //!
 //! # fn demo() -> Result<(), autumn_harvest_agent::AgentError> {
-//! let key = std::env::var("OPENROUTER_API_KEY").unwrap_or_default();
-//! let model = OpenAiModel::new(OPENROUTER_BASE_URL, "openai/gpt-5-mini")?
-//!     .api_key(&key)?
+//! // Reads `OPENROUTER_API_KEY`, the key variable of this host.
+//! let model = OpenAiModel::with_env_key(OPENROUTER_BASE_URL, "openai/gpt-5-mini")?
 //!     .header("X-Title", "My agent")?;
 //! let harness = AgentHarness::new(Arc::new(model));
 //! # let _ = harness;
@@ -37,9 +36,9 @@ mod stream;
 pub mod wire;
 
 pub use client::Client;
-pub use model::{KEY_ENV, OpenAiModel};
+pub use model::OpenAiModel;
 pub use stream::ChunkAssembler;
 pub use wire::{
-    OLLAMA_BASE_URL, OPENAI_BASE_URL, OPENROUTER_BASE_URL, Settings, TokenField, endpoint,
-    parse_response, request_body, usage, wire_messages,
+    OLLAMA_BASE_URL, OPENAI_BASE_URL, OPENAI_KEY_ENV, OPENROUTER_BASE_URL, OPENROUTER_KEY_ENV,
+    Settings, TokenField, endpoint, key_env, parse_response, request_body, usage, wire_messages,
 };

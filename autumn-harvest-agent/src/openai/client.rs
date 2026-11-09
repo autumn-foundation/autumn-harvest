@@ -31,6 +31,10 @@ impl Client {
 
     /// A client for `base_url` that sends each request through `http`.
     ///
+    /// Build `http` with [`http_client`](provider::http_client), or turn
+    /// off its redirects. A redirect to another host keeps each custom
+    /// header that [`header`](Self::header) adds.
+    ///
     /// # Errors
     ///
     /// A `Config` error when `base_url` is not an `http` or `https` URL.
@@ -45,10 +49,17 @@ impl Client {
     /// # Errors
     ///
     /// A `Config` error when the key is blank, or holds a byte that a header
-    /// cannot carry.
+    /// cannot carry. A key for a plain `http` URL is refused too, unless the
+    /// host is a loopback name or address.
     pub fn api_key(self, key: &str) -> Result<Self, AgentError> {
         if key.trim().is_empty() {
             return Err(AgentError::new(ErrorKind::Config, "the API key is blank"));
+        }
+        if wire::is_open_network(self.url())? {
+            return Err(AgentError::new(
+                ErrorKind::Config,
+                "the key would travel over plain http to another host. Use an https URL",
+            ));
         }
         let value = provider::secret_header(&format!("Bearer {key}"), "API key")?;
         Ok(Self {
@@ -61,7 +72,9 @@ impl Client {
     ///
     /// # Errors
     ///
-    /// A `Config` error when the name or the value is not valid.
+    /// A `Config` error when the name or the value is not valid. The headers
+    /// that the client sets are refused too: the key, the body type and the
+    /// framing.
     pub fn header(self, name: &str, value: &str) -> Result<Self, AgentError> {
         let name = HeaderName::from_bytes(name.as_bytes()).map_err(|_| {
             AgentError::new(
@@ -69,6 +82,12 @@ impl Client {
                 format!("{} is not a header name", provider::printable(name)),
             )
         })?;
+        if RESERVED.contains(&name.as_str()) {
+            return Err(AgentError::new(
+                ErrorKind::Config,
+                format!("the client sets {name}. Use `api_key` for the key"),
+            ));
+        }
         // A header can carry a secret too, so its value stays out of logs.
         let value = provider::secret_header(value, "header value")?;
         Ok(Self {
@@ -97,7 +116,11 @@ impl Client {
     /// object is the error of its code. A body with no `choices` array is
     /// `Decode`.
     pub async fn create(&self, body: &Value) -> Result<Value, ApiError> {
-        let (status, answer) = self.transport.json(body, &HeaderMap::new()).await?;
+        let (status, answer) = self
+            .transport
+            .json(body, &HeaderMap::new())
+            .await
+            .map_err(overflow)?;
         check_answer(answer, status)
     }
 
@@ -134,7 +157,8 @@ impl Client {
             .events(&body, &HeaderMap::new(), |data| {
                 chunks.event(data, on_delta)
             })
-            .await?;
+            .await
+            .map_err(overflow)?;
         let answer = chunks
             .finish()
             .map_err(|e| ApiError::new(e.kind(), Some(status), e.message()))?;
@@ -142,14 +166,40 @@ impl Client {
     }
 }
 
+/// The headers that the client or the HTTP layer sets. A caller cannot set
+/// them, so the key goes only through `api_key` and the framing stays whole.
+const RESERVED: [&str; 9] = [
+    "authorization",
+    "proxy-authorization",
+    "content-type",
+    "content-length",
+    "transfer-encoding",
+    "host",
+    "connection",
+    "te",
+    "upgrade",
+];
+
+/// A context overflow as a `Budget` error.
+///
+/// The status of an overflow is `400`, which the shared table reads as a
+/// refused request. The body names the overflow, so the kind follows it.
+fn overflow(error: ApiError) -> ApiError {
+    if error.status() == Some(400) && error.message().contains("context_length_exceeded") {
+        return ApiError::new(ErrorKind::Budget, error.status(), error.message());
+    }
+    error
+}
+
 /// Refuse a `2xx` body that holds an error or no choice.
 ///
 /// Some servers, `OpenRouter` among them, answer `200` with an `error`
-/// object. That body is the error of its code.
+/// object. That body is the error of its code. It has no status, because
+/// no answer came: a `2xx` status would read as a billed turn.
 fn check_answer(answer: Value, status: u16) -> Result<Value, ApiError> {
     if answer.get("error").is_some_and(|error| !error.is_null()) {
         let error = wire::error_of(&answer["error"]);
-        return Err(ApiError::new(error.kind(), Some(status), error.message()));
+        return Err(ApiError::new(error.kind(), None, error.message()));
     }
     if answer["choices"].is_array() {
         Ok(answer)
@@ -231,7 +281,10 @@ mod tests {
         let (url, _) = serve(200, br#"{"error":{"code":502,"message":"upstream"}}"#).await;
         let error = client(&url).create(&json!({})).await.unwrap_err();
         assert_eq!(error.kind(), ErrorKind::Unavailable);
-        assert_eq!(error.status(), Some(200));
+        assert!(
+            !error.accepted(),
+            "no answer came, so a retry pays nothing twice"
+        );
         let (url, _) = serve(200, br#"{"id":"x"}"#).await;
         let error = client(&url).create(&json!({})).await.unwrap_err();
         assert_eq!(error.kind(), ErrorKind::Decode);
@@ -274,6 +327,28 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.kind(), ErrorKind::Config);
+    }
+
+    #[tokio::test]
+    async fn a_context_overflow_is_a_budget_error() {
+        let body = br#"{"error":{"code":"context_length_exceeded","message":"too long"}}"#;
+        let (url, _) = serve(400, body).await;
+        let error = client(&url).create(&json!({})).await.unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Budget);
+    }
+
+    #[test]
+    fn a_reserved_header_or_a_key_over_open_http_is_refused() {
+        let ok = Client::new("http://localhost:1/v1").unwrap();
+        for reserved in ["Authorization", "content-type", "Content-Length", "host"] {
+            assert!(ok.clone().header(reserved, "v").is_err(), "{reserved}");
+        }
+        let open = Client::new("http://gpu-host:8000/v1").unwrap();
+        assert_eq!(open.api_key("sk-a").unwrap_err().kind(), ErrorKind::Config);
+        assert!(
+            ok.api_key("sk-a").is_ok(),
+            "a loopback server may get a key"
+        );
     }
 
     #[test]

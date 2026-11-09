@@ -5,9 +5,6 @@ use super::wire::{self, Settings, TokenField};
 use crate::provider::Price;
 use crate::{AgentError, AgentModel, BoxFuture, ChatRequest, ChatResponse, TokenUsage};
 
-/// The environment variable that [`OpenAiModel::with_env_key`] reads.
-pub const KEY_ENV: &str = "OPENAI_API_KEY";
-
 /// The key in `value`, or `None` when it is unset or blank.
 fn env_key(value: Option<String>) -> Option<String> {
     value
@@ -39,18 +36,41 @@ impl OpenAiModel {
         Ok(Self::with_client(Client::new(base_url)?, model))
     }
 
-    /// `model` at `base_url`, with the key from [`KEY_ENV`] when it is set.
+    /// `model` at `base_url`, with the key of a known host from the
+    /// environment.
     ///
-    /// The key comes from the environment, not from an argument. The
-    /// arguments of a process are readable by each user of the host. A
-    /// blank or unset variable means no key, as a local server needs.
+    /// The variable is the one that [`key_env`](wire::key_env) names:
+    /// `OPENAI_API_KEY` for `OpenAI` and `OPENROUTER_API_KEY` for
+    /// `OpenRouter`. Another host gets no key, so a key of one provider never
+    /// reaches another. Name a variable with [`with_key_from`](Self::with_key_from).
     ///
     /// # Errors
     ///
     /// The errors of [`new`](Self::new) and of [`api_key`](Self::api_key).
     pub fn with_env_key(base_url: &str, model: impl Into<String>) -> Result<Self, AgentError> {
+        match wire::key_env(base_url) {
+            Some(var) => Self::with_key_from(base_url, model, var),
+            None => Self::new(base_url, model),
+        }
+    }
+
+    /// `model` at `base_url`, with the key from the environment variable
+    /// `var` when it is set.
+    ///
+    /// The key comes from the environment, not from an argument. The
+    /// arguments of a process are readable by each user of the host. A
+    /// blank or unset variable means no key.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`new`](Self::new) and of [`api_key`](Self::api_key).
+    pub fn with_key_from(
+        base_url: &str,
+        model: impl Into<String>,
+        var: &str,
+    ) -> Result<Self, AgentError> {
         let model = Self::new(base_url, model)?;
-        match env_key(std::env::var(KEY_ENV).ok()) {
+        match env_key(std::env::var(var).ok()) {
             Some(key) => model.api_key(&key),
             None => Ok(model),
         }
@@ -62,11 +82,20 @@ impl OpenAiModel {
         let model = model.into();
         // The endpoint parsed when the client was built, so the host is there.
         let host = wire::host(client.url()).unwrap_or_default();
+        // The `OpenAI` models refuse `max_tokens` now. Others take it.
+        let token_field = if host == "api.openai.com" {
+            TokenField::MaxCompletionTokens
+        } else {
+            TokenField::MaxTokens
+        };
         Self {
             id: format!("{model}@{host}"),
             client,
             model,
-            settings: Settings::default(),
+            settings: Settings {
+                token_field,
+                ..Settings::default()
+            },
             price: None,
         }
     }
@@ -297,10 +326,33 @@ mod tests {
     }
 
     #[test]
+    fn a_key_variable_reaches_only_its_own_host() {
+        // No known variable for a local or unknown host: no key at all.
+        assert!(wire::key_env(OLLAMA_BASE_URL).is_none());
+        assert!(wire::key_env("https://litellm.example.test/v1").is_none());
+        assert_eq!(
+            wire::key_env(OPENROUTER_BASE_URL),
+            Some("OPENROUTER_API_KEY")
+        );
+    }
+
+    #[test]
     fn a_blank_or_unset_key_variable_means_no_key() {
         assert_eq!(env_key(None), None);
         assert_eq!(env_key(Some("  ".into())), None);
         assert_eq!(env_key(Some(" sk-a \n".into())), Some("sk-a".into()));
+    }
+
+    #[test]
+    fn the_openai_host_sends_the_cap_in_the_field_its_models_need() {
+        let mut request = ask();
+        request.max_tokens = Some(8);
+        let openai = OpenAiModel::new(crate::openai::OPENAI_BASE_URL, "gpt-5-mini").unwrap();
+        let body = wire::request_body(&request, "gpt-5-mini", openai.settings);
+        assert_eq!(body["max_completion_tokens"], 8);
+        let local = OpenAiModel::new(OLLAMA_BASE_URL, "m").unwrap();
+        let body = wire::request_body(&request, "m", local.settings);
+        assert_eq!(body["max_tokens"], 8);
     }
 
     #[test]

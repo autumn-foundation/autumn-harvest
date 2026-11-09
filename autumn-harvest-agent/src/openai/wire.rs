@@ -1,6 +1,7 @@
 //! The Chat Completions wire format, with no I/O.
 
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 use crate::provider::{error_kind, printable};
 use crate::{
@@ -15,6 +16,12 @@ pub const OPENROUTER_BASE_URL: &str = "https://openrouter.ai/api/v1";
 
 /// The base URL of a local Ollama server.
 pub const OLLAMA_BASE_URL: &str = "http://localhost:11434/v1";
+
+/// The environment variable of the `OpenAI` key.
+pub const OPENAI_KEY_ENV: &str = "OPENAI_API_KEY";
+
+/// The environment variable of the `OpenRouter` key.
+pub const OPENROUTER_KEY_ENV: &str = "OPENROUTER_API_KEY";
 
 /// The field that carries the output cap of a request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -67,7 +74,12 @@ pub fn endpoint(base_url: &str) -> Result<String, AgentError> {
 /// As [`endpoint`].
 pub fn host(base_url: &str) -> Result<String, AgentError> {
     let url = parse(base_url)?;
-    let name = url.host_str().unwrap_or_default();
+    // An IPv6 host has brackets, and the ledger refuses them in an id.
+    let name = url
+        .host_str()
+        .unwrap_or_default()
+        .trim_start_matches('[')
+        .trim_end_matches(']');
     Ok(url
         .port()
         .map_or_else(|| name.to_owned(), |port| format!("{name}:{port}")))
@@ -89,7 +101,57 @@ fn parse(base_url: &str) -> Result<reqwest::Url, AgentError> {
     if !web || url.host_str().is_none_or(str::is_empty) {
         return Err(refused());
     }
+    // A user, a password, a query or a fragment would go into each endpoint
+    // and each log line of it. The key goes in a header.
+    let extra = !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some();
+    if extra {
+        return Err(AgentError::new(
+            ErrorKind::Config,
+            "the base URL holds a user, a password, a query or a fragment. Put the key in \
+             a header, and give the URL with its path only",
+        ));
+    }
     Ok(url)
+}
+
+/// Does `base_url` reach its server with no encryption off this host?
+///
+/// That is a plain `http` URL whose host is not a loopback name or address.
+/// A key must not travel over such a URL.
+///
+/// # Errors
+///
+/// As [`endpoint`].
+pub fn is_open_network(base_url: &str) -> Result<bool, AgentError> {
+    let url = parse(base_url)?;
+    if url.scheme() == "https" {
+        return Ok(false);
+    }
+    let host = url.host_str().unwrap_or_default();
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    let loopback = host.eq_ignore_ascii_case("localhost")
+        || bare
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback());
+    Ok(!loopback)
+}
+
+/// The environment variable that holds the key of the server at
+/// `base_url`, when this module knows the server.
+///
+/// A key of one provider must not reach another host. So only the `OpenAI`
+/// and the `OpenRouter` hosts have a variable. Another server names its
+/// variable with [`OpenAiModel::with_key_from`](super::OpenAiModel::with_key_from).
+#[must_use]
+pub fn key_env(base_url: &str) -> Option<&'static str> {
+    match host(base_url).ok()?.as_str() {
+        "api.openai.com" => Some(OPENAI_KEY_ENV),
+        "openrouter.ai" => Some(OPENROUTER_KEY_ENV),
+        _ => None,
+    }
 }
 
 /// The text parts of `parts`, joined by a newline.
@@ -142,7 +204,10 @@ pub fn wire_messages(request: &ChatRequest) -> Vec<Value> {
                     })
                     .collect();
                 if calls.is_empty() {
-                    out.push(json!({"role": "assistant", "content": text}));
+                    // Some servers refuse an empty turn, so it does not go.
+                    if !text.is_empty() {
+                        out.push(json!({"role": "assistant", "content": text}));
+                    }
                 } else {
                     let content = if text.is_empty() {
                         Value::Null
@@ -215,14 +280,37 @@ pub fn usage(body: &Value) -> TokenUsage {
         count(&counters["prompt_tokens"]),
         count(&counters["completion_tokens"]),
     );
-    usage.cache_read_tokens = count(&counters["prompt_tokens_details"]["cached_tokens"]);
+    // DeepSeek names the cached part `prompt_cache_hit_tokens`.
+    let cached = &counters["prompt_tokens_details"]["cached_tokens"];
+    usage.cache_read_tokens = if cached.is_u64() {
+        count(cached)
+    } else {
+        count(&counters["prompt_cache_hit_tokens"])
+    };
     usage
+}
+
+/// An id for the call at `index` of `body`, which gave none.
+fn made_id(body: &Value, index: usize) -> String {
+    let origin = body["id"].as_str().map_or_else(
+        || {
+            let digest = Sha256::digest(body.to_string().as_bytes());
+            digest[..8].iter().fold(String::new(), |mut hex, byte| {
+                use std::fmt::Write as _;
+                let _ = write!(hex, "{byte:02x}");
+                hex
+            })
+        },
+        |id| id.chars().filter(char::is_ascii_alphanumeric).collect(),
+    );
+    format!("call_{origin}_{index}")
 }
 
 /// The error of an `error` object.
 ///
 /// A number in `code` is an HTTP status, as `OpenRouter` sends it, and maps
-/// through the shared table. A text code or type maps by its words.
+/// through the shared table. So is a number as text. Another code or type
+/// maps by its words.
 #[must_use]
 pub fn error_of(error: &Value) -> AgentError {
     let words = format!(
@@ -230,9 +318,15 @@ pub fn error_of(error: &Value) -> AgentError {
         error["code"].as_str().unwrap_or_default(),
         error["type"].as_str().unwrap_or_default()
     );
-    let kind = error["code"]
-        .as_u64()
+    // LiteLLM sends a status as text, such as `"429"`.
+    let status = error["code"].as_u64().or_else(|| {
+        error["code"]
+            .as_str()
+            .and_then(|code| code.parse::<u64>().ok())
+    });
+    let kind = status
         .and_then(|code| u16::try_from(code).ok())
+        .filter(|code| (100..600).contains(code))
         .map_or_else(|| kind_of_words(&words), error_kind);
     let message = printable(error["message"].as_str().unwrap_or("no message"));
     AgentError::new(kind, format!("the API answered an error: {message}"))
@@ -268,8 +362,12 @@ pub fn parse_response(body: &Value) -> Result<ChatResponse, AgentError> {
         .as_array()
         .and_then(|choices| choices.first())
         .ok_or_else(|| AgentError::new(ErrorKind::Decode, "the response has no choice"))?;
+    // `OpenRouter` puts an upstream error in the choice.
+    if choice.get("error").is_some_and(|error| !error.is_null()) {
+        return Err(error_of(&choice["error"]));
+    }
     let message = &choice["message"];
-    if let Some(refusal) = message["refusal"].as_str() {
+    if let Some(refusal) = message["refusal"].as_str().filter(|text| !text.is_empty()) {
         return Err(AgentError::new(
             ErrorKind::Provider,
             format!("the model declined the request: {}", printable(refusal)),
@@ -288,17 +386,22 @@ pub fn parse_response(body: &Value) -> Result<ChatResponse, AgentError> {
         _ => StopReason::Unknown,
     };
     let mut content = Vec::new();
-    if let Some(text) = message["content"].as_str().filter(|text| !text.is_empty()) {
-        content.push(ContentPart::Text(text.to_owned()));
+    let text = content_text(&message["content"]);
+    if !text.is_empty() {
+        content.push(ContentPart::Text(text));
     }
-    for (index, call) in message["tool_calls"]
+    let calls = message["tool_calls"]
         .as_array()
         .map(Vec::as_slice)
-        .unwrap_or_default()
-        .iter()
-        .enumerate()
-    {
-        content.push(tool_call(index, call)?);
+        .unwrap_or_default();
+    for (index, call) in calls.iter().enumerate() {
+        match tool_call(body, index, call) {
+            Ok(part) => content.push(part),
+            // A turn cut at the cap can end inside a call. The loop ends the
+            // run as capped, so the broken call goes, as no tool can run it.
+            Err(_) if stop_reason == StopReason::MaxTokens => {}
+            Err(e) => return Err(e),
+        }
     }
     Ok(ChatResponse {
         content,
@@ -307,11 +410,26 @@ pub fn parse_response(body: &Value) -> Result<ChatResponse, AgentError> {
     })
 }
 
-/// One tool call of a response.
+/// The text of a `content` value: a string, or the text parts of an array.
+fn content_text(content: &Value) -> String {
+    match content {
+        Value::String(text) => text.clone(),
+        Value::Array(parts) => parts
+            .iter()
+            .filter(|part| part["type"] == "text")
+            .filter_map(|part| part["text"].as_str())
+            .collect(),
+        _ => String::new(),
+    }
+}
+
+/// One tool call of the response `body`.
 ///
-/// A missing id becomes `call_{index}`, so a result can name the call. The
-/// same response gives the same id on each read.
-fn tool_call(index: usize, call: &Value) -> Result<ContentPart, AgentError> {
+/// A missing id is made from the response and the place of the call. The
+/// response `id` names it, or a hash of the body when there is no `id`. So
+/// a result can name the call, two turns get two ids, and one response gives
+/// the same id on each read.
+fn tool_call(body: &Value, index: usize, call: &Value) -> Result<ContentPart, AgentError> {
     let function = &call["function"];
     let name = function["name"]
         .as_str()
@@ -331,7 +449,7 @@ fn tool_call(index: usize, call: &Value) -> Result<ContentPart, AgentError> {
     let id = call["id"]
         .as_str()
         .filter(|id| !id.is_empty())
-        .map_or_else(|| format!("call_{index}"), str::to_owned);
+        .map_or_else(|| made_id(body, index), str::to_owned);
     Ok(ContentPart::ToolCall {
         id,
         name: name.to_owned(),
@@ -402,6 +520,136 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    #[test]
+    fn a_base_url_with_a_secret_or_a_query_is_refused() {
+        for bad in [
+            "https://user:pw@example.test/v1",
+            "https://example.test/v1?api-version=1",
+            "https://example.test/v1#x",
+        ] {
+            let error = endpoint(bad).unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::Config, "{bad}");
+            assert!(!error.message().contains("pw@"), "{error}");
+        }
+        // An IPv6 host has no brackets in the id, so the ledger takes it.
+        assert_eq!(host("http://[::1]:8000/v1").unwrap(), "::1:8000");
+    }
+
+    #[test]
+    fn only_plain_http_to_another_host_is_open_network() {
+        for (url, open) in [
+            (OPENAI_BASE_URL, false),
+            ("http://localhost:11434/v1", false),
+            ("http://127.0.0.1:8000/v1", false),
+            ("http://[::1]:8000/v1", false),
+            ("http://gpu-host:8000/v1", true),
+            ("http://10.0.0.5/v1", true),
+        ] {
+            assert_eq!(is_open_network(url).unwrap(), open, "{url}");
+        }
+    }
+
+    #[test]
+    fn only_a_known_host_has_a_key_variable() {
+        assert_eq!(key_env(OPENAI_BASE_URL), Some(OPENAI_KEY_ENV));
+        assert_eq!(key_env(OPENROUTER_BASE_URL), Some(OPENROUTER_KEY_ENV));
+        assert_eq!(key_env(OLLAMA_BASE_URL), None);
+        assert_eq!(key_env("https://litellm.example.test/v1"), None);
+    }
+
+    #[test]
+    fn an_empty_assistant_turn_is_not_sent() {
+        let mut ask = request();
+        ask.messages
+            .insert(2, ChatMessage::text(ChatRole::Assistant, ""));
+        let messages = wire_messages(&ask);
+        assert_eq!(messages.len(), 4, "{messages:?}");
+    }
+
+    #[test]
+    fn a_cut_off_answer_drops_its_broken_call_and_ends_at_the_cap() {
+        let body = json!({"choices": [{"finish_reason": "length", "message": {
+            "content": "Part", "tool_calls": [
+                {"id": "c", "function": {"name": "write", "arguments": "{\"path\": \"a"}}]}}]});
+        let response = parse_response(&body).unwrap();
+        assert_eq!(response.stop_reason, StopReason::MaxTokens);
+        assert_eq!(response.content, [ContentPart::Text("Part".into())]);
+    }
+
+    #[test]
+    fn a_missing_call_id_differs_across_responses_and_not_across_reads() {
+        let body = |id: &str| {
+            json!({"id": id, "choices": [{"finish_reason": "tool_calls", "message": {
+                "tool_calls": [{"function": {"name": "n", "arguments": "{}"}}]}}]})
+        };
+        let id_of = |body: &Value| {
+            parse_response(body)
+                .unwrap()
+                .content
+                .iter()
+                .find_map(|part| match part {
+                    ContentPart::ToolCall { id, .. } => Some(id.clone()),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        let one = body("chatcmpl-1");
+        assert_eq!(
+            id_of(&one),
+            id_of(&one),
+            "the same response gives the same id"
+        );
+        assert_ne!(id_of(&one), id_of(&body("chatcmpl-2")));
+        let anonymous = |text: &str| {
+            json!({"choices": [{"finish_reason": "tool_calls", "message": {"content": text,
+                "tool_calls": [{"function": {"name": "n", "arguments": "{}"}}]}}]})
+        };
+        assert_ne!(id_of(&anonymous("a")), id_of(&anonymous("b")));
+    }
+
+    #[test]
+    fn an_upstream_error_in_a_choice_is_an_error() {
+        let body = json!({"choices": [{"finish_reason": "error",
+            "error": {"code": 502, "message": "upstream"}, "message": {"content": ""}}]});
+        assert_eq!(
+            parse_response(&body).unwrap_err().kind(),
+            ErrorKind::Unavailable
+        );
+    }
+
+    #[test]
+    fn array_content_keeps_its_text_parts() {
+        let body = json!({"choices": [{"finish_reason": "stop", "message": {"content": [
+            {"type": "thinking", "thinking": "hm"},
+            {"type": "text", "text": "A"}, {"type": "text", "text": "B"}]}}]});
+        assert_eq!(
+            parse_response(&body).unwrap().content,
+            [ContentPart::Text("AB".into())]
+        );
+    }
+
+    #[test]
+    fn an_empty_refusal_is_not_a_refusal() {
+        let body = json!({"choices": [{"finish_reason": "stop",
+            "message": {"content": "ok", "refusal": ""}}]});
+        assert!(parse_response(&body).is_ok());
+    }
+
+    #[test]
+    fn a_numeric_text_code_is_a_status_and_deepseek_cache_counts() {
+        assert_eq!(
+            error_of(&json!({"code": "429"})).kind(),
+            ErrorKind::RateLimited
+        );
+        assert_eq!(
+            error_of(&json!({"code": "500"})).kind(),
+            ErrorKind::Unavailable
+        );
+        let body = json!({"usage": {"prompt_tokens": 10, "completion_tokens": 1,
+            "prompt_cache_hit_tokens": 6}});
+        assert_eq!(usage(&body).cache_read_tokens, 6);
     }
 
     #[test]
@@ -487,9 +735,11 @@ mod tests {
         assert_eq!(response.content[0], ContentPart::Text("Looking.".into()));
         assert!(matches!(&response.content[1],
             ContentPart::ToolCall { id, arguments, .. } if id == "call_9" && arguments["q"] == "x"));
-        // A missing id gets one from its place. An object argument is taken.
+        // A missing id is made from the body and the place. An object
+        // argument is taken as it is.
         assert!(matches!(&response.content[2],
-            ContentPart::ToolCall { id, arguments, .. } if id == "call_1" && arguments["id"] == 2));
+            ContentPart::ToolCall { id, arguments, .. }
+                if id.starts_with("call_") && id.ends_with("_1") && arguments["id"] == 2));
         assert_eq!(response.usage.input_tokens, 100);
         assert_eq!(response.usage.cache_read_tokens, 60);
         assert_eq!(response.usage.cache_write_tokens, 0);

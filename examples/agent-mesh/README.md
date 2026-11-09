@@ -65,10 +65,11 @@ $ cargo run -p agent-mesh -- --dir /tmp/desk --model claude answer T-2
 ```
 
 To run them on another server, pass `--model openai` with `--base-url` and
-`--openai-model`. A key in `OPENAI_API_KEY` is sent when it is set:
+`--openai-model`. The key comes from `OPENAI_API_KEY` or `OPENROUTER_API_KEY`,
+as the host needs. `--api-key-env` names the variable for another host:
 
 ```console
-$ export OPENAI_API_KEY=sk-or-...
+$ export OPENROUTER_API_KEY=sk-or-...
 $ cargo run -p agent-mesh -- --dir /tmp/desk --model openai \
     --base-url https://openrouter.ai/api/v1 --openai-model openai/gpt-5-mini answer T-2
 ```

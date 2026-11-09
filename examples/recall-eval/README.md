@@ -19,8 +19,9 @@ ANTHROPIC_API_KEY=... cargo run -p recall-eval -- --model claude-opus-5-5 --db r
 ```
 
 Run it on any OpenAI-compatible server with `--base-url`. `--model` then
-names a model of that server. A key in `OPENAI_API_KEY` is sent when it is
-set:
+names a model of that server. The key comes from `OPENAI_API_KEY` or
+`OPENROUTER_API_KEY`, as the host needs. `--api-key-env` names another
+variable:
 
 ```sh
 cargo run -p recall-eval -- --base-url http://localhost:11434/v1 --model qwen2.5:7b

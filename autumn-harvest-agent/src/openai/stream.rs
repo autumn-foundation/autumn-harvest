@@ -1,7 +1,5 @@
 //! The chunks of a streamed Chat Completions response.
 
-use std::collections::BTreeMap;
-
 use serde_json::{Value, json};
 
 use super::wire::error_of;
@@ -25,7 +23,8 @@ const MAX_CALLS: u64 = 1024;
 #[derive(Debug, Default)]
 pub struct ChunkAssembler {
     text: String,
-    calls: BTreeMap<u64, Call>,
+    /// Each call with its stream index, in the order the calls began.
+    calls: Vec<(u64, Call)>,
     finish: Option<String>,
     usage: Option<Value>,
     done: bool,
@@ -84,15 +83,44 @@ impl ChunkAssembler {
     fn call(&mut self, chunk: &Value) -> Result<(), AgentError> {
         let index = chunk["index"]
             .as_u64()
-            .filter(|index| *index < MAX_CALLS)
             .ok_or_else(|| AgentError::new(ErrorKind::Decode, "a tool call chunk has no index"))?;
-        let call = self.calls.entry(index).or_default();
-        if let Some(id) = chunk["id"].as_str() {
+        let id = chunk["id"].as_str().filter(|id| !id.is_empty());
+        // Ollama sends each call whole, each at index 0. A new id at an index
+        // that holds another call starts a new call.
+        let fresh = self.calls.last().is_none_or(|(at, call)| {
+            *at != index || id.is_some_and(|id| !call.id.is_empty() && call.id != id)
+        });
+        if fresh {
+            let held = u64::try_from(self.calls.len()).unwrap_or(u64::MAX);
+            if held >= MAX_CALLS {
+                return Err(AgentError::new(
+                    ErrorKind::Decode,
+                    format!("a stream holds more than {MAX_CALLS} tool calls"),
+                ));
+            }
+            if let Some(pos) = self.calls.iter().position(|(at, _)| *at == index)
+                && id.is_none()
+            {
+                // A later piece of an earlier call at this index.
+                let entry = self.calls.remove(pos);
+                self.calls.push(entry);
+            } else {
+                self.calls.push((index, Call::default()));
+            }
+        }
+        let Some((_, call)) = self.calls.last_mut() else {
+            return Ok(());
+        };
+        if let Some(id) = id {
             id.clone_into(&mut call.id);
         }
         let function = &chunk["function"];
-        if let Some(name) = function["name"].as_str() {
-            call.name.push_str(name);
+        // Most servers name a call in its first chunk only. Some repeat the
+        // whole name in each chunk, so the name is set once.
+        if let Some(name) = function["name"].as_str()
+            && call.name.is_empty()
+        {
+            name.clone_into(&mut call.name);
         }
         match &function["arguments"] {
             Value::String(piece) => call.arguments.push_str(piece),
@@ -119,8 +147,8 @@ impl ChunkAssembler {
         }
         let calls: Vec<Value> = self
             .calls
-            .into_values()
-            .map(|call| {
+            .into_iter()
+            .map(|(_, call)| {
                 let id = if call.id.is_empty() {
                     Value::Null
                 } else {
@@ -242,6 +270,51 @@ mod tests {
         assert_eq!(streamed(&["{"]).unwrap_err().kind(), ErrorKind::Decode);
         let odd = json!({"choices": [{"delta": {"tool_calls": [{"index": "x"}]}}]}).to_string();
         assert_eq!(streamed(&[&odd]).unwrap_err().kind(), ErrorKind::Decode);
+    }
+
+    #[test]
+    fn two_calls_at_one_index_with_two_ids_stay_two_calls() {
+        // Ollama sends each call whole, each at index 0.
+        let call = |id: &str, name: &str, args: &str| {
+            chunk(
+                &json!({"tool_calls": [{"index": 0, "id": id, "type": "function",
+                    "function": {"name": name, "arguments": args}}]}),
+                None,
+            )
+        };
+        let events = [
+            call("call_a", "search", "{\"q\":1}"),
+            call("call_b", "close", "{\"id\":2}"),
+            chunk(&json!({}), Some("tool_calls")),
+            "[DONE]".to_owned(),
+        ];
+        let refs: Vec<&str> = events.iter().map(String::as_str).collect();
+        let (body, _) = streamed(&refs).unwrap();
+        let response = parse_response(&body).unwrap();
+        assert_eq!(response.content.len(), 2, "{response:?}");
+        assert!(matches!(&response.content[1],
+            ContentPart::ToolCall { id, name, .. } if id == "call_b" && name == "close"));
+    }
+
+    #[test]
+    fn a_name_repeated_in_each_chunk_is_kept_once() {
+        let piece = |args: &str| {
+            chunk(
+                &json!({"tool_calls": [{"index": 0,
+                    "function": {"name": "search", "arguments": args}}]}),
+                None,
+            )
+        };
+        let events = [
+            piece("{\"q\":"),
+            piece("1}"),
+            chunk(&json!({}), Some("tool_calls")),
+            "[DONE]".to_owned(),
+        ];
+        let refs: Vec<&str> = events.iter().map(String::as_str).collect();
+        let (body, _) = streamed(&refs).unwrap();
+        assert!(matches!(&parse_response(&body).unwrap().content[0],
+            ContentPart::ToolCall { name, .. } if name == "search"));
     }
 
     #[test]

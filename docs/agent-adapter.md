@@ -354,16 +354,23 @@ many servers:
 | vLLM, LM Studio, a LiteLLM proxy | The `/v1` URL of the server |
 
 - `OpenAiModel::new(base_url, model)` takes no key, as a local server
-  needs. `api_key(key)` sends `Authorization: Bearer`.
-  `with_env_key(base_url, model)` reads `OPENAI_API_KEY` when it is set.
+  needs. `api_key(key)` sends `Authorization: Bearer`. A key for a plain
+  `http` URL is refused, unless the host is a loopback name or address.
+- `with_env_key(base_url, model)` reads the key variable of a known host:
+  `OPENAI_API_KEY` for OpenAI, `OPENROUTER_API_KEY` for OpenRouter. Another
+  host gets no key, so a key of one provider never reaches another.
+  `with_key_from(base_url, model, var)` names the variable.
 - `header(name, value)` adds a header, such as the `HTTP-Referer` and
-  `X-Title` of OpenRouter.
+  `X-Title` of OpenRouter. The headers that the client sets are refused:
+  the key, the body type and the framing.
 - `model_id()` is `{model}@{host}`, so two servers do not share cache
   entries. `id(name)` sets another id.
 - `price(Price)` prices each call. The default is unpriced, because each
   provider has its own rates. A local server costs nothing.
-- `max_completion_tokens(true)` sends the output cap in the field that the
-  OpenAI reasoning models need. `seed(false)` stops the draw number going
+- The output cap goes as `max_completion_tokens` to the OpenAI host, as its
+  current models need, and as `max_tokens` to another server.
+  `max_completion_tokens(on)` sets the field. The OpenAI reasoning models
+  also refuse a `temperature` other than 1. `seed(false)` stops the draw number going
   as `seed`. `stream_usage(false)` stops the usage request on a stream, for
   a server that refuses `stream_options`.
 
@@ -372,7 +379,20 @@ is not JSON is a `Decode` error, so no tool runs on a value that the model
 did not send. A stream needs a finish reason, and the end marker or the
 usage. One that breaks off is a `Transport` error, so the retry asks again.
 A `2xx` body with an `error` object is the error of its code. OpenRouter
-sends such a body.
+sends such a body. A turn cut at the output cap keeps its text and drops a
+call whose arguments it cut. A call with no id gets one made from the
+response, so two turns never share a call id. A context overflow is a
+`Budget` error.
+
+The base URL is the path only. A user, a password, a query or a fragment
+is refused, because each would go into each log line. Use the `/v1`
+endpoint of Azure OpenAI, which needs no query.
+
+Limits. The model sends no reasoning back: a model that needs its
+`reasoning_details` in a tool loop, such as Gemini 3 behind OpenRouter, is
+not supported yet. Each system message goes where it stands, and some
+chat templates refuse a second one. The Mistral API wants call ids of nine
+characters, which a made id is not.
 
 Both models use the shared `provider` module. It holds the transport, the
 error type, the body cap, the status table above, the Server-Sent Events

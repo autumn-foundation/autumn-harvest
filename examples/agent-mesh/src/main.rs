@@ -34,6 +34,10 @@ struct Cli {
     /// The base URL, with `--model openai`.
     #[arg(long, env = "OPENAI_BASE_URL", default_value = OPENAI_BASE_URL, global = true)]
     base_url: String,
+    /// The environment variable of the key, with `--model openai`. The
+    /// default is the variable of a known host.
+    #[arg(long, global = true)]
+    api_key_env: Option<String>,
     /// The most tokens of the mesh in one day.
     #[arg(long, default_value_t = 200_000, global = true)]
     daily_tokens: u64,
@@ -124,10 +128,12 @@ fn model(cli: &Cli) -> Result<Arc<dyn AgentModel>, Error> {
             if cli.openai_model.trim().is_empty() {
                 return Err("set --openai-model or OPENAI_MODEL to use --model openai".into());
             }
-            Arc::new(
-                OpenAiModel::with_env_key(&cli.base_url, cli.openai_model.trim())
-                    .map_err(|e| format!("--model openai: {}", e.message()))?,
-            )
+            let model = cli.openai_model.trim();
+            let built = cli.api_key_env.as_ref().map_or_else(
+                || OpenAiModel::with_env_key(&cli.base_url, model),
+                |var| OpenAiModel::with_key_from(&cli.base_url, model, var),
+            );
+            Arc::new(built.map_err(|e| format!("--model openai: {}", e.message()))?)
         }
     })
 }
