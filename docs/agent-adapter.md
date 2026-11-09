@@ -850,15 +850,19 @@ writes an edit and its key. A write names the version that it read. A
 write that loses a race reads again, so two workers on one scope lose no
 edit. The memory store keeps the newest 4 096 keys of a scope.
 
-```rust,ignore
+```rust
+use std::path::Path;
 use std::sync::Arc;
 
 use autumn_harvest_agent::stores::{SqliteEpisodeStore, SqliteMemoryStore, SqliteTranscriptStore};
+use autumn_harvest_agent::{AgentError, AgentHarness};
 
-let harness = harness
-    .memory(Arc::new(SqliteMemoryStore::open("agent.db")?))
-    .episodes(Arc::new(SqliteEpisodeStore::open("agent.db")?))
-    .transcript_store(Arc::new(SqliteTranscriptStore::open("agent.db")?));
+fn durable(harness: AgentHarness, db: &Path) -> Result<AgentHarness, AgentError> {
+    Ok(harness
+        .memory(Arc::new(SqliteMemoryStore::open(db)?))
+        .episodes(Arc::new(SqliteEpisodeStore::open(db)?))
+        .transcript_store(Arc::new(SqliteTranscriptStore::open(db)?)))
+}
 ```
 
 On Postgres, `PostgresMemoryStore::new(pool)`, `PostgresEpisodeStore::new(pool)`

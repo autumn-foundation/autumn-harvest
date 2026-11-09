@@ -29,6 +29,8 @@ pub const EXPIRED_BATCH: u32 = 64;
 
 /// The version after `current`. A document that does not exist has no
 /// version, and its first write is 1. `None` means that the counter is full.
+///
+/// `formal/verus/src/agent_stores.rs` proves it.
 #[must_use]
 pub const fn next_doc_version(current: Option<u64>) -> Option<u64> {
     match current {
