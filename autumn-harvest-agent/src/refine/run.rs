@@ -32,7 +32,7 @@ use std::time::Duration;
 use autumn_harvest::failure::{ActivityFailure, IntoActivityErrorString};
 use autumn_harvest::policy::RetryPolicy;
 use autumn_harvest::prelude::*;
-use autumn_harvest::types::ExecutionId;
+use autumn_harvest::types::{ExecutionId, IdempotencyKey};
 use serde::{Deserialize, Serialize};
 
 use super::adopt::RefineStatus;
@@ -46,6 +46,7 @@ use super::lessons::{
     LESSON_PATCH, Lesson, LessonOutcome, LessonRequest, agent_refine_lesson_info, lesson_scope,
     writes_lesson,
 };
+use super::meter::Charge;
 use super::policy::{PolicyCeilings, RefinePolicy};
 use super::policy_read::read_refine_policy;
 use super::propose::{
@@ -463,13 +464,9 @@ fn failure(err: &RefineError) -> String {
         .into_error_payload()
 }
 
-/// The kind of the source `record`, or `None` when it names none.
+/// The kind of the `agent_loop` source `record`, or `None` when it names
+/// none.
 fn kind_of(record: &super::sources::SourceRecord) -> Result<Option<String>, String> {
-    if record.workflow_name == AGENT_WORKFLOW_NAME {
-        return Ok(AgentId::parse(&record.workflow_id)
-            .ok()
-            .map(|id| id.kind().to_owned()));
-    }
     task_of(&record.events)
         .map(|task| task.kind)
         .map_err(|err| err.to_string())
@@ -503,6 +500,16 @@ fn brief_of(
             workflow: truncate(&record.workflow_name, crate::mesh::MAX_NAME_LEN),
         }));
     }
+    // The replay probe reads one task. A durable agent runs many ops in one
+    // history, so no probe can read it. The refusal comes before the end
+    // and kind checks, so each agent run gets this error.
+    if record.workflow_name == AGENT_WORKFLOW_NAME {
+        return Err(failure(&RefineError::SourceNotReplayable {
+            run: name,
+            reason: "the replay probe reads agent_loop runs only, not a durable agent run"
+                .to_owned(),
+        }));
+    }
     if !record.ended {
         return Err(failure(&RefineError::SourceInFlight { run: name }));
     }
@@ -517,13 +524,6 @@ fn brief_of(
             run: name,
             kind: kind.to_owned(),
             found: found.map(|kind| truncate(&kind, crate::mesh::MAX_NAME_LEN)),
-        }));
-    }
-    if record.workflow_name == AGENT_WORKFLOW_NAME {
-        return Err(failure(&RefineError::SourceNotReplayable {
-            run: name,
-            reason: "the replay probe reads agent_loop runs only, not a durable agent run"
-                .to_owned(),
         }));
     }
     let not_replayable = |reason: String| {
@@ -681,6 +681,7 @@ pub async fn agent_refine_start(
 pub(crate) async fn run_probe(
     harness: &AgentHarness,
     request: ProbeRequest,
+    fork_key: Option<&str>,
 ) -> Result<ProbeResult, String> {
     let events = source_events(harness, request.source).await?;
     let candidate = Candidate::new(harness.clone())
@@ -709,6 +710,7 @@ pub(crate) async fn run_probe(
                 overlay: &request.overlay,
                 effects: &request.effects,
                 ceilings: &request.ceilings,
+                fork_key,
             })
             .await;
         match ran {
@@ -741,27 +743,22 @@ pub async fn agent_refine_probe(
     ctx: &ActivityContext,
     request: ProbeRequest,
 ) -> Result<ProbeResult, String> {
-    let result = run_probe(crate::workflow::harness(ctx)?, request).await?;
+    // The key is the same for each attempt, so a retry finds its fork.
+    let key = ctx.idempotency_key().ok().map(IdempotencyKey::as_str);
+    let result = run_probe(crate::workflow::harness(ctx)?, request, key).await?;
     super::propose::record_calls(ctx, probe_calls(&result));
     Ok(result)
 }
 
-/// The cost ledger call of one probe. The probe records one row for the
-/// sum of its candidate turns, under the unknown model id.
+/// The cost ledger calls of one probe: one call for each candidate turn
+/// that called a model. Each call names the model of its turn.
 pub(crate) fn probe_calls(result: &ProbeResult) -> Vec<autumn_harvest::llm_ledger::LlmCall> {
-    let evaluation = &result.evaluation;
-    if evaluation.candidate_usage == TokenUsage::default() {
-        return Vec::new();
-    }
-    let mut call = autumn_harvest::llm_ledger::LlmCall::new(
-        crate::model::UNKNOWN_MODEL_ID,
-        u64::from(evaluation.candidate_usage.input_tokens),
-        u64::from(evaluation.candidate_usage.output_tokens),
-    );
-    if evaluation.candidate_cost_usd_micros > 0 {
-        call = call.with_cost_usd_micros(evaluation.candidate_cost_usd_micros);
-    }
-    vec![call]
+    result
+        .evaluation
+        .candidate_calls
+        .iter()
+        .map(Charge::ledger_call)
+        .collect()
 }
 
 /// The state of one refine run.

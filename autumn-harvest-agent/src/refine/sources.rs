@@ -44,6 +44,11 @@ pub struct LiveRequest<'a> {
     /// The ceilings of the run. The fork applies the overlay under them, as
     /// the stages and the replay probe do.
     pub ceilings: &'a Ceilings,
+    /// A key that stays the same over the retries of the probe, such as the
+    /// idempotency key of its activity. A host that has it forks once for
+    /// each key. A retry then waits for the fork of the first attempt.
+    /// `None` forks each time.
+    pub fork_key: Option<&'a str>,
 }
 
 /// How a live re-probe ended.

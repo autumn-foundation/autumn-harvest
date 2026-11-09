@@ -56,6 +56,19 @@ pub const PROBE_FORK_REASON: &str = "live probe (issue #2378)";
 #[cfg_attr(not(feature = "postgres"), allow(dead_code))]
 pub const PROBE_FORK_OPERATOR: &str = "autumn_harvest_agent::eval::live_probe";
 
+/// The start of the workflow id of a keyed probe fork. See
+/// [`probe_fork_id`].
+pub const PROBE_FORK_ID_PREFIX: &str = "agent-probe-";
+
+/// The workflow id of the probe fork of `key`.
+///
+/// A caller passes a key that stays the same over its retries, such as the
+/// idempotency key of its activity. Each retry then names the same fork.
+#[must_use]
+pub fn probe_fork_id(key: &str) -> String {
+    format!("{PROBE_FORK_ID_PREFIX}{key}")
+}
+
 /// The recorded source of a probe.
 #[derive(Debug, Clone)]
 pub struct SourceRun {
@@ -100,6 +113,42 @@ pub trait LiveProbeHost {
         source: ExecutionId,
         input: Value,
     ) -> BoxFuture<'_, Result<ProbeFork, EvalError>>;
+
+    /// The run that holds the workflow id `fork_id` on the shard of
+    /// `source`, or `None`. A terminated run holds no id.
+    ///
+    /// The default has no fork.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EvalError::Unsupported`] when the backend has no fork, and
+    /// [`EvalError::Fork`] when the read fails.
+    fn find_fork(
+        &self,
+        source: ExecutionId,
+        fork_id: &str,
+    ) -> BoxFuture<'_, Result<Option<ProbeFork>, EvalError>> {
+        let _ = (source, fork_id);
+        Box::pin(std::future::ready(Err(EvalError::Unsupported("this host"))))
+    }
+
+    /// [`Self::fork_live`] under the workflow id `fork_id`.
+    ///
+    /// The default has no fork.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Self::fork_live`], and [`EvalError::ForkIdInUse`]
+    /// when another run holds `fork_id`.
+    fn fork_live_as(
+        &self,
+        source: ExecutionId,
+        input: Value,
+        fork_id: &str,
+    ) -> BoxFuture<'_, Result<ProbeFork, EvalError>> {
+        let _ = (source, input, fork_id);
+        Box::pin(std::future::ready(Err(EvalError::Unsupported("this host"))))
+    }
 }
 
 /// A started live probe.
@@ -171,6 +220,101 @@ pub async fn live_probe_with<H: LiveProbeHost + ?Sized>(
     allowed: &[ToolEffect],
     ceilings: Option<&Ceilings>,
 ) -> Result<LiveProbe, EvalError> {
+    let effects: BTreeSet<ToolEffect> = allowed.iter().copied().collect();
+    let input = probe_input(host, harness, source, overlay, &effects, ceilings).await?;
+    let fork = host.fork_live(source, input).await?;
+    Ok(LiveProbe::of(fork, effects, overlay))
+}
+
+/// [`live_probe_with`] under the workflow id `fork_id`. A second call with
+/// the same id finds the first fork, and forks nothing.
+///
+/// Pass [`probe_fork_id`] of a key that stays the same over the retries of
+/// the caller. A crash during the wait for the fork then costs no second
+/// fork. The id is held until the fork is terminated, so a fork that ended
+/// is found too.
+///
+/// The function looks for the fork first. A found fork skips the source
+/// read and the overlay checks, because the call that made it passed them.
+/// A concurrent call that wins the id gives [`EvalError::ForkIdInUse`].
+/// The function then reads the fork of the winner.
+///
+/// # Errors
+///
+/// The errors of [`live_probe`]. [`EvalError::Fork`] when a run of another
+/// source holds `fork_id`.
+#[allow(clippy::future_not_send)]
+pub async fn live_probe_keyed<H: LiveProbeHost + ?Sized>(
+    host: &H,
+    harness: &AgentHarness,
+    source: ExecutionId,
+    overlay: &ProfileOverlay,
+    allowed: &[ToolEffect],
+    ceilings: Option<&Ceilings>,
+    fork_id: &str,
+) -> Result<LiveProbe, EvalError> {
+    let effects: BTreeSet<ToolEffect> = allowed.iter().copied().collect();
+    if let Some(fork) = host.find_fork(source, fork_id).await? {
+        return of_source(fork, source).map(|fork| LiveProbe::of(fork, effects, overlay));
+    }
+    let input = probe_input(host, harness, source, overlay, &effects, ceilings).await?;
+    let fork = match host.fork_live_as(source, input, fork_id).await {
+        Err(EvalError::ForkIdInUse(_)) => {
+            host.find_fork(source, fork_id).await?.ok_or_else(|| {
+                EvalError::Fork(format!(
+                    "the fork id {fork_id} is in use, but no run on the source shard holds it"
+                ))
+            })?
+        }
+        other => other?,
+    };
+    of_source(fork, source).map(|fork| LiveProbe::of(fork, effects, overlay))
+}
+
+/// `fork`, when `source` is its source.
+///
+/// # Errors
+///
+/// Returns [`EvalError::Fork`] when another source made `fork`.
+fn of_source(fork: ProbeFork, source: ExecutionId) -> Result<ProbeFork, EvalError> {
+    if fork.forked_from_exec_id == source {
+        Ok(fork)
+    } else {
+        Err(EvalError::Fork(format!(
+            "the fork id {} names a fork of {}, not of {source}",
+            fork.workflow_id, fork.forked_from_exec_id
+        )))
+    }
+}
+
+impl LiveProbe {
+    /// The started probe of `fork`.
+    fn of(fork: ProbeFork, effects: BTreeSet<ToolEffect>, overlay: &ProfileOverlay) -> Self {
+        Self {
+            exec_id: fork.exec_id,
+            workflow_id: fork.workflow_id,
+            forked_from_exec_id: fork.forked_from_exec_id,
+            effects,
+            overlay_digest: overlay.digest(),
+        }
+    }
+}
+
+/// The fork input of a probe of `source`: its task under `overlay`, with
+/// the mark.
+///
+/// # Errors
+///
+/// The refusals of [`live_probe`].
+#[allow(clippy::future_not_send)]
+async fn probe_input<H: LiveProbeHost + ?Sized>(
+    host: &H,
+    harness: &AgentHarness,
+    source: ExecutionId,
+    overlay: &ProfileOverlay,
+    effects: &BTreeSet<ToolEffect>,
+    ceilings: Option<&Ceilings>,
+) -> Result<Value, EvalError> {
     let run = host.source_run(source).await?;
     if run.workflow_name != WORKFLOW_NAME {
         return Err(EvalError::NotAnAgentRun(format!(
@@ -178,17 +322,8 @@ pub async fn live_probe_with<H: LiveProbeHost + ?Sized>(
             run.workflow_name
         )));
     }
-    let effects: BTreeSet<ToolEffect> = allowed.iter().copied().collect();
-    let task = probe_task(&task_of(&run.events)?, harness, overlay, &effects, ceilings)?;
-    let input = serde_json::to_value(&task).map_err(|e| EvalError::Undecodable(e.to_string()))?;
-    let fork = host.fork_live(source, input).await?;
-    Ok(LiveProbe {
-        exec_id: fork.exec_id,
-        workflow_id: fork.workflow_id,
-        forked_from_exec_id: fork.forked_from_exec_id,
-        effects,
-        overlay_digest: overlay.digest(),
-    })
+    let task = probe_task(&task_of(&run.events)?, harness, overlay, effects, ceilings)?;
+    serde_json::to_value(&task).map_err(|e| EvalError::Undecodable(e.to_string()))
 }
 
 /// The probe input: the source `task` under `overlay`, with the mark.
@@ -252,6 +387,10 @@ mod tests {
         name: String,
         events: Vec<WorkflowEvent>,
         forks: Mutex<Vec<Value>>,
+        /// The fork that holds each workflow id.
+        held: Mutex<Vec<(String, ProbeFork)>>,
+        /// Hide a held id from the first lookup, as a concurrent fork does.
+        race: Mutex<bool>,
     }
 
     impl FakeHost {
@@ -266,7 +405,23 @@ mod tests {
                     scheduled_time: None,
                 }],
                 forks: Mutex::new(Vec::new()),
+                held: Mutex::new(Vec::new()),
+                race: Mutex::new(false),
             }
+        }
+
+        /// Hold `fork_id` with a fork of `source`, as an earlier attempt did.
+        fn hold(&self, fork_id: &str, source: ExecutionId) -> ExecutionId {
+            let exec_id = ExecutionId::new();
+            self.held.lock().unwrap().push((
+                fork_id.to_owned(),
+                ProbeFork {
+                    exec_id,
+                    workflow_id: fork_id.to_owned(),
+                    forked_from_exec_id: source,
+                },
+            ));
+            exec_id
         }
 
         fn forks(&self) -> Vec<Value> {
@@ -296,6 +451,48 @@ mod tests {
                     forked_from_exec_id: source,
                 })
             })
+        }
+
+        fn find_fork(
+            &self,
+            _source: ExecutionId,
+            fork_id: &str,
+        ) -> BoxFuture<'_, Result<Option<ProbeFork>, EvalError>> {
+            let hidden = std::mem::take(&mut *self.race.lock().unwrap());
+            let found = self
+                .held
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(id, _)| id == fork_id && !hidden)
+                .map(|(_, fork)| fork.clone());
+            Box::pin(async move { Ok(found) })
+        }
+
+        fn fork_live_as(
+            &self,
+            source: ExecutionId,
+            input: Value,
+            fork_id: &str,
+        ) -> BoxFuture<'_, Result<ProbeFork, EvalError>> {
+            let held = self
+                .held
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(id, _)| id == fork_id);
+            let result = if held {
+                Err(EvalError::ForkIdInUse(fork_id.to_owned()))
+            } else {
+                self.forks.lock().unwrap().push(input);
+                let exec_id = self.hold(fork_id, source);
+                Ok(ProbeFork {
+                    exec_id,
+                    workflow_id: fork_id.to_owned(),
+                    forked_from_exec_id: source,
+                })
+            };
+            Box::pin(async move { result })
         }
     }
 
@@ -451,6 +648,90 @@ mod tests {
             "{refused:?}"
         );
         assert_eq!(host.forks(), Vec::<Value>::new());
+    }
+
+    /// A keyed probe of `source` with the fork id `fork_id`.
+    async fn keyed(
+        host: &FakeHost,
+        source: ExecutionId,
+        fork_id: &str,
+    ) -> Result<LiveProbe, EvalError> {
+        live_probe_keyed(
+            host,
+            &harness(),
+            source,
+            &system("new"),
+            &[ToolEffect::ReadOnly],
+            None,
+            fork_id,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_keyed_probe_forks_once_under_its_id() {
+        let host = FakeHost::new(serde_json::to_value(AgentTask::new("hi")).unwrap());
+        let source = ExecutionId::new();
+        let first = keyed(&host, source, "probe-k").await.unwrap();
+        assert_eq!(first.workflow_id, "probe-k");
+        assert_eq!(first.forked_from_exec_id, source);
+        // A retry with the same key finds the first fork.
+        let again = keyed(&host, source, "probe-k").await.unwrap();
+        assert_eq!(again, first);
+        assert_eq!(host.forks().len(), 1, "a retry forks nothing");
+        // Another key forks again.
+        let other = keyed(&host, source, "probe-j").await.unwrap();
+        assert_ne!(other.exec_id, first.exec_id);
+        assert_eq!(host.forks().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_keyed_probe_that_loses_the_race_reads_the_winner() {
+        let host = FakeHost::new(serde_json::to_value(AgentTask::new("hi")).unwrap());
+        let source = ExecutionId::new();
+        let winner = host.hold("probe-k", source);
+        *host.race.lock().unwrap() = true;
+        let probe = keyed(&host, source, "probe-k").await.unwrap();
+        assert_eq!(probe.exec_id, winner);
+        assert_eq!(host.forks(), Vec::<Value>::new(), "the loser forks nothing");
+    }
+
+    #[tokio::test]
+    async fn a_fork_id_of_another_source_is_refused() {
+        let host = FakeHost::new(serde_json::to_value(AgentTask::new("hi")).unwrap());
+        host.hold("probe-k", ExecutionId::new());
+        let refused = keyed(&host, ExecutionId::new(), "probe-k").await;
+        assert!(matches!(refused, Err(EvalError::Fork(_))), "{refused:?}");
+        assert_eq!(host.forks(), Vec::<Value>::new());
+    }
+
+    #[tokio::test]
+    async fn a_keyed_probe_still_refuses_a_wider_overlay() {
+        let task = AgentTask::new("hi").max_steps(4);
+        let host = FakeHost::new(serde_json::to_value(&task).unwrap());
+        let wider = ProfileOverlay {
+            max_steps: Some(40),
+            ..ProfileOverlay::default()
+        };
+        let refused = live_probe_keyed(
+            &host,
+            &harness(),
+            ExecutionId::new(),
+            &wider,
+            &[],
+            None,
+            "probe-k",
+        )
+        .await;
+        assert!(matches!(refused, Err(EvalError::Overlay(_))), "{refused:?}");
+        assert_eq!(host.forks(), Vec::<Value>::new());
+    }
+
+    #[test]
+    fn the_fork_id_is_a_pure_function_of_the_key() {
+        assert_eq!(probe_fork_id("k-1"), probe_fork_id("k-1"));
+        assert_ne!(probe_fork_id("k-1"), probe_fork_id("k-2"));
+        assert!(probe_fork_id("k-1").starts_with(PROBE_FORK_ID_PREFIX));
     }
 
     #[test]

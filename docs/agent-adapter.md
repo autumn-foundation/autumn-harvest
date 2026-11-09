@@ -3260,7 +3260,8 @@ On Postgres, install `postgres::Sources::new(pg)` and start the workflow
   `agent_loop` run, so the run names its kind. A run with no kind gets
   `RefineSourceOtherKind`, and so does each run recorded before this
   release. A durable `agent` run has no replay probe yet, so it gets
-  `RefineSourceNotReplayable`.
+  `RefineSourceNotReplayable` before the end and kind checks, of any kind
+  and in any state.
 - **Parallel.** For each source, k INV and k DOM stages start from one
   base. Each candidate gets one probe. k compositions read the shared
   probes. Each candidate composition gets one probe. One selection
@@ -3271,8 +3272,11 @@ On Postgres, install `postgres::Sources::new(pg)` and start the workflow
 - **Probe.** `eval::evaluate` against the recorded source, so the base
   rollout costs nothing. A probe that stubs a tool call asks for a live
   re-probe with `probe_effects`. The fork applies the overlay under the
-  policy ceilings, as the stages do. SQLite has no fork, so the probe records
-  `live re-probe skipped: SQLite has no fork` in the stage notes.
+  policy ceilings, as the stages do. The fork id comes from the
+  idempotency key of the probe activity, so a retry after a crash waits
+  for the fork of the first attempt and forks nothing. SQLite has no fork,
+  so the probe records `live re-probe skipped: SQLite has no fork` in the
+  stage notes.
 - **Compose and select.** An `OverlayComposer` reads the probes under
   opaque ids, with the anonymised pool. The pool redacts
   each route that a probe asked for, with its model id. So a route that a
@@ -3289,7 +3293,9 @@ On Postgres, install `postgres::Sources::new(pg)` and start the workflow
   it with `RefineBudgetIdentity`.
 - **Spend.** A proposer, composer or selector reports each model call
   with `charge`. `ModelProposer` charges each of its calls. Each step
-  writes its calls to the cost ledger under the refine run. With a budget,
+  writes its calls to the cost ledger under the refine run. A probe writes
+  one row for each candidate turn that called a model, with the model id
+  of that turn. With a budget,
   the run stops before the next step once its own spend reaches a cap. It
   ends as `budget_exhausted` with no `chosen` overlay. A live re-probe
   records its rows under the fork. The run counts the spend of a

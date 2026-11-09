@@ -2634,6 +2634,8 @@ async fn the_report_keeps_every_field_that_is_not_an_identity() {
             candidate_usage,
             // A price names a model, so the cost is an identity.
             candidate_cost_usd_micros: _,
+            // Each call names its model and its price.
+            candidate_calls: _,
         } = alone;
         let kept = report
             .pool
@@ -2989,6 +2991,38 @@ async fn a_recorded_peer_route_and_its_model_id_are_redacted() {
     }
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn each_candidate_turn_names_its_model_and_spend() {
+    let source = one_lookup().await;
+    let model = ScriptedModel::named(
+        "model-a",
+        vec![
+            calls(&[("c1", "lookup", json!({"q": "x"}))], 5),
+            answer("done", 7),
+        ],
+    );
+    let (harness, _) = candidate(model);
+    let evaluation = evaluate(&source, &Candidate::new(harness)).await.unwrap();
+    let models: Vec<_> = evaluation
+        .candidate_calls
+        .iter()
+        .map(|call| call.model_id.as_deref())
+        .collect();
+    assert_eq!(models, [Some("model-a"), Some("model-a")]);
+    let sum = evaluation
+        .candidate_calls
+        .iter()
+        .fold(autumn_harvest_agent::TokenUsage::default(), |sum, call| {
+            sum.saturating_add(call.usage)
+        });
+    assert_eq!(sum, evaluation.candidate_usage);
+    // An evaluation of an older release decodes with no turn spend.
+    let mut old = serde_json::to_value(&evaluation).unwrap();
+    old.as_object_mut().unwrap().remove("candidate_calls");
+    let decoded: Evaluation = serde_json::from_value(old).unwrap();
+    assert_eq!(decoded.candidate_calls, Vec::new());
+}
+
 // ── Scored evaluations (issue #2447) ────────────────────────────────────────
 
 /// The golden JSON of an evaluation with no scorer. The code from before
@@ -3046,6 +3080,8 @@ async fn with_no_scorer_the_report_keeps_its_json() {
         None,
         "an unpriced model"
     );
+    let calls = spend.remove("candidate_calls").expect("two model calls");
+    assert_eq!(calls.as_array().map(Vec::len), Some(2), "{calls}");
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(NO_SCORER_GOLDEN);
     if std::env::var_os("UPDATE_GOLDEN").is_some() {
         let text = serde_json::to_string_pretty(&value).unwrap();
@@ -3059,6 +3095,7 @@ async fn with_no_scorer_the_report_keeps_its_json() {
     let decoded: Evaluation = serde_json::from_value(golden).unwrap();
     let mut expected = evaluation;
     expected.candidate_usage = autumn_harvest_agent::TokenUsage::default();
+    expected.candidate_calls = Vec::new();
     assert_eq!(decoded, expected);
 }
 
