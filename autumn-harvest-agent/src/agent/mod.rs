@@ -1743,6 +1743,9 @@ impl AgentRun<'_> {
 
     /// Clear the memory scope of the agent, and count its entries. Returns
     /// `None` when the agent has no memory scope.
+    ///
+    /// The count step records the entries first, so a retried clear keeps
+    /// the count. A failed count fails the reset after the clear.
     async fn erase_memory(&self) -> Result<Option<u64>, String> {
         let (Ok(id), Ok(profile)) = (&self.id, &self.profile) else {
             return Ok(None);
@@ -1750,24 +1753,42 @@ impl AgentRun<'_> {
         let Some(scope) = profile.memory_scope(id) else {
             return Ok(None);
         };
-        self.ctx
-            .execute_activity(&agent_memory_erase_info(), scope)
+        // A failed count still clears, so a bad row never blocks an erase.
+        let held: Result<u64, String> = self
+            .ctx
+            .execute_activity(&agent_memory_count_info(), scope.clone())
             .await
-            .map(Some)
-            .map_err(|err| err.to_string())
+            .map_err(|err| err.to_string());
+        let (): () = self
+            .ctx
+            .execute_activity(&agent_memory_reset_info(), scope)
+            .await
+            .map_err(|err| err.to_string())?;
+        held.map(Some)
     }
 
     /// Delete the transcript windows of the agent, and count them. Each turn
     /// of the agent keeps its windows under the agent id as its session.
-    /// Returns `None` when the store cannot erase by session.
+    /// Returns `None` when the store cannot count or cannot erase.
+    ///
+    /// The count step records the windows first, so a retried erase keeps
+    /// the count.
     async fn erase_transcripts(&self) -> Result<Option<u64>, String> {
         let Ok(id) = &self.id else {
             return Ok(None);
         };
-        self.ctx
-            .execute_activity(&agent_transcript_erase_info(), SessionId::new(id.as_str()))
+        let session = SessionId::new(id.as_str());
+        let held: Option<u64> = self
+            .ctx
+            .execute_activity(&agent_transcript_count_info(), session.clone())
             .await
-            .map_err(|err| err.to_string())
+            .map_err(|err| err.to_string())?;
+        let erased: Option<u64> = self
+            .ctx
+            .execute_activity(&agent_transcript_erase_info(), session)
+            .await
+            .map_err(|err| err.to_string())?;
+        Ok(erased.and(held))
     }
 
     /// Remove each lesson of the kind that names the agent, and count them.
@@ -2895,7 +2916,7 @@ pub async fn agent_memory_reset(ctx: &ActivityContext, scope: MemoryScope) -> Re
     harness(ctx)?.memory_reset(scope).await
 }
 
-/// Clear one memory scope and count its entries, as an activity.
+/// Count the entries of one memory scope, as an activity.
 ///
 /// # Errors
 ///
@@ -2904,8 +2925,25 @@ pub async fn agent_memory_reset(ctx: &ActivityContext, scope: MemoryScope) -> Re
     start_to_close = "1m",
     retry = RetryPolicy::exponential(3, Duration::from_secs(1))
 )]
-pub async fn agent_memory_erase(ctx: &ActivityContext, scope: MemoryScope) -> Result<u64, String> {
-    harness(ctx)?.memory_erase(scope).await
+pub async fn agent_memory_count(ctx: &ActivityContext, scope: MemoryScope) -> Result<u64, String> {
+    harness(ctx)?.memory_count(scope).await
+}
+
+/// Count the transcript windows of one session, as an activity. Returns
+/// `None` when the store cannot count.
+///
+/// # Errors
+///
+/// Returns an error when the store fails.
+#[activity(
+    start_to_close = "1m",
+    retry = RetryPolicy::exponential(3, Duration::from_secs(1))
+)]
+pub async fn agent_transcript_count(
+    ctx: &ActivityContext,
+    session: SessionId,
+) -> Result<Option<u64>, String> {
+    harness(ctx)?.transcript_count(session).await
 }
 
 /// Delete the transcript windows of one session and count them, as an

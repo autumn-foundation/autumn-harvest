@@ -30,9 +30,9 @@ use crate::agent::{
     Steer,
 };
 use crate::agent::{
-    agent_info, agent_memory_erase_info, agent_memory_reset_info, agent_profile_info,
-    agent_profile_overlay_info, agent_transcript_erase_info, agent_workspace_floor_info,
-    agent_workspace_reset_info, agent_workspace_retain_info,
+    agent_info, agent_memory_count_info, agent_memory_reset_info, agent_profile_info,
+    agent_profile_overlay_info, agent_transcript_count_info, agent_transcript_erase_info,
+    agent_workspace_floor_info, agent_workspace_reset_info, agent_workspace_retain_info,
 };
 use crate::answer_check::{self, Checked};
 use crate::approval::{Approval, Decision, approval_signal, await_decision, decode_decision};
@@ -3587,7 +3587,8 @@ pub fn activities() -> Vec<ActivityInfo> {
         agent_profile_info(),
         agent_profile_overlay_info(),
         agent_memory_reset_info(),
-        agent_memory_erase_info(),
+        agent_memory_count_info(),
+        agent_transcript_count_info(),
         agent_transcript_erase_info(),
         agent_workspace_retain_info(),
         agent_workspace_reset_info(),

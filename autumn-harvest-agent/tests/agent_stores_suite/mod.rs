@@ -74,6 +74,8 @@ pub async fn run_all(make: MakeStores<'_>) {
     an_erase_removes_only_the_windows_of_its_session(make).await;
     a_put_keeps_only_the_newest_windows_of_a_run(make).await;
     a_window_with_text_that_holds_a_nul_round_trips(make).await;
+    a_put_again_moves_the_window_to_its_new_run(make).await;
+    a_count_sees_the_windows_that_an_erase_removes(make).await;
 }
 
 /// A retried append after a crash finds its key in the database.
@@ -390,9 +392,10 @@ pub async fn a_put_keeps_only_the_newest_windows_of_a_run(make: MakeStores<'_>) 
         "the oldest window of the run is gone"
     );
     let held = make().transcripts.erase(&session).await.unwrap().unwrap();
-    assert!(
-        (1..=u64::from(transcript::DEFAULT_KEEP_PER_RUN)).contains(&held),
-        "the run kept {held} windows"
+    assert_eq!(
+        held,
+        u64::from(transcript::DEFAULT_KEEP_PER_RUN),
+        "the run keeps exactly its newest windows"
     );
 }
 
@@ -418,4 +421,58 @@ pub async fn a_window_with_text_that_holds_a_nul_round_trips(make: MakeStores<'_
         .unwrap();
     let log = make().episodes.load(&scope).await.unwrap();
     assert_eq!(log.episodes().next(), Some(&nul));
+}
+
+/// A window that a later run puts again belongs to that run, so the prune
+/// of the first run keeps it.
+pub async fn a_put_again_moves_the_window_to_its_new_run(make: MakeStores<'_>) {
+    let session = SessionId::new(unique("suite/o"));
+    let shared = window(&unique("opening"), 2);
+    let shared_digest = transcript::chain(None, &shared);
+    let stores = make();
+    let owner = |run| WindowOwner::new(run, Some(&session));
+    stores
+        .transcripts
+        .put(owner("run-1"), &shared_digest, &shared)
+        .await;
+    stores
+        .transcripts
+        .put(owner("run-2"), &shared_digest, &shared)
+        .await;
+    let tag = unique("later");
+    for n in 0..=transcript::DEFAULT_KEEP_PER_RUN {
+        let messages = window(&format!("{tag} {n}"), 1);
+        let digest = transcript::chain(None, &messages);
+        stores
+            .transcripts
+            .put(owner("run-1"), &digest, &messages)
+            .await;
+    }
+    assert_eq!(
+        stores.transcripts.get(&shared_digest).await,
+        Some(shared),
+        "the window now belongs to run-2"
+    );
+}
+
+/// A count before an erase sees each window that the erase removes. The
+/// reset records the count first, so a retried erase keeps it.
+pub async fn a_count_sees_the_windows_that_an_erase_removes(make: MakeStores<'_>) {
+    let session = SessionId::new(unique("suite/p"));
+    let stores = make();
+    for n in 0..3 {
+        let messages = window(&unique(&format!("counted {n}")), 1);
+        let digest = transcript::chain(None, &messages);
+        stores
+            .transcripts
+            .put(
+                WindowOwner::new(&format!("run-{n}"), Some(&session)),
+                &digest,
+                &messages,
+            )
+            .await;
+    }
+    assert_eq!(make().transcripts.count(&session).await.unwrap(), Some(3));
+    assert_eq!(make().transcripts.erase(&session).await.unwrap(), Some(3));
+    assert_eq!(make().transcripts.count(&session).await.unwrap(), Some(0));
 }

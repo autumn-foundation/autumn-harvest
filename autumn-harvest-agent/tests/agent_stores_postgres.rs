@@ -346,6 +346,16 @@ async fn an_erase_removes_the_rows_of_the_agent_and_counts_them() {
         .map(|block| block.entries.len())
         .sum();
     assert_eq!(facts, 3, "one fact per episode");
+    // A plain note, so the memory count differs from the fact count.
+    let note = autumn_harvest_agent::memory::MemoryOp::Add {
+        block: "user".into(),
+        text: "prefers mornings".into(),
+    };
+    stores
+        .memory
+        .apply(&memory, note, &EditKey::new("note"))
+        .await
+        .unwrap();
     let windows = count(&url, "harvest_agent_transcripts", "session", id.as_str()).await;
     assert!(windows > 0, "each op kept a window under its session");
 
@@ -357,7 +367,7 @@ async fn an_erase_removes_the_rows_of_the_agent_and_counts_them() {
     let reset = state.episode_reset.expect("the episode count");
     assert_eq!(reset.episodes, 3);
     assert_eq!(reset.facts, 3);
-    assert_eq!(state.memory_entries_erased, Some(3));
+    assert_eq!(state.memory_entries_erased, Some(4), "3 facts and 1 note");
     assert_eq!(
         state.transcripts_erased,
         Some(u64::try_from(windows).unwrap())
@@ -368,17 +378,19 @@ async fn an_erase_removes_the_rows_of_the_agent_and_counts_them() {
         0,
         "no window of the agent"
     );
+    // A clear keeps each document as a tombstone, so its version grows.
     assert_eq!(
-        count(&url, "harvest_agent_store_docs", "scope", memory.as_str()).await,
-        0,
-        "no memory row of the agent"
+        tombstone(&url, memory.as_str()).await,
+        b"{}",
+        "the memory tombstone is empty"
     );
-    let tombstone = tombstone(&url, episodes.as_str()).await;
-    let body = String::from_utf8(tombstone).unwrap();
-    assert!(
-        !body.contains("noted"),
-        "the tombstone holds no episode text: {body}"
-    );
+    let body = String::from_utf8(tombstone(&url, episodes.as_str()).await).unwrap();
+    for text in ["noted", "thing"] {
+        assert!(
+            !body.contains(text),
+            "the tombstone holds no episode or fact text: {body}"
+        );
+    }
     let log = stores.episodes.load(&episodes).await.unwrap();
     assert!(log.is_empty());
     assert_eq!(log.generation(), 1, "the tombstone keeps the generation");

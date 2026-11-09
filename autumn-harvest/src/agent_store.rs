@@ -50,6 +50,7 @@ pub const fn next_doc_version(current: Option<u64>) -> Option<u64> {
 pub const MAX_AGE_SECS: u64 = 100 * 365 * 24 * 60 * 60;
 
 /// One stored document.
+#[doc(hidden)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DocRow {
     /// The version of the document, from 1.
@@ -59,6 +60,7 @@ pub struct DocRow {
 }
 
 /// One window to keep.
+#[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WindowPut<'a> {
     /// The chained digest of the window.
@@ -78,7 +80,7 @@ pub struct WindowPut<'a> {
 #[cfg(feature = "db")]
 #[doc(hidden)]
 pub use pg::{
-    delete_agent_doc, erase_agent_windows, get_agent_window, put_agent_window, read_agent_doc,
+    count_agent_windows, erase_agent_windows, get_agent_window, put_agent_window, read_agent_doc,
     swap_agent_doc,
 };
 
@@ -199,28 +201,6 @@ mod pg {
         Ok(written == 1)
     }
 
-    /// Delete the document of `store` and `scope`. Returns `true` when a
-    /// document was there.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`HarvestError::Database`] when the statement fails.
-    pub async fn delete_agent_doc(
-        conn: &mut AsyncPgConnection,
-        store: &str,
-        scope: &str,
-    ) -> HarvestResult<bool> {
-        let deleted = diesel::sql_query(
-            "DELETE FROM harvest_agent_store_docs WHERE store = $1 AND scope = $2",
-        )
-        .bind::<Text, _>(store)
-        .bind::<Text, _>(scope)
-        .execute(conn)
-        .await
-        .map_err(database_error)?;
-        Ok(deleted > 0)
-    }
-
     /// The newest window with `digest` that is younger than the age limit.
     ///
     /// # Errors
@@ -234,7 +214,7 @@ mod pg {
         let rows: Vec<Window> = diesel::sql_query(
             "SELECT body FROM harvest_agent_transcripts
              WHERE digest = $1
-               AND created_at > clock_timestamp() - make_interval(secs => $2::double precision)
+               AND created_at > now() - make_interval(secs => $2::double precision)
              ORDER BY created_at DESC
              LIMIT 1",
         )
@@ -249,8 +229,13 @@ mod pg {
     /// Keep one window, then delete the old windows of its run and a batch
     /// of expired windows.
     ///
-    /// A window that the session holds already keeps its first row. The
-    /// prune is a second statement. A crash between the two leaves an
+    /// The times read `now()`, which is stable in a statement, so the
+    /// planner reads the time index. `SKIP LOCKED` keeps two puts off the
+    /// same expired rows.
+    ///
+    /// A window that the session holds already moves to this run and this
+    /// time, so a prefix in use never expires. Each prune is its own
+    /// statement, because `FOR UPDATE` refuses a `UNION`. A crash between the two leaves an
     /// extra window, which the next put of the run deletes.
     ///
     /// # Errors
@@ -263,8 +248,9 @@ mod pg {
         diesel::sql_query(
             "INSERT INTO harvest_agent_transcripts
                  (digest, session, run_id, body, created_at)
-             VALUES ($1, $2, $3, $4, clock_timestamp())
-             ON CONFLICT (digest, session) DO NOTHING",
+             VALUES ($1, $2, $3, $4, now())
+             ON CONFLICT (digest, session) DO UPDATE
+                 SET run_id = EXCLUDED.run_id, created_at = EXCLUDED.created_at",
         )
         .bind::<Text, _>(put.digest)
         .bind::<Text, _>(put.session)
@@ -276,24 +262,56 @@ mod pg {
         diesel::sql_query(
             "DELETE FROM harvest_agent_transcripts
              WHERE (digest, session) IN (
-                 (SELECT digest, session FROM harvest_agent_transcripts
-                  WHERE session = $1 AND run_id = $2
-                  ORDER BY created_at DESC, digest
-                  OFFSET $3)
-                 UNION ALL
-                 (SELECT digest, session FROM harvest_agent_transcripts
-                  WHERE created_at < clock_timestamp() - make_interval(secs => $4::double precision)
-                  LIMIT $5))",
+                 SELECT digest, session FROM harvest_agent_transcripts
+                 WHERE session = $1 AND run_id = $2
+                 ORDER BY created_at DESC, digest
+                 OFFSET $3)",
         )
         .bind::<Text, _>(put.session)
         .bind::<Text, _>(put.run_id)
         .bind::<BigInt, _>(i64::from(put.keep.max(1)))
+        .execute(conn)
+        .await
+        .map_err(database_error)?;
+        diesel::sql_query(
+            "DELETE FROM harvest_agent_transcripts
+             WHERE (digest, session) IN (
+                 SELECT digest, session FROM harvest_agent_transcripts
+                 WHERE created_at < now() - make_interval(secs => $1::double precision)
+                 ORDER BY created_at
+                 LIMIT $2
+                 FOR UPDATE SKIP LOCKED)",
+        )
         .bind::<BigInt, _>(age_secs(put.max_age_secs))
         .bind::<BigInt, _>(i64::from(EXPIRED_BATCH))
         .execute(conn)
         .await
         .map_err(database_error)?;
         Ok(())
+    }
+
+    /// The number of windows that `session` holds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestError::Database`] when the statement fails.
+    pub async fn count_agent_windows(
+        conn: &mut AsyncPgConnection,
+        session: &str,
+    ) -> HarvestResult<u64> {
+        #[derive(QueryableByName)]
+        struct Count {
+            #[diesel(sql_type = BigInt)]
+            n: i64,
+        }
+        let row: Count = diesel::sql_query(
+            "SELECT COUNT(*) AS n FROM harvest_agent_transcripts WHERE session = $1",
+        )
+        .bind::<Text, _>(session)
+        .get_result(conn)
+        .await
+        .map_err(database_error)?;
+        Ok(u64::try_from(row.n).unwrap_or(0))
     }
 
     /// Delete every window of `session`. Returns the number deleted.

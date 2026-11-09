@@ -129,6 +129,21 @@ pub trait TranscriptStore: Send + Sync + std::fmt::Debug {
         window: &'a [ChatMessage],
     ) -> BoxFuture<'a, ()>;
 
+    /// The number of windows that `session` keeps. The reset of a durable
+    /// agent records it before the erase, so a retried erase keeps the
+    /// count. The default returns `None`: the store cannot count.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the store cannot read.
+    fn count<'a>(
+        &'a self,
+        session: &'a SessionId,
+    ) -> BoxFuture<'a, Result<Option<u64>, AgentError>> {
+        let _ = session;
+        Box::pin(std::future::ready(Ok(None)))
+    }
+
     /// Delete every window that `session` keeps, and count them.
     ///
     /// The default returns `None`: the store cannot erase by session, and
@@ -230,6 +245,15 @@ impl InMemoryTranscriptStore {
         );
     }
 
+    fn count_now(&self, session: &SessionId) -> u64 {
+        let key = Some(session.clone());
+        self.windows()
+            .by_digest
+            .values()
+            .filter(|held| held.owners.contains(&key))
+            .count() as u64
+    }
+
     fn erase_now(&self, session: &SessionId) -> u64 {
         let mut windows = self.windows();
         let key = Some(session.clone());
@@ -246,9 +270,8 @@ impl InMemoryTranscriptStore {
         for digest in &orphans {
             windows.remove(digest);
         }
-        windows
-            .order
-            .retain(|digest| !orphans.iter().any(|orphan| orphan == digest));
+        let orphans: BTreeSet<String> = orphans.into_iter().collect();
+        windows.order.retain(|digest| !orphans.contains(digest));
         erased
     }
 }
@@ -271,6 +294,14 @@ impl TranscriptStore for InMemoryTranscriptStore {
     ) -> BoxFuture<'a, ()> {
         self.put_now(owner, digest, window);
         Box::pin(std::future::ready(()))
+    }
+
+    fn count<'a>(
+        &'a self,
+        session: &'a SessionId,
+    ) -> BoxFuture<'a, Result<Option<u64>, AgentError>> {
+        let held = self.count_now(session);
+        Box::pin(std::future::ready(Ok(Some(held))))
     }
 
     fn erase<'a>(
@@ -381,7 +412,9 @@ mod tests {
         store
             .put(WindowOwner::new("r2", Some(&kept)), "shared", &window)
             .await;
+        assert_eq!(store.count(&gone).await.unwrap(), Some(2));
         assert_eq!(store.erase(&gone).await.unwrap(), Some(2));
+        assert_eq!(store.count(&gone).await.unwrap(), Some(0));
         assert!(store.get("own").await.is_none());
         assert_eq!(store.get("shared").await, Some(window));
         assert_eq!(store.erase(&gone).await.unwrap(), Some(0));
@@ -401,5 +434,10 @@ mod tests {
         store.erase(&session).await.unwrap();
         store.put(WindowOwner::new("r", None), "two", &window).await;
         assert_eq!(store.windows().bytes, size, "the erase freed its bytes");
+        assert_eq!(
+            store.windows().order.len(),
+            1,
+            "the erase dropped its digest"
+        );
     }
 }

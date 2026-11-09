@@ -7,11 +7,11 @@ kind = ["ddl", "read"]
 tables = ["harvest_agent_store_docs", "harvest_agent_transcripts"]
 measured = "unmeasured"
 
-["delete_doc_in"]
+["count_windows_in"]
 driver = "per_request"
 backend = ["sqlite"]
-kind = ["write"]
-tables = ["harvest_agent_store_docs"]
+kind = ["read"]
+tables = ["harvest_agent_transcripts"]
 measured = "unmeasured"
 
 ["erase_windows_in"]

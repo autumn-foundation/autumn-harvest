@@ -36,6 +36,9 @@ The chosen option is in bold.
 | An append commits, the ack is lost, and the retry appends again. | The key is in the document. One statement writes both. |
 | Two writers read version 3 and both write. | A write needs the version that it read. The loser reads again. |
 | A pass that runs across an erase writes its facts back. | A clear keeps the generation in a tombstone document. |
+| A clear deletes a row, a new row starts at version 1, and a stale writer matches it. | A clear keeps a tombstone, so no version comes back. |
+| A delete commits, the result is lost, and the retry counts 0. | A recorded count step runs before each delete. |
+| A row from another build does not decode, and the erase fails. | A clear writes its tombstone without a full decode. |
 | An erase leaves transcript text in the store. | Each window keeps its session. The reset deletes the rows of the session and counts them. |
 | An old run replays a reset with a new activity. | The new steps run behind the patch `agent_store_counts`. |
 | A transcript read error fails the turn. | A read error is a miss. The turn goes in the full form. |
@@ -67,11 +70,13 @@ The chosen option is in bold.
   tables: `harvest_agent_store_docs` and `harvest_agent_transcripts`.
 - `autumn_harvest_agent::stores` holds `SqliteEpisodeStore`,
   `SqliteMemoryStore`, `SqliteTranscriptStore` and their `Postgres` forms.
-- `TranscriptStore::put` takes a `WindowOwner`. `TranscriptStore::erase`
-  deletes the windows of a session. The default reports no count.
+- `TranscriptStore::put` takes a `WindowOwner`. `TranscriptStore::count`
+  and `TranscriptStore::erase` count and delete the windows of a session.
+  The defaults report no count.
 - Under the patch `agent_store_counts`, `Control::ResetMemory` counts the
-  memory entries that it removes and erases the transcript windows of the
-  agent. `harvest agents erase` reports `memory_entries_erased` and
+  memory entries, clears the memory, counts the transcript windows of the
+  agent and erases them. Each count is a recorded step before its delete.
+  `harvest agents erase` reports `memory_entries_erased` and
   `transcripts_erased`.
 
 ## 6. Acceptance criteria

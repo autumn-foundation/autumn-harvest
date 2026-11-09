@@ -822,19 +822,21 @@ impl AgentHarness {
             Some(prefix) => {
                 // The digest check makes a changed window a miss, so a
                 // shared store cannot put words into a turn.
-                let held = self
-                    .transcripts
-                    .get(&prefix.digest)
-                    .await
-                    .filter(|held| u32::try_from(held.len()).is_ok_and(|len| len == prefix.len))
-                    .filter(|held| chain(None, held) == prefix.digest)
-                    .ok_or_else(|| {
-                        ActivityFailure::non_retryable(
-                            PREFIX_MISSING,
-                            "the transcript store does not hold the prefix of this turn",
-                        )
-                        .into_error_payload()
-                    })?;
+                // A store that hangs is a miss, as a store error is.
+                let held =
+                    tokio::time::timeout(self.hook_timeout, self.transcripts.get(&prefix.digest))
+                        .await
+                        .ok()
+                        .flatten()
+                        .filter(|held| u32::try_from(held.len()).is_ok_and(|len| len == prefix.len))
+                        .filter(|held| chain(None, held) == prefix.digest)
+                        .ok_or_else(|| {
+                            ActivityFailure::non_retryable(
+                                PREFIX_MISSING,
+                                "the transcript store does not hold the prefix of this turn",
+                            )
+                            .into_error_payload()
+                        })?;
                 let mut window = held;
                 window.extend(added.iter().cloned());
                 (Some(prefix.digest.as_str()), window)
@@ -848,9 +850,28 @@ impl AgentHarness {
                 |prefix| chain(Some(prefix), &added),
             );
             let owner = WindowOwner::new(&request.run_id, request.session_id.as_ref());
-            self.transcripts.put(owner, &digest, &window).await;
+            if tokio::time::timeout(
+                self.hook_timeout,
+                self.transcripts.put(owner, &digest, &window),
+            )
+            .await
+            .is_err()
+            {
+                tracing::warn!("the transcript store did not keep a window in time");
+            }
         }
         Ok(window)
+    }
+
+    /// The windows that `session` keeps in the transcript store. `None`
+    /// means that the store cannot count.
+    ///
+    /// # Errors
+    ///
+    /// Returns the store error, or a timeout.
+    pub async fn transcript_count(&self, session: SessionId) -> Result<Option<u64>, String> {
+        self.hooked("the transcript store", self.transcripts.count(&session))
+            .await
     }
 
     /// Delete every window that `session` keeps in the transcript store,
@@ -1804,26 +1825,23 @@ impl AgentHarness {
             .map_err(|err| model_failure(&err))
     }
 
-    /// Clear the memory of `scope`, and count the entries that it held.
-    ///
-    /// The count reads the scope before the clear. A paused agent writes
-    /// nothing between the two calls.
+    /// The entries that the memory of `scope` holds. The reset of a durable
+    /// agent records the count before the clear, so a retried clear keeps
+    /// it.
     ///
     /// # Errors
     ///
     /// The errors of [`memory_reset`](Self::memory_reset), and a failed
     /// read.
-    pub async fn memory_erase(&self, scope: MemoryScope) -> Result<u64, String> {
+    pub async fn memory_count(&self, scope: MemoryScope) -> Result<u64, String> {
         let store = self.memory_for_reset()?;
-        let entries = tokio::time::timeout(self.hook_timeout, store.load(&scope))
+        Ok(tokio::time::timeout(self.hook_timeout, store.load(&scope))
             .await
             .map_err(|_| self.hook_timed_out("MemoryTimeout", "the memory store"))?
             .map_err(|err| model_failure(&err))?
             .iter()
             .map(|block| block.entries.len() as u64)
-            .sum();
-        self.memory_reset(scope).await?;
-        Ok(entries)
+            .sum())
     }
 
     /// The memory store of a reset. A missing store is a non-retryable

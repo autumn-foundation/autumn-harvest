@@ -78,11 +78,13 @@ impl SqliteAgentStoreDb {
 
     fn prepare(conn: Connection) -> SqliteResult<Self> {
         // As in `SqliteRuntime::open`: wait for another writer, and keep a
-        // commit across a crash.
+        // commit across a crash. The rows hold text in clear, so a delete
+        // or a rewrite also zeroes the freed pages.
         conn.execute_batch(
             "PRAGMA busy_timeout = 5000;\n\
              PRAGMA journal_mode = WAL;\n\
-             PRAGMA synchronous = FULL;",
+             PRAGMA synchronous = FULL;\n\
+             PRAGMA secure_delete = ON;",
         )?;
         conn.execute_batch(AGENT_STORE_SCHEMA)?;
         Ok(Self {
@@ -126,16 +128,6 @@ impl SqliteAgentStoreDb {
         self.with_conn(|conn| swap_doc_in(conn, store, scope, expected, body, now_ms))
     }
 
-    /// Delete the document of `store` and `scope`. Returns `true` when a
-    /// document was there.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SqliteError::Sqlite`] when the statement fails.
-    pub fn delete_doc(&self, store: &str, scope: &str) -> SqliteResult<bool> {
-        self.with_conn(|conn| delete_doc_in(conn, store, scope))
-    }
-
     /// The newest window with `digest` that is younger than the age limit
     /// at `now_ms`.
     ///
@@ -152,13 +144,24 @@ impl SqliteAgentStoreDb {
     }
 
     /// Keep one window, then delete the old windows of its run and a batch
-    /// of expired windows. One `IMMEDIATE` transaction does both.
+    /// of expired windows. One `IMMEDIATE` transaction does both. The
+    /// delete matches by `rowid`, so it reads no table scan. A window
+    /// that the session holds already moves to this run and this time.
     ///
     /// # Errors
     ///
     /// Returns [`SqliteError::Sqlite`] when a statement fails.
     pub fn put_window(&self, put: &WindowPut<'_>, now_ms: i64) -> SqliteResult<()> {
         self.with_conn(|conn| put_window_in(conn, put, now_ms))
+    }
+
+    /// The number of windows that `session` holds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqliteError::Sqlite`] when the query fails.
+    pub fn count_windows(&self, session: &str) -> SqliteResult<u64> {
+        self.with_conn(|conn| count_windows_in(conn, session))
     }
 
     /// Delete every window of `session`. Returns the number deleted.
@@ -226,15 +229,6 @@ fn swap_doc_in(
     Ok(written == 1)
 }
 
-/// The body of [`SqliteAgentStoreDb::delete_doc`].
-fn delete_doc_in(conn: &Connection, store: &str, scope: &str) -> SqliteResult<bool> {
-    let deleted = conn.execute(
-        "DELETE FROM harvest_agent_store_docs WHERE store = ?1 AND scope = ?2",
-        params![store, scope],
-    )?;
-    Ok(deleted > 0)
-}
-
 /// The earliest creation time that is still young at `now_ms`.
 fn cutoff_ms(max_age_secs: u64, now_ms: i64) -> i64 {
     let age_ms = i64::try_from(max_age_secs.min(MAX_AGE_SECS))
@@ -269,21 +263,23 @@ fn put_window_in(conn: &mut Connection, put: &WindowPut<'_>, now_ms: i64) -> Sql
         "INSERT INTO harvest_agent_transcripts
              (digest, session, run_id, body, created_at_ms)
          VALUES (?1, ?2, ?3, ?4, ?5)
-         ON CONFLICT (digest, session) DO NOTHING",
+         ON CONFLICT (digest, session) DO UPDATE
+             SET run_id = excluded.run_id, created_at_ms = excluded.created_at_ms",
         params![put.digest, put.session, put.run_id, put.body, now_ms],
     )?;
     tx.execute(
         "DELETE FROM harvest_agent_transcripts
-         WHERE (digest, session) IN (
-             SELECT digest, session FROM (
-                 SELECT digest, session FROM harvest_agent_transcripts
+         WHERE rowid IN (
+             SELECT rowid FROM (
+                 SELECT rowid FROM harvest_agent_transcripts
                  WHERE session = ?1 AND run_id = ?2
-                 ORDER BY created_at_ms DESC, digest
+                 ORDER BY created_at_ms DESC, rowid DESC
                  LIMIT -1 OFFSET ?3)
              UNION ALL
-             SELECT digest, session FROM (
-                 SELECT digest, session FROM harvest_agent_transcripts
+             SELECT rowid FROM (
+                 SELECT rowid FROM harvest_agent_transcripts
                  WHERE created_at_ms < ?4
+                 ORDER BY created_at_ms
                  LIMIT ?5))",
         params![
             put.session,
@@ -295,6 +291,16 @@ fn put_window_in(conn: &mut Connection, put: &WindowPut<'_>, now_ms: i64) -> Sql
     )?;
     tx.commit()?;
     Ok(())
+}
+
+/// The body of [`SqliteAgentStoreDb::count_windows`].
+fn count_windows_in(conn: &Connection, session: &str) -> SqliteResult<u64> {
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM harvest_agent_transcripts WHERE session = ?1",
+        params![session],
+        |row| row.get(0),
+    )?;
+    Ok(u64::try_from(n).unwrap_or(0))
 }
 
 /// The body of [`SqliteAgentStoreDb::erase_windows`].

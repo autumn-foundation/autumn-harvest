@@ -632,14 +632,24 @@ result for the next turn.
 - A store holds transcript text outside history and outside the payload
   codecs. Each window keeps the run and the session of its turn
   (`WindowOwner`). A durable agent sets the session of each turn to its
-  agent id. Its memory reset calls `TranscriptStore::erase`, so `harvest
-  agents erase` deletes each window of the agent. A store that does not
-  implement `erase` reports no count, and the app must clear it itself.
+  agent id. Its memory reset counts the windows with
+  `TranscriptStore::count`, then calls `TranscriptStore::erase`. So
+  `harvest agents erase` deletes each window of the agent. A store that
+  does not implement both reports no count, and the app must clear it
+  itself.
+- `InMemoryTranscriptStore` erases in its own process only. With more
+  than one worker, the other workers keep their windows until eviction or
+  a restart. Use a durable store when an erase must reach every window.
 - `stores::SqliteTranscriptStore` and `stores::PostgresTranscriptStore`
   are durable stores that every worker shares. Each keeps the newest 4
-  windows of a run (`keep_per_run`) and no window older than 7 days
-  (`max_age`). A read or write error is a miss, so the turn goes in the
+  windows of a run (`keep_per_run`). A read misses a window older than 7
+  days (`max_age`). A later put deletes such windows, at most 64 at a
+  time, so a store with no puts keeps them. A read or write error is a
+  miss, and so is a call past the hook timeout. The turn then goes in the
   full form.
+- A window that a delegated peer keeps is under the session of the peer.
+  An erase of the sender does not reach it, as with the history of the
+  peer.
 - `TranscriptStore` is async. A store that implemented the earlier `get`
   and `put` returns a boxed future from each, and `put` takes a
   `WindowOwner`.
@@ -848,20 +858,27 @@ The durable stores of the `stores` module follow these rules. Each one
 keeps a scope as one document with its applied keys, so one statement
 writes an edit and its key. A write names the version that it read. A
 write that loses a race reads again, so two workers on one scope lose no
-edit. The memory store keeps the newest 4 096 keys of a scope.
+edit. A clear keeps the document with no text, so its version still
+grows. A writer that read the scope before the clear then loses its
+write. The memory store keeps the newest 4 096 keys of a scope, and cuts
+a stored edit error to 1 KB.
 
 ```rust
 use std::path::Path;
 use std::sync::Arc;
 
-use autumn_harvest_agent::stores::{SqliteEpisodeStore, SqliteMemoryStore, SqliteTranscriptStore};
+use autumn_harvest_agent::stores::{
+    SqliteAgentDb, SqliteEpisodeStore, SqliteMemoryStore, SqliteTranscriptStore,
+};
 use autumn_harvest_agent::{AgentError, AgentHarness};
 
-fn durable(harness: AgentHarness, db: &Path) -> Result<AgentHarness, AgentError> {
+fn durable(harness: AgentHarness, path: &Path) -> Result<AgentHarness, AgentError> {
+    // The three stores share one connection.
+    let db = SqliteAgentDb::open(path)?;
     Ok(harness
-        .memory(Arc::new(SqliteMemoryStore::open(db)?))
-        .episodes(Arc::new(SqliteEpisodeStore::open(db)?))
-        .transcript_store(Arc::new(SqliteTranscriptStore::open(db)?)))
+        .memory(Arc::new(SqliteMemoryStore::on(db.clone())))
+        .episodes(Arc::new(SqliteEpisodeStore::on(db.clone())))
+        .transcript_store(Arc::new(SqliteTranscriptStore::on(db))))
 }
 ```
 
@@ -1768,16 +1785,31 @@ must clear those stores itself.
    `entity_states_scrubbed` and the rest. `episodes_erased`,
    `facts_erased`, `lessons_removed`, `memory_entries_erased` and
    `transcripts_erased` come from the final state. A `null` count means
-   that the store was not reached: the agent has no memory scope, or the
-   transcript store cannot erase by session. It lists each skipped child
+   that the store was not reached or did not count. The agent has no
+   memory scope, the transcript store cannot count, a reset failed, or
+   the reset ran before the counts existed. It lists each skipped child
    and each failure.
 
+The reset records each count in its own step before it deletes. So a
+retried delete after a crash keeps the first count.
+
 With the durable stores of the `stores` module, the erase removes the
-rows of the agent from each store. The memory row and each transcript row
-of the agent go. The episode scope keeps one tombstone row with the
-generation and the counts of the clear. It holds no episode text. The
-generation stops a pass that runs across the erase from writing its facts
-back.
+data of the agent from each store:
+
+- Each transcript row of the session of the agent goes.
+- The memory row stays as an empty tombstone, with no entry and no key.
+- The episode row stays as a tombstone. It holds the generation, the key
+  of the clear and its result: the episode count and the fact hash of
+  each derived fact (16 hex digits of SHA-256). It holds no episode text.
+  The generation stops a pass that runs across the erase from writing its
+  facts back.
+
+A tombstone keeps its version, so a writer that read the scope before the
+erase cannot write the old text back. A row that this build cannot decode
+still clears. On SQLite the stores set `secure_delete`, so a delete and a
+rewrite zero the freed pages. The WAL file keeps old frames until a
+checkpoint. On Postgres, a dead row stays until `VACUUM`, and the WAL and
+the backups keep their copies.
 
 The spend of an erased run leaves the LLM budget and mesh budget sums.
 
@@ -1916,8 +1948,9 @@ fn support(
   `AgentState::transcripts_erased` the windows. `harvest agents erase`
   reports them as `episodes_erased`, `facts_erased`,
   `memory_entries_erased` and `transcripts_erased`. A reset that history
-  recorded before these counts replays with no count. It also erases each pass that a schedule started, by
-  the search attribute `agent_consolidation_of`. A pass that runs across
+  recorded before these counts replays with no count. `harvest agents
+  erase` also erases each pass that a schedule started, by the search
+  attribute `agent_consolidation_of`. A pass that runs across
   the reset writes no fact after it and ends as `reset`. A pass that still
   runs is a failure in the report, so erase again after it ends.
 

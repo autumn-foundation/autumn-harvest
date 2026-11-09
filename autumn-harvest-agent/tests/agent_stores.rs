@@ -15,6 +15,7 @@ mod common;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use agent_stores_suite::Stores;
 use autumn_harvest_agent::episode::{
@@ -183,6 +184,15 @@ async fn an_erase_removes_the_rows_of_the_agent_and_counts_them() {
         .map(|block| block.entries.len())
         .sum();
     assert_eq!(facts, 3, "one fact per episode");
+    // A plain note, so the memory count differs from the fact count.
+    let note = autumn_harvest_agent::memory::MemoryOp::Add {
+        block: "user".into(),
+        text: "prefers mornings".into(),
+    };
+    held.memory
+        .apply(&memory, note, &EditKey::new("note"))
+        .await
+        .unwrap();
     let windows = count(&path, "harvest_agent_transcripts", "session", "desk/d1");
     assert!(windows > 0, "each op kept a window under its session");
 
@@ -200,14 +210,14 @@ async fn an_erase_removes_the_rows_of_the_agent_and_counts_them() {
     let reset = state.episode_reset.expect("the episode count");
     assert_eq!(reset.episodes, 3);
     assert_eq!(reset.facts, 3);
-    assert_eq!(state.memory_entries_erased, Some(3));
+    assert_eq!(state.memory_entries_erased, Some(4), "3 facts and 1 note");
     assert_eq!(
         state.transcripts_erased,
         Some(u64::try_from(windows).unwrap())
     );
     // `harvest agents erase` reads these keys from the final state.
     let wire = serde_json::to_value(&state).unwrap();
-    assert_eq!(wire["memory_entries_erased"], 3);
+    assert_eq!(wire["memory_entries_erased"], 4);
     assert_eq!(wire["transcripts_erased"], windows);
     assert_eq!(wire["episode_reset"]["episodes"], 3);
 
@@ -216,24 +226,26 @@ async fn an_erase_removes_the_rows_of_the_agent_and_counts_them() {
         0,
         "no window of the agent"
     );
-    assert_eq!(
-        count(&path, "harvest_agent_store_docs", "scope", "agent:desk/d1"),
-        0,
-        "no memory row of the agent"
-    );
-    let conn = rusqlite::Connection::open(&path).unwrap();
-    let body: Vec<u8> = conn
-        .query_row(
-            "SELECT body FROM harvest_agent_store_docs WHERE scope = ?1",
-            ["agent:desk/d1:episodes"],
-            |row| row.get(0),
-        )
-        .unwrap();
-    let body = String::from_utf8(body).unwrap();
-    assert!(
-        !body.contains("noted"),
-        "the tombstone holds no episode text: {body}"
-    );
+    // A clear keeps each document as a tombstone, so its version grows.
+    let body = |scope: &str| -> String {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let body: Vec<u8> = conn
+            .query_row(
+                "SELECT body FROM harvest_agent_store_docs WHERE scope = ?1",
+                [scope],
+                |row| row.get(0),
+            )
+            .unwrap();
+        String::from_utf8(body).unwrap()
+    };
+    assert_eq!(body("agent:desk/d1"), "{}", "the memory tombstone is empty");
+    let episodes_body = body("agent:desk/d1:episodes");
+    for text in ["noted", "thing"] {
+        assert!(
+            !episodes_body.contains(text),
+            "the tombstone holds no episode or fact text: {episodes_body}"
+        );
+    }
     let log = held.episodes.load(&episodes).await.unwrap();
     assert!(log.is_empty());
     assert_eq!(log.generation(), 1, "the tombstone keeps the generation");
@@ -245,14 +257,29 @@ async fn an_erase_removes_the_rows_of_the_agent_and_counts_them() {
 
 const DB_ENV: &str = "AGENT_STORES_CRASH_DB";
 
-/// A `SQLite` episode store that aborts the process after its first append
-/// commits, before the activity can report.
+/// A `SQLite` episode store that counts its appends. With `abort` set, it
+/// aborts the process after its first append commits, before the activity
+/// can report.
 #[derive(Debug)]
-struct AbortAfterAppend(SqliteEpisodeStore);
+struct Watched {
+    inner: SqliteEpisodeStore,
+    abort: bool,
+    appends: AtomicU32,
+}
 
-impl EpisodeStore for AbortAfterAppend {
+impl Watched {
+    fn new(path: &Path, abort: bool) -> Arc<Self> {
+        Arc::new(Self {
+            inner: SqliteEpisodeStore::open(path).unwrap(),
+            abort,
+            appends: AtomicU32::new(0),
+        })
+    }
+}
+
+impl EpisodeStore for Watched {
     fn load<'a>(&'a self, scope: &'a MemoryScope) -> BoxFuture<'a, Result<EpisodeLog, AgentError>> {
-        self.0.load(scope)
+        self.inner.load(scope)
     }
 
     fn append<'a>(
@@ -263,9 +290,13 @@ impl EpisodeStore for AbortAfterAppend {
         max_episodes: u32,
     ) -> BoxFuture<'a, Result<Appended, AgentError>> {
         Box::pin(async move {
-            let appended = self.0.append(scope, key, episode, max_episodes).await;
-            assert!(appended.is_ok(), "{appended:?}");
-            std::process::abort();
+            let appended = self.inner.append(scope, key, episode, max_episodes).await;
+            self.appends.fetch_add(1, Ordering::SeqCst);
+            if self.abort {
+                assert!(appended.is_ok(), "{appended:?}");
+                std::process::abort();
+            }
+            appended
         })
     }
 
@@ -274,7 +305,7 @@ impl EpisodeStore for AbortAfterAppend {
         scope: &'a MemoryScope,
         mark: PassMark,
     ) -> BoxFuture<'a, Result<bool, AgentError>> {
-        self.0.mark(scope, mark)
+        self.inner.mark(scope, mark)
     }
 
     fn clear<'a>(
@@ -282,7 +313,7 @@ impl EpisodeStore for AbortAfterAppend {
         scope: &'a MemoryScope,
         key: &'a EditKey,
     ) -> BoxFuture<'a, Result<Cleared, AgentError>> {
-        self.0.clear(scope, key)
+        self.inner.clear(scope, key)
     }
 }
 
@@ -293,10 +324,9 @@ async fn child_aborts_after_the_append_commits() {
         return;
     };
     let path = PathBuf::from(db);
-    let episodes = AbortAfterAppend(SqliteEpisodeStore::open(&path).unwrap());
     let harness = AgentHarness::new(model())
         .memory(Arc::new(SqliteMemoryStore::open(&path).unwrap()))
-        .episodes(Arc::new(episodes))
+        .episodes(Watched::new(&path, true))
         .agent(
             AgentProfile::new("desk")
                 .memory(AgentMemory::Store)
@@ -332,9 +362,10 @@ async fn a_crash_after_the_sqlite_append_does_not_duplicate_it() {
     // A new process replays the op. The append activity runs again with
     // the same key.
     let model = model();
+    let episodes = Watched::new(&path, false);
     let harness = AgentHarness::new(model.clone())
         .memory(Arc::new(SqliteMemoryStore::open(&path).unwrap()))
-        .episodes(Arc::new(SqliteEpisodeStore::open(&path).unwrap()))
+        .episodes(episodes.clone())
         .agent(
             AgentProfile::new("desk")
                 .memory(AgentMemory::Store)
@@ -356,5 +387,10 @@ async fn a_crash_after_the_sqlite_append_does_not_duplicate_it() {
         .load(&scope)
         .await
         .unwrap();
+    assert_eq!(
+        episodes.appends.load(Ordering::SeqCst),
+        1,
+        "the new process ran the append again"
+    );
     assert_eq!(log.len(), 1, "one op, one episode");
 }

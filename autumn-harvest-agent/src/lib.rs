@@ -152,11 +152,12 @@ pub use agent::{
     AGENT_WORKFLOW_NAME, Agent, AgentHeartbeat, AgentId, AgentIdError, AgentMemory, AgentOp,
     AgentProfile, AgentState, AgentStatus, Control, HeartbeatSetting, INTERRUPT_SIGNAL, Interrupt,
     PROFILE_VERSION_ATTR, PeerEnvelope, PeerReply, STEER_SIGNAL, Steer, Urgency, UserMessage,
-    agent, agent_info, agent_memory_erase, agent_memory_erase_info, agent_memory_reset,
+    agent, agent_info, agent_memory_count, agent_memory_count_info, agent_memory_reset,
     agent_memory_reset_info, agent_profile, agent_profile_info, agent_profile_overlay,
-    agent_profile_overlay_info, agent_transcript_erase, agent_transcript_erase_info,
-    agent_workspace_floor, agent_workspace_floor_info, agent_workspace_reset,
-    agent_workspace_reset_info, agent_workspace_retain, agent_workspace_retain_info,
+    agent_profile_overlay_info, agent_transcript_count, agent_transcript_count_info,
+    agent_transcript_erase, agent_transcript_erase_info, agent_workspace_floor,
+    agent_workspace_floor_info, agent_workspace_reset, agent_workspace_reset_info,
+    agent_workspace_retain, agent_workspace_retain_info,
 };
 pub use answer_check::{
     AnswerCheck, CheckAdmission, CheckRequest, agent_answer_check, agent_answer_check_info,

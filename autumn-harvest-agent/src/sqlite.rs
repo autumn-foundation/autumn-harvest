@@ -28,9 +28,9 @@ use serde_json::Value;
 
 use crate::agent::{
     AGENT_WORKFLOW_NAME, Agent, AgentId, AgentOp, AgentState, Control, INTERRUPT_SIGNAL, Interrupt,
-    agent_info, agent_memory_erase_info, agent_memory_reset_info, agent_profile_info,
-    agent_profile_overlay_info, agent_transcript_erase_info, agent_workspace_floor_info,
-    agent_workspace_reset_info, agent_workspace_retain_info,
+    agent_info, agent_memory_count_info, agent_memory_reset_info, agent_profile_info,
+    agent_profile_overlay_info, agent_transcript_count_info, agent_transcript_erase_info,
+    agent_workspace_floor_info, agent_workspace_reset_info, agent_workspace_retain_info,
 };
 use crate::answer_check::{CheckRequest, admission, agent_answer_check_info};
 use crate::approval::Approval;
@@ -95,8 +95,12 @@ pub fn register(rt: &mut SqliteRuntime, harness: Arc<AgentHarness>) {
         call(input, |scope| h.memory_reset(scope))
     });
     let h = Arc::clone(&harness);
-    rt.register_activity_with_body(&agent_memory_erase_info(), move |input| {
-        call(input, |scope| h.memory_erase(scope))
+    rt.register_activity_with_body(&agent_memory_count_info(), move |input| {
+        call(input, |scope| h.memory_count(scope))
+    });
+    let h = Arc::clone(&harness);
+    rt.register_activity_with_body(&agent_transcript_count_info(), move |input| {
+        call(input, |session| h.transcript_count(session))
     });
     let h = Arc::clone(&harness);
     rt.register_activity_with_body(&agent_transcript_erase_info(), move |input| {

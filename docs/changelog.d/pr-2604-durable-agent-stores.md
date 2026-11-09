@@ -12,20 +12,29 @@ transcript deltas. The design is in `docs/design/DESIGN-2604.md`.
 - Each episode and memory scope is one document with its applied edit
   keys. One statement writes an edit and its key, so a retried append
   after a crash lands once. A write names the version that it read, so
-  two workers on one scope lose no edit. An episode clear keeps a
-  tombstone with the generation and no episode text.
+  two workers on one scope lose no edit. A clear keeps the row as a
+  tombstone, so a version never comes back and a stale writer loses. An
+  episode tombstone holds the generation, the clear key, the episode count
+  and the fact hashes. A memory tombstone is empty. A row that does not
+  decode still clears.
 - A transcript window keeps its run and its session. A durable store
-  keeps the newest 4 windows of a run and no window older than 7 days.
+  keeps the newest 4 windows of a run. A read misses a window older than
+  7 days, and a later put deletes it. The SQLite stores set
+  `secure_delete`.
 - **Breaking.** `TranscriptStore` is async. `get` and `put` return a boxed
-  future, and `put` takes a `WindowOwner`. A new `erase(session)` deletes
-  the windows of a session. Its default reports no count.
+  future, and `put` takes a `WindowOwner`. New `count(session)` and
+  `erase(session)` count and delete the windows of a session. Their
+  defaults report no count. The harness bounds `get` and `put` by the
+  hook timeout.
 - `ErrorKind` now derives `Serialize` and `Deserialize`, in `snake_case`.
 - Under the patch `agent_store_counts`, `Control::ResetMemory` counts the
   memory entries that it removes and erases the transcript windows of the
-  agent. `AgentState` gains `memory_entries_erased` and
+  agent. Each count is its own recorded step before the delete, so a
+  retried delete keeps it. `AgentState` gains `memory_entries_erased` and
   `transcripts_erased`. `harvest agents erase` reports both. New
-  activities: `agent_memory_erase` and `agent_transcript_erase`. A reset
-  that history recorded before the patch replays with no count.
+  activities: `agent_memory_count`, `agent_transcript_count` and
+  `agent_transcript_erase`. A reset that history recorded before the
+  patch replays with no count. Upgrade every worker before an erase.
 - **Migration.** `20261109005653_harvest_agent_stores` adds the tables
   `harvest_agent_store_docs` and `harvest_agent_transcripts`. They are new
   and not hot. No existing table changes. No new `WorkflowEvent` variant.
@@ -38,3 +47,7 @@ transcript deltas. The design is in `docs/design/DESIGN-2604.md`.
     `a_retried_postgres_append_after_a_lost_ack_lands_once` on a real
     worker, and the erase test.
   - `the_report_counts_the_erased_memory_entries_and_windows` in the CLI.
+  - Unit tests in `stores.rs`: a lost race keeps both edits, a store gives
+    up after `MAX_SWAP_ATTEMPTS`, a stale write after a clear loses, a row
+    that does not decode still clears, expiry, `keep_per_run` and the
+    template.

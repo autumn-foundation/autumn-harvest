@@ -1,11 +1,12 @@
 //! The version counter of the durable agent stores.
 //!
 //! `next_doc_version` gives the version of the next write of a document.
-//! A writer names the version that it read, and the store writes only
-//! when the stored version is still that one. The copy below proves that
-//! the first version is 1, that each write moves the version up by one,
-//! and that a full counter refuses the write. So a version never comes
-//! back, and a write that read an old version never matches.
+//! A writer names the version that it read. The store writes only when
+//! the stored version is still that one. The copy below proves three
+//! facts. The first version is 1. Each write moves the version up by one.
+//! A full counter refuses the write. So a version never comes back, and a
+//! write that read an old version never matches. A clear keeps the row, so
+//! no delete resets the counter either.
 
 use vstd::prelude::*;
 
