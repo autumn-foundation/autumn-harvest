@@ -94,32 +94,28 @@ impl ChunkAssembler {
             .as_u64()
             .ok_or_else(|| AgentError::new(ErrorKind::Decode, "a tool call chunk has no index"))?;
         let id = chunk["id"].as_str().filter(|id| !id.is_empty());
-        // Ollama sends each call whole, each at index 0. A new id at an index
-        // that holds another call starts a new call.
-        let fresh = self.calls.last().is_none_or(|(at, call)| {
-            *at != index || id.is_some_and(|id| !call.id.is_empty() && call.id != id)
+        // The newest call at this index takes the piece. Ollama sends each
+        // call whole, each at index 0, so a new id there starts a new call.
+        // A call stays where it began, because the calls run in that order.
+        let newest = self.calls.iter().rposition(|(at, _)| *at == index);
+        let held = newest.filter(|&pos| {
+            let known = &self.calls[pos].1.id;
+            id.is_none_or(|id| known.is_empty() || known == id)
         });
-        if fresh {
-            let held = u64::try_from(self.calls.len()).unwrap_or(u64::MAX);
-            if held >= MAX_CALLS {
+        let pos = if let Some(pos) = held {
+            pos
+        } else {
+            let count = u64::try_from(self.calls.len()).unwrap_or(u64::MAX);
+            if count >= MAX_CALLS {
                 return Err(AgentError::new(
                     ErrorKind::Decode,
                     format!("a stream holds more than {MAX_CALLS} tool calls"),
                 ));
             }
-            if let Some(pos) = self.calls.iter().position(|(at, _)| *at == index)
-                && id.is_none()
-            {
-                // A later piece of an earlier call at this index.
-                let entry = self.calls.remove(pos);
-                self.calls.push(entry);
-            } else {
-                self.calls.push((index, Call::default()));
-            }
-        }
-        let Some((_, call)) = self.calls.last_mut() else {
-            return Ok(());
+            self.calls.push((index, Call::default()));
+            self.calls.len() - 1
         };
+        let call = &mut self.calls[pos].1;
         if let Some(id) = id {
             id.clone_into(&mut call.id);
         }
@@ -306,6 +302,41 @@ mod tests {
         assert_eq!(response.content.len(), 2, "{response:?}");
         assert!(matches!(&response.content[1],
             ContentPart::ToolCall { id, name, .. } if id == "call_b" && name == "close"));
+    }
+
+    #[test]
+    fn interleaved_calls_keep_the_order_in_which_they_began() {
+        let piece = |index: u64, id: Option<&str>, name: Option<&str>, args: &str| {
+            let mut call = json!({"index": index, "function": {"arguments": args}});
+            if let Some(id) = id {
+                call["id"] = json!(id);
+            }
+            if let Some(name) = name {
+                call["function"]["name"] = json!(name);
+            }
+            chunk(&json!({"tool_calls": [call]}), None)
+        };
+        let events = [
+            piece(0, Some("call_a"), Some("first"), "{\"n\":"),
+            piece(1, Some("call_b"), Some("second"), "{\"n\":2}"),
+            piece(0, None, None, "1}"),
+            chunk(&json!({}), Some("tool_calls")),
+            "[DONE]".to_owned(),
+        ];
+        let refs: Vec<&str> = events.iter().map(String::as_str).collect();
+        let (body, _) = streamed(&refs).unwrap();
+        let names: Vec<String> = parse_response(&body)
+            .unwrap()
+            .content
+            .into_iter()
+            .filter_map(|part| match part {
+                ContentPart::ToolCall {
+                    name, arguments, ..
+                } => Some(format!("{name}:{}", arguments["n"])),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(names, ["first:1", "second:2"]);
     }
 
     #[test]
