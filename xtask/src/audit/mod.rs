@@ -6,6 +6,7 @@ use smop::prelude::*;
 
 pub mod action_sha_pin;
 pub mod audit_catalog_coverage;
+pub mod byte_size_parse_sync;
 pub mod cli_flag_coverage;
 pub mod comment_hygiene;
 pub mod config_cli_drift;
@@ -38,6 +39,9 @@ pub enum Command {
     ActionShaPin(action_sha_pin::Args),
     /// Port of `docs/audits/audit-catalog-coverage.py`.
     AuditCatalogCoverage(audit_catalog_coverage::Args),
+    /// Keeps the `parse_byte_size` / `parse_byte_size_macro` clone class
+    /// linked (issue #2625).
+    ByteSizeParseSync(byte_size_parse_sync::Args),
     /// Port of `docs/audits/cli-flag-coverage.py`.
     CliFlagCoverage(cli_flag_coverage::Args),
     /// Port of `docs/audits/comment-hygiene.py`.
@@ -93,6 +97,7 @@ pub fn run(command: Command) -> Result<ExitCode> {
     match command {
         Command::ActionShaPin(args) => action_sha_pin::run(args),
         Command::AuditCatalogCoverage(args) => audit_catalog_coverage::run(args),
+        Command::ByteSizeParseSync(args) => byte_size_parse_sync::run(args),
         Command::CliFlagCoverage(args) => cli_flag_coverage::run(args),
         Command::CommentHygiene(args) => comment_hygiene::run(args),
         Command::ConfigCliDrift(args) => config_cli_drift::run(args),

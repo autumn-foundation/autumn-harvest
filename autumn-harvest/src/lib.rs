@@ -992,6 +992,10 @@ pub use futures;
 /// assert_eq!(autumn_harvest::parse_byte_size("4MB"), Some(4_000_000));
 /// assert_eq!(autumn_harvest::parse_byte_size("invalid"), None);
 /// ```
+///
+/// This body is a sibling of `autumn_harvest_macros::parse_byte_size_macro`
+/// (issue #2625). Change both copies the same way. `cargo xtask audit
+/// byte-size-parse-sync` checks that in CI.
 #[must_use]
 #[allow(clippy::option_if_let_else)]
 pub fn parse_byte_size(s: &str) -> Option<u64> {
@@ -999,6 +1003,7 @@ pub fn parse_byte_size(s: &str) -> Option<u64> {
     if s.is_empty() {
         return None;
     }
+    // Try suffixes in longest-first order to avoid prefix collisions.
     let (digits, multiplier): (&str, u64) = if let Some(n) = s.strip_suffix("GiB") {
         (n.trim(), 1024 * 1024 * 1024)
     } else if let Some(n) = s.strip_suffix("GB") {
