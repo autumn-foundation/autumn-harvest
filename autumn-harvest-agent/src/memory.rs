@@ -675,7 +675,7 @@ impl InMemoryMemoryStore {
 }
 
 /// The block that `op` names, unchanged.
-fn current(blocks: &[MemoryBlock], op: &MemoryOp) -> Result<MemoryBlock, AgentError> {
+pub(crate) fn current(blocks: &[MemoryBlock], op: &MemoryOp) -> Result<MemoryBlock, AgentError> {
     blocks
         .iter()
         .find(|block| block.label == op.block())

@@ -25,7 +25,7 @@ use crate::live::{Coalescer, LiveEvent, LiveSink};
 use crate::memory::{MEMORY_TOOL, MemoryScope, MemorySnapshot, MemoryStore, MemoryTool};
 use crate::mesh::{DELEGATE_TOOL, Peer, delegate_definition, valid_name};
 use crate::mesh_control::{MESH_BUDGET_EXCEEDED, MeshBudget, MeshBudgetExceeded, MeshSpend};
-use crate::message::{ChatMessage, ContentPart, RunId, TokenUsage, ToolDefinition};
+use crate::message::{ChatMessage, ContentPart, RunId, SessionId, TokenUsage, ToolDefinition};
 use crate::model::{AgentModel, BoxFuture, ChatRequest, ChatResponse, UNKNOWN_MODEL_ID};
 use crate::policy::{
     AllowAll, RunInfo, Strictest, ToolDecision, ToolPolicy, ToolRules, effect_refusal,
@@ -42,7 +42,9 @@ use crate::tool::{Tool, ToolContext, ToolEffect};
 use autumn_harvest::builder::DEFAULT_MAX_ACTIVITY_RESULT_BYTES;
 use autumn_harvest::failure::{ActivityFailure, IntoActivityErrorString};
 
-use crate::transcript::{InMemoryTranscriptStore, PREFIX_MISSING, TranscriptStore, chain};
+use crate::transcript::{
+    InMemoryTranscriptStore, PREFIX_MISSING, TranscriptStore, WindowOwner, chain,
+};
 use crate::types::{ModelTurn, ModelTurnRequest, SkillLookup, ToolCallRequest, ToolOutcome};
 use crate::workspace::{WorkspaceHandle, WorkspaceMount, WorkspaceRef, WorkspaceStore};
 
@@ -813,25 +815,28 @@ impl AgentHarness {
     ///
     /// Returns a non-retryable [`PREFIX_MISSING`] payload when the store does
     /// not hold the prefix. The workflow then sends the full form.
-    fn window(&self, request: &mut ModelTurnRequest) -> Result<Vec<ChatMessage>, String> {
+    async fn window(&self, request: &mut ModelTurnRequest) -> Result<Vec<ChatMessage>, String> {
         let added = std::mem::take(&mut request.messages);
         let (digest, window) = match &request.prefix {
             None => (None, added.clone()),
             Some(prefix) => {
                 // The digest check makes a changed window a miss, so a
                 // shared store cannot put words into a turn.
-                let held = self
-                    .transcripts
-                    .get(&prefix.digest)
-                    .filter(|held| u32::try_from(held.len()).is_ok_and(|len| len == prefix.len))
-                    .filter(|held| chain(None, held) == prefix.digest)
-                    .ok_or_else(|| {
-                        ActivityFailure::non_retryable(
-                            PREFIX_MISSING,
-                            "the transcript store does not hold the prefix of this turn",
-                        )
-                        .into_error_payload()
-                    })?;
+                // A store that hangs is a miss, as a store error is.
+                let held =
+                    tokio::time::timeout(self.hook_timeout, self.transcripts.get(&prefix.digest))
+                        .await
+                        .ok()
+                        .flatten()
+                        .filter(|held| u32::try_from(held.len()).is_ok_and(|len| len == prefix.len))
+                        .filter(|held| chain(None, held) == prefix.digest)
+                        .ok_or_else(|| {
+                            ActivityFailure::non_retryable(
+                                PREFIX_MISSING,
+                                "the transcript store does not hold the prefix of this turn",
+                            )
+                            .into_error_payload()
+                        })?;
                 let mut window = held;
                 window.extend(added.iter().cloned());
                 (Some(prefix.digest.as_str()), window)
@@ -844,9 +849,40 @@ impl AgentHarness {
                 || chain(None, &window),
                 |prefix| chain(Some(prefix), &added),
             );
-            self.transcripts.put(&digest, &window);
+            let owner = WindowOwner::new(&request.run_id, request.session_id.as_ref());
+            if tokio::time::timeout(
+                self.hook_timeout,
+                self.transcripts.put(owner, &digest, &window),
+            )
+            .await
+            .is_err()
+            {
+                tracing::warn!("the transcript store did not keep a window in time");
+            }
         }
         Ok(window)
+    }
+
+    /// The windows that `session` keeps in the transcript store. `None`
+    /// means that the store cannot count.
+    ///
+    /// # Errors
+    ///
+    /// Returns the store error, or a timeout.
+    pub async fn transcript_count(&self, session: SessionId) -> Result<Option<u64>, String> {
+        self.hooked("the transcript store", self.transcripts.count(&session))
+            .await
+    }
+
+    /// Delete every window that `session` keeps in the transcript store,
+    /// and count them. `None` means that the store cannot erase by session.
+    ///
+    /// # Errors
+    ///
+    /// Returns the store error, or a timeout.
+    pub async fn transcript_erase(&self, session: SessionId) -> Result<Option<u64>, String> {
+        self.hooked("the transcript store", self.transcripts.erase(&session))
+            .await
     }
 
     /// Add one peer to the roster. A run whose mandate names the peer can
@@ -1104,7 +1140,7 @@ impl AgentHarness {
         let client = self.model(request.model.as_deref())?;
         self.check_mesh_budget(request.mesh.as_deref(), now).await?;
         let mut request = request;
-        let messages = self.window(&mut request)?;
+        let messages = self.window(&mut request).await?;
         let (builtins, tools) = self.turn_tools(&request);
         let allowed = request.allowed_tools.as_ref();
         let chat = ChatRequest {
@@ -1782,17 +1818,42 @@ impl AgentHarness {
     /// Returns a non-retryable error when no store is installed, and the
     /// store error otherwise.
     pub async fn memory_reset(&self, scope: MemoryScope) -> Result<(), String> {
-        let Some(store) = &self.memory else {
-            return Err(ActivityFailure::non_retryable(
-                "MemoryStoreMissing",
-                "the agent has a memory scope, but no memory store is installed: call AgentHarness::memory",
-            )
-            .into_error_payload());
-        };
+        let store = self.memory_for_reset()?;
         tokio::time::timeout(self.hook_timeout, store.clear(&scope))
             .await
             .map_err(|_| self.hook_timed_out("MemoryTimeout", "the memory store"))?
             .map_err(|err| model_failure(&err))
+    }
+
+    /// The entries that the memory of `scope` holds. The reset of a durable
+    /// agent records the count before the clear, so a retried clear keeps
+    /// it.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`memory_reset`](Self::memory_reset), and a failed
+    /// read.
+    pub async fn memory_count(&self, scope: MemoryScope) -> Result<u64, String> {
+        let store = self.memory_for_reset()?;
+        Ok(tokio::time::timeout(self.hook_timeout, store.load(&scope))
+            .await
+            .map_err(|_| self.hook_timed_out("MemoryTimeout", "the memory store"))?
+            .map_err(|err| model_failure(&err))?
+            .iter()
+            .map(|block| block.entries.len() as u64)
+            .sum())
+    }
+
+    /// The memory store of a reset. A missing store is a non-retryable
+    /// error, because a reset must not report a clear that did not happen.
+    fn memory_for_reset(&self) -> Result<&Arc<dyn MemoryStore>, String> {
+        self.memory.as_ref().ok_or_else(|| {
+            ActivityFailure::non_retryable(
+                "MemoryStoreMissing",
+                "the agent has a memory scope, but no memory store is installed: call AgentHarness::memory",
+            )
+            .into_error_payload()
+        })
     }
 
     /// Send one report to the delivery.

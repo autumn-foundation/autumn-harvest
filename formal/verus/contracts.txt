@@ -260,6 +260,11 @@ pub proof fn theorem_the_shares_sum_to_the_remainder(remaining: int, siblings: i
 pub proof fn theorem_no_first_children_pass_the_cap(remaining: int, siblings: int, n: int) requires 0 <= remaining, 0 < siblings, 0 <= n <= siblings, ensures total(remaining, siblings, n) <= remaining,
 pub proof fn theorem_each_share_is_the_base_or_one_more(remaining: int, siblings: int, i: int, j: int,) requires 0 <= remaining, 0 < siblings, ensures share(remaining, siblings, i) == remaining / siblings || share(remaining, siblings, i) == remaining / siblings + 1, i <= j ==> share(remaining, siblings, i) >= share(remaining, siblings, j),
 
+## formal/verus/src/agent_stores.rs
+pub open spec fn spec_next_doc_version(current: Option < u64 >) -> Option < u64 > { match current { None => Some(1u64), Some(version) => if version < u64::MAX { Some((version + 1) as u64) } else { None }, } }
+pub fn next_doc_version(current: Option < u64 >) -> (r: Option < u64 >) ensures r == spec_next_doc_version(current), current.is_none() ==> r == Some(1u64), current.is_some() && r.is_some() ==> r.unwrap() == current.unwrap() + 1, r.is_none() ==> current == Some(u64::MAX),
+pub proof fn a_version_only_grows(current: u64) requires current < u64::MAX, ensures spec_next_doc_version(Some(current)).unwrap() > current, spec_next_doc_version(Some(current)).unwrap() >= 1,
+
 ## formal/verus/src/agent_sweep.rs
 pub const MAX_PARALLEL_CHILDREN: u32 = 16;
 pub enum SweepPlan { Run { items: u32, draws: u32 }, TooManyConcurrent, }

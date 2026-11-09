@@ -104,6 +104,11 @@ const EPISODE_RESET_PATCH: &str = "agent_episode_reset";
 /// The patch gate of the lesson erase in `Control::ResetMemory`.
 const LESSON_ERASE_PATCH: &str = "agent_lesson_erase";
 
+/// The patch gate of the store counts in `Control::ResetMemory`. The memory
+/// reset counts its entries, and the transcript windows of the agent go. A
+/// run recorded before it replays the plain memory reset.
+const STORE_COUNTS_PATCH: &str = "agent_store_counts";
+
 /// The signal that interrupts the op that an agent runs (issue #2265).
 ///
 /// Its payload is an [`Interrupt`]. An interrupt that arrives while no op
@@ -1219,6 +1224,15 @@ pub struct AgentState {
     /// erase` reads the count from the final state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lessons_removed: Option<u64>,
+    /// The memory entries that the last memory reset removed. `None` when
+    /// the agent has no memory scope. `harvest agents erase` reads it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_entries_erased: Option<u64>,
+    /// The transcript windows of the agent that the last memory reset
+    /// removed. `None` when the store cannot erase by session. `harvest
+    /// agents erase` reads it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcripts_erased: Option<u64>,
     /// The episode appends since the last pass that the agent ran (issue
     /// #2454). `ConsolidationTrigger::Every` reads it.
     #[serde(skip_serializing_if = "is_zero_u32")]
@@ -1636,7 +1650,22 @@ impl AgentRun<'_> {
                         }
                     }
                 }
-                if let Err(err) = self.reset_memory().await {
+                if self.ctx.patched(STORE_COUNTS_PATCH) {
+                    match self.erase_memory().await {
+                        Ok(erased) => state.memory_entries_erased = erased,
+                        Err(err) => {
+                            state.memory_entries_erased = None;
+                            fail(&mut state, &err);
+                        }
+                    }
+                    match self.erase_transcripts().await {
+                        Ok(erased) => state.transcripts_erased = erased,
+                        Err(err) => {
+                            state.transcripts_erased = None;
+                            fail(&mut state, &err);
+                        }
+                    }
+                } else if let Err(err) = self.reset_memory().await {
                     fail(&mut state, &err);
                 }
             }
@@ -1710,6 +1739,56 @@ impl AgentRun<'_> {
             .execute_activity(&agent_memory_reset_info(), scope)
             .await
             .map_err(|err| err.to_string())
+    }
+
+    /// Clear the memory scope of the agent, and count its entries. Returns
+    /// `None` when the agent has no memory scope.
+    ///
+    /// The count step records the entries first, so a retried clear keeps
+    /// the count. A failed count fails the reset after the clear.
+    async fn erase_memory(&self) -> Result<Option<u64>, String> {
+        let (Ok(id), Ok(profile)) = (&self.id, &self.profile) else {
+            return Ok(None);
+        };
+        let Some(scope) = profile.memory_scope(id) else {
+            return Ok(None);
+        };
+        // A failed count still clears, so a bad row never blocks an erase.
+        let held: Result<u64, String> = self
+            .ctx
+            .execute_activity(&agent_memory_count_info(), scope.clone())
+            .await
+            .map_err(|err| err.to_string());
+        let (): () = self
+            .ctx
+            .execute_activity(&agent_memory_reset_info(), scope)
+            .await
+            .map_err(|err| err.to_string())?;
+        held.map(Some)
+    }
+
+    /// Delete the transcript windows of the agent, and count them. Each turn
+    /// of the agent keeps its windows under the agent id as its session.
+    /// Returns `None` when the store cannot count or cannot erase.
+    ///
+    /// The count step records the windows first, so a retried erase keeps
+    /// the count.
+    async fn erase_transcripts(&self) -> Result<Option<u64>, String> {
+        let Ok(id) = &self.id else {
+            return Ok(None);
+        };
+        let session = SessionId::new(id.as_str());
+        let held: Option<u64> = self
+            .ctx
+            .execute_activity(&agent_transcript_count_info(), session.clone())
+            .await
+            .map_err(|err| err.to_string())?;
+        let erased: Option<u64> = self
+            .ctx
+            .execute_activity(&agent_transcript_erase_info(), session)
+            .await
+            .map_err(|err| err.to_string())?;
+        Ok(erased.and(held))
     }
 
     /// Remove each lesson of the kind that names the agent, and count them.
@@ -2835,6 +2914,53 @@ pub async fn agent_profile_overlay(
 )]
 pub async fn agent_memory_reset(ctx: &ActivityContext, scope: MemoryScope) -> Result<(), String> {
     harness(ctx)?.memory_reset(scope).await
+}
+
+/// Count the entries of one memory scope, as an activity.
+///
+/// # Errors
+///
+/// Returns an error when no store is installed or the store fails.
+#[activity(
+    start_to_close = "1m",
+    retry = RetryPolicy::exponential(3, Duration::from_secs(1))
+)]
+pub async fn agent_memory_count(ctx: &ActivityContext, scope: MemoryScope) -> Result<u64, String> {
+    harness(ctx)?.memory_count(scope).await
+}
+
+/// Count the transcript windows of one session, as an activity. Returns
+/// `None` when the store cannot count.
+///
+/// # Errors
+///
+/// Returns an error when the store fails.
+#[activity(
+    start_to_close = "1m",
+    retry = RetryPolicy::exponential(3, Duration::from_secs(1))
+)]
+pub async fn agent_transcript_count(
+    ctx: &ActivityContext,
+    session: SessionId,
+) -> Result<Option<u64>, String> {
+    harness(ctx)?.transcript_count(session).await
+}
+
+/// Delete the transcript windows of one session and count them, as an
+/// activity. Returns `None` when the store cannot erase by session.
+///
+/// # Errors
+///
+/// Returns an error when the store fails.
+#[activity(
+    start_to_close = "1m",
+    retry = RetryPolicy::exponential(3, Duration::from_secs(1))
+)]
+pub async fn agent_transcript_erase(
+    ctx: &ActivityContext,
+    session: SessionId,
+) -> Result<Option<u64>, String> {
+    harness(ctx)?.transcript_erase(session).await
 }
 
 /// Delete the snapshots of the scope of `mount` that are older than its
