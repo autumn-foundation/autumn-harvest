@@ -12,8 +12,9 @@ path = "src/main.rs"
 
 [dependencies]
 autumn-harvest-sqlite = { version = "0.10.0", path = "../../autumn-harvest-sqlite" }
-# `anthropic` is the shared Claude model.
-autumn-harvest-agent = { version = "0.10.0", path = "../../autumn-harvest-agent", features = ["sqlite", "anthropic"] }
+# `anthropic` is the shared Claude model. `openai` reaches any
+# OpenAI-compatible server through `--base-url`.
+autumn-harvest-agent = { version = "0.10.0", path = "../../autumn-harvest-agent", features = ["sqlite", "anthropic", "openai"] }
 chrono = { workspace = true }
 clap = { version = "4.6", features = ["derive", "env"] }
 tempfile = "3"

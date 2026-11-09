@@ -253,7 +253,9 @@ a worker. Otherwise the adapter ends a run that the store could carry.
 
 - `new(model)` — any `AgentModel`. Implement its one `chat` method for your
   provider, or bridge a framework you already use. The `anthropic` feature
-  ships one model, `ClaudeModel`. See [The Claude model](#the-claude-model).
+  ships `ClaudeModel`. See [The Claude model](#the-claude-model). The
+  `openai` feature ships `OpenAiModel` for any OpenAI-compatible server. See
+  [An OpenAI-compatible model](#an-openai-compatible-model).
 - `tool(tool)` / `tools(iter)` — any `Tool`. `FnTool` wraps an async
   function.
 - `policy(policy)` — any `ToolPolicy`. The default is `AllowAll`.
@@ -337,6 +339,64 @@ copy.
 
 An app with its own transcript format can use `Client` and `wire` alone.
 `examples/claude-agent-daemon` does that.
+
+### An OpenAI-compatible model
+
+The `openai` feature adds the `openai` module. Its `OpenAiModel` speaks the
+Chat Completions API at a base URL that the app sets. So one model reaches
+many servers:
+
+| Server | Base URL |
+|---|---|
+| OpenAI | `openai::OPENAI_BASE_URL` |
+| OpenRouter | `openai::OPENROUTER_BASE_URL` |
+| Ollama | `openai::OLLAMA_BASE_URL` |
+| vLLM, LM Studio, a LiteLLM proxy | The `/v1` URL of the server |
+
+- `OpenAiModel::new(base_url, model)` takes no key, as a local server
+  needs. `api_key(key)` sends `Authorization: Bearer`. A key for a plain
+  `http` URL is refused, unless the host is a loopback name or address.
+- `with_env_key(base_url, model)` reads the key variable of a known host:
+  `OPENAI_API_KEY` for OpenAI, `OPENROUTER_API_KEY` for OpenRouter. Another
+  host gets no key, so a key of one provider never reaches another.
+  `with_key_from(base_url, model, var)` names the variable.
+- `header(name, value)` adds a header, such as the `HTTP-Referer` and
+  `X-Title` of OpenRouter. The headers that the client sets are refused:
+  the key, the body type and the framing.
+- `model_id()` is `{model}@{host}{path}`, so two endpoints do not share cache
+  entries. `id(name)` sets another id.
+- `price(Price)` prices each call. The default is unpriced, because each
+  provider has its own rates. A local server costs nothing.
+- The output cap goes as `max_completion_tokens` to the OpenAI host, as its
+  current models need, and as `max_tokens` to another server.
+  `max_completion_tokens(on)` sets the field. The OpenAI reasoning models
+  also refuse a `temperature` other than 1. `seed(false)` stops the draw number going
+  as `seed`. `stream_usage(false)` stops the usage request on a stream, for
+  a server that refuses `stream_options`.
+
+Each tool call goes back as a JSON string of its arguments. A string that
+is not JSON is a `Decode` error, so no tool runs on a value that the model
+did not send. A stream needs a finish reason, and the end marker or the
+usage. One that breaks off is a `Transport` error, so the retry asks again.
+A `2xx` body with an `error` object is the error of its code. OpenRouter
+sends such a body. A turn cut at the output cap keeps its text and drops a
+call whose arguments it cut. A call with no id gets one made from the
+response, so two turns never share a call id. A context overflow is a
+`Budget` error.
+
+The base URL is the path only. A user, a password, a query or a fragment
+is refused, because each would go into each log line. Use the `/v1`
+endpoint of Azure OpenAI, which needs no query.
+
+Limits. The model sends no reasoning back: a model that needs its
+`reasoning_details` in a tool loop, such as Gemini 3 behind OpenRouter, is
+not supported yet. Each system message goes where it stands, and some
+chat templates refuse a second one. The Mistral API wants call ids of nine
+characters, which a made id is not.
+
+Both models use the shared `provider` module. It holds the transport, the
+error type, the body cap, the status table above, the Server-Sent Events
+framing and `Price`. A fix there reaches both models.
 
 ### The cost ledger
 

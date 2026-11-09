@@ -8,6 +8,7 @@ use agent_mesh::mesh::{self, DeskDelivery, MESH, MeshConfig, PrintSink};
 use agent_mesh::scripted::ScriptedDesk;
 use autumn_harvest::chrono::{DateTime, Duration, Utc};
 use autumn_harvest_agent::anthropic::{ClaudeModel, DEFAULT_MODEL};
+use autumn_harvest_agent::openai::{OPENAI_BASE_URL, OpenAiModel};
 use autumn_harvest_agent::{AgentModel, AgentOp, Approval, Control, sqlite};
 use autumn_harvest_sqlite::SqliteRuntime;
 use clap::{Parser, Subcommand, ValueEnum};
@@ -27,6 +28,16 @@ struct Cli {
     /// The Claude model, with `--model claude`.
     #[arg(long, default_value = DEFAULT_MODEL, global = true)]
     claude_model: String,
+    /// The model id, with `--model openai`.
+    #[arg(long, env = "OPENAI_MODEL", default_value = "", global = true)]
+    openai_model: String,
+    /// The base URL, with `--model openai`.
+    #[arg(long, env = "OPENAI_BASE_URL", default_value = OPENAI_BASE_URL, global = true)]
+    base_url: String,
+    /// The environment variable of the key, with `--model openai`. The
+    /// default is the variable of a known host.
+    #[arg(long, global = true)]
+    api_key_env: Option<String>,
     /// The most tokens of the mesh in one day.
     #[arg(long, default_value_t = 200_000, global = true)]
     daily_tokens: u64,
@@ -40,6 +51,9 @@ enum ModelKind {
     Scripted,
     /// Claude over the Messages API. Set `ANTHROPIC_API_KEY`.
     Claude,
+    /// A model behind an OpenAI-compatible API, at `--base-url`. Reads
+    /// `OPENAI_API_KEY` when it is set.
+    Openai,
 }
 
 #[derive(Debug, Subcommand)]
@@ -109,6 +123,17 @@ fn model(cli: &Cli) -> Result<Arc<dyn AgentModel>, Error> {
                     .map_err(|e| format!("ANTHROPIC_API_KEY: {}", e.message()))?
                     .model(&cli.claude_model),
             )
+        }
+        ModelKind::Openai => {
+            if cli.openai_model.trim().is_empty() {
+                return Err("set --openai-model or OPENAI_MODEL to use --model openai".into());
+            }
+            let model = cli.openai_model.trim();
+            let built = cli.api_key_env.as_ref().map_or_else(
+                || OpenAiModel::with_env_key(&cli.base_url, model),
+                |var| OpenAiModel::with_key_from(&cli.base_url, model, var),
+            );
+            Arc::new(built.map_err(|e| format!("--model openai: {}", e.message()))?)
         }
     })
 }

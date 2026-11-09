@@ -33,18 +33,19 @@ mod model;
 mod sse;
 pub mod wire;
 
+/// The HTTP client crate, so an app can build a client for
+/// [`Client::with_http`].
+pub use crate::provider::reqwest;
+pub use crate::provider::{
+    ApiError, BodyError, CONNECT_TIMEOUT, MAX_BODY_BYTES, REQUEST_TIMEOUT, decode_body,
+    http_client, printable, push_capped,
+};
 pub use chat::{
     TurnStore, parse_response, replayable, request_body, streaming_body, turn_context, turn_key,
     wire_messages,
 };
-pub use client::{
-    ApiError, BodyError, CONNECT_TIMEOUT, Client, MAX_BODY_BYTES, REQUEST_TIMEOUT, decode_body,
-    http_client, printable, push_capped,
-};
+pub use client::Client;
 pub use model::ClaudeModel;
-/// The HTTP client crate, so an app can build a client for
-/// [`Client::with_http`].
-pub use reqwest;
 pub use sse::{SseFrames, StreamAssembler};
 pub use wire::{
     API_VERSION, DEFAULT_MAX_TOKENS, DEFAULT_MODEL, EFFORT, ENDPOINT, FALLBACK_BETA, Price,

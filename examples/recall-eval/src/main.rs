@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use autumn_harvest_agent::anthropic::{ClaudeModel, DEFAULT_MODEL};
+use autumn_harvest_agent::openai::OpenAiModel;
 use autumn_harvest_agent::recall::{
     self, EPISODES, MEMORY, NOTES, ReaderModel, RecallFixture, WINDOW,
 };
@@ -24,9 +25,18 @@ struct Args {
     /// Run on the scripted `ReaderModel`. It needs no key and no network.
     #[arg(long)]
     scripted: bool,
-    /// The Claude model.
+    /// The model: a Claude model, or with `--base-url` a model of that
+    /// server.
     #[arg(long, default_value = DEFAULT_MODEL)]
     model: String,
+    /// The base URL of an OpenAI-compatible server, such as `OpenRouter` or
+    /// Ollama. A flag only, so a variable of another tool cannot move a run.
+    #[arg(long)]
+    base_url: Option<String>,
+    /// The environment variable of the key of `--base-url`. The default is
+    /// the variable of a known host: `OPENAI_API_KEY` or `OPENROUTER_API_KEY`.
+    #[arg(long)]
+    api_key_env: Option<String>,
     /// The API key. Only a real-model run reads it.
     #[arg(long, env = "ANTHROPIC_API_KEY", hide_env_values = true)]
     api_key: Option<String>,
@@ -48,6 +58,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     let (model, name): (Arc<dyn AgentModel>, String) = if args.scripted {
         (ReaderModel::new(), "ReaderModel (scripted)".to_owned())
+    } else if let Some(base_url) = &args.base_url {
+        let model = args
+            .api_key_env
+            .as_ref()
+            .map_or_else(
+                || OpenAiModel::with_env_key(base_url, args.model.clone()),
+                |var| OpenAiModel::with_key_from(base_url, args.model.clone(), var),
+            )
+            .map_err(|e| format!("--base-url: {}", e.message()))?;
+        let name = model.model_id().unwrap_or_default().to_owned();
+        (Arc::new(model), name)
     } else {
         let key = args
             .api_key

@@ -46,6 +46,11 @@ the Anthropic Messages API. It is off by default, so the crate without it has
 no HTTP client. The model reports a ledger id and a price for each call. See
 [The Claude model](../docs/agent-adapter.md#the-claude-model).
 
+The `openai` feature adds `openai::OpenAiModel`. It speaks the Chat
+Completions API at a base URL, so it reaches OpenAI, OpenRouter, Ollama,
+vLLM and a LiteLLM proxy. See
+[An OpenAI-compatible model](../docs/agent-adapter.md#an-openai-compatible-model).
+
 ```sh
 cargo run -p autumn-harvest-agent --features sqlite --example sqlite_agent
 cargo run -p autumn-harvest-agent --features sqlite --example sqlite_mesh

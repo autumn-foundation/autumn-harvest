@@ -207,6 +207,17 @@ key comes from the environment only. The agent adapter keeps text and tool
 calls, but the API wants each thinking block back. So the model keeps each
 raw turn in `.autoresearch/claude-turns` and sends it back unchanged.
 
+`--model openai` runs the agents on any OpenAI-compatible server.
+`--base-url` names it, and `--openai-model` names the model. The key comes
+from the variable of a known host: `OPENAI_API_KEY` or `OPENROUTER_API_KEY`.
+For another host, `--api-key-env` names the variable. For example, a local
+Ollama, which needs no key:
+
+```bash
+cargo run -p autoresearch -- run --lab ~/autoresearch --tag local \
+  --model openai --base-url http://localhost:11434/v1 --openai-model qwen2.5:7b
+```
+
 `serve` runs the nightly schedule and the heartbeat instead of one night.
 
 ## Commands

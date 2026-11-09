@@ -25,6 +25,7 @@ use autoresearch::stores::TurnDir;
 use autoresearch::trainer::TrainerSpec;
 use autoresearch::workflows::{SessionConfig, SessionReport};
 use autumn_harvest_agent::anthropic::{ClaudeModel, DEFAULT_MODEL};
+use autumn_harvest_agent::openai::{self, OPENAI_BASE_URL, OpenAiModel};
 use autumn_harvest_agent::{AgentHarness, AgentModel};
 use autumn_harvest_sqlite::{ExecutionId, SqliteReader, SqliteRuntime};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -45,6 +46,9 @@ enum ModelKind {
     Scripted,
     /// Claude over the Messages API. Needs `ANTHROPIC_API_KEY`.
     Claude,
+    /// A model behind an OpenAI-compatible API, at `--base-url`. Reads
+    /// `OPENAI_API_KEY` when it is set.
+    Openai,
 }
 
 #[derive(Debug, Parser)]
@@ -77,6 +81,18 @@ struct ModelArgs {
     /// The Claude model id.
     #[arg(long, default_value = DEFAULT_MODEL)]
     claude_model: String,
+    /// The model id with `--model openai`, such as `llama3.1:8b`.
+    #[arg(long, env = "OPENAI_MODEL", default_value = "")]
+    openai_model: String,
+    /// The base URL with `--model openai`: `OpenAI`, `OpenRouter`, Ollama,
+    /// vLLM or a `LiteLLM` proxy.
+    #[arg(long, env = "OPENAI_BASE_URL", default_value = OPENAI_BASE_URL)]
+    base_url: String,
+    /// The environment variable of the key, with `--model openai`. The
+    /// default is the variable of a known host: `OPENAI_API_KEY` or
+    /// `OPENROUTER_API_KEY`. Another host gets no key unless this names one.
+    #[arg(long)]
+    api_key_env: Option<String>,
 }
 
 /// The options of a session.
@@ -344,7 +360,23 @@ fn model(args: &ModelArgs, state: &Path) -> Result<Arc<dyn AgentModel>, String> 
                 .turn_store(Arc::new(TurnDir::new(state.join("claude-turns"))));
             Ok(Arc::new(model))
         }
+        ModelKind::Openai => Ok(Arc::new(openai_model(args)?)),
     }
+}
+
+/// The model of `--model openai`.
+fn openai_model(args: &ModelArgs) -> Result<OpenAiModel, String> {
+    if args.openai_model.trim().is_empty() {
+        return Err("--model openai needs --openai-model or OPENAI_MODEL".into());
+    }
+    let model = args.openai_model.trim();
+    args.api_key_env
+        .as_ref()
+        .map_or_else(
+            || OpenAiModel::with_env_key(&args.base_url, model),
+            |var| OpenAiModel::with_key_from(&args.base_url, model, var),
+        )
+        .map_err(|e| format!("--model openai: {}", e.message()))
 }
 
 fn harness(lab: &Lab, state: &Path, args: &ModelArgs) -> Result<AgentHarness, String> {
@@ -398,6 +430,13 @@ fn model_label(args: &ModelArgs) -> String {
     match args.model {
         ModelKind::Scripted => "scripted".into(),
         ModelKind::Claude => format!("claude:{}", args.claude_model),
+        // The id names the model and the host, so another server is another
+        // model.
+        ModelKind::Openai => format!(
+            "openai:{}@{}",
+            args.openai_model.trim(),
+            openai::wire::origin(&args.base_url).unwrap_or_default()
+        ),
     }
 }
 
@@ -864,6 +903,9 @@ async fn verify(args: &LabArgs) -> Result<(), String> {
     let scripted = ModelArgs {
         model: ModelKind::Scripted,
         claude_model: String::new(),
+        openai_model: String::new(),
+        base_url: OPENAI_BASE_URL.into(),
+        api_key_env: None,
     };
     let rt = open_existing(&db, harness(&lab, &state, &scripted)?)?;
     let runs = runtime::stored_runs(&rt)?;
@@ -889,6 +931,9 @@ fn purge(args: &LabArgs, days: u64) -> Result<(), String> {
     let scripted = ModelArgs {
         model: ModelKind::Scripted,
         claude_model: String::new(),
+        openai_model: String::new(),
+        base_url: OPENAI_BASE_URL.into(),
+        api_key_env: None,
     };
     let mut rt = open_existing(&db, harness(&lab, &state, &scripted)?)?;
     let removed = runtime::purge(&mut rt, Duration::from_secs(days.saturating_mul(86_400)))?;

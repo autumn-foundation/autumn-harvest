@@ -140,49 +140,18 @@ mod tests {
 
     use autumn_harvest::llm_ledger::LlmCall;
     use serde_json::json;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
 
     use super::*;
+    use crate::provider::testing::{head, serve_each};
     use crate::{ChatMessage, ChatRole, ContentPart, ErrorKind, StopReason};
 
     /// A server that answers each request with the next `(status, body)`.
     async fn serve(answers: Vec<(u16, String)>) -> String {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}/v1/messages", listener.local_addr().unwrap());
-        tokio::spawn(async move {
-            for (status, body) in answers {
-                let (mut socket, _) = listener.accept().await.unwrap();
-                let mut request = Vec::new();
-                let mut buffer = [0_u8; 8192];
-                // Read the head, then the body that its length names.
-                loop {
-                    let read = socket.read(&mut buffer).await.unwrap();
-                    if read == 0 {
-                        break;
-                    }
-                    request.extend_from_slice(&buffer[..read]);
-                    let text = String::from_utf8_lossy(&request).to_lowercase();
-                    if let Some(end) = text.find("\r\n\r\n") {
-                        let length = text
-                            .lines()
-                            .find_map(|l| l.strip_prefix("content-length: "))
-                            .and_then(|n| n.trim().parse::<usize>().ok())
-                            .unwrap_or(0);
-                        if request.len() >= end + 4 + length {
-                            break;
-                        }
-                    }
-                }
-                let head = format!(
-                    "HTTP/1.1 {status} X\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-                    body.len()
-                );
-                socket.write_all(head.as_bytes()).await.unwrap();
-                socket.write_all(body.as_bytes()).await.unwrap();
-            }
-        });
-        url
+        let answers = answers
+            .into_iter()
+            .map(|(status, body)| (head(status, body.len()), body.into_bytes()))
+            .collect();
+        serve_each(answers).await.0
     }
 
     fn model(url: &str) -> ClaudeModel {

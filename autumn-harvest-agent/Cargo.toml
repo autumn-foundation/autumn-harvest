@@ -26,6 +26,9 @@ sandbox = ["autumn-harvest/sandbox-activities", "dep:tokio-util"]
 # A Claude model over the Anthropic Messages API. It adds an HTTP client, so
 # it is off by default. See `docs/agent-adapter.md`.
 anthropic = ["dep:reqwest", "dep:rustls"]
+# A model over any OpenAI-compatible Chat Completions API: OpenAI,
+# OpenRouter, Ollama, vLLM, a LiteLLM proxy. The same HTTP client.
+openai = ["dep:reqwest", "dep:rustls"]
 
 [dependencies]
 # The backend-neutral core only: no Diesel, no Postgres, no autumn-web.
@@ -45,7 +48,7 @@ tracing = { workspace = true }
 # The cancellation token of a sandbox run. The core crate already depends on
 # this version.
 tokio-util = { version = "0.7", optional = true }
-# The HTTP client of the `anthropic` feature. The examples already lock
+# The HTTP client of the `anthropic` and `openai` features. The examples already lock
 # these versions. The TLS provider is `ring`.
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"], optional = true }
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"], optional = true }
@@ -372,3 +375,9 @@ required-features = ["sqlite"]
 [[test]]
 name = "agent_stores_postgres"
 required-features = ["postgres"]
+
+# A live check against a real OpenAI-compatible server. Its tests are
+# ignored by default.
+[[test]]
+name = "openai_live"
+required-features = ["openai"]
