@@ -1,12 +1,17 @@
 //! The error type of models and tools.
 
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// The category of an [`AgentError`].
 ///
 /// The loop reads the category of a model failure to decide on a retry. See
 /// [`ErrorKind::is_retryable`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+///
+/// It serialises in `snake_case`, so a durable store can keep a failed
+/// edit with its category.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum ErrorKind {
     /// The model or tool configuration is not valid.

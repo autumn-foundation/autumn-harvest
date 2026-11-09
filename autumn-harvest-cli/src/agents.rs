@@ -536,6 +536,12 @@ pub struct StoresOutcome {
     /// The lessons of the kind that the memory reset removed. A lesson goes
     /// when a run of the agent is one of its sources.
     pub lessons_removed: u64,
+    /// The memory entries that the memory reset removed. `None` when the
+    /// agent has no memory scope, or when its run predates the count.
+    pub memory_entries_erased: Option<u64>,
+    /// The transcript windows of the agent that the memory reset removed.
+    /// `None` when the transcript store cannot erase by session.
+    pub transcripts_erased: Option<u64>,
 }
 
 /// Compare the failure count of the agent before the resets with its final
@@ -551,6 +557,8 @@ pub fn stores_outcome(failures_before: u64, output: Option<&Value>) -> StoresOut
             episodes_erased: 0,
             facts_erased: 0,
             lessons_removed: 0,
+            memory_entries_erased: None,
+            transcripts_erased: None,
         };
     };
     let count = |key: &str| {
@@ -565,6 +573,8 @@ pub fn stores_outcome(failures_before: u64, output: Option<&Value>) -> StoresOut
         .get("lessons_removed")
         .and_then(Value::as_u64)
         .unwrap_or(0);
+    let memory_entries_erased = state.get("memory_entries_erased").and_then(Value::as_u64);
+    let transcripts_erased = state.get("transcripts_erased").and_then(Value::as_u64);
     if failures(state) > failures_before {
         let error = state
             .get("last_error")
@@ -576,6 +586,8 @@ pub fn stores_outcome(failures_before: u64, output: Option<&Value>) -> StoresOut
             episodes_erased,
             facts_erased,
             lessons_removed,
+            memory_entries_erased,
+            transcripts_erased,
         };
     }
     StoresOutcome {
@@ -584,6 +596,8 @@ pub fn stores_outcome(failures_before: u64, output: Option<&Value>) -> StoresOut
         episodes_erased,
         facts_erased,
         lessons_removed,
+        memory_entries_erased,
+        transcripts_erased,
     }
 }
 
@@ -717,6 +731,14 @@ pub fn erase_report(agent_id: &str, stores: &StoresOutcome, outcomes: &[Value]) 
     report.insert("episodes_erased".to_owned(), json!(stores.episodes_erased));
     report.insert("facts_erased".to_owned(), json!(stores.facts_erased));
     report.insert("lessons_removed".to_owned(), json!(stores.lessons_removed));
+    report.insert(
+        "memory_entries_erased".to_owned(),
+        json!(stores.memory_entries_erased),
+    );
+    report.insert(
+        "transcripts_erased".to_owned(),
+        json!(stores.transcripts_erased),
+    );
     report.insert("runs_erased".to_owned(), json!(runs));
     report.extend(totals);
     report.insert("skipped_children".to_owned(), Value::Array(skipped));
@@ -814,6 +836,8 @@ mod tests {
             episodes_erased: 0,
             facts_erased: 0,
             lessons_removed: 0,
+            memory_entries_erased: None,
+            transcripts_erased: None,
         };
         let report = erase_report("support/ada", &stores, &outcomes);
         assert_eq!(report["runs_erased"], 3);
@@ -839,6 +863,28 @@ mod tests {
         // A state with no reset counts erases nothing.
         let plain = stores_outcome(0, Some(&json!({"failures": 0})));
         assert_eq!((plain.episodes_erased, plain.facts_erased), (0, 0));
+    }
+
+    #[test]
+    fn the_report_counts_the_erased_memory_entries_and_windows() {
+        let state = json!({"failures": 0, "memory_entries_erased": 4, "transcripts_erased": 7});
+        let stores = stores_outcome(0, Some(&state));
+        assert!(stores.reset);
+        assert_eq!(stores.memory_entries_erased, Some(4));
+        assert_eq!(stores.transcripts_erased, Some(7));
+        let report = erase_report("support/ada", &stores, &[]);
+        assert_eq!(report["memory_entries_erased"], 4);
+        assert_eq!(report["transcripts_erased"], 7);
+        // A store that cannot count reports null, not a false 0.
+        let plain = stores_outcome(0, Some(&json!({"failures": 0})));
+        let report = erase_report("support/ada", &plain, &[]);
+        assert_eq!(report["memory_entries_erased"], Value::Null);
+        assert_eq!(report["transcripts_erased"], Value::Null);
+        // A failed reset keeps the counts that the state holds.
+        let failed = json!({"failures": 1, "last_error": "down", "transcripts_erased": 2});
+        let failed = stores_outcome(0, Some(&failed));
+        assert!(!failed.reset);
+        assert_eq!(failed.transcripts_erased, Some(2));
     }
 
     #[test]
@@ -884,6 +930,8 @@ mod tests {
                 episodes_erased: 0,
                 facts_erased: 0,
                 lessons_removed: 0,
+                memory_entries_erased: None,
+                transcripts_erased: None,
             }
         );
         let failed = json!({"failures": 3, "last_error": "the store is down"});

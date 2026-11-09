@@ -50,6 +50,8 @@ chrono = { workspace = true }
 autumn-harvest-sqlite = { version = "0.10.0", path = "../autumn-harvest-sqlite" }
 proptest = { workspace = true }
 tempfile = "3"
+# The store tests read the rows of the SQLite file. Already in the lockfile.
+rusqlite = { workspace = true }
 # The sandbox tool tests pass a cancellation token.
 tokio-util = "0.7"
 # Measures gzip against delta encoding (issue #2009). Already in the lockfile.
@@ -353,3 +355,13 @@ harness = false
 [[test]]
 name = "approval_notices"
 required-features = ["sqlite"]
+
+# The durable stores on SQLite: the suite, a crash and an erase.
+[[test]]
+name = "agent_stores"
+required-features = ["sqlite"]
+
+# The same suite on Postgres, with a worker in the process.
+[[test]]
+name = "agent_stores_postgres"
+required-features = ["postgres"]

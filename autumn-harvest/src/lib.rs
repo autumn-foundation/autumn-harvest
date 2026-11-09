@@ -211,6 +211,8 @@ pub mod admission_gate;
 pub mod aead_codec;
 /// The operator policies of agent kinds (issue #2439).
 pub mod agent_policy_log;
+/// The rows of the durable agent stores.
+pub mod agent_store;
 /// History analyzer and linter.
 pub mod analyzer;
 /// Pure token-secret helpers shared by the mint route and the CLI (issue #942).

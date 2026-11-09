@@ -630,8 +630,19 @@ result for the next turn.
 - A read checks the digest of the window. A store that hands back a
   changed window is a miss, and the turn goes in the full form.
 - A store holds transcript text outside history and outside the payload
-  codecs. An erasure does not reach it, because `TranscriptStore` has only
-  `get` and `put`. The app must clear its own store when it erases a run.
+  codecs. Each window keeps the run and the session of its turn
+  (`WindowOwner`). A durable agent sets the session of each turn to its
+  agent id. Its memory reset calls `TranscriptStore::erase`, so `harvest
+  agents erase` deletes each window of the agent. A store that does not
+  implement `erase` reports no count, and the app must clear it itself.
+- `stores::SqliteTranscriptStore` and `stores::PostgresTranscriptStore`
+  are durable stores that every worker shares. Each keeps the newest 4
+  windows of a run (`keep_per_run`) and no window older than 7 days
+  (`max_age`). A read or write error is a miss, so the turn goes in the
+  full form.
+- `TranscriptStore` is async. A store that implemented the earlier `get`
+  and `put` returns a boxed future from each, and `put` takes a
+  `WindowOwner`.
 
 A 50-turn run with a 1 KB tool result each turn stores about 86% less
 history (`a_50_turn_run_stores_at_least_80_percent_less_history`).
@@ -811,7 +822,8 @@ replays as it ran. A task built from JSON can set
 `AgentTask::memory` gives the run a memory scope, and the model a `memory`
 tool to add, replace and remove entries. The store is a `MemoryStore` on
 the harness. `InMemoryMemoryStore` suits tests. Use a durable store in
-production. A run with a scope and no store fails as `MemoryStoreMissing`.
+production: `stores::SqliteMemoryStore` or `stores::PostgresMemoryStore`.
+A run with a scope and no store fails as `MemoryStoreMissing`.
 
 An activity reads the snapshot once per segment. The workflow adds it to
 the system prompt. A write during the segment goes to the store at once,
@@ -831,6 +843,28 @@ failed `remove` therefore cannot remove a newer entry after a crash. A
 durable store must save the key and its result with the edit, in one
 transaction. An `add` of an entry that already exists changes nothing
 either.
+
+The durable stores of the `stores` module follow these rules. Each one
+keeps a scope as one document with its applied keys, so one statement
+writes an edit and its key. A write names the version that it read. A
+write that loses a race reads again, so two workers on one scope lose no
+edit. The memory store keeps the newest 4 096 keys of a scope.
+
+```rust,ignore
+use std::sync::Arc;
+
+use autumn_harvest_agent::stores::{SqliteEpisodeStore, SqliteMemoryStore, SqliteTranscriptStore};
+
+let harness = harness
+    .memory(Arc::new(SqliteMemoryStore::open("agent.db")?))
+    .episodes(Arc::new(SqliteEpisodeStore::open("agent.db")?))
+    .transcript_store(Arc::new(SqliteTranscriptStore::open("agent.db")?));
+```
+
+On Postgres, `PostgresMemoryStore::new(pool)`, `PostgresEpisodeStore::new(pool)`
+and `PostgresTranscriptStore::new(pool)` take the pool of shard 0. The
+migration `20261109005653_harvest_agent_stores` creates their tables. The
+stores keep text in clear, outside the payload codecs.
 
 ### Loop guard
 
@@ -1698,14 +1732,16 @@ SQLite plugin does not serve these routes yet (epic #2466).
 
 **Erase.** `harvest agents erase` erases an agent and prints one report.
 It removes the history payloads, the entity state, the memory, the
-workspace, the stream chunks and the cost ledger rows. It does not reach
-a `TranscriptStore` (section 8a) or the response cache (section 11). The
-app must clear those stores itself.
+episodes, the transcript windows, the workspace, the stream chunks and the
+cost ledger rows. It does not reach the response cache (section 11), or a
+`TranscriptStore` that does not implement `erase` (section 8a). The app
+must clear those stores itself.
 
 1. The agent gets `pause`, `reset_memory` and `reset_workspace`, then a
    delete. The pause holds new work and stops the ticks, so nothing writes
    the stores after the resets. The resets clear a `MemoryStore` scope, the
-   episode scope and every workspace snapshot, with the scratch files of stopped puts. See
+   episode scope, the transcript windows of the agent and every workspace
+   snapshot, with the scratch files of stopped puts. See
    "Scratch files" and "A save after a reset" below for the two windows
    that stay. An agent that ended gets a new run for them,
    through `POST /workflows/agent/signal-with-start` on the queue of its
@@ -1726,8 +1762,18 @@ app must clear those stores itself.
 6. The report sums each count over every run and child:
    `events_scrubbed`, `stream_chunks_deleted`, `ledger_rows_deleted`,
    `entity_states_scrubbed` and the rest. `episodes_erased`,
-   `facts_erased` and `lessons_removed` come from the final state. It
-   lists each skipped child and each failure.
+   `facts_erased`, `lessons_removed`, `memory_entries_erased` and
+   `transcripts_erased` come from the final state. A `null` count means
+   that the store was not reached: the agent has no memory scope, or the
+   transcript store cannot erase by session. It lists each skipped child
+   and each failure.
+
+With the durable stores of the `stores` module, the erase removes the
+rows of the agent from each store. The memory row and each transcript row
+of the agent go. The episode scope keeps one tombstone row with the
+generation and the counts of the clear. It holds no episode text. The
+generation stops a pass that runs across the erase from writing its facts
+back.
 
 The spend of an erased run leaves the LLM budget and mesh budget sums.
 
@@ -1860,16 +1906,24 @@ fn support(
   write no fact and mark no episode. SQLite has no run budget, so a pass
   there always passes the budget check.
 - **Erase.** `Control::ResetMemory` clears the episode scope first, then the
-  memory scope. `AgentState::episode_reset` counts the episodes and the
-  derived facts. `harvest agents erase` reports them as `episodes_erased`
-  and `facts_erased`. It also erases each pass that a schedule started, by
+  memory scope, then the transcript windows of the agent.
+  `AgentState::episode_reset` counts the episodes and the derived facts.
+  `AgentState::memory_entries_erased` counts the memory entries, and
+  `AgentState::transcripts_erased` the windows. `harvest agents erase`
+  reports them as `episodes_erased`, `facts_erased`,
+  `memory_entries_erased` and `transcripts_erased`. A reset that history
+  recorded before these counts replays with no count. It also erases each pass that a schedule started, by
   the search attribute `agent_consolidation_of`. A pass that runs across
   the reset writes no fact after it and ends as `reset`. A pass that still
   runs is a failure in the report, so erase again after it ends.
 
-The crate ships `InMemoryEpisodeStore`. A durable store implements
-`EpisodeStore` and calls the methods of `EpisodeLog`, so the rules are the
-same in every store.
+The crate ships `InMemoryEpisodeStore`, and the durable
+`stores::SqliteEpisodeStore` and `stores::PostgresEpisodeStore`. Each
+durable store keeps the `EpisodeLog` of a scope as one document, so an
+append and its key land in one write. A retried append after a crash
+finds its key and adds nothing. Another store implements `EpisodeStore`
+and calls the methods of `EpisodeLog`, so the rules are the same in every
+store.
 
 #### Scheduled passes (issue #2540)
 

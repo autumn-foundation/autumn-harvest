@@ -126,6 +126,8 @@ pub mod score;
 pub mod skill;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+pub mod stores;
 pub mod tool;
 pub mod transcript;
 pub mod types;
@@ -150,10 +152,11 @@ pub use agent::{
     AGENT_WORKFLOW_NAME, Agent, AgentHeartbeat, AgentId, AgentIdError, AgentMemory, AgentOp,
     AgentProfile, AgentState, AgentStatus, Control, HeartbeatSetting, INTERRUPT_SIGNAL, Interrupt,
     PROFILE_VERSION_ATTR, PeerEnvelope, PeerReply, STEER_SIGNAL, Steer, Urgency, UserMessage,
-    agent, agent_info, agent_memory_reset, agent_memory_reset_info, agent_profile,
-    agent_profile_info, agent_profile_overlay, agent_profile_overlay_info, agent_workspace_floor,
-    agent_workspace_floor_info, agent_workspace_reset, agent_workspace_reset_info,
-    agent_workspace_retain, agent_workspace_retain_info,
+    agent, agent_info, agent_memory_erase, agent_memory_erase_info, agent_memory_reset,
+    agent_memory_reset_info, agent_profile, agent_profile_info, agent_profile_overlay,
+    agent_profile_overlay_info, agent_transcript_erase, agent_transcript_erase_info,
+    agent_workspace_floor, agent_workspace_floor_info, agent_workspace_reset,
+    agent_workspace_reset_info, agent_workspace_retain, agent_workspace_retain_info,
 };
 pub use answer_check::{
     AnswerCheck, CheckAdmission, CheckRequest, agent_answer_check, agent_answer_check_info,
@@ -214,8 +217,12 @@ pub use score::{
     agent_sample_score_info, agent_score, agent_score_info, select,
 };
 pub use skill::{LOAD_SKILL_TOOL, SkillText};
+#[cfg(feature = "postgres")]
+pub use stores::{PostgresEpisodeStore, PostgresMemoryStore, PostgresTranscriptStore};
+#[cfg(feature = "sqlite")]
+pub use stores::{SqliteEpisodeStore, SqliteMemoryStore, SqliteTranscriptStore};
 pub use tool::{FnTool, Tool, ToolContext, ToolEffect};
-pub use transcript::{InMemoryTranscriptStore, PrefixRef, TranscriptStore};
+pub use transcript::{InMemoryTranscriptStore, PrefixRef, TranscriptStore, WindowOwner};
 pub use types::{
     AgentReport, AgentStop, AgentTask, MAX_PARALLEL_CHILDREN, ModelTurn, ModelTurnRequest,
     PROBE_EFFECT_REFUSED, Probe, RunIdSource, ToolCallRequest, ToolOutcome,

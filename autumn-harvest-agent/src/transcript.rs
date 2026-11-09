@@ -16,13 +16,16 @@
 //! longer window follows from a shorter one and the added messages, so the
 //! workflow hashes each message once.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::Mutex;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
-use crate::message::ChatMessage;
+use crate::error::AgentError;
+use crate::message::{ChatMessage, SessionId};
+use crate::model::BoxFuture;
 
 /// The activity error type of a turn whose prefix the store does not hold.
 pub const PREFIX_MISSING: &str = "TranscriptPrefixMissing";
@@ -73,20 +76,74 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
         })
 }
 
+/// The default number of windows that a durable store keeps for one run.
+/// A later turn names the newest one. A retried turn names the one before.
+pub const DEFAULT_KEEP_PER_RUN: u32 = 4;
+
+/// The default age limit of a window in a durable store: 7 days.
+pub const DEFAULT_MAX_AGE: Duration = Duration::from_hours(7 * 24);
+
+/// The run and the session of the turn that keeps a window.
+///
+/// An erase of the session deletes the window. A durable agent sets the
+/// session of each turn to its agent id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct WindowOwner<'a> {
+    /// The run id of the turn.
+    pub run: &'a str,
+    /// The session of the turn, if it has one.
+    pub session: Option<&'a SessionId>,
+}
+
+impl<'a> WindowOwner<'a> {
+    /// The owner of a window of the run `run` in `session`.
+    #[must_use]
+    pub const fn new(run: &'a str, session: Option<&'a SessionId>) -> Self {
+        Self { run, session }
+    }
+}
+
 /// Where the model-turn activity keeps the windows that later turns name.
 ///
-/// A store may drop any window at any time. A shared store, such as one in
-/// Redis, lets a delta hit on every worker. A read checks the digest of the
-/// window, so a changed window is a miss.
+/// A store may drop any window at any time. A shared store lets a delta hit
+/// on every worker. A read checks the digest of the window, so a changed
+/// window is a miss.
 ///
 /// A store holds transcript text outside history and outside the payload
-/// codecs. Erasure does not reach it, so the app clears its own store.
+/// codecs. The reset of a durable agent calls [`erase`](Self::erase) with
+/// the agent id, so `harvest agents erase` reaches each window of the
+/// agent. The crate ships [`InMemoryTranscriptStore`] and the durable
+/// stores of [`stores`](crate::stores).
 pub trait TranscriptStore: Send + Sync + std::fmt::Debug {
-    /// The window with the digest `digest`, if the store holds it.
-    fn get(&self, digest: &str) -> Option<Vec<ChatMessage>>;
+    /// The window with the digest `digest`, if the store holds it. A store
+    /// that cannot read returns `None`, and the turn goes in the full form.
+    fn get<'a>(&'a self, digest: &'a str) -> BoxFuture<'a, Option<Vec<ChatMessage>>>;
 
-    /// Keep `window` under `digest`.
-    fn put(&self, digest: &str, window: &[ChatMessage]);
+    /// Keep `window` under `digest` for `owner`. A store that cannot write
+    /// keeps nothing, and a later turn misses.
+    fn put<'a>(
+        &'a self,
+        owner: WindowOwner<'a>,
+        digest: &'a str,
+        window: &'a [ChatMessage],
+    ) -> BoxFuture<'a, ()>;
+
+    /// Delete every window that `session` keeps, and count them.
+    ///
+    /// The default returns `None`: the store cannot erase by session, and
+    /// the app must clear it itself. The erase report then shows no count.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the store cannot delete.
+    fn erase<'a>(
+        &'a self,
+        session: &'a SessionId,
+    ) -> BoxFuture<'a, Result<Option<u64>, AgentError>> {
+        let _ = session;
+        Box::pin(std::future::ready(Ok(None)))
+    }
 }
 
 /// An in-process [`TranscriptStore`] with a byte bound.
@@ -99,11 +156,28 @@ pub struct InMemoryTranscriptStore {
     inner: Mutex<Windows>,
 }
 
+/// One held window and the sessions that keep it.
+#[derive(Debug)]
+struct Held {
+    window: Vec<ChatMessage>,
+    size: usize,
+    /// `None` stands for a turn with no session.
+    owners: BTreeSet<Option<SessionId>>,
+}
+
 #[derive(Debug, Default)]
 struct Windows {
-    by_digest: HashMap<String, (Vec<ChatMessage>, usize)>,
+    by_digest: HashMap<String, Held>,
     order: VecDeque<String>,
     bytes: usize,
+}
+
+impl Windows {
+    fn remove(&mut self, digest: &str) {
+        if let Some(held) = self.by_digest.remove(digest) {
+            self.bytes -= held.size;
+        }
+    }
 }
 
 impl Default for InMemoryTranscriptStore {
@@ -127,38 +201,84 @@ impl InMemoryTranscriptStore {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
-}
 
-impl TranscriptStore for InMemoryTranscriptStore {
-    fn get(&self, digest: &str) -> Option<Vec<ChatMessage>> {
-        self.windows()
-            .by_digest
-            .get(digest)
-            .map(|(window, _)| window.clone())
-    }
-
-    fn put(&self, digest: &str, window: &[ChatMessage]) {
+    fn put_now(&self, owner: WindowOwner<'_>, digest: &str, window: &[ChatMessage]) {
         let size = usize::try_from(crate::bounds::json_len(&window)).unwrap_or(usize::MAX);
         if size > self.max_bytes {
             return;
         }
         let mut windows = self.windows();
-        if windows.by_digest.contains_key(digest) {
+        if let Some(held) = windows.by_digest.get_mut(digest) {
+            held.owners.insert(owner.session.cloned());
             return;
         }
         while windows.bytes + size > self.max_bytes {
             let Some(oldest) = windows.order.pop_front() else {
                 break;
             };
-            if let Some((_, freed)) = windows.by_digest.remove(&oldest) {
-                windows.bytes -= freed;
-            }
+            windows.remove(&oldest);
         }
         windows.bytes += size;
         windows.order.push_back(digest.to_owned());
+        windows.by_digest.insert(
+            digest.to_owned(),
+            Held {
+                window: window.to_vec(),
+                size,
+                owners: BTreeSet::from([owner.session.cloned()]),
+            },
+        );
+    }
+
+    fn erase_now(&self, session: &SessionId) -> u64 {
+        let mut windows = self.windows();
+        let key = Some(session.clone());
+        let mut erased = 0_u64;
+        let mut orphans = Vec::new();
+        for (digest, held) in &mut windows.by_digest {
+            if held.owners.remove(&key) {
+                erased += 1;
+                if held.owners.is_empty() {
+                    orphans.push(digest.clone());
+                }
+            }
+        }
+        for digest in &orphans {
+            windows.remove(digest);
+        }
         windows
+            .order
+            .retain(|digest| !orphans.iter().any(|orphan| orphan == digest));
+        erased
+    }
+}
+
+impl TranscriptStore for InMemoryTranscriptStore {
+    fn get<'a>(&'a self, digest: &'a str) -> BoxFuture<'a, Option<Vec<ChatMessage>>> {
+        let window = self
+            .windows()
             .by_digest
-            .insert(digest.to_owned(), (window.to_vec(), size));
+            .get(digest)
+            .map(|held| held.window.clone());
+        Box::pin(std::future::ready(window))
+    }
+
+    fn put<'a>(
+        &'a self,
+        owner: WindowOwner<'a>,
+        digest: &'a str,
+        window: &'a [ChatMessage],
+    ) -> BoxFuture<'a, ()> {
+        self.put_now(owner, digest, window);
+        Box::pin(std::future::ready(()))
+    }
+
+    fn erase<'a>(
+        &'a self,
+        session: &'a SessionId,
+    ) -> BoxFuture<'a, Result<Option<u64>, AgentError>> {
+        let erased = self.erase_now(session);
+        Box::pin(std::future::ready(Ok(Some(erased))))
     }
 }
 
@@ -201,6 +321,8 @@ impl Sent {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used)]
+
     use super::*;
     use crate::message::ChatRole;
 
@@ -236,10 +358,48 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_window_over_the_bound_is_not_kept() {
+    #[tokio::test]
+    async fn a_window_over_the_bound_is_not_kept() {
         let store = InMemoryTranscriptStore::with_max_bytes(10);
-        store.put("big", &messages(3));
-        assert!(store.get("big").is_none());
+        store
+            .put(WindowOwner::new("r", None), "big", &messages(3))
+            .await;
+        assert!(store.get("big").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn an_erase_removes_only_the_windows_of_its_session() {
+        let store = InMemoryTranscriptStore::default();
+        let (gone, kept) = (SessionId::new("a/1"), SessionId::new("a/2"));
+        let window = messages(2);
+        store
+            .put(WindowOwner::new("r1", Some(&gone)), "own", &window)
+            .await;
+        store
+            .put(WindowOwner::new("r1", Some(&gone)), "shared", &window)
+            .await;
+        store
+            .put(WindowOwner::new("r2", Some(&kept)), "shared", &window)
+            .await;
+        assert_eq!(store.erase(&gone).await.unwrap(), Some(2));
+        assert!(store.get("own").await.is_none());
+        assert_eq!(store.get("shared").await, Some(window));
+        assert_eq!(store.erase(&gone).await.unwrap(), Some(0));
+        assert_eq!(store.erase(&kept).await.unwrap(), Some(1));
+        assert!(store.get("shared").await.is_none(), "no session holds it");
+    }
+
+    #[tokio::test]
+    async fn an_erase_frees_the_bytes_of_the_window() {
+        let window = messages(2);
+        let size = usize::try_from(crate::bounds::json_len(&window)).unwrap_or(usize::MAX);
+        let store = InMemoryTranscriptStore::with_max_bytes(size);
+        let session = SessionId::new("a/1");
+        store
+            .put(WindowOwner::new("r", Some(&session)), "one", &window)
+            .await;
+        store.erase(&session).await.unwrap();
+        store.put(WindowOwner::new("r", None), "two", &window).await;
+        assert_eq!(store.windows().bytes, size, "the erase freed its bytes");
     }
 }

@@ -802,6 +802,7 @@
 //! here always replays byte-identically on the core `WorkflowReplayer`.
 
 mod agent_policy_log;
+mod agent_store;
 #[doc(hidden)]
 pub mod append_only;
 mod auth;
@@ -832,6 +833,8 @@ pub use autumn_harvest::{ExecutionId, ExternalActivityToken, WorkflowEvent};
 
 #[doc(hidden)]
 pub use crate::agent_policy_log::SqlitePolicyLog;
+#[doc(hidden)]
+pub use crate::agent_store::SqliteAgentStoreDb;
 pub use crate::auth::{
     AuditFilter, AuditRow, MAX_AUDIT_PAGE, NewAuditRow, NewDeadLetter, NewToken, SqliteAuthStore,
     StoredToken,

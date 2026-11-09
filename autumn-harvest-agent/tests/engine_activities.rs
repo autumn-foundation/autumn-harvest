@@ -289,6 +289,8 @@ fn the_engine_registration_builds() {
             "agent_profile",
             "agent_profile_overlay",
             "agent_memory_reset",
+            "agent_memory_erase",
+            "agent_transcript_erase",
             "agent_workspace_retain",
             "agent_workspace_reset",
             "agent_workspace_floor",
