@@ -111,14 +111,15 @@ const RESET_ON_FULL_PATCH: &str = "agent_reset_on_full_round";
 /// the gate only for a gated call, so each other run records no marker.
 const APPROVAL_NOTICE_PATCH: &str = "agent_approval_notice";
 
-/// The gate of the verdict text of a durable peer with no reply (issue
-/// #2484). A history from before the gate holds the old text, so its replay
-/// keeps it.
+/// The patch that gates the verdict of a durable peer with no reply (issue
+/// #2484). It gates the model text, the record verdict and the decode of a
+/// value that is not a reply. A history from before the gate keeps each of
+/// them, so its replay holds.
 ///
 /// A sent message asks the gate before its wait. A run that waits across
-/// the upgrade then reads no marker, so it keeps the old text. Strict
-/// replay does not accept a marker right after a fired wait deadline, so
-/// the gate cannot come after the wait.
+/// the upgrade then reads no marker, so it keeps the old shape. The strict
+/// replayer of the test engine refuses a marker right after a fired wait
+/// deadline. So the gate cannot come after the wait.
 const REPLY_VERDICT_PATCH: &str = "agent_peer_reply_verdict";
 
 /// A signal name that no client sends. A probe of it claims nothing.
@@ -1957,8 +1958,8 @@ fn fit(call: &ToolCall, decision: Option<&ToolDecision>, agent: &Member) -> Fit 
 /// The call pushes its own record last, after the records of its subtree.
 /// A refused delegation did not run, so its record keeps no reason. This
 /// includes a durable peer that refuses the message. A message with no
-/// reply went out, so its record keeps the reason (issue #2484). A person
-/// can also reject a gated call. It then pushes no record.
+/// reply went out, so its record keeps its serial reason (issue #2484). A
+/// person can also reject a gated call. It then pushes no record.
 fn note_serial(
     ctx: &WorkflowContext,
     tree: &mut Tree,
@@ -3033,7 +3034,12 @@ async fn durable_peer(
         peer.reply_timeout_secs
             .unwrap_or(crate::mesh::DEFAULT_REPLY_TIMEOUT_SECS),
     );
-    let outcome = await_reply(ctx, run.live, progress, &mut promise, timeout).await?;
+    let wait = ReplyWait {
+        live: run.live,
+        timeout,
+        verdict_text,
+    };
+    let outcome = await_reply(ctx, wait, progress, &mut promise).await?;
     let mut chain = mandate.chain;
     if chain.last().is_none_or(|last| *last != peer.name) {
         chain.push(peer.name.clone());
@@ -3072,7 +3078,8 @@ struct PeerSent<'a> {
 }
 
 /// The most characters of a no-reply cause that the model reads. A caller
-/// outside the run writes the reason of a rejection, so it has a bound.
+/// outside the run writes the reason of a rejection, so the cause has a
+/// bound.
 const MAX_NO_REPLY_CAUSE_CHARS: usize = 256;
 
 /// Why a durable peer sent no reply (issue #2484).
@@ -3183,12 +3190,13 @@ fn peer_outcome(
         }
         Err(missing) => {
             // The message went out, so the record keeps the run id. A
-            // parent then still counts its unit and its draws.
+            // parent then still counts its unit and its draws. A history
+            // from before the gate keeps its old record with no verdict.
             tree.records.push(DelegationRecord {
                 chain,
                 run_id: Some(target_id.to_owned()),
                 stop: None,
-                refusal: Some(missing.verdict()),
+                refusal: verdict_text.then(|| missing.verdict()),
                 usage: TokenUsage::default(),
                 steps_used: 0,
                 tool_calls: 0,
@@ -3215,25 +3223,43 @@ fn peer_outcome(
     }
 }
 
-/// Wait for the reply of a durable peer until `timeout`.
+/// How one caller waits for the reply of a durable peer.
+#[derive(Debug, Clone, Copy)]
+struct ReplyWait {
+    /// `true` for a durable agent. It also races the wait against an
+    /// interrupt.
+    live: bool,
+    /// The reply deadline.
+    timeout: Duration,
+    /// The value of [`REPLY_VERDICT_PATCH`] for this message.
+    verdict_text: bool,
+}
+
+/// Wait for the reply of a durable peer until its deadline.
 ///
 /// A durable agent also races the wait against an interrupt. Returns the
 /// reply, or why there is none.
 async fn await_reply(
     ctx: &WorkflowContext,
-    live: bool,
+    wait: ReplyWait,
     progress: &mut Progress,
     promise: &mut autumn_harvest::durable_promise::DurablePromise<'_>,
-    timeout: Duration,
 ) -> Result<Result<PeerReply, NoReply>, String> {
+    let ReplyWait {
+        live,
+        timeout,
+        verdict_text,
+    } = wait;
     if !live {
         let settled = promise
-            .wait_timeout::<PeerReply>(timeout)
+            .wait_timeout::<serde_json::Value>(timeout)
             .await
             .map_err(|err| err.to_string())?;
-        return Ok(settled.map_or(Err(NoReply::Timeout(timeout)), |settled| {
-            settled.map_err(|rejected| NoReply::Rejected(rejected.error))
-        }));
+        return match settled {
+            None => Ok(Err(NoReply::Timeout(timeout))),
+            Some(Ok(value)) => decode_reply(value, verdict_text),
+            Some(Err(rejected)) => Ok(Err(NoReply::Rejected(rejected.error))),
+        };
     }
     let winner = ctx
         .race()
@@ -3244,15 +3270,37 @@ async fn await_reply(
         .await
         .map_err(|err| err.to_string())?;
     Ok(match winner.index {
-        0 => PromiseSettlement::decode::<PeerReply>(winner.value)
+        0 => match PromiseSettlement::decode::<serde_json::Value>(winner.value)
             .map_err(|err| err.to_string())?
-            .map_err(|rejected| NoReply::Rejected(rejected.error)),
+        {
+            Ok(value) => decode_reply(value, verdict_text)?,
+            Err(rejected) => Err(NoReply::Rejected(rejected.error)),
+        },
         1 => {
             progress.interrupted = true;
             Err(NoReply::Interrupted)
         }
         _ => Err(NoReply::Timeout(timeout)),
     })
+}
+
+/// Decode the value of a resolved reply.
+///
+/// A caller outside the run can resolve the promise with any value. With
+/// the gate, a value that is not a reply is a rejected reply, so the record
+/// keeps its verdict and its key (issue #2484). Without the gate, it fails
+/// the call with the old error text.
+fn decode_reply(
+    value: serde_json::Value,
+    verdict_text: bool,
+) -> Result<Result<PeerReply, NoReply>, String> {
+    match serde_json::from_value::<PeerReply>(value) {
+        Ok(reply) => Ok(Ok(reply)),
+        Err(err) if verdict_text => Ok(Err(NoReply::Rejected(format!(
+            "the reply does not decode: {err}"
+        )))),
+        Err(err) => Err(HarvestError::from(err).to_string()),
+    }
 }
 
 /// Record a refused delegation to `name` and answer the model.
@@ -4555,7 +4603,8 @@ mod tests {
         let text = long.error("researcher");
         let message = Refusal::ReplyRejected.message("researcher");
         let cause = text.strip_prefix(&format!("{message}: ")).unwrap();
-        assert_eq!(cause, crate::harness::truncate(&"x".repeat(10_000), 256));
+        assert!(cause.starts_with(&"x".repeat(256)), "{cause}");
+        assert!(!cause.contains(&"x".repeat(257)), "{cause}");
         assert!(long.legacy("researcher").ends_with(&"x".repeat(10_000)));
     }
 

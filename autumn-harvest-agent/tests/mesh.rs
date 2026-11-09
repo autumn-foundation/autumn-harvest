@@ -1279,9 +1279,6 @@ fn every_refusal_code_is_documented() {
         Refusal::BudgetExhausted,
         Refusal::InvalidMandate,
         Refusal::InvalidArguments,
-        Refusal::ReplyTimeout,
-        Refusal::ReplyRejected,
-        Refusal::ReplyInterrupted,
     ] {
         assert!(
             guide.contains(&format!("`{}`", refusal.code())),

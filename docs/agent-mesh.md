@@ -194,8 +194,9 @@ start, before any model call.
 
 ## 5. Refusals
 
-A refused delegation does not run. The model reads an error result with the
-verdict, and the report lists it:
+A refused delegation does not run. A `reply_*` verdict is the exception:
+its message went out. The model reads an error result with the verdict, and
+the report lists it:
 
 ```json
 {"error": "\"researcher\" is already in the delegation chain", "verdict": "cycle"}
@@ -217,7 +218,7 @@ verdict, and the report lists it:
 | `draws_exceeded` | A strategy run asks for more draws than `max_draws`. |
 | `strategy_needs_durable_peer` | A `delegate` call asks an inline peer for a strategy. |
 | `reply_timeout` | The message to a durable peer went out, but no reply came before the deadline. |
-| `reply_rejected` | The message to a durable peer went out, but a caller rejected the reply promise. |
+| `reply_rejected` | The message to a durable peer went out, but a caller rejected the reply promise, or resolved it with a value that is not a reply. |
 | `reply_interrupted` | The message to a durable peer went out, but a person interrupted the wait. |
 
 A delegation runs the first eight checks in the order of the table.
@@ -547,15 +548,19 @@ fn mesh(model: Arc<dyn AgentModel>) -> Result<AgentHarness, AgentIdError> {
   slow peer a longer deadline.
 - A delegation with no reply has a verdict (issue #2484): `reply_timeout`,
   `reply_rejected` or `reply_interrupted`. Its record keeps the `run_id`
-  of the peer, so it still counts one delegation and its draws.
+  of the peer, so it still counts one delegation and its draws. Only a
+  durable agent races an interrupt, and it keeps no records. So only its
+  model reads `reply_interrupted`.
 - Each record of a sent message holds `idempotency_key`, the key
   `<from>:<seq>` of the message. A refusal before the send holds none. A
   new ask gets a new key, so the receiver does not dedupe it. Before you
-  ask again, read the state of the receiver. `AgentState::inbound.applied_key`
-  is `true` when it took the message. A `false` can also mean that its bound
-  dropped the number. The model does not see the key.
-- A report with a new verdict does not decode on an older worker. Roll out
-  the new version to every worker first.
+  ask again, read the state of the peer that `run_id` names.
+  `AgentState::inbound.applied_key` is `true` when the receiver took the
+  message. A `false` can also mean that its bound dropped the sender or
+  the number. The model does not see the key.
+- A run that started before this change keeps the old record and the old
+  text. An older worker cannot decode a report with a new verdict. So
+  upgrade every worker before a run can record one.
 - A durable peer runs on its own worker, in its own history, under its own
   profile budget. Its tokens are not added to the budget of the sender.
 

@@ -132,8 +132,10 @@ impl Inbound {
     /// `key` (issue #2484).
     ///
     /// The key is `<from>:<seq>`, as `DelegationRecord::idempotency_key`
-    /// holds it. A `true` is sound. A `false` can also mean that the bound
-    /// dropped the sender or the number. A malformed key is `false`.
+    /// holds it. A sender numbers its messages per receiver, so check the
+    /// key on the receiver that the record names. Then a `true` is sound. A
+    /// `false` can also mean that the bound dropped the sender or the
+    /// number. A malformed key is `false`.
     #[must_use]
     pub fn applied_key(&self, key: &str) -> bool {
         let Some((sender, seq)) = key.rsplit_once(':') else {

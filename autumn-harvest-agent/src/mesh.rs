@@ -820,9 +820,11 @@ where
 /// mandate. Last, it checks `DrawsExceeded`, then `FanOutExhausted`.
 ///
 /// The last three variants mean that the message went out, but no reply
-/// came (issue #2484). See [`Refusal::unanswered`]. A report carries each verdict to its parent. A
-/// worker that does not know a new variant cannot decode that report, so
-/// roll out a new variant to every worker first.
+/// came (issue #2484). See [`Refusal::unanswered`].
+///
+/// A report carries each verdict to its parent. A worker that does not
+/// know a variant cannot decode that report. So upgrade every worker before
+/// a run can record a new variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
 #[serde(rename_all = "snake_case")]
 #[error("the delegation is refused: {}", self.code())]
@@ -892,7 +894,7 @@ impl Refusal {
     /// `true` when the message went out, but no reply came back.
     ///
     /// The durable peer can still apply the message. A new ask has a new
-    /// key, so the peer then runs the task twice.
+    /// key, so the peer can run the task twice.
     #[must_use]
     pub const fn unanswered(self) -> bool {
         matches!(
@@ -931,16 +933,16 @@ impl Refusal {
                 format!("{peer:?} is not a durable agent, so it cannot run a strategy")
             }
             Self::ReplyTimeout => format!(
-                "no reply from {peer:?} came in time; it can still do the task, \
-                 so a new ask can run it twice"
+                "no reply from {peer:?} came in time; the peer can still do the \
+                 task, so a new ask can run it twice"
             ),
             Self::ReplyRejected => format!(
-                "the reply of {peer:?} was rejected; it can still do the task, \
-                 so a new ask can run it twice"
+                "a caller rejected the wait for {peer:?}; the peer can still do \
+                 the task, so a new ask can run it twice"
             ),
             Self::ReplyInterrupted => format!(
-                "a person interrupted the wait for {peer:?}; it can still do the task, \
-                 so a new ask can run it twice"
+                "a person interrupted the wait for {peer:?}; the peer can still \
+                 do the task, so a new ask can run it twice"
             ),
         }
     }
@@ -1098,7 +1100,8 @@ pub struct DelegationRecord {
     pub draws: u32,
     /// The idempotency key `<from>:<seq>` of the message to a durable peer
     /// (issue #2484). `None` when no message went out. A new ask gets a
-    /// new key, so look for this key at the peer before you ask again.
+    /// new key. So before you ask again, check this key on the state of the
+    /// peer that `run_id` names. The key does not name the peer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idempotency_key: Option<String>,
 }

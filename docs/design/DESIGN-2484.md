@@ -15,15 +15,20 @@ record gives no handle to see that two asks are the same.
 - `await_reply` in `workflow.rs` returns `Err(String)` in three cases:
   the deadline passes, a caller rejects the promise, or a person
   interrupts the wait. Only a durable agent races an interrupt.
-- `peer_outcome` records each of them as `stop: None, refusal: None`.
+- Before this change, `peer_outcome` records each of them as
+  `stop: None, refusal: None`.
+- A resolved promise with a value that is not a `PeerReply` fails the
+  call. The message went out, but no record holds it.
 - Every refusal before the send uses `refuse`. The model reads
   `{"error": ..., "verdict": ...}`.
 - The send uses the key `<from>:<seq>`. The engine and the receiver
   dedupe on it. A new ask takes a new `seq`, so a new key.
 - `nested_units` counts a record with a `run_id`. A sent message counts
   one unit, so its record keeps the `run_id`.
-- `note_serial` skips a record with a refusal. Today an unanswered
-  delegation gets `serial: durable_peer`.
+- `note_serial` skips a record with a refusal. Before this change, an
+  unanswered delegation gets `serial: durable_peer`.
+- `used_delegations` in `sampling/sample.rs` counts the units of a beam
+  step. It skips a record with a refusal.
 - A durable agent keeps no records. Only an `agent_loop` run reports
   them. Its wait has no interrupt branch.
 - The anonymised evaluation clears each delegation `run_id` when the
@@ -32,8 +37,11 @@ record gives no handle to see that two asks are the same.
 - The tool result enters the transcript. Strict replay compares each
   model input, so the repository gates each change of one with
   `ctx.patched`.
-- Strict replay does not accept a patch marker right after a fired wait
-  deadline. The worker path accepts it.
+- The strict replayer of the test engine refuses a patch marker right
+  after a fired wait deadline. A first try of this change put the gate
+  there, and its replay test failed. The worker path accepts it.
+- A durable agent can drain early signals after a send. Its gate then
+  reads no marker, so it keeps the old shape. That is deterministic.
 - The receiver keeps the applied numbers of each sender in
   `AgentState::inbound`. A `contains` there is sound.
 
@@ -54,7 +62,8 @@ The chosen option is in bold.
 | Where the gate goes | after the wait, only with no reply · **after the send, before the wait** |
 | How a caller uses the key | read the history of the peer · **`Inbound::applied_key` on the peer state** |
 | A rejection reason | as it is · **cut to 256 characters for the model** |
-| The record of an old history | keep it empty · **the verdict and the key: the report is not a model input** |
+| The record of an old history | the verdict · **no verdict, as before; the patch gates it too** |
+| A value that is not a reply | fail the call · **`reply_rejected`, behind the patch** |
 
 ## 4. Reverse brainstorming
 
@@ -63,6 +72,8 @@ The chosen option is in bold.
 | Failure | Rule |
 |---|---|
 | A parent stops counting the unit of an unanswered child. | The record keeps its `run_id`. A unit test proves the count. |
+| A beam stops counting the unit of an unanswered step. | `used_delegations` skips only a verdict that is not `unanswered()`. A unit test proves it. |
+| A caller checks a key on the wrong peer. Each peer has its own numbers. | The docs say to check the peer that `run_id` names. |
 | An unanswered delegation loses `serial: durable_peer`. | `note_serial` skips only a verdict that is not `unanswered()`. A test proves it. |
 | A replay of an old run sends the model new text, and diverges. | The patch `agent_peer_reply_verdict` gates the text. A replay test proves both branches. |
 | A run that waits across the upgrade gets the new text. | The gate comes before the wait. Such a run reads no marker there. |
@@ -96,11 +107,13 @@ The chosen option is in bold.
   `ReplyInterrupted`. `Refusal::unanswered()` is `true` for them only.
 - `DelegationRecord::idempotency_key` holds `<from>:<seq>` for each
   message that went out.
+- A resolved value that is not a reply is `reply_rejected`.
 - An unanswered call records its verdict, its `run_id`, its draws and
   its key. The model reads `{"error": ..., "verdict": ...}`.
 - `Inbound::applied_key` finds a sent message at the receiver.
-- The patch `agent_peer_reply_verdict` gates the new model text. A sent
-  message asks it before its wait.
+- The patch `agent_peer_reply_verdict` gates the new model text, the
+  record verdict and the decode rule. A sent message asks it before its
+  wait.
 
 ## 7. Acceptance
 
