@@ -155,6 +155,16 @@ ignore = [
     # Revisit: if autumn-web drops or replaces `validator`, or
     # proc-macro-error2 gains a maintained release.
     { id = "RUSTSEC-2026-0173", reason = "unmaintained, no safe upgrade exists; entirely inside autumn-web's `validator` dependency, not used directly here. Revisit: autumn-web drops/replaces validator, or proc-macro-error2 is revived." },
+    # RUSTSEC-2026-0459 — libsqlite3-sys, bundled SQLite before 3.54.0 can
+    # return uninitialised page-cache memory when it opens a database with a
+    # sibling `-wal` file of another page size. The fix is libsqlite3-sys
+    # 0.39. No graph can take it yet: the crate declares `links = "sqlite3"`,
+    # so one version serves every user, and diesel 2.3.14 (the newest) and
+    # autumn-web 0.10 still require 0.38. rusqlite 0.41 already moved.
+    # Reachability: Harvest opens only the SQLite files that it creates in
+    # its own data directory. An attacker must plant a crafted file pair
+    # there, which needs write access to that directory already.
+    { id = "RUSTSEC-2026-0459", reason = "no compatible upgrade: libsqlite3-sys is a `links` crate, and diesel 2.3.14 and autumn-web 0.10 still require 0.38. Local only: an attacker must plant a crafted database and -wal pair in the data directory that Harvest creates. Revisit: diesel and autumn-web accept libsqlite3-sys >= 0.39; then move rusqlite to 0.41." },
 
     # RUSTSEC-2023-0071 — rsa 0.9.10 Marvin Attack (timing side-channel on
     # private-key ops). Pulled by jsonwebtoken -> autumn-web; whether this is
