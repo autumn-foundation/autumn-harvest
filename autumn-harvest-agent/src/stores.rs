@@ -1022,6 +1022,7 @@ mod postgres {
 mod tests {
     #![allow(clippy::unwrap_used)]
 
+    #[cfg(feature = "sqlite")]
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
     use super::*;
@@ -1048,6 +1049,7 @@ mod tests {
         assert_eq!(newer.to_error().kind(), ErrorKind::Tool);
     }
 
+    #[cfg(feature = "sqlite")]
     fn add(text: &str) -> MemoryOp {
         MemoryOp::Add {
             block: "memory".into(),
@@ -1055,6 +1057,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "sqlite")]
     fn entries(blocks: &[MemoryBlock]) -> Vec<String> {
         blocks
             .iter()
@@ -1306,6 +1309,7 @@ mod tests {
         assert_eq!(store.load(&scope).await.unwrap(), template);
     }
 
+    #[cfg(feature = "sqlite")]
     fn one(text: &str) -> Vec<ChatMessage> {
         vec![ChatMessage::text(crate::message::ChatRole::User, text)]
     }
