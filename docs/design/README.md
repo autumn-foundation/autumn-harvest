@@ -17,7 +17,7 @@ files by path.
 | Changelog entry | [`docs/changelog.d/`](../changelog.d/README.md) | see its README |
 
 Never write one of these at the repository root.
-[`root-files.py`](../audits/root-files.py) fails the `lint` job on a root
+`cargo xtask audit root-files` ([`xtask/src/audit/root_files.rs`](../../xtask/src/audit/root_files.rs)) fails the `lint` job on a root
 file that is not in its allow list.
 
 ## Links
