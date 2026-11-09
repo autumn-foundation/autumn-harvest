@@ -111,6 +111,16 @@ const RESET_ON_FULL_PATCH: &str = "agent_reset_on_full_round";
 /// the gate only for a gated call, so each other run records no marker.
 const APPROVAL_NOTICE_PATCH: &str = "agent_approval_notice";
 
+/// The gate of the verdict text of a durable peer with no reply (issue
+/// #2484). A history from before the gate holds the old text, so its replay
+/// keeps it.
+///
+/// A sent message asks the gate before its wait. A run that waits across
+/// the upgrade then reads no marker, so it keeps the old text. Strict
+/// replay does not accept a marker right after a fired wait deadline, so
+/// the gate cannot come after the wait.
+const REPLY_VERDICT_PATCH: &str = "agent_peer_reply_verdict";
+
 /// A signal name that no client sends. A probe of it claims nothing.
 ///
 /// The probe moves each signal that waits at the end of history into the
@@ -1946,8 +1956,9 @@ fn fit(call: &ToolCall, decision: Option<&ToolDecision>, agent: &Member) -> Fit 
 ///
 /// The call pushes its own record last, after the records of its subtree.
 /// A refused delegation did not run, so its record keeps no reason. This
-/// includes a durable peer that refuses the message. A person can also
-/// reject a gated call. It then pushes no record.
+/// includes a durable peer that refuses the message. A message with no
+/// reply went out, so its record keeps the reason (issue #2484). A person
+/// can also reject a gated call. It then pushes no record.
 fn note_serial(
     ctx: &WorkflowContext,
     tree: &mut Tree,
@@ -1958,7 +1969,7 @@ fn note_serial(
     let Some(record) = tree.records.get_mut(before..).and_then(<[_]>::last_mut) else {
         return;
     };
-    if record.refusal.is_some() {
+    if record.refusal.is_some_and(|refusal| !refusal.unanswered()) {
         return;
     }
     record.serial = Some(reason);
@@ -2549,6 +2560,7 @@ async fn delegate(
         answer_truncated: false,
         serial: None,
         draws: 0,
+        idempotency_key: None,
     });
     let mut outcome = serde_json::json!({
         "agent": peer.name,
@@ -2693,6 +2705,7 @@ fn refuse_delegation(agent: &Member, tree: &mut Tree, refusal: Refusal, name: &s
         answer_truncated: false,
         serial: None,
         draws: 0,
+        idempotency_key: None,
     });
     refused(refusal, name)
 }
@@ -2908,6 +2921,7 @@ fn merge_child(
         answer_truncated: false,
         serial: None,
         draws: 0,
+        idempotency_key: None,
     });
     let mut outcome = serde_json::json!({
         "agent": peer.name,
@@ -3002,7 +3016,7 @@ async fn durable_peer(
             target_id,
             ENTITY_OP_SIGNAL,
             EntityMessage::op(AgentOp::PeerMessage(envelope)),
-            key,
+            key.clone(),
         )
         .await;
     match sent {
@@ -3014,6 +3028,7 @@ async fn durable_peer(
         }
         Err(other) => return Err(other.to_string()),
     }
+    let verdict_text = ctx.patched(REPLY_VERDICT_PATCH);
     let timeout = Duration::from_secs(
         peer.reply_timeout_secs
             .unwrap_or(crate::mesh::DEFAULT_REPLY_TIMEOUT_SECS),
@@ -3028,6 +3043,8 @@ async fn durable_peer(
         target_id,
         chain,
         draws,
+        key,
+        verdict_text,
     };
     Ok(peer_outcome(room, tree, peer, sent, outcome))
 }
@@ -3048,6 +3065,65 @@ struct PeerSent<'a> {
     chain: Vec<String>,
     /// The draw units that the caller counted.
     draws: u32,
+    /// The idempotency key of the message.
+    key: String,
+    /// The value of [`REPLY_VERDICT_PATCH`] for this message.
+    verdict_text: bool,
+}
+
+/// The most characters of a no-reply cause that the model reads. A caller
+/// outside the run writes the reason of a rejection, so it has a bound.
+const MAX_NO_REPLY_CAUSE_CHARS: usize = 256;
+
+/// Why a durable peer sent no reply (issue #2484).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum NoReply {
+    /// The deadline passed.
+    Timeout(Duration),
+    /// A caller rejected the reply promise, with this reason.
+    Rejected(String),
+    /// A person interrupted the wait.
+    Interrupted,
+}
+
+impl NoReply {
+    /// The verdict of the cause.
+    const fn verdict(&self) -> Refusal {
+        match self {
+            Self::Timeout(_) => Refusal::ReplyTimeout,
+            Self::Rejected(_) => Refusal::ReplyRejected,
+            Self::Interrupted => Refusal::ReplyInterrupted,
+        }
+    }
+
+    /// The cause in words.
+    fn cause(&self) -> String {
+        match self {
+            Self::Timeout(timeout) => {
+                format!("no reply arrived within {}s", timeout.as_secs())
+            }
+            Self::Rejected(reason) => reason.clone(),
+            Self::Interrupted => {
+                "a person interrupted this op while it waited for the reply".to_owned()
+            }
+        }
+    }
+
+    /// The error text that the model reads: the verdict text, then the cause
+    /// cut to [`MAX_NO_REPLY_CAUSE_CHARS`].
+    fn error(&self, peer: &str) -> String {
+        let cause = crate::harness::truncate(&self.cause(), MAX_NO_REPLY_CAUSE_CHARS);
+        format!("{}: {cause}", self.verdict().message(peer))
+    }
+
+    /// The error text of a history from before [`REPLY_VERDICT_PATCH`]. It
+    /// must not change, so it keeps the whole cause.
+    fn legacy(&self, peer: &str) -> String {
+        format!(
+            "the durable agent {peer:?} gave no answer: {}",
+            self.cause()
+        )
+    }
 }
 
 /// Record one exchange with a durable peer and answer the model.
@@ -3056,12 +3132,14 @@ fn peer_outcome(
     tree: &mut Tree,
     peer: &Peer,
     sent: PeerSent<'_>,
-    outcome: Result<PeerReply, String>,
+    outcome: Result<PeerReply, NoReply>,
 ) -> ToolOutcome {
     let PeerSent {
         target_id,
         chain,
         draws,
+        key,
+        verdict_text,
     } = sent;
     match outcome {
         Ok(reply) => {
@@ -3079,6 +3157,7 @@ fn peer_outcome(
                 answer_truncated: false,
                 serial: None,
                 draws,
+                idempotency_key: Some(key),
             });
             if let Some(refusal) = reply.refusal {
                 refused(refusal, &peer.name)
@@ -3102,12 +3181,14 @@ fn peer_outcome(
                 }
             }
         }
-        Err(error) => {
+        Err(missing) => {
+            // The message went out, so the record keeps the run id. A
+            // parent then still counts its unit and its draws.
             tree.records.push(DelegationRecord {
                 chain,
                 run_id: Some(target_id.to_owned()),
                 stop: None,
-                refusal: None,
+                refusal: Some(missing.verdict()),
                 usage: TokenUsage::default(),
                 steps_used: 0,
                 tool_calls: 0,
@@ -3115,11 +3196,21 @@ fn peer_outcome(
                 answer_truncated: false,
                 serial: None,
                 draws,
+                idempotency_key: Some(key),
             });
-            ToolOutcome::error(&format!(
-                "the durable agent {:?} gave no answer: {error}",
-                peer.name
-            ))
+            if verdict_text {
+                ToolOutcome {
+                    content: serde_json::json!({
+                        "error": missing.error(&peer.name),
+                        "verdict": missing.verdict(),
+                    })
+                    .to_string(),
+                    is_error: true,
+                    workspace: None,
+                }
+            } else {
+                ToolOutcome::error(&missing.legacy(&peer.name))
+            }
         }
     }
 }
@@ -3134,17 +3225,15 @@ async fn await_reply(
     progress: &mut Progress,
     promise: &mut autumn_harvest::durable_promise::DurablePromise<'_>,
     timeout: Duration,
-) -> Result<Result<PeerReply, String>, String> {
-    let timed_out = || format!("no reply arrived within {}s", timeout.as_secs());
+) -> Result<Result<PeerReply, NoReply>, String> {
     if !live {
         let settled = promise
             .wait_timeout::<PeerReply>(timeout)
             .await
             .map_err(|err| err.to_string())?;
-        return Ok(settled.map_or_else(
-            || Err(timed_out()),
-            |settled| settled.map_err(|rejected| rejected.error),
-        ));
+        return Ok(settled.map_or(Err(NoReply::Timeout(timeout)), |settled| {
+            settled.map_err(|rejected| NoReply::Rejected(rejected.error))
+        }));
     }
     let winner = ctx
         .race()
@@ -3157,12 +3246,12 @@ async fn await_reply(
     Ok(match winner.index {
         0 => PromiseSettlement::decode::<PeerReply>(winner.value)
             .map_err(|err| err.to_string())?
-            .map_err(|rejected| rejected.error),
+            .map_err(|rejected| NoReply::Rejected(rejected.error)),
         1 => {
             progress.interrupted = true;
-            Err("a person interrupted this op while it waited for the reply".to_owned())
+            Err(NoReply::Interrupted)
         }
-        _ => Err(timed_out()),
+        _ => Err(NoReply::Timeout(timeout)),
     })
 }
 
@@ -3182,6 +3271,7 @@ fn refuse(agent: &Member, tree: &mut Tree, refusal: Refusal, name: &str) -> Tool
         answer_truncated: false,
         serial: None,
         draws: 0,
+        idempotency_key: None,
     });
     refused(refusal, name)
 }
@@ -4403,6 +4493,7 @@ mod tests {
             answer_truncated: false,
             serial: None,
             draws,
+            idempotency_key: None,
         }
     }
 
@@ -4416,5 +4507,73 @@ mod tests {
         assert_eq!(nested_units(&[ran(0), ran(3), refused]), 1 + 4);
         assert_eq!(nested_units(&[]), 0);
         assert_eq!(nested_units(&[ran(u32::MAX), ran(1)]), u32::MAX);
+    }
+
+    // Issue #2484: the message of an unanswered delegation went out, so
+    // its unit and its draws still count.
+    #[test]
+    fn an_unanswered_delegation_still_counts_its_units() {
+        let unanswered = DelegationRecord {
+            stop: None,
+            refusal: Some(Refusal::ReplyTimeout),
+            idempotency_key: Some("r:1".into()),
+            ..ran(2)
+        };
+        assert_eq!(nested_units(&[unanswered]), 1 + 2);
+    }
+
+    // Issue #2484: each cause of a missing reply has its own verdict.
+    #[test]
+    fn each_missing_reply_has_its_verdict_and_its_cause() {
+        let timeout = NoReply::Timeout(Duration::from_secs(60));
+        let rejected = NoReply::Rejected("the operator said no".into());
+        let interrupted = NoReply::Interrupted;
+        assert_eq!(timeout.verdict(), Refusal::ReplyTimeout);
+        assert_eq!(rejected.verdict(), Refusal::ReplyRejected);
+        assert_eq!(interrupted.verdict(), Refusal::ReplyInterrupted);
+        for cause in [&timeout, &rejected, &interrupted] {
+            assert!(cause.verdict().unanswered());
+            let text = cause.error("researcher");
+            assert!(
+                text.starts_with(&cause.verdict().message("researcher")),
+                "{text}"
+            );
+        }
+        assert!(timeout.error("researcher").contains("60s"));
+        assert!(
+            rejected
+                .error("researcher")
+                .contains("the operator said no")
+        );
+    }
+
+    // Issue #2484: a caller outside the run writes a rejection reason, so
+    // the model reads a bounded cause. The legacy text keeps it whole.
+    #[test]
+    fn a_long_rejection_reason_is_cut_for_the_model() {
+        let long = NoReply::Rejected("x".repeat(10_000));
+        let text = long.error("researcher");
+        let message = Refusal::ReplyRejected.message("researcher");
+        let cause = text.strip_prefix(&format!("{message}: ")).unwrap();
+        assert_eq!(cause, crate::harness::truncate(&"x".repeat(10_000), 256));
+        assert!(long.legacy("researcher").ends_with(&"x".repeat(10_000)));
+    }
+
+    // Issue #2484: a history from before the gate keeps its old text.
+    #[test]
+    fn the_legacy_text_of_each_missing_reply_is_unchanged() {
+        assert_eq!(
+            NoReply::Timeout(Duration::from_secs(60)).legacy("researcher"),
+            "the durable agent \"researcher\" gave no answer: no reply arrived within 60s"
+        );
+        assert_eq!(
+            NoReply::Rejected("no".into()).legacy("researcher"),
+            "the durable agent \"researcher\" gave no answer: no"
+        );
+        assert_eq!(
+            NoReply::Interrupted.legacy("researcher"),
+            "the durable agent \"researcher\" gave no answer: \
+             a person interrupted this op while it waited for the reply"
+        );
     }
 }

@@ -1303,6 +1303,8 @@ fn run_end_of(
 ///
 /// Only the root id itself, or the id of a lane under it, changes. A lane
 /// starts with `:`, so another id that starts with `from` keeps its value.
+/// A run keys its peer messages on its run id, so each key gets the same
+/// change (issue #2484).
 fn rebase_run_ids(report: &mut AgentReport, from: &str, to: &str) {
     let rebase = |run_id: &mut Option<String>| {
         let lane = run_id
@@ -1316,6 +1318,7 @@ fn rebase_run_ids(report: &mut AgentReport, from: &str, to: &str) {
     rebase(&mut report.run_id);
     for delegation in &mut report.delegations {
         rebase(&mut delegation.run_id);
+        rebase(&mut delegation.idempotency_key);
     }
 }
 
@@ -2415,6 +2418,8 @@ mod tests {
             answer_truncated: false,
             serial: None,
             draws: 0,
+            // A sender keys its message on its own run id (issue #2484).
+            idempotency_key: Some(format!("{run_id}:1")),
         };
         report.delegations = vec![child("e1:d1"), child("e10"), child("x")];
         rebase_run_ids(&mut report, "e1", "r1");
@@ -2425,6 +2430,12 @@ mod tests {
             .map(|record| record.run_id.as_deref())
             .collect();
         assert_eq!(ids, [Some("r1:d1"), Some("e10"), Some("x")]);
+        let keys: Vec<_> = report
+            .delegations
+            .iter()
+            .map(|record| record.idempotency_key.as_deref())
+            .collect();
+        assert_eq!(keys, [Some("r1:d1:1"), Some("e10:1"), Some("x:1")]);
     }
 
     #[test]
