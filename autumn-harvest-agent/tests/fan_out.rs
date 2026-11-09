@@ -1318,11 +1318,12 @@ fn a_reason_has_a_stable_code_and_wire_form() {
     }
 }
 
-// Issue #2485: each delegation mode has its own run-id form. A fan-out
-// child run has its execution id as its run id. A later inline child gets
-// `{root}:d{n}`, and `n` counts the fan-out children too.
+// Issue #2485: a fan-out child and an inline child have different run-id
+// forms. A fan-out child run has its execution id as its run id. A later
+// inline child gets `{root run id}:d{n}`, and `n` counts the fan-out
+// children too. `durable_peers.rs` covers the run id of a durable peer.
 #[tokio::test(flavor = "multi_thread")]
-async fn each_delegation_mode_has_its_own_run_id_form() {
+async fn fan_out_and_inline_children_have_their_own_run_id_forms() {
     let (_dir, db) = fresh_db();
     let model = FnModel::new(|request| {
         if first_user(request) != ROOT_INPUT {

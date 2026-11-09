@@ -12,17 +12,27 @@ const MESH: &str = "docs/agent-mesh.md";
 /// The durable-agents guide.
 const ADAPTER: &str = "docs/agent-adapter.md";
 
-/// The child settings that `child_task` changes or keeps, beyond memory,
-/// follow-ups and delivery.
-const CHILD_ROWS: [&str; 7] = [
-    "Workspace",
-    "Tool guidance, skills",
-    "Answer check",
-    "Kind",
-    "Flow labels",
-    "Failure report",
-    "Effect allowlist, probe, context reset, mesh",
+/// The child settings that `child_task` sets, beyond memory, follow-ups and
+/// delivery. Each pair holds the first cell of a row and a word of its value.
+const CHILD_ROWS: [(&str, &str); 9] = [
+    ("Workspace", "None"),
+    ("Tool guidance, skills", "None"),
+    ("Answer check", "Off"),
+    ("Kind", "None"),
+    ("Flow labels", "shares the label set"),
+    ("Failure report", "Off"),
+    ("Draw", "keeps the draw id"),
+    ("Streaming, parallel-children bound", "As the parent"),
+    (
+        "Effect allowlist, probe, context reset, mesh",
+        "As the parent",
+    ),
 ];
+
+/// The own checks of a durable peer, in the order that `durable_peer` runs
+/// them.
+const DURABLE_CHECKS: &str = "A durable peer then checks `peer_unavailable`, \
+     `not_permitted`, `deadlock` and `invalid_mandate`, in this order.";
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -38,7 +48,8 @@ fn read(relative: &str) -> String {
         .replace("\r\n", "\n")
 }
 
-/// The text of the level-2 section that opens with `heading`.
+/// The text of the level-2 section that opens with `heading`. The text
+/// holds the level-3 subsections of the section.
 fn section<'a>(text: &'a str, heading: &str) -> &'a str {
     let start = text
         .find(&format!("\n{heading}\n"))
@@ -51,8 +62,8 @@ fn section<'a>(text: &'a str, heading: &str) -> &'a str {
     &body[..end]
 }
 
-/// `text` with each run of white space as one space, so a line wrap does not
-/// hide a phrase.
+/// Returns `text` with each run of white space as one space. A line wrap then
+/// does not hide a phrase.
 fn flat(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
@@ -68,7 +79,7 @@ fn row<'a>(text: &'a str, name: &str) -> &'a str {
         .unwrap_or_else(|| panic!("no table row starts with `{name}`"))
 }
 
-// Item 1: a finished lookup replays from history. Only a lookup in flight
+// DESIGN-2485 item 1: a finished lookup replays from history. Only a lookup in flight
 // runs again.
 #[test]
 fn the_crash_table_reads_a_finished_lookup_from_history() {
@@ -79,34 +90,37 @@ fn the_crash_table_reads_a_finished_lookup_from_history() {
     assert!(lookup.contains("finished lookup"), "{lookup}");
 }
 
-// Item 2: the guide states the checks of a durable peer after the first
-// eight. `mesh::tests` checks the order of the table.
+// DESIGN-2485 item 2: the guide states the own checks of a durable peer, in
+// order. `mesh::tests` checks the order of the table.
 #[test]
 fn the_refusals_state_the_durable_checks() {
     let guide = read(MESH);
     let refusals = flat(section(&guide, "## 5. Refusals"));
     assert!(
-        refusals.contains("A durable peer then checks"),
-        "section 5 lacks the durable checks"
+        refusals.contains(DURABLE_CHECKS),
+        "section 5 lacks the durable checks in order"
     );
 }
 
-// Item 3: the child table names each setting that `child_task` sets.
+// DESIGN-2485 item 3: the child table names each setting that `child_task`
+// sets, with its value.
 #[test]
 fn the_child_table_names_every_child_setting() {
     let guide = read(MESH);
     let child = section(&guide, "## 3. What the child gets");
-    for name in CHILD_ROWS {
-        row(child, name);
+    for (name, value) in CHILD_ROWS {
+        let line = row(child, name);
+        assert!(line.contains(value), "{line}");
     }
 }
 
-// Item 4: the approval helper takes the tree round, not the child step.
+// DESIGN-2485 item 4: the approval helper takes the tree round, not the child step.
 #[test]
 fn the_guides_name_the_tree_round_of_an_approval() {
     let adapter = flat(&read(ADAPTER));
     assert!(adapter.contains("approval_signal(round, position, call_id)"));
     assert!(!adapter.contains("approval_signal(step"));
+    assert!(!adapter.contains("tool_approval:step:"));
     let guide = read(MESH);
     let approvals = flat(section(&guide, "## 8. Approvals in a child"));
     assert!(
@@ -115,7 +129,7 @@ fn the_guides_name_the_tree_round_of_an_approval() {
     );
 }
 
-// Item 5: each delegation mode has its own run-id form.
+// DESIGN-2485 item 5: each delegation mode has its own run-id form.
 #[test]
 fn the_guide_states_the_run_id_of_each_mode() {
     let guide = read(MESH);
@@ -128,11 +142,14 @@ fn the_guide_states_the_run_id_of_each_mode() {
     assert!(durable.contains("workflow id"), "{durable}");
 }
 
-// Item 6: the guide states both roster rules.
+// DESIGN-2485 item 6: the guide states both roster rules.
 #[test]
 fn the_guide_states_the_roster_rules() {
     let guide = read(MESH);
     let delegate = flat(section(&guide, "## 2. Delegate to a peer"));
-    assert!(delegate.contains("the later one wins"), "duplicate rule");
+    assert!(
+        delegate.contains("keeps the peer added last"),
+        "duplicate rule"
+    );
     assert!(delegate.contains("invalid name"), "invalid-name rule");
 }

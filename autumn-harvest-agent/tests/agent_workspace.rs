@@ -9,22 +9,23 @@
 mod common;
 
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use autumn_harvest::aead_codec::{AeadCodec, DataKey};
 use autumn_harvest::chrono::{DateTime, Utc};
 use autumn_harvest::payload_codec::PayloadCodecs;
 use autumn_harvest_agent::flow::labels;
+use autumn_harvest_agent::mesh::DELEGATE_TOOL;
 use autumn_harvest_agent::{
     AgentError, AgentHarness, AgentHeartbeat, AgentId, AgentOp, AgentProfile, AgentState,
-    BoxFuture, ChatRole, ContentPart, Control, DirWorkspaceBlobs, ErrorKind, FlowRules, FnTool,
-    InMemoryWorkspaceBlobs, Rule, Tool, ToolEffect, WorkspaceBlobs, WorkspaceMount, WorkspaceStore,
-    sqlite,
+    BoxFuture, ChatRequest, ChatRole, ContentPart, Control, DirWorkspaceBlobs, ErrorKind,
+    FlowRules, FnTool, InMemoryWorkspaceBlobs, Mandate, Peer, Rule, Tool, ToolEffect,
+    WorkspaceBlobs, WorkspaceMount, WorkspaceStore, sqlite,
 };
 use autumn_harvest_sqlite::{RunState, SqliteRuntime};
-use common::{ScriptedModel, answer, calls, runtime};
+use common::{ScriptedModel, TryFnModel, answer, calls, runtime};
 use serde_json::json;
 
 fn fresh_db() -> (tempfile::TempDir, PathBuf) {
@@ -559,15 +560,36 @@ async fn a_reset_in_a_new_life_deletes_the_keys_of_an_old_life_on_a_fast_clock()
     );
 }
 
-// Issue #2485: a delegated child has no workspace, so siblings never race on
-// one head. A workspace tool in the child sees none. The parent sees its own.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_child_gets_no_workspace() {
-    use autumn_harvest_agent::mesh::DELEGATE_TOOL;
-    use autumn_harvest_agent::{Mandate, Peer};
+/// The text of each user message of `request`.
+fn user_texts(request: &ChatRequest) -> Vec<String> {
+    request
+        .messages
+        .iter()
+        .filter(|m| m.role == ChatRole::User)
+        .flat_map(|m| &m.content)
+        .filter_map(|part| match part {
+            ContentPart::Text(text) => Some(text.clone()),
+            _ => None,
+        })
+        .collect()
+}
 
+/// The count of tool results in `request`.
+fn result_count(request: &ChatRequest) -> usize {
+    request
+        .messages
+        .iter()
+        .flat_map(|m| &m.content)
+        .filter(|part| matches!(part, ContentPart::ToolResult { .. }))
+        .count()
+}
+
+/// Run the agent `coder`, which has a workspace. It calls `probe`, then
+/// delegates `asks` tasks to `helper` in one turn. Each helper calls
+/// `probe`. Returns whether each `probe` call saw a workspace, in order.
+async fn probe_mounts(asks: &[&str], parallel: u32) -> Vec<bool> {
     let (_dir, db) = fresh_db();
-    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = Arc::new(Mutex::new(Vec::new()));
     let probe = {
         let seen = seen.clone();
         FnTool::with_context(
@@ -583,20 +605,32 @@ async fn a_child_gets_no_workspace() {
         .uses_workspace()
         .shared()
     };
-    let model = ScriptedModel::new(vec![
-        calls(&[("p1", "probe", json!({}))], 1),
-        calls(
-            &[(
-                "d1",
-                DELEGATE_TOOL,
-                json!({"agent": "helper", "task": "probe it"}),
-            )],
-            1,
-        ),
-        calls(&[("p1", "probe", json!({}))], 1),
-        answer("child done", 1),
-        answer("done", 1),
-    ]);
+    let tasks: Vec<String> = asks.iter().map(|ask| (*ask).to_owned()).collect();
+    // Each agent answers by the state of its own request, so the order of
+    // concurrent children does not matter.
+    let model = TryFnModel::new(move |request| {
+        let child = user_texts(request).iter().any(|text| tasks.contains(text));
+        match (child, result_count(request)) {
+            (_, 0) => calls(&[("p1", "probe", json!({}))], 1),
+            (true, _) => answer("child done", 1),
+            (false, 1) => {
+                let delegations: Vec<(String, &str, serde_json::Value)> = tasks
+                    .iter()
+                    .enumerate()
+                    .map(|(n, task)| {
+                        let call = json!({"agent": "helper", "task": task});
+                        (format!("d{n}"), DELEGATE_TOOL, call)
+                    })
+                    .collect();
+                let list: Vec<(&str, &str, serde_json::Value)> = delegations
+                    .iter()
+                    .map(|(id, name, call)| (id.as_str(), *name, call.clone()))
+                    .collect();
+                calls(&list, 1)
+            }
+            (false, _) => answer("done", 1),
+        }
+    });
     let store = WorkspaceStore::new(
         Arc::new(InMemoryWorkspaceBlobs::default()),
         PayloadCodecs::default(),
@@ -608,6 +642,7 @@ async fn a_child_gets_no_workspace() {
         .agent(
             AgentProfile::new("coder")
                 .workspace()
+                .parallel_children(parallel)
                 .mandate(Mandate::new("coder").peers(["helper"])),
         );
     let mut rt = runtime(&db, harness);
@@ -616,5 +651,21 @@ async fn a_child_gets_no_workspace() {
     let ended = say(&mut rt, &agent, "go").await;
 
     assert_eq!(ended.last_answer.as_deref(), Some("done"));
-    assert_eq!(*seen.lock().unwrap(), [true, false]);
+    seen.lock().unwrap().clone()
+}
+
+// Issue #2485: an inline child has no workspace. A workspace tool in the
+// child sees none. The parent sees its own.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_inline_child_gets_no_workspace() {
+    assert_eq!(probe_mounts(&["probe it"], 0).await, [true, false]);
+}
+
+// Issue #2485: a fan-out child run has no workspace, so siblings never race
+// on one head. `child_task` sets it, because the child run mounts the
+// workspace of its task.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fan_out_child_gets_no_workspace() {
+    let seen = probe_mounts(&["probe a", "probe b"], 2).await;
+    assert_eq!(seen, [true, false, false]);
 }

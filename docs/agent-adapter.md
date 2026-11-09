@@ -234,9 +234,9 @@ with a serialised `Approval` as the payload. Read the signal name from the wait:
 deadline timer of the wait is `__signal_timeout:<seq>:<signal name>`. On
 SQLite, `RunState::WaitingSignal` holds the name. For a run with no
 delegation, `approval::approval_signal(round, position, call_id)` also builds
-it from the recorded `ModelTurn`. There, `round` is the step of the run. A
-delegation makes `round` count the tool rounds of the whole tree. Then read
-the name from the wait. A worker with
+it from the recorded `ModelTurn`. In such a run, `round` is the step of the
+run. An inline delegation makes `round` count the tool rounds of the whole
+inline tree. A worker with
 no harness fails the call as `AgentHarnessMissing`, which is not retryable.
 
 A worker with a payload cap other than the default must say so. Set

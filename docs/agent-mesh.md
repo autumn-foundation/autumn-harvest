@@ -60,10 +60,12 @@ fn planner(
 A harness takes each tool as an `Arc<dyn Tool>`. `FnTool::new` wraps an async
 function, and `shared` returns it as an `Arc<dyn Tool>`. Section 7 shows both.
 
-The roster keys each peer by its name. When two peers share a name, the later
-one wins. A peer needs a valid agent name (section 4). The lookup leaves out
-a peer with an invalid name and logs a warning. A mandate that names such a
-peer fails its run at the start, so no run reaches the peer.
+The roster keys each peer by its name. If two peers have the same name, the
+harness keeps the peer added last. A peer needs a valid agent name (section
+4). The peer lookup leaves out a peer with an invalid name. It logs a
+warning. A mandate that names such a peer is not valid. A root run with that
+mandate fails at the start, and a durable agent with it fails each op. So no
+run reaches the peer.
 
 The planner sees one more tool, `delegate`. Its input is `agent`, one of the
 peer names, and `task`, the text for the peer. The tool description lists
@@ -127,21 +129,23 @@ the task.
 | System prompt | `Peer::system` |
 | Input | The `task` argument |
 | Transcript | Fresh |
-| Run id | One form for each mode. See [Run ids](#run-ids). |
+| Run id | One form for each mode (see Run ids, below) |
 | Tools | The meet of the parent mandate and `Peer::tools` |
 | Steps | `Peer::max_steps` (default `DEFAULT_MAX_STEPS`) |
 | Model | `Peer::model`, else the model of the parent (section 14) |
 | Token cap | The smaller of `Peer::max_total_tokens` and the parent remainder |
 | Read-only | On when the parent, the peer or the mandate is read-only |
 | Memory, follow-ups, delivery | Off. A child never edits the memory of its parent. |
-| Workspace | None. A workspace tool in a child gets no workspace, so siblings never race on one head. |
+| Workspace | None. A workspace tool in a child gets no workspace. So two children never write one workspace at the same time. |
 | Tool guidance, skills | None. The peer has its own prompt. |
-| Answer check | Off. Only the answer of the root is checked. |
-| Kind | None. A peer is not of the kind of its parent. |
-| Flow labels | None on the child task. The tree holds one label set (section 7). |
-| Failure report | Off. A fan-out child turns it on, so the parent keeps the usage of a failed child. |
+| Answer check | Off. Only the root runs the answer check. |
+| Kind | None. A peer does not take the kind of its parent. |
+| Flow labels | An inline child shares the label set of the tree (section 7). A fan-out child starts with the labels of the tree. Its labels join the tree when the batch ends. |
+| Failure report | Off. A fan-out child turns it on (section 15). Then the parent keeps the usage of a failed child. A run recorded before the flag keeps it off. |
+| Draw | The child keeps the draw id of the parent. It drops the draw root, so it has its own run id. |
 | Session, tenant, output cap, unattended flag | As the parent |
 | Loop guard, approval timeout, request cap | As the parent |
+| Streaming, parallel-children bound | As the parent |
 | Effect allowlist, probe, context reset, mesh | As the parent |
 | Answer | Cut to `Peer::answer_limit`, else to `AgentHarness::tool_output_limit` (default 8 000 characters). |
 
@@ -167,17 +171,30 @@ The run id of a child depends on how it runs:
 
 | Mode | Run id of the child |
 |---|---|
-| Inline child | `{root run id}:d{n}`. The root run id is the run id of the root agent, usually its execution id. |
-| Fan-out child (section 15) | The execution id of the child run. That run is a new root, so its inline children get `{its execution id}:d{n}`. |
-| Durable peer (section 13) | The workflow id of the peer, its `AgentId`, such as `research/r1`. |
+| Inline child | `{root run id}:d{n}`. An inline child of an inline child uses the same root. |
+| Fan-out child (section 15) | The execution id of the child run. That run is a new root. Its inline children get `{its execution id}:d{n}`. |
+| Durable peer (section 13) | The peer runs the task under its own run id, `<incarnation>:s<n>`. `DelegationRecord::run_id` holds the workflow id of the peer, its `AgentId`, such as `research/r1`. |
 
-`n` is the delegation count of the tree after the delegation. A fan-out
-child, a message to a durable peer and each draw of its strategy also add
-to the count. So `n` can skip a number. A refusal before a child run or a
-send adds nothing.
+The root run id is the run id of the root agent:
 
-`DelegationRecord::run_id` holds the run id. Do not parse it to find the
-agent. Read `DelegationRecord::chain`.
+- A one-shot run uses its execution id. A run recorded with
+  `RunIdSource::WorkflowId` keeps its workflow id.
+- A draw of a strategy uses `{root}:s{n}`.
+- A segment of a durable agent uses `<incarnation>:s<n>`.
+
+`n` is the delegation count of the tree after the delegation. Other
+delegations add to the count too, so `n` can skip a number:
+
+- A fan-out child adds one when it starts. When it ends, each delegation
+  that ran under it adds one, plus its draw units.
+- A message to a durable peer adds one before the send. A refused send keeps
+  that unit.
+- A strategy ask adds its draw cap once the message is out. A beam adds
+  none.
+- A refusal before a child run starts, or before a message counts, adds
+  nothing.
+
+Do not parse a run id to find the agent. Read `DelegationRecord::chain`.
 
 ## 4. Mandates
 
@@ -235,7 +252,7 @@ the report lists it:
 | Verdict | Cause |
 |---|---|
 | `invalid_arguments` | The `delegate` call does not have exactly the arguments `agent` and `task`. |
-| `not_permitted` | The mandate does not name the peer. |
+| `not_permitted` | The mandate does not name the peer. Or a run with an effect allowlist or a probe asks a durable peer. |
 | `unknown_peer` | The mandate names the peer, but the roster has no valid peer of that name. |
 | `cycle` | The peer is already in the chain. |
 | `depth_exceeded` | The delegation passes `max_depth`. |
@@ -253,11 +270,11 @@ the report lists it:
 
 A delegation runs the first eight checks in the order of the table. A
 durable peer then checks `peer_unavailable`, `not_permitted`, `deadlock` and
-`invalid_mandate`, in this order. This `peer_unavailable` means that the
-roster names no valid agent id. This `not_permitted` refuses a run with an
-effect allowlist or a probe. A send that finds no running peer also returns
+`invalid_mandate`, in this order. A strategy ask then checks `draws_exceeded`
+and `fan_out_exhausted`. Last, a send that finds no running peer returns
 `peer_unavailable`. `a_durable_peer_runs_the_mandate_checks_before_its_own`
-proves the order.
+proves that the mandate checks run first.
+
 `Mandate::accept` returns `invalid_mandate`, `cycle` or `depth_exceeded`. A
 durable receiver returns `model_forbidden` when the accepted mandate does
 not allow its own model. Only a send to a durable peer returns `deadlock` or
@@ -300,7 +317,7 @@ order each ended:
 | Field | Meaning |
 |---|---|
 | `chain` | The agents from the root to the delegate |
-| `run_id` | The child run id (section 3). `None` for a refusal before a send. An unanswered durable peer keeps its run id. |
+| `run_id` | The child run id (section 3). `None` for a refusal before the message went out, a refused send included. A sent message keeps the workflow id of the peer, also with no reply or a refusal by the peer. |
 | `stop` | How the child ended. `None` for a refusal. |
 | `refusal` | The verdict of a refused delegation |
 | `usage` | Tokens of the child and of every agent under it |
@@ -448,9 +465,11 @@ A gated call in a child waits on a signal, as in a root run. The name is
 of the whole tree, so a parent and a child never share a name. A run with no
 delegation keeps the names it had before.
 
-In a child, `round` is not the step of the child. A child at its first step
-can wait on `tool_approval:1:0:c1`. So do not build the name from the steps
-of a child. `a_gated_call_in_a_child_waits_on_a_tree_unique_name` proves this.
+In an inline child, `round` is not the step of the child. An inline child
+at its first step can wait on `tool_approval:1:0:c1`
+(`a_gated_call_in_a_child_waits_on_a_tree_unique_name`). A fan-out child is
+its own run. Its rounds start at 0, and it waits on the child run (section
+15).
 
 Read the name from the wait. On SQLite, `RunState::WaitingSignal` holds it.
 On Postgres, the deadline timer of the wait is
@@ -505,7 +524,7 @@ fn receive(meta: &Map<String, Value>, text: &str)
 
 | In flight at the crash | On resume |
 |---|---|
-| A peer lookup | That lookup runs again. A finished lookup does not run again: replay reads its answer from history. |
+| A peer lookup | That lookup runs again. A finished lookup does not run again. Replay reads its answer from history. |
 | A child model call | The worker sends that one call again. |
 | A child tool call | That one call runs again, with the same idempotency key. |
 | A child approval wait | The wait resumes. Its deadline is durable. |

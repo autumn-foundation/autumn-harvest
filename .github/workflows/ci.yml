@@ -3041,6 +3041,12 @@ jobs:
         # The guards check guide section 28, ADR 0017, both indexes, the
         # changelog entry and the CI steps of the strategies example.
         run: "cargo test -p autumn-harvest-agent --features sqlite,eval,sandbox,postgres --test strategies_docs"
+      - name: Run agent mesh docs guards (also on docs-only PRs)
+        # The guards check the agent-mesh facts of issue #2485 in both agent
+        # guides. The unit test checks the order of the refusal table.
+        run: "cargo test -p autumn-harvest-agent --features sqlite,eval,sandbox,postgres --test mesh_docs"
+      - name: Run agent mesh refusal table guard (also on docs-only PRs)
+        run: "cargo test -p autumn-harvest-agent --features sqlite,eval,sandbox,postgres --lib mesh::tests::the_guide_lists_every_verdict_in_variant_order"
       - name: "Check agent guide snippets compile (issue #2482)"
         # Each Rust fence of docs/agent-adapter.md and docs/agent-mesh.md
         # compiles as a doctest through `guide_snippets` in src/lib.rs. The

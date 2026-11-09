@@ -1815,30 +1815,68 @@ async fn an_interrupted_wait_for_a_reply_is_a_named_verdict() {
 }
 
 // Issue #2485: a durable peer runs the first eight checks of the refusal
-// table before its own checks. The researcher never started, so its own
-// check would refuse it as `peer_unavailable`. The mandate check of the
-// model comes first.
+// table before its own checks. Its own checks then run `peer_unavailable`
+// before `not_permitted`. Each pair sets up two refusals, so only the stated
+// order passes.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_durable_peer_runs_the_mandate_checks_before_its_own() {
     use autumn_harvest_agent::{DEFAULT_MODEL, Refusal};
 
-    let refusal_of = |forbid: bool| async move {
+    /// The verdict of one delegation to the durable researcher.
+    async fn refusal_of(valid_id: bool, forbid_model: bool, narrow: bool) -> Option<Refusal> {
         let (_dir, db) = fresh_db();
-        let harness = AgentHarness::new(mesh_model())
-            .peer(Peer::agent("researcher", "Finds facts.", &research()).model("strong"));
+        let mut peer = Peer::agent("researcher", "Finds facts.", &research()).model("strong");
+        if !valid_id {
+            // The own check of the durable peer refuses an id that does not parse.
+            peer.agent = Some("not an id".to_owned());
+        }
+        let harness = AgentHarness::new(mesh_model()).peer(peer);
         let mut mandate = Mandate::new("triage").peers(["researcher"]);
-        if forbid {
+        if forbid_model {
             mandate = mandate.models([DEFAULT_MODEL]);
         }
+        let mut task = AgentTask::new("what is it?").mandate(mandate);
+        if narrow {
+            // Each effect is allowed, so the decision lets `delegate` run.
+            // Only the durable peer refuses a run with an allowlist.
+            let every = [
+                ToolEffect::ReadOnly,
+                ToolEffect::Internal,
+                ToolEffect::Write,
+                ToolEffect::External,
+            ];
+            task.allowed_effects = Some(every.into());
+        }
         let mut rt = runtime(&db, harness);
-        let exec = sqlite::start(&mut rt, &AgentTask::new("what is it?").mandate(mandate)).unwrap();
+        let exec = sqlite::start(&mut rt, &task).unwrap();
         let ended = report(rt.run_until_blocked(exec).await.unwrap());
         let [record] = ended.delegations.as_slice() else {
             panic!("one record: {:?}", ended.delegations);
         };
         record.refusal
-    };
+    }
 
-    assert_eq!(refusal_of(false).await, Some(Refusal::PeerUnavailable));
-    assert_eq!(refusal_of(true).await, Some(Refusal::ModelForbidden));
+    // Each check fires alone.
+    assert_eq!(
+        refusal_of(false, false, false).await,
+        Some(Refusal::PeerUnavailable)
+    );
+    assert_eq!(
+        refusal_of(true, true, false).await,
+        Some(Refusal::ModelForbidden)
+    );
+    assert_eq!(
+        refusal_of(true, false, true).await,
+        Some(Refusal::NotPermitted)
+    );
+    // The mandate check runs before the own checks.
+    assert_eq!(
+        refusal_of(false, true, false).await,
+        Some(Refusal::ModelForbidden)
+    );
+    // The id check runs before the effect check.
+    assert_eq!(
+        refusal_of(false, false, true).await,
+        Some(Refusal::PeerUnavailable)
+    );
 }

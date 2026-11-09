@@ -1754,10 +1754,12 @@ mod tests {
 
     // Issues #2484 and #2485: the refusal table lists each verdict once, in
     // the order of the variants. The guide says that a delegation runs the
-    // checks in the order of the table, so this order is a fact of the guide.
+    // first eight checks in table order. `admit` and `Mandate::delegate` run
+    // them in variant order, so the table order is a fact of the guide.
     #[test]
     fn the_guide_lists_every_verdict_in_variant_order() {
-        let guide = include_str!("../../docs/agent-mesh.md");
+        // A Windows checkout can give CRLF line ends.
+        let guide = include_str!("../../docs/agent-mesh.md").replace("\r\n", "\n");
         let start = guide.find("\n## 5. Refusals\n").expect("section 5");
         let section = &guide[start + 1..];
         let section = &section[..section.find("\n## 6.").expect("section 6")];
