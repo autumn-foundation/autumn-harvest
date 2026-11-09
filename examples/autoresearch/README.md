@@ -99,8 +99,8 @@ schedule every 30m ─► agent_heartbeat (precheck: a new crash streak) ─► 
 - [`src/rules.rs`](src/rules.rs): the keep rule, one pure function.
 - [`src/runtime.rs`](src/runtime.rs): registration, the drive, the inbox
   commands, `verify`, `eval`, the schedules and the Postgres registration.
-- [`src/scripted.rs`](src/scripted.rs) and [`src/claude.rs`](src/claude.rs):
-  the two models.
+- [`src/scripted.rs`](src/scripted.rs): the scripted model. The Claude model
+  is `autumn_harvest_agent::anthropic::ClaudeModel`.
 
 Two sessions can share one lab. The session holds the mutex `lab:<path>` for
 each experiment, so the sessions take turns. Each experiment checks out its

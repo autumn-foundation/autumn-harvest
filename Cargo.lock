@@ -70,7 +70,6 @@ dependencies = [
 name = "agent-mesh"
 version = "0.10.0"
 dependencies = [
- "autoresearch",
  "autumn-harvest",
  "autumn-harvest-agent",
  "autumn-harvest-sqlite",
@@ -434,9 +433,7 @@ dependencies = [
  "chrono",
  "clap",
  "proptest",
- "reqwest",
  "rustix",
- "rustls",
  "serde",
  "serde_json",
  "sha2 0.11.1",
@@ -525,7 +522,9 @@ dependencies = [
  "flate2",
  "futures",
  "proptest",
+ "reqwest",
  "rusqlite",
+ "rustls",
  "serde",
  "serde_json",
  "sha2 0.11.1",
@@ -1868,10 +1867,8 @@ dependencies = [
  "autumn-harvest-sqlite",
  "clap",
  "libc",
- "reqwest",
  "rusqlite",
  "rustix",
- "rustls",
  "serde",
  "serde_json",
  "tempfile",
@@ -6148,7 +6145,6 @@ dependencies = [
 name = "recall-eval"
 version = "0.10.0"
 dependencies = [
- "autoresearch",
  "autumn-harvest-agent",
  "autumn-harvest-sqlite",
  "chrono",

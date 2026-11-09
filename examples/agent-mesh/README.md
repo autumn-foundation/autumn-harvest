@@ -64,7 +64,8 @@ $ export ANTHROPIC_API_KEY=...
 $ cargo run -p agent-mesh -- --dir /tmp/desk --model claude answer T-2
 ```
 
-The Claude adapter is `autoresearch::claude::ClaudeModel`. It streams over
+The Claude adapter is `autumn_harvest_agent::anthropic::ClaudeModel`, behind
+the `anthropic` feature. It streams over
 Server-Sent Events, so the text shows while the model writes it.
 
 ## The files

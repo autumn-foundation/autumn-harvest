@@ -56,10 +56,19 @@ cargo run -p claude-agent-daemon -- serve --workspace /path/to/your/project
 cargo run -p claude-agent-daemon -- submit "find the TODOs and write them to TODO.md"
 ```
 
-The request uses `claude-opus-5` with adaptive thinking and the three workspace
-tools below. Pick another model with `--model`.
+The request uses `claude-opus-5-5` with adaptive thinking, effort `high` and
+the three workspace tools below. Pick another model with `--model`. A session
+recorded on `claude-opus-5` resumes with `--model claude-opus-5`.
 
-Adaptive thinking is asked for on `claude-opus-5` only. A model that does not
+The HTTP client, the API version, the settings of each model and the retry
+table come from the `anthropic` feature of `autumn-harvest-agent`. The daemon
+retries what the Anthropic SDKs retry: `408`, `409`, `429` and `5xx`. Each live
+turn writes one row to the cost ledger, with its model, tokens and price. A
+billed turn that the daemon refuses, such as a malformed reply, writes no
+row. See
+[`docs/llm-cost-ledger.md`](../../docs/llm-cost-ledger.md).
+
+Adaptive thinking and the effort are asked for on `claude-opus-5-5` only. A model that does not
 take the parameter refuses the whole request, and that refusal is not
 retryable, so an unconditional ask would fail every turn of a session started
 on another model. This example holds no capability for a model it was not
@@ -283,7 +292,8 @@ approval by hand from a trimmed view is still yours to do.
   adapter (issue #1973). The daemon takes its approval signal names
   (`approval_signal`, `approval_call_id`) and its payload-cap checks from it.
   The daemon keeps its own Anthropic-native turn, because it replays thinking
-  blocks verbatim. For a provider-neutral loop over any `AgentModel`,
+  blocks verbatim. It sends that turn through the shared `anthropic::Client`.
+  For a provider-neutral loop over any `AgentModel`,
   start from [`docs/agent-adapter.md`](../../docs/agent-adapter.md).
 - **[`src/session.rs`](src/session.rs)** — the agent loop, as a `#[workflow]`.
   Ordinary Rust: a `for` loop over turns, a model call, a tool call per
@@ -291,7 +301,8 @@ approval by hand from a trimmed view is still yours to do.
   from activity results on every replay, so it is a projection of history rather
   than state the daemon has to hold.
 - **[`src/claude.rs`](src/claude.rs)** — one Messages API request, as one
-  durable activity body, plus the offline stub. The assistant content blocks are
+  durable activity body, plus the offline stub. It holds the rules of the
+  daemon, not a copy of the client. The assistant content blocks are
   stored and replayed **verbatim**, which is what keeps thinking blocks valid
   across turns on the same model.
 - **[`src/tools.rs`](src/tools.rs)** — `list_files`, `read_file`, and

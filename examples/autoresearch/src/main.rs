@@ -15,15 +15,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use autoresearch::agent::{self, HarnessParts};
-use autoresearch::claude::ClaudeModel;
 use autoresearch::inbox::{Command, Inbox};
 use autoresearch::lab::Lab;
 use autoresearch::results::{ResultRow, short};
 use autoresearch::rules::KeepPolicy;
 use autoresearch::runtime::{self, Refused, Step, session_id};
 use autoresearch::scripted::ScriptedResearcher;
+use autoresearch::stores::TurnDir;
 use autoresearch::trainer::TrainerSpec;
 use autoresearch::workflows::{SessionConfig, SessionReport};
+use autumn_harvest_agent::anthropic::{ClaudeModel, DEFAULT_MODEL};
 use autumn_harvest_agent::{AgentHarness, AgentModel};
 use autumn_harvest_sqlite::{ExecutionId, SqliteReader, SqliteRuntime};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -74,7 +75,7 @@ struct ModelArgs {
     #[arg(long, value_enum, default_value_t = ModelKind::Scripted)]
     model: ModelKind,
     /// The Claude model id.
-    #[arg(long, default_value = autoresearch::claude::DEFAULT_MODEL)]
+    #[arg(long, default_value = DEFAULT_MODEL)]
     claude_model: String,
 }
 
@@ -338,8 +339,9 @@ fn model(args: &ModelArgs, state: &Path) -> Result<Arc<dyn AgentModel>, String> 
                 return Err("--model claude needs ANTHROPIC_API_KEY in the environment".into());
             }
             let model = ClaudeModel::new(key)
+                .map_err(|e| format!("--model claude: {e}"))?
                 .model(&args.claude_model)
-                .turn_dir(state.join("claude-turns"));
+                .turn_store(Arc::new(TurnDir::new(state.join("claude-turns"))));
             Ok(Arc::new(model))
         }
     }

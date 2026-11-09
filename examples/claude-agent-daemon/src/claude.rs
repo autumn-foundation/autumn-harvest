@@ -5,13 +5,23 @@
 //! runtime commits that reply to history, so a later replay never repeats the
 //! request and never pays for it twice.
 //!
+//! The HTTP client, the API version, the settings of each model and the
+//! error table come from `autumn_harvest_agent::anthropic`. This module keeps
+//! the rules of the daemon: the durable reply, the approval gate and the
+//! offline stub.
+//!
 //! With no API key the daemon registers an offline stub instead (see
 //! [`offline`]). The stub drives the same loop, so the durability, approval,
 //! and restart behaviour are demonstrable with no key and no network.
 
 use std::time::Duration;
 
+use autumn_harvest::chrono::{DateTime, Utc};
 use autumn_harvest::failure::{ActivityFailure, IntoActivityErrorString};
+use autumn_harvest::llm_ledger::LlmCall;
+use autumn_harvest_agent::anthropic::reqwest::StatusCode;
+use autumn_harvest_agent::anthropic::reqwest::header::HeaderValue;
+use autumn_harvest_agent::anthropic::{self, ApiError, BodyError, Client, wire};
 use serde_json::{Value, json};
 use tokio::runtime::Handle;
 
@@ -19,60 +29,31 @@ use crate::session::{SYSTEM_PROMPT, ToolCall, TurnReply, TurnRequest};
 use crate::shutdown::Signal;
 use crate::tools;
 
-/// The Messages API endpoint.
-const API_URL: &str = "https://api.anthropic.com/v1/messages";
-/// The API version header every request carries.
-const API_VERSION: &str = "2023-06-01";
-/// The `stop_reason` of a turn that stopped to call a tool.
-pub const STOP_TOOL_USE: &str = "tool_use";
+pub use wire::{DEFAULT_MAX_TOKENS, DEFAULT_MODEL, STOP_END_TURN, STOP_TOOL_USE};
 
-/// The `stop_reason` of a turn the model finished on its own.
-pub const STOP_END_TURN: &str = "end_turn";
-
-/// The default model. Adaptive thinking is on by default on this model.
-///
-/// It is also the ONE model this example asks thinking of. See
-/// [`thinking_for`].
-pub const DEFAULT_MODEL: &str = "claude-opus-5";
-/// The default output cap for a non-streaming request.
-pub const DEFAULT_MAX_TOKENS: u32 = 16_000;
 /// The request timeout. It sits under the activity `start_to_close` budget.
 const HTTP_TIMEOUT: Duration = Duration::from_mins(14);
 
 /// Everything the model activity needs.
 pub struct ModelConfig {
     /// `None` selects the offline stub.
-    pub api_key: Option<String>,
+    client: Option<Client>,
     pub model: String,
     pub max_tokens: u32,
-    pub http: reqwest::Client,
     /// Raised when the daemon is asked to stop. See [`call_api`].
     pub shutdown: Signal,
 }
 
-/// Why this key cannot go in an HTTP header, if it cannot.
+/// The refusal of a key that cannot go in an HTTP header.
 ///
-/// The key travels as a header value, and not every byte can. A key read out
-/// of a file can carry an interior newline. The trim on the way in does not
-/// remove that byte, because it is not at an end.
-///
-/// Reqwest then refuses to build the header on EVERY turn. That failure reads
-/// as retryable, so each session spends its attempts and fails without one
-/// request reaching the API. The daemon advertises readiness the whole time.
-///
-/// The key is tested as the thing it becomes. This example does not keep its
-/// own list of the bytes a header value accepts.
-fn header_refusal(api_key: Option<&str>) -> Option<String> {
-    api_key
-        .filter(|key| reqwest::header::HeaderValue::from_str(key).is_err())
-        .map(|_| {
-            "`ANTHROPIC_API_KEY` holds a byte that cannot go in an HTTP header, \
-             such as a newline inside the value. Every turn would fail before it \
-             reached the API. Read the key without the surrounding line, or unset \
-             it to use the offline stub."
-                .to_string()
-        })
-}
+/// A key read out of a file can carry an interior newline. The trim on the
+/// way in does not remove that byte, because it is not at an end. Each turn
+/// would then fail before it reached the API, and the failure reads as
+/// retryable. The shared client refuses such a key, and this names the fix.
+const HEADER_REFUSAL: &str = "`ANTHROPIC_API_KEY` holds a byte that cannot go in an HTTP header, \
+     such as a newline inside the value. Every turn would fail before it \
+     reached the API. Read the key without the surrounding line, or unset \
+     it to use the offline stub.";
 
 /// The identity an offline session records, in place of a model name.
 pub const OFFLINE_MODEL: &str = "offline-stub";
@@ -138,8 +119,13 @@ impl ModelConfig {
                 refused.escape_unicode()
             ));
         }
-        if let Some(message) = header_refusal(api_key.as_deref()) {
-            return Err(message);
+        // The key is tested as the thing it becomes: a header value. The
+        // check runs here, before the stub check, as it always has.
+        if api_key
+            .as_deref()
+            .is_some_and(|key| HeaderValue::from_str(key).is_err())
+        {
+            return Err(HEADER_REFUSAL.to_string());
         }
         if live && model == OFFLINE_MODEL {
             return Err(format!(
@@ -150,26 +136,35 @@ impl ModelConfig {
                  offline."
             ));
         }
-        let http = {
-            // Reqwest panics without a provider. An `Err` means that one is installed.
-            let _ = rustls::crypto::ring::default_provider().install_default();
-            reqwest::Client::builder()
-        }
-        .timeout(HTTP_TIMEOUT)
-        .build()
-        .map_err(|e| format!("cannot build the HTTP client: {e}"))?;
+        let client = match api_key {
+            None => None,
+            Some(key) => {
+                let http = anthropic::http_client(HTTP_TIMEOUT)
+                    .map_err(|e| format!("cannot build the HTTP client: {e}"))?;
+                let client = Client::with_http(&key, http)
+                    .map_err(|e| format!("the API key is refused: {}", e.message()))?;
+                Some(client.max_body_bytes(MAX_BODY_BYTES))
+            }
+        };
         Ok(Self {
-            api_key,
+            client,
             model,
             max_tokens,
-            http,
             shutdown,
         })
     }
 
+    /// Send each live request to `url`. A test points it at a local server.
+    #[cfg(test)]
+    #[must_use]
+    pub fn endpoint(mut self, url: &str) -> Self {
+        self.client = self.client.map(|client| client.endpoint(url));
+        self
+    }
+
     /// Does this configuration call the real API?
     pub const fn is_live(&self) -> bool {
-        self.api_key.is_some()
+        self.client.is_some()
     }
 
     /// What a session started under this configuration records.
@@ -186,10 +181,15 @@ impl ModelConfig {
 }
 
 /// Build the synchronous activity body the runtime registers for `claude_turn`.
+///
+/// A live turn returns one cost ledger call with its reply. The runtime
+/// writes the row in the transaction that records the reply. An offline turn
+/// calls no model, so it returns no call.
 pub fn activity_body(
     config: ModelConfig,
-) -> impl Fn(Value) -> Result<Value, String> + Send + Sync + 'static {
-    move |input| {
+) -> impl Fn(Value, DateTime<Utc>) -> Result<(Value, Vec<LlmCall>), String> + Send + Sync + 'static
+{
+    move |input, _now| {
         let request: TurnRequest =
             serde_json::from_value(input).map_err(|e| format!("malformed turn request: {e}"))?;
         // A session continues on the model it started on. Earlier turns came
@@ -206,11 +206,39 @@ pub fn activity_body(
             )
             .into_error_payload());
         }
-        let reply = match config.api_key.as_deref() {
-            Some(key) => call_api(&config, key, &request)?,
-            None => offline::reply(&request),
+        let (reply, calls) = match &config.client {
+            Some(client) => {
+                let (reply, call) = call_api(&config, client, &request)?;
+                (reply, vec![call])
+            }
+            None => (offline::reply(&request), Vec::new()),
         };
-        serde_json::to_value(reply).map_err(|e| format!("turn reply is not JSON: {e}"))
+        let reply =
+            serde_json::to_value(reply).map_err(|e| format!("turn reply is not JSON: {e}"))?;
+        Ok((reply, calls))
+    }
+}
+
+/// The ledger call of one live turn: the model, its tokens and its price.
+///
+/// The id is the shared id of the model and its settings, as
+/// `ClaudeModel` records it. The daemon asks for no fallback. The input
+/// count holds the whole prompt, cache reads and writes included. The price
+/// is `None` for a model that the shared table does not know.
+///
+/// A billed turn that the daemon refuses writes no row. The runtime writes
+/// rows only with a completed attempt.
+#[must_use]
+pub fn ledger_call(model: &str, payload: &Value) -> LlmCall {
+    let usage = anthropic::usage(payload);
+    let call = LlmCall::new(
+        anthropic::model_id(model, false),
+        u64::from(usage.input_tokens),
+        u64::from(usage.output_tokens),
+    );
+    match anthropic::cost_usd_micros(model, &usage) {
+        Some(cost) => call.with_cost_usd_micros(cost),
+        None => call,
     }
 }
 
@@ -226,86 +254,36 @@ pub fn activity_body(
 /// outside. The request therefore waits on the shutdown flag itself. A stop
 /// abandons the request and reports a retryable error, because the turn is not
 /// committed and the daemon is going away.
+///
+/// The flag covers the body read too. A response whose headers arrived can
+/// still stall on its body. That would hold the daemon for the rest of the
+/// timeout.
 fn call_api(
     config: &ModelConfig,
-    api_key: &str,
+    client: &Client,
     request: &TurnRequest,
-) -> Result<TurnReply, String> {
+) -> Result<(TurnReply, LlmCall), String> {
     let body = request_body(config, request);
     let mut stop = config.shutdown.clone();
-    let response = tokio::task::block_in_place(|| {
+    let answer = tokio::task::block_in_place(|| {
         Handle::current().block_on(async {
             tokio::select! {
-                result = config
-                    .http
-                    .post(API_URL)
-                    .header("x-api-key", api_key)
-                    .header("anthropic-version", API_VERSION)
-                    .json(&body)
-                    .send() => Some(result),
+                result = client.create(&body) => Some(result),
                 () = stop.raised() => None,
             }
         })
     });
-    let Some(response) = response else {
-        // The same ambiguous window a dropped connection leaves: the API may
-        // have this request. The error is retryable, so the turn runs again on
-        // the next start, and the README names the window.
+    // A stop leaves the same ambiguous window that a dropped connection
+    // leaves: the API may have this request. The error is retryable, so the
+    // turn runs again on the next start, and the README names the window.
+    //
+    // A stop is not a malformed answer, so it stays RETRYABLE even when the
+    // request was accepted. A non-retryable failure here would end the
+    // session, and `Ctrl-C` would then destroy what a `kill` leaves resumable.
+    let Some(answer) = answer else {
         return Err("the daemon is stopping, so this turn did not finish".to_string());
     };
-
-    // A failure BEFORE a response arrived keeps the plain error string, so the
-    // activity retry policy applies. This is the ambiguous window. The request
-    // may already have reached the API, and the Messages API takes no
-    // idempotency key. A retry here can therefore pay for one turn twice. The
-    // window is one turn wide, and the README names it.
-    let response = response.map_err(|e| format!("the request to the Claude API failed: {e}"))?;
-    let status = response.status();
-
-    // The body is read under the same flag as the request above. A response
-    // whose headers arrived can still stall on its body. That would hold the
-    // daemon for the rest of the timeout, which is the case this race exists
-    // for.
-    let body = tokio::task::block_in_place(|| {
-        Handle::current().block_on(async {
-            tokio::select! {
-                result = read_capped(response) => Some(result),
-                () = stop.raised() => None,
-            }
-        })
-    });
-    let text = match body {
-        Some(Ok(text)) => text,
-        Some(Err(reason)) => return Err(body_failure(status, &reason)),
-        // A stop is not a malformed answer, so this stays RETRYABLE even though
-        // the request was accepted. A non-retryable failure here would end the
-        // session, and `Ctrl-C` would then destroy what a `kill` leaves
-        // resumable. The turn is re-sent on the next start, in the window the
-        // README names.
-        None => return Err("the daemon is stopping, so this turn did not finish".to_string()),
-    };
-
-    if !status.is_success() {
-        return Err(http_failure(status, &text));
-    }
-    let payload: Value = match serde_json::from_str(&text) {
-        Ok(payload) => payload,
-        Err(e) => {
-            return Err(body_failure(
-                status,
-                &format!("its response did not parse as JSON: {e}"),
-            ));
-        }
-    };
-    // Valid JSON is not yet a message. An accepted `{}` would fall through
-    // every default below and record a clean, empty `end_turn`. That reports a
-    // malformed billed response as a finished session.
-    if !is_message(&payload) {
-        return Err(body_failure(
-            status,
-            "its response was not a message: `content` and a `stop_reason` are required",
-        ));
-    }
+    let payload = answer.map_err(|e| api_failure(&e))?;
 
     let reply = parse_reply(&payload);
     // An approval is addressed by tool-use id, so a blank or repeated id would
@@ -327,7 +305,7 @@ fn call_api(
     // All three are ONE test, because a recorded reply is held to the same
     // rules on a restart. See [`unusable_reply`].
     if let Some(reason) = unusable_reply(&reply) {
-        return Err(body_failure(status, reason));
+        return Err(body_failure(StatusCode::OK, reason));
     }
     // The reply is measured as it will be STORED, which no arithmetic over
     // the body can promise. `MAX_BODY_BYTES` divides the recorded cap by the
@@ -340,9 +318,40 @@ fn call_api(
     // retryable. The session would then fail with no reason an operator can
     // act on. This refusal names the cap.
     if let Some(refusal) = activity_refusal_for_oversized_reply(&reply) {
-        return Err(body_failure(status, &refusal));
+        return Err(body_failure(StatusCode::OK, &refusal));
     }
-    Ok(reply)
+    Ok((reply, ledger_call(&config.model, &payload)))
+}
+
+/// The activity error of one failed call to the shared client.
+///
+/// A failure BEFORE a response arrived keeps the plain error string, so the
+/// activity retry policy applies. This is the ambiguous window. The request
+/// may already have reached the API, and the Messages API takes no
+/// idempotency key. A retry here can therefore pay for one turn twice. The
+/// window is one turn wide, and the README names it.
+///
+/// A failure after a status goes to [`body_failure`], which the status
+/// decides.
+fn api_failure(error: &ApiError) -> String {
+    let Some(code) = error.status() else {
+        return format!("the request to the Claude API failed: {}", error.message());
+    };
+    let status = StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    // The shared message starts with the status, which `http_failure` names.
+    let prefix = format!("HTTP {code}: ");
+    let detail = error.body_error().map_or_else(
+        || {
+            let message = error.message();
+            message.strip_prefix(&prefix).unwrap_or(message).to_string()
+        },
+        body_refusal,
+    );
+    if status.is_success() {
+        body_failure(status, &detail)
+    } else {
+        http_failure(status, &detail)
+    }
 }
 
 /// The recorded size of one activity result this backend accepts.
@@ -406,6 +415,10 @@ pub fn activity_refusal_for_oversized_reply(reply: &TurnReply) -> Option<String>
 /// cannot see what the API accepts. It can see what this daemon asks for, and
 /// a field the model does not take is refused before any turn runs.
 ///
+/// The shared rule adds the settings of the model. Only the default model
+/// gets adaptive thinking and an effort. The rule reads the RECORDED model,
+/// so each replay of one session sends the same settings.
+///
 /// There are deliberately NO server-side refusal fallbacks here. A fallback
 /// answers one turn on a DIFFERENT model, and this is a multi-turn loop. The
 /// next request would go back to the configured model, which switches the
@@ -416,6 +429,10 @@ pub fn activity_refusal_for_oversized_reply(reply: &TurnReply) -> Option<String>
 /// A refusal therefore ends the session under its own stop reason, where the
 /// operator can see it. It is not routed to a model the session is not
 /// recorded against.
+///
+/// `max_tokens` is left to the operator. A model with a lower output cap
+/// refuses a request above it, and the answer names the field. The operator
+/// has `--max-tokens` for that.
 pub fn request_body(config: &ModelConfig, request: &TurnRequest) -> Value {
     let mut body = json!({
         "model": config.model,
@@ -424,40 +441,19 @@ pub fn request_body(config: &ModelConfig, request: &TurnRequest) -> Value {
         "tools": tools::definitions(),
         "messages": request.messages,
     });
-    if let Some(thinking) = thinking_for(&config.model) {
-        body["thinking"] = thinking;
+    wire::apply_settings(&mut body, &config.model);
+    if RECORDED_THINKING_MODELS.contains(&config.model.as_str()) {
+        body["thinking"] = json!({ "type": "adaptive" });
     }
     body
 }
 
-/// The thinking this request asks for, if it asks for any.
+/// Earlier defaults of this daemon that asked for adaptive thinking.
 ///
-/// Adaptive thinking is a property of the MODEL, and not of the API. A model
-/// that does not take the parameter refuses the whole request, and a refused
-/// request is not retryable. Every turn of the session then fails, and the
-/// session fails instead of running on the model it was asked to run on.
-///
-/// This example asks for adaptive thinking on the ONE model it is written
-/// for, and asks for none on any other. It cannot know what another model
-/// takes: there is no capability to read, only a name the operator typed. A
-/// list of names would rot as models are released, and a name it guessed
-/// wrong about would fail every turn again.
-///
-/// The cost is stated rather than hidden. A model that DOES take adaptive
-/// thinking runs here without it. That is a weaker answer, and not a failed
-/// session, so it is the side to be wrong on.
-///
-/// `max_tokens` is the same shape of risk and is left alone. A model with a
-/// lower output cap refuses a request above it, and the answer names the
-/// field. The operator has `--max-tokens` for that, and has no flag for this.
-///
-/// The answer is a function of the RECORDED model, so it is the same on every
-/// replay of one session. A build that changed this rule could send a
-/// transcript holding thinking blocks to a request that asks for none. The
-/// model is pinned in history against the same hazard.
-fn thinking_for(model: &str) -> Option<Value> {
-    (model == DEFAULT_MODEL).then(|| json!({ "type": "adaptive" }))
-}
+/// A session recorded on one of these holds thinking blocks. It resumes with
+/// `--model`, and its next turn must ask for thinking as the earlier turns
+/// did. The shared rule names the current default only.
+pub const RECORDED_THINKING_MODELS: [&str; 1] = ["claude-opus-5"];
 
 /// How much room the read cap leaves above the recorded payload cap.
 ///
@@ -498,95 +494,16 @@ pub const MAX_BODY_BYTES: usize = {
     bytes
 };
 
-/// Read one response body, and stop at [`MAX_BODY_BYTES`].
+/// The refusal of a body that the shared client could not read.
 ///
-/// `text()` buffers whatever arrives. The timeout above bounds the TIME a
-/// body may take, and not the BYTES it may carry. One answer could therefore
-/// spend the daemon's memory and stall every session with it. An error body
-/// is the likelier offender, because it comes from whatever is between this
-/// daemon and the API rather than from the API itself.
-async fn read_capped(mut response: reqwest::Response) -> Result<String, String> {
-    let mut body: Vec<u8> = Vec::new();
-    loop {
-        let chunk = response
-            .chunk()
-            .await
-            .map_err(|e| format!("its response was lost: {e}"))?;
-        let Some(chunk) = chunk else { break };
-        if push_capped(&mut body, &chunk) {
-            break;
-        }
+/// A body past the cap names `--max-tokens`, which is the operator's lever.
+/// A body that is not text names the byte that begins no character.
+#[must_use]
+pub fn body_refusal(reason: BodyError) -> String {
+    match reason {
+        BodyError::TooLong { .. } => format!("{reason}. Lower `--max-tokens`."),
+        BodyError::NotText { .. } => reason.to_string(),
     }
-    decode_body(body)
-}
-
-/// Read one response body as the text a turn parses, or refuse it.
-///
-/// A body PAST the cap is refused, and never read as its prefix. The read
-/// takes one byte more than the cap. That byte tells a body which ENDED at
-/// the cap from one that merely reached it. See [`push_capped`].
-///
-/// The bytes are decoded STRICTLY. A lossy read replaces an invalid byte with
-/// U+FFFD. That can turn a malformed body into valid JSON carrying a value
-/// the model never sent. Measured, with a raw `FF` inside a tool path: the
-/// lossy body parses, and the daemon runs `write_file` on
-/// `note\u{fffd}.md`. The operator approves the path they are shown, and the
-/// model asked for another one.
-///
-/// Strict costs nothing here. A body cut at the read cap is refused either
-/// way. This check refuses it when the cut splits a character. The JSON
-/// parse refuses it when the cut does not, because the document then ends
-/// unclosed. So the lossy read never rescued a body that would have worked.
-///
-/// Split out from the read above so a test can drive both decisions without
-/// an HTTP response, the way [`push_capped`] carries the arithmetic.
-///
-/// # Errors
-///
-/// Returns the reason phrase for [`body_failure`] when the body is longer
-/// than the cap, or when its bytes are not text.
-pub fn decode_body(body: Vec<u8>) -> Result<String, String> {
-    if body.len() > MAX_BODY_BYTES {
-        return Err(format!(
-            "its response is longer than the {MAX_BODY_BYTES} bytes this daemon \
-             reads. Lower `--max-tokens`."
-        ));
-    }
-    String::from_utf8(body).map_err(|e| {
-        format!(
-            "its response is not UTF-8 text: the byte at {} begins no character",
-            e.utf8_error().valid_up_to()
-        )
-    })
-}
-
-/// Append as much of one chunk as the cap allows, and ONE byte more.
-///
-/// Returns `true` once the body has passed the cap, which ends the read. The
-/// buffer then holds `MAX_BODY_BYTES + 1` bytes, and the caller refuses it.
-///
-/// That one extra byte is the whole point. The read once stopped AT the cap
-/// and handed back the prefix. A body of exactly the cap followed by more
-/// data was then read as though it had ended there. JSON allows trailing
-/// whitespace, so a complete message padded to the boundary parses, and the
-/// daemon ran a tool call from it. The whole body did not parse, which is
-/// the answer it should have given.
-///
-/// A body that fits the cap EXACTLY is still accepted. The buffer reaches
-/// the cap and no more arrives, so nothing passes it.
-///
-/// Split out from the loop above so a test can drive the arithmetic,
-/// including a chunk that straddles the cap. The loop itself is three lines
-/// of reqwest.
-pub fn push_capped(body: &mut Vec<u8>, chunk: &[u8]) -> bool {
-    // One past the cap, so reaching the cap is not the same as passing it.
-    let room = MAX_BODY_BYTES.saturating_sub(body.len()) + 1;
-    if chunk.len() >= room {
-        body.extend_from_slice(&chunk[..room]);
-        return true;
-    }
-    body.extend_from_slice(chunk);
-    false
 }
 
 /// Classify a failure that happened AFTER the response headers arrived.
@@ -597,7 +514,7 @@ pub fn push_capped(body: &mut Vec<u8>, chunk: &[u8]) -> bool {
 /// did not produce a turn. The status alone decides there, exactly as it does
 /// for a body that read cleanly. A rate limit therefore still backs off and
 /// retries, instead of ending the session.
-pub fn body_failure(status: reqwest::StatusCode, detail: &str) -> String {
+pub fn body_failure(status: StatusCode, detail: &str) -> String {
     if status.is_success() {
         return ActivityFailure::non_retryable(
             "ClaudeApiResponseLost",
@@ -617,25 +534,19 @@ pub fn body_failure(status: reqwest::StatusCode, detail: &str) -> String {
 /// billed, and a retry buys it twice. A request that never ran costs nothing
 /// to send again.
 ///
-/// Three answers say no turn ran. A rate limit refused the request before it
-/// was read. A server fault is the server's own, and the same bytes may work
-/// on the next attempt. A request timeout says the request never arrived
-/// whole, so nothing was read and nothing was charged. Each keeps the plain
-/// error string, and the retry policy applies.
-///
-/// The transport timeout already takes the retry path, so a request timeout
-/// reported as a STATUS belongs on the same side. It was on the other one.
+/// The shared table decides, so this daemon retries what the Anthropic SDKs
+/// retry. A rate limit refused the request before it was read. A server
+/// fault or an overload is the server's own, and the same bytes may work on
+/// the next attempt. A request timeout says the request never arrived whole.
+/// A conflict is a lock of the API, and the SDKs send the request again. Each
+/// keeps the plain error string, and the retry policy applies.
 ///
 /// Anything else is a request the server read and rejected. The same bytes
 /// fail again, so the attempt fails terminally instead of burning the retry
-/// curve. A `409` or a `425` is not included: neither says the request went
-/// unread, and this daemon retries only what it knows was never processed.
-fn http_failure(status: reqwest::StatusCode, body: &str) -> String {
+/// curve. A `425` is in this group.
+fn http_failure(status: StatusCode, body: &str) -> String {
     let detail = body.chars().take(400).collect::<String>();
-    let transient = status == reqwest::StatusCode::REQUEST_TIMEOUT
-        || status == reqwest::StatusCode::TOO_MANY_REQUESTS
-        || status.is_server_error();
-    if transient {
+    if wire::error_kind(status.as_u16()).is_retryable() {
         return format!("the Claude API returned {status}: {detail}");
     }
     ActivityFailure::non_retryable(
@@ -643,35 +554,6 @@ fn http_failure(status: reqwest::StatusCode, body: &str) -> String {
         format!("the Claude API returned {status}: {detail}"),
     )
     .into_error_payload()
-}
-
-/// Does this payload have the shape of a Messages API response?
-///
-/// Only the two fields the reply is built from are required. A response that
-/// carries them can be projected; one that does not is malformed, however well
-/// formed its JSON is.
-///
-/// The stop reason must say something. A blank one is not a stop reason, and
-/// it differs from `end_turn`, so the usability test below would accept it.
-/// The loop then records a completed session whose stop reason says nothing.
-///
-/// It must also say it EXACTLY. A reason with space around it is refused
-/// here, rather than normalised later, because normalising it has no safe
-/// answer. Trimming turns ` tool_use ` into the reason that AUTHORISES a
-/// tool call, so a malformed response would reach the approval gate and run
-/// an approved write. Keeping it verbatim matches no reason this loop acts
-/// on, so ` end_turn ` would instead record a session as complete with no
-/// answer.
-///
-/// A padded reason is a malformed body, and this example already ends a turn
-/// on one. The refusal is terminal, because the response was billed, so an
-/// operator sees it rather than a session that quietly did nothing.
-pub fn is_message(payload: &Value) -> bool {
-    payload.get("content").is_some_and(Value::is_array)
-        && payload
-            .get("stop_reason")
-            .and_then(Value::as_str)
-            .is_some_and(|reason| !reason.is_empty() && reason.trim() == reason)
 }
 
 /// Why this reply cannot be used, when it cannot.
@@ -804,64 +686,7 @@ pub fn has_replayable_content(reply: &TurnReply) -> bool {
     reply
         .content
         .as_array()
-        .is_some_and(|blocks| blocks.iter().all(is_replayable_block))
-}
-
-/// The block types this example knows how to check.
-///
-/// A type outside this list is one a later API added, and its fields cannot
-/// be guessed. A type INSIDE it must carry that type's fields.
-const KNOWN_BLOCKS: [&str; 4] = ["text", "thinking", "redacted_thinking", "tool_use"];
-
-/// Is one content block whole enough to send back?
-fn is_replayable_block(block: &Value) -> bool {
-    let Some(kind) = block.get("type").and_then(Value::as_str) else {
-        return false;
-    };
-    let names = |field: &str| {
-        block
-            .get(field)
-            .and_then(Value::as_str)
-            .is_some_and(|text| !text.trim().is_empty())
-    };
-    // The type is matched EXACTLY. `parse_reply` matches it exactly, and the
-    // API accepts no padded name, so a trimmed match here would accept a
-    // block that both of them refuse.
-    match kind {
-        // The text must say SOMETHING. A text block is declared with a
-        // minimum length of one character, so an empty one is refused on
-        // replay. A block of one space is a character and passes, which is
-        // why this asks for length and not for content.
-        "text" => block
-            .get("text")
-            .and_then(Value::as_str)
-            .is_some_and(|text| !text.is_empty()),
-        // The thinking text may be EMPTY, and an empty one is still replayed.
-        // A request that asks for thinking asks for no display, and the
-        // default display returns every thinking block with an empty text. A
-        // check for text here would refuse ordinary replies.
-        //
-        // The SIGNATURE is the field that must be there. It carries the
-        // encrypted reasoning whatever the display setting, and the API reads
-        // it to prove the block came from the model.
-        "thinking" => block.get("thinking").is_some_and(Value::is_string) && names("signature"),
-        // The same argument, for the block that carries only the ciphertext.
-        "redacted_thinking" => names("data"),
-        // The input must be an OBJECT. A tool input is declared with an
-        // object schema, so `null` is a value the API refuses on replay.
-        "tool_use" => {
-            names("id") && names("name") && block.get("input").is_some_and(Value::is_object)
-        }
-        // A type from a later API. Its name is all this example can judge.
-        //
-        // A name that is blank, or that becomes a KNOWN name when the space
-        // around it is removed, is not such a type. It is a corrupted block
-        // of a type this example knows, and the API refuses it by name.
-        other => {
-            let bare = other.trim();
-            !bare.is_empty() && !KNOWN_BLOCKS.contains(&bare)
-        }
-    }
+        .is_some_and(|blocks| blocks.iter().all(wire::is_replayable_block))
 }
 
 /// Bytes of a decision frame that the tool-use id does not occupy.

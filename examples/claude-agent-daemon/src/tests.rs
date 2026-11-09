@@ -1308,17 +1308,34 @@ fn only_the_model_this_example_knows_is_asked_for_thinking() {
         "the model this example is written for is asked for adaptive thinking: {known}"
     );
     assert_eq!(
+        known["output_config"],
+        json!({ "effort": autumn_harvest_agent::anthropic::EFFORT }),
+        "and for the shared effort, since its own default is lower: {known}"
+    );
+    assert_eq!(
         keys(&known),
         [
             "max_tokens",
             "messages",
             "model",
+            "output_config",
             "system",
             "thinking",
             "tools"
         ],
         "and the turn sends these keys and no others: {known}"
     );
+
+    // An earlier default that a recorded session may hold. Its next turn
+    // asks for thinking as its earlier turns did. It gets no effort, which
+    // it never had.
+    let recorded = body("claude-opus-5");
+    assert_eq!(
+        recorded["thinking"],
+        json!({ "type": "adaptive" }),
+        "{recorded}"
+    );
+    assert_eq!(recorded.get("output_config"), None, "{recorded}");
 
     // Any other name. The daemon holds no capability for it, only the name.
     for other in ["claude-3-haiku-20240307", "claude-sonnet-4-20250514", "x"] {
@@ -1936,7 +1953,7 @@ fn a_block_that_cannot_be_replayed_is_refused() {
 
     // The refusal is terminal, because the response was billed.
     let refused = parse_error_payload_full(&claude::body_failure(
-        reqwest::StatusCode::OK,
+        autumn_harvest_agent::anthropic::reqwest::StatusCode::OK,
         "its response carried a content block that cannot be replayed",
     ));
     assert!(refused.non_retryable, "a billed malformed body is terminal");
@@ -2124,7 +2141,7 @@ fn a_cut_pending_call_offers_no_approval() {
 #[test]
 fn only_an_accepted_request_is_refused_a_retry() {
     use autumn_harvest::failure::parse_error_payload_full;
-    use reqwest::StatusCode;
+    use autumn_harvest_agent::anthropic::reqwest::StatusCode;
 
     // A body that fails after a 2xx means the turn was billed. Retrying buys it
     // twice, so that case is terminal.
@@ -2134,10 +2151,12 @@ fn only_an_accepted_request_is_refused_a_retry() {
         "a lost response to an accepted request must not be retried"
     );
 
-    // These three produced no turn, so each must still back off and retry. A
-    // rate limit refused the request before reading it. A server fault is the
-    // server's own. A REQUEST TIMEOUT says the request never arrived whole,
-    // so nothing was read and nothing was charged.
+    // These produced no turn, so each must still back off and retry. A rate
+    // limit refused the request before reading it. A server fault or an
+    // overload is the server's own. A REQUEST TIMEOUT says the request never
+    // arrived whole. A conflict is a lock of the API. The shared table is the
+    // retry table of the Anthropic SDKs, so the daemon and the agent model
+    // agree.
     //
     // The request timeout was terminal, which failed a session permanently
     // for a transport fault the transport layer already retries.
@@ -2145,6 +2164,8 @@ fn only_an_accepted_request_is_refused_a_retry() {
         StatusCode::TOO_MANY_REQUESTS,
         StatusCode::BAD_GATEWAY,
         StatusCode::REQUEST_TIMEOUT,
+        StatusCode::CONFLICT,
+        StatusCode::from_u16(529).expect("529 is a status"),
     ] {
         let transient = parse_error_payload_full(&claude::body_failure(status, "it went away"));
         assert!(
@@ -2154,11 +2175,10 @@ fn only_an_accepted_request_is_refused_a_retry() {
     }
 
     // A request the server READ and rejected fails the same way whether or
-    // not its body read. Neither of these says the request went unread, so
-    // neither joins the retryable side.
+    // not its body read. None of these joins the retryable side.
     for status in [
         StatusCode::BAD_REQUEST,
-        StatusCode::CONFLICT,
+        StatusCode::PAYLOAD_TOO_LARGE,
         StatusCode::TOO_EARLY,
     ] {
         let rejected = parse_error_payload_full(&claude::body_failure(status, "gone"));
@@ -2188,7 +2208,7 @@ async fn a_session_refuses_to_continue_on_another_model() {
 
     let mut rt = SqliteRuntime::open(dir.path().join("agentd.db")).expect("the database opens");
     rt.register_workflow(&session::agent_session_info());
-    rt.register_activity_with_body(&session::claude_turn_info(), claude::activity_body(model));
+    rt.register_activity_with_ledger(&session::claude_turn_info(), claude::activity_body(model));
     rt.register_activity_with_body(
         &session::run_tool_info(),
         tools::activity_body(workspace.clone()),
@@ -2208,6 +2228,122 @@ async fn a_session_refuses_to_continue_on_another_model() {
     );
 }
 
+/// A live turn writes one cost ledger row with its model, tokens and price.
+///
+/// A local server stands in for the API, so the test needs no key and no
+/// network. The turn answers and ends the session.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_live_turn_writes_one_priced_ledger_row() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir_all(&workspace).expect("the workspace is created");
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("a local port");
+    let url = format!(
+        "http://{}/v1/messages",
+        listener.local_addr().expect("an address")
+    );
+    let answer = json!({
+        "type": "message",
+        "content": [{ "type": "text", "text": "The workspace is empty." }],
+        "stop_reason": "end_turn",
+        "usage": { "input_tokens": 1000, "output_tokens": 50, "cache_read_input_tokens": 0 }
+    })
+    .to_string();
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("a connection");
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 16384];
+        // Read the head, then the body that its length names.
+        loop {
+            let read = socket.read(&mut buffer).await.expect("a read");
+            request.extend_from_slice(&buffer[..read]);
+            let text = String::from_utf8_lossy(&request).to_lowercase();
+            let Some(end) = text.find("\r\n\r\n") else {
+                continue;
+            };
+            let length = text
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length: "))
+                .and_then(|n| n.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            if read == 0 || request.len() >= end + 4 + length {
+                break;
+            }
+        }
+        let head = format!(
+            "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            answer.len()
+        );
+        socket.write_all(head.as_bytes()).await.expect("a write");
+        socket.write_all(answer.as_bytes()).await.expect("a write");
+    });
+
+    // The sender stays alive. A dropped sender reads as a stop.
+    let (_stop, signal) = crate::shutdown::channel();
+    let model = claude::ModelConfig::new(
+        Some("sk-ant-not-a-real-key".to_string()),
+        claude::DEFAULT_MODEL,
+        claude::DEFAULT_MAX_TOKENS,
+        signal,
+    )
+    .expect("the configuration builds")
+    .endpoint(&url);
+    let mut rt = SqliteRuntime::open(dir.path().join("agentd.db")).expect("the database opens");
+    rt.register_workflow(&session::agent_session_info());
+    rt.register_activity_with_ledger(&session::claude_turn_info(), claude::activity_body(model));
+    rt.register_activity_with_body(
+        &session::run_tool_info(),
+        tools::activity_body(workspace.clone()),
+    );
+
+    let exec = rt
+        .start_workflow(WORKFLOW_NAME, task_on(&workspace, claude::DEFAULT_MODEL))
+        .expect("the session starts");
+    let state = rt.run_until_blocked(exec).await.expect("the run advances");
+    assert!(
+        matches!(state, RunState::Completed(_)),
+        "the turn ends the session: {state:?}"
+    );
+    let rows = rt.llm_ledger(exec).expect("the ledger reads");
+    assert_eq!(rows.len(), 1, "one live turn is one row: {rows:?}");
+    assert_eq!(
+        rows[0].model,
+        autumn_harvest_agent::anthropic::model_id(claude::DEFAULT_MODEL, false),
+        "the row names the model and its settings, as the agent model does"
+    );
+    assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (1000, 50));
+    // 1000 input tokens at $4 and 50 output tokens at $20 per million.
+    assert_eq!(rows[0].cost_usd_micros, Some(5_000));
+}
+
+/// The ledger call of a turn counts the whole prompt and prices it.
+#[test]
+fn a_ledger_call_counts_the_cache_and_passes_the_ledger_check() {
+    let payload = json!({ "usage": {
+        "input_tokens": 10, "output_tokens": 2,
+        "cache_read_input_tokens": 90, "cache_creation_input_tokens": 0
+    }});
+    let call = claude::ledger_call(claude::DEFAULT_MODEL, &payload);
+    assert_eq!((call.input_tokens(), call.output_tokens()), (100, 2));
+    assert_eq!(call.cost_usd_micros(), Some(98));
+    call.validate().expect("the ledger takes the call");
+    assert_eq!(
+        call.model(),
+        autumn_harvest_agent::anthropic::model_id(claude::DEFAULT_MODEL, false)
+    );
+    let unknown = claude::ledger_call("claude-x", &payload);
+    assert_eq!(
+        unknown.cost_usd_micros(),
+        None,
+        "an unknown model is unpriced"
+    );
+}
+
 #[test]
 fn a_billed_response_that_is_not_a_message_is_refused() {
     use autumn_harvest::failure::parse_error_payload_full;
@@ -2221,7 +2357,7 @@ fn a_billed_response_that_is_not_a_message_is_refused() {
         json!({ "content": "not an array", "stop_reason": "end_turn" }),
     ] {
         assert!(
-            !claude::is_message(&malformed),
+            !autumn_harvest_agent::anthropic::wire::is_message(&malformed),
             "{malformed} must not pass as a message"
         );
     }
@@ -2230,7 +2366,10 @@ fn a_billed_response_that_is_not_a_message_is_refused() {
         "content": [{ "type": "text", "text": "hello" }],
         "stop_reason": "end_turn",
     });
-    assert!(claude::is_message(&message), "a real message must pass");
+    assert!(
+        autumn_harvest_agent::anthropic::wire::is_message(&message),
+        "a real message must pass"
+    );
 
     // A blank stop reason is not a stop reason. It also differs from
     // `end_turn`, so the usability test would accept it, and the loop would
@@ -2242,14 +2381,14 @@ fn a_billed_response_that_is_not_a_message_is_refused() {
         json!({ "content": [Value::Null], "stop_reason": "\t\n" }),
     ] {
         assert!(
-            !claude::is_message(&blank),
+            !autumn_harvest_agent::anthropic::wire::is_message(&blank),
             "{blank} must not pass as a message"
         );
     }
 
     // A malformed body from an accepted request is terminal, like the others.
     let refused = parse_error_payload_full(&claude::body_failure(
-        reqwest::StatusCode::OK,
+        autumn_harvest_agent::anthropic::reqwest::StatusCode::OK,
         "its response was not a message",
     ));
     assert!(refused.non_retryable, "a billed malformed body is terminal");
@@ -2270,7 +2409,7 @@ fn a_padded_stop_reason_is_refused_rather_than_normalised() {
             "stop_reason": padded,
         });
         assert!(
-            !claude::is_message(&payload),
+            !autumn_harvest_agent::anthropic::wire::is_message(&payload),
             "a padded stop reason must be refused: {padded:?}"
         );
     }
@@ -2282,7 +2421,7 @@ fn a_padded_stop_reason_is_refused_rather_than_normalised() {
             "stop_reason": exact,
         });
         assert!(
-            claude::is_message(&payload),
+            autumn_harvest_agent::anthropic::wire::is_message(&payload),
             "an exact stop reason must pass: {exact}"
         );
     }
@@ -2294,7 +2433,7 @@ fn a_padded_stop_reason_is_refused_rather_than_normalised() {
             "stop_reason": blank,
         });
         assert!(
-            !claude::is_message(&payload),
+            !autumn_harvest_agent::anthropic::wire::is_message(&payload),
             "a blank stop reason must be refused: {blank:?}"
         );
     }
@@ -6531,7 +6670,11 @@ fn a_response_body_is_read_under_a_byte_cap() {
     // A body that ends under the cap is read whole.
     let mut body = Vec::new();
     assert!(
-        !claude::push_capped(&mut body, b"{\"ok\":true}"),
+        !autumn_harvest_agent::anthropic::push_capped(
+            &mut body,
+            b"{\"ok\":true}",
+            claude::MAX_BODY_BYTES
+        ),
         "a small chunk must not end the read"
     );
     assert_eq!(body.len(), 11, "a small chunk is taken whole");
@@ -6542,7 +6685,11 @@ fn a_response_body_is_read_under_a_byte_cap() {
     // See `a_response_body_longer_than_the_cap_is_refused`.
     let mut body = vec![b'a'; cap - 10];
     assert!(
-        claude::push_capped(&mut body, &vec![b'b'; 4096]),
+        autumn_harvest_agent::anthropic::push_capped(
+            &mut body,
+            &vec![b'b'; 4096],
+            claude::MAX_BODY_BYTES
+        ),
         "a chunk past the cap must end the read"
     );
     assert_eq!(
@@ -6555,7 +6702,7 @@ fn a_response_body_is_read_under_a_byte_cap() {
     // grow by the whole chunk.
     let mut body = vec![b'a'; cap];
     assert!(
-        claude::push_capped(&mut body, b"more"),
+        autumn_harvest_agent::anthropic::push_capped(&mut body, b"more", claude::MAX_BODY_BYTES),
         "a full body must end the read"
     );
     assert_eq!(body.len(), cap + 1, "a full body grows by one byte only");
@@ -6564,7 +6711,11 @@ fn a_response_body_is_read_under_a_byte_cap() {
     // exactly the cap is still accepted.
     let mut body = Vec::new();
     assert!(
-        !claude::push_capped(&mut body, &vec![b'a'; cap]),
+        !autumn_harvest_agent::anthropic::push_capped(
+            &mut body,
+            &vec![b'a'; cap],
+            claude::MAX_BODY_BYTES
+        ),
         "a body of exactly the cap must not end the read"
     );
     assert_eq!(body.len(), cap, "and it is taken whole");
@@ -6782,7 +6933,9 @@ fn a_response_body_that_is_not_text_is_refused() {
     );
 
     // The strict read refuses those bytes, and says where.
-    let refused = claude::decode_body(body).expect_err("a body that is not text must be refused");
+    let refused = autumn_harvest_agent::anthropic::decode_body(body, claude::MAX_BODY_BYTES)
+        .map_err(claude::body_refusal)
+        .expect_err("a body that is not text must be refused");
     assert!(
         refused.contains("not UTF-8 text") && refused.contains("begins no character"),
         "the refusal must say what is wrong: {refused}"
@@ -6795,7 +6948,9 @@ fn a_response_body_that_is_not_text_is_refused() {
     }))
     .expect("the body serialises");
     assert!(
-        claude::decode_body(whole.clone()).is_ok(),
+        autumn_harvest_agent::anthropic::decode_body(whole.clone(), claude::MAX_BODY_BYTES)
+            .map_err(claude::body_refusal)
+            .is_ok(),
         "a body of ordinary text must still read"
     );
 
@@ -6804,7 +6959,10 @@ fn a_response_body_that_is_not_text_is_refused() {
     let cut = whole[..whole.len() - 2].to_vec();
     let by_json = serde_json::from_str::<Value>(&String::from_utf8_lossy(&cut));
     assert!(
-        claude::decode_body(cut).is_err() || by_json.is_err(),
+        autumn_harvest_agent::anthropic::decode_body(cut, claude::MAX_BODY_BYTES)
+            .map_err(claude::body_refusal)
+            .is_err()
+            || by_json.is_err(),
         "a cut body must be refused by one check or the other"
     );
 }
@@ -6853,7 +7011,7 @@ fn a_response_body_longer_than_the_cap_is_refused() {
     let mut body: Vec<u8> = Vec::new();
     let mut stopped = false;
     for chunk in whole.chunks(64 * 1024) {
-        if claude::push_capped(&mut body, chunk) {
+        if autumn_harvest_agent::anthropic::push_capped(&mut body, chunk, claude::MAX_BODY_BYTES) {
             stopped = true;
             break;
         }
@@ -6868,7 +7026,8 @@ fn a_response_body_longer_than_the_cap_is_refused() {
     // So the body is refused, and its prefix is never parsed. The read is
     // mapped to its LENGTH before asserting, because a failure here would
     // otherwise print four megabytes of padding.
-    let refused = claude::decode_body(body)
+    let refused = autumn_harvest_agent::anthropic::decode_body(body, claude::MAX_BODY_BYTES)
+        .map_err(claude::body_refusal)
         .map(|text| text.len())
         .expect_err("a body past the cap must be refused");
     assert!(
@@ -6882,13 +7041,15 @@ fn a_response_body_longer_than_the_cap_is_refused() {
     let mut body: Vec<u8> = Vec::new();
     for chunk in prefix.chunks(64 * 1024) {
         assert!(
-            !claude::push_capped(&mut body, chunk),
+            !autumn_harvest_agent::anthropic::push_capped(&mut body, chunk, claude::MAX_BODY_BYTES),
             "a body of exactly the cap must not end the read early"
         );
     }
     assert_eq!(body.len(), cap, "the whole body is buffered");
     assert!(
-        claude::decode_body(body).is_ok(),
+        autumn_harvest_agent::anthropic::decode_body(body, claude::MAX_BODY_BYTES)
+            .map_err(claude::body_refusal)
+            .is_ok(),
         "a body that ends at the cap must still be read"
     );
 }

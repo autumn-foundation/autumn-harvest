@@ -1293,22 +1293,23 @@ jobs:
       # Issue #1973. Offline: a scripted model, no API key, no network. The
       # crash test runs its own binary as a child process. Issue #2001 adds
       # the `eval` suite.
+      # The `anthropic` suite runs against a local HTTP server, with no key.
       - name: Run autumn-harvest-agent tests (issues #1973, #2001)
         if: needs.changes.outputs.code == 'true' && matrix.shard == 3
-        run: cargo test -p autumn-harvest-agent --features sqlite,eval,sandbox
+        run: cargo test -p autumn-harvest-agent --features sqlite,eval,sandbox,anthropic
       # The refine example runs offline: scripted models, no key, no network.
       # It exits non-zero when op 2 fails, so this step fails too. It takes
       # the features of the test step above, so only the example links. The
       # guide names `sqlite,eval`, and a clippy step checks that set.
       - name: Run the agent refine example
         if: needs.changes.outputs.code == 'true' && matrix.shard == 3
-        run: cargo run -p autumn-harvest-agent --features sqlite,eval,sandbox --example agent_refine
+        run: cargo run -p autumn-harvest-agent --features sqlite,eval,sandbox,anthropic --example agent_refine
       # The mesh example runs offline: a scripted model, no key, no network.
       # It exits non-zero when one of its claims fails. It takes the features
       # of the test step above, so only the example links.
       - name: Run the agent mesh example
         if: needs.changes.outputs.code == 'true' && matrix.shard == 3
-        run: cargo run -p autumn-harvest-agent --features sqlite,eval,sandbox --example sqlite_mesh
+        run: cargo run -p autumn-harvest-agent --features sqlite,eval,sandbox,anthropic --example sqlite_mesh
       # Sandboxed code activities. The tests need no KVM: a fake VMM, fake
       # `firecracker` and `jailer` scripts and a fake API server stand in. The
       # Linux backends compile on Linux only, so the other OSes run the
@@ -2733,6 +2734,8 @@ jobs:
         run: cargo clippy -p autumn-harvest-agent --all-targets --features sqlite,eval --no-deps -- -D warnings
       - name: Clippy autumn-harvest-agent (sandbox feature)
         run: cargo clippy -p autumn-harvest-agent --all-targets --features sandbox --no-deps -- -D warnings
+      - name: Clippy autumn-harvest-agent (anthropic feature)
+        run: cargo clippy -p autumn-harvest-agent --all-targets --features anthropic --no-deps -- -D warnings
       - name: Clippy autumn-harvest-agent (postgres and sqlite features, issue #2371)
         run: cargo clippy -p autumn-harvest-agent --all-targets --features postgres,sqlite --no-deps -- -D warnings
       - name: Clippy autumn-harvest-agent (postgres and eval features, issue #2378)
