@@ -210,6 +210,14 @@ fn self_failed_body(run_url: &str) -> String {
 }
 
 /// Maps a child exit status to an exit code, as a POSIX shell does.
+///
+/// Clone-class note: this function, `gh_output`, `gh_status`,
+/// `open_issue_titled`, and `issue_number_titled` below repeat verbatim, or
+/// near-verbatim, in [`crate::ci::advisory_scan`]. Apply a change in the
+/// `gh` pagination, the pull-request exclusion filter, or the exit-code
+/// mapping to both modules. Two instances only, so the merge-evidence bar
+/// (rule of three, or a missed-fix) is not met yet. See the note on
+/// `advisory_scan::exit_code`.
 fn exit_code(status: ExitStatus) -> u8 {
     #[cfg(unix)]
     {

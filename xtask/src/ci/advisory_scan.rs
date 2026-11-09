@@ -216,6 +216,22 @@ fn run_cargo_deny(log: &Path) -> Result<u8> {
 }
 
 /// Maps a child exit status to an exit code, as a POSIX shell does.
+///
+/// Clone-class note: this function, `gh_output`, `gh_status`,
+/// `open_issue_titled`, and `issue_number_titled` below repeat verbatim, or
+/// near-verbatim, in [`crate::ci::chaos_watchdog`]. Apply a change in the
+/// `gh` pagination, the pull-request exclusion filter, or the exit-code
+/// mapping to both modules.
+///
+/// Two instances only. Neither module has a commit past its creation in PR
+/// #2574, so neither has a co-change or a missed-fix to cite. The
+/// duplication predates the port: `.github/ci/advisory-scan.sh` (issue
+/// #1826, PR #1928) and `.github/ci/chaos-watchdog.sh` (issue #1790, PR
+/// #1841) hand-rolled the same `gh api --paginate` and issue-lookup
+/// convention independently, months apart. PR #2574 then hand-translated
+/// each script into its own Rust module, rather than factoring one shared
+/// module. The merge-evidence bar (rule of three, or a missed-fix) is not
+/// met yet. See the note on `chaos_watchdog::exit_code`.
 fn exit_code(status: ExitStatus) -> u8 {
     #[cfg(unix)]
     {
