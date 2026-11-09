@@ -1,4 +1,4 @@
-## Documentation — agent-mesh guide errata (issue #2485)
+## Documentation — agent-mesh guide errata (issue #2485, PR #2636)
 
 - `docs/agent-mesh.md` section 10: a finished peer lookup replays from
   history. Only a lookup in flight runs again.
