@@ -58,8 +58,8 @@ change is in the bench harness and the docs only.
 * **Yellow (benefits).** The first Harvest number that has the same shape
   as a published capacity figure. The pure rule is unit-tested, so the
   soundness logic is fixed before a run.
-* **Green (alternatives).** A later run on a 16-core host with a separate
-  database host makes the comparison fair. The harness takes
+* **Green (alternatives).** A later run on a larger host with a separate
+  database host measures that layout. The harness takes
   `HARVEST_BENCH_SHARD_URLS` for that layout.
 * **Blue (process).** RED tests for the pure rule first. Then the runner.
   Then one measured run on the reference box. Then the docs and their
@@ -148,7 +148,7 @@ the bench host today, so no multi-shard capacity cell gives a ratio yet.
 | A unit test pins the sustainable-rate rule. | `the_sustainable_rate_stops_at_the_first_growing_backlog`, which builds each verdict from `judge_shard` |
 | One measured run on the reference box, 1 shard, both arms. | `docs/benchmarks/capacity-2026-11.md`: 190.7 no-op and 48.8 canonical workflows/s, both sound |
 | `benchmarks.md` states that the closed-loop cell is latency-bound, and that co-located shard cells are not a scaling result. | `benchmarks_docs.rs` guards |
-| `comparison.md` cites the DBOS figure only next to a Harvest number from this scenario, with the hardware of each. | `capacity_docs` guards |
+| `comparison.md` cites the DBOS figure only next to a Harvest number from this scenario, with the hardware of each. | Dropped by the maintainer. A figure from a 16-vCPU database with 48 workers says nothing next to one from 4 workers that share 4 CPUs with their database. `comparison.md` is unchanged. |
 
 ---
 

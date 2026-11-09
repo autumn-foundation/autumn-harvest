@@ -689,7 +689,7 @@ pub struct PublishedCapacity {
 
 /// The capacity cells [`PUBLISHED_CAPACITY_FILE`] publishes.
 ///
-/// The docs guard pins each value to that file and to `docs/comparison.md`.
+/// The docs guard pins each value to that file and to `docs/benchmarks.md`.
 pub const PUBLISHED_CAPACITY: &[PublishedCapacity] = &[
     PublishedCapacity {
         arm: CapacityArm::Noop,

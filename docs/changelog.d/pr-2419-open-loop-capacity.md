@@ -29,8 +29,6 @@ What shipped:
 - `docs/benchmarks/capacity-2026-11.md` publishes one measured run on the
   reference box. `docs/benchmarks.md` states that the closed-loop cell is
   latency-bound and that co-located shard cells are not a scaling result.
-  `docs/comparison.md` cites the DBOS figure next to the Harvest number,
-  with the hardware of each.
 
 No migration. No new `WorkflowEvent` variant. No engine change.
 
