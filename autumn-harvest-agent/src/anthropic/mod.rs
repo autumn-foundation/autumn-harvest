@@ -39,10 +39,11 @@ pub use chat::{
 };
 pub use client::{
     ApiError, BodyError, CONNECT_TIMEOUT, Client, MAX_BODY_BYTES, REQUEST_TIMEOUT, decode_body,
-    http_client, push_capped,
+    http_client, printable, push_capped,
 };
 pub use model::ClaudeModel;
-/// The HTTP client crate, so an app can build a client for [`Client::http`].
+/// The HTTP client crate, so an app can build a client for
+/// [`Client::with_http`].
 pub use reqwest;
 pub use sse::{SseFrames, StreamAssembler};
 pub use wire::{

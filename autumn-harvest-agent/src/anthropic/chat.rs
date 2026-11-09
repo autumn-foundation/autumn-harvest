@@ -10,7 +10,7 @@
 //! text and tool calls. Two turns with the same text in two conversations
 //! then keep their own blocks.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -37,14 +37,51 @@ pub trait TurnStore: Send + Sync + fmt::Debug {
     fn put(&self, key: &str, raw: &[Value]) -> Result<(), AgentError>;
 }
 
+/// The most raw turns that one model keeps in memory.
+///
+/// A worker shares one model across its runs, so the copy must not grow
+/// for the life of the process. The oldest turn goes first. A durable store
+/// still holds it.
+pub const MAX_MEMORY_TURNS: usize = 4096;
+
 /// The raw turns of one model: a memory copy and an optional durable store.
 #[derive(Debug, Clone, Default)]
 pub struct Turns {
     pub store: Option<Arc<dyn TurnStore>>,
-    memory: Arc<Mutex<HashMap<String, Vec<Value>>>>,
+    memory: Arc<Mutex<Memory>>,
+}
+
+/// The memory copy, with the order of its keys for the bound.
+#[derive(Debug, Default)]
+struct Memory {
+    turns: HashMap<String, Vec<Value>>,
+    order: VecDeque<String>,
+}
+
+impl Memory {
+    /// Keep `raw` under `key`, and drop the oldest turns past the bound.
+    fn insert(&mut self, key: String, raw: Vec<Value>) {
+        if self.turns.insert(key.clone(), raw).is_none() {
+            self.order.push_back(key);
+        }
+        while self.order.len() > MAX_MEMORY_TURNS {
+            if let Some(oldest) = self.order.pop_front() {
+                self.turns.remove(&oldest);
+            }
+        }
+    }
 }
 
 impl Turns {
+    /// The same durable store with an empty memory copy of its own.
+    #[must_use]
+    pub fn fresh(&self) -> Self {
+        Self {
+            store: self.store.clone(),
+            memory: Arc::default(),
+        }
+    }
+
     pub fn put(&self, key: String, raw: Vec<Value>) -> Result<(), AgentError> {
         if let Some(store) = &self.store {
             store.put(&key, &raw)?;
@@ -62,6 +99,7 @@ impl Turns {
             .memory
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
+            .turns
             .get(&key)
         {
             return Some(raw.clone());
@@ -260,10 +298,13 @@ pub fn request_body(
 /// on each tool. The assembler parses each tool input in full.
 #[must_use]
 pub fn streaming_body(mut body: Value) -> Value {
-    body["stream"] = json!(true);
-    if let Some(tools) = body["tools"].as_array_mut() {
-        for tool in tools {
-            tool["eager_input_streaming"] = json!(true);
+    let Some(map) = body.as_object_mut() else {
+        return body;
+    };
+    map.insert("stream".to_owned(), json!(true));
+    if let Some(tools) = map.get_mut("tools").and_then(Value::as_array_mut) {
+        for tool in tools.iter_mut().filter_map(Value::as_object_mut) {
+            tool.insert("eager_input_streaming".to_owned(), json!(true));
         }
     }
     body
@@ -547,6 +588,28 @@ mod tests {
             ..Turns::default()
         };
         assert_eq!(restarted.get(&[], &shown), Some(raw));
+    }
+
+    #[test]
+    fn the_memory_copy_keeps_the_newest_turns_only() {
+        let turns = Turns::default();
+        let shown = |n: usize| vec![json!({"type": "text", "text": n.to_string()})];
+        for n in 0..=MAX_MEMORY_TURNS {
+            turns.put(turn_key(&[], &shown(n)), vec![json!(n)]).unwrap();
+        }
+        assert_eq!(
+            turns.get(&[], &shown(0)),
+            None,
+            "the oldest turn went first"
+        );
+        assert_eq!(
+            turns.get(&[], &shown(MAX_MEMORY_TURNS)),
+            Some(vec![json!(MAX_MEMORY_TURNS)])
+        );
+        assert!(
+            turns.fresh().get(&[], &shown(1)).is_none(),
+            "a fresh copy is empty"
+        );
     }
 
     #[test]

@@ -54,10 +54,15 @@ impl ClaudeModel {
     }
 
     /// Use `model` in place of the default.
+    ///
+    /// The model gets a memory copy of its own. A thinking block belongs to
+    /// the model that wrote it, so a clone on another model does not see the
+    /// turns of this one.
     #[must_use]
     pub fn model(mut self, model: impl Into<String>) -> Self {
         self.model = model.into();
         self.id = wire::model_id(&self.model, self.fallbacks);
+        self.turns = self.turns.fresh();
         self
     }
 
@@ -112,8 +117,7 @@ impl AgentModel for ClaudeModel {
         on_delta: &'a (dyn Fn(&str) + Send + Sync),
     ) -> BoxFuture<'a, Result<ChatResponse, AgentError>> {
         Box::pin(async move {
-            let body = chat::streaming_body(self.body(request));
-            let body = self.client.stream(&body, on_delta).await?;
+            let body = self.client.stream(self.body(request), on_delta).await?;
             self.finish(request, &body)
         })
     }
@@ -122,6 +126,9 @@ impl AgentModel for ClaudeModel {
         Some(&self.id)
     }
 
+    /// The price of the configured model. A turn that a refusal fallback
+    /// answers is billed at the rates of the fallback model. This price does
+    /// not see that model, so it reads the rates of the configured one.
     fn cost_usd_micros(&self, usage: &TokenUsage) -> Option<u64> {
         wire::cost_usd_micros(&self.model, usage)
     }
@@ -151,6 +158,9 @@ mod tests {
                 // Read the head, then the body that its length names.
                 loop {
                     let read = socket.read(&mut buffer).await.unwrap();
+                    if read == 0 {
+                        break;
+                    }
                     request.extend_from_slice(&buffer[..read]);
                     let text = String::from_utf8_lossy(&request).to_lowercase();
                     if let Some(end) = text.find("\r\n\r\n") {
@@ -159,7 +169,7 @@ mod tests {
                             .find_map(|l| l.strip_prefix("content-length: "))
                             .and_then(|n| n.trim().parse::<usize>().ok())
                             .unwrap_or(0);
-                        if request.len() >= end + 4 + length || read == 0 {
+                        if request.len() >= end + 4 + length {
                             break;
                         }
                     }

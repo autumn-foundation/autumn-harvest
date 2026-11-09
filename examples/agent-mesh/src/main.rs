@@ -104,7 +104,11 @@ fn model(cli: &Cli) -> Result<Arc<dyn AgentModel>, Error> {
         ModelKind::Claude => {
             let key = std::env::var("ANTHROPIC_API_KEY")
                 .map_err(|_| "set ANTHROPIC_API_KEY to use --model claude")?;
-            Arc::new(ClaudeModel::new(&key)?.model(&cli.claude_model))
+            Arc::new(
+                ClaudeModel::new(&key)
+                    .map_err(|e| format!("ANTHROPIC_API_KEY: {}", e.message()))?
+                    .model(&cli.claude_model),
+            )
         }
     })
 }

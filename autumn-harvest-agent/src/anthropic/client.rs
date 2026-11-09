@@ -21,6 +21,33 @@ pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// The most characters of an error body that an [`ApiError`] keeps.
 const ERROR_DETAIL_CHARS: usize = 500;
 
+/// The most bytes of an error body that a [`Client`] reads. It keeps only
+/// [`ERROR_DETAIL_CHARS`] of them, so a larger read only costs memory.
+const ERROR_BODY_BYTES: usize = 64 * 1024;
+
+/// The first [`ERROR_DETAIL_CHARS`] of `text`, with each control and bidi
+/// character escaped.
+///
+/// An error body comes from the API or from a proxy before it. It goes
+/// into an error message, and from there into history and logs. An escape
+/// character there could rewrite the terminal of an operator.
+#[must_use]
+pub fn printable(text: &str) -> String {
+    text.chars()
+        .take(ERROR_DETAIL_CHARS)
+        .flat_map(|c| {
+            let hidden = c.is_control()
+                || matches!(c, '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}');
+            let shown: Vec<char> = if hidden {
+                c.escape_unicode().collect()
+            } else {
+                vec![c]
+            };
+            shown
+        })
+        .collect()
+}
+
 /// Why a response body cannot be read as text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BodyError {
@@ -158,8 +185,13 @@ impl From<ApiError> for AgentError {
 
 /// An HTTP client for the Messages API, with `timeout` for each request.
 ///
+/// The client follows no redirect. A redirect would send the key header and
+/// the whole prompt to the next host, because a redirect keeps `x-api-key`.
+///
 /// The client uses `rustls` with the `ring` provider. The call installs that
-/// provider as the process default when no provider is installed.
+/// provider as the process default when no provider is installed. An app
+/// that needs another provider installs it first, then calls this, or
+/// passes its own client to [`Client::with_http`].
 ///
 /// # Errors
 ///
@@ -170,6 +202,7 @@ pub fn http_client(timeout: Duration) -> Result<reqwest::Client, AgentError> {
     reqwest::Client::builder()
         .timeout(timeout)
         .connect_timeout(CONNECT_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| AgentError::new(ErrorKind::Config, format!("no HTTP client: {e}")))
 }
@@ -199,33 +232,29 @@ impl Client {
     ///
     /// # Errors
     ///
+    /// The errors of [`with_http`](Self::with_http), and a `Config` error
+    /// when the HTTP client cannot be built.
+    pub fn new(api_key: &str) -> Result<Self, AgentError> {
+        Self::with_http(api_key, http_client(REQUEST_TIMEOUT)?)
+    }
+
+    /// A client with `api_key` that sends each request through `http`.
+    ///
+    /// Build `http` with [`http_client`], or turn off its redirects. A
+    /// redirect sends the key header to the next host.
+    ///
+    /// # Errors
+    ///
     /// A `Config` error when the key is blank, or when it holds a byte that
     /// an HTTP header cannot carry, such as an interior newline. Each request
     /// would fail with that key, and the failure would read as retryable.
-    pub fn new(api_key: &str) -> Result<Self, AgentError> {
-        if api_key.trim().is_empty() {
-            return Err(AgentError::new(ErrorKind::Config, "the API key is blank"));
-        }
-        let mut header = reqwest::header::HeaderValue::from_str(api_key).map_err(|_| {
-            AgentError::new(
-                ErrorKind::Config,
-                "the API key holds a byte that cannot go in an HTTP header",
-            )
-        })?;
-        header.set_sensitive(true);
+    pub fn with_http(api_key: &str, http: reqwest::Client) -> Result<Self, AgentError> {
         Ok(Self {
-            api_key: header,
-            http: http_client(REQUEST_TIMEOUT)?,
+            api_key: key_header(api_key)?,
+            http,
             endpoint: ENDPOINT.to_owned(),
             max_body_bytes: MAX_BODY_BYTES,
         })
-    }
-
-    /// Send each request through `http` in place of the default client.
-    #[must_use]
-    pub fn http(mut self, http: reqwest::Client) -> Self {
-        self.http = http;
-        self
     }
 
     /// Read at most `cap` bytes of each response body.
@@ -235,7 +264,9 @@ impl Client {
         self
     }
 
-    /// Send each request to `url` in place of [`ENDPOINT`]. A test uses it.
+    /// Send each request to `url` in place of [`ENDPOINT`], for example a
+    /// gateway or a local test server. Use `https` for a remote host: the
+    /// key travels in a header.
     #[must_use]
     pub fn endpoint(mut self, url: impl Into<String>) -> Self {
         self.endpoint = url.into();
@@ -275,23 +306,32 @@ impl Client {
         check_message(message, status)
     }
 
-    /// Send one request `body` with `"stream": true`, and return the message.
+    /// Send one request `body` as a stream, and return the message.
     ///
+    /// The call sets `"stream": true` and asks for eager input streaming on
+    /// each tool, as [`streaming_body`](super::streaming_body) does.
     /// `on_delta` gets each text delta, and `""` at each other event. The
     /// returned message has the shape of a [`create`](Self::create) answer.
     ///
     /// # Errors
     ///
-    /// As [`create`](Self::create). An `error` event takes its kind from
+    /// As [`create`](Self::create). A body that is not an object is a
+    /// `Config` error. An `error` event takes its kind from
     /// [`wire::error_type_kind`]. A stream that ends before `message_stop`
-    /// is `Transport`.
+    /// is `Transport`. A line that is not UTF-8 is `Decode`.
     pub async fn stream(
         &self,
-        body: &Value,
+        body: Value,
         on_delta: &(dyn Fn(&str) + Send + Sync),
     ) -> Result<Value, ApiError> {
-        let mut body = body.clone();
-        body["stream"] = Value::Bool(true);
+        if !body.is_object() {
+            return Err(ApiError::new(
+                ErrorKind::Config,
+                None,
+                "the request body is not a JSON object",
+            ));
+        }
+        let body = super::chat::streaming_body(body);
         let mut response = self.send(&body).await?;
         let status = response.status().as_u16();
         let failed = |e: AgentError| ApiError::new(e.kind(), Some(status), e.message());
@@ -314,11 +354,11 @@ impl Client {
                 error.body = Some(cap);
                 return Err(error);
             }
-            for data in frames.push(&chunk) {
+            for data in frames.push(&chunk).map_err(failed)? {
                 stream.event(&data, on_delta).map_err(failed)?;
             }
         }
-        for data in frames.end() {
+        for data in frames.end().map_err(failed)? {
             stream.event(&data, on_delta).map_err(failed)?;
         }
         check_message(stream.finish().map_err(failed)?, status)
@@ -354,10 +394,7 @@ impl Client {
             return Ok(response);
         }
         // The body names the error. It holds no secret: the key is a header.
-        let detail = self.read(response).await.map_or_else(
-            |_| "the error body could not be read".to_owned(),
-            |text| text.chars().take(ERROR_DETAIL_CHARS).collect(),
-        );
+        let detail = read_error(response).await;
         Err(ApiError::new(
             wire::error_kind(status),
             Some(status),
@@ -387,6 +424,41 @@ impl Client {
     }
 }
 
+/// The key as a sensitive header value, or a `Config` error.
+fn key_header(api_key: &str) -> Result<reqwest::header::HeaderValue, AgentError> {
+    if api_key.trim().is_empty() {
+        return Err(AgentError::new(ErrorKind::Config, "the API key is blank"));
+    }
+    let mut header = reqwest::header::HeaderValue::from_str(api_key).map_err(|_| {
+        AgentError::new(
+            ErrorKind::Config,
+            "the API key holds a byte that cannot go in an HTTP header",
+        )
+    })?;
+    header.set_sensitive(true);
+    Ok(header)
+}
+
+/// The printable start of an error body, read up to [`ERROR_BODY_BYTES`].
+///
+/// The text only names the error, and no code acts on it, so a lossy decode
+/// is safe here.
+async fn read_error(mut response: reqwest::Response) -> String {
+    let mut body = Vec::new();
+    loop {
+        match response.chunk().await {
+            Ok(Some(chunk)) => {
+                if push_capped(&mut body, &chunk, ERROR_BODY_BYTES) {
+                    break;
+                }
+            }
+            Err(_) if body.is_empty() => return "the error body could not be read".to_owned(),
+            Ok(None) | Err(_) => break,
+        }
+    }
+    printable(&String::from_utf8_lossy(&body))
+}
+
 /// Refuse a parsed body that is not a message.
 fn check_message(message: Value, status: u16) -> Result<Value, ApiError> {
     if wire::is_message(&message) {
@@ -412,37 +484,48 @@ mod tests {
 
     use super::*;
 
-    /// A one-shot HTTP server. It answers with `status` and `body`, and
-    /// keeps the head of the request it got.
-    async fn serve(status: u16, body: &[u8]) -> (String, Arc<Mutex<String>>) {
+    /// A one-shot HTTP server. It answers with `head` and `body`, and keeps
+    /// the head of the request it got. It reads the whole request first, so
+    /// no unread byte resets the connection.
+    async fn serve_raw(head: String, body: Vec<u8>) -> (String, Arc<Mutex<String>>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/v1/messages", listener.local_addr().unwrap());
         let seen = Arc::new(Mutex::new(String::new()));
-        let head = seen.clone();
-        let answer = format!(
-            "HTTP/1.1 {status} X\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-            body.len()
-        )
-        .into_bytes()
-        .into_iter()
-        .chain(body.iter().copied())
-        .collect::<Vec<u8>>();
+        let kept = seen.clone();
         tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
             let mut request = Vec::new();
             let mut buffer = [0_u8; 4096];
-            // The head ends at a blank line. The test bodies are small.
-            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+            loop {
                 let read = socket.read(&mut buffer).await.unwrap();
-                if read == 0 {
+                request.extend_from_slice(&buffer[..read]);
+                let text = String::from_utf8_lossy(&request).to_lowercase();
+                let whole = text.find("\r\n\r\n").is_some_and(|end| {
+                    let length = text
+                        .lines()
+                        .find_map(|l| l.strip_prefix("content-length: "))
+                        .and_then(|n| n.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    request.len() >= end + 4 + length
+                });
+                if whole || read == 0 {
+                    *kept.lock().unwrap() = text;
                     break;
                 }
-                request.extend_from_slice(&buffer[..read]);
             }
-            *head.lock().unwrap() = String::from_utf8_lossy(&request).to_lowercase();
-            socket.write_all(&answer).await.unwrap();
+            socket.write_all(head.as_bytes()).await.unwrap();
+            socket.write_all(&body).await.unwrap();
         });
         (url, seen)
+    }
+
+    /// A one-shot server that answers with `status` and `body`.
+    async fn serve(status: u16, body: &[u8]) -> (String, Arc<Mutex<String>>) {
+        let head = format!(
+            "HTTP/1.1 {status} X\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            body.len()
+        );
+        serve_raw(head, body.to_vec()).await
     }
 
     fn client(url: &str) -> Client {
@@ -520,6 +603,109 @@ mod tests {
         assert_eq!(error.kind(), ErrorKind::Transport);
         assert_eq!(error.status(), None);
         assert!(error.kind().is_retryable());
+    }
+
+    #[tokio::test]
+    async fn a_redirect_is_not_followed() {
+        // A redirect would send the key to the next host.
+        let (other, seen) = serve(200, message().to_string().as_bytes()).await;
+        let head = format!(
+            "HTTP/1.1 307 X\r\nlocation: {other}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+        );
+        let (url, _) = serve_raw(head, Vec::new()).await;
+        let error = client(&url).create(&json!({})).await.unwrap_err();
+        assert_eq!(error.status(), Some(307));
+        assert!(!error.kind().is_retryable());
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "the other host got nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_error_body_is_cut_and_its_control_characters_escaped() {
+        let mut body = b"bad \x1b[2J request ".to_vec();
+        body.extend(std::iter::repeat_n(b'x', 200_000));
+        let (url, _) = serve(400, &body).await;
+        let error = client(&url).create(&json!({})).await.unwrap_err();
+        assert!(!error.message().contains('\u{1b}'), "{}", error.message());
+        assert!(error.message().contains("\\u{1b}"), "{}", error.message());
+        assert!(error.message().len() < 1_000, "the detail is cut");
+        assert_eq!(printable("a\u{202e}b"), "a\\u{202e}b");
+    }
+
+    fn sse(events: &[Value]) -> Vec<u8> {
+        events
+            .iter()
+            .fold(String::new(), |wire, e| {
+                wire + "data: " + &e.to_string() + "\n\n"
+            })
+            .into_bytes()
+    }
+
+    fn start() -> Value {
+        json!({"type": "message_start", "message": {"type": "message", "role": "assistant",
+            "content": [], "stop_reason": null, "usage": {"input_tokens": 1, "output_tokens": 1}}})
+    }
+
+    #[tokio::test]
+    async fn a_stream_asks_for_eager_input_and_returns_the_message() {
+        let events = [
+            start(),
+            json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}}),
+            json!({"type": "message_stop"}),
+        ];
+        let (url, seen) = serve(200, &sse(&events)).await;
+        let body = json!({"tools": [{"name": "t"}]});
+        let message = client(&url).stream(body, &|_| {}).await.unwrap();
+        assert_eq!(message["stop_reason"], "end_turn");
+        let request = seen.lock().unwrap().clone();
+        assert!(request.contains("\"stream\":true"), "{request}");
+        assert!(
+            request.contains("\"eager_input_streaming\":true"),
+            "{request}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stream_error_an_early_end_or_a_long_stream_is_an_accepted_error() {
+        let overloaded = sse(&[
+            start(),
+            json!({"type": "error", "error": {"type": "overloaded_error", "message": "busy"}}),
+        ]);
+        let (url, _) = serve(200, &overloaded).await;
+        let error = client(&url).stream(json!({}), &|_| {}).await.unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Unavailable);
+        assert!(error.accepted());
+
+        let (url, _) = serve(200, &sse(&[start()])).await;
+        let error = client(&url).stream(json!({}), &|_| {}).await.unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Transport, "the stream ended early");
+
+        let (url, _) = serve(200, &sse(&[start(), start(), start()])).await;
+        let error = client(&url)
+            .max_body_bytes(64)
+            .stream(json!({}), &|_| {})
+            .await
+            .unwrap_err();
+        assert_eq!(error.body_error(), Some(BodyError::TooLong { cap: 64 }));
+    }
+
+    #[tokio::test]
+    async fn a_body_that_is_not_an_object_is_refused_before_a_request() {
+        let error = client("http://127.0.0.1:9/")
+            .stream(json!([1]), &|_| {})
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Config);
+        assert_eq!(error.status(), None);
+    }
+
+    #[test]
+    fn a_client_with_its_own_http_client_checks_the_key_too() {
+        let http = reqwest::Client::new();
+        assert!(Client::with_http("sk-ant-a\nb", http.clone()).is_err());
+        assert!(Client::with_http("sk-ant-ok", http).is_ok());
     }
 
     #[test]

@@ -310,7 +310,9 @@ so the crate without it has no HTTP client. The module has three layers:
 | `anthropic::ClaudeModel` | The `AgentModel`. `chat` sends one request. `chat_stream` streams it over Server-Sent Events. |
 
 `ClaudeModel::new(key)` refuses a blank key, and a key that an HTTP header
-cannot carry. The default model is `claude-opus-5-5`. Only that model gets
+cannot carry. The client follows no redirect, because a redirect keeps the
+key header. It refuses a stream line that is not UTF-8, as it refuses such a
+body. The default model is `claude-opus-5-5`. Only that model gets
 adaptive thinking, effort `high` and the server-side refusal fallback.
 Another model gets the API defaults. `fallbacks(false)` turns the fallback
 off.
@@ -328,7 +330,8 @@ A status maps to an `ErrorKind` as the Anthropic SDKs retry it:
 A thinking block has no place in a `ChatMessage`, and the API wants it back
 in a tool loop. So the model keeps each raw assistant turn by a hash key.
 `turn_store(store)` adds a durable `TurnStore`, so a restarted process can
-replay the turns.
+replay the turns. The memory copy keeps the newest 4096 turns. Each call of
+`model(name)` starts an empty memory copy.
 
 An app with its own transcript format can use `Client` and `wire` alone.
 `examples/claude-agent-daemon` does that.
@@ -353,7 +356,8 @@ encrypted turn output, so the usage report can sum it per tenant. Two
 `anthropic::price`, which holds the first-party rates of the Claude 5
 models by exact name. A cache read and a cache write each have their own
 rate. A cache write uses the five-minute rate. An alias or an unknown model
-is unpriced.
+is unpriced. A turn that a refusal fallback answers is priced at the rates of
+the configured model.
 
 A response cache hit calls no model and spends no tokens, so it writes no
 ledger row.

@@ -31,6 +31,18 @@ The examples move to it and delete their copies:
   `high`. A session recorded on `claude-opus-5` resumes with
   `--model claude-opus-5`. A `409` now retries.
 
+Notes for an upgrade:
+
+- The model id changes from `effort=high` to `effort:high`. Each response
+  cache entry under the old id misses once.
+- autoresearch on Postgres sets a daily tenant cost budget of $20. The
+  calls were unpriced before, so the budget counted nothing. It now stops a
+  lab once a day of Opus spend passes it.
+- A 2xx body with no stop reason is now a `Decode` error.
+- The client follows no redirect, because a redirect keeps the key header.
+- A daemon session recorded on `claude-opus-5` still asks for adaptive
+  thinking on resume.
+
 Fixed drift: the autoresearch model id held `=`, so the ledger recorded it
 as `unknown`. Neither copy priced a call. A key with an interior newline
 failed every autoresearch request as a retryable error.

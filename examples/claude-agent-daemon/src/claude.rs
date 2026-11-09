@@ -20,6 +20,7 @@ use autumn_harvest::chrono::{DateTime, Utc};
 use autumn_harvest::failure::{ActivityFailure, IntoActivityErrorString};
 use autumn_harvest::llm_ledger::LlmCall;
 use autumn_harvest_agent::anthropic::reqwest::StatusCode;
+use autumn_harvest_agent::anthropic::reqwest::header::HeaderValue;
 use autumn_harvest_agent::anthropic::{self, ApiError, BodyError, Client, wire};
 use serde_json::{Value, json};
 use tokio::runtime::Handle;
@@ -118,6 +119,14 @@ impl ModelConfig {
                 refused.escape_unicode()
             ));
         }
+        // The key is tested as the thing it becomes: a header value. The
+        // check runs here, before the stub check, as it always has.
+        if api_key
+            .as_deref()
+            .is_some_and(|key| HeaderValue::from_str(key).is_err())
+        {
+            return Err(HEADER_REFUSAL.to_string());
+        }
         if live && model == OFFLINE_MODEL {
             return Err(format!(
                 "`{OFFLINE_MODEL}` is the name this daemon records for its own stub, \
@@ -132,8 +141,9 @@ impl ModelConfig {
             Some(key) => {
                 let http = anthropic::http_client(HTTP_TIMEOUT)
                     .map_err(|e| format!("cannot build the HTTP client: {e}"))?;
-                let client = Client::new(&key).map_err(|_| HEADER_REFUSAL.to_string())?;
-                Some(client.http(http).max_body_bytes(MAX_BODY_BYTES))
+                let client = Client::with_http(&key, http)
+                    .map_err(|e| format!("the API key is refused: {}", e.message()))?;
+                Some(client.max_body_bytes(MAX_BODY_BYTES))
             }
         };
         Ok(Self {
@@ -211,13 +221,18 @@ pub fn activity_body(
 
 /// The ledger call of one live turn: the model, its tokens and its price.
 ///
-/// The input count holds the whole prompt, cache reads and writes included.
-/// The price is `None` for a model that the shared table does not know.
+/// The id is the shared id of the model and its settings, as
+/// `ClaudeModel` records it. The daemon asks for no fallback. The input
+/// count holds the whole prompt, cache reads and writes included. The price
+/// is `None` for a model that the shared table does not know.
+///
+/// A billed turn that the daemon refuses writes no row. The runtime writes
+/// rows only with a completed attempt.
 #[must_use]
 pub fn ledger_call(model: &str, payload: &Value) -> LlmCall {
     let usage = anthropic::usage(payload);
     let call = LlmCall::new(
-        model,
+        anthropic::model_id(model, false),
         u64::from(usage.input_tokens),
         u64::from(usage.output_tokens),
     );
@@ -427,8 +442,18 @@ pub fn request_body(config: &ModelConfig, request: &TurnRequest) -> Value {
         "messages": request.messages,
     });
     wire::apply_settings(&mut body, &config.model);
+    if RECORDED_THINKING_MODELS.contains(&config.model.as_str()) {
+        body["thinking"] = json!({ "type": "adaptive" });
+    }
     body
 }
+
+/// Earlier defaults of this daemon that asked for adaptive thinking.
+///
+/// A session recorded on one of these holds thinking blocks. It resumes with
+/// `--model`, and its next turn must ask for thinking as the earlier turns
+/// did. The shared rule names the current default only.
+pub const RECORDED_THINKING_MODELS: [&str; 1] = ["claude-opus-5"];
 
 /// How much room the read cap leaves above the recorded payload cap.
 ///

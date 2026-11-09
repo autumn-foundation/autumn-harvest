@@ -63,7 +63,9 @@ recorded on `claude-opus-5` resumes with `--model claude-opus-5`.
 The HTTP client, the API version, the settings of each model and the retry
 table come from the `anthropic` feature of `autumn-harvest-agent`. The daemon
 retries what the Anthropic SDKs retry: `408`, `409`, `429` and `5xx`. Each live
-turn writes one row to the cost ledger, with its model, tokens and price. See
+turn writes one row to the cost ledger, with its model, tokens and price. A
+billed turn that the daemon refuses, such as a malformed reply, writes no
+row. See
 [`docs/llm-cost-ledger.md`](../../docs/llm-cost-ledger.md).
 
 Adaptive thinking and the effort are asked for on `claude-opus-5-5` only. A model that does not

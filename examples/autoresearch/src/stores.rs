@@ -734,22 +734,28 @@ impl TurnDir {
         Self { dir: dir.into() }
     }
 
-    fn path(&self, key: &str) -> PathBuf {
-        self.dir.join(format!("{key}.json"))
+    /// The file of `key`. A key that is not a SHA-256 in hex has no file,
+    /// so no key can name a path outside `dir`.
+    fn path(&self, key: &str) -> Option<PathBuf> {
+        let hex = key.len() == 64 && key.bytes().all(|b| b.is_ascii_hexdigit());
+        hex.then(|| self.dir.join(format!("{key}.json")))
     }
 }
 
 impl TurnStore for TurnDir {
     fn get(&self, key: &str) -> Option<Vec<Value>> {
-        let bytes = read_regular(&self.path(key)).ok()??;
+        let bytes = read_regular(&self.path(key)?).ok()??;
         serde_json::from_slice(&bytes).ok()
     }
 
     fn put(&self, key: &str, raw: &[Value]) -> Result<(), AgentError> {
         let failed = |e: String| AgentError::new(ErrorKind::Unavailable, e);
+        let path = self
+            .path(key)
+            .ok_or_else(|| AgentError::new(ErrorKind::Config, "a turn key is not a hash"))?;
         std::fs::create_dir_all(&self.dir).map_err(|e| failed(e.to_string()))?;
         let bytes = serde_json::to_vec(raw).map_err(|e| failed(e.to_string()))?;
-        write_atomic(&self.path(key), &bytes).map_err(failed)
+        write_atomic(&path, &bytes).map_err(failed)
     }
 }
 
@@ -807,12 +813,22 @@ mod tests {
     fn a_turn_survives_in_the_turn_directory() {
         let dir = tempfile::tempdir().unwrap();
         let raw = vec![serde_json::json!({"type": "thinking", "thinking": "", "signature": "s"})];
+        let key = "b7a2938c960c1c6955c99292910d767edc89d2d117f2343da65badacccb5be11";
         TurnDir::new(dir.path().join("turns"))
-            .put("k", &raw)
+            .put(key, &raw)
             .unwrap();
+        assert!(
+            dir.path()
+                .join("turns")
+                .join(format!("{key}.json"))
+                .is_file()
+        );
         let restarted = TurnDir::new(dir.path().join("turns"));
-        assert_eq!(restarted.get("k"), Some(raw));
-        assert_eq!(restarted.get("missing"), None);
+        assert_eq!(restarted.get(key), Some(raw.clone()));
+        assert_eq!(restarted.get(&"0".repeat(64)), None);
+        // A key that is not a hash names no file, so it cannot leave `dir`.
+        assert!(restarted.put("../escape", &raw).is_err());
+        assert_eq!(restarted.get("../escape"), None);
     }
 
     /// A model call whose result a crash lost runs again in a new process.

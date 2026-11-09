@@ -151,7 +151,10 @@ spends no tokens, so it records no call. See
 Its id passes the ledger check. Its price is the sum of four parts: the
 uncached input, the cache reads, the cache writes and the output, each at
 its own rate. `input_tokens` holds the whole prompt, cache parts included.
-`examples/claude-agent-daemon` writes the same row for each live turn.
+`examples/claude-agent-daemon` writes a row with the same id form for each
+live turn. A billed turn that the daemon refuses writes no row, because the
+runtime writes rows only with a completed attempt. Section 6 lists this
+limit.
 
 ## 5. Lifecycle
 
@@ -173,7 +176,10 @@ its own rate. `input_tokens` holds the whole prompt, cache parts included.
 
 ## 6. Limits
 
-- A failed attempt writes no row. So does an attempt that loses its lease,
+- A failed attempt writes no row, even when the provider billed it. A
+  response that the activity refuses after a `2xx`, such as a malformed
+  message, is such an attempt.
+- An attempt that loses its lease writes no row. So does an attempt
   or that returns a result over the result cap. Tokens that such an attempt
   spent are not counted.
 - The ledger has no columns for cached prompt tokens.

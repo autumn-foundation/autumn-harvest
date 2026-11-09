@@ -1326,6 +1326,17 @@ fn only_the_model_this_example_knows_is_asked_for_thinking() {
         "and the turn sends these keys and no others: {known}"
     );
 
+    // An earlier default that a recorded session may hold. Its next turn
+    // asks for thinking as its earlier turns did. It gets no effort, which
+    // it never had.
+    let recorded = body("claude-opus-5");
+    assert_eq!(
+        recorded["thinking"],
+        json!({ "type": "adaptive" }),
+        "{recorded}"
+    );
+    assert_eq!(recorded.get("output_config"), None, "{recorded}");
+
     // Any other name. The daemon holds no capability for it, only the name.
     for other in ["claude-3-haiku-20240307", "claude-sonnet-4-20250514", "x"] {
         let sent = body(other);
@@ -2300,7 +2311,11 @@ async fn a_live_turn_writes_one_priced_ledger_row() {
     );
     let rows = rt.llm_ledger(exec).expect("the ledger reads");
     assert_eq!(rows.len(), 1, "one live turn is one row: {rows:?}");
-    assert_eq!(rows[0].model, claude::DEFAULT_MODEL);
+    assert_eq!(
+        rows[0].model,
+        autumn_harvest_agent::anthropic::model_id(claude::DEFAULT_MODEL, false),
+        "the row names the model and its settings, as the agent model does"
+    );
     assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (1000, 50));
     // 1000 input tokens at $4 and 50 output tokens at $20 per million.
     assert_eq!(rows[0].cost_usd_micros, Some(5_000));
@@ -2317,6 +2332,10 @@ fn a_ledger_call_counts_the_cache_and_passes_the_ledger_check() {
     assert_eq!((call.input_tokens(), call.output_tokens()), (100, 2));
     assert_eq!(call.cost_usd_micros(), Some(98));
     call.validate().expect("the ledger takes the call");
+    assert_eq!(
+        call.model(),
+        autumn_harvest_agent::anthropic::model_id(claude::DEFAULT_MODEL, false)
+    );
     let unknown = claude::ledger_call("claude-x", &payload);
     assert_eq!(
         unknown.cost_usd_micros(),

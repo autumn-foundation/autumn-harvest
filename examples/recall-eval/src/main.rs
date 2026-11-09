@@ -53,7 +53,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .api_key
             .clone()
             .ok_or("a real-model run needs ANTHROPIC_API_KEY, or pass --scripted")?;
-        let model = ClaudeModel::new(&key)?.model(args.model.clone());
+        let model = ClaudeModel::new(&key)
+            .map_err(|e| format!("ANTHROPIC_API_KEY: {}", e.message()))?
+            .model(args.model.clone());
         (Arc::new(model), args.model.clone())
     };
     let temp = tempfile::tempdir()?;

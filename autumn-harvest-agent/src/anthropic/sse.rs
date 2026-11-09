@@ -25,11 +25,20 @@ pub struct SseFrames {
     /// The last chunk ended with `\r`. A `\n` at the start of the next
     /// chunk is the rest of that line end.
     after_cr: bool,
+    /// The bytes of `pending` that hold no line end. A new chunk scans from
+    /// here, so a long line costs linear time, not quadratic time.
+    scanned: usize,
 }
 
 impl SseFrames {
     /// Add `bytes`. Returns the data of each event that they complete.
-    pub fn push(&mut self, mut bytes: &[u8]) -> Vec<String> {
+    ///
+    /// # Errors
+    ///
+    /// A `Decode` error when a whole line is not UTF-8. A lossy decode puts
+    /// U+FFFD in place of a bad byte, and that can change a streamed tool
+    /// input.
+    pub fn push(&mut self, mut bytes: &[u8]) -> Result<Vec<String>, AgentError> {
         if self.after_cr && !bytes.is_empty() {
             self.after_cr = false;
             bytes = bytes.strip_prefix(b"\n").unwrap_or(bytes);
@@ -37,11 +46,12 @@ impl SseFrames {
         self.pending.extend_from_slice(bytes);
         let mut out = Vec::new();
         let mut start = 0;
-        while let Some(at) = self.pending[start..]
+        let mut from = self.scanned;
+        while let Some(at) = self.pending[from..]
             .iter()
             .position(|byte| matches!(byte, b'\n' | b'\r'))
         {
-            let end = start + at;
+            let end = from + at;
             let mut next = end + 1;
             if self.pending[end] == b'\r' {
                 match self.pending.get(next) {
@@ -51,24 +61,31 @@ impl SseFrames {
                     None => self.after_cr = true,
                 }
             }
-            let line = String::from_utf8_lossy(&self.pending[start..end]).into_owned();
+            let line = text(&self.pending[start..end])?.to_owned();
             self.line(&line, &mut out);
             start = next;
+            from = next;
         }
         self.pending.drain(..start);
-        out
+        self.scanned = self.pending.len();
+        Ok(out)
     }
 
     /// The data of an event that the stream ended without a blank line.
-    pub fn end(&mut self) -> Vec<String> {
+    ///
+    /// # Errors
+    ///
+    /// A `Decode` error when the last line is not UTF-8.
+    pub fn end(&mut self) -> Result<Vec<String>, AgentError> {
         let rest = std::mem::take(&mut self.pending);
         self.after_cr = false;
+        self.scanned = 0;
         let mut out = Vec::new();
         if !rest.is_empty() {
-            self.line(&String::from_utf8_lossy(&rest), &mut out);
+            self.line(text(&rest)?, &mut out);
         }
         self.line("", &mut out);
-        out
+        Ok(out)
     }
 
     /// Apply one whole line. A blank line ends the event.
@@ -83,6 +100,27 @@ impl SseFrames {
                 .push(data.strip_prefix(' ').unwrap_or(data).to_owned());
         }
     }
+}
+
+/// One whole line as text, or a `Decode` error.
+fn text(line: &[u8]) -> Result<&str, AgentError> {
+    std::str::from_utf8(line).map_err(|e| {
+        AgentError::new(
+            ErrorKind::Decode,
+            format!(
+                "a stream line is not UTF-8 text: the byte at {} begins no character",
+                e.valid_up_to()
+            ),
+        )
+    })
+}
+
+/// A `Decode` error for an event of the wrong shape.
+fn malformed(what: &str) -> AgentError {
+    AgentError::new(
+        ErrorKind::Decode,
+        format!("a stream event is malformed: {what}"),
+    )
 }
 
 /// Builds the message of a streamed response from its events.
@@ -125,11 +163,22 @@ impl StreamAssembler {
     }
 
     /// Apply one parsed event.
+    ///
+    /// Each value that the assembler writes into must be an object. A
+    /// `serde_json` index on another value panics, so the shape is checked.
     fn apply(&mut self, event: &Value, on_delta: &dyn Fn(&str)) -> Result<(), AgentError> {
         match event["type"].as_str() {
-            Some("message_start") => self.message = Some(event["message"].clone()),
+            Some("message_start") => {
+                if !event["message"].is_object() {
+                    return Err(malformed("`message_start` holds no message object"));
+                }
+                self.message = Some(event["message"].clone());
+            }
             Some("content_block_start") => {
                 let index = block_index(event)?;
+                if !event["content_block"].is_object() {
+                    return Err(malformed("`content_block_start` holds no block object"));
+                }
                 if self.blocks.len() <= index {
                     self.blocks.resize(index + 1, Value::Null);
                 }
@@ -138,27 +187,33 @@ impl StreamAssembler {
             Some("content_block_delta") => self.delta(event, on_delta)?,
             Some("content_block_stop") => self.close_block(block_index(event)?)?,
             Some("message_delta") => {
-                let message = self.message.get_or_insert_with(|| json!({}));
+                let message = self
+                    .message
+                    .get_or_insert_with(|| json!({}))
+                    .as_object_mut()
+                    .ok_or_else(|| malformed("the message is not an object"))?;
                 if let Some(delta) = event["delta"].as_object() {
                     for (key, value) in delta {
-                        message[key] = value.clone();
+                        message.insert(key.clone(), value.clone());
                     }
                 }
                 if let Some(usage) = event["usage"].as_object() {
+                    let counters = message
+                        .entry("usage")
+                        .or_insert_with(|| json!({}))
+                        .as_object_mut()
+                        .ok_or_else(|| malformed("the usage is not an object"))?;
                     for (key, value) in usage {
-                        message["usage"][key] = value.clone();
+                        counters.insert(key.clone(), value.clone());
                     }
                 }
             }
             Some("message_stop") => self.stopped = true,
             Some("error") => {
                 let kind = error_type_kind(event["error"]["type"].as_str().unwrap_or_default());
-                let detail: String = event["error"]["message"]
-                    .as_str()
-                    .unwrap_or("no message")
-                    .chars()
-                    .take(500)
-                    .collect();
+                let detail = super::client::printable(
+                    event["error"]["message"].as_str().unwrap_or("no message"),
+                );
                 return Err(AgentError::new(kind, format!("stream error: {detail}")));
             }
             // A ping, and any later event type, changes nothing.
@@ -172,13 +227,19 @@ impl StreamAssembler {
         let block = self
             .blocks
             .get_mut(index)
-            .filter(|block| !block.is_null())
+            .and_then(Value::as_object_mut)
             .ok_or_else(|| AgentError::new(ErrorKind::Decode, "a delta for no block"))?;
         let delta = &event["delta"];
-        let append = |block: &mut Value, key: &str, piece: &str| {
-            let text = format!("{}{piece}", block[key].as_str().unwrap_or_default());
-            block[key] = json!(text);
-        };
+        // Append in place. A copy of the whole text on each delta costs
+        // quadratic time over a long answer.
+        let append =
+            |block: &mut serde_json::Map<String, Value>, key: &str, piece: &str| match block
+                .entry(key)
+                .or_insert_with(|| json!(""))
+            {
+                Value::String(text) => text.push_str(piece),
+                other => *other = json!(piece),
+            };
         match delta["type"].as_str() {
             Some("text_delta") => {
                 let piece = delta["text"].as_str().unwrap_or_default();
@@ -226,8 +287,8 @@ impl StreamAssembler {
                 )
             })?
         };
-        if let Some(block) = self.blocks.get_mut(index) {
-            block["input"] = input;
+        if let Some(block) = self.blocks.get_mut(index).and_then(Value::as_object_mut) {
+            block.insert("input".to_owned(), input);
         }
         Ok(())
     }
@@ -237,7 +298,9 @@ impl StreamAssembler {
     /// # Errors
     ///
     /// A stream with no `message_start` or no `message_stop` is a
-    /// `Transport` error: it ended early, so a retry asks again.
+    /// `Transport` error: it ended early, so a retry asks again. A tool input
+    /// with no `content_block_stop` is a `Decode` error. The call would
+    /// otherwise run with the empty input of its start event.
     pub fn finish(self) -> Result<Value, AgentError> {
         let (Some(mut message), true) = (self.message, self.stopped) else {
             return Err(AgentError::new(
@@ -245,8 +308,16 @@ impl StreamAssembler {
                 "the stream ended before the message",
             ));
         };
-        message["content"] =
-            Value::Array(self.blocks.into_iter().filter(|b| !b.is_null()).collect());
+        if !self.inputs.is_empty() {
+            return Err(malformed("a tool input has no `content_block_stop`"));
+        }
+        message
+            .as_object_mut()
+            .ok_or_else(|| malformed("the message is not an object"))?
+            .insert(
+                "content".to_owned(),
+                Value::Array(self.blocks.into_iter().filter(|b| !b.is_null()).collect()),
+            );
         Ok(message)
     }
 }
@@ -288,11 +359,11 @@ mod tests {
         let on_delta = |piece: &str| seen.lock().unwrap().push(piece.to_owned());
         // Split the wire in odd places, as a network does.
         for chunk in wire.as_bytes().chunks(size) {
-            for data in frames.push(chunk) {
+            for data in frames.push(chunk)? {
                 stream.event(&data, &on_delta)?;
             }
         }
-        for data in frames.end() {
+        for data in frames.end()? {
             stream.event(&data, &on_delta)?;
         }
         Ok((stream.finish()?, seen.into_inner().unwrap()))
@@ -382,25 +453,93 @@ mod tests {
     fn sse_frames_join_data_lines_and_skip_comments() {
         let mut frames = SseFrames::default();
         assert_eq!(
-            frames.push(b": ping\n\nevent: a\r\ndata: 1"),
+            frames.push(b": ping\n\nevent: a\r\ndata: 1").unwrap(),
             Vec::<String>::new()
         );
-        assert_eq!(frames.push(b"\r\ndata: 2\r\n\r\n"), ["1\n2"]);
-        assert_eq!(frames.push(b"data: 3"), Vec::<String>::new());
-        assert_eq!(frames.end(), ["3"]);
+        assert_eq!(frames.push(b"\r\ndata: 2\r\n\r\n").unwrap(), ["1\n2"]);
+        assert_eq!(frames.push(b"data: 3").unwrap(), Vec::<String>::new());
+        assert_eq!(frames.end().unwrap(), ["3"]);
     }
 
     #[test]
     fn a_line_end_split_across_chunks_or_a_bare_cr_ends_a_line_once() {
         let mut frames = SseFrames::default();
         // A `\r\n` pair split over two chunks is one line end.
-        assert_eq!(frames.push(b"data: 1\r"), Vec::<String>::new());
-        assert_eq!(frames.push(b"\ndata: 2\r"), Vec::<String>::new());
-        assert_eq!(frames.push(b"\n\r"), ["1\n2"]);
-        assert_eq!(frames.push(b"\n"), Vec::<String>::new());
+        assert_eq!(frames.push(b"data: 1\r").unwrap(), Vec::<String>::new());
+        assert_eq!(frames.push(b"\ndata: 2\r").unwrap(), Vec::<String>::new());
+        assert_eq!(frames.push(b"\n\r").unwrap(), ["1\n2"]);
+        assert_eq!(frames.push(b"\n").unwrap(), Vec::<String>::new());
         // A bare `\r` ends a line, and a blank one ends the event.
-        assert_eq!(frames.push(b"data: 3\rdata: 4\r\r"), ["3\n4"]);
-        assert_eq!(frames.end(), Vec::<String>::new());
+        assert_eq!(frames.push(b"data: 3\rdata: 4\r\r").unwrap(), ["3\n4"]);
+        assert_eq!(frames.end().unwrap(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_long_line_in_small_chunks_is_scanned_once() {
+        let mut frames = SseFrames::default();
+        for _ in 0..1000 {
+            assert_eq!(frames.push(b"xxxxxxxx").unwrap(), Vec::<String>::new());
+        }
+        assert_eq!(frames.scanned, 8000, "each chunk scans its own bytes only");
+        assert_eq!(frames.push(b"\n\n").unwrap(), Vec::<String>::new());
+        assert_eq!(frames.scanned, 0);
+    }
+
+    #[test]
+    fn a_line_that_is_not_utf8_is_refused() {
+        // A streamed tool path with a raw `FF` byte must not become U+FFFD.
+        let mut frames = SseFrames::default();
+        let refused = frames
+            .push(b"data: {\"p\": \"note\xff.md\"}\n")
+            .unwrap_err();
+        assert_eq!(refused.kind(), ErrorKind::Decode);
+        let mut frames = SseFrames::default();
+        frames.push(b"data: \xff").unwrap();
+        assert_eq!(frames.end().unwrap_err().kind(), ErrorKind::Decode);
+    }
+
+    #[test]
+    fn an_event_of_the_wrong_shape_is_an_error_and_not_a_panic() {
+        let block = |content: Value| json!({"type": "content_block_start", "index": 0, "content_block": content});
+        let cases = [
+            vec![json!({"type": "message_start", "message": 1})],
+            vec![start(), block(json!("x"))],
+            vec![
+                json!({"type": "message_delta", "delta": {}, "usage": {"output_tokens": 1}}),
+                json!({"type": "message_delta", "delta": {"usage": 7},
+                       "usage": {"output_tokens": 1}}),
+            ],
+        ];
+        for events in cases {
+            let error = streamed(&events).unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::Decode, "{events:?}");
+        }
+    }
+
+    #[test]
+    fn a_tool_input_with_no_stop_is_refused() {
+        let error = streamed(&[
+            start(),
+            json!({"type": "content_block_start", "index": 0,
+                   "content_block": {"type": "tool_use", "id": "t", "name": "n", "input": {}}}),
+            json!({"type": "content_block_delta", "index": 0,
+                   "delta": {"type": "input_json_delta", "partial_json": "{\"path\": \"a\"}"}}),
+            json!({"type": "message_delta", "delta": {"stop_reason": "tool_use"}}),
+            json!({"type": "message_stop"}),
+        ])
+        .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Decode);
+    }
+
+    #[test]
+    fn a_stream_error_message_loses_its_control_characters() {
+        let error = streamed(&[
+            start(),
+            json!({"type": "error",
+                   "error": {"type": "overloaded_error", "message": "busy\u{1b}[31m"}}),
+        ])
+        .unwrap_err();
+        assert!(!error.message().contains('\u{1b}'), "{}", error.message());
     }
 
     #[test]
