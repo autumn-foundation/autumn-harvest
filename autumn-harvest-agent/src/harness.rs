@@ -117,8 +117,10 @@ pub(crate) const TRUNCATED: &str = "…[truncated]";
 
 /// The model, the tools, and the policy behind the two agent activities.
 ///
-/// Install it once per worker. On the Postgres engine, pass it to
-/// `HarvestBuilder::state`. On SQLite, pass it to `sqlite::register`.
+/// Install it once per worker. On a `HarvestBuilder`, pass it to
+/// [`register`](crate::register). Under `HarvestPlugin`, pass it to
+/// `HarvestPlugin::agent`. On a `SqliteRuntime`, pass it to
+/// `sqlite::register`.
 #[derive(Debug, Clone)]
 pub struct AgentHarness {
     client: Arc<dyn AgentModel>,

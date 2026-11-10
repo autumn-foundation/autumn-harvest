@@ -3761,6 +3761,25 @@ pub fn activities() -> Vec<ActivityInfo> {
     list
 }
 
+/// Register the agent workflows, their activities and `harness` on a
+/// worker builder.
+///
+/// It needs no backend feature. Each activity reads the harness with
+/// `ActivityContext::state`. The Postgres worker and the SQLite driver of
+/// `HarvestPlugin` both give the builder state to an `#[activity]` body.
+/// A worker with no harness fails each call as `AgentHarnessMissing`. Call
+/// it once per builder.
+#[must_use]
+pub fn register(
+    builder: autumn_harvest::builder::HarvestBuilder,
+    harness: AgentHarness,
+) -> autumn_harvest::builder::HarvestBuilder {
+    builder
+        .workflows(workflows())
+        .activities(activities())
+        .state(harness)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

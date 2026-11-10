@@ -22,11 +22,14 @@
 //!   [`ops`] for the admin routes.
 //! - MCP tools and tasks, webhook receivers and broker connectors start runs
 //!   through the [`HarvestSqlite`] handle (issue #2471).
+//! - `HarvestPlugin::agent` hosts the durable agent. The [`agent`] module
+//!   sends its ops and decisions through the handle.
 //!
 //! Every builder option and mode that this slice cannot honour fails the
 //! build or the boot, and names the issue that ports it. A silent no-op would
 //! let an app believe a protection or a feature is on.
 
+pub mod agent;
 mod api;
 mod driver;
 mod fleet;
@@ -416,6 +419,26 @@ fn builder_refusals(builder: &HarvestBuilder) -> Vec<(&'static str, u32)> {
         refused.push(("WorkerConfig::with_cost_hold", EPIC_ISSUE));
     }
     refused
+}
+
+/// The options that a Harvest per fleet tenant cannot honour.
+///
+/// Each tenant driver shares the one plugin state. The agent keys its
+/// memory, its workspace and its transcript by agent id, with no tenant. So
+/// two tenants with the same agent id would share that data.
+pub(crate) fn tenant_refusals(
+    builder: &HarvestBuilder,
+    per_tenant: bool,
+) -> Vec<(&'static str, u32)> {
+    let agent = builder
+        .workflow_infos()
+        .iter()
+        .any(|info| info.name == autumn_harvest_agent::AGENT_WORKFLOW_NAME);
+    if per_tenant && agent {
+        vec![("HarvestPlugin::agent with sqlite_per_tenant", EPIC_ISSUE)]
+    } else {
+        Vec::new()
+    }
 }
 
 /// The days to keep an audit row. A dry run keeps every row.
@@ -1128,6 +1151,39 @@ mod tests {
     #[test]
     fn a_plain_builder_has_no_refusal() {
         assert!(builder_refusals(&HarvestBuilder::default()).is_empty());
+    }
+
+    /// Fleet tenants would share one harness, and so one agent memory. The
+    /// build refuses the agent with a Harvest per tenant.
+    #[test]
+    fn the_agent_is_refused_with_a_harvest_per_tenant() {
+        let model: Arc<dyn autumn_harvest_agent::AgentModel> = Arc::new(Idle);
+        let agent = autumn_harvest_agent::register(
+            HarvestBuilder::default(),
+            autumn_harvest_agent::AgentHarness::new(model),
+        );
+        assert_eq!(
+            tenant_refusals(&agent, true),
+            [("HarvestPlugin::agent with sqlite_per_tenant", EPIC_ISSUE)]
+        );
+        assert_eq!(tenant_refusals(&agent, false), []);
+        assert_eq!(tenant_refusals(&HarvestBuilder::default(), true), []);
+    }
+
+    /// A model that the refusal test never calls.
+    #[derive(Debug)]
+    struct Idle;
+
+    impl autumn_harvest_agent::AgentModel for Idle {
+        fn chat<'a>(
+            &'a self,
+            _request: &'a autumn_harvest_agent::ChatRequest,
+        ) -> autumn_harvest_agent::BoxFuture<
+            'a,
+            Result<autumn_harvest_agent::ChatResponse, autumn_harvest_agent::AgentError>,
+        > {
+            panic!("the refusal calls no model")
+        }
     }
 
     /// The SQLite worker reads no cost hold, so a hold is refused rather than

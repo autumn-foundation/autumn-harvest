@@ -73,19 +73,16 @@
 //! The `postgres` feature adds the `postgres` module. It has the calls of
 //! the `sqlite` module, for an app whose workers run on Postgres.
 //!
-//! Register the workflows and the activities, and install the harness as
-//! worker state:
+//! [`register`] adds the workflows, the activities and the harness to a
+//! `HarvestBuilder`. It needs no backend feature. `HarvestPlugin::agent`
+//! calls it, on Postgres and on SQLite:
 //!
 //! ```
 //! # fn demo(model: std::sync::Arc<dyn autumn_harvest_agent::AgentModel>) {
 //! use autumn_harvest::builder::HarvestBuilder;
-//! use autumn_harvest_agent::{AgentHarness, activities, workflows};
+//! use autumn_harvest_agent::{AgentHarness, register};
 //!
-//! let built = HarvestBuilder::new()
-//!     .workflows(workflows())
-//!     .activities(activities())
-//!     .state(AgentHarness::new(model))
-//!     .build();
+//! let built = register(HarvestBuilder::new(), AgentHarness::new(model)).build();
 //! assert!(built.state::<AgentHarness>().is_some());
 //! # }
 //! ```
@@ -243,7 +240,7 @@ pub use workflow::{
     agent_deliver_info, agent_discover_peers, agent_discover_peers_info, agent_loop,
     agent_loop_info, agent_memory_snapshot, agent_memory_snapshot_info, agent_model_turn,
     agent_model_turn_info, agent_precheck, agent_precheck_info, agent_tool_call,
-    agent_tool_call_info, workflows,
+    agent_tool_call_info, register, workflows,
 };
 pub use workspace::{
     DirWorkspaceBlobs, InMemoryWorkspaceBlobs, Workspace, WorkspaceBlobs, WorkspaceFile,

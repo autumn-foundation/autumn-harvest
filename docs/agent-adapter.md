@@ -98,9 +98,33 @@ async fn save_a_note(model: Arc<dyn AgentModel>) -> Result<RunState, Box<dyn std
 }
 ```
 
-The SQLite backend has no shared-state registry, so `sqlite::register`
-captures the harness in synchronous closures. Each closure runs its async
-body with `block_in_place`, so use a multi-thread Tokio runtime.
+`sqlite::register` takes a `SqliteRuntime` that the app owns. It captures
+the harness in synchronous closures. Each closure runs its async body with
+`block_in_place`, so use a multi-thread Tokio runtime.
+
+### Under `HarvestPlugin`
+
+An autumn-web app on SQLite needs no runtime of its own. The neutral
+`register` adds the workflows, the activities and the harness to a
+`HarvestBuilder`. It needs no backend feature:
+
+```rust
+use std::sync::Arc;
+use autumn_harvest::builder::HarvestBuilder;
+use autumn_harvest_agent::{AgentHarness, AgentModel, register};
+
+fn agents(model: Arc<dyn AgentModel>) -> HarvestBuilder {
+    register(HarvestBuilder::new(), AgentHarness::new(model))
+}
+```
+
+`HarvestPlugin::agent(harness)` calls it on the builder of the plugin, on
+either backend. On SQLite the driver gives the harness to each
+`#[activity]` body as state.
+The module `autumn_harvest_plugin::sqlite::agent` sends ops and decisions
+through the `HarvestSqlite` handle. It has `send`, `delete`,
+`current_run`, `state` and `decide`. See
+["The durable agent"](sqlite-plugin.md#the-durable-agent).
 
 The next step is a mesh of agents. The example `sqlite_mesh` adds a peer, a
 mandate and a refused delegation to the `sqlite_agent` story. Read
@@ -109,7 +133,9 @@ mandate and a refused delegation to the `sqlite_agent` story. Read
 ## 3. Run it on Postgres
 
 Register the workflows and the activities. Install the harness as worker
-state, because the activities read it with `ActivityContext::state`:
+state, because the activities read it with `ActivityContext::state`.
+`register(builder, harness)` does all three in one call. So does
+`HarvestPlugin::agent(harness)`:
 
 ```rust
 use std::sync::Arc;
@@ -1925,8 +1951,8 @@ The spend of an erased run leaves the LLM budget and mesh budget sums.
 
 ### Mid-turn messages (issue #2265)
 
-A message carries an `Urgency`. `sqlite::send` and `postgres::send` send the
-extra signal first, then the op. Without the module, send the signal of
+A message carries an `Urgency`. `sqlite::send`, `postgres::send` and the
+plugin call `sqlite::agent::send` send the extra signal first, then the op. Without the module, send the signal of
 `Agent::urgency_signal(&op)` to the running run, then the op.
 
 | Urgency | Signal | Effect |

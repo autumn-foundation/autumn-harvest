@@ -16801,6 +16801,9 @@ pub struct ActivityContext {
     /// #783). Set by the constructor, not by the caller's identity, so it can
     /// never disagree with the dispatch path that actually built the context.
     is_local: bool,
+    /// `false` on a backend that stores no run tenant, such as
+    /// `autumn-harvest-sqlite`. The embedded constructors clear it.
+    keeps_run_tenant: bool,
     /// The dispatch task queue (issue #783); the owning workflow task's queue
     /// for a local activity.
     queue_name: String,
@@ -16931,6 +16934,7 @@ impl ActivityContext {
             transactional_commit_occurred: std::sync::atomic::AtomicBool::new(false),
             identity,
             is_local: false,
+            keeps_run_tenant: true,
             queue_name: String::new(),
             task_id: None,
             deadline: None,
@@ -16988,6 +16992,7 @@ impl ActivityContext {
             transactional_commit_occurred: std::sync::atomic::AtomicBool::new(false),
             identity,
             is_local: false,
+            keeps_run_tenant: true,
             queue_name: String::new(),
             // The queue-row PK this attempt is running under — the id the
             // operator `retry-now`/`fail-now` routes address (issue #783).
@@ -17031,6 +17036,7 @@ impl ActivityContext {
             // Set by the constructor, never by the caller's identity: this IS the
             // inline dispatch path, so it can never disagree with reality.
             is_local: true,
+            keeps_run_tenant: true,
             queue_name: String::new(),
             task_id: None,
             deadline: None,
@@ -17061,14 +17067,16 @@ impl ActivityContext {
         heartbeat_details: Option<serde_json::Value>,
     ) -> Self {
         let key = IdempotencyKey::from_activity_exec_id(identity.activity_id);
-        Self::new(
+        let mut ctx = Self::new(
             state,
             Some(heartbeat_tx.into()),
             tokio_util::sync::CancellationToken::new(),
             identity,
         )
         .seed_heartbeat_details(heartbeat_details)
-        .with_idempotency_key(key)
+        .with_idempotency_key(key);
+        ctx.keeps_run_tenant = false;
+        ctx
     }
 
     /// Build a local-activity context for an embedded backend, such as
@@ -17084,8 +17092,11 @@ impl ActivityContext {
     #[must_use]
     pub fn new_embedded_local(state: SharedState, identity: ActivityIdentity) -> Self {
         let key = IdempotencyKey::from_activity_exec_id(identity.activity_id);
-        Self::new_local_activity(state, tokio_util::sync::CancellationToken::new(), identity)
-            .with_idempotency_key(key)
+        let mut ctx =
+            Self::new_local_activity(state, tokio_util::sync::CancellationToken::new(), identity)
+                .with_idempotency_key(key);
+        ctx.keeps_run_tenant = false;
+        ctx
     }
 
     /// Seed the checkpoint of the previous attempt and the auto-heartbeat
@@ -17921,6 +17932,16 @@ impl ActivityContext {
     #[must_use]
     pub fn state<T: Any + Send + Sync>(&self) -> Option<&T> {
         self.state.get(&TypeId::of::<T>())?.downcast_ref::<T>()
+    }
+
+    /// Whether the backend stores a run tenant for [`run_tenant`](Self::run_tenant).
+    ///
+    /// It is `false` on an embedded backend, such as `autumn-harvest-sqlite`.
+    /// There `run_tenant` always reads `None`, so a caller can use a tenant
+    /// that the input declares.
+    #[must_use]
+    pub const fn keeps_run_tenant(&self) -> bool {
+        self.keeps_run_tenant
     }
 
     /// Read the verified tenant of the run that owns this activity (issue
@@ -18981,6 +19002,23 @@ mod tests {
             ctx.heartbeat(1).await,
             Err(HarvestError::ActivityCancelled(_))
         ));
+    }
+
+    /// An embedded backend stores no run tenant. Every other context does.
+    #[test]
+    fn only_an_embedded_context_keeps_no_run_tenant() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let embedded = ActivityContext::new_embedded(
+            empty_shared_state(),
+            ActivityIdentity::for_test(),
+            tx,
+            None,
+        );
+        assert!(!embedded.keeps_run_tenant());
+        let local =
+            ActivityContext::new_embedded_local(empty_shared_state(), ActivityIdentity::for_test());
+        assert!(!local.keeps_run_tenant());
+        assert!(ActivityContext::new_test().keeps_run_tenant());
     }
 
     // ── Signal handlers (issue #546) ────────────────────────────────────────
