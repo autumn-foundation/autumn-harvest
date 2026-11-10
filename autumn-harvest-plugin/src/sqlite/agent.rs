@@ -1,9 +1,14 @@
 //! The durable agent through the [`HarvestSqlite`] handle.
 //!
 //! Register the agent with `HarvestPlugin::agent`. These calls then send
-//! ops, read state and send decisions through the handle. They mirror
-//! `autumn_harvest_agent::sqlite`, which drives a `SqliteRuntime` of its own.
-//! Here the driver of the plugin runs each op, so no call drives.
+//! ops, read state and send decisions through the handle. They mirror the
+//! durable agent calls of `autumn_harvest_agent::sqlite`, which drives a
+//! `SqliteRuntime` of its own. Here the driver of the plugin runs each op, so
+//! no call drives.
+//!
+//! An activity runs on the driver task. A call from an activity body can
+//! wait for that same driver, and then it hangs. Make these calls from app
+//! code.
 
 use autumn_harvest::ExecutionId;
 use autumn_harvest::WorkflowIdReusePolicy;
@@ -19,8 +24,9 @@ use super::{
 /// Send `op` to the durable agent `id`. Start the agent when it has no run.
 ///
 /// A steer or an interrupt goes first, as its own signal, to the running
-/// run. That run then sees it while an op is in flight. Pass the message id
-/// as `idempotency_key`, so a client retry delivers the op once.
+/// run. One driver command finds that run and stages the signal. With no
+/// running run, nothing is in flight, so the op alone is enough. Pass the
+/// message id as `idempotency_key`, so a client retry delivers the op once.
 ///
 /// # Errors
 ///
@@ -31,12 +37,18 @@ pub async fn send(
     op: &AgentOp,
     idempotency_key: Option<&str>,
 ) -> Result<SignalWithStartOutcome, HarvestSqliteError> {
-    // With no run, nothing is in flight, and the op alone is enough.
-    if let Some((name, payload)) = Agent::urgency_signal(op)
-        && let Some(exec) = current_run(harvest, id).await?
-    {
+    if let Some((name, payload)) = Agent::urgency_signal(op) {
         let key = idempotency_key.map(|key| format!("{name}:{key}"));
-        harvest.signal(exec, name, payload, key).await?;
+        match harvest
+            .signal_by_workflow_id(AGENT_WORKFLOW_NAME, id.as_str(), name, payload, key)
+            .await
+        {
+            Ok(_)
+            | Err(HarvestSqliteError::Sqlite(
+                SqliteError::WorkflowIdNotFound { .. } | SqliteError::WorkflowNotRunning { .. },
+            )) => {}
+            Err(error) => return Err(error),
+        }
     }
     signal(harvest, id, Agent::payload(op), idempotency_key).await
 }
@@ -79,7 +91,7 @@ async fn signal(
 ///
 /// # Errors
 ///
-/// Returns a read error.
+/// Returns a read error, or [`HarvestSqliteError::Stopped`].
 pub async fn current_run(
     harvest: &HarvestSqlite,
     id: &AgentId,
@@ -119,7 +131,8 @@ pub async fn state(
 ///
 /// The approval notice of the harness names `signal`. A decision for a wait
 /// that already timed out stays unread. It never releases a later call.
-/// Returns `false` when `idempotency_key` was already delivered.
+/// Returns `false` when `idempotency_key` was already delivered. To decide
+/// a one-shot `agent_loop` run, call `HarvestSqlite::signal` with its id.
 ///
 /// # Errors
 ///

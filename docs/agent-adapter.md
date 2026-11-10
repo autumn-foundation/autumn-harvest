@@ -118,8 +118,9 @@ fn agents(model: Arc<dyn AgentModel>) -> HarvestBuilder {
 }
 ```
 
-`HarvestPlugin::agent(harness)` calls it on the builder of the plugin. The
-driver of the plugin gives the harness to each `#[activity]` body as state.
+`HarvestPlugin::agent(harness)` calls it on the builder of the plugin, on
+either backend. On SQLite the driver gives the harness to each
+`#[activity]` body as state.
 The module `autumn_harvest_plugin::sqlite::agent` sends ops and decisions
 through the `HarvestSqlite` handle. It has `send`, `delete`,
 `current_run`, `state` and `decide`. See
@@ -132,7 +133,9 @@ mandate and a refused delegation to the `sqlite_agent` story. Read
 ## 3. Run it on Postgres
 
 Register the workflows and the activities. Install the harness as worker
-state, because the activities read it with `ActivityContext::state`:
+state, because the activities read it with `ActivityContext::state`.
+`register(builder, harness)` does all three in one call. So does
+`HarvestPlugin::agent(harness)`:
 
 ```rust
 use std::sync::Arc;
@@ -1948,8 +1951,8 @@ The spend of an erased run leaves the LLM budget and mesh budget sums.
 
 ### Mid-turn messages (issue #2265)
 
-A message carries an `Urgency`. `sqlite::send` and `postgres::send` send the
-extra signal first, then the op. Without the module, send the signal of
+A message carries an `Urgency`. `sqlite::send`, `postgres::send` and the
+plugin call `sqlite::agent::send` send the extra signal first, then the op. Without the module, send the signal of
 `Agent::urgency_signal(&op)` to the running run, then the op.
 
 | Urgency | Signal | Effect |

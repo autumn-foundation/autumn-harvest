@@ -687,7 +687,8 @@ impl HarvestPlugin {
     /// It calls `autumn_harvest_agent::register`, so it works on both
     /// backends. On SQLite the driver of the plugin runs the agent, and the
     /// app needs no `SqliteRuntime` of its own. Send ops through
-    /// `sqlite::agent`. Call it once.
+    /// `sqlite::agent`. On Postgres, send them through
+    /// `autumn_harvest_agent::postgres`. Call it once.
     #[must_use]
     pub fn agent(mut self, harness: autumn_harvest_agent::AgentHarness) -> Self {
         self.builder = autumn_harvest_agent::register(self.builder, harness);
@@ -1778,6 +1779,10 @@ impl HarvestPlugin {
             "HarvestPlugin::cost_deferrable_activities",
             crate::sqlite::EPIC_ISSUE,
         );
+        refused.extend(crate::sqlite::tenant_refusals(
+            &self.builder,
+            self.sqlite_per_tenant,
+        ));
         crate::sqlite::build(
             app,
             crate::sqlite::SqliteParts {

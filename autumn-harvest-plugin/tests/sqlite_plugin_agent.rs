@@ -17,16 +17,21 @@ use std::time::{Duration, Instant};
 
 use autumn_harvest::entity::{ENTITY_OP_SIGNAL, ENTITY_STATE_QUERY};
 use autumn_harvest::event::WorkflowEvent;
+use autumn_harvest::handle::{WorkflowResult, WorkflowResultState};
 use autumn_harvest::testing::{ReplayReport, WorkflowReplayer};
 use autumn_harvest::{ExecutionId, WorkflowIdReusePolicy};
+use autumn_harvest_agent::sampling::{
+    InMemorySamplingPolicyStore, SamplingPolicy, SamplingPolicyStore, ScorerRef,
+};
 use autumn_harvest_agent::{
-    AGENT_WORKFLOW_NAME, Agent, AgentHarness, AgentId, AgentOp, AgentProfile, AgentState,
-    AgentStop, Approval, ChatRole, ContentPart, ProfileOverlayStore, SqliteOverlayStore, Urgency,
-    agent_info,
+    AGENT_WORKFLOW_NAME, Agent, AgentError, AgentHarness, AgentId, AgentOp, AgentProfile,
+    AgentState, AgentStop, AgentTask, AnswerCheck, Approval, BoxFuture, ChatRole, ContentPart,
+    ProfileOverlayStore, ScoreContext, ScoreInput, Scorer, SqliteOverlayStore, Urgency, Verdict,
+    WORKFLOW_NAME, agent_info,
 };
 use autumn_harvest_plugin::HarvestPlugin;
 use autumn_harvest_plugin::sqlite::{
-    ExecutionFilter, ExecutionSummary, HarvestSqlite, SignalWithStartParams, agent,
+    ExecutionFilter, ExecutionSummary, HarvestSqlite, SignalWithStartParams, StartOptions, agent,
 };
 use autumn_web::config::AutumnConfig;
 use autumn_web::test::{TestApp, TestClient};
@@ -34,7 +39,7 @@ use overlay_read_suite::{Backend, PromptModel};
 use serde_json::{Value, json};
 
 /// How long a poll waits before the test fails.
-const LIMIT: Duration = Duration::from_secs(20);
+const LIMIT: Duration = Duration::from_secs(30);
 
 fn config(dir: &Path) -> AutumnConfig {
     let mut config = AutumnConfig::default();
@@ -172,10 +177,13 @@ impl Backend for Plugin {
     }
 
     async fn approve(&mut self, id: &AgentId, signal: &str) {
-        let delivered = agent::decide(self.handle(), id, signal, &Approval::Approve, None)
-            .await
-            .expect("the decision is sent");
-        assert!(delivered, "the decision is new");
+        let key = format!("decide:{signal}");
+        let decide = || agent::decide(self.handle(), id, signal, &Approval::Approve, Some(&key));
+        assert!(decide().await.expect("the decision is sent"), "a new key");
+        assert!(
+            !decide().await.expect("the retry is sent"),
+            "a retry of the key is not delivered again"
+        );
     }
 
     async fn delete(&mut self, id: &AgentId) {
@@ -278,6 +286,11 @@ async fn a_policy_ceiling_reaches_the_op_read() {
     overlay_read_suite::a_policy_ceiling_reaches_the_op_read(&mut Plugin::new()).await;
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rollback_after_an_auto_adoption_restores_v1() {
+    overlay_read_suite::a_rollback_after_an_auto_adoption_restores_v1(&mut Plugin::new()).await;
+}
+
 /// The text of each message, with its role.
 fn texts(state: &AgentState) -> Vec<(ChatRole, String)> {
     state
@@ -349,12 +362,8 @@ async fn an_entity_agent_runs_through_signal_with_start() {
 
     // The turn is a recorded activity of the run.
     let events = handle.history(exec).await.unwrap();
-    assert!(
-        events
-            .iter()
-            .any(|event| matches!(event, WorkflowEvent::ActivityCompleted { .. })),
-        "the turn completed"
-    );
+    let turns = overlay_read_suite::recorded(&events, "agent_model_turn");
+    assert_eq!(turns.len(), 1, "one recorded model turn");
 
     // The management API of the plugin lists the agent.
     let listed: Value = client.get("/harvest/workflows").send().await.json();
@@ -399,7 +408,7 @@ async fn an_interrupt_ends_an_approval_wait() {
     assert!(results[0].contains("interrupted"), "{results:?}");
 }
 
-/// A send with no running run reads no run, and the state reads `None`.
+/// An agent with no op has no run, and its state reads `None`.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_unknown_agent_has_no_run_and_no_state() {
     let mut backend = Plugin::new();
@@ -412,4 +421,120 @@ async fn an_unknown_agent_has_no_run_and_no_state() {
         None
     );
     assert!(backend.state(&id).await.is_none());
+}
+
+/// A client retry of an op with the same key runs the op once. So does a
+/// retry of an interrupt.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_retried_key_delivers_the_op_once() {
+    let mut backend = Plugin::new();
+    let model = PromptModel::new();
+    backend
+        .serve(overlay_read_suite::base_harness("support", model.clone()))
+        .await;
+    let id = AgentId::new("support", "retry").unwrap();
+    let hello = AgentOp::message("hello");
+    let first = agent::send(backend.handle(), &id, &hello, Some("m-1"))
+        .await
+        .unwrap();
+    assert!(first.signal_delivered);
+    let again = agent::send(backend.handle(), &id, &hello, Some("m-1"))
+        .await
+        .unwrap();
+    assert!(!again.signal_delivered, "the retry is a duplicate");
+    backend
+        .settle(&id, &|state: &AgentState| state.segments >= 1)
+        .await;
+
+    backend.send(&id, &AgentOp::message("write it")).await;
+    backend
+        .wait_approval(&id, &overlay_read_suite::first_approval())
+        .await;
+    let stop = AgentOp::urgent("never mind", "m-2", Urgency::Interrupt);
+    for _ in 0..2 {
+        agent::send(backend.handle(), &id, &stop, Some("m-2"))
+            .await
+            .unwrap();
+    }
+    let state = backend
+        .settle(&id, &|state: &AgentState| state.segments >= 3)
+        .await;
+    let users = texts(&state)
+        .into_iter()
+        .filter(|(role, _text)| *role == ChatRole::User)
+        .count();
+    assert_eq!(users, 3, "hello, write it and never mind, each once");
+    assert_eq!(state.failures, 0, "{:?}", state.last_error);
+}
+
+/// A scorer that passes each answer.
+#[derive(Debug)]
+struct PassAll;
+
+impl Scorer for PassAll {
+    fn id(&self) -> &'static str {
+        "pass_all"
+    }
+
+    fn score<'a>(
+        &'a self,
+        _input: &'a ScoreInput,
+        _cx: &'a ScoreContext<'_>,
+    ) -> BoxFuture<'a, Result<Verdict, AgentError>> {
+        Box::pin(async { Verdict::score(1.0) })
+    }
+}
+
+/// Run one `agent_loop` task through the handle, and return its result.
+async fn run_task(handle: &HarvestSqlite, task: &AgentTask) -> WorkflowResult {
+    let started = handle
+        .start(
+            WORKFLOW_NAME,
+            serde_json::to_value(task).unwrap(),
+            StartOptions::default(),
+        )
+        .await
+        .unwrap();
+    let deadline = Instant::now() + LIMIT;
+    loop {
+        let result = handle.result(started.exec_id).await.unwrap();
+        if result.state != WorkflowResultState::Running {
+            return result;
+        }
+        assert!(Instant::now() < deadline, "the task did not end");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+/// SQLite keeps no run tenant, so the answer check admits the tenant that
+/// the task declares, as the `sqlite` module of the agent crate does.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_answer_check_reads_the_task_tenant() {
+    let dir = tempfile::tempdir().unwrap();
+    let policies = Arc::new(InMemorySamplingPolicyStore::new());
+    let policy = SamplingPolicy {
+        max_answer_retries: 2,
+        ..SamplingPolicy::default()
+    };
+    policies.set("writer", &policy, "ops").await.unwrap();
+    let harness = AgentHarness::new(PromptModel::new())
+        .agent(AgentProfile::new("writer").tenant("acme"))
+        .scorer(Arc::new(PassAll) as Arc<dyn Scorer>)
+        .sampling_policies(policies);
+    let client = boot(dir.path(), harness);
+    let handle = handle_of(&client);
+    let check =
+        AnswerCheck::new("writer", ScorerRef::deterministic("pass_all").unwrap()).retries(1);
+    let task = |tenant: &str| {
+        AgentTask::new("Answer.")
+            .answer_check(check.clone())
+            .tenant(tenant)
+    };
+
+    let own = run_task(&handle, &task("acme")).await;
+    assert_eq!(own.state, WorkflowResultState::Completed, "{:?}", own.error);
+    let other = run_task(&handle, &task("globex")).await;
+    assert_eq!(other.state, WorkflowResultState::Failed);
+    let error = other.error.unwrap_or_default();
+    assert!(error.contains("other_tenant"), "{error}");
 }

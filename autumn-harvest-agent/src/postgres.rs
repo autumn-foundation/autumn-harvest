@@ -223,7 +223,7 @@ impl PostgresAgents {
 /// builder.
 ///
 /// It is the Postgres form of `sqlite::register`. It calls the neutral
-/// [`register`](crate::register), so both forms stay the same.
+/// [`register`](crate::register), so the two registrations cannot drift.
 #[must_use]
 pub fn register(builder: HarvestBuilder, harness: AgentHarness) -> HarvestBuilder {
     crate::register(builder, harness)
