@@ -400,34 +400,24 @@ fn is_printable(c: char) -> bool {
 
 /// Returns the Python `repr()` of a string.
 pub fn repr(s: &str) -> String {
-    let quote = if s.contains('\'') && !s.contains('"') {
-        '"'
-    } else {
-        '\''
-    };
+    let quote = crate::py_repr::repr_quote(s);
     let mut out = String::with_capacity(s.len() + 2);
     out.push(quote);
     for c in s.chars() {
-        match c {
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            _ if c == quote => {
-                out.push('\\');
-                out.push(c);
-            }
-            _ if is_printable(c) => out.push(c),
-            _ => {
-                let code = u32::from(c);
-                let _ = if code < 0x100 {
-                    write!(out, "\\x{code:02x}")
-                } else if code < 0x1_0000 {
-                    write!(out, "\\u{code:04x}")
-                } else {
-                    write!(out, "\\U{code:08x}")
-                };
-            }
+        if crate::py_repr::push_common_repr_escape(&mut out, c, quote) {
+            continue;
+        }
+        if is_printable(c) {
+            out.push(c);
+        } else {
+            let code = u32::from(c);
+            let _ = if code < 0x100 {
+                write!(out, "\\x{code:02x}")
+            } else if code < 0x1_0000 {
+                write!(out, "\\u{code:04x}")
+            } else {
+                write!(out, "\\U{code:08x}")
+            };
         }
     }
     out.push(quote);
@@ -494,6 +484,12 @@ mod tests {
         assert_eq!(repr("a'b\"c"), "'a\\'b\"c'");
         assert_eq!(repr("tab\there\\"), "'tab\\there\\\\'");
         assert_eq!(repr("é\u{7f}\u{200b}"), "'é\\x7f\\u200b'");
+    }
+
+    #[test]
+    fn repr_escapes_newline_and_cr() {
+        assert_eq!(repr("a\nb"), "'a\\nb'");
+        assert_eq!(repr("a\rb"), "'a\\rb'");
     }
 
     #[test]

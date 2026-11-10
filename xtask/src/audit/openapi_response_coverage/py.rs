@@ -877,24 +877,12 @@ pub fn universal_newlines(text: String) -> String {
 
 /// Python's `repr` of a string, as `str()` of a tuple prints it.
 pub fn repr(text: &str) -> String {
-    let quote = if text.contains('\'') && !text.contains('"') {
-        '"'
-    } else {
-        '\''
-    };
+    let quote = crate::py_repr::repr_quote(text);
     let mut out = String::new();
     out.push(quote);
     for char in text.chars() {
-        match char {
-            '\\' => out.push_str(r"\\"),
-            '\n' => out.push_str(r"\n"),
-            '\r' => out.push_str(r"\r"),
-            '\t' => out.push_str(r"\t"),
-            _ if char == quote => {
-                out.push('\\');
-                out.push(char);
-            }
-            _ => out.push(char),
+        if !crate::py_repr::push_common_repr_escape(&mut out, char, quote) {
+            out.push(char);
         }
     }
     out.push(quote);
@@ -973,6 +961,19 @@ mod tests {
     fn repr_quotes_as_python_does() {
         assert_eq!(repr("a"), "'a'");
         assert_eq!(repr("it's"), "\"it's\"");
+    }
+
+    #[test]
+    fn repr_escapes_newline_cr_tab_and_a_bare_backslash() {
+        assert_eq!(repr("a\nb"), "'a\\nb'");
+        assert_eq!(repr("a\rb"), "'a\\rb'");
+        assert_eq!(repr("a\tb"), "'a\\tb'");
+        assert_eq!(repr("a\\b"), "'a\\\\b'");
+    }
+
+    #[test]
+    fn repr_passes_other_control_characters_through_unescaped() {
+        assert_eq!(repr("a\u{7}b"), "'a\u{7}b'");
     }
 
     #[test]

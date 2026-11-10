@@ -10,36 +10,32 @@ use std::fmt::Write as _;
 ///
 /// Python picks single quotes, unless the text holds a single quote and no
 /// double quote.
+///
+/// Clone-class note: the non-printable escape tail below (everything past
+/// the shared [`crate::py_repr`] prefix) repeats verbatim in
+/// [`crate::audit::comment_hygiene::pyre::repr`]. Apply any change to the
+/// `0x20`/`0x7f` cutoff or the `is_control` branch to both copies. Two
+/// instances only, so the merge bar is not met yet. See the note on
+/// `pyre::repr`.
 pub fn str_repr(text: &str) -> String {
-    let quote = if text.contains('\'') && !text.contains('"') {
-        '"'
-    } else {
-        '\''
-    };
+    let quote = crate::py_repr::repr_quote(text);
     let mut out = String::with_capacity(text.len() + 2);
     out.push(quote);
-    for ch in text.chars() {
-        match ch {
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if c == quote => {
-                out.push('\\');
-                out.push(c);
+    for c in text.chars() {
+        if crate::py_repr::push_common_repr_escape(&mut out, c, quote) {
+            continue;
+        }
+        if (c as u32) < 0x20 || c as u32 == 0x7f {
+            let _ = write!(out, "\\x{:02x}", c as u32);
+        } else if c.is_control() {
+            let code = c as u32;
+            if code <= 0xff {
+                let _ = write!(out, "\\x{code:02x}");
+            } else {
+                let _ = write!(out, "\\u{code:04x}");
             }
-            c if (c as u32) < 0x20 || c as u32 == 0x7f => {
-                let _ = write!(out, "\\x{:02x}", c as u32);
-            }
-            c if c.is_control() => {
-                let code = c as u32;
-                if code <= 0xff {
-                    let _ = write!(out, "\\x{code:02x}");
-                } else {
-                    let _ = write!(out, "\\u{code:04x}");
-                }
-            }
-            c => out.push(c),
+        } else {
+            out.push(c);
         }
     }
     out.push(quote);
@@ -120,6 +116,13 @@ mod tests {
         assert_eq!(str_repr("it's"), "\"it's\"");
         assert_eq!(str_repr("a'b\"c"), "'a\\'b\"c'");
         assert_eq!(str_repr("tab\there"), "'tab\\there'");
+    }
+
+    #[test]
+    fn a_string_escapes_newline_cr_and_a_bare_backslash() {
+        assert_eq!(str_repr("a\nb"), "'a\\nb'");
+        assert_eq!(str_repr("a\rb"), "'a\\rb'");
+        assert_eq!(str_repr("a\\b"), "'a\\\\b'");
     }
 
     #[test]
