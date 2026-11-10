@@ -1,17 +1,17 @@
 //! The one part of Python's `str` `repr()` every script-port shares.
 //!
 //! Issue tracker: see the clone-class note on each caller. Several xtask
-//! modules port a Python script that called `repr()` on a string, and each
+//! modules port a Python script that called `repr()` on a string. Each one
 //! was hand-translated independently (`#2574`). Python's string literal
-//! escape rules fix five cases with no room for interpretation: a
+//! escape rules fix five cases with no room for interpretation. They are a
 //! backslash, `\n`, `\r`, `\t`, and the quote character `repr()` chose for
 //! this string. The Python Language Reference lists them as the literal
-//! escape sequences every string repr uses (`\\`, `\n`, `\r`, `\t`, and the
-//! active quote), so every port agrees on them byte for byte. What each
+//! escape sequences every string repr uses: `\\`, `\n`, `\r`, `\t`, and the
+//! active quote. So every port agrees on them byte for byte. What each
 //! caller does for every *other* character is where they deliberately
-//! differ (some escape the non-printable set, one escapes nothing, one
-//! must handle a lone surrogate that cannot be a Rust `char` at all), so
-//! that part stays with the caller.
+//! differ. Some escape the non-printable set, one escapes nothing, and one
+//! must handle a lone surrogate that cannot be a Rust `char` at all. That
+//! part stays with the caller.
 
 /// Returns Python's quote character for `repr()` of `s`.
 ///
@@ -28,9 +28,10 @@ pub fn repr_quote(s: &str) -> char {
 /// Pushes `c`'s escape onto `out` for the five cases every `repr()` port
 /// shares, and returns `true` when it did.
 ///
-/// Returns `false` for every other character, so the caller can apply its
-/// own rule for the rest of `repr()` — escape the non-printable set, pass
-/// everything through, or decode a surrogate-aware code point first.
+/// Returns `false` for every other character. The caller then applies its
+/// own rule for the rest of `repr()`. That rule may escape the
+/// non-printable set, pass everything through, or decode a
+/// surrogate-aware code point first.
 #[must_use]
 pub fn push_common_repr_escape(out: &mut String, c: char, quote: char) -> bool {
     match c {
