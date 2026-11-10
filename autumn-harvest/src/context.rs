@@ -3800,79 +3800,18 @@ impl WorkflowContext {
 
     // ── Constructors ──────────────────────────────────────────────────
 
-    /// Create a context for replaying a workflow from its event history.
+    /// Builds a context with each field at its fresh value (issue #2586).
     ///
-    /// The `events` slice must begin with `WorkflowStarted` (the timestamp
-    /// is extracted for deterministic `now()`). The matcher is initialized
-    /// with the cursor past the `WorkflowStarted` event.
-    ///
-    /// This method is primarily used internally by the framework when hydrating
-    /// a workflow from the database, but is also highly useful for writing
-    /// replay unit tests.
-    #[must_use]
-    pub fn for_replay(exec_id: ExecutionId, events: Vec<WorkflowEvent>) -> Self {
-        Self::for_replay_with_state(exec_id, events, empty_shared_state())
-    }
-
-    /// Create a replay context with shared application state.
-    ///
-    /// Similar to [`Self::for_replay`], but allows injecting typed shared state
-    /// into the context. This is required if the workflow handler uses
-    /// `ctx.state::<T>()`.
-    #[must_use]
-    pub fn for_replay_with_state(
-        exec_id: ExecutionId,
-        events: Vec<WorkflowEvent>,
-        state: SharedState,
-    ) -> Self {
-        Self::for_replay_with_state_and_history_policy(
-            exec_id,
-            events,
-            state,
-            WorkflowHistoryPolicy::default(),
-        )
-    }
-
-    #[must_use]
+    /// This is the one full struct literal of `WorkflowContext`. Each
+    /// constructor starts here and then sets the fields that its caller
+    /// supplies. Give a new field its fresh value here, and nowhere else.
     #[allow(clippy::too_many_lines)]
-    pub fn for_replay_with_state_and_history_policy(
+    fn fresh(
         exec_id: ExecutionId,
-        events: Vec<WorkflowEvent>,
+        start_time: DateTime<Utc>,
+        matcher: HistoryMatcher,
         state: SharedState,
-        history_policy: WorkflowHistoryPolicy,
     ) -> Self {
-        // Extract start_time, carryover, and scheduled slot from WorkflowStarted (first event).
-        let (start_time, last_completion_result, last_error, scheduled_time) = events
-            .first()
-            .and_then(|e| match e {
-                WorkflowEvent::WorkflowStarted {
-                    timestamp,
-                    last_completion_result,
-                    last_error,
-                    scheduled_time,
-                    ..
-                } => Some((
-                    *timestamp,
-                    last_completion_result.clone(),
-                    last_error.clone(),
-                    *scheduled_time,
-                )),
-                _ => None,
-            })
-            .unwrap_or_else(|| (Utc::now(), None, None, None));
-
-        // Capture any terminal cancellation event so workflow code can detect
-        // it via `is_cancelled()` / `check_cancellation()` during replay.
-        let cancellation_reason = events.iter().find_map(|e| match e {
-            WorkflowEvent::WorkflowCancelled { reason } => Some(reason.clone()),
-            _ => None,
-        });
-
-        let mut matcher = HistoryMatcher::new(events);
-        // Advance past the WorkflowStarted lifecycle event -- it does not
-        // correspond to a workflow command.
-        matcher.advance();
-
         Self {
             exec_id,
             matcher: Mutex::new(matcher),
@@ -3880,7 +3819,7 @@ impl WorkflowContext {
             parks: ParkCounter::default(),
             promise_keys: Mutex::default(),
             start_time,
-            history_policy,
+            history_policy: WorkflowHistoryPolicy::default(),
             execution_timeout: None,
             deadline_at: None,
             current_shard_id: None,
@@ -3921,7 +3860,7 @@ impl WorkflowContext {
             declarative_updates: Mutex::new(std::collections::HashMap::new()),
             signal_registry: Mutex::new(SignalHandlerRegistry::new()),
             signal_pump_hold: std::sync::atomic::AtomicUsize::new(0),
-            cancellation_reason,
+            cancellation_reason: None,
             cancellation_pending: PendingCancel::None,
             strict_replay: false,
             canary_mode: false,
@@ -3943,9 +3882,9 @@ impl WorkflowContext {
             deferred_nd_error: Mutex::new(None),
             current_details_cap: DEFAULT_CURRENT_DETAILS_CAP_BYTES,
             context_headers: std::sync::Arc::new(HashMap::new()),
-            last_completion_result,
-            last_error,
-            scheduled_time,
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
             #[cfg(any(test, feature = "testing"))]
             timer_clock_elapsed_secs: None,
             #[cfg(any(test, feature = "testing"))]
@@ -3954,6 +3893,88 @@ impl WorkflowContext {
             metrics: std::sync::Arc::new(crate::telemetry::NoOpMetrics),
             parent_execution_id: None,
             start_provenance: StartProvenance::default(),
+        }
+    }
+
+    /// Create a context for replaying a workflow from its event history.
+    ///
+    /// The `events` slice must begin with `WorkflowStarted` (the timestamp
+    /// is extracted for deterministic `now()`). The matcher is initialized
+    /// with the cursor past the `WorkflowStarted` event.
+    ///
+    /// This method is primarily used internally by the framework when hydrating
+    /// a workflow from the database, but is also highly useful for writing
+    /// replay unit tests.
+    #[must_use]
+    pub fn for_replay(exec_id: ExecutionId, events: Vec<WorkflowEvent>) -> Self {
+        Self::for_replay_with_state(exec_id, events, empty_shared_state())
+    }
+
+    /// Create a replay context with shared application state.
+    ///
+    /// Similar to [`Self::for_replay`], but allows injecting typed shared state
+    /// into the context. This is required if the workflow handler uses
+    /// `ctx.state::<T>()`.
+    #[must_use]
+    pub fn for_replay_with_state(
+        exec_id: ExecutionId,
+        events: Vec<WorkflowEvent>,
+        state: SharedState,
+    ) -> Self {
+        Self::for_replay_with_state_and_history_policy(
+            exec_id,
+            events,
+            state,
+            WorkflowHistoryPolicy::default(),
+        )
+    }
+
+    #[must_use]
+    pub fn for_replay_with_state_and_history_policy(
+        exec_id: ExecutionId,
+        events: Vec<WorkflowEvent>,
+        state: SharedState,
+        history_policy: WorkflowHistoryPolicy,
+    ) -> Self {
+        // Extract start_time, carryover, and scheduled slot from WorkflowStarted (first event).
+        let (start_time, last_completion_result, last_error, scheduled_time) = events
+            .first()
+            .and_then(|e| match e {
+                WorkflowEvent::WorkflowStarted {
+                    timestamp,
+                    last_completion_result,
+                    last_error,
+                    scheduled_time,
+                    ..
+                } => Some((
+                    *timestamp,
+                    last_completion_result.clone(),
+                    last_error.clone(),
+                    *scheduled_time,
+                )),
+                _ => None,
+            })
+            .unwrap_or_else(|| (Utc::now(), None, None, None));
+
+        // Capture any terminal cancellation event so workflow code can detect
+        // it via `is_cancelled()` / `check_cancellation()` during replay.
+        let cancellation_reason = events.iter().find_map(|e| match e {
+            WorkflowEvent::WorkflowCancelled { reason } => Some(reason.clone()),
+            _ => None,
+        });
+
+        let mut matcher = HistoryMatcher::new(events);
+        // Advance past the WorkflowStarted lifecycle event -- it does not
+        // correspond to a workflow command.
+        matcher.advance();
+
+        Self {
+            history_policy,
+            cancellation_reason,
+            last_completion_result,
+            last_error,
+            scheduled_time,
+            ..Self::fresh(exec_id, start_time, matcher, state)
         }
     }
 
@@ -4075,86 +4096,8 @@ impl WorkflowContext {
         state: SharedState,
     ) -> std::sync::Arc<Self> {
         std::sync::Arc::new(Self {
-            exec_id,
-            matcher: Mutex::new(crate::replay::HistoryMatcher::new(vec![])),
-            commands: Mutex::new(Vec::new()),
-            parks: ParkCounter::default(),
-            promise_keys: Mutex::default(),
-            start_time,
-            history_policy: WorkflowHistoryPolicy::default(),
-            execution_timeout: None,
-            deadline_at: None,
-            current_shard_id: None,
-            activity_seq: Mutex::new(0),
-            fan_out_seq: Mutex::new(0),
-            signal_timeout_seq: Mutex::new(0),
-            child_timeout_seq: Mutex::new(0),
-            child_placement_seq: Mutex::new(0),
-            shard_router: None,
-            race_seq: Mutex::new(0),
-            scope_seq: Mutex::new(0),
-            shield_seq: Mutex::new(0),
-            scope_stack: Mutex::new(Vec::new()),
-            live_scopes: Mutex::new(Vec::new()),
-            open_races: std::sync::atomic::AtomicUsize::new(0),
-            speculative: std::sync::atomic::AtomicBool::new(false),
-            speculation_read_position: std::sync::atomic::AtomicBool::new(false),
-            session_seq: Mutex::new(0),
-            business_day_seq: Mutex::new(0),
-            progress_local_index: std::sync::atomic::AtomicU64::new(0),
-            durable_progress_ordinal: std::sync::atomic::AtomicU64::new(0),
-            durable_progress_queued: std::sync::atomic::AtomicU64::new(0),
-            log_call_ordinal: std::sync::atomic::AtomicU64::new(0),
-            log_commands_queued: std::sync::atomic::AtomicU64::new(0),
-            log_policy: None,
-            saga_seq: Mutex::new(0),
-            cancellable_timer_state: Mutex::new(std::collections::HashMap::new()),
-            timer_arm_epochs: Mutex::new(std::collections::HashMap::new()),
-            timer_undo: Mutex::new(Vec::new()),
-            command_order: std::sync::atomic::AtomicU64::new(0),
-            classic_timer_ids: Mutex::new(std::collections::HashSet::new()),
-            held_mutex_keys: Mutex::new(std::collections::HashSet::new()),
-            suspending: std::sync::atomic::AtomicBool::new(false),
-            state,
-            query_registry: Mutex::new(QueryRegistry::new()),
-            declarative_queries: Mutex::new(std::collections::HashMap::new()),
-            update_registry: Mutex::new(UpdateRegistry::new()),
-            declarative_updates: Mutex::new(std::collections::HashMap::new()),
-            signal_registry: Mutex::new(SignalHandlerRegistry::new()),
-            signal_pump_hold: std::sync::atomic::AtomicUsize::new(0),
             cancellation_reason,
-            cancellation_pending: PendingCancel::None,
-            strict_replay: false,
-            canary_mode: false,
-            update_dispatch: None,
-            workflow_name: String::new(),
-            queue_name: String::new(),
-            workflow_id: String::new(),
-            build_id: None,
-            nd_details: Mutex::new(None),
-            payload_max_activity_input: DEFAULT_MAX_ACTIVITY_INPUT_BYTES,
-            payload_max_workflow_input: DEFAULT_MAX_WORKFLOW_INPUT_BYTES,
-            payload_max_side_effect: DEFAULT_MAX_WORKFLOW_INPUT_BYTES,
-            payload_max_signal: DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES,
-            payload_offload_threshold: None,
-            default_activity_retry_policy: None,
-            default_activity_start_to_close: None,
-            activity_overrides: None,
-            activity_input_cap_overrides: HashMap::new(),
-            deferred_nd_error: Mutex::new(None),
-            current_details_cap: DEFAULT_CURRENT_DETAILS_CAP_BYTES,
-            context_headers: std::sync::Arc::new(HashMap::new()),
-            last_completion_result: None,
-            last_error: None,
-            scheduled_time: None,
-            #[cfg(any(test, feature = "testing"))]
-            timer_clock_elapsed_secs: None,
-            #[cfg(any(test, feature = "testing"))]
-            side_effect_rng: None,
-            drive_clock_ms: None,
-            metrics: std::sync::Arc::new(crate::telemetry::NoOpMetrics),
-            parent_execution_id: None,
-            start_provenance: StartProvenance::default(),
+            ..Self::fresh(exec_id, start_time, HistoryMatcher::new(Vec::new()), state)
         })
     }
 
@@ -4163,90 +4106,12 @@ impl WorkflowContext {
     #[cfg(any(test, feature = "testing"))]
     #[must_use]
     pub fn new_test() -> Self {
-        let exec_id = ExecutionId::new();
-        let start_time = Utc::now();
-        Self {
-            exec_id,
-            matcher: Mutex::new(HistoryMatcher::new(vec![])),
-            commands: Mutex::new(Vec::new()),
-            parks: ParkCounter::default(),
-            promise_keys: Mutex::default(),
-            start_time,
-            history_policy: WorkflowHistoryPolicy::default(),
-            execution_timeout: None,
-            deadline_at: None,
-            current_shard_id: None,
-            activity_seq: Mutex::new(0),
-            fan_out_seq: Mutex::new(0),
-            signal_timeout_seq: Mutex::new(0),
-            child_timeout_seq: Mutex::new(0),
-            child_placement_seq: Mutex::new(0),
-            shard_router: None,
-            race_seq: Mutex::new(0),
-            scope_seq: Mutex::new(0),
-            shield_seq: Mutex::new(0),
-            scope_stack: Mutex::new(Vec::new()),
-            live_scopes: Mutex::new(Vec::new()),
-            open_races: std::sync::atomic::AtomicUsize::new(0),
-            speculative: std::sync::atomic::AtomicBool::new(false),
-            speculation_read_position: std::sync::atomic::AtomicBool::new(false),
-            session_seq: Mutex::new(0),
-            business_day_seq: Mutex::new(0),
-            progress_local_index: std::sync::atomic::AtomicU64::new(0),
-            durable_progress_ordinal: std::sync::atomic::AtomicU64::new(0),
-            durable_progress_queued: std::sync::atomic::AtomicU64::new(0),
-            log_call_ordinal: std::sync::atomic::AtomicU64::new(0),
-            log_commands_queued: std::sync::atomic::AtomicU64::new(0),
-            log_policy: None,
-            saga_seq: Mutex::new(0),
-            cancellable_timer_state: Mutex::new(std::collections::HashMap::new()),
-            timer_arm_epochs: Mutex::new(std::collections::HashMap::new()),
-            timer_undo: Mutex::new(Vec::new()),
-            command_order: std::sync::atomic::AtomicU64::new(0),
-            classic_timer_ids: Mutex::new(std::collections::HashSet::new()),
-            held_mutex_keys: Mutex::new(std::collections::HashSet::new()),
-            suspending: std::sync::atomic::AtomicBool::new(false),
-            state: empty_shared_state(),
-            query_registry: Mutex::new(QueryRegistry::new()),
-            declarative_queries: Mutex::new(std::collections::HashMap::new()),
-            update_registry: Mutex::new(UpdateRegistry::new()),
-            declarative_updates: Mutex::new(std::collections::HashMap::new()),
-            signal_registry: Mutex::new(SignalHandlerRegistry::new()),
-            signal_pump_hold: std::sync::atomic::AtomicUsize::new(0),
-            cancellation_reason: None,
-            cancellation_pending: PendingCancel::None,
-            strict_replay: false,
-            canary_mode: false,
-            update_dispatch: None,
-            workflow_name: String::new(),
-            queue_name: String::new(),
-            workflow_id: String::new(),
-            build_id: None,
-            nd_details: Mutex::new(None),
-            payload_max_activity_input: DEFAULT_MAX_ACTIVITY_INPUT_BYTES,
-            payload_max_workflow_input: DEFAULT_MAX_WORKFLOW_INPUT_BYTES,
-            payload_max_side_effect: DEFAULT_MAX_WORKFLOW_INPUT_BYTES,
-            payload_max_signal: DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES,
-            payload_offload_threshold: None,
-            default_activity_retry_policy: None,
-            default_activity_start_to_close: None,
-            activity_overrides: None,
-            activity_input_cap_overrides: HashMap::new(),
-            deferred_nd_error: Mutex::new(None),
-            current_details_cap: DEFAULT_CURRENT_DETAILS_CAP_BYTES,
-            context_headers: std::sync::Arc::new(HashMap::new()),
-            last_completion_result: None,
-            last_error: None,
-            scheduled_time: None,
-            #[cfg(any(test, feature = "testing"))]
-            timer_clock_elapsed_secs: None,
-            #[cfg(any(test, feature = "testing"))]
-            side_effect_rng: None,
-            drive_clock_ms: None,
-            metrics: std::sync::Arc::new(crate::telemetry::NoOpMetrics),
-            parent_execution_id: None,
-            start_provenance: StartProvenance::default(),
-        }
+        Self::fresh(
+            ExecutionId::new(),
+            Utc::now(),
+            HistoryMatcher::new(Vec::new()),
+            empty_shared_state(),
+        )
     }
 
     /// Enable the advancing virtual clock (issue #526, test harness only).
@@ -34531,5 +34396,417 @@ mod activity_override_tests {
                 ..
             }
         ));
+    }
+}
+
+/// Characterization tests for the `WorkflowContext` constructors (issue #2586).
+///
+/// Each constructor must give the same fresh value for each field that its
+/// caller does not supply. The exhaustive destructure in `assert_fresh` makes
+/// a new field fail to compile here until the test states its fresh value.
+#[cfg(test)]
+mod constructor_tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    /// Asserts the fresh value of each field that no constructor argument sets.
+    ///
+    /// This function ignores the fields that a caller supplies, and the two
+    /// replay flags. Each test checks them for its own constructor.
+    #[allow(clippy::too_many_lines)]
+    fn assert_fresh(ctx: &WorkflowContext) {
+        let WorkflowContext {
+            exec_id: _,
+            matcher: _,
+            commands,
+            parks,
+            promise_keys,
+            start_time: _,
+            history_policy: _,
+            execution_timeout,
+            deadline_at,
+            activity_seq,
+            fan_out_seq,
+            signal_timeout_seq,
+            child_timeout_seq,
+            child_placement_seq,
+            shard_router,
+            current_shard_id,
+            race_seq,
+            scope_seq,
+            shield_seq,
+            scope_stack,
+            live_scopes,
+            open_races,
+            speculative,
+            speculation_read_position,
+            session_seq,
+            business_day_seq,
+            progress_local_index,
+            durable_progress_ordinal,
+            durable_progress_queued,
+            log_call_ordinal,
+            log_commands_queued,
+            log_policy,
+            saga_seq,
+            cancellable_timer_state,
+            timer_arm_epochs,
+            timer_undo,
+            command_order,
+            classic_timer_ids,
+            held_mutex_keys,
+            suspending,
+            state: _,
+            query_registry,
+            declarative_queries,
+            update_registry,
+            declarative_updates,
+            signal_registry,
+            signal_pump_hold,
+            cancellation_reason: _,
+            cancellation_pending,
+            strict_replay: _,
+            canary_mode: _,
+            update_dispatch,
+            workflow_name,
+            queue_name,
+            workflow_id,
+            build_id,
+            nd_details,
+            payload_max_activity_input,
+            payload_max_workflow_input,
+            payload_max_side_effect,
+            payload_max_signal,
+            payload_offload_threshold,
+            default_activity_retry_policy,
+            default_activity_start_to_close,
+            activity_overrides,
+            activity_input_cap_overrides,
+            deferred_nd_error,
+            current_details_cap,
+            context_headers,
+            last_completion_result: _,
+            last_error: _,
+            scheduled_time: _,
+            timer_clock_elapsed_secs,
+            side_effect_rng,
+            drive_clock_ms,
+            metrics,
+            parent_execution_id,
+            start_provenance,
+        } = ctx;
+
+        assert!(commands.lock().unwrap().is_empty());
+        assert!(!parks.is_held());
+        assert!(promise_keys.lock().unwrap().is_empty());
+        assert!(execution_timeout.is_none());
+        assert!(deadline_at.is_none());
+        for seq in [
+            activity_seq,
+            fan_out_seq,
+            signal_timeout_seq,
+            child_timeout_seq,
+            child_placement_seq,
+            race_seq,
+            scope_seq,
+            shield_seq,
+            session_seq,
+            business_day_seq,
+            saga_seq,
+        ] {
+            assert_eq!(*seq.lock().unwrap(), 0);
+        }
+        assert!(shard_router.is_none());
+        assert!(current_shard_id.is_none());
+        assert!(scope_stack.lock().unwrap().is_empty());
+        assert!(live_scopes.lock().unwrap().is_empty());
+        assert_eq!(open_races.load(Ordering::SeqCst), 0);
+        assert_eq!(signal_pump_hold.load(Ordering::SeqCst), 0);
+        for flag in [speculative, speculation_read_position, suspending] {
+            assert!(!flag.load(Ordering::SeqCst));
+        }
+        for counter in [
+            progress_local_index,
+            durable_progress_ordinal,
+            durable_progress_queued,
+            log_call_ordinal,
+            log_commands_queued,
+            command_order,
+        ] {
+            assert_eq!(counter.load(Ordering::SeqCst), 0);
+        }
+        assert!(log_policy.is_none());
+        assert!(cancellable_timer_state.lock().unwrap().is_empty());
+        assert!(timer_arm_epochs.lock().unwrap().is_empty());
+        assert!(timer_undo.lock().unwrap().is_empty());
+        assert!(classic_timer_ids.lock().unwrap().is_empty());
+        assert!(held_mutex_keys.lock().unwrap().is_empty());
+        assert_eq!(
+            query_registry.lock().unwrap().list_names(),
+            Vec::<String>::new()
+        );
+        assert!(declarative_queries.lock().unwrap().is_empty());
+        assert!(update_registry.lock().unwrap().is_empty());
+        assert!(declarative_updates.lock().unwrap().is_empty());
+        assert_eq!(
+            signal_registry.lock().unwrap().list_names(),
+            Vec::<String>::new()
+        );
+        assert_eq!(*cancellation_pending, PendingCancel::None);
+        assert!(update_dispatch.is_none());
+        assert_eq!(workflow_name, "");
+        assert_eq!(queue_name, "");
+        assert_eq!(workflow_id, "");
+        assert!(build_id.is_none());
+        assert!(nd_details.lock().unwrap().is_none());
+        assert_eq!(
+            *payload_max_activity_input,
+            DEFAULT_MAX_ACTIVITY_INPUT_BYTES
+        );
+        assert_eq!(
+            *payload_max_workflow_input,
+            DEFAULT_MAX_WORKFLOW_INPUT_BYTES
+        );
+        assert_eq!(*payload_max_side_effect, DEFAULT_MAX_WORKFLOW_INPUT_BYTES);
+        assert_eq!(*payload_max_signal, DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES);
+        assert!(payload_offload_threshold.is_none());
+        assert!(default_activity_retry_policy.is_none());
+        assert!(default_activity_start_to_close.is_none());
+        assert!(activity_overrides.is_none());
+        assert!(activity_input_cap_overrides.is_empty());
+        assert!(deferred_nd_error.lock().unwrap().is_none());
+        assert_eq!(*current_details_cap, DEFAULT_CURRENT_DETAILS_CAP_BYTES);
+        assert!(context_headers.is_empty());
+        assert!(timer_clock_elapsed_secs.is_none());
+        assert!(side_effect_rng.is_none());
+        assert!(drive_clock_ms.is_none());
+        assert!(!metrics.is_enabled(), "the fresh recorder is NoOpMetrics");
+        assert!(parent_execution_id.is_none());
+        assert_eq!(*start_provenance, StartProvenance::default());
+    }
+
+    /// Asserts that `ctx` holds no carryover from a prior run.
+    const fn assert_no_carryover(ctx: &WorkflowContext) {
+        assert!(ctx.last_completion_result.is_none());
+        assert!(ctx.last_error.is_none());
+        assert!(ctx.scheduled_time.is_none());
+    }
+
+    fn event_count(ctx: &WorkflowContext) -> u64 {
+        ctx.matcher.lock().unwrap().event_count()
+    }
+
+    /// A history with carryover, a command event and a cancel.
+    ///
+    /// The marker sits before the cancel, so the cancel scan must read past
+    /// the event after `WorkflowStarted`.
+    fn rich_history(started: DateTime<Utc>, slot: DateTime<Utc>) -> Vec<WorkflowEvent> {
+        vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: started,
+                last_completion_result: Some(serde_json::json!({"n": 1})),
+                last_error: Some("prior run failed".into()),
+                scheduled_time: Some(slot),
+            },
+            WorkflowEvent::MarkerRecorded {
+                name: "step".into(),
+                details: Value::Null,
+            },
+            WorkflowEvent::WorkflowCancelled {
+                reason: "operator".into(),
+            },
+        ]
+    }
+
+    /// Each replay constructor reads its inputs from the history.
+    ///
+    /// Each one must also pass its state through, keep the other fields
+    /// fresh, and set only its own replay flags.
+    #[test]
+    fn each_replay_constructor_takes_its_inputs_from_the_history() {
+        type Build = fn(ExecutionId, Vec<WorkflowEvent>, SharedState) -> WorkflowContext;
+        let with_policy: Build = |id, events, state| {
+            WorkflowContext::for_replay_with_state_and_history_policy(
+                id,
+                events,
+                state,
+                WorkflowHistoryPolicy::default(),
+            )
+        };
+        let cases: [(&str, Build, bool, bool, bool); 6] = [
+            (
+                "for_replay",
+                |id, ev, _| WorkflowContext::for_replay(id, ev),
+                false,
+                false,
+                false,
+            ),
+            (
+                "for_replay_with_state",
+                WorkflowContext::for_replay_with_state,
+                true,
+                false,
+                false,
+            ),
+            ("with_history_policy", with_policy, true, false, false),
+            (
+                "for_replay_strict",
+                |id, ev, _| WorkflowContext::for_replay_strict(id, ev),
+                false,
+                true,
+                false,
+            ),
+            (
+                "strict_with_state",
+                WorkflowContext::for_replay_strict_with_state,
+                true,
+                true,
+                false,
+            ),
+            (
+                "canary_with_state",
+                WorkflowContext::for_replay_canary_with_state,
+                true,
+                true,
+                true,
+            ),
+        ];
+        let started = Utc::now() - chrono::Duration::hours(1);
+        let slot = started - chrono::Duration::minutes(5);
+
+        for (name, build, takes_state, strict, canary) in cases {
+            let exec_id = ExecutionId::new();
+            let mut state_map = SharedStateMap::new();
+            state_map.insert(TypeId::of::<u8>(), Box::new(7_u8));
+            let state: SharedState = Arc::new(state_map);
+
+            let ctx = build(exec_id, rich_history(started, slot), Arc::clone(&state));
+
+            assert_fresh(&ctx);
+            assert_eq!(ctx.exec_id, exec_id, "{name}");
+            assert_eq!(ctx.start_time, started, "{name}");
+            assert_eq!(
+                ctx.history_policy,
+                WorkflowHistoryPolicy::default(),
+                "{name}"
+            );
+            assert_eq!(Arc::ptr_eq(&ctx.state, &state), takes_state, "{name}");
+            assert_eq!(ctx.state.is_empty(), !takes_state, "{name}");
+            assert_eq!(
+                ctx.cancellation_reason.as_deref(),
+                Some("operator"),
+                "{name}"
+            );
+            assert_eq!(
+                ctx.last_completion_result,
+                Some(serde_json::json!({"n": 1})),
+                "{name}"
+            );
+            assert_eq!(
+                ctx.last_error.as_deref(),
+                Some("prior run failed"),
+                "{name}"
+            );
+            assert_eq!(ctx.scheduled_time, Some(slot), "{name}");
+            assert_eq!(
+                (ctx.strict_replay, ctx.canary_mode),
+                (strict, canary),
+                "{name}"
+            );
+            assert_eq!(event_count(&ctx), 3, "{name}");
+            assert_eq!(
+                ctx.first_unconsumed_command_event(),
+                Some((1, "MarkerRecorded(step)".to_string())),
+                "{name}: the matcher starts past WorkflowStarted"
+            );
+        }
+    }
+
+    #[test]
+    fn for_replay_with_state_and_history_policy_keeps_its_policy() {
+        let policy = WorkflowHistoryPolicy::default().with_continue_as_new_threshold(7);
+        let ctx = WorkflowContext::for_replay_with_state_and_history_policy(
+            ExecutionId::new(),
+            Vec::new(),
+            empty_shared_state(),
+            policy,
+        );
+        assert_eq!(ctx.history_policy, policy);
+    }
+
+    #[test]
+    fn for_replay_with_no_start_event_reads_the_clock() {
+        let before = Utc::now();
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), Vec::new());
+        let after = Utc::now();
+
+        assert_fresh(&ctx);
+        assert!((before..=after).contains(&ctx.start_time));
+        assert_eq!(ctx.history_policy, WorkflowHistoryPolicy::default());
+        assert!(ctx.cancellation_reason.is_none());
+        assert!(!ctx.strict_replay && !ctx.canary_mode);
+        assert_no_carryover(&ctx);
+        assert_eq!(event_count(&ctx), 0);
+    }
+
+    #[test]
+    fn new_for_handler_inherits_only_its_arguments() {
+        let exec_id = ExecutionId::new();
+        let started = Utc::now() - chrono::Duration::hours(2);
+        let state = empty_shared_state();
+
+        let ctx = WorkflowContext::new_for_handler(
+            exec_id,
+            started,
+            Some("parent cancelled".into()),
+            Arc::clone(&state),
+        );
+
+        assert_fresh(&ctx);
+        assert_eq!(ctx.exec_id, exec_id);
+        assert_eq!(ctx.start_time, started);
+        assert!(Arc::ptr_eq(&ctx.state, &state));
+        assert_eq!(ctx.cancellation_reason.as_deref(), Some("parent cancelled"));
+        assert_eq!(ctx.history_policy, WorkflowHistoryPolicy::default());
+        assert!(!ctx.strict_replay && !ctx.canary_mode);
+        assert_no_carryover(&ctx);
+        assert_eq!(event_count(&ctx), 0);
+    }
+
+    /// One full struct literal builds a `WorkflowContext` (issue #2586).
+    ///
+    /// The test counts the lines that start with `parks:`. The field
+    /// declaration is one, and the literal in `fresh` is the other. A
+    /// constructor that uses struct update syntax does not name `parks`.
+    /// The test splits its needle, so its own source does not match.
+    #[test]
+    fn one_struct_literal_builds_a_context() {
+        let needle = concat!("parks", ":");
+        let lines = include_str!("context.rs")
+            .lines()
+            .filter(|line| line.trim_start().starts_with(needle))
+            .count();
+        assert_eq!(
+            lines, 2,
+            "start each WorkflowContext constructor from WorkflowContext::fresh"
+        );
+    }
+
+    #[test]
+    fn new_test_is_a_live_context_with_a_new_id() {
+        let before = Utc::now();
+        let ctx = WorkflowContext::new_test();
+        let after = Utc::now();
+
+        assert_fresh(&ctx);
+        assert_ne!(ctx.exec_id, WorkflowContext::new_test().exec_id);
+        assert!((before..=after).contains(&ctx.start_time));
+        assert!(ctx.state.is_empty());
+        assert!(ctx.cancellation_reason.is_none());
+        assert_eq!(ctx.history_policy, WorkflowHistoryPolicy::default());
+        assert!(!ctx.strict_replay && !ctx.canary_mode);
+        assert_no_carryover(&ctx);
+        assert_eq!(event_count(&ctx), 0);
     }
 }
