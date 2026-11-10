@@ -155,6 +155,10 @@ name = "refine_run"
 required-features = ["eval", "sqlite"]
 
 [[test]]
+name = "refine_live"
+required-features = ["eval", "sqlite"]
+
+[[test]]
 name = "refine_gate"
 required-features = ["eval", "sqlite"]
 

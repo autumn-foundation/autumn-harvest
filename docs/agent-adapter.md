@@ -3270,7 +3270,8 @@ On Postgres, install `postgres::Sources::new(pg)` and start the workflow
   follows.
 - **Sequential.** For each source, k steps. Each step runs INV, DOM, their
   probes, one composition and its probe. A candidate composition is the
-  base of the next step.
+  base of the next step. A composition that failed its live re-probe is
+  not. The next step keeps the base of the step before.
 - **Probe.** `eval::evaluate` against the recorded source, so the base
   rollout costs nothing. A probe that stubs a tool call asks for a live
   re-probe with `probe_effects`. The fork applies the overlay under the
@@ -3286,9 +3287,17 @@ On Postgres, install `postgres::Sources::new(pg)` and start the workflow
   redacted too. With a workspace store, the composer also reads an
   evidence bundle, which hides the same names. An `OverlaySelector` picks
   one id. The rule picks in its place when no selector is installed, or when
-  the selector fails, times out or names an id outside the pool. The rule
-  takes a completed end first, then the fewest stubbed tool calls, then
-  the lowest id.
+  the selector fails, times out, or names an id outside the pool or a live
+  failure. The rule never picks a live failure. Then it takes a completed
+  end first, then the fewest stubbed tool calls, then the lowest id.
+- **A live failure.** The pool shows the live re-probe of each candidate
+  as `AnonymisedEvaluation::live`, an `eval::LiveCheck`. It holds no fork
+  id, no cost and no host error, and the pool redacts each run error. A
+  live failure is a fork that did not complete: it failed, ended in
+  another state, or did not end in time. A failed fork call or wait is not
+  one. When each candidate failed live, the select step asks no selector
+  and picks none. A run that started before this release keeps the old
+  rule. The design is in `docs/design/DESIGN-2579.md`.
 - **Budget identity.** For each source, both modes run 3k sessions. Each
   candidate stage adds one probe. A `KeptBase` or `FellBack` stage adds
   none. A run that ran its whole plan checks the counts. A mismatch fails
@@ -3471,7 +3480,8 @@ never reads a waiting candidate.
    composer combines the probed candidates
    ([section 22](#22-refine-a-kind-issue-2380)). In parallel mode, a
    selector or the fallback rule picks one. In sequential mode, each
-   composition is the base of the next step.
+   composition is the base of the next step. Neither mode takes a
+   composition that failed its live re-probe.
 4. **Adopt.** The chosen overlay goes to the adoption gate
    ([section 23](#23-the-adoption-gate)).
 5. **Learn.** With a memory store, each adoption adds one lesson to the
