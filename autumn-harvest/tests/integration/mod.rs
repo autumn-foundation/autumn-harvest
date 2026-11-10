@@ -456,6 +456,8 @@ mod throttle_tests;
 mod throwaway_db;
 #[cfg(feature = "db")]
 mod timeout_refill_shared_page_perf;
+#[cfg(feature = "db")]
+mod timer_pending_exec_lookup_perf;
 // The recorder is used by the chaos suite only. Its unit tests run in
 // every build, so the exporter is checked on each PR (issue #2003).
 #[cfg_attr(not(feature = "chaos"), allow(dead_code))]

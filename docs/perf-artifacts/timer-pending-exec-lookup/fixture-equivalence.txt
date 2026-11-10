@@ -1,0 +1,22 @@
+##### ledger_timers (asof 2026-11-10 19:53:39.538082+00)
+SET
+         q         |  rows  |              digest              
+-------------------+--------+----------------------------------
+ ingest            |   3091 | d85af4b4172bc41569f8116ed490e5a5
+ ingest_fired_true | 111900 | 9c8796b7b8f0ce00c883333303b8c0a2
+ by_id_open        |   1000 | e1a7d67247fe69181594eca9bc4c86f5
+ by_ids_lag        |   7603 | ff232bd4d0c5bd2fd8f89ddb7c7df75f
+ no_such_run       |      0 | d41d8cd98f00b204e9800998ecf8427e
+(5 rows)
+
+##### lt_mig (asof 2026-11-10 19:53:39.538082+00)
+SET
+         q         |  rows  |              digest              
+-------------------+--------+----------------------------------
+ ingest            |   3091 | d85af4b4172bc41569f8116ed490e5a5
+ ingest_fired_true | 111900 | 9c8796b7b8f0ce00c883333303b8c0a2
+ by_id_open        |   1000 | e1a7d67247fe69181594eca9bc4c86f5
+ by_ids_lag        |   7603 | ff232bd4d0c5bd2fd8f89ddb7c7df75f
+ no_such_run       |      0 | d41d8cd98f00b204e9800998ecf8427e
+(5 rows)
+

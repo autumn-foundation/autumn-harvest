@@ -84,7 +84,7 @@ driver = "per_task"
 backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_timers"]
-measured = "unmeasured"
+measured = "docs/performance-timer-pending-exec-lookup.md"
 plan = "docs/ledger/plans/autumn-harvest/worker.md"
 
 ["insert_awaited_child_execution"]
@@ -194,7 +194,7 @@ driver = "per_task"
 backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_events", "harvest_task_queue", "harvest_timers"]
-measured = "unmeasured"
+measured = "docs/performance-timer-pending-exec-lookup.md"
 plan = "docs/ledger/plans/autumn-harvest/worker.md"
 
 ["persist_workflow_continue_as_new_with_verdict"]
