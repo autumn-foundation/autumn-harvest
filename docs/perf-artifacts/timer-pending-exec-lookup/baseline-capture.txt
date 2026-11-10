@@ -1,0 +1,194 @@
+# Timer lookup capture: baseline
+
+## Run of 250 timers
+
+state COMPLETED, timer rows 250, unfired 0, TimerFired events 250, timer digest `be600552e7df7c7bd19f8fca89e1d448`, window 5924 ms
+
+| total buffers | total calls | WAL bytes | temp blocks written |
+|--:|--:|--:|--:|
+| 58857 | 20897 | 990652 | 0 |
+
+Timer lookups: 5689 buffers (9.7% of buffers), 751 calls (3.6% of calls), 7.6 buffers per call, 22.8 buffers per timer.
+
+### Top 10 by buffers
+
+| buffers | % | calls | rows | statement |
+|--:|--:|--:|--:|---|
+| 8771 | 14.9 | 501 | 501 | `INSERT INTO "harvest_events" ("workflow_exec_id", "event_id", "event_type", "event_data") VALUES ($1, $2, $3, $4) RETURNING txid_c` |
+| 7501 | 12.7 | 254 | 251 | `WITH worker_info AS ( SELECT COALESCE((SELECT labels FROM harvest_workers WHERE worker_id = $1), $7::jsonb) AS labels ), paused_qu` |
+| 5585 | 9.5 | 250 | 250 | `UPDATE "harvest_task_queue" SET "state" = $1, "worker_id" = $2, "started_at" = $3, "last_heartbeat_at" = $4, "crash_strikes" = $5,` |
+| 3786 | 6.4 | 500 | 0 | `SELECT "harvest_timers"."id", "harvest_timers"."workflow_exec_id", "harvest_timers"."timer_id", "harvest_timers"."fires_at", "harv` |
+| 3655 | 6.2 | 250 | 250 | `INSERT INTO "harvest_timers" ("workflow_exec_id", "timer_id", "fires_at") VALUES ($1, $2, $3)` |
+| 3055 | 5.2 | 250 | 250 | `UPDATE "harvest_timers" SET "fired" = $1 WHERE ("harvest_timers"."id" = ANY($2))` |
+| 2971 | 5.0 | 250 | 250 | `UPDATE harvest_task_queue SET sticky_worker_id = $2, sticky_until = NOW() + $3, sticky_timeout = $3 WHERE id = $1` |
+| 2970 | 5.0 | 250 | 250 | `UPDATE "harvest_task_queue" SET "activity_name" = $1 WHERE ("harvest_task_queue"."id" = $2)` |
+| 2683 | 4.6 | 500 | 0 | `WITH worker_info AS ( SELECT COALESCE((SELECT labels FROM harvest_workers WHERE worker_id = $1), $7::jsonb) AS labels ), paused_qu` |
+| 2174 | 3.7 | 250 | 250 | `WITH candidate AS ( SELECT id, wake_requested FROM harvest_task_queue WHERE id = $1 AND task_type = $2 FOR UPDATE ), updated AS ( ` |
+
+### Top 10 by calls
+
+| calls | % | buffers | statement |
+|--:|--:|--:|---|
+| 1983 | 9.5 | 0 | `COMMIT` |
+| 1843 | 8.8 | 0 | `SELECT $1` |
+| 1229 | 5.9 | 0 | `BEGIN` |
+| 860 | 4.1 | 106 | `SELECT to_regclass($1) IS NOT NULL AS present` |
+| 754 | 3.6 | 0 | `BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED` |
+| 754 | 3.6 | 0 | `SET LOCAL enable_bitmapscan = off` |
+| 754 | 3.6 | 0 | `SET LOCAL enable_sort = off` |
+| 754 | 3.6 | 0 | `SET LOCAL jit = off` |
+| 754 | 3.6 | 0 | `SET LOCAL plan_cache_mode = force_generic_plan` |
+| 705 | 3.4 | 0 | `SELECT current_database()::text AS database, pg_postmaster_start_time() AS started_at, pg_notification_queue_usage() AS queue_usag` |
+
+### Top 10 by WAL bytes
+
+| WAL bytes | calls | statement |
+|--:|--:|---|
+| 363594 | 501 | `INSERT INTO "harvest_events" ("workflow_exec_id", "event_id", "event_type", "event_data") VALUES ($1, $2, $3, $4) RETURNING txid_c` |
+| 243699 | 250 | `UPDATE "harvest_task_queue" SET "state" = $1, "worker_id" = $2, "started_at" = $3, "last_heartbeat_at" = $4, "crash_strikes" = $5,` |
+| 140890 | 254 | `WITH worker_info AS ( SELECT COALESCE((SELECT labels FROM harvest_workers WHERE worker_id = $1), $7::jsonb) AS labels ), paused_qu` |
+| 86394 | 250 | `INSERT INTO "harvest_timers" ("workflow_exec_id", "timer_id", "fires_at") VALUES ($1, $2, $3)` |
+| 54472 | 250 | `UPDATE "harvest_timers" SET "fired" = $1 WHERE ("harvest_timers"."id" = ANY($2))` |
+| 32500 | 250 | `WITH candidate AS ( SELECT id, wake_requested FROM harvest_task_queue WHERE id = $1 AND task_type = $2 FOR UPDATE ), updated AS ( ` |
+| 23270 | 250 | `UPDATE harvest_task_queue SET sticky_worker_id = $2, sticky_until = NOW() + $3, sticky_timeout = $3 WHERE id = $1` |
+| 21275 | 250 | `UPDATE "harvest_task_queue" SET "activity_name" = $1 WHERE ("harvest_task_queue"."id" = $2)` |
+| 13554 | 251 | `SELECT "harvest_workflow_executions"."state" FROM "harvest_workflow_executions" WHERE ("harvest_workflow_executions"."id" = $1) LI` |
+| 1732 | 1 | `INSERT INTO "harvest_task_queue" ("id", "queue_name", "task_type", "workflow_exec_id", "activity_name", "activity_id", "input", "p` |
+
+### Timer lookups
+
+* 3786 buffers, 500 calls, 0 rows:
+  `SELECT "harvest_timers"."id", "harvest_timers"."workflow_exec_id", "harvest_timers"."timer_id", "harvest_timers"."fires_at", "harvest_timers"."fired" FROM "harvest_timers" WHERE ((("harvest_timers"."workflow_exec_id" = $1) AND ("harvest_timers"."timer_id" = $2)) AND ("harvest_timers"."fired" = $3)) LIMIT $4`
+* 1903 buffers, 251 calls, 250 rows:
+  `SELECT "harvest_timers"."id", "harvest_timers"."workflow_exec_id", "harvest_timers"."timer_id", "harvest_timers"."fires_at", "harvest_timers"."fired" FROM "harvest_timers" WHERE ((("harvest_timers"."workflow_exec_id" = $1) AND ("harvest_timers"."fired" = $2)) AND ("harvest_timers"."fires_at" <= NOW())) ORDER BY "harvest_timers"."fires_at" ASC, "harvest_timers"."timer_id" ASC`
+
+harvest_timers indexes at seed time (bytes): harvest_timers_pkey 44941312, idx_harvest_timers_exec 8650752, idx_harvest_timers_pending 540672
+
+## Run of 1000 timers
+
+state COMPLETED, timer rows 1000, unfired 0, TimerFired events 1000, timer digest `8bcc3fb3c362114e12ce509d131ee418`, window 22020 ms
+
+| total buffers | total calls | WAL bytes | temp blocks written |
+|--:|--:|--:|--:|
+| 266175 | 82976 | 4004839 | 0 |
+
+Timer lookups: 34899 buffers (13.1% of buffers), 3001 calls (3.6% of calls), 11.6 buffers per call, 34.9 buffers per timer.
+
+### Top 10 by buffers
+
+| buffers | % | calls | rows | statement |
+|--:|--:|--:|--:|---|
+| 37628 | 14.1 | 2001 | 2001 | `INSERT INTO "harvest_events" ("workflow_exec_id", "event_id", "event_type", "event_data") VALUES ($1, $2, $3, $4) RETURNING txid_c` |
+| 33062 | 12.4 | 1003 | 1001 | `WITH worker_info AS ( SELECT COALESCE((SELECT labels FROM harvest_workers WHERE worker_id = $1), $7::jsonb) AS labels ), paused_qu` |
+| 25364 | 9.5 | 1000 | 1000 | `UPDATE "harvest_task_queue" SET "state" = $1, "worker_id" = $2, "started_at" = $3, "last_heartbeat_at" = $4, "crash_strikes" = $5,` |
+| 23260 | 8.7 | 2000 | 0 | `SELECT "harvest_timers"."id", "harvest_timers"."workflow_exec_id", "harvest_timers"."timer_id", "harvest_timers"."fires_at", "harv` |
+| 18099 | 6.8 | 2020 | 0 | `WITH worker_info AS ( SELECT COALESCE((SELECT labels FROM harvest_workers WHERE worker_id = $1), $7::jsonb) AS labels ), paused_qu` |
+| 12927 | 4.9 | 1000 | 1000 | `INSERT INTO "harvest_timers" ("workflow_exec_id", "timer_id", "fires_at") VALUES ($1, $2, $3)` |
+| 12469 | 4.7 | 1000 | 1000 | `UPDATE harvest_task_queue SET sticky_worker_id = $2, sticky_until = NOW() + $3, sticky_timeout = $3 WHERE id = $1` |
+| 12382 | 4.7 | 1000 | 1000 | `UPDATE "harvest_task_queue" SET "activity_name" = $1 WHERE ("harvest_task_queue"."id" = $2)` |
+| 12207 | 4.6 | 1000 | 1000 | `UPDATE "harvest_timers" SET "fired" = $1 WHERE ("harvest_timers"."id" = ANY($2))` |
+| 11639 | 4.4 | 1001 | 1000 | `SELECT "harvest_timers"."id", "harvest_timers"."workflow_exec_id", "harvest_timers"."timer_id", "harvest_timers"."fires_at", "harv` |
+
+### Top 10 by calls
+
+| calls | % | buffers | statement |
+|--:|--:|--:|---|
+| 7858 | 9.5 | 0 | `COMMIT` |
+| 7339 | 8.8 | 0 | `SELECT $1` |
+| 4835 | 5.8 | 0 | `BEGIN` |
+| 3365 | 4.1 | 131 | `SELECT to_regclass($1) IS NOT NULL AS present` |
+| 3023 | 3.6 | 0 | `BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED` |
+| 3023 | 3.6 | 0 | `SET LOCAL enable_bitmapscan = off` |
+| 3023 | 3.6 | 0 | `SET LOCAL enable_sort = off` |
+| 3023 | 3.6 | 0 | `SET LOCAL jit = off` |
+| 3023 | 3.6 | 0 | `SET LOCAL plan_cache_mode = force_generic_plan` |
+| 2813 | 3.4 | 0 | `SELECT current_database()::text AS database, pg_postmaster_start_time() AS started_at, pg_notification_queue_usage() AS queue_usag` |
+
+### Top 10 by WAL bytes
+
+| WAL bytes | calls | statement |
+|--:|--:|---|
+| 1467577 | 2001 | `INSERT INTO "harvest_events" ("workflow_exec_id", "event_id", "event_type", "event_data") VALUES ($1, $2, $3, $4) RETURNING txid_c` |
+| 989881 | 1000 | `UPDATE "harvest_task_queue" SET "state" = $1, "worker_id" = $2, "started_at" = $3, "last_heartbeat_at" = $4, "crash_strikes" = $5,` |
+| 562532 | 1003 | `WITH worker_info AS ( SELECT COALESCE((SELECT labels FROM harvest_workers WHERE worker_id = $1), $7::jsonb) AS labels ), paused_qu` |
+| 358026 | 1000 | `INSERT INTO "harvest_timers" ("workflow_exec_id", "timer_id", "fires_at") VALUES ($1, $2, $3)` |
+| 238235 | 1000 | `UPDATE "harvest_timers" SET "fired" = $1 WHERE ("harvest_timers"."id" = ANY($2))` |
+| 130664 | 1000 | `WITH candidate AS ( SELECT id, wake_requested FROM harvest_task_queue WHERE id = $1 AND task_type = $2 FOR UPDATE ), updated AS ( ` |
+| 96243 | 1000 | `UPDATE harvest_task_queue SET sticky_worker_id = $2, sticky_until = NOW() + $3, sticky_timeout = $3 WHERE id = $1` |
+| 84168 | 1000 | `UPDATE "harvest_task_queue" SET "activity_name" = $1 WHERE ("harvest_task_queue"."id" = $2)` |
+| 54054 | 1001 | `SELECT "harvest_workflow_executions"."state" FROM "harvest_workflow_executions" WHERE ("harvest_workflow_executions"."id" = $1) LI` |
+| 8000 | 2000 | `SELECT "harvest_timers"."id", "harvest_timers"."workflow_exec_id", "harvest_timers"."timer_id", "harvest_timers"."fires_at", "harv` |
+
+### Timer lookups
+
+* 23260 buffers, 2000 calls, 0 rows:
+  `SELECT "harvest_timers"."id", "harvest_timers"."workflow_exec_id", "harvest_timers"."timer_id", "harvest_timers"."fires_at", "harvest_timers"."fired" FROM "harvest_timers" WHERE ((("harvest_timers"."workflow_exec_id" = $1) AND ("harvest_timers"."timer_id" = $2)) AND ("harvest_timers"."fired" = $3)) LIMIT $4`
+* 11639 buffers, 1001 calls, 1000 rows:
+  `SELECT "harvest_timers"."id", "harvest_timers"."workflow_exec_id", "harvest_timers"."timer_id", "harvest_timers"."fires_at", "harvest_timers"."fired" FROM "harvest_timers" WHERE ((("harvest_timers"."workflow_exec_id" = $1) AND ("harvest_timers"."fired" = $2)) AND ("harvest_timers"."fires_at" <= NOW())) ORDER BY "harvest_timers"."fires_at" ASC, "harvest_timers"."timer_id" ASC`
+
+harvest_timers indexes at seed time (bytes): harvest_timers_pkey 44343296, idx_harvest_timers_exec 8650752, idx_harvest_timers_pending 540672
+
+## Run of 2000 timers
+
+state COMPLETED, timer rows 2000, unfired 0, TimerFired events 2000, timer digest `87d1f8e5bd2888694ebe1385a2c87f93`, window 43029 ms
+
+| total buffers | total calls | WAL bytes | temp blocks written |
+|--:|--:|--:|--:|
+| 534871 | 164768 | 7998552 | 0 |
+
+Timer lookups: 108924 buffers (20.4% of buffers), 6001 calls (3.6% of calls), 18.2 buffers per call, 54.5 buffers per timer.
+
+### Top 10 by buffers
+
+| buffers | % | calls | rows | statement |
+|--:|--:|--:|--:|---|
+| 75731 | 14.2 | 4001 | 4001 | `INSERT INTO "harvest_events" ("workflow_exec_id", "event_id", "event_type", "event_data") VALUES ($1, $2, $3, $4) RETURNING txid_c` |
+| 72604 | 13.6 | 4000 | 0 | `SELECT "harvest_timers"."id", "harvest_timers"."workflow_exec_id", "harvest_timers"."timer_id", "harvest_timers"."fires_at", "harv` |
+| 58960 | 11.0 | 2001 | 2001 | `WITH worker_info AS ( SELECT COALESCE((SELECT labels FROM harvest_workers WHERE worker_id = $1), $7::jsonb) AS labels ), paused_qu` |
+| 49269 | 9.2 | 2000 | 2000 | `UPDATE "harvest_task_queue" SET "state" = $1, "worker_id" = $2, "started_at" = $3, "last_heartbeat_at" = $4, "crash_strikes" = $5,` |
+| 36320 | 6.8 | 2001 | 2000 | `SELECT "harvest_timers"."id", "harvest_timers"."workflow_exec_id", "harvest_timers"."timer_id", "harvest_timers"."fires_at", "harv` |
+| 25584 | 4.8 | 2000 | 2000 | `INSERT INTO "harvest_timers" ("workflow_exec_id", "timer_id", "fires_at") VALUES ($1, $2, $3)` |
+| 24958 | 4.7 | 2000 | 2000 | `UPDATE "harvest_timers" SET "fired" = $1 WHERE ("harvest_timers"."id" = ANY($2))` |
+| 22466 | 4.2 | 2000 | 2000 | `UPDATE harvest_task_queue SET sticky_worker_id = $2, sticky_until = NOW() + $3, sticky_timeout = $3 WHERE id = $1` |
+| 22311 | 4.2 | 2000 | 2000 | `UPDATE "harvest_task_queue" SET "activity_name" = $1 WHERE ("harvest_task_queue"."id" = $2)` |
+| 22260 | 4.2 | 2000 | 2000 | `SELECT COALESCE(SUM(pg_column_size(event_data)), $5)::bigint FROM "harvest_events" WHERE ((("harvest_events"."workflow_exec_id" = ` |
+
+### Top 10 by calls
+
+| calls | % | buffers | statement |
+|--:|--:|--:|---|
+| 15555 | 9.4 | 0 | `COMMIT` |
+| 14586 | 8.9 | 0 | `SELECT $1` |
+| 9541 | 5.8 | 0 | `BEGIN` |
+| 6620 | 4.0 | 131 | `SELECT to_regclass($1) IS NOT NULL AS present` |
+| 6014 | 3.6 | 0 | `BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED` |
+| 6014 | 3.6 | 0 | `SET LOCAL enable_bitmapscan = off` |
+| 6014 | 3.6 | 0 | `SET LOCAL enable_sort = off` |
+| 6014 | 3.6 | 0 | `SET LOCAL jit = off` |
+| 6014 | 3.6 | 0 | `SET LOCAL plan_cache_mode = force_generic_plan` |
+| 5592 | 3.4 | 0 | `SELECT current_database()::text AS database, pg_postmaster_start_time() AS started_at, pg_notification_queue_usage() AS queue_usag` |
+
+### Top 10 by WAL bytes
+
+| WAL bytes | calls | statement |
+|--:|--:|---|
+| 2944232 | 4001 | `INSERT INTO "harvest_events" ("workflow_exec_id", "event_id", "event_type", "event_data") VALUES ($1, $2, $3, $4) RETURNING txid_c` |
+| 1993340 | 2000 | `UPDATE "harvest_task_queue" SET "state" = $1, "worker_id" = $2, "started_at" = $3, "last_heartbeat_at" = $4, "crash_strikes" = $5,` |
+| 1126919 | 2001 | `WITH worker_info AS ( SELECT COALESCE((SELECT labels FROM harvest_workers WHERE worker_id = $1), $7::jsonb) AS labels ), paused_qu` |
+| 682389 | 2000 | `INSERT INTO "harvest_timers" ("workflow_exec_id", "timer_id", "fires_at") VALUES ($1, $2, $3)` |
+| 484927 | 2000 | `UPDATE "harvest_timers" SET "fired" = $1 WHERE ("harvest_timers"."id" = ANY($2))` |
+| 263291 | 2000 | `WITH candidate AS ( SELECT id, wake_requested FROM harvest_task_queue WHERE id = $1 AND task_type = $2 FOR UPDATE ), updated AS ( ` |
+| 190195 | 2000 | `UPDATE harvest_task_queue SET sticky_worker_id = $2, sticky_until = NOW() + $3, sticky_timeout = $3 WHERE id = $1` |
+| 166672 | 2000 | `UPDATE "harvest_task_queue" SET "activity_name" = $1 WHERE ("harvest_task_queue"."id" = $2)` |
+| 108054 | 2001 | `SELECT "harvest_workflow_executions"."state" FROM "harvest_workflow_executions" WHERE ("harvest_workflow_executions"."id" = $1) LI` |
+| 16217 | 4000 | `SELECT "harvest_timers"."id", "harvest_timers"."workflow_exec_id", "harvest_timers"."timer_id", "harvest_timers"."fires_at", "harv` |
+
+### Timer lookups
+
+* 72604 buffers, 4000 calls, 0 rows:
+  `SELECT "harvest_timers"."id", "harvest_timers"."workflow_exec_id", "harvest_timers"."timer_id", "harvest_timers"."fires_at", "harvest_timers"."fired" FROM "harvest_timers" WHERE ((("harvest_timers"."workflow_exec_id" = $1) AND ("harvest_timers"."timer_id" = $2)) AND ("harvest_timers"."fired" = $3)) LIMIT $4`
+* 36320 buffers, 2001 calls, 2000 rows:
+  `SELECT "harvest_timers"."id", "harvest_timers"."workflow_exec_id", "harvest_timers"."timer_id", "harvest_timers"."fires_at", "harvest_timers"."fired" FROM "harvest_timers" WHERE ((("harvest_timers"."workflow_exec_id" = $1) AND ("harvest_timers"."fired" = $2)) AND ("harvest_timers"."fires_at" <= NOW())) ORDER BY "harvest_timers"."fires_at" ASC, "harvest_timers"."timer_id" ASC`
+
+harvest_timers indexes at seed time (bytes): harvest_timers_pkey 43196416, idx_harvest_timers_exec 8650752, idx_harvest_timers_pending 540672
+
