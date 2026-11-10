@@ -217,16 +217,7 @@ fn run_cargo_deny(log: &Path) -> Result<u8> {
 
 /// Maps a child exit status to an exit code, as a POSIX shell does.
 fn exit_code(status: ExitStatus) -> u8 {
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::ExitStatusExt;
-        if let Some(signal) = status.signal() {
-            return u8::try_from(128 + signal).unwrap_or(u8::MAX);
-        }
-    }
-    status.code().map_or(1, |code| {
-        u8::try_from(code.rem_euclid(256)).unwrap_or(u8::MAX)
-    })
+    crate::perf::support::status_code(status)
 }
 
 /// Runs `gh` with `args` and returns its stdout.
@@ -398,6 +389,27 @@ fn finding_body(status: u8, run_url: &str, ids: &str, log: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exit_code_passes_through_a_normal_status() {
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("exit 42")
+            .status()
+            .unwrap();
+        assert_eq!(exit_code(status), 42);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exit_code_maps_a_signal_to_128_plus_signal() {
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("kill -9 $$")
+            .status()
+            .unwrap();
+        assert_eq!(exit_code(status), 137);
+    }
 
     const LISTING: &str = r#"[{"number":5,"title":"Other"}]
 [{"number":9,"title":"Advisory scan: cargo deny check advisories failed","pull_request":{}},

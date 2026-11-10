@@ -211,16 +211,7 @@ fn self_failed_body(run_url: &str) -> String {
 
 /// Maps a child exit status to an exit code, as a POSIX shell does.
 fn exit_code(status: ExitStatus) -> u8 {
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::ExitStatusExt;
-        if let Some(signal) = status.signal() {
-            return u8::try_from(128 + signal).unwrap_or(u8::MAX);
-        }
-    }
-    status.code().map_or(1, |code| {
-        u8::try_from(code.rem_euclid(256)).unwrap_or(u8::MAX)
-    })
+    crate::perf::support::status_code(status)
 }
 
 /// Runs `gh` with `args` and returns its stdout.
@@ -341,6 +332,27 @@ fn close_alert(repo: &str, title: &str, comment: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exit_code_passes_through_a_normal_status() {
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("exit 42")
+            .status()
+            .unwrap();
+        assert_eq!(exit_code(status), 42);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exit_code_maps_a_signal_to_128_plus_signal() {
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("kill -9 $$")
+            .status()
+            .unwrap();
+        assert_eq!(exit_code(status), 137);
+    }
 
     #[test]
     fn since_is_48_hours_back_in_utc() {
