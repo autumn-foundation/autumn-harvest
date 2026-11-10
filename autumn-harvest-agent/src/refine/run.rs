@@ -73,12 +73,13 @@ use crate::workflow::WORKFLOW_NAME;
 pub const REFINE_WORKFLOW_NAME: &str = "agent_refine";
 
 /// The patch of the live rule. A run that started before it keeps the old
-/// rule fallback and carries each sequential composition on replay.
+/// fallback rule on replay. It carries each pick and each composition,
+/// whatever its live end. Its inputs hold no live end.
 pub(crate) const LIVE_RULE_PATCH: &str = "agent_refine_live_rule";
 
 /// The note of a stage that the run does not carry, because its live
 /// re-probe failed.
-const LIVE_REFUSED: &str = "the live re-probe failed, so the run keeps the current overlay";
+const LIVE_REFUSED: &str = "the live run did not complete, so the run keeps the current overlay";
 
 /// The most characters of a stage error or a note in the report.
 const MAX_NOTE_CHARS: usize = 500;
@@ -304,9 +305,9 @@ pub enum LiveReprobe {
 }
 
 impl LiveReprobe {
-    /// `true` for a live failure: a fork that ended and did not complete.
-    /// A failed fork or wait is no live failure. It says nothing about the
-    /// overlay.
+    /// `true` for a live failure: a fork that did not complete. It failed,
+    /// ended in another state, or did not end in time. A failed fork or wait
+    /// is no live failure. It says nothing about the overlay.
     #[must_use]
     pub const fn failed(&self) -> bool {
         matches!(self, Self::Ran(end) if !end.completed)
@@ -314,14 +315,12 @@ impl LiveReprobe {
 }
 
 impl From<&LiveReprobe> for LiveCheck {
-    /// The live end with no fork id, no tokens and no cost.
+    /// The live end with no fork id, no tokens, no cost and no host error.
     fn from(live: &LiveReprobe) -> Self {
         match live {
             LiveReprobe::NotNeeded => Self::NotNeeded,
             LiveReprobe::Skipped { .. } => Self::Skipped,
-            LiveReprobe::Failed { error } => Self::NoEnd {
-                error: error.clone(),
-            },
+            LiveReprobe::Failed { .. } => Self::NoEnd,
             LiveReprobe::Ran(end) if end.completed => Self::Completed,
             LiveReprobe::Ran(end) => Self::Failed {
                 error: end.error.clone(),
@@ -440,7 +439,7 @@ pub struct SelectionRecord {
     pub id: Option<AnonId>,
     /// Who made the pick.
     pub by: SelectedBy,
-    /// Why the rule replaced the pick of the installed selector.
+    /// Why the rule picked in place of the selector, or why it picked none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
     /// Why the selector picked the id.
@@ -858,7 +857,7 @@ struct Refine<'a> {
     /// overlay.
     reason: (Option<String>, Option<String>),
     /// `true` when the run took [`LIVE_RULE_PATCH`]. A live failure is then
-    /// out of the fallback pick, and sequential mode does not carry it.
+    /// out of the fallback pick, and neither mode carries it.
     live_rule: bool,
 }
 
@@ -1116,7 +1115,9 @@ impl Refine<'_> {
                 overlay,
                 evaluation: result.evaluation,
                 routes: result.routes,
-                live: Some(result.live),
+                // A run of an older release recorded its inputs with no live
+                // end. A strict replay compares each input.
+                live: self.live_rule.then_some(result.live),
             });
             probed.push(at);
         }
@@ -1177,7 +1178,12 @@ impl Refine<'_> {
             cost_usd_micros: spent.cost_usd_micros,
             note: Some(truncate(
                 &format!(
-                    "the select step failed, so the rule picked: {}",
+                    "the select step failed, so the rule picked{}: {}",
+                    if index.is_none() && !probes.is_empty() {
+                        " none"
+                    } else {
+                        ""
+                    },
                     error_text(err)
                 ),
                 MAX_NOTE_CHARS,
@@ -1749,9 +1755,7 @@ mod tests {
                 LiveReprobe::Failed {
                     error: "the wait failed".to_owned(),
                 },
-                LiveCheck::NoEnd {
-                    error: "the wait failed".to_owned(),
-                },
+                LiveCheck::NoEnd,
             ),
             (LiveReprobe::Ran(live_end(true)), LiveCheck::Completed),
             (

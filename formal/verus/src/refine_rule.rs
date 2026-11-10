@@ -77,8 +77,7 @@ pub open spec fn ruled(s: Seq<(u32, Option<u64>)>) -> Option<(u32, u64)>
     }
 }
 
-/// `w` is at least as good as the entry `e`. A live failure is below every
-/// key.
+/// `w` is at least as good as the entry `e`. `w` beats each live failure.
 pub open spec fn beats(w: (u32, u64), e: (u32, Option<u64>)) -> bool {
     match e.1 {
         None => true,

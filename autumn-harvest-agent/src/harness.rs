@@ -691,6 +691,12 @@ impl AgentHarness {
         !is_builtin_name(name) && self.tools.iter().any(|tool| tool.name() == name)
     }
 
+    /// The name of each named model route of the registry.
+    #[cfg_attr(not(feature = "eval"), allow(dead_code))]
+    pub(crate) fn model_names(&self) -> impl Iterator<Item = &str> {
+        self.models.keys().map(String::as_str)
+    }
+
     /// The model `name`. `None` is the [`DEFAULT_MODEL`].
     ///
     /// # Errors

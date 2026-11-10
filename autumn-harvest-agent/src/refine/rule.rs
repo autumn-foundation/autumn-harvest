@@ -61,8 +61,9 @@ pub(crate) const fn rule_best(entries: &[(u32, Option<u64>)]) -> Option<(u32, u6
     best
 }
 
-/// The position in `entries` of the rule pick. Each entry is a live
-/// failure, a completed replay end and a stubbed call count.
+/// The position in `entries` of the rule pick. Each entry holds three
+/// values: whether it is a live failure, whether its replay completed, and
+/// its stubbed call count.
 pub(crate) fn rule_pick(entries: impl IntoIterator<Item = (bool, bool, u32)>) -> Option<usize> {
     let keyed: Vec<(u32, Option<u64>)> = entries
         .into_iter()
@@ -110,7 +111,10 @@ mod tests {
         /// lowest index.
         #[test]
         fn the_rule_picks_the_lowest_key(
-            entries in prop::collection::vec((any::<bool>(), any::<bool>(), any::<u32>()), 0..12)
+            entries in prop::collection::vec(
+                (any::<bool>(), any::<bool>(), prop_oneof![0u32..4, any::<u32>()]),
+                0..12,
+            )
         ) {
             let model = entries
                 .iter()

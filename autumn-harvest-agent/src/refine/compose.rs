@@ -205,9 +205,12 @@ pub struct Composition {
 ///
 /// The routes are the default route, each overlay model and each route that
 /// a probe asked for. A probe can inherit the route of its source task, or
-/// ask for the route of a recorded peer.
+/// ask for the route of a recorded peer. The routes also hold each named
+/// route of the harness. A live re-probe records no route, and its error
+/// can name a route that the replay never asked for.
 fn identities_of(harness: &AgentHarness, probes: &[ProbedCandidate]) -> Vec<String> {
     let mut routes: BTreeSet<Option<String>> = BTreeSet::from([None]);
+    routes.extend(harness.model_names().map(|name| Some(name.to_owned())));
     let mut identities: Vec<String> = Vec::new();
     for probe in probes {
         identities.push(probe.evaluation.overlay_digest.clone());
@@ -592,7 +595,7 @@ pub struct Selection {
     /// The cost that the selector charged.
     #[serde(default)]
     pub cost_usd_micros: u64,
-    /// Why the rule replaced the pick of the installed selector.
+    /// Why the rule picked in place of the selector, or why it picked none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
     /// Why the selector picked the id. A rule pick has none.

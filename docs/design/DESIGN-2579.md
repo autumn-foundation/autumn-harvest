@@ -28,17 +28,25 @@ end with no identity:
 |---|---|---|
 | `NotNeeded` | `NotNeeded` | no |
 | `Skipped` | `Skipped` | no |
-| `Failed` | `NoEnd { error }` | no |
+| `Failed` | `NoEnd` | no |
 | `Ran`, completed | `Completed` | no |
 | `Ran`, not completed | `Failed { error }` | yes |
 
 `LiveCheck` holds no fork id, no token count and no cost. A price names a
-model. Each error text loses each identity of the pool, as a run end does.
-The pool text shows the live end of each candidate on one line.
+model. `NoEnd` holds no error text. A host error can name the fork id or
+the source run. The pool redacts each identity in the error of `Failed`,
+as it does in a run end. The pool text shows the live end of each
+candidate on one line.
 
-Only a fork that ended and did not complete is a live failure. A fork that
-did not end in time is one. A failed fork or wait is not. It says nothing
-about the overlay, so it counts as an unknown end, as a skip does.
+The identities of the pool now hold each named route of the harness. A
+live run records no route, and its error can name a route that the replay
+never asked for. A host cuts a long error before the pool redacts it. So
+the pool drops the part of a name in front of the cut mark.
+
+A live failure is a fork that did not complete. It failed, ended in
+another state, or did not end in time. A failed fork call or a failed wait
+is not one. It says nothing about the overlay, so it counts as an unknown
+end, as a skip does.
 
 ### The rule order
 
@@ -56,26 +64,31 @@ fallback of the run use the same kernel.
 ### The selector
 
 The selector reads the live end in `SelectContext::report` and in the text.
-A pick of a live failure is refused, as a pick of an id outside the pool
-is. The rule pick then stands, with a note. When each candidate failed live,
-the select step asks no selector. It picks none, with a note.
+`run_select` refuses a pick of a live failure, as it refuses an id outside
+the pool. The rule pick then stands, with a note. When each candidate
+failed live, the select step asks no selector. It picks none, with a
+note.
 
 ### Sequential mode
 
 A composition whose live re-probe failed does not become the current
 overlay. The next step starts from the overlay before it. The stage notes
-say so.
+say so. Parallel mode refuses to carry a pick of a live failure in the same
+way. Only a select step of an older worker can make such a pick.
 
 ### Replay of a run in flight
 
-The rule fallback and the sequential carry run in the workflow. The patch
-`agent_refine_live_rule` gates both. A run that started before the change
-keeps the old rule on replay. The select step is an activity, so its new
-rule needs no patch.
+The fallback rule and the carry of each mode run in the workflow. The
+patch `agent_refine_live_rule` gates them. A run that started before the
+change keeps the old rule on replay.
 
-`ComposeRequest` and `SelectRequest` hold the new field. A worker matches
-an activity by name and not by input, so a run in flight replays. A
-request of an older release decodes with no live end.
+`ComposeRequest::probes` and `SelectRequest::probes` carry
+`ProbedCandidate::live`. The patch gates that field too. A strict replay,
+such as `WorkflowReplayer` or the deploy canary, compares each activity
+input. So a run that started before the change sends the inputs that it
+recorded, with no live end. Its select step then reads no live end, and it
+picks by the old rule. A request of an older release decodes with no live
+end.
 
 ## Brainstorm
 
@@ -103,7 +116,10 @@ Each failure has a guard.
 | Sequential mode carries a live failure. | The carry checks the live end of the probe. |
 | The fallback rule of the run picks a live failure. | `rule_of` uses the same kernel. |
 | A fork error names a model in the pool. | The pool redacts each identity in a live error. |
-| The fork id or the cost reaches the pool. | `LiveCheck` has no such field. |
+| A live error names a route that no replay asked for. | The identities hold each named route of the harness. |
+| A cut error keeps part of a model id. | The pool drops the part of a name before the cut mark. |
+| The fork id or the cost reaches the pool. | `LiveCheck` has no such field. `NoEnd` holds no host error. |
+| A strict replay of a run in flight sees a new input field. | The patch gates `ProbedCandidate::live`. |
 | A flaky fork drops a good overlay. | A failed fork is `NoEnd`, not a live failure. |
 | Each candidate failed live, and the run spends on a selector. | The select step asks no selector when the rule has no pick. |
 | An old run replays with a new decision. | The patch gates the workflow code. |
@@ -129,16 +145,25 @@ Each failure has a guard.
 
 ## Tests
 
-- `refine_run.rs`: a scripted `RefineSources` fails the live re-probe of
-  some overlays.
+- `refine_live.rs`: a scripted `RefineSources` fails the live re-probe of
+  some overlays, or loses their fork.
   - The rule picks another composition, and the selection changes.
-  - A selector pick of a live failure is refused, with a note.
+  - `run_select` refuses a selector pick of a live failure and adds a note.
+    A pick that did not fail live stands.
   - With each composition failed live, the run picks none and asks no
     selector.
+  - A failed select step falls back to the rule, which skips a live
+    failure.
   - Sequential mode keeps the overlay before a live failure.
-  - The composer reads the live end of each candidate.
+  - A lost fork is no live failure, and the pool shows no host error.
+  - The composer reads the live end of each candidate, with each route and
+    model id redacted.
+  - A history with no patch marker and no live end replays strictly.
 - `refine/rule.rs` unit tests and a proptest: the kernel against a model.
 - `eval/anonymise.rs` unit tests: the live line of the text, the redaction
-  of a live error, and the decode of an entry with no live end.
+  of a live error and of a cut name, and the decode of an entry with no
+  live end.
+- `refine/run.rs` unit tests: the map to `LiveCheck`, the fallback rule
+  with and without the patch, and the decode of an old input.
 - `formal/verus/src/refine_rule.rs`: a live failure never wins, the winner
   has the lowest key, and a completed end comes first.
