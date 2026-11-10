@@ -1083,7 +1083,7 @@ async fn a_durable_agent_source_is_refused_before_the_kind_and_end_checks() {
         Composer::default(),
         Model::default(),
     );
-    // An agent of another kind. The kind check would name the wrong cause.
+    // A live agent of another kind.
     let other = autumn_harvest_agent::AgentId::new("billing", "acct-1").unwrap();
     sqlite::send(
         &mut f.rt,
@@ -1102,7 +1102,23 @@ async fn a_durable_agent_source_is_refused_before_the_kind_and_end_checks() {
     )
     .unwrap();
     sqlite::drive(&mut f.rt, &live).await.unwrap();
-    for id in [&other, &live] {
+    // An ended agent of another kind. The kind check would name the wrong
+    // cause.
+    let ended = autumn_harvest_agent::AgentId::new("billing", "acct-3").unwrap();
+    sqlite::send(
+        &mut f.rt,
+        &ended,
+        &autumn_harvest_agent::AgentOp::message("hi"),
+        None,
+    )
+    .unwrap();
+    sqlite::delete(&mut f.rt, &ended, None).unwrap();
+    let state = sqlite::drive(&mut f.rt, &ended).await.unwrap();
+    assert!(
+        matches!(state, Some(RunState::Completed(_) | RunState::Failed(_))),
+        "{state:?}"
+    );
+    for id in [&other, &live, &ended] {
         let run = agent_run(&f.rt, id);
         let input = RefineInput::new(KIND, vec![run], 1, RefineMode::Parallel, 1);
         assert_eq!(

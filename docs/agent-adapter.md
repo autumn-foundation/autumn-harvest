@@ -1537,7 +1537,7 @@ async fn choose(
 | `AnonId` | `eval::anon::assign` gives the ids, as for an evidence bundle. The key of a candidate is `Candidate::digest`. An id is `c-` and a hex prefix of `SHA-256(seed, source run id, Candidate::digest)`. The prefix has at least 12 digits. It grows until no two ids are equal. `formal/verus/src/agent_anonymise.rs` proves the width rule. |
 | The order | The pool lists the ids in order. The input order changes no id and no text. The candidates also run in pool order. |
 | `text` | `AnonymisedPool::render`: the source end, then per id the counts, the end, each scorer verdict, each turn verdict, and each turn decision as JSON. It holds no model name, overlay digest, label or input index. |
-| `pool` | The same content as JSON. Each `AnonymisedEvaluation` keeps every field of `Evaluation` except `overlay_digest` and `candidate_cost_usd_micros` (issue #2380). A price names a model. The recorded end is in the pool once. |
+| `pool` | The same content as JSON. Each `AnonymisedEvaluation` keeps every field of `Evaluation` except `overlay_digest`, `candidate_cost_usd_micros` (issue #2380) and `candidate_calls` (issue #2577). A price or a model id names a model. The recorded end is in the pool once. |
 | `key` | Each id with its `CandidateRef`: the input index, the candidate digest, the overlay digest and the label. Keep it from the reader. `AnonymisedReport` does not implement `Serialize`, and its `Debug` form hides the key. |
 | A failure text | Each run end error, report error and scorer reject reason replaces each label, digest, route and model id of the pool with `[redacted]`. A judge route of a scorer counts as a route. The source end gets the same treatment. Each route that a run asks for counts, with the model id behind it in each harness. So a route that a candidate keeps from the source, such as the model of a recorded peer, counts too. Only a whole name is replaced, so a short route such as `a` also replaces that word. |
 | `Candidate::label` | An operator name, such as an overlay version id. It enters the digest, never the text. |
@@ -3273,8 +3273,8 @@ On Postgres, install `postgres::Sources::new(pg)` and start the workflow
   rollout costs nothing. A probe that stubs a tool call asks for a live
   re-probe with `probe_effects`. The fork applies the overlay under the
   policy ceilings, as the stages do. The fork id comes from the
-  idempotency key of the probe activity, so a retry after a crash waits
-  for the fork of the first attempt and forks nothing. SQLite has no fork,
+  idempotency key of the probe activity. A retry after a crash waits for
+  the fork of the first attempt, and forks nothing. SQLite has no fork,
   so the probe records `live re-probe skipped: SQLite has no fork` in the
   stage notes.
 - **Compose and select.** An `OverlayComposer` reads the probes under

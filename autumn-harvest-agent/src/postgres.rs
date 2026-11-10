@@ -1093,9 +1093,16 @@ impl crate::eval::LiveProbeHost for PostgresAgents {
                 .await
                 .map_err(host)?;
             // A terminated run frees its id, so it is no fork of this key.
-            let Some(run) = found.filter(|run| !matches!(run.state.as_str(), "TERMINATED")) else {
+            let Some(run) = found.filter(|run| run.state != "TERMINATED") else {
                 return Ok(None);
             };
+            // A rebalance moves the fork. The probe then cannot wait for it
+            // here, so it reports the move.
+            if is_migration_copy(&run.state) {
+                return Err(crate::eval::EvalError::Fork(format!(
+                    "the probe fork {fork_id} moved to another shard"
+                )));
+            }
             let history = autumn_harvest::store::load_history_inflated(
                 &mut conn,
                 run.exec_id,
@@ -1104,13 +1111,16 @@ impl crate::eval::LiveProbeHost for PostgresAgents {
             )
             .await
             .map_err(host)?;
-            let (forked_from_exec_id, _effects) =
-                autumn_harvest::fork::fork_marker(&history.events).ok_or_else(|| {
-                    crate::eval::EvalError::Fork(format!(
-                        "the run {} holds the fork id {fork_id}, but it is not a fork",
-                        run.exec_id
-                    ))
-                })?;
+            let marker = autumn_harvest::fork::fork_marker(&history.events);
+            // A probe forks with quiet live effects. Any other run that holds
+            // the id is not a probe fork, so the probe does not wait for it.
+            let Some((forked_from_exec_id, autumn_harvest::fork::ForkEffects::LiveQuiet)) = marker
+            else {
+                return Err(crate::eval::EvalError::Fork(format!(
+                    "the run {} holds the fork id {fork_id}, but it is not a probe fork",
+                    run.exec_id
+                )));
+            };
             Ok(Some(crate::eval::ProbeFork {
                 exec_id: run.exec_id,
                 workflow_id: fork_id,
@@ -1178,6 +1188,41 @@ impl PostgresAgents {
             forked_from_exec_id: fork.forked_from_exec_id,
         })
     }
+}
+
+/// The most suffixes that [`keyed_fork_id`] tries. With `N` shards, a
+/// suffix fits after about `N` tries.
+#[cfg(feature = "eval")]
+const FORK_ID_TRIES: u32 = 10_000;
+
+/// The process shard router that the fork checks, if one is set.
+#[cfg(feature = "eval")]
+fn global_router() -> Option<ShardRouter> {
+    autumn_harvest::shard::GLOBAL_SHARD_ROUTER
+        .read()
+        .ok()
+        .and_then(|guard| guard.as_ref().cloned())
+}
+
+/// The workflow id of the keyed probe fork of `key`, on the source shard
+/// `shard`.
+///
+/// A fork lands on the shard of its source. The fork refuses a chosen id
+/// that `router` sends to another shard, because a by-id call would go
+/// there. So the id takes the first suffix that `router` sends to `shard`.
+/// The result depends only on its inputs, so each retry gets the same id.
+/// With no router, or a shard that takes no new run, it is
+/// `eval::probe_fork_id(key)`.
+#[cfg(feature = "eval")]
+fn keyed_fork_id(key: &str, shard: ShardId, router: Option<&ShardRouter>) -> String {
+    let base = crate::eval::probe_fork_id(key);
+    let Some(router) = router.filter(|router| router.accepts_unpinned(shard)) else {
+        return base;
+    };
+    std::iter::once(base.clone())
+        .chain((1..FORK_ID_TRIES).map(|n| format!("{base}-{n}")))
+        .find(|id| router.pick_for_new_workflow(WORKFLOW_NAME, id) == shard)
+        .unwrap_or(base)
 }
 
 /// How long a live re-probe of a refine run waits for its fork (issue
@@ -1296,6 +1341,12 @@ impl crate::refine::RefineSources for Sources {
             let effects: Vec<_> = request.effects.iter().copied().collect();
             let probe = match request.fork_key {
                 Some(key) => {
+                    let shard = self
+                        .pg
+                        .shard_of(request.source)
+                        .await
+                        .map_err(|err| LiveProbeError::Failed(err.to_string()))?;
+                    let fork_id = keyed_fork_id(key, shard, global_router().as_ref());
                     crate::eval::live_probe_keyed(
                         &self.pg,
                         request.harness,
@@ -1303,7 +1354,7 @@ impl crate::refine::RefineSources for Sources {
                         request.overlay,
                         &effects,
                         Some(request.ceilings),
-                        &crate::eval::probe_fork_id(key),
+                        &fork_id,
                     )
                     .await
                 }
@@ -1388,6 +1439,23 @@ mod tests {
             timer_id: TimerId::new(id),
             duration_secs: 60,
         }
+    }
+
+    #[cfg(feature = "eval")]
+    #[test]
+    fn a_keyed_fork_id_routes_to_the_source_shard_and_is_stable() {
+        let shards: Vec<ShardId> = (0..4).map(ShardId::new).collect();
+        let router = ShardRouter::new(shards.clone(), shards, ShardId::new(0));
+        for shard in (0..4).map(ShardId::new) {
+            for key in ["k-1", "k-2", "k-3"] {
+                let id = keyed_fork_id(key, shard, Some(&router));
+                assert!(id.starts_with(&crate::eval::probe_fork_id(key)), "{id}");
+                assert_eq!(router.pick_for_new_workflow(WORKFLOW_NAME, &id), shard);
+                assert_eq!(id, keyed_fork_id(key, shard, Some(&router)), "a retry");
+            }
+        }
+        let alone = keyed_fork_id("k-1", ShardId::new(0), None);
+        assert_eq!(alone, crate::eval::probe_fork_id("k-1"));
     }
 
     #[test]

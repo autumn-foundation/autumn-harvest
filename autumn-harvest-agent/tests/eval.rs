@@ -3023,6 +3023,30 @@ async fn each_candidate_turn_names_its_model_and_spend() {
     assert_eq!(decoded.candidate_calls, Vec::new());
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn a_routed_turn_names_the_model_of_its_route() {
+    let source = one_lookup().await;
+    // The default model must not answer. The route answers each turn.
+    let (harness, _) = candidate(ScriptedModel::named("model-default", Vec::new()));
+    let routed = ScriptedModel::named(
+        "model-routed",
+        vec![
+            calls(&[("c1", "lookup", json!({"q": "x"}))], 5),
+            answer("done", 7),
+        ],
+    );
+    let harness = harness.model_named("fast", routed);
+    let evaluation = evaluate(&source, &Candidate::new(harness).model("fast"))
+        .await
+        .unwrap();
+    let models: Vec<_> = evaluation
+        .candidate_calls
+        .iter()
+        .map(|call| call.model_id.as_deref())
+        .collect();
+    assert_eq!(models, [Some("model-routed"), Some("model-routed")]);
+}
+
 // ── Scored evaluations (issue #2447) ────────────────────────────────────────
 
 /// The golden JSON of an evaluation with no scorer. The code from before

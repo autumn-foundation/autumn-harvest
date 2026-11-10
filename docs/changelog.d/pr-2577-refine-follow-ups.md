@@ -21,16 +21,32 @@ Four limits of the `agent_refine` workflow of issue #2380. The design is in
   id, the tokens and the cost of each candidate turn that called a model.
   A probe writes one cost ledger row for each, in place of one row under
   the unknown model id. The anonymised pool leaves the field out.
-- **A replaced attempt.** The design states why its spend cannot reach the
-  refine ledger: a retry writes no event, a retry reads only the error
-  text of the attempt before it, a heartbeat can lose to the requeue, and
-  a crash reports nothing.
+- **The id of a keyed fork.** A sharded router can send `agent-probe-<key>`
+  to another shard. The Postgres host then adds the first suffix that the
+  router sends to the source shard.
+- **The call cap.** A probe with more than 256 turns writes one row for
+  each model, so the rows still hold the whole spend.
+- **A replaced attempt.** The design states why the refine ledger cannot
+  hold its spend exactly. A retry of a regular activity writes no event.
+  A retry reads only the error text of the attempt before it. A heartbeat
+  can lose to the requeue. A crash gives no failure details.
+
+**API notes.** `LiveRequest` gets the field `fork_key`, and `Evaluation`
+gets `candidate_calls`. A struct literal of either type needs the new
+field. `EvalError` gets `ForkIdInUse`. The new `LiveProbeHost` methods
+have defaults.
 
 No new `WorkflowEvent` variant, no migration, and no history change. An
 `Evaluation` recorded before this change decodes with no turn spend.
 
-Tests: `refine_run.rs` (an `agent` source of another kind and a live one;
-each probe row names its model; each probe attempt passes the same key),
-`live_probe_postgres.rs` (a probe killed during the wait, then a retry,
-makes one fork), `eval.rs` (the turn spend sums to the candidate spend)
-and the unit tests of `eval/probe.rs` (reuse, the race, a foreign fork).
+Tests:
+
+- `refine_run.rs`: three `agent` sources are refused (live of another
+  kind, ended of another kind, live of the kind). Each probe row names its
+  model. Each probe attempt passes the same key.
+- `live_probe_postgres.rs`: a probe killed during the wait, then a retry,
+  makes one fork.
+- `eval.rs`: each turn names its model, and a routed turn names its route.
+- Unit tests: `eval/probe.rs` (reuse, the race, a foreign fork),
+  `refine/run.rs` (the call cap) and `postgres.rs` (a fork id on the
+  source shard).
