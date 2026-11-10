@@ -93,6 +93,12 @@ impl UpdateRegistry {
             .or_insert(UpdateEntry { validator, handler });
     }
 
+    /// Returns `true` if no handler is registered.
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
     /// Returns `true` if a handler is registered under `name`.
     #[must_use]
     pub fn contains(&self, name: &str) -> bool {
