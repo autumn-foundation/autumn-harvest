@@ -114,8 +114,11 @@ pub trait LiveProbeHost {
         input: Value,
     ) -> BoxFuture<'_, Result<ProbeFork, EvalError>>;
 
-    /// The run that holds the workflow id `fork_id` on the shard of
-    /// `source`, or `None`. A terminated run holds no id.
+    /// The probe fork of `source` for `key`, or `None`. A terminated run
+    /// is no fork of the key.
+    ///
+    /// The host maps a key to a workflow id. Use the same map as
+    /// [`Self::fork_live_as`], so a retry finds the fork of its first call.
     ///
     /// The default has no fork.
     ///
@@ -126,27 +129,28 @@ pub trait LiveProbeHost {
     fn find_fork(
         &self,
         source: ExecutionId,
-        fork_id: &str,
+        key: &str,
     ) -> BoxFuture<'_, Result<Option<ProbeFork>, EvalError>> {
-        let _ = (source, fork_id);
+        let _ = (source, key);
         Box::pin(std::future::ready(Err(EvalError::Unsupported("this host"))))
     }
 
-    /// [`Self::fork_live`] under the workflow id `fork_id`.
+    /// [`Self::fork_live`] under a workflow id of `key`. Start the id with
+    /// [`probe_fork_id`] of `key`.
     ///
     /// The default has no fork.
     ///
     /// # Errors
     ///
     /// The errors of [`Self::fork_live`], and [`EvalError::ForkIdInUse`]
-    /// when another run holds `fork_id`.
+    /// when another run holds the id.
     fn fork_live_as(
         &self,
         source: ExecutionId,
         input: Value,
-        fork_id: &str,
+        key: &str,
     ) -> BoxFuture<'_, Result<ProbeFork, EvalError>> {
-        let _ = (source, input, fork_id);
+        let _ = (source, input, key);
         Box::pin(std::future::ready(Err(EvalError::Unsupported("this host"))))
     }
 }
@@ -226,13 +230,13 @@ pub async fn live_probe_with<H: LiveProbeHost + ?Sized>(
     Ok(LiveProbe::of(fork, effects, overlay))
 }
 
-/// [`live_probe_with`] under the workflow id `fork_id`. A second call with
-/// the same id finds the first fork, and forks nothing.
+/// [`live_probe_with`] with a fork of `key`. A second call with the same
+/// key finds the first fork, and forks nothing.
 ///
-/// Pass [`probe_fork_id`] of a key that stays the same over the retries of
-/// the caller. A crash during the wait for the fork then costs no second
-/// fork. The id is held until the fork is terminated, so a fork that ended
-/// is found too.
+/// Pass a key that stays the same over the retries of the caller, such as
+/// the idempotency key of its activity. A crash during the wait for the
+/// fork then costs no second fork. A fork holds its id until it is
+/// terminated, so a fork that ended is found too.
 ///
 /// The function looks for the fork first. A found fork skips the source
 /// read and the overlay checks, because the call that made it passed them.
@@ -242,7 +246,7 @@ pub async fn live_probe_with<H: LiveProbeHost + ?Sized>(
 /// # Errors
 ///
 /// The errors of [`live_probe`]. [`EvalError::Fork`] when a run of another
-/// source holds `fork_id`.
+/// source holds the id.
 #[allow(clippy::future_not_send)]
 pub async fn live_probe_keyed<H: LiveProbeHost + ?Sized>(
     host: &H,
@@ -251,21 +255,19 @@ pub async fn live_probe_keyed<H: LiveProbeHost + ?Sized>(
     overlay: &ProfileOverlay,
     allowed: &[ToolEffect],
     ceilings: Option<&Ceilings>,
-    fork_id: &str,
+    key: &str,
 ) -> Result<LiveProbe, EvalError> {
     let effects: BTreeSet<ToolEffect> = allowed.iter().copied().collect();
-    if let Some(fork) = host.find_fork(source, fork_id).await? {
+    if let Some(fork) = host.find_fork(source, key).await? {
         return of_source(fork, source).map(|fork| LiveProbe::of(fork, effects, overlay));
     }
     let input = probe_input(host, harness, source, overlay, &effects, ceilings).await?;
-    let fork = match host.fork_live_as(source, input, fork_id).await {
-        Err(EvalError::ForkIdInUse(_)) => {
-            host.find_fork(source, fork_id).await?.ok_or_else(|| {
-                EvalError::Fork(format!(
-                    "the fork id {fork_id} is in use, but no run on the source shard holds it"
-                ))
-            })?
-        }
+    let fork = match host.fork_live_as(source, input, key).await {
+        Err(EvalError::ForkIdInUse(id)) => host.find_fork(source, key).await?.ok_or_else(|| {
+            EvalError::Fork(format!(
+                "the fork id {id} is in use, but no fork of the key holds it"
+            ))
+        })?,
         other => other?,
     };
     of_source(fork, source).map(|fork| LiveProbe::of(fork, effects, overlay))
@@ -410,14 +412,15 @@ mod tests {
             }
         }
 
-        /// Hold `fork_id` with a fork of `source`, as an earlier attempt did.
-        fn hold(&self, fork_id: &str, source: ExecutionId) -> ExecutionId {
+        /// Hold the id of `key` with a fork of `source`, as an earlier
+        /// attempt did.
+        fn hold(&self, key: &str, source: ExecutionId) -> ExecutionId {
             let exec_id = ExecutionId::new();
             self.held.lock().unwrap().push((
-                fork_id.to_owned(),
+                probe_fork_id(key),
                 ProbeFork {
                     exec_id,
-                    workflow_id: fork_id.to_owned(),
+                    workflow_id: probe_fork_id(key),
                     forked_from_exec_id: source,
                 },
             ));
@@ -456,15 +459,16 @@ mod tests {
         fn find_fork(
             &self,
             _source: ExecutionId,
-            fork_id: &str,
+            key: &str,
         ) -> BoxFuture<'_, Result<Option<ProbeFork>, EvalError>> {
+            let fork_id = probe_fork_id(key);
             let hidden = std::mem::take(&mut *self.race.lock().unwrap());
             let found = self
                 .held
                 .lock()
                 .unwrap()
                 .iter()
-                .find(|(id, _)| id == fork_id && !hidden)
+                .find(|(id, _)| *id == fork_id && !hidden)
                 .map(|(_, fork)| fork.clone());
             Box::pin(async move { Ok(found) })
         }
@@ -473,22 +477,23 @@ mod tests {
             &self,
             source: ExecutionId,
             input: Value,
-            fork_id: &str,
+            key: &str,
         ) -> BoxFuture<'_, Result<ProbeFork, EvalError>> {
+            let fork_id = probe_fork_id(key);
             let held = self
                 .held
                 .lock()
                 .unwrap()
                 .iter()
-                .any(|(id, _)| id == fork_id);
+                .any(|(id, _)| *id == fork_id);
             let result = if held {
-                Err(EvalError::ForkIdInUse(fork_id.to_owned()))
+                Err(EvalError::ForkIdInUse(fork_id))
             } else {
                 self.forks.lock().unwrap().push(input);
-                let exec_id = self.hold(fork_id, source);
+                let exec_id = self.hold(key, source);
                 Ok(ProbeFork {
                     exec_id,
-                    workflow_id: fork_id.to_owned(),
+                    workflow_id: fork_id,
                     forked_from_exec_id: source,
                 })
             };
@@ -650,11 +655,11 @@ mod tests {
         assert_eq!(host.forks(), Vec::<Value>::new());
     }
 
-    /// A keyed probe of `source` with the fork id `fork_id`.
+    /// A keyed probe of `source` with `key`.
     async fn keyed(
         host: &FakeHost,
         source: ExecutionId,
-        fork_id: &str,
+        key: &str,
     ) -> Result<LiveProbe, EvalError> {
         live_probe_keyed(
             host,
@@ -663,7 +668,7 @@ mod tests {
             &system("new"),
             &[ToolEffect::ReadOnly],
             None,
-            fork_id,
+            key,
         )
         .await
     }
@@ -673,7 +678,7 @@ mod tests {
         let host = FakeHost::new(serde_json::to_value(AgentTask::new("hi")).unwrap());
         let source = ExecutionId::new();
         let first = keyed(&host, source, "probe-k").await.unwrap();
-        assert_eq!(first.workflow_id, "probe-k");
+        assert_eq!(first.workflow_id, probe_fork_id("probe-k"));
         assert_eq!(first.forked_from_exec_id, source);
         // A retry with the same key finds the first fork.
         let again = keyed(&host, source, "probe-k").await.unwrap();

@@ -49,7 +49,16 @@ source shard:
 The id is `agent-probe-<key>`. A fork lands on the source shard, and the
 engine refuses a chosen id that the router sends to another shard. So the
 Postgres host adds the first suffix `-<n>` that the router sends to the
-source shard. The router is the same for each retry, so the id is too.
+source shard. The host maps the key to the id, in `find_fork` and in
+`fork_live_as` alike. The id stays the same while the writable shards stay
+the same.
+
+A change of the writable shards between a crash and its retry can give
+the retry another id. The retry then forks a second time. A drain during
+one probe is an operator action, and the second fork runs only
+`probe_effects`. A lookup that is free of the router needs a prefix scan of
+`harvest_workflow_executions`, a hot table, on each probe. That cost is too
+high for this case.
 
 A fork id is held while its run is not terminated, so a completed or a
 cancelled fork is found too. Its retry reads its end and starts no second
@@ -134,6 +143,7 @@ guard.
 | A per-turn row sums to a value other than the probe. | `candidate_usage` is the sum of `candidate_calls`. A test compares the rows with the model calls. |
 | A long probe passes the ledger call cap. | Past the cap, the probe writes one row for each model. |
 | A sharded router sends the fork id to another shard. | The host adds a suffix that the router sends to the source shard. |
+| The writable shards change between a crash and its retry. | Not guarded. The retry can fork again. The design states why. |
 | A model id leaks into the pool. | `anonymise` names `candidate_calls` an identity and drops it. |
 | A bad model id fails the ledger write. | `Charge::ledger_call` records it under the unknown model id. |
 | An evaluation of an older release has no turns. | `candidate_calls` decodes with none. |

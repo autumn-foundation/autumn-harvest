@@ -1079,16 +1079,15 @@ impl crate::eval::LiveProbeHost for PostgresAgents {
     fn find_fork(
         &self,
         source: ExecutionId,
-        fork_id: &str,
+        key: &str,
     ) -> BoxFuture<'_, Result<Option<crate::eval::ProbeFork>, crate::eval::EvalError>> {
-        let fork_id = fork_id.to_owned();
+        let key = key.to_owned();
         Box::pin(async move {
             let host = |err: HarvestError| crate::eval::EvalError::Fork(err.to_string());
             // A fork lands on the shard of its source.
-            let mut conn = self
-                .conn(self.shard_of(source).await.map_err(host)?)
-                .await
-                .map_err(host)?;
+            let shard = self.shard_of(source).await.map_err(host)?;
+            let fork_id = keyed_fork_id(&key, shard, global_router().as_ref());
+            let mut conn = self.conn(shard).await.map_err(host)?;
             let found = resolve_execution_id_by_workflow_id(&mut conn, WORKFLOW_NAME, &fork_id)
                 .await
                 .map_err(host)?;
@@ -1133,9 +1132,17 @@ impl crate::eval::LiveProbeHost for PostgresAgents {
         &self,
         source: ExecutionId,
         input: Value,
-        fork_id: &str,
+        key: &str,
     ) -> BoxFuture<'_, Result<crate::eval::ProbeFork, crate::eval::EvalError>> {
-        Box::pin(self.probe_fork(source, input, Some(fork_id.to_owned())))
+        let key = key.to_owned();
+        Box::pin(async move {
+            let shard = self
+                .shard_of(source)
+                .await
+                .map_err(|err| crate::eval::EvalError::Fork(err.to_string()))?;
+            let fork_id = keyed_fork_id(&key, shard, global_router().as_ref());
+            self.probe_fork(source, input, Some(fork_id)).await
+        })
     }
 }
 
@@ -1210,9 +1217,9 @@ fn global_router() -> Option<ShardRouter> {
 /// A fork lands on the shard of its source. The fork refuses a chosen id
 /// that `router` sends to another shard, because a by-id call would go
 /// there. So the id takes the first suffix that `router` sends to `shard`.
-/// The result depends only on its inputs, so each retry gets the same id.
-/// With no router, or a shard that takes no new run, it is
-/// `eval::probe_fork_id(key)`.
+/// The result depends only on its inputs, so each retry gets the same id
+/// while the writable shards stay the same. With no router, or a shard that
+/// takes no new run, it is `eval::probe_fork_id(key)`.
 #[cfg(feature = "eval")]
 fn keyed_fork_id(key: &str, shard: ShardId, router: Option<&ShardRouter>) -> String {
     let base = crate::eval::probe_fork_id(key);
@@ -1341,12 +1348,6 @@ impl crate::refine::RefineSources for Sources {
             let effects: Vec<_> = request.effects.iter().copied().collect();
             let probe = match request.fork_key {
                 Some(key) => {
-                    let shard = self
-                        .pg
-                        .shard_of(request.source)
-                        .await
-                        .map_err(|err| LiveProbeError::Failed(err.to_string()))?;
-                    let fork_id = keyed_fork_id(key, shard, global_router().as_ref());
                     crate::eval::live_probe_keyed(
                         &self.pg,
                         request.harness,
@@ -1354,7 +1355,7 @@ impl crate::refine::RefineSources for Sources {
                         request.overlay,
                         &effects,
                         Some(request.ceilings),
-                        &fork_id,
+                        key,
                     )
                     .await
                 }
