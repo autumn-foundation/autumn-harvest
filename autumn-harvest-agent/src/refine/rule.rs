@@ -106,9 +106,9 @@ mod tests {
     }
 
     proptest! {
-        /// The kernel picks what a plain model of the rule picks: no live
-        /// failure, then a completed end, then the fewest stubs, then the
-        /// lowest index.
+        /// The kernel picks what a plain model of the rule picks. The model
+        /// skips each live failure. It then takes a completed end, then the
+        /// fewest stubs, then the lowest index.
         #[test]
         fn the_rule_picks_the_lowest_key(
             entries in prop::collection::vec(
