@@ -189,7 +189,7 @@ mod tests {
         let p = profile(&report, Schedule::Earliest);
         assert_eq!(p.peak(), 0);
         assert_eq!(p.peak_at(), None);
-        assert!(p.segments.is_empty());
+        assert_eq!(p.segments, Vec::new());
     }
 
     #[test]
