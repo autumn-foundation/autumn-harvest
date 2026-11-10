@@ -1,4 +1,4 @@
-## Refactor — one base constructor for `WorkflowContext` (issue #2586)
+## Refactor — one base constructor for `WorkflowContext` (issue #2586, PR #2642)
 
 `WorkflowContext::fresh` holds the one full struct literal of the context.
 `for_replay_with_state_and_history_policy`, `new_for_handler` and
