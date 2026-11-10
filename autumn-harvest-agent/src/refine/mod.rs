@@ -15,6 +15,8 @@
 //! design is in `docs/design/DESIGN-2381.md`.
 //! [`lessons`] keeps a lesson for each adoption. Its design is in
 //! `docs/design/DESIGN-2382.md`.
+//! The rule pick of a round never takes a candidate that failed its live
+//! re-probe.
 
 pub mod adopt;
 pub mod bundle;
@@ -29,6 +31,8 @@ pub mod policy;
 pub mod policy_read;
 pub mod prompts;
 pub mod propose;
+#[cfg(feature = "eval")]
+mod rule;
 #[cfg(feature = "eval")]
 pub mod run;
 pub mod sources;

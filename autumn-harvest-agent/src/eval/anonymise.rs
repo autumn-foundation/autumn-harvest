@@ -24,7 +24,7 @@
 //! A failure text comes from the harness or the provider, so it can name a
 //! model. Each run end error and each report error replaces every identity
 //! of every candidate in the pool with [`REDACTED`]. The source end gets the
-//! same treatment. The routes include each route that a run asked for, such
+//! same treatment, and so does the error of a [`LiveCheck`]. The routes include each route that a run asked for, such
 //! as the model of a recorded peer. An identity is a label,
 //! a digest, a route or a model id. Only a whole name is replaced. A name
 //! ends at a character that is not a letter, a digit, `-` or `_`. So a
@@ -114,6 +114,62 @@ pub struct AnonymisedEvaluation {
     /// leaves out the cost, because a price names a model.
     #[serde(default, skip_serializing_if = "is_no_usage")]
     pub candidate_usage: TokenUsage,
+    /// The live re-probe of the candidate, with each error redacted. `None`
+    /// when no live re-probe was asked for, such as in
+    /// [`compare_anonymised`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live: Option<LiveCheck>,
+}
+
+/// The live re-probe of one candidate, with no identity.
+///
+/// A refine run re-probes a candidate live on a fork when its replay probe
+/// stubs a tool call. This type holds no fork id, no token count and no
+/// cost. A price names a model.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "live", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum LiveCheck {
+    /// The replay probe stubbed no tool call, so no live run was needed.
+    NotNeeded,
+    /// The backend has no fork, so the live run did not start.
+    Skipped,
+    /// The fork or its wait failed, so the live run gave no end. This
+    /// says nothing about the candidate.
+    NoEnd {
+        /// The error.
+        error: String,
+    },
+    /// The live run completed.
+    Completed,
+    /// The live run ended and did not complete. This is a live failure.
+    Failed {
+        /// The error of the run, if any.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+}
+
+impl LiveCheck {
+    /// `true` for a live failure: a live run that ended and did not
+    /// complete. A refine run never picks such a candidate.
+    #[must_use]
+    pub const fn failed(&self) -> bool {
+        matches!(self, Self::Failed { .. })
+    }
+
+    /// `self` with each identity of `scrub` replaced in its error.
+    fn scrubbed(self, scrub: &Scrub) -> Self {
+        match self {
+            Self::NoEnd { error } => Self::NoEnd {
+                error: redact(&error, &scrub.identities),
+            },
+            Self::Failed { error } => Self::Failed {
+                error: error.map(|error| redact(&error, &scrub.identities)),
+            },
+            other => other,
+        }
+    }
 }
 
 /// Whether `usage` is empty, so an entry leaves it out.
@@ -252,13 +308,14 @@ pub async fn compare_anonymised(
 }
 
 /// The pool of recorded `entries` under their ids, in id order (issue
-/// #2380). No candidate runs again.
+/// #2380). No candidate runs again. Each entry holds its live re-probe, if
+/// any.
 ///
 /// `identities` are the names to redact from each failure text, such as
 /// the overlay digests and the model names of the pool.
 pub fn recorded_pool(
     recorded: RunEnd,
-    mut entries: Vec<(AnonId, Evaluation)>,
+    mut entries: Vec<(AnonId, Evaluation, Option<LiveCheck>)>,
     mut identities: Vec<String>,
 ) -> AnonymisedPool {
     identities.retain(|name| !name.is_empty());
@@ -273,7 +330,10 @@ pub fn recorded_pool(
         recorded: scrub_end(recorded, &scrub),
         candidates: entries
             .into_iter()
-            .map(|(id, evaluation)| anonymise(evaluation, id, &scrub))
+            .map(|(id, evaluation, live)| AnonymisedEvaluation {
+                live: live.map(|live| live.scrubbed(&scrub)),
+                ..anonymise(evaluation, id, &scrub)
+            })
             .collect(),
     }
 }
@@ -340,6 +400,7 @@ fn anonymise(evaluation: Evaluation, id: AnonId, scrub: &Scrub) -> AnonymisedEva
         candidate_verdict: candidate_verdict.map(|verdict| scrub_verdict(verdict, scrub)),
         scorer_usage,
         candidate_usage,
+        live: None,
     }
 }
 
@@ -472,6 +533,9 @@ fn render_entry(out: &mut String, entry: &AnonymisedEvaluation) -> fmt::Result {
     writeln!(out, "- Tool calls replayed: {}", entry.replayed_tool_calls)?;
     writeln!(out, "- Tool calls stubbed: {}", entry.stubbed_tool_calls)?;
     writeln!(out, "- End: {}", end_text(&entry.end))?;
+    if let Some(live) = &entry.live {
+        writeln!(out, "- Live re-probe: {}", live_text(live))?;
+    }
     if let Some(verdict) = &entry.recorded_verdict {
         writeln!(out, "- Source verdict: {}", score_text(verdict))?;
     }
@@ -488,6 +552,19 @@ fn render_entry(out: &mut String, entry: &AnonymisedEvaluation) -> fmt::Result {
         )?;
     }
     Ok(())
+}
+
+/// One live re-probe in words. An error is JSON, so a newline in it cannot
+/// break the layout.
+fn live_text(live: &LiveCheck) -> String {
+    match live {
+        LiveCheck::NotNeeded => "not needed".to_owned(),
+        LiveCheck::Skipped => "skipped, no fork".to_owned(),
+        LiveCheck::NoEnd { error } => format!("no end, error {}", json(error)),
+        LiveCheck::Completed => "completed".to_owned(),
+        LiveCheck::Failed { error: None } => "failed".to_owned(),
+        LiveCheck::Failed { error: Some(error) } => format!("failed, error {}", json(error)),
+    }
 }
 
 const fn yes_no(flag: bool) -> &'static str {
@@ -687,6 +764,115 @@ mod tests {
         };
         assert_eq!(report.delegations[0].run_id, None);
         assert_eq!(report.delegations[0].idempotency_key, None);
+    }
+
+    /// A probe that failed with `error`.
+    fn failed_probe(error: &str) -> Evaluation {
+        serde_json::from_value(serde_json::json!({
+            "turns": [],
+            "first_divergence": null,
+            "recorded": {"end": "failed", "detail": "x"},
+            "candidate": {"end": "failed", "detail": error},
+            "end_diverged": false,
+            "replayed_tool_calls": 0,
+            "stubbed_tool_calls": 1,
+            "turn_cap_reached": false,
+            "overlay_digest": "sha256:d1",
+        }))
+        .expect("an evaluation")
+    }
+
+    fn id(text: &str) -> AnonId {
+        serde_json::from_value(serde_json::json!(text)).expect("an id")
+    }
+
+    #[test]
+    fn a_live_end_is_redacted_and_shown_on_one_line() {
+        let pool = recorded_pool(
+            RunEnd::Failed("x".into()),
+            vec![
+                (
+                    id("c-000000000002"),
+                    failed_probe("e"),
+                    Some(LiveCheck::Failed {
+                        error: Some("m-1 refused\nthe call".into()),
+                    }),
+                ),
+                (
+                    id("c-000000000001"),
+                    failed_probe("e"),
+                    Some(LiveCheck::NoEnd {
+                        error: "the fork of m-1 failed".into(),
+                    }),
+                ),
+                (id("c-000000000003"), failed_probe("e"), None),
+            ],
+            vec!["m-1".to_owned()],
+        );
+        let lives: Vec<Option<LiveCheck>> = pool
+            .candidates
+            .iter()
+            .map(|entry| entry.live.clone())
+            .collect();
+        assert_eq!(
+            lives,
+            [
+                Some(LiveCheck::NoEnd {
+                    error: "the fork of [redacted] failed".into(),
+                }),
+                Some(LiveCheck::Failed {
+                    error: Some("[redacted] refused\nthe call".into()),
+                }),
+                None,
+            ]
+        );
+        let text = pool.render();
+        assert!(
+            text.contains("- Live re-probe: no end, error \"the fork of [redacted] failed\"\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("- Live re-probe: failed, error \"[redacted] refused\\nthe call\"\n"),
+            "{text}"
+        );
+        assert!(!text.contains("m-1"), "{text}");
+        assert_eq!(
+            text.matches("Live re-probe").count(),
+            2,
+            "an entry with no live end has no line"
+        );
+    }
+
+    #[test]
+    fn each_live_end_has_words() {
+        assert_eq!(live_text(&LiveCheck::NotNeeded), "not needed");
+        assert_eq!(live_text(&LiveCheck::Skipped), "skipped, no fork");
+        assert_eq!(live_text(&LiveCheck::Completed), "completed");
+        assert_eq!(live_text(&LiveCheck::Failed { error: None }), "failed");
+        assert!(LiveCheck::Failed { error: None }.failed());
+        for other in [
+            LiveCheck::NotNeeded,
+            LiveCheck::Skipped,
+            LiveCheck::Completed,
+            LiveCheck::NoEnd { error: "x".into() },
+        ] {
+            assert!(!other.failed(), "{other:?}");
+        }
+    }
+
+    #[test]
+    fn an_entry_with_no_live_end_decodes() {
+        let pool = recorded_pool(
+            RunEnd::Failed("x".into()),
+            vec![(id("c-000000000001"), failed_probe("e"), None)],
+            Vec::new(),
+        );
+        let value = serde_json::to_value(&pool.candidates[0]).expect("json");
+        assert!(value.get("live").is_none(), "{value}");
+        let read: AnonymisedEvaluation = serde_json::from_value(value).expect("decode");
+        assert_eq!(read.live, None);
+        let live = serde_json::to_value(LiveCheck::Failed { error: None }).expect("json");
+        assert_eq!(live, serde_json::json!({"live": "failed"}));
     }
 
     /// A copy of `digests` in an order that `shuffle` picks.

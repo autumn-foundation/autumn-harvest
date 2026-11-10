@@ -73,7 +73,8 @@ pub struct RefineInput {
 4. One probe for each candidate composition.
 5. `agent_refine_select` picks one composition by its opaque id. The
    selector reads the overlays and the pool under those ids. With no
-   candidate, the source keeps the current overlay.
+   candidate, the source keeps the current overlay. The pick is never a
+   live failure (#2579).
 
 The stages of one round are independent. The workflow still runs them
 one after another, so the history order is fixed and the budget check
@@ -81,7 +82,8 @@ runs between any two steps.
 
 **Sequential mode.** For each source, k steps. Each step runs INV, DOM,
 their probes, one composition over those two probes, and its probe. A
-candidate composition becomes the current overlay of the next step.
+candidate composition becomes the current overlay of the next step. A
+composition that failed its live re-probe does not (#2579).
 
 ### The probe
 
@@ -93,7 +95,8 @@ forks the source and waits for the fork. The fork id comes from the
 idempotency key of the probe activity, so a retry finds the fork of the
 first attempt and forks nothing (#2577). The SQLite host has no fork. The
 probe then records `LiveReprobe::Skipped` with the reason, and the stage
-notes say so.
+notes say so. The composer, the selector and the rule read the live end of
+each probe. [`DESIGN-2579.md`](DESIGN-2579.md) gives the rule.
 
 ### The budget identity
 

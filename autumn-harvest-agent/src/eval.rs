@@ -171,7 +171,8 @@ mod anonymise;
 
 pub(crate) use anonymise::recorded_pool;
 pub use anonymise::{
-    AnonymisedEvaluation, AnonymisedPool, AnonymisedReport, CandidateRef, compare_anonymised,
+    AnonymisedEvaluation, AnonymisedPool, AnonymisedReport, CandidateRef, LiveCheck,
+    compare_anonymised,
 };
 
 use crate::workflow::{

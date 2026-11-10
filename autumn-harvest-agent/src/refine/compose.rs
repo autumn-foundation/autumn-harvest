@@ -29,12 +29,13 @@ use super::propose::{
     Ask, Edit, ProposalAttempts, ProposerReply, StageOutcome, edit_stage, record_calls,
     spent_failure,
 };
+use super::run::LiveReprobe;
 use crate::agent::AgentProfile;
 use crate::agent::overlay::{Ceilings, ProfileOverlay};
 use crate::error::AgentError;
 use crate::eval::anon::AnonId;
 use crate::eval::evidence::{EvidenceWorkspace, candidate_ids, write_bundle};
-use crate::eval::{AnonymisedPool, Evaluation, RunEnd, recorded_end, recorded_pool};
+use crate::eval::{AnonymisedPool, Evaluation, LiveCheck, RunEnd, recorded_end, recorded_pool};
 use crate::harness::{AgentHarness, truncate};
 use crate::message::TokenUsage;
 use crate::model::BoxFuture;
@@ -147,6 +148,11 @@ pub struct ProbedCandidate {
     /// each one. An input recorded before this field decodes with none.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub routes: BTreeSet<String>,
+    /// The live re-probe of the probe. The pool shows it, and the rule
+    /// never picks a live failure. An input recorded before this field
+    /// decodes with none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live: Option<LiveReprobe>,
 }
 
 /// The input of [`agent_refine_compose`].
@@ -235,11 +241,14 @@ fn pool_of(
     let ids = candidate_ids(seed, events, &evaluations);
     let identities = identities_of(harness, probes);
     let recorded = recorded_end(events).map_err(|err| err.to_string())?;
-    let pool = recorded_pool(
-        recorded,
-        ids.iter().cloned().zip(evaluations).collect(),
-        identities,
-    );
+    let entries = ids
+        .iter()
+        .cloned()
+        .zip(evaluations)
+        .zip(probes)
+        .map(|((id, evaluation), probe)| (id, evaluation, probe.live.as_ref().map(LiveCheck::from)))
+        .collect();
+    let pool = recorded_pool(recorded, entries, identities);
     let mut candidates: Vec<ComposeCandidate> = ids
         .into_iter()
         .zip(probes)
@@ -464,13 +473,18 @@ impl<'a> SelectContext<'a> {
 
 /// A selector of one composition.
 ///
-/// It returns the id of the pick. In four cases, the rule of
+/// It returns the id of the pick. In five cases, the rule of
 /// [`SelectedBy::Rule`] picks in its place:
 ///
 /// - no selector is installed;
 /// - the selector names an id outside the pool;
+/// - it names a candidate that failed its live re-probe;
 /// - it fails with a kind that a retry cannot fix;
 /// - it does not answer in time.
+///
+/// The step asks no selector when each candidate failed its live re-probe.
+/// It then picks none. [`SelectContext::report`] shows the live end of each
+/// candidate.
 ///
 /// A retryable error retries the step.
 pub trait OverlaySelector: Send + Sync + fmt::Debug {
@@ -556,8 +570,8 @@ pub struct SelectRequest {
 pub enum SelectedBy {
     /// The installed selector.
     Selector,
-    /// The rule: a completed end first, then the fewest stubbed tool
-    /// calls, then the lowest id.
+    /// The rule. A live failure is out of the pick. Then a completed end
+    /// comes first, then the fewest stubbed tool calls, then the lowest id.
     Rule,
 }
 
@@ -565,7 +579,8 @@ pub enum SelectedBy {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Selection {
     /// The index of the pick in [`SelectRequest::probes`]. `None` for an
-    /// empty pool.
+    /// empty pool, and for a pool where each candidate failed its live
+    /// re-probe.
     pub index: Option<usize>,
     /// The opaque id of the pick.
     pub id: Option<AnonId>,
@@ -588,21 +603,28 @@ pub struct Selection {
     pub lesson: Option<String>,
 }
 
-/// The rule pick of `pool`: a completed end first, then the fewest
-/// stubbed tool calls, then the lowest id.
+/// The rule pick of `pool`. A live failure is out of the pick. Then a
+/// completed end comes first, then the fewest stubbed tool calls, then the
+/// lowest id. The pool lists its entries in id order. See
+/// [`rule`](super::rule).
 fn rule_pick(pool: &AnonymisedPool) -> Option<AnonId> {
+    let at = super::rule::rule_pick(pool.candidates.iter().map(|entry| {
+        (
+            entry.live.as_ref().is_some_and(LiveCheck::failed),
+            matches!(entry.end, RunEnd::Completed(_)),
+            entry.stubbed_tool_calls,
+        )
+    }))?;
+    pool.candidates.get(at).map(|entry| entry.id.clone())
+}
+
+/// Whether the pool entry of `id` is a live failure.
+fn live_failed(pool: &AnonymisedPool, id: &AnonId) -> bool {
     pool.candidates
         .iter()
-        .min_by(|a, b| {
-            let key = |entry: &crate::eval::AnonymisedEvaluation| {
-                (
-                    !matches!(entry.end, RunEnd::Completed(_)),
-                    entry.stubbed_tool_calls,
-                )
-            };
-            key(a).cmp(&key(b)).then_with(|| a.id.cmp(&b.id))
-        })
-        .map(|entry| entry.id.clone())
+        .find(|entry| entry.id == *id)
+        .and_then(|entry| entry.live.as_ref())
+        .is_some_and(LiveCheck::failed)
 }
 
 /// Runs one select step on `harness`.
@@ -638,6 +660,13 @@ pub(crate) async fn run_select(
         why: None,
         lesson: None,
     };
+    if selection.id.is_none() && !candidates.is_empty() {
+        // Each candidate is a live failure. No pick can stand, so the step
+        // asks no selector.
+        selection.note =
+            Some("each candidate failed its live re-probe, so the rule picked none".to_owned());
+        return Ok((selection, Vec::new()));
+    }
     let Some(selector) = harness.overlay_selector() else {
         return Ok((selection, Vec::new()));
     };
@@ -660,6 +689,15 @@ pub(crate) async fn run_select(
     selection.cost_usd_micros = cost_usd_micros;
     match picked {
         Ok(Ok(choice)) => match index_of(&choice.id) {
+            Some(_) if live_failed(&report, &choice.id) => {
+                selection.note = Some(truncate(
+                    &format!(
+                        "the selector named {}, which failed its live re-probe",
+                        choice.id
+                    ),
+                    MAX_NOTE_CHARS,
+                ));
+            }
             Some(index) => {
                 selection.index = Some(index);
                 selection.why = reason(&choice.why, MAX_WHY_CHARS);

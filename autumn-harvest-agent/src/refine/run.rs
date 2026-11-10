@@ -59,7 +59,9 @@ use crate::agent::overlay_store::{OverlayVersion, StoredOverlay};
 use crate::agent::{AGENT_WORKFLOW_NAME, AgentId, AgentProfile};
 use crate::eval::anon::AnonId;
 use crate::eval::evidence::{render_source, source_labels};
-use crate::eval::{Candidate, Evaluation, RunEnd, check_source, evaluate_routed, task_of};
+use crate::eval::{
+    Candidate, Evaluation, LiveCheck, RunEnd, check_source, evaluate_routed, task_of,
+};
 use crate::harness::{AgentHarness, truncate};
 use crate::memory::MemorySnapshot;
 use crate::mesh_control::{MESH_ATTR, MeshBudget};
@@ -69,6 +71,14 @@ use crate::workflow::WORKFLOW_NAME;
 
 /// The registered workflow name of a refine run.
 pub const REFINE_WORKFLOW_NAME: &str = "agent_refine";
+
+/// The patch of the live rule. A run that started before it keeps the old
+/// rule fallback and carries each sequential composition on replay.
+pub(crate) const LIVE_RULE_PATCH: &str = "agent_refine_live_rule";
+
+/// The note of a stage that the run does not carry, because its live
+/// re-probe failed.
+const LIVE_REFUSED: &str = "the live re-probe failed, so the run keeps the current overlay";
 
 /// The most characters of a stage error or a note in the report.
 const MAX_NOTE_CHARS: usize = 500;
@@ -291,6 +301,33 @@ pub enum LiveReprobe {
     },
     /// The re-probe ran on a fork.
     Ran(LiveEnd),
+}
+
+impl LiveReprobe {
+    /// `true` for a live failure: a fork that ended and did not complete.
+    /// A failed fork or wait is no live failure. It says nothing about the
+    /// overlay.
+    #[must_use]
+    pub const fn failed(&self) -> bool {
+        matches!(self, Self::Ran(end) if !end.completed)
+    }
+}
+
+impl From<&LiveReprobe> for LiveCheck {
+    /// The live end with no fork id, no tokens and no cost.
+    fn from(live: &LiveReprobe) -> Self {
+        match live {
+            LiveReprobe::NotNeeded => Self::NotNeeded,
+            LiveReprobe::Skipped { .. } => Self::Skipped,
+            LiveReprobe::Failed { error } => Self::NoEnd {
+                error: error.clone(),
+            },
+            LiveReprobe::Ran(end) if end.completed => Self::Completed,
+            LiveReprobe::Ran(end) => Self::Failed {
+                error: end.error.clone(),
+            },
+        }
+    }
 }
 
 /// The input of [`agent_refine_probe`].
@@ -776,6 +813,25 @@ pub(crate) fn probe_calls(result: &ProbeResult) -> Vec<autumn_harvest::llm_ledge
     by_model.values().map(Charge::ledger_call).collect()
 }
 
+/// The position in `probes` of the pick of the fallback rule. A stage
+/// with no probe is no candidate. With `live_rule`, a live failure is out
+/// of the pick. A run of an older release replays without it.
+fn fallback_pick(probes: &[Option<&ProbeRecord>], live_rule: bool) -> Option<usize> {
+    let probed: Vec<(usize, &ProbeRecord)> = probes
+        .iter()
+        .enumerate()
+        .filter_map(|(at, probe)| Some((at, (*probe)?)))
+        .collect();
+    let pick = super::rule::rule_pick(probed.iter().map(|(_, probe)| {
+        (
+            live_rule && probe.live.failed(),
+            probe.completed,
+            probe.stubbed_tool_calls,
+        )
+    }))?;
+    probed.get(pick).map(|(at, _)| *at)
+}
+
 /// The state of one refine run.
 struct Refine<'a> {
     ctx: &'a WorkflowContext,
@@ -801,6 +857,9 @@ struct Refine<'a> {
     /// The `why` and `lesson` text of the selection that set the current
     /// overlay.
     reason: (Option<String>, Option<String>),
+    /// `true` when the run took [`LIVE_RULE_PATCH`]. A live failure is then
+    /// out of the fallback pick, and sequential mode does not carry it.
+    live_rule: bool,
 }
 
 /// Whether a stage that failed with `err` falls back to the current
@@ -1057,6 +1116,7 @@ impl Refine<'_> {
                 overlay,
                 evaluation: result.evaluation,
                 routes: result.routes,
+                live: Some(result.live),
             });
             probed.push(at);
         }
@@ -1100,15 +1160,14 @@ impl Refine<'_> {
         Ok(stage)
     }
 
-    /// The pick of a select step that failed with `err`: a completed probe
-    /// first, then the fewest stubbed tool calls, then the first stage.
+    /// The pick of a select step that failed with `err`, by the rule of
+    /// [`fallback_pick`]. The first stage wins a tie.
     fn rule_of(&self, stages: &[usize], err: &HarvestError) -> Selection {
-        let index = stages
+        let probes: Vec<Option<&ProbeRecord>> = stages
             .iter()
-            .enumerate()
-            .filter_map(|(index, &at)| Some((index, self.stages.get(at)?.probe.as_ref()?)))
-            .min_by_key(|(index, probe)| (!probe.completed, probe.stubbed_tool_calls, *index))
-            .map(|(index, _)| index);
+            .map(|&at| self.stages.get(at).and_then(|stage| stage.probe.as_ref()))
+            .collect();
+        let index = fallback_pick(&probes, self.live_rule);
         let spent = spent_of(err);
         Selection {
             index,
@@ -1126,6 +1185,22 @@ impl Refine<'_> {
             why: None,
             lesson: None,
         }
+    }
+
+    /// Whether the run refuses to carry stage `at`, because its probe is a
+    /// live failure. A refusal adds a note to the stage. The select step
+    /// never picks a live failure, but a select step of an older worker can.
+    fn refused_live(&mut self, at: usize) -> bool {
+        let failed = self.live_rule
+            && self
+                .stages
+                .get(at)
+                .and_then(|stage| stage.probe.as_ref())
+                .is_some_and(|probe| probe.live.failed());
+        if failed {
+            self.stages[at].notes.push(LIVE_REFUSED.to_owned());
+        }
+        failed
     }
 
     /// The overlay of the candidate stage `at`.
@@ -1171,6 +1246,7 @@ impl Refine<'_> {
             return Ok(false);
         }
         if let Some(chosen) = self.select(source, &composed).await?
+            && !self.refused_live(chosen)
             && let Some(overlay) = self.overlay_of(chosen)
         {
             self.current = overlay;
@@ -1205,7 +1281,9 @@ impl Refine<'_> {
             if self.probe_all(source, &[composition]).await?.is_none() {
                 return Ok(false);
             }
-            if let Some(overlay) = self.overlay_of(composition) {
+            if !self.refused_live(composition)
+                && let Some(overlay) = self.overlay_of(composition)
+            {
                 self.current = overlay;
                 self.reason = (None, None);
             }
@@ -1239,6 +1317,7 @@ pub async fn agent_refine(
         .await
         .map_err(|err| start_failure(&err))?;
     set_mesh(ctx, &input);
+    let live_rule = ctx.patched(LIVE_RULE_PATCH);
     let mut run = Refine {
         ctx,
         input: &input,
@@ -1256,6 +1335,7 @@ pub async fn agent_refine(
         selector: start.selector,
         lessons: start.lessons.as_ref(),
         reason: (None, None),
+        live_rule,
     };
     for source in &start.sources {
         let more = match input.mode {
@@ -1643,6 +1723,92 @@ mod tests {
         // At the cap, each turn keeps its own call.
         let at_cap = probe_calls(&probed(charges[..cap].to_vec()));
         assert_eq!(at_cap.len(), cap);
+    }
+
+    fn live_end(completed: bool) -> LiveEnd {
+        LiveEnd {
+            exec_id: "fork-1".to_owned(),
+            completed,
+            error: (!completed).then(|| "tool refused".to_owned()),
+            usage: TokenUsage::new(3, 1),
+            cost_usd_micros: 9,
+        }
+    }
+
+    #[test]
+    fn each_live_reprobe_maps_to_a_check_with_no_identity() {
+        let cases = [
+            (LiveReprobe::NotNeeded, LiveCheck::NotNeeded),
+            (
+                LiveReprobe::Skipped {
+                    reason: "SQLite has no fork".to_owned(),
+                },
+                LiveCheck::Skipped,
+            ),
+            (
+                LiveReprobe::Failed {
+                    error: "the wait failed".to_owned(),
+                },
+                LiveCheck::NoEnd {
+                    error: "the wait failed".to_owned(),
+                },
+            ),
+            (LiveReprobe::Ran(live_end(true)), LiveCheck::Completed),
+            (
+                LiveReprobe::Ran(live_end(false)),
+                LiveCheck::Failed {
+                    error: Some("tool refused".to_owned()),
+                },
+            ),
+        ];
+        for (live, check) in cases {
+            assert_eq!(live.failed(), check.failed(), "{live:?}");
+            assert_eq!(LiveCheck::from(&live), check);
+        }
+    }
+
+    fn record(completed: bool, stubbed: u32, live: LiveReprobe) -> ProbeRecord {
+        ProbeRecord {
+            overlay_digest: "sha256:d".to_owned(),
+            first_divergence: None,
+            end_diverged: false,
+            completed,
+            replayed_tool_calls: 0,
+            stubbed_tool_calls: stubbed,
+            turn_cap_reached: false,
+            live,
+            usage: TokenUsage::default(),
+            cost_usd_micros: 0,
+        }
+    }
+
+    #[test]
+    fn the_fallback_rule_skips_a_live_failure_under_the_patch() {
+        let failed = record(true, 0, LiveReprobe::Ran(live_end(false)));
+        let worse = record(false, 3, LiveReprobe::Ran(live_end(true)));
+        let probes = [None, Some(&failed), Some(&worse)];
+        assert_eq!(fallback_pick(&probes, true), Some(2));
+        // A run of an older release keeps the old rule on replay.
+        assert_eq!(fallback_pick(&probes, false), Some(1));
+        assert_eq!(fallback_pick(&[Some(&failed)], true), None);
+        assert_eq!(fallback_pick(&[None, None], true), None);
+    }
+
+    #[test]
+    fn a_probed_candidate_of_an_older_release_decodes_with_no_live_end() {
+        let candidate = ProbedCandidate {
+            overlay: ProfileOverlay::default(),
+            evaluation: probed(Vec::new()).evaluation,
+            routes: BTreeSet::new(),
+            live: Some(LiveReprobe::NotNeeded),
+        };
+        let mut old = serde_json::to_value(&candidate).unwrap();
+        old.as_object_mut().unwrap().remove("live");
+        let read: ProbedCandidate = serde_json::from_value(old).unwrap();
+        assert_eq!(read.live, None);
+        let again: ProbedCandidate =
+            serde_json::from_value(serde_json::to_value(&candidate).unwrap()).unwrap();
+        assert_eq!(again, candidate);
     }
 
     #[test]
