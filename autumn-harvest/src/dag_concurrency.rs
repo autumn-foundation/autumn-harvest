@@ -102,7 +102,7 @@ pub fn profile(report: &DagSlackReport, schedule: Schedule) -> ConcurrencyProfil
 ///
 /// Returns `(lower, upper)`. A run with `upper` slots always meets its
 /// makespan. A run with fewer than `lower` slots may still meet it when slack
-/// levels the load, but that is not guaranteed by these two schedules alone.
+/// levels the load. These two schedules alone do not guarantee that.
 #[must_use]
 pub fn peak_bounds(report: &DagSlackReport) -> (usize, usize) {
     let early = profile(report, Schedule::Earliest).peak();
