@@ -22,14 +22,14 @@ use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::fork::{ForkEffects, fork_marker};
 use autumn_harvest::worker::{DbPool, Worker, WorkerRuntimeConfig};
 use autumn_harvest::{ExecutionId, HarvestBuilder, ShardId, WorkerConfig, migrate};
-use autumn_harvest_agent::eval::{PROBE_EFFECT_REFUSED, live_probe};
+use autumn_harvest_agent::eval::{PROBE_EFFECT_REFUSED, live_probe, probe_fork_id};
 use autumn_harvest_agent::mesh::DELEGATE_TOOL;
 use autumn_harvest_agent::postgres::{self, PostgresAgents, RunState};
-use autumn_harvest_agent::refine::RefinePolicy;
+use autumn_harvest_agent::refine::{LiveEnd, LiveRequest, RefinePolicy, RefineSources as _};
 use autumn_harvest_agent::{
-    AgentError, AgentHarness, AgentModel, AgentReport, AgentTask, AllowAll, BoxFuture, ChatRequest,
-    ChatResponse, ChatRole, ContentPart, Delivery, FnTool, Mandate, Peer, ProfileOverlay, Report,
-    StopReason, TokenUsage, Tool, ToolEffect, ToolRules,
+    AgentError, AgentHarness, AgentModel, AgentProfile, AgentReport, AgentTask, AllowAll,
+    BoxFuture, Ceilings, ChatRequest, ChatResponse, ChatRole, ContentPart, Delivery, FnTool,
+    Mandate, Peer, ProfileOverlay, Report, StopReason, TokenUsage, Tool, ToolEffect, ToolRules,
 };
 use common::tool_results;
 use diesel::sql_types::Text;
@@ -54,6 +54,9 @@ const DELEGATE: &str = "Probe: delegate.";
 
 /// The task text of a delegated child.
 const CHILD_TASK: &str = "child: write a note";
+
+/// The system prompt of a candidate whose first turn waits for a release.
+const HOLD: &str = "Probe: wait.";
 
 /// A migrated database, and the container that serves it, if any.
 async fn database() -> (String, Option<ContainerAsync<Postgres>>) {
@@ -175,6 +178,8 @@ impl Delivery for CountingDelivery {
 #[derive(Debug, Default)]
 struct ProbeModel {
     requests: Mutex<Vec<ChatRequest>>,
+    /// Lets a [`HOLD`] turn answer.
+    released: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl ProbeModel {
@@ -244,6 +249,15 @@ impl AgentModel for ProbeModel {
         self.requests.lock().unwrap().push(request.clone());
         let system = first_text(request, ChatRole::System);
         let answered = !results(request).is_empty();
+        if system.contains(HOLD) && !answered {
+            let released = Arc::clone(&self.released);
+            return Box::pin(async move {
+                while !released.load(Ordering::SeqCst) {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                Ok(text("held done"))
+            });
+        }
         let reply = if first_user(request) == CHILD_TASK {
             if answered {
                 text("child done")
@@ -420,6 +434,120 @@ impl Fixture {
             .expect("load the history")
             .events
     }
+}
+
+impl Fixture {
+    /// The number of runs that hold the workflow id `id`.
+    async fn runs_of(&self, id: &str) -> usize {
+        let rows = diesel::sql_query(
+            "SELECT count(*)::text AS text FROM harvest_workflow_executions \
+             WHERE workflow_id = $1",
+        )
+        .bind::<Text, _>(id);
+        let rows: Vec<TextRow> = diesel_async::RunQueryDsl::load(rows, &mut self.conn().await)
+            .await
+            .expect("count the runs");
+        rows.into_iter()
+            .next()
+            .map_or(0, |row| row.text.parse().unwrap())
+    }
+
+    /// The number of forks of `source` with a derived workflow id.
+    async fn derived_forks(&self, source: ExecutionId) -> usize {
+        let rows = diesel::sql_query(
+            "SELECT count(*)::text AS text FROM harvest_workflow_executions f \
+             JOIN harvest_workflow_executions s ON s.id = $1::uuid \
+             WHERE f.workflow_id LIKE s.workflow_id || '-fork-%'",
+        )
+        .bind::<Text, _>(source.to_string());
+        let rows: Vec<TextRow> = diesel_async::RunQueryDsl::load(rows, &mut self.conn().await)
+            .await
+            .expect("count the forks");
+        rows.into_iter()
+            .next()
+            .map_or(0, |row| row.text.parse().unwrap())
+    }
+
+    /// The number of [`HOLD`] runs that asked the model for a first turn.
+    fn held_starts(&self) -> usize {
+        self.model
+            .requests()
+            .iter()
+            .filter(|request| {
+                first_text(request, ChatRole::System).contains(HOLD) && results(request).is_empty()
+            })
+            .count()
+    }
+
+    /// Run one attempt of a refine live re-probe of `source` with `key`.
+    fn reprobe(
+        &self,
+        source: ExecutionId,
+        key: &str,
+    ) -> tokio::task::JoinHandle<Result<LiveEnd, autumn_harvest_agent::refine::LiveProbeError>>
+    {
+        let sources = postgres::Sources::new(self.pg.clone());
+        let harness = self.harness.clone();
+        let key = key.to_owned();
+        tokio::spawn(async move {
+            let overlay = ProfileOverlay {
+                system: Some(HOLD.to_owned()),
+                ..ProfileOverlay::default()
+            };
+            let effects = BTreeSet::from([ToolEffect::ReadOnly]);
+            let ceilings = Ceilings::from_profile(&AgentProfile::new("support"));
+            sources
+                .live_probe(LiveRequest {
+                    harness: &harness,
+                    source,
+                    overlay: &overlay,
+                    effects: &effects,
+                    ceilings: &ceilings,
+                    fork_key: Some(&key),
+                })
+                .await
+        })
+    }
+}
+
+/// Wait until `check` holds, up to [`LIMIT`].
+async fn until(check: impl Fn() -> bool) {
+    let deadline = tokio::time::Instant::now() + LIMIT;
+    while !check() {
+        assert!(tokio::time::Instant::now() < deadline, "timed out");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refine_probe_killed_during_the_wait_reuses_its_fork_on_retry() {
+    let fx = Fixture::new(Arc::new(AllowAll)).await;
+    let source = fx.source(&source_task()).await;
+    let key = unique("attempt-key");
+    let fork_id = probe_fork_id(&key);
+
+    // The first attempt forks, then the worker dies during the wait.
+    let first = fx.reprobe(source, &key);
+    until(|| fx.held_starts() == 1).await;
+    assert_eq!(fx.runs_of(&fork_id).await, 1);
+    first.abort();
+    assert!(first.await.unwrap_err().is_cancelled());
+
+    // The retry has the same key. It finds the fork and waits for its end.
+    let retry = fx.reprobe(source, &key);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    fx.model.released.store(true, Ordering::SeqCst);
+    let end = retry.await.unwrap().expect("the retry reads the fork");
+
+    assert!(end.completed, "{end:?}");
+    assert_eq!(fx.runs_of(&fork_id).await, 1, "one fork holds the key");
+    let resolved = postgres::run_state(&fx.pg, end.exec_id.parse().unwrap()).await;
+    assert!(
+        matches!(resolved, Ok(RunState::Completed(_))),
+        "{resolved:?}"
+    );
+    assert_eq!(fx.derived_forks(source).await, 0, "no unkeyed fork");
+    assert_eq!(fx.held_starts(), 1, "the model ran the probe once");
 }
 
 #[derive(diesel::QueryableByName)]

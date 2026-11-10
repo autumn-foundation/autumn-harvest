@@ -133,8 +133,8 @@ pub mod evidence;
 mod probe;
 
 pub use probe::{
-    LiveProbe, LiveProbeHost, PROBE_APPROVAL_TIMEOUT_SECS, ProbeFork, SourceRun, live_probe,
-    live_probe_with,
+    LiveProbe, LiveProbeHost, PROBE_APPROVAL_TIMEOUT_SECS, PROBE_FORK_ID_PREFIX, ProbeFork,
+    SourceRun, live_probe, live_probe_keyed, live_probe_with, probe_fork_id,
 };
 #[cfg(feature = "postgres")]
 pub(crate) use probe::{PROBE_FORK_OPERATOR, PROBE_FORK_REASON};
@@ -161,6 +161,7 @@ use crate::memory::MemorySnapshot;
 use crate::mesh::Peer;
 use crate::message::{ContentPart, StopReason, TokenUsage, ToolCall};
 use crate::policy::ToolDecision;
+use crate::refine::Charge;
 use crate::score::{self, ScoreContext, ScoreInput, Scorer};
 pub use crate::types::PROBE_EFFECT_REFUSED;
 use crate::types::{
@@ -545,6 +546,10 @@ pub enum EvalError {
     /// #2378). The source stays unchanged.
     #[error("the live probe fork failed: {0}")]
     Fork(String),
+    /// Another run holds the workflow id of a keyed probe fork. The value
+    /// is the id.
+    #[error("the probe fork id {0} is in use")]
+    ForkIdInUse(String),
     /// The scorer failed, or did not end within
     /// [`AgentHarness::score_timeout`] (issue #2447). A scorer error is not
     /// a reject, so the evaluation fails. [`Side::Recorded`] is the source
@@ -756,6 +761,13 @@ pub struct Evaluation {
     /// (issue #2380). An unpriced turn adds none.
     #[serde(default, skip_serializing_if = "is_zero_cost")]
     pub candidate_cost_usd_micros: u64,
+    /// The model, the tokens and the cost of each candidate turn that
+    /// called a model, in run order. A cache hit adds none. The tokens sum
+    /// to [`Self::candidate_usage`], and the costs to
+    /// [`Self::candidate_cost_usd_micros`]. An evaluation of an older
+    /// release decodes with none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub candidate_calls: Vec<Charge>,
 }
 
 /// Whether `usage` is empty, so an evaluation leaves it out.
@@ -1059,27 +1071,24 @@ async fn run_with_routes(
     let outcome = env.run(agent_loop_info().handler, input).await;
 
     let candidate_turns = model_turns(outcome.events())?;
-    let (candidate_usage, candidate_cost_usd_micros) =
-        candidate_turns
-            .iter()
-            .fold((TokenUsage::default(), 0_u64), |(usage, cost), turn| {
-                (
-                    usage.saturating_add(turn.usage),
-                    cost.saturating_add(turn.cost_usd_micros.unwrap_or(0)),
-                )
-            });
-    let (replayed, stubbed, cap_reached, root, mut routes) = {
+    let (replayed, stubbed, cap_reached, root, mut routes, candidate_calls) = {
         let mut session = lock(&session);
         let root = session.root.clone();
         let routes = std::mem::take(&mut session.routes);
+        let calls = std::mem::take(&mut session.calls);
         (
             session.replayed,
             session.stubbed,
             session.cap_reached,
             root,
             routes,
+            calls,
         )
     };
+    // Each turn that called a model has one charge. A cache hit has none
+    // and spent nothing, so the charges sum to the spend of every turn.
+    let (candidate_usage, candidate_cost_usd_micros) =
+        crate::refine::meter::total(&candidate_calls);
     let candidate_end = run_end_of(outcome.result, root.as_deref(), recording)?;
 
     let turns = diff_turns(&recording.turns, &candidate_turns);
@@ -1105,6 +1114,7 @@ async fn run_with_routes(
         scorer_usage: verdicts.usage,
         candidate_usage,
         candidate_cost_usd_micros,
+        candidate_calls,
     };
     Ok((evaluation, routes))
 }
@@ -1769,6 +1779,8 @@ struct Session {
     /// Each model route that a candidate turn asked for. `None` is the
     /// default model.
     routes: BTreeSet<Option<String>>,
+    /// The spend of each candidate turn that called a model, in order.
+    calls: Vec<Charge>,
 }
 
 impl Session {
@@ -1788,6 +1800,7 @@ impl Session {
             replayed: 0,
             stubbed: 0,
             routes: BTreeSet::new(),
+            calls: Vec::new(),
         }
     }
 
@@ -1968,6 +1981,17 @@ fn model_mock(
             (&recorded, &taken, index),
             &retry,
         )?;
+        if !turn.cache_hit {
+            let model_id = harness
+                .model(request.model.as_deref())
+                .ok()
+                .and_then(|model| model.model_id());
+            lock(&session).calls.push(Charge {
+                model_id: model_id.map(str::to_owned),
+                usage: turn.usage,
+                cost_usd_micros: turn.cost_usd_micros,
+            });
+        }
         encode(&turn)
     }
 }

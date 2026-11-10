@@ -273,7 +273,8 @@ fn register_refine_run(rt: &mut SqliteRuntime, harness: &Arc<AgentHarness>) {
         call_with_ledger(input, |request| {
             let h = Arc::clone(&h);
             async move {
-                let result = run_probe(&h, request).await?;
+                // SQLite has no fork, so the probe needs no fork key.
+                let result = run_probe(&h, request, None).await?;
                 let calls = probe_calls(&result);
                 Ok((result, calls))
             }

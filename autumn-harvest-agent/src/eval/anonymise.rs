@@ -324,6 +324,8 @@ fn anonymise(evaluation: Evaluation, id: AnonId, scrub: &Scrub) -> AnonymisedEva
         candidate_usage,
         // A price names a model, so the cost is an identity.
         candidate_cost_usd_micros: _,
+        // Each call names its model and its price.
+        candidate_calls: _,
     } = evaluation;
     AnonymisedEvaluation {
         id,
