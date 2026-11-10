@@ -1,4 +1,4 @@
-## Open-timer lookups read only the open timers of a run (issue #2643)
+## Open-timer lookups read only the open timers of a run (issue #2643, PR #2646)
 
 Each workflow decision reads the open timers of its run from
 `harvest_timers`, by `workflow_exec_id` and `fired`. A fired timer row stays
