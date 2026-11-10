@@ -497,6 +497,12 @@ mod tests {
     }
 
     #[test]
+    fn repr_escapes_newline_and_cr() {
+        assert_eq!(repr("a\nb"), "'a\\nb'");
+        assert_eq!(repr("a\rb"), "'a\\rb'");
+    }
+
+    #[test]
     fn word_boundaries_follow_python() {
         let re = regex(r"\b\d+ x\b").unwrap();
         // A combining mark is no word character in Python, so `\b` holds.

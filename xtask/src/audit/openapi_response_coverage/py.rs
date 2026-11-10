@@ -976,6 +976,19 @@ mod tests {
     }
 
     #[test]
+    fn repr_escapes_newline_cr_tab_and_a_bare_backslash() {
+        assert_eq!(repr("a\nb"), "'a\\nb'");
+        assert_eq!(repr("a\rb"), "'a\\rb'");
+        assert_eq!(repr("a\tb"), "'a\\tb'");
+        assert_eq!(repr("a\\b"), "'a\\\\b'");
+    }
+
+    #[test]
+    fn repr_passes_other_control_characters_through_unescaped() {
+        assert_eq!(repr("a\u{7}b"), "'a\u{7}b'");
+    }
+
+    #[test]
     fn a_literal_with_a_lookahead_matches_as_the_full_machine_does() {
         let text = "Q<T> x::Q(1) Q (2) aQ(3) Q::<u8>(4)";
         let pattern = r"(?<![\w:.])Q\b(?=\s*(?:::<|\())";

@@ -123,6 +123,13 @@ mod tests {
     }
 
     #[test]
+    fn a_string_escapes_newline_cr_and_a_bare_backslash() {
+        assert_eq!(str_repr("a\nb"), "'a\\nb'");
+        assert_eq!(str_repr("a\rb"), "'a\\rb'");
+        assert_eq!(str_repr("a\\b"), "'a\\\\b'");
+    }
+
+    #[test]
     fn a_list_renders_like_python() {
         assert_eq!(list_repr(&["extra"]), "['extra']");
         assert_eq!(list_repr::<&str>(&[]), "[]");

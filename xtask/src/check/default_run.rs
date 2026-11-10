@@ -214,4 +214,17 @@ mod tests {
         assert_eq!(python_str_repr("it's"), "\"it's\"");
         assert_eq!(python_str_repr("a'b\"c"), "'a\\'b\"c'");
     }
+
+    #[test]
+    fn python_repr_escapes_newline_cr_tab_and_a_bare_backslash() {
+        assert_eq!(python_str_repr("a\nb"), "'a\\nb'");
+        assert_eq!(python_str_repr("a\rb"), "'a\\rb'");
+        assert_eq!(python_str_repr("a\tb"), "'a\\tb'");
+        assert_eq!(python_str_repr("a\\b"), "'a\\\\b'");
+    }
+
+    #[test]
+    fn python_repr_passes_other_control_characters_through_unescaped() {
+        assert_eq!(python_str_repr("a\u{7}b"), "'a\u{7}b'");
+    }
 }

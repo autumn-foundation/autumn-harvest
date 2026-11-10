@@ -172,6 +172,8 @@ mod tests {
         assert_eq!(repr_str("a\nb\\"), "'a\\nb\\\\'");
         assert_eq!(repr_str("\x07\u{85}"), "'\\x07\\x85'");
         assert_eq!(repr_str("é"), "'é'");
+        assert_eq!(repr_str("a\rb"), "'a\\rb'");
+        assert_eq!(repr_str("a\tb"), "'a\\tb'");
     }
 
     #[test]

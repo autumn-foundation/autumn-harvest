@@ -476,6 +476,13 @@ mod tests {
     }
 
     #[test]
+    fn repr_escapes_cr_tab_and_a_bare_backslash() {
+        assert_eq!(repr("a\rb"), "'a\\rb'");
+        assert_eq!(repr("a\tb"), "'a\\tb'");
+        assert_eq!(repr("a\\b"), "'a\\\\b'");
+    }
+
+    #[test]
     fn strip_verbose_keeps_classes_and_escapes() {
         assert_eq!(strip_verbose("a b # note\n [ #] \\# c"), "ab[ #]\\#c");
         assert_eq!(strip_verbose("[]] x"), "[]]x");
