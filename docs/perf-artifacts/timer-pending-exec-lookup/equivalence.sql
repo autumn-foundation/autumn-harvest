@@ -1,14 +1,15 @@
 -- Result identity. Run every per-decision lookup for every run of the fixture
--- and hash the full ordered result. The id breaks every tie.
+-- and hash the full ordered result. The id breaks every tie. Pass one
+-- :asof to both databases, because the seeded open timers come due over time.
 \set ON_ERROR_STOP 1
 SET plan_cache_mode = force_generic_plan;
 SELECT 'ingest' AS q, count(*) AS rows, md5(string_agg(r::text, ',' ORDER BY r.workflow_exec_id, r.fires_at, r.timer_id, r.id)) AS digest
 FROM harvest_workflow_executions e
-CROSS JOIN LATERAL (SELECT t.* FROM harvest_timers t WHERE t.workflow_exec_id = e.id AND t.fired = false AND t.fires_at <= now() ORDER BY t.fires_at, t.timer_id) r
+CROSS JOIN LATERAL (SELECT t.* FROM harvest_timers t WHERE t.workflow_exec_id = e.id AND t.fired = false AND t.fires_at <= :'asof'::timestamptz ORDER BY t.fires_at, t.timer_id) r
 UNION ALL
 SELECT 'ingest_fired_true', count(*), md5(string_agg(r::text, ',' ORDER BY r.id))
 FROM harvest_workflow_executions e
-CROSS JOIN LATERAL (SELECT t.* FROM harvest_timers t WHERE t.workflow_exec_id = e.id AND t.fired = true AND t.fires_at <= now()) r
+CROSS JOIN LATERAL (SELECT t.* FROM harvest_timers t WHERE t.workflow_exec_id = e.id AND t.fired = true AND t.fires_at <= :'asof'::timestamptz) r
 WHERE e.workflow_name <> 'long_lived'
 UNION ALL
 SELECT 'by_id_open', count(*), md5(string_agg(r::text, ',' ORDER BY r.id))

@@ -3073,3 +3073,8 @@ standalone note rather than part of the claim-path attribution table above:
   5,884 to 5. Each dead-letter insert costs about 8 more buffers. A filter
   that no index serves can now walk the `failed_at` index, which costs more
   on a shuffled heap.
+* [`docs/performance-timer-pending-exec-lookup.md`](performance-timer-pending-exec-lookup.md)
+  — before issue #2643, each open-timer lookup of a decision read every fired
+  timer of its run. `idx_harvest_timers_exec` now holds
+  `(workflow_exec_id, fired)` (timer-lookup buffers -47%, -66% and -78% for
+  runs of 250, 1,000 and 2,000 timers, `pg_stat_statements`).

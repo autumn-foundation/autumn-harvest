@@ -1,0 +1,120 @@
+##### ledger_timers
+Pager usage is off.
+BEGIN
+                                                                   QUERY PLAN                                                                   
+------------------------------------------------------------------------------------------------------------------------------------------------
+ Delete on harvest_timers  (cost=118.37..12885.63 rows=0 width=0) (actual time=106.759..106.760 rows=0 loops=1)
+   Buffers: shared hit=10000 read=7010 dirtied=6970 written=4098
+   ->  Bitmap Heap Scan on harvest_timers  (cost=118.37..12885.63 rows=10057 width=6) (actual time=1.873..37.228 rows=10000 loops=1)
+         Recheck Cond: (workflow_exec_id = '00000000-0000-4000-8000-000000000003'::uuid)
+         Heap Blocks: exact=7000
+         Buffers: shared read=7010 written=4098
+         ->  Bitmap Index Scan on idx_harvest_timers_exec  (cost=0.00..115.85 rows=10057 width=0) (actual time=1.074..1.074 rows=10044 loops=1)
+               Index Cond: (workflow_exec_id = '00000000-0000-4000-8000-000000000003'::uuid)
+               Buffers: shared read=10
+ Planning:
+   Buffers: shared hit=68 read=31
+ Planning Time: 0.412 ms
+ Execution Time: 106.917 ms
+(13 rows)
+
+                                                                             QUERY PLAN                                                                             
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Delete on harvest_workflow_executions  (cost=0.29..8.30 rows=0 width=0) (actual time=0.201..0.202 rows=0 loops=1)
+   Buffers: shared hit=19 read=9 dirtied=1 written=9
+   ->  Index Scan using harvest_workflow_executions_pkey on harvest_workflow_executions  (cost=0.29..8.30 rows=1 width=6) (actual time=0.020..0.021 rows=1 loops=1)
+         Index Cond: (id = '00000000-0000-4000-8000-000000000004'::uuid)
+         Buffers: shared read=3 written=3
+ Planning:
+   Buffers: shared hit=658 read=101 written=101
+ Planning Time: 1.615 ms
+ Trigger for constraint harvest_events_workflow_exec_id_fkey: time=0.732 calls=1
+ Trigger for constraint harvest_task_queue_workflow_exec_id_fkey: time=0.947 calls=1
+ Trigger for constraint harvest_signals_workflow_exec_id_fkey: time=0.271 calls=1
+ Trigger for constraint harvest_timers_workflow_exec_id_fkey: time=81.613 calls=1
+ Trigger for constraint harvest_external_tasks_workflow_exec_id_fkey: time=7.600 calls=1
+ Trigger for constraint harvest_payload_refs_workflow_exec_id_fkey: time=0.212 calls=1
+ Trigger for constraint harvest_sessions_workflow_exec_id_fkey: time=0.177 calls=1
+ Trigger for constraint harvest_workflow_logs_workflow_exec_id_fkey: time=0.104 calls=1
+ Trigger for constraint harvest_stream_chunks_workflow_exec_id_fkey: time=0.088 calls=1
+ Trigger for constraint harvest_llm_ledger_workflow_exec_id_fkey: time=0.103 calls=1
+ Trigger for constraint harvest_entity_state_execution_id_fkey: time=0.154 calls=1
+ Execution Time: 92.245 ms
+(20 rows)
+
+                                                                QUERY PLAN                                                                
+------------------------------------------------------------------------------------------------------------------------------------------
+ Bitmap Heap Scan on harvest_timers  (cost=132.57..13127.32 rows=10801 width=51) (actual time=4.917..22.056 rows=10100 loops=1)
+   Recheck Cond: (workflow_exec_id = ANY ('{00000000-0000-4000-8000-000000000005,00000000-0000-4000-8000-0000000001f6}'::uuid[]))
+   Heap Blocks: exact=7035
+   Buffers: shared hit=4389 read=2659 written=19
+   ->  Bitmap Index Scan on idx_harvest_timers_exec  (cost=0.00..129.87 rows=10801 width=0) (actual time=0.947..0.947 rows=10148 loops=1)
+         Index Cond: (workflow_exec_id = ANY ('{00000000-0000-4000-8000-000000000005,00000000-0000-4000-8000-0000000001f6}'::uuid[]))
+         Buffers: shared hit=3 read=10
+ Planning:
+   Buffers: shared hit=63 read=7
+ Planning Time: 0.202 ms
+ Execution Time: 22.561 ms
+(11 rows)
+
+ROLLBACK
+##### lt_mig
+Pager usage is off.
+BEGIN
+                                                                  QUERY PLAN                                                                   
+-----------------------------------------------------------------------------------------------------------------------------------------------
+ Delete on harvest_timers  (cost=111.66..12557.63 rows=0 width=0) (actual time=102.035..102.036 rows=0 loops=1)
+   Buffers: shared hit=18226 read=5725 dirtied=6971 written=1216
+   ->  Bitmap Heap Scan on harvest_timers  (cost=111.66..12557.63 rows=9191 width=6) (actual time=2.321..34.638 rows=10000 loops=1)
+         Recheck Cond: (workflow_exec_id = '00000000-0000-4000-8000-000000000003'::uuid)
+         Heap Blocks: exact=6970
+         Buffers: shared hit=1258 read=5724 written=1216
+         ->  Bitmap Index Scan on idx_harvest_timers_exec  (cost=0.00..109.36 rows=9191 width=0) (actual time=1.351..1.352 rows=10000 loops=1)
+               Index Cond: (workflow_exec_id = '00000000-0000-4000-8000-000000000003'::uuid)
+               Buffers: shared hit=2 read=10
+ Planning:
+   Buffers: shared hit=76 read=31
+ Planning Time: 0.464 ms
+ Execution Time: 102.212 ms
+(13 rows)
+
+                                                                             QUERY PLAN                                                                             
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Delete on harvest_workflow_executions  (cost=0.29..8.30 rows=0 width=0) (actual time=0.149..0.150 rows=0 loops=1)
+   Buffers: shared hit=19 read=9 dirtied=1 written=9
+   ->  Index Scan using harvest_workflow_executions_pkey on harvest_workflow_executions  (cost=0.29..8.30 rows=1 width=6) (actual time=0.023..0.024 rows=1 loops=1)
+         Index Cond: (id = '00000000-0000-4000-8000-000000000004'::uuid)
+         Buffers: shared read=3 written=3
+ Planning:
+   Buffers: shared hit=671 read=88 written=88
+ Planning Time: 1.476 ms
+ Trigger for constraint harvest_events_workflow_exec_id_fkey: time=0.828 calls=1
+ Trigger for constraint harvest_task_queue_workflow_exec_id_fkey: time=0.879 calls=1
+ Trigger for constraint harvest_signals_workflow_exec_id_fkey: time=0.243 calls=1
+ Trigger for constraint harvest_timers_workflow_exec_id_fkey: time=78.150 calls=1
+ Trigger for constraint harvest_external_tasks_workflow_exec_id_fkey: time=0.518 calls=1
+ Trigger for constraint harvest_payload_refs_workflow_exec_id_fkey: time=0.137 calls=1
+ Trigger for constraint harvest_sessions_workflow_exec_id_fkey: time=0.213 calls=1
+ Trigger for constraint harvest_workflow_logs_workflow_exec_id_fkey: time=0.112 calls=1
+ Trigger for constraint harvest_stream_chunks_workflow_exec_id_fkey: time=0.104 calls=1
+ Trigger for constraint harvest_llm_ledger_workflow_exec_id_fkey: time=0.112 calls=1
+ Trigger for constraint harvest_entity_state_execution_id_fkey: time=0.116 calls=1
+ Execution Time: 81.603 ms
+(20 rows)
+
+                                                               QUERY PLAN                                                                
+-----------------------------------------------------------------------------------------------------------------------------------------
+ Bitmap Heap Scan on harvest_timers  (cost=114.94..12705.16 rows=9559 width=51) (actual time=1.745..15.085 rows=10100 loops=1)
+   Recheck Cond: (workflow_exec_id = ANY ('{00000000-0000-4000-8000-000000000005,00000000-0000-4000-8000-0000000001f6}'::uuid[]))
+   Heap Blocks: exact=7002
+   Buffers: shared hit=5366 read=1651 written=108
+   ->  Bitmap Index Scan on idx_harvest_timers_exec  (cost=0.00..112.56 rows=9559 width=0) (actual time=0.966..0.966 rows=10100 loops=1)
+         Index Cond: (workflow_exec_id = ANY ('{00000000-0000-4000-8000-000000000005,00000000-0000-4000-8000-0000000001f6}'::uuid[]))
+         Buffers: shared hit=4 read=11 written=11
+ Planning:
+   Buffers: shared hit=65 read=5 written=5
+ Planning Time: 0.203 ms
+ Execution Time: 15.525 ms
+(11 rows)
+
+ROLLBACK
