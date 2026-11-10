@@ -877,24 +877,12 @@ pub fn universal_newlines(text: String) -> String {
 
 /// Python's `repr` of a string, as `str()` of a tuple prints it.
 pub fn repr(text: &str) -> String {
-    let quote = if text.contains('\'') && !text.contains('"') {
-        '"'
-    } else {
-        '\''
-    };
+    let quote = crate::py_repr::repr_quote(text);
     let mut out = String::new();
     out.push(quote);
     for char in text.chars() {
-        match char {
-            '\\' => out.push_str(r"\\"),
-            '\n' => out.push_str(r"\n"),
-            '\r' => out.push_str(r"\r"),
-            '\t' => out.push_str(r"\t"),
-            _ if char == quote => {
-                out.push('\\');
-                out.push(char);
-            }
-            _ => out.push(char),
+        if !crate::py_repr::push_common_repr_escape(&mut out, char, quote) {
+            out.push(char);
         }
     }
     out.push(quote);

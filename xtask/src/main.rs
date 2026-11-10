@@ -16,6 +16,7 @@ mod ci;
 mod dev;
 mod interrupt;
 mod perf;
+mod py_repr;
 mod sandbox;
 mod util;
 

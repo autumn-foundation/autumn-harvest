@@ -87,24 +87,12 @@ fn python_str_list(items: &[&str]) -> String {
 ///
 /// Python quotes with `'`, unless the text holds a `'` and no `"`.
 fn python_str_repr(text: &str) -> String {
-    let quote = if text.contains('\'') && !text.contains('"') {
-        '"'
-    } else {
-        '\''
-    };
+    let quote = crate::py_repr::repr_quote(text);
     let mut out = String::new();
     out.push(quote);
     for c in text.chars() {
-        match c {
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if c == quote => {
-                out.push('\\');
-                out.push(c);
-            }
-            c => out.push(c),
+        if !crate::py_repr::push_common_repr_escape(&mut out, c, quote) {
+            out.push(c);
         }
     }
     out.push(quote);

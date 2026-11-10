@@ -110,33 +110,23 @@ fn is_py_printable(c: char) -> bool {
 
 /// Renders `text` as Python `repr` of a `str`.
 pub fn repr_str(text: &str) -> String {
-    let quote = if text.contains('\'') && !text.contains('"') {
-        '"'
-    } else {
-        '\''
-    };
+    let quote = crate::py_repr::repr_quote(text);
     let mut out = String::with_capacity(text.len() + 2);
     out.push(quote);
     for c in text.chars() {
-        match c {
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if c == quote => {
-                out.push('\\');
-                out.push(c);
-            }
-            c if is_py_printable(c) => out.push(c),
-            c => {
-                let code = u32::from(c);
-                if code < 0x100 {
-                    let _ = write!(out, "\\x{code:02x}");
-                } else if code < 0x1_0000 {
-                    let _ = write!(out, "\\u{code:04x}");
-                } else {
-                    let _ = write!(out, "\\U{code:08x}");
-                }
+        if crate::py_repr::push_common_repr_escape(&mut out, c, quote) {
+            continue;
+        }
+        if is_py_printable(c) {
+            out.push(c);
+        } else {
+            let code = u32::from(c);
+            if code < 0x100 {
+                let _ = write!(out, "\\x{code:02x}");
+            } else if code < 0x1_0000 {
+                let _ = write!(out, "\\u{code:04x}");
+            } else {
+                let _ = write!(out, "\\U{code:08x}");
             }
         }
     }
