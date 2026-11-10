@@ -296,7 +296,7 @@ impl OverlaySelector for Selector {
             .iter()
             .find(|entry| entry.id == pick.id)
             .unwrap();
-        *self.seen.lock().unwrap() = entry.live.clone();
+        self.seen.lock().unwrap().clone_from(&entry.live);
         let id = pick.id.clone();
         Box::pin(async move { Ok(id) })
     }

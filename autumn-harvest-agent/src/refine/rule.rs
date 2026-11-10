@@ -16,7 +16,7 @@
 /// before each end that did not complete.
 #[must_use]
 #[allow(clippy::cast_lossless)]
-pub(crate) const fn rule_key(live_failed: bool, completed: bool, stubbed: u32) -> Option<u64> {
+pub const fn rule_key(live_failed: bool, completed: bool, stubbed: u32) -> Option<u64> {
     if live_failed {
         None
     } else if completed {
@@ -51,7 +51,7 @@ const fn rule_step(best: Option<(u32, u64)>, next: (u32, Option<u64>)) -> Option
 /// `formal/verus/src/refine_rule.rs` proves two properties. A live failure
 /// never wins, so the result is `None` only when each entry is one. The
 /// winner has the lowest key.
-pub(crate) const fn rule_best(entries: &[(u32, Option<u64>)]) -> Option<(u32, u64)> {
+pub const fn rule_best(entries: &[(u32, Option<u64>)]) -> Option<(u32, u64)> {
     let mut best = None;
     let mut i = 0;
     while i < entries.len() {
@@ -64,7 +64,7 @@ pub(crate) const fn rule_best(entries: &[(u32, Option<u64>)]) -> Option<(u32, u6
 /// The position in `entries` of the rule pick. Each entry holds three
 /// values: whether it is a live failure, whether its replay completed, and
 /// its stubbed call count.
-pub(crate) fn rule_pick(entries: impl IntoIterator<Item = (bool, bool, u32)>) -> Option<usize> {
+pub fn rule_pick(entries: impl IntoIterator<Item = (bool, bool, u32)>) -> Option<usize> {
     let keyed: Vec<(u32, Option<u64>)> = entries
         .into_iter()
         .enumerate()

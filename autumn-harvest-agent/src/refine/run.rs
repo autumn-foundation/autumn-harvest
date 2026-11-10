@@ -816,19 +816,19 @@ pub(crate) fn probe_calls(result: &ProbeResult) -> Vec<autumn_harvest::llm_ledge
 /// with no probe is no candidate. With `live_rule`, a live failure is out
 /// of the pick. A run of an older release replays without it.
 fn fallback_pick(probes: &[Option<&ProbeRecord>], live_rule: bool) -> Option<usize> {
-    let probed: Vec<(usize, &ProbeRecord)> = probes
+    let candidates: Vec<(usize, &ProbeRecord)> = probes
         .iter()
         .enumerate()
         .filter_map(|(at, probe)| Some((at, (*probe)?)))
         .collect();
-    let pick = super::rule::rule_pick(probed.iter().map(|(_, probe)| {
+    let pick = super::rule::rule_pick(candidates.iter().map(|(_, probe)| {
         (
             live_rule && probe.live.failed(),
             probe.completed,
             probe.stubbed_tool_calls,
         )
     }))?;
-    probed.get(pick).map(|(at, _)| *at)
+    candidates.get(pick).map(|(at, _)| *at)
 }
 
 /// The state of one refine run.
