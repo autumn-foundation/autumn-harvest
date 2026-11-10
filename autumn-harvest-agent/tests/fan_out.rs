@@ -1317,3 +1317,67 @@ fn a_reason_has_a_stable_code_and_wire_form() {
         assert_eq!(serde_json::to_value(reason).unwrap(), json!(code));
     }
 }
+
+// Issue #2485: a fan-out child and an inline child have different run-id
+// forms. A fan-out child run has its execution id as its run id. A later
+// inline child gets `{root run id}:d{n}`, and `n` counts the fan-out
+// children too. `durable_peers.rs` covers the run id of a durable peer.
+#[tokio::test(flavor = "multi_thread")]
+async fn fan_out_and_inline_children_have_their_own_run_id_forms() {
+    let (_dir, db) = fresh_db();
+    let model = FnModel::new(|request| {
+        if first_user(request) != ROOT_INPUT {
+            return text(&format!("done: {}", first_user(request)), 2);
+        }
+        match results(request).len() {
+            0 => tool_calls(
+                &[
+                    (
+                        "d1",
+                        DELEGATE_TOOL,
+                        json!({"agent": "flights", "task": "find flights"}),
+                    ),
+                    (
+                        "d2",
+                        DELEGATE_TOOL,
+                        json!({"agent": "hotels", "task": "find hotels"}),
+                    ),
+                ],
+                3,
+            ),
+            2 => tool_calls(
+                &[(
+                    "d3",
+                    DELEGATE_TOOL,
+                    json!({"agent": "visas", "task": "check visas"}),
+                )],
+                3,
+            ),
+            _ => text("trip planned", 3),
+        }
+    });
+    let mut rt = runtime(&db, trip_harness(model));
+    let (exec, report) = run(&mut rt, &trip_task(2)).await;
+
+    assert_eq!(report.stop, AgentStop::Completed);
+    let started: Vec<String> = rt
+        .load_history(exec)
+        .unwrap()
+        .into_iter()
+        .filter_map(|event| match event {
+            WorkflowEvent::ChildWorkflowStarted { child_id, .. } => Some(child_id.to_string()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(started.len(), 2, "one child run for each fan-out call");
+    let root = report.run_id.clone().expect("a root run id");
+    let ids: Vec<String> = report
+        .delegations
+        .iter()
+        .map(|record| record.run_id.clone().expect("each delegation ran"))
+        .collect();
+    assert_eq!(
+        ids,
+        [started[0].clone(), started[1].clone(), format!("{root}:d3")]
+    );
+}
