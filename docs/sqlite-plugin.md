@@ -311,6 +311,46 @@ The handle has `start`, `signal_with_start`, `signal`,
 A violation is `HarvestSqliteError::InvalidInput` or `InvalidSignal`. Over
 HTTP it is the Postgres `400` with `violations`.
 
+## The durable agent
+
+`HarvestPlugin::agent(harness)` hosts the durable agent of
+`autumn-harvest-agent`. It calls `autumn_harvest_agent::register`, so the
+app needs no `SqliteRuntime` of its own and no `postgres` feature. The
+driver gives the harness to each agent activity as state:
+
+```rust,ignore
+use autumn_harvest_agent::{AgentHarness, AgentId, AgentOp, Approval};
+use autumn_harvest_plugin::sqlite::{HarvestSqlite, agent};
+
+let plugin = HarvestPlugin::new()
+    .agent(AgentHarness::new(model).agent(profile))
+    .api("/harvest");
+
+// In a handler that takes `harvest: HarvestSqlite`:
+let id = AgentId::new("support", "acct-42")?;
+agent::send(&harvest, &id, &AgentOp::message("hello"), Some("m-1")).await?;
+let state = agent::state(&harvest, &id).await?;
+agent::decide(&harvest, &id, &signal, &Approval::Approve, Some("d-1")).await?;
+```
+
+The module `sqlite::agent` mirrors `autumn_harvest_agent::sqlite`:
+
+- `send` starts the agent when it has no run. A steer or an interrupt goes
+  first, to the running run.
+- `delete` ends the agent once its inbox is empty.
+- `current_run` and `state` read the running run. With no run they return
+  `None`.
+- `decide` sends a decision to the approval wait that its signal names. The
+  approval notice of the harness names the signal.
+
+No call drives the run. The driver runs each op, so a long model turn
+delays the next write. Each fleet tenant shares the one harness.
+
+The agent reads its profile overlays through the store of the harness,
+such as `SqliteOverlayStore` in a file of its own. The
+`/agents/{kind}/profile` routes still need Postgres, so the build refuses
+`agent_overlay_store`.
+
 ## The transactional outbox
 
 A start from the handle commits in the Harvest file, not in your business
@@ -745,9 +785,10 @@ directory, with no Postgres and no Docker:
 ```bash
 cargo test -p autumn-harvest-plugin --features sqlite,oidc,mcp,webhooks,connectors --test sqlite_plugin
 cargo test -p autumn-harvest-plugin --features sqlite --test sqlite_plugin_fleet
+cargo test -p autumn-harvest-plugin --features sqlite --test sqlite_plugin_agent
 ```
 
-CI runs both in the `sqlite-plugin` job, with `oidc`, `mcp`, `webhooks` and
+CI runs all three in the `sqlite-plugin` job, with `oidc`, `mcp`, `webhooks` and
 `connectors` on. One clippy step turns on `sqlite` alone, for the code that
 those features turn off. The
 `ops_parity` module covers schedules and retention. The `trigger_parity`
@@ -755,6 +796,9 @@ module covers MCP, webhooks and connectors, and runs only with those
 features. The
 fleet suite boots a tenant fleet. It covers each tenant's file and driver,
 the tenant routes, a close, a reopen and a delete.
+The agent suite runs the overlay read suite of the agent crate on the
+plugin, as a third backend. It covers ops, approvals and overlay reads
+through the handle.
 
 `tests/sqlite_plugin_split.rs` runs a SQLite app on a Postgres Harvest
 database in split and external mode. It starts a Postgres container, or

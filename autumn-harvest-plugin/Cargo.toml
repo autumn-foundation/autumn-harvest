@@ -236,6 +236,8 @@ ed25519-dalek = "3.0"
 # #1981).
 base64 = "0.23"
 sha2 = "0.11"
+# The agent test reads overlays from a SQLite store.
+autumn-harvest-agent = { version = "0.10.0", path = "../autumn-harvest-agent", features = ["postgres", "sqlite"] }
 
 # Deterministic (non-criterion) instruction/allocation-count profiling
 # harness for `dag_graph::build_run_graph` -- the pure projection behind
@@ -323,4 +325,9 @@ required-features = ["sqlite"]
 # Per-tenant Harvest in a SQLite fleet app (issue #2472). It needs no Docker.
 [[test]]
 name = "sqlite_plugin_fleet"
+required-features = ["sqlite"]
+
+# The durable agent under `HarvestPlugin` on SQLite. It needs no Docker.
+[[test]]
+name = "sqlite_plugin_agent"
 required-features = ["sqlite"]

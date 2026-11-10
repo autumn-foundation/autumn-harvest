@@ -22,11 +22,14 @@
 //!   [`ops`] for the admin routes.
 //! - MCP tools and tasks, webhook receivers and broker connectors start runs
 //!   through the [`HarvestSqlite`] handle (issue #2471).
+//! - `HarvestPlugin::agent` hosts the durable agent. The [`agent`] module
+//!   sends its ops and decisions through the handle.
 //!
 //! Every builder option and mode that this slice cannot honour fails the
 //! build or the boot, and names the issue that ports it. A silent no-op would
 //! let an app believe a protection or a feature is on.
 
+pub mod agent;
 mod api;
 mod driver;
 mod fleet;

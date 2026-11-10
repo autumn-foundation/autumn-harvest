@@ -56,7 +56,7 @@ use crate::heartbeat::{HEARTBEAT_WORKFLOW_NAME, HeartbeatTask};
 use crate::mesh_control::{MESH_ATTR, MeshPause, MeshSpend, Spend};
 use crate::model::BoxFuture;
 use crate::types::AgentTask;
-use crate::workflow::{WORKFLOW_NAME, activities, workflows};
+use crate::workflow::WORKFLOW_NAME;
 use autumn_harvest::chrono::{DateTime, Utc};
 
 /// The queue of a new run when the caller names none.
@@ -222,15 +222,11 @@ impl PostgresAgents {
 /// Register the agent workflows, their activities and `harness` on a worker
 /// builder.
 ///
-/// It is the Postgres form of `sqlite::register`. The activities read
-/// the harness with `ActivityContext::state`, so a worker with no harness
-/// fails each call as `AgentHarnessMissing`.
+/// It is the Postgres form of `sqlite::register`. It calls the neutral
+/// [`register`](crate::register), so both forms stay the same.
 #[must_use]
 pub fn register(builder: HarvestBuilder, harness: AgentHarness) -> HarvestBuilder {
-    builder
-        .workflows(workflows())
-        .activities(activities())
-        .state(harness)
+    crate::register(builder, harness)
 }
 
 /// Start one agent run. Returns its execution id.
