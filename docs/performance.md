@@ -3078,3 +3078,9 @@ standalone note rather than part of the claim-path attribution table above:
   timer of its run. `idx_harvest_timers_exec` now holds
   `(workflow_exec_id, fired)` (timer-lookup buffers -47%, -66% and -78% for
   runs of 250, 1,000 and 2,000 timers, `pg_stat_statements`).
+* [`docs/performance-worker-task-stats-prune.md`](performance-worker-task-stats-prune.md)
+  — each worker heartbeat ran `prune_worker_task_stats` as a sequential scan
+  that parsed every cohort key. The prune now states the retention bound that
+  `harvest_worker_task_stats_updated_at_idx` serves (prune buffers -97.5%,
+  -98.3% and -98.2% for live fleets of 500, 2,000 and 8,000 workers,
+  `pg_stat_statements`).

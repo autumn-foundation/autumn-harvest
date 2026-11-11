@@ -1760,10 +1760,16 @@ struct StoredSnapshotSeq {
 /// A worker with a fast heartbeat then cannot delete a slow peer's live row. A
 /// key without the field falls back to `fallback_stale_secs`.
 ///
+/// The threshold of a row is never shorter than the retention. So the first
+/// predicate holds for each row that the second predicate deletes. It is the
+/// only predicate that `harvest_worker_task_stats_updated_at_idx` can serve.
+/// Without it, each heartbeat reads and parses every key in the table. See
+/// `docs/performance-worker-task-stats-prune.md`.
+///
 /// # Errors
 ///
-/// Returns [`HarvestError`] on database failure, or when a stored cohort key
-/// is not JSON.
+/// Returns [`HarvestError`] on database failure, or when the cohort key of a
+/// row older than the retention is not JSON.
 pub async fn prune_worker_task_stats(
     conn: &mut AsyncPgConnection,
     fallback_stale_secs: i64,
@@ -1771,7 +1777,8 @@ pub async fn prune_worker_task_stats(
     let retention = i64::try_from(WORKER_TASK_STATS_RETENTION.as_secs()).unwrap_or(i64::MAX);
     diesel::sql_query(format!(
         "DELETE FROM harvest_worker_task_stats s \
-         WHERE s.updated_at < NOW() - (GREATEST($1::bigint, {}) * INTERVAL '1 second')",
+         WHERE s.updated_at < NOW() - ($1::bigint * INTERVAL '1 second') \
+           AND s.updated_at < NOW() - (GREATEST($1::bigint, {}) * INTERVAL '1 second')",
         cohort_stale_secs_sql("$2")
     ))
     .bind::<diesel::sql_types::BigInt, _>(retention)
