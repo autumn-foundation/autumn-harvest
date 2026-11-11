@@ -170,6 +170,9 @@ const MECHANISMS: &[(&str, &[&str])] = &[
     // own. What it does establish is that the module's portability cannot be
     // read off its Diesel usage, which is precisely what class (a) asserts.
     // `raw_sql_modules_are_never_classified_trivially_traitable` enforces that.
+    // `const_sql!` and `ConstSql` are the constant fragment of
+    // `cached_stmt` (issue #2651). It is the same escape hatch as `sql::<`
+    // with a type of its own, so the closed rule must name it too.
     (
         "raw-sql",
         &[
@@ -177,6 +180,8 @@ const MECHANISMS: &[(&str, &[&str])] = &[
             "sql_query(",
             "define_sql_function",
             "sql_function!",
+            "const_sql!",
+            "ConstSql",
         ],
     ),
     ("listen/notify", &["pg_notify", "LISTEN "]),

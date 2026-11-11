@@ -429,9 +429,9 @@ mod tests {
             "SELECT COUNT(*) AS n FROM harvest_events",
             "SELECT count( * ) FROM t",
             "SELECT a * 2 AS doubled FROM t",
-            "SELECT $1::bigint * INTERVAL '1 second' AS span",
+            "SELECT (a + b) * $1 AS scaled FROM t",
             "UPDATE t SET a = a * $1 WHERE id = $2 RETURNING id, a",
-            "SELECT pg_notify(t.c, t.p) FROM unnest($1::text[], $2::text[]) AS t(c, p)",
+            "SELECT f(t.c, t.p) FROM unnest($1, $2) AS t(c, p)",
         ] {
             assert!(names_its_result_columns(sql), "{sql}");
         }
