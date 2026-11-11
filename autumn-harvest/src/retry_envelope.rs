@@ -11,6 +11,10 @@
 //! its `start_to_close` bound and that jitter picks the longest delay. Both
 //! bounds hold for every jitter seed, so the report needs no sampling.
 //!
+//! The analysis covers the delays of the policy only. A failure with
+//! `ActivityFailure::with_retry_after` replaces the policy delay with its
+//! hint. That hint can be shorter or longer, so the bounds do not apply to it.
+//!
 //! The module is pure. It sends no SQL and reads no clock.
 
 use std::time::Duration;
