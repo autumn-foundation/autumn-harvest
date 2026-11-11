@@ -518,6 +518,8 @@ pub mod resident;
 pub mod retention;
 /// Per-activity-type retry budget that bounds retry load (issue #1793).
 pub mod retry_budget;
+/// Retry envelope analysis: which configured attempts fit the deadline.
+pub mod retry_envelope;
 /// Continue-as-new run-chain assembly (issue #701).
 pub mod run_chain;
 pub mod saga;
