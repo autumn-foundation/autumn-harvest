@@ -844,3 +844,10 @@ harness = false
 [[bench]]
 name = "schedule_slot_walk_profile"
 harness = false
+
+# Deterministic (non-criterion) instruction/allocation-count profiling harness
+# for the audit-export batch delivery path. See
+# `benches/audit_export_batch_profile.rs`.
+[[bench]]
+name = "audit_export_batch_profile"
+harness = false
