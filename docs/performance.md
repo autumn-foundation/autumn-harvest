@@ -1373,7 +1373,9 @@ change. Design record: [`docs/design/DESIGN-1971.md`](design/DESIGN-1971.md).
   cached statement.
 - The transaction first sends `queue::CLAIM_PLAN_SETTINGS_SQL` in one
   batch: `SET LOCAL jit = off`, `SET LOCAL plan_cache_mode =
-  force_generic_plan` and `SET LOCAL enable_bitmapscan = off`.
+  force_generic_plan` and `SET LOCAL enable_bitmapscan = off`. Since issue
+  #2651 that batch also holds the `BEGIN` of the transaction, so the
+  settings cost no round trip of their own.
   - The plan carries the cost estimate of the full scan, which passes
     `jit_above_cost`.
   - A custom plan costs about 6 ms to plan on each call. On a small backlog
@@ -3078,3 +3080,9 @@ standalone note rather than part of the claim-path attribution table above:
   timer of its run. `idx_harvest_timers_exec` now holds
   `(workflow_exec_id, fired)` (timer-lookup buffers -47%, -66% and -78% for
   runs of 250, 1,000 and 2,000 timers, `pg_stat_statements`).
+* [`docs/performance-hot-path-statement-cache.md`](performance-hot-path-statement-cache.md)
+  — an audit of the whole hot path (issue #2651). Diesel sent most hot
+  statements unnamed, so Postgres planned more than it executed: 22.2 s of
+  planning against 18.6 s of execution in one `throughput` run.
+  `cached_stmt` keeps them prepared (`throughput` 47.8 to 82.0 workflows/s,
+  the median of six alternating pairs, `pg_stat_statements` and `perf`).

@@ -430,6 +430,7 @@ pub async fn try_lock_queue_for_claim(
     conn: &mut AsyncPgConnection,
     queue_name: &str,
 ) -> HarvestResult<bool> {
+    use crate::cached_stmt::CachePreparedDsl as _;
     use diesel_async::RunQueryDsl;
 
     #[derive(diesel::QueryableByName)]
@@ -442,6 +443,7 @@ pub async fn try_lock_queue_for_claim(
     let row: AcquiredRow = diesel::sql_query(try_lock_queue_for_claim_query())
         .bind::<diesel::sql_types::Integer, _>(key1)
         .bind::<diesel::sql_types::Integer, _>(key2)
+        .cache_prepared()
         .get_result(conn)
         .await
         .map_err(crate::error::database_error)?;

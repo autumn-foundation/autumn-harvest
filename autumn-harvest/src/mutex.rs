@@ -396,6 +396,42 @@ pub const fn waiter_wait_metrics_stmt() -> &'static str {
      FROM harvest_mutex_waiters WHERE lock_key = $1 AND waiter_exec_id = $2"
 }
 
+/// Whether `history` records a mutex grant to its execution (issue #2651).
+///
+/// A decision renews the leases of its execution only when this is true.
+/// Two statements per decision then go away for a workflow that never takes
+/// a mutex: the table probe and an `UPDATE` of zero rows.
+///
+/// # Why a history with no grant holds no lock
+///
+/// One statement inserts a `harvest_mutex_locks` row: [`grant_lock_stmt`].
+/// One function runs it: `try_grant_or_enqueue`. One caller calls that
+/// function: the mutex park of the worker, in the decision of the holder.
+/// That transaction also appends [`WorkflowEvent::MutexGranted`] to the
+/// history of the holder. So a lock row of an execution implies a
+/// `MutexGranted` event in its committed history.
+///
+/// A decision loads its history before it renews. Only one decision of an
+/// execution runs at a time, and only that decision can grant. So no grant
+/// can commit between the load and the renewal. A history with no
+/// `MutexGranted` therefore proves that the renewal would change no row.
+///
+/// The test is one-way. A release appends no event, so a history with a
+/// grant can belong to an execution that holds nothing now. The renewal
+/// then runs and changes no row, as before.
+///
+/// `the_grant_has_one_caller_and_it_appends_the_event` guards the premise.
+/// A second writer of lock rows must append the event too, or this test
+/// must go.
+///
+/// [`WorkflowEvent::MutexGranted`]: crate::event::WorkflowEvent::MutexGranted
+#[must_use]
+pub fn history_records_a_grant(history: &[crate::event::WorkflowEvent]) -> bool {
+    history
+        .iter()
+        .any(|event| matches!(event, crate::event::WorkflowEvent::MutexGranted { .. }))
+}
+
 // ── DB-backed operations (advisory-first; to_regclass-guarded entry points) ──
 
 #[cfg(feature = "db")]
@@ -407,6 +443,7 @@ mod db_ops {
         reclaim_expired_lock_and_wake_target_stmt, release_lock_by_holder_key_stmt,
         release_lock_stmt, renew_leases_for_holder_stmt, waiter_keys_for_holder_stmt,
     };
+    use crate::cached_stmt::CachePreparedDsl as _;
     use crate::error::{HarvestResult, database_error};
     use crate::types::ExecutionId;
     use chrono::{DateTime, Utc};
@@ -481,6 +518,7 @@ mod db_ops {
     pub async fn table_present(conn: &mut AsyncPgConnection) -> HarvestResult<bool> {
         let exists: TableExists =
             diesel::sql_query("SELECT to_regclass('harvest_mutex_locks') IS NOT NULL AS present")
+                .cache_prepared()
                 .get_result(conn)
                 .await
                 .map_err(database_error)?;
@@ -492,6 +530,7 @@ mod db_ops {
     async fn advisory_lock(conn: &mut AsyncPgConnection, key: &str) -> HarvestResult<()> {
         diesel::sql_query(advisory_lock_stmt())
             .bind::<diesel::sql_types::Text, _>(key)
+            .cache_prepared()
             .execute(conn)
             .await
             .map(|_| ())
@@ -505,6 +544,7 @@ mod db_ops {
     ) -> HarvestResult<Option<ExecutionId>> {
         let row: Option<WaiterRow> = diesel::sql_query(head_of_line_stmt())
             .bind::<diesel::sql_types::Text, _>(key)
+            .cache_prepared()
             .get_result(conn)
             .await
             .optional()
@@ -532,6 +572,7 @@ mod db_ops {
         diesel::sql_query(enqueue_waiter_stmt())
             .bind::<diesel::sql_types::Text, _>(key)
             .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+            .cache_prepared()
             .execute(conn)
             .await
             .map_err(database_error)?;
@@ -540,6 +581,7 @@ mod db_ops {
             .bind::<diesel::sql_types::Text, _>(key)
             .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
             .bind::<diesel::sql_types::Double, _>(ttl.as_secs_f64())
+            .cache_prepared()
             .get_result(conn)
             .await
             .optional()
@@ -570,6 +612,7 @@ mod db_ops {
         let row: Option<WaitMetricsRow> = diesel::sql_query(super::waiter_wait_metrics_stmt())
             .bind::<diesel::sql_types::Text, _>(key)
             .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+            .cache_prepared()
             .get_result(conn)
             .await
             .optional()
@@ -590,6 +633,7 @@ mod db_ops {
         let row: Grantable = diesel::sql_query(is_grantable_head_stmt())
             .bind::<diesel::sql_types::Text, _>(key)
             .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+            .cache_prepared()
             .get_result(conn)
             .await
             .map_err(database_error)?;
@@ -616,6 +660,7 @@ mod db_ops {
             .bind::<diesel::sql_types::Text, _>(key)
             .bind::<diesel::sql_types::Uuid, _>(holder.as_uuid())
             .bind::<diesel::sql_types::BigInt, _>(lock_seq)
+            .cache_prepared()
             .get_result(conn)
             .await
             .optional()
@@ -628,6 +673,7 @@ mod db_ops {
         diesel::sql_query(delete_holder_waiter_for_key_stmt())
             .bind::<diesel::sql_types::Text, _>(key)
             .bind::<diesel::sql_types::Uuid, _>(holder.as_uuid())
+            .cache_prepared()
             .execute(conn)
             .await
             .map_err(database_error)?;
@@ -657,6 +703,7 @@ mod db_ops {
 
         let keys: Vec<KeyRow> = diesel::sql_query(held_keys_for_holder_stmt())
             .bind::<diesel::sql_types::Uuid, _>(holder.as_uuid())
+            .cache_prepared()
             .load(conn)
             .await
             .map_err(database_error)?;
@@ -668,6 +715,7 @@ mod db_ops {
                 diesel::sql_query(release_lock_by_holder_key_stmt())
                     .bind::<diesel::sql_types::Text, _>(&k.lock_key)
                     .bind::<diesel::sql_types::Uuid, _>(holder.as_uuid())
+                    .cache_prepared()
                     .get_result(conn)
                     .await
                     .optional()
@@ -677,6 +725,7 @@ mod db_ops {
                 diesel::sql_query(delete_holder_waiter_for_key_stmt())
                     .bind::<diesel::sql_types::Text, _>(&k.lock_key)
                     .bind::<diesel::sql_types::Uuid, _>(holder.as_uuid())
+                    .cache_prepared()
                     .execute(conn)
                     .await
                     .map_err(database_error)?;
@@ -708,6 +757,7 @@ mod db_ops {
 
         let keys: Vec<KeyRow> = diesel::sql_query(waiter_keys_for_holder_stmt())
             .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+            .cache_prepared()
             .load(conn)
             .await
             .map_err(database_error)?;
@@ -718,6 +768,7 @@ mod db_ops {
             diesel::sql_query(delete_holder_waiter_for_key_stmt())
                 .bind::<diesel::sql_types::Text, _>(&k.lock_key)
                 .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+                .cache_prepared()
                 .execute(conn)
                 .await
                 .map_err(database_error)?;
@@ -748,6 +799,7 @@ mod db_ops {
         }
 
         let keys: Vec<KeyRow> = diesel::sql_query(expired_leases_stmt())
+            .cache_prepared()
             .load(conn)
             .await
             .map_err(database_error)?;
@@ -765,6 +817,7 @@ mod db_ops {
             let row: ReclaimAndWakeTargetRow =
                 diesel::sql_query(reclaim_expired_lock_and_wake_target_stmt())
                     .bind::<diesel::sql_types::Text, _>(&k.lock_key)
+                    .cache_prepared()
                     .get_result(conn)
                     .await
                     .map_err(database_error)?;
@@ -796,6 +849,7 @@ mod db_ops {
         diesel::sql_query(renew_leases_for_holder_stmt())
             .bind::<diesel::sql_types::Uuid, _>(holder.as_uuid())
             .bind::<diesel::sql_types::Double, _>(ttl.as_secs_f64())
+            .cache_prepared()
             .execute(conn)
             .await
             .map(|_| ())
@@ -836,6 +890,7 @@ mod db_ops {
         }
         let row: Option<KeyRow> = diesel::sql_query(holder_holds_any_stmt())
             .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+            .cache_prepared()
             .get_result(conn)
             .await
             .optional()
@@ -1018,6 +1073,71 @@ mod pure_tests {
         assert!(reclaim.contains("lease_expires_at < now()"));
         assert!(reclaim.contains("e.state = 'PAUSED'"));
         assert!(reclaim.contains("RETURNING holder_exec_id"));
+    }
+
+    #[test]
+    fn a_history_with_no_grant_records_none() {
+        use crate::event::WorkflowEvent;
+        let history = vec![WorkflowEvent::TimerFired {
+            timer_id: crate::types::TimerId::new("t-1"),
+        }];
+        assert!(!history_records_a_grant(&[]));
+        assert!(!history_records_a_grant(&history));
+    }
+
+    #[test]
+    fn a_grant_anywhere_in_the_history_is_found() {
+        use crate::event::WorkflowEvent;
+        let grant = WorkflowEvent::MutexGranted {
+            key: "account-1".to_string(),
+            lock_seq: 7,
+            acquired_at: chrono::Utc::now(),
+        };
+        let other = || WorkflowEvent::TimerFired {
+            timer_id: crate::types::TimerId::new("t-1"),
+        };
+        assert!(history_records_a_grant(std::slice::from_ref(&grant)));
+        assert!(history_records_a_grant(&[other(), grant.clone()]));
+        assert!(history_records_a_grant(&[grant, other()]));
+    }
+
+    /// The premise of [`history_records_a_grant`]: one statement inserts a
+    /// lock row, one function runs it, and its one caller appends
+    /// `MutexGranted` in the same transaction.
+    #[test]
+    fn the_grant_has_one_caller_and_it_appends_the_event() {
+        let mutex = include_str!("mutex.rs");
+        let production = mutex.split("mod pure_tests").next().expect("production");
+        assert_eq!(
+            production
+                .matches("INSERT INTO harvest_mutex_locks")
+                .count(),
+            1,
+            "a second statement inserts a lock row"
+        );
+        assert_eq!(
+            production.matches("sql_query(grant_lock_stmt())").count(),
+            1,
+            "a second function runs the grant statement"
+        );
+
+        let worker = include_str!("worker.rs");
+        let call = "crate::mutex::try_grant_or_enqueue(";
+        assert_eq!(
+            worker.matches(call).count(),
+            1,
+            "a second caller grants a lock"
+        );
+        let after = &worker[worker.find(call).expect("the grant call")..];
+        let transaction_end = after
+            .find(".await?;\n\n    for start in deferred")
+            .expect("the grant transaction ends before the deferred starts");
+        let granted_arm = &after[..transaction_end];
+        assert!(
+            granted_arm.contains("WorkflowEvent::MutexGranted {")
+                && granted_arm.contains("store::append_single_event(conn, exec_id, granted_event)"),
+            "the grant transaction no longer appends MutexGranted"
+        );
     }
 
     #[test]

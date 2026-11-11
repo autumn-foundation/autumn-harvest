@@ -218,21 +218,46 @@ diesel::table! {
 /// `harvest_workflow_executions` is in the `FROM` clause under its own name.
 /// Do not use one with a diesel `alias!` of the table.
 pub mod harvest_workflow_executions_unmapped {
-    use diesel::expression::SqlLiteral;
+    use crate::cached_stmt::ConstSql;
     use diesel::sql_types::{Jsonb, Nullable, Text, Uuid};
 
     /// The SQL type of each fragment, for `select_expression_type`.
+    ///
+    /// Each fragment is a [`ConstSql`], so a statement that selects it stays
+    /// a cached prepared statement (issue #2651). A `sql::<T>()` fragment
+    /// made every load of `WorkflowExecution` parse and plan again.
     pub mod types {
-        use super::{Jsonb, Nullable, SqlLiteral, Text, Uuid};
+        use super::{ConstSql, Jsonb, Nullable, Text, Uuid};
+
+        crate::const_sql! {
+            /// The marker of [`super::migrated_from_shards`].
+            pub MigratedFromShardsColumn: Nullable<Jsonb> =
+                r#""harvest_workflow_executions"."migrated_from_shards""#
+        }
+        crate::const_sql! {
+            /// The marker of [`super::migrated_run_terminal_state`].
+            pub MigratedRunTerminalStateColumn: Nullable<Text> =
+                r#""harvest_workflow_executions"."migrated_run_terminal_state""#
+        }
+        crate::const_sql! {
+            /// The marker of [`super::staging_vacated_state`].
+            pub StagingVacatedStateColumn: Nullable<Text> =
+                r#""harvest_workflow_executions"."staging_vacated_state""#
+        }
+        crate::const_sql! {
+            /// The marker of [`super::staging_vacated_by`].
+            pub StagingVacatedByColumn: Nullable<Uuid> =
+                r#""harvest_workflow_executions"."staging_vacated_by""#
+        }
 
         /// The type of [`super::migrated_from_shards`].
-        pub type MigratedFromShards = SqlLiteral<Nullable<Jsonb>>;
+        pub type MigratedFromShards = ConstSql<MigratedFromShardsColumn>;
         /// The type of [`super::migrated_run_terminal_state`].
-        pub type MigratedRunTerminalState = SqlLiteral<Nullable<Text>>;
+        pub type MigratedRunTerminalState = ConstSql<MigratedRunTerminalStateColumn>;
         /// The type of [`super::staging_vacated_state`].
-        pub type StagingVacatedState = SqlLiteral<Nullable<Text>>;
+        pub type StagingVacatedState = ConstSql<StagingVacatedStateColumn>;
         /// The type of [`super::staging_vacated_by`].
-        pub type StagingVacatedBy = SqlLiteral<Nullable<Uuid>>;
+        pub type StagingVacatedBy = ConstSql<StagingVacatedByColumn>;
     }
 
     /// The names of the columns that this module covers.
@@ -252,8 +277,9 @@ pub mod harvest_workflow_executions_unmapped {
     /// intermediate residences. This array keeps them. The array plus the
     /// shard of the live row is the complete set of shards that still hold
     /// a copy of the run. A cross-residence payload erasure traverses that set.
-    pub fn migrated_from_shards() -> types::MigratedFromShards {
-        diesel::dsl::sql(r#""harvest_workflow_executions"."migrated_from_shards""#)
+    #[must_use]
+    pub const fn migrated_from_shards() -> types::MigratedFromShards {
+        ConstSql::new()
     }
 
     /// The terminal state of the live copy of a `MIGRATED` seal (issue #1317).
@@ -261,8 +287,9 @@ pub mod harvest_workflow_executions_unmapped {
     /// The reconciler writes it with `migrated_run_terminal_at`. The `state`
     /// of the seal stays `MIGRATED` forever. A reuse-policy decision reads
     /// this column to tell a failed live copy from a successful one.
-    pub fn migrated_run_terminal_state() -> types::MigratedRunTerminalState {
-        diesel::dsl::sql(r#""harvest_workflow_executions"."migrated_run_terminal_state""#)
+    #[must_use]
+    pub const fn migrated_run_terminal_state() -> types::MigratedRunTerminalState {
+        ConstSql::new()
     }
 
     /// The state that a shard-rebalance staging vacate sealed over (issue #1317).
@@ -270,8 +297,9 @@ pub mod harvest_workflow_executions_unmapped {
     /// It is not NULL only while the migration that vacated this row is in
     /// flight. An abort restores `state` to this value and clears it. A
     /// successful cutover clears it.
-    pub fn staging_vacated_state() -> types::StagingVacatedState {
-        diesel::dsl::sql(r#""harvest_workflow_executions"."staging_vacated_state""#)
+    #[must_use]
+    pub const fn staging_vacated_state() -> types::StagingVacatedState {
+        ConstSql::new()
     }
 
     /// The execution id of the migration whose staging vacated this row (issue #1596).
@@ -279,8 +307,9 @@ pub mod harvest_workflow_executions_unmapped {
     /// It is not NULL exactly when `staging_vacated_state` is not NULL.
     /// `activate_target` finalizes the marker with a direct match on this id.
     /// That needs no cross-database write and has no retry race.
-    pub fn staging_vacated_by() -> types::StagingVacatedBy {
-        diesel::dsl::sql(r#""harvest_workflow_executions"."staging_vacated_by""#)
+    #[must_use]
+    pub const fn staging_vacated_by() -> types::StagingVacatedBy {
+        ConstSql::new()
     }
 }
 

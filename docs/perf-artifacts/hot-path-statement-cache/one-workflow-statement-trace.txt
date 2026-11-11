@@ -1,0 +1,657 @@
+    -1.0ms [488] PARSE  0.042 SELECT COUNT(*) AS n FROM harvest_workflow_executions WHERE 
+    -1.0ms [483] stat  0.022 BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED
+    -1.0ms [483] stat  0.019 SET LOCAL jit = off; SET LOCAL plan_cache_mode = force_generic_plan; SET LOCAL enable_bitmapscan = off; SET LOCAL enable_sort = off
+    -1.0ms [488] exec  0.012 SELECT COUNT(*) AS n FROM harvest_workflow_executions WHERE state = 'COMPLETED' AND workflow_id LIKE $1
+    -1.0ms [489] exec  0.006 SELECT id, queue_name, build_id, deployment_name, created_at, updated_at, target_build_id, ramp_percent FROM harvest_build_policies WHERE queue_name =
+    -1.0ms [489] stat  0.009 BEGIN
+    -1.0ms [489] exec  0.004 SELECT pg_advisory_xact_lock(hashtext($1)::bigint)
+     0.0ms [489] exec  0.228 INSERT INTO "harvest_workflow_executions" ("id", "workflow_name", "workflow_id", "shard_id", "input", "parent_id", "queue_name", "execution_timeout", 
+     0.0ms [483] exec  0.559 WITH worker_info AS ( SELECT COALESCE((SELECT labels FROM harvest_workers WHERE worker_id = $1), '{}'::jsonb) AS labels ), paused_queues AS MATERIALIZ
+     0.0ms [483] stat  0.024 COMMIT
+     0.0ms [483] PARSE  0.109 SELECT DISTINCT q.activity_name FROM harvest_task_queue q JO
+     0.0ms [489] exec  0.272 INSERT INTO "harvest_events" ("workflow_exec_id", "event_id", "event_type", "event_data") VALUES ($1, $2, $3, $4) RETURNING txid_current(), current_da
+     0.0ms [481] exec  0.018 SELECT current_database()::text AS database, pg_postmaster_start_time() AS started_at, pg_notification_queue_usage() AS queue_usage, ARRAY(SELECT CASE
+     0.0ms [483] exec  0.011 SELECT DISTINCT q.activity_name FROM harvest_task_queue q JOIN harvest_rate_limit_buckets b ON b.key = q.rate_limit_key WHERE q.queue_name = ANY($1) A
+     1.0ms [481] exec  0.010 SELECT pg_notify(t.c, t.p) FROM unnest($1::text[], $2::text[]) AS t(c, p)
+     1.0ms [489] exec  0.211 INSERT INTO "harvest_task_queue" ("id", "queue_name", "task_type", "workflow_exec_id", "activity_name", "activity_id", "input", "priority", "max_attem
+     1.0ms [489] stat  0.034 COMMIT
+     1.0ms [487] exec  0.014 SELECT current_database()::text AS database, pg_postmaster_start_time() AS started_at, pg_notification_queue_usage() AS queue_usage, ARRAY(SELECT CASE
+     1.0ms [487] exec  0.006 SELECT pg_notify(t.c, t.p) FROM unnest($1::text[], $2::text[]) AS t(c, p)
+    21.0ms [493] stat  0.015 BEGIN
+    21.0ms [493] PARSE  0.009 SET LOCAL lock_timeout = '1s'
+    21.0ms [493] exec  0.007 SET LOCAL lock_timeout = '1s'
+    22.0ms [493] PARSE  0.118 INSERT INTO harvest_scanner_leases AS l (shard_id, scanner, 
+    22.0ms [493] exec  0.059 INSERT INTO harvest_scanner_leases AS l (shard_id, scanner, holder, epoch, lease_until, acquired_at) VALUES ($1, $2, $3, 1, clock_timestamp() + make_i
+    22.0ms [493] stat  0.024 COMMIT
+    22.0ms [493] PARSE  0.026 SELECT key_id FROM harvest_codec_key_state WHERE state = 'ac
+    22.0ms [493] exec  0.004 SELECT key_id FROM harvest_codec_key_state WHERE state = 'active' LIMIT 1
+    22.0ms [493] PARSE  0.022 SELECT NOW() AS as_of
+    22.0ms [493] exec  0.004 SELECT NOW() AS as_of
+    23.0ms [493] PARSE  0.407 WITH page AS MATERIALIZED (SELECT id, state, queue_name, tas
+    24.0ms [493] exec  0.043 WITH page AS MATERIALIZED (SELECT id, state, queue_name, task_type, activity_name, workflow_exec_id, scheduled_at, started_at, last_heartbeat_at, hear
+    25.0ms [493] exec  0.005 SELECT "harvest_external_tasks"."id", "harvest_external_tasks"."token", "harvest_external_tasks"."workflow_exec_id", "harvest_external_tasks"."activit
+    25.0ms [493] PARSE  0.068 UPDATE "harvest_workflow_executions" SET "sla_breached" = $1
+    25.0ms [493] exec  0.021 UPDATE "harvest_workflow_executions" SET "sla_breached" = $1, "sla_breached_at" = $2 WHERE (((("harvest_workflow_executions"."state" != $3) AND ("harv
+    25.0ms [493] exec  0.009 SELECT "harvest_workflow_executions"."id", "harvest_workflow_executions"."workflow_name", "harvest_workflow_executions"."workflow_id", "harvest_workfl
+    25.0ms [493] stat  0.007 BEGIN
+    26.0ms [493] PARSE  0.089 SELECT e.* FROM harvest_events e JOIN LATERAL ( SELECT 1 AS 
+    26.0ms [493] exec  0.006 SELECT e.* FROM harvest_events e JOIN LATERAL ( SELECT 1 AS running_exec FROM harvest_workflow_executions x WHERE x.id = e.workflow_exec_id AND x.stat
+    26.0ms [493] stat  0.027 COMMIT
+    26.0ms [488] PARSE  0.053 SELECT COUNT(*) AS n FROM harvest_workflow_executions WHERE 
+    26.0ms [493] stat  0.005 BEGIN
+    27.0ms [493] PARSE  0.127 SELECT e.* FROM harvest_events e JOIN LATERAL ( SELECT 1 AS 
+    27.0ms [488] exec  0.013 SELECT COUNT(*) AS n FROM harvest_workflow_executions WHERE state = 'COMPLETED' AND workflow_id LIKE $1
+    27.0ms [493] exec  0.007 SELECT e.* FROM harvest_events e JOIN LATERAL ( SELECT 1 AS running_exec FROM harvest_workflow_executions x WHERE x.id = e.workflow_exec_id AND x.stat
+    27.0ms [493] stat  0.029 COMMIT
+    27.0ms [493] stat  0.005 BEGIN
+    28.0ms [493] PARSE  0.127 SELECT e.* FROM harvest_events e JOIN LATERAL ( SELECT 1 AS 
+    28.0ms [493] exec  0.006 SELECT e.* FROM harvest_events e JOIN LATERAL ( SELECT 1 AS running_exec FROM harvest_workflow_executions x WHERE x.id = e.workflow_exec_id AND x.stat
+    28.0ms [493] stat  0.024 COMMIT
+    28.0ms [493] exec  0.007 SELECT "harvest_completion_trigger_outbox"."id", "harvest_completion_trigger_outbox"."source_exec_id", "harvest_completion_trigger_outbox"."trigger_id
+    28.0ms [493] PARSE  0.050 SELECT "harvest_completion_trigger_outbox"."id", "harvest_co
+    28.0ms [493] exec  0.005 SELECT "harvest_completion_trigger_outbox"."id", "harvest_completion_trigger_outbox"."source_exec_id", "harvest_completion_trigger_outbox"."trigger_id
+    29.0ms [493] exec  0.004 SELECT "harvest_completion_trigger_outbox"."id", "harvest_completion_trigger_outbox"."source_exec_id", "harvest_completion_trigger_outbox"."trigger_id
+    29.0ms [493] PARSE  0.057 SELECT "harvest_cross_shard_children"."child_exec_id", "harv
+    29.0ms [493] exec  0.004 SELECT "harvest_cross_shard_children"."child_exec_id", "harvest_cross_shard_children"."parent_exec_id", "harvest_cross_shard_children"."target_shard",
+    29.0ms [493] PARSE  0.045 SELECT "harvest_cross_shard_children"."child_exec_id", "harv
+    29.0ms [493] exec  0.004 SELECT "harvest_cross_shard_children"."child_exec_id", "harvest_cross_shard_children"."parent_exec_id", "harvest_cross_shard_children"."target_shard",
+    29.0ms [493] PARSE  0.013 SELECT to_regclass('harvest_debounce') IS NOT NULL AS presen
+    29.0ms [493] exec  0.004 SELECT to_regclass('harvest_debounce') IS NOT NULL AS present
+    29.0ms [493] stat  0.004 BEGIN
+    29.0ms [493] PARSE  0.026 SELECT id, workflow_name, debounce_key, workflow_id, queue_n
+    29.0ms [493] exec  0.003 SELECT id, workflow_name, debounce_key, workflow_id, queue_name, last_input, start_options, shard_id, max_fire_at FROM harvest_debounce WHERE effectiv
+    29.0ms [493] stat  0.008 COMMIT
+    29.0ms [493] PARSE  0.011 SELECT to_regclass('harvest_start_throttle') IS NOT NULL AS 
+    30.0ms [493] exec  0.004 SELECT to_regclass('harvest_start_throttle') IS NOT NULL AS present
+    30.0ms [493] PARSE  0.017 SELECT EXISTS (SELECT 1 FROM harvest_start_throttle LIMIT 1)
+    30.0ms [493] exec  0.003 SELECT EXISTS (SELECT 1 FROM harvest_start_throttle LIMIT 1) AS present
+    30.0ms [493] PARSE  0.009 SELECT to_regclass('harvest_event_batches') IS NOT NULL AS p
+    30.0ms [493] exec  0.003 SELECT to_regclass('harvest_event_batches') IS NOT NULL AS present
+    30.0ms [493] stat  0.004 BEGIN
+    30.0ms [493] PARSE  0.027 SELECT id, workflow_name, batch_key, workflow_id, queue_name
+    30.0ms [493] exec  0.004 SELECT id, workflow_name, batch_key, workflow_id, queue_name, buffered_payloads, start_options, fire_at, max_size, shard_id FROM harvest_event_batches
+    30.0ms [493] stat  0.007 COMMIT
+    30.0ms [493] PARSE  0.077 SELECT s.* FROM harvest_sessions s LEFT JOIN harvest_workers
+    30.0ms [493] exec  0.006 SELECT s.* FROM harvest_sessions s LEFT JOIN harvest_workers w ON w.worker_id = s.host_worker_id LEFT JOIN harvest_workflow_executions e ON e.id = s.w
+    31.0ms [493] PARSE  0.018 SELECT to_regclass('harvest_start_idempotency') IS NOT NULL 
+    31.0ms [493] exec  0.004 SELECT to_regclass('harvest_start_idempotency') IS NOT NULL AS present
+    31.0ms [493] PARSE  0.045 DELETE FROM harvest_start_idempotency WHERE ctid IN ( SELECT
+    31.0ms [493] exec  0.053 DELETE FROM harvest_start_idempotency WHERE ctid IN ( SELECT ctid FROM harvest_start_idempotency WHERE shard_id = $1 AND created_at <= now() - make_in
+    31.0ms [493] stat  0.006 BEGIN
+    31.0ms [493] exec  0.004 SELECT to_regclass('harvest_mutex_locks') IS NOT NULL AS present
+    31.0ms [493] exec  0.006 SELECT l.lock_key FROM harvest_mutex_locks l WHERE l.lease_expires_at < now() AND NOT EXISTS ( SELECT 1 FROM harvest_workflow_executions e WHERE e.id 
+    31.0ms [493] stat  0.009 COMMIT
+    52.0ms [488] PARSE  0.048 SELECT COUNT(*) AS n FROM harvest_workflow_executions WHERE 
+    53.0ms [488] exec  0.012 SELECT COUNT(*) AS n FROM harvest_workflow_executions WHERE state = 'COMPLETED' AND workflow_id LIKE $1
+    56.0ms [480] stat  0.016 BEGIN
+    56.0ms [480] PARSE  0.009 SET LOCAL lock_timeout = '1s'
+    56.0ms [480] exec  0.009 SET LOCAL lock_timeout = '1s'
+    56.0ms [480] PARSE  0.094 INSERT INTO harvest_scanner_leases AS l (shard_id, scanner, 
+    57.0ms [480] exec  0.053 INSERT INTO harvest_scanner_leases AS l (shard_id, scanner, holder, epoch, lease_until, acquired_at) VALUES ($1, $2, $3, 1, clock_timestamp() + make_i
+    57.0ms [480] stat  0.025 COMMIT
+    57.0ms [480] PARSE  0.024 SELECT key_id FROM harvest_codec_key_state WHERE state = 'ac
+    57.0ms [480] exec  0.004 SELECT key_id FROM harvest_codec_key_state WHERE state = 'active' LIMIT 1
+    57.0ms [480] PARSE  0.009 SELECT NOW() AS as_of
+    57.0ms [480] exec  0.003 SELECT NOW() AS as_of
+    57.0ms [480] PARSE  0.335 WITH page AS MATERIALIZED (SELECT id, state, queue_name, tas
+    59.0ms [480] exec  0.042 WITH page AS MATERIALIZED (SELECT id, state, queue_name, task_type, activity_name, workflow_exec_id, scheduled_at, started_at, last_heartbeat_at, hear
+    59.0ms [480] exec  0.008 SELECT "harvest_external_tasks"."id", "harvest_external_tasks"."token", "harvest_external_tasks"."workflow_exec_id", "harvest_external_tasks"."activit
+    59.0ms [480] PARSE  0.060 UPDATE "harvest_workflow_executions" SET "sla_breached" = $1
+    60.0ms [480] exec  0.022 UPDATE "harvest_workflow_executions" SET "sla_breached" = $1, "sla_breached_at" = $2 WHERE (((("harvest_workflow_executions"."state" != $3) AND ("harv
+    60.0ms [480] exec  0.007 SELECT "harvest_workflow_executions"."id", "harvest_workflow_executions"."workflow_name", "harvest_workflow_executions"."workflow_id", "harvest_workfl
+    60.0ms [480] stat  0.008 BEGIN
+    60.0ms [480] PARSE  0.093 SELECT e.* FROM harvest_events e JOIN LATERAL ( SELECT 1 AS 
+    61.0ms [480] exec  0.007 SELECT e.* FROM harvest_events e JOIN LATERAL ( SELECT 1 AS running_exec FROM harvest_workflow_executions x WHERE x.id = e.workflow_exec_id AND x.stat
+    61.0ms [480] stat  0.026 COMMIT
+    61.0ms [480] stat  0.004 BEGIN
+    61.0ms [480] PARSE  0.097 SELECT e.* FROM harvest_events e JOIN LATERAL ( SELECT 1 AS 
+    61.0ms [480] exec  0.007 SELECT e.* FROM harvest_events e JOIN LATERAL ( SELECT 1 AS running_exec FROM harvest_workflow_executions x WHERE x.id = e.workflow_exec_id AND x.stat
+    61.0ms [480] stat  0.022 COMMIT
+    62.0ms [480] stat  0.004 BEGIN
+    62.0ms [480] PARSE  0.081 SELECT e.* FROM harvest_events e JOIN LATERAL ( SELECT 1 AS 
+    62.0ms [480] exec  0.006 SELECT e.* FROM harvest_events e JOIN LATERAL ( SELECT 1 AS running_exec FROM harvest_workflow_executions x WHERE x.id = e.workflow_exec_id AND x.stat
+    62.0ms [480] stat  0.020 COMMIT
+    62.0ms [480] exec  0.007 SELECT "harvest_completion_trigger_outbox"."id", "harvest_completion_trigger_outbox"."source_exec_id", "harvest_completion_trigger_outbox"."trigger_id
+    62.0ms [480] PARSE  0.046 SELECT "harvest_completion_trigger_outbox"."id", "harvest_co
+    63.0ms [480] exec  0.024 SELECT "harvest_completion_trigger_outbox"."id", "harvest_completion_trigger_outbox"."source_exec_id", "harvest_completion_trigger_outbox"."trigger_id
+    63.0ms [480] exec  0.004 SELECT "harvest_completion_trigger_outbox"."id", "harvest_completion_trigger_outbox"."source_exec_id", "harvest_completion_trigger_outbox"."trigger_id
+    63.0ms [480] PARSE  0.054 SELECT "harvest_cross_shard_children"."child_exec_id", "harv
+    63.0ms [480] exec  0.005 SELECT "harvest_cross_shard_children"."child_exec_id", "harvest_cross_shard_children"."parent_exec_id", "harvest_cross_shard_children"."target_shard",
+    63.0ms [480] PARSE  0.048 SELECT "harvest_cross_shard_children"."child_exec_id", "harv
+    63.0ms [480] exec  0.004 SELECT "harvest_cross_shard_children"."child_exec_id", "harvest_cross_shard_children"."parent_exec_id", "harvest_cross_shard_children"."target_shard",
+    63.0ms [480] PARSE  0.012 SELECT to_regclass('harvest_debounce') IS NOT NULL AS presen
+    63.0ms [480] exec  0.004 SELECT to_regclass('harvest_debounce') IS NOT NULL AS present
+    63.0ms [480] stat  0.004 BEGIN
+    63.0ms [480] PARSE  0.025 SELECT id, workflow_name, debounce_key, workflow_id, queue_n
+    63.0ms [480] exec  0.003 SELECT id, workflow_name, debounce_key, workflow_id, queue_name, last_input, start_options, shard_id, max_fire_at FROM harvest_debounce WHERE effectiv
+    64.0ms [480] stat  0.009 COMMIT
+    64.0ms [480] PARSE  0.011 SELECT to_regclass('harvest_start_throttle') IS NOT NULL AS 
+    64.0ms [480] exec  0.003 SELECT to_regclass('harvest_start_throttle') IS NOT NULL AS present
+    64.0ms [480] PARSE  0.015 SELECT EXISTS (SELECT 1 FROM harvest_start_throttle LIMIT 1)
+    64.0ms [480] exec  0.002 SELECT EXISTS (SELECT 1 FROM harvest_start_throttle LIMIT 1) AS present
+    64.0ms [480] PARSE  0.009 SELECT to_regclass('harvest_event_batches') IS NOT NULL AS p
+    64.0ms [480] exec  0.003 SELECT to_regclass('harvest_event_batches') IS NOT NULL AS present
+    64.0ms [480] stat  0.003 BEGIN
+    64.0ms [480] PARSE  0.026 SELECT id, workflow_name, batch_key, workflow_id, queue_name
+    64.0ms [480] exec  0.004 SELECT id, workflow_name, batch_key, workflow_id, queue_name, buffered_payloads, start_options, fire_at, max_size, shard_id FROM harvest_event_batches
+    64.0ms [480] stat  0.007 COMMIT
+    64.0ms [480] PARSE  0.076 SELECT s.* FROM harvest_sessions s LEFT JOIN harvest_workers
+    65.0ms [480] exec  0.008 SELECT s.* FROM harvest_sessions s LEFT JOIN harvest_workers w ON w.worker_id = s.host_worker_id LEFT JOIN harvest_workflow_executions e ON e.id = s.w
+    65.0ms [480] PARSE  0.017 SELECT to_regclass('harvest_start_idempotency') IS NOT NULL 
+    65.0ms [480] exec  0.004 SELECT to_regclass('harvest_start_idempotency') IS NOT NULL AS present
+    65.0ms [480] PARSE  0.043 DELETE FROM harvest_start_idempotency WHERE ctid IN ( SELECT
+    65.0ms [480] exec  0.023 DELETE FROM harvest_start_idempotency WHERE ctid IN ( SELECT ctid FROM harvest_start_idempotency WHERE shard_id = $1 AND created_at <= now() - make_in
+    65.0ms [480] stat  0.005 BEGIN
+    65.0ms [480] exec  0.003 SELECT to_regclass('harvest_mutex_locks') IS NOT NULL AS present
+    65.0ms [480] exec  0.006 SELECT l.lock_key FROM harvest_mutex_locks l WHERE l.lease_expires_at < now() AND NOT EXISTS ( SELECT 1 FROM harvest_workflow_executions e WHERE e.id 
+    65.0ms [483] stat  0.024 BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED
+    65.0ms [480] stat  0.010 COMMIT
+    65.0ms [483] stat  0.019 SET LOCAL jit = off; SET LOCAL plan_cache_mode = force_generic_plan; SET LOCAL enable_bitmapscan = off; SET LOCAL enable_sort = off
+    66.0ms [483] exec  0.703 WITH worker_info AS ( SELECT COALESCE((SELECT labels FROM harvest_workers WHERE worker_id = $1), '{}'::jsonb) AS labels ), paused_queues AS MATERIALIZ
+    67.0ms [483] exec  0.004 SELECT pg_try_advisory_xact_lock_shared($1, $2) AS acquired
+    67.0ms [483] exec  0.030 UPDATE harvest_task_queue SET state = 'PENDING', worker_id = NULL, started_at = NULL, attempt = GREATEST(attempt - 1, 0) WHERE id = $1 AND state = 'RU
+    67.0ms [483] exec  0.017 UPDATE harvest_task_queue SET state = 'PENDING', worker_id = NULL, started_at = NULL, attempt = GREATEST(attempt - 1, 0) WHERE id = $1 AND state = 'RU
+    67.0ms [483] stat  0.063 COMMIT
+    67.0ms [487] stat  0.013 BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED
+    67.0ms [481] stat  0.075 BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED
+    67.0ms [487] stat  0.023 SET LOCAL jit = off; SET LOCAL plan_cache_mode = force_generic_plan; SET LOCAL enable_bitmapscan = off; SET LOCAL enable_sort = off
+    67.0ms [481] stat  0.018 SET LOCAL jit = off; SET LOCAL plan_cache_mode = force_generic_plan; SET LOCAL enable_bitmapscan = off; SET LOCAL enable_sort = off
+    67.0ms [493] exec  0.014 SELECT "harvest_workflow_executions"."id", "harvest_workflow_executions"."workflow_name", "harvest_workflow_executions"."workflow_id", "harvest_workfl
+    67.0ms [493] exec  0.018 SELECT "harvest_events"."id", "harvest_events"."workflow_exec_id", "harvest_events"."event_id", "harvest_events"."event_type", "harvest_events"."event
+    68.0ms [493] exec  0.005 SELECT "harvest_timers"."id", "harvest_timers"."workflow_exec_id", "harvest_timers"."timer_id", "harvest_timers"."fires_at", "harvest_timers"."fired" 
+    68.0ms [493] exec  0.003 SELECT "harvest_signals"."id", "harvest_signals"."workflow_exec_id", "harvest_signals"."signal_name", "harvest_signals"."payload", "harvest_signals"."
+    68.0ms [493] PARSE  0.041 SELECT "harvest_events"."id", "harvest_events"."workflow_exe
+    68.0ms [493] exec  0.010 SELECT "harvest_events"."id", "harvest_events"."workflow_exec_id", "harvest_events"."event_id", "harvest_events"."event_type", "harvest_events"."event
+    68.0ms [493] exec  0.004 SELECT to_regclass('harvest_mutex_locks') IS NOT NULL AS present
+    68.0ms [481] exec  0.580 WITH worker_info AS ( SELECT COALESCE((SELECT labels FROM harvest_workers WHERE worker_id = $1), '{}'::jsonb) AS labels ), paused_queues AS MATERIALIZ
+    68.0ms [493] exec  0.009 UPDATE harvest_mutex_locks SET lease_expires_at = now() + make_interval(secs => $2) WHERE holder_exec_id = $1
+    68.0ms [487] exec  0.709 WITH worker_info AS ( SELECT COALESCE((SELECT labels FROM harvest_workers WHERE worker_id = $1), '{}'::jsonb) AS labels ), paused_queues AS MATERIALIZ
+    68.0ms [481] stat  0.031 COMMIT
+    68.0ms [487] stat  0.022 COMMIT
+    68.0ms [493] exec  0.010 SELECT "harvest_workflow_executions"."state" FROM "harvest_workflow_executions" WHERE ("harvest_workflow_executions"."id" = $1) LIMIT $2
+    68.0ms [481] PARSE  0.119 SELECT DISTINCT q.activity_name FROM harvest_task_queue q JO
+    68.0ms [493] stat  0.008 BEGIN
+    69.0ms [493] exec  0.016 SELECT "harvest_workflow_executions"."state" FROM "harvest_workflow_executions" WHERE ("harvest_workflow_executions"."id" = $1) LIMIT $2 FOR UPDATE
+    69.0ms [493] stat  0.009 SAVEPOINT diesel_savepoint_1
+    69.0ms [481] exec  0.014 SELECT DISTINCT q.activity_name FROM harvest_task_queue q JOIN harvest_rate_limit_buckets b ON b.key = q.rate_limit_key WHERE q.queue_name = ANY($1) A
+    69.0ms [480] stat  0.017 BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED
+    69.0ms [480] stat  0.015 SET LOCAL jit = off; SET LOCAL plan_cache_mode = force_generic_plan; SET LOCAL enable_bitmapscan = off; SET LOCAL enable_sort = off
+    69.0ms [493] exec  0.155 INSERT INTO "harvest_events" ("workflow_exec_id", "event_id", "event_type", "event_data") VALUES ($1, $2, $3, $4) RETURNING txid_current(), current_da
+    69.0ms [493] exec  0.225 INSERT INTO "harvest_task_queue" ("id", "queue_name", "task_type", "workflow_exec_id", "activity_name", "activity_id", "input", "priority", "max_attem
+    70.0ms [493] exec  0.103 WITH candidate AS ( SELECT id, wake_requested FROM harvest_task_queue WHERE id = $1 AND task_type = 'workflow' AND state = 'RUNNING' FOR UPDATE ), upd
+    70.0ms [480] exec  0.552 WITH worker_info AS ( SELECT COALESCE((SELECT labels FROM harvest_workers WHERE worker_id = $1), '{}'::jsonb) AS labels ), paused_queues AS MATERIALIZ
+    70.0ms [480] stat  0.019 COMMIT
+    70.0ms [493] stat  0.021 RELEASE SAVEPOINT diesel_savepoint_1
+    70.0ms [493] stat  0.032 COMMIT
+    70.0ms [483] exec  0.016 SELECT current_database()::text AS database, pg_postmaster_start_time() AS started_at, pg_notification_queue_usage() AS queue_usage, ARRAY(SELECT CASE
+    70.0ms [480] PARSE  0.120 SELECT DISTINCT q.activity_name FROM harvest_task_queue q JO
+    70.0ms [483] exec  0.011 SELECT pg_notify(t.c, t.p) FROM unnest($1::text[], $2::text[]) AS t(c, p)
+    71.0ms [480] exec  0.019 SELECT DISTINCT q.activity_name FROM harvest_task_queue q JOIN harvest_rate_limit_buckets b ON b.key = q.rate_limit_key WHERE q.queue_name = ANY($1) A
+    71.0ms [487] stat  0.019 BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED
+    71.0ms [487] stat  0.017 SET LOCAL jit = off; SET LOCAL plan_cache_mode = force_generic_plan; SET LOCAL enable_bitmapscan = off; SET LOCAL enable_sort = off
+    72.0ms [487] exec  0.800 WITH worker_info AS ( SELECT COALESCE((SELECT labels FROM harvest_workers WHERE worker_id = $1), '{}'::jsonb) AS labels ), paused_queues AS MATERIALIZ
+    72.0ms [487] exec  0.004 SELECT pg_try_advisory_xact_lock_shared($1, $2) AS acquired
+    72.0ms [487] exec  0.026 UPDATE harvest_task_queue SET state = 'PENDING', worker_id = NULL, started_at = NULL, attempt = GREATEST(attempt - 1, 0) WHERE id = $1 AND state = 'RU
+    72.0ms [487] exec  0.020 UPDATE harvest_task_queue SET state = 'PENDING', worker_id = NULL, started_at = NULL, attempt = GREATEST(attempt - 1, 0) WHERE id = $1 AND state = 'RU
+    72.0ms [487] stat  0.028 COMMIT
+    72.0ms [493] stat  0.013 BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED
+    73.0ms [493] stat  0.035 SET LOCAL jit = off; SET LOCAL plan_cache_mode = force_generic_plan; SET LOCAL enable_bitmapscan = off; SET LOCAL enable_sort = off
+    73.0ms [481] stat  0.039 BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED
+    73.0ms [483] stat  0.034 BEGIN
+    73.0ms [481] stat  0.023 SET LOCAL jit = off; SET LOCAL plan_cache_mode = force_generic_plan; SET LOCAL enable_bitmapscan = off; SET LOCAL enable_sort = off
+    73.0ms [483] exec  0.019 SELECT "harvest_workflow_executions"."id", "harvest_workflow_executions"."workflow_name", "harvest_workflow_executions"."workflow_id", "harvest_workfl
+    73.0ms [483] exec  0.024 SELECT "harvest_events"."id", "harvest_events"."workflow_exec_id", "harvest_events"."event_id", "harvest_events"."event_type", "harvest_events"."event
+    73.0ms [483] exec  0.007 SELECT "harvest_task_queue"."state", ((("harvest_task_queue"."state" = $1) AND ("harvest_task_queue"."worker_id" = $2)) AND ("harvest_task_queue"."att
+    73.0ms [483] exec  0.057 UPDATE "harvest_task_queue" SET "handler_started_attempt" = $1, "handler_started_at" = clock_timestamp() WHERE (("harvest_task_queue"."id" = $2) AND (
+    73.0ms [483] exec  0.134 INSERT INTO "harvest_events" ("workflow_exec_id", "event_id", "event_type", "event_data") VALUES ($1, $2, $3, $4) RETURNING txid_current(), current_da
+    73.0ms [481] exec  0.464 WITH worker_info AS ( SELECT COALESCE((SELECT labels FROM harvest_workers WHERE worker_id = $1), '{}'::jsonb) AS labels ), paused_queues AS MATERIALIZ
+    73.0ms [483] stat  0.024 COMMIT
+    74.0ms [480] exec  0.016 SELECT current_database()::text AS database, pg_postmaster_start_time() AS started_at, pg_notification_queue_usage() AS queue_usage, ARRAY(SELECT CASE
+    74.0ms [487] stat  0.007 BEGIN
+    74.0ms [481] stat  0.022 COMMIT
+    74.0ms [493] exec  0.885 WITH worker_info AS ( SELECT COALESCE((SELECT labels FROM harvest_workers WHERE worker_id = $1), '{}'::jsonb) AS labels ), paused_queues AS MATERIALIZ
+    74.0ms [480] exec  0.005 SELECT pg_notify(t.c, t.p) FROM unnest($1::text[], $2::text[]) AS t(c, p)
+    74.0ms [493] stat  0.016 COMMIT
+    74.0ms [481] PARSE  0.120 SELECT DISTINCT q.activity_name FROM harvest_task_queue q JO
+    74.0ms [487] exec  0.019 SELECT "harvest_workflow_executions"."id", "harvest_workflow_executions"."workflow_name", "harvest_workflow_executions"."workflow_id", "harvest_workfl
+    74.0ms [487] exec  0.025 SELECT "harvest_events"."id", "harvest_events"."workflow_exec_id", "harvest_events"."event_id", "harvest_events"."event_type", "harvest_events"."event
+    74.0ms [481] exec  0.010 SELECT DISTINCT q.activity_name FROM harvest_task_queue q JOIN harvest_rate_limit_buckets b ON b.key = q.rate_limit_key WHERE q.queue_name = ANY($1) A
+    74.0ms [487] exec  0.008 SELECT "harvest_task_queue"."state", ((("harvest_task_queue"."state" = $1) AND ("harvest_task_queue"."worker_id" = $2)) AND ("harvest_task_queue"."att
+    74.0ms [483] stat  0.016 BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED
+    75.0ms [483] stat  0.035 SET LOCAL jit = off; SET LOCAL plan_cache_mode = force_generic_plan; SET LOCAL enable_bitmapscan = off; SET LOCAL enable_sort = off
+    75.0ms [487] exec  0.183 INSERT INTO "harvest_events" ("workflow_exec_id", "event_id", "event_type", "event_data") VALUES ($1, $2, $3, $4) RETURNING txid_current(), current_da
+    75.0ms [487] exec  0.110 UPDATE "harvest_task_queue" SET "state" = $1, "output" = $2, "heartbeat_details" = $3, "error" = $4, "completed_at" = $5 WHERE (("harvest_task_queue".
+    75.0ms [487] exec  0.083 UPDATE harvest_task_queue SET state = 'PENDING', worker_id = NULL, started_at = NULL, scheduled_at = $2, created_at = clock_timestamp(), activity_name
+    75.0ms [483] exec  0.514 WITH worker_info AS ( SELECT COALESCE((SELECT labels FROM harvest_workers WHERE worker_id = $1), '{}'::jsonb) AS labels ), paused_queues AS MATERIALIZ
+    75.0ms [483] stat  0.020 COMMIT
+    75.0ms [487] exec  0.006 SELECT id, queue_name, scheduled_at, priority, task_type FROM harvest_task_queue WHERE workflow_exec_id = $1 AND task_type = 'workflow' AND state = 'P
+    76.0ms [487] stat  0.038 COMMIT
+    76.0ms [483] PARSE  0.129 SELECT DISTINCT q.activity_name FROM harvest_task_queue q JO
+    76.0ms [480] exec  0.015 SELECT current_database()::text AS database, pg_postmaster_start_time() AS started_at, pg_notification_queue_usage() AS queue_usage, ARRAY(SELECT CASE
+    76.0ms [480] exec  0.006 SELECT pg_notify(t.c, t.p) FROM unnest($1::text[], $2::text[]) AS t(c, p)
+    76.0ms [483] exec  0.016 SELECT DISTINCT q.activity_name FROM harvest_task_queue q JOIN harvest_rate_limit_buckets b ON b.key = q.rate_limit_key WHERE q.queue_name = ANY($1) A
+    76.0ms [493] stat  0.014 BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED
+    76.0ms [493] stat  0.015 SET LOCAL jit = off; SET LOCAL plan_cache_mode = force_generic_plan; SET LOCAL enable_bitmapscan = off; SET LOCAL enable_sort = off
+    77.0ms [493] exec  0.875 WITH worker_info AS ( SELECT COALESCE((SELECT labels FROM harvest_workers WHERE worker_id = $1), '{}'::jsonb) AS labels ), paused_queues AS MATERIALIZ
+    78.0ms [493] exec  0.004 SELECT pg_try_advisory_xact_lock_shared($1, $2) AS acquired
+    78.0ms [493] exec  0.027 UPDATE harvest_task_queue SET state = 'PENDING', worker_id = NULL, started_at = NULL, attempt = GREATEST(attempt - 1, 0) WHERE id = $1 AND state = 'RU
+    78.0ms [493] exec  0.017 UPDATE harvest_task_queue SET state = 'PENDING', worker_id = NULL, started_at = NULL, attempt = GREATEST(attempt - 1, 0) WHERE id = $1 AND state = 'RU
+    78.0ms [493] stat  0.029 COMMIT
+    78.0ms [487] stat  0.013 BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED
+    78.0ms [481] stat  0.020 BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED
+    78.0ms [487] stat  0.014 SET LOCAL jit = off; SET LOCAL plan_cache_mode = force_generic_plan; SET LOCAL enable_bitmapscan = off; SET LOCAL enable_sort = off
+    78.0ms [481] stat  0.016 SET LOCAL jit = off; SET LOCAL plan_cache_mode = force_generic_plan; SET LOCAL enable_bitmapscan = off; SET LOCAL enable_sort = off
+    78.0ms [480] exec  0.019 SELECT "harvest_workflow_executions"."id", "harvest_workflow_executions"."workflow_name", "harvest_workflow_executions"."workflow_id", "harvest_workfl
+    78.0ms [488] PARSE  0.049 SELECT COUNT(*) AS n FROM harvest_workflow_executions WHERE 
+    78.0ms [480] exec  0.037 SELECT "harvest_events"."id", "harvest_events"."workflow_exec_id", "harvest_events"."event_id", "harvest_events"."event_type", "harvest_events"."event
+    79.0ms [480] exec  0.008 SELECT "harvest_timers"."id", "harvest_timers"."workflow_exec_id", "harvest_timers"."timer_id", "harvest_timers"."fires_at", "harvest_timers"."fired" 
+    79.0ms [480] exec  0.004 SELECT "harvest_signals"."id", "harvest_signals"."workflow_exec_id", "harvest_signals"."signal_name", "harvest_signals"."payload", "harvest_signals"."
+    79.0ms [480] exec  0.005 SELECT "harvest_events"."id", "harvest_events"."workflow_exec_id", "harvest_events"."event_id", "harvest_events"."event_type", "harvest_events"."event
+    79.0ms [487] exec  0.530 WITH worker_info AS ( SELECT COALESCE((SELECT labels FROM harvest_workers WHERE worker_id = $1), '{}'::jsonb) AS labels ), paused_queues AS MATERIALIZ
+    79.0ms [480] exec  0.010 SELECT COALESCE(SUM(pg_column_size(event_data)), 0)::bigint FROM "harvest_events" WHERE ((("harvest_events"."workflow_exec_id" = $1) AND ("harvest_eve
+    79.0ms [487] stat  0.021 COMMIT
+    79.0ms [480] exec  0.005 SELECT to_regclass('harvest_mutex_locks') IS NOT NULL AS present
+    79.0ms [481] exec  0.545 WITH worker_info AS ( SELECT COALESCE((SELECT labels FROM harvest_workers WHERE worker_id = $1), '{}'::jsonb) AS labels ), paused_queues AS MATERIALIZ
+    79.0ms [480] exec  0.015 UPDATE harvest_mutex_locks SET lease_expires_at = now() + make_interval(secs => $2) WHERE holder_exec_id = $1
+    79.0ms [481] stat  0.021 COMMIT
+    79.0ms [488] exec  0.010 SELECT COUNT(*) AS n FROM harvest_workflow_executions WHERE state = 'COMPLETED' AND workflow_id LIKE $1
+    79.0ms [480] exec  0.008 SELECT "harvest_workflow_executions"."state" FROM "harvest_workflow_executions" WHERE ("harvest_workflow_executions"."id" = $1) LIMIT $2
+    79.0ms [481] PARSE  0.119 SELECT DISTINCT q.activity_name FROM harvest_task_queue q JO
+    79.0ms [480] stat  0.009 BEGIN
+    80.0ms [480] exec  0.009 SELECT "harvest_workflow_executions"."state" FROM "harvest_workflow_executions" WHERE ("harvest_workflow_executions"."id" = $1) LIMIT $2 FOR UPDATE
+    80.0ms [480] stat  0.009 SAVEPOINT diesel_savepoint_1
+    80.0ms [480] exec  0.093 INSERT INTO "harvest_events" ("workflow_exec_id", "event_id", "event_type", "event_data") VALUES ($1, $2, $3, $4) RETURNING txid_current(), current_da
+    80.0ms [481] exec  0.013 SELECT DISTINCT q.activity_name FROM harvest_task_queue q JOIN harvest_rate_limit_buckets b ON b.key = q.rate_limit_key WHERE q.queue_name = ANY($1) A
+    80.0ms [480] exec  0.166 INSERT INTO "harvest_task_queue" ("id", "queue_name", "task_type", "workflow_exec_id", "activity_name", "activity_id", "input", "priority", "max_attem
+    80.0ms [480] exec  0.121 WITH candidate AS ( SELECT id, wake_requested FROM harvest_task_queue WHERE id = $1 AND task_type = 'workflow' AND state = 'RUNNING' FOR UPDATE ), upd
+    81.0ms [480] stat  0.021 RELEASE SAVEPOINT diesel_savepoint_1
+    81.0ms [480] stat  0.048 COMMIT
+    81.0ms [483] exec  0.015 SELECT current_database()::text AS database, pg_postmaster_start_time() AS started_at, pg_notification_queue_usage() AS queue_usage, ARRAY(SELECT CASE
+    81.0ms [493] stat  0.020 BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED
+    81.0ms [483] exec  0.006 SELECT pg_notify(t.c, t.p) FROM unnest($1::text[], $2::text[]) AS t(c, p)
+    81.0ms [493] stat  0.017 SET LOCAL jit = off; SET LOCAL plan_cache_mode = force_generic_plan; SET LOCAL enable_bitmapscan = off; SET LOCAL enable_sort = off
+    82.0ms [493] exec  0.838 WITH worker_info AS ( SELECT COALESCE((SELECT labels FROM harvest_workers WHERE worker_id = $1), '{}'::jsonb) AS labels ), paused_queues AS MATERIALIZ
+    82.0ms [493] exec  0.003 SELECT pg_try_advisory_xact_lock_shared($1, $2) AS acquired
+    82.0ms [493] exec  0.026 UPDATE harvest_task_queue SET state = 'PENDING', worker_id = NULL, started_at = NULL, attempt = GREATEST(attempt - 1, 0) WHERE id = $1 AND state = 'RU
+    82.0ms [493] exec  0.019 UPDATE harvest_task_queue SET state = 'PENDING', worker_id = NULL, started_at = NULL, attempt = GREATEST(attempt - 1, 0) WHERE id = $1 AND state = 'RU
+    82.0ms [493] stat  0.031 COMMIT
+    82.0ms [487] stat  0.021 BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED
+    83.0ms [481] stat  0.034 BEGIN
+    83.0ms [480] stat  0.012 BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED
+    83.0ms [487] stat  0.019 SET LOCAL jit = off; SET LOCAL plan_cache_mode = force_generic_plan; SET LOCAL enable_bitmapscan = off; SET LOCAL enable_sort = off
+    83.0ms [480] stat  0.018 SET LOCAL jit = off; SET LOCAL plan_cache_mode = force_generic_plan; SET LOCAL enable_bitmapscan = off; SET LOCAL enable_sort = off
+    83.0ms [481] exec  0.027 SELECT "harvest_workflow_executions"."id", "harvest_workflow_executions"."workflow_name", "harvest_workflow_executions"."workflow_id", "harvest_workfl
+    83.0ms [481] exec  0.036 SELECT "harvest_events"."id", "harvest_events"."workflow_exec_id", "harvest_events"."event_id", "harvest_events"."event_type", "harvest_events"."event
+    83.0ms [481] exec  0.010 SELECT "harvest_task_queue"."state", ((("harvest_task_queue"."state" = $1) AND ("harvest_task_queue"."worker_id" = $2)) AND ("harvest_task_queue"."att
+    83.0ms [481] exec  0.056 UPDATE "harvest_task_queue" SET "handler_started_attempt" = $1, "handler_started_at" = clock_timestamp() WHERE (("harvest_task_queue"."id" = $2) AND (
+    83.0ms [480] exec  0.506 WITH worker_info AS ( SELECT COALESCE((SELECT labels FROM harvest_workers WHERE worker_id = $1), '{}'::jsonb) AS labels ), paused_queues AS MATERIALIZ
+    84.0ms [481] exec  0.121 INSERT INTO "harvest_events" ("workflow_exec_id", "event_id", "event_type", "event_data") VALUES ($1, $2, $3, $4) RETURNING txid_current(), current_da
+    84.0ms [480] stat  0.030 COMMIT
+    84.0ms [481] stat  0.050 COMMIT
+    84.0ms [483] exec  0.015 SELECT current_database()::text AS database, pg_postmaster_start_time() AS started_at, pg_notification_queue_usage() AS queue_usage, ARRAY(SELECT CASE
+    84.0ms [493] stat  0.011 BEGIN
+    84.0ms [487] exec  0.450 WITH worker_info AS ( SELECT COALESCE((SELECT labels FROM harvest_workers WHERE worker_id = $1), '{}'::jsonb) AS labels ), paused_queues AS MATERIALIZ
+    84.0ms [493] exec  0.020 SELECT "harvest_workflow_executions"."id", "harvest_workflow_executions"."workflow_name", "harvest_workflow_executions"."workflow_id", "harvest_workfl
+    84.0ms [487] stat  0.020 COMMIT
+    84.0ms [493] exec  0.043 SELECT "harvest_events"."id", "harvest_events"."workflow_exec_id", "harvest_events"."event_id", "harvest_events"."event_type", "harvest_events"."event
+    85.0ms [487] PARSE  0.125 SELECT DISTINCT q.activity_name FROM harvest_task_queue q JO
+    85.0ms [493] exec  0.018 SELECT "harvest_task_queue"."state", ((("harvest_task_queue"."state" = $1) AND ("harvest_task_queue"."worker_id" = $2)) AND ("harvest_task_queue"."att
+    85.0ms [487] exec  0.012 SELECT DISTINCT q.activity_name FROM harvest_task_queue q JOIN harvest_rate_limit_buckets b ON b.key = q.rate_limit_key WHERE q.queue_name = ANY($1) A
+    85.0ms [493] exec  0.111 INSERT INTO "harvest_events" ("workflow_exec_id", "event_id", "event_type", "event_data") VALUES ($1, $2, $3, $4) RETURNING txid_current(), current_da
+    85.0ms [480] stat  0.020 BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED
+    85.0ms [480] stat  0.025 SET LOCAL jit = off; SET LOCAL plan_cache_mode = force_generic_plan; SET LOCAL enable_bitmapscan = off; SET LOCAL enable_sort = off
+    85.0ms [493] exec  0.112 UPDATE "harvest_task_queue" SET "state" = $1, "output" = $2, "heartbeat_details" = $3, "error" = $4, "completed_at" = $5 WHERE (("harvest_task_queue".
+    86.0ms [493] exec  0.094 UPDATE harvest_task_queue SET state = 'PENDING', worker_id = NULL, started_at = NULL, scheduled_at = $2, created_at = clock_timestamp(), activity_name
+    86.0ms [480] exec  0.516 WITH worker_info AS ( SELECT COALESCE((SELECT labels FROM harvest_workers WHERE worker_id = $1), '{}'::jsonb) AS labels ), paused_queues AS MATERIALIZ
+    86.0ms [493] exec  0.007 SELECT id, queue_name, scheduled_at, priority, task_type FROM harvest_task_queue WHERE workflow_exec_id = $1 AND task_type = 'workflow' AND state = 'P
+    86.0ms [480] stat  0.029 COMMIT
+    86.0ms [493] stat  0.057 COMMIT
+    86.0ms [483] exec  0.015 SELECT current_database()::text AS database, pg_postmaster_start_time() AS started_at, pg_notification_queue_usage() AS queue_usage, ARRAY(SELECT CASE
+    86.0ms [483] exec  0.008 SELECT pg_notify(t.c, t.p) FROM unnest($1::text[], $2::text[]) AS t(c, p)
+    86.0ms [480] PARSE  0.158 SELECT DISTINCT q.activity_name FROM harvest_task_queue q JO
+    87.0ms [480] exec  0.014 SELECT DISTINCT q.activity_name FROM harvest_task_queue q JOIN harvest_rate_limit_buckets b ON b.key = q.rate_limit_key WHERE q.queue_name = ANY($1) A
+    89.0ms [481] stat  0.013 BEGIN
+    89.0ms [481] PARSE  0.008 SET LOCAL lock_timeout = '1s'
+    89.0ms [481] exec  0.007 SET LOCAL lock_timeout = '1s'
+    89.0ms [481] PARSE  0.098 INSERT INTO harvest_scanner_leases AS l (shard_id, scanner, 
+    90.0ms [481] exec  0.069 INSERT INTO harvest_scanner_leases AS l (shard_id, scanner, holder, epoch, lease_until, acquired_at) VALUES ($1, $2, $3, 1, clock_timestamp() + make_i
+    90.0ms [481] stat  0.021 COMMIT
+    90.0ms [481] PARSE  0.032 SELECT key_id FROM harvest_codec_key_state WHERE state = 'ac
+    90.0ms [481] exec  0.006 SELECT key_id FROM harvest_codec_key_state WHERE state = 'active' LIMIT 1
+    90.0ms [481] PARSE  0.015 SELECT NOW() AS as_of
+    90.0ms [481] exec  0.003 SELECT NOW() AS as_of
+    91.0ms [481] PARSE  0.421 WITH page AS MATERIALIZED (SELECT id, state, queue_name, tas
+    92.0ms [481] exec  0.045 WITH page AS MATERIALIZED (SELECT id, state, queue_name, task_type, activity_name, workflow_exec_id, scheduled_at, started_at, last_heartbeat_at, hear
+    92.0ms [487] exec  0.018 SELECT current_database()::text AS database, pg_postmaster_start_time() AS started_at, pg_notification_queue_usage() AS queue_usage, ARRAY(SELECT CASE
+    93.0ms [487] exec  0.009 SELECT pg_notify(t.c, t.p) FROM unnest($1::text[], $2::text[]) AS t(c, p)
+    93.0ms [481] exec  0.009 SELECT "harvest_external_tasks"."id", "harvest_external_tasks"."token", "harvest_external_tasks"."workflow_exec_id", "harvest_external_tasks"."activit
+    93.0ms [481] PARSE  0.062 UPDATE "harvest_workflow_executions" SET "sla_breached" = $1
+    93.0ms [481] exec  0.022 UPDATE "harvest_workflow_executions" SET "sla_breached" = $1, "sla_breached_at" = $2 WHERE (((("harvest_workflow_executions"."state" != $3) AND ("harv
+    93.0ms [481] exec  0.008 SELECT "harvest_workflow_executions"."id", "harvest_workflow_executions"."workflow_name", "harvest_workflow_executions"."workflow_id", "harvest_workfl
+    93.0ms [481] stat  0.007 BEGIN
+    93.0ms [481] PARSE  0.092 SELECT e.* FROM harvest_events e JOIN LATERAL ( SELECT 1 AS 
+    94.0ms [481] exec  0.007 SELECT e.* FROM harvest_events e JOIN LATERAL ( SELECT 1 AS running_exec FROM harvest_workflow_executions x WHERE x.id = e.workflow_exec_id AND x.stat
+    94.0ms [481] stat  0.024 COMMIT
+    94.0ms [481] stat  0.004 BEGIN
+    94.0ms [481] PARSE  0.084 SELECT e.* FROM harvest_events e JOIN LATERAL ( SELECT 1 AS 
+    95.0ms [481] exec  0.006 SELECT e.* FROM harvest_events e JOIN LATERAL ( SELECT 1 AS running_exec FROM harvest_workflow_executions x WHERE x.id = e.workflow_exec_id AND x.stat
+    95.0ms [481] stat  0.023 COMMIT
+    95.0ms [481] stat  0.004 BEGIN
+    95.0ms [481] PARSE  0.087 SELECT e.* FROM harvest_events e JOIN LATERAL ( SELECT 1 AS 
+    96.0ms [481] exec  0.006 SELECT e.* FROM harvest_events e JOIN LATERAL ( SELECT 1 AS running_exec FROM harvest_workflow_executions x WHERE x.id = e.workflow_exec_id AND x.stat
+    96.0ms [481] stat  0.021 COMMIT
+    96.0ms [481] exec  0.009 SELECT "harvest_completion_trigger_outbox"."id", "harvest_completion_trigger_outbox"."source_exec_id", "harvest_completion_trigger_outbox"."trigger_id
+    96.0ms [481] PARSE  0.048 SELECT "harvest_completion_trigger_outbox"."id", "harvest_co
+    96.0ms [481] exec  0.005 SELECT "harvest_completion_trigger_outbox"."id", "harvest_completion_trigger_outbox"."source_exec_id", "harvest_completion_trigger_outbox"."trigger_id
+    96.0ms [481] exec  0.004 SELECT "harvest_completion_trigger_outbox"."id", "harvest_completion_trigger_outbox"."source_exec_id", "harvest_completion_trigger_outbox"."trigger_id
+    96.0ms [481] PARSE  0.057 SELECT "harvest_cross_shard_children"."child_exec_id", "harv
+    96.0ms [481] exec  0.004 SELECT "harvest_cross_shard_children"."child_exec_id", "harvest_cross_shard_children"."parent_exec_id", "harvest_cross_shard_children"."target_shard",
+    96.0ms [481] PARSE  0.046 SELECT "harvest_cross_shard_children"."child_exec_id", "harv
+    96.0ms [481] exec  0.004 SELECT "harvest_cross_shard_children"."child_exec_id", "harvest_cross_shard_children"."parent_exec_id", "harvest_cross_shard_children"."target_shard",
+    97.0ms [481] PARSE  0.014 SELECT to_regclass('harvest_debounce') IS NOT NULL AS presen
+    97.0ms [481] exec  0.004 SELECT to_regclass('harvest_debounce') IS NOT NULL AS present
+    97.0ms [481] stat  0.004 BEGIN
+    97.0ms [481] PARSE  0.027 SELECT id, workflow_name, debounce_key, workflow_id, queue_n
+    97.0ms [481] exec  0.004 SELECT id, workflow_name, debounce_key, workflow_id, queue_name, last_input, start_options, shard_id, max_fire_at FROM harvest_debounce WHERE effectiv
+    97.0ms [481] stat  0.008 COMMIT
+    97.0ms [481] PARSE  0.010 SELECT to_regclass('harvest_start_throttle') IS NOT NULL AS 
+    97.0ms [481] exec  0.003 SELECT to_regclass('harvest_start_throttle') IS NOT NULL AS present
+    97.0ms [481] PARSE  0.016 SELECT EXISTS (SELECT 1 FROM harvest_start_throttle LIMIT 1)
+    97.0ms [481] exec  0.003 SELECT EXISTS (SELECT 1 FROM harvest_start_throttle LIMIT 1) AS present
+    97.0ms [481] PARSE  0.009 SELECT to_regclass('harvest_event_batches') IS NOT NULL AS p
+    97.0ms [481] exec  0.003 SELECT to_regclass('harvest_event_batches') IS NOT NULL AS present
+    97.0ms [481] stat  0.003 BEGIN
+    97.0ms [481] PARSE  0.026 SELECT id, workflow_name, batch_key, workflow_id, queue_name
+    97.0ms [481] exec  0.004 SELECT id, workflow_name, batch_key, workflow_id, queue_name, buffered_payloads, start_options, fire_at, max_size, shard_id FROM harvest_event_batches
+    97.0ms [481] stat  0.007 COMMIT
+    98.0ms [481] PARSE  0.081 SELECT s.* FROM harvest_sessions s LEFT JOIN harvest_workers
+    98.0ms [481] exec  0.007 SELECT s.* FROM harvest_sessions s LEFT JOIN harvest_workers w ON w.worker_id = s.host_worker_id LEFT JOIN harvest_workflow_executions e ON e.id = s.w
+    98.0ms [481] PARSE  0.015 SELECT to_regclass('harvest_start_idempotency') IS NOT NULL 
+    98.0ms [481] exec  0.004 SELECT to_regclass('harvest_start_idempotency') IS NOT NULL AS present
+    98.0ms [481] PARSE  0.042 DELETE FROM harvest_start_idempotency WHERE ctid IN ( SELECT
+    98.0ms [481] exec  0.022 DELETE FROM harvest_start_idempotency WHERE ctid IN ( SELECT ctid FROM harvest_start_idempotency WHERE shard_id = $1 AND created_at <= now() - make_in
+    98.0ms [481] stat  0.005 BEGIN
+    98.0ms [481] exec  0.004 SELECT to_regclass('harvest_mutex_locks') IS NOT NULL AS present
+    98.0ms [481] exec  0.006 SELECT l.lock_key FROM harvest_mutex_locks l WHERE l.lease_expires_at < now() AND NOT EXISTS ( SELECT 1 FROM harvest_workflow_executions e WHERE e.id 
+    99.0ms [481] stat  0.009 COMMIT
+   106.0ms [488] PARSE  0.048 SELECT COUNT(*) AS n FROM harvest_workflow_executions WHERE 
+   106.0ms [488] exec  0.012 SELECT COUNT(*) AS n FROM harvest_workflow_executions WHERE state = 'COMPLETED' AND workflow_id LIKE $1
+   128.0ms [493] stat  0.016 BEGIN
+   128.0ms [493] PARSE  0.009 SET LOCAL lock_timeout = '1s'
+   128.0ms [493] exec  0.008 SET LOCAL lock_timeout = '1s'
+   128.0ms [493] PARSE  0.091 INSERT INTO harvest_scanner_leases AS l (shard_id, scanner, 
+   128.0ms [493] exec  0.052 INSERT INTO harvest_scanner_leases AS l (shard_id, scanner, holder, epoch, lease_until, acquired_at) VALUES ($1, $2, $3, 1, clock_timestamp() + make_i
+   128.0ms [493] stat  0.023 COMMIT
+   128.0ms [493] PARSE  0.023 SELECT key_id FROM harvest_codec_key_state WHERE state = 'ac
+   128.0ms [493] exec  0.004 SELECT key_id FROM harvest_codec_key_state WHERE state = 'active' LIMIT 1
+   128.0ms [493] PARSE  0.009 SELECT NOW() AS as_of
+   128.0ms [493] exec  0.002 SELECT NOW() AS as_of
+   129.0ms [493] PARSE  0.355 WITH page AS MATERIALIZED (SELECT id, state, queue_name, tas
+   130.0ms [493] exec  0.041 WITH page AS MATERIALIZED (SELECT id, state, queue_name, task_type, activity_name, workflow_exec_id, scheduled_at, started_at, last_heartbeat_at, hear
+   130.0ms [493] exec  0.005 SELECT "harvest_external_tasks"."id", "harvest_external_tasks"."token", "harvest_external_tasks"."workflow_exec_id", "harvest_external_tasks"."activit
+   131.0ms [493] PARSE  0.057 UPDATE "harvest_workflow_executions" SET "sla_breached" = $1
+   131.0ms [493] exec  0.027 UPDATE "harvest_workflow_executions" SET "sla_breached" = $1, "sla_breached_at" = $2 WHERE (((("harvest_workflow_executions"."state" != $3) AND ("harv
+   131.0ms [493] exec  0.008 SELECT "harvest_workflow_executions"."id", "harvest_workflow_executions"."workflow_name", "harvest_workflow_executions"."workflow_id", "harvest_workfl
+   131.0ms [493] stat  0.007 BEGIN
+   132.0ms [493] PARSE  0.092 SELECT e.* FROM harvest_events e JOIN LATERAL ( SELECT 1 AS 
+   132.0ms [493] exec  0.007 SELECT e.* FROM harvest_events e JOIN LATERAL ( SELECT 1 AS running_exec FROM harvest_workflow_executions x WHERE x.id = e.workflow_exec_id AND x.stat
+   132.0ms [493] stat  0.023 COMMIT
+   132.0ms [493] stat  0.004 BEGIN
+   132.0ms [488] PARSE  0.053 SELECT COUNT(*) AS n FROM harvest_workflow_executions WHERE 
+   132.0ms [493] PARSE  0.087 SELECT e.* FROM harvest_events e JOIN LATERAL ( SELECT 1 AS 
+   133.0ms [488] exec  0.012 SELECT COUNT(*) AS n FROM harvest_workflow_executions WHERE state = 'COMPLETED' AND workflow_id LIKE $1
+   133.0ms [493] exec  0.006 SELECT e.* FROM harvest_events e JOIN LATERAL ( SELECT 1 AS running_exec FROM harvest_workflow_executions x WHERE x.id = e.workflow_exec_id AND x.stat
+   133.0ms [493] stat  0.020 COMMIT
+   133.0ms [493] stat  0.003 BEGIN
+   133.0ms [493] PARSE  0.079 SELECT e.* FROM harvest_events e JOIN LATERAL ( SELECT 1 AS 
+   133.0ms [493] exec  0.006 SELECT e.* FROM harvest_events e JOIN LATERAL ( SELECT 1 AS running_exec FROM harvest_workflow_executions x WHERE x.id = e.workflow_exec_id AND x.stat
+   134.0ms [493] stat  0.020 COMMIT
+   134.0ms [493] exec  0.006 SELECT "harvest_completion_trigger_outbox"."id", "harvest_completion_trigger_outbox"."source_exec_id", "harvest_completion_trigger_outbox"."trigger_id
+   134.0ms [493] PARSE  0.050 SELECT "harvest_completion_trigger_outbox"."id", "harvest_co
+   134.0ms [493] exec  0.005 SELECT "harvest_completion_trigger_outbox"."id", "harvest_completion_trigger_outbox"."source_exec_id", "harvest_completion_trigger_outbox"."trigger_id
+   134.0ms [493] exec  0.004 SELECT "harvest_completion_trigger_outbox"."id", "harvest_completion_trigger_outbox"."source_exec_id", "harvest_completion_trigger_outbox"."trigger_id
+   134.0ms [493] PARSE  0.055 SELECT "harvest_cross_shard_children"."child_exec_id", "harv
+   134.0ms [493] exec  0.004 SELECT "harvest_cross_shard_children"."child_exec_id", "harvest_cross_shard_children"."parent_exec_id", "harvest_cross_shard_children"."target_shard",
+   134.0ms [493] PARSE  0.044 SELECT "harvest_cross_shard_children"."child_exec_id", "harv
+   135.0ms [493] exec  0.020 SELECT "harvest_cross_shard_children"."child_exec_id", "harvest_cross_shard_children"."parent_exec_id", "harvest_cross_shard_children"."target_shard",
+   135.0ms [493] PARSE  0.013 SELECT to_regclass('harvest_debounce') IS NOT NULL AS presen
+   135.0ms [493] exec  0.004 SELECT to_regclass('harvest_debounce') IS NOT NULL AS present
+   135.0ms [493] stat  0.004 BEGIN
+   135.0ms [493] PARSE  0.026 SELECT id, workflow_name, debounce_key, workflow_id, queue_n
+   135.0ms [493] exec  0.004 SELECT id, workflow_name, debounce_key, workflow_id, queue_name, last_input, start_options, shard_id, max_fire_at FROM harvest_debounce WHERE effectiv
+   135.0ms [493] stat  0.009 COMMIT
+   135.0ms [493] PARSE  0.011 SELECT to_regclass('harvest_start_throttle') IS NOT NULL AS 
+   135.0ms [493] exec  0.003 SELECT to_regclass('harvest_start_throttle') IS NOT NULL AS present
+   135.0ms [493] PARSE  0.015 SELECT EXISTS (SELECT 1 FROM harvest_start_throttle LIMIT 1)
+   135.0ms [493] exec  0.002 SELECT EXISTS (SELECT 1 FROM harvest_start_throttle LIMIT 1) AS present
+   135.0ms [493] PARSE  0.009 SELECT to_regclass('harvest_event_batches') IS NOT NULL AS p
+   135.0ms [493] exec  0.003 SELECT to_regclass('harvest_event_batches') IS NOT NULL AS present
+   135.0ms [493] stat  0.004 BEGIN
+   135.0ms [493] PARSE  0.027 SELECT id, workflow_name, batch_key, workflow_id, queue_name
+   136.0ms [493] exec  0.004 SELECT id, workflow_name, batch_key, workflow_id, queue_name, buffered_payloads, start_options, fire_at, max_size, shard_id FROM harvest_event_batches
+   136.0ms [493] stat  0.007 COMMIT
+   136.0ms [493] PARSE  0.079 SELECT s.* FROM harvest_sessions s LEFT JOIN harvest_workers
+   136.0ms [493] exec  0.007 SELECT s.* FROM harvest_sessions s LEFT JOIN harvest_workers w ON w.worker_id = s.host_worker_id LEFT JOIN harvest_workflow_executions e ON e.id = s.w
+   136.0ms [493] PARSE  0.015 SELECT to_regclass('harvest_start_idempotency') IS NOT NULL 
+   136.0ms [493] exec  0.004 SELECT to_regclass('harvest_start_idempotency') IS NOT NULL AS present
+   136.0ms [493] PARSE  0.043 DELETE FROM harvest_start_idempotency WHERE ctid IN ( SELECT
+   136.0ms [493] exec  0.020 DELETE FROM harvest_start_idempotency WHERE ctid IN ( SELECT ctid FROM harvest_start_idempotency WHERE shard_id = $1 AND created_at <= now() - make_in
+   136.0ms [493] stat  0.005 BEGIN
+   136.0ms [493] exec  0.003 SELECT to_regclass('harvest_mutex_locks') IS NOT NULL AS present
+   137.0ms [493] exec  0.006 SELECT l.lock_key FROM harvest_mutex_locks l WHERE l.lease_expires_at < now() AND NOT EXISTS ( SELECT 1 FROM harvest_workflow_executions e WHERE e.id 
+   137.0ms [493] stat  0.008 COMMIT
+   150.0ms [483] stat  0.023 BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED
+   150.0ms [483] stat  0.023 SET LOCAL jit = off; SET LOCAL plan_cache_mode = force_generic_plan; SET LOCAL enable_bitmapscan = off; SET LOCAL enable_sort = off
+   151.0ms [483] exec  0.931 WITH worker_info AS ( SELECT COALESCE((SELECT labels FROM harvest_workers WHERE worker_id = $1), '{}'::jsonb) AS labels ), paused_queues AS MATERIALIZ
+   152.0ms [483] exec  0.005 SELECT pg_try_advisory_xact_lock_shared($1, $2) AS acquired
+   152.0ms [483] exec  0.046 UPDATE harvest_task_queue SET state = 'PENDING', worker_id = NULL, started_at = NULL, attempt = GREATEST(attempt - 1, 0) WHERE id = $1 AND state = 'RU
+   152.0ms [483] exec  0.024 UPDATE harvest_task_queue SET state = 'PENDING', worker_id = NULL, started_at = NULL, attempt = GREATEST(attempt - 1, 0) WHERE id = $1 AND state = 'RU
+   152.0ms [483] stat  0.037 COMMIT
+   152.0ms [480] stat  0.024 BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED
+   152.0ms [487] stat  0.033 BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED
+   152.0ms [480] stat  0.030 SET LOCAL jit = off; SET LOCAL plan_cache_mode = force_generic_plan; SET LOCAL enable_bitmapscan = off; SET LOCAL enable_sort = off
+   152.0ms [487] stat  0.018 SET LOCAL jit = off; SET LOCAL plan_cache_mode = force_generic_plan; SET LOCAL enable_bitmapscan = off; SET LOCAL enable_sort = off
+   152.0ms [481] exec  0.020 SELECT "harvest_workflow_executions"."id", "harvest_workflow_executions"."workflow_name", "harvest_workflow_executions"."workflow_id", "harvest_workfl
+   153.0ms [481] exec  0.021 SELECT "harvest_events"."id", "harvest_events"."workflow_exec_id", "harvest_events"."event_id", "harvest_events"."event_type", "harvest_events"."event
+   153.0ms [481] exec  0.009 SELECT "harvest_timers"."id", "harvest_timers"."workflow_exec_id", "harvest_timers"."timer_id", "harvest_timers"."fires_at", "harvest_timers"."fired" 
+   153.0ms [487] exec  0.544 WITH worker_info AS ( SELECT COALESCE((SELECT labels FROM harvest_workers WHERE worker_id = $1), '{}'::jsonb) AS labels ), paused_queues AS MATERIALIZ
+   153.0ms [487] stat  0.022 COMMIT
+   153.0ms [480] exec  0.777 WITH worker_info AS ( SELECT COALESCE((SELECT labels FROM harvest_workers WHERE worker_id = $1), '{}'::jsonb) AS labels ), paused_queues AS MATERIALIZ
+   153.0ms [481] exec  0.006 SELECT "harvest_signals"."id", "harvest_signals"."workflow_exec_id", "harvest_signals"."signal_name", "harvest_signals"."payload", "harvest_signals"."
+   153.0ms [480] stat  0.033 COMMIT
+   153.0ms [481] exec  0.007 SELECT "harvest_events"."id", "harvest_events"."workflow_exec_id", "harvest_events"."event_id", "harvest_events"."event_type", "harvest_events"."event
+   154.0ms [481] exec  0.012 SELECT COALESCE(SUM(pg_column_size(event_data)), 0)::bigint FROM "harvest_events" WHERE ((("harvest_events"."workflow_exec_id" = $1) AND ("harvest_eve
+   154.0ms [480] PARSE  0.141 SELECT DISTINCT q.activity_name FROM harvest_task_queue q JO
+   154.0ms [481] exec  0.004 SELECT to_regclass('harvest_mutex_locks') IS NOT NULL AS present
+   154.0ms [481] exec  0.010 UPDATE harvest_mutex_locks SET lease_expires_at = now() + make_interval(secs => $2) WHERE holder_exec_id = $1
+   154.0ms [481] exec  0.005 SELECT "harvest_workflow_executions"."state" FROM "harvest_workflow_executions" WHERE ("harvest_workflow_executions"."id" = $1) LIMIT $2
+   154.0ms [480] exec  0.016 SELECT DISTINCT q.activity_name FROM harvest_task_queue q JOIN harvest_rate_limit_buckets b ON b.key = q.rate_limit_key WHERE q.queue_name = ANY($1) A
+   154.0ms [493] stat  0.015 BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED
+   154.0ms [481] stat  0.016 BEGIN
+   154.0ms [493] stat  0.015 SET LOCAL jit = off; SET LOCAL plan_cache_mode = force_generic_plan; SET LOCAL enable_bitmapscan = off; SET LOCAL enable_sort = off
+   155.0ms [481] exec  0.015 SELECT "harvest_workflow_executions"."state" FROM "harvest_workflow_executions" WHERE ("harvest_workflow_executions"."id" = $1) LIMIT $2 FOR UPDATE
+   155.0ms [481] stat  0.012 SAVEPOINT diesel_savepoint_1
+   155.0ms [481] exec  0.101 INSERT INTO "harvest_events" ("workflow_exec_id", "event_id", "event_type", "event_data") VALUES ($1, $2, $3, $4) RETURNING txid_current(), current_da
+   155.0ms [493] exec  0.604 WITH worker_info AS ( SELECT COALESCE((SELECT labels FROM harvest_workers WHERE worker_id = $1), '{}'::jsonb) AS labels ), paused_queues AS MATERIALIZ
+   155.0ms [493] stat  0.018 COMMIT
+   155.0ms [493] PARSE  0.107 SELECT DISTINCT q.activity_name FROM harvest_task_queue q JO
+   156.0ms [481] exec  0.491 INSERT INTO "harvest_task_queue" ("id", "queue_name", "task_type", "workflow_exec_id", "activity_name", "activity_id", "input", "priority", "max_attem
+   156.0ms [493] exec  0.012 SELECT DISTINCT q.activity_name FROM harvest_task_queue q JOIN harvest_rate_limit_buckets b ON b.key = q.rate_limit_key WHERE q.queue_name = ANY($1) A
+   156.0ms [483] stat  0.016 BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED
+   156.0ms [483] stat  0.014 SET LOCAL jit = off; SET LOCAL plan_cache_mode = force_generic_plan; SET LOCAL enable_bitmapscan = off; SET LOCAL enable_sort = off
+   156.0ms [481] exec  0.124 WITH candidate AS ( SELECT id, wake_requested FROM harvest_task_queue WHERE id = $1 AND task_type = 'workflow' AND state = 'RUNNING' FOR UPDATE ), upd
+   156.0ms [481] stat  0.020 RELEASE SAVEPOINT diesel_savepoint_1
+   156.0ms [481] stat  0.030 COMMIT
+   156.0ms [487] exec  0.013 SELECT current_database()::text AS database, pg_postmaster_start_time() AS started_at, pg_notification_queue_usage() AS queue_usage, ARRAY(SELECT CASE
+   156.0ms [487] exec  0.009 SELECT pg_notify(t.c, t.p) FROM unnest($1::text[], $2::text[]) AS t(c, p)
+   157.0ms [483] exec  0.771 WITH worker_info AS ( SELECT COALESCE((SELECT labels FROM harvest_workers WHERE worker_id = $1), '{}'::jsonb) AS labels ), paused_queues AS MATERIALIZ
+   157.0ms [483] exec  0.004 SELECT pg_try_advisory_xact_lock_shared($1, $2) AS acquired
+   157.0ms [483] exec  0.025 UPDATE harvest_task_queue SET state = 'PENDING', worker_id = NULL, started_at = NULL, attempt = GREATEST(attempt - 1, 0) WHERE id = $1 AND state = 'RU
+   157.0ms [483] exec  0.020 UPDATE harvest_task_queue SET state = 'PENDING', worker_id = NULL, started_at = NULL, attempt = GREATEST(attempt - 1, 0) WHERE id = $1 AND state = 'RU
+   157.0ms [483] stat  0.029 COMMIT
+   157.0ms [493] stat  0.012 BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED
+   157.0ms [481] stat  0.014 BEGIN
+   157.0ms [493] stat  0.014 SET LOCAL jit = off; SET LOCAL plan_cache_mode = force_generic_plan; SET LOCAL enable_bitmapscan = off; SET LOCAL enable_sort = off
+   157.0ms [480] stat  0.009 BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED
+   158.0ms [480] stat  0.033 SET LOCAL jit = off; SET LOCAL plan_cache_mode = force_generic_plan; SET LOCAL enable_bitmapscan = off; SET LOCAL enable_sort = off
+   158.0ms [493] exec  0.474 WITH worker_info AS ( SELECT COALESCE((SELECT labels FROM harvest_workers WHERE worker_id = $1), '{}'::jsonb) AS labels ), paused_queues AS MATERIALIZ
+   158.0ms [481] exec  0.016 SELECT "harvest_workflow_executions"."id", "harvest_workflow_executions"."workflow_name", "harvest_workflow_executions"."workflow_id", "harvest_workfl
+   158.0ms [480] exec  0.525 WITH worker_info AS ( SELECT COALESCE((SELECT labels FROM harvest_workers WHERE worker_id = $1), '{}'::jsonb) AS labels ), paused_queues AS MATERIALIZ
+   158.0ms [493] stat  0.019 COMMIT
+   159.0ms [488] PARSE  0.073 SELECT COUNT(*) AS n FROM harvest_workflow_executions WHERE 
+   159.0ms [480] stat  0.025 COMMIT
+   159.0ms [481] exec  0.043 SELECT "harvest_events"."id", "harvest_events"."workflow_exec_id", "harvest_events"."event_id", "harvest_events"."event_type", "harvest_events"."event
+   159.0ms [488] exec  0.012 SELECT COUNT(*) AS n FROM harvest_workflow_executions WHERE state = 'COMPLETED' AND workflow_id LIKE $1
+   159.0ms [480] PARSE  0.136 SELECT DISTINCT q.activity_name FROM harvest_task_queue q JO
+   159.0ms [481] exec  0.017 SELECT "harvest_task_queue"."state", ((("harvest_task_queue"."state" = $1) AND ("harvest_task_queue"."worker_id" = $2)) AND ("harvest_task_queue"."att
+   159.0ms [481] exec  0.081 UPDATE "harvest_task_queue" SET "handler_started_attempt" = $1, "handler_started_at" = clock_timestamp() WHERE (("harvest_task_queue"."id" = $2) AND (
+   159.0ms [480] exec  0.015 SELECT DISTINCT q.activity_name FROM harvest_task_queue q JOIN harvest_rate_limit_buckets b ON b.key = q.rate_limit_key WHERE q.queue_name = ANY($1) A
+   159.0ms [487] stat  0.020 BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED
+   159.0ms [481] exec  0.113 INSERT INTO "harvest_events" ("workflow_exec_id", "event_id", "event_type", "event_data") VALUES ($1, $2, $3, $4) RETURNING txid_current(), current_da
+   159.0ms [487] stat  0.020 SET LOCAL jit = off; SET LOCAL plan_cache_mode = force_generic_plan; SET LOCAL enable_bitmapscan = off; SET LOCAL enable_sort = off
+   159.0ms [481] stat  0.038 COMMIT
+   160.0ms [483] exec  0.012 SELECT current_database()::text AS database, pg_postmaster_start_time() AS started_at, pg_notification_queue_usage() AS queue_usage, ARRAY(SELECT CASE
+   160.0ms [493] stat  0.011 BEGIN
+   160.0ms [493] exec  0.022 SELECT "harvest_workflow_executions"."id", "harvest_workflow_executions"."workflow_name", "harvest_workflow_executions"."workflow_id", "harvest_workfl
+   160.0ms [493] exec  0.029 SELECT "harvest_events"."id", "harvest_events"."workflow_exec_id", "harvest_events"."event_id", "harvest_events"."event_type", "harvest_events"."event
+   160.0ms [493] exec  0.009 SELECT "harvest_task_queue"."state", ((("harvest_task_queue"."state" = $1) AND ("harvest_task_queue"."worker_id" = $2)) AND ("harvest_task_queue"."att
+   160.0ms [487] exec  0.695 WITH worker_info AS ( SELECT COALESCE((SELECT labels FROM harvest_workers WHERE worker_id = $1), '{}'::jsonb) AS labels ), paused_queues AS MATERIALIZ
+   161.0ms [493] exec  0.083 INSERT INTO "harvest_events" ("workflow_exec_id", "event_id", "event_type", "event_data") VALUES ($1, $2, $3, $4) RETURNING txid_current(), current_da
+   161.0ms [487] stat  0.025 COMMIT
+   161.0ms [493] exec  0.075 UPDATE "harvest_task_queue" SET "state" = $1, "output" = $2, "heartbeat_details" = $3, "error" = $4, "completed_at" = $5 WHERE (("harvest_task_queue".
+   161.0ms [487] PARSE  0.159 SELECT DISTINCT q.activity_name FROM harvest_task_queue q JO
+   161.0ms [493] exec  0.087 UPDATE harvest_task_queue SET state = 'PENDING', worker_id = NULL, started_at = NULL, scheduled_at = $2, created_at = clock_timestamp(), activity_name
+   161.0ms [487] exec  0.015 SELECT DISTINCT q.activity_name FROM harvest_task_queue q JOIN harvest_rate_limit_buckets b ON b.key = q.rate_limit_key WHERE q.queue_name = ANY($1) A
+   161.0ms [493] exec  0.006 SELECT id, queue_name, scheduled_at, priority, task_type FROM harvest_task_queue WHERE workflow_exec_id = $1 AND task_type = 'workflow' AND state = 'P
+   161.0ms [493] stat  0.037 COMMIT
+   162.0ms [483] stat  0.014 BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED
+   162.0ms [480] exec  0.020 SELECT current_database()::text AS database, pg_postmaster_start_time() AS started_at, pg_notification_queue_usage() AS queue_usage, ARRAY(SELECT CASE
+   162.0ms [483] stat  0.015 SET LOCAL jit = off; SET LOCAL plan_cache_mode = force_generic_plan; SET LOCAL enable_bitmapscan = off; SET LOCAL enable_sort = off
+   162.0ms [480] exec  0.009 SELECT pg_notify(t.c, t.p) FROM unnest($1::text[], $2::text[]) AS t(c, p)
+   162.0ms [483] exec  0.646 WITH worker_info AS ( SELECT COALESCE((SELECT labels FROM harvest_workers WHERE worker_id = $1), '{}'::jsonb) AS labels ), paused_queues AS MATERIALIZ
+   163.0ms [483] exec  0.004 SELECT pg_try_advisory_xact_lock_shared($1, $2) AS acquired
+   163.0ms [483] exec  0.022 UPDATE harvest_task_queue SET state = 'PENDING', worker_id = NULL, started_at = NULL, attempt = GREATEST(attempt - 1, 0) WHERE id = $1 AND state = 'RU
+   163.0ms [483] exec  0.016 UPDATE harvest_task_queue SET state = 'PENDING', worker_id = NULL, started_at = NULL, attempt = GREATEST(attempt - 1, 0) WHERE id = $1 AND state = 'RU
+   163.0ms [483] stat  0.028 COMMIT
+   163.0ms [487] stat  0.013 BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED
+   163.0ms [481] stat  0.022 BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED
+   163.0ms [481] stat  0.022 SET LOCAL jit = off; SET LOCAL plan_cache_mode = force_generic_plan; SET LOCAL enable_bitmapscan = off; SET LOCAL enable_sort = off
+   163.0ms [493] exec  0.013 SELECT "harvest_workflow_executions"."id", "harvest_workflow_executions"."workflow_name", "harvest_workflow_executions"."workflow_id", "harvest_workfl
+   163.0ms [487] stat  0.017 SET LOCAL jit = off; SET LOCAL plan_cache_mode = force_generic_plan; SET LOCAL enable_bitmapscan = off; SET LOCAL enable_sort = off
+   163.0ms [493] exec  0.012 SELECT "harvest_events"."id", "harvest_events"."workflow_exec_id", "harvest_events"."event_id", "harvest_events"."event_type", "harvest_events"."event
+   164.0ms [493] exec  0.006 SELECT "harvest_timers"."id", "harvest_timers"."workflow_exec_id", "harvest_timers"."timer_id", "harvest_timers"."fires_at", "harvest_timers"."fired" 
+   164.0ms [493] exec  0.003 SELECT "harvest_signals"."id", "harvest_signals"."workflow_exec_id", "harvest_signals"."signal_name", "harvest_signals"."payload", "harvest_signals"."
+   164.0ms [493] exec  0.003 SELECT "harvest_events"."id", "harvest_events"."workflow_exec_id", "harvest_events"."event_id", "harvest_events"."event_type", "harvest_events"."event
+   164.0ms [493] exec  0.009 SELECT COALESCE(SUM(pg_column_size(event_data)), 0)::bigint FROM "harvest_events" WHERE ((("harvest_events"."workflow_exec_id" = $1) AND ("harvest_eve
+   164.0ms [493] exec  0.004 SELECT to_regclass('harvest_mutex_locks') IS NOT NULL AS present
+   164.0ms [493] exec  0.009 UPDATE harvest_mutex_locks SET lease_expires_at = now() + make_interval(secs => $2) WHERE holder_exec_id = $1
+   164.0ms [481] exec  0.813 WITH worker_info AS ( SELECT COALESCE((SELECT labels FROM harvest_workers WHERE worker_id = $1), '{}'::jsonb) AS labels ), paused_queues AS MATERIALIZ
+   164.0ms [493] exec  0.005 SELECT "harvest_workflow_executions"."state" FROM "harvest_workflow_executions" WHERE ("harvest_workflow_executions"."id" = $1) LIMIT $2
+   164.0ms [487] exec  0.615 WITH worker_info AS ( SELECT COALESCE((SELECT labels FROM harvest_workers WHERE worker_id = $1), '{}'::jsonb) AS labels ), paused_queues AS MATERIALIZ
+   164.0ms [481] stat  0.037 COMMIT
+   164.0ms [487] stat  0.016 COMMIT
+   165.0ms [493] exec  0.002 SELECT "harvest_workflow_executions"."parent_close_policy" FROM "harvest_workflow_executions" WHERE ((("harvest_workflow_executions"."parent_id" = $1)
+   165.0ms [493] stat  0.008 BEGIN
+   165.0ms [481] PARSE  0.142 SELECT DISTINCT q.activity_name FROM harvest_task_queue q JO
+   165.0ms [493] exec  0.014 SELECT "harvest_workflow_executions"."state" FROM "harvest_workflow_executions" WHERE ("harvest_workflow_executions"."id" = $1) LIMIT $2 FOR UPDATE
+   165.0ms [481] exec  0.011 SELECT DISTINCT q.activity_name FROM harvest_task_queue q JOIN harvest_rate_limit_buckets b ON b.key = q.rate_limit_key WHERE q.queue_name = ANY($1) A
+   165.0ms [480] stat  0.009 BEGIN
+   165.0ms [493] exec  0.008 SELECT EXISTS (SELECT "harvest_signals"."id", "harvest_signals"."workflow_exec_id", "harvest_signals"."signal_name", "harvest_signals"."payload", "har
+   165.0ms [480] PARSE  0.007 SET LOCAL lock_timeout = '1s'
+   165.0ms [493] stat  0.014 SAVEPOINT diesel_savepoint_1
+   165.0ms [480] exec  0.006 SET LOCAL lock_timeout = '1s'
+   166.0ms [480] PARSE  0.104 INSERT INTO harvest_scanner_leases AS l (shard_id, scanner, 
+   166.0ms [493] exec  0.017 SELECT "harvest_task_queue"."id" FROM "harvest_task_queue" WHERE ((("harvest_task_queue"."id" = $1) AND ((("harvest_task_queue"."state" = $2) AND ("ha
+   166.0ms [480] exec  0.042 INSERT INTO harvest_scanner_leases AS l (shard_id, scanner, holder, epoch, lease_until, acquired_at) VALUES ($1, $2, $3, 1, clock_timestamp() + make_i
+   166.0ms [493] exec  0.104 INSERT INTO "harvest_events" ("workflow_exec_id", "event_id", "event_type", "event_data") VALUES ($1, $2, $3, $4) RETURNING txid_current(), current_da
+   166.0ms [480] stat  0.021 COMMIT
+   166.0ms [480] PARSE  0.021 SELECT key_id FROM harvest_codec_key_state WHERE state = 'ac
+   166.0ms [480] exec  0.003 SELECT key_id FROM harvest_codec_key_state WHERE state = 'active' LIMIT 1
+   166.0ms [493] exec  0.011 SELECT ("harvest_workflow_executions"."nd_blocked_at" IS NOT NULL) FROM "harvest_workflow_executions" WHERE ("harvest_workflow_executions"."id" = $1) 
+   166.0ms [480] PARSE  0.008 SELECT NOW() AS as_of
+   166.0ms [480] exec  0.002 SELECT NOW() AS as_of
+   166.0ms [493] exec  0.126 UPDATE "harvest_workflow_executions" SET "state" = $1, "output" = $2, "error" = $3, "sticky_worker_id" = $4, "completed_at" = $5, "nd_blocked_at" = $6
+   167.0ms [480] PARSE  0.339 WITH page AS MATERIALIZED (SELECT id, state, queue_name, tas
+   167.0ms [493] exec  0.075 UPDATE "harvest_task_queue" SET "state" = $1, "output" = $2, "heartbeat_details" = $3, "error" = $4, "completed_at" = $5 WHERE (("harvest_task_queue".
+   167.0ms [493] exec  0.006 SELECT "harvest_workflow_executions"."id", "harvest_workflow_executions"."workflow_name", "harvest_workflow_executions"."parent_close_policy" FROM "ha
+   167.0ms [493] exec  0.014 SELECT "harvest_workflow_executions"."id", "harvest_workflow_executions"."workflow_name", "harvest_workflow_executions"."workflow_id", "harvest_workfl
+   167.0ms [493] exec  0.004 SELECT to_regclass('harvest_mutex_locks') IS NOT NULL AS present
+   167.0ms [493] exec  0.002 SELECT to_regclass('harvest_mutex_locks') IS NOT NULL AS present
+   167.0ms [493] exec  0.005 SELECT lock_key FROM harvest_mutex_locks WHERE holder_exec_id = $1 ORDER BY lock_key
+   167.0ms [493] exec  0.003 SELECT to_regclass('harvest_mutex_locks') IS NOT NULL AS present
+   168.0ms [493] exec  0.004 SELECT DISTINCT lock_key FROM harvest_mutex_waiters WHERE waiter_exec_id = $1 ORDER BY lock_key
+   168.0ms [493] exec  0.003 SELECT "harvest_completion_triggers"."id", "harvest_completion_triggers"."source_workflow_name", "harvest_completion_triggers"."terminal_states", "har
+   168.0ms [493] stat  0.019 RELEASE SAVEPOINT diesel_savepoint_1
+   168.0ms [493] stat  0.043 COMMIT
+   168.0ms [483] exec  0.014 SELECT current_database()::text AS database, pg_postmaster_start_time() AS started_at, pg_notification_queue_usage() AS queue_usage, ARRAY(SELECT CASE
+   168.0ms [480] exec  0.043 WITH page AS MATERIALIZED (SELECT id, state, queue_name, task_type, activity_name, workflow_exec_id, scheduled_at, started_at, last_heartbeat_at, hear
+   168.0ms [493] exec  0.023 SELECT "harvest_workflow_executions"."id", "harvest_workflow_executions"."workflow_name", "harvest_workflow_executions"."workflow_id", "harvest_workfl
+   168.0ms [483] exec  0.008 SELECT pg_notify(t.c, t.p) FROM unnest($1::text[], $2::text[]) AS t(c, p)
+   168.0ms [480] exec  0.007 SELECT "harvest_external_tasks"."id", "harvest_external_tasks"."token", "harvest_external_tasks"."workflow_exec_id", "harvest_external_tasks"."activit
+   168.0ms [493] exec  0.042 SELECT "harvest_events"."id", "harvest_events"."workflow_exec_id", "harvest_events"."event_id", "harvest_events"."event_type", "harvest_events"."event
+   168.0ms [487] stat  0.022 BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED
+   168.0ms [480] PARSE  0.066 UPDATE "harvest_workflow_executions" SET "sla_breached" = $1
+   168.0ms [487] stat  0.026 SET LOCAL jit = off; SET LOCAL plan_cache_mode = force_generic_plan; SET LOCAL enable_bitmapscan = off; SET LOCAL enable_sort = off
+   169.0ms [480] exec  0.024 UPDATE "harvest_workflow_executions" SET "sla_breached" = $1, "sla_breached_at" = $2 WHERE (((("harvest_workflow_executions"."state" != $3) AND ("harv
+   169.0ms [480] exec  0.007 SELECT "harvest_workflow_executions"."id", "harvest_workflow_executions"."workflow_name", "harvest_workflow_executions"."workflow_id", "harvest_workfl
+   169.0ms [480] stat  0.007 BEGIN
+   169.0ms [480] PARSE  0.097 SELECT e.* FROM harvest_events e JOIN LATERAL ( SELECT 1 AS 
+   169.0ms [487] exec  0.712 WITH worker_info AS ( SELECT COALESCE((SELECT labels FROM harvest_workers WHERE worker_id = $1), '{}'::jsonb) AS labels ), paused_queues AS MATERIALIZ
+   170.0ms [480] exec  0.036 SELECT e.* FROM harvest_events e JOIN LATERAL ( SELECT 1 AS running_exec FROM harvest_workflow_executions x WHERE x.id = e.workflow_exec_id AND x.stat
+   170.0ms [487] stat  0.022 COMMIT
+   170.0ms [480] stat  0.031 COMMIT
+   170.0ms [480] stat  0.006 BEGIN
+   170.0ms [487] PARSE  0.112 SELECT DISTINCT q.activity_name FROM harvest_task_queue q JO
+   170.0ms [480] PARSE  0.109 SELECT e.* FROM harvest_events e JOIN LATERAL ( SELECT 1 AS 
+   170.0ms [487] exec  0.010 SELECT DISTINCT q.activity_name FROM harvest_task_queue q JOIN harvest_rate_limit_buckets b ON b.key = q.rate_limit_key WHERE q.queue_name = ANY($1) A
+   170.0ms [481] stat  0.016 BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED
+   170.0ms [481] stat  0.016 SET LOCAL jit = off; SET LOCAL plan_cache_mode = force_generic_plan; SET LOCAL enable_bitmapscan = off; SET LOCAL enable_sort = off
+   170.0ms [480] exec  0.007 SELECT e.* FROM harvest_events e JOIN LATERAL ( SELECT 1 AS running_exec FROM harvest_workflow_executions x WHERE x.id = e.workflow_exec_id AND x.stat
+   170.0ms [480] stat  0.027 COMMIT
+   170.0ms [480] stat  0.004 BEGIN
+   171.0ms [480] PARSE  0.120 SELECT e.* FROM harvest_events e JOIN LATERAL ( SELECT 1 AS 
+   171.0ms [481] exec  0.566 WITH worker_info AS ( SELECT COALESCE((SELECT labels FROM harvest_workers WHERE worker_id = $1), '{}'::jsonb) AS labels ), paused_queues AS MATERIALIZ
+   171.0ms [480] exec  0.008 SELECT e.* FROM harvest_events e JOIN LATERAL ( SELECT 1 AS running_exec FROM harvest_workflow_executions x WHERE x.id = e.workflow_exec_id AND x.stat
+   171.0ms [481] stat  0.019 COMMIT
+   171.0ms [480] stat  0.031 COMMIT
+   171.0ms [480] exec  0.009 SELECT "harvest_completion_trigger_outbox"."id", "harvest_completion_trigger_outbox"."source_exec_id", "harvest_completion_trigger_outbox"."trigger_id
+   171.0ms [481] PARSE  0.108 SELECT DISTINCT q.activity_name FROM harvest_task_queue q JO
+   172.0ms [480] PARSE  0.116 SELECT "harvest_completion_trigger_outbox"."id", "harvest_co
+   172.0ms [481] exec  0.010 SELECT DISTINCT q.activity_name FROM harvest_task_queue q JOIN harvest_rate_limit_buckets b ON b.key = q.rate_limit_key WHERE q.queue_name = ANY($1) A
+   172.0ms [480] exec  0.011 SELECT "harvest_completion_trigger_outbox"."id", "harvest_completion_trigger_outbox"."source_exec_id", "harvest_completion_trigger_outbox"."trigger_id
+   172.0ms [480] exec  0.008 SELECT "harvest_completion_trigger_outbox"."id", "harvest_completion_trigger_outbox"."source_exec_id", "harvest_completion_trigger_outbox"."trigger_id
+   172.0ms [480] PARSE  0.098 SELECT "harvest_cross_shard_children"."child_exec_id", "harv
+   172.0ms [480] exec  0.007 SELECT "harvest_cross_shard_children"."child_exec_id", "harvest_cross_shard_children"."parent_exec_id", "harvest_cross_shard_children"."target_shard",
+   172.0ms [480] PARSE  0.071 SELECT "harvest_cross_shard_children"."child_exec_id", "harv
+   173.0ms [480] exec  0.007 SELECT "harvest_cross_shard_children"."child_exec_id", "harvest_cross_shard_children"."parent_exec_id", "harvest_cross_shard_children"."target_shard",
+   173.0ms [480] PARSE  0.019 SELECT to_regclass('harvest_debounce') IS NOT NULL AS presen
+   173.0ms [480] exec  0.005 SELECT to_regclass('harvest_debounce') IS NOT NULL AS present
+   173.0ms [480] stat  0.007 BEGIN
+   173.0ms [480] PARSE  0.037 SELECT id, workflow_name, debounce_key, workflow_id, queue_n
+   173.0ms [480] exec  0.005 SELECT id, workflow_name, debounce_key, workflow_id, queue_name, last_input, start_options, shard_id, max_fire_at FROM harvest_debounce WHERE effectiv
+   173.0ms [480] stat  0.011 COMMIT
+   173.0ms [480] PARSE  0.016 SELECT to_regclass('harvest_start_throttle') IS NOT NULL AS 
+   173.0ms [480] exec  0.004 SELECT to_regclass('harvest_start_throttle') IS NOT NULL AS present
+   173.0ms [480] PARSE  0.022 SELECT EXISTS (SELECT 1 FROM harvest_start_throttle LIMIT 1)
+   173.0ms [480] exec  0.004 SELECT EXISTS (SELECT 1 FROM harvest_start_throttle LIMIT 1) AS present
+   174.0ms [480] PARSE  0.014 SELECT to_regclass('harvest_event_batches') IS NOT NULL AS p
+   174.0ms [480] exec  0.004 SELECT to_regclass('harvest_event_batches') IS NOT NULL AS present
+   174.0ms [480] stat  0.005 BEGIN
+   174.0ms [480] PARSE  0.039 SELECT id, workflow_name, batch_key, workflow_id, queue_name
+   174.0ms [480] exec  0.005 SELECT id, workflow_name, batch_key, workflow_id, queue_name, buffered_payloads, start_options, fire_at, max_size, shard_id FROM harvest_event_batches
+   174.0ms [480] stat  0.011 COMMIT
+   174.0ms [480] PARSE  0.100 SELECT s.* FROM harvest_sessions s LEFT JOIN harvest_workers
+   174.0ms [480] exec  0.009 SELECT s.* FROM harvest_sessions s LEFT JOIN harvest_workers w ON w.worker_id = s.host_worker_id LEFT JOIN harvest_workflow_executions e ON e.id = s.w
+   175.0ms [480] PARSE  0.026 SELECT to_regclass('harvest_start_idempotency') IS NOT NULL 
+   175.0ms [480] exec  0.006 SELECT to_regclass('harvest_start_idempotency') IS NOT NULL AS present
+   175.0ms [480] PARSE  0.057 DELETE FROM harvest_start_idempotency WHERE ctid IN ( SELECT
+   175.0ms [480] exec  0.030 DELETE FROM harvest_start_idempotency WHERE ctid IN ( SELECT ctid FROM harvest_start_idempotency WHERE shard_id = $1 AND created_at <= now() - make_in
+   175.0ms [480] stat  0.009 BEGIN
+   175.0ms [480] exec  0.006 SELECT to_regclass('harvest_mutex_locks') IS NOT NULL AS present
+   175.0ms [480] exec  0.008 SELECT l.lock_key FROM harvest_mutex_locks l WHERE l.lease_expires_at < now() AND NOT EXISTS ( SELECT 1 FROM harvest_workflow_executions e WHERE e.id 
+   175.0ms [480] stat  0.012 COMMIT
+   185.0ms [488] PARSE  0.053 SELECT COUNT(*) AS n FROM harvest_workflow_executions WHERE 
+   185.0ms [488] exec  0.012 SELECT COUNT(*) AS n FROM harvest_workflow_executions WHERE state = 'COMPLETED' AND workflow_id LIKE $1
+   185.0ms [489] exec  0.006 SELECT id, queue_name, build_id, deployment_name, created_at, updated_at, target_build_id, ramp_percent FROM harvest_build_policies WHERE queue_name =
+   186.0ms [489] stat  0.010 BEGIN
+   186.0ms [489] exec  0.004 SELECT pg_advisory_xact_lock(hashtext($1)::bigint)

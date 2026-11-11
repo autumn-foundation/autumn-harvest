@@ -24,6 +24,7 @@ use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
 use crate::builder::WorkerConfig;
+use crate::cached_stmt::CachePreparedDsl as _;
 use crate::completion_trigger::DeferredTriggerStart;
 #[cfg(feature = "db")]
 use crate::context::TransactionalState;
@@ -6048,10 +6049,7 @@ async fn load_unfired_timers_by_id(
 async fn db_clock_now(
     conn: &mut AsyncPgConnection,
 ) -> HarvestResult<chrono::DateTime<chrono::Utc>> {
-    use diesel::dsl::sql;
-    use diesel::sql_types::Timestamptz;
-
-    diesel::select(sql::<Timestamptz>("NOW()"))
+    diesel::select(crate::cached_stmt::pg_now())
         .get_result(conn)
         .await
         .map_err(crate::error::database_error)
@@ -7016,6 +7014,7 @@ async fn update_workflow_execution_completed(
         SetExt(harvest_workflow_executions_ext::nd_block_reason.eq(None::<String>)),
         dsl::nd_block_count.eq(0),
     ))
+    .cache_prepared()
     .execute(conn)
     .await
     .map_err(crate::error::database_error)?;
@@ -9667,6 +9666,7 @@ async fn update_workflow_execution_failed(
         SetExt(harvest_workflow_executions_ext::nd_block_reason.eq(None::<String>)),
         dsl::nd_block_count.eq(0),
     ))
+    .cache_prepared()
     .execute(conn)
     .await
     .map_err(crate::error::database_error)?;
@@ -9883,6 +9883,7 @@ async fn block_workflow_for_non_determinism(
             SetExt(harvest_workflow_executions_ext::nd_block_reason.eq(Some(error_owned.clone()))),
             exec_dsl::nd_block_count.eq(exec_dsl::nd_block_count + 1),
         ))
+        .cache_prepared()
         .execute(conn)
         .await
         .map_err(crate::error::database_error)?;
@@ -9964,6 +9965,7 @@ async fn clear_nd_block(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> H
             SetExt(harvest_workflow_executions_ext::nd_block_reason.eq(None::<String>)),
             dsl::nd_block_count.eq(0),
         ))
+        .cache_prepared()
         .execute(conn)
         .await
         .map_err(crate::error::database_error)?;
@@ -12651,6 +12653,7 @@ async fn persist_started_timer(
         };
         diesel::update(queue_dsl::harvest_task_queue.find(task_id))
             .set(queue_dsl::activity_name.eq(activity_name_val))
+            .cache_prepared()
             .execute(conn)
             .await
             .map_err(crate::error::database_error)?;
@@ -14370,6 +14373,7 @@ async fn persist_child_timeout_race(
             queue::reschedule_task(conn, task_id, fires_at).await?;
             diesel::update(queue_dsl::harvest_task_queue.find(task_id))
                 .set(queue_dsl::activity_name.eq(Some("mixed_signal_suspension".to_string())))
+                .cache_prepared()
                 .execute(conn)
                 .await
                 .map_err(crate::error::database_error)?;
@@ -14907,6 +14911,7 @@ async fn persist_mixed_suspension_batch(
             // arm already matches, so no stamp is needed there.)
             diesel::update(queue_dsl::harvest_task_queue.find(task_id))
                 .set(queue_dsl::activity_name.eq(Some("mixed_signal_suspension".to_string())))
+                .cache_prepared()
                 .execute(conn)
                 .await
                 .map_err(crate::error::database_error)?;
@@ -14932,6 +14937,7 @@ async fn persist_mixed_suspension_batch(
             // equally hygienic.
             diesel::update(queue_dsl::harvest_task_queue.find(task_id))
                 .set(queue_dsl::activity_name.eq(None::<String>))
+                .cache_prepared()
                 .execute(conn)
                 .await
                 .map_err(crate::error::database_error)?;
@@ -15096,15 +15102,13 @@ pub async fn ingest_due_timers_and_signals(
     codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<(Vec<TimerId>, Vec<String>)> {
     use crate::schema::harvest_timers::dsl;
-    use diesel::dsl::sql;
-    use diesel::sql_types::Timestamptz;
 
     let due_timers = dsl::harvest_timers
         .filter(dsl::workflow_exec_id.eq(exec_id.as_uuid()))
         .filter(dsl::fired.eq(false))
         // Use the database clock here so timer replay stays consistent with the
         // queue claim path, which also uses Postgres NOW().
-        .filter(dsl::fires_at.le(sql::<Timestamptz>("NOW()")))
+        .filter(dsl::fires_at.le(crate::cached_stmt::pg_now()))
         .order((dsl::fires_at.asc(), dsl::timer_id.asc()))
         .select(HarvestTimer::as_select())
         .load(conn)
@@ -15152,6 +15156,7 @@ pub async fn ingest_due_timers_and_signals(
             if !timer_row_ids.is_empty() {
                 diesel::update(dsl::harvest_timers.filter(dsl::id.eq_any(&timer_row_ids)))
                     .set(dsl::fired.eq(true))
+                    .cache_prepared()
                     .execute(conn)
                     .await
                     .map_err(crate::error::database_error)?;
@@ -15850,8 +15855,6 @@ pub async fn materialize_due_child_timeout_deadlines(
 ) -> HarvestResult<usize> {
     use crate::schema::harvest_timers::dsl;
     use diesel::TextExpressionMethods;
-    use diesel::dsl::sql;
-    use diesel::sql_types::Timestamptz;
 
     // ── Per-table lock-ordering convention (issue #779, Codex round-11 review) ──
     //
@@ -15902,7 +15905,7 @@ pub async fn materialize_due_child_timeout_deadlines(
         .filter(dsl::workflow_exec_id.eq(parent_exec_id.as_uuid()))
         .filter(dsl::fired.eq(false))
         .filter(dsl::timer_id.like(r"\_\_child\_timeout:%"))
-        .filter(dsl::fires_at.le(sql::<Timestamptz>("NOW()")))
+        .filter(dsl::fires_at.le(crate::cached_stmt::pg_now()))
         .order(dsl::fires_at.asc())
         .for_update()
         .select(HarvestTimer::as_select())
@@ -15930,6 +15933,7 @@ pub async fn materialize_due_child_timeout_deadlines(
         .await?;
         diesel::update(dsl::harvest_timers.filter(dsl::id.eq(timer_row_id)))
             .set(dsl::fired.eq(true))
+            .cache_prepared()
             .execute(conn)
             .await
             .map_err(crate::error::database_error)?;
@@ -25040,6 +25044,7 @@ async fn persist_workflow_continue_as_new_with_verdict(
                 harvest_workflow_executions::sticky_worker_id.eq(Some(worker_id.to_string())),
                 harvest_workflow_executions::completed_at.eq(Some(chrono::Utc::now())),
             ))
+            .cache_prepared()
             .execute(conn)
             .await
             .map_err(crate::error::database_error)?;
@@ -25120,6 +25125,7 @@ async fn persist_workflow_continue_as_new_with_verdict(
                 .filter(diesel::dsl::not(harvest_signals::consumed)),
         )
         .set(harvest_signals::workflow_exec_id.eq(new_exec_id.as_uuid()))
+        .cache_prepared()
         .execute(conn)
         .await
         .map_err(crate::error::database_error)?;
@@ -27241,12 +27247,17 @@ async fn process_workflow_task(
     // non-holder). Best-effort — a transient renewal failure is tolerated (the
     // TTL exceeds several decision cycles and the reclaim path re-checks under
     // the advisory lock), so it never fails an otherwise-healthy workflow task.
-    if let Err(e) = crate::mutex::renew_leases_for_holder(
-        conn,
-        prepared.exec_id,
-        crate::mutex::effective_mutex_lease_ttl(),
-    )
-    .await
+    //
+    // Issue #2651: a history with no `MutexGranted` proves that the execution
+    // holds no lock, so the renewal is skipped. See
+    // `mutex::history_records_a_grant` for the argument.
+    if crate::mutex::history_records_a_grant(&prepared.history_events)
+        && let Err(e) = crate::mutex::renew_leases_for_holder(
+            conn,
+            prepared.exec_id,
+            crate::mutex::effective_mutex_lease_ttl(),
+        )
+        .await
     {
         tracing::warn!(
             exec_id = %prepared.exec_id,

@@ -4,8 +4,9 @@
 //! This module handles the durable enqueuing of signals into the database, loading pending
 //! signals for a workflow, and marking them as consumed once processed by the workflow context.
 #[cfg(feature = "db")]
-use diesel::{ExpressionMethods, OptionalExtension, QueryDsl, SelectableHelper};
+use crate::cached_stmt::CachePreparedDsl as _;
 #[cfg(feature = "db")]
+use diesel::{ExpressionMethods, OptionalExtension, QueryDsl, SelectableHelper};
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
 
 use crate::error::{HarvestError, HarvestResult};
@@ -272,6 +273,7 @@ pub async fn send_signal_idempotent_with_codecs(
             let inserted = diesel::insert_into(harvest_signals::table)
                 .values(&row)
                 .on_conflict_do_nothing()
+                .cache_prepared()
                 .execute(conn)
                 .await
                 .map_err(crate::error::database_error)?;
@@ -614,6 +616,7 @@ pub async fn forward_signals_to_retry_attempt(
         harvest_signals::workflow_exec_id.eq(to.as_uuid()),
         harvest_signals::consumed.eq(false),
     ))
+    .cache_prepared()
     .execute(conn)
     .await
     .map_err(crate::error::database_error)
@@ -914,6 +917,7 @@ pub async fn mark_signals_consumed(
 
     diesel::update(dsl::harvest_signals.filter(dsl::id.eq_any(signal_ids)))
         .set(dsl::consumed.eq(true))
+        .cache_prepared()
         .execute(conn)
         .await
         .map_err(crate::error::database_error)?;

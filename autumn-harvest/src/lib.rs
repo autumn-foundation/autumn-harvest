@@ -246,6 +246,9 @@ pub mod batch_start;
 pub mod build_routing;
 pub mod builder;
 pub mod cache;
+/// Cached prepared statements for constant SQL text (issue #2651).
+#[cfg(feature = "db")]
+pub mod cached_stmt;
 /// Calendar-aware schedule filtering: named exclusion sets, skip policies, and
 /// schedule preview generation (issue #337).
 pub mod calendar;

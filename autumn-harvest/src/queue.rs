@@ -18,6 +18,7 @@ use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
 use uuid::Uuid;
 
+use crate::cached_stmt::CachePreparedDsl as _;
 use crate::error::HarvestResult;
 use crate::models::{NewTaskQueueItem, TaskQueueItem};
 use crate::shared_json::SharedJson;
@@ -526,9 +527,16 @@ async fn insert_task_rows(
     use crate::schema::harvest_task_queue;
 
     let _phase = crate::worker::PersistPhaseTimer::start(crate::telemetry::PersistPhase::Tasks);
+    // Each `None` of a row renders `DEFAULT`, so the text of the insert
+    // follows the option set of each row. One row has a bounded set of
+    // texts: one per task shape that the deployment enqueues. A batch
+    // multiplies that set by its row count, so only a single row is cached
+    // (issue #2651).
+    let cache = rows.len() == 1;
     let insert = diesel::insert_into(harvest_task_queue::table).values(rows);
     if !crate::notify::stamp_wanted(conn) {
         insert
+            .cache_prepared_if(cache)
             .execute(conn)
             .await
             .map_err(crate::error::database_error)?;
@@ -536,6 +544,7 @@ async fn insert_task_rows(
     }
     let stamps = insert
         .returning(crate::notify::stamp_returning())
+        .cache_prepared_if(cache)
         .get_results::<crate::notify::Stamp>(conn)
         .await
         .map_err(crate::error::database_error)?;
@@ -643,6 +652,7 @@ pub async fn enqueue(conn: &mut AsyncPgConnection, params: &EnqueueParams) -> Ha
         .bind::<diesel::sql_types::Uuid, _>(task_id)
         .bind::<diesel::sql_types::Text, _>(worker_id)
         .bind::<diesel::sql_types::Interval, _>(timeout)
+        .cache_prepared()
         .execute(conn)
         .await
         .map_err(crate::error::database_error)?;
@@ -924,6 +934,7 @@ pub async fn enqueue_batch(
             .bind::<diesel::sql_types::Uuid, _>(task_id)
             .bind::<diesel::sql_types::Text, _>(worker_id)
             .bind::<diesel::sql_types::Interval, _>(chrono_timeout)
+            .cache_prepared()
             .execute(conn)
             .await
             .map_err(crate::error::database_error)?;
@@ -2098,6 +2109,23 @@ const fn claim_task_full_scan_query() -> &'static str {
     )
 }
 
+/// The text of [`CLAIM_PLAN_SETTINGS_SQL`], as a literal for `concat!`.
+macro_rules! claim_plan_settings_sql {
+    () => {
+        "SET LOCAL jit = off; \
+         SET LOCAL plan_cache_mode = force_generic_plan; \
+         SET LOCAL enable_bitmapscan = off; \
+         SET LOCAL enable_sort = off"
+    };
+}
+
+/// The text of [`CLAIM_AGEING_PLAN_SETTINGS_SQL`], as a literal for `concat!`.
+macro_rules! claim_ageing_plan_settings_sql {
+    () => {
+        "SET LOCAL jit = off; SET LOCAL plan_cache_mode = force_generic_plan"
+    };
+}
+
 /// The planner settings for the rest of the claim transaction (issue #1971).
 ///
 /// **JIT off.** The claim plan holds three candidate scans. Postgres adds the
@@ -2146,10 +2174,29 @@ const fn claim_task_full_scan_query() -> &'static str {
 /// They also cover the post-claim rechecks. Those are short statements on
 /// one row, so these settings suit them too. All settings go in one batch,
 /// so they cost one round trip.
-pub const CLAIM_PLAN_SETTINGS_SQL: &str = "SET LOCAL jit = off; \
-     SET LOCAL plan_cache_mode = force_generic_plan; \
-     SET LOCAL enable_bitmapscan = off; \
-     SET LOCAL enable_sort = off";
+pub const CLAIM_PLAN_SETTINGS_SQL: &str = claim_plan_settings_sql!();
+
+/// The `BEGIN` of a claim transaction (issue #619).
+///
+/// The level is pinned on the `BEGIN` itself. See the claim transaction for
+/// why an inherited level is not enough.
+macro_rules! claim_begin_sql {
+    () => {
+        "BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED"
+    };
+}
+
+/// `BEGIN` and [`CLAIM_PLAN_SETTINGS_SQL`] in one batch (issue #2651).
+///
+/// The settings were a batch of their own, one round trip after the `BEGIN`.
+/// Every claim paid it. One batch opens the transaction and sets the
+/// planner in one round trip. The statements and their order are the same.
+pub const CLAIM_BEGIN_WITH_SETTINGS_SQL: &str =
+    concat!(claim_begin_sql!(), "; ", claim_plan_settings_sql!());
+
+/// `BEGIN` and [`CLAIM_AGEING_PLAN_SETTINGS_SQL`] in one batch (issue #2651).
+pub const CLAIM_AGEING_BEGIN_WITH_SETTINGS_SQL: &str =
+    concat!(claim_begin_sql!(), "; ", claim_ageing_plan_settings_sql!());
 
 /// The planner settings of a claim with priority ageing on (issue #1971).
 ///
@@ -2158,8 +2205,7 @@ pub const CLAIM_PLAN_SETTINGS_SQL: &str = "SET LOCAL jit = off; \
 /// statement again when a planner setting changes. So the ageing claim
 /// carries [`CLAIM_AGEING_MARKER`], and the connection caches it as a
 /// separate statement with its own plan.
-pub const CLAIM_AGEING_PLAN_SETTINGS_SQL: &str =
-    "SET LOCAL jit = off; SET LOCAL plan_cache_mode = force_generic_plan";
+pub const CLAIM_AGEING_PLAN_SETTINGS_SQL: &str = claim_ageing_plan_settings_sql!();
 
 /// The comment in front of the ageing claim statement (issue #1971).
 ///
@@ -2804,6 +2850,7 @@ pub async fn take_claim_slot(
         .bind::<diesel::sql_types::BigInt, _>(CLAIM_SLOT_LOCK_CLASS)
         .bind::<diesel::sql_types::Integer, _>(i32::from(count))
         .bind::<diesel::sql_types::Integer, _>(i32::from(start))
+        .cache_prepared()
         .get_result(conn)
         .await
         .optional()
@@ -2971,67 +3018,72 @@ async fn claim_task_one_statement(
     // With `slots`, the transaction first takes one claim slot of the shard.
     // A miss ends the transaction before any claim statement. `None` from
     // the transaction body is that miss. See [`ClaimSlots`].
-    let mut tx = conn.build_transaction().read_committed();
-    let outcome: Option<ClaimOutcome> = tx
-        .run(
-            async |conn: &mut AsyncPgConnection| -> HarvestResult<Option<ClaimOutcome>> {
-                if let Some(slots) = slots
-                    && take_claim_slot(conn, slots).await?.is_none()
-                {
-                    return Ok(None);
-                }
-                let ageing = aging_secs_i64.is_some_and(|secs| secs > 0);
-                // A fair claim skips the seek window and always runs the full
-                // scan, as ageing does (issue #1976). It takes the same plan
-                // settings. Its text differs, so it gets its own cached plan.
-                let settings = if ageing || fairness == ClaimFairness::Keys {
-                    CLAIM_AGEING_PLAN_SETTINGS_SQL
-                } else {
-                    CLAIM_PLAN_SETTINGS_SQL
-                };
-                diesel_async::SimpleAsyncConnection::batch_execute(conn, settings)
-                    .await
-                    .map_err(crate::error::database_error)?;
-                // Cross-region DR fence (issues #954, #1823). The unfenced
-                // form binds no fence values, so a process with no DR marker
-                // sends the same statement as before. `CachedClaimQuery` binds
-                // without a boxed builder, so neither form pays a heap
-                // allocation per bind.
-                let fence = fence_binding(shard);
-                // An activity-only claim never takes a workflow row, so it
-                // keeps the legacy text (issue #2252).
-                let owned = owned.filter(|_| kind != Some(TaskType::Activity));
-                let sql = match owned {
-                    Some(_) => owned_claim_query_for(kind, fence.is_some(), fairness),
-                    None => claim_query_for(kind, fence.is_some(), fairness),
-                };
-                let result: Vec<TaskQueueItem> = CachedClaimQuery {
-                    sql,
-                    ageing,
-                    worker_id,
-                    queues,
-                    worker_build_id,
-                    aging_secs: aging_secs_i64,
-                    circuit_breaker_activities,
-                    ineligible_activities,
-                    fence,
-                    by_id: None,
-                    owned: owned.map(|o| (o.holder.as_str(), o.mask())),
-                }
-                .load(conn)
-                .await
-                .map_err(crate::error::database_error)?;
+    // # One batch for `BEGIN` and the plan settings (issue #2651)
+    //
+    // The planner settings were a batch of their own, one round trip after
+    // the `BEGIN`. The batch below sends both. It is what
+    // `build_transaction().read_committed().run()` does, with the settings
+    // added to its `BEGIN`: the same transaction manager calls, in the same
+    // order. The settings now also cover the claim slot statement, a lookup
+    // of one row that they suit.
+    let ageing = aging_secs_i64.is_some_and(|secs| secs > 0);
+    // A fair claim skips the seek window and always runs the full scan, as
+    // ageing does (issue #1976). It takes the same plan settings. Its text
+    // differs, so it gets its own cached plan.
+    let begin = if ageing || fairness == ClaimFairness::Keys {
+        CLAIM_AGEING_BEGIN_WITH_SETTINGS_SQL
+    } else {
+        CLAIM_BEGIN_WITH_SETTINGS_SQL
+    };
+    diesel_async::AnsiTransactionManager::begin_transaction_sql(conn, begin)
+        .await
+        .map_err(crate::error::database_error)?;
+    let body: HarvestResult<Option<ClaimOutcome>> = async {
+        if let Some(slots) = slots
+            && take_claim_slot(conn, slots).await?.is_none()
+        {
+            return Ok(None);
+        }
+        // Cross-region DR fence (issues #954, #1823). The unfenced
+        // form binds no fence values, so a process with no DR marker
+        // sends the same statement as before. `CachedClaimQuery` binds
+        // without a boxed builder, so neither form pays a heap
+        // allocation per bind.
+        let fence = fence_binding(shard);
+        // An activity-only claim never takes a workflow row, so it
+        // keeps the legacy text (issue #2252).
+        let owned = owned.filter(|_| kind != Some(TaskType::Activity));
+        let sql = match owned {
+            Some(_) => owned_claim_query_for(kind, fence.is_some(), fairness),
+            None => claim_query_for(kind, fence.is_some(), fairness),
+        };
+        let result: Vec<TaskQueueItem> = CachedClaimQuery {
+            sql,
+            ageing,
+            worker_id,
+            queues,
+            worker_build_id,
+            aging_secs: aging_secs_i64,
+            circuit_breaker_activities,
+            ineligible_activities,
+            fence,
+            by_id: None,
+            owned: owned.map(|o| (o.holder.as_str(), o.mask())),
+        }
+        .load(conn)
+        .await
+        .map_err(crate::error::database_error)?;
 
-                let Some(task) = result.into_iter().next() else {
-                    return Ok(Some(ClaimOutcome::Empty));
-                };
+        let Some(task) = result.into_iter().next() else {
+            return Ok(Some(ClaimOutcome::Empty));
+        };
 
-                recheck_and_charge(conn, task, worker_id, fairness)
-                    .await
-                    .map(Some)
-            },
-        )
-        .await?;
+        recheck_and_charge(conn, task, worker_id, fairness)
+            .await
+            .map(Some)
+    }
+    .await;
+    let outcome = finish_claim_transaction(conn, body).await?;
 
     let Some(outcome) = outcome else {
         return Ok(SlottedClaim::NoSlot);
@@ -3047,6 +3099,33 @@ async fn claim_task_one_statement(
             Ok(SlottedClaim::Empty)
         }
         ClaimOutcome::Empty => Ok(SlottedClaim::Empty),
+    }
+}
+
+/// Commit the claim transaction on `Ok`, and roll it back on `Err`.
+///
+/// It is the end of `TransactionBuilder::run` for a transaction that
+/// `begin_transaction_sql` opened (issue #2651). A failed rollback wins over
+/// the body error, as it does there. The connection then holds an open
+/// transaction, and the caller must not use it again.
+async fn finish_claim_transaction<T>(
+    conn: &mut AsyncPgConnection,
+    body: HarvestResult<T>,
+) -> HarvestResult<T> {
+    use diesel_async::TransactionManager as _;
+    match body {
+        Ok(value) => {
+            diesel_async::AnsiTransactionManager::commit_transaction(conn)
+                .await
+                .map_err(crate::error::database_error)?;
+            Ok(value)
+        }
+        Err(error) => {
+            diesel_async::AnsiTransactionManager::rollback_transaction(conn)
+                .await
+                .map_err(crate::error::database_error)?;
+            Err(error)
+        }
     }
 }
 
@@ -3524,6 +3603,7 @@ async fn charge_fairness_key(
                 .as_deref()
                 .unwrap_or(crate::queue_fairness::DEFAULT_FAIRNESS_KEY),
         )
+        .cache_prepared()
         .execute(conn)
         .await
         .map_err(crate::error::database_error)?;
@@ -3668,9 +3748,12 @@ pub(crate) async fn release_claim_via(
     task_id: Uuid,
     worker_id: &str,
 ) -> HarvestResult<bool> {
+    // Each caller passes a constant, so the cache holds one statement per
+    // recheck (issue #2651). Two or three of them run on every claim.
     let released = diesel::sql_query(sql)
         .bind::<diesel::sql_types::Uuid, _>(task_id)
         .bind::<diesel::sql_types::Text, _>(worker_id)
+        .cache_prepared()
         .execute(conn)
         .await
         .map_err(crate::error::database_error)?;
@@ -4235,6 +4318,7 @@ pub async fn owner_scan(
         .bind::<diesel::sql_types::Array<diesel::sql_types::SmallInt>, _>(&owned.partitions)
         .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(skip)
         .bind::<diesel::sql_types::BigInt, _>(i64::try_from(limit).unwrap_or(i64::MAX))
+        .cache_prepared()
         .load(conn)
         .await
         .map_err(crate::error::database_error)?;
@@ -4269,6 +4353,7 @@ pub async fn owner_keys(
 ) -> HarvestResult<Vec<OwnerRow>> {
     let rows: Vec<OwnerScanRow> = diesel::sql_query(OWNER_KEYS_SQL)
         .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(execs)
+        .cache_prepared()
         .load(conn)
         .await
         .map_err(crate::error::database_error)?;
@@ -4352,6 +4437,7 @@ pub async fn dispatch_probe(
     let rows: Vec<Row> = diesel::sql_query(dispatch_probe_query())
         .bind::<diesel::sql_types::Uuid, _>(task_id)
         .bind::<diesel::sql_types::Text, _>(worker_id)
+        .cache_prepared()
         .load(conn)
         .await
         .map_err(crate::error::database_error)?;
@@ -4646,6 +4732,7 @@ pub(crate) async fn record_pending_hints(conn: &mut AsyncPgConnection, ids: &[Uu
     for chunk in ids.chunks(PENDING_HINT_READ_CHUNK) {
         let rows: Result<Vec<PendingHintRow>, _> = diesel::sql_query(pending_hint_rows_query())
             .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(chunk)
+            .cache_prepared()
             .load(conn)
             .await;
         match rows {
@@ -5066,6 +5153,12 @@ type TaskUpdate<'a, V, Ret> = diesel::query_builder::BoxedUpdateStatement<
 /// This is the one place that fences a task row write. `None` keeps the
 /// unfenced behavior for writers that are not the claim owner, for example
 /// timeouts and operator actions.
+///
+/// Every caller marks the result with `cache_prepared` (issue #2651). A
+/// boxed update is unsafe to cache for diesel, because a caller can build
+/// its text at run time. Each caller here builds one fixed text, and the
+/// fence adds one more. So each task row write has two texts at most. Keep
+/// it so: do not pass an update whose text follows a runtime value.
 fn fence<'a, V, Ret>(
     update: TaskUpdate<'a, V, Ret>,
     claim: Option<&'a TaskClaim>,
@@ -5306,6 +5399,7 @@ pub(crate) async fn record_timed_out_claim(
     )
     .bind::<diesel::sql_types::Uuid, _>(task_id)
     .bind::<diesel::sql_types::Text, _>(timed_out_claim_key(attempt, started_at))
+    .cache_prepared()
     .execute(conn)
     .await
     .map_err(crate::error::database_error)?;
@@ -5336,6 +5430,7 @@ pub(crate) async fn take_timed_out_claim(
     )
     .bind::<diesel::sql_types::Uuid, _>(task_id)
     .bind::<diesel::sql_types::Text, _>(timed_out_claim_key(attempt, started_at))
+    .cache_prepared()
     .execute(conn)
     .await
     .map(|rows| rows > 0)
@@ -5376,6 +5471,7 @@ pub(crate) async fn mark_claim_handler_started(
         ))
         .into_boxed();
     let updated = fence(update, Some(claim))
+        .cache_prepared()
         .execute(conn)
         .await
         .map_err(crate::error::database_error)?;
@@ -5608,6 +5704,7 @@ async fn defer_claimed_task(
             dsl::task_type,
             dsl::scheduled_at,
         ))
+        .cache_prepared()
         .get_result::<(String, i32, String, chrono::DateTime<Utc>)>(conn)
         .await
         .optional()
@@ -5694,6 +5791,7 @@ pub async fn release_unstarted_claim(
             dsl::task_type,
             dsl::scheduled_at,
         ))
+        .cache_prepared()
         .get_result::<(String, i32, String, DateTime<Utc>)>(conn)
         .await
         .optional()
@@ -5799,6 +5897,7 @@ pub async fn release_abandoned_claim(
             dsl::task_type,
             dsl::scheduled_at,
         ))
+        .cache_prepared()
         .get_result::<(String, i32, String, DateTime<Utc>)>(conn)
         .await
         .optional()
@@ -5874,6 +5973,7 @@ async fn complete_task_inner(
         ))
         .into_boxed();
     let updated = fence(update, Some(claim))
+        .cache_prepared()
         .execute(conn)
         .await
         .map_err(crate::error::database_error)?;
@@ -5930,6 +6030,7 @@ async fn fail_task_inner(
     ))
     .into_boxed();
     let updated = fence(update, claim)
+        .cache_prepared()
         .execute(conn)
         .await
         .map_err(crate::error::database_error)?;
@@ -6613,10 +6714,16 @@ async fn write_heartbeat(
                 dsl::heartbeat_details.eq(Some(details)),
             ))
             .into_boxed();
-        fence(update, Some(claim)).execute(conn).await
+        fence(update, Some(claim))
+            .cache_prepared()
+            .execute(conn)
+            .await
     } else {
         let update = target.set(dsl::last_heartbeat_at.eq(stamp)).into_boxed();
-        fence(update, Some(claim)).execute(conn).await
+        fence(update, Some(claim))
+            .cache_prepared()
+            .execute(conn)
+            .await
     }
     .map_err(crate::error::database_error)?;
     Ok(claim_write(updated > 0))
@@ -6732,6 +6839,7 @@ async fn requeue_for_retry_inner(
             dsl::task_type,
             dsl::scheduled_at,
         ))
+        .cache_prepared()
         .get_result::<(String, i32, String, chrono::DateTime<Utc>)>(conn)
         .await
         .optional()
@@ -7160,6 +7268,7 @@ async fn requeue_claimed_workflow_task_with_backoff(
             dsl::workflow_exec_id,
             sql::<diesel::sql_types::Bool>("scheduled_at <= clock_timestamp()"),
         ))
+        .cache_prepared()
         .get_results::<(String, i32, chrono::DateTime<Utc>, Option<Uuid>, bool)>(conn)
         .await
         .map_err(crate::error::database_error)?;
@@ -7537,6 +7646,7 @@ async fn defer_rate_limited_task_inner(
     .into_boxed();
     let Some((queue_name, priority, task_type)) = fence(update, claim)
         .returning((dsl::queue_name, dsl::priority, dsl::task_type))
+        .cache_prepared()
         .get_result::<(String, i32, String)>(conn)
         .await
         .optional()
@@ -7948,6 +8058,7 @@ pub async fn reset_capability_misses_after_inline_progress(
     let updated = diesel::sql_query(reset_capability_misses_after_inline_progress_query())
         .bind::<diesel::sql_types::Uuid, _>(task_id)
         .bind::<diesel::sql_types::Text, _>(worker_id)
+        .cache_prepared()
         .execute(conn)
         .await
         .map_err(crate::error::database_error)?;
@@ -8487,6 +8598,7 @@ async fn release_workflow_claim_inner(
         .bind::<diesel::sql_types::Text, _>(worker_id)
         .bind::<diesel::sql_types::Integer, _>(crash_strikes)
         .bind::<diesel::sql_types::Integer, _>(attempt)
+        .cache_prepared()
         .get_results(conn)
         .await
         .map_err(crate::error::database_error)?;
@@ -8601,6 +8713,7 @@ pub async fn set_task_sticky_affinity(
         .bind::<diesel::sql_types::Uuid, _>(task_id)
         .bind::<diesel::sql_types::Text, _>(hint.worker_id)
         .bind::<diesel::sql_types::Interval, _>(timeout)
+        .cache_prepared()
         .execute(conn)
         .await
         .map_err(crate::error::database_error)?
@@ -8726,6 +8839,7 @@ async fn park_workflow_task_inner(
             .bind::<diesel::sql_types::Uuid, _>(task_id)
             .bind::<diesel::sql_types::Text, _>(hint.worker_id)
             .bind::<diesel::sql_types::Interval, _>(timeout)
+            .cache_prepared()
             .load(conn)
             .await
             .map_err(crate::error::database_error)?
@@ -8737,6 +8851,7 @@ async fn park_workflow_task_inner(
         // is running with sticky routing disabled.
         diesel::sql_query(park_workflow_task_query(reset_capability_misses))
             .bind::<diesel::sql_types::Uuid, _>(task_id)
+            .cache_prepared()
             .load(conn)
             .await
             .map_err(crate::error::database_error)?
@@ -8789,6 +8904,7 @@ pub async fn take_wake_requested(
 
     let rows: Vec<WakeRequestedRow> = diesel::sql_query(take_wake_requested_query())
         .bind::<diesel::sql_types::Uuid, _>(task_id)
+        .cache_prepared()
         .load(conn)
         .await
         .map_err(crate::error::database_error)?;
@@ -8977,6 +9093,7 @@ pub async fn wake_workflow_task(
     if repended.is_empty() {
         let fallback_updated = diesel::sql_query(wake_requested_fallback_query())
             .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+            .cache_prepared()
             .execute(conn)
             .await
             .map_err(crate::error::database_error)?;
@@ -9013,6 +9130,7 @@ pub async fn wake_workflow_task(
     )
     .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
     .bind::<diesel::sql_types::Timestamptz, _>(Utc::now())
+    .cache_prepared()
     .load(conn)
     .await
     .map_err(crate::error::database_error)?;
@@ -9083,6 +9201,7 @@ async fn primary_repend_workflow_task(
     let rows: Vec<PendingHintRow> = diesel::sql_query(primary_repend_workflow_task_query())
         .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
         .bind::<diesel::sql_types::Timestamptz, _>(Utc::now() - IMMEDIATE_SCHEDULE_SKEW_ALLOWANCE)
+        .cache_prepared()
         .load(conn)
         .await
         .map_err(crate::error::database_error)?;
@@ -9449,6 +9568,9 @@ pub async fn check_throttled_keys(
            AND {effective_tokens} < 1.0"
     ))
     .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(queues)
+    // The token expression has one text for the alias `b`, so this is one
+    // constant text. Each empty poll runs it (issue #2651).
+    .cache_prepared()
     .load(conn)
     .await
     .map_err(crate::error::database_error)?;
