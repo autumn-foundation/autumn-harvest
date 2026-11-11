@@ -1,4 +1,4 @@
-## Hot statements stay prepared (issue #2651)
+## Hot statements stay prepared (issue #2651, PR #2652)
 
 An audit of the whole hot path found that Postgres planned more than it
 executed. In one run of the `throughput` cell of `e2e_bench`, 172,247 of
@@ -37,7 +37,7 @@ Postgres parses and plans it on every call. `queue::CachedClaimQuery` (issue
   workflows/s on one 4-core box: the median of six alternating pairs, 1.67
   to 1.79 times in each. A pooled connection holds about 1.1 MB more. See
   `docs/performance-hot-path-statement-cache.md`, which also records five
-  costs that this change leaves in place.
+  costs that this change leaves in place. Issues #2653 and #2654 track them.
 - Tests: `cached_stmt::tests`, `cached_stmt_db_tests`,
   `mutex::pure_tests::the_grant_has_one_caller_and_it_appends_the_event` and
   `mutex_tests::a_decision_of_a_holder_renews_its_lease`.

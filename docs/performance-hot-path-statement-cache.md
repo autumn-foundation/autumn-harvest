@@ -33,7 +33,7 @@ a statement trace. It then removes the largest cost that it finds.
 * **Three more changes remove round trips:** one batch for the claim
   `BEGIN` and its planner settings, no lease renewal for a run that never
   took a mutex, and a cached load of `WorkflowExecution`.
-* **Four findings are recorded, not fixed.** See
+* **Five findings are recorded, not fixed.** See
   [What this audit did not change](#what-this-audit-did-not-change).
 
 ## The method
@@ -238,6 +238,7 @@ primary key. The claim statement did not change.
 ## What this audit did not change
 
 Each item below is a measured cost that this change leaves in place.
+Issue #2653 tracks the first one. Issue #2654 tracks the others.
 
 **1. A NOTIFY does not cut a settle sleep.** After an empty poll that a
 NOTIFY caused, a claim loop sleeps 50 to 75 ms (issue #2422). A NOTIFY
