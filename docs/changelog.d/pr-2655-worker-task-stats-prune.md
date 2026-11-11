@@ -1,4 +1,4 @@
-## The heartbeat task-stats prune reads only rows past the retention
+## The heartbeat task-stats prune reads only rows past the retention (PR #2655)
 
 Each heartbeat of each worker runs `workers::prune_worker_task_stats` (issue
 #1815). The threshold of each row comes from the `peer_stale_secs` in its
