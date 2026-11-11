@@ -492,6 +492,8 @@ mod with_start_shared_tests;
 #[cfg(feature = "db")]
 mod worker_saturation_metrics_tests;
 mod worker_session_tests;
+#[cfg(feature = "db")]
+mod worker_task_stats_prune_perf;
 mod workflow_backoff_requeue_tests;
 #[cfg(feature = "db")]
 mod workflow_handle_tests;
