@@ -1,7 +1,7 @@
 # Runs of the `throughput` cell on the final build, 1 shard (issue #2651).
-# The final build has the review changes: the workflow start insert and the
-# lookups by workflow name and id are not cached, and five more statements
-# are. No base run ran beside these, so they compare with nothing but each
+# The final build has the review changes: the workflow start insert and
+# every load of WorkflowExecution that is not by primary key are not
+# cached, and five more statements are. No base run ran beside these, so they compare with nothing but each
 # other. Runs 1 to 3 shared the box with two leftover test containers. Runs
 # 4 to 7 ran after their removal.
 final_1 workflows_per_sec=76.39 replay_events_per_sec=9816942.15

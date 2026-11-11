@@ -2176,8 +2176,9 @@ macro_rules! claim_ageing_plan_settings_sql {
 /// connection do not change. The settings travel with the claim, as the
 /// isolation level does, so they do not depend on the pool configuration.
 /// They also cover the post-claim rechecks. Those are short statements on
-/// one row, so these settings suit them too. All settings go in one batch,
-/// so they cost one round trip.
+/// one row, so these settings suit them too. All settings go in one batch.
+/// A claim sends that batch with its `BEGIN`, so the settings cost no round
+/// trip of their own (issue #2651).
 pub const CLAIM_PLAN_SETTINGS_SQL: &str = claim_plan_settings_sql!();
 
 /// The `BEGIN` of a claim transaction (issue #619).

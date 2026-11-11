@@ -54,7 +54,7 @@ Three tools, each for one question:
 |:--|:--|
 | Which statements run, how often, and at what cost? | `pg_stat_statements`, [`census.sql`](perf-artifacts/hot-path-statement-cache/census.sql) |
 | Where does the CPU go? | `perf record -a`, 299 Hz, DWARF call graphs |
-| In what order does one workflow send its statements? | `log_min_duration_statement = 0`, one workflow in flight, on a build with the cache marks and without the two round-trip changes |
+| In what order does one workflow send its statements? | `log_min_duration_statement = 0`, one workflow in flight, on an early build of the cache marks. Read it for the order, not for the cached set |
 
 Raw output:
 [`perf-artifacts/hot-path-statement-cache/`](perf-artifacts/hot-path-statement-cache/).
@@ -150,8 +150,8 @@ not. One of them must not be cached: the lookup by workflow name and id
 binds the sealed states as an array. A generic plan cannot prove the
 predicate of the partial active-key index from a bind. On a fixture with a
 continue-as-new chain of 20,000 sealed runs, that lookup read 3,215 buffers
-under a generic plan and 5 under a custom plan. So the eight loads by
-primary key carry the mark, and every other load of the model runs as
+under a generic plan and 5 under a custom plan. So each load by
+primary key carries the mark, and every other load of the model runs as
 before. `cached_stmt_db_tests` pins both sides.
 
 **The workflow start insert is not marked.** Its row has 28 options, and
@@ -208,12 +208,15 @@ each connection, and the scanners of the poll tick, which this change
 leaves unnamed.
 
 The census, the profile and the runs below come from the first form of this
-change. A review then took three statements out of the cached set: the
-workflow start insert, and the two lookups by workflow name and id. It
-added five others on the timer, child and rate-limit paths. Per canonical
-workflow that is one insert that plans again. The paired runs were not
-repeated for it. Four runs of the final build on a quiet box read 83.7 to
-92.4 workflows/s, with no base run beside them
+change. A review then took the workflow start insert out of the cached
+set, and every load of `WorkflowExecution` that is not by primary key. The
+first form cached each of those loads through a constant fragment. Among
+them is the deadline scanner of the poll tick. The review added five other
+statements on the timer, child and rate-limit paths. On the measured path
+that is one insert for each workflow that plans again, and one scanner
+statement for each poll tick. The paired runs were not repeated for it.
+Four runs of the final build on a quiet box read 83.7 to 92.4 workflows/s,
+with no base run beside them
 ([`final-build-runs.txt`](perf-artifacts/hot-path-statement-cache/final-build-runs.txt)).
 
 ### Throughput and latency

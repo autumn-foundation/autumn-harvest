@@ -1,7 +1,11 @@
 # The statements of one canonical workflow, one workflow in flight (issue #2651).
-# Build: the cache marks only. The claim BEGIN batch and the mutex renewal
-# gate came later, so this trace still shows BEGIN and the settings as two
-# statements, and one lease renewal for each decision.
+# Build: an early build of the cache marks. Read it for statement order,
+# not for the cached set. Two marks differ from the final build: the
+# workflow start insert was still cached (no PARSE), and the rate-limit
+# probe (SELECT DISTINCT q.activity_name) was not yet marked (PARSE on
+# each run). The claim BEGIN batch and the mutex renewal gate came later,
+# so this trace still shows BEGIN and the settings as two statements, and
+# one lease renewal for each decision.
 # Columns: time since the start insert, backend pid mod 1000, protocol
 # phase (PARSE, exec, or stat for a simple statement), server ms, text.
     -1.0ms [488] PARSE  0.042 SELECT COUNT(*) AS n FROM harvest_workflow_executions WHERE 

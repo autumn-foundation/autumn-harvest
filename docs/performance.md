@@ -1763,8 +1763,10 @@ The median of about 195 sampled claim plans in each half of run 2:
   `PENDING` rows. It adds one index entry per enqueue and per non-HOT
   update of a `PENDING` row. It was 33 MB for 700,000 pending rows with distinct due times, against
   27 MB for `idx_harvest_tq_poll`, and took 2.0 s to build.
-- **One more round trip.** The planner settings go in one batch before the
-  claim. A claim on a capped key adds one more for the cap re-check. See
+- **One more round trip, on a capped key only.** A claim on a capped key
+  adds one for the cap re-check. The planner settings were a batch of
+  their own, one more round trip on every claim, until issue #2651 put
+  them in the `BEGIN` batch. See
   [what is actually timed](#what-is-actually-timed).
 - **Generic plan.** Postgres builds it once per connection, and an
   `ANALYZE` of the table invalidates it.
@@ -2247,7 +2249,7 @@ a single round trip either. It issues, in order:
    SET LOCAL enable_bitmapscan = off; SET LOCAL enable_sort = off`
    (`queue::CLAIM_BEGIN_WITH_SETTINGS_SQL`, issues #1971, #2547 and #2651),
    one batch, one round trip. The level is pinned on the `BEGIN` itself
-   rather than inherited, so steps 3 and 4 always get a fresh snapshot. The
+   rather than inherited, so steps 4 and 5 always get a fresh snapshot. The
    claim plan carries the cost estimate of its fallback scan, and that
    estimate can pass `jit_above_cost`. A custom plan costs more to plan
    than the claim costs to run. A bitmap scan would read a whole queue head
@@ -2286,11 +2288,16 @@ plus transaction overhead. A workflow task without a run skips the type-gated
 pause re-check, so it takes five. The
 `EXPLAIN` plan explains the *dominant* statement rather than the whole
 measured operation. The seeded scenarios claim at most a fifth of the backlog
-they seed, so their samples are overwhelmingly hits. The tables on this
-page were measured before issue #2651, with the settings as a batch of
-their own, so each of their claims has one more round trip. The tables
-measured before issue #1971 had no settings batch and no step 5, so they
-count the same as now, and one fewer on a capped key.
+they seed, so their samples are overwhelmingly hits.
+
+The tables on this page were measured before issue #2651. The settings
+were then a batch of their own. The queue lock and each re-check ran
+unnamed, at two round trips each. So a hit cost ten round trips, and a
+miss four. See
+[the hot-path statement cache](performance-hot-path-statement-cache.md).
+The tables measured before issue #1971 had no settings batch and no step
+5, but their claim statement ran unnamed too. A hit there also cost ten
+round trips.
 
 That distinction is the first thing to reason about when moving this workload to
 a **remote** database: the round-trip count, not the query plan, is what network

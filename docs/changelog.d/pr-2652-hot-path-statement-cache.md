@@ -21,7 +21,7 @@ Postgres parses and plans it on every call. `queue::CachedClaimQuery` (issue
   `RETURNING` stamp of each notifying write.
 - The four unmapped columns of `harvest_workflow_executions` made every load
   of `WorkflowExecution` run unnamed since the table split (issue #2492).
-  They stay `sql::<T>()` fragments. The eight loads by primary key carry the
+  They stay `sql::<T>()` fragments. Each load by primary key carries the
   mark. The lookup by workflow name and id does not: a generic plan cannot
   use the partial active-key index, and reads every sealed run of a
   continue-as-new chain.
