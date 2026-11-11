@@ -1,3 +1,9 @@
+# The statements of one canonical workflow, one workflow in flight (issue #2651).
+# Build: the cache marks only. The claim BEGIN batch and the mutex renewal
+# gate came later, so this trace still shows BEGIN and the settings as two
+# statements, and one lease renewal for each decision.
+# Columns: time since the start insert, backend pid mod 1000, protocol
+# phase (PARSE, exec, or stat for a simple statement), server ms, text.
     -1.0ms [488] PARSE  0.042 SELECT COUNT(*) AS n FROM harvest_workflow_executions WHERE 
     -1.0ms [483] stat  0.022 BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED
     -1.0ms [483] stat  0.019 SET LOCAL jit = off; SET LOCAL plan_cache_mode = force_generic_plan; SET LOCAL enable_bitmapscan = off; SET LOCAL enable_sort = off

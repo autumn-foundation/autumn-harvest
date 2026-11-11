@@ -20,7 +20,7 @@ a statement trace. It then removes the largest cost that it finds.
   every batch insert, every insert with an `Option` value and every
   statement with a `sql::<T>()` fragment. An unnamed statement costs two
   round trips, and Postgres parses and plans it on every call.
-* **The fix keeps 84 statement sites prepared.** One adapter,
+* **The fix keeps the hot statements prepared.** One adapter,
   [`cached_stmt`](../autumn-harvest/src/cached_stmt.rs), marks a
   constant-text statement as safe to cache. Planner runs fall from 172,247
   to 11,795 per run, and planning time from 22.2 s to 2.9 s.
@@ -30,9 +30,9 @@ a statement trace. It then removes the largest cost that it finds.
   start-to-completion time falls from 574 ms to 351 ms.
 * **Each connection holds about 1.1 MB more.** The median backend grows
   from 6.8 MB to 7.9 MB of memory contexts, for its cached plans.
-* **Three more changes remove round trips:** one batch for the claim
-  `BEGIN` and its planner settings, no lease renewal for a run that never
-  took a mutex, and a cached load of `WorkflowExecution`.
+* **Two more changes remove round trips:** one batch for the claim
+  `BEGIN` and its planner settings, and no lease renewal for a run that
+  never took a mutex.
 * **Five findings are recorded, not fixed.** See
   [What this audit did not change](#what-this-audit-did-not-change).
 
@@ -54,7 +54,7 @@ Three tools, each for one question:
 |:--|:--|
 | Which statements run, how often, and at what cost? | `pg_stat_statements`, [`census.sql`](perf-artifacts/hot-path-statement-cache/census.sql) |
 | Where does the CPU go? | `perf record -a`, 299 Hz, DWARF call graphs |
-| In what order does one workflow send its statements? | `log_min_duration_statement = 0`, one workflow in flight |
+| In what order does one workflow send its statements? | `log_min_duration_statement = 0`, one workflow in flight, on a build with the cache marks and without the two round-trip changes |
 
 Raw output:
 [`perf-artifacts/hot-path-statement-cache/`](perf-artifacts/hot-path-statement-cache/).
@@ -84,8 +84,9 @@ profile, `GetCachedPlan` and the planner below it take 22% of all samples.
 
 **A bare round trip is cheap. An unnamed statement is not.** `pgbench`
 reads 47 µs for `SELECT 1` on this host. The same statement through the
-engine pool reads 102 µs. The claim transaction had seven round trips and
-took 5.4 ms, of which the server ran statements for 0.8 ms.
+engine pool reads 102 µs. The base claim transaction sent seven statements
+in ten round trips, because the queue lock and both rechecks ran unnamed.
+It took 5.4 ms, and the server ran its statements for 0.8 ms of that.
 
 ### Why a statement runs unnamed
 
@@ -102,13 +103,14 @@ Diesel answers no for five forms:
 | `diesel::sql_query` | the text can come from anywhere | the three claim rechecks, park, wake, re-pend |
 | any DSL `UPDATE` | a changeset can skip a `None` field | task completion, the handler-start marker, the terminal execution update |
 | a batch insert | the row count is part of the text | every `harvest_events` append |
-| an insert with an `Option` value | `None` renders `DEFAULT` | every task enqueue, every workflow start |
+| an insert with an `Option` value | `None` renders `DEFAULT` | every task enqueue |
 | a `sql::<T>()` fragment | the text can come from anywhere | every load of `WorkflowExecution` |
 
 The last row is a regression of the table split (issue #2492). The four
 unmapped columns of `harvest_workflow_executions` became `sql::<T>()`
 fragments in the select list of the model. Every load of an execution then
-ran unnamed: 12 loads per workflow, 0.2 ms of planning each.
+ran unnamed: 12 loads per workflow, 0.2 ms of planning each. Before the
+split, diesel cached each of them.
 
 `queue::CachedClaimQuery` (issue #1971) fixed this for the claim statement
 alone. 44 other statements of the measured path had `plans = calls`. The
@@ -138,9 +140,25 @@ The module states three rules for a marked statement:
 
 [`cached_stmt::ConstSql`](../autumn-harvest/src/cached_stmt.rs) is a
 `sql::<T>()` fragment with a type of its own. A statement that holds one
-stays cacheable with no mark. It now carries the four unmapped execution
-columns, the `RETURNING` stamp of each notifying write, `NOW()` in the
-due-timer reads and the stored-bytes expressions.
+stays cacheable with no mark. It carries the `RETURNING` stamp of each
+notifying write, `NOW()` in the due-timer reads and the stored-bytes
+expressions.
+
+**The unmapped execution columns stay `sql::<T>()` fragments.** A constant
+fragment there would cache every load of `WorkflowExecution`, reviewed or
+not. One of them must not be cached: the lookup by workflow name and id
+binds the sealed states as an array. A generic plan cannot prove the
+predicate of the partial active-key index from a bind. On a fixture with a
+continue-as-new chain of 20,000 sealed runs, that lookup read 3,215 buffers
+under a generic plan and 5 under a custom plan. So the eight loads by
+primary key carry the mark, and every other load of the model runs as
+before. `cached_stmt_db_tests` pins both sides.
+
+**The workflow start insert is not marked.** Its row has 28 options, and
+the caller of a start chooses most of them. Each option set is one text,
+and one cached text costs a connection about 150 KB. A task insert of one
+row is marked: its option sets follow the activities that the deployment
+declares, so it has tens of texts at about 50 KB each.
 
 No statement text changes. Each statement sends the same SQL and the same
 binds as before.
@@ -151,6 +169,13 @@ A claim sent `BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED`, then its
 planner settings as a second batch. `queue::CLAIM_BEGIN_WITH_SETTINGS_SQL`
 sends both in one batch. The statements and their order are the same. Each
 claim saves one round trip, and a workflow claims 7 times.
+
+One path differs from the two-batch form. A statement of the batch can fail
+after its `BEGIN` ran, for example on a query cancel. The server then holds
+an aborted transaction that the transaction manager does not know. So
+`queue::begin_claim_transaction` sends a `ROLLBACK` on a database error.
+`cached_stmt_db_tests::a_failed_claim_begin_batch_leaves_no_open_transaction`
+proves it.
 
 ### No lease renewal for a run with no mutex
 
@@ -181,6 +206,15 @@ One run each, `track_planning = on`:
 The planner runs that stay are the first five runs of each statement on
 each connection, and the scanners of the poll tick, which this change
 leaves unnamed.
+
+The census, the profile and the runs below come from the first form of this
+change. A review then took three statements out of the cached set: the
+workflow start insert, and the two lookups by workflow name and id. It
+added five others on the timer, child and rate-limit paths. Per canonical
+workflow that is one insert that plans again. The paired runs were not
+repeated for it. Four runs of the final build on a quiet box read 83.7 to
+92.4 workflows/s, with no base run beside them
+([`final-build-runs.txt`](perf-artifacts/hot-path-statement-cache/final-build-runs.txt)).
 
 ### Throughput and latency
 
@@ -228,12 +262,21 @@ Each cached statement keeps its plan in the backend of its connection.
 paired run, reads a median of 6.8 MB for the base and 7.9 MB for the
 changed build. That is about 1.1 MB for each pooled connection.
 
-### No plan got worse
+The bench runs one workflow shape. A deployment adds about 50 KB to each
+connection for each distinct task shape that it enqueues, because the task
+insert has one text for each option set.
+
+### Plans
 
 The mean execution time of each statement was compared before and after.
 The writes that take a row lock read up to 0.1 ms slower. That is lock
 wait at a higher rate, not a plan change: each one finds its row by
 primary key. The claim statement did not change.
+
+The bench cannot show a plan that is worse only on skewed data. A review of
+the marked statements against the partial indexes found one such case, the
+lookup by workflow name and id, and that lookup is not cached. See
+[the changes](#keep-constant-text-statements-prepared).
 
 ## What this audit did not change
 
@@ -292,6 +335,6 @@ The tests of the change:
 | Test | Proves |
 |:--|:--|
 | `cached_stmt::tests` | the wrapper renders the same text and binds, and refuses `*` |
-| `cached_stmt_db_tests` | a marked statement is prepared once, a load of `WorkflowExecution` is cached, and a cached statement survives an added column |
+| `cached_stmt_db_tests` | a marked statement is prepared once, a load of `WorkflowExecution` by primary key is cached and a lookup by key is not, and a cached statement survives an added column |
 | `mutex::pure_tests::the_grant_has_one_caller_and_it_appends_the_event` | the premise of the lease renewal gate |
 | `mutex_tests::a_decision_of_a_holder_renews_its_lease` | a holder still renews |

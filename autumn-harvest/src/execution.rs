@@ -2051,7 +2051,11 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
                 .values(&row)
                 .on_conflict_do_nothing()
                 .returning(WorkflowExecution::as_returning())
-                .cache_prepared()
+                // Not marked with `cache_prepared` (issue #2651). Each `None`
+                // of the row renders `DEFAULT`, and the caller of a start
+                // chooses most of the 28 options. So this insert has one text
+                // for each option set. A cached text costs each connection
+                // about 150 KB, and nothing evicts it.
                 .get_result(conn)
                 .await
                 .optional()

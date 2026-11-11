@@ -786,6 +786,7 @@ pub async fn append_new_execution_started_events_batch(
                     crate::worker::PersistPhaseTimer::start(crate::telemetry::PersistPhase::Events);
                 diesel::insert_into(harvest_events::table)
                     .values(&rows)
+                    .cache_small_batch(rows.len())
                     .execute(conn)
                     .await
                     .map_err(crate::error::database_error)?;
@@ -1054,7 +1055,10 @@ pub async fn append_single_event_with_codecs(
         .find(exec_id.as_uuid())
         .for_update()
         .select(WorkflowExecution::as_select())
-        .first(conn)
+        // A load by primary key has one plan. `first` adds this limit.
+        .limit(1)
+        .cache_prepared()
+        .get_result(conn)
         .await
         .optional()
         .map_err(crate::error::database_error)?
@@ -1271,7 +1275,10 @@ pub async fn admit_update_event_with_codecs(
                 .find(exec_id.as_uuid())
                 .for_update()
                 .select(WorkflowExecution::as_select())
-                .first(conn)
+                // A load by primary key has one plan. `first` adds this limit.
+                .limit(1)
+                .cache_prepared()
+                .get_result(conn)
                 .await
                 .optional()
                 .map_err(crate::error::database_error)?

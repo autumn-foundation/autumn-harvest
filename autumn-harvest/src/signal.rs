@@ -230,7 +230,10 @@ pub async fn send_signal_idempotent_with_codecs(
                 .find(exec_id.as_uuid())
                 .for_update()
                 .select(crate::models::WorkflowExecution::as_select())
-                .first(conn)
+                // A load by primary key has one plan. `first` adds this limit.
+                .limit(1)
+                .cache_prepared()
+                .get_result(conn)
                 .await
                 .optional()
                 .map_err(crate::error::database_error)?

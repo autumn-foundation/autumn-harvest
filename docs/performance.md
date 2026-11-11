@@ -2242,16 +2242,20 @@ One `queue::claim_task(...)` call, wall clock, from the client. That call is **a
 whole transaction**, not the single statement the `EXPLAIN` below shows — and not
 a single round trip either. It issues, in order:
 
-1. `BEGIN ISOLATION LEVEL READ COMMITTED`. The level is pinned on the `BEGIN`
-   itself rather than inherited, so steps 5 and 6 always get a fresh snapshot.
-2. `SET LOCAL jit = off; SET LOCAL plan_cache_mode = force_generic_plan;
-   SET LOCAL enable_bitmapscan = off` (issue #1971), one batch, one round
-   trip. The claim plan carries the cost estimate of its fallback scan, and
-   that estimate can pass `jit_above_cost`. A custom plan costs more to plan
+1. `BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED; SET LOCAL jit = off;
+   SET LOCAL plan_cache_mode = force_generic_plan;
+   SET LOCAL enable_bitmapscan = off; SET LOCAL enable_sort = off`
+   (`queue::CLAIM_BEGIN_WITH_SETTINGS_SQL`, issues #1971, #2547 and #2651),
+   one batch, one round trip. The level is pinned on the `BEGIN` itself
+   rather than inherited, so steps 3 and 4 always get a fresh snapshot. The
+   claim plan carries the cost estimate of its fallback scan, and that
+   estimate can pass `jit_above_cost`. A custom plan costs more to plan
    than the claim costs to run. A bitmap scan would read a whole queue head
    instead of the window. Since issue #1971 the claim statement is also cached once per
-   connection. See [the seek window](#the-seek-window-issue-1971).
-3. **The claim CTE.** The rate-limit debit and the per-key concurrency
+   connection. See [the seek window](#the-seek-window-issue-1971). Before
+   issue #2651 the settings were a batch of their own, one round trip after
+   the `BEGIN`.
+2. **The claim CTE.** The rate-limit debit and the per-key concurrency
    advisory-lock re-check are branches *within* this statement, not extra ones —
    this is the statement the `EXPLAIN` below plans. When the DR fence is in
    force (issue #954; by default only on a database with a DR marker, issue
@@ -2260,35 +2264,37 @@ a single round trip either. It issues, in order:
    round-trip count. The published figures below were measured unfenced: the
    configuration on a database with no DR marker, and the one the plan
    applies to.
-4. *(hit only)* `queue_pause::try_lock_queue_for_claim` — a
+3. *(hit only)* `queue_pause::try_lock_queue_for_claim` — a
    `pg_try_advisory_xact_lock` on the queue. If it loses the race against a
    concurrent pause or resume, `queue_pause::release_claim` hands the row back
    and the call returns "no task": same round-trip count, no claim.
-5. *(hit only)* `queue_pause::release_claim_if_queue_paused` — the authoritative
+4. *(hit only)* `queue_pause::release_claim_if_queue_paused` — the authoritative
    queue-pause re-check. It is a *separate statement* precisely so it takes a
    snapshot the claim could not have; folding it into the CTE would defeat it.
    The activity-pause and workflow-pause re-checks follow, each only for the
    task type it can hold.
-6. *(hit on a capped concurrency key only)* `release_claim_if_over_cap`
+5. *(hit on a capped concurrency key only)* `release_claim_if_over_cap`
    (issue #1971). The claim counts the key under its own snapshot, which
    predates the advisory lock. This statement counts again in a fresh
    snapshot, under the lock, and gives the row back if the key is over its
    cap.
-7. `COMMIT`.
+6. `COMMIT`.
 
-So a published number is **seven** client↔server round trips when the claim
-lands on a row, **eight** on a capped key and **four** when the queue is empty —
+So a claim is **six** client↔server round trips when it lands on a row,
+**seven** on a capped key and **three** when the queue is empty —
 plus transaction overhead. A workflow task without a run skips the type-gated
-pause re-check, so it takes six. The
+pause re-check, so it takes five. The
 `EXPLAIN` plan explains the *dominant* statement rather than the whole
 measured operation. The seeded scenarios claim at most a fifth of the backlog
-they seed, so their samples are overwhelmingly hits. The tables
-measured before issue #1971 had no step 2 and no step 6, so they count one
-fewer, two fewer on a capped key.
+they seed, so their samples are overwhelmingly hits. The tables on this
+page were measured before issue #2651, with the settings as a batch of
+their own, so each of their claims has one more round trip. The tables
+measured before issue #1971 had no settings batch and no step 5, so they
+count the same as now, and one fewer on a capped key.
 
 That distinction is the first thing to reason about when moving this workload to
 a **remote** database: the round-trip count, not the query plan, is what network
-latency multiplies. Seven round trips at 1 ms of network RTT is 7 ms of floor per
+latency multiplies. Six round trips at 1 ms of network RTT is 6 ms of floor per
 claim that no amount of index tuning removes. Every number on this page was
 measured against a loopback server, so that floor is ~0 here and the plan
 dominates; that ordering inverts across a network.

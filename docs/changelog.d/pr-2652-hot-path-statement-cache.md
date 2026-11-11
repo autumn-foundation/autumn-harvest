@@ -13,21 +13,28 @@ Postgres parses and plans it on every call. `queue::CachedClaimQuery` (issue
 #1971) fixed this for the claim statement alone.
 
 - `cached_stmt::CachePreparedDsl::cache_prepared` marks one statement as
-  safe to cache. The cache key is the SQL text and the bind types. 84
-  statement sites of the claim, decide, start and complete paths carry the
-  mark. No statement text changes.
+  safe to cache. The cache key is the SQL text and the bind types. The
+  statement sites of the claim, decide and complete paths carry the mark.
+  No statement text changes.
 - `cached_stmt::ConstSql` is a `sql::<T>()` fragment with a type of its own,
   so a statement that holds one stays cacheable with no mark. It carries the
-  four unmapped columns of `harvest_workflow_executions`. Those fragments
-  made every load of `WorkflowExecution` run unnamed since the table split
-  (issue #2492). It also carries the `RETURNING` stamp of each notifying
-  write.
+  `RETURNING` stamp of each notifying write.
+- The four unmapped columns of `harvest_workflow_executions` made every load
+  of `WorkflowExecution` run unnamed since the table split (issue #2492).
+  They stay `sql::<T>()` fragments. The eight loads by primary key carry the
+  mark. The lookup by workflow name and id does not: a generic plan cannot
+  use the partial active-key index, and reads every sealed run of a
+  continue-as-new chain.
+- The workflow start insert is not marked. Its row has 28 options that the
+  caller of a start chooses, and each option set is one text.
 - A marked statement must come from a small fixed set of texts and must name
   its result columns. A cached statement that returns `*` fails after a
   migration adds a column. A debug build refuses such a statement. A batch
   insert is cached up to 8 rows, and a task insert for one row only.
 - A claim sends its `BEGIN` and its planner settings in one batch
-  (`queue::CLAIM_BEGIN_WITH_SETTINGS_SQL`), not two.
+  (`queue::CLAIM_BEGIN_WITH_SETTINGS_SQL`), not two. A statement of that
+  batch can fail after its `BEGIN` ran, so `begin_claim_transaction` sends a
+  `ROLLBACK` on a database error.
 - A decision renews the mutex leases of its run only when its history
   records a `MutexGranted` event (`mutex::history_records_a_grant`). The
   gate is exact: the one caller of the grant statement appends that event in

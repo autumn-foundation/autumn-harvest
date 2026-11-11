@@ -6340,7 +6340,10 @@ async fn lock_workflow_execution_row_and_load_history(
         .find(exec_id.as_uuid())
         .for_update()
         .select(WorkflowExecution::as_select())
-        .first(conn)
+        // A load by primary key has one plan. `first` adds this limit.
+        .limit(1)
+        .cache_prepared()
+        .get_result(conn)
         .await
         .optional()
         .map_err(crate::error::database_error)?
@@ -6878,7 +6881,10 @@ async fn load_workflow_execution(
     harvest_workflow_executions::table
         .find(exec_id.as_uuid())
         .select(WorkflowExecution::as_select())
-        .first(conn)
+        // A load by primary key has one plan. `first` adds this limit.
+        .limit(1)
+        .cache_prepared()
+        .get_result(conn)
         .await
         .optional()
         .map_err(crate::error::database_error)?
@@ -11670,7 +11676,10 @@ async fn persist_activity_wait_park(
             .find(exec_id.as_uuid())
             .for_update()
             .select(WorkflowExecution::as_select())
-            .first(conn)
+            // A load by primary key has one plan. `first` adds this limit.
+            .limit(1)
+            .cache_prepared()
+            .get_result(conn)
             .await
             .optional()
             .map_err(crate::error::database_error)?
@@ -12623,6 +12632,7 @@ async fn persist_started_timer(
                  LIMIT 1"
             )
             .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+            .cache_prepared()
             .load(conn)
             .await;
             if let Ok(rows) = unresolved_exists
@@ -15885,7 +15895,10 @@ pub async fn materialize_due_child_timeout_deadlines(
             .find(parent_exec_id.as_uuid())
             .for_update()
             .select(WorkflowExecution::as_select())
-            .first(conn)
+            // A load by primary key has one plan. `first` adds this limit.
+            .limit(1)
+            .cache_prepared()
+            .get_result(conn)
             .await
             .optional()
             .map_err(crate::error::database_error)?;

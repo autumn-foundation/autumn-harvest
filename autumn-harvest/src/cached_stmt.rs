@@ -265,19 +265,67 @@ pub const fn pg_now() -> ConstSql<PgNow> {
 /// Whether `sql` names each result column, so its result type is stable.
 ///
 /// It refuses a `*` in a result list: `SELECT *`, `SELECT t.*`,
-/// `RETURNING *` and `DISTINCT *`. It accepts `COUNT(*)` and a
-/// multiplication, because neither changes with the table.
+/// `RETURNING *`, `DISTINCT *` and `DISTINCT ON (..) *`. It refuses a
+/// `TABLE t` statement, which returns every column. It accepts `COUNT(*)`
+/// and a multiplication, because neither changes with the table.
 ///
-/// The test reads the token in front of each `*`. A `*` in a string literal
-/// or a comment can give a false refusal. It cannot give a false pass.
+/// The test is a heuristic, not a parser. It reads the text in front of each
+/// `*`. So it refuses a `*` in a subquery, a string literal or a comment,
+/// although none of them changes the result type. It does not find a `*`
+/// that a comment separates from its `SELECT`. Write a marked statement
+/// with no such text.
 #[must_use]
 pub fn names_its_result_columns(sql: &str) -> bool {
     let bytes = sql.as_bytes();
+    if first_word(bytes).eq_ignore_ascii_case(b"TABLE") {
+        return false;
+    }
     bytes
         .iter()
         .enumerate()
         .filter(|(_, byte)| **byte == b'*')
         .all(|(star, _)| !star_is_a_result_list(&bytes[..star]))
+}
+
+/// The first word of `text`, after leading space and one opening paren.
+fn first_word(text: &[u8]) -> &[u8] {
+    let text = text.trim_ascii_start();
+    let text = text.strip_prefix(b"(").unwrap_or(text).trim_ascii_start();
+    let end = text
+        .iter()
+        .position(|byte| !byte.is_ascii_alphabetic())
+        .unwrap_or(text.len());
+    &text[..end]
+}
+
+/// The last word of `text`, after trailing space, and the text in front of it.
+fn split_last_word(text: &[u8]) -> (&[u8], &[u8]) {
+    let text = text.trim_ascii_end();
+    let start = text
+        .iter()
+        .rposition(|byte| !(byte.is_ascii_alphanumeric() || *byte == b'_'))
+        .map_or(0, |at| at + 1);
+    text.split_at(start)
+}
+
+/// Whether `before` ends with `DISTINCT ON (..)`, so the next `*` is a
+/// result list.
+fn ends_with_distinct_on(before: &[u8]) -> bool {
+    let mut depth = 0_usize;
+    let open = before.iter().rposition(|byte| {
+        match byte {
+            b')' => depth += 1,
+            b'(' => depth -= 1,
+            _ => {}
+        }
+        depth == 0
+    });
+    let Some(open) = open else {
+        return false;
+    };
+    let (rest, on) = split_last_word(&before[..open]);
+    let (_, distinct) = split_last_word(rest);
+    on.eq_ignore_ascii_case(b"ON") && distinct.eq_ignore_ascii_case(b"DISTINCT")
 }
 
 /// Whether the text in front of a `*` makes that `*` a result list.
@@ -286,14 +334,12 @@ fn star_is_a_result_list(before: &[u8]) -> bool {
     let Some(last) = before.last() else {
         return true;
     };
-    if matches!(last, b'.' | b',') {
-        return true;
+    match last {
+        b'.' | b',' => return true,
+        b')' => return ends_with_distinct_on(before),
+        _ => {}
     }
-    let word_start = before
-        .iter()
-        .rposition(|byte| !(byte.is_ascii_alphanumeric() || *byte == b'_'))
-        .map_or(0, |at| at + 1);
-    let word = &before[word_start..];
+    let (_, word) = split_last_word(before);
     [&b"SELECT"[..], b"RETURNING", b"DISTINCT", b"ALL"]
         .iter()
         .any(|keyword| word.eq_ignore_ascii_case(keyword))
@@ -431,6 +477,9 @@ mod tests {
             "SELECT a * 2 AS doubled FROM t",
             "SELECT (a + b) * $1 AS scaled FROM t",
             "UPDATE t SET a = a * $1 WHERE id = $2 RETURNING id, a",
+            "SELECT DISTINCT ON (id) id, a FROM t ORDER BY id",
+            "SELECT (SELECT COUNT(*) FROM u) * 2 AS doubled FROM t",
+            "SELECT id FROM tables",
             "SELECT f(t.c, t.p) FROM unnest($1, $2) AS t(c, p)",
         ] {
             assert!(names_its_result_columns(sql), "{sql}");
@@ -448,6 +497,11 @@ mod tests {
             "INSERT INTO t (a) VALUES ($1) RETURNING *",
             "UPDATE t SET a = 1 RETURNING\n  *",
             "WITH x AS (SELECT t.* FROM t) SELECT id FROM x",
+            "SELECT DISTINCT ON (id) * FROM t ORDER BY id",
+            "select distinct on (lower(name), id) * from t",
+            "TABLE t",
+            "  table harvest_events",
+            "(TABLE t)",
             "*",
         ] {
             assert!(!names_its_result_columns(sql), "{sql}");

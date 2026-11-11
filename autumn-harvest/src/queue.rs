@@ -98,6 +98,7 @@ struct ClockTimestampRow {
 /// Returns [`crate::error::HarvestError::Database`] on query failure.
 pub async fn db_clock_now(conn: &mut AsyncPgConnection) -> HarvestResult<DateTime<Utc>> {
     diesel::sql_query("SELECT clock_timestamp() AS now")
+        .cache_prepared()
         .get_result::<ClockTimestampRow>(conn)
         .await
         .map(|row| row.now)
@@ -528,10 +529,13 @@ async fn insert_task_rows(
 
     let _phase = crate::worker::PersistPhaseTimer::start(crate::telemetry::PersistPhase::Tasks);
     // Each `None` of a row renders `DEFAULT`, so the text of the insert
-    // follows the option set of each row. One row has a bounded set of
-    // texts: one per task shape that the deployment enqueues. A batch
-    // multiplies that set by its row count, so only a single row is cached
-    // (issue #2651).
+    // follows the option set of the row. One row has a bounded set of
+    // texts. The activities that the deployment declares give the option
+    // sets. Four request options multiply them: build id, fairness key,
+    // context headers and trace context. The stamp doubles them. A
+    // deployment has tens of texts, at about 50 KB each for a connection.
+    // A batch multiplies that set by its row count, so only a single row
+    // is cached (issue #2651).
     let cache = rows.len() == 1;
     let insert = diesel::insert_into(harvest_task_queue::table).values(rows);
     if !crate::notify::stamp_wanted(conn) {
@@ -3026,6 +3030,11 @@ async fn claim_task_one_statement(
     // added to its `BEGIN`: the same transaction manager calls, in the same
     // order. The settings now also cover the claim slot statement, a lookup
     // of one row that they suit.
+    //
+    // One path differs. A statement of the batch can fail after its `BEGIN`
+    // ran, for example on a query cancel. The server then holds an aborted
+    // transaction, and the transaction manager records none.
+    // `begin_claim_transaction` ends that transaction before it returns.
     let ageing = aging_secs_i64.is_some_and(|secs| secs > 0);
     // A fair claim skips the seek window and always runs the full scan, as
     // ageing does (issue #1976). It takes the same plan settings. Its text
@@ -3035,9 +3044,7 @@ async fn claim_task_one_statement(
     } else {
         CLAIM_BEGIN_WITH_SETTINGS_SQL
     };
-    diesel_async::AnsiTransactionManager::begin_transaction_sql(conn, begin)
-        .await
-        .map_err(crate::error::database_error)?;
+    begin_claim_transaction(conn, begin).await?;
     let body: HarvestResult<Option<ClaimOutcome>> = async {
         if let Some(slots) = slots
             && take_claim_slot(conn, slots).await?.is_none()
@@ -3100,6 +3107,58 @@ async fn claim_task_one_statement(
         }
         ClaimOutcome::Empty => Ok(SlottedClaim::Empty),
     }
+}
+
+/// Open the claim transaction with `begin`, a batch that starts with `BEGIN`.
+///
+/// # A failure inside the batch
+///
+/// A statement after the `BEGIN` can fail, for example on a query cancel or
+/// a statement timeout. The server session is then in an aborted
+/// transaction. The transaction manager sees a failed `BEGIN` and records no
+/// transaction, so nothing would roll it back. The pool would hand the
+/// connection out again, and each statement on it would fail.
+///
+/// So a database error here sends one `ROLLBACK`. With no open transaction
+/// the server answers with a warning only. If that `ROLLBACK` fails too, the
+/// manager is set to its error state, and the pool drops the connection.
+///
+/// Only a database error takes this path. The other errors of
+/// `begin_transaction_sql` come before it sends a statement. One of them is
+/// `AlreadyInTransaction`, and a `ROLLBACK` there would end the transaction
+/// of the caller.
+async fn begin_claim_transaction(
+    conn: &mut AsyncPgConnection,
+    begin: &'static str,
+) -> HarvestResult<()> {
+    let Err(begin_error) =
+        diesel_async::AnsiTransactionManager::begin_transaction_sql(conn, begin).await
+    else {
+        return Ok(());
+    };
+    if matches!(begin_error, diesel::result::Error::DatabaseError(..))
+        && diesel_async::SimpleAsyncConnection::batch_execute(conn, "ROLLBACK")
+            .await
+            .is_err()
+    {
+        use diesel_async::TransactionManager as _;
+        diesel_async::AnsiTransactionManager::transaction_manager_status_mut(conn).set_in_error();
+    }
+    Err(crate::error::database_error(begin_error))
+}
+
+/// [`begin_claim_transaction`] for a test that makes the batch fail after
+/// its `BEGIN`.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] when the batch fails.
+#[doc(hidden)]
+pub async fn begin_claim_transaction_for_test(
+    conn: &mut AsyncPgConnection,
+    begin: &'static str,
+) -> HarvestResult<()> {
+    begin_claim_transaction(conn, begin).await
 }
 
 /// Commit the claim transaction on `Ok`, and roll it back on `Err`.
@@ -7571,6 +7630,7 @@ pub async fn reschedule_task(
         dsl::timer_fires_at.eq(Some(scheduled_at)),
     ))
     .returning((dsl::queue_name, dsl::priority, dsl::task_type))
+    .cache_prepared()
     .get_result::<(String, i32, String)>(conn)
     .await
     .optional()
@@ -9636,6 +9696,7 @@ pub async fn try_consume_rate_limit_token(
         SELECT EXISTS (SELECT 1 FROM debited) AS debited"
     ))
     .bind::<diesel::sql_types::Text, _>(key)
+    .cache_prepared()
     .get_result(conn)
     .await
     .optional()
@@ -11609,6 +11670,7 @@ pub(crate) async fn db_now(conn: &mut AsyncPgConnection) -> HarvestResult<DateTi
         now: DateTime<Utc>,
     }
     let row: Now = diesel::sql_query("SELECT clock_timestamp() AS now")
+        .cache_prepared()
         .get_result(conn)
         .await
         .map_err(crate::error::database_error)?;

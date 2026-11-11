@@ -235,7 +235,7 @@ Classification rule:
 | `schedule_decision` | diesel | (a) | Append-only decision log. |
 | `schedule_override` | diesel, raw-pg-sql, raw-sql, row-lock | (b) | Operator overrides for code-declared schedules (issues #2385, #2386). Plain keyed reads, an upsert and a delete. The patch takes `FOR UPDATE` on the override row; the single write lock subsumes it. The pass fingerprint hashes each row's `xmin`, which SQLite lacks. SQLite needs no fingerprint, because it has no tick that rewrites a row: an upsert merges the stored override itself. Shipped for workflow schedules in `autumn-harvest-sqlite/src/schedule.rs` (#2390); SQLite has no DAGs. |
 | `scheduler` | diesel, row-lock, advisory-lock, interval-sql, raw-pg-sql, raw-sql | (b) | Cron/interval arithmetic as epoch ms. |
-| `schema` | diesel, raw-sql | (c) | Diesel `table!` definitions; reimplemented wholesale. The four unmapped columns of `harvest_workflow_executions` are constant fragments of `cached_stmt`. |
+| `schema` | diesel | (c) | Diesel `table!` definitions; reimplemented wholesale. |
 | `sessions` | diesel, row-lock, interval-sql, raw-pg-sql, raw-sql | (b) | Lease expiry as epoch ms. |
 | `signal` | diesel, row-lock | (b) | Insert under a row lock; subsumed by the single write lock. |
 | `shard` | diesel | (a) | Routing and pool construction. The router itself is pure arithmetic over shard ids; the only Diesel contact is `ShardedDbPool::from_dsns` building a connection pool per shard (issue #964). A single-file SQLite deployment has exactly one shard, so this is a one-entry map rather than a port. |
