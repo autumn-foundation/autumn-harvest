@@ -1101,12 +1101,18 @@ mod pure_tests {
         assert!(history_records_a_grant(&[grant, other()]));
     }
 
-    /// The premise of [`history_records_a_grant`]: one statement inserts a
-    /// lock row, one function runs it, and its one caller appends
-    /// `MutexGranted` in the same transaction.
-    #[test]
-    fn the_grant_has_one_caller_and_it_appends_the_event() {
-        let mutex = include_str!("mutex.rs");
+    /// Check the premise of [`history_records_a_grant`] on the two sources.
+    ///
+    /// One statement inserts a lock row, one function runs it, and its one
+    /// caller appends `MutexGranted` in the same transaction.
+    ///
+    /// A Windows checkout can hold CRLF line endings, and one needle spans
+    /// two lines. So each source is normalized first, as `queue.rs` does for
+    /// its own source scans.
+    fn assert_grant_premise(mutex_source: &str, worker_source: &str) {
+        let mutex = mutex_source.replace("\r\n", "\n");
+        let worker = worker_source.replace("\r\n", "\n");
+
         let production = mutex.split("mod pure_tests").next().expect("production");
         assert_eq!(
             production
@@ -1121,7 +1127,6 @@ mod pure_tests {
             "a second function runs the grant statement"
         );
 
-        let worker = include_str!("worker.rs");
         let call = "crate::mutex::try_grant_or_enqueue(";
         assert_eq!(
             worker.matches(call).count(),
@@ -1138,6 +1143,22 @@ mod pure_tests {
                 && granted_arm.contains("store::append_single_event(conn, exec_id, granted_event)"),
             "the grant transaction no longer appends MutexGranted"
         );
+    }
+
+    #[test]
+    fn the_grant_has_one_caller_and_it_appends_the_event() {
+        assert_grant_premise(include_str!("mutex.rs"), include_str!("worker.rs"));
+    }
+
+    /// The Windows job checks the sources out with CRLF line endings. This
+    /// test gives the guard such text on every platform.
+    #[test]
+    fn the_grant_premise_check_reads_crlf_sources() {
+        let crlf = |source: &str| source.replace("\r\n", "\n").replace('\n', "\r\n");
+        let mutex = crlf(include_str!("mutex.rs"));
+        let worker = crlf(include_str!("worker.rs"));
+        assert!(worker.contains("\r\n"));
+        assert_grant_premise(&mutex, &worker);
     }
 
     #[test]
