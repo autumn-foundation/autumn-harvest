@@ -3456,11 +3456,17 @@ jobs:
     name: Fuzz smoke (manual)
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
+    env:
+      # The nightly that `fuzz-nightly.yml` pins. A newer nightly fails to
+      # build the `db` feature with E0275 in the diesel transaction futures,
+      # so `toolchain: nightly` made this job fail before any fuzzing.
+      # `fuzz_nightly_wiring` checks that the two pins agree.
+      FUZZ_TOOLCHAIN: nightly-2026-08-14
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
-          toolchain: nightly
+          toolchain: ${{ env.FUZZ_TOOLCHAIN }}
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: fuzz
@@ -3473,5 +3479,5 @@ jobs:
           for t in fuzz_workflow_event_deser fuzz_det_check_source \
                    fuzz_validate_target_url fuzz_failure_signature; do
             echo "=== ${t} ==="
-            cargo +nightly fuzz run "${t}" -- -max_total_time=30
+            cargo "+${FUZZ_TOOLCHAIN}" fuzz run "${t}" -- -max_total_time=30
           done
