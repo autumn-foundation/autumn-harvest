@@ -24584,6 +24584,41 @@ pub(crate) async fn cancel_workflow(
     }
 }
 
+/// The runtime's metrics recorder, or a no-op when the runtime is not
+/// installed (the boot window).
+///
+/// Clone-class note (closed, PR #2576 origin): this function already
+/// claimed to be the one fallback path for every handler. Five call sites
+/// did not use it. `ui.rs`'s `cancel_workflow_ui`, `terminate_workflow_ui`,
+/// `pause_workflow_ui` and `resume_workflow_ui` each inlined the same
+/// fallback. `redrive_from_shards` below inlined it too. All six sites,
+/// including this one, landed in the same commit that added this doc
+/// comment. The UI handlers now call this function instead.
+pub(crate) fn metrics_recorder_or_noop(
+    api_state: &HarvestApiState,
+) -> Arc<dyn autumn_harvest::telemetry::MetricsRecorder + Send + Sync> {
+    api_state.runtime().map_or_else(
+        |_| Arc::new(autumn_harvest::telemetry::NoOpMetrics) as _,
+        |rt| Arc::clone(&rt.registry.telemetry().metrics),
+    )
+}
+
+#[cfg(test)]
+mod metrics_recorder_or_noop_tests {
+    use super::{HarvestApiState, metrics_recorder_or_noop};
+
+    // Pins the fallback that cancel/terminate/pause/resume share (clone
+    // class, PR #2576). Six call sites once resolved this fallback on their
+    // own. Five now call this function instead. This test pins the one
+    // behavior all six already agreed on.
+    #[test]
+    fn falls_back_to_a_disabled_recorder_before_the_runtime_attaches() {
+        let state = HarvestApiState::new();
+        let recorder = metrics_recorder_or_noop(&state);
+        assert!(!recorder.is_enabled());
+    }
+}
+
 /// Force-terminate a single workflow execution (issue #504).
 ///
 /// The forceful sibling of `cancel_workflow`: it delegates to the
@@ -24593,18 +24628,6 @@ pub(crate) async fn cancel_workflow(
 /// `ExecutionId`), audited via `OP_WORKFLOW_TERMINATE`, and idempotent against
 /// an already-terminal execution (non-mutating no-op, `newly_terminated:
 /// false`).
-/// The runtime's metrics recorder, or a no-op when the runtime is not installed
-/// (the boot window). Shared by the cancel/terminate/pause/resume handlers so
-/// the fall-back is resolved identically everywhere.
-fn metrics_recorder_or_noop(
-    api_state: &HarvestApiState,
-) -> Arc<dyn autumn_harvest::telemetry::MetricsRecorder + Send + Sync> {
-    api_state.runtime().map_or_else(
-        |_| Arc::new(autumn_harvest::telemetry::NoOpMetrics) as _,
-        |rt| Arc::clone(&rt.registry.telemetry().metrics),
-    )
-}
-
 async fn terminate_workflow(
     Extension(api_state): Extension<HarvestApiState>,
     Path(id): Path<String>,
@@ -35592,11 +35615,7 @@ async fn redrive_from_shards(
     let pool = api_state.storage_pool()?;
     let runtime = api_state.runtime().ok();
     let registry = runtime.as_ref().map(|r| r.registry().as_ref());
-    let metrics: Arc<dyn autumn_harvest::telemetry::MetricsRecorder + Send + Sync> =
-        runtime.as_ref().map_or_else(
-            || Arc::new(autumn_harvest::telemetry::NoOpMetrics) as _,
-            |rt| Arc::clone(&rt.registry.telemetry().metrics),
-        );
+    let metrics = metrics_recorder_or_noop(api_state);
     let reason = request.reason.as_deref();
 
     let mut total = dlq::RedriveResult {
