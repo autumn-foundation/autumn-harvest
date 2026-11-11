@@ -100,8 +100,14 @@ impl RetryEnvelope {
     ///
     /// It is the latest finish of the last attempt, capped at the deadline.
     /// It is `None` when neither timeout bounds the last attempt.
+    ///
+    /// A truncated list omits attempts, so its last finish is not the end.
+    /// Then only the deadline bounds the total.
     #[must_use]
     pub fn worst_case_total(&self) -> Option<Duration> {
+        if self.truncated {
+            return self.schedule_to_close;
+        }
         let last = self.attempts.last().and_then(|w| w.latest_finish);
         match (last, self.schedule_to_close) {
             (Some(finish), Some(deadline)) => Some(finish.min(deadline)),
@@ -349,6 +355,20 @@ mod tests {
         assert!(env.truncated);
         assert_eq!(env.possible_attempts(), MAX_LISTED_ATTEMPTS);
         assert_eq!(env.unreachable_attempts(), 0);
+    }
+
+    #[test]
+    fn truncation_does_not_understate_the_worst_case() {
+        let policy = RetryPolicy::fixed(MAX_LISTED_ATTEMPTS + 1, Duration::ZERO)
+            .with_jitter(JitterPolicy::None);
+        // The listed prefix ends at 10,000 s, but one more attempt is configured.
+        let env = analyze(&policy, Some(secs(1)), None);
+        assert!(env.truncated);
+        assert_eq!(env.worst_case_total(), None);
+        // A deadline past the listed prefix is the only safe bound.
+        let env = analyze(&policy, Some(secs(1)), Some(secs(20_000)));
+        assert!(env.truncated);
+        assert_eq!(env.worst_case_total(), Some(secs(20_000)));
     }
 
     #[test]
