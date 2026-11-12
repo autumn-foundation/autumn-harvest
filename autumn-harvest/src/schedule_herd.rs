@@ -135,10 +135,7 @@ pub fn forecast(
             }
             read += 1;
             let key = next.timestamp().div_euclid(width);
-            let members = buckets.entry(key).or_default();
-            if members.last().map(String::as_str) != Some(name) {
-                members.push(name.to_string());
-            }
+            buckets.entry(key).or_default().push(name.to_string());
         }
         fires += read;
     }
@@ -146,7 +143,9 @@ pub fn forecast(
     let mut spots: Vec<HerdSpot> = buckets
         .into_iter()
         .filter_map(|(key, mut members)| {
+            // A caller can pass one name twice, so dedup before the threshold.
             members.sort();
+            members.dedup();
             let at = DateTime::from_timestamp(key.saturating_mul(width), 0)?;
             (members.len() >= min_herd).then_some(HerdSpot {
                 at,
@@ -318,6 +317,28 @@ mod tests {
         let report = forecast(&[("s", &every_second)], at(0), at(limit + 10), MINUTE, 2);
         assert_eq!(report.fires, MAX_FIRES_PER_SCHEDULE);
         assert_eq!(report.truncated, ["s"]);
+    }
+
+    #[test]
+    fn a_repeated_name_counts_once() {
+        let a = cron("0 * * * *");
+        let b = cron("0 * * * *");
+        let report = forecast(
+            &[("a", &a), ("b", &b), ("a", &a)],
+            at(0),
+            at(HOUR),
+            MINUTE,
+            3,
+        );
+        assert_eq!(report.spots, []);
+        let pair = forecast(
+            &[("a", &a), ("b", &b), ("a", &a)],
+            at(0),
+            at(HOUR),
+            MINUTE,
+            2,
+        );
+        assert_eq!(pair.spots[0].schedules, ["a", "b"]);
     }
 
     #[test]
