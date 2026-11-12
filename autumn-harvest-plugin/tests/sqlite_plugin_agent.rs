@@ -31,7 +31,8 @@ use autumn_harvest_agent::{
 };
 use autumn_harvest_plugin::HarvestPlugin;
 use autumn_harvest_plugin::sqlite::{
-    ExecutionFilter, ExecutionSummary, HarvestSqlite, SignalWithStartParams, StartOptions, agent,
+    ExecutionFilter, ExecutionSummary, HarvestSqlite, HarvestSqliteError, SignalWithStartParams,
+    SqliteError, StartOptions, agent,
 };
 use autumn_web::config::AutumnConfig;
 use autumn_web::test::{TestApp, TestClient};
@@ -338,13 +339,17 @@ async fn an_entity_agent_runs_through_signal_with_start() {
 
     let deadline = Instant::now() + LIMIT;
     let state: AgentState = loop {
-        let value: Value = handle
-            .query(exec, ENTITY_STATE_QUERY, Value::Null)
-            .await
-            .unwrap();
-        let state: AgentState = serde_json::from_value(value).unwrap();
-        if state.segments >= 1 {
-            break state;
+        // The agent reads its profile before it registers the query. Until
+        // the first decision records that read, the query has no handler.
+        match handle.query(exec, ENTITY_STATE_QUERY, Value::Null).await {
+            Ok(value) => {
+                let state: AgentState = serde_json::from_value(value).unwrap();
+                if state.segments >= 1 {
+                    break state;
+                }
+            }
+            Err(HarvestSqliteError::Sqlite(SqliteError::QueryNotFound { .. })) => {}
+            Err(error) => panic!("the state query failed: {error}"),
         }
         assert!(Instant::now() < deadline, "the op did not run");
         tokio::time::sleep(Duration::from_millis(25)).await;
