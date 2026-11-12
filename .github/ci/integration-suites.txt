@@ -121,6 +121,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          claim_budget_tests
 linux        autumn-harvest         integration                      -                          claim_concurrency_tests
 linux        autumn-harvest         integration                      -                          claim_continuation_priority_tests
+linux        autumn-harvest         integration                      -                          claim_recheck_pipeline_db_tests
 linux        autumn-harvest         integration                      -                          claim_run_deadline_tests
 linux        autumn-harvest         integration                      -                          claim_seek_tests
 linux        autumn-harvest         integration                      -                          claim_slot_tests
@@ -176,6 +177,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          mixed_suspension_tests
 linux        autumn-harvest         integration                      -                          mixed_suspension_timer_batch_perf
 linux        autumn-harvest         integration                      -                          mutex_lease_reclaim_perf
+linux        autumn-harvest         integration                      -                          mutex_terminal_sweep_db_tests
 linux        autumn-harvest         integration                      -                          mutex_tests
 linux        autumn-harvest         integration                      -                          notify_post_commit_tests
 linux        autumn-harvest         integration                      -                          notify_stage_probe_tests
