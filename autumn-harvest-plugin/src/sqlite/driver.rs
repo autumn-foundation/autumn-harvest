@@ -643,8 +643,7 @@ async fn drive(
 ) -> Option<oneshot::Sender<()>> {
     let reply = drive_loop(&mut runtime, receiver, tick, stop, retention, wake.as_mut()).await;
     if let Some(wake) = &wake {
-        let raw = runtime.next_wake_at().ok().flatten();
-        wake.exit(raw).await;
+        wake.exit(&runtime);
     }
     drop(runtime);
     reply
@@ -743,7 +742,7 @@ async fn drive_loop(
 }
 
 /// Mark the wake report dirty: work ran since the last idle point.
-const fn touch(wake: Option<&mut WakeReport>) {
+fn touch(wake: Option<&mut WakeReport>) {
     if let Some(wake) = wake {
         wake.touch();
     }
@@ -1282,7 +1281,7 @@ mod tests {
         .expect("pool")
         .expect("a url gives a pool");
         let book = Arc::new(
-            super::super::wake::WakeBook::open(pool)
+            super::super::wake::WakeBook::open(pool, None)
                 .await
                 .expect("wake table"),
         );
@@ -1295,6 +1294,13 @@ mod tests {
         let key = FleetDbKey::Slot(7);
         let stop = CancellationToken::new();
         let report = super::super::wake::WakeReport::new(Arc::clone(&book), key.clone());
+        book.flush().await.expect("flush");
+        let first = chrono::Utc::now().timestamp_millis();
+        let due = |at: i64| {
+            let book = Arc::clone(&book);
+            async move { book.due_names(at).await.expect("due") }
+        };
+        assert_eq!(due(first).await, vec![key.name()], "a start records now");
         let (sender, task) = Driver::spawn_tenant(
             runtime,
             Duration::from_millis(250),
@@ -1325,18 +1331,26 @@ mod tests {
 
         // The idle point recorded the timer. A flush writes it.
         book.flush().await.expect("flush");
-        let due = |at: i64| {
-            let book = Arc::clone(&book);
-            async move { book.due_names(at).await.expect("due") }
-        };
         assert!(due(before + 599_000).await.is_empty(), "not due yet");
         assert_eq!(due(before + 700_000).await, vec![key.name()]);
 
-        // A clean stop keeps the value.
+        // A start with no settle, then a stop. The stop records either now
+        // or the new 60 s timer, and the sweep flush writes it.
+        let (reply, started) = oneshot::channel();
+        sender
+            .send(Command::Start {
+                workflow_name: "napping".to_owned(),
+                input: serde_json::json!(60),
+                options: StartOptions::new(),
+                reply,
+            })
+            .await
+            .expect("send");
+        started.await.expect("reply").expect("start");
         stop.cancel();
         task.await.expect("the driver stops");
-        assert!(due(before + 599_000).await.is_empty());
-        assert_eq!(due(before + 700_000).await, vec![key.name()]);
+        book.flush().await.expect("flush");
+        assert_eq!(due(before + 61_000 + 10_000).await, vec![key.name()]);
     }
 
     /// An unknown workflow in a code schedule fails the open, and names it.

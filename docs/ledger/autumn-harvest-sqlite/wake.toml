@@ -1,5 +1,6 @@
 # Ledger profiles for `autumn-harvest-sqlite/src/wake.rs`. See `docs/ledger/README.md`.
-# A tenant driver reads it at each idle point, so at most once per tick.
+# A tenant driver reads it at an idle point after work, or after a known
+# deadline passed. A quiet idle point skips it.
 
 ["next_wake_at"]
 driver = "per_tick"

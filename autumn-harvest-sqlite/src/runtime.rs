@@ -680,8 +680,21 @@ impl SqliteRuntime {
     ///
     /// Returns [`SqliteError::Sqlite`] when the read fails.
     pub fn next_wake_at(&self) -> SqliteResult<Option<i64>> {
+        self.next_wake_after(i64::MIN)
+    }
+
+    /// As [`next_wake_at`](Self::next_wake_at), but only the deadlines after
+    /// `after`, in epoch milliseconds.
+    ///
+    /// A deadline that a drive cannot clear stays in the past. This read
+    /// then still finds the next healthy deadline.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqliteError::Sqlite`] when the read fails.
+    pub fn next_wake_after(&self, after: i64) -> SqliteResult<Option<i64>> {
         let now = (self.now_fn)().timestamp_millis();
-        crate::wake::next_wake_at(&self.conn, now, self.schedules_enabled)
+        crate::wake::next_wake_after(&self.conn, now, self.schedules_enabled, after)
     }
 
     /// Set the app state that `ctx.state::<T>()` returns (issue #2467).

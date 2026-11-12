@@ -228,13 +228,15 @@ the tenant at that time.
 ```mermaid
 sequenceDiagram
     participant D as tenant driver
-    participant C as control database
+    participant B as wake book (memory)
     participant S as wake sweep
+    participant C as control database
     participant F as DatabaseFleet
-    D->>C: next_wake_at, when it changes and when the tenant closes
+    D->>B: next_wake_at: when work starts, when idle, when it stops
     loop each harvest.sqlite.tick_ms
-        S->>C: read the due rows
-        S->>F: owned and closed: open in the background
+        S->>C: write the book
+        S->>C: read the due rows of the owned slot ranges
+        S->>F: closed: open in the background
         S->>D: run until idle
         S->>F: close it again
     end
@@ -245,28 +247,36 @@ sequenceDiagram
   backoff and a run deadline. A paused schedule and a disabled scheduler
   give no slot. `None` means no deadline.
 - **Where it is kept.** The control database holds one row per tenant in
-  `harvest_tenant_wakes (tenant_key, next_wake_at)`. The boot creates the
-  table. `TENANT_WAKES_SCHEMA_SQL` holds its DDL.
-- **How late.** A due item fires within one tick of its time. The sweep
-  runs on `harvest.sqlite.tick_ms`.
-- **One host.** A host wakes only the tenants of the slot ranges that it
-  owns. A slot of a closed tenant runs once, not once per host.
+  `harvest_tenant_wakes (tenant_key, routing_slot, next_wake_at)`. The boot
+  creates the table. `TENANT_WAKES_SCHEMA_SQL` holds its DDL.
+- **How late.** A due item fires within one tick, plus the time to open
+  the tenant. The sweep runs on `harvest.sqlite.tick_ms`.
+- **One host.** A host reads and wakes only the tenants of the slot ranges
+  that it owns, and writes only their rows. A slot of a closed tenant runs
+  once, not once per host.
 - **No eviction.** A wake is a background open. It never goes past
   `max_open`, and a full fleet tries again on the next tick. The fleet
   closes the tenant when no request used it meanwhile.
+- **A crash.** A driver records now when work starts. A crash during work
+  then leaves a due row, and the next owner finishes the work. A crash
+  loses at most one tick of other records.
 - **A stuck deadline.** A deadline that a drive cannot clear, such as a
-  timer of a run that fails on each drive, comes back once a minute.
-- **A long run.** A wake keeps its tenant open for at most five minutes
-  while the driver works. The fleet then closes it after the pass in
-  flight.
+  timer of a run that fails on each drive, comes back once a minute. It
+  never hides a healthy deadline of the same tenant.
+- **A failed wake.** A tenant that cannot open or start, or whose file is
+  not on this host yet, is tried again a minute later. Only a fleet delete
+  removes a row.
+- **A long run.** A wake keeps its lease for at most five minutes while the
+  driver works. It then asks the fleet to close the tenant. A tenant that a
+  request uses stays open until the fleet closes it as idle.
 
 ### Limits
 
 - A closed tenant runs no timer, retry or activity until the wake sweep
   opens it. An app with no control database runs no sweep: the next open
   resumes the runs, and the boot logs a warning.
-- A tenant gets its first wake row when its driver first goes idle. A
-  tenant that has not opened since this release waits for its next open.
+- A tenant gets its first wake row when its driver starts. A tenant that
+  has not opened since this release waits for its next open.
 - A takeover loses the runs that the old owner did not ship: at most one
   sync interval of work.
 - A direct `DatabaseFleet::restore` to a point in time restores the

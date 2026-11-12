@@ -757,7 +757,10 @@ async fn start(
 /// # Errors
 ///
 /// Returns the error of the wake table DDL.
-async fn tenant_wakes(state: &AppState) -> autumn_web::AutumnResult<Option<Arc<wake::WakeBook>>> {
+async fn tenant_wakes(
+    state: &AppState,
+    fleet: &autumn_web::db::fleet::DatabaseFleet,
+) -> autumn_web::AutumnResult<Option<Arc<wake::WakeBook>>> {
     let Some(pool) = state.pool() else {
         tracing::warn!(
             "the app has no control database, so no sweep wakes a closed tenant: its timers \
@@ -765,7 +768,7 @@ async fn tenant_wakes(state: &AppState) -> autumn_web::AutumnResult<Option<Arc<w
         );
         return Ok(None);
     };
-    let book = wake::WakeBook::open(pool.clone())
+    let book = wake::WakeBook::open(pool.clone(), Some(fleet.clone()))
         .await
         .map_err(AutumnError::service_unavailable_msg)?;
     Ok(Some(Arc::new(book)))
@@ -787,7 +790,7 @@ async fn start_tenants(
     tenant_replica: Option<TenantReplica>,
 ) -> autumn_web::AutumnResult<HarvestFleet> {
     // The wake table comes first. Its error then starts no replication loop.
-    let wakes = tenant_wakes(state).await?;
+    let wakes = tenant_wakes(state, &fleet).await?;
     let replicas = tenant_replicas(state, &fleet, tenant_replica)
         .await
         .map_err(AutumnError::service_unavailable_msg)?;

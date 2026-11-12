@@ -30,7 +30,8 @@ use autumn_web::fleet_layout::FleetDbKey;
 use autumn_web::test::{TestApp, TestClient};
 use serde_json::{Value, json};
 
-/// The driver tick and the sweep interval of each test app.
+/// The default driver tick, which is also the sweep interval. No test app
+/// sets `harvest.sqlite.tick_ms`.
 const TICK: Duration = Duration::from_millis(250);
 
 /// The time that a background open and a first drive pass may take on a
@@ -129,6 +130,27 @@ fn state(run: &ExecutionSummary) -> String {
 
 fn workflow_id(run: &ExecutionSummary) -> String {
     run.workflow_id.clone().into_value().unwrap_or_default()
+}
+
+/// The wake row of `tenant` in the control database: `None` with no row.
+async fn wake_row(dir: &Path, tenant: &FleetDbKey) -> Option<Option<i64>> {
+    #[derive(diesel::QueryableByName)]
+    struct Row {
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::BigInt>)]
+        next_wake_at: Option<i64>,
+    }
+    let pool = control_pool(dir);
+    let mut conn = pool.get().await.expect("control connection");
+    diesel_async::RunQueryDsl::load::<Row>(
+        diesel::sql_query("SELECT next_wake_at FROM harvest_tenant_wakes WHERE tenant_key = ?")
+            .bind::<diesel::sql_types::Text, _>(tenant.name()),
+        &mut *conn,
+    )
+    .await
+    .expect("wake row")
+    .into_iter()
+    .next()
+    .map(|row| row.next_wake_at)
 }
 
 fn harvest_fleet(host: &Host) -> HarvestFleet {
@@ -273,18 +295,72 @@ async fn a_closed_tenant_runs_a_schedule_slot_once() {
     schedule(&host.client, "acme", 2).await;
     close(&host, "acme").await;
 
+    // A slot can fire before the close. Count the slots after it.
     let file = harvest_file(&host.fleet, "acme");
-    assert!(runs(&file, "beat").is_empty(), "no slot is due yet");
-    eventually(Duration::from_secs(15), "two slots run", || {
+    let before = runs(&file, "beat").len();
+    eventually(Duration::from_secs(15), "two more slots run", || {
         runs(&file, "beat")
             .iter()
             .filter(|run| state(run) == "COMPLETED")
             .count()
-            >= 2
+            >= before + 2
     })
     .await;
-    assert_each_slot_ran_once(&file, 2);
+    assert_each_slot_ran_once(&file, before + 2);
     host.fleet.close_all().await;
+}
+
+/// A delete removes the wake row, so no sweep opens a deleted tenant.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_delete_removes_the_wake_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("fleet");
+    let host = boot(dir.path(), "a", fleet_at(&root));
+    let acme = key(&host.fleet, "acme");
+    drop(host.fleet.provision(&acme).await.expect("provision"));
+    let exec = start(&host.client, "acme", "napper", json!(600)).await;
+    armed(&host.client, "acme", &exec).await;
+    close(&host, "acme").await;
+    wait_row(dir.path(), &acme, "the row holds the timer", |row| {
+        row.is_some_and(|at| at.is_some())
+    })
+    .await;
+
+    assert!(host.fleet.delete(&acme).await.expect("delete"));
+    wait_row(dir.path(), &acme, "the row is gone", |row| row.is_none()).await;
+    host.fleet.close_all().await;
+}
+
+/// Write a wake row for `tenant`, as another host does.
+async fn put_row(dir: &Path, tenant: &FleetDbKey, at: i64) {
+    let pool = control_pool(dir);
+    let mut conn = pool.get().await.expect("control connection");
+    diesel_async::RunQueryDsl::execute(
+        diesel::sql_query(
+            "INSERT INTO harvest_tenant_wakes (tenant_key, routing_slot, next_wake_at) \
+             VALUES (?, ?, ?)",
+        )
+        .bind::<diesel::sql_types::Text, _>(tenant.name())
+        .bind::<diesel::sql_types::Integer, _>(i32::from(tenant.routing_slot()))
+        .bind::<diesel::sql_types::BigInt, _>(at),
+        &mut *conn,
+    )
+    .await
+    .expect("put row");
+}
+
+/// Wait until the wake row of `tenant` passes `done`, or fail.
+async fn wait_row(
+    dir: &Path,
+    tenant: &FleetDbKey,
+    what: &str,
+    done: impl Fn(Option<Option<i64>>) -> bool + Send + Sync,
+) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !done(wake_row(dir, tenant).await) {
+        assert!(Instant::now() < deadline, "timed out: {what}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 /// A fleet on `root` that owns the slot range `start..=end`, through the
@@ -310,27 +386,26 @@ async fn owned_fleet(dir: &Path, root: &Path, owner: &str, start: u16, end: u16)
     fleet
 }
 
-/// Two hosts share one control database. Each sweep reads every wake row,
-/// and each host wakes only the tenants of its own range. So a schedule slot
-/// of a closed tenant runs once, not once per host. The other host never
-/// opens the tenant, and never removes its row.
+/// Two hosts share one volume and one control database. Each host wakes
+/// only the tenants of its own range. So a schedule slot of a closed tenant
+/// runs once, not once per host. The other host never opens the tenant,
+/// and its sweeps leave the row of the owner as it is.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_host_wakes_only_the_tenants_it_owns() {
     let dir = tempfile::tempdir().unwrap();
-    let root_a = dir.path().join("fleet-a");
-    let root_b = dir.path().join("fleet-b");
+    let root = dir.path().join("fleet");
     let probe = fleet_at(&dir.path().join("probe"));
     let slot = key(&probe, "acme").routing_slot();
     let other = (slot + 1) % 16_384;
     let host_a = boot(
         dir.path(),
         "a",
-        owned_fleet(dir.path(), &root_a, "host-a", slot, slot).await,
+        owned_fleet(dir.path(), &root, "host-a", slot, slot).await,
     );
     let host_b = boot(
         dir.path(),
         "b",
-        owned_fleet(dir.path(), &root_b, "host-b", other, other).await,
+        owned_fleet(dir.path(), &root, "host-b", other, other).await,
     );
     assert!(host_a.fleet.owns(&key(&host_a.fleet, "acme")));
     assert!(!host_b.fleet.owns(&key(&host_b.fleet, "acme")));
@@ -346,18 +421,33 @@ async fn a_host_wakes_only_the_tenants_it_owns() {
     close(&host_a, "acme").await;
 
     let file = harvest_file(&host_a.fleet, "acme");
-    eventually(Duration::from_secs(15), "two slots run", || {
+    let acme_b = key(&host_b.fleet, "acme");
+    let before = runs(&file, "beat").len();
+    eventually(Duration::from_secs(15), "two more slots run", || {
+        assert!(
+            host_b.fleet.get_open(&acme_b).is_none(),
+            "host B opened acme"
+        );
         runs(&file, "beat")
             .iter()
             .filter(|run| state(run) == "COMPLETED")
             .count()
-            >= 2
+            >= before + 2
     })
     .await;
-    assert_each_slot_ran_once(&file, 2);
-    // Host B never opened the tenant. It has no file of it.
-    assert!(!harvest_file(&host_b.fleet, "acme").exists());
-    assert!(!host_b.fleet.path_of(&key(&host_b.fleet, "acme")).exists());
+    assert_each_slot_ran_once(&file, before + 2);
+    assert_eq!(harvest_fleet(&host_b).open_tenants(), Vec::new());
+
+    // A due row of a tenant that neither host owns stays as it is. No
+    // sweep opens, defers or removes it.
+    let zed = (0..1_000)
+        .map(|n| key(&probe, &format!("zed{n}")))
+        .find(|zed| ![slot, other].contains(&zed.routing_slot()))
+        .expect("a tenant of another slot");
+    let due = chrono::Utc::now().timestamp_millis() - 1_000;
+    put_row(dir.path(), &zed, due).await;
+    tokio::time::sleep(TICK * 8).await;
+    assert_eq!(wake_row(dir.path(), &zed).await, Some(Some(due)));
     host_a.fleet.close_all().await;
     host_b.fleet.close_all().await;
 }

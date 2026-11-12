@@ -193,3 +193,33 @@ async fn an_execution_timeout_is_a_deadline() {
     rt.poll_once().await.unwrap();
     assert_eq!(rt.next_wake_at().unwrap(), None, "the run timed out");
 }
+
+/// `next_wake_after` skips each deadline at or before its bound. A stuck
+/// deadline then never hides a later one.
+#[tokio::test]
+async fn next_wake_after_skips_the_earlier_deadlines() {
+    let (_dir, _clock, mut rt) = fixture();
+    rt.start_workflow("napper", json!(5)).unwrap();
+    rt.start_workflow("napper", json!(90)).unwrap();
+    rt.poll_once().await.unwrap();
+    assert_eq!(rt.next_wake_after(i64::MIN).unwrap(), Some(T0 + 5 * SECOND));
+    assert_eq!(
+        rt.next_wake_after(T0 + 5 * SECOND).unwrap(),
+        Some(T0 + 90 * SECOND)
+    );
+    assert_eq!(rt.next_wake_after(T0 + 90 * SECOND).unwrap(), None);
+}
+
+/// A run backoff in the past is no deadline: the run has started.
+#[tokio::test]
+async fn a_past_run_backoff_is_not_a_deadline() {
+    let (_dir, clock, mut rt) = fixture();
+    rt.start_workflow("retrier", json!(1)).unwrap();
+    rt.poll_once().await.unwrap();
+    // Each attempt fails. The retries pass, and the run fails for good.
+    for minute in 1..=3 {
+        clock.store(T0 + minute * MINUTE, Ordering::SeqCst);
+        rt.poll_once().await.unwrap();
+    }
+    assert_eq!(rt.next_wake_at().unwrap(), None, "nothing is left to drive");
+}
