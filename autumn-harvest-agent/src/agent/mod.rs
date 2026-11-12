@@ -43,6 +43,7 @@ pub mod profile_read;
 pub mod wake;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::pin::Pin;
 use std::time::Duration;
 
 use autumn_harvest::entity::{ENTITY_OP_SIGNAL, Entity, EntityMessage, Wake};
@@ -1515,13 +1516,11 @@ impl AgentRun<'_> {
         let now = self.ctx.system_now().timestamp_millis();
         self.publish(&state, self.profile.as_ref().ok(), "running", now);
         let mut ticked = false;
-        let mut loaded = None;
+        let mut reload = None;
         match admit(state.status.inbox(), op.class()) {
             Admit::Apply => match op {
                 AgentOp::Control(Control::ReloadProfile) => {
-                    // A box keeps the read and the discovery out of each op
-                    // future. Inline, they overflow a 1 MiB thread stack.
-                    loaded = Some(Box::pin(load_run(self.ctx, self.id.clone())).await);
+                    reload = Some(self.boxed_reload_read().await);
                 }
                 AgentOp::Control(control) => state = self.control(state, control).await,
                 AgentOp::Unpark => state = self.unpark(state).await,
@@ -1550,8 +1549,8 @@ impl AgentRun<'_> {
         // heartbeat and sets the search attributes of this op. A failed
         // reload keeps the run profile, and the run goes on.
         let mut profile = self.profile.as_ref().ok();
-        if let Some(loaded) = &loaded {
-            let read = loaded.profile.as_ref().map(Some).map_err(String::as_str);
+        if let Some(read) = &reload {
+            let read = read.as_deref().map(Some).map_err(String::as_str);
             let (next, error) = reloaded(profile, read);
             if let Some(err) = error {
                 fail(&mut state, &format!("the profile reload failed: {err}"));
@@ -1573,6 +1572,28 @@ impl AgentRun<'_> {
         state.last_active_ms = Some(now);
         self.publish(&state, profile, state.status.name(), now);
         Ok(state)
+    }
+
+    /// Read the profile of the kind again, as the next run reads it. A
+    /// failed read or a failed peer discovery gives the error.
+    async fn reload_read(&self) -> Result<Box<AgentProfile>, String> {
+        load_run(self.ctx, self.id.clone())
+            .await
+            .profile
+            .map(Box::new)
+    }
+
+    /// [`reload_read`](Self::reload_read) on the heap.
+    ///
+    /// A debug build makes a future in the frame of its caller before it
+    /// boxes it. This function owns that frame, and it returns before the
+    /// poll. So the frame of `handle` holds a pointer only. With the future
+    /// inline, each op needs more stack, and a 1 MiB main thread overflows.
+    #[inline(never)]
+    fn boxed_reload_read(
+        &self,
+    ) -> Pin<Box<impl Future<Output = Result<Box<AgentProfile>, String>> + '_>> {
+        Box::pin(self.reload_read())
     }
 
     /// The profile of one op and its overlay version (issue #2372).
