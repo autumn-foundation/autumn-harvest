@@ -1222,6 +1222,148 @@ mod tests {
         drop(theirs);
     }
 
+    /// A slot database ships under its slot prefix.
+    #[test]
+    fn a_slot_replica_sits_under_the_slot_prefix() {
+        let root = tenant_harvest_replica_root("app/test", &FleetDbKey::Slot(42));
+        assert_eq!(root, "app/test/fleet/slot/00042/harvest");
+    }
+
+    /// A destination that refuses each upload while it is down.
+    struct Flaky {
+        inner: FileDestination,
+        down: AtomicBool,
+    }
+
+    impl Flaky {
+        fn refused(&self) -> Result<(), autumn_web::replication::DestinationError> {
+            if self.down.load(Ordering::SeqCst) {
+                return Err(autumn_web::replication::DestinationError::Io {
+                    op: "put",
+                    detail: "the destination is down".to_owned(),
+                });
+            }
+            Ok(())
+        }
+    }
+
+    impl ReplicaDestination for Flaky {
+        fn describe(&self) -> String {
+            self.inner.describe()
+        }
+        fn put(
+            &self,
+            key: &str,
+            body: &[u8],
+        ) -> Result<(), autumn_web::replication::DestinationError> {
+            self.refused()?;
+            self.inner.put(key, body)
+        }
+        fn put_file(
+            &self,
+            key: &str,
+            path: &Path,
+        ) -> Result<(), autumn_web::replication::DestinationError> {
+            self.refused()?;
+            self.inner.put_file(key, path)
+        }
+        fn get(&self, key: &str) -> Result<Vec<u8>, autumn_web::replication::DestinationError> {
+            self.inner.get(key)
+        }
+        fn get_to_file(
+            &self,
+            key: &str,
+            path: &Path,
+        ) -> Result<(), autumn_web::replication::DestinationError> {
+            self.inner.get_to_file(key, path)
+        }
+        fn list(
+            &self,
+            prefix: &str,
+        ) -> Result<Vec<String>, autumn_web::replication::DestinationError> {
+            self.inner.list(prefix)
+        }
+        fn delete(&self, key: &str) -> Result<(), autumn_web::replication::DestinationError> {
+            self.inner.delete(key)
+        }
+    }
+
+    /// A close that cannot ship parks its shipper. The loop ships the
+    /// backlog once the destination is back, then drops the shipper.
+    #[test]
+    fn a_failed_close_parks_the_shipper_until_the_backlog_ships() {
+        let dir = tempfile::tempdir().unwrap();
+        let flaky = Arc::new(Flaky {
+            inner: FileDestination::new(dir.path().join("replicas")).unwrap(),
+            down: AtomicBool::new(false),
+        });
+        let replicas = Replicas::new(
+            TenantReplica::new(
+                Arc::clone(&flaky) as Arc<dyn ReplicaDestination>,
+                settings(),
+            ),
+            Arc::new(autumn_web::time::SystemClock),
+            fleet(&dir.path().join("fleet")),
+        );
+        let key = replicas.fleet.key_for("acme").unwrap();
+        let path = super::super::fleet::tenant_harvest_file(&replicas.fleet.path_of(&key));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let runtime = autumn_harvest_sqlite::SqliteRuntime::open_replicated(&path).unwrap();
+        runtime.raise_fleet_epoch(1).unwrap();
+        replicas.attach(&key, &path, None);
+        replicas.tick_all();
+
+        runtime.raise_fleet_epoch(2).unwrap();
+        flaky.down.store(true, Ordering::SeqCst);
+        drop(runtime);
+        replicas.close(&key);
+        assert!(replicas.parked_map().contains_key(&key), "the close parked");
+
+        flaky.down.store(false, Ordering::SeqCst);
+        replicas.tick_all();
+        assert!(replicas.parked_map().is_empty(), "the backlog shipped");
+
+        let restored = dir.path().join("restored.harvest.db");
+        let Planned::Plan(plan) = replicas.plan(&key, None).unwrap() else {
+            panic!("the replica has a file");
+        };
+        replicas
+            .publish_plan(&key, &restored, &plan, false)
+            .unwrap();
+        assert_eq!(
+            autumn_harvest_sqlite::fleet_epoch::read(&restored).unwrap(),
+            2
+        );
+    }
+
+    /// A release drops a parked shipper, so a delete never waits on it.
+    #[test]
+    fn a_release_drops_a_parked_shipper() {
+        let dir = tempfile::tempdir().unwrap();
+        let flaky = Arc::new(Flaky {
+            inner: FileDestination::new(dir.path().join("replicas")).unwrap(),
+            down: AtomicBool::new(true),
+        });
+        let replicas = Replicas::new(
+            TenantReplica::new(
+                Arc::clone(&flaky) as Arc<dyn ReplicaDestination>,
+                settings(),
+            ),
+            Arc::new(autumn_web::time::SystemClock),
+            fleet(&dir.path().join("fleet")),
+        );
+        let key = replicas.fleet.key_for("acme").unwrap();
+        let path = dir.path().join("acme.harvest.db");
+        let runtime = autumn_harvest_sqlite::SqliteRuntime::open_replicated(&path).unwrap();
+        runtime.raise_fleet_epoch(1).unwrap();
+        replicas.attach(&key, &path, None);
+        drop(runtime);
+        replicas.close(&key);
+        assert!(replicas.parked_map().contains_key(&key));
+        replicas.release(&key);
+        assert!(replicas.parked_map().is_empty());
+    }
+
     /// Without a replica, a missing file stays missing.
     #[test]
     fn a_missing_file_with_no_replica_stays_missing() {
