@@ -2076,6 +2076,11 @@ fn age_out(sink: &SinkShared, held: &mut Vec<Staged>) {
 /// fails, the tick reads again with no send. A failure of the second send
 /// counts its wakes as lost.
 ///
+/// A wake is a hint, so a rare duplicate is safe. When the connection drops
+/// after the combined statement commits, the read again fails, and the next
+/// tick sends the same wakes once more. A runtime that stops during the
+/// statement counts each held note as lost, even when its wake went out.
+///
 /// Returns `false` when the commit state cannot be read. The notes then stay
 /// held for the next tick.
 async fn tick(sink: &SinkShared, conn: &mut AsyncPgConnection, held: &mut Vec<Staged>) -> bool {

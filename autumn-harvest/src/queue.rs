@@ -3898,6 +3898,7 @@ pub enum RecheckVerdict {
 /// recheck gave the row back. The claim keeps a row only when the lock holds
 /// and no recheck released it. `formal/verus/src/claim_recheck.rs` proves
 /// that the pipeline keeps a row exactly when the sequential rechecks keep it.
+/// The proof does not cover the order on the server. A DB test covers it.
 #[must_use]
 pub const fn recheck_verdict(acquired: bool, released: bool) -> RecheckVerdict {
     if released {
@@ -3928,6 +3929,11 @@ pub const fn recheck_verdict(acquired: bool, released: bool) -> RecheckVerdict {
 /// - A statement that is not prepared yet holds the statement cache lock
 ///   while it prepares. That lock is fair, so the next statement waits for
 ///   it and sends after it.
+///
+/// The order also needs builtin bind types. A custom type makes the driver
+/// look up its oid before the statement cache lock, and that lookup can let a
+/// later statement send first. Each statement here binds a uuid, a text or an
+/// int4 only.
 ///
 /// `claim_recheck_pipeline_db_tests` proves the order on a cold, a warm and
 /// a mixed connection. Each statement also runs when an earlier one gave the
