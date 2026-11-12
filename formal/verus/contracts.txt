@@ -394,6 +394,28 @@ pub fn mix64(mut x: u64) -> (r: u64) ensures r == spec_mix64(x),
 pub fn dlq_mix64(seed: u64) -> (r: u64) ensures r == spec_mix64(seed),
 pub fn splitmix64(seed: u64) -> (r: u64) ensures r == spec_splitmix64(seed),
 
+## formal/verus/src/notify_settle.rs
+pub enum SettleState < T > { Clear, Due, Rest(T), }
+pub enum SettlePlan < T > { Skip, Fresh, Rest(T), }
+pub open spec fn spec_take_settle < T > (state: SettleState < T >) -> SettlePlan < T > { match state { SettleState::Clear => SettlePlan::Skip, SettleState::Due => SettlePlan::Fresh, SettleState::Rest(end) => SettlePlan::Rest(end), } }
+pub open spec fn spec_after_notify_cut < T > (plan: SettlePlan < T >, end: T) -> Option < SettleState < T >> { match plan { SettlePlan::Fresh => Some(SettleState::Rest(end)), _ => None, } }
+pub fn take_settle < T > (state: SettleState < T >) -> (r: SettlePlan < T >) ensures r == spec_take_settle(state), state is Clear <==> r is Skip, state is Due <==> r is Fresh, forall | end: T | state == SettleState::Rest(end) ==> r == SettlePlan::Rest(end),
+pub fn after_notify_cut < T > (plan: SettlePlan < T >, end: T) -> (r: Option < SettleState < T >>) ensures r == spec_after_notify_cut(plan, end), plan is Fresh ==> r == Some(SettleState::Rest(end)), ! (plan is Fresh) ==> r is None,
+pub open spec fn spec_after_slept_settle < T > (queued: bool) -> SettleState < T > { if queued { SettleState::Due } else { SettleState::Clear } }
+pub fn after_slept_settle < T > (queued: bool) -> (r: SettleState < T >) ensures r == spec_after_slept_settle::< T > (queued), queued ==> r is Due, ! queued ==> r is Clear,
+pub enum Event { Wake, Begin, Notify(int), Slept(bool), DecisionEnd, }
+pub struct Run { pub state: SettleState < int >, pub plan: SettlePlan < int >, pub fresh: nat, pub rests: nat, pub cuts: nat, }
+pub open spec fn step(run: Run, event: Event) -> Run { match event { Event::Wake => if run.state is Clear && run.plan is Skip { Run { state: SettleState::Due,..run } } else { run }, Event::Begin => { let plan = spec_take_settle(run.state); Run { state: SettleState::Clear, plan: plan, fresh: if plan is Fresh { run.fresh + 1 } else { run.fresh }, rests: if plan is Rest { run.rests + 1 } else { run.rests }, cuts: run.cuts, } }, Event::Notify(end) => match spec_after_notify_cut(run.plan, end) { Some(state) => Run { state: state, plan: SettlePlan::Skip, cuts: run.cuts + 1,..run }, None => run, }, Event::Slept(queued) => if run.plan is Skip { run } else { Run { state: spec_after_slept_settle(queued), plan: SettlePlan::Skip,..run } }, Event::DecisionEnd => Run { plan: SettlePlan::Skip,..run }, } }
+pub open spec fn run_all(run: Run, events: Seq < Event >) -> Run decreases events.len(), { if events.len() == 0 { run } else { run_all(step(run, events [0]), events.drop_first()) } }
+pub open spec fn bounded(run: Run) -> bool { &&& run.cuts + (if run.plan is Fresh { 1nat } else { 0nat }) <= run.fresh &&& run.cuts == run.rests + (if run.state is Rest { 1nat } else { 0nat }) &&&! (run.plan is Skip) ==> run.state is Clear }
+proof fn lemma_step_keeps_the_bound(run: Run, event: Event) requires bounded(run), ensures bounded(step(run, event)),
+proof fn lemma_run_all_keeps_the_bound(run: Run, events: Seq < Event >) requires bounded(run), ensures bounded(run_all(run, events)), decreases events.len(),
+pub open spec fn start() -> Run { Run { state: SettleState::Clear, plan: SettlePlan::Skip, fresh: 0, rests: 0, cuts: 0 } }
+pub proof fn theorem_each_settle_has_one_cut_at_most(events: Seq < Event >) ensures run_all(start(), events).cuts <= run_all(start(), events).fresh,
+pub proof fn theorem_each_cut_owes_its_rest(events: Seq < Event >) ensures run_all(start(), events).cuts == run_all(start(), events).rests + (if run_all(start(), events,).state is Rest { 1nat } else { 0nat }),
+pub proof fn theorem_a_cut_keeps_the_end(end: int) ensures spec_take_settle(spec_after_notify_cut(SettlePlan::< int >::Fresh, end).unwrap()) == SettlePlan::Rest(end),
+pub proof fn theorem_no_notify_cuts_a_rest(end: int, at: int) ensures spec_after_notify_cut(SettlePlan::Rest(end), at) is None,
+
 ## formal/verus/src/overlay_log.rs
 pub open spec fn spec_next_overlay_version(latest: Option < u64 >) -> Option < u64 > { match latest { None => Some(1u64), Some(last) => if last < u64::MAX { Some((last + 1) as u64) } else { None }, } }
 pub fn next_overlay_version(latest: Option < u64 >) -> (r: Option < u64 >) ensures r == spec_next_overlay_version(latest), latest.is_none() ==> r == Some(1u64), latest.is_some() && r.is_some() ==> r.unwrap() == latest.unwrap() + 1, r.is_none() ==> latest == Some(u64::MAX),

@@ -1,0 +1,21 @@
+# RED phase: the new settle tests, run with the NOTIFY cut disabled.
+# The cut branch of Worker::settle stayed pending. Five behaviour tests fail.
+# a_rest_past_its_end_polls_at_once hung here; it now has a timeout.
+test notify::tests::a_notify_cuts_a_fresh_settle_and_keeps_its_end ... ok
+test notify::tests::a_notify_cuts_no_rest_and_no_skip ... ok
+test notify::tests::take_settle_gives_the_plan_of_each_state ... ok
+test worker::tests::a_cut_settle_owes_its_poll_with_no_listener ... ok
+test worker::tests::a_local_decision_end_cuts_the_rest_and_owes_its_end ... FAILED
+test worker::tests::a_local_decision_end_cuts_the_settle_short_and_owes_a_poll ... ok
+test worker::tests::a_local_decision_end_wakes_the_idle_wait_without_a_settle ... ok
+test worker::tests::a_notify_cuts_the_settle_once_and_the_rest_keeps_its_end ... FAILED
+test worker::tests::a_notify_polls_before_it_settles ... ok
+test worker::tests::a_ready_notify_cuts_a_fresh_settle_through_settle_if_pending ... FAILED
+test worker::tests::a_released_permit_does_not_cut_the_settle_delay_short ... ok
+test worker::tests::a_released_permit_wakes_the_poll_loop ... ok
+test worker::tests::a_released_workflow_permit_wakes_the_leader ... ok
+test worker::tests::a_wait_with_no_notify_does_not_cut_the_settle ... ok
+test worker::tests::an_owner_wake_cuts_the_settle_short ... FAILED
+test worker::tests::an_owner_wake_does_not_cut_the_rest ... FAILED
+test worker::tests::the_shard_cut_waits_with_no_listener ... ok
+test worker::tests::two_cut_settles_owe_a_poll_at_the_later_end ... ok

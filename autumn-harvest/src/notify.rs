@@ -852,6 +852,80 @@ pub(crate) fn settle_delay() -> Duration {
     Duration::from_micros(rand::rng().random_range(min..=max))
 }
 
+/// What the leader claim loop owes after a NOTIFY.
+///
+/// `T` is the end of a settle. The worker uses a `tokio` instant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SettleState<T> {
+    /// The leader owes nothing.
+    Clear,
+    /// The leader owes a fresh settle. One NOTIFY can cut it. Either a NOTIFY
+    /// woke the leader and its poll was empty, or a NOTIFY or an owner wake
+    /// waited at the end of a settle.
+    Due,
+    /// A NOTIFY cut the settle that ends at `T`. The leader owes the rest.
+    /// No NOTIFY cuts the rest, so a fleet cannot poll once per NOTIFY.
+    Rest(T),
+}
+
+/// The settle that the leader runs now.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SettlePlan<T> {
+    /// No settle.
+    Skip,
+    /// A fresh settle of [`settle_delay`]. A NOTIFY can cut it.
+    Fresh,
+    /// The rest of a cut settle, up to `T`. Only a local decision end cuts
+    /// it.
+    Rest(T),
+}
+
+/// Give the settle that `state` owes. The caller takes `state` and leaves
+/// `Clear` in its place.
+///
+/// `formal/verus/src/notify_settle.rs` proves the function for every input.
+pub(crate) fn take_settle<T>(state: SettleState<T>) -> SettlePlan<T> {
+    match state {
+        SettleState::Clear => SettlePlan::Skip,
+        SettleState::Due => SettlePlan::Fresh,
+        SettleState::Rest(end) => SettlePlan::Rest(end),
+    }
+}
+
+/// Give the state after a NOTIFY arrives in the settle of `plan`, which
+/// ends at `end`.
+///
+/// Only a fresh settle gives a cut. The cut keeps `end`, so the leader still
+/// polls at the end of the settle. `None` means that the NOTIFY does not
+/// cut. `formal/verus/src/notify_settle.rs` proves the function for every
+/// input, and proves that each settle has one cut at most.
+pub(crate) const fn after_notify_cut<T: Copy>(
+    plan: SettlePlan<T>,
+    end: T,
+) -> Option<SettleState<T>> {
+    match plan {
+        SettlePlan::Fresh => Some(SettleState::Rest(end)),
+        SettlePlan::Skip | SettlePlan::Rest(_) => None,
+    }
+}
+
+/// Give the state after a settle that slept to its end.
+///
+/// `queued` tells whether a NOTIFY waits at that end. The poll after the
+/// settle comes after each such NOTIFY, so that poll covers it. The NOTIFY
+/// then needs no poll of its own, only a settle if that poll is empty.
+/// Without this, the next idle wait polls again at once. In a fleet under a
+/// steady NOTIFY stream, that poll is empty on each worker.
+///
+/// `formal/verus/src/notify_settle.rs` proves the function for every input.
+pub(crate) const fn after_slept_settle<T>(queued: bool) -> SettleState<T> {
+    if queued {
+        SettleState::Due
+    } else {
+        SettleState::Clear
+    }
+}
+
 /// Notifications lost to an error since the process started.
 ///
 /// A failed send adds one for each merged wake. A dropped or rejected note
@@ -2394,6 +2468,18 @@ impl QueueListener {
         }
     }
 
+    /// Take each notification that is queued now, with no wait.
+    ///
+    /// Returns `true` when at least one was queued. A payload that does not
+    /// parse counts too, because it still marks a write.
+    pub(crate) fn take_queued(&mut self) -> bool {
+        let mut any = false;
+        while self.rx.try_recv().is_ok() {
+            any = true;
+        }
+        any
+    }
+
     /// The queue names this listener is subscribed to.
     #[must_use]
     pub fn queues(&self) -> &[String] {
@@ -3325,6 +3411,38 @@ mod tests {
             delays.iter().any(|d| *d != delays[0]),
             "the delay must vary between wakes"
         );
+    }
+
+    #[test]
+    fn take_settle_gives_the_plan_of_each_state() {
+        assert_eq!(take_settle(SettleState::<u32>::Clear), SettlePlan::Skip);
+        assert_eq!(take_settle(SettleState::<u32>::Due), SettlePlan::Fresh);
+        assert_eq!(take_settle(SettleState::Rest(7_u32)), SettlePlan::Rest(7));
+    }
+
+    #[test]
+    fn a_notify_cuts_a_fresh_settle_and_keeps_its_end() {
+        assert_eq!(
+            after_notify_cut(SettlePlan::Fresh, 9_u32),
+            Some(SettleState::Rest(9))
+        );
+        assert_eq!(
+            take_settle(SettleState::Rest(9_u32)),
+            SettlePlan::Rest(9),
+            "the rest must keep the end of the cut settle"
+        );
+    }
+
+    #[test]
+    fn a_queued_notify_at_the_end_owes_a_settle() {
+        assert_eq!(after_slept_settle::<u32>(true), SettleState::Due);
+        assert_eq!(after_slept_settle::<u32>(false), SettleState::Clear);
+    }
+
+    #[test]
+    fn a_notify_cuts_no_rest_and_no_skip() {
+        assert_eq!(after_notify_cut(SettlePlan::Rest(3_u32), 9), None);
+        assert_eq!(after_notify_cut(SettlePlan::<u32>::Skip, 9), None);
     }
 
     // ── TLS for listener connections (issue #1717) ───────────────────────
