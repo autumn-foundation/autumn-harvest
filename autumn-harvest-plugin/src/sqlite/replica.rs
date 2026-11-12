@@ -14,31 +14,35 @@
 //! both. The fleet restore reads `generations/` and `epochs/` of the tenant
 //! prefix only, so it never reads a Harvest key.
 //!
+//! The Harvest file records the identity of its tenant database file. A
+//! restore, a re-create or an import of the database gives a new file, and
+//! so a new identity. The next open then makes the Harvest file follow it.
+//!
 //! ```text
-//! on_open  ─► restore or replace the file ─► open it ─► raise its epoch
-//!             ─► attach a shipper
-//! loop     ─► each tick: check the ownership epoch, then ship
-//! on_close ─► ship until caught up, or park the shipper and retry
-//! release  ─► drop a parked shipper, restore at the next open
+//! on_open   ─► restore or replace the file ─► open it ─► raise its epoch
+//!              ─► record the database identity ─► attach a shipper
+//! loop      ─► each tick: check the ownership epoch, then ship
+//! on_close  ─► ship until caught up, or park the shipper and retry
+//! release   ─► drop a parked shipper, keep the target of a restore
 //! on_delete ─► forget the tenant
 //! ```
 //!
-//! Autumn ADR 0040 gives a lifecycle hook a destination scoped to
-//! `<key prefix>/<engine name>/`. This module uses that layout now, on
-//! the public parts of autumn-web 0.10.
+//! Autumn ADR 0040 plans a destination for a lifecycle hook, scoped to
+//! `<key prefix>/<engine name>/`. This module uses that layout now, on the
+//! public parts of autumn-web 0.10.
 
 use std::collections::HashMap;
 use std::fs::File;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use autumn_web::db::fleet::DatabaseFleet;
 use autumn_web::db::fleet_replication::replica_root;
 use autumn_web::db::fleet_tombstones::restore_allowed;
 use autumn_web::fleet_layout::FleetDbKey;
-use autumn_web::replication::restore::{self, RestoreError};
+use autumn_web::replication::restore::{self, RestoreError, RestorePlan};
 use autumn_web::replication::{
     ReplicaDestination, ReplicationSettings, ReplicationStatus, Replicator, segment,
 };
@@ -48,7 +52,7 @@ use chrono::{DateTime, Utc};
 /// The engine name of the Harvest file under the prefix of its tenant.
 pub const REPLICA_ENGINE: &str = "harvest";
 
-/// Most ticks that the close-time ship takes. One tick ships one segment.
+/// Most ticks that a close-time ship takes. One tick ships one segment.
 const FINAL_SHIP_MAX_TICKS: usize = 64;
 
 /// The longest that a close waits for another process to free the lock.
@@ -60,8 +64,20 @@ const CLAIM_POLL: Duration = Duration::from_millis(25);
 /// The pause of the loop between two checks of its stop flag.
 const STOP_POLL: Duration = Duration::from_millis(100);
 
+/// The pause between two flush passes at shutdown.
+const FLUSH_RETRY: Duration = Duration::from_millis(100);
+
 /// The SQLite sidecars of a database file.
 const SIDECARS: [&str; 3] = ["-wal", "-shm", "-journal"];
+
+/// The suffix of the file that holds the tenant database identity.
+pub const IDENTITY_SUFFIX: &str = ".tenant-db";
+
+/// The suffix of the file that holds the target of a tenant restore.
+pub const TARGET_SUFFIX: &str = ".restore-target";
+
+/// The text of a restore target that asks for the latest state.
+const LATEST: &str = "latest";
 
 /// The replica prefix of the Harvest file of `key`, under the replication
 /// root `base`.
@@ -78,9 +94,9 @@ pub fn tenant_harvest_replica_root(base: &str, key: &FleetDbKey) -> String {
 /// Where the tenant Harvest files ship.
 ///
 /// Give it the destination and the settings that the fleet replication
-/// uses. `settings.root` is the replication root, and each tenant file
-/// ships under [`tenant_harvest_replica_root`]. `database_path` and
-/// `verify_interval` are not used.
+/// uses. `settings.root` is the replication root. Each tenant file ships
+/// under [`tenant_harvest_replica_root`]. The plugin ignores
+/// `database_path` and `verify_interval`.
 ///
 /// The plugin builds one from `[replication]` when the fleet replicates.
 /// Pass one to `HarvestPlugin::sqlite_tenant_replica` to set it in code.
@@ -122,22 +138,15 @@ impl TenantReplica {
     }
 }
 
-/// The restore that the next open of a tenant runs.
+/// What this host knows about its range of a tenant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Pending {
-    /// The fleet replaced the tenant database. Take the latest state.
-    Latest,
-    /// `HarvestFleet::restore` asked for this point in time.
-    At(DateTime<Utc>),
-}
-
-impl Pending {
-    const fn target(self) -> Option<DateTime<Utc>> {
-        match self {
-            Self::Latest => None,
-            Self::At(at) => Some(at),
-        }
-    }
+enum Hold {
+    /// This host holds the range at the epoch of the file.
+    Held,
+    /// This host holds the range at another epoch, so another owner came.
+    Lost,
+    /// The local lease ran out. A renewal can bring it back.
+    Unknown,
 }
 
 /// The replicator of one open Harvest file.
@@ -150,6 +159,9 @@ struct Shipper {
     epoch: Option<u64>,
     /// Set once the shipper must ship nothing more.
     fenced: AtomicBool,
+    /// Set when the tenant closes. A tick that took the shipper before the
+    /// close then ships nothing.
+    retired: AtomicBool,
 }
 
 impl Shipper {
@@ -164,14 +176,12 @@ impl Shipper {
 
     /// Take the OS lock, or `None` when another process holds it.
     fn try_lock_file(&self) -> Option<File> {
-        let mut name = self.path.clone().into_os_string();
-        name.push(".replicator.lock");
         let opened = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
-            .open(PathBuf::from(name));
+            .open(suffixed(&self.path, ".replicator.lock"));
         match opened {
             Ok(file) => file.try_lock().is_ok().then_some(file),
             Err(error) => {
@@ -192,12 +202,14 @@ impl Shipper {
     }
 }
 
-/// Why a restore did not publish a file.
-enum Restored {
-    /// The file is in place.
-    Done,
-    /// The replica has nothing for the request. Keep the local file.
-    Nothing(String),
+/// What the replica holds for a restore request.
+enum Planned {
+    /// A generation to restore.
+    Plan(Box<RestorePlan>),
+    /// The replica has no file.
+    NoReplica,
+    /// The replica no longer reaches the requested time.
+    TooOld(String),
 }
 
 /// The shippers of the open tenant Harvest files.
@@ -209,11 +221,14 @@ pub struct Replicas {
     /// Shippers of closed tenants whose last ship failed. Each keeps its
     /// connection, so no checkpoint drops the frames that it did not ship.
     parked: Mutex<HashMap<FleetDbKey, Arc<Shipper>>>,
-    pending: Mutex<HashMap<FleetDbKey, Pending>>,
+    /// The targets of `HarvestFleet::restore` calls in flight. The `release`
+    /// hook writes each one to disk, after the fleet drained the tenant.
+    requested: Mutex<HashMap<FleetDbKey, Option<DateTime<Utc>>>>,
     stopped: AtomicBool,
 }
 
 impl Replicas {
+    /// The shippers of the Harvest files of `fleet`, to `replica`.
     pub fn new(replica: TenantReplica, clock: Arc<dyn ClockSource>, fleet: DatabaseFleet) -> Self {
         Self {
             replica,
@@ -221,7 +236,7 @@ impl Replicas {
             fleet,
             open: Mutex::new(HashMap::new()),
             parked: Mutex::new(HashMap::new()),
-            pending: Mutex::new(HashMap::new()),
+            requested: Mutex::new(HashMap::new()),
             stopped: AtomicBool::new(false),
         }
     }
@@ -234,105 +249,174 @@ impl Replicas {
         self.parked.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn pending_map(&self) -> MutexGuard<'_, HashMap<FleetDbKey, Pending>> {
-        self.pending.lock().unwrap_or_else(PoisonError::into_inner)
+    fn requested_map(&self) -> MutexGuard<'_, HashMap<FleetDbKey, Option<DateTime<Utc>>>> {
+        self.requested
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     fn destination(&self) -> &dyn ReplicaDestination {
         self.replica.destination.as_ref()
     }
 
-    /// Whether this host holds the range of `key` at `epoch`. Always `true`
-    /// without ownership.
-    fn holds(&self, key: &FleetDbKey, epoch: Option<u64>) -> bool {
-        self.fleet.ownership().is_none_or(|ownership| {
-            ownership
-                .epoch_for(key.routing_slot())
-                .map(autumn_web::lock::FencingToken::get)
-                == epoch
-        })
+    /// What this host knows about its range of `key` at `epoch`.
+    fn hold(&self, key: &FleetDbKey, epoch: Option<u64>) -> Hold {
+        let Some(ownership) = self.fleet.ownership() else {
+            return Hold::Held;
+        };
+        match ownership.epoch_for(key.routing_slot()) {
+            Some(held) if Some(held.get()) == epoch => Hold::Held,
+            Some(_) => Hold::Lost,
+            None => Hold::Unknown,
+        }
+    }
+
+    /// Whether a close or a parked shipper may ship.
+    ///
+    /// A local lease that ran out is not a lost range. The destination then
+    /// decides: a newer epoch there fences the shipper.
+    fn may_ship_closed(&self, key: &FleetDbKey, shipper: &Shipper) -> bool {
+        if shipper.fenced() {
+            return false;
+        }
+        match self.hold(key, shipper.epoch) {
+            Hold::Held => true,
+            Hold::Lost => {
+                fence(key, shipper, "another owner holds the range");
+                false
+            }
+            Hold::Unknown => match (self.newest_epoch(key), shipper.epoch) {
+                (Ok(Some(newest)), Some(epoch)) if newest > epoch => {
+                    fence(key, shipper, &format!("epoch {newest} took over"));
+                    false
+                }
+                _ => true,
+            },
+        }
     }
 
     /// Make the Harvest file of `key` current before its runtime opens it.
     ///
-    /// - After a restore of the tenant database, restore the file too.
     /// - A missing file restores from the replica, as the fleet restores a
     ///   missing database.
+    /// - When the tenant database is a new file, the Harvest file follows
+    ///   it. `HarvestFleet::restore` sets the point in time.
     /// - A file from an older epoch of another owner is replaced.
     ///
-    /// Blocking.
+    /// It blocks the thread.
     ///
     /// # Errors
     ///
     /// Returns a message when the replica cannot be read, or when a needed
     /// restore fails. The open is then refused, so no stale file serves.
-    pub fn prepare(&self, key: &FleetDbKey, path: &Path, epoch: Option<u64>) -> Result<(), String> {
-        let pending = self.pending_map().remove(key);
-        if let Some(pending) = pending {
+    pub fn prepare(
+        &self,
+        key: &FleetDbKey,
+        path: &Path,
+        database: &Path,
+        epoch: Option<u64>,
+    ) -> Result<(), String> {
+        let current = database_identity(database)?;
+        let recorded = std::fs::read_to_string(suffixed(path, IDENTITY_SUFFIX)).ok();
+        let target = read_target(path)?;
+        let replaced = recorded.is_some_and(|recorded| recorded.trim() != current);
+        if !path.exists() || replaced {
             self.drop_parked(key);
-            return match self.restore_in_place(key, path, pending.target()) {
-                Ok(Restored::Done) => {
-                    tracing::info!(tenant = %key, "tenant Harvest file restored with its database");
-                    Ok(())
-                }
-                Ok(Restored::Nothing(why)) => {
-                    tracing::warn!(tenant = %key, %why, "the tenant database was restored, but its Harvest file has no replica to match; the local file stays");
-                    Ok(())
-                }
-                Err(error) => {
-                    // The next open tries again.
-                    self.pending_map().entry(key.clone()).or_insert(pending);
-                    Err(error)
-                }
-            };
+            match target {
+                Some(target) => self.restore_explicit(key, path, target.time())?,
+                None if replaced => self.follow_replaced(key, path)?,
+                None => self.restore_missing(key, path)?,
+            }
+        } else if let Some(epoch) = epoch {
+            self.replace_if_stale(key, path, epoch)?;
         }
-        if !path.exists() {
-            return self.restore_missing(key, path);
+        // The open used the target, or a failed restore left it beside an
+        // unchanged database. It goes in both cases.
+        remove_quietly(&suffixed(path, TARGET_SUFFIX));
+        Ok(())
+    }
+
+    /// What the replica of `key` holds at `target`, or at its latest state.
+    fn plan(&self, key: &FleetDbKey, target: Option<DateTime<Utc>>) -> Result<Planned, String> {
+        let root = self.replica.root_for(key);
+        match restore::plan(self.destination(), &root, target) {
+            Ok(plan) => Ok(Planned::Plan(Box::new(plan))),
+            Err(RestoreError::NoReplica { .. }) => Ok(Planned::NoReplica),
+            Err(error @ RestoreError::TargetBeforeRetention { .. }) => {
+                Ok(Planned::TooOld(error.to_string()))
+            }
+            Err(error) => Err(format!("cannot plan the Harvest restore of {key}: {error}")),
         }
-        epoch.map_or(Ok(()), |epoch| self.replace_if_stale(key, path, epoch))
+    }
+
+    /// Restore the file to `target`, as `HarvestFleet::restore` asked. The
+    /// fleet already restored the tenant database.
+    fn restore_explicit(
+        &self,
+        key: &FleetDbKey,
+        path: &Path,
+        target: Option<DateTime<Utc>>,
+    ) -> Result<(), String> {
+        match self.plan(key, target)? {
+            Planned::Plan(plan) => self.publish_plan(key, path, &plan, true),
+            Planned::NoReplica => {
+                tracing::warn!(tenant = %key, "the tenant database was restored, but its Harvest file has no replica: the Harvest file starts empty");
+                set_aside(key, path)
+            }
+            // The target file stays, so each open refuses until an operator
+            // restores the tenant again.
+            Planned::TooOld(why) => Err(format!(
+                "the Harvest replica of {key} cannot reach the restore target: {why}. \
+                 Restore the tenant again with a target that both replicas hold"
+            )),
+        }
+    }
+
+    /// The tenant database is a new file, with no requested target. A
+    /// restore or a stale-epoch replacement keeps its replica, so the
+    /// Harvest file takes the latest one. A re-created or a deleted tenant
+    /// has a tombstone, so its old Harvest file goes aside.
+    fn follow_replaced(&self, key: &FleetDbKey, path: &Path) -> Result<(), String> {
+        let plan = match self.plan(key, None)? {
+            Planned::Plan(plan) => plan,
+            Planned::NoReplica | Planned::TooOld(_) => return set_aside(key, path),
+        };
+        if !self.restore_allowed_for(key, &plan)? {
+            return set_aside(key, path);
+        }
+        tracing::warn!(tenant = %key, "the tenant database is a new file: its Harvest file is restored from the replica");
+        self.publish_plan(key, path, &plan, true)
     }
 
     /// Restore a missing file from its replica, under the fleet's rules.
     fn restore_missing(&self, key: &FleetDbKey, path: &Path) -> Result<(), String> {
-        let Some(replication) = self.fleet.replication() else {
-            return Ok(());
-        };
-        if !replication.restores_missing() {
+        if !self
+            .fleet
+            .replication()
+            .is_some_and(|replication| replication.restores_missing())
+        {
             return Ok(());
         }
-        let root = self.replica.root_for(key);
-        let plan = match restore::plan(self.destination(), &root, None) {
-            Ok(plan) => plan,
-            Err(RestoreError::NoReplica { .. }) => return Ok(()),
-            Err(error) => return Err(format!("cannot plan the Harvest restore of {key}: {error}")),
+        let Planned::Plan(plan) = self.plan(key, None)? else {
+            return Ok(());
         };
-        let row = tombstone_row(replication, key)?;
-        let marker = replication.marker(key)?.map(|marker| marker.deleted_at());
-        if !restore_allowed(row, marker, plan.generation_started_at) {
+        if !self.restore_allowed_for(key, &plan)? {
             tracing::info!(tenant = %key, "the tenant was deleted: its Harvest file is not restored");
             return Ok(());
         }
-        let staging = staging_of(path);
-        let applied = restore::apply(self.destination(), &plan, &staging);
-        let result = match applied {
-            Ok(_) => {
-                remove_sidecars(path);
-                match std::fs::hard_link(&staging, path) {
-                    Ok(()) => {
-                        tracing::info!(tenant = %key, "tenant Harvest file restored from its replica");
-                        Ok(())
-                    }
-                    // Another opener published it first. Open theirs.
-                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
-                    Err(error) => Err(format!(
-                        "cannot publish the restored Harvest file of {key}: {error}"
-                    )),
-                }
-            }
-            Err(error) => Err(format!("cannot restore the Harvest file of {key}: {error}")),
+        self.publish_plan(key, path, &plan, false)?;
+        tracing::info!(tenant = %key, "tenant Harvest file restored from its replica");
+        Ok(())
+    }
+
+    /// Whether the tombstone row and the delete marker allow `plan`.
+    fn restore_allowed_for(&self, key: &FleetDbKey, plan: &RestorePlan) -> Result<bool, String> {
+        let Some(replication) = self.fleet.replication() else {
+            return Ok(true);
         };
-        discard(&staging);
-        result
+        let row = tombstone_row(replication, key)?;
+        let marker = replication.marker(key)?.map(|marker| marker.deleted_at());
+        Ok(restore_allowed(row, marker, plan.generation_started_at))
     }
 
     /// Replace the file when another owner shipped a newer epoch of it.
@@ -343,7 +427,8 @@ impl Replicas {
             return Ok(());
         }
         let newest = self.newest_epoch(key)?;
-        // An epoch belongs to one owner, so a replica at `epoch` is ours.
+        // An epoch belongs to one owner, so a replica at `epoch` comes from
+        // this host.
         if !newest.is_some_and(|newest| newest > stamp && newest != epoch) {
             return Ok(());
         }
@@ -355,10 +440,10 @@ impl Replicas {
             "the tenant Harvest file is older than its replica: another host owned it; it is restored from the replica"
         );
         self.drop_parked(key);
-        match self.restore_in_place(key, path, None)? {
-            Restored::Done => Ok(()),
-            Restored::Nothing(why) => Err(format!(
-                "the Harvest file of {key} is stale, and its replica cannot replace it: {why}"
+        match self.plan(key, None)? {
+            Planned::Plan(plan) => self.publish_plan(key, path, &plan, true),
+            Planned::NoReplica | Planned::TooOld(_) => Err(format!(
+                "the Harvest file of {key} is stale, and its replica has no file to replace it"
             )),
         }
     }
@@ -376,51 +461,28 @@ impl Replicas {
             .max())
     }
 
-    /// Rebuild the file from its replica, as of `target`, over the local
-    /// file. It holds the Harvest writer lock while it replaces the file.
-    fn restore_in_place(
+    /// Build `plan` in a private file, then publish it at `path`.
+    ///
+    /// Each publisher holds `<file>.publish.lock`. With `replace`, it also
+    /// holds the Harvest writer lock, so it never replaces a file that a
+    /// runtime has open. Without `replace`, a file that another opener
+    /// published stays.
+    fn publish_plan(
         &self,
         key: &FleetDbKey,
         path: &Path,
-        target: Option<DateTime<Utc>>,
-    ) -> Result<Restored, String> {
-        let root = self.replica.root_for(key);
-        let plan = match restore::plan(self.destination(), &root, target) {
-            Ok(plan) => plan,
-            Err(
-                error @ (RestoreError::NoReplica { .. }
-                | RestoreError::TargetBeforeRetention { .. }),
-            ) => {
-                return Ok(Restored::Nothing(error.to_string()));
-            }
-            Err(error) => return Err(format!("cannot plan the Harvest restore of {key}: {error}")),
-        };
+        plan: &RestorePlan,
+        replace: bool,
+    ) -> Result<(), String> {
         let staging = staging_of(path);
-        if let Err(error) = restore::apply(self.destination(), &plan, &staging) {
+        if let Err(error) = restore::apply(self.destination(), plan, &staging) {
             discard(&staging);
             return Err(format!("cannot restore the Harvest file of {key}: {error}"));
         }
-        let lock = if path.exists() {
-            match autumn_harvest_sqlite::FileWriterLock::acquire(path) {
-                Ok(lock) => Some(lock),
-                Err(error) => {
-                    discard(&staging);
-                    return Err(format!(
-                        "cannot lock {} to replace it: {error}",
-                        path.display()
-                    ));
-                }
-            }
-        } else {
-            None
-        };
-        // The old frames must not replay onto the restored file.
-        remove_sidecars(path);
-        let published = std::fs::rename(&staging, path)
-            .map_err(|error| format!("cannot publish the restored Harvest file of {key}: {error}"));
-        drop(lock);
+        let published = publish(&staging, path, replace);
         discard(&staging);
-        published.map(|()| Restored::Done)
+        published
+            .map_err(|error| format!("cannot publish the restored Harvest file of {key}: {error}"))
     }
 
     /// Ship the open Harvest file of `key`. Call it after the runtime opened
@@ -432,14 +494,15 @@ impl Replicas {
             && parked.epoch == epoch
         {
             // It still holds the frames that it did not ship.
+            parked.retired.store(false, Ordering::Release);
             self.open_map().insert(key.clone(), parked);
             return;
         }
         let settings = ReplicationSettings {
             database_path: path.to_path_buf(),
             root: self.replica.root_for(key),
-            // A verification restores the whole file. That is the
-            // operator's call, not a timer's.
+            // A verification restores the whole file. An operator starts
+            // it. No timer starts it.
             verify_interval: None,
             ..self.replica.settings.clone()
         };
@@ -453,12 +516,14 @@ impl Replicas {
             path: path.to_path_buf(),
             epoch,
             fenced: AtomicBool::new(false),
+            retired: AtomicBool::new(false),
         });
         shipper.claim();
         self.open_map().insert(key.clone(), shipper);
     }
 
-    /// Ship each open file once, and retry each parked one. Blocking.
+    /// Ship each open file once, and retry each parked one. It blocks the
+    /// thread.
     pub fn tick_all(&self) {
         let open: Vec<(FleetDbKey, Arc<Shipper>)> = self
             .open_map()
@@ -474,18 +539,23 @@ impl Replicas {
             .map(|(key, shipper)| (key.clone(), Arc::clone(shipper)))
             .collect();
         for (key, shipper) in parked {
-            self.tick_parked(&key, &shipper);
+            self.tick_parked(&key, &shipper, None);
         }
     }
 
     /// One tick of an open file. A host that lost the range ships nothing.
-    fn tick(&self, key: &FleetDbKey, shipper: &Shipper) {
-        if shipper.fenced() {
+    fn tick(&self, key: &FleetDbKey, shipper: &Arc<Shipper>) {
+        if shipper.fenced() || shipper.retired.load(Ordering::Acquire) {
             return;
         }
-        if !self.holds(key, shipper.epoch) {
-            fence(key, shipper, "this host lost the range");
-            return;
+        match self.hold(key, shipper.epoch) {
+            Hold::Held => {}
+            Hold::Lost => {
+                fence(key, shipper, "another owner holds the range");
+                return;
+            }
+            // A renewal can bring the lease back. Ship nothing until then.
+            Hold::Unknown => return,
         }
         if !shipper.claim() {
             return;
@@ -494,6 +564,14 @@ impl Replicas {
         let Ok(mut replicator) = shipper.replicator.try_lock() else {
             return;
         };
+        // The tenant closed since the snapshot of the map.
+        let current = self
+            .open_map()
+            .get(key)
+            .is_some_and(|open| Arc::ptr_eq(open, shipper));
+        if !current || shipper.retired.load(Ordering::Acquire) {
+            return;
+        }
         if let Err(error) = replicator.tick() {
             tracing::debug!(tenant = %key, %error, "tenant Harvest replication tick failed");
         }
@@ -502,9 +580,19 @@ impl Replicas {
         }
     }
 
-    /// Ship the backlog of a closed file. Drop its shipper once caught up.
-    fn tick_parked(&self, key: &FleetDbKey, shipper: &Arc<Shipper>) {
-        let caught_up = self.ship_parked(key, shipper);
+    /// Ship the backlog of a closed file. Drop its shipper once it caught
+    /// up or is fenced. `deadline` bounds a shutdown flush.
+    fn tick_parked(&self, key: &FleetDbKey, shipper: &Arc<Shipper>, deadline: Option<Instant>) {
+        let caught_up = self.may_ship_closed(key, shipper) && {
+            let mut replicator = shipper.replicator();
+            let stop = || shipper.fenced() || deadline.is_some_and(|at| Instant::now() >= at);
+            let caught_up = ship_until_caught_up(&mut replicator, &stop).is_ok();
+            if let Some(newest) = replicator.fenced_by() {
+                fence(key, shipper, &format!("epoch {newest} took over"));
+            }
+            drop(replicator);
+            caught_up
+        };
         if caught_up || shipper.fenced() {
             let mut parked = self.parked_map();
             if parked
@@ -516,38 +604,24 @@ impl Replicas {
         }
     }
 
-    /// Ship a parked file until caught up. `true` once nothing is left.
-    fn ship_parked(&self, key: &FleetDbKey, shipper: &Shipper) -> bool {
-        let mut replicator = shipper.replicator();
-        let caught_up = !shipper.fenced()
-            && self.holds(key, shipper.epoch)
-            && ship_until_caught_up(&mut replicator).is_ok();
-        if replicator.fenced_by().is_some() {
-            shipper.fenced.store(true, Ordering::Release);
-        }
-        drop(replicator);
-        caught_up
-    }
-
-    /// The tenant closed. Ship what its runs committed. Blocking.
+    /// The tenant closed. Ship what its runs committed. It blocks the
+    /// thread.
     ///
     /// The fleet stopped the driver first, so no new frame comes.
     pub fn close(&self, key: &FleetDbKey) {
         let Some(shipper) = self.open_map().remove(key) else {
             return;
         };
-        if shipper.fenced() {
-            return;
-        }
-        if !self.holds(key, shipper.epoch) {
-            fence(key, &shipper, "this host lost the range");
+        shipper.retired.store(true, Ordering::Release);
+        if !self.may_ship_closed(key, &shipper) {
             return;
         }
         if !claim_for_close(&shipper) {
+            tracing::warn!(tenant = %key, "another process holds the Harvest replicator lock: it ships the last frames");
             return;
         }
         let mut replicator = shipper.replicator();
-        let outcome = ship_until_caught_up(&mut replicator);
+        let outcome = ship_until_caught_up(&mut replicator, &|| shipper.fenced());
         let newest = replicator.fenced_by();
         drop(replicator);
         if let Some(newest) = newest {
@@ -561,41 +635,74 @@ impl Replicas {
     }
 
     /// A delete or a restore of the tenant database starts. Let go of the
-    /// file. The next open restores the Harvest file, unless a delete
-    /// follows: [`forget`](Self::forget) clears that.
+    /// file. For a `HarvestFleet::restore`, write its target beside the
+    /// Harvest file. The next open reads it once the database is a new file.
     pub fn release(&self, key: &FleetDbKey) {
         self.drop_parked(key);
-        self.pending_map()
-            .entry(key.clone())
-            .or_insert(Pending::Latest);
+        let requested = self.requested_map().get(key).copied();
+        if let Some(target) = requested {
+            let path = super::fleet::tenant_harvest_file(&self.fleet.path_of(key));
+            if let Err(error) = write_target(&path, target) {
+                tracing::error!(tenant = %key, %error, "cannot keep the restore target of the tenant Harvest file");
+            }
+        }
     }
 
     /// The tenant is deleted.
     pub fn forget(&self, key: &FleetDbKey) {
         self.drop_parked(key);
-        self.pending_map().remove(key);
     }
 
-    /// `HarvestFleet::restore` asks for `pending` at the next open.
-    pub fn expect_restore(&self, key: &FleetDbKey, pending: Pending) {
-        self.pending_map().insert(key.clone(), pending);
+    /// `HarvestFleet::restore` starts a restore of `key` to `target`.
+    pub fn request_restore(&self, key: &FleetDbKey, target: Option<DateTime<Utc>>) {
+        self.requested_map().insert(key.clone(), target);
     }
 
-    /// A restore that `expect_restore` announced failed.
-    pub fn cancel_restore(&self, key: &FleetDbKey) {
-        self.pending_map().remove(key);
+    /// The restore that [`request_restore`](Self::request_restore) started
+    /// ended. A failed one leaves the database as it was, so its target
+    /// goes.
+    pub fn end_restore(&self, key: &FleetDbKey, restored: bool) {
+        self.requested_map().remove(key);
+        if !restored {
+            let path = super::fleet::tenant_harvest_file(&self.fleet.path_of(key));
+            remove_quietly(&suffixed(&path, TARGET_SUFFIX));
+        }
     }
 
+    /// Stop the parked shipper of `key`. A tick in flight stops after its
+    /// current step.
     fn drop_parked(&self, key: &FleetDbKey) {
         let parked = self.parked_map().remove(key);
         if let Some(parked) = parked {
-            // A tick in flight finishes first. Then nothing ships again.
             parked.fenced.store(true, Ordering::Release);
             drop(parked.replicator());
         }
     }
 
-    /// Tick every `interval` on a thread, until [`stop`](Self::stop).
+    /// Ship the parked backlog until it caught up or `within` passed. It
+    /// blocks the thread. Each tenant still behind is logged.
+    pub fn flush_parked(&self, within: Duration) {
+        let deadline = Instant::now() + within;
+        loop {
+            let parked: Vec<(FleetDbKey, Arc<Shipper>)> = self
+                .parked_map()
+                .iter()
+                .map(|(key, shipper)| (key.clone(), Arc::clone(shipper)))
+                .collect();
+            if parked.is_empty() || Instant::now() >= deadline {
+                break;
+            }
+            for (key, shipper) in parked {
+                self.tick_parked(&key, &shipper, Some(deadline));
+            }
+            std::thread::sleep(FLUSH_RETRY.min(deadline.saturating_duration_since(Instant::now())));
+        }
+        for key in self.parked_map().keys() {
+            tracing::error!(tenant = %key, "shutdown: frames of the tenant Harvest file are not shipped and stay on this volume");
+        }
+    }
+
+    /// Tick every sync interval on a thread, until [`stop`](Self::stop).
     ///
     /// # Errors
     ///
@@ -607,7 +714,7 @@ impl Replicas {
             .name("harvest-tenant-replica".to_owned())
             .spawn(move || {
                 while !this.stopped.load(Ordering::Acquire) {
-                    let started = std::time::Instant::now();
+                    let started = Instant::now();
                     this.tick_all();
                     let pause = interval.saturating_sub(started.elapsed());
                     let mut slept = Duration::ZERO;
@@ -626,6 +733,19 @@ impl Replicas {
     }
 }
 
+/// Record that the Harvest file at `path` belongs to `database`. Call it
+/// once the runtime opened the file.
+///
+/// # Errors
+///
+/// Returns a message when the record cannot be written.
+pub fn record_database(path: &Path, database: &Path) -> Result<(), String> {
+    write_atomic(
+        &suffixed(path, IDENTITY_SUFFIX),
+        &database_identity(database)?,
+    )
+}
+
 fn fence(key: &FleetDbKey, shipper: &Shipper, why: &str) {
     if !shipper.fenced.swap(true, Ordering::AcqRel) {
         tracing::warn!(tenant = %key, why, "the tenant Harvest file ships nothing more");
@@ -634,21 +754,27 @@ fn fence(key: &FleetDbKey, shipper: &Shipper, why: &str) {
 
 /// Claim at a close. Another process can hold the lock while it ships.
 fn claim_for_close(shipper: &Shipper) -> bool {
-    let limit = std::time::Instant::now() + CLAIM_WAIT;
+    let limit = Instant::now() + CLAIM_WAIT;
     loop {
         if shipper.claim() {
             return true;
         }
-        if std::time::Instant::now() >= limit {
+        if Instant::now() >= limit {
             return false;
         }
         std::thread::sleep(CLAIM_POLL);
     }
 }
 
-/// Tick until nothing committed is left to ship.
-fn ship_until_caught_up(replicator: &mut Replicator) -> Result<(), String> {
+/// Tick until nothing committed is left to ship, or until `stop` is true.
+fn ship_until_caught_up(
+    replicator: &mut Replicator,
+    stop: &dyn Fn() -> bool,
+) -> Result<(), String> {
     for _ in 0..FINAL_SHIP_MAX_TICKS {
+        if stop() {
+            return Err("the ship stopped".to_owned());
+        }
         let report = replicator.tick().map_err(|error| error.to_string())?;
         if report.pending_bytes == 0 {
             return Ok(());
@@ -679,32 +805,185 @@ fn tombstone_row(
         .map_err(|error| format!("cannot read the tombstone of {key}: {error}"))
 }
 
+/// The identity of the tenant database file. A restore, a re-create or an
+/// import publishes a new file, so the identity changes.
+fn database_identity(database: &Path) -> Result<String, String> {
+    let meta = std::fs::metadata(database)
+        .map_err(|error| format!("cannot read {}: {error}", database.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        Ok(format!("{}:{}", meta.dev(), meta.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        let created = meta
+            .created()
+            .map_err(|error| format!("cannot read {}: {error}", database.display()))?;
+        let nanos = created
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_nanos());
+        Ok(format!("{nanos}:{}", meta.len()))
+    }
+}
+
+/// The point in time of a requested restore.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Target {
+    /// The latest state of the replica.
+    Latest,
+    /// The state at this time.
+    At(DateTime<Utc>),
+}
+
+impl Target {
+    const fn time(self) -> Option<DateTime<Utc>> {
+        match self {
+            Self::Latest => None,
+            Self::At(at) => Some(at),
+        }
+    }
+}
+
+/// The restore target beside the Harvest file at `path`, if any.
+fn read_target(path: &Path) -> Result<Option<Target>, String> {
+    let file = suffixed(path, TARGET_SUFFIX);
+    let text = match std::fs::read_to_string(&file) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("cannot read {}: {error}", file.display())),
+    };
+    let text = text.trim();
+    if text == LATEST {
+        return Ok(Some(Target::Latest));
+    }
+    DateTime::parse_from_rfc3339(text)
+        .map(|at| Some(Target::At(at.with_timezone(&Utc))))
+        .map_err(|error| format!("unreadable restore target in {}: {error}", file.display()))
+}
+
+/// Keep the restore target beside the Harvest file at `path`.
+fn write_target(path: &Path, target: Option<DateTime<Utc>>) -> Result<(), String> {
+    let text = target.map_or_else(|| LATEST.to_owned(), |at| at.to_rfc3339());
+    write_atomic(&suffixed(path, TARGET_SUFFIX), &text)
+}
+
+/// Write `text` to `file` through a private file and a rename.
+fn write_atomic(file: &Path, text: &str) -> Result<(), String> {
+    let staging = suffixed(file, &format!(".{}", unique()));
+    std::fs::write(&staging, text)
+        .and_then(|()| std::fs::rename(&staging, file))
+        .map_err(|error| {
+            remove_quietly(&staging);
+            format!("cannot write {}: {error}", file.display())
+        })
+}
+
+/// Move the Harvest file at `path` and its sidecars aside. The next open
+/// then starts an empty file. An operator can still read the old one.
+fn set_aside(key: &FleetDbKey, path: &Path) -> Result<(), String> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let _publish = PublishLock::acquire(path)?;
+    let _writer = autumn_harvest_sqlite::FileWriterLock::acquire(path)
+        .map_err(|error| format!("cannot lock {} to set it aside: {error}", path.display()))?;
+    let aside = suffixed(path, &format!(".aside-{}", unique()));
+    for suffix in SIDECARS {
+        let sidecar = suffixed(path, suffix);
+        if sidecar.exists() {
+            let _ = std::fs::rename(&sidecar, suffixed(&aside, suffix));
+        }
+    }
+    std::fs::rename(path, &aside)
+        .map_err(|error| format!("cannot set {} aside: {error}", path.display()))?;
+    tracing::warn!(tenant = %key, aside = %aside.display(), "the Harvest file does not belong to the tenant database: it is set aside");
+    Ok(())
+}
+
+/// Publish the restored file `staging` at `path`. See
+/// [`Replicas::publish_plan`].
+fn publish(staging: &Path, path: &Path, replace: bool) -> Result<(), String> {
+    let _publish = PublishLock::acquire(path)?;
+    let _writer = if path.exists() {
+        if !replace {
+            // Another opener published the file first. Open that file.
+            return Ok(());
+        }
+        Some(
+            autumn_harvest_sqlite::FileWriterLock::acquire(path).map_err(|error| {
+                format!("cannot lock {} to replace it: {error}", path.display())
+            })?,
+        )
+    } else {
+        None
+    };
+    // The frames of the old file must not replay onto the restored one.
+    for sidecar in sidecars(path) {
+        remove_quietly(&sidecar);
+    }
+    std::fs::rename(staging, path).map_err(|error| error.to_string())
+}
+
+/// The OS lock `<file>.publish.lock`, held while a file is published.
+struct PublishLock {
+    _file: File,
+}
+
+impl PublishLock {
+    fn acquire(path: &Path) -> Result<Self, String> {
+        let name = suffixed(path, ".publish.lock");
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&name)
+            .map_err(|error| format!("cannot open {}: {error}", name.display()))?;
+        file.lock()
+            .map_err(|error| format!("cannot lock {}: {error}", name.display()))?;
+        Ok(Self { _file: file })
+    }
+}
+
+/// A name part that no other staging file of this host has.
+fn unique() -> String {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    format!(
+        "{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+/// `path` with `suffix` appended to its file name.
+fn suffixed(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
 /// The private path that a restore builds before it publishes.
 fn staging_of(path: &Path) -> PathBuf {
-    let mut name = path.as_os_str().to_os_string();
-    name.push(".restoring");
-    PathBuf::from(name)
+    suffixed(path, &format!(".restoring-{}", unique()))
 }
 
 /// The SQLite sidecars of `path`.
 fn sidecars(path: &Path) -> impl Iterator<Item = PathBuf> + '_ {
-    SIDECARS.iter().map(move |suffix| {
-        let mut name = path.as_os_str().to_os_string();
-        name.push(suffix);
-        PathBuf::from(name)
-    })
+    SIDECARS.iter().map(move |suffix| suffixed(path, suffix))
 }
 
-/// Remove `path` and its sidecars. A missing file is not an error.
+/// Remove a private file and its sidecars. A missing file is not an error.
 fn discard(path: &Path) {
-    for file in std::iter::once(path.to_path_buf()).chain(sidecars(path)) {
-        let _ = std::fs::remove_file(file);
+    remove_quietly(path);
+    for sidecar in sidecars(path) {
+        remove_quietly(&sidecar);
     }
 }
 
-/// Remove the sidecars of `path`, and `path` itself.
-fn remove_sidecars(path: &Path) {
-    discard(path);
+/// Remove `file`. A missing file is not an error.
+fn remove_quietly(file: &Path) {
+    let _ = std::fs::remove_file(file);
 }
 
 #[cfg(test)]
@@ -754,53 +1033,143 @@ mod tests {
         assert!(root.starts_with("app/test/fleet/tenant/"), "{root}");
     }
 
-    /// A shipped file comes back byte for byte, and a release asks the
-    /// next open to restore it.
+    /// A tenant database file that `prepare` can read.
+    fn database(dir: &Path, name: &str) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, b"tenant").unwrap();
+        path
+    }
+
+    /// Replace the database file with a new one, as a restore does.
+    fn replace_database(path: &Path) {
+        let fresh = suffixed(path, ".fresh");
+        std::fs::write(&fresh, b"restored").unwrap();
+        std::fs::rename(&fresh, path).unwrap();
+    }
+
+    /// A restore through `HarvestFleet` keeps its target on disk at the
+    /// release. The next open restores the shipped file to it.
     #[test]
-    fn a_shipped_file_restores_after_a_release() {
+    fn a_requested_restore_brings_the_shipped_file_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let replicas = replicas(dir.path());
+        let key = replicas.fleet.key_for("acme").unwrap();
+        let path = super::super::fleet::tenant_harvest_file(&replicas.fleet.path_of(&key));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let db = database(path.parent().unwrap(), "acme.db");
+        ship_at(&replicas, &key, &path, 7);
+        record_database(&path, &db).unwrap();
+        assert!(replicas.open_map().is_empty());
+        assert!(replicas.parked_map().is_empty(), "the close caught up");
+
+        replicas.request_restore(&key, None);
+        replicas.release(&key);
+        replace_database(&db);
+        replicas.end_restore(&key, true);
+        std::fs::remove_file(&path).unwrap();
+        replicas.prepare(&key, &path, &db, None).unwrap();
+        assert_eq!(autumn_harvest_sqlite::fleet_epoch::read(&path).unwrap(), 7);
+        assert!(
+            !suffixed(&path, TARGET_SUFFIX).exists(),
+            "the restore ran once"
+        );
+    }
+
+    /// A release with no `HarvestFleet::restore`, such as a delete, keeps no
+    /// target. A failed restore drops its target.
+    #[test]
+    fn only_a_requested_restore_keeps_a_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let replicas = replicas(dir.path());
+        let key = replicas.fleet.key_for("acme").unwrap();
+        let path = super::super::fleet::tenant_harvest_file(&replicas.fleet.path_of(&key));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let target = suffixed(&path, TARGET_SUFFIX);
+        replicas.release(&key);
+        assert!(!target.exists(), "a plain release");
+
+        let at = Utc::now();
+        replicas.request_restore(&key, Some(at));
+        replicas.release(&key);
+        assert_eq!(read_target(&path).unwrap(), Some(Target::At(at)));
+        replicas.end_restore(&key, false);
+        assert!(!target.exists(), "a failed restore");
+    }
+
+    /// A target beside an unchanged database is stale. The open drops it
+    /// and keeps the file.
+    #[test]
+    fn a_target_beside_an_unchanged_database_is_dropped() {
         let dir = tempfile::tempdir().unwrap();
         let replicas = replicas(dir.path());
         let key = replicas.fleet.key_for("acme").unwrap();
         let path = dir.path().join("acme.harvest.db");
+        let db = database(dir.path(), "acme.db");
         let runtime = autumn_harvest_sqlite::SqliteRuntime::open_replicated(&path).unwrap();
-        runtime.raise_fleet_epoch(7).unwrap();
-        replicas.attach(&key, &path, None);
-        replicas.tick_all();
+        runtime.raise_fleet_epoch(4).unwrap();
         drop(runtime);
-        replicas.close(&key);
-        assert!(replicas.open_map().is_empty());
-        assert!(replicas.parked_map().is_empty(), "the close caught up");
-
-        std::fs::remove_file(&path).unwrap();
-        replicas.release(&key);
-        replicas.prepare(&key, &path, None).unwrap();
-        assert_eq!(autumn_harvest_sqlite::fleet_epoch::read(&path).unwrap(), 7);
-        assert!(replicas.pending_map().is_empty(), "the restore ran once");
+        record_database(&path, &db).unwrap();
+        write_target(&path, None).unwrap();
+        replicas.prepare(&key, &path, &db, None).unwrap();
+        assert_eq!(autumn_harvest_sqlite::fleet_epoch::read(&path).unwrap(), 4);
+        assert!(!suffixed(&path, TARGET_SUFFIX).exists());
     }
 
-    /// A delete clears the restore that its release asked for.
+    /// A new tenant database with no Harvest replica sets the old Harvest
+    /// file aside. A re-created tenant never reads the runs of the old one.
     #[test]
-    fn a_delete_forgets_the_pending_restore() {
+    fn a_new_database_with_no_replica_sets_the_old_file_aside() {
         let dir = tempfile::tempdir().unwrap();
         let replicas = replicas(dir.path());
         let key = replicas.fleet.key_for("acme").unwrap();
-        replicas.release(&key);
-        replicas.forget(&key);
-        assert!(replicas.pending_map().is_empty());
+        let path = dir.path().join("acme.harvest.db");
+        let db = database(dir.path(), "acme.db");
+        drop(autumn_harvest_sqlite::SqliteRuntime::open_replicated(&path).unwrap());
+        record_database(&path, &db).unwrap();
+        replace_database(&db);
+        replicas.prepare(&key, &path, &db, None).unwrap();
+        assert!(!path.exists(), "the open starts an empty file");
+        let aside = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| entry.file_name().to_string_lossy().contains(".aside-"));
+        assert!(aside, "an operator can still read the old file");
     }
 
-    /// An explicit point in time survives the release of its own restore.
+    /// A new tenant database with a Harvest replica takes its latest file.
     #[test]
-    fn an_explicit_target_survives_the_release() {
+    fn a_new_database_takes_the_latest_harvest_replica() {
         let dir = tempfile::tempdir().unwrap();
         let replicas = replicas(dir.path());
         let key = replicas.fleet.key_for("acme").unwrap();
-        let at = Utc::now();
-        replicas.expect_restore(&key, Pending::At(at));
-        replicas.release(&key);
-        assert_eq!(replicas.pending_map().get(&key), Some(&Pending::At(at)));
-        replicas.cancel_restore(&key);
-        assert!(replicas.pending_map().is_empty());
+        std::fs::create_dir_all(dir.path().join("b")).unwrap();
+        ship_at(&replicas, &key, &dir.path().join("b/acme.harvest.db"), 5);
+
+        let path = dir.path().join("acme.harvest.db");
+        let db = database(dir.path(), "acme.db");
+        let runtime = autumn_harvest_sqlite::SqliteRuntime::open_replicated(&path).unwrap();
+        runtime.raise_fleet_epoch(2).unwrap();
+        drop(runtime);
+        record_database(&path, &db).unwrap();
+        replace_database(&db);
+        replicas.prepare(&key, &path, &db, None).unwrap();
+        assert_eq!(autumn_harvest_sqlite::fleet_epoch::read(&path).unwrap(), 5);
+    }
+
+    /// A publish without replace keeps a file that another opener
+    /// published. It never deletes a live file.
+    #[test]
+    fn a_publish_keeps_a_file_that_another_opener_published() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("acme.harvest.db");
+        let theirs = autumn_harvest_sqlite::SqliteRuntime::open_replicated(&path).unwrap();
+        theirs.raise_fleet_epoch(9).unwrap();
+        let staging = dir.path().join("staging.db");
+        drop(autumn_harvest_sqlite::SqliteRuntime::open_replicated(&staging).unwrap());
+        publish(&staging, &path, false).unwrap();
+        assert_eq!(autumn_harvest_sqlite::fleet_epoch::read(&path).unwrap(), 9);
+        assert!(suffixed(&path, "-wal").exists(), "their WAL stays");
+        drop(theirs);
     }
 
     /// Without a replica, a missing file stays missing.
@@ -810,7 +1179,8 @@ mod tests {
         let replicas = replicas(dir.path());
         let key = replicas.fleet.key_for("acme").unwrap();
         let path = dir.path().join("acme.harvest.db");
-        replicas.prepare(&key, &path, Some(3)).unwrap();
+        let db = database(dir.path(), "acme.db");
+        replicas.prepare(&key, &path, &db, Some(3)).unwrap();
         assert!(!path.exists());
     }
 
@@ -838,7 +1208,9 @@ mod tests {
         let runtime = autumn_harvest_sqlite::SqliteRuntime::open_replicated(&local).unwrap();
         runtime.raise_fleet_epoch(1).unwrap();
         drop(runtime);
-        replicas.prepare(&key, &local, Some(3)).unwrap();
+        replicas
+            .prepare(&key, &local, &database(dir.path(), "acme.db"), Some(3))
+            .unwrap();
         assert_eq!(autumn_harvest_sqlite::fleet_epoch::read(&local).unwrap(), 2);
     }
 
@@ -855,7 +1227,9 @@ mod tests {
         let runtime = autumn_harvest_sqlite::SqliteRuntime::open_replicated(&local).unwrap();
         runtime.raise_fleet_epoch(1).unwrap();
         drop(runtime);
-        replicas.prepare(&key, &local, Some(3)).unwrap();
+        replicas
+            .prepare(&key, &local, &database(dir.path(), "acme.db"), Some(3))
+            .unwrap();
         assert_eq!(autumn_harvest_sqlite::fleet_epoch::read(&local).unwrap(), 1);
     }
 
@@ -871,7 +1245,9 @@ mod tests {
         let local = dir.path().join("acme.harvest.db");
         let runtime = autumn_harvest_sqlite::SqliteRuntime::open_replicated(&local).unwrap();
         runtime.raise_fleet_epoch(1).unwrap();
-        let refused = replicas.prepare(&key, &local, Some(3)).unwrap_err();
+        let refused = replicas
+            .prepare(&key, &local, &database(dir.path(), "acme.db"), Some(3))
+            .unwrap_err();
         assert!(refused.contains("cannot lock"), "{refused}");
         assert_eq!(autumn_harvest_sqlite::fleet_epoch::read(&local).unwrap(), 1);
         drop(runtime);
@@ -887,7 +1263,9 @@ mod tests {
         let runtime = autumn_harvest_sqlite::SqliteRuntime::open_replicated(&path).unwrap();
         runtime.raise_fleet_epoch(1).unwrap();
         drop(runtime);
-        replicas.prepare(&key, &path, Some(2)).unwrap();
+        replicas
+            .prepare(&key, &path, &database(dir.path(), "acme.db"), Some(2))
+            .unwrap();
         assert_eq!(autumn_harvest_sqlite::fleet_epoch::read(&path).unwrap(), 1);
     }
 }

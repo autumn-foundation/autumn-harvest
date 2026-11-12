@@ -913,10 +913,10 @@ impl HarvestPlugin {
 
     /// Ship each tenant Harvest file to `replica`, with its tenant database.
     ///
-    /// The plugin ships the files only when the fleet replicates. By
-    /// default it builds the destination from `[replication]`, as the fleet
-    /// does. Set it here when app code builds the fleet replication. Give
-    /// it the same destination and settings.
+    /// It needs [`Self::sqlite_per_tenant`]. The files ship only when the
+    /// fleet replicates. By default the plugin builds the destination from
+    /// `[replication]`, as the fleet does. Set it here when app code builds
+    /// the fleet replication. Give it the same destination and settings.
     ///
     /// Each file ships under
     /// [`tenant_harvest_replica_root`](crate::sqlite::tenant_harvest_replica_root).

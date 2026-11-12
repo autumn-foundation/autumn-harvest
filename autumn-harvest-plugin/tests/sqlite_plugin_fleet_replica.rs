@@ -277,6 +277,15 @@ async fn completed(client: &TestClient, exec: &str) -> Value {
         .clone()
 }
 
+/// Assert that the tenant has no run `exec`.
+async fn absent(client: &TestClient, exec: &str) {
+    client
+        .get(&format!("/harvest/tenants/acme/workflows/{exec}"))
+        .send()
+        .await
+        .assert_status(404);
+}
+
 async fn state_of(client: &TestClient, exec: &str) -> Option<String> {
     let response = client
         .get(&format!("/harvest/tenants/acme/workflows/{exec}"))
@@ -353,11 +362,8 @@ async fn a_standby_takes_over_and_finishes_the_run() {
         1,
         "the activity does not run again"
     );
-    assert_eq!(
-        state_of(&b.client, &unshipped).await,
-        None,
-        "b has the last shipped generation only"
-    );
+    // B has the last shipped generation only.
+    absent(&b.client, &unshipped).await;
     assert_eq!(
         autumn_harvest_sqlite::fleet_epoch::read(&b.harvest_file()).unwrap(),
         2
@@ -433,7 +439,7 @@ async fn a_failback_never_opens_the_stale_harvest_file() {
     completed(&b.client, &exec).await;
     b.fleet.close(&key).await;
     // B hands the range back, as at its shutdown.
-    b.fleet.release_ownership().await;
+    assert!(b.fleet.release_ownership().await);
 
     // A gets the range back at a newer epoch and reopens the tenant.
     let ownership = a.ownership.as_ref().unwrap();
@@ -505,7 +511,7 @@ async fn a_recreated_tenant_gets_no_deleted_run_back() {
     )
     .await;
     drop(fresh.harvest().open(&key).await.expect("re-create acme"));
-    assert_eq!(state_of(&fresh.client, &exec).await, None);
+    absent(&fresh.client, &exec).await;
     a.fleet.close_all().await;
     fresh.fleet.close_all().await;
 }
@@ -561,5 +567,102 @@ async fn a_direct_fleet_restore_restores_the_harvest_file() {
     drop(a.harvest().open(&key).await.expect("reopen acme"));
     signal(&a.client, &exec).await;
     completed(&a.client, &exec).await;
+    a.fleet.close_all().await;
+}
+
+/// An old owner that does not know it lost the range still ships to its
+/// own epoch. A restore takes the newest epoch first, so its late runs never
+/// come back.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_zombie_owner_never_wins_a_restore() {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = TickingClock::starting_at(chrono::Utc::now());
+    let a = host(dir.path(), &clock, &Options::owned("a")).await;
+    let key = a.key();
+    drop(a.harvest().open(&key).await.expect("open acme on a"));
+    let first = start(&a.client, true).await;
+    waiting(&a.client, &first).await;
+    a.ship().await;
+
+    clock.advance(TTL + Duration::from_secs(1));
+    let b = host(dir.path(), &clock, &Options::owned("b")).await;
+    drop(b.harvest().open(&key).await.expect("open acme on b"));
+    b.ship().await;
+
+    // A never refreshed, so it still holds epoch 1 and ships.
+    let late = start(&a.client, true).await;
+    waiting(&a.client, &late).await;
+    a.ship().await;
+
+    // B restores its tenant from the replica again.
+    b.fleet.close(&key).await;
+    std::fs::remove_file(b.fleet.path_of(&key)).unwrap();
+    std::fs::remove_file(b.harvest_file()).unwrap();
+    drop(b.harvest().open(&key).await.expect("restore acme on b"));
+    assert!(state_of(&b.client, &first).await.is_some());
+    absent(&b.client, &late).await;
+    a.fleet.close_all().await;
+    b.fleet.close_all().await;
+}
+
+/// A restore to a point in time takes the Harvest file to the same point.
+/// No delete comes first, so the open must replace the current file.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_point_in_time_restore_takes_both_files_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = TickingClock::starting_at(chrono::Utc::now());
+    let options = Options {
+        volume: "a",
+        owner: None,
+        retention_after_delete: Duration::ZERO,
+    };
+    let a = host(dir.path(), &clock, &options).await;
+    let key = a.key();
+    let harvest = a.harvest();
+    drop(harvest.open(&key).await.expect("open acme"));
+    let kept = start(&a.client, true).await;
+    waiting(&a.client, &kept).await;
+    a.ship().await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let target = chrono::Utc::now();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let later = start(&a.client, true).await;
+    waiting(&a.client, &later).await;
+    a.ship().await;
+    a.fleet.close(&key).await;
+
+    harvest
+        .restore(&key, Some(target))
+        .await
+        .expect("restore acme to the target");
+    drop(harvest.open(&key).await.expect("reopen acme"));
+    absent(&a.client, &later).await;
+    signal(&a.client, &kept).await;
+    completed(&a.client, &kept).await;
+    a.fleet.close_all().await;
+}
+
+/// A delete with no retention purges the Harvest replica with the tenant.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_delete_purges_the_harvest_replica() {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = TickingClock::starting_at(chrono::Utc::now());
+    let options = Options {
+        volume: "a",
+        owner: None,
+        retention_after_delete: Duration::ZERO,
+    };
+    let a = host(dir.path(), &clock, &options).await;
+    let key = a.key();
+    drop(a.harvest().open(&key).await.expect("open acme"));
+    let exec = start(&a.client, true).await;
+    waiting(&a.client, &exec).await;
+    a.ship().await;
+    assert!(
+        !harvest_objects(dir.path(), &key).is_empty(),
+        "the Harvest file shipped"
+    );
+    assert!(a.fleet.delete(&key).await.expect("delete"));
+    assert_eq!(harvest_objects(dir.path(), &key), Vec::<String>::new());
     a.fleet.close_all().await;
 }

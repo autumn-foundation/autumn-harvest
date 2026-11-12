@@ -353,6 +353,10 @@ async fn stop(slot: &Mutex<Slot>) {
         }
     }
     if let Some(fleet) = fleet {
+        // The fleet's own shutdown flush bounds this one too.
+        let within = fleet.flush_window();
+        let flushing = fleet.clone();
+        let _ = tokio::task::spawn_blocking(move || flushing.flush_replicas(within)).await;
         fleet.release();
     }
     if let Some(driver) = driver {
@@ -961,8 +965,15 @@ async fn tenant_replicas(
 async fn replica_from_config(state: &AppState) -> Option<TenantReplica> {
     let config = state.config();
     let replication = config.replication.as_deref()?.clone();
-    let url = config.database.effective_primary_url()?.to_owned();
-    let profile = state.profile().to_owned();
+    // The same URL and profile as the fleet replication of the app, so the
+    // root is the same.
+    let url = config
+        .database
+        .primary_url
+        .clone()
+        .or_else(|| config.database.url.clone())
+        .unwrap_or_default();
+    let profile = config.profile.clone().unwrap_or_else(|| "dev".to_owned());
     let clock = autumn_web::db::DbState::clock(state);
     // The S3 destination uses a blocking client.
     let built = tokio::task::spawn_blocking(move || {

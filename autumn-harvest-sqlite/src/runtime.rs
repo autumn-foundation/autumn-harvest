@@ -512,9 +512,11 @@ impl SqliteRuntime {
     /// As [`open`](Self::open), for a file that an external replicator ships.
     ///
     /// The connection sets `wal_autocheckpoint = 0` before any other
-    /// statement. The replicator is then the only checkpointer of the file.
-    /// It copies the main file as a base for the shipped WAL frames, and a
-    /// second checkpointer would change that file behind it.
+    /// statement, so the runtime never checkpoints the file. The replicator
+    /// copies the main file as a base for the shipped WAL frames. A second
+    /// checkpointer would change that file behind it. `SQLite` still
+    /// checkpoints when the last connection closes, so the replicator keeps
+    /// a connection open while it ships.
     ///
     /// # Errors
     ///

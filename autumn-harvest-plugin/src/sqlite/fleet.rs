@@ -32,16 +32,17 @@ use tokio_util::sync::CancellationToken;
 use super::driver::{Driver, Registry, Retention};
 use super::handle::Catalog;
 use super::handle::{HarvestSqlite, HarvestSqliteError};
-use super::replica::{Pending, Replicas};
+use super::replica::{IDENTITY_SUFFIX, Replicas, TARGET_SUFFIX};
 
 /// How long a caller waits for a tenant driver that another task starts.
 const START_WAIT: Duration = Duration::from_secs(10);
 
-/// The SQLite sidecars that a delete removes with a Harvest file.
+/// The files that a delete removes with a Harvest file: the SQLite
+/// sidecars and the replica records.
 ///
-/// The `.lock` file stays. The lock module forbids its delete while a
-/// runtime can still hold it.
-const SIDECARS: [&str; 3] = ["-wal", "-shm", "-journal"];
+/// The `.lock` files stay. The lock module forbids the delete of a lock
+/// file while a holder can still have it.
+const SIDECARS: [&str; 5] = ["-wal", "-shm", "-journal", IDENTITY_SUFFIX, TARGET_SUFFIX];
 
 tokio::task_local! {
     /// The tenant whose driver runs the current task.
@@ -247,6 +248,8 @@ impl HarvestFleet {
     /// The registry holds a clone of `AppState`, and `AppState` holds this
     /// fleet. Without the release, an app that stops never frees its state.
     /// A running tenant driver keeps its own copy until the fleet closes it.
+    /// The release also stops the replication loop. A later close still
+    /// ships its tenant Harvest file.
     pub fn release(&self) {
         *self
             .shared
@@ -264,10 +267,10 @@ impl HarvestFleet {
         self.shared.replicas.is_some()
     }
 
-    /// Ship each open tenant Harvest file once. Blocking: run it on a
-    /// blocking thread. The loop calls it on its interval. Tests call it to
-    /// step the replication without a sleep. Without replication, it does
-    /// nothing.
+    /// Ship each open tenant Harvest file once, and retry each backlog of a
+    /// closed one. It blocks, so call it on a blocking thread. The loop does
+    /// the same work on its interval. Tests call it to step the replication
+    /// without a sleep. Without replication, it does nothing.
     pub fn tick_replicas(&self) {
         if let Some(replicas) = &self.shared.replicas {
             replicas.tick_all();
@@ -277,10 +280,12 @@ impl HarvestFleet {
     /// Restore the tenant database `key` and its Harvest file, as of
     /// `target`, or at their latest state for `None`.
     ///
-    /// The fleet restores the database at once. The Harvest file follows at
-    /// the next open of the tenant, before its driver starts. A direct
-    /// `DatabaseFleet::restore` also restores the Harvest file, but at its
-    /// latest state.
+    /// The fleet restores the database at once. The target stays on disk
+    /// beside the Harvest file. The next open of the tenant restores the
+    /// Harvest file to it, before the driver starts. When the Harvest
+    /// replica cannot reach the target, each open refuses until a new
+    /// restore. A direct `DatabaseFleet::restore` restores the Harvest file
+    /// at its latest state.
     ///
     /// # Errors
     ///
@@ -293,12 +298,30 @@ impl HarvestFleet {
         let Some(replicas) = &self.shared.replicas else {
             return Ok(self.shared.fleet.restore(key, target).await?);
         };
-        replicas.expect_restore(key, target.map_or(Pending::Latest, Pending::At));
+        replicas.request_restore(key, target);
         let restored = self.shared.fleet.restore(key, target).await;
-        if restored.is_err() {
-            replicas.cancel_restore(key);
-        }
+        replicas.end_restore(key, restored.is_ok());
         Ok(restored?)
+    }
+
+    /// How long the shutdown flush ships the backlog of closed tenant
+    /// Harvest files: the final flush of the fleet replication.
+    pub(crate) fn flush_window(&self) -> Duration {
+        self.shared
+            .fleet
+            .replication()
+            .map_or(Duration::from_secs(5), |replication| {
+                replication.final_flush()
+            })
+    }
+
+    /// Ship the backlog of closed tenant Harvest files within `within`. It
+    /// blocks, so call it on a blocking thread. The shutdown hook calls it
+    /// before [`release`](Self::release).
+    pub(crate) fn flush_replicas(&self, within: Duration) {
+        if let Some(replicas) = &self.shared.replicas {
+            replicas.flush_parked(within);
+        }
     }
 
     /// The leased handle of the open database `db`.
@@ -418,7 +441,7 @@ impl Shared {
             })?;
         let epoch = db.epoch().map(autumn_web::lock::FencingToken::get);
         if let Some(replicas) = &self.replicas {
-            replicas.prepare(&key, &path, epoch)?;
+            replicas.prepare(&key, &path, db.path(), epoch)?;
         }
         let runtime = Driver::open_with(&path, &registry, self.replicas.is_some())?;
         if self.replicas.is_some()
@@ -434,6 +457,7 @@ impl Shared {
         let reader = autumn_harvest_sqlite::SqliteReader::open(&path)
             .map_err(|error| format!("cannot open a reader on {}: {error}", path.display()))?;
         if let Some(replicas) = &self.replicas {
+            super::replica::record_database(&path, db.path())?;
             replicas.attach(&key, &path, epoch);
         }
         let stop = CancellationToken::new();

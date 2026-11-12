@@ -223,11 +223,16 @@ API behind `api_with_auth` outside `dev`.
 - A closed tenant runs no timer, retry or activity. The next open resumes
   its runs. The fleet sweeper wakes a tenant for outbox, hook and backfill
   work only.
+- A takeover loses the runs that the old owner did not ship: at most one
+  sync interval of work.
 - A direct `DatabaseFleet::restore` to a point in time restores the
   Harvest file at its latest state. Use `HarvestFleet::restore` for one
   target on both files.
-- A refused fleet delete still makes the next open restore the Harvest file
-  from its replica. The replica holds the last shipped state.
+- An import or a re-create gives the tenant a new database file. A Harvest
+  file with no replica then goes aside, as `<file>.aside-<n>`.
+- `DatabaseFleet::release_ownership` does not wait for a Harvest backlog.
+  The shutdown hook ships it within the fleet's final flush, and logs each
+  tenant that stays behind.
 
 ### Replication
 
@@ -259,26 +264,33 @@ sequenceDiagram
     F->>L: on_close(acme): ship until caught up
 ```
 
-- **A takeover keeps the runs.** A host that opens a tenant restores a
-  missing Harvest file before the driver starts, under the fleet's
-  `restore_missing`.
+- **A takeover keeps the runs up to the last ship.** A host that opens a
+  tenant restores a missing Harvest file before the driver starts, under
+  the fleet's `restore_missing`.
+- **The Harvest file follows its database.** The file records the identity
+  of its tenant database file. A restore gives a new database file. The
+  next open then restores the Harvest file from the replica.
 - **A stale file never opens.** The file records the newest epoch that it
   opened under. When the replica holds a newer epoch of another owner, the
   open replaces the local file first.
 - **A host that lost the range ships nothing.** Each tick checks the
-  ownership epoch. The replicator also reads the epoch markers. A restore
-  takes the newest epoch first, so a later file of an old owner never wins.
+  ownership epoch. A close also reads the epochs at the destination. A
+  restore takes the newest epoch first, so a later file of an old owner
+  never wins.
 - **A delete covers both files.** The tombstone marker sits under the
   tenant prefix, and the purge removes both replicas. A re-created tenant
   gets no deleted run back.
 - **A restore covers both files.** `HarvestFleet::restore(key, target)`
-  restores the database, and the next open restores the Harvest file to the
-  same point.
+  restores the database. It keeps the target on disk, and the next open
+  restores the Harvest file to the same point. When the Harvest replica no
+  longer reaches the target, each open refuses until a new restore.
 - **One checkpointer.** A shipped file opens with
   `wal_autocheckpoint = 0`. The replicator checkpoints only what it has
   shipped.
 
-`HarvestFleet::tick_replicas()` ships once, for tests.
+`HarvestFleet::tick_replicas()` ships once, for tests. It blocks, so call
+it on a blocking thread. `HarvestPlugin::sqlite_tenant_replica` needs
+`sqlite_per_tenant()`.
 
 ## How it runs
 

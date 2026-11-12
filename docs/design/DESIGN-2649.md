@@ -50,6 +50,8 @@ The chosen option is in bold.
 | The destination | a new config section · **`[replication]`, or app code through `HarvestPlugin::sqlite_tenant_replica`** |
 | When to restore | `restore_missing` (the first hook that restores wins, so ours can be skipped) · **`on_open`, before the driver opens the file** |
 | The epoch record | a file next to the Harvest file · **a one-row table in the Harvest file, as the fleet does** |
+| How the Harvest file follows a restore | a flag set by the `release` hook (a refused delete also sets it) · **the identity of the tenant database file, recorded beside the Harvest file** |
+| Where a restore target lives | in memory (a restart loses it) · **in `<file>.restore-target`, written by the `release` hook** |
 | A point-in-time restore | the latest Harvest state · **`HarvestFleet::restore(key, target)`, one target for both files** |
 
 Why the tenant prefix? The fleet purge lists `<tenant prefix>/` and
@@ -66,12 +68,18 @@ rule.
 | A host that lost the range ships a stale file | Each tick checks the ownership epoch. The replicator also reads the epoch markers. A fenced shipper ships nothing again. |
 | A restore takes the later file of a fenced owner | `restore::plan` orders by epoch, then by time. |
 | A failback opens the old local file | The file records its epoch. A newer epoch of another owner at the replica replaces the file before the driver opens it. |
-| A re-created tenant gets its deleted runs back | A missing file restores only when `restore_allowed` passes for the tombstone row and the marker. |
+| A re-created tenant gets its deleted runs back | A missing file restores only when `restore_allowed` passes for the tombstone row and the marker. A new database file with no allowed replica sets the old Harvest file aside. |
+| A refused delete rolls the Harvest file back | Only a new database file triggers a restore. A refused delete keeps the file. |
+| A restart loses the target of a restore | The target is on disk until the open that uses it. |
+| An open before the drain takes the target | The `release` hook writes the target, after the fleet drained the tenant. |
+| A short lease lapse stops shipping for good | A tick skips while the lease is unknown. Only another epoch fences it. |
+| A late tick ships after a close | A close retires its shipper. A tick checks the map and the flag under the replicator lock. |
+| A restore unlinks a file that another opener published | A publish holds `<file>.publish.lock`, and never removes a published file without `replace`. |
 | SQLite checkpoints behind the replicator | A shipped file opens with `wal_autocheckpoint = 0`. The replicator holds a connection until its last ship. |
 | Two processes ship one file | The shipper holds `<harvest file>.replicator.lock`. |
 | A restore replaces a file that a runtime has open | The restore holds the Harvest writer lock while it replaces the file. |
 | Stray `-wal` frames replay onto a restored file | The restore removes the sidecars before it publishes. |
-| A close loses the last frames | `on_close` ships until caught up. A failed ship parks the shipper, and the loop retries it. |
+| A close loses the last frames | `on_close` ships until caught up. A failed ship parks the shipper. The loop retries it, and the shutdown hook flushes it. |
 | A delete waits on a parked shipper | `release` drops the parked shipper. |
 | The Harvest keys confuse a fleet restore | The fleet reads `<prefix>/generations/` and `<prefix>/epochs/` only. A test restores both from one prefix. |
 
@@ -94,15 +102,16 @@ rule.
 
 ## 6. Decision
 
-1. `autumn-harvest-sqlite` gains three seams: `SqliteRuntime::open_replicated`
-   (no auto checkpoint), `FileWriterLock` (the writer lock without a
-   runtime) and `fleet_epoch::{read, raise}`.
+1. `autumn-harvest-sqlite` gains these seams: `SqliteRuntime::open_replicated`
+   (no auto checkpoint), `SqliteRuntime::raise_fleet_epoch`,
+   `fleet_epoch::read` and `FileWriterLock` (the writer lock without a
+   runtime).
 2. `autumn-harvest-plugin` gains `sqlite::replica`. It holds one shipper
    for each open tenant file and a loop thread that ticks them.
 3. `on_open` restores or replaces the Harvest file, then opens it, then
-   raises its epoch, then attaches a shipper.
-4. `on_close` ships the tail. `release` drops a parked shipper and marks
-   the next open to restore. `on_delete` forgets the tenant.
+   raises its epoch, records the database identity and attaches a shipper.
+4. `on_close` ships the tail. `release` drops a parked shipper and writes
+   the target of a `HarvestFleet::restore`. `on_delete` forgets the tenant.
 5. Without fleet replication, nothing ships, as before.
 
 ## 7. Acceptance criteria
@@ -124,5 +133,5 @@ rule.
 | `fleet_epoch` unit tests | A missing table reads 0. A raise never lowers. |
 | `FileWriterLock` unit test | A held lock refuses a runtime open. |
 | `open_replicated` unit test | The runtime connection has no auto checkpoint. |
-| `replica` unit tests | The prefix, the fence rule and the restore rules. |
-| `sqlite_plugin_fleet_replica` | AC 1 to 5 on two hosts with one destination. |
+| `replica` unit tests | The prefix, the restore target, the database identity, the stale epoch and the publish lock. |
+| `sqlite_plugin_fleet_replica` | AC 1 to 5 on two hosts with one destination, a zombie owner, a point-in-time restore and a purge. |
