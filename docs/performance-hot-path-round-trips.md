@@ -17,6 +17,9 @@ It keeps the rest, each with its reason.
 * **One run sends 6% fewer statements and plans 31% less often.** The
   census reads 328,863 statements and 13,564 planner runs for the base,
   and 307,677 and 9,387 for the changed build.
+* **Only the claim pipeline moves the cell on its own** (median ratio
+  1.05). Each other item alone stays inside the noise of the box. See
+  [Each item alone](#each-item-alone).
 * **A claim that lands on a row takes four round trips, not six.** The
   queue lock and the rechecks go in one pipeline. The server still runs
   them in order, each with its own snapshot.
@@ -200,7 +203,28 @@ Six alternating pairs. Raw output:
 
 ### Each item alone
 
-ITEM_TABLE_PLACEHOLDER
+Each item alone on the base, four alternating pairs each. Raw output:
+[`per-item-paired-runs.txt`](perf-artifacts/hot-path-round-trips/per-item-paired-runs.txt).
+
+| item | base median | item median | ratio per pair | median ratio |
+|:--|--:|--:|:--|--:|
+| 1. claim pipeline | 68.02 | 71.62 | 1.27, 1.06, 1.04, 0.99 | 1.05 |
+| 2. ingest pipeline | 69.15 | 67.66 | 0.93, 1.02, 1.02, 0.96 | 0.99 |
+| 3. savepoint gate | 67.05 | 66.53 | 0.95, 1.05, 0.98, 0.95 | 0.97 |
+| 4. notify read and send | 69.22 | 66.11 | 0.80, 1.15, 1.07, 0.90 | 0.98 |
+| 5. cached scanners | 70.85 | 71.49 | 1.04, 1.06, 0.97, 0.96 | 1.00 |
+| 6. mutex sweep | 72.25 | 71.81 | 0.96, 0.98, 1.03, 1.01 | 1.00 |
+
+**Only the claim pipeline moves the cell on its own.** The base itself
+read 57.3 to 73.7 workflows/s over these runs, so one run of this box
+moves by about 10%. Items 2 to 6 each remove one to six statements per
+workflow, and alone they stay inside that noise. Together with item 1 they
+give the six of six pairs above. The census shows each of their statement
+counts fall, so each is kept for its cost, not for a throughput claim of
+its own.
+
+Item 3 ran here without the race-loser case of its savepoint gate. The
+bench runs no race, so that case does not change this run.
 
 ## What stays
 
