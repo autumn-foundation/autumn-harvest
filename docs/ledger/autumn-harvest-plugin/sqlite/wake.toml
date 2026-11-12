@@ -2,7 +2,7 @@
 # Each query is diesel on the SQLite control database. The scan reads diesel
 # as Postgres, so `backend` lists both.
 
-["WakeBook::due_names"]
+["WakeBook::due_page"]
 driver = "per_tick"
 backend = ["postgres", "sqlite"]
 kind = ["read"]

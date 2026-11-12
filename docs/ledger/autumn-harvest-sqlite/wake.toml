@@ -2,7 +2,7 @@
 # A tenant driver reads it at an idle point after work, or after a known
 # deadline passed. A quiet idle point skips it.
 
-["next_wake_at"]
+["next_wake_after"]
 driver = "per_tick"
 backend = ["sqlite"]
 kind = ["read"]
