@@ -319,7 +319,9 @@ impl Replicas {
         let current = database_identity(database)?;
         let recorded = std::fs::read_to_string(suffixed(path, IDENTITY_SUFFIX)).ok();
         let target = read_target(path)?;
-        let replaced = recorded.is_some_and(|recorded| recorded.trim() != current);
+        // A file with no record predates the record. Only a target then
+        // shows that the database changed.
+        let replaced = recorded.map_or(target.is_some(), |recorded| recorded.trim() != current);
         if !path.exists() || replaced {
             self.drop_parked(key);
             match target {
@@ -327,6 +329,9 @@ impl Replicas {
                 None if replaced => self.follow_replaced(key, path)?,
                 None => self.restore_missing(key, path)?,
             }
+            // Before the target goes: an open that stops after this point
+            // keeps the restored file.
+            record_database(path, database)?;
         } else if let Some(epoch) = epoch {
             self.replace_if_stale(key, path, epoch)?;
         }
@@ -1112,6 +1117,50 @@ mod tests {
         write_target(&path, None).unwrap();
         replicas.prepare(&key, &path, &db, None).unwrap();
         assert_eq!(autumn_harvest_sqlite::fleet_epoch::read(&path).unwrap(), 4);
+        assert!(!suffixed(&path, TARGET_SUFFIX).exists());
+    }
+
+    /// A file from before the database record still follows a requested
+    /// restore.
+    #[test]
+    fn a_target_applies_to_a_file_with_no_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let replicas = replicas(dir.path());
+        let key = replicas.fleet.key_for("acme").unwrap();
+        std::fs::create_dir_all(dir.path().join("b")).unwrap();
+        ship_at(&replicas, &key, &dir.path().join("b/acme.harvest.db"), 6);
+
+        let path = dir.path().join("acme.harvest.db");
+        let db = database(dir.path(), "acme.db");
+        let runtime = autumn_harvest_sqlite::SqliteRuntime::open_replicated(&path).unwrap();
+        runtime.raise_fleet_epoch(1).unwrap();
+        drop(runtime);
+        write_target(&path, None).unwrap();
+        replicas.prepare(&key, &path, &db, None).unwrap();
+        assert_eq!(autumn_harvest_sqlite::fleet_epoch::read(&path).unwrap(), 6);
+    }
+
+    /// A restore records the database before its target goes. An open that
+    /// stops after `prepare` then keeps the restored file.
+    #[test]
+    fn a_restore_records_the_database_before_the_target_goes() {
+        let dir = tempfile::tempdir().unwrap();
+        let replicas = replicas(dir.path());
+        let key = replicas.fleet.key_for("acme").unwrap();
+        std::fs::create_dir_all(dir.path().join("b")).unwrap();
+        ship_at(&replicas, &key, &dir.path().join("b/acme.harvest.db"), 6);
+
+        let path = dir.path().join("acme.harvest.db");
+        let db = database(dir.path(), "acme.db");
+        drop(autumn_harvest_sqlite::SqliteRuntime::open_replicated(&path).unwrap());
+        record_database(&path, &db).unwrap();
+        replace_database(&db);
+        write_target(&path, None).unwrap();
+        replicas.prepare(&key, &path, &db, None).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(suffixed(&path, IDENTITY_SUFFIX)).unwrap(),
+            database_identity(&db).unwrap()
+        );
         assert!(!suffixed(&path, TARGET_SUFFIX).exists());
     }
 
