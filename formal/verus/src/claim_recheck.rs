@@ -114,8 +114,8 @@ proof fn lemma_pipeline_releases_iff_a_hold(paused: Seq<bool>)
 }
 
 /// The pipelined claim keeps its row exactly when the sequential claim
-/// keeps it. A `Release` verdict gives the row back, so every other verdict
-/// ends with the row released.
+/// keeps it. Every verdict but `Keep` ends with the row released: `Released`
+/// by a recheck, `Release` by the claim.
 pub proof fn theorem_the_pipeline_keeps_what_the_sequence_keeps(
     acquired: bool,
     paused: Seq<bool>,

@@ -3,8 +3,8 @@
 //!
 //! The queue pause recheck must see the shared queue lock. A trigger on
 //! `harvest_task_queue` records whether the session holds that lock when the
-//! recheck updates the row. Each test runs on a cold connection, on a warm
-//! connection and on a connection that prepared the recheck before the lock.
+//! recheck updates the row. Three tests cover a cold connection, a warm
+//! connection and a connection that prepared only the recheck.
 
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
 use testcontainers::ContainerAsync;
@@ -61,17 +61,18 @@ async fn connect(url: &str) -> AsyncPgConnection {
         .expect("connect to the test database")
 }
 
-/// Record, for each update of a task row, whether the session holds a
-/// shared advisory lock.
+/// Record, for each release of a task row, the shared advisory locks that the
+/// session holds, as `classid:objid` pairs.
 async fn install_probe(conn: &mut AsyncPgConnection) {
     conn.batch_execute(
-        "CREATE TABLE IF NOT EXISTS recheck_probe (task_id uuid, saw_lock bool); \
+        "CREATE TABLE IF NOT EXISTS recheck_probe (task_id uuid, locks text[]); \
          CREATE OR REPLACE FUNCTION recheck_probe_fn() RETURNS trigger AS $$ \
          BEGIN \
            IF OLD.state = 'RUNNING' AND NEW.state = 'PENDING' THEN \
-             INSERT INTO recheck_probe SELECT NEW.id, EXISTS ( \
-               SELECT 1 FROM pg_locks WHERE pid = pg_backend_pid() \
-                 AND locktype = 'advisory' AND mode = 'ShareLock' AND granted); \
+             INSERT INTO recheck_probe SELECT NEW.id, ARRAY( \
+               SELECT classid::text || ':' || objid::text FROM pg_locks \
+               WHERE pid = pg_backend_pid() AND locktype = 'advisory' \
+                 AND mode = 'ShareLock' AND granted); \
            END IF; \
            RETURN NEW; \
          END $$ LANGUAGE plpgsql; \
@@ -132,18 +133,23 @@ async fn recheck(conn: &mut AsyncPgConnection, task_id: Uuid) -> bool {
 
 #[derive(diesel::QueryableByName)]
 struct Probe {
-    #[diesel(sql_type = diesel::sql_types::Bool)]
-    saw_lock: bool,
+    #[diesel(sql_type = diesel::sql_types::Array<diesel::sql_types::Text>)]
+    locks: Vec<String>,
 }
 
-async fn probes(conn: &mut AsyncPgConnection, task_id: Uuid) -> Vec<bool> {
-    diesel::sql_query("SELECT saw_lock FROM recheck_probe WHERE task_id = $1")
+/// For each release of `task_id`, whether the session held the shared lock
+/// of `queue`.
+async fn probes(conn: &mut AsyncPgConnection, task_id: Uuid, queue: &str) -> Vec<bool> {
+    let (key1, key2) = autumn_harvest::queue_pause::queue_lock_keys(queue);
+    // An advisory lock on two int4 keys shows them as unsigned oids.
+    let expected = format!("{}:{}", key1.cast_unsigned(), key2.cast_unsigned());
+    diesel::sql_query("SELECT locks FROM recheck_probe WHERE task_id = $1")
         .bind::<diesel::sql_types::Uuid, _>(task_id)
         .load::<Probe>(conn)
         .await
         .expect("read the probe")
         .into_iter()
-        .map(|p| p.saw_lock)
+        .map(|p| p.locks.contains(&expected))
         .collect()
 }
 
@@ -179,10 +185,37 @@ async fn assert_release_under_the_lock(
     );
     assert_eq!(task_state(admin, task_id).await, "PENDING");
     assert_eq!(
-        probes(admin, task_id).await,
+        probes(admin, task_id, &queue).await,
         vec![true],
         "one recheck released the row, and it ran under the queue lock"
     );
+}
+
+/// The queue and the run are both paused. The queue recheck releases the
+/// row, and the run recheck after it matches no row.
+#[tokio::test]
+async fn a_queue_and_a_run_pause_release_the_row_once() {
+    let db = database().await;
+    let mut admin = connect(&db.url).await;
+    install_probe(&mut admin).await;
+    let mut conn = connect(&db.url).await;
+    let queue = format!("pipeline-{}", Uuid::new_v4().simple());
+    let task_id = claimed_task(&mut admin, &queue).await;
+    autumn_harvest::queue_pause::pause_queue(&mut admin, &queue, "test", "alice", None)
+        .await
+        .expect("pause the queue");
+    diesel::sql_query(
+        "UPDATE harvest_workflow_executions SET state = 'PAUSED' \
+         WHERE id = (SELECT workflow_exec_id FROM harvest_task_queue WHERE id = $1)",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(task_id)
+    .execute(&mut admin)
+    .await
+    .expect("pause the run");
+
+    assert!(!recheck(&mut conn, task_id).await);
+    assert_eq!(task_state(&mut admin, task_id).await, "PENDING");
+    assert_eq!(probes(&mut admin, task_id, &queue).await, vec![true]);
 }
 
 /// A cold connection prepares each statement inside the pipeline.

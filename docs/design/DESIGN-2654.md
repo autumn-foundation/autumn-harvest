@@ -38,7 +38,7 @@ changes its text.**
 | B5 | Pipeline the execution load and the history load. | Rejected for now. Owner mode needs the execution before it chooses the history read. An offloaded history runs more statements. The error of each read has its own path. |
 | B6 | Skip the second history load when the ingest appends nothing. | Rejected. That load also reads events that a concurrent writer appended during the ingest. Without it, a decision persists at an older event id more often and collides on the key. |
 | B7 | Drop the unlocked pause read before the persist. | Rejected. It parks a paused run before the non-determinism block, the deadlock requeue, the panic retry, the cascade reads and the history-cap fail. |
-| B8 | Open the suspension savepoint only for a detached child spawn or a fork. | **Adopted.** Two statements less per decision of a plain fan-out. |
+| B8 | Open the suspension savepoint only for a detached child spawn, a race with a losing child, or a fork. | **Adopted.** Two statements less per decision of a plain fan-out. |
 | B9 | One statement reads the commit state and sends the wakes when every held note is ready. | **Adopted.** The read alone runs when a note is aborted, open or on another server. |
 | B10 | Move the coalescing of the notify sender into SQL. | Rejected. B9 sends the same set with the same Rust coalescing. |
 | B11 | Cache the poll-tick scanners whose partial-index predicates are literals. | **Adopted** for nine statements. |
@@ -53,7 +53,7 @@ changes its text.**
 | R1 | The pause recheck runs before the queue lock, and a pause slips past the claim. | `claim_recheck_pipeline_db_tests` checks that the recheck sees the lock on a cold, a warm and a mixed connection. With the order swapped, three of its tests fail. |
 | R2 | A pipelined recheck runs after the lock failed and keeps a claim. | A recheck can only release. A Verus proof shows that the pipeline keeps a row exactly when the sequential rechecks keep it. |
 | R3 | A failed statement in the pipeline hides the cause. | `join4` waits for every reply. The lock error comes first. |
-| R4 | The suspension body fails with no savepoint, and a partial write commits. | Only a quota or shard error commits after an error, and those keep the savepoint. Each other error rolls back the persist. |
+| R4 | The suspension body fails with no savepoint, and a partial write commits. | Only a quota or shard error commits after an error. A detached spawn and the cancel of a losing child raise them, and both keep the savepoint. Each other error rolls back the persist. |
 | R5 | The failure write then fails on the aborted transaction and replaces the cause. | `fail_execution_on_error` reports the first error when the second is the aborted-transaction reply. |
 | R6 | The combined notify statement sends a wake for an aborted or open note. | The send runs only when no status is aborted or open and the server matches every note. `a_rolled_back_write_sends_no_wake` covers it. |
 | R7 | A failed `pg_notify` now fails the read, and the sender stops reporting health. | The tick reads again with no send. The second send counts its wakes as lost, as before. `a_failed_send_is_counted_and_the_append_commits` covers it. |
@@ -82,7 +82,7 @@ changes its text.**
 |---|---|---|
 | 1 | Claim: six round trips | Fixed. The lock and the rechecks go in one pipeline. |
 | 2 | Decision: four reads, a second history load, an unlocked pause read | The timer and signal reads are pipelined. The other three stay, with reasons B5, B6 and B7. |
-| 3 | Savepoint of the suspension persist | Fixed. It opens only for a detached child spawn or a fork. |
+| 3 | Savepoint of the suspension persist | Fixed. It opens only for a detached child spawn, a race with a losing child, or a fork. |
 | 4 | Notify sender: two statements per tick | Fixed. One statement in the common tick. |
 | 5 | Unnamed poll-tick scanners | Nine statements fixed. Four stay unnamed, with reasons. |
 | 6 | Terminal mutex sweep | Fixed. One probe and one key read. |

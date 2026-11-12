@@ -1746,7 +1746,7 @@ async fn send_outside_diesel_transaction(
 }
 
 /// The start of the Postgres message for SQLSTATE `25P02`.
-const ABORTED_BLOCK_MESSAGE: &str = "current transaction is aborted";
+pub(crate) const ABORTED_BLOCK_MESSAGE: &str = "current transaction is aborted";
 
 /// True when the failed `probe` aborted a raw `BEGIN` block on `conn`.
 ///
@@ -1879,8 +1879,9 @@ const GATE_SQL: &str = concat!(gate_columns_sql!(), ", NULL::bigint AS sent");
 ///
 /// The send is a scalar subquery in a `CASE` branch. Postgres runs such a
 /// subquery only when the branch is taken.
-/// `notify_post_commit_tests` proves that an aborted or open note sends
-/// nothing. `array_position` reads a `NULL` status as no match, where
+/// `a_rolled_back_write_sends_no_wake` and
+/// `a_committed_and_an_open_note_send_only_the_committed_wake` prove that an
+/// aborted or open note sends nothing. `array_position` reads a `NULL` status as no match, where
 /// `= ANY` would give `NULL`.
 const GATE_AND_SEND_SQL: &str = concat!(
     "WITH g AS MATERIALIZED (",
@@ -2069,11 +2070,10 @@ fn age_out(sink: &SinkShared, held: &mut Vec<Staged>) {
 /// A note staged against another server is dropped and counted, because its
 /// transaction id means nothing here.
 ///
-/// In the common tick every note is ready. The read then sends the wakes in
-/// the same statement, see [`GATE_AND_SEND_SQL`]. Otherwise the read sends
-/// nothing, and the tick sends the ready wakes in a second statement, as
-/// before. When the combined statement fails, the tick reads again with no
-/// send. A failed send thus still gives a good read, and the second send
+/// In the common tick every note is ready, and the read also sends the wakes.
+/// See [`GATE_AND_SEND_SQL`]. Otherwise the read sends nothing, and the tick
+/// sends the ready wakes in a second statement. When the combined statement
+/// fails, the tick reads again with no send. A failure of the second send
 /// counts its wakes as lost.
 ///
 /// Returns `false` when the commit state cannot be read. The notes then stay
@@ -4096,5 +4096,68 @@ mod tests {
         assert_eq!(AtomicU64::load(&sink.failures, Ordering::Relaxed), 0);
         send_counted(&sink, 2, async { Err::<(), String>("refused".into()) }).await;
         assert_eq!(AtomicU64::load(&sink.failures, Ordering::Relaxed), 2);
+    }
+
+    fn staged(database: &str, note: Note) -> Staged {
+        Staged {
+            txid: Some(7),
+            fingerprint: Arc::new(Fingerprint {
+                database: database.into(),
+                started_at: DateTime::<Utc>::UNIX_EPOCH,
+            }),
+            queued_at: Instant::now(),
+            note,
+        }
+    }
+
+    fn task_note(channel: &str) -> Note {
+        Note::Task {
+            channel: channel.into(),
+            task_id: Uuid::new_v4(),
+        }
+    }
+
+    #[test]
+    fn the_read_sends_the_merged_wakes_of_one_server() {
+        let held = vec![
+            staged("a", task_note("q1")),
+            staged("a", task_note("q1")),
+            staged("a", task_note("q2")),
+        ];
+        let (server, wakes) = wakes_with_the_read(&held).expect("one server");
+        assert_eq!(server.database, "a");
+        let notes = held.iter().map(|s| s.note.clone()).collect();
+        assert_eq!(wakes, coalesce(notes), "the same coalescing as a tick");
+        assert_eq!(wakes.len(), 2);
+    }
+
+    #[test]
+    fn the_read_sends_nothing_for_two_servers_or_owner_notes_only() {
+        assert!(wakes_with_the_read(&[]).is_none());
+        let mixed = vec![staged("a", task_note("q1")), staged("b", task_note("q1"))];
+        assert!(wakes_with_the_read(&mixed).is_none());
+        let owner = vec![staged(
+            "a",
+            Note::Owner {
+                exec_id: Uuid::new_v4(),
+                evict: false,
+                writer: None,
+                channel: String::new(),
+            },
+        )];
+        assert!(wakes_with_the_read(&owner).is_none());
+    }
+
+    #[test]
+    fn the_combined_read_sends_only_in_its_case_branch() {
+        assert!(GATE_AND_SEND_SQL.starts_with("WITH g AS MATERIALIZED ("));
+        assert!(GATE_AND_SEND_SQL.contains("array_position(g.statuses, 'aborted') IS NULL"));
+        assert!(GATE_AND_SEND_SQL.contains("array_position(g.statuses, 'in progress') IS NULL"));
+        assert!(GATE_AND_SEND_SQL.contains("g.database = $2 AND g.started_at = $3"));
+        assert_eq!(GATE_AND_SEND_SQL.matches("pg_notify(").count(), 1);
+        assert!(
+            !GATE_SQL.contains("pg_notify("),
+            "the plain read sends nothing"
+        );
     }
 }

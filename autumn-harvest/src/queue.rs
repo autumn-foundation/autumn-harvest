@@ -3897,7 +3897,7 @@ pub enum RecheckVerdict {
 /// `acquired` is the result of the queue lock. `released` is true when a
 /// recheck gave the row back. The claim keeps a row only when the lock holds
 /// and no recheck released it. `formal/verus/src/claim_recheck.rs` proves
-/// that this verdict equals the verdict of the sequential rechecks.
+/// that the pipeline keeps a row exactly when the sequential rechecks keep it.
 #[must_use]
 pub const fn recheck_verdict(acquired: bool, released: bool) -> RecheckVerdict {
     if released {

@@ -12338,8 +12338,9 @@ async fn persist_scheduled_activities(
     // being scheduled here cannot have completed yet), so no other in-band
     // check exists to catch it.
     //
-    // The body runs in a savepoint only when the caller can recover from one
-    // of its errors. See [`suspension_needs_savepoint`].
+    // With no caller transaction, the body opens its own. Inside one, it takes
+    // a savepoint only when the caller can recover from one of its errors. See
+    // [`suspension_needs_savepoint`].
     let body = async |conn: &mut AsyncPgConnection| -> HarvestResult<_> {
         // Issue #2251: the owner fence comes first.
         crate::replication::assert_decision_fence(conn).await?;
@@ -12468,16 +12469,20 @@ async fn persist_scheduled_activities(
 ///
 /// The caller recovers from two errors and then commits the persist
 /// transaction: a full tenant quota and an unavailable shard (see
-/// `recover_from_child_quota_exceeded`). Only a detached child spawn can
-/// raise them in this body. A fork reads a second history here, so it keeps
-/// the savepoint as a margin. The savepoint discards the events that the body
+/// `recover_from_child_quota_exceeded`). Two steps of this body can raise
+/// them: a detached child spawn, and the cancel of a losing child of a race.
+/// The cancel of a child on a moving shard raises the shard error. A fork
+/// reads the history of its source here. The savepoint stays for a fork, so
+/// a new error path in that read stays safe. The savepoint discards the events that the body
 /// appended before such an error. Every other error rolls back the whole
 /// persist transaction, so it needs no savepoint.
 fn suspension_needs_savepoint(commands: &[WorkflowCommand], is_fork: bool) -> bool {
     is_fork
-        || commands
-            .iter()
-            .any(|cmd| matches!(cmd, WorkflowCommand::SpawnDetachedChildWorkflow { .. }))
+        || commands.iter().any(|cmd| match cmd {
+            WorkflowCommand::SpawnDetachedChildWorkflow { .. } => true,
+            WorkflowCommand::CancelRaceLosers { children, .. } => !children.is_empty(),
+            _ => false,
+        })
 }
 
 #[allow(clippy::too_many_lines)]
@@ -15145,7 +15150,7 @@ pub async fn ingest_due_timers_and_signals(
     use crate::schema::harvest_timers::dsl;
 
     // The two reads are independent, so they go in one pipeline. The server
-    // runs them in this order, each with its own snapshot, as before.
+    // runs them in this order, each with its own snapshot.
     let shared: &AsyncPgConnection = conn;
     let due_timers = async {
         let mut shared = shared;
@@ -22788,11 +22793,11 @@ pub async fn fail_execution_on_error<T>(
 
 /// True when `error` is the reply to a statement in an aborted transaction
 /// (SQLSTATE `25P02`). Diesel exposes no SQLSTATE, so this reads the message.
-/// With another `lc_messages` it is false, and the caller reports the second
-/// error, as before.
+/// With a localized `lc_messages` it returns false. The caller then reports
+/// the failure-write error.
 fn is_aborted_transaction(error: &HarvestError) -> bool {
     matches!(error, HarvestError::Database(message)
-        if message.contains("current transaction is aborted"))
+        if message.contains(crate::notify::ABORTED_BLOCK_MESSAGE))
 }
 
 /// Lower/upper bounds for the randomized reschedule delay after a child
@@ -50706,6 +50711,29 @@ mod tests {
         assert!(suspension_needs_savepoint(
             &[mixed_schedule_activity("a")],
             true
+        ));
+    }
+
+    /// The cancel of a losing child can raise the shard error that the
+    /// caller recovers from. A race with no losing child needs no savepoint.
+    #[test]
+    fn a_race_with_a_losing_child_keeps_the_savepoint() {
+        let losers = |children: Vec<ExecutionId>| WorkflowCommand::CancelRaceLosers {
+            reason: crate::context::LoserCancelReason::RaceLoser,
+            activities: vec![crate::types::ActivityExecId::new()],
+            children,
+            timers: vec![],
+        };
+        assert!(suspension_needs_savepoint(
+            &[
+                mixed_schedule_activity("a"),
+                losers(vec![ExecutionId::new()])
+            ],
+            false
+        ));
+        assert!(!suspension_needs_savepoint(
+            &[mixed_schedule_activity("a"), losers(vec![])],
+            false
         ));
     }
 

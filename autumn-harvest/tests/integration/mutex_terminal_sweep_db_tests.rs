@@ -4,8 +4,8 @@
 //! - A run with no lock and no waiter row costs two statements: the table
 //!   probe and the key read.
 //! - A run that holds a key and waits on others frees each key, drops each
-//!   waiter row and wakes each new head of line, as the two separate sweeps
-//!   did.
+//!   waiter row and wakes each new head of line, as
+//!   `release_all_locks_for_holder` then `delete_waiters_for_holder` do.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -167,7 +167,7 @@ async fn a_run_with_no_mutex_rows_costs_two_statements() {
 }
 
 /// The holder frees its key, drops its own waiter row on that key and its
-/// waiter row on another key. The waiter of each key wakes.
+/// waiter row on another key. The next waiter of each key wakes.
 #[tokio::test]
 async fn the_sweep_frees_held_keys_and_drops_waiter_rows() {
     let mut db = connect().await;
@@ -175,6 +175,7 @@ async fn the_sweep_frees_held_keys_and_drops_waiter_rows() {
     let holder = run(conn, "holder").await;
     let first = run(conn, "first").await;
     let second = run(conn, "second").await;
+    let third = run(conn, "third").await;
     let held = format!("held-{holder}");
     let waited = format!("waited-{holder}");
 
@@ -184,6 +185,7 @@ async fn the_sweep_frees_held_keys_and_drops_waiter_rows() {
     wait(conn, &held, first).await;
     hold(conn, &waited, second).await;
     wait(conn, &waited, holder).await;
+    wait(conn, &waited, third).await;
 
     autumn_harvest::mutex::sweep_terminal_holder_and_wake(conn, ExecutionId::from_uuid(holder))
         .await
@@ -222,6 +224,16 @@ async fn the_sweep_frees_held_keys_and_drops_waiter_rows() {
     assert_eq!(
         task_state(conn, first).await,
         "PENDING",
-        "the next waiter wakes"
+        "the next waiter of the freed key wakes"
+    );
+    assert_eq!(
+        task_state(conn, third).await,
+        "PENDING",
+        "the next waiter of a key that the holder waited on wakes"
+    );
+    assert_eq!(
+        task_state(conn, second).await,
+        "RUNNING",
+        "the holder of the other key is not woken"
     );
 }

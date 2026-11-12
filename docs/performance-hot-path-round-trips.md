@@ -1,8 +1,8 @@
 # Hot path round trips (issue #2654)
 
 The [statement cache audit](performance-hot-path-statement-cache.md) left
-six measured costs in place. This page fixes five of them in whole or in
-part and keeps the rest, each with its reason.
+six measured costs in place. This page fixes four of them and two in part.
+It keeps the rest, each with its reason.
 [`design/DESIGN-2654.md`](design/DESIGN-2654.md) holds the plan.
 
 > **This is a reference measurement, not an SLO.** It comes from one 4-core
@@ -27,9 +27,9 @@ part and keeps the rest, each with its reason.
 ## The method
 
 The workload is the `throughput` cell of `e2e_bench` at one shard, as in
-the [audit](performance-hot-path-statement-cache.md#the-method): one
-in-process worker with 8 workflow slots, 16 activity slots and 2 claim
-loops, with 32 workflows in flight.
+the [audit](performance-hot-path-statement-cache.md#the-method). It runs
+one in-process worker with 8 workflow slots, 16 activity slots and 2 claim
+loops. 32 workflows are in flight.
 
 Host: 4 logical CPUs, 15 GB. PostgreSQL 16 on the same host, with
 `fsync = off`, `synchronous_commit = off` and `max_connections = 200`, as in
@@ -99,9 +99,10 @@ savepoint matters for one path only. `handle_suspended_workflow` recovers
 from a full tenant quota or an unavailable shard, then commits. The
 savepoint discards the events that the body appended before such an error.
 
-Within the body, only a detached child spawn raises those errors. So the
-savepoint now opens only for a batch with a detached child spawn, or for a
-fork, which reads a second history in the body. Any other error rolls back
+Within the body, two steps raise those errors: a detached child spawn, and
+the cancel of a losing child of a race on a moving shard. So the savepoint
+now opens only for a batch with one of those, or for a fork. A fork reads a
+second history in the body. Any other error rolls back
 the whole persist transaction, so it needs no savepoint.
 
 One report changes. With no savepoint, a failed statement aborts the
@@ -151,9 +152,8 @@ ran the planner on every tick before.
 
 ### 6. The terminal mutex sweep reads its keys once
 
-`mutex::sweep_terminal_holder_and_wake` sent a table probe, then the lock
-sweep with a probe and a key read, then the waiter sweep with a probe and a
-key read. Now it sends one probe and one key read, a `UNION ALL` of the held
+`mutex::sweep_terminal_holder_and_wake` sent a table probe. Then the lock
+sweep sent a probe and a key read, and the waiter sweep did the same. Now it sends one probe and one key read, a `UNION ALL` of the held
 keys and the waiter keys. The waiter part skips each key that the lock part
 freed, because that free also deleted the waiter row. So the sweep does the
 same work as before.
