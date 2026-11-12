@@ -855,8 +855,9 @@ pub use crate::operator::{
     BufferedSignal, ChildRun, CountFilter, ExecutionCount, PendingTask, PendingTimer, PendingWork,
     TimedEvent,
 };
+pub use crate::overlay_log::SqliteConnector;
 #[doc(hidden)]
-pub use crate::overlay_log::{SqliteConnector, SqliteOverlayLog};
+pub use crate::overlay_log::SqliteOverlayLog;
 pub use crate::query::{DEFAULT_QUERY_TIMEOUT, ReplayInput};
 pub use crate::runtime::{
     ActivityBody, ActivitySpec, AdmittedUpdate, ExecutionOutcome, LedgerActivityBody, RunState,

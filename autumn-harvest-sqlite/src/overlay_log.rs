@@ -132,7 +132,8 @@ END;
 ///
 /// Each call must open the same database. Set the pragmas of the app in
 /// the closure, such as `journal_mode`, `busy_timeout` and
-/// `wal_autocheckpoint`.
+/// `wal_autocheckpoint`. The app uses the `rusqlite` version of this
+/// crate, so the `Connection` types match.
 pub type SqliteConnector = Arc<dyn Fn() -> rusqlite::Result<Connection> + Send + Sync>;
 
 /// The columns of one policy row.

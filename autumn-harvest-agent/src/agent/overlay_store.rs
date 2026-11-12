@@ -1588,7 +1588,9 @@ impl InMemoryOverlayStore {
 /// [`open`](Self::open) keeps its own connection. It can share the file of
 /// a `SqliteRuntime`. [`with_connector`](Self::with_connector) opens a new
 /// connection for each call. A call runs its statements on the polling
-/// thread, and a busy file can hold that thread for up to 5 seconds.
+/// thread. With `open`, a busy file can hold that thread for up to 5
+/// seconds. With `with_connector`, the `busy_timeout` of the factory sets
+/// the wait.
 #[cfg(feature = "sqlite")]
 pub struct SqliteOverlayStore {
     log: autumn_harvest_sqlite::SqliteOverlayLog,

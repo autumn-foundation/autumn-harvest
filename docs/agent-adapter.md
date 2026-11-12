@@ -2481,8 +2481,13 @@ fn with_fleet_overlays(db: PathBuf, base: AgentHarness) -> Result<AgentHarness, 
   keeps no connection between calls, and runs one call at a time.
 - The store sets `foreign_keys = ON` and no other pragma. Set the pragmas
   of the fleet in the factory.
-- Open a connection only while the app holds its fleet lease. Then a store
-  connection never closes last.
+- Open a connection only while another connection of the app stays open,
+  such as the replicator connection. Then a store connection never closes
+  last.
+- Set `busy_timeout` in the factory. With none, a call fails at once on a
+  busy file.
+- Use the `rusqlite` version of `autumn-harvest-sqlite`, so the
+  `Connection` types match.
 - Each call must open the same database. A new in-memory database on each
   call has no tables.
 - The guards of the tables do not change. See

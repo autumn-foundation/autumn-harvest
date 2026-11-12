@@ -2,8 +2,8 @@
 //!
 //! A fleet database replicates its WAL. Only its replicator checkpoints,
 //! and the replicator connection closes last. These tests show that a
-//! factory log keeps both rules. `DESIGN-2656.md` in `docs/design/` has the
-//! plan.
+//! factory log keeps both rules. The design record in `docs/design/` has
+//! the plan.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -179,9 +179,8 @@ fn the_log_keeps_no_connection_between_calls() {
         .expect("v1");
     log.activate("support", &mv(1, None)).expect("activate");
     assert!(fleet.wal().exists(), "the frames are in the WAL");
-    // The log is still open. If it held a connection, the replicator
-    // connection would not be the last one, and its close would keep the
-    // WAL file.
+    // The log is still open. A held connection stays open after the
+    // replicator closes, and the WAL file then stays.
     fleet.close_replicator();
     assert!(
         !fleet.wal().exists(),

@@ -92,6 +92,6 @@ A test opens the store through a factory on a WAL file with
 
 - `autumn-harvest-agent/tests/overlay_store.rs`: the shared suite on a
   factory store, and the acceptance test.
-- `autumn-harvest-sqlite/tests/integration/overlay_log.rs`: the factory
+- `autumn-harvest-sqlite/tests/integration/overlay_log_connector.rs`: the factory
   calls, the last close, the 1000-page write, the control and the failed
   connect.
