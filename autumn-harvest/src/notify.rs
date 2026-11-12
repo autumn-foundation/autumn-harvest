@@ -909,20 +909,31 @@ pub(crate) const fn after_notify_cut<T: Copy>(
     }
 }
 
-/// Give the state after a settle that slept to its end.
+/// Give the state after the settle of `plan` ends, at its end or at a local
+/// decision end.
 ///
-/// `queued` tells whether a NOTIFY waits at that end. The poll after the
-/// settle comes after each such NOTIFY, so that poll covers it. The NOTIFY
-/// then needs no poll of its own, only a settle if that poll is empty.
-/// Without this, the next idle wait polls again at once. In a fleet under a
-/// steady NOTIFY stream, that poll is empty on each worker.
+/// A rest always owes a fresh settle. The NOTIFY that cut the settle can
+/// name a row that a host clock stamped early. The poll at the cut and the
+/// poll at the end can both come before that row is claimable. The fresh
+/// settle gives that NOTIFY its own margin, as a queued NOTIFY got before.
+///
+/// `queued` tells whether a NOTIFY waits at the end of a fresh settle. The
+/// poll after the settle comes after each such NOTIFY, so that poll covers
+/// it. The NOTIFY then needs no poll of its own, only a settle if that poll
+/// is empty. Without this, the next idle wait polls again at once. In a
+/// fleet under a steady NOTIFY stream, that poll is empty on each worker.
 ///
 /// `formal/verus/src/notify_settle.rs` proves the function for every input.
-pub(crate) const fn after_slept_settle<T>(queued: bool) -> SettleState<T> {
-    if queued {
-        SettleState::Due
-    } else {
-        SettleState::Clear
+pub(crate) const fn after_settle<T: Copy>(plan: SettlePlan<T>, queued: bool) -> SettleState<T> {
+    match plan {
+        SettlePlan::Rest(_) => SettleState::Due,
+        SettlePlan::Skip | SettlePlan::Fresh => {
+            if queued {
+                SettleState::Due
+            } else {
+                SettleState::Clear
+            }
+        }
     }
 }
 
@@ -3435,8 +3446,26 @@ mod tests {
 
     #[test]
     fn a_queued_notify_at_the_end_owes_a_settle() {
-        assert_eq!(after_slept_settle::<u32>(true), SettleState::Due);
-        assert_eq!(after_slept_settle::<u32>(false), SettleState::Clear);
+        assert_eq!(
+            after_settle(SettlePlan::<u32>::Fresh, true),
+            SettleState::Due
+        );
+        assert_eq!(
+            after_settle(SettlePlan::<u32>::Fresh, false),
+            SettleState::Clear
+        );
+    }
+
+    #[test]
+    fn a_rest_always_owes_a_settle_for_the_notify_that_cut_it() {
+        assert_eq!(
+            after_settle(SettlePlan::Rest(4_u32), false),
+            SettleState::Due
+        );
+        assert_eq!(
+            after_settle(SettlePlan::Rest(4_u32), true),
+            SettleState::Due
+        );
     }
 
     #[test]

@@ -77,26 +77,35 @@ pub fn after_notify_cut<T>(plan: SettlePlan<T>, end: T) -> (r: Option<SettleStat
     }
 }
 
-/// `after_slept_settle` as a spec.
-pub open spec fn spec_after_slept_settle<T>(queued: bool) -> SettleState<T> {
-    if queued {
-        SettleState::Due
-    } else {
-        SettleState::Clear
+/// `after_settle` as a spec.
+pub open spec fn spec_after_settle<T>(plan: SettlePlan<T>, queued: bool) -> SettleState<T> {
+    match plan {
+        SettlePlan::Rest(_) => SettleState::Due,
+        _ => if queued {
+            SettleState::Due
+        } else {
+            SettleState::Clear
+        },
     }
 }
 
-// mirror: autumn-harvest/src/notify.rs after_slept_settle
-pub fn after_slept_settle<T>(queued: bool) -> (r: SettleState<T>)
+// mirror: autumn-harvest/src/notify.rs after_settle
+pub fn after_settle<T: Copy>(plan: SettlePlan<T>, queued: bool) -> (r: SettleState<T>)
     ensures
-        r == spec_after_slept_settle::<T>(queued),
-        queued ==> r is Due,
-        !queued ==> r is Clear,
+        r == spec_after_settle(plan, queued),
+        plan is Rest ==> r is Due,
+        !(plan is Rest) && queued ==> r is Due,
+        !(plan is Rest) && !queued ==> r is Clear,
 {
-    if queued {
-        SettleState::Due
-    } else {
-        SettleState::Clear
+    match plan {
+        SettlePlan::Rest(_) => SettleState::Due,
+        SettlePlan::Skip | SettlePlan::Fresh => {
+            if queued {
+                SettleState::Due
+            } else {
+                SettleState::Clear
+            }
+        }
     }
 }
 
@@ -154,9 +163,13 @@ pub open spec fn step(run: Run, event: Event) -> Run {
         Event::Slept(queued) => if run.plan is Skip {
             run
         } else {
-            Run { state: spec_after_slept_settle(queued), plan: SettlePlan::Skip, ..run }
+            Run { state: spec_after_settle(run.plan, queued), plan: SettlePlan::Skip, ..run }
         },
-        Event::DecisionEnd => Run { plan: SettlePlan::Skip, ..run },
+        Event::DecisionEnd => if run.plan is Skip {
+            run
+        } else {
+            Run { state: spec_after_settle(run.plan, false), plan: SettlePlan::Skip, ..run }
+        },
     }
 }
 
@@ -232,6 +245,15 @@ pub proof fn theorem_each_cut_owes_its_rest(events: Seq<Event>)
         }),
 {
     lemma_run_all_keeps_the_bound(start(), events);
+}
+
+/// A rest always ends owing a fresh settle. So the NOTIFY that cut the
+/// settle gets a full margin of its own, after the poll at the old end.
+pub proof fn theorem_a_rest_owes_a_fresh_settle(end: int, queued: bool)
+    ensures
+        spec_after_settle(SettlePlan::Rest(end), queued) is Due,
+        spec_take_settle(spec_after_settle(SettlePlan::Rest(end), queued)) is Fresh,
+{
 }
 
 /// A cut keeps the end of its settle, so the leader still polls at that end.

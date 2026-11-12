@@ -38093,14 +38093,14 @@ impl Worker {
             {
                 SettleEnd::Skipped => {}
                 SettleEnd::Cut => continue,
-                SettleEnd::Slept => {
+                SettleEnd::Slept(plan) => {
                     // Drain each listener. A short circuit would leave a
                     // NOTIFY queued for an extra poll.
                     let queued = shard_listeners
                         .iter_mut()
                         .flatten()
                         .fold(false, |any, listener| listener.take_queued() | any);
-                    self.owe_settle_after_sleep(queued);
+                    self.owe_settle_after_sleep(plan, queued);
                     continue;
                 }
             }
@@ -40722,9 +40722,9 @@ impl Worker {
         match self.settle_if_pending(cut).await {
             SettleEnd::Skipped => {}
             SettleEnd::Cut => return,
-            SettleEnd::Slept => {
+            SettleEnd::Slept(plan) => {
                 let queued = notify.take_queued();
-                self.owe_settle_after_sleep(queued);
+                self.owe_settle_after_sleep(plan, queued);
                 return;
             }
         }
@@ -40748,10 +40748,14 @@ impl Worker {
     /// Set the state after a settle that slept to its end.
     ///
     /// `queued` tells whether a listener holds a NOTIFY. A stored owner wake
-    /// counts too, and this takes it. See [`crate::notify::after_slept_settle`].
-    fn owe_settle_after_sleep(&self, queued: bool) {
+    /// counts too, and this takes it. See [`crate::notify::after_settle`].
+    fn owe_settle_after_sleep(
+        &self,
+        plan: crate::notify::SettlePlan<tokio::time::Instant>,
+        queued: bool,
+    ) {
         let owner = futures::FutureExt::now_or_never(self.owner_woken.notified()).is_some();
-        self.owe_settle(crate::notify::after_slept_settle(queued || owner));
+        self.owe_settle(crate::notify::after_settle(plan, queued || owner));
     }
 
     /// Set the settle that the leader owes.
@@ -40786,7 +40790,7 @@ impl Worker {
             crate::notify::SettlePlan::Skip => SettleEnd::Skipped,
             plan => {
                 if self.settle(plan, notify).await {
-                    SettleEnd::Slept
+                    SettleEnd::Slept(plan)
                 } else {
                     SettleEnd::Cut
                 }
@@ -40839,13 +40843,22 @@ impl Worker {
         tokio::select! {
             () = tokio::time::sleep_until(end) => true,
             () = self.decision_done.notified() => {
-                let mut owed = self
-                    .owed_poll
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                // Keep the later end. A row due at the earlier end is still
-                // pending then, so one poll covers both.
-                *owed = Some(owed.map_or(end, |at| at.max(end)));
+                match crate::notify::after_settle(plan, false) {
+                    // A cut rest owes a fresh settle. That settle ends after
+                    // both margins, so it needs no owed poll.
+                    crate::notify::SettleState::Due => {
+                        self.owe_settle(crate::notify::SettleState::Due);
+                    }
+                    crate::notify::SettleState::Clear | crate::notify::SettleState::Rest(_) => {
+                        let mut owed = self
+                            .owed_poll
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        // Keep the later end. A row due at the earlier end is
+                        // still pending then, so one poll covers both.
+                        *owed = Some(owed.map_or(end, |at| at.max(end)));
+                    }
+                }
                 false
             }
             rest = cut => {
@@ -45008,8 +45021,8 @@ pub fn dr_fence_targets(
 enum SettleEnd {
     /// No settle was owed.
     Skipped,
-    /// The settle slept to its end.
-    Slept,
+    /// The settle of the given plan slept to its end.
+    Slept(crate::notify::SettlePlan<tokio::time::Instant>),
     /// A NOTIFY, an owner wake or a local decision end cut the settle.
     Cut,
 }
@@ -59805,13 +59818,58 @@ mod tests {
             "the rest must end at the original end, ended after {waited:?}"
         );
 
-        // The rest is paid. The next wait does not settle.
+        // The NOTIFY that cut the settle gets its own margin: a fresh settle.
+        let after_rest = tokio::time::Instant::now();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            worker.idle_wait_then_settle(&mut NoNotify),
+        )
+        .await
+        .expect("a rest must owe a fresh settle");
+        let margin = after_rest.elapsed();
+        assert!(
+            margin >= crate::notify::SETTLE_DELAY_MIN && margin <= crate::notify::SETTLE_DELAY_MAX,
+            "the cutting NOTIFY must get a full settle, got {margin:?}"
+        );
+
+        // That settle saw no NOTIFY. The next wait does not settle.
         let later = tokio::time::timeout(
             Duration::from_secs(1),
             worker.idle_wait_then_settle(&mut NoNotify),
         )
         .await;
         assert!(later.is_err(), "a cut settle must owe its rest once only");
+    }
+
+    /// A NOTIFY that cuts a settle late still gets a full margin. Its row
+    /// can be stamped ahead of the database clock, so the poll at the cut
+    /// and the poll at the original end can both come too early.
+    #[tokio::test(start_paused = true)]
+    async fn a_late_cut_still_gives_its_notify_a_full_margin() {
+        let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));
+        let worker = Worker::new(default_runtime_config(), registry).expect("valid config");
+
+        worker.idle_wait_then_settle(&mut InstantNotify).await;
+        let begin = tokio::time::Instant::now();
+        let late = crate::notify::SETTLE_DELAY_MIN.saturating_sub(Duration::from_millis(1));
+        worker.idle_wait_then_settle(&mut NotifyAfter(late)).await;
+        let cut_at = tokio::time::Instant::now();
+        assert_eq!(cut_at - begin, late, "the late NOTIFY must cut the settle");
+
+        // The rest ends at the original end. Then a fresh settle follows.
+        for _ in 0..2 {
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                worker.idle_wait_then_settle(&mut NoNotify),
+            )
+            .await
+            .expect("the rest and the fresh settle must end");
+        }
+        let margin = cut_at.elapsed();
+        assert!(
+            margin >= crate::notify::SETTLE_DELAY_MIN,
+            "the last poll must come a full settle after the cut, came after {margin:?}"
+        );
     }
 
     /// An owner wake is a NOTIFY too, so it cuts a fresh settle.
@@ -59935,9 +59993,9 @@ mod tests {
     }
 
     /// A local decision end cuts the rest of a settle too. The cut then owes
-    /// a poll at the original end.
+    /// a fresh settle, which ends after the margins of both NOTIFYs.
     #[tokio::test(start_paused = true)]
-    async fn a_local_decision_end_cuts_the_rest_and_owes_its_end() {
+    async fn a_local_decision_end_cuts_the_rest_and_owes_a_settle() {
         let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));
         let worker = Worker::new(default_runtime_config(), registry).expect("valid config");
 
@@ -59960,18 +60018,28 @@ mod tests {
             "a local decision end must cut the rest at once"
         );
 
-        // The next idle wait ends at the poll owed at the original end.
+        // The poll after the cut was empty. A fresh settle follows, so the
+        // NOTIFY that cut the first settle gets its own margin.
+        let cut_at = tokio::time::Instant::now();
         tokio::time::timeout(
             Duration::from_secs(1),
             worker.idle_wait_then_settle(&mut NoNotify),
         )
         .await
-        .expect("the owed poll must end the wait");
-        let waited = begin.elapsed();
+        .expect("a cut rest must owe a fresh settle");
+        let waited = cut_at.elapsed();
         assert!(
             waited >= crate::notify::SETTLE_DELAY_MIN && waited <= crate::notify::SETTLE_DELAY_MAX,
-            "the owed poll must come at the original end, came after {waited:?}"
+            "the fresh settle must run in full, ran {waited:?}"
         );
+
+        // The fresh settle saw no NOTIFY, and no owed poll is left.
+        let later = tokio::time::timeout(
+            Duration::from_secs(1),
+            worker.idle_wait_then_settle(&mut NoNotify),
+        )
+        .await;
+        assert!(later.is_err(), "nothing more must be owed");
     }
 
     /// A local decision end cuts a fresh settle before a NOTIFY does. That
@@ -60020,7 +60088,8 @@ mod tests {
     }
 
     /// A rest whose end has passed polls at once. A claim loop that claimed
-    /// after the cut can reach its rest late.
+    /// after the cut can reach its rest late. The rest then owes a fresh
+    /// settle for the NOTIFY that cut it.
     #[tokio::test(start_paused = true)]
     async fn a_rest_past_its_end_polls_at_once() {
         let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));
@@ -60044,12 +60113,25 @@ mod tests {
             "a past rest must poll at once"
         );
 
+        let after_rest = tokio::time::Instant::now();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            worker.idle_wait_then_settle(&mut NoNotify),
+        )
+        .await
+        .expect("a past rest must owe a fresh settle");
+        let margin = after_rest.elapsed();
+        assert!(
+            margin >= crate::notify::SETTLE_DELAY_MIN && margin <= crate::notify::SETTLE_DELAY_MAX,
+            "the cutting NOTIFY must get a full settle, got {margin:?}"
+        );
+
         let later = tokio::time::timeout(
             Duration::from_secs(1),
             worker.idle_wait_then_settle(&mut NoNotify),
         )
         .await;
-        assert!(later.is_err(), "a past rest must clear");
+        assert!(later.is_err(), "nothing more must be owed");
     }
 
     /// A wait that ends with no NOTIFY, as on a closed channel, does not
@@ -60083,7 +60165,7 @@ mod tests {
             worker
                 .settle_if_pending(worker.shard_notify(&mut listeners))
                 .await,
-            SettleEnd::Slept
+            SettleEnd::Slept(crate::notify::SettlePlan::Fresh)
         );
         let waited = begin.elapsed();
         assert!(
@@ -60111,7 +60193,10 @@ mod tests {
         assert_eq!(worker.settle_if_pending(async {}).await, SettleEnd::Cut);
         assert_eq!(begin.elapsed(), Duration::ZERO);
         // The rest ignores a ready NOTIFY.
-        assert_eq!(worker.settle_if_pending(async {}).await, SettleEnd::Slept);
+        assert!(matches!(
+            worker.settle_if_pending(async {}).await,
+            SettleEnd::Slept(crate::notify::SettlePlan::Rest(_))
+        ));
         let waited = begin.elapsed();
         assert!(
             waited >= crate::notify::SETTLE_DELAY_MIN && waited <= crate::notify::SETTLE_DELAY_MAX,

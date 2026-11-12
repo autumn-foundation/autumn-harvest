@@ -43,7 +43,7 @@ This change lets a NOTIFY cut a settle, once. **No migration. No new
 | # | How to make it harmful | Mitigation |
 |---|---|---|
 | R1 | Each NOTIFY cuts, so a fleet polls once per NOTIFY. | A cut moves the state to `Rest(end)`. No NOTIFY cuts a rest, and no wake drops it. A Verus proof shows that the cuts never exceed the fresh settles, and that each cut owes its rest. |
-| R2 | A cut drops the clock-skew poll. | The rest sleeps to the original end, then the leader polls. A unit test checks the end. |
+| R2 | A cut drops the clock-skew poll. | The rest sleeps to the original end, then the leader polls. The rest then owes a fresh settle, so the NOTIFY that cut also gets a full margin. Unit tests check both ends. |
 | R3 | A closed listener channel returns at once, so the cut spins. | In the single-pool path, a wait with no NOTIFY never ends the cut. It stays pending. In the multi-shard path, a round removes a closed listener. |
 | R4 | The cut swallows a NOTIFY, and its row waits a poll interval. | A cut always leads to a poll at once. |
 | R5 | A claim after the cut leaves the rest owed for a long time. | A rest whose end has passed polls at once and clears. |
@@ -82,15 +82,15 @@ stateDiagram-v2
     Due --> Clear: the fresh settle ends with nothing queued, or a decision end cuts it and owes a poll at the end
     Due --> Due: the fresh settle ends with a NOTIFY or an owner wake queued
     Due --> Rest: a NOTIFY cuts the fresh settle
-    Rest --> Clear: the rest ends with nothing queued, or a decision end cuts it and owes a poll at the end
-    Rest --> Due: the rest ends with a NOTIFY or an owner wake queued
+    Rest --> Due: the rest ends, or a decision end cuts it
 ```
 
 The pure kernel is `notify::SettleState`. `Worker::settle_if_pending` takes
 the state and leaves `Clear`. `notify::take_settle` gives the plan.
 `notify::after_notify_cut` gives the state after a NOTIFY cuts a plan.
-`notify::after_slept_settle` gives the state after a settle that slept to
-its end.
+`notify::after_settle` gives the state after a settle ends. A rest always
+owes a fresh settle. The NOTIFY that cut the settle can name a row that a
+host clock stamped early, and the fresh settle gives that row its margin.
 `formal/verus/src/notify_settle.rs` proves the kernel. Its model folds the
 leader events over any sequence. It proves that the cuts never exceed the
 fresh settles, and that each cut owes its rest. The poll count below follows
@@ -105,8 +105,14 @@ B8 removes the poll after the end: a NOTIFY queued at the end owes a fresh
 settle, and a NOTIFY cuts that settle at once. So each worker polls twice
 per settle again: at the cut and at the end. The proof allows one cut per
 fresh settle. The poll count follows from the loop. So a dense stream
-adds no empty poll. A sparse stream gains one poll for each NOTIFY that
-lands in a settle, and that NOTIFY is the latency win.
+adds no empty poll.
+
+Take one NOTIFY that lands in a settle. Before, the leader polled at the
+end, polled again at once for the queued NOTIFY, then settled and polled at
+the end of that settle. Now it polls at the cut and at the end, then
+settles and polls at the end of that settle. The count is the same. The
+poll for the NOTIFY moves from after the settle to the cut, and that move
+is the latency win.
 
 ## 2. Acceptance criteria
 

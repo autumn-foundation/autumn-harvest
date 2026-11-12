@@ -30,6 +30,8 @@ once. [`design/DESIGN-2653.md`](design/DESIGN-2653.md) holds the design.
   The rest of the settle stays owed, up to the original end, and no NOTIFY
   cuts the rest. So each settle has one NOTIFY cut at most, and the poll at
   the original end still comes for a row that a host clock stamped early.
+  The rest then owes a fresh settle, so the NOTIFY that cut also gets a
+  full margin.
 * A settle that sleeps to its end takes the NOTIFYs queued then, and owes a
   fresh settle for them. The poll at the end covers each of them. Before,
   the next idle wait polled again at once. In a fleet, that poll was empty
