@@ -1,4 +1,4 @@
-## A NOTIFY cuts the settle once (issue #2653)
+## A NOTIFY cuts the settle once (issue #2653, PR #2662)
 
 The leader claim loop sleeps a 50 to 75 ms settle after an empty poll that a
 NOTIFY caused. A NOTIFY that arrived in that sleep waited for its end. So a
