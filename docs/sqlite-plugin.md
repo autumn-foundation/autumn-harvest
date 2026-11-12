@@ -77,7 +77,8 @@ of them. Each app in one process, as in a test binary, needs its own file.
 ```toml
 [harvest.sqlite]
 path = "/var/lib/app/harvest.db"
-# How often the driver fires due timers, retries and schedule slots.
+# How often the driver fires due timers, retries and schedule slots. The
+# tenant wake sweep runs on the same interval.
 tick_ms = 250
 ```
 
@@ -218,11 +219,54 @@ The auth layer and the #1802 mutation gate cover these routes too. The gate
 passes a read, and a read opens its tenant, which starts its driver. Put the
 API behind `api_with_auth` outside `dev`.
 
+### Waking a closed tenant
+
+The fleet closes an idle tenant, and a closed tenant runs no driver. So each
+tenant driver records when its Harvest file next has due work. A sweep opens
+the tenant at that time.
+
+```mermaid
+sequenceDiagram
+    participant D as tenant driver
+    participant C as control database
+    participant S as wake sweep
+    participant F as DatabaseFleet
+    D->>C: next_wake_at, when it changes and when the tenant closes
+    loop each harvest.sqlite.tick_ms
+        S->>C: read the due rows
+        S->>F: owned and closed: open in the background
+        S->>D: run until idle
+        S->>F: close it again
+    end
+```
+
+- **What is due.** `SqliteRuntime::next_wake_at()` gives the earliest of
+  these times: an unfired timer, a schedule slot, an activity retry, a run
+  backoff and a run deadline. A paused schedule and a disabled scheduler
+  give no slot. `None` means no deadline.
+- **Where it is kept.** The control database holds one row per tenant in
+  `harvest_tenant_wakes (tenant_key, next_wake_at)`. The boot creates the
+  table. `TENANT_WAKES_SCHEMA_SQL` holds its DDL.
+- **How late.** A due item fires within one tick of its time. The sweep
+  runs on `harvest.sqlite.tick_ms`.
+- **One host.** A host wakes only the tenants of the slot ranges that it
+  owns. A slot of a closed tenant runs once, not once per host.
+- **No eviction.** A wake is a background open. It never goes past
+  `max_open`, and a full fleet tries again on the next tick. The fleet
+  closes the tenant when no request used it meanwhile.
+- **A stuck deadline.** A deadline that a drive cannot clear, such as a
+  timer of a run that fails on each drive, comes back once a minute.
+- **A long run.** A wake keeps its tenant open for at most five minutes
+  while the driver works. The fleet then closes it after the pass in
+  flight.
+
 ### Limits
 
-- A closed tenant runs no timer, retry or activity. The next open resumes
-  its runs. The fleet sweeper wakes a tenant for outbox, hook and backfill
-  work only.
+- A closed tenant runs no timer, retry or activity until the wake sweep
+  opens it. An app with no control database runs no sweep: the next open
+  resumes the runs, and the boot logs a warning.
+- A tenant gets its first wake row when its driver first goes idle. A
+  tenant that has not opened since this release waits for its next open.
 - A takeover loses the runs that the old owner did not ship: at most one
   sync interval of work.
 - A direct `DatabaseFleet::restore` to a point in time restores the
