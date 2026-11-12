@@ -354,6 +354,17 @@ impl Replicas {
             .as_ref()
             .filter(|entry| self.unreturned(key).as_ref() == Some(*entry))
             .cloned();
+        // The database moved after the release, so a publish ran. It can be
+        // the restore itself, before it returned, or a stale-epoch open. The
+        // pending target cannot tell them apart, so the open waits for the
+        // return. A refused open of a stale-epoch open also frees the drain.
+        if let Some(Entry::Pending { from, .. }) = &unreturned
+            && *from != current
+        {
+            return Err(format!(
+                "a restore of {key} is ending: open the tenant again once it returns"
+            ));
+        }
         let seen = unreturned.as_ref().map_or(entry, before_request);
         let resolution = resolve_target(held(seen, &current));
         let superseded = matches!(resolution, Resolution::Superseded);
@@ -1769,11 +1780,12 @@ mod tests {
         let replicas = replicas(dir.path());
         let (key, path, db) = shipped_acme(dir.path(), &replicas);
         replicas.request_restore(&key, unreachable());
-        // The stale-epoch open releases, replaces the database, then opens.
+        // The stale-epoch open releases and replaces the database. Its
+        // Harvest open then refuses, so the drain of the restore can start.
         replicas.release(&key);
         replace_database(&db);
-        replicas.prepare(&key, &path, &db, None).unwrap();
-        assert_eq!(autumn_harvest_sqlite::fleet_epoch::read(&path).unwrap(), 6);
+        let refused = replicas.prepare(&key, &path, &db, None).unwrap_err();
+        assert!(refused.contains("is ending"), "{refused}");
         assert!(matches!(entry(&path), Some(Entry::Pending { .. })), "kept");
 
         // The restore drains, releases and publishes.
@@ -1824,6 +1836,30 @@ mod tests {
             replicas.prepare(&key, &path, &db, None).is_err(),
             "the target applies"
         );
+    }
+
+    /// An open after the publish of a restore and before its return
+    /// refuses. It never serves the Harvest file of another point in time.
+    #[test]
+    fn an_open_before_the_return_waits_for_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let replicas = replicas(dir.path());
+        let (key, path, db) = shipped_acme(dir.path(), &replicas);
+        replicas.request_restore(&key, unreachable());
+        replicas.release(&key);
+        replace_database(&db);
+
+        let refused = replicas.prepare(&key, &path, &db, None).unwrap_err();
+        assert!(refused.contains("is ending"), "{refused}");
+        assert_eq!(autumn_harvest_sqlite::fleet_epoch::read(&path).unwrap(), 1);
+        replicas.restore_returned(&key);
+        assert!(
+            replicas.prepare(&key, &path, &db, None).is_err(),
+            "the target applies after the return"
+        );
+        assert!(matches!(entry(&path), Some(Entry::Pending { .. })));
+        replicas.end_restore(&key, true);
+        assert!(matches!(entry(&path), Some(Entry::Committed { .. })));
     }
 
     /// A release drops a target whose database file is gone. An inode number

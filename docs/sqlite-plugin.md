@@ -228,6 +228,8 @@ API behind `api_with_auth` outside `dev`.
 - A direct `DatabaseFleet::restore` to a point in time restores the
   Harvest file at its latest state. Use `HarvestFleet::restore` for one
   target on both files.
+- An open of a tenant refuses in the short time between the publish of
+  its `HarvestFleet::restore` and the return. Open it again.
 - Do not run a direct restore of a tenant while a `HarvestFleet::restore`
   of it runs. A direct restore that publishes just before the
   `HarvestFleet::restore` returns can take its target.

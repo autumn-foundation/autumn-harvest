@@ -72,6 +72,7 @@ gives a rule.
 | The open restores a Harvest file that already follows the database | A superseded entry forces a restore only when the Harvest file has no database record. |
 | A stale-epoch open releases between the request and the drain | Each release before the return writes the target again, from the entry before the request. The release of the drain comes last. |
 | An open during the drain removes the pending target | The open reads the entry from before the request. It keeps the pending target and drops the earlier one, which it used. |
+| An open after the publish and before the return serves the wrong point in time | When the pending target of an unreturned restore moved, the open refuses. A retry after the return applies the target. The refusal also frees the drain from a stale-epoch open. |
 | A dropped caller skips `end_restore`, or gives its request to the next restore | The request, the fleet restore and the end run in one owned task, under the restore turn. |
 | A release cannot write the target | The request records the release. `end_restore` then writes the committed target. |
 | A crash leaves an unreadable target, and each open refuses | A release replaces an unreadable entry. A write syncs the file before the rename. |
@@ -138,4 +139,27 @@ stateDiagram-v2
    end in one owned task, under the restore turn.
 2. `release` takes the target lock. Before the fleet restore returns, it
    writes the pending entry again, from the entry before the request.
-   After that
+   After that, it binds the entry to the current file.
+3. `end_restore` takes the lock. While the file holds its pending entry,
+   it writes a committed entry, or puts `previous` back.
+4. `prepare` takes the lock for the whole open. Before the return, it
+   refuses when the pending entry moved. Otherwise, before the return, it
+   reads the entry from before the request and keeps the pending entry.
+   After the return, it applies the result, then removes the file.
+5. `on_delete` removes the target file.
+
+## 7. Acceptance criteria
+
+1. A test runs `HarvestFleet::restore(Some(t1))`, then a direct
+   `DatabaseFleet::restore(None)`, then an open. The Harvest file is at
+   its latest state.
+2. A test runs `HarvestFleet::restore(Some(t1))`, then a direct restore
+   that fails, then an open. The Harvest file is at `t1`.
+
+## 8. Test plan
+
+| Test | Proves |
+|---|---|
+| `formal/verus/src/restore_target.rs` | The kernel for every input. Each step keeps the invariant, so each open that does not refuse applies the target of the last finished `HarvestFleet::restore`, and none after a successful direct restore. An identity can come back. A release before the drain does no harm. An open between the publish and the return refuses. |
+| `replica` unit tests | The entry format and the older format, the lock, and the rows of section 4 except the dropped caller. |
+| `sqlite_plugin_fleet_replica` | AC 1 and 2 on a real app, and a dropped caller. |

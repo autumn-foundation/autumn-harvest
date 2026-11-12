@@ -164,6 +164,9 @@ pub enum Run<T> {
     /// The restore of `target` did not return. `written` is the entry of
     /// its last release.
     Asked { target: T, written: Option<Entry<T>> },
+    /// The restore of `target` published `pending`'s file, or failed. It
+    /// did not return.
+    Published { target: T, pending: Entry<T>, ok: bool },
     /// The fleet restore returned. The end did not run.
     Returned { pending: Entry<T>, ok: bool },
 }
@@ -184,8 +187,10 @@ pub enum Step<T> {
     /// A release while the restore did not return. A stale-epoch open
     /// makes one, and so does the drain of the restore.
     Release,
-    /// The restore publishes the file `to`, or fails, and returns.
+    /// The restore publishes the file `to`, or fails.
     Publish { ok: bool, to: nat },
+    /// The fleet restore returns.
+    Return,
     /// `end_restore`.
     End,
     /// `end_restore` fails to write. The entry stays.
@@ -203,6 +208,7 @@ pub enum Step<T> {
 pub open spec fn opens<T>(w: World<T>) -> Option<T> {
     match w.run {
         Run::Asked { written, .. } => applies(seen(w.file, written), w.db),
+        Run::Published { pending, .. } => applies(seen(w.file, Some(pending)), w.db),
         _ => applies(w.file, w.db),
     }
 }
@@ -228,6 +234,27 @@ pub open spec fn released<T>(w: World<T>) -> World<T> {
     }
 }
 
+/// Whether an open refuses in `w`. The pending entry of a restore that
+/// did not return moved, so a publish ran. A refused open changes nothing.
+pub open spec fn refused<T>(w: World<T>) -> bool {
+    match w.run {
+        Run::Asked { written, .. } => match written {
+            Some(entry) => moved_pending(w, entry),
+            None => false,
+        },
+        Run::Published { pending, .. } => moved_pending(w, pending),
+        _ => false,
+    }
+}
+
+/// Whether the file holds `entry`, a pending entry whose file moved.
+pub open spec fn moved_pending<T>(w: World<T>, entry: Entry<T>) -> bool {
+    w.file == Some(entry) && match entry {
+        Entry::Pending { from, .. } => from != w.db,
+        Entry::Committed { .. } => false,
+    }
+}
+
 /// Whether `step` can happen in `w`.
 pub open spec fn valid<T>(w: World<T>, step: Step<T>) -> bool {
     match step {
@@ -243,11 +270,12 @@ pub open spec fn valid<T>(w: World<T>, step: Step<T>) -> bool {
             },
             _ => false,
         },
+        Step::Return => w.run is Published,
         Step::End => w.run is Returned,
         Step::EndFails => w.run is Returned,
-        Step::Direct { ok, to } => ok ==> to != w.db,
-        Step::Open => true,
-        Step::Delete { .. } => true,
+        Step::Direct { ok, to } => !(w.run is Published) && (ok ==> to != w.db),
+        Step::Open => !refused(w),
+        Step::Delete { .. } => !(w.run is Published),
     }
 }
 
@@ -260,12 +288,16 @@ pub open spec fn step<T>(w: World<T>, step: Step<T>) -> World<T> {
             Run::Asked { target, written } => match written {
                 Some(entry) => World {
                     db: if ok { to } else { w.db },
-                    run: Run::Returned { pending: entry, ok },
+                    run: Run::Published { target, pending: entry, ok },
                     want: if ok { Some(target) } else { w.want },
                     ..w
                 },
                 None => w,
             },
+            _ => w,
+        },
+        Step::Return => match w.run {
+            Run::Published { pending, ok, .. } => World { run: Run::Returned { pending, ok }, ..w },
             _ => w,
         },
         Step::End => match w.run {
@@ -321,6 +353,22 @@ pub open spec fn step<T>(w: World<T>, step: Step<T>) -> World<T> {
                 },
                 None => World { file: None, want: None, ..w },
             },
+            Run::Published { target, pending, ok } => if w.file == Some(pending) {
+                match pending {
+                    Entry::Pending { target: pended, from, .. } => {
+                        let kept = Entry::Pending { target: pended, from, previous: None };
+                        World {
+                            file: Some(kept),
+                            run: Run::Published { target, pending: kept, ok },
+                            want: None,
+                            ..w
+                        }
+                    },
+                    Entry::Committed { .. } => World { file: None, want: None, ..w },
+                }
+            } else {
+                World { file: None, want: None, ..w }
+            },
             _ => World { file: None, want: None, ..w },
         },
         Step::Delete { to } => World { db: to, file: None, want: None, ..w },
@@ -338,6 +386,16 @@ pub open spec fn inv<T>(w: World<T>) -> bool {
                 Entry::Committed { .. } => false,
             },
             None => true,
+        },
+        Run::Published { target, pending, ok } => match pending {
+            Entry::Pending { target: pended, from, previous } => pended == target && if w.file
+                == Some(pending) {
+                (ok ==> from != w.db && w.want == Some(pended)) && (!ok ==> from == w.db
+                    && w.want == previous)
+            } else {
+                applies(w.file, w.db) == w.want
+            },
+            Entry::Committed { .. } => false,
         },
         Run::Returned { pending, ok } => match pending {
             Entry::Pending { target, from, previous } => if w.file == Some(pending) {
@@ -384,10 +442,11 @@ pub proof fn theorem_each_step_keeps_the_invariant<T>(w: World<T>, s: Step<T>)
     }
 }
 
-/// Each open applies the target that it must apply.
+/// Each open that does not refuse applies the target that it must apply.
 pub proof fn theorem_an_open_applies_the_wanted_target<T>(w: World<T>)
     requires
         inv(w),
+        !refused(w),
     ensures
         opens(w) == w.want,
 {
@@ -412,7 +471,8 @@ pub proof fn theorem_every_run_keeps_the_invariant<T>(w: World<T>, steps: Seq<St
     requires
         inv(w),
     ensures
-        run_all(w, steps) matches Some(end) ==> inv(end) && opens(end) == end.want,
+        run_all(w, steps) matches Some(end) ==> inv(end) && (!refused(end) ==> opens(end)
+            == end.want),
     decreases steps.len(),
 {
     if steps.len() > 0 && valid(w, steps[0]) {
@@ -426,7 +486,8 @@ pub open spec fn restore_then_direct<T>(w: World<T>, target: T, to: nat, ok: boo
     let asked = step(w, Step::Ask { target });
     let drained = step(asked, Step::Release);
     let published = step(drained, Step::Publish { ok: true, to });
-    let ended = step(published, Step::End);
+    let returned = step(published, Step::Return);
+    let ended = step(returned, Step::End);
     step(ended, Step::Direct { ok, to: again })
 }
 
@@ -453,8 +514,10 @@ proof fn lemma_restore_then_direct<T>(w: World<T>, target: T, to: nat, ok: bool,
     theorem_each_step_keeps_the_invariant(asked, Step::Release);
     let published = step(drained, Step::Publish { ok: true, to });
     theorem_each_step_keeps_the_invariant(drained, Step::Publish { ok: true, to });
-    let ended = step(published, Step::End);
-    theorem_each_step_keeps_the_invariant(published, Step::End);
+    let returned = step(published, Step::Return);
+    theorem_each_step_keeps_the_invariant(published, Step::Return);
+    let ended = step(returned, Step::End);
+    theorem_each_step_keeps_the_invariant(returned, Step::End);
     theorem_each_step_keeps_the_invariant(ended, Step::Direct { ok, to: again });
 }
 
@@ -497,8 +560,8 @@ pub proof fn theorem_a_failed_direct_restore_keeps_the_target<T>(
 }
 
 /// A stale-epoch open releases and replaces the database between the
-/// request and the drain of a restore. The open applies the target of the
-/// restore all the same.
+/// request and the drain of a restore. Its Harvest open refuses. The next
+/// open applies the target of the restore all the same.
 pub proof fn theorem_a_release_before_the_drain_does_no_harm<T>(
     w: World<T>,
     target: T,
@@ -514,25 +577,43 @@ pub proof fn theorem_a_release_before_the_drain_does_no_harm<T>(
         ({
             let asked = step(w, Step::Ask { target });
             let replaced = step(asked, Step::Direct { ok: true, to: stale });
-            let opened = step(replaced, Step::Open);
-            let drained = step(opened, Step::Release);
+            refused(replaced) && ({
+            let drained = step(replaced, Step::Release);
             let published = step(drained, Step::Publish { ok: true, to });
-            let ended = step(published, Step::End);
+            let ended = step(step(published, Step::Return), Step::End);
             opens(ended) == Some(target)
+            })
         }),
 {
     let asked = step(w, Step::Ask { target });
     theorem_each_step_keeps_the_invariant(w, Step::Ask { target });
     let replaced = step(asked, Step::Direct { ok: true, to: stale });
     theorem_each_step_keeps_the_invariant(asked, Step::Direct { ok: true, to: stale });
-    let opened = step(replaced, Step::Open);
-    theorem_each_step_keeps_the_invariant(replaced, Step::Open);
-    let drained = step(opened, Step::Release);
-    theorem_each_step_keeps_the_invariant(opened, Step::Release);
+    let drained = step(replaced, Step::Release);
+    theorem_each_step_keeps_the_invariant(replaced, Step::Release);
     let published = step(drained, Step::Publish { ok: true, to });
     theorem_each_step_keeps_the_invariant(drained, Step::Publish { ok: true, to });
-    let ended = step(published, Step::End);
-    theorem_each_step_keeps_the_invariant(published, Step::End);
+    let returned = step(published, Step::Return);
+    theorem_each_step_keeps_the_invariant(published, Step::Return);
+    let ended = step(returned, Step::End);
+    theorem_each_step_keeps_the_invariant(returned, Step::End);
+}
+
+/// An open after the publish of a restore and before its return refuses.
+/// So no open applies the entry from before the request to the new file.
+pub proof fn theorem_an_open_before_the_return_refuses<T>(w: World<T>, target: T, to: nat)
+    requires
+        inv(w),
+        w.run is Idle,
+        to != w.db,
+    ensures
+        ({
+            let drained = step(step(w, Step::Ask { target }), Step::Release);
+            valid(drained, Step::Publish { ok: true, to }) && refused(
+                step(drained, Step::Publish { ok: true, to }),
+            )
+        }),
+{
 }
 
 } // verus!

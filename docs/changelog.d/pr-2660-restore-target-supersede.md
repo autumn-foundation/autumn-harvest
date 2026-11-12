@@ -14,7 +14,8 @@ open. A direct `DatabaseFleet::restore` before that open no longer leaves
   release binds the target that applies now to the current file, or drops
   it. So an old inode number never revives a target.
 - **Open.** An open before the fleet restore returns reads the entry from
-  before the request, and keeps the pending entry.
+  before the request, and keeps the pending entry. When that entry moved,
+  a publish ran, so the open refuses until the return.
 - **Robustness.** `HarvestFleet::restore` runs in an owned task, so a
   dropped caller never skips the end. A release replaces an unreadable
   entry, and a write syncs the file. An entry in the older format applies
