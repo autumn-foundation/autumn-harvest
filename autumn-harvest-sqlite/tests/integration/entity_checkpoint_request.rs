@@ -157,11 +157,11 @@ async fn a_request_ends_the_run_after_its_op_and_carries_the_rest() {
         .await
         .unwrap();
     assert_eq!(state["ops"], json!(["a", "cut", "b"]));
-    let stats = rt
+    let counters = rt
         .query(runs[1], ENTITY_STATS_QUERY, json!(null))
         .await
         .unwrap();
-    assert_eq!(stats["checkpoints"], json!(1));
+    assert_eq!(counters["checkpoints"], json!(1));
     assert_replays(&mut rt, &cut_log_info()).await;
 }
 

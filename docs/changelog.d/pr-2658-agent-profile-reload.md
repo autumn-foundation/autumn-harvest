@@ -10,6 +10,8 @@ the recorded profile. The design is in `docs/design/DESIGN-2658.md`.
   good read ends the run at a checkpoint after the op. The next run reads
   the profile at its start, so each later op runs on it. The reload op
   books the heartbeat and sets the search attributes with the new profile.
+  A changed heartbeat interval drops the old booking, as
+  `Control::SetHeartbeat` does.
 - `Entity::run_with_wakes_and_checkpoints` is a new engine hook. After each
   op, the loop calls `take` on the state, before the snapshot. A `true`
   ends the run at a checkpoint after that op. `run` and `run_with_wakes`

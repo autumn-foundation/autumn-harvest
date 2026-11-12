@@ -1827,7 +1827,8 @@ async fn reload(
   the profile at its start, as each run does, and the ops that wait move to
   it. `Entity::run_with_wakes_and_checkpoints` takes that checkpoint.
 - The reload op books the heartbeat and sets the search attributes with
-  the profile that it read.
+  the profile that it read. A changed interval drops the old booking, so
+  the next tick comes one new interval after the reload.
 - Every other field changes at the next run, `max_ops_per_run` and the
   mandate included.
 - A waiting op that does not fit the checkpoint input runs first, on the

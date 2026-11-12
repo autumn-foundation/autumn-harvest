@@ -1551,11 +1551,21 @@ impl AgentRun<'_> {
         if let Some(loaded) = &loaded {
             let read = loaded.profile.as_ref().map(Some).map_err(String::as_str);
             let (next, error) = reloaded(profile, read);
-            profile = next;
-            match error {
-                Some(err) => fail(&mut state, &format!("the profile reload failed: {err}")),
-                None => state.reload_requested = true,
+            if let Some(err) = error {
+                fail(&mut state, &format!("the profile reload failed: {err}"));
+            } else {
+                state.reload_requested = true;
+                // A new interval books a new tick, as `SetHeartbeat` does.
+                let every = |profile| {
+                    state
+                        .effective_heartbeat(profile)
+                        .map(AgentHeartbeat::every_ms)
+                };
+                if every(profile) != every(next) {
+                    state.next_heartbeat_ms = None;
+                }
             }
+            profile = next;
         }
         schedule(&mut state, profile, booked_at, ticked);
         state.last_active_ms = Some(now);

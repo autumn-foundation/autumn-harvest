@@ -513,3 +513,38 @@ async fn reload_profiles_reads_every_page() {
     }
     assert_eq!(sqlite::reload_profiles(&mut rt, "support").unwrap(), agents);
 }
+
+/// A reload that changes the heartbeat interval books the next tick with
+/// the new interval. A booking of the old interval does not stay.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reload_rebooks_a_changed_heartbeat() {
+    let (_dir, db) = fresh_db();
+    let agent = id("support", "acct-9");
+    let daily = AgentHeartbeat::every(Duration::from_hours(24));
+    let mut rt = runtime(
+        &db,
+        AgentHarness::new(model(1)).agent(AgentProfile::new("support").heartbeat(daily)),
+    );
+    say(&mut rt, &agent, "one");
+    sqlite::drive(&mut rt, &agent).await.unwrap();
+    assert!(state(&rt, &agent).await.next_heartbeat_ms.is_some());
+
+    let minute = AgentHeartbeat::every(Duration::from_secs(60));
+    let profile = AgentProfile::new("support").heartbeat(minute);
+    sqlite::register(
+        &mut rt,
+        Arc::new(AgentHarness::new(model(0)).agent(profile)),
+    );
+    reload(&mut rt, &agent);
+    let before = Utc::now().timestamp_millis();
+    sqlite::drive(&mut rt, &agent).await.unwrap();
+    let after = Utc::now().timestamp_millis();
+    let booked = state(&rt, &agent)
+        .await
+        .next_heartbeat_ms
+        .expect("a tick is booked");
+    assert!(
+        (before + 60_000..=after + 60_000).contains(&booked),
+        "one new interval after the reload: {booked}"
+    );
+}
