@@ -8,8 +8,10 @@ closed tenant fired only when a request opened the tenant again.
   milliseconds: an unfired timer, an unpaused schedule slot, an activity
   retry backoff, a run backoff or a run deadline. Each source counts only
   for a running run. A disabled scheduler gives no slot. A backoff counts
-  only while it is in the future. `next_wake_after(after)` skips the
-  deadlines up to a bound. The read finds the running runs through the
+  until a drive starts its run. `next_wake_since(consumed)` keeps a
+  backoff that ended after the last drive, so a tenant that closes between
+  two drives keeps it. `next_wake_after(after)` skips the deadlines up to a
+  bound. The read finds the running runs through the
   state index, and reads timers and tasks by run key.
 - Each tenant driver records in a memory book: now when work starts, the
   value at each idle point when it changes, and the final value at the

@@ -52,7 +52,8 @@ How could this change fail? Each answer gives a guard.
 |---|---|
 | Report a deadline that a drive never clears, such as a timer of a run that fails on each drive. The sweep then opens the tenant on each tick. | A value due before the last idle pass started is stuck. The driver reports the earlier of the next healthy deadline and `now + 60 s`. |
 | Let one stuck run hide a healthy timer of the same tenant. | `next_wake_after(pass_started)` finds the next healthy deadline. |
-| Count `start_at` of a run that started long ago. | `start_at` and `local_retry_at` count only while they are in the future. |
+| Count `start_at` of a run that started long ago. | `start_at` and `local_retry_at` count only when they end after the start of the last drive. |
+| Drop a backoff that ended after the last drive, when the tenant closes before the next drive. | The driver reads with `next_wake_since(last drive start)`, so the backoff stays a deadline. |
 | Count a schedule while the scheduler is off, or a timer of a terminal run. | A disabled scheduler gives no slot. Each source joins a running run. |
 | Wake a tenant on two hosts. A slot runs twice. | The read keeps the owned ranges. The sweep checks `owns`. The Harvest file advances a slot in its fire transaction. |
 | A host that lost a range writes over the row of the new owner. | A flush drops each key that this host does not own. |

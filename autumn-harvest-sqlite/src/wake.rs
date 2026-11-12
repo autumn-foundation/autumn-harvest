@@ -11,8 +11,9 @@
 //! - the deadline of a running run;
 //! - the backoff of a running run (`start_at` and `local_retry_at`).
 //!
-//! A backoff gates a drive only while it is in the future. A drive does not
-//! clear it. So a past backoff is no deadline.
+//! A backoff gates a drive only until it ends. A drive does not clear it.
+//! So a backoff that ended before the last drive started is no deadline.
+//! One that ended later still is: no drive has started its run yet.
 
 use rusqlite::{Connection, params};
 
@@ -52,9 +53,11 @@ SELECT MIN(at) FROM (
 /// The earliest time, in epoch milliseconds, at which a drive has due work
 /// after `after`. `None` when no source has such a deadline.
 ///
-/// `now` is the clock of the runtime. `schedules` is `false` while the
-/// scheduler is off. A slot then fires nothing, so it is no deadline. Pass
-/// `i64::MIN` as `after` for every deadline.
+/// `consumed` is the start of the last drive. That drive started each run
+/// whose backoff ended before it. So a backoff counts only after
+/// `consumed`. `schedules` is `false` while the scheduler is off. A slot
+/// then fires nothing, so it is no deadline. Pass `i64::MIN` as `after` for
+/// every deadline.
 ///
 /// # Errors
 ///
@@ -62,12 +65,12 @@ SELECT MIN(at) FROM (
 /// fails.
 pub fn next_wake_after(
     conn: &Connection,
-    now: i64,
+    consumed: i64,
     schedules: bool,
     after: i64,
 ) -> SqliteResult<Option<i64>> {
     let mut stmt = conn.prepare_cached(NEXT_WAKE_AT_SQL)?;
-    Ok(stmt.query_row(params![now, schedules, after], |row| row.get(0))?)
+    Ok(stmt.query_row(params![consumed, schedules, after], |row| row.get(0))?)
 }
 
 #[cfg(test)]

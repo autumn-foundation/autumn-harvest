@@ -52,6 +52,19 @@ async fn retrier(ctx: &WorkflowContext, n: i64) -> Result<i64, String> {
         .map_err(|e| e.to_string())
 }
 
+/// Fails at once. Its workflow retry waits ten minutes.
+#[workflow(retry = RetryPolicy {
+    max_attempts: 2,
+    initial_interval: Duration::from_secs(600),
+    backoff_coefficient: 1.0,
+    max_interval: Duration::from_secs(600),
+    non_retryable_errors: Vec::new(),
+    jitter: autumn_harvest::policy::JitterPolicy::None,
+})]
+async fn flaky_run(_ctx: &WorkflowContext, _n: i64) -> Result<(), String> {
+    Err("boom".to_owned())
+}
+
 /// Waits for `go` with a 30-second execution timeout.
 #[workflow(execution_timeout = "30s")]
 async fn bounded(ctx: &WorkflowContext, _n: i64) -> Result<(), String> {
@@ -68,6 +81,7 @@ fn runtime_at(path: &std::path::Path, clock: &Arc<AtomicI64>) -> SqliteRuntime {
     rt.register_workflow(&waiter_info());
     rt.register_workflow(&retrier_info());
     rt.register_workflow(&bounded_info());
+    rt.register_workflow(&flaky_run_info());
     rt.register_activity(&always_fails_info());
     rt
 }
@@ -222,4 +236,28 @@ async fn a_past_run_backoff_is_not_a_deadline() {
         rt.poll_once().await.unwrap();
     }
     assert_eq!(rt.next_wake_at().unwrap(), None, "nothing is left to drive");
+}
+
+/// A run backoff that expired after the last pass still counts. No pass
+/// started the run yet, so a stop must keep the deadline.
+#[tokio::test]
+async fn an_unconsumed_run_backoff_counts_since_the_last_pass() {
+    let (_dir, clock, mut rt) = fixture();
+    rt.start_workflow("flaky_run", json!(0)).unwrap();
+    rt.poll_once().await.unwrap();
+    let retry_at = T0 + 10 * MINUTE;
+    assert_eq!(rt.next_wake_at().unwrap(), Some(retry_at));
+
+    // The backoff passes, and no pass runs.
+    clock.store(retry_at + MINUTE, Ordering::SeqCst);
+    assert_eq!(
+        rt.next_wake_at().unwrap(),
+        None,
+        "as of now: consumed or not"
+    );
+    assert_eq!(rt.next_wake_since(T0).unwrap(), Some(retry_at));
+
+    // A pass after the backoff starts the retry. It fails for good.
+    rt.poll_once().await.unwrap();
+    assert_eq!(rt.next_wake_since(retry_at + MINUTE).unwrap(), None);
 }

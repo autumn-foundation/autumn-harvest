@@ -418,7 +418,8 @@ impl WakeReport {
         if quiet(self.dirty, self.last, now) {
             return;
         }
-        let raw = match runtime.next_wake_at() {
+        // A backoff that ended during the pass still counts.
+        let raw = match runtime.next_wake_since(pass_started) {
             Ok(raw) => raw,
             Err(error) => {
                 tracing::warn!(tenant = %self.tenant, %error, "cannot read the next wake time");
@@ -450,7 +451,8 @@ impl WakeReport {
             self.book.record(&self.tenant, Some(now));
             return;
         }
-        let raw = runtime.next_wake_at().ok().flatten();
+        // A backoff that ended after the last pass still counts.
+        let raw = runtime.next_wake_since(self.last_pass).ok().flatten();
         let stuck = raw.is_some_and(|at| at <= self.last_pass);
         let later = || runtime.next_wake_after(self.last_pass).ok().flatten();
         self.book

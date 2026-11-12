@@ -667,7 +667,9 @@ impl SqliteRuntime {
     /// - the slots of unpaused schedules.
     ///
     /// A slot counts only while schedules are on. A backoff counts only
-    /// while it is in the future.
+    /// while it is in the future. See
+    /// [`next_wake_since`](Self::next_wake_since) for a backoff that ended
+    /// after the last drive.
     ///
     /// ```rust,ignore
     /// let mut rt = SqliteRuntime::open(&path)?;
@@ -680,11 +682,26 @@ impl SqliteRuntime {
     ///
     /// Returns [`SqliteError::Sqlite`] when the read fails.
     pub fn next_wake_at(&self) -> SqliteResult<Option<i64>> {
-        self.next_wake_after(i64::MIN)
+        self.next_wake_since((self.now_fn)().timestamp_millis())
     }
 
-    /// As [`next_wake_at`](Self::next_wake_at), but only the deadlines after
-    /// `after`, in epoch milliseconds.
+    /// As [`next_wake_at`](Self::next_wake_at), for a caller that knows
+    /// when the last drive started, in epoch milliseconds.
+    ///
+    /// A backoff that ended after `consumed` still counts: no drive has
+    /// started its run yet. A driver that stops between two drives passes
+    /// the start of the last one, so it keeps such a deadline.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqliteError::Sqlite`] when the read fails.
+    pub fn next_wake_since(&self, consumed: i64) -> SqliteResult<Option<i64>> {
+        crate::wake::next_wake_after(&self.conn, consumed, self.schedules_enabled, i64::MIN)
+    }
+
+    /// As [`next_wake_since`](Self::next_wake_since), but only the deadlines
+    /// after `after`, in epoch milliseconds. `after` is also the start of
+    /// the last drive.
     ///
     /// A deadline that a drive cannot clear stays in the past. This read
     /// then still finds the next healthy deadline.
@@ -693,8 +710,7 @@ impl SqliteRuntime {
     ///
     /// Returns [`SqliteError::Sqlite`] when the read fails.
     pub fn next_wake_after(&self, after: i64) -> SqliteResult<Option<i64>> {
-        let now = (self.now_fn)().timestamp_millis();
-        crate::wake::next_wake_after(&self.conn, now, self.schedules_enabled, after)
+        crate::wake::next_wake_after(&self.conn, after, self.schedules_enabled, after)
     }
 
     /// Set the app state that `ctx.state::<T>()` returns (issue #2467).
