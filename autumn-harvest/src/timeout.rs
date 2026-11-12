@@ -315,10 +315,17 @@ pub const fn workflow_history_ceiling_query() -> &'static str {
 /// pending request goes first, so newer arrivals cannot starve a backlog.
 /// Note `timestamp` is caller-settable, so this is request order and not
 /// append order; `id` is append order and decides every tie.
+///
+/// The result names the columns of [`crate::models::HarvestEvent`]. A cached
+/// statement must name its columns, so each scanner keeps its plan prepared.
+/// Each event type in the text is a literal, so the generic plan still proves
+/// the predicate of `idx_harvest_events_external_outbox_pending`.
 macro_rules! external_outbox_claim_query {
     (requested = $requested:literal, resolved = ($first:literal, $second:literal), key = $key:literal) => {
         concat!(
-            "SELECT e.* FROM harvest_events e \
+            "SELECT e.id, e.workflow_exec_id, e.event_id, e.event_type, e.event_data, \
+                    e.timestamp \
+             FROM harvest_events e \
              JOIN LATERAL ( \
                  SELECT 1 AS running_exec FROM harvest_workflow_executions x \
                  WHERE x.id = e.workflow_exec_id \
@@ -4442,6 +4449,7 @@ pub async fn enforce_external_signals_outbox(
                 let row_opt: Option<crate::models::HarvestEvent> = diesel::sql_query(sql)
                     .bind::<diesel::sql_types::Array<diesel::sql_types::Integer>, _>(&shards)
                     .bind::<diesel::sql_types::Array<diesel::sql_types::BigInt>, _>(&excluded)
+                    .cache_prepared()
                     .get_result(conn)
                     .await
                     .optional()
@@ -4959,6 +4967,7 @@ pub async fn enforce_external_cancels_outbox(
                 let row_opt: Option<crate::models::HarvestEvent> = diesel::sql_query(sql)
                     .bind::<diesel::sql_types::Array<diesel::sql_types::Integer>, _>(&shards)
                     .bind::<diesel::sql_types::Array<diesel::sql_types::BigInt>, _>(&excluded)
+                    .cache_prepared()
                     .get_result(conn)
                     .await
                     .optional()
@@ -5624,6 +5633,7 @@ pub async fn enforce_external_awaits_outbox(
                 let row_opt: Option<crate::models::HarvestEvent> = diesel::sql_query(sql)
                     .bind::<diesel::sql_types::Array<diesel::sql_types::Integer>, _>(&shards)
                     .bind::<diesel::sql_types::Array<diesel::sql_types::BigInt>, _>(&excluded)
+                    .cache_prepared()
                     .get_result(conn)
                     .await
                     .optional()

@@ -277,6 +277,18 @@ pub const fn waiter_keys_for_holder_stmt() -> &'static str {
     "SELECT DISTINCT lock_key FROM harvest_mutex_waiters WHERE waiter_exec_id = $1 ORDER BY lock_key"
 }
 
+/// Every key of `$1` in one read: the keys that it holds (`part` 0), then
+/// the distinct keys that it waits on (`part` 1). Each part is ordered by
+/// key, as [`held_keys_for_holder_stmt`] and [`waiter_keys_for_holder_stmt`]
+/// order it.
+#[must_use]
+pub const fn terminal_keys_for_holder_stmt() -> &'static str {
+    "SELECT 0 AS part, lock_key FROM harvest_mutex_locks WHERE holder_exec_id = $1 \
+     UNION ALL \
+     SELECT DISTINCT 1 AS part, lock_key FROM harvest_mutex_waiters WHERE waiter_exec_id = $1 \
+     ORDER BY part, lock_key"
+}
+
 /// Candidate expired leases whose holder is not `PAUSED` (unlocked SELECT — the
 /// scanner re-checks under the advisory lock before reclaiming). No `FOR UPDATE`.
 #[must_use]
@@ -441,7 +453,8 @@ mod db_ops {
         enqueue_waiter_stmt, expired_leases_stmt, grant_lock_stmt, head_of_line_stmt,
         held_keys_for_holder_stmt, holder_holds_any_stmt, is_grantable_head_stmt,
         reclaim_expired_lock_and_wake_target_stmt, release_lock_by_holder_key_stmt,
-        release_lock_stmt, renew_leases_for_holder_stmt, waiter_keys_for_holder_stmt,
+        release_lock_stmt, renew_leases_for_holder_stmt, terminal_keys_for_holder_stmt,
+        waiter_keys_for_holder_stmt,
     };
     use crate::cached_stmt::CachePreparedDsl as _;
     use crate::error::{HarvestResult, database_error};
@@ -465,6 +478,15 @@ mod db_ops {
 
     #[derive(diesel::QueryableByName)]
     struct KeyRow {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        lock_key: String,
+    }
+
+    /// One row of [`terminal_keys_for_holder_stmt`].
+    #[derive(diesel::QueryableByName)]
+    struct PartKeyRow {
+        #[diesel(sql_type = diesel::sql_types::Integer)]
+        part: i32,
         #[diesel(sql_type = diesel::sql_types::Text)]
         lock_key: String,
     }
@@ -708,12 +730,27 @@ mod db_ops {
             .await
             .map_err(database_error)?;
 
-        for k in keys {
-            advisory_lock(conn, &k.lock_key).await?;
+        free_held_keys(conn, holder, keys.into_iter().map(|k| k.lock_key)).await?;
+        Ok(())
+    }
+
+    /// Free each of `keys` that `holder` still holds, and wake its new head
+    /// of line. Returns the keys that it freed.
+    ///
+    /// A freed key also loses the waiter row of `holder`, so the waiter sweep
+    /// skips it.
+    async fn free_held_keys(
+        conn: &mut AsyncPgConnection,
+        holder: ExecutionId,
+        keys: impl IntoIterator<Item = String>,
+    ) -> HarvestResult<Vec<String>> {
+        let mut freed = Vec::new();
+        for key in keys {
+            advisory_lock(conn, &key).await?;
 
             let released: Option<AcquiredAtRow> =
                 diesel::sql_query(release_lock_by_holder_key_stmt())
-                    .bind::<diesel::sql_types::Text, _>(&k.lock_key)
+                    .bind::<diesel::sql_types::Text, _>(&key)
                     .bind::<diesel::sql_types::Uuid, _>(holder.as_uuid())
                     .cache_prepared()
                     .get_result(conn)
@@ -723,20 +760,21 @@ mod db_ops {
 
             if released.is_some() {
                 diesel::sql_query(delete_holder_waiter_for_key_stmt())
-                    .bind::<diesel::sql_types::Text, _>(&k.lock_key)
+                    .bind::<diesel::sql_types::Text, _>(&key)
                     .bind::<diesel::sql_types::Uuid, _>(holder.as_uuid())
                     .cache_prepared()
                     .execute(conn)
                     .await
                     .map_err(database_error)?;
 
-                if let Some(head) = head_of_line(conn, &k.lock_key).await? {
+                if let Some(head) = head_of_line(conn, &key).await? {
                     crate::queue::wake_workflow_task(conn, head).await?;
                 }
+                freed.push(key);
             }
         }
 
-        Ok(())
+        Ok(freed)
     }
 
     /// Remove every waiter row for `exec_id` across all keys and wake each key's
@@ -762,18 +800,28 @@ mod db_ops {
             .await
             .map_err(database_error)?;
 
-        for k in keys {
-            advisory_lock(conn, &k.lock_key).await?;
+        drop_waiter_keys(conn, exec_id, keys.into_iter().map(|k| k.lock_key)).await
+    }
+
+    /// Remove the waiter row of `exec_id` on each of `keys`, and wake the new
+    /// head of line of each key.
+    async fn drop_waiter_keys(
+        conn: &mut AsyncPgConnection,
+        exec_id: ExecutionId,
+        keys: impl IntoIterator<Item = String>,
+    ) -> HarvestResult<()> {
+        for key in keys {
+            advisory_lock(conn, &key).await?;
 
             diesel::sql_query(delete_holder_waiter_for_key_stmt())
-                .bind::<diesel::sql_types::Text, _>(&k.lock_key)
+                .bind::<diesel::sql_types::Text, _>(&key)
                 .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
                 .cache_prepared()
                 .execute(conn)
                 .await
                 .map_err(database_error)?;
 
-            if let Some(head) = head_of_line(conn, &k.lock_key).await? {
+            if let Some(head) = head_of_line(conn, &key).await? {
                 crate::queue::wake_workflow_task(conn, head).await?;
             }
         }
@@ -862,6 +910,15 @@ mod db_ops {
     /// Guarded. Folded into the
     /// terminal-transition chokepoint in a later milestone.
     ///
+    /// One table probe and one key read cover both sweeps. A run with no lock
+    /// and no waiter row thus costs two statements. The waiter sweep skips
+    /// each key that the lock sweep freed, because that free also deleted the
+    /// waiter row. So it does the same work as
+    /// [`release_all_locks_for_holder`] then [`delete_waiters_for_holder`].
+    ///
+    /// The read does not need the history of the run. A run that never took
+    /// a mutex can still hold a waiter row, so each terminal path sweeps.
+    ///
     /// # Errors
     /// Returns `HarvestError` if a database query fails.
     pub async fn sweep_terminal_holder_and_wake(
@@ -871,9 +928,20 @@ mod db_ops {
         if !table_present(conn).await? {
             return Ok(());
         }
-        release_all_locks_for_holder(conn, exec_id).await?;
-        delete_waiters_for_holder(conn, exec_id).await?;
-        Ok(())
+        let rows: Vec<PartKeyRow> = diesel::sql_query(terminal_keys_for_holder_stmt())
+            .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+            .cache_prepared()
+            .load(conn)
+            .await
+            .map_err(database_error)?;
+        let (held, waits): (Vec<PartKeyRow>, Vec<PartKeyRow>) =
+            rows.into_iter().partition(|row| row.part == 0);
+        let freed = free_held_keys(conn, exec_id, held.into_iter().map(|r| r.lock_key)).await?;
+        let waits = waits
+            .into_iter()
+            .map(|r| r.lock_key)
+            .filter(|key| !freed.contains(key));
+        drop_waiter_keys(conn, exec_id, waits).await
     }
 
     /// Any lock key `exec_id` currently holds (for the reset-reject check), or

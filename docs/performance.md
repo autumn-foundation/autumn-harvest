@@ -2269,7 +2269,7 @@ a single round trip either. It issues, in order:
 3. *(hit only)* `queue_pause::try_lock_queue_for_claim` — a
    `pg_try_advisory_xact_lock` on the queue. If it loses the race against a
    concurrent pause or resume, `queue_pause::release_claim` hands the row back
-   and the call returns "no task": same round-trip count, no claim.
+   and the call returns "no task".
 4. *(hit only)* `queue_pause::release_claim_if_queue_paused` — the authoritative
    queue-pause re-check. It is a *separate statement* precisely so it takes a
    snapshot the claim could not have; folding it into the CTE would defeat it.
@@ -2282,16 +2282,19 @@ a single round trip either. It issues, in order:
    cap.
 6. `COMMIT`.
 
-So a claim is **six** client↔server round trips when it lands on a row,
-**seven** on a capped key and **three** when the queue is empty —
-plus transaction overhead. A workflow task without a run skips the type-gated
-pause re-check, so it takes five. The
-`EXPLAIN` plan explains the *dominant* statement rather than the whole
+Steps 3 to 5 go to the server in one pipeline (see
+[the round-trip page](performance-hot-path-round-trips.md)). The server
+still runs them in order, each with its own snapshot. So a claim is
+**four** client↔server round trips when it lands on a row, on a capped key
+or not, and **three** when the queue is empty, plus transaction overhead.
+A lost queue lock adds one round trip for `queue_pause::release_claim`.
+The `EXPLAIN` plan explains the *dominant* statement rather than the whole
 measured operation. The seeded scenarios claim at most a fifth of the backlog
 they seed, so their samples are overwhelmingly hits.
 
 The tables on this page were measured before issue #2651. The settings
-were then a batch of their own. The queue lock and each re-check ran
+were then a batch of their own. Steps 3 to 5 each took a round trip of
+their own until the round-trip change. The queue lock and each re-check ran
 unnamed, at two round trips each. So a hit cost ten round trips, and a
 miss four. See
 [the hot-path statement cache](performance-hot-path-statement-cache.md).
@@ -3099,3 +3102,9 @@ standalone note rather than part of the claim-path attribution table above:
   planning against 18.6 s of execution in one `throughput` run.
   `cached_stmt` keeps them prepared (`throughput` 47.8 to 82.0 workflows/s,
   the median of six alternating pairs, `pg_stat_statements` and `perf`).
+* [`docs/performance-hot-path-round-trips.md`](performance-hot-path-round-trips.md)
+  — the round trips that the audit left (issue #2654). The claim rechecks
+  and the wake-ingest reads go in pipelines, the notify sender reads and
+  sends in one statement, and the low-risk poll-tick scanners stay
+  prepared (`throughput` 71.8 to 78.5 workflows/s, the median of six
+  alternating pairs, `pg_stat_statements`).

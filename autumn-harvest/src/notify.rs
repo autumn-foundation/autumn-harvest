@@ -1842,6 +1842,115 @@ struct GateRow {
     /// `txid_status()` of each staged id, in order.
     #[diesel(sql_type = diesel::sql_types::Array<diesel::sql_types::Nullable<Text>>)]
     statuses: Vec<Option<String>>,
+    /// The number of wakes that the read sent, or `NULL` when it sent none.
+    /// Only [`GATE_AND_SEND_SQL`] fills it.
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::BigInt>)]
+    sent: Option<i64>,
+}
+
+/// The commit-state read of [`tick`].
+///
+/// `txid_status` raises an error for an id that this server has not assigned
+/// yet. The `CASE` guard therefore reads no id at or past the snapshot `xmax`.
+/// No such transaction has completed, so the guard reports it in progress.
+macro_rules! gate_columns_sql {
+    () => {
+        "SELECT current_database()::text AS database, \
+                pg_postmaster_start_time() AS started_at, \
+                pg_notification_queue_usage() AS queue_usage, \
+                ARRAY(SELECT CASE WHEN t.x < txid_snapshot_xmax(txid_current_snapshot()) \
+                                  THEN txid_status(t.x) ELSE 'in progress' END \
+                      FROM unnest($1::bigint[]) WITH ORDINALITY AS t(x, n) \
+                      ORDER BY t.n) AS statuses"
+    };
+}
+
+/// The commit-state read alone. A tick runs it after [`GATE_AND_SEND_SQL`]
+/// fails, so a failed send still leaves a good read.
+const GATE_SQL: &str = concat!(gate_columns_sql!(), ", NULL::bigint AS sent");
+
+/// The commit-state read that also sends the wakes when every note is ready.
+///
+/// `$2` and `$3` are the server of every held note, `$4` and `$5` the
+/// channels and payloads of the wakes. The statement sends them only when
+/// the server is that server and no status is aborted or in progress. That is
+/// the case where [`tick`] sends every wake after the read. A `NULL` in `$2`
+/// turns the send off.
+///
+/// The send is a scalar subquery in a `CASE` branch. Postgres runs such a
+/// subquery only when the branch is taken.
+/// `notify_post_commit_tests` proves that an aborted or open note sends
+/// nothing. `array_position` reads a `NULL` status as no match, where
+/// `= ANY` would give `NULL`.
+const GATE_AND_SEND_SQL: &str = concat!(
+    "WITH g AS MATERIALIZED (",
+    gate_columns_sql!(),
+    ") SELECT g.database, g.started_at, g.queue_usage, g.statuses, \
+       CASE WHEN g.database = $2 AND g.started_at = $3 \
+                 AND array_position(g.statuses, 'aborted') IS NULL \
+                 AND array_position(g.statuses, 'in progress') IS NULL \
+            THEN (SELECT count(pg_notify(w.c, w.p)) \
+                  FROM unnest($4::text[], $5::text[]) AS w(c, p)) \
+       END AS sent \
+     FROM g"
+);
+
+/// The wakes that a tick sends with its read, and the server they need.
+///
+/// A tick can send in its read only when every held note names one server.
+/// The wakes are those of every note but the owner notes, which need a
+/// lookup first. `None` when no such wake exists.
+fn wakes_with_the_read(held: &[Staged]) -> Option<(Fingerprint, Vec<(String, String)>)> {
+    let first = held.first()?;
+    if held
+        .iter()
+        .any(|staged| staged.fingerprint != first.fingerprint)
+    {
+        return None;
+    }
+    let notes: Vec<Note> = held
+        .iter()
+        .filter(|staged| !matches!(staged.note, Note::Owner { .. }))
+        .map(|staged| staged.note.clone())
+        .collect();
+    let wakes = coalesce(notes);
+    if wakes.is_empty() {
+        return None;
+    }
+    Some(((*first.fingerprint).clone(), wakes))
+}
+
+/// Read the commit state, and send `wakes` in the same statement when every
+/// note is ready.
+async fn read_gate(
+    conn: &mut AsyncPgConnection,
+    txids: Vec<i64>,
+    wakes: Option<(Fingerprint, Vec<(String, String)>)>,
+) -> Result<GateRow, diesel::result::Error> {
+    use diesel::sql_types::{Array, BigInt, Nullable, Timestamptz};
+    let (server, wakes) = wakes.map_or((None, Vec::new()), |(fp, w)| (Some(fp), w));
+    let (channels, payloads): (Vec<String>, Vec<String>) = wakes.into_iter().unzip();
+    diesel::sql_query(GATE_AND_SEND_SQL)
+        .bind::<Array<BigInt>, _>(txids)
+        .bind::<Nullable<Text>, _>(server.as_ref().map(|fp| fp.database.as_str()))
+        .bind::<Nullable<Timestamptz>, _>(server.as_ref().map(|fp| fp.started_at))
+        .bind::<Array<Text>, _>(channels)
+        .bind::<Array<Text>, _>(payloads)
+        .cache_prepared()
+        .get_result::<GateRow>(conn)
+        .await
+}
+
+/// Read the commit state alone. See [`GATE_SQL`].
+async fn read_gate_only(
+    conn: &mut AsyncPgConnection,
+    txids: Vec<i64>,
+) -> Result<GateRow, diesel::result::Error> {
+    diesel::sql_query(GATE_SQL)
+        .bind::<diesel::sql_types::Array<diesel::sql_types::BigInt>, _>(txids)
+        .cache_prepared()
+        .get_result::<GateRow>(conn)
+        .await
 }
 
 /// The notes a sender task holds.
@@ -1960,27 +2069,24 @@ fn age_out(sink: &SinkShared, held: &mut Vec<Staged>) {
 /// A note staged against another server is dropped and counted, because its
 /// transaction id means nothing here.
 ///
-/// `txid_status` raises an error for an id that this server has not assigned
-/// yet. The `CASE` guard therefore reads no id at or past the snapshot `xmax`.
-/// No such transaction has completed, so the guard reports it in progress.
+/// In the common tick every note is ready. The read then sends the wakes in
+/// the same statement, see [`GATE_AND_SEND_SQL`]. Otherwise the read sends
+/// nothing, and the tick sends the ready wakes in a second statement, as
+/// before. When the combined statement fails, the tick reads again with no
+/// send. A failed send thus still gives a good read, and the second send
+/// counts its wakes as lost.
 ///
 /// Returns `false` when the commit state cannot be read. The notes then stay
 /// held for the next tick.
 async fn tick(sink: &SinkShared, conn: &mut AsyncPgConnection, held: &mut Vec<Staged>) -> bool {
     let txids: Vec<i64> = held.iter().filter_map(|staged| staged.txid).collect();
-    let gate = diesel::sql_query(
-        "SELECT current_database()::text AS database, \
-                pg_postmaster_start_time() AS started_at, \
-                pg_notification_queue_usage() AS queue_usage, \
-                ARRAY(SELECT CASE WHEN t.x < txid_snapshot_xmax(txid_current_snapshot()) \
-                                  THEN txid_status(t.x) ELSE 'in progress' END \
-                      FROM unnest($1::bigint[]) WITH ORDINALITY AS t(x, n) \
-                      ORDER BY t.n) AS statuses",
-    )
-    .bind::<diesel::sql_types::Array<diesel::sql_types::BigInt>, _>(txids)
-    .cache_prepared()
-    .get_result::<GateRow>(conn)
-    .await;
+    let gate = match read_gate(conn, txids.clone(), wakes_with_the_read(held)).await {
+        Ok(gate) => Ok(gate),
+        Err(error) => {
+            tracing::debug!(error = %error, "harvest: notify read with its send failed");
+            read_gate_only(conn, txids).await
+        }
+    };
     let gate = match gate {
         Ok(gate) => gate,
         Err(error) => {
@@ -1988,6 +2094,7 @@ async fn tick(sink: &SinkShared, conn: &mut AsyncPgConnection, held: &mut Vec<St
             return false;
         }
     };
+    let sent_with_the_read = gate.sent;
     let fingerprint = Fingerprint {
         database: gate.database,
         started_at: gate.started_at,
@@ -2043,7 +2150,13 @@ async fn tick(sink: &SinkShared, conn: &mut AsyncPgConnection, held: &mut Vec<St
     sink.record(rejected, &"Postgres rejects the channel name");
     let wakes = coalesce(ready_notes);
     let count = wakes.len();
-    if count > 0 {
+    // The read sent these wakes only when every note was ready on this
+    // server. The classification above then found each note ready.
+    debug_assert!(
+        sent_with_the_read.is_none_or(|sent| usize::try_from(sent).ok() == Some(count)),
+        "the read sent the wakes of the tick"
+    );
+    if count > 0 && sent_with_the_read.is_none() {
         send_counted(sink, count, send_wakes(conn, wakes)).await;
     }
     if !owner_notes.is_empty() {

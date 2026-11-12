@@ -5561,7 +5561,7 @@ pub const fn release_claim_if_workflow_paused_query() -> &'static str {
 ///
 /// Returns [`crate::error::HarvestError::Database`] on query failure.
 pub async fn release_claim_if_workflow_paused(
-    conn: &mut AsyncPgConnection,
+    conn: &AsyncPgConnection,
     task_id: Uuid,
     worker_id: &str,
 ) -> HarvestResult<bool> {

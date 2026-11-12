@@ -104,6 +104,8 @@ mod claim_concurrency_tests;
 #[cfg(feature = "db")]
 mod claim_continuation_priority_tests;
 #[cfg(feature = "db")]
+mod claim_recheck_pipeline_db_tests;
+#[cfg(feature = "db")]
 mod claim_run_deadline_tests;
 #[cfg(feature = "db")]
 mod claim_seek_tests;
@@ -255,6 +257,8 @@ mod mixed_suspension_tests;
 mod mixed_suspension_timer_batch_perf;
 #[cfg(feature = "db")]
 mod mutex_lease_reclaim_perf;
+#[cfg(feature = "db")]
+mod mutex_terminal_sweep_db_tests;
 #[cfg(feature = "db")]
 mod mutex_tests;
 mod nd_block_tests;

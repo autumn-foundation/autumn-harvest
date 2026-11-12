@@ -1,0 +1,8 @@
+# RED phase: the claim pipeline order tests, run with the queue lock moved
+# after the pause recheck in the join4 arguments. Three tests fail.
+test claim_recheck_pipeline_db_tests::an_unpaused_queue_keeps_its_claim ... ok
+test claim_recheck_pipeline_db_tests::a_failed_queue_lock_gives_the_row_back ... ok
+test claim_recheck_pipeline_db_tests::the_pause_recheck_runs_under_the_lock_on_a_warm_connection ... FAILED
+test claim_recheck_pipeline_db_tests::the_pause_recheck_runs_under_the_lock_on_a_cold_connection ... FAILED
+test claim_recheck_pipeline_db_tests::the_pause_recheck_runs_under_the_lock_when_only_the_recheck_is_prepared ... FAILED
+test result: FAILED. 2 passed; 3 failed; 0 ignored; 0 measured; 5334 filtered out; finished in 0.96s
