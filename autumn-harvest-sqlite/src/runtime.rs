@@ -471,6 +471,15 @@ impl Drop for SqliteRuntime {
     }
 }
 
+/// Who checkpoints the WAL of the runtime's file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Checkpointer {
+    /// `SQLite`, with its default auto checkpoint.
+    Sqlite,
+    /// An external replicator. The runtime never checkpoints.
+    External,
+}
+
 /// A wall-clock source for the public drivers — see [`SqliteRuntime::set_clock`].
 ///
 /// `Fn`-based (not a stored timestamp) precisely so it can be re-read on every
@@ -497,7 +506,33 @@ impl SqliteRuntime {
     pub fn open(path: impl AsRef<Path>) -> SqliteResult<Self> {
         let conn = Connection::open(path.as_ref())?;
         let writer_lock = lock::acquire(&conn, path.as_ref())?;
-        Self::from_connection(conn, writer_lock)
+        Self::from_connection(conn, writer_lock, Checkpointer::Sqlite)
+    }
+
+    /// As [`open`](Self::open), for a file that an external replicator ships.
+    ///
+    /// The connection sets `wal_autocheckpoint = 0` before any other
+    /// statement. The replicator is then the only checkpointer of the file.
+    /// It copies the main file as a base for the shipped WAL frames, and a
+    /// second checkpointer would change that file behind it.
+    ///
+    /// # Errors
+    ///
+    /// As [`open`](Self::open).
+    pub fn open_replicated(path: impl AsRef<Path>) -> SqliteResult<Self> {
+        let conn = Connection::open(path.as_ref())?;
+        let writer_lock = lock::acquire(&conn, path.as_ref())?;
+        Self::from_connection(conn, writer_lock, Checkpointer::External)
+    }
+
+    /// Record that a fleet host opens this file under `epoch`. It never
+    /// lowers the recorded epoch. See [`fleet_epoch`](crate::fleet_epoch).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqliteError::Sqlite`] when the write fails.
+    pub fn raise_fleet_epoch(&self, epoch: u64) -> SqliteResult<()> {
+        crate::fleet_epoch::raise_on(&self.conn, epoch)
     }
 
     /// Open a private, in-memory database (each call is a fresh, empty database —
@@ -511,11 +546,15 @@ impl SqliteRuntime {
     pub fn open_in_memory() -> SqliteResult<Self> {
         let conn = Connection::open_in_memory()?;
         let writer_lock = lock::acquire(&conn, Path::new(":memory:"))?;
-        Self::from_connection(conn, writer_lock)
+        Self::from_connection(conn, writer_lock, Checkpointer::Sqlite)
     }
 
     /// Apply the pragmas and the schema, and reclaim orphaned tasks.
-    fn prepare(conn: &Connection) -> SqliteResult<()> {
+    fn prepare(conn: &Connection, checkpointer: Checkpointer) -> SqliteResult<()> {
+        if checkpointer == Checkpointer::External {
+            // First, so no later statement of this connection checkpoints.
+            conn.execute_batch("PRAGMA wal_autocheckpoint = 0;")?;
+        }
         // Durability & concurrency posture (issue #1068). This backend makes a
         // deliberate, conservative durability claim (a committed transaction
         // survives a crash/power-loss — the crash-then-reopen tests depend on it),
@@ -553,6 +592,7 @@ impl SqliteRuntime {
     fn from_connection(
         mut conn: Connection,
         writer_lock: Option<WriterLock>,
+        checkpointer: Checkpointer,
     ) -> SqliteResult<Self> {
         // Each transaction takes the write lock when it begins (issue #2469).
         // A second writer, such as the auth store, can share the file. A
@@ -562,7 +602,7 @@ impl SqliteRuntime {
         conn.set_transaction_behavior(rusqlite::TransactionBehavior::Immediate);
         // A failed setup builds no runtime, so `Drop` never runs. Release the
         // lock here, or an in-memory owner row would outlive the failed open.
-        if let Err(err) = Self::prepare(&conn) {
+        if let Err(err) = Self::prepare(&conn, checkpointer) {
             if let Some(lock) = &writer_lock {
                 lock.release(&conn);
             }
@@ -7771,5 +7811,39 @@ mod transaction_behavior_tests {
         other
             .execute_batch("CREATE TABLE IF NOT EXISTS probe (x INTEGER)")
             .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod replicated_open_tests {
+    use super::SqliteRuntime;
+
+    fn autocheckpoint(runtime: &SqliteRuntime) -> i64 {
+        runtime
+            .conn
+            .query_row("PRAGMA wal_autocheckpoint", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    /// A shipped file has one checkpointer: the replicator.
+    #[test]
+    fn a_replicated_open_turns_the_auto_checkpoint_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let plain = SqliteRuntime::open(dir.path().join("plain.db")).unwrap();
+        assert_ne!(autocheckpoint(&plain), 0, "the default stays");
+        let shipped = SqliteRuntime::open_replicated(dir.path().join("shipped.db")).unwrap();
+        assert_eq!(autocheckpoint(&shipped), 0);
+    }
+
+    /// The runtime records its fleet epoch and never lowers it.
+    #[test]
+    fn the_runtime_raises_the_fleet_epoch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("acme.harvest.db");
+        let runtime = SqliteRuntime::open_replicated(&path).unwrap();
+        assert_eq!(crate::fleet_epoch::read(&path).unwrap(), 0);
+        runtime.raise_fleet_epoch(4).unwrap();
+        runtime.raise_fleet_epoch(2).unwrap();
+        assert_eq!(crate::fleet_epoch::read(&path).unwrap(), 4);
     }
 }
