@@ -3941,11 +3941,10 @@ pub const fn recheck_verdict(acquired: bool, released: bool) -> RecheckVerdict {
 /// `state = 'RUNNING'`. When the lock fails, the rechecks still run without
 /// it. A recheck can only give the row back, so that is safe.
 async fn apply_post_claim_rechecks(
-    conn: &mut AsyncPgConnection,
+    shared: &AsyncPgConnection,
     task: TaskQueueItem,
     worker_id: &str,
 ) -> HarvestResult<ClaimOutcome> {
-    let shared: &AsyncPgConnection = conn;
     // Commit-order barrier (issue #619). The re-check below
     // reads a snapshot taken *before* this transaction commits, so on its own
     // it cannot stop a pause from committing — and being acknowledged to the

@@ -1725,7 +1725,7 @@ async fn a_claim_that_beat_the_pause_is_released_with_its_attempt_restored() {
         .await
         .expect("pause");
 
-    let released = queue_pause::release_claim_if_queue_paused(&mut conn, task_id, "w1")
+    let released = queue_pause::release_claim_if_queue_paused(&conn, task_id, "w1")
         .await
         .expect("release");
     assert!(released, "a claim on a now-paused queue must be released");
@@ -1775,7 +1775,7 @@ async fn an_ordinary_claim_is_not_released_when_the_queue_is_not_paused() {
     let task_id = enqueue_activity(&mut conn, &q, None).await;
     assert_eq!(claim_one(&mut conn, &q).await, Some(task_id));
 
-    let released = queue_pause::release_claim_if_queue_paused(&mut conn, task_id, "w1")
+    let released = queue_pause::release_claim_if_queue_paused(&conn, task_id, "w1")
         .await
         .expect("release");
     assert!(
@@ -2525,7 +2525,7 @@ async fn a_pause_does_not_stall_a_hashtext_colliding_queue() {
     // A claim on the *colliding* queue must still get its shared barrier.
     let mut claimer = connect(&url).await;
     claimer.batch_execute("BEGIN").await.expect("claimer begin");
-    let acquired = autumn_harvest::queue_pause::try_lock_queue_for_claim(&mut claimer, &colliding)
+    let acquired = autumn_harvest::queue_pause::try_lock_queue_for_claim(&claimer, &colliding)
         .await
         .expect("probe the claim barrier on the colliding queue");
     assert!(
@@ -2539,7 +2539,7 @@ async fn a_pause_does_not_stall_a_hashtext_colliding_queue() {
     // the fix cannot have simply disabled the barrier.
     let mut same = connect(&url).await;
     same.batch_execute("BEGIN").await.expect("same begin");
-    let same_acquired = autumn_harvest::queue_pause::try_lock_queue_for_claim(&mut same, &paused)
+    let same_acquired = autumn_harvest::queue_pause::try_lock_queue_for_claim(&same, &paused)
         .await
         .expect("probe the claim barrier on the paused queue");
     assert!(

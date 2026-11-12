@@ -325,7 +325,7 @@ async fn resolver_signal_delivers_to_running_predecessor() {
     .expect("resolve+signal should succeed");
     assert_eq!(outcome, ByIdSignalOutcome::Delivered);
 
-    let pending = signal::load_pending_signals(&mut conn, pred)
+    let pending = signal::load_pending_signals(&conn, pred)
         .await
         .expect("load pending signals");
     assert_eq!(pending.len(), 1, "signal must be queued against pred");
@@ -356,14 +356,14 @@ async fn resolver_signal_delivers_to_successor_after_can() {
     .expect("resolve+signal should succeed");
     assert_eq!(outcome, ByIdSignalOutcome::Delivered);
 
-    let pending_pred = signal::load_pending_signals(&mut conn, pred)
+    let pending_pred = signal::load_pending_signals(&conn, pred)
         .await
         .expect("load pending signals for pred");
     assert!(
         pending_pred.is_empty(),
         "the stale predecessor must never receive the signal"
     );
-    let pending_succ = signal::load_pending_signals(&mut conn, succ)
+    let pending_succ = signal::load_pending_signals(&conn, succ)
         .await
         .expect("load pending signals for succ");
     assert_eq!(
@@ -420,7 +420,7 @@ async fn resolver_signal_terminal_current_run_is_not_running() {
     .expect("resolve+signal should succeed");
     assert_eq!(outcome, ByIdSignalOutcome::NotRunning);
 
-    let pending = signal::load_pending_signals(&mut conn, exec_id)
+    let pending = signal::load_pending_signals(&conn, exec_id)
         .await
         .expect("load pending signals");
     assert!(pending.is_empty(), "no signal should ever be queued");
@@ -487,7 +487,7 @@ async fn resolver_signal_keyed_retry_after_target_went_terminal_is_delivered_not
          the target has since gone terminal"
     );
 
-    let pending = signal::load_pending_signals(&mut conn, exec_id)
+    let pending = signal::load_pending_signals(&conn, exec_id)
         .await
         .expect("load pending signals");
     assert_eq!(
@@ -556,7 +556,7 @@ async fn resolver_signal_keyed_retry_after_continue_as_new_does_not_double_deliv
          predecessor execution in the same (workflow_name, workflow_id) chain"
     );
 
-    let pending_succ = signal::load_pending_signals(&mut conn, succ)
+    let pending_succ = signal::load_pending_signals(&conn, succ)
         .await
         .expect("load pending signals for succ");
     assert!(
@@ -740,8 +740,8 @@ async fn resolver_signal_races_to_successor_exactly_mid_delivery() {
          never a false Delivered"
     );
 
-    let mut verify_conn = connect(&url).await;
-    let pending_pred = signal::load_pending_signals(&mut verify_conn, pred)
+    let verify_conn = connect(&url).await;
+    let pending_pred = signal::load_pending_signals(&verify_conn, pred)
         .await
         .expect("load pending signals for pred");
     assert!(
@@ -976,16 +976,16 @@ async fn randomized_signal_by_id_continue_as_new_race_zero_misdeliveries() {
         }));
     }
 
-    let mut verify_conn = connect(&url).await;
+    let verify_conn = connect(&url).await;
     let mut delivered_to_pred = 0usize;
     let mut delivered_to_succ = 0usize;
     let mut raced_then_retried = 0usize;
     for (i, h) in handles.into_iter().enumerate() {
         let (pred, succ, outcome, retried) = h.await.expect("trial task should not panic");
-        let pred_pending = signal::load_pending_signals(&mut verify_conn, pred)
+        let pred_pending = signal::load_pending_signals(&verify_conn, pred)
             .await
             .expect("load pred pending signals");
-        let succ_pending = signal::load_pending_signals(&mut verify_conn, succ)
+        let succ_pending = signal::load_pending_signals(&verify_conn, succ)
             .await
             .expect("load succ pending signals");
 
@@ -1026,10 +1026,10 @@ async fn randomized_signal_by_id_continue_as_new_race_zero_misdeliveries() {
                     "trial {i}: retrying after RacedToSuccessor must deliver, \
                      got {retried:?}"
                 );
-                let pred_pending_after = signal::load_pending_signals(&mut verify_conn, pred)
+                let pred_pending_after = signal::load_pending_signals(&verify_conn, pred)
                     .await
                     .expect("load pred pending signals after retry");
-                let succ_pending_after = signal::load_pending_signals(&mut verify_conn, succ)
+                let succ_pending_after = signal::load_pending_signals(&verify_conn, succ)
                     .await
                     .expect("load succ pending signals after retry");
                 assert!(

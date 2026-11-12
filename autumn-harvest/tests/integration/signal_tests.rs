@@ -99,7 +99,7 @@ async fn test_send_and_load_signals() {
         .unwrap();
 
     // Load initial - should be empty
-    let signals = load_pending_signals(&mut conn, exec_id).await.unwrap();
+    let signals = load_pending_signals(&conn, exec_id).await.unwrap();
     assert!(signals.is_empty());
 
     // Send a signal
@@ -109,7 +109,7 @@ async fn test_send_and_load_signals() {
         .unwrap();
 
     // Load again
-    let signals = load_pending_signals(&mut conn, exec_id).await.unwrap();
+    let signals = load_pending_signals(&conn, exec_id).await.unwrap();
     assert_eq!(signals.len(), 1);
     assert_eq!(signals[0].signal_name, "test_signal");
     assert_eq!(signals[0].payload, payload);
@@ -177,7 +177,7 @@ async fn test_mark_signals_consumed() {
         .await
         .unwrap();
 
-    let signals = load_pending_signals(&mut conn, exec_id).await.unwrap();
+    let signals = load_pending_signals(&conn, exec_id).await.unwrap();
     assert_eq!(signals.len(), 2);
 
     // Mark first signal consumed
@@ -187,7 +187,7 @@ async fn test_mark_signals_consumed() {
         .unwrap();
 
     // Load again
-    let pending_signals = load_pending_signals(&mut conn, exec_id).await.unwrap();
+    let pending_signals = load_pending_signals(&conn, exec_id).await.unwrap();
     assert_eq!(pending_signals.len(), 1);
     assert_eq!(pending_signals[0].id, signals[1].id);
     assert_eq!(pending_signals[0].signal_name, "sig2");
@@ -196,7 +196,7 @@ async fn test_mark_signals_consumed() {
     mark_signals_consumed(&mut conn, &ids_to_mark)
         .await
         .unwrap(); // Empty list test
-    let pending_signals = load_pending_signals(&mut conn, exec_id).await.unwrap();
+    let pending_signals = load_pending_signals(&conn, exec_id).await.unwrap();
     assert_eq!(pending_signals.len(), 1);
 }
 
@@ -276,7 +276,7 @@ async fn idempotent_signal_with_same_key_lands_exactly_once() {
     }
 
     // Exactly one row queued.
-    let signals = load_pending_signals(&mut conn, exec_id).await.unwrap();
+    let signals = load_pending_signals(&conn, exec_id).await.unwrap();
     assert_eq!(
         signals.len(),
         1,
@@ -310,7 +310,7 @@ async fn idempotent_signal_with_distinct_keys_lands_each_time() {
         assert!(delivered, "each distinct key is a fresh delivery");
     }
 
-    let signals = load_pending_signals(&mut conn, exec_id).await.unwrap();
+    let signals = load_pending_signals(&conn, exec_id).await.unwrap();
     assert_eq!(
         signals.len(),
         4,
@@ -332,7 +332,7 @@ async fn unkeyed_signal_preserves_at_least_once_behavior() {
         assert!(delivered, "unkeyed deliveries always report delivered=true");
     }
 
-    let signals = load_pending_signals(&mut conn, exec_id).await.unwrap();
+    let signals = load_pending_signals(&conn, exec_id).await.unwrap();
     assert_eq!(
         signals.len(),
         3,
@@ -368,14 +368,8 @@ async fn idempotency_key_is_scoped_per_execution() {
     .unwrap();
 
     assert!(a && b, "same key on distinct executions both deliver");
-    assert_eq!(
-        load_pending_signals(&mut conn, exec_a).await.unwrap().len(),
-        1
-    );
-    assert_eq!(
-        load_pending_signals(&mut conn, exec_b).await.unwrap().len(),
-        1
-    );
+    assert_eq!(load_pending_signals(&conn, exec_a).await.unwrap().len(), 1);
+    assert_eq!(load_pending_signals(&conn, exec_b).await.unwrap().len(), 1);
 }
 
 #[tokio::test]
@@ -391,7 +385,7 @@ async fn plain_send_signal_still_appends_each_call() {
         .await
         .unwrap();
 
-    let signals = load_pending_signals(&mut conn, exec_id).await.unwrap();
+    let signals = load_pending_signals(&conn, exec_id).await.unwrap();
     assert_eq!(signals.len(), 2);
 }
 
@@ -419,7 +413,7 @@ async fn committed_sends_are_recorded_in_send_order() {
                 .await
                 .unwrap();
         }
-        let pending = load_pending_signals(&mut conn, exec_id).await.unwrap();
+        let pending = load_pending_signals(&conn, exec_id).await.unwrap();
         assert!(
             pending
                 .windows(2)
@@ -460,7 +454,7 @@ async fn committed_sends_are_recorded_in_send_order() {
         "SignalReceived events must follow the send order"
     );
     assert!(
-        load_pending_signals(&mut conn, exec_id)
+        load_pending_signals(&conn, exec_id)
             .await
             .unwrap()
             .is_empty(),
@@ -519,7 +513,7 @@ async fn reset_buffer_keeps_the_order_of_pending_signals() {
     .unwrap();
     assert_eq!(result.source_signals_buffered, 8);
 
-    let order: Vec<i64> = load_pending_signals(&mut conn, result.new_exec_id)
+    let order: Vec<i64> = load_pending_signals(&conn, result.new_exec_id)
         .await
         .unwrap()
         .iter()

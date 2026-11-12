@@ -459,7 +459,7 @@ async fn signal_insert_waits_for_concurrent_cancellation_lock() {
         .expect_err("signal should be rejected after cancellation commits");
     assert!(matches!(error, HarvestError::Cancelled(message) if message.contains("racing cancel")));
 
-    let pending = signal::load_pending_signals(&mut locker, exec_id)
+    let pending = signal::load_pending_signals(&locker, exec_id)
         .await
         .expect("pending signal query should succeed");
     assert!(

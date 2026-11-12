@@ -277,10 +277,11 @@ pub const fn waiter_keys_for_holder_stmt() -> &'static str {
     "SELECT DISTINCT lock_key FROM harvest_mutex_waiters WHERE waiter_exec_id = $1 ORDER BY lock_key"
 }
 
-/// Every key of `$1` in one read: the keys that it holds (`part` 0), then
-/// the distinct keys that it waits on (`part` 1). Each part is ordered by
-/// key, as [`held_keys_for_holder_stmt`] and [`waiter_keys_for_holder_stmt`]
-/// order it.
+/// Every key of `$1` in one read.
+///
+/// The keys that it holds come first (`part` 0), then the distinct keys that
+/// it waits on (`part` 1). Each part is ordered by key, as
+/// [`held_keys_for_holder_stmt`] and [`waiter_keys_for_holder_stmt`] order it.
 #[must_use]
 pub const fn terminal_keys_for_holder_stmt() -> &'static str {
     "SELECT 0 AS part, lock_key FROM harvest_mutex_locks WHERE holder_exec_id = $1 \
