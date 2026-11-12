@@ -4,6 +4,7 @@
 //! The `UNIQUE(workflow_exec_id, event_id)` constraint guarantees
 //! that two workers can't append conflicting events to the same workflow.
 
+use crate::cached_stmt::CachePreparedDsl as _;
 use crate::schema::harvest_workflow_executions_ext;
 use crate::table_split::SetExt;
 use diesel::BoolExpressionMethods;
@@ -281,9 +282,12 @@ async fn insert_events(
     stamped: bool,
 ) -> HarvestResult<(usize, Option<crate::notify::Stamp>)> {
     let _phase = crate::worker::PersistPhaseTimer::start(crate::telemetry::PersistPhase::Events);
+    // A batch insert is unsafe to cache for diesel, because its text holds
+    // the row count. A small batch has a bounded set of texts (issue #2651).
     let insert = diesel::insert_into(harvest_events::table).values(rows);
     if !stamped {
         let inserted = insert
+            .cache_small_batch(rows.len())
             .execute(conn)
             .await
             .map_err(crate::error::database_error)?;
@@ -291,6 +295,7 @@ async fn insert_events(
     }
     let stamps = insert
         .returning(crate::notify::stamp_returning())
+        .cache_small_batch(rows.len())
         .get_results::<crate::notify::Stamp>(conn)
         .await
         .map_err(crate::error::database_error)?;
@@ -781,6 +786,7 @@ pub async fn append_new_execution_started_events_batch(
                     crate::worker::PersistPhaseTimer::start(crate::telemetry::PersistPhase::Events);
                 diesel::insert_into(harvest_events::table)
                     .values(&rows)
+                    .cache_small_batch(rows.len())
                     .execute(conn)
                     .await
                     .map_err(crate::error::database_error)?;
@@ -1049,7 +1055,10 @@ pub async fn append_single_event_with_codecs(
         .find(exec_id.as_uuid())
         .for_update()
         .select(WorkflowExecution::as_select())
-        .first(conn)
+        // A load by primary key has one plan. `first` adds this limit.
+        .limit(1)
+        .cache_prepared()
+        .get_result(conn)
         .await
         .optional()
         .map_err(crate::error::database_error)?
@@ -1165,8 +1174,12 @@ pub(crate) async fn sum_history_bytes_between(
     from_event_id: i32,
     to_event_id: i32,
 ) -> HarvestResult<u64> {
-    use diesel::dsl::sql;
-    use diesel::sql_types::BigInt;
+    crate::const_sql! {
+        /// The stored bytes of the selected events. A constant fragment
+        /// keeps the statement cached (issue #2651).
+        StoredBytesSum: diesel::sql_types::BigInt =
+            "COALESCE(SUM(pg_column_size(event_data)), 0)::bigint"
+    }
 
     if from_event_id >= to_event_id {
         return Ok(0);
@@ -1175,9 +1188,7 @@ pub(crate) async fn sum_history_bytes_between(
         .filter(harvest_events::workflow_exec_id.eq(exec_id.as_uuid()))
         .filter(harvest_events::event_id.ge(from_event_id))
         .filter(harvest_events::event_id.lt(to_event_id))
-        .select(sql::<BigInt>(
-            "COALESCE(SUM(pg_column_size(event_data)), 0)::bigint",
-        ))
+        .select(crate::cached_stmt::ConstSql::<StoredBytesSum>::new())
         .first(conn)
         .await
         .map_err(crate::error::database_error)?;
@@ -1264,7 +1275,10 @@ pub async fn admit_update_event_with_codecs(
                 .find(exec_id.as_uuid())
                 .for_update()
                 .select(WorkflowExecution::as_select())
-                .first(conn)
+                // A load by primary key has one plan. `first` adds this limit.
+                .limit(1)
+                .cache_prepared()
+                .get_result(conn)
                 .await
                 .optional()
                 .map_err(crate::error::database_error)?
@@ -1795,15 +1809,19 @@ pub(crate) async fn load_history_inflated_with_bytes(
     offloader: Option<&crate::payload_store::PayloadOffloader>,
 ) -> HarvestResult<(EventHistory, u64)> {
     use crate::models::HarvestEvent;
-    use diesel::dsl::sql;
-    use diesel::sql_types::Integer;
+
+    crate::const_sql! {
+        /// The stored bytes of one event. A constant fragment keeps the
+        /// statement cached (issue #2651).
+        StoredBytes: diesel::sql_types::Integer = "pg_column_size(event_data)"
+    }
 
     let rows: Vec<(HarvestEvent, i32)> = harvest_events::table
         .filter(harvest_events::workflow_exec_id.eq(exec_id.as_uuid()))
         .order(harvest_events::event_id.asc())
         .select((
             HarvestEvent::as_select(),
-            sql::<Integer>("pg_column_size(event_data)"),
+            crate::cached_stmt::ConstSql::<StoredBytes>::new(),
         ))
         .load(conn)
         .await
@@ -2666,6 +2684,7 @@ pub async fn update_search_attrs<S: std::hash::BuildHasher + Sync>(
 
     diesel::update(dsl::harvest_workflow_executions.find(exec_id.as_uuid()))
         .set(dsl::search_attrs.eq(Some(new_attrs)))
+        .cache_prepared()
         .execute(conn)
         .await
         .map_err(crate::error::database_error)?;
@@ -2704,6 +2723,7 @@ pub async fn update_current_details(
         .set(SetExt(
             harvest_workflow_executions_ext::current_details.eq(details),
         ))
+        .cache_prepared()
         .execute(conn)
         .await
         .map_err(crate::error::database_error)?;
@@ -3091,6 +3111,7 @@ async fn append_stream_chunks_in_tx(
     // inserts below. A terminal write does not take it, so no cycle forms.
     diesel::sql_query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
         .bind::<diesel::sql_types::Text, _>(format!("harvest_stream_chunks:{}", exec_id.as_uuid()))
+        .cache_prepared()
         .execute(conn)
         .await
         .map_err(crate::error::database_error)?;

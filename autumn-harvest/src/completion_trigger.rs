@@ -1712,6 +1712,7 @@ pub fn evaluate_triggers_for_execution_collecting_with_codecs<'a>(
     use futures::FutureExt;
     async move {
         use diesel::prelude::*;
+        use crate::cached_stmt::CachePreparedDsl as _;
         use diesel_async::RunQueryDsl;
         use crate::schema::harvest_completion_triggers::dsl as triggers_dsl;
         use crate::schema::harvest_completion_trigger_fires::dsl as fires_dsl;
@@ -1725,7 +1726,10 @@ pub fn evaluate_triggers_for_execution_collecting_with_codecs<'a>(
         let execution = execs_dsl::harvest_workflow_executions
             .find(exec_id.as_uuid())
             .select(WorkflowExecution::as_select())
-            .first::<WorkflowExecution>(conn)
+            // A load by primary key has one plan. `first` adds this limit.
+            .limit(1)
+            .cache_prepared()
+            .get_result::<WorkflowExecution>(conn)
             .await
             .optional()
             .map_err(crate::error::database_error)?;

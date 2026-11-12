@@ -1373,7 +1373,9 @@ change. Design record: [`docs/design/DESIGN-1971.md`](design/DESIGN-1971.md).
   cached statement.
 - The transaction first sends `queue::CLAIM_PLAN_SETTINGS_SQL` in one
   batch: `SET LOCAL jit = off`, `SET LOCAL plan_cache_mode =
-  force_generic_plan` and `SET LOCAL enable_bitmapscan = off`.
+  force_generic_plan` and `SET LOCAL enable_bitmapscan = off`. Since issue
+  #2651 that batch also holds the `BEGIN` of the transaction, so the
+  settings cost no round trip of their own.
   - The plan carries the cost estimate of the full scan, which passes
     `jit_above_cost`.
   - A custom plan costs about 6 ms to plan on each call. On a small backlog
@@ -1761,8 +1763,10 @@ The median of about 195 sampled claim plans in each half of run 2:
   `PENDING` rows. It adds one index entry per enqueue and per non-HOT
   update of a `PENDING` row. It was 33 MB for 700,000 pending rows with distinct due times, against
   27 MB for `idx_harvest_tq_poll`, and took 2.0 s to build.
-- **One more round trip.** The planner settings go in one batch before the
-  claim. A claim on a capped key adds one more for the cap re-check. See
+- **One more round trip, on a capped key only.** A claim on a capped key
+  adds one for the cap re-check. The planner settings were a batch of
+  their own, one more round trip on every claim, until issue #2651 put
+  them in the `BEGIN` batch. See
   [what is actually timed](#what-is-actually-timed).
 - **Generic plan.** Postgres builds it once per connection, and an
   `ANALYZE` of the table invalidates it.
@@ -2240,16 +2244,20 @@ One `queue::claim_task(...)` call, wall clock, from the client. That call is **a
 whole transaction**, not the single statement the `EXPLAIN` below shows — and not
 a single round trip either. It issues, in order:
 
-1. `BEGIN ISOLATION LEVEL READ COMMITTED`. The level is pinned on the `BEGIN`
-   itself rather than inherited, so steps 5 and 6 always get a fresh snapshot.
-2. `SET LOCAL jit = off; SET LOCAL plan_cache_mode = force_generic_plan;
-   SET LOCAL enable_bitmapscan = off` (issue #1971), one batch, one round
-   trip. The claim plan carries the cost estimate of its fallback scan, and
-   that estimate can pass `jit_above_cost`. A custom plan costs more to plan
+1. `BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED; SET LOCAL jit = off;
+   SET LOCAL plan_cache_mode = force_generic_plan;
+   SET LOCAL enable_bitmapscan = off; SET LOCAL enable_sort = off`
+   (`queue::CLAIM_BEGIN_WITH_SETTINGS_SQL`, issues #1971, #2547 and #2651),
+   one batch, one round trip. The level is pinned on the `BEGIN` itself
+   rather than inherited, so steps 4 and 5 always get a fresh snapshot. The
+   claim plan carries the cost estimate of its fallback scan, and that
+   estimate can pass `jit_above_cost`. A custom plan costs more to plan
    than the claim costs to run. A bitmap scan would read a whole queue head
    instead of the window. Since issue #1971 the claim statement is also cached once per
-   connection. See [the seek window](#the-seek-window-issue-1971).
-3. **The claim CTE.** The rate-limit debit and the per-key concurrency
+   connection. See [the seek window](#the-seek-window-issue-1971). Before
+   issue #2651 the settings were a batch of their own, one round trip after
+   the `BEGIN`.
+2. **The claim CTE.** The rate-limit debit and the per-key concurrency
    advisory-lock re-check are branches *within* this statement, not extra ones —
    this is the statement the `EXPLAIN` below plans. When the DR fence is in
    force (issue #954; by default only on a database with a DR marker, issue
@@ -2258,35 +2266,42 @@ a single round trip either. It issues, in order:
    round-trip count. The published figures below were measured unfenced: the
    configuration on a database with no DR marker, and the one the plan
    applies to.
-4. *(hit only)* `queue_pause::try_lock_queue_for_claim` — a
+3. *(hit only)* `queue_pause::try_lock_queue_for_claim` — a
    `pg_try_advisory_xact_lock` on the queue. If it loses the race against a
    concurrent pause or resume, `queue_pause::release_claim` hands the row back
    and the call returns "no task": same round-trip count, no claim.
-5. *(hit only)* `queue_pause::release_claim_if_queue_paused` — the authoritative
+4. *(hit only)* `queue_pause::release_claim_if_queue_paused` — the authoritative
    queue-pause re-check. It is a *separate statement* precisely so it takes a
    snapshot the claim could not have; folding it into the CTE would defeat it.
    The activity-pause and workflow-pause re-checks follow, each only for the
    task type it can hold.
-6. *(hit on a capped concurrency key only)* `release_claim_if_over_cap`
+5. *(hit on a capped concurrency key only)* `release_claim_if_over_cap`
    (issue #1971). The claim counts the key under its own snapshot, which
    predates the advisory lock. This statement counts again in a fresh
    snapshot, under the lock, and gives the row back if the key is over its
    cap.
-7. `COMMIT`.
+6. `COMMIT`.
 
-So a published number is **seven** client↔server round trips when the claim
-lands on a row, **eight** on a capped key and **four** when the queue is empty —
+So a claim is **six** client↔server round trips when it lands on a row,
+**seven** on a capped key and **three** when the queue is empty —
 plus transaction overhead. A workflow task without a run skips the type-gated
-pause re-check, so it takes six. The
+pause re-check, so it takes five. The
 `EXPLAIN` plan explains the *dominant* statement rather than the whole
 measured operation. The seeded scenarios claim at most a fifth of the backlog
-they seed, so their samples are overwhelmingly hits. The tables
-measured before issue #1971 had no step 2 and no step 6, so they count one
-fewer, two fewer on a capped key.
+they seed, so their samples are overwhelmingly hits.
+
+The tables on this page were measured before issue #2651. The settings
+were then a batch of their own. The queue lock and each re-check ran
+unnamed, at two round trips each. So a hit cost ten round trips, and a
+miss four. See
+[the hot-path statement cache](performance-hot-path-statement-cache.md).
+The tables measured before issue #1971 had no settings batch and no step
+5, but their claim statement ran unnamed too. A hit there also cost ten
+round trips.
 
 That distinction is the first thing to reason about when moving this workload to
 a **remote** database: the round-trip count, not the query plan, is what network
-latency multiplies. Seven round trips at 1 ms of network RTT is 7 ms of floor per
+latency multiplies. Six round trips at 1 ms of network RTT is 6 ms of floor per
 claim that no amount of index tuning removes. Every number on this page was
 measured against a loopback server, so that floor is ~0 here and the plan
 dominates; that ordering inverts across a network.
@@ -3078,3 +3093,9 @@ standalone note rather than part of the claim-path attribution table above:
   timer of its run. `idx_harvest_timers_exec` now holds
   `(workflow_exec_id, fired)` (timer-lookup buffers -47%, -66% and -78% for
   runs of 250, 1,000 and 2,000 timers, `pg_stat_statements`).
+* [`docs/performance-hot-path-statement-cache.md`](performance-hot-path-statement-cache.md)
+  — an audit of the whole hot path (issue #2651). Diesel sent most hot
+  statements unnamed, so Postgres planned more than it executed: 22.2 s of
+  planning against 18.6 s of execution in one `throughput` run.
+  `cached_stmt` keeps them prepared (`throughput` 47.8 to 82.0 workflows/s,
+  the median of six alternating pairs, `pg_stat_statements` and `perf`).

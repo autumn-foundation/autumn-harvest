@@ -56,6 +56,7 @@ use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection as _, AsyncPgConnection, RunQueryDsl};
 use uuid::Uuid;
 
+use crate::cached_stmt::CachePreparedDsl as _;
 use crate::error::{HarvestError, HarvestResult};
 
 // ---------------------------------------------------------------------------
@@ -793,6 +794,7 @@ async fn resolve_owner_notes(conn: &mut AsyncPgConnection, notes: &mut Vec<Note>
                  WHERE id = ANY($1::uuid[])",
             )
             .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(ids)
+            .cache_prepared()
             .load::<OwnerRow>(conn)
             .await
         })
@@ -1275,22 +1277,40 @@ pub(crate) struct Stamp {
     started_at: DateTime<Utc>,
 }
 
+crate::const_sql! {
+    /// The id of the top-level transaction of the statement.
+    pub(crate) StampTxid: diesel::sql_types::Nullable<diesel::sql_types::BigInt> =
+        "txid_current()"
+}
+crate::const_sql! {
+    /// The database of the statement.
+    pub(crate) StampDatabase: Text = "current_database()::text"
+}
+crate::const_sql! {
+    /// The start time of the server of the statement.
+    pub(crate) StampStartedAt: diesel::sql_types::Timestamptz = "pg_postmaster_start_time()"
+}
+
 /// The `RETURNING` expressions of a [`Stamp`].
+///
+/// Each one is a constant fragment (issue #2651). A write that returns its
+/// stamp therefore stays a cached prepared statement. A `sql::<T>()`
+/// fragment made each such write parse and plan again.
 pub(crate) type StampReturning = (
-    diesel::expression::SqlLiteral<diesel::sql_types::Nullable<diesel::sql_types::BigInt>>,
-    diesel::expression::SqlLiteral<Text>,
-    diesel::expression::SqlLiteral<diesel::sql_types::Timestamptz>,
+    crate::cached_stmt::ConstSql<StampTxid>,
+    crate::cached_stmt::ConstSql<StampDatabase>,
+    crate::cached_stmt::ConstSql<StampStartedAt>,
 );
 
 /// The `RETURNING` expressions that make a write return its [`Stamp`].
 ///
 /// `txid_current()` gives the id of the top-level transaction, also inside a
 /// savepoint. Every row of one statement returns the same values.
-pub(crate) fn stamp_returning() -> StampReturning {
+pub(crate) const fn stamp_returning() -> StampReturning {
     (
-        diesel::dsl::sql("txid_current()"),
-        diesel::dsl::sql("current_database()::text"),
-        diesel::dsl::sql("pg_postmaster_start_time()"),
+        crate::cached_stmt::ConstSql::new(),
+        crate::cached_stmt::ConstSql::new(),
+        crate::cached_stmt::ConstSql::new(),
     )
 }
 
@@ -1472,18 +1492,20 @@ async fn stage_now(
 /// that wrote. After an autocommit write it reads NULL, because that write
 /// already committed.
 async fn probe(conn: &mut AsyncPgConnection, in_tx: bool) -> diesel::QueryResult<Stamp> {
-    let txid = if in_tx {
-        "txid_current()"
-    } else {
-        "txid_current_if_assigned()"
-    };
-    diesel::sql_query(format!(
-        "SELECT {txid} AS txid, \
+    // Two constant texts, so the connection caches each one (issue #2651).
+    let sql = if in_tx {
+        "SELECT txid_current() AS txid, \
                 current_database()::text AS database, \
                 pg_postmaster_start_time() AS started_at"
-    ))
-    .get_result::<Stamp>(conn)
-    .await
+    } else {
+        "SELECT txid_current_if_assigned() AS txid, \
+                current_database()::text AS database, \
+                pg_postmaster_start_time() AS started_at"
+    };
+    diesel::sql_query(sql)
+        .cache_prepared()
+        .get_result::<Stamp>(conn)
+        .await
 }
 
 /// The fallback: send `notes` on the write connection.
@@ -1714,6 +1736,7 @@ async fn send_wakes(
     diesel::sql_query("SELECT pg_notify(t.c, t.p) FROM unnest($1::text[], $2::text[]) AS t(c, p)")
         .bind::<diesel::sql_types::Array<Text>, _>(channels)
         .bind::<diesel::sql_types::Array<Text>, _>(payloads)
+        .cache_prepared()
         .execute(conn)
         .await
         .map(drop)
@@ -1870,6 +1893,7 @@ async fn tick(sink: &SinkShared, conn: &mut AsyncPgConnection, held: &mut Vec<St
                       ORDER BY t.n) AS statuses",
     )
     .bind::<diesel::sql_types::Array<diesel::sql_types::BigInt>, _>(txids)
+    .cache_prepared()
     .get_result::<GateRow>(conn)
     .await;
     let gate = match gate {
@@ -2088,6 +2112,7 @@ pub async fn notify_activity_progress_batch(
     )
     .bind::<diesel::sql_types::Array<Text>, _>(&channels)
     .bind::<diesel::sql_types::Array<Text>, _>(&payloads)
+    .cache_prepared()
     .execute(conn)
     .await
     .map_err(crate::error::database_error)?;
@@ -2108,6 +2133,7 @@ async fn send_progress(
     diesel::sql_query("SELECT pg_notify($1, $2)")
         .bind::<Text, _>(&channel)
         .bind::<Text, _>(&payload)
+        .cache_prepared()
         .execute(conn)
         .await
         .map_err(crate::error::database_error)?;

@@ -1,0 +1,13 @@
+# Runs of the `throughput` cell on the final build, 1 shard (issue #2651).
+# The final build has the review changes: the workflow start insert and
+# every load of WorkflowExecution that is not by primary key are not
+# cached, and five more statements are. No base run ran beside these, so they compare with nothing but each
+# other. Runs 1 to 3 shared the box with two leftover test containers. Runs
+# 4 to 7 ran after their removal.
+final_1 workflows_per_sec=76.39 replay_events_per_sec=9816942.15
+final_2 workflows_per_sec=79.17 replay_events_per_sec=10449863.43
+final_3 workflows_per_sec=66.75 replay_events_per_sec=9342345.93
+final_4 workflows_per_sec=91.15 replay_events_per_sec=10585656.39
+final_5 workflows_per_sec=92.41 replay_events_per_sec=9700394.48
+final_6 workflows_per_sec=87.39 replay_events_per_sec=8640844.64
+final_7 workflows_per_sec=83.66 replay_events_per_sec=10517658.96

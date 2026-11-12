@@ -8,6 +8,13 @@ tables = ["harvest_task_queue"]
 measured = "unmeasured"
 plan = "docs/ledger/plans/autumn-harvest/queue.md"
 
+["begin_claim_transaction"]
+driver = "per_task"
+backend = ["postgres"]
+kind = []
+tables = []
+measured = "docs/performance-hot-path-statement-cache.md"
+
 ["bounded_queue_depths"]
 driver = "per_tick"
 backend = ["postgres"]

@@ -341,9 +341,11 @@ async fn lock_concurrency_key(
     conn: &mut diesel_async::AsyncPgConnection,
     concurrency_key: &str,
 ) -> crate::error::HarvestResult<()> {
+    use crate::cached_stmt::CachePreparedDsl as _;
     use diesel_async::RunQueryDsl;
     diesel::sql_query("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)")
         .bind::<diesel::sql_types::Text, _>(concurrency_key)
+        .cache_prepared()
         .execute(conn)
         .await
         .map_err(crate::error::database_error)?;
