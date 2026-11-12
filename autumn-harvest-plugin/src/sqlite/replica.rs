@@ -79,6 +79,9 @@ pub const TARGET_SUFFIX: &str = ".restore-target";
 /// The text of a restore target that asks for the latest state.
 const LATEST: &str = "latest";
 
+/// The prefix of a restore target whose database restore finished.
+const COMMITTED: &str = "committed ";
+
 /// The replica prefix of the Harvest file of `key`, under the replication
 /// root `base`.
 ///
@@ -326,10 +329,12 @@ impl Replicas {
         let current = database_identity(database)?;
         let recorded = std::fs::read_to_string(suffixed(path, IDENTITY_SUFFIX)).ok();
         let target = read_target(path)?;
-        // A file with no record predates the record. Only a target then
-        // shows that the database changed.
-        let replaced =
-            recorded.map_or_else(|| target.is_some(), |recorded| recorded.trim() != current);
+        // A committed target follows a restore that the fleet finished. It
+        // applies even when the database identity did not change, as a
+        // rename on Windows can keep the creation time. A file with no
+        // record predates the record, so any target then applies.
+        let replaced = target_committed(path)
+            || recorded.map_or_else(|| target.is_some(), |recorded| recorded.trim() != current);
         if !path.exists() || replaced {
             self.drop_parked(key);
             match target {
@@ -683,13 +688,21 @@ impl Replicas {
     /// an earlier restore comes back.
     pub fn end_restore(&self, key: &FleetDbKey, restored: bool) {
         let requested = self.requested_map().remove(key);
-        if restored {
-            return;
-        }
         let file = suffixed(
             &super::fleet::tenant_harvest_file(&self.fleet.path_of(key)),
             TARGET_SUFFIX,
         );
+        if restored {
+            // The fleet replaced the database. The next open applies the
+            // target whatever the database identity says.
+            if let Ok(text) = std::fs::read_to_string(&file)
+                && !text.starts_with(COMMITTED)
+                && let Err(error) = write_atomic(&file, &format!("{COMMITTED}{}", text.trim()))
+            {
+                tracing::error!(tenant = %key, %error, "cannot commit the restore target of the tenant Harvest file");
+            }
+            return;
+        }
         match requested.and_then(|requested| requested.previous) {
             Some(previous) => {
                 if let Err(error) = write_atomic(&file, &previous) {
@@ -877,6 +890,12 @@ impl Target {
     }
 }
 
+/// Whether the restore target beside `path` belongs to a finished restore.
+fn target_committed(path: &Path) -> bool {
+    std::fs::read_to_string(suffixed(path, TARGET_SUFFIX))
+        .is_ok_and(|text| text.starts_with(COMMITTED))
+}
+
 /// The restore target beside the Harvest file at `path`, if any.
 fn read_target(path: &Path) -> Result<Option<Target>, String> {
     let file = suffixed(path, TARGET_SUFFIX);
@@ -886,6 +905,7 @@ fn read_target(path: &Path) -> Result<Option<Target>, String> {
         Err(error) => return Err(format!("cannot read {}: {error}", file.display())),
     };
     let text = text.trim();
+    let text = text.strip_prefix(COMMITTED).unwrap_or(text);
     if text == LATEST {
         return Ok(Some(Target::Latest));
     }
@@ -1146,6 +1166,31 @@ mod tests {
         replicas.release(&key);
         replicas.end_restore(&key, false);
         assert_eq!(read_target(&path).unwrap(), Some(Target::At(first)));
+    }
+
+    /// A finished restore applies its target even when the database
+    /// identity did not change.
+    #[test]
+    fn a_committed_target_applies_with_an_unchanged_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let replicas = replicas(dir.path());
+        let key = replicas.fleet.key_for("acme").unwrap();
+        let path = super::super::fleet::tenant_harvest_file(&replicas.fleet.path_of(&key));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(dir.path().join("b")).unwrap();
+        ship_at(&replicas, &key, &dir.path().join("b/acme.harvest.db"), 6);
+
+        let db = database(path.parent().unwrap(), "acme.db");
+        let runtime = autumn_harvest_sqlite::SqliteRuntime::open_replicated(&path).unwrap();
+        runtime.raise_fleet_epoch(1).unwrap();
+        drop(runtime);
+        record_database(&path, &db).unwrap();
+        replicas.request_restore(&key, None);
+        replicas.release(&key);
+        replicas.end_restore(&key, true);
+        assert!(target_committed(&path));
+        replicas.prepare(&key, &path, &db, None).unwrap();
+        assert_eq!(autumn_harvest_sqlite::fleet_epoch::read(&path).unwrap(), 6);
     }
 
     /// A target beside an unchanged database is stale. The open drops it
