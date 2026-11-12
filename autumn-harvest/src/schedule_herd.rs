@@ -104,7 +104,10 @@ pub fn forecast(
     bucket: Duration,
     min_herd: usize,
 ) -> HerdForecast {
-    let width = i64::try_from(bucket.as_secs()).unwrap_or(i64::MAX).max(1);
+    // The width counts in milliseconds, so a fractional bucket keeps its size.
+    let width = i64::try_from(bucket.as_millis())
+        .unwrap_or(i64::MAX)
+        .max(1_000);
     let min_herd = if min_herd == 0 { 2 } else { min_herd };
     let mut buckets: BTreeMap<i64, Vec<String>> = BTreeMap::new();
     let mut fires = 0;
@@ -134,7 +137,7 @@ pub fn forecast(
                 break;
             }
             read += 1;
-            let key = next.timestamp().div_euclid(width);
+            let key = next.timestamp_millis().div_euclid(width);
             buckets.entry(key).or_default().push(name.to_string());
         }
         fires += read;
@@ -146,7 +149,7 @@ pub fn forecast(
             // A caller can pass one name twice, so dedup before the threshold.
             members.sort();
             members.dedup();
-            let at = DateTime::from_timestamp(key.saturating_mul(width), 0)?;
+            let at = DateTime::from_timestamp_millis(key.saturating_mul(width))?;
             (members.len() >= min_herd).then_some(HerdSpot {
                 at,
                 schedules: members,
@@ -317,6 +320,20 @@ mod tests {
         let report = forecast(&[("s", &every_second)], at(0), at(limit + 10), MINUTE, 2);
         assert_eq!(report.fires, MAX_FIRES_PER_SCHEDULE);
         assert_eq!(report.truncated, ["s"]);
+    }
+
+    #[test]
+    fn a_fractional_bucket_keeps_its_width() {
+        let two = cron("2 * * * * *");
+        let three = cron("3 * * * * *");
+        let width = Duration::from_millis(2_500);
+        let apart = forecast(&[("two", &two), ("three", &three)], at(0), at(4), width, 2);
+        assert_eq!(apart.spots, []);
+        let five = cron("5 * * * * *");
+        let six = cron("6 * * * * *");
+        let join = forecast(&[("five", &five), ("six", &six)], at(0), at(10), width, 2);
+        let start = DateTime::from_timestamp_millis(5_000).unwrap();
+        assert_eq!(join.spots[0].at, start);
     }
 
     #[test]
