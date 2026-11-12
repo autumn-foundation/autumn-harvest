@@ -247,7 +247,7 @@ sequenceDiagram
   backoff and a run deadline. A paused schedule and a disabled scheduler
   give no slot. `None` means no deadline.
 - **Where it is kept.** The control database holds one row per tenant in
-  `harvest_tenant_wakes (tenant_key, routing_slot, next_wake_at)`. The boot
+  `harvest_tenant_wakes (tenant_key, routing_slot, next_wake_at, epoch)`. The boot
   creates the table. `TENANT_WAKES_SCHEMA_SQL` holds its DDL.
 - **How late.** A due item fires within one tick, plus the time to open
   the tenant. The sweep runs on `harvest.sqlite.tick_ms`.

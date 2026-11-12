@@ -688,22 +688,26 @@ async fn drive_loop(
             }
         }
         let pass_started = chrono::Utc::now().timestamp_millis();
-        let progressed = match runtime.poll_once().await {
-            Ok(progressed) => {
-                last_error = None;
-                progressed
-            }
-            Err(error) => {
-                // A broken run fails every pass. Log it once per change, and
-                // wait for the tick, so it cannot spin the task.
+        // A pass can move a healthy run while another run fails. The
+        // progress then still counts, so a woken tenant never settles over
+        // due work.
+        let (progressed, error) = match runtime.poll_once_reporting().await {
+            Ok(pass) => (pass.progressed, pass.error),
+            Err(error) => (false, Some(error)),
+        };
+        match error {
+            None => last_error = None,
+            Some(error) => {
+                // A broken run fails every pass. Log it once per change. A
+                // pass with no progress waits for the tick, so a broken run
+                // cannot spin the task.
                 let text = error.to_string();
                 if last_error.as_deref() != Some(text.as_str()) {
                     tracing::warn!(error = %text, "harvest-sqlite drive pass failed");
                     last_error = Some(text);
                 }
-                false
             }
-        };
+        }
         if progressed {
             touch(wake.as_deref_mut());
         }

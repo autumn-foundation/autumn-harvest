@@ -56,7 +56,8 @@ How could this change fail? Each answer gives a guard.
 | Drop a backoff that ended after the last drive, when the tenant closes before the next drive. | The driver reads with `next_wake_since(last drive start)`, so the backoff stays a deadline. |
 | Count a schedule while the scheduler is off, or a timer of a terminal run. | A disabled scheduler gives no slot. Each source joins a running run. |
 | Wake a tenant on two hosts. A slot runs twice. | The read keeps the owned ranges. The sweep checks `owns`. The Harvest file advances a slot in its fire transaction. |
-| A host that lost a range writes over the row of the new owner. | A flush drops each key that this host does not own. |
+| A host that lost a range writes over the row of the new owner. | A flush drops each key that this host does not own. Each row keeps the ownership epoch of its write, and a write under an older epoch changes nothing. The check runs in the write transaction. |
+| A pass moves a healthy run while another run fails, and the driver reads the pass as idle. | `poll_once_reporting` returns the progress and the error apart. The driver settles only after a pass with no progress. |
 | A new owner deletes the row of a tenant that it has not restored yet. | No wake removes a row. A failed wake tries again after 60 s. Only a fleet delete removes a row. |
 | Rows of other hosts, or of open tenants, fill the read. The own rows starve. | The owned-range filter, and a cursor on `(next_wake_at, tenant_key)`. |
 | A broken tenant reopens on each tick. | A failed open or start defers the row by 60 s. |
@@ -116,7 +117,7 @@ sequenceDiagram
 - `autumn-harvest-plugin/src/sqlite/wake.rs` holds the table, the book,
   the driver record and the sweep.
 - The table: `harvest_tenant_wakes (tenant_key TEXT PRIMARY KEY,
-  routing_slot INTEGER, next_wake_at INTEGER)`. `tenant_key` is
+  routing_slot INTEGER, next_wake_at INTEGER, epoch INTEGER)`. `tenant_key` is
   `FleetDbKey::name`. `NULL` means no deadline.
 - The control driver records nothing. It runs always.
 - An app with no control database runs no sweep, and the boot logs a

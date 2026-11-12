@@ -40,26 +40,36 @@ use tokio_util::sync::CancellationToken;
 
 use super::fleet::HarvestFleet;
 
-/// DDL of the wake table on the control database. Times are epoch
-/// milliseconds. A `NULL` time means no deadline. `routing_slot` lets a host
-/// read the rows of its own slot ranges only.
+/// DDL of the wake table on the control database.
+///
+/// Times are epoch milliseconds. A `NULL` time means no deadline.
+/// `routing_slot` lets a host read the rows of its own slot ranges only.
+/// `epoch` is the ownership epoch of the last write, or 0 in a fleet with no
+/// ownership.
 pub const SCHEMA_SQL: &str = "\
 CREATE TABLE IF NOT EXISTS harvest_tenant_wakes (
     tenant_key   TEXT PRIMARY KEY,
     routing_slot INTEGER NOT NULL,
-    next_wake_at INTEGER
+    next_wake_at INTEGER,
+    epoch        INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_harvest_tenant_wakes_due
     ON harvest_tenant_wakes (next_wake_at, tenant_key)
     WHERE next_wake_at IS NOT NULL;";
 
 /// Set the wake time of one tenant.
+///
+/// An ownership epoch only grows. A write under an older epoch than the row
+/// changes nothing. So a host that lost its range during a flush never
+/// overwrites the row of the new owner.
 const UPSERT_SQL: &str = "INSERT INTO harvest_tenant_wakes \
-     (tenant_key, routing_slot, next_wake_at) VALUES (?, ?, ?) \
-     ON CONFLICT (tenant_key) DO UPDATE SET next_wake_at = excluded.next_wake_at";
+     (tenant_key, routing_slot, next_wake_at, epoch) VALUES (?, ?, ?, ?) \
+     ON CONFLICT (tenant_key) DO UPDATE \
+     SET next_wake_at = excluded.next_wake_at, epoch = excluded.epoch \
+     WHERE excluded.epoch >= harvest_tenant_wakes.epoch";
 
-/// Remove the row of a deleted tenant.
-const DELETE_SQL: &str = "DELETE FROM harvest_tenant_wakes WHERE tenant_key = ?";
+/// Remove the row of a deleted tenant, under the same epoch rule.
+const DELETE_SQL: &str = "DELETE FROM harvest_tenant_wakes WHERE tenant_key = ? AND epoch <= ?";
 
 /// The due rows after a cursor, earliest first. The partial index answers
 /// it.
@@ -187,11 +197,19 @@ impl WakeBook {
         self.lock().insert(tenant.name(), Pending::Forget);
     }
 
-    /// Whether this host may write the row of `name`.
-    fn owns(&self, name: &str) -> bool {
-        self.fleet
-            .as_ref()
-            .is_none_or(|fleet| fleet.key_for_name(name).is_ok_and(|key| fleet.owns(&key)))
+    /// The ownership epoch under which this host writes the row of `name`.
+    /// `None` when this host does not own the key. A fleet with no
+    /// ownership writes under epoch 0.
+    fn epoch_of(&self, name: &str) -> Option<i64> {
+        let Some(fleet) = &self.fleet else {
+            return Some(0);
+        };
+        let key = fleet.key_for_name(name).ok()?;
+        fleet.ownership().map_or(Some(0), |ownership| {
+            ownership
+                .epoch_for(key.routing_slot())
+                .map(|epoch| i64::try_from(epoch.get()).unwrap_or(i64::MAX))
+        })
     }
 
     /// Write each pending change to the control database.
@@ -206,16 +224,23 @@ impl WakeBook {
     pub async fn flush(&self) -> Result<(), String> {
         let _turn = self.flush_turn.lock().await;
         let mut batch = std::mem::take(&mut *self.lock());
-        batch.retain(|name, _| self.owns(name));
+        let mut rows = Vec::with_capacity(batch.len());
+        batch.retain(|name, change| {
+            let epoch = self.epoch_of(name);
+            if let Some(epoch) = epoch {
+                rows.push((name.clone(), *change, epoch));
+            }
+            epoch.is_some()
+        });
         let mut taken = Taken {
             book: self,
             batch,
             written: false,
         };
-        if taken.batch.is_empty() {
+        if rows.is_empty() {
             return Ok(());
         }
-        let written = write(&self.pool, taken.batch.clone()).await;
+        let written = write(&self.pool, rows).await;
         taken.written = written.is_ok();
         written
     }
@@ -302,31 +327,35 @@ impl Drop for Taken<'_> {
     }
 }
 
-/// Write `batch` in one immediate transaction, so a flush costs one commit.
+/// One change to write: the key, the change and the ownership epoch.
+type Row = (String, Pending, i64);
+
+/// Write `rows` in one immediate transaction, so a flush costs one commit.
 ///
 /// The transaction runs as one blocking task. A dropped caller does not
-/// stop it, so the pooled connection never stays inside a transaction.
-async fn write(
-    pool: &Pool<RuntimeConnection>,
-    batch: HashMap<String, Pending>,
-) -> Result<(), String> {
+/// stop it, so the pooled connection never stays inside a transaction. The
+/// epoch rule runs inside the transaction, so it holds at the commit.
+async fn write(pool: &Pool<RuntimeConnection>, rows: Vec<Row>) -> Result<(), String> {
     let mut conn = pool
         .get()
         .await
         .map_err(|error| format!("wake write: no connection: {error}"))?;
     conn.spawn_blocking(move |conn| {
         conn.immediate_transaction(|conn| {
-            for (key, change) in &batch {
+            for (key, change, epoch) in &rows {
                 match change {
                     Pending::Set { slot, at } => diesel::RunQueryDsl::execute(
                         diesel::sql_query(UPSERT_SQL)
                             .bind::<Text, _>(key)
                             .bind::<BigInt, _>(i64::from(*slot))
-                            .bind::<Nullable<BigInt>, _>(*at),
+                            .bind::<Nullable<BigInt>, _>(*at)
+                            .bind::<BigInt, _>(*epoch),
                         conn,
                     )?,
                     Pending::Forget => diesel::RunQueryDsl::execute(
-                        diesel::sql_query(DELETE_SQL).bind::<Text, _>(key),
+                        diesel::sql_query(DELETE_SQL)
+                            .bind::<Text, _>(key)
+                            .bind::<BigInt, _>(*epoch),
                         conn,
                     )?,
                 };
@@ -845,6 +874,46 @@ mod tests {
             written: false,
         });
         assert_eq!(book.pending_at(&acme), Some(Some(2_000)));
+    }
+
+    /// A write under an older epoch than the row changes nothing. A write
+    /// under the same or a newer epoch wins.
+    #[tokio::test]
+    async fn an_older_epoch_never_overwrites_a_newer_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let book = book(dir.path()).await;
+        let acme = tenant("acme");
+        let set = |at: i64| Pending::Set {
+            slot: acme.routing_slot(),
+            at: Some(at),
+        };
+        write(&book.pool, vec![(acme.name(), set(9_000), 5)])
+            .await
+            .unwrap();
+        // The old owner writes late, under epoch 3.
+        write(&book.pool, vec![(acme.name(), set(1_000), 3)])
+            .await
+            .unwrap();
+        write(&book.pool, vec![(acme.name(), Pending::Forget, 3)])
+            .await
+            .unwrap();
+        assert_eq!(book.due_names(9_000).await.unwrap(), vec![acme.name()]);
+        assert!(
+            book.due_names(8_999).await.unwrap().is_empty(),
+            "the stale value lost"
+        );
+
+        write(&book.pool, vec![(acme.name(), set(2_000), 5)])
+            .await
+            .unwrap();
+        assert_eq!(book.due_names(2_000).await.unwrap(), vec![acme.name()]);
+        write(&book.pool, vec![(acme.name(), Pending::Forget, 6)])
+            .await
+            .unwrap();
+        assert!(
+            book.due_names(9_000).await.unwrap().is_empty(),
+            "a newer delete wins"
+        );
     }
 
     /// The DDL runs twice with no error, so each boot can run it.

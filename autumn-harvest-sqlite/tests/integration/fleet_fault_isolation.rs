@@ -488,3 +488,29 @@ async fn run_until_idle_converges_past_a_persistently_broken_running_execution()
         ExecutionOutcome::Completed(ref v) if v.as_i64() == Some(12)
     ));
 }
+
+/// `poll_once_reporting` keeps the progress of a pass apart from its first
+/// error. A driver then does not read a pass that moved a healthy run as
+/// idle only because another run failed.
+#[tokio::test]
+async fn poll_once_reporting_keeps_progress_beside_the_error() {
+    let (mut rt, broken) = runtime_with_headroom(|rt| {
+        rt.register_workflow(&broken_wf_info());
+        rt.register_workflow(&healthy_wf_info());
+        rt.start_workflow("broken_wf", json!(ExecutionId::new()))
+            .unwrap()
+    });
+    let healthy_after = start_healthy_after(&mut rt, broken);
+
+    let pass = rt.poll_once_reporting().await.expect("the pass runs");
+    assert!(pass.progressed, "the healthy run moved in this pass");
+    assert!(
+        matches!(pass.error, Some(SqliteError::Unsupported(_))),
+        "{:?}",
+        pass.error
+    );
+    assert!(matches!(
+        rt.outcome(healthy_after).unwrap(),
+        ExecutionOutcome::Completed(_)
+    ));
+}

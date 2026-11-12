@@ -258,6 +258,15 @@ pub enum ExecutionOutcome {
     Terminated(String),
 }
 
+/// What one drive pass did. See [`SqliteRuntime::poll_once_reporting`].
+#[derive(Debug)]
+pub struct PassReport {
+    /// A run moved in this pass.
+    pub progressed: bool,
+    /// The first error of one run in this pass. The other runs still moved.
+    pub error: Option<SqliteError>,
+}
+
 /// The result of a start-boundary reuse-policy decision (issue #1068) — returned by
 /// [`SqliteRuntime::start_workflow_with_reuse_policy`](crate::SqliteRuntime::start_workflow_with_reuse_policy).
 ///
@@ -3157,9 +3166,26 @@ impl SqliteRuntime {
     /// error variants a single execution can produce. A fleet pass never
     /// returns `ExecutionNotFound`, because it drives only stored executions.
     pub async fn poll_once(&mut self) -> SqliteResult<bool> {
+        let report = self.poll_once_reporting().await?;
+        report.error.map_or(Ok(report.progressed), Err)
+    }
+
+    /// One drive pass, as [`poll_once`](Self::poll_once). It reports the
+    /// progress and the first error of one run apart.
+    ///
+    /// A pass can move a healthy run while another run fails. `poll_once`
+    /// then returns the error alone. A driver that waits for an idle pass
+    /// reads the progress here, so a failing run never hides due work.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only when the pass cannot run at all, such as a
+    /// failed read of the running runs. The error of one run goes in
+    /// [`PassReport::error`].
+    pub async fn poll_once_reporting(&mut self) -> SqliteResult<PassReport> {
         let mut skip = HashSet::new();
-        let (progress, first_error) = self.poll_once_pass(&mut skip, true).await?;
-        first_error.map_or(Ok(progress), Err)
+        let (progressed, error) = self.poll_once_pass(&mut skip, true).await?;
+        Ok(PassReport { progressed, error })
     }
 
     /// One fleet-wide driving pass, shared by [`poll_once`](Self::poll_once)
