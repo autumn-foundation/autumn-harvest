@@ -1636,6 +1636,7 @@ impl SqliteOverlayStore {
     /// - The store sets `foreign_keys = ON` on each connection, and no
     ///   other pragma. Set the pragmas of the app in `connect`, such as
     ///   `wal_autocheckpoint = 0` and `busy_timeout`.
+    /// - A store connection does not checkpoint when it closes.
     /// - Open a connection in `connect` only while another connection of
     ///   the app stays open. Then a store connection never closes last.
     ///

@@ -50,6 +50,8 @@ A test opens the store through a factory on a WAL file with
 | The store keeps a connection after a call. | A test closes the replicator connection while the store lives. The WAL must go. |
 | The store sets `journal_mode` or `wal_autocheckpoint` and undoes the app. | The store sets `foreign_keys` only. A test writes over 1000 pages, and the main file must not change. |
 | The test cannot see a checkpoint. | A control test sets `wal_autocheckpoint = 1` and sees one. |
+| A store call runs after the replicator closes, and its connection closes last. | Each store connection turns off the checkpoint at its close. A test closes the replicator first. |
+| The open waits for a fleet writer. | The schema runs in a `DEFERRED` transaction. A test opens while another connection holds the write lock. |
 | The schema runs on a connection outside the factory. | A test counts the factory calls of the open. |
 | A failed connect panics or hangs. | A test fails the factory, and the call returns a backend error. |
 | The guards stop on a factory connection. | The shared store suite runs on a factory store. |
@@ -67,8 +69,9 @@ A test opens the store through a factory on a WAL file with
 - **Yellow (value):** the overlays join the tenant database. So one
   replica holds the full state of an owner.
 - **Green (options):** the borrowed connection changes every trait method.
-  A pool trait adds a dependency. A flag cannot stop the last close. The
-  factory is the smallest change that meets both rules.
+  A pool trait adds a dependency. A flag on `open` keeps the connection,
+  so it can still close last. The factory is the smallest change that
+  meets both rules.
 - **Blue (process):** red tests first, then the code, then a refactor,
   the docs and the gates.
 
@@ -78,10 +81,15 @@ A test opens the store through a factory on a WAL file with
   `Arc<dyn Fn() -> rusqlite::Result<Connection> + Send + Sync>`.
   `autumn-harvest-agent` re-exports it with the `sqlite` feature.
 - `SqliteOverlayLog::with_connector(connect)` applies the schema through
-  `connect`, in one `IMMEDIATE` transaction, and drops that connection.
+  `connect`, in one `DEFERRED` transaction, and drops that connection. A
+  file that has the schema needs no write, so the open takes no write
+  lock.
 - Each later call opens one connection through `connect`, sets
   `foreign_keys = ON`, runs its statements and drops the connection.
 - The store runs one call at a time, as `open` does.
+- Each store connection sets `SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE`. So a
+  store connection that closes last in a shutdown race checkpoints
+  nothing. The app rule stays: the replicator connection closes last.
 - The store sets no other pragma. The app sets `journal_mode`,
   `busy_timeout`, `synchronous` and `wal_autocheckpoint` in `connect`.
 - `SqliteOverlayStore::with_connector(connect, validator)` wraps the log.
@@ -93,5 +101,7 @@ A test opens the store through a factory on a WAL file with
 - `autumn-harvest-agent/tests/overlay_store.rs`: the shared suite on a
   factory store, and the acceptance test.
 - `autumn-harvest-sqlite/tests/integration/overlay_log_connector.rs`: the factory
-  calls, the last close, the 1000-page write, the control and the failed
+  calls, the last close, the close of a store connection after the
+  replicator, the open under a writer, the 1000-page write, the control
+  and the failed
   connect.

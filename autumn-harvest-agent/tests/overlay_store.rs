@@ -197,5 +197,72 @@ async fn a_factory_store_leaves_every_frame_in_the_wal() {
     assert_eq!(busy, 0);
     assert!(log > 0, "the WAL still holds the frames of the store");
     assert_eq!(done, log, "the replicator checkpoints them all");
+
+    // The store is still open. A held store connection stays open after
+    // the replicator closes, and the WAL file then stays.
+    let Fleet {
+        _dir: dir,
+        path,
+        replicator,
+    } = fleet;
+    replicator.close().expect("close");
+    assert!(
+        !wal_of(&path).exists(),
+        "the replicator connection closed last, and SQLite removed the WAL"
+    );
     drop(store);
+    drop(dir);
+}
+
+/// The WAL file of the database at `path`.
+#[cfg(feature = "sqlite")]
+fn wal_of(path: &std::path::Path) -> std::path::PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push("-wal");
+    std::path::PathBuf::from(name)
+}
+
+/// A failed connect is a backend error, at the open and at a later call.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn a_failed_connect_is_a_backend_error() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use autumn_harvest_agent::{
+        OverlayStoreError, ProfileOverlay, ProfileOverlayStore, Provenance, SqliteConnector,
+        SqliteOverlayStore,
+    };
+
+    let gate = Arc::new(overlay_store_suite::Gate::default());
+    let refuse: SqliteConnector =
+        Arc::new(|| Err(rusqlite::Error::InvalidPath("no fleet lease".into())));
+    let err = SqliteOverlayStore::with_connector(refuse, gate.clone()).expect_err("no connection");
+    assert!(matches!(err, OverlayStoreError::Backend { .. }), "{err}");
+
+    let fleet = Fleet::new();
+    let inner = fleet.connector();
+    let lost = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&lost);
+    let connect: SqliteConnector = Arc::new(move || {
+        if flag.load(Ordering::SeqCst) {
+            return Err(rusqlite::Error::InvalidPath(
+                "the fleet lease is gone".into(),
+            ));
+        }
+        inner()
+    });
+    let store = SqliteOverlayStore::with_connector(connect, gate).expect("open");
+    lost.store(true, Ordering::SeqCst);
+    let overlay = ProfileOverlay {
+        max_steps: Some(4),
+        ..ProfileOverlay::default()
+    };
+    let err = store
+        .put("support", &overlay, Provenance::operator("ops"))
+        .await
+        .expect_err("no connection");
+    assert!(matches!(err, OverlayStoreError::Backend { .. }), "{err}");
+    let err = store.active("support").await.expect_err("no connection");
+    assert!(matches!(err, OverlayStoreError::Backend { .. }), "{err}");
 }

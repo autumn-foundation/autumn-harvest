@@ -312,3 +312,44 @@ fn the_guards_hold_on_a_factory_log() {
         assert!(err.to_string().contains(guard), "{statement}: {err}");
     }
 }
+
+#[test]
+fn a_store_connection_that_closes_last_does_not_checkpoint() {
+    let mut fleet = Fleet::new();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let log = SqliteOverlayLog::with_connector(fleet.connector(0, &calls)).expect("open");
+    // A shutdown race: the replicator closes, and then a store call runs.
+    // The store connection is then the last one to close.
+    fleet.close_replicator();
+    let main_before = fleet.main_bytes();
+    log.append("support", b"{}", "operator", "ops")
+        .expect("append")
+        .expect("v1");
+    assert_eq!(
+        fleet.main_bytes(),
+        main_before,
+        "the last close of a store connection folds no frame"
+    );
+    assert!(fleet.wal().exists(), "the frames stay in the WAL");
+}
+
+#[test]
+fn the_open_of_a_set_up_file_needs_no_write_lock() {
+    let fleet = Fleet::new();
+    let calls = Arc::new(AtomicUsize::new(0));
+    drop(SqliteOverlayLog::with_connector(fleet.connector(0, &calls)).expect("first open"));
+    let writer = Connection::open(&fleet.path).expect("writer");
+    writer
+        .execute_batch("BEGIN IMMEDIATE; INSERT INTO app_rows (id) VALUES (1);")
+        .expect("a fleet write in progress");
+    // The rest of `fleet` stays alive to the end of the test.
+    let path = fleet.path;
+    let no_wait: SqliteConnector = Arc::new(move || {
+        let conn = Connection::open(&path)?;
+        conn.execute_batch("PRAGMA busy_timeout = 0; PRAGMA wal_autocheckpoint = 0;")?;
+        Ok(conn)
+    });
+    let log = SqliteOverlayLog::with_connector(no_wait).expect("the open waits for no writer");
+    assert!(log.active("support").expect("read").is_none());
+    writer.execute_batch("COMMIT;").expect("commit");
+}

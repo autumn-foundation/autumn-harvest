@@ -21,6 +21,7 @@ use autumn_harvest::overlay_log::{
     decide_auto_move, logs_activation, next_overlay_version, policy_write_passes, utc_day,
 };
 use chrono::{DateTime, Utc};
+use rusqlite::config::DbConfig;
 use rusqlite::{Connection, OptionalExtension as _, Row, TransactionBehavior, params};
 
 use crate::error::{SqliteError, SqliteResult};
@@ -134,6 +135,9 @@ END;
 /// the closure, such as `journal_mode`, `busy_timeout` and
 /// `wal_autocheckpoint`. The app uses the `rusqlite` version of this
 /// crate, so the `Connection` types match.
+///
+/// Return an error from the closure, not a panic. A panic unwinds into the
+/// caller of the store.
 pub type SqliteConnector = Arc<dyn Fn() -> rusqlite::Result<Connection> + Send + Sync>;
 
 /// The columns of one policy row.
@@ -193,7 +197,9 @@ impl SqliteOverlayLog {
     /// time, so at most one of its connections is open.
     ///
     /// The log sets `foreign_keys = ON` on each connection, and no other
-    /// pragma. The app sets the rest in `connect`.
+    /// pragma. The app sets the rest in `connect`. The log also turns off
+    /// the checkpoint at the close of each connection. So a store
+    /// connection that closes last checkpoints nothing.
     ///
     /// # Errors
     ///
@@ -412,15 +418,22 @@ impl SqliteOverlayLog {
 }
 
 /// One connection from `connect`, with the foreign key of the pointer on.
+///
+/// The connection does not checkpoint when it closes. So a store
+/// connection that closes last leaves every frame in the WAL.
 fn connect_once(connect: &SqliteConnector) -> SqliteResult<Connection> {
     let conn = connect()?;
+    conn.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true)?;
     conn.execute_batch("PRAGMA foreign_keys = ON;")?;
     Ok(conn)
 }
 
-/// Apply [`OVERLAY_SCHEMA`] in one `IMMEDIATE` transaction.
+/// Apply [`OVERLAY_SCHEMA`] in one `DEFERRED` transaction.
+///
+/// A file that has the schema needs no write, so the transaction takes no
+/// write lock. The open then does not wait for another writer.
 fn apply_schema(conn: &mut Connection) -> SqliteResult<()> {
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
     tx.execute_batch(OVERLAY_SCHEMA)?;
     tx.commit()?;
     Ok(())
@@ -784,4 +797,25 @@ fn to_version(stored: i64) -> SqliteResult<u64> {
 fn from_millis(ms: i64) -> SqliteResult<DateTime<Utc>> {
     DateTime::from_timestamp_millis(ms)
         .ok_or_else(|| SqliteError::Unsupported(format!("overlay time {ms} is out of range")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A factory connection gets the foreign key of the pointer, and no
+    /// checkpoint at its close.
+    #[test]
+    fn a_factory_connection_has_the_store_settings() {
+        let connect: SqliteConnector = Arc::new(Connection::open_in_memory);
+        let conn = connect_once(&connect).expect("connect");
+        let foreign_keys: i64 = conn
+            .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+            .expect("pragma");
+        assert_eq!(foreign_keys, 1);
+        assert!(
+            conn.db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE)
+                .expect("config")
+        );
+    }
 }

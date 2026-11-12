@@ -2481,6 +2481,8 @@ fn with_fleet_overlays(db: PathBuf, base: AgentHarness) -> Result<AgentHarness, 
   keeps no connection between calls, and runs one call at a time.
 - The store sets `foreign_keys = ON` and no other pragma. Set the pragmas
   of the fleet in the factory.
+- A store connection does not checkpoint when it closes, also when it
+  closes last.
 - Open a connection only while another connection of the app stays open,
   such as the replicator connection. Then a store connection never closes
   last.
