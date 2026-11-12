@@ -48,8 +48,11 @@ once. [`design/DESIGN-2653.md`](design/DESIGN-2653.md) holds the design.
   `pg_stat_statements` preloaded.
 * **Builds.** `base` is `trunk-dev` at `83b0417`. Three changed builds ran
   in turn: `new` cut the settle and did nothing else, `v2` added the drain,
-  and `v3` added the fresh settle after a rest. `v3` ships. Each build is a
-  release `e2e_bench` binary.
+  and `v3` added the fresh settle after a rest. Each build is a release
+  `e2e_bench` binary. The shipped code adds one change after `v3`. A local
+  decision end that cuts a rest also keeps the poll at the original end.
+  That path needs a NOTIFY cut and then a decision end in the same settle.
+  It adds at most one poll there, so this page did not measure it again.
 * **Runs.** Each run is one `e2e_bench` invocation at 1 shard. The builds
   alternate, so a drift of the box hits both. The latency runs hold
   `signal_roundtrip` and `dispatch_latency`. Each capacity run holds one
