@@ -235,8 +235,8 @@ async fn write(
 /// The wake time to report at an idle point.
 ///
 /// `raw` is `next_wake_at` after a pass that made no progress. That pass
-/// started at `pass_started`. A value due at that start is a deadline that
-/// the pass could not clear, such as a timer of a run that fails on each
+/// started at `pass_started`. A value due at that start is stuck: the pass
+/// could not clear it. An example is a timer of a run that fails on each
 /// drive. A report of it as is would make the sweep open the tenant on each
 /// tick. So it is reported as `now + STUCK_RETRY_MS`.
 #[must_use]

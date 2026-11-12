@@ -659,11 +659,15 @@ impl SqliteRuntime {
     /// The earliest time, in epoch milliseconds, at which a drive has due
     /// work. `None` when nothing is due at a known time.
     ///
-    /// A fleet host opens a closed tenant at this time. The sources are the
-    /// unfired timers and pending activity retries of running runs, the
-    /// deadlines and backoffs of running runs, and the slots of unpaused
-    /// schedules. A slot counts only while schedules are on. A backoff counts
-    /// only while it is in the future.
+    /// A fleet host opens a closed tenant at this time. These are the
+    /// sources:
+    ///
+    /// - the unfired timers and pending activity retries of running runs;
+    /// - the deadlines and backoffs of running runs;
+    /// - the slots of unpaused schedules.
+    ///
+    /// A slot counts only while schedules are on. A backoff counts only
+    /// while it is in the future.
     ///
     /// ```rust,ignore
     /// let mut rt = SqliteRuntime::open(&path)?;
