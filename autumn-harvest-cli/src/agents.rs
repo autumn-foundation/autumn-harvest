@@ -109,8 +109,9 @@ pub enum AgentCommand {
         /// The agent id, `<kind>/<name>`.
         agent_id: String,
     },
-    /// Make an agent read the profile of its kind again. Its next op runs
-    /// on the new profile. Deploy the new harness first.
+    /// Make an agent read the profile of its kind again. A good read ends
+    /// the run, so the next op runs on the new profile. Deploy the new
+    /// harness to every worker first.
     Reload {
         /// The agent id, `<kind>/<name>`.
         agent_id: String,

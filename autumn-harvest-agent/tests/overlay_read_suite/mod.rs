@@ -139,6 +139,10 @@ pub trait Backend {
     /// Send `op` to the agent `id`.
     async fn send(&mut self, id: &AgentId, op: &AgentOp);
 
+    /// Send `Control::ReloadProfile` to each running agent of `kind`, with
+    /// the reload helper of the backend. Returns the agents.
+    async fn reload_kind(&mut self, kind: &str) -> Vec<AgentId>;
+
     /// Run the agent `id` until its state passes `done`. Returns the state.
     async fn settle(
         &mut self,
@@ -637,15 +641,20 @@ pub async fn a_reload_reads_the_new_profile<B: Backend>(backend: &mut B) {
     }
 
     // The replay holds a third profile, so a read outside history would
-    // change the turn input.
+    // change the turn input. The reload ended the first run, so the agent
+    // has two runs.
     backend.delete(&id).await;
-    let other = prompt_harness(&kind, PromptModel::new(), "Another prompt.");
-    for report in backend.replay(&id, other).await {
+    let replay_model = PromptModel::new();
+    let other = prompt_harness(&kind, replay_model.clone(), "Another prompt.");
+    let reports = backend.replay(&id, other).await;
+    assert_eq!(reports.len(), 2, "the reload ends the first run");
+    for report in reports {
         assert!(
             matches!(report.status, ReplayStatus::ReplaySucceeded),
             "{report}"
         );
     }
+    assert_eq!(replay_model.calls(), 0, "the replay asks no model");
 }
 
 /// An active overlay applies to the reloaded profile.
@@ -665,9 +674,7 @@ pub async fn a_reload_keeps_the_active_overlay<B: Backend>(backend: &mut B) {
     let model = PromptModel::new();
     let (harness, _store) = with_store(backend, prompt_harness(&kind, model.clone(), PROMPT_NEW));
     backend.serve(harness).await;
-    backend
-        .send(&id, &AgentOp::Control(Control::ReloadProfile))
-        .await;
+    assert_eq!(backend.reload_kind(&kind).await, vec![id.clone()]);
     backend.send(&id, &AgentOp::message("two")).await;
     let state = backend.settle(&id, &segments(2)).await;
     assert_eq!(state.failures, 0, "{:?}", state.last_error);

@@ -935,9 +935,12 @@ pub fn pause_mesh(rt: &mut SqliteRuntime, mesh: &str, reason: &str) -> SqliteRes
 /// the agents, sorted by id.
 ///
 /// Register the new harness first. The reload reads the profile when the
-/// agent runs the op, so [`drive`] each agent after the call. The filter is
-/// the workflow id prefix `<kind>/`. So a run that has not run an op yet
-/// gets the reload too, and a kind that only starts with `kind` does not.
+/// agent runs the op, so [`drive`] each agent after the call. The op goes
+/// to the listed run only, so an agent with no running run stays ended.
+/// Each call uses its own idempotency key.
+///
+/// The filter is the workflow id prefix `<kind>/`. So a run that has run no
+/// op yet gets the reload. An agent of a kind such as `<kind>2` does not.
 ///
 /// # Errors
 ///
@@ -948,25 +951,27 @@ pub fn reload_profiles(rt: &mut SqliteRuntime, kind: &str) -> SqliteResult<Vec<A
         .workflow_name(AGENT_WORKFLOW_NAME)
         .state("RUNNING")
         .workflow_id_prefix(format!("{kind}/"));
-    let mut agents = Vec::new();
+    let mut targets = Vec::new();
     let mut cursor = None;
     loop {
         let page = cursor.map_or_else(|| filter.clone(), |cursor| filter.clone().before(cursor));
         let found = rt.list_executions(&page)?;
-        agents.extend(found.executions.iter().filter_map(|summary| {
+        targets.extend(found.executions.iter().filter_map(|summary| {
             let id = AgentId::parse(summary.workflow_id.value()?).ok()?;
-            (id.kind() == kind).then_some(id)
+            Some((summary.execution_id()?, id)).filter(|(_, id)| id.kind() == kind)
         }));
         match found.next {
             Some(next) => cursor = Some(next),
             None => break,
         }
     }
-    agents.sort_by(|a, b| a.as_str().cmp(b.as_str()));
-    agents.dedup();
-    let reload = AgentOp::Control(Control::ReloadProfile);
-    for id in &agents {
-        send(rt, id, &reload, None)?;
+    targets.sort_by(|(_, a), (_, b)| a.as_str().cmp(b.as_str()));
+    let key = format!("reload-profiles:{kind}:{}", Utc::now().timestamp_millis());
+    let payload = Agent::payload(&AgentOp::Control(Control::ReloadProfile));
+    let mut agents = Vec::with_capacity(targets.len());
+    for (exec, id) in targets {
+        rt.send_signal_idempotent(exec, ENTITY_OP_SIGNAL, payload.clone(), Some(&key))?;
+        agents.push(id);
     }
     Ok(agents)
 }

@@ -1,6 +1,7 @@
 //! The recorded profile read of a durable agent (issue #2372).
 //!
-//! A run reads its profile once, through the activity `agent_profile`. With
+//! A run reads its profile once, through the activity `agent_profile`. A
+//! `Control::ReloadProfile` reads it again, then ends the run. With
 //! an overlay store, each op also reads the active overlay, through the
 //! activity `agent_profile_overlay`. History records both results, so a
 //! replay never reads the store. The design is in
@@ -76,11 +77,12 @@ pub(crate) fn op_profile<P, V, E>(
     }
 }
 
-/// The run after a profile reload, and the error of a failed read.
+/// The profile of the rest of a reload op, and the error of a failed read.
 ///
-/// A good read replaces `current`. A failed read keeps `current`, so a
-/// failed reload never drops a working profile. The caller records the
-/// error. `formal/verus/src/agent_profile_read.rs` proves it.
+/// A good read replaces `current`, and the run then ends at a checkpoint. A
+/// failed read keeps `current`, so a failed reload never drops a working
+/// profile. The caller records the error.
+/// `formal/verus/src/agent_profile_read.rs` proves it.
 pub(crate) fn reloaded<R, E>(current: R, read: Result<R, E>) -> (R, Option<E>) {
     match read {
         Ok(next) => (next, None),

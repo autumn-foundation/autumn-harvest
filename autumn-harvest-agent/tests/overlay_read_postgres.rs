@@ -208,6 +208,13 @@ impl Backend for Pg {
         self.worker = Some((worker, handle));
     }
 
+    async fn reload_kind(&mut self, kind: &str) -> Vec<AgentId> {
+        let pg = autumn_harvest_agent::postgres::PostgresAgents::single(self.pool.clone());
+        autumn_harvest_agent::postgres::reload_profiles(&pg, kind)
+            .await
+            .unwrap()
+    }
+
     async fn send(&mut self, id: &AgentId, op: &AgentOp) {
         use autumn_harvest::WorkflowIdReusePolicy;
         use autumn_harvest::execution::{

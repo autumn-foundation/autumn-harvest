@@ -507,10 +507,14 @@ where
     /// the state, so the next run does not ask again.
     ///
     /// The loop calls `take` before the snapshot of the op. So no snapshot
-    /// and no checkpoint input holds a request that `take` cleared. Replay
-    /// runs the handler again, so `take` gives the same answer. `take` must
-    /// be a pure function of the state. A history from before this hook
-    /// replays when `take` gives `false` for each of its states.
+    /// and no checkpoint input holds a request that `take` cleared. The
+    /// answer of `take` must depend only on the state. Replay runs the
+    /// handler again, so `take` then gives the same answer. A history from
+    /// before this hook replays when `take` gives `false` for each state.
+    ///
+    /// A checkpoint that `take` asks for records no checkpoint side effect
+    /// for that op. A waiting op that does not fit the checkpoint input runs
+    /// in this run first. The request stays until the checkpoint.
     ///
     /// # Errors
     ///

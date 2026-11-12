@@ -3,8 +3,7 @@
 //! `Control::ReloadProfile` reads the profile of the kind again, through
 //! the recorded activity `agent_profile`. A good read ends the run at a
 //! checkpoint, so the next op runs on the profile of the next run.
-//! `tests/overlay_read_suite` runs the same check on Postgres. The design
-//! is in `docs/design/DESIGN-2658.md`.
+//! `tests/overlay_read_suite` runs the same check on Postgres.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -14,13 +13,18 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use autumn_harvest::ExecutionId;
+use autumn_harvest::chrono::Utc;
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::failure::{ActivityFailure, IntoActivityErrorString};
+use autumn_harvest::testing::{ReplayStatus, WorkflowReplayer};
+use autumn_harvest_agent::mesh::Mandate;
 use autumn_harvest_agent::{
     AgentHarness, AgentHeartbeat, AgentId, AgentOp, AgentProfile, AgentState, ChatRequest,
-    ChatRole, ContentPart, Control, FnTool, agent_profile_info, sqlite,
+    ChatRole, ContentPart, Control, FnTool, agent_discover_peers_info, agent_info,
+    agent_profile_info, sqlite,
 };
-use autumn_harvest_sqlite::{ExecutionFilter, ExecutionSummary, SqliteRuntime};
+use autumn_harvest_sqlite::{ExecutionFilter, ExecutionSummary, RunState, SqliteRuntime};
 use common::{ScriptedModel, answer, runtime};
 use serde_json::json;
 
@@ -71,6 +75,22 @@ fn system(request: &ChatRequest) -> String {
             _ => None,
         })
         .collect()
+}
+
+/// Every run of the agent, oldest first.
+fn runs(rt: &SqliteRuntime, agent: &AgentId) -> Vec<ExecutionId> {
+    let filter = ExecutionFilter::new()
+        .workflow_name("agent")
+        .workflow_id(agent.as_str());
+    let mut runs: Vec<_> = rt
+        .list_executions(&filter)
+        .unwrap()
+        .executions
+        .iter()
+        .filter_map(ExecutionSummary::execution_id)
+        .collect();
+    runs.reverse();
+    runs
 }
 
 /// The number of recorded `agent_profile` reads of the agent, over all
@@ -136,9 +156,11 @@ async fn a_restart_and_a_reload_reach_the_new_prompt() {
     restart_then_reload(None).await;
 }
 
+/// With a bound of 4 ops, op 3 would run in the first run with no reload.
+/// So only the reload can give it the new prompt.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_reload_reaches_the_new_prompt_with_one_op_per_run() {
-    restart_then_reload(Some(1)).await;
+async fn a_reload_reaches_the_new_prompt_under_max_ops_per_run() {
+    restart_then_reload(Some(4)).await;
 }
 
 /// A reload with no restart. A new `register` replaces the harness of a
@@ -300,12 +322,18 @@ async fn a_reload_books_the_new_heartbeat() {
         Arc::new(AgentHarness::new(model(0)).agent(profile)),
     );
     reload(&mut rt, &agent);
+    let before = Utc::now().timestamp_millis();
     sqlite::drive(&mut rt, &agent).await.unwrap();
+    let after = Utc::now().timestamp_millis();
     let state = state(&rt, &agent).await;
     assert_eq!(state.failures, 0, "{:?}", state.last_error);
+    assert_eq!(runs(&rt, &agent).len(), 2, "the reload ended the first run");
+    let booked = state
+        .next_heartbeat_ms
+        .expect("the new heartbeat is booked");
     assert!(
-        state.next_heartbeat_ms.is_some(),
-        "the new heartbeat is booked"
+        (before + 3_600_000..=after + 3_600_000).contains(&booked),
+        "one interval after the reload: {booked}"
     );
 }
 
@@ -343,4 +371,145 @@ async fn reload_profiles_reaches_each_agent_of_the_kind() {
         sqlite::reload_profiles(&mut rt, "nobody").unwrap(),
         Vec::<AgentId>::new()
     );
+}
+
+/// A run whose start read failed gets its profile from a reload.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reload_recovers_a_run_whose_start_read_failed() {
+    let (_dir, db) = fresh_db();
+    let agent = id("support", "acct-6");
+    let first = model(0);
+    let other = AgentProfile::new("billing");
+    let mut rt = runtime(&db, AgentHarness::new(first.clone()).agent(other));
+    say(&mut rt, &agent, "one");
+    sqlite::drive(&mut rt, &agent).await.unwrap();
+    assert_eq!(
+        state(&rt, &agent).await.failures,
+        1,
+        "the kind has no profile"
+    );
+
+    let second = model(1);
+    let profile = AgentProfile::new("support").system(NEW);
+    sqlite::register(
+        &mut rt,
+        Arc::new(AgentHarness::new(second.clone()).agent(profile)),
+    );
+    reload(&mut rt, &agent);
+    say(&mut rt, &agent, "two");
+    sqlite::drive(&mut rt, &agent).await.unwrap();
+
+    assert_eq!(first.calls(), 0);
+    assert_eq!(system(&second.requests()[0]), NEW);
+    let state = state(&rt, &agent).await;
+    assert_eq!(state.failures, 1, "{:?}", state.last_error);
+    assert_eq!(state.last_answer.as_deref(), Some("ok"));
+}
+
+/// A reload whose peer discovery fails keeps the current profile.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_peer_discovery_keeps_the_profile() {
+    let (_dir, db) = fresh_db();
+    let agent = id("support", "acct-7");
+    let first = model(1);
+    let old = AgentProfile::new("support").system(OLD);
+    let mut rt = runtime(&db, AgentHarness::new(first).agent(old));
+    say(&mut rt, &agent, "one");
+    sqlite::drive(&mut rt, &agent).await.unwrap();
+
+    let second = model(1);
+    let new = AgentProfile::new("support")
+        .system(NEW)
+        .mandate(Mandate::new("support").peers(["desk"]));
+    sqlite::register(
+        &mut rt,
+        Arc::new(AgentHarness::new(second.clone()).agent(new)),
+    );
+    rt.register_activity_with_body(&agent_discover_peers_info(), |_| {
+        Err(
+            ActivityFailure::non_retryable("DirectoryDown", "the peer directory is down")
+                .into_error_payload(),
+        )
+    });
+    reload(&mut rt, &agent);
+    say(&mut rt, &agent, "two");
+    sqlite::drive(&mut rt, &agent).await.unwrap();
+
+    let state = state(&rt, &agent).await;
+    assert_eq!(state.failures, 1);
+    let error = state.last_error.unwrap_or_default();
+    assert!(error.contains("the peer directory is down"), "{error}");
+    assert_eq!(runs(&rt, &agent).len(), 1, "a failed reload keeps the run");
+    assert_eq!(system(&second.requests()[0]), OLD);
+}
+
+/// A reload and a delete in one inbox. The reload ends the first run, and
+/// the delete ends the second. Both runs replay.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reload_then_a_delete_replays() {
+    let (_dir, db) = fresh_db();
+    let agent = id("support", "acct-8");
+    let profile = AgentProfile::new("support").system(OLD);
+    let mut rt = runtime(&db, AgentHarness::new(model(1)).agent(profile));
+    say(&mut rt, &agent, "one");
+    reload(&mut rt, &agent);
+    sqlite::delete(&mut rt, &agent, None).unwrap();
+    let ended = sqlite::drive(&mut rt, &agent).await.unwrap();
+    assert!(matches!(ended, Some(RunState::Completed(_))), "{ended:?}");
+
+    let runs = runs(&rt, &agent);
+    assert_eq!(runs.len(), 2);
+    for exec in runs {
+        let report = WorkflowReplayer::new()
+            .register(vec![agent_info()])
+            .with_workflow_id(agent.as_str())
+            .replay_from_events(rt.load_history(exec).unwrap())
+            .await;
+        assert!(
+            matches!(report.status, ReplayStatus::ReplaySucceeded),
+            "{report}"
+        );
+    }
+}
+
+/// An agent with no running run gets no reload, so a reload never starts
+/// it again.
+#[tokio::test(flavor = "multi_thread")]
+async fn reload_profiles_skips_an_ended_agent() {
+    let (_dir, db) = fresh_db();
+    let a = id("support", "a");
+    let b = id("support", "b");
+    let mut rt = runtime(
+        &db,
+        AgentHarness::new(model(2)).agent(AgentProfile::new("support")),
+    );
+    for agent in [&a, &b] {
+        say(&mut rt, agent, "one");
+        sqlite::drive(&mut rt, agent).await.unwrap();
+    }
+    sqlite::delete(&mut rt, &b, None).unwrap();
+    sqlite::drive(&mut rt, &b).await.unwrap();
+
+    assert_eq!(
+        sqlite::reload_profiles(&mut rt, "support").unwrap(),
+        vec![a]
+    );
+    assert_eq!(sqlite::current_run(&rt, &b).unwrap(), None, "b stays ended");
+}
+
+/// The list reads every page. The default page holds 100 runs.
+#[tokio::test(flavor = "multi_thread")]
+async fn reload_profiles_reads_every_page() {
+    let (_dir, db) = fresh_db();
+    let mut rt = runtime(
+        &db,
+        AgentHarness::new(model(0)).agent(AgentProfile::new("support")),
+    );
+    let agents: Vec<AgentId> = (0..105)
+        .map(|n| id("support", &format!("a{n:03}")))
+        .collect();
+    for agent in &agents {
+        say(&mut rt, agent, "one");
+    }
+    assert_eq!(sqlite::reload_profiles(&mut rt, "support").unwrap(), agents);
 }

@@ -19,11 +19,17 @@ the recorded profile. The design is in `docs/design/DESIGN-2658.md`.
   makes the choice, and `formal/verus/src/agent_profile_read.rs` proves
   it.
 - `sqlite::reload_profiles(rt, kind)` sends the op to each running agent
-  of a kind, by the workflow id prefix `<kind>/`. On Postgres, send the op
-  with `postgres::send`. `harvest agents reload <id>` sends it through the
-  management API.
+  of a kind, by the workflow id prefix `<kind>/`. `postgres::reload_profiles`
+  does the same by the search attribute `agent_kind`. Both send to the live
+  run only, with one idempotency key for each call, so an ended agent stays
+  ended. `harvest agents reload <id>` sends the op through the management
+  API.
 - No new event, no migration and no patch gate. No old history holds the
   op, and the request flag is never serialized.
+- **Rolling deploy:** send the op only after every worker runs this
+  release. An older worker cannot decode the op, and cannot replay a run
+  that holds it. `docs/upgrading/0.10.0.md` lists it under "turn on new
+  features after the roll".
 
 Tests: `autumn-harvest-sqlite` `entity_checkpoint_request` checks the
 engine hook and its replay. `tests/profile_reload.rs` runs the repro of the issue on SQLite,

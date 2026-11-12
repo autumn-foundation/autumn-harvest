@@ -85,6 +85,10 @@ impl Backend for Sqlite {
         sqlite::send(self.rt(), id, op, None).unwrap();
     }
 
+    async fn reload_kind(&mut self, kind: &str) -> Vec<AgentId> {
+        sqlite::reload_profiles(self.rt(), kind).unwrap()
+    }
+
     async fn settle(
         &mut self,
         id: &AgentId,

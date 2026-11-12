@@ -9,10 +9,10 @@
 //! op fails and names the version. So no active version ever yields the
 //! base with no version.
 //!
-//! `reloaded` picks the run of an agent after a profile reload. `current`
-//! is the run, and `read` is the result of the reload read. A good read
-//! replaces the run. A failed read keeps the run and returns the error. So
-//! a failed reload never drops a run, and never hides its error.
+//! `reloaded` picks the profile of the rest of a reload op. `current` is the
+//! run profile, and `read` is the result of the reload read. A good read
+//! replaces it. A failed read keeps it and returns the error. So a failed
+//! reload never drops a working profile, and never hides its error.
 
 use vstd::prelude::*;
 

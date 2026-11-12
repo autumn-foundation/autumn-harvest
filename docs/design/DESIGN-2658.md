@@ -54,7 +54,7 @@ waits for its next op.
 | Idea 7: a replay sees another request than the live run. | The loop takes the request before the snapshot. Replay runs the handler again, so it takes the same request. |
 | An overlay no longer applies, or applies to the old base. | The op read takes the run profile. After a reload that is the new profile. |
 | Replay reads the new harness. | The reload is a recorded activity. Replay reads its result. |
-| An old worker gets the new op. | It does not decode. The entity counts a failed op and keeps the state. |
+| An old worker gets the new op. | It does not decode, so it counts a failed op. In a rolling deploy, an old worker also cannot replay a run that holds the op. The guide and the upgrade guide say: send the op only after the roll. |
 | The kind helper misses an agent whose run just started. | It filters on the workflow id prefix `<kind>/`. A new run has that id before it runs any op. |
 
 ## Six hats
@@ -65,8 +65,8 @@ waits for its next op.
   nobody, but it costs each op an activity.
 - **Black.** A reload changes the mandate and the heartbeat. That is the
   purpose of the reload, and the operator asks for it. Each reload adds
-  one run and one extra profile read. Reloads are rare, so the cost is
-  small.
+  one run and two profile reads: the reload read and the read at the next
+  run start. Reloads are rare, so the cost is small.
 - **Yellow.** The op is explicit, cheap and replay-safe. It works on
   SQLite and on Postgres, because both run the same workflow. It needs no
   migration and no patch gate. No old history holds the op. A checkpoint
@@ -91,22 +91,25 @@ waits for its next op.
 - The engine hook `Entity::run_with_wakes_and_checkpoints` takes the flag
   after the op, before the snapshot. It then ends the run at a checkpoint.
   The next run reads the profile at its start.
-- `sqlite::reload_profiles(rt, kind)` sends the op to each running agent
-  of the kind. On Postgres, send the op with `postgres::send`.
-  `harvest agents reload <id>` sends it through the management API.
+- `sqlite::reload_profiles(rt, kind)` and `postgres::reload_profiles(pg,
+  kind)` send the op to the live run of each running agent of the kind,
+  with one idempotency key for each call. `harvest agents reload <id>`
+  sends it through the management API.
 
 ## Acceptance criteria
 
 1. A running agent picks up a changed profile at the next op after a
-   `Control::ReloadProfile`, on SQLite and on Postgres.
+   `Control::ReloadProfile`, on SQLite and on Postgres. A waiting op that
+   does not fit the checkpoint input runs first, on the old profile.
 2. The repro of the issue passes: after a restart with a new harness and
    a reload, the model gets the new system prompt.
 3. A change to `system`, `window` or the tool guidance reaches the agent.
 4. History records the reload. Replay asks no model and reads no harness.
 5. An active overlay applies to the reloaded profile.
 6. A failed reload keeps the current profile and names the error.
-7. `sqlite::reload_profiles` reloads each running agent of a kind, and no
-   other agent. `harvest agents reload <id>` sends the op.
+7. `sqlite::reload_profiles` and `postgres::reload_profiles` reload each
+   running agent of a kind, and no other agent. They never start an ended
+   agent. `harvest agents reload <id>` sends the op.
 8. The guide, the changelog fragment and this record describe the
    reload.
 9. Verus proves the reload kernel. A proptest checks the engine copy.

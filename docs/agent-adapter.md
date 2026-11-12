@@ -1766,7 +1766,7 @@ idempotency key. An app without the module sends the same signal.
 | `control: reset_memory` | Clears the memory: the scope `agent:<id>`, or the state memory. It also removes each lesson of the kind that names the agent (section 24). |
 | `control: clear_transcript` | Clears the transcript. Only the labels of the memory and of the workspace files stay (issues #2272, #2274). |
 | `control: reset_workspace` | Deletes every workspace snapshot of the agent (issue #2274). |
-| `control: reload_profile` | Reads the profile of the kind again, then ends the run at a checkpoint. The next op runs on the new profile (issue #2658). |
+| `control: reload_profile` | Reads the profile of the kind again. A good read ends the run at a checkpoint, so the next op runs on the new profile. A failed read keeps the run and sets `last_error` (issue #2658). |
 
 A control op applies at once, also while the agent is paused. The kernel
 `agent::inbox::admit` makes the choice. Verus proves it, see
@@ -1821,21 +1821,31 @@ async fn reload(
 
 - The op reads the profile through the recorded activity `agent_profile`,
   then discovers the peers again. Replay reads both results from history.
+  The op uses only the success of the discovery. The next run discovers
+  the peers again.
 - A good read ends the run at a checkpoint after the op. The next run reads
   the profile at its start, as each run does, and the ops that wait move to
   it. `Entity::run_with_wakes_and_checkpoints` takes that checkpoint.
 - The reload op books the heartbeat and sets the search attributes with
   the profile that it read.
-- Every field changes at the next run, `max_ops_per_run`, the mandate and
-  the heartbeat included.
+- Every other field changes at the next run, `max_ops_per_run` and the
+  mandate included.
+- A waiting op that does not fit the checkpoint input runs first, on the
+  old profile. The checkpoint follows it.
 - An active overlay applies to the new profile at each later op.
 - A failed read keeps the current profile. The op adds one to `failures`
   and names the error in `last_error`. The kernel
   `profile_read::reloaded` makes the choice. Verus proves it, see
   `formal/verus/src/agent_profile_read.rs`.
 - `sqlite::reload_profiles` sends the op to each running agent of a kind,
-  by the workflow id prefix `<kind>/`. On Postgres, send the op with
-  `postgres::send`, or run `harvest agents reload <id>`.
+  by the workflow id prefix `<kind>/`. `postgres::reload_profiles` does the
+  same by the search attribute `agent_kind`, which each op sets. So it
+  skips an agent that has run no op yet. Both send the op to the live run
+  only, so an ended agent stays ended. `harvest agents reload <id>` sends
+  the op to one agent.
+- In a rolling deploy, send the op only after every worker runs this
+  release. An older worker cannot decode it, and cannot replay a run that
+  holds it.
 - A control op applies at once, also while the agent is paused. A held op
   runs on the new profile at the resume.
 
@@ -2483,7 +2493,8 @@ fn with_overlays(db: &Path, base: AgentHarness) -> Result<AgentHarness, Box<dyn 
   Then it applies to the run profile under the run ceilings. The op takes
   only the fields that an overlay can set. The mandate, the peers and the heartbeat stay those of the
   run, so a deploy still changes the next run only. A
-  `Control::ReloadProfile` also changes them (see "Reload the profile").
+  `Control::ReloadProfile` ends the run, so the next run reads them (see
+  "Reload the profile").
 - With no store, the op schedules no read. With no active version, the
   read records `overlay_version: None`, and the op runs on the run
   profile.

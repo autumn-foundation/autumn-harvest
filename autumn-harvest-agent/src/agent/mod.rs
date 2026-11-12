@@ -300,6 +300,9 @@ pub enum Control {
     /// Read the profile of the kind again. A good read ends the run at a
     /// checkpoint, so the next op runs on the profile that the next run
     /// reads. A failed read keeps the run and names the error.
+    ///
+    /// A waiting op that does not fit the checkpoint input runs first, on
+    /// the old profile. Send this op only after every worker can decode it.
     ReloadProfile,
 }
 
@@ -1711,7 +1714,7 @@ impl AgentRun<'_> {
                     fail(&mut state, &err);
                 }
             }
-            // `handle` reads the profile for this op.
+            // `handle` takes this op before `control`, so this arm never runs.
             Control::ReloadProfile => {}
             Control::ClearTranscript => {
                 state.transcript.clear();
