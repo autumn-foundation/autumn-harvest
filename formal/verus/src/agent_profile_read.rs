@@ -8,6 +8,11 @@
 //! records that version. With an active version that does not apply, the
 //! op fails and names the version. So no active version ever yields the
 //! base with no version.
+//!
+//! `reloaded` picks the run of an agent after a profile reload. `current`
+//! is the run, and `read` is the result of the reload read. A good read
+//! replaces the run. A failed read keeps the run and returns the error. So
+//! a failed reload never drops a run, and never hides its error.
 
 use vstd::prelude::*;
 
@@ -72,6 +77,52 @@ pub proof fn theorem_the_recorded_version_is_the_applied_one<P, V, E>(
             (P, Option<V>),
             (V, E),
         >((applied, Some(version))),
+{
+}
+
+/// The run after a reload, as a spec.
+pub open spec fn spec_reloaded<R, E>(current: R, read: Result<R, E>) -> (R, Option<E>) {
+    match read {
+        Ok(next) => (next, None),
+        Err(err) => (current, Some(err)),
+    }
+}
+
+// mirror: autumn-harvest-agent/src/agent/profile_read.rs reloaded
+pub fn reloaded<R, E>(current: R, read: Result<R, E>) -> (r: (R, Option<E>))
+    ensures
+        r == spec_reloaded(current, read),
+        read is Ok ==> r == (read->Ok_0, None::<E>),
+        read is Err ==> r == (current, Some(read->Err_0)),
+{
+    match read {
+        Ok(next) => (next, None),
+        Err(err) => (current, Some(err)),
+    }
+}
+
+/// A failed reload keeps the run, and reports exactly its error.
+pub proof fn theorem_a_failed_reload_keeps_the_run<R, E>(current: R, err: E)
+    ensures
+        spec_reloaded(current, Err::<R, E>(err)).0 == current,
+        spec_reloaded(current, Err::<R, E>(err)).1 == Some(err),
+{
+}
+
+/// A good reload always takes effect, and reports no error.
+pub proof fn theorem_a_good_reload_replaces_the_run<R, E>(current: R, next: R)
+    ensures
+        spec_reloaded(current, Ok::<R, E>(next)) == (next, None::<E>),
+{
+}
+
+/// The error slot is set exactly when the read failed.
+pub proof fn theorem_the_error_is_reported_exactly_on_a_failure<R, E>(
+    current: R,
+    read: Result<R, E>,
+)
+    ensures
+        spec_reloaded(current, read).1 is Some <==> read is Err,
 {
 }
 

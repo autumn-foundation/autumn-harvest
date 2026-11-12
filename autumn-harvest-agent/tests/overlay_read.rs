@@ -261,3 +261,13 @@ async fn a_policy_ceiling_reaches_the_op_read() {
 async fn a_rollback_after_an_auto_adoption_restores_v1() {
     overlay_read_suite::a_rollback_after_an_auto_adoption_restores_v1(&mut Sqlite::new()).await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reload_reads_the_new_profile() {
+    overlay_read_suite::a_reload_reads_the_new_profile(&mut Sqlite::new()).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reload_keeps_the_active_overlay() {
+    overlay_read_suite::a_reload_keeps_the_active_overlay(&mut Sqlite::new()).await;
+}

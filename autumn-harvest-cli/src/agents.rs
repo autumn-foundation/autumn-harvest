@@ -1,5 +1,5 @@
-//! `harvest agents`: list, describe, pause, resume and erase durable agents
-//! (issue #2267).
+//! `harvest agents`: list, describe, pause, resume, reload and erase
+//! durable agents (issue #2267).
 //!
 //! A durable agent is a keyed-entity run of the workflow `agent`. Its id,
 //! `<kind>/<name>`, is the workflow id. Each command uses the generic routes
@@ -9,7 +9,7 @@
 //! |---|---|
 //! | `list` | `GET /workflows` with a `filter` on the agent search attributes |
 //! | `describe` | `GET /workflows/by-id/agent/{id}/query/harvest.entity.state` |
-//! | `pause`, `resume` | `POST /workflows/by-id/agent/{id}/signal/harvest.entity.op` |
+//! | `pause`, `resume`, `reload` | `POST /workflows/by-id/agent/{id}/signal/harvest.entity.op` |
 //! | `erase` | the signal route, then `POST /workflows/{id}/erase-payloads` for each run |
 //! | `sampling policy <kind> show`, `set`, `reset` | `GET`, `PUT`, `DELETE /admin/agents/{kind}/sampling-policy` |
 //!
@@ -106,6 +106,12 @@ pub enum AgentCommand {
     },
     /// Run the held work of an agent in order, then take new work.
     Resume {
+        /// The agent id, `<kind>/<name>`.
+        agent_id: String,
+    },
+    /// Make an agent read the profile of its kind again. Its next op runs
+    /// on the new profile. Deploy the new harness first.
+    Reload {
         /// The agent id, `<kind>/<name>`.
         agent_id: String,
     },
@@ -251,6 +257,9 @@ pub fn agent_request(command: &AgentCommand) -> Result<ApiRequest, CliError> {
             Ok(signal(agent_id, op_payload(control)))
         }
         AgentCommand::Resume { agent_id } => Ok(signal(agent_id, control_payload("resume"))),
+        AgentCommand::Reload { agent_id } => {
+            Ok(signal(agent_id, control_payload("reload_profile")))
+        }
         AgentCommand::Erase { .. } => Err(CliError::AgentEraseIsMultiStep),
         AgentCommand::Profile { command } => crate::agent_profile::profile_request(command),
         AgentCommand::Sampling {
@@ -816,6 +825,22 @@ mod tests {
         assert_eq!(
             resume.body,
             Some(json!({"kind": "op", "op": {"type": "control", "action": "resume"}}))
+        );
+    }
+
+    #[test]
+    fn reload_sends_the_reload_profile_op_to_the_agent() {
+        let reload = agent_request(&AgentCommand::Reload {
+            agent_id: "support/ada".to_owned(),
+        })
+        .unwrap();
+        assert_eq!(
+            reload.path,
+            "/workflows/by-id/agent/support%2Fada/signal/harvest.entity.op"
+        );
+        assert_eq!(
+            reload.body,
+            Some(json!({"kind": "op", "op": {"type": "control", "action": "reload_profile"}}))
         );
     }
 

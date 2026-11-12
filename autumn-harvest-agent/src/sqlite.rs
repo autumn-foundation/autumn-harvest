@@ -931,6 +931,46 @@ pub fn pause_mesh(rt: &mut SqliteRuntime, mesh: &str, reason: &str) -> SqliteRes
     Ok(record)
 }
 
+/// Send `Control::ReloadProfile` to each running agent of `kind`. Returns
+/// the agents, sorted by id.
+///
+/// Register the new harness first. The reload reads the profile when the
+/// agent runs the op, so [`drive`] each agent after the call. The filter is
+/// the workflow id prefix `<kind>/`. So a run that has not run an op yet
+/// gets the reload too, and a kind that only starts with `kind` does not.
+///
+/// # Errors
+///
+/// Returns a list or a send error. Agents that got the op before it keep
+/// it.
+pub fn reload_profiles(rt: &mut SqliteRuntime, kind: &str) -> SqliteResult<Vec<AgentId>> {
+    let filter = ExecutionFilter::new()
+        .workflow_name(AGENT_WORKFLOW_NAME)
+        .state("RUNNING")
+        .workflow_id_prefix(format!("{kind}/"));
+    let mut agents = Vec::new();
+    let mut cursor = None;
+    loop {
+        let page = cursor.map_or_else(|| filter.clone(), |cursor| filter.clone().before(cursor));
+        let found = rt.list_executions(&page)?;
+        agents.extend(found.executions.iter().filter_map(|summary| {
+            let id = AgentId::parse(summary.workflow_id.value()?).ok()?;
+            (id.kind() == kind).then_some(id)
+        }));
+        match found.next {
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
+    }
+    agents.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+    agents.dedup();
+    let reload = AgentOp::Control(Control::ReloadProfile);
+    for id in &agents {
+        send(rt, id, &reload, None)?;
+    }
+    Ok(agents)
+}
+
 /// Decode `input`, run `body` to completion, and encode its result.
 fn call<I, O, F, Fut>(input: Value, body: F) -> Result<Value, String>
 where
