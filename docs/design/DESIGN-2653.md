@@ -82,7 +82,7 @@ stateDiagram-v2
     Due --> Clear: the fresh settle ends with nothing queued, or a decision end cuts it and owes a poll at the end
     Due --> Due: the fresh settle ends with a NOTIFY or an owner wake queued
     Due --> Rest: a NOTIFY cuts the fresh settle
-    Rest --> Due: the rest ends, or a decision end cuts it
+    Rest --> Due: the rest ends, or a decision end cuts it and owes a poll at the end
 ```
 
 The pure kernel is `notify::SettleState`. `Worker::settle_if_pending` takes

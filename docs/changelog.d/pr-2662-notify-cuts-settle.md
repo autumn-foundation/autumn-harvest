@@ -9,7 +9,9 @@ the rest of it.
   once. The rest of the settle stays owed, up to the original end. No NOTIFY
   cuts the rest. So each settle has one NOTIFY cut at most, and a row that a
   host clock stamped early still gets its poll at the end. The rest then
-  owes a fresh settle, so the NOTIFY that cut also gets a full margin.
+  owes a fresh settle, so the NOTIFY that cut also gets a full margin. A
+  local decision end that cuts the rest keeps the poll at the original end
+  too, because the fresh settle has its own jitter and can end sooner.
 - A settle that sleeps to its end takes the NOTIFYs queued then, and owes a
   fresh settle for them. The poll at the end covers each of them. Before,
   the next idle wait polled again at once, and in a fleet that poll was

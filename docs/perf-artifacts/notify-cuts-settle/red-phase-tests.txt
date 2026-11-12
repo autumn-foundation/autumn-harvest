@@ -24,3 +24,7 @@ test worker::tests::two_cut_settles_owe_a_poll_at_the_later_end ... ok
 # With that old rule restored in notify::after_settle, both tests fail.
 test worker::tests::a_late_cut_still_gives_its_notify_a_full_margin ... FAILED
 test worker::tests::a_notify_cuts_the_settle_once_and_the_rest_keeps_its_end ... FAILED
+
+# RED phase for the second Codex finding: a decision end that cut a rest
+# owed no poll at the original end. With that rule restored, the test fails.
+test worker::tests::a_local_decision_end_cuts_the_rest_and_owes_a_settle ... FAILED

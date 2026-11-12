@@ -40843,22 +40843,19 @@ impl Worker {
         tokio::select! {
             () = tokio::time::sleep_until(end) => true,
             () = self.decision_done.notified() => {
-                match crate::notify::after_settle(plan, false) {
-                    // A cut rest owes a fresh settle. That settle ends after
-                    // both margins, so it needs no owed poll.
-                    crate::notify::SettleState::Due => {
-                        self.owe_settle(crate::notify::SettleState::Due);
-                    }
-                    crate::notify::SettleState::Clear | crate::notify::SettleState::Rest(_) => {
-                        let mut owed = self
-                            .owed_poll
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        // Keep the later end. A row due at the earlier end is
-                        // still pending then, so one poll covers both.
-                        *owed = Some(owed.map_or(end, |at| at.max(end)));
-                    }
+                {
+                    let mut owed = self
+                        .owed_poll
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    // Keep the later end. A row due at the earlier end is
+                    // still pending then, so one poll covers both.
+                    *owed = Some(owed.map_or(end, |at| at.max(end)));
                 }
+                // A cut rest also owes a fresh settle for the NOTIFY that cut
+                // it. That settle has its own jitter, so it can end before
+                // `end`. The owed poll above still comes at `end`.
+                self.owe_settle(crate::notify::after_settle(plan, false));
                 false
             }
             rest = cut => {
@@ -59992,8 +59989,8 @@ mod tests {
         assert!(later.is_err(), "a settle with no NOTIFY must owe nothing");
     }
 
-    /// A local decision end cuts the rest of a settle too. The cut then owes
-    /// a fresh settle, which ends after the margins of both NOTIFYs.
+    /// A local decision end cuts the rest of a settle too. The cut owes a
+    /// poll at the original end, and a fresh settle for the NOTIFY that cut.
     #[tokio::test(start_paused = true)]
     async fn a_local_decision_end_cuts_the_rest_and_owes_a_settle() {
         let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));
@@ -60018,6 +60015,19 @@ mod tests {
             "a local decision end must cut the rest at once"
         );
 
+        // The cut keeps a poll at the original end. A fresh settle can end
+        // before that end, because its jitter is its own.
+        let original_end = (*worker
+            .owed_poll
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner))
+        .expect("a decision cut must owe a poll at the original end");
+        let gap = original_end - begin;
+        assert!(
+            gap >= crate::notify::SETTLE_DELAY_MIN && gap <= crate::notify::SETTLE_DELAY_MAX,
+            "the owed poll must be at the original end, is after {gap:?}"
+        );
+
         // The poll after the cut was empty. A fresh settle follows, so the
         // NOTIFY that cut the first settle gets its own margin.
         let cut_at = tokio::time::Instant::now();
@@ -60033,7 +60043,24 @@ mod tests {
             "the fresh settle must run in full, ran {waited:?}"
         );
 
-        // The fresh settle saw no NOTIFY, and no owed poll is left.
+        // The owed poll comes at the original end, or at once if that end
+        // passed in the fresh settle.
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            worker.idle_wait_then_settle(&mut NoNotify),
+        )
+        .await
+        .expect("the owed poll must end the wait");
+        // The timer rounds a deadline up to the next millisecond.
+        let due = original_end.max(cut_at + waited);
+        let now = tokio::time::Instant::now();
+        assert!(
+            now >= due && now - due < Duration::from_millis(1),
+            "the owed poll must come at the original end, came {:?} after it",
+            now.saturating_duration_since(due)
+        );
+
+        // Nothing more is owed.
         let later = tokio::time::timeout(
             Duration::from_secs(1),
             worker.idle_wait_then_settle(&mut NoNotify),
