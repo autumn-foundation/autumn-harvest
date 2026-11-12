@@ -43,6 +43,7 @@ mod replica;
 #[cfg(any(feature = "webhooks", feature = "connectors"))]
 pub(crate) mod triggers;
 mod ui;
+mod wake;
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
@@ -60,6 +61,7 @@ pub use handle::{HarvestSqlite, HarvestSqliteError};
 pub use outbox::{SCHEMA_SQL as OUTBOX_SCHEMA_SQL, enqueue_workflow_start_outbox};
 pub(crate) use outbox::{SqliteOutbox, warn_if_stranded};
 pub use replica::{REPLICA_ENGINE, TenantReplica, tenant_harvest_replica_root};
+pub use wake::SCHEMA_SQL as TENANT_WAKES_SCHEMA_SQL;
 
 /// The `autumn-harvest-sqlite` types that [`HarvestSqlite`] takes and returns.
 pub use autumn_harvest_sqlite::{
@@ -122,6 +124,8 @@ struct Slot {
     fleet: Option<HarvestFleet>,
     /// The outbox relay and its stop token (issue #2470).
     relay: Option<Relay>,
+    /// The sweep that wakes closed tenants, and its stop token.
+    wake_sweep: Option<Relay>,
     /// The broker connectors. The startup hook starts them after the
     /// driver. The shutdown hook stops them before it (issue #2471).
     #[cfg(feature = "connectors")]
@@ -342,14 +346,26 @@ async fn stop(slot: &Mutex<Slot>) {
         );
         crate::plugin::stop_connectors(loops).await;
     }
-    let (driver, fleet, relay) = {
+    let (driver, fleet, relay, wake_sweep) = {
         let mut slot = slot.lock().unwrap_or_else(PoisonError::into_inner);
-        (slot.driver.take(), slot.fleet.take(), slot.relay.take())
+        (
+            slot.driver.take(),
+            slot.fleet.take(),
+            slot.relay.take(),
+            slot.wake_sweep.take(),
+        )
     };
     if let Some((stop, task)) = relay {
         stop.cancel();
         if task.await.is_err() {
             tracing::warn!("the harvest-sqlite outbox relay did not stop cleanly");
+        }
+    }
+    // The sweep wakes no tenant after this. It writes its book once more.
+    if let Some((stop, task)) = wake_sweep {
+        stop.cancel();
+        if task.await.is_err() {
+            tracing::warn!("the harvest-sqlite tenant wake sweep did not stop cleanly");
         }
     }
     if let Some(fleet) = fleet {
@@ -727,32 +743,67 @@ async fn start(
     tracing::info!(path = %path.display(), "harvest is running on SQLite");
 
     if let Some(fleet) = fleet {
-        let tenants = start_tenants(state, fleet, registry, tick, tenant_replica).await?;
-        slot.lock().unwrap_or_else(PoisonError::into_inner).fleet = Some(tenants.clone());
+        let tenants = start_tenants(state, slot, fleet, registry, tick, tenant_replica).await?;
         let _ = handles.fleet.set(tenants);
     }
     Ok(())
 }
 
-/// Start the per-tenant Harvests and the shippers of their files.
+/// The book of tenant wake times on the control database.
+///
+/// `None` when the app has no control database. A closed tenant then runs
+/// nothing until its next open, and the boot says so.
 ///
 /// # Errors
 ///
-/// Returns the error of the replication thread start.
+/// Returns the error of the wake table DDL.
+async fn tenant_wakes(state: &AppState) -> autumn_web::AutumnResult<Option<Arc<wake::WakeBook>>> {
+    let Some(pool) = state.pool() else {
+        tracing::warn!(
+            "the app has no control database, so no sweep wakes a closed tenant: its timers \
+             and schedules wait for its next open"
+        );
+        return Ok(None);
+    };
+    let book = wake::WakeBook::open(pool.clone())
+        .await
+        .map_err(AutumnError::service_unavailable_msg)?;
+    Ok(Some(Arc::new(book)))
+}
+
+/// Start the per-tenant Harvests, the shippers of their files and the sweep
+/// that wakes a closed tenant. Keep them in `slot` for the shutdown hook.
+///
+/// # Errors
+///
+/// Returns the error of the replication thread start or of the wake table
+/// DDL.
 async fn start_tenants(
     state: &AppState,
+    slot: &Mutex<Slot>,
     fleet: autumn_web::db::fleet::DatabaseFleet,
     registry: Arc<Registry>,
     tick: Duration,
     tenant_replica: Option<TenantReplica>,
 ) -> autumn_web::AutumnResult<HarvestFleet> {
+    // The wake table comes first. Its error then starts no replication loop.
+    let wakes = tenant_wakes(state).await?;
     let replicas = tenant_replicas(state, &fleet, tenant_replica)
         .await
         .map_err(AutumnError::service_unavailable_msg)?;
-    let tenants = HarvestFleet::new(fleet, registry, tick, replicas);
+    let tenants = HarvestFleet::new(fleet, registry, tick, replicas, wakes.clone());
     tenants.install().await;
     state.insert_extension(tenants.clone());
     tracing::info!("harvest runs one SQLite file per open fleet tenant");
+    let wake_sweep = wakes.map(|wakes| {
+        let stop = CancellationToken::new();
+        let task = wake::WakeSweep::new(tenants.clone(), wakes).spawn(tick, stop.clone());
+        (stop, task)
+    });
+    let mut slot = slot.lock().unwrap_or_else(PoisonError::into_inner);
+    slot.fleet = Some(tenants.clone());
+    slot.wake_sweep = wake_sweep;
+    drop(slot);
     Ok(tenants)
 }
 

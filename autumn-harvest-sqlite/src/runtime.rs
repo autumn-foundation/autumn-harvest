@@ -656,6 +656,30 @@ impl SqliteRuntime {
         self.schedules_enabled = enabled;
     }
 
+    /// The earliest time, in epoch milliseconds, at which a drive has due
+    /// work. `None` when nothing is due at a known time.
+    ///
+    /// A fleet host opens a closed tenant at this time. The sources are the
+    /// unfired timers and pending activity retries of running runs, the
+    /// deadlines and backoffs of running runs, and the slots of unpaused
+    /// schedules. A slot counts only while schedules are on. A backoff counts
+    /// only while it is in the future.
+    ///
+    /// ```rust,ignore
+    /// let mut rt = SqliteRuntime::open(&path)?;
+    /// rt.start_workflow("nap_then_mail", json!(5))?;
+    /// rt.poll_once().await?;
+    /// assert!(rt.next_wake_at()?.is_some());
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqliteError::Sqlite`] when the read fails.
+    pub fn next_wake_at(&self) -> SqliteResult<Option<i64>> {
+        let now = (self.now_fn)().timestamp_millis();
+        crate::wake::next_wake_at(&self.conn, now, self.schedules_enabled)
+    }
+
     /// Set the app state that `ctx.state::<T>()` returns (issue #2467).
     ///
     /// Workflows, activities, local activities, update replays and query

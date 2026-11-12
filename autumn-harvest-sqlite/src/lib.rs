@@ -826,6 +826,7 @@ mod schema;
 mod store;
 mod update;
 mod visibility;
+mod wake;
 mod worker;
 mod workflow_log;
 

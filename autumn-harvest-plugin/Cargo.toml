@@ -333,6 +333,12 @@ required-features = ["sqlite"]
 name = "sqlite_plugin_fleet_replica"
 required-features = ["sqlite"]
 
+# A closed tenant wakes when its next timer or schedule slot is due. It needs
+# no Docker.
+[[test]]
+name = "sqlite_plugin_fleet_wake"
+required-features = ["sqlite"]
+
 # The durable agent under `HarvestPlugin` on SQLite. It needs no Docker.
 [[test]]
 name = "sqlite_plugin_agent"
