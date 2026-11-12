@@ -18,12 +18,12 @@
 
 | scenario | shards | metric | value | sound |
 |:--|--:|:--|--:|:--|
-| `dispatch_latency` | 1 | `p50_ms` | 5.40 | yes |
-| `dispatch_latency` | 1 | `p99_ms` | 10.33 | yes |
+| `dispatch_latency` | 1 | `p50_ms` | 6.21 | yes |
+| `dispatch_latency` | 1 | `p99_ms` | 12.55 | yes |
 | `dispatch_latency` | 1 | `samples` | 1080.00 | yes |
 | `dispatch_latency` | 1 | `achieved_starts_per_sec` | 8.00 | yes |
-| `signal_roundtrip` | 1 | `p50_ms` | 7.84 | yes |
-| `signal_roundtrip` | 1 | `p99_ms` | 73.70 | yes |
+| `signal_roundtrip` | 1 | `p50_ms` | 9.12 | yes |
+| `signal_roundtrip` | 1 | `p99_ms` | 72.10 | yes |
 | `signal_roundtrip` | 1 | `samples` | 400.00 | yes |
 | `signal_roundtrip` | 1 | `achieved_signals_per_sec` | 8.00 | yes |
 
@@ -36,10 +36,10 @@
 * topology: independent-servers
 * host layout: 1 shard(s) on 1 database host(s) (localhost); a database shares the bench host with the workers and the generator
 * target pace: 8.0 workflow starts/s
-* host-to-database clock offset before the window: +0.044 ms (per shard, median of 7 probes)
-* host-to-database clock offset after the window: +0.023 ms
+* host-to-database clock offset before the window: +0.075 ms (per shard, median of 7 probes)
+* host-to-database clock offset after the window: +0.022 ms
 * 0 re-dispatched task row(s); 0 dispatch(es) recorded no task id
-* wall clock: 51.9s
+* wall clock: 52.1s
 * sound: every published number on this row rests on a measured sample
 
 ### `signal_roundtrip` at 1 shard(s)
@@ -49,7 +49,7 @@
 * host layout: 1 shard(s) on 1 database host(s) (localhost); a database shares the bench host with the workers and the generator
 * target pace: 8.0 signals/s per shard, one paced sender per shard running concurrently; achieved 8.0/s
 * 400 measured signals after a discarded warmup cohort of 80
-* wall clock: 64.0s
+* wall clock: 64.4s
 * sound: every published number on this row rests on a measured sample
 
 

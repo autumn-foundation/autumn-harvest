@@ -21,10 +21,10 @@ the rest of it.
   `after_settle`. `formal/verus/src/notify_settle.rs` proves that the
   cuts never exceed the fresh settles, and that each cut owes its rest.
 - Measured at 1 shard on one 4-core box: the `signal_roundtrip` p99 falls
-  from 73.7 ms to 14.9 ms, and the `dispatch_latency` p99 from 10.3 ms to
-  8.2 ms. The capacity cells with 4 worker processes show a median paired
-  difference of zero ladder steps. Empty polls rise 17% to 23%. See
-  `docs/performance-notify-cuts-settle.md`.
+  from 74.8 ms to 15.9 ms, and the `dispatch_latency` p99 from 12.6 ms to
+  10.7 ms. In the capacity cells with 4 worker processes, no paired
+  difference is more than one ladder step, the noise of that box. Empty
+  polls rise 6% to 11%. See `docs/performance-notify-cuts-settle.md`.
 - Tests: the settle tests in `worker::tests` and `notify::tests`.
 - No new `WorkflowEvent` variant. No migration. No schema change. No claim
   statement changes.

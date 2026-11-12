@@ -11,18 +11,18 @@ once. [`design/DESIGN-2653.md`](design/DESIGN-2653.md) holds the design.
 
 ## TL;DR
 
-* **The signal round-trip p99 falls from 73.7 ms to 14.9 ms** at 1 shard.
-  Each of five changed runs reads 14.3 to 15.7 ms. Each of five base runs
-  reads 72.2 to 77.3 ms.
-* **The dispatch p99 falls from 10.3 ms to 8.2 ms.** The p50 values of
+* **The signal round-trip p99 falls from 74.8 ms to 15.9 ms** at 1 shard.
+  Each of five changed runs reads 15.1 to 18.8 ms. Each of five base runs
+  reads 72.1 to 75.4 ms.
+* **The dispatch p99 falls from 12.6 ms to 10.7 ms.** The p50 values of
   both scenarios fall by about 1 ms.
 * **The capacity cells show no systematic loss.** Over three alternating
-  pairs, the median paired difference is zero ladder steps for both arms.
-  Each single difference is one step, and one step is the noise of this
-  box. The no-op arm leans low and the canonical arm leans high.
-* **Empty polls rise.** The median rate rises 21% in `capacity_noop`, 17% in
-  `capacity_canonical` and 23% in the latency cells. A first version
-  without the drain (below) raised them 36% and 27% in the capacity cells.
+  pairs per arm, no paired difference is more than one ladder step, and one
+  step is the noise of this box. The no-op arm leans low and the canonical
+  arm leans high, over all versions measured.
+* **Empty polls rise a little.** The median rate rises 11% in
+  `capacity_noop`, 11% in `capacity_canonical` and 6% in the latency cells.
+  Two earlier versions, below, raised them more.
 
 ## The change
 
@@ -30,8 +30,8 @@ once. [`design/DESIGN-2653.md`](design/DESIGN-2653.md) holds the design.
   The rest of the settle stays owed, up to the original end, and no NOTIFY
   cuts the rest. So each settle has one NOTIFY cut at most, and the poll at
   the original end still comes for a row that a host clock stamped early.
-  The rest then owes a fresh settle, so the NOTIFY that cut also gets a
-  full margin.
+* A rest always owes a fresh settle. So the NOTIFY that cut also gets a full
+  margin of its own.
 * A settle that sleeps to its end takes the NOTIFYs queued then, and owes a
   fresh settle for them. The poll at the end covers each of them. Before,
   the next idle wait polled again at once. In a fleet, that poll was empty
@@ -46,14 +46,14 @@ once. [`design/DESIGN-2653.md`](design/DESIGN-2653.md) holds the design.
   port 55432, set up like the services in
   [`benchmarks/docker-compose.yml`](../benchmarks/docker-compose.yml), with
   `pg_stat_statements` preloaded.
-* **Builds.** `base` is `trunk-dev` at `83b0417`. `new` is the first
-  version, with the cut and no drain. `v2` is the version that ships, with
-  the cut and the drain. Each build is a release `e2e_bench` binary.
+* **Builds.** `base` is `trunk-dev` at `83b0417`. Three changed builds ran
+  in turn: `new` cut the settle and did nothing else, `v2` added the drain,
+  and `v3` added the fresh settle after a rest. `v3` ships. Each build is a
+  release `e2e_bench` binary.
 * **Runs.** Each run is one `e2e_bench` invocation at 1 shard. The builds
-  alternate in the order base, changed, changed, base, so a drift of the
-  box hits both. The latency runs hold `signal_roundtrip` and
-  `dispatch_latency`. Each capacity run holds one arm, with the default 4
-  worker processes.
+  alternate, so a drift of the box hits both. The latency runs hold
+  `signal_roundtrip` and `dispatch_latency`. Each capacity run holds one
+  arm, with the default 4 worker processes.
 * **Empty polls.** Before each run, `pg_stat_statements_reset()` clears the
   counters. After it, the claim statement gives its calls and its rows. A
   claim returns one row at most, so the empty polls are the calls less the
@@ -71,8 +71,8 @@ Five alternating pairs of the shipped version. The outputs are in
 
 | build | signal p50 ms | signal p99 ms | dispatch p50 ms | dispatch p99 ms | empty polls/s | empty polls per claim |
 |:--|--:|--:|--:|--:|--:|--:|
-| base (median of 5) | 7.90 | 73.68 | 5.50 | 10.33 | 85.40 | 2.29 |
-| v2 (median of 5) | 6.74 | 14.87 | 4.76 | 8.16 | 104.90 | 2.81 |
+| base (median of 5) | 9.12 | 74.79 | 6.65 | 12.55 | 83.40 | 2.25 |
+| v3 (median of 5) | 7.93 | 15.87 | 5.93 | 10.68 | 88.50 | 2.38 |
 
 The signal p99 of the base build stays near the settle. A signal that
 lands in a settle waits for the rest of it. That matches the 80 to 85 ms
@@ -84,47 +84,59 @@ published. The changed build polls at the NOTIFY instead.
 Three alternating pairs of the shipped version, at 1 shard. The sustainable
 rate is the highest ladder step that holds. The ladder steps by 1.25 times.
 
-| arm | pair | base rate/s | v2 rate/s | base empty polls/s | v2 empty polls/s | base empty per claim | v2 empty per claim |
+| arm | pair | base rate/s | v3 rate/s | base empty polls/s | v3 empty polls/s | base empty per claim | v3 empty per claim |
 |:--|--:|--:|--:|--:|--:|--:|--:|
-| `capacity_noop` | 1 | 372.5 | 372.5 | 281.1 | 314.7 | 1.64 | 1.81 |
-| `capacity_noop` | 2 | 238.4 | 298.0 | 326.0 | 339.2 | 2.50 | 2.24 |
-| `capacity_noop` | 3 | 372.5 | 298.0 | 274.0 | 364.9 | 1.57 | 2.32 |
-| `capacity_canonical` | 1 | 76.3 | 76.3 | 237.2 | 281.5 | 0.67 | 0.86 |
-| `capacity_canonical` | 2 | 61.0 | 61.0 | 269.6 | 348.5 | 0.91 | 1.19 |
-| `capacity_canonical` | 3 | 61.0 | 76.3 | 329.1 | 315.9 | 1.12 | 0.97 |
+| `capacity_noop` | 1 | 372.5 | not published | 281.2 | 345.1 | 1.65 | 2.64 |
+| `capacity_noop` | 2 | 298.0 | 372.5 | 296.1 | 312.8 | 1.76 | 1.79 |
+| `capacity_noop` | 3 | 372.5 | 298.0 | 276.7 | 290.0 | 1.60 | 1.92 |
+| `capacity_canonical` | 1 | 76.3 | 76.3 | 272.0 | 301.5 | 0.82 | 0.91 |
+| `capacity_canonical` | 2 | 61.0 | 61.0 | 263.1 | 297.3 | 0.92 | 0.89 |
+| `capacity_canonical` | 3 | 61.0 | 76.3 | 268.1 | 245.7 | 0.93 | 0.70 |
 
-Pairs 1 and 2 ran base first. Pair 3 ran v2 first.
+Pairs 1 and 3 ran base first. Pair 2 ran v3 first.
 
-* **The rate.** In `capacity_noop` the changed build is equal, one step
-  higher and one step lower. In `capacity_canonical` it is equal, equal
-  and one step higher. Over the five changed no-op runs of both versions,
-  the arm held 372.5/s in two and 298.0/s in three. Base held 372.5/s in
-  four of its five no-op runs. So a one-step loss on the no-op arm is
-  possible. This box cannot separate it from noise, because base itself
-  moved two steps between runs. Over the five changed canonical runs, the
-  arm held 76.3/s in four. Base held it in two of five.
+* **Pair 1 of `capacity_noop` is not published.** At 298.0/s the generator
+  wait p99 read 107.1 ms, over its 100 ms limit. The engine kept up: its
+  backlog fell. The bench rule then calls the step generator-bound, so the
+  cell has no engine rate. The step before it, 238.4/s, held.
+* **The rate.** In `capacity_noop` the shipped build is one step higher in
+  one pair and one step lower in another. In `capacity_canonical` it is
+  equal, equal and one step higher.
+* **All versions together.** The no-op arm held 372.5/s in three of the
+  seven published changed runs, and base held it in six of eight. The
+  canonical arm held 76.3/s in six of eight changed runs, and base held it
+  in three of eight. So a one-step loss on the no-op arm and a one-step
+  gain on the canonical arm are both possible. This box cannot separate
+  either from noise, because base itself moved two steps between runs.
 * **The p99 at the sustainable rate.** It moves with the rate and the run.
-  In pair 1 of the canonical arm both builds held 76.3/s. There the p99
-  read 812 ms for v2 and 483 ms for base. The first version read 985 and
-  893 ms against 372 ms. A run at a lower rate is not comparable.
-* **Empty polls.** The median rate rises from 281.1 to 339.2 per second in
-  `capacity_noop` and from 269.6 to 315.9 in `capacity_canonical`.
+  In pair 1 of the canonical arm both builds held 76.3/s. There the p99 read
+  1112 ms for v3 and 988 ms for base. A run at a lower rate is not
+  comparable.
+* **Empty polls.** The median rate rises from 281.2 to 312.8 per second in
+  `capacity_noop` and from 268.1 to 297.3 in `capacity_canonical`.
 
-## The first version, without the drain
+## The earlier versions
 
-The first version cut the settle and did nothing else. Two alternating
-pairs per arm. The outputs are in
-[`round1/`](perf-artifacts/notify-cuts-settle/round1/).
+The first version, `new`, cut the settle and did nothing else. Two
+alternating pairs per arm, in
+[`round1/`](perf-artifacts/notify-cuts-settle/round1/). The second, `v2`,
+added the drain. Three pairs per arm and five latency pairs, in
+[`round2/`](perf-artifacts/notify-cuts-settle/round2/).
 
-| arm | base rates/s | new rates/s | base empty polls/s | new empty polls/s |
-|:--|:--|:--|:--|:--|
-| `capacity_noop` | 372.5, 372.5 | 298.0, 372.5 | 305.2, 323.9 | 450.5, 402.4 |
-| `capacity_canonical` | 76.3, 61.0 | 76.3, 76.3 | 296.1, 355.7 | 414.2, 411.9 |
+| version | noop rates/s (base / changed) | canonical rates/s (base / changed) | median empty polls/s, noop (base / changed) | median empty polls/s, canonical (base / changed) | median empty polls/s, latency (base / changed) |
+|:--|:--|:--|:--|:--|:--|
+| `new` | 372.5/298.0, 372.5/372.5 | 76.3/76.3, 61.0/76.3 | 314.6 / 426.5 | 325.9 / 413.1 | 85.8 / 106.1 |
+| `v2` | 372.5/372.5, 238.4/298.0, 372.5/298.0 | 76.3/76.3, 61.0/61.0, 61.0/76.3 | 281.1 / 339.2 | 269.6 / 315.9 | 85.4 / 104.9 |
 
-Its latency gains matched the shipped version: a signal p99 of 15.4 ms
-against 73.8 ms. But it raised the empty polls by up to 48% in a pair. The
-leader polled at the cut, at the end, and again at once for each NOTIFY
-that queued in the rest. The drain removes that last poll.
+* `new` polled at the cut, at the end, and again at once for each NOTIFY
+  that queued in the rest. It raised the empty polls by up to 48% in a pair.
+* `v2` removed that last poll. But a rest then owed nothing. So the NOTIFY
+  that cut got only the poll at the cut and the poll at the old end, and
+  both can come before a row that a host clock stamped early. A code review
+  found this. `v3` makes a rest owe a fresh settle. That also took the
+  empty polls down again.
+* All three versions gave the same latency gain. The signal p99 read 15.4,
+  14.9 and 15.9 ms against base runs at 73.8, 73.7 and 74.8 ms.
 
 ## What this page does not show
 
