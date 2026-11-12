@@ -1,4 +1,4 @@
-## Hot path round trips (issue #2654)
+## Hot path round trips (issue #2654, PR #2669)
 
 The statement cache audit left six measured costs in place. This change
 fixes four of them and two in part. It keeps the rest with a reason.
