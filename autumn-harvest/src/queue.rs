@@ -3983,8 +3983,8 @@ async fn apply_post_claim_rechecks(
     // committing while the claim was in flight is invisible to it. This is a
     // separate statement and therefore takes a fresh snapshot.
     //
-    // Gated on `task_type` so a workflow task -- which can never be held by an
-    // activity pause -- pays no extra statement on the hot claim path. The
+    // Gated on `task_type`. An activity pause can never hold a workflow task,
+    // so a workflow task pays no extra statement on the hot claim path. The
     // guard is not merely an optimization: it makes the added cost fall only on
     // the rows the feature can actually hold.
     //

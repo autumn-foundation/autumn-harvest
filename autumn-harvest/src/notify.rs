@@ -4115,7 +4115,7 @@ mod tests {
         }
     }
 
-    fn task_note(channel: &str) -> Note {
+    fn pending_task_note(channel: &str) -> Note {
         Note::Task {
             channel: channel.into(),
             task_id: Uuid::new_v4(),
@@ -4125,9 +4125,9 @@ mod tests {
     #[test]
     fn the_read_sends_the_merged_wakes_of_one_server() {
         let held = vec![
-            staged("a", task_note("q1")),
-            staged("a", task_note("q1")),
-            staged("a", task_note("q2")),
+            staged("a", pending_task_note("q1")),
+            staged("a", pending_task_note("q1")),
+            staged("a", pending_task_note("q2")),
         ];
         let (server, wakes) = wakes_with_the_read(&held).expect("one server");
         assert_eq!(server.database, "a");
@@ -4139,7 +4139,10 @@ mod tests {
     #[test]
     fn the_read_sends_nothing_for_two_servers_or_owner_notes_only() {
         assert!(wakes_with_the_read(&[]).is_none());
-        let mixed = vec![staged("a", task_note("q1")), staged("b", task_note("q1"))];
+        let mixed = vec![
+            staged("a", pending_task_note("q1")),
+            staged("b", pending_task_note("q1")),
+        ];
         assert!(wakes_with_the_read(&mixed).is_none());
         let owner = vec![staged(
             "a",

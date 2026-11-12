@@ -116,7 +116,8 @@ is the terminal persist, one for each workflow.
 ### 4. The notify sender reads and sends in one statement
 
 Each tick of the sender read the commit state of its held notes, then sent
-the ready wakes. Now one statement does both when every note is ready:
+the ready wakes. Now one statement, `notify::read_gate`, does both when
+every note is ready:
 
 * Rust builds the wakes of all held notes before the read, with the same
   coalescing as before. Owner notes keep their own lookup.
@@ -126,7 +127,8 @@ the ready wakes. Now one statement does both when every note is ready:
   the branch is taken.
 * Otherwise the statement only reads, and the tick sends the ready wakes
   in a second statement, as before.
-* When the combined statement fails, the tick reads again with no send. A
+* When the combined statement fails, the tick reads again with no send,
+  through `notify::read_gate_only`. A
   failed `pg_notify` thus still gives a good read, and the second send
   counts its wakes as lost, as before.
 
@@ -156,7 +158,8 @@ ran the planner on every tick before.
 sweep sent a probe and a key read, and the waiter sweep did the same. Now it sends one probe and one key read, a `UNION ALL` of the held
 keys and the waiter keys. The waiter part skips each key that the lock part
 freed, because that free also deleted the waiter row. So the sweep does the
-same work as before.
+same work as before. `free_held_keys` and `drop_waiter_keys` hold the two
+loops, which the old functions now share.
 
 The issue suggested a gate on `mutex::history_records_a_grant`, as the lease
 renewal uses. The merged read saves the same statement on every terminal

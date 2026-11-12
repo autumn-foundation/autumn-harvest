@@ -3,9 +3,10 @@
 //!
 //! - A run with no lock and no waiter row costs two statements: the table
 //!   probe and the key read.
-//! - A run that holds a key and waits on others frees each key, drops each
-//!   waiter row and wakes each new head of line, as
-//!   `release_all_locks_for_holder` then `delete_waiters_for_holder` do.
+//! - A run that holds a key and waits on others frees each key. It drops each
+//!   waiter row and wakes each new head of line. The two separate sweeps,
+//!   `release_all_locks_for_holder` then `delete_waiters_for_holder`, do the
+//!   same.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
