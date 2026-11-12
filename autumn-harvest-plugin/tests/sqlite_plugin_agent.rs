@@ -31,7 +31,8 @@ use autumn_harvest_agent::{
 };
 use autumn_harvest_plugin::HarvestPlugin;
 use autumn_harvest_plugin::sqlite::{
-    ExecutionFilter, ExecutionSummary, HarvestSqlite, SignalWithStartParams, StartOptions, agent,
+    ExecutionFilter, ExecutionSummary, HarvestSqlite, HarvestSqliteError, SignalWithStartParams,
+    SqliteError, StartOptions, agent,
 };
 use autumn_web::config::AutumnConfig;
 use autumn_web::test::{TestApp, TestClient};
@@ -54,6 +55,17 @@ fn boot(dir: &Path, harness: AgentHarness) -> TestClient {
         .profile("dev")
         .plugin(HarvestPlugin::new().agent(harness).api("/harvest"))
         .build()
+}
+
+/// `true` when the run has not registered the state query yet.
+///
+/// The agent reads its profile in an activity before the entity registers
+/// the query. Until that activity completes, a query replay finds no handler.
+const fn not_ready(err: &HarvestSqliteError) -> bool {
+    matches!(
+        err,
+        HarvestSqliteError::Sqlite(SqliteError::QueryNotFound { .. })
+    )
 }
 
 fn handle_of(client: &TestClient) -> HarvestSqlite {
@@ -110,10 +122,13 @@ impl Plugin {
         runs
     }
 
+    /// The state of the agent `id`, or `None` while it is not ready.
     async fn state(&self, id: &AgentId) -> Option<AgentState> {
-        agent::state(self.handle(), id)
-            .await
-            .expect("the state reads")
+        match agent::state(self.handle(), id).await {
+            Ok(state) => state,
+            Err(err) if not_ready(&err) => None,
+            Err(err) => panic!("the state reads: {err}"),
+        }
     }
 }
 
@@ -338,13 +353,15 @@ async fn an_entity_agent_runs_through_signal_with_start() {
 
     let deadline = Instant::now() + LIMIT;
     let state: AgentState = loop {
-        let value: Value = handle
-            .query(exec, ENTITY_STATE_QUERY, Value::Null)
-            .await
-            .unwrap();
-        let state: AgentState = serde_json::from_value(value).unwrap();
-        if state.segments >= 1 {
-            break state;
+        match handle.query(exec, ENTITY_STATE_QUERY, Value::Null).await {
+            Ok(value) => {
+                let state: AgentState = serde_json::from_value(value).unwrap();
+                if state.segments >= 1 {
+                    break state;
+                }
+            }
+            Err(err) if not_ready(&err) => {}
+            Err(err) => panic!("the state reads: {err}"),
         }
         assert!(Instant::now() < deadline, "the op did not run");
         tokio::time::sleep(Duration::from_millis(25)).await;
