@@ -1519,7 +1519,9 @@ impl AgentRun<'_> {
         match admit(state.status.inbox(), op.class()) {
             Admit::Apply => match op {
                 AgentOp::Control(Control::ReloadProfile) => {
-                    loaded = Some(load_run(self.ctx, self.id.clone()).await);
+                    // A box keeps the read and the discovery out of each op
+                    // future. Inline, they overflow a 1 MiB thread stack.
+                    loaded = Some(Box::pin(load_run(self.ctx, self.id.clone())).await);
                 }
                 AgentOp::Control(control) => state = self.control(state, control).await,
                 AgentOp::Unpark => state = self.unpark(state).await,
