@@ -120,6 +120,9 @@ struct Shared {
     /// The shippers of the tenant Harvest files. `None` when the fleet does
     /// not replicate.
     replicas: Option<Arc<Replicas>>,
+    /// One [`HarvestFleet::restore`] at a time. Two restores of one tenant
+    /// would otherwise swap their targets.
+    restore_turn: tokio::sync::Mutex<()>,
 }
 
 /// The per-tenant Harvests of a fleet app.
@@ -164,6 +167,7 @@ impl HarvestFleet {
                 tenants: Mutex::new(HashMap::new()),
                 generation: AtomicU64::new(0),
                 replicas,
+                restore_turn: tokio::sync::Mutex::new(()),
             }),
         }
     }
@@ -284,8 +288,9 @@ impl HarvestFleet {
     /// beside the Harvest file. The next open of the tenant restores the
     /// Harvest file to it, before the driver starts. When the Harvest
     /// replica cannot reach the target, each open refuses until a new
-    /// restore. A direct `DatabaseFleet::restore` restores the Harvest file
-    /// at its latest state.
+    /// restore. One restore runs at a time, so two restores never swap
+    /// their targets. A direct `DatabaseFleet::restore` restores the
+    /// Harvest file at its latest state.
     ///
     /// # Errors
     ///
@@ -298,6 +303,7 @@ impl HarvestFleet {
         let Some(replicas) = &self.shared.replicas else {
             return Ok(self.shared.fleet.restore(key, target).await?);
         };
+        let _turn = self.shared.restore_turn.lock().await;
         replicas.request_restore(key, target);
         let restored = self.shared.fleet.restore(key, target).await;
         replicas.end_restore(key, restored.is_ok());
