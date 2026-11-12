@@ -98,6 +98,34 @@ pub fn acquire(conn: &Connection, requested: &Path) -> SqliteResult<Option<Write
         Some(reported) => Path::new(reported),
         None => requested,
     };
+    lock_file(db_path).map(|file| Some(WriterLock::File(file)))
+}
+
+/// The single-writer lock of a database file, held without a runtime.
+///
+/// A fleet host holds it while it replaces a stale Harvest file. No runtime
+/// can then open the file, in this process or another one. Drop it before
+/// the runtime opens the file.
+#[derive(Debug)]
+pub struct FileWriterLock {
+    _file: File,
+}
+
+impl FileWriterLock {
+    /// Take the lock of the database file at `path`. The file must exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqliteError::DatabaseLocked`] when a runtime holds the lock.
+    /// Returns [`SqliteError::Io`] when the file is missing, or when the lock
+    /// file cannot be opened or locked.
+    pub fn acquire(path: &Path) -> SqliteResult<Self> {
+        lock_file(path).map(|file| Self { _file: file })
+    }
+}
+
+/// Take the OS lock on `<canonical db_path>.lock`.
+fn lock_file(db_path: &Path) -> SqliteResult<File> {
     let canonical = canonicalize(db_path)?;
     let path = lock_path(&canonical);
     let mut options = OpenOptions::new();
@@ -118,7 +146,7 @@ pub fn acquire(conn: &Connection, requested: &Path) -> SqliteResult<Option<Write
     let mut attempt = 1;
     loop {
         match file.try_lock() {
-            Ok(()) => return Ok(Some(WriterLock::File(file))),
+            Ok(()) => return Ok(file),
             Err(std::fs::TryLockError::WouldBlock) if attempt < LOCK_ATTEMPTS => {
                 attempt += 1;
                 std::thread::sleep(LOCK_RETRY_DELAY);
@@ -166,4 +194,38 @@ fn lock_path(canonical: &Path) -> PathBuf {
     let mut name = canonical.as_os_str().to_os_string();
     name.push(".lock");
     PathBuf::from(name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A held file lock refuses a runtime on the same file.
+    #[test]
+    fn a_held_file_lock_refuses_a_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("acme.harvest.db");
+        drop(crate::SqliteRuntime::open(&path).unwrap());
+        let held = FileWriterLock::acquire(&path).unwrap();
+        let refused = crate::SqliteRuntime::open(&path).err();
+        assert!(
+            matches!(refused, Some(SqliteError::DatabaseLocked { .. })),
+            "{refused:?}"
+        );
+        drop(held);
+        drop(crate::SqliteRuntime::open(&path).unwrap());
+    }
+
+    /// A running runtime refuses a file lock.
+    #[test]
+    fn a_runtime_refuses_a_file_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("acme.harvest.db");
+        let runtime = crate::SqliteRuntime::open(&path).unwrap();
+        assert!(matches!(
+            FileWriterLock::acquire(&path),
+            Err(SqliteError::DatabaseLocked { .. })
+        ));
+        drop(runtime);
+    }
 }

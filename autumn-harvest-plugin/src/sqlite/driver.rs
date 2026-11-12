@@ -458,7 +458,26 @@ impl Driver {
     /// Returns the open error, such as a writer lock that another process
     /// holds, or the registration panic message.
     pub(crate) fn open(path: &Path, registry: &Registry) -> Result<SqliteRuntime, String> {
-        let mut runtime = SqliteRuntime::open(path).map_err(|error| {
+        Self::open_with(path, registry, false)
+    }
+
+    /// As [`open`](Self::open). With `replicated`, the runtime never
+    /// checkpoints, because a replicator ships the file.
+    ///
+    /// # Errors
+    ///
+    /// As [`open`](Self::open).
+    pub(crate) fn open_with(
+        path: &Path,
+        registry: &Registry,
+        replicated: bool,
+    ) -> Result<SqliteRuntime, String> {
+        let opened = if replicated {
+            SqliteRuntime::open_replicated(path)
+        } else {
+            SqliteRuntime::open(path)
+        };
+        let mut runtime = opened.map_err(|error| {
             format!(
                 "cannot open the Harvest SQLite database {}: {error}",
                 path.display()

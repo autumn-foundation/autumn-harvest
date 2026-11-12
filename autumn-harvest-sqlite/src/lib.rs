@@ -809,6 +809,7 @@ mod auth;
 mod composition;
 mod error;
 mod external_task;
+pub mod fleet_epoch;
 mod history_cap;
 mod history_page;
 mod llm_ledger;
@@ -849,6 +850,7 @@ pub use crate::history_page::{
     DEFAULT_HISTORY_PAGE, HistoryFilter, HistoryPage, MAX_HISTORY_PAGE, PagedEvent,
 };
 pub use crate::llm_ledger::LlmLedgerRow;
+pub use crate::lock::FileWriterLock;
 pub use crate::operator::{
     BufferedSignal, ChildRun, CountFilter, ExecutionCount, PendingTask, PendingTimer, PendingWork,
     TimedEvent,
