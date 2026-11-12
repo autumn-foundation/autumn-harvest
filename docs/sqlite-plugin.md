@@ -228,6 +228,10 @@ API behind `api_with_auth` outside `dev`.
 - A direct `DatabaseFleet::restore` to a point in time restores the
   Harvest file at its latest state. Use `HarvestFleet::restore` for one
   target on both files.
+- On Unix the database identity is the device and inode. Elsewhere it is
+  the creation time, which Windows can keep across a rename. A restore on
+  Windows can then keep the old Harvest file. Use `HarvestFleet::restore`
+  there: its target always applies.
 - An import or a re-create gives the tenant a new database file. A Harvest
   file with no replica then goes aside, as `<file>.aside-<n>`.
 - `DatabaseFleet::release_ownership` does not wait for a Harvest backlog.

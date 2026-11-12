@@ -202,6 +202,13 @@ impl Shipper {
     }
 }
 
+/// A `HarvestFleet::restore` call in flight.
+struct Requested {
+    target: Option<DateTime<Utc>>,
+    /// The target of an earlier restore that waits for the next open.
+    previous: Option<String>,
+}
+
 /// What the replica holds for a restore request.
 enum Planned {
     /// A generation to restore.
@@ -223,7 +230,7 @@ pub struct Replicas {
     parked: Mutex<HashMap<FleetDbKey, Arc<Shipper>>>,
     /// The targets of `HarvestFleet::restore` calls in flight. The `release`
     /// hook writes each one to disk, after the fleet drained the tenant.
-    requested: Mutex<HashMap<FleetDbKey, Option<DateTime<Utc>>>>,
+    requested: Mutex<HashMap<FleetDbKey, Requested>>,
     stopped: AtomicBool,
 }
 
@@ -249,7 +256,7 @@ impl Replicas {
         self.parked.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn requested_map(&self) -> MutexGuard<'_, HashMap<FleetDbKey, Option<DateTime<Utc>>>> {
+    fn requested_map(&self) -> MutexGuard<'_, HashMap<FleetDbKey, Requested>> {
         self.requested
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -645,7 +652,10 @@ impl Replicas {
     /// Harvest file. The next open reads it once the database is a new file.
     pub fn release(&self, key: &FleetDbKey) {
         self.drop_parked(key);
-        let requested = self.requested_map().get(key).copied();
+        let requested = self
+            .requested_map()
+            .get(key)
+            .map(|requested| requested.target);
         if let Some(target) = requested {
             let path = super::fleet::tenant_harvest_file(&self.fleet.path_of(key));
             if let Err(error) = write_target(&path, target) {
@@ -661,17 +671,32 @@ impl Replicas {
 
     /// `HarvestFleet::restore` starts a restore of `key` to `target`.
     pub fn request_restore(&self, key: &FleetDbKey, target: Option<DateTime<Utc>>) {
-        self.requested_map().insert(key.clone(), target);
+        let path = super::fleet::tenant_harvest_file(&self.fleet.path_of(key));
+        // An earlier restore can wait for the next open. Keep its target.
+        let previous = std::fs::read_to_string(suffixed(&path, TARGET_SUFFIX)).ok();
+        self.requested_map()
+            .insert(key.clone(), Requested { target, previous });
     }
 
     /// The restore that [`request_restore`](Self::request_restore) started
-    /// ended. A failed one leaves the database as it was, so its target
-    /// goes.
+    /// ended. A failed one leaves the database as it was, so the target of
+    /// an earlier restore comes back.
     pub fn end_restore(&self, key: &FleetDbKey, restored: bool) {
-        self.requested_map().remove(key);
-        if !restored {
-            let path = super::fleet::tenant_harvest_file(&self.fleet.path_of(key));
-            remove_quietly(&suffixed(&path, TARGET_SUFFIX));
+        let requested = self.requested_map().remove(key);
+        if restored {
+            return;
+        }
+        let file = suffixed(
+            &super::fleet::tenant_harvest_file(&self.fleet.path_of(key)),
+            TARGET_SUFFIX,
+        );
+        match requested.and_then(|requested| requested.previous) {
+            Some(previous) => {
+                if let Err(error) = write_atomic(&file, &previous) {
+                    tracing::error!(tenant = %key, %error, "cannot put back the earlier restore target of the tenant Harvest file");
+                }
+            }
+            None => remove_quietly(&file),
         }
     }
 
@@ -829,7 +854,8 @@ fn database_identity(database: &Path) -> Result<String, String> {
         let nanos = created
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |since| since.as_nanos());
-        Ok(format!("{nanos}:{}", meta.len()))
+        // Not the length: an ordinary checkpoint changes it.
+        Ok(nanos.to_string())
     }
 }
 
@@ -1100,6 +1126,26 @@ mod tests {
         assert_eq!(read_target(&path).unwrap(), Some(Target::At(at)));
         replicas.end_restore(&key, false);
         assert!(!target.exists(), "a failed restore");
+    }
+
+    /// A failed restore puts back the target of an earlier one that waits
+    /// for the next open.
+    #[test]
+    fn a_failed_restore_keeps_the_earlier_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let replicas = replicas(dir.path());
+        let key = replicas.fleet.key_for("acme").unwrap();
+        let path = super::super::fleet::tenant_harvest_file(&replicas.fleet.path_of(&key));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let first = Utc::now();
+        replicas.request_restore(&key, Some(first));
+        replicas.release(&key);
+        replicas.end_restore(&key, true);
+
+        replicas.request_restore(&key, None);
+        replicas.release(&key);
+        replicas.end_restore(&key, false);
+        assert_eq!(read_target(&path).unwrap(), Some(Target::At(first)));
     }
 
     /// A target beside an unchanged database is stale. The open drops it
