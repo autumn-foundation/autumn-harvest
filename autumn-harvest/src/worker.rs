@@ -24,6 +24,7 @@ use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
 use crate::builder::WorkerConfig;
+use crate::cached_stmt::CachePreparedDsl as _;
 use crate::completion_trigger::DeferredTriggerStart;
 #[cfg(feature = "db")]
 use crate::context::TransactionalState;
@@ -6048,10 +6049,7 @@ async fn load_unfired_timers_by_id(
 async fn db_clock_now(
     conn: &mut AsyncPgConnection,
 ) -> HarvestResult<chrono::DateTime<chrono::Utc>> {
-    use diesel::dsl::sql;
-    use diesel::sql_types::Timestamptz;
-
-    diesel::select(sql::<Timestamptz>("NOW()"))
+    diesel::select(crate::cached_stmt::pg_now())
         .get_result(conn)
         .await
         .map_err(crate::error::database_error)
@@ -6342,7 +6340,10 @@ async fn lock_workflow_execution_row_and_load_history(
         .find(exec_id.as_uuid())
         .for_update()
         .select(WorkflowExecution::as_select())
-        .first(conn)
+        // A load by primary key has one plan. `first` adds this limit.
+        .limit(1)
+        .cache_prepared()
+        .get_result(conn)
         .await
         .optional()
         .map_err(crate::error::database_error)?
@@ -6880,7 +6881,10 @@ async fn load_workflow_execution(
     harvest_workflow_executions::table
         .find(exec_id.as_uuid())
         .select(WorkflowExecution::as_select())
-        .first(conn)
+        // A load by primary key has one plan. `first` adds this limit.
+        .limit(1)
+        .cache_prepared()
+        .get_result(conn)
         .await
         .optional()
         .map_err(crate::error::database_error)?
@@ -7016,6 +7020,7 @@ async fn update_workflow_execution_completed(
         SetExt(harvest_workflow_executions_ext::nd_block_reason.eq(None::<String>)),
         dsl::nd_block_count.eq(0),
     ))
+    .cache_prepared()
     .execute(conn)
     .await
     .map_err(crate::error::database_error)?;
@@ -9667,6 +9672,7 @@ async fn update_workflow_execution_failed(
         SetExt(harvest_workflow_executions_ext::nd_block_reason.eq(None::<String>)),
         dsl::nd_block_count.eq(0),
     ))
+    .cache_prepared()
     .execute(conn)
     .await
     .map_err(crate::error::database_error)?;
@@ -9883,6 +9889,7 @@ async fn block_workflow_for_non_determinism(
             SetExt(harvest_workflow_executions_ext::nd_block_reason.eq(Some(error_owned.clone()))),
             exec_dsl::nd_block_count.eq(exec_dsl::nd_block_count + 1),
         ))
+        .cache_prepared()
         .execute(conn)
         .await
         .map_err(crate::error::database_error)?;
@@ -9964,6 +9971,7 @@ async fn clear_nd_block(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> H
             SetExt(harvest_workflow_executions_ext::nd_block_reason.eq(None::<String>)),
             dsl::nd_block_count.eq(0),
         ))
+        .cache_prepared()
         .execute(conn)
         .await
         .map_err(crate::error::database_error)?;
@@ -11668,7 +11676,10 @@ async fn persist_activity_wait_park(
             .find(exec_id.as_uuid())
             .for_update()
             .select(WorkflowExecution::as_select())
-            .first(conn)
+            // A load by primary key has one plan. `first` adds this limit.
+            .limit(1)
+            .cache_prepared()
+            .get_result(conn)
             .await
             .optional()
             .map_err(crate::error::database_error)?
@@ -12621,6 +12632,7 @@ async fn persist_started_timer(
                  LIMIT 1"
             )
             .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+            .cache_prepared()
             .load(conn)
             .await;
             if let Ok(rows) = unresolved_exists
@@ -12651,6 +12663,7 @@ async fn persist_started_timer(
         };
         diesel::update(queue_dsl::harvest_task_queue.find(task_id))
             .set(queue_dsl::activity_name.eq(activity_name_val))
+            .cache_prepared()
             .execute(conn)
             .await
             .map_err(crate::error::database_error)?;
@@ -14370,6 +14383,7 @@ async fn persist_child_timeout_race(
             queue::reschedule_task(conn, task_id, fires_at).await?;
             diesel::update(queue_dsl::harvest_task_queue.find(task_id))
                 .set(queue_dsl::activity_name.eq(Some("mixed_signal_suspension".to_string())))
+                .cache_prepared()
                 .execute(conn)
                 .await
                 .map_err(crate::error::database_error)?;
@@ -14907,6 +14921,7 @@ async fn persist_mixed_suspension_batch(
             // arm already matches, so no stamp is needed there.)
             diesel::update(queue_dsl::harvest_task_queue.find(task_id))
                 .set(queue_dsl::activity_name.eq(Some("mixed_signal_suspension".to_string())))
+                .cache_prepared()
                 .execute(conn)
                 .await
                 .map_err(crate::error::database_error)?;
@@ -14932,6 +14947,7 @@ async fn persist_mixed_suspension_batch(
             // equally hygienic.
             diesel::update(queue_dsl::harvest_task_queue.find(task_id))
                 .set(queue_dsl::activity_name.eq(None::<String>))
+                .cache_prepared()
                 .execute(conn)
                 .await
                 .map_err(crate::error::database_error)?;
@@ -15096,15 +15112,13 @@ pub async fn ingest_due_timers_and_signals(
     codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<(Vec<TimerId>, Vec<String>)> {
     use crate::schema::harvest_timers::dsl;
-    use diesel::dsl::sql;
-    use diesel::sql_types::Timestamptz;
 
     let due_timers = dsl::harvest_timers
         .filter(dsl::workflow_exec_id.eq(exec_id.as_uuid()))
         .filter(dsl::fired.eq(false))
         // Use the database clock here so timer replay stays consistent with the
         // queue claim path, which also uses Postgres NOW().
-        .filter(dsl::fires_at.le(sql::<Timestamptz>("NOW()")))
+        .filter(dsl::fires_at.le(crate::cached_stmt::pg_now()))
         .order((dsl::fires_at.asc(), dsl::timer_id.asc()))
         .select(HarvestTimer::as_select())
         .load(conn)
@@ -15152,6 +15166,7 @@ pub async fn ingest_due_timers_and_signals(
             if !timer_row_ids.is_empty() {
                 diesel::update(dsl::harvest_timers.filter(dsl::id.eq_any(&timer_row_ids)))
                     .set(dsl::fired.eq(true))
+                    .cache_prepared()
                     .execute(conn)
                     .await
                     .map_err(crate::error::database_error)?;
@@ -15850,8 +15865,6 @@ pub async fn materialize_due_child_timeout_deadlines(
 ) -> HarvestResult<usize> {
     use crate::schema::harvest_timers::dsl;
     use diesel::TextExpressionMethods;
-    use diesel::dsl::sql;
-    use diesel::sql_types::Timestamptz;
 
     // ── Per-table lock-ordering convention (issue #779, Codex round-11 review) ──
     //
@@ -15882,7 +15895,10 @@ pub async fn materialize_due_child_timeout_deadlines(
             .find(parent_exec_id.as_uuid())
             .for_update()
             .select(WorkflowExecution::as_select())
-            .first(conn)
+            // A load by primary key has one plan. `first` adds this limit.
+            .limit(1)
+            .cache_prepared()
+            .get_result(conn)
             .await
             .optional()
             .map_err(crate::error::database_error)?;
@@ -15902,7 +15918,7 @@ pub async fn materialize_due_child_timeout_deadlines(
         .filter(dsl::workflow_exec_id.eq(parent_exec_id.as_uuid()))
         .filter(dsl::fired.eq(false))
         .filter(dsl::timer_id.like(r"\_\_child\_timeout:%"))
-        .filter(dsl::fires_at.le(sql::<Timestamptz>("NOW()")))
+        .filter(dsl::fires_at.le(crate::cached_stmt::pg_now()))
         .order(dsl::fires_at.asc())
         .for_update()
         .select(HarvestTimer::as_select())
@@ -15930,6 +15946,7 @@ pub async fn materialize_due_child_timeout_deadlines(
         .await?;
         diesel::update(dsl::harvest_timers.filter(dsl::id.eq(timer_row_id)))
             .set(dsl::fired.eq(true))
+            .cache_prepared()
             .execute(conn)
             .await
             .map_err(crate::error::database_error)?;
@@ -25040,6 +25057,7 @@ async fn persist_workflow_continue_as_new_with_verdict(
                 harvest_workflow_executions::sticky_worker_id.eq(Some(worker_id.to_string())),
                 harvest_workflow_executions::completed_at.eq(Some(chrono::Utc::now())),
             ))
+            .cache_prepared()
             .execute(conn)
             .await
             .map_err(crate::error::database_error)?;
@@ -25120,6 +25138,7 @@ async fn persist_workflow_continue_as_new_with_verdict(
                 .filter(diesel::dsl::not(harvest_signals::consumed)),
         )
         .set(harvest_signals::workflow_exec_id.eq(new_exec_id.as_uuid()))
+        .cache_prepared()
         .execute(conn)
         .await
         .map_err(crate::error::database_error)?;
@@ -27241,12 +27260,17 @@ async fn process_workflow_task(
     // non-holder). Best-effort — a transient renewal failure is tolerated (the
     // TTL exceeds several decision cycles and the reclaim path re-checks under
     // the advisory lock), so it never fails an otherwise-healthy workflow task.
-    if let Err(e) = crate::mutex::renew_leases_for_holder(
-        conn,
-        prepared.exec_id,
-        crate::mutex::effective_mutex_lease_ttl(),
-    )
-    .await
+    //
+    // Issue #2651: a history with no `MutexGranted` proves that the execution
+    // holds no lock, so the renewal is skipped. See
+    // `mutex::history_records_a_grant` for the argument.
+    if crate::mutex::history_records_a_grant(&prepared.history_events)
+        && let Err(e) = crate::mutex::renew_leases_for_holder(
+            conn,
+            prepared.exec_id,
+            crate::mutex::effective_mutex_lease_ttl(),
+        )
+        .await
     {
         tracing::warn!(
             exec_id = %prepared.exec_id,
@@ -34045,9 +34069,9 @@ pub struct Worker {
     /// The end of a settle that `decision_done` cut short (issue #2418).
     /// The leader owes one poll at that instant.
     owed_poll: std::sync::Mutex<Option<tokio::time::Instant>>,
-    /// A NOTIFY woke the leader, and its settle waits for an empty poll
+    /// The settle that the leader owes after a NOTIFY and an empty poll
     /// (issue #2422). See [`Worker::settle_if_pending`].
-    settle_pending: AtomicBool,
+    settle_state: std::sync::Mutex<crate::notify::SettleState<tokio::time::Instant>>,
     /// The claim targets of the running claim loops (issue #2255). The run
     /// path sets them.
     claim_targets: std::sync::RwLock<Vec<Option<crate::types::ShardId>>>,
@@ -36967,7 +36991,7 @@ impl Worker {
             decider_capacity: Arc::new(tokio::sync::Notify::new()),
             decision_done: Arc::new(tokio::sync::Notify::new()),
             owed_poll: std::sync::Mutex::new(None),
-            settle_pending: AtomicBool::new(false),
+            settle_state: std::sync::Mutex::new(crate::notify::SettleState::Clear),
             claim_targets: std::sync::RwLock::default(),
             owner_wake_shards: std::sync::RwLock::default(),
             owner_listening: Arc::default(),
@@ -38063,8 +38087,22 @@ impl Worker {
             start_idx = (start_idx + 1) % n;
 
             // A NOTIFY polled first, and that poll was empty (issue #2422).
-            if self.settle_if_pending().await {
-                continue;
+            match self
+                .settle_if_pending(self.shard_notify(&mut shard_listeners))
+                .await
+            {
+                SettleEnd::Skipped => {}
+                SettleEnd::Cut => continue,
+                SettleEnd::Slept(plan) => {
+                    // Drain each listener. A short circuit would leave a
+                    // NOTIFY queued for an extra poll.
+                    let queued = shard_listeners
+                        .iter_mut()
+                        .flatten()
+                        .fold(false, |any, listener| listener.take_queued() | any);
+                    self.owe_settle_after_sleep(plan, queued);
+                    continue;
+                }
             }
 
             // All shards idle — poll all per-shard listeners in round-robin
@@ -38142,40 +38180,81 @@ impl Worker {
                 notified = true;
                 break 'notify_wait;
             }
-            let mut broken_idx: Option<usize> = None;
-            for (i, slot) in shard_listeners.iter_mut().enumerate() {
-                if let Some(listener) = slot.as_mut() {
-                    match listener.wait_for_notification(per_check).await {
-                        Ok(Some(_)) => {
-                            notified = true;
-                            break 'notify_wait;
-                        }
-                        Ok(None) => {}
-                        Err(error) => {
-                            tracing::warn!(
-                                worker_id = %self.config.worker_id,
-                                shard_idx = i,
-                                error = %error,
-                                "LISTEN/NOTIFY wait failed for shard; removing listener"
-                            );
-                            broken_idx = Some(i);
-                            break;
-                        }
-                    }
-                }
+            if self.shard_listener_round(shard_listeners, per_check).await {
+                notified = true;
+                break 'notify_wait;
             }
-            if let Some(i) = broken_idx {
-                shard_listeners[i] = None;
-                // All listeners gone: nothing left to await in this loop,
-                // so bail out instead of busy-spinning until the deadline.
-                if shard_listeners.iter().all(Option::is_none) {
-                    break 'notify_wait;
-                }
+            // With no listener left, nothing remains to await. The loop ends
+            // and does not spin until the deadline.
+            if shard_listeners.iter().all(Option::is_none) {
+                break 'notify_wait;
             }
         }
         if notified {
-            self.settle_pending.store(true, Ordering::Relaxed);
+            self.owe_settle(crate::notify::SettleState::Due);
         }
+    }
+
+    /// Wait on each shard listener in turn, for up to `per_check` each.
+    ///
+    /// Returns `true` at the first NOTIFY. The round removes a listener that
+    /// fails or whose channel closed, and ends there. A closed channel
+    /// returns at once, so a kept one would make each round spin.
+    async fn shard_listener_round(
+        &self,
+        shard_listeners: &mut [Option<crate::notify::QueueListener>],
+        per_check: Duration,
+    ) -> bool {
+        let mut broken_idx: Option<usize> = None;
+        for (i, slot) in shard_listeners.iter_mut().enumerate() {
+            if let Some(listener) = slot.as_mut() {
+                match listener.wait_for_notification_outcome(per_check).await {
+                    Ok(crate::notify::QueueWaitOutcome::Notification(_)) => return true,
+                    Ok(crate::notify::QueueWaitOutcome::TimedOut) => {}
+                    Ok(crate::notify::QueueWaitOutcome::ChannelClosed) => {
+                        tracing::warn!(
+                            worker_id = %self.config.worker_id,
+                            shard_idx = i,
+                            "LISTEN/NOTIFY channel closed for shard; removing listener"
+                        );
+                        broken_idx = Some(i);
+                        break;
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            worker_id = %self.config.worker_id,
+                            shard_idx = i,
+                            error = %error,
+                            "LISTEN/NOTIFY wait failed for shard; removing listener"
+                        );
+                        broken_idx = Some(i);
+                        break;
+                    }
+                }
+            }
+        }
+        if let Some(i) = broken_idx {
+            shard_listeners[i] = None;
+        }
+        false
+    }
+
+    /// Resolve at the first NOTIFY on a shard listener, for the cut of a
+    /// settle.
+    ///
+    /// The wait ends after [`crate::notify::SETTLE_DELAY_MAX`] and then stays
+    /// pending, because no settle lasts longer. A round removes a closed
+    /// listener, so the loop does not spin. With no listener left, the
+    /// future stays pending.
+    async fn shard_notify(&self, shard_listeners: &mut [Option<crate::notify::QueueListener>]) {
+        let until = tokio::time::Instant::now() + crate::notify::SETTLE_DELAY_MAX;
+        let per_check = Duration::from_millis(10).min(self.config.poll_interval);
+        while tokio::time::Instant::now() < until && shard_listeners.iter().any(Option::is_some) {
+            if self.shard_listener_round(shard_listeners, per_check).await {
+                return;
+            }
+        }
+        std::future::pending::<()>().await;
     }
 
     /// Clean up monitoring task handles (extracted for the multi-shard path).
@@ -40610,46 +40689,44 @@ impl Worker {
                 continue;
             }
 
-            let idle_wait = async {
-                if let Some(listener) = listener.as_mut() {
-                    match listener
-                        .wait_for_notification(self.config.poll_interval)
-                        .await
-                    {
-                        Ok(Some(_)) => return true,
-                        Ok(None) => {}
-                        Err(error) => {
-                            tracing::warn!(
-                                worker_id = %self.config.worker_id,
-                                error = %error,
-                                "LISTEN/NOTIFY wait failed; sleeping before retry"
-                            );
-                            tokio::time::sleep(self.config.poll_interval).await;
-                        }
-                    }
-                } else {
-                    tokio::time::sleep(self.config.poll_interval).await;
-                }
-                false
+            // A NOTIFY wakes an idle wait and cuts a fresh settle.
+            let mut notify = LeaderListener {
+                worker: self,
+                listener: listener.as_mut(),
             };
-            self.idle_wait_then_settle(idle_wait).await;
+            self.idle_wait_then_settle(&mut notify).await;
         }
     }
 
     /// One idle wait of the single-pool leader (issues #1787, #1796).
     ///
-    /// `idle` waits on the listener or the timer. It returns `true` on a
-    /// NOTIFY. A released permit or a due deferral also ends the wait.
+    /// `notify` waits on the listener or the timer. It returns `true` on a
+    /// NOTIFY. A released permit or a due deferral also ends the idle wait.
     ///
     /// A NOTIFY returns at once, so the leader polls first (issue #2422).
     /// The next call after an empty poll sleeps the settle delay instead of
     /// a wait. Host clocks can run ahead of the database `NOW()`. The
-    /// jittered delay lets such a task become claimable. Only a workflow
-    /// task of this worker that ends cuts it short (issue #2418). An earlier
-    /// wake leaves the NOTIFY queued for the next wait.
-    async fn idle_wait_then_settle(&self, idle: impl std::future::Future<Output = bool>) {
-        if self.settle_if_pending().await {
-            return;
+    /// jittered delay lets such a task become claimable. A workflow task of
+    /// this worker that ends cuts it short (issue #2418). A NOTIFY cuts a
+    /// fresh settle too, once. See [`Self::settle`]. A rest, or a settle that
+    /// a decision end cuts, leaves the NOTIFY queued for the next wait. A
+    /// dropped wait loses no NOTIFY.
+    async fn idle_wait_then_settle(&self, notify: &mut impl NotifyWait) {
+        // No settle lasts longer than the longest delay. A wait with no
+        // NOTIFY never cuts it, so a closed channel cannot spin.
+        let cut = async {
+            if !notify.wait(crate::notify::SETTLE_DELAY_MAX).await {
+                std::future::pending::<()>().await;
+            }
+        };
+        match self.settle_if_pending(cut).await {
+            SettleEnd::Skipped => {}
+            SettleEnd::Cut => return,
+            SettleEnd::Slept(plan) => {
+                let queued = notify.take_queued();
+                self.owe_settle_after_sleep(plan, queued);
+                return;
+            }
         }
         // A full pool also wakes on a released permit (issue #1787).
         let capacity = self.capacity_wait();
@@ -40661,14 +40738,35 @@ impl Worker {
             () = self.owed_poll() => false,
             // An owner wake is a NOTIFY too, so it settles (issue #2253).
             () = self.owner_woken.notified() => true,
-            notified = idle => notified,
+            notified = notify.wait(self.config.poll_interval) => notified,
         };
         if notified {
-            self.settle_pending.store(true, Ordering::Relaxed);
+            self.owe_settle(crate::notify::SettleState::Due);
         }
     }
 
-    /// Run the settle that a NOTIFY left pending, and report whether it ran
+    /// Set the state after a settle that slept to its end.
+    ///
+    /// `queued` tells whether a listener holds a NOTIFY. A stored owner wake
+    /// counts too, and this takes it. See [`crate::notify::after_settle`].
+    fn owe_settle_after_sleep(
+        &self,
+        plan: crate::notify::SettlePlan<tokio::time::Instant>,
+        queued: bool,
+    ) {
+        let owner = futures::FutureExt::now_or_never(self.owner_woken.notified()).is_some();
+        self.owe_settle(crate::notify::after_settle(plan, queued || owner));
+    }
+
+    /// Set the settle that the leader owes.
+    fn owe_settle(&self, state: crate::notify::SettleState<tokio::time::Instant>) {
+        *self
+            .settle_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = state;
+    }
+
+    /// Run the settle that a NOTIFY left owed, and report how it ended
     /// (issue #2422).
     ///
     /// A NOTIFY polls first. A row that the database clock stamped is
@@ -40678,17 +40776,34 @@ impl Worker {
     ///
     /// Before, every NOTIFY slept the settle before its first poll. A signal
     /// to an idle worker waited 50 ms at least.
-    async fn settle_if_pending(&self) -> bool {
-        if !self.settle_pending.swap(false, Ordering::Relaxed) {
-            return false;
+    ///
+    /// `notify` resolves at a NOTIFY. It can cut a fresh settle.
+    async fn settle_if_pending(&self, notify: impl std::future::Future<Output = ()>) -> SettleEnd {
+        let state = std::mem::replace(
+            &mut *self
+                .settle_state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            crate::notify::SettleState::Clear,
+        );
+        match crate::notify::take_settle(state) {
+            crate::notify::SettlePlan::Skip => SettleEnd::Skipped,
+            plan => {
+                if self.settle(plan, notify).await {
+                    SettleEnd::Slept(plan)
+                } else {
+                    SettleEnd::Cut
+                }
+            }
         }
-        self.settle().await;
-        true
     }
 
-    /// Sleep the settle delay after a NOTIFY (issue #2418).
+    /// Sleep the settle of `plan` (issue #2418).
     ///
-    /// A workflow task of this worker that ends cuts the delay short. Its
+    /// A fresh settle sleeps [`crate::notify::settle_delay`]. A rest sleeps
+    /// to the end of the settle that a NOTIFY cut.
+    ///
+    /// A workflow task of this worker that ends cuts either one short. Its
     /// commit is visible, so the tasks that it schedules need no settle.
     /// The NOTIFY can name another row that is not claimable yet. So a cut
     /// settle owes one more poll at its original end.
@@ -40696,18 +40811,56 @@ impl Worker {
     /// Without the cut, two claim loops drain the workflow backlog and then
     /// both go idle. Each activity committed in the settle waits for it, so
     /// the dispatch p50 rose from 13 ms to 66 ms.
-    async fn settle(&self) {
-        let end = tokio::time::Instant::now() + crate::notify::settle_delay();
+    ///
+    /// A NOTIFY or an owner wake cuts a fresh settle, and the rest stays
+    /// owed. Without that cut, a start, a signal or a completion that lands
+    /// in a settle waits for the rest of it. No NOTIFY cuts a rest. So each
+    /// settle has one NOTIFY cut at most, and a fleet cannot poll once per
+    /// NOTIFY.
+    ///
+    /// Returns `true` when the settle slept to its end, and `false` on a cut.
+    async fn settle(
+        &self,
+        plan: crate::notify::SettlePlan<tokio::time::Instant>,
+        notify: impl std::future::Future<Output = ()>,
+    ) -> bool {
+        let end = match plan {
+            crate::notify::SettlePlan::Rest(end) => end,
+            crate::notify::SettlePlan::Skip | crate::notify::SettlePlan::Fresh => {
+                tokio::time::Instant::now() + crate::notify::settle_delay()
+            }
+        };
+        let cut = async {
+            let Some(rest) = crate::notify::after_notify_cut(plan, end) else {
+                return std::future::pending().await;
+            };
+            tokio::select! {
+                () = notify => {}
+                () = self.owner_woken.notified() => {}
+            }
+            rest
+        };
         tokio::select! {
-            () = tokio::time::sleep_until(end) => {}
+            () = tokio::time::sleep_until(end) => true,
             () = self.decision_done.notified() => {
-                let mut owed = self
-                    .owed_poll
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                // Keep the later end. A row due at the earlier end is still
-                // pending then, so one poll covers both.
-                *owed = Some(owed.map_or(end, |at| at.max(end)));
+                {
+                    let mut owed = self
+                        .owed_poll
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    // Keep the later end. A row due at the earlier end is
+                    // still pending then, so one poll covers both.
+                    *owed = Some(owed.map_or(end, |at| at.max(end)));
+                }
+                // A cut rest also owes a fresh settle for the NOTIFY that cut
+                // it. That settle has its own jitter, so it can end before
+                // `end`. The owed poll above still comes at `end`.
+                self.owe_settle(crate::notify::after_settle(plan, false));
+                false
+            }
+            rest = cut => {
+                self.owe_settle(rest);
+                false
             }
         }
     }
@@ -44858,6 +45011,66 @@ pub fn dr_fence_targets(
         .map(|shard| (*shard, fallback_pool.clone()))
         .collect();
     Some((targets, shard))
+}
+
+/// How the leader's settle ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SettleEnd {
+    /// No settle was owed.
+    Skipped,
+    /// The settle of the given plan slept to its end.
+    Slept(crate::notify::SettlePlan<tokio::time::Instant>),
+    /// A NOTIFY, an owner wake or a local decision end cut the settle.
+    Cut,
+}
+
+/// A source of NOTIFY wakes for the single-pool leader.
+///
+/// The future is `Send` by contract, so a spawned worker stays `Send`.
+trait NotifyWait {
+    /// Wait up to `wait` for a NOTIFY. Returns `true` on one.
+    fn wait(&mut self, wait: Duration) -> impl std::future::Future<Output = bool> + Send;
+
+    /// Take each NOTIFY that is queued now, with no wait. Returns `true` when
+    /// at least one was queued.
+    fn take_queued(&mut self) -> bool;
+}
+
+/// The LISTEN connection of the single-pool leader. With no listener, a
+/// wait sleeps.
+struct LeaderListener<'a> {
+    /// The worker that owns the listener.
+    worker: &'a Worker,
+    /// The listener, if the connection is up.
+    listener: Option<&'a mut crate::notify::QueueListener>,
+}
+
+impl NotifyWait for LeaderListener<'_> {
+    async fn wait(&mut self, wait: Duration) -> bool {
+        if let Some(listener) = self.listener.as_mut() {
+            match listener.wait_for_notification(wait).await {
+                Ok(Some(_)) => return true,
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        worker_id = %self.worker.config.worker_id,
+                        error = %error,
+                        "LISTEN/NOTIFY wait failed; sleeping before retry"
+                    );
+                    tokio::time::sleep(wait).await;
+                }
+            }
+        } else {
+            tokio::time::sleep(wait).await;
+        }
+        false
+    }
+
+    fn take_queued(&mut self) -> bool {
+        self.listener
+            .as_mut()
+            .is_some_and(|listener| listener.take_queued())
+    }
 }
 
 #[cfg(test)]
@@ -59307,6 +59520,72 @@ mod tests {
         );
     }
 
+    /// A NOTIFY source that never fires.
+    struct NoNotify;
+
+    impl NotifyWait for NoNotify {
+        async fn wait(&mut self, _: Duration) -> bool {
+            std::future::pending().await
+        }
+
+        fn take_queued(&mut self) -> bool {
+            false
+        }
+    }
+
+    /// A NOTIFY source with a NOTIFY queued at each check, and no new one.
+    struct QueuedNotify;
+
+    impl NotifyWait for QueuedNotify {
+        async fn wait(&mut self, _: Duration) -> bool {
+            std::future::pending().await
+        }
+
+        fn take_queued(&mut self) -> bool {
+            true
+        }
+    }
+
+    /// A NOTIFY source that fires at once.
+    struct InstantNotify;
+
+    impl NotifyWait for InstantNotify {
+        fn wait(&mut self, _: Duration) -> impl std::future::Future<Output = bool> + Send {
+            std::future::ready(true)
+        }
+
+        fn take_queued(&mut self) -> bool {
+            false
+        }
+    }
+
+    /// A NOTIFY source that fires a fixed time after each call.
+    struct NotifyAfter(Duration);
+
+    impl NotifyWait for NotifyAfter {
+        async fn wait(&mut self, _: Duration) -> bool {
+            tokio::time::sleep(self.0).await;
+            true
+        }
+
+        fn take_queued(&mut self) -> bool {
+            false
+        }
+    }
+
+    /// A wait that ends at once with no NOTIFY, as on a closed channel.
+    struct QuietWait;
+
+    impl NotifyWait for QuietWait {
+        fn wait(&mut self, _: Duration) -> impl std::future::Future<Output = bool> + Send {
+            std::future::ready(false)
+        }
+
+        fn take_queued(&mut self) -> bool {
+            false
+        }
+    }
+
     /// A NOTIFY polls before it settles (issue #2422). The wait returns at
     /// the NOTIFY. The next wait, after an empty poll, is the settle.
     #[tokio::test(start_paused = true)]
@@ -59316,10 +59595,7 @@ mod tests {
 
         let start = tokio::time::Instant::now();
         worker
-            .idle_wait_then_settle(async {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-                true
-            })
+            .idle_wait_then_settle(&mut NotifyAfter(Duration::from_millis(10)))
             .await;
         assert_eq!(
             start.elapsed(),
@@ -59328,9 +59604,7 @@ mod tests {
         );
 
         // The poll was empty. The next wait settles and has no other wake.
-        worker
-            .idle_wait_then_settle(std::future::pending::<bool>())
-            .await;
+        worker.idle_wait_then_settle(&mut NoNotify).await;
         let waited = start.elapsed().saturating_sub(Duration::from_millis(10));
         assert!(
             waited >= crate::notify::SETTLE_DELAY_MIN && waited <= crate::notify::SETTLE_DELAY_MAX,
@@ -59340,7 +59614,7 @@ mod tests {
         // The settle is spent. A later wait does not settle again.
         let later = tokio::time::timeout(
             Duration::from_secs(1),
-            worker.idle_wait_then_settle(std::future::pending::<bool>()),
+            worker.idle_wait_then_settle(&mut NoNotify),
         )
         .await;
         assert!(later.is_err(), "one NOTIFY must settle once only");
@@ -59360,10 +59634,7 @@ mod tests {
 
         // A NOTIFY at 10 ms, then a released permit at 20 ms.
         let start = tokio::time::Instant::now();
-        let notify = async {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-            true
-        };
+        let mut notify = NotifyAfter(Duration::from_millis(10));
         let freed = Arc::clone(&worker.capacity_freed);
         let release = async move {
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -59372,10 +59643,8 @@ mod tests {
         // The NOTIFY returns at once (issue #2422). The settle follows the
         // empty poll.
         let settle = async {
-            worker.idle_wait_then_settle(notify).await;
-            worker
-                .idle_wait_then_settle(std::future::pending::<bool>())
-                .await;
+            worker.idle_wait_then_settle(&mut notify).await;
+            worker.idle_wait_then_settle(&mut NoNotify).await;
         };
         tokio::join!(settle, release);
         assert!(
@@ -59384,7 +59653,7 @@ mod tests {
         );
 
         let start = tokio::time::Instant::now();
-        worker.idle_wait_then_settle(async { false }).await;
+        worker.idle_wait_then_settle(&mut QuietWait).await;
         assert!(
             start.elapsed() < crate::notify::SETTLE_DELAY_MIN,
             "an idle wait with no NOTIFY must not settle"
@@ -59404,10 +59673,8 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(5)).await;
             done.notify_one();
         };
-        tokio::join!(
-            worker.idle_wait_then_settle(std::future::pending::<bool>()),
-            end
-        );
+        let mut quiet = NoNotify;
+        tokio::join!(worker.idle_wait_then_settle(&mut quiet), end);
         assert!(
             start.elapsed() < crate::notify::SETTLE_DELAY_MIN,
             "a local decision end must wake the wait at once, waited {:?}",
@@ -59425,10 +59692,7 @@ mod tests {
 
         // A NOTIFY at 10 ms, then a local decision end at 20 ms.
         let start = tokio::time::Instant::now();
-        let notify = async {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-            true
-        };
+        let mut notify = NotifyAfter(Duration::from_millis(10));
         let done = Arc::clone(&worker.decision_done);
         let end = async move {
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -59437,10 +59701,8 @@ mod tests {
         // The NOTIFY returns at once (issue #2422). The settle follows the
         // empty poll.
         let settle = async {
-            worker.idle_wait_then_settle(notify).await;
-            worker
-                .idle_wait_then_settle(std::future::pending::<bool>())
-                .await;
+            worker.idle_wait_then_settle(&mut notify).await;
+            worker.idle_wait_then_settle(&mut NoNotify).await;
         };
         tokio::join!(settle, end);
         assert!(
@@ -59450,9 +59712,7 @@ mod tests {
         );
 
         // The next wait has no other wake. It ends when the settle would have.
-        worker
-            .idle_wait_then_settle(std::future::pending::<bool>())
-            .await;
+        worker.idle_wait_then_settle(&mut NoNotify).await;
         let waited = start.elapsed();
         assert!(
             waited >= Duration::from_millis(10) + crate::notify::SETTLE_DELAY_MIN
@@ -59463,7 +59723,7 @@ mod tests {
         // The owed poll is paid. A later wait does not wake for it again.
         let later = tokio::time::timeout(
             Duration::from_secs(1),
-            worker.idle_wait_then_settle(std::future::pending::<bool>()),
+            worker.idle_wait_then_settle(&mut NoNotify),
         )
         .await;
         assert!(later.is_err(), "an owed poll must wake one wait only");
@@ -59478,16 +59738,18 @@ mod tests {
 
         let start = tokio::time::Instant::now();
         worker.decision_done.notify_one();
-        worker.settle().await;
+        worker
+            .settle(crate::notify::SettlePlan::Fresh, std::future::pending())
+            .await;
         // The second settle starts past the latest end of the first.
         tokio::time::sleep(crate::notify::SETTLE_DELAY_MAX).await;
         let second = tokio::time::Instant::now();
         worker.decision_done.notify_one();
-        worker.settle().await;
-
         worker
-            .idle_wait_then_settle(std::future::pending::<bool>())
+            .settle(crate::notify::SettlePlan::Fresh, std::future::pending())
             .await;
+
+        worker.idle_wait_then_settle(&mut NoNotify).await;
         let waited = second.elapsed();
         assert!(
             waited >= crate::notify::SETTLE_DELAY_MIN && waited <= crate::notify::SETTLE_DELAY_MAX,
@@ -59509,13 +59771,463 @@ mod tests {
 
         let start = tokio::time::Instant::now();
         worker.decision_done.notify_one();
-        worker.settle().await;
+        worker
+            .settle(crate::notify::SettlePlan::Fresh, std::future::pending())
+            .await;
         let shut = worker.wait_without_listeners(worker.capacity_wait()).await;
         let waited = start.elapsed();
         assert!(!shut, "the wait must not report a shutdown");
         assert!(
             waited >= crate::notify::SETTLE_DELAY_MIN && waited <= crate::notify::SETTLE_DELAY_MAX,
             "the owed poll must come at the end of the cut settle, came after {waited:?}"
+        );
+    }
+
+    /// A NOTIFY cuts a fresh settle short. The leader then polls at once.
+    /// The rest of the settle stays owed, and no NOTIFY cuts the rest. So
+    /// the leader still polls at the original end.
+    #[tokio::test(start_paused = true)]
+    async fn a_notify_cuts_the_settle_once_and_the_rest_keeps_its_end() {
+        let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));
+        let worker = Worker::new(default_runtime_config(), registry).expect("valid config");
+
+        // A NOTIFY wakes the leader. Its poll is empty, so the leader owes a
+        // settle.
+        worker.idle_wait_then_settle(&mut InstantNotify).await;
+        let begin = tokio::time::Instant::now();
+
+        // A NOTIFY 5 ms into the settle cuts it.
+        worker
+            .idle_wait_then_settle(&mut NotifyAfter(Duration::from_millis(5)))
+            .await;
+        assert_eq!(
+            begin.elapsed(),
+            Duration::from_millis(5),
+            "a NOTIFY must cut a fresh settle at once"
+        );
+
+        // The poll after the cut is empty. A NOTIFY at once does not cut
+        // the rest, which ends at the original end.
+        worker.idle_wait_then_settle(&mut InstantNotify).await;
+        let waited = begin.elapsed();
+        assert!(
+            waited >= crate::notify::SETTLE_DELAY_MIN && waited <= crate::notify::SETTLE_DELAY_MAX,
+            "the rest must end at the original end, ended after {waited:?}"
+        );
+
+        // The NOTIFY that cut the settle gets its own margin: a fresh settle.
+        let after_rest = tokio::time::Instant::now();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            worker.idle_wait_then_settle(&mut NoNotify),
+        )
+        .await
+        .expect("a rest must owe a fresh settle");
+        let margin = after_rest.elapsed();
+        assert!(
+            margin >= crate::notify::SETTLE_DELAY_MIN && margin <= crate::notify::SETTLE_DELAY_MAX,
+            "the cutting NOTIFY must get a full settle, got {margin:?}"
+        );
+
+        // That settle saw no NOTIFY. The next wait does not settle.
+        let later = tokio::time::timeout(
+            Duration::from_secs(1),
+            worker.idle_wait_then_settle(&mut NoNotify),
+        )
+        .await;
+        assert!(later.is_err(), "a cut settle must owe its rest once only");
+    }
+
+    /// A NOTIFY that cuts a settle late still gets a full margin. A host
+    /// clock can stamp its row ahead of the database clock. Then the poll at
+    /// the cut and the poll at the original end both come too early.
+    #[tokio::test(start_paused = true)]
+    async fn a_late_cut_still_gives_its_notify_a_full_margin() {
+        let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));
+        let worker = Worker::new(default_runtime_config(), registry).expect("valid config");
+
+        worker.idle_wait_then_settle(&mut InstantNotify).await;
+        let begin = tokio::time::Instant::now();
+        let late = crate::notify::SETTLE_DELAY_MIN.saturating_sub(Duration::from_millis(1));
+        worker.idle_wait_then_settle(&mut NotifyAfter(late)).await;
+        let cut_at = tokio::time::Instant::now();
+        assert_eq!(cut_at - begin, late, "the late NOTIFY must cut the settle");
+
+        // The rest ends at the original end. Then a fresh settle follows.
+        for _ in 0..2 {
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                worker.idle_wait_then_settle(&mut NoNotify),
+            )
+            .await
+            .expect("the rest and the fresh settle must end");
+        }
+        let margin = cut_at.elapsed();
+        assert!(
+            margin >= crate::notify::SETTLE_DELAY_MIN,
+            "the last poll must come a full settle after the cut, came after {margin:?}"
+        );
+    }
+
+    /// An owner wake is a NOTIFY too, so it cuts a fresh settle.
+    #[tokio::test(start_paused = true)]
+    async fn an_owner_wake_cuts_the_settle_short() {
+        let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));
+        let worker = Worker::new(default_runtime_config(), registry).expect("valid config");
+
+        worker.idle_wait_then_settle(&mut InstantNotify).await;
+        let begin = tokio::time::Instant::now();
+        let woken = Arc::clone(&worker.owner_woken);
+        let wake = async move {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            woken.notify_one();
+        };
+        let mut quiet = NoNotify;
+        tokio::join!(worker.idle_wait_then_settle(&mut quiet), wake);
+        assert_eq!(
+            begin.elapsed(),
+            Duration::from_millis(5),
+            "an owner wake must cut a fresh settle at once"
+        );
+
+        // The rest still ends at the original end.
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            worker.idle_wait_then_settle(&mut NoNotify),
+        )
+        .await
+        .expect("the rest must end at the original end");
+        let waited = begin.elapsed();
+        assert!(
+            waited >= crate::notify::SETTLE_DELAY_MIN && waited <= crate::notify::SETTLE_DELAY_MAX,
+            "the rest must end at the original end, ended after {waited:?}"
+        );
+    }
+
+    /// An owner wake does not cut the rest of a settle. The rest takes the
+    /// stored wake at its end. The poll at that end covers it, so the leader
+    /// owes a fresh settle, not a second poll.
+    #[tokio::test(start_paused = true)]
+    async fn an_owner_wake_does_not_cut_the_rest() {
+        let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));
+        let worker = Worker::new(default_runtime_config(), registry).expect("valid config");
+
+        worker.idle_wait_then_settle(&mut InstantNotify).await;
+        let begin = tokio::time::Instant::now();
+        worker.idle_wait_then_settle(&mut InstantNotify).await;
+        assert_eq!(begin.elapsed(), Duration::ZERO, "the NOTIFY cuts at once");
+
+        worker.owner_woken.notify_one();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            worker.idle_wait_then_settle(&mut NoNotify),
+        )
+        .await
+        .expect("the rest must end at the original end");
+        let waited = begin.elapsed();
+        assert!(
+            waited >= crate::notify::SETTLE_DELAY_MIN,
+            "an owner wake must not cut the rest, ended after {waited:?}"
+        );
+
+        // The poll at the end was empty. The leader then runs a fresh settle.
+        let after_rest = tokio::time::Instant::now();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            worker.idle_wait_then_settle(&mut NoNotify),
+        )
+        .await
+        .expect("the stored owner wake must owe a settle");
+        let waited = after_rest.elapsed();
+        assert!(
+            waited >= crate::notify::SETTLE_DELAY_MIN && waited <= crate::notify::SETTLE_DELAY_MAX,
+            "the stored owner wake must owe a fresh settle, waited {waited:?}"
+        );
+    }
+
+    /// A NOTIFY queued at the end of a settle owes a fresh settle. The poll
+    /// at that end covers it, so the leader does not poll again at once.
+    #[tokio::test(start_paused = true)]
+    async fn a_queued_notify_at_the_end_owes_a_settle_and_no_extra_poll() {
+        let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));
+        let worker = Worker::new(default_runtime_config(), registry).expect("valid config");
+
+        worker.idle_wait_then_settle(&mut InstantNotify).await;
+        let begin = tokio::time::Instant::now();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            worker.idle_wait_then_settle(&mut QueuedNotify),
+        )
+        .await
+        .expect("the settle must end at its end");
+        let slept = begin.elapsed();
+        assert!(
+            slept >= crate::notify::SETTLE_DELAY_MIN && slept <= crate::notify::SETTLE_DELAY_MAX,
+            "a queued NOTIFY must not cut the settle, ended after {slept:?}"
+        );
+
+        // The poll at the end was empty. The next call settles, not polls.
+        let after = tokio::time::Instant::now();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            worker.idle_wait_then_settle(&mut NoNotify),
+        )
+        .await
+        .expect("a queued NOTIFY must owe a settle");
+        let waited = after.elapsed();
+        assert!(
+            waited >= crate::notify::SETTLE_DELAY_MIN && waited <= crate::notify::SETTLE_DELAY_MAX,
+            "a queued NOTIFY must owe a fresh settle, waited {waited:?}"
+        );
+
+        // That settle saw no NOTIFY, so nothing more is owed.
+        let later = tokio::time::timeout(
+            Duration::from_secs(1),
+            worker.idle_wait_then_settle(&mut NoNotify),
+        )
+        .await;
+        assert!(later.is_err(), "a settle with no NOTIFY must owe nothing");
+    }
+
+    /// A local decision end cuts the rest of a settle too. The cut owes a
+    /// poll at the original end, and a fresh settle for the NOTIFY that cut.
+    #[tokio::test(start_paused = true)]
+    async fn a_local_decision_end_cuts_the_rest_and_owes_a_settle() {
+        let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));
+        let worker = Worker::new(default_runtime_config(), registry).expect("valid config");
+
+        worker.idle_wait_then_settle(&mut InstantNotify).await;
+        let begin = tokio::time::Instant::now();
+        worker
+            .idle_wait_then_settle(&mut NotifyAfter(Duration::from_millis(5)))
+            .await;
+
+        let done = Arc::clone(&worker.decision_done);
+        let end = async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            done.notify_one();
+        };
+        let mut quiet = NoNotify;
+        tokio::join!(worker.idle_wait_then_settle(&mut quiet), end);
+        assert_eq!(
+            begin.elapsed(),
+            Duration::from_millis(15),
+            "a local decision end must cut the rest at once"
+        );
+
+        // The cut keeps a poll at the original end. A fresh settle can end
+        // before that end, because its jitter is its own.
+        let original_end = (*worker
+            .owed_poll
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner))
+        .expect("a decision cut must owe a poll at the original end");
+        let gap = original_end - begin;
+        assert!(
+            gap >= crate::notify::SETTLE_DELAY_MIN && gap <= crate::notify::SETTLE_DELAY_MAX,
+            "the owed poll must be at the original end, is after {gap:?}"
+        );
+
+        // The poll after the cut was empty. A fresh settle follows, so the
+        // NOTIFY that cut the first settle gets its own margin.
+        let cut_at = tokio::time::Instant::now();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            worker.idle_wait_then_settle(&mut NoNotify),
+        )
+        .await
+        .expect("a cut rest must owe a fresh settle");
+        let waited = cut_at.elapsed();
+        assert!(
+            waited >= crate::notify::SETTLE_DELAY_MIN && waited <= crate::notify::SETTLE_DELAY_MAX,
+            "the fresh settle must run in full, ran {waited:?}"
+        );
+
+        // The owed poll comes at the original end, or at once if that end
+        // passed in the fresh settle.
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            worker.idle_wait_then_settle(&mut NoNotify),
+        )
+        .await
+        .expect("the owed poll must end the wait");
+        // The timer rounds a deadline up to the next millisecond.
+        let due = original_end.max(cut_at + waited);
+        let now = tokio::time::Instant::now();
+        assert!(
+            now >= due && now - due < Duration::from_millis(1),
+            "the owed poll must come at the original end, came {:?} after it",
+            now.saturating_duration_since(due)
+        );
+
+        // Nothing more is owed.
+        let later = tokio::time::timeout(
+            Duration::from_secs(1),
+            worker.idle_wait_then_settle(&mut NoNotify),
+        )
+        .await;
+        assert!(later.is_err(), "nothing more must be owed");
+    }
+
+    /// A local decision end cuts a fresh settle before a NOTIFY does. That
+    /// cut owes a poll at the original end and leaves no rest, so the
+    /// later NOTIFY stays queued for the next wait.
+    #[tokio::test(start_paused = true)]
+    async fn a_decision_end_before_a_notify_owes_the_end_and_no_rest() {
+        let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));
+        let worker = Worker::new(default_runtime_config(), registry).expect("valid config");
+
+        worker.idle_wait_then_settle(&mut InstantNotify).await;
+        let begin = tokio::time::Instant::now();
+        let done = Arc::clone(&worker.decision_done);
+        let end = async move {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            done.notify_one();
+        };
+        let mut late = NotifyAfter(Duration::from_millis(20));
+        tokio::join!(worker.idle_wait_then_settle(&mut late), end);
+        assert_eq!(
+            begin.elapsed(),
+            Duration::from_millis(5),
+            "a local decision end must cut the settle at once"
+        );
+        assert_eq!(
+            *worker
+                .settle_state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            crate::notify::SettleState::Clear,
+            "a decision end must leave no rest"
+        );
+
+        // The next idle wait ends at the owed poll, not at a NOTIFY.
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            worker.idle_wait_then_settle(&mut NoNotify),
+        )
+        .await
+        .expect("the owed poll must end the wait");
+        let waited = begin.elapsed();
+        assert!(
+            waited >= crate::notify::SETTLE_DELAY_MIN && waited <= crate::notify::SETTLE_DELAY_MAX,
+            "the owed poll must come at the original end, came after {waited:?}"
+        );
+    }
+
+    /// A rest whose end has passed polls at once. A claim loop that claimed
+    /// after the cut can reach its rest late. The rest then owes a fresh
+    /// settle for the NOTIFY that cut it.
+    #[tokio::test(start_paused = true)]
+    async fn a_rest_past_its_end_polls_at_once() {
+        let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));
+        let worker = Worker::new(default_runtime_config(), registry).expect("valid config");
+
+        worker.idle_wait_then_settle(&mut InstantNotify).await;
+        worker.idle_wait_then_settle(&mut InstantNotify).await;
+        // The claims after the cut outlast the settle.
+        tokio::time::sleep(crate::notify::SETTLE_DELAY_MAX).await;
+
+        let begin = tokio::time::Instant::now();
+        let rest = tokio::time::timeout(
+            Duration::from_secs(1),
+            worker.idle_wait_then_settle(&mut NoNotify),
+        )
+        .await;
+        assert!(rest.is_ok(), "a past rest must end the wait");
+        assert_eq!(
+            begin.elapsed(),
+            Duration::ZERO,
+            "a past rest must poll at once"
+        );
+
+        let after_rest = tokio::time::Instant::now();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            worker.idle_wait_then_settle(&mut NoNotify),
+        )
+        .await
+        .expect("a past rest must owe a fresh settle");
+        let margin = after_rest.elapsed();
+        assert!(
+            margin >= crate::notify::SETTLE_DELAY_MIN && margin <= crate::notify::SETTLE_DELAY_MAX,
+            "the cutting NOTIFY must get a full settle, got {margin:?}"
+        );
+
+        let later = tokio::time::timeout(
+            Duration::from_secs(1),
+            worker.idle_wait_then_settle(&mut NoNotify),
+        )
+        .await;
+        assert!(later.is_err(), "nothing more must be owed");
+    }
+
+    /// A wait that ends with no NOTIFY, as on a closed channel, does not
+    /// cut the settle.
+    #[tokio::test(start_paused = true)]
+    async fn a_wait_with_no_notify_does_not_cut_the_settle() {
+        let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));
+        let worker = Worker::new(default_runtime_config(), registry).expect("valid config");
+
+        worker.idle_wait_then_settle(&mut InstantNotify).await;
+        let begin = tokio::time::Instant::now();
+        worker.idle_wait_then_settle(&mut QuietWait).await;
+        let waited = begin.elapsed();
+        assert!(
+            waited >= crate::notify::SETTLE_DELAY_MIN && waited <= crate::notify::SETTLE_DELAY_MAX,
+            "a wait with no NOTIFY must not cut the settle, ended after {waited:?}"
+        );
+    }
+
+    /// The multi-shard cut stays pending with no listener. It does not
+    /// spin, and the settle runs in full.
+    #[tokio::test(start_paused = true)]
+    async fn the_shard_cut_waits_with_no_listener() {
+        let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));
+        let worker = Worker::new(default_runtime_config(), registry).expect("valid config");
+
+        let mut listeners: Vec<Option<crate::notify::QueueListener>> = vec![None, None];
+        worker.owe_settle(crate::notify::SettleState::Due);
+        let begin = tokio::time::Instant::now();
+        assert_eq!(
+            worker
+                .settle_if_pending(worker.shard_notify(&mut listeners))
+                .await,
+            SettleEnd::Slept(crate::notify::SettlePlan::Fresh)
+        );
+        let waited = begin.elapsed();
+        assert!(
+            waited >= crate::notify::SETTLE_DELAY_MIN && waited <= crate::notify::SETTLE_DELAY_MAX,
+            "the settle must run in full with no listener, ended after {waited:?}"
+        );
+        assert_eq!(
+            worker
+                .settle_if_pending(worker.shard_notify(&mut listeners))
+                .await,
+            SettleEnd::Skipped,
+            "a settle that ran in full owes nothing"
+        );
+    }
+
+    /// `settle_if_pending` takes a ready NOTIFY future. A ready NOTIFY cuts a
+    /// fresh settle, and the rest stays owed.
+    #[tokio::test(start_paused = true)]
+    async fn a_ready_notify_cuts_a_fresh_settle_through_settle_if_pending() {
+        let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));
+        let worker = Worker::new(default_runtime_config(), registry).expect("valid config");
+
+        worker.owe_settle(crate::notify::SettleState::Due);
+        let begin = tokio::time::Instant::now();
+        assert_eq!(worker.settle_if_pending(async {}).await, SettleEnd::Cut);
+        assert_eq!(begin.elapsed(), Duration::ZERO);
+        // The rest ignores a ready NOTIFY.
+        assert!(matches!(
+            worker.settle_if_pending(async {}).await,
+            SettleEnd::Slept(crate::notify::SettlePlan::Rest(_))
+        ));
+        let waited = begin.elapsed();
+        assert!(
+            waited >= crate::notify::SETTLE_DELAY_MIN && waited <= crate::notify::SETTLE_DELAY_MAX,
+            "the rest must end at the original end, ended after {waited:?}"
         );
     }
 

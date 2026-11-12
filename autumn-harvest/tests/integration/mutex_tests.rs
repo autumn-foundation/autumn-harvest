@@ -697,6 +697,22 @@ async fn lock_holder(url: &str, key: &str) -> Option<Uuid> {
         .map(|r| r.holder_exec_id)
 }
 
+/// The lease end of the lock on `key`, when a row exists.
+async fn lease_end(url: &str, key: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    #[derive(diesel::QueryableByName)]
+    struct Row {
+        #[diesel(sql_type = diesel::sql_types::Timestamptz)]
+        lease_expires_at: chrono::DateTime<chrono::Utc>,
+    }
+    let mut conn = connect(url).await;
+    diesel::sql_query("SELECT lease_expires_at FROM harvest_mutex_locks WHERE lock_key = $1")
+        .bind::<diesel::sql_types::Text, _>(key)
+        .get_result::<Row>(&mut conn)
+        .await
+        .optional_ext()
+        .map(|r| r.lease_expires_at)
+}
+
 /// The FIFO-ordered waiter exec ids for `key` (from `harvest_mutex_waiters`).
 async fn waiter_ids(url: &str, key: &str) -> Vec<Uuid> {
     #[derive(diesel::QueryableByName)]
@@ -1273,6 +1289,47 @@ async fn cancelled_waiter_cleanup() {
         "only C should have run its critical section (B was cancelled)"
     );
     reset_lease_ttl();
+}
+
+/// A decision of a holder renews its lease (issue #2651).
+///
+/// The renewal runs only when the history records a grant. This test proves
+/// that a holder still renews. A signal that the workflow does not wait for
+/// drives one more decision. The lease end then moves forward.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_decision_of_a_holder_renews_its_lease() {
+    let (url, _c) = setup().await;
+    let witness = Arc::new(Witness::default());
+    let key = "renew-key";
+
+    with_worker(&url, Arc::clone(&witness), 8, || async {
+        let holder = start(
+            &url,
+            "hold_wait_signal",
+            "renew-holder",
+            json!({"key": key}),
+        )
+        .await;
+        poll_until(Duration::from_secs(15), || async {
+            lock_holder(&url, key).await == Some(holder.as_uuid())
+        })
+        .await;
+        // The grant parks the task and wakes it again. Let that decision end,
+        // so the lease end below is the one that it left.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let before = lease_end(&url, key).await.expect("the holder has a lease");
+
+        send_signal(&url, holder, "poke").await;
+        poll_until(Duration::from_secs(15), || async {
+            lease_end(&url, key).await.is_some_and(|end| end > before)
+        })
+        .await;
+        assert_eq!(lock_holder(&url, key).await, Some(holder.as_uuid()));
+
+        send_signal(&url, holder, "release").await;
+        wait_for_state(&url, holder, "COMPLETED", Duration::from_secs(30)).await;
+    })
+    .await;
 }
 
 /// A crashed holder's expired lease is reclaimed by the worker's own timeout

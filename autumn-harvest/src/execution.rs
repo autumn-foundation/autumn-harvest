@@ -3,6 +3,7 @@
 //! The public start helper in this module gives callers idempotent workflow
 //! start semantics scoped to `(workflow_name, workflow_id)`.
 
+use crate::cached_stmt::CachePreparedDsl as _;
 use crate::schema::harvest_workflow_executions_ext;
 use crate::table_split::SetExt;
 use chrono::Utc;
@@ -2050,6 +2051,11 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
                 .values(&row)
                 .on_conflict_do_nothing()
                 .returning(WorkflowExecution::as_returning())
+                // Not marked with `cache_prepared` (issue #2651). Each `None`
+                // of the row renders `DEFAULT`, and the caller of a start
+                // chooses most of the 28 options. So this insert has one text
+                // for each option set. A cached text costs each connection
+                // about 150 KB, and nothing evicts it.
                 .get_result(conn)
                 .await
                 .optional()
@@ -4959,7 +4965,10 @@ async fn load_execution_row(
     harvest_workflow_executions::table
         .find(exec_id.as_uuid())
         .select(WorkflowExecution::as_select())
-        .first(conn)
+        // A load by primary key has one plan. `first` adds this limit.
+        .limit(1)
+        .cache_prepared()
+        .get_result(conn)
         .await
         .optional()
         .map_err(database_error)?
@@ -8933,6 +8942,7 @@ async fn lock_execution_admission(
     let namespace = admission_lock_namespace(workflow_name, workflow_id);
     diesel::sql_query("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)")
         .bind::<diesel::sql_types::Text, _>(namespace)
+        .cache_prepared()
         .execute(conn)
         .await
         .map_err(database_error)?;
@@ -9036,6 +9046,7 @@ async fn stage_signal_with_idempotency(
     let inserted = diesel::insert_into(harvest_signals::table)
         .values(&row)
         .on_conflict_do_nothing()
+        .cache_prepared()
         .execute(conn)
         .await
         .map_err(database_error)?;
@@ -10336,7 +10347,10 @@ pub async fn load_execution(
     harvest_workflow_executions::table
         .find(exec_id.as_uuid())
         .select(WorkflowExecution::as_select())
-        .first(conn)
+        // A load by primary key has one plan. `first` adds this limit.
+        .limit(1)
+        .cache_prepared()
+        .get_result(conn)
         .await
         .optional()
         .map_err(database_error)?

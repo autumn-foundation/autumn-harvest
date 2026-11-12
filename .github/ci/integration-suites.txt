@@ -107,6 +107,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          build_routing_tests
 linux        autumn-harvest         integration                      -                          business_day_timer_tests
 linux        autumn-harvest         integration                      -                          cache_delta_load_tests
+linux        autumn-harvest         integration                      -                          cached_stmt_db_tests
 linux        autumn-harvest         integration                      -                          canary_tests
 linux        autumn-harvest         integration                      -                          cancellation_scope_tests
 linux        autumn-harvest         integration                      -                          cancellation_tests

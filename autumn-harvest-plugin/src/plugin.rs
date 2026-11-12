@@ -322,6 +322,10 @@ pub struct HarvestPlugin {
     /// [`Self::sqlite_per_tenant`].
     #[cfg(feature = "sqlite")]
     sqlite_per_tenant: bool,
+    /// Where the tenant Harvest files ship. Set via
+    /// [`Self::sqlite_tenant_replica`].
+    #[cfg(feature = "sqlite")]
+    sqlite_tenant_replica: Option<crate::sqlite::TenantReplica>,
 }
 
 /// One registered broker connector: a binding plus the source that feeds it.
@@ -630,6 +634,8 @@ impl HarvestPlugin {
             sqlite_path: None,
             #[cfg(feature = "sqlite")]
             sqlite_per_tenant: false,
+            #[cfg(feature = "sqlite")]
+            sqlite_tenant_replica: None,
         }
     }
 
@@ -902,6 +908,23 @@ impl HarvestPlugin {
     #[must_use]
     pub const fn sqlite_per_tenant(mut self) -> Self {
         self.sqlite_per_tenant = true;
+        self
+    }
+
+    /// Ship each tenant Harvest file to `replica`, with its tenant database.
+    ///
+    /// It needs [`Self::sqlite_per_tenant`]. The files ship only when the
+    /// fleet replicates. By default the plugin builds the destination from
+    /// `[replication]`, as the fleet does. Set it here when app code builds
+    /// the fleet replication. Give it the same destination and settings.
+    ///
+    /// Each file ships under
+    /// [`tenant_harvest_replica_root`](crate::sqlite::tenant_harvest_replica_root).
+    /// A takeover restores the file before the tenant driver starts.
+    #[cfg(feature = "sqlite")]
+    #[must_use]
+    pub fn sqlite_tenant_replica(mut self, replica: crate::sqlite::TenantReplica) -> Self {
+        self.sqlite_tenant_replica = Some(replica);
         self
     }
 
@@ -1792,6 +1815,7 @@ impl HarvestPlugin {
                 allow_unauthenticated_mutations: self.allow_unauthenticated_mutations,
                 path: self.sqlite_path,
                 per_tenant: self.sqlite_per_tenant,
+                tenant_replica: self.sqlite_tenant_replica,
                 auth: crate::api::AdminAuthLayers {
                     api_tokens: self.api_tokens_enabled,
                     read_only_role: self.role_auth_enabled,
@@ -1903,6 +1927,8 @@ impl HarvestPlugin {
                 sqlite_path: _,
             #[cfg(feature = "sqlite")]
                 sqlite_per_tenant: _,
+            #[cfg(feature = "sqlite")]
+                sqlite_tenant_replica: _,
         } = self;
         crate::mcp_unserved::warn_for_builder(
             "postgres",

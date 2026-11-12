@@ -56,6 +56,7 @@ use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection as _, AsyncPgConnection, RunQueryDsl};
 use uuid::Uuid;
 
+use crate::cached_stmt::CachePreparedDsl as _;
 use crate::error::{HarvestError, HarvestResult};
 
 // ---------------------------------------------------------------------------
@@ -793,6 +794,7 @@ async fn resolve_owner_notes(conn: &mut AsyncPgConnection, notes: &mut Vec<Note>
                  WHERE id = ANY($1::uuid[])",
             )
             .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(ids)
+            .cache_prepared()
             .load::<OwnerRow>(conn)
             .await
         })
@@ -848,6 +850,91 @@ pub(crate) fn settle_delay() -> Duration {
     let min = u64::try_from(SETTLE_DELAY_MIN.as_micros()).unwrap_or(u64::MAX);
     let max = u64::try_from(SETTLE_DELAY_MAX.as_micros()).unwrap_or(u64::MAX);
     Duration::from_micros(rand::rng().random_range(min..=max))
+}
+
+/// What the leader claim loop owes after a NOTIFY.
+///
+/// `T` is the end of a settle. The worker uses a `tokio` instant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SettleState<T> {
+    /// The leader owes nothing.
+    Clear,
+    /// The leader owes a fresh settle. One NOTIFY can cut it. Either a NOTIFY
+    /// woke the leader and its poll was empty, or a NOTIFY or an owner wake
+    /// waited at the end of a settle.
+    Due,
+    /// A NOTIFY cut the settle that ends at `T`. The leader owes the rest.
+    /// No NOTIFY cuts the rest, so a fleet cannot poll once per NOTIFY.
+    Rest(T),
+}
+
+/// The settle that the leader runs now.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SettlePlan<T> {
+    /// No settle.
+    Skip,
+    /// A fresh settle of [`settle_delay`]. A NOTIFY can cut it.
+    Fresh,
+    /// The rest of a cut settle, up to `T`. Only a local decision end cuts
+    /// it.
+    Rest(T),
+}
+
+/// Give the settle that `state` owes. The caller takes `state` and leaves
+/// `Clear` in its place.
+///
+/// `formal/verus/src/notify_settle.rs` proves the function for every input.
+pub(crate) fn take_settle<T>(state: SettleState<T>) -> SettlePlan<T> {
+    match state {
+        SettleState::Clear => SettlePlan::Skip,
+        SettleState::Due => SettlePlan::Fresh,
+        SettleState::Rest(end) => SettlePlan::Rest(end),
+    }
+}
+
+/// Give the state after a NOTIFY arrives in the settle of `plan`, which
+/// ends at `end`.
+///
+/// Only a fresh settle gives a cut. The cut keeps `end`, so the leader still
+/// polls at the end of the settle. `None` means that the NOTIFY does not
+/// cut. `formal/verus/src/notify_settle.rs` proves the function for every
+/// input, and proves that each settle has one cut at most.
+pub(crate) const fn after_notify_cut<T: Copy>(
+    plan: SettlePlan<T>,
+    end: T,
+) -> Option<SettleState<T>> {
+    match plan {
+        SettlePlan::Fresh => Some(SettleState::Rest(end)),
+        SettlePlan::Skip | SettlePlan::Rest(_) => None,
+    }
+}
+
+/// Give the state after the settle of `plan` ends, at its end or at a local
+/// decision end.
+///
+/// A rest always owes a fresh settle. The NOTIFY that cut the settle can
+/// name a row that a host clock stamped early. The poll at the cut and the
+/// poll at the end can both come before that row is claimable. The fresh
+/// settle gives that NOTIFY its own margin, as a queued NOTIFY got before.
+///
+/// `queued` tells whether a NOTIFY waits at the end of a fresh settle. The
+/// poll after the settle comes after each such NOTIFY, so that poll covers
+/// it. The NOTIFY then needs no poll of its own, only a settle if that poll
+/// is empty. Without this, the next idle wait polls again at once. In a
+/// fleet under a steady NOTIFY stream, that poll is empty on each worker.
+///
+/// `formal/verus/src/notify_settle.rs` proves the function for every input.
+pub(crate) const fn after_settle<T: Copy>(plan: SettlePlan<T>, queued: bool) -> SettleState<T> {
+    match plan {
+        SettlePlan::Rest(_) => SettleState::Due,
+        SettlePlan::Skip | SettlePlan::Fresh => {
+            if queued {
+                SettleState::Due
+            } else {
+                SettleState::Clear
+            }
+        }
+    }
 }
 
 /// Notifications lost to an error since the process started.
@@ -1275,22 +1362,40 @@ pub(crate) struct Stamp {
     started_at: DateTime<Utc>,
 }
 
+crate::const_sql! {
+    /// The id of the top-level transaction of the statement.
+    pub(crate) StampTxid: diesel::sql_types::Nullable<diesel::sql_types::BigInt> =
+        "txid_current()"
+}
+crate::const_sql! {
+    /// The database of the statement.
+    pub(crate) StampDatabase: Text = "current_database()::text"
+}
+crate::const_sql! {
+    /// The start time of the server of the statement.
+    pub(crate) StampStartedAt: diesel::sql_types::Timestamptz = "pg_postmaster_start_time()"
+}
+
 /// The `RETURNING` expressions of a [`Stamp`].
+///
+/// Each one is a constant fragment (issue #2651). A write that returns its
+/// stamp therefore stays a cached prepared statement. A `sql::<T>()`
+/// fragment made each such write parse and plan again.
 pub(crate) type StampReturning = (
-    diesel::expression::SqlLiteral<diesel::sql_types::Nullable<diesel::sql_types::BigInt>>,
-    diesel::expression::SqlLiteral<Text>,
-    diesel::expression::SqlLiteral<diesel::sql_types::Timestamptz>,
+    crate::cached_stmt::ConstSql<StampTxid>,
+    crate::cached_stmt::ConstSql<StampDatabase>,
+    crate::cached_stmt::ConstSql<StampStartedAt>,
 );
 
 /// The `RETURNING` expressions that make a write return its [`Stamp`].
 ///
 /// `txid_current()` gives the id of the top-level transaction, also inside a
 /// savepoint. Every row of one statement returns the same values.
-pub(crate) fn stamp_returning() -> StampReturning {
+pub(crate) const fn stamp_returning() -> StampReturning {
     (
-        diesel::dsl::sql("txid_current()"),
-        diesel::dsl::sql("current_database()::text"),
-        diesel::dsl::sql("pg_postmaster_start_time()"),
+        crate::cached_stmt::ConstSql::new(),
+        crate::cached_stmt::ConstSql::new(),
+        crate::cached_stmt::ConstSql::new(),
     )
 }
 
@@ -1472,18 +1577,20 @@ async fn stage_now(
 /// that wrote. After an autocommit write it reads NULL, because that write
 /// already committed.
 async fn probe(conn: &mut AsyncPgConnection, in_tx: bool) -> diesel::QueryResult<Stamp> {
-    let txid = if in_tx {
-        "txid_current()"
-    } else {
-        "txid_current_if_assigned()"
-    };
-    diesel::sql_query(format!(
-        "SELECT {txid} AS txid, \
+    // Two constant texts, so the connection caches each one (issue #2651).
+    let sql = if in_tx {
+        "SELECT txid_current() AS txid, \
                 current_database()::text AS database, \
                 pg_postmaster_start_time() AS started_at"
-    ))
-    .get_result::<Stamp>(conn)
-    .await
+    } else {
+        "SELECT txid_current_if_assigned() AS txid, \
+                current_database()::text AS database, \
+                pg_postmaster_start_time() AS started_at"
+    };
+    diesel::sql_query(sql)
+        .cache_prepared()
+        .get_result::<Stamp>(conn)
+        .await
 }
 
 /// The fallback: send `notes` on the write connection.
@@ -1714,6 +1821,7 @@ async fn send_wakes(
     diesel::sql_query("SELECT pg_notify(t.c, t.p) FROM unnest($1::text[], $2::text[]) AS t(c, p)")
         .bind::<diesel::sql_types::Array<Text>, _>(channels)
         .bind::<diesel::sql_types::Array<Text>, _>(payloads)
+        .cache_prepared()
         .execute(conn)
         .await
         .map(drop)
@@ -1870,6 +1978,7 @@ async fn tick(sink: &SinkShared, conn: &mut AsyncPgConnection, held: &mut Vec<St
                       ORDER BY t.n) AS statuses",
     )
     .bind::<diesel::sql_types::Array<diesel::sql_types::BigInt>, _>(txids)
+    .cache_prepared()
     .get_result::<GateRow>(conn)
     .await;
     let gate = match gate {
@@ -2088,6 +2197,7 @@ pub async fn notify_activity_progress_batch(
     )
     .bind::<diesel::sql_types::Array<Text>, _>(&channels)
     .bind::<diesel::sql_types::Array<Text>, _>(&payloads)
+    .cache_prepared()
     .execute(conn)
     .await
     .map_err(crate::error::database_error)?;
@@ -2108,6 +2218,7 @@ async fn send_progress(
     diesel::sql_query("SELECT pg_notify($1, $2)")
         .bind::<Text, _>(&channel)
         .bind::<Text, _>(&payload)
+        .cache_prepared()
         .execute(conn)
         .await
         .map_err(crate::error::database_error)?;
@@ -2366,6 +2477,18 @@ impl QueueListener {
             Ok(None) => Ok(QueueWaitOutcome::ChannelClosed),
             Err(_elapsed) => Ok(QueueWaitOutcome::TimedOut),
         }
+    }
+
+    /// Take each notification that is queued now, with no wait.
+    ///
+    /// Returns `true` when at least one was queued. A payload that does not
+    /// parse counts too, because it still marks a write.
+    pub(crate) fn take_queued(&mut self) -> bool {
+        let mut any = false;
+        while self.rx.try_recv().is_ok() {
+            any = true;
+        }
+        any
     }
 
     /// The queue names this listener is subscribed to.
@@ -3299,6 +3422,56 @@ mod tests {
             delays.iter().any(|d| *d != delays[0]),
             "the delay must vary between wakes"
         );
+    }
+
+    #[test]
+    fn take_settle_gives_the_plan_of_each_state() {
+        assert_eq!(take_settle(SettleState::<u32>::Clear), SettlePlan::Skip);
+        assert_eq!(take_settle(SettleState::<u32>::Due), SettlePlan::Fresh);
+        assert_eq!(take_settle(SettleState::Rest(7_u32)), SettlePlan::Rest(7));
+    }
+
+    #[test]
+    fn a_notify_cuts_a_fresh_settle_and_keeps_its_end() {
+        assert_eq!(
+            after_notify_cut(SettlePlan::Fresh, 9_u32),
+            Some(SettleState::Rest(9))
+        );
+        assert_eq!(
+            take_settle(SettleState::Rest(9_u32)),
+            SettlePlan::Rest(9),
+            "the rest must keep the end of the cut settle"
+        );
+    }
+
+    #[test]
+    fn a_queued_notify_at_the_end_owes_a_settle() {
+        assert_eq!(
+            after_settle(SettlePlan::<u32>::Fresh, true),
+            SettleState::Due
+        );
+        assert_eq!(
+            after_settle(SettlePlan::<u32>::Fresh, false),
+            SettleState::Clear
+        );
+    }
+
+    #[test]
+    fn a_rest_always_owes_a_settle_for_the_notify_that_cut_it() {
+        assert_eq!(
+            after_settle(SettlePlan::Rest(4_u32), false),
+            SettleState::Due
+        );
+        assert_eq!(
+            after_settle(SettlePlan::Rest(4_u32), true),
+            SettleState::Due
+        );
+    }
+
+    #[test]
+    fn a_notify_cuts_no_rest_and_no_skip() {
+        assert_eq!(after_notify_cut(SettlePlan::Rest(3_u32), 9), None);
+        assert_eq!(after_notify_cut(SettlePlan::<u32>::Skip, 9), None);
     }
 
     // ── TLS for listener connections (issue #1717) ───────────────────────

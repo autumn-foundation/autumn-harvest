@@ -39,6 +39,7 @@ pub(crate) mod mcp;
 mod ops;
 mod outbox;
 mod reads;
+mod replica;
 #[cfg(any(feature = "webhooks", feature = "connectors"))]
 pub(crate) mod triggers;
 mod ui;
@@ -58,6 +59,7 @@ pub use fleet::{HarvestFleet, HarvestTenant, tenant_harvest_file};
 pub use handle::{HarvestSqlite, HarvestSqliteError};
 pub use outbox::{SCHEMA_SQL as OUTBOX_SCHEMA_SQL, enqueue_workflow_start_outbox};
 pub(crate) use outbox::{SqliteOutbox, warn_if_stranded};
+pub use replica::{REPLICA_ENGINE, TenantReplica, tenant_harvest_replica_root};
 
 /// The `autumn-harvest-sqlite` types that [`HarvestSqlite`] takes and returns.
 pub use autumn_harvest_sqlite::{
@@ -84,6 +86,8 @@ pub(crate) struct SqliteParts {
     pub path: Option<PathBuf>,
     /// One Harvest per open fleet tenant (issue #2472).
     pub per_tenant: bool,
+    /// Where the tenant Harvest files ship, when the app sets it in code.
+    pub tenant_replica: Option<TenantReplica>,
     /// The admin-auth layers (issue #2469). They run as on Postgres.
     pub auth: crate::api::AdminAuthLayers,
     /// The MCP tools and tasks (issue #2471). The build fills in the roles,
@@ -112,6 +116,8 @@ struct Slot {
     code_path: Option<PathBuf>,
     /// Whether to run one Harvest per open fleet tenant.
     per_tenant: bool,
+    /// Where the tenant Harvest files ship, when the app sets it in code.
+    tenant_replica: Option<TenantReplica>,
     /// The per-tenant Harvests. The shutdown hook releases them.
     fleet: Option<HarvestFleet>,
     /// The outbox relay and its stop token (issue #2470).
@@ -180,6 +186,7 @@ pub(crate) fn build(app: AppBuilder, parts: SqliteParts) -> AppBuilder {
         allow_unauthenticated_mutations,
         path: code_path,
         per_tenant,
+        tenant_replica,
         auth,
         #[cfg(feature = "mcp")]
         mut mcp,
@@ -260,15 +267,12 @@ pub(crate) fn build(app: AppBuilder, parts: SqliteParts) -> AppBuilder {
 
     let slot = Arc::new(Mutex::new(Slot {
         parts: Some(start_parts),
-        driver: None,
         code_path,
         per_tenant,
-        fleet: None,
-        relay: None,
+        tenant_replica,
         #[cfg(feature = "connectors")]
         connectors,
-        #[cfg(feature = "connectors")]
-        connector_loops: Vec::new(),
+        ..Slot::default()
     }));
     let app = lifecycle_hooks(app, slot, &handles, &api_state);
 
@@ -349,6 +353,10 @@ async fn stop(slot: &Mutex<Slot>) {
         }
     }
     if let Some(fleet) = fleet {
+        // The fleet's own shutdown flush bounds this one too.
+        let within = fleet.flush_window();
+        let flushing = fleet.clone();
+        let _ = tokio::task::spawn_blocking(move || flushing.flush_replicas(within)).await;
         fleet.release();
     }
     if let Some(driver) = driver {
@@ -648,19 +656,21 @@ async fn start(
     let sqlite_config = HarvestSqliteConfig::load()
         .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?;
     let app_config = state.config();
-    let (parts, code_path, per_tenant) = {
+    let (parts, code_path, per_tenant, tenant_replica) = {
         let mut slot = slot.lock().unwrap_or_else(PoisonError::into_inner);
-        (slot.parts.take(), slot.code_path.clone(), slot.per_tenant)
+        (
+            slot.parts.take(),
+            slot.code_path.clone(),
+            slot.per_tenant,
+            slot.tenant_replica.take(),
+        )
     };
     let Some(parts) = parts else {
         // A second startup in one process keeps the running driver.
         return Ok(());
     };
-    let fleet = if per_tenant {
-        Some(app_fleet(state).map_err(AutumnError::service_unavailable_msg)?)
-    } else {
-        None
-    };
+    let fleet = tenant_fleet(state, per_tenant, tenant_replica.is_some())
+        .map_err(AutumnError::service_unavailable_msg)?;
     let path = resolve_path(
         sqlite_config.path.as_deref(),
         code_path.as_deref(),
@@ -717,14 +727,55 @@ async fn start(
     tracing::info!(path = %path.display(), "harvest is running on SQLite");
 
     if let Some(fleet) = fleet {
-        let tenants = HarvestFleet::new(fleet, registry, tick);
-        tenants.install().await;
-        state.insert_extension(tenants.clone());
+        let tenants = start_tenants(state, fleet, registry, tick, tenant_replica).await?;
         slot.lock().unwrap_or_else(PoisonError::into_inner).fleet = Some(tenants.clone());
         let _ = handles.fleet.set(tenants);
-        tracing::info!("harvest runs one SQLite file per open fleet tenant");
     }
     Ok(())
+}
+
+/// Start the per-tenant Harvests and the shippers of their files.
+///
+/// # Errors
+///
+/// Returns the error of the replication thread start.
+async fn start_tenants(
+    state: &AppState,
+    fleet: autumn_web::db::fleet::DatabaseFleet,
+    registry: Arc<Registry>,
+    tick: Duration,
+    tenant_replica: Option<TenantReplica>,
+) -> autumn_web::AutumnResult<HarvestFleet> {
+    let replicas = tenant_replicas(state, &fleet, tenant_replica)
+        .await
+        .map_err(AutumnError::service_unavailable_msg)?;
+    let tenants = HarvestFleet::new(fleet, registry, tick, replicas);
+    tenants.install().await;
+    state.insert_extension(tenants.clone());
+    tracing::info!("harvest runs one SQLite file per open fleet tenant");
+    Ok(tenants)
+}
+
+/// The app's fleet when `sqlite_per_tenant` is on, else `None`.
+///
+/// # Errors
+///
+/// Returns a message when `sqlite_per_tenant` is on and the app has no
+/// fleet.
+fn tenant_fleet(
+    state: &AppState,
+    per_tenant: bool,
+    replica_set: bool,
+) -> Result<Option<autumn_web::db::fleet::DatabaseFleet>, String> {
+    if per_tenant {
+        return app_fleet(state).map(Some);
+    }
+    if replica_set {
+        tracing::warn!(
+            "HarvestPlugin::sqlite_tenant_replica has no effect without sqlite_per_tenant"
+        );
+    }
+    Ok(None)
 }
 
 /// Open the control file on a blocking thread: the runtime with its code
@@ -863,6 +914,87 @@ async fn start_outbox(
     let stop = CancellationToken::new();
     let task = relay.spawn(stop.clone());
     Ok(Some((stop, task)))
+}
+
+/// The shippers of the tenant Harvest files, with their loop running.
+///
+/// They run only when the fleet replicates. The destination comes from
+/// app code, or else from `[replication]`, as the fleet's does.
+///
+/// # Errors
+///
+/// Returns a message when the loop thread cannot start.
+async fn tenant_replicas(
+    state: &AppState,
+    fleet: &autumn_web::db::fleet::DatabaseFleet,
+    explicit: Option<TenantReplica>,
+) -> Result<Option<Arc<replica::Replicas>>, String> {
+    if fleet.replication().is_none() {
+        if explicit.is_some() {
+            tracing::warn!(
+                "HarvestPlugin::sqlite_tenant_replica is set, but the fleet does not replicate: \
+                 the tenant Harvest files do not ship"
+            );
+        }
+        return Ok(None);
+    }
+    let replica = match explicit {
+        Some(replica) => Some(replica),
+        None => replica_from_config(state).await,
+    };
+    let Some(replica) = replica else {
+        tracing::warn!(
+            "the fleet replicates its databases, but the tenant Harvest files do not ship: \
+             no [replication] destination reaches the plugin"
+        );
+        return Ok(None);
+    };
+    let replicas = Arc::new(replica::Replicas::new(
+        replica.clone(),
+        autumn_web::db::DbState::clock(state),
+        fleet.clone(),
+    ));
+    replicas
+        .spawn_loop()
+        .map_err(|error| format!("cannot start the tenant Harvest replication thread: {error}"))?;
+    tracing::info!(root = %replica.root(), "tenant Harvest files ship with their databases");
+    Ok(Some(replicas))
+}
+
+/// The tenant replica from `[replication]`, with the root of the fleet.
+async fn replica_from_config(state: &AppState) -> Option<TenantReplica> {
+    let config = state.config();
+    let replication = config.replication.as_deref()?.clone();
+    // The same URL and profile as the fleet replication of the app, so the
+    // root is the same.
+    let url = config
+        .database
+        .primary_url
+        .clone()
+        .or_else(|| config.database.url.clone())
+        .unwrap_or_default();
+    let profile = config.profile.clone().unwrap_or_else(|| "dev".to_owned());
+    let clock = autumn_web::db::DbState::clock(state);
+    // The S3 destination uses a blocking client.
+    let built = tokio::task::spawn_blocking(move || {
+        autumn_web::replication::build(&replication, &url, &profile, None, clock)
+    })
+    .await;
+    match built {
+        Ok(Ok(runtime)) => Some(TenantReplica::new(
+            Arc::clone(runtime.replicator.destination()),
+            runtime.settings,
+        )),
+        Ok(Err(autumn_web::replication::SetupError::Disabled)) => None,
+        Ok(Err(error)) => {
+            tracing::warn!(%error, "cannot build the tenant Harvest replica from [replication]");
+            None
+        }
+        Err(error) => {
+            tracing::warn!(%error, "the tenant Harvest replica setup task failed");
+            None
+        }
+    }
 }
 
 /// The app's SQLite fleet, for `sqlite_per_tenant` (issue #2472).

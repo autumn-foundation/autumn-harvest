@@ -263,6 +263,8 @@ pub struct BuildReachability {
 // ── DB functions ──────────────────────────────────────────────────────────────
 
 #[cfg(feature = "db")]
+use crate::cached_stmt::CachePreparedDsl as _;
+#[cfg(feature = "db")]
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
 
 /// Upsert the active build policy for a queue.
@@ -564,12 +566,15 @@ pub async fn get_build_policy(
     conn: &mut AsyncPgConnection,
     queue_name: &str,
 ) -> HarvestResult<Option<BuildPolicy>> {
+    // The column list is a constant, so the text is one constant text. Each
+    // workflow start reads the policy of its queue (issue #2651).
     let rows: Vec<BuildPolicyRow> = diesel::sql_query(format!(
         "SELECT {BUILD_POLICY_COLUMNS} \
          FROM harvest_build_policies \
          WHERE queue_name = $1"
     ))
     .bind::<diesel::sql_types::Text, _>(queue_name)
+    .cache_prepared()
     .load(conn)
     .await
     .map_err(database_error)?;

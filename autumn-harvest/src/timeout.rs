@@ -15,6 +15,7 @@ use crate::table_split::SetExt;
 use std::collections::HashSet;
 use std::time::Duration;
 
+use crate::cached_stmt::CachePreparedDsl as _;
 use chrono::Utc;
 use diesel::{
     BoolExpressionMethods, ExpressionMethods, OptionalExtension, QueryDsl, SelectableHelper,
@@ -1437,7 +1438,10 @@ async fn lock_workflow_execution_row_and_load_history(
         .find(exec_id.as_uuid())
         .for_update()
         .select(WorkflowExecution::as_select())
-        .first(conn)
+        // A load by primary key has one plan. `first` adds this limit.
+        .limit(1)
+        .cache_prepared()
+        .get_result(conn)
         .await
         .optional()
         .map_err(crate::error::database_error)?

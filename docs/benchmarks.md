@@ -121,7 +121,10 @@ poll interval is not as direct a lever as it looks: with LISTEN/NOTIFY wired,
 as it is here, a successful notification wakes a worker at once, regardless
 of the configured interval. Since issue #2422 the worker polls first. It
 sleeps the 50 to 75 ms settle only after an empty poll. Before 0.8.0 every
-notification slept the settle first. A worker claiming tasks back to back
+notification slept the settle first. Since issue #2653 a notification in
+the settle cuts it once, and the worker polls at once. See
+[`performance-notify-cuts-settle.md`](performance-notify-cuts-settle.md).
+A worker claiming tasks back to back
 under load never waits at all. The interval mainly bounds a *missed*
 notification, per
 [the configuration these numbers were taken at](#the-configuration-these-numbers-were-taken-at).

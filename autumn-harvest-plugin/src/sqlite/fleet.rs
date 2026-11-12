@@ -32,15 +32,17 @@ use tokio_util::sync::CancellationToken;
 use super::driver::{Driver, Registry, Retention};
 use super::handle::Catalog;
 use super::handle::{HarvestSqlite, HarvestSqliteError};
+use super::replica::{IDENTITY_SUFFIX, Replicas, TARGET_SUFFIX};
 
 /// How long a caller waits for a tenant driver that another task starts.
 const START_WAIT: Duration = Duration::from_secs(10);
 
-/// The SQLite sidecars that a delete removes with a Harvest file.
+/// The files that a delete removes with a Harvest file: the SQLite
+/// sidecars and the replica records.
 ///
-/// The `.lock` file stays. The lock module forbids its delete while a
-/// runtime can still hold it.
-const SIDECARS: [&str; 3] = ["-wal", "-shm", "-journal"];
+/// The `.lock` files stay. The lock module forbids the delete of a lock
+/// file while a holder can still have it.
+const SIDECARS: [&str; 5] = ["-wal", "-shm", "-journal", IDENTITY_SUFFIX, TARGET_SUFFIX];
 
 tokio::task_local! {
     /// The tenant whose driver runs the current task.
@@ -115,6 +117,12 @@ struct Shared {
     tenants: Mutex<HashMap<FleetDbKey, Slot>>,
     /// The last start generation.
     generation: AtomicU64,
+    /// The shippers of the tenant Harvest files. `None` when the fleet does
+    /// not replicate.
+    replicas: Option<Arc<Replicas>>,
+    /// One [`HarvestFleet::restore`] at a time. Two restores of one tenant
+    /// would otherwise swap their targets.
+    restore_turn: tokio::sync::Mutex<()>,
 }
 
 /// The per-tenant Harvests of a fleet app.
@@ -144,7 +152,12 @@ impl std::fmt::Debug for HarvestFleet {
 }
 
 impl HarvestFleet {
-    pub(crate) fn new(fleet: DatabaseFleet, registry: Arc<Registry>, tick: Duration) -> Self {
+    pub(crate) fn new(
+        fleet: DatabaseFleet,
+        registry: Arc<Registry>,
+        tick: Duration,
+        replicas: Option<Arc<Replicas>>,
+    ) -> Self {
         Self {
             shared: Arc::new(Shared {
                 fleet,
@@ -153,6 +166,8 @@ impl HarvestFleet {
                 tick,
                 tenants: Mutex::new(HashMap::new()),
                 generation: AtomicU64::new(0),
+                replicas,
+                restore_turn: tokio::sync::Mutex::new(()),
             }),
         }
     }
@@ -237,12 +252,82 @@ impl HarvestFleet {
     /// The registry holds a clone of `AppState`, and `AppState` holds this
     /// fleet. Without the release, an app that stops never frees its state.
     /// A running tenant driver keeps its own copy until the fleet closes it.
+    /// The release also stops the replication loop. A later close still
+    /// ships its tenant Harvest file.
     pub fn release(&self) {
         *self
             .shared
             .registry
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = None;
+        if let Some(replicas) = &self.shared.replicas {
+            replicas.stop();
+        }
+    }
+
+    /// Whether the tenant Harvest files ship with their tenant databases.
+    #[must_use]
+    pub fn replicates(&self) -> bool {
+        self.shared.replicas.is_some()
+    }
+
+    /// Ship each open tenant Harvest file once, and retry each backlog of a
+    /// closed one. It blocks, so call it on a blocking thread. The loop does
+    /// the same work on its interval. Tests call it to step the replication
+    /// without a sleep. Without replication, it does nothing.
+    pub fn tick_replicas(&self) {
+        if let Some(replicas) = &self.shared.replicas {
+            replicas.tick_all();
+        }
+    }
+
+    /// Restore the tenant database `key` and its Harvest file, as of
+    /// `target`, or at their latest state for `None`.
+    ///
+    /// The fleet restores the database at once. The target stays on disk
+    /// beside the Harvest file. The next open of the tenant restores the
+    /// Harvest file to it, before the driver starts. When the Harvest
+    /// replica cannot reach the target, each open refuses until a new
+    /// restore. One restore runs at a time, so two restores never swap
+    /// their targets. A direct `DatabaseFleet::restore` restores the
+    /// Harvest file at its latest state.
+    ///
+    /// # Errors
+    ///
+    /// [`HarvestSqliteError::Fleet`] when the fleet refuses the restore.
+    pub async fn restore(
+        &self,
+        key: &FleetDbKey,
+        target: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<autumn_web::replication::RestoreOutcome, HarvestSqliteError> {
+        let Some(replicas) = &self.shared.replicas else {
+            return Ok(self.shared.fleet.restore(key, target).await?);
+        };
+        let _turn = self.shared.restore_turn.lock().await;
+        replicas.request_restore(key, target);
+        let restored = self.shared.fleet.restore(key, target).await;
+        replicas.end_restore(key, restored.is_ok());
+        Ok(restored?)
+    }
+
+    /// How long the shutdown flush ships the backlog of closed tenant
+    /// Harvest files: the final flush of the fleet replication.
+    pub(crate) fn flush_window(&self) -> Duration {
+        self.shared
+            .fleet
+            .replication()
+            .map_or(Duration::from_secs(5), |replication| {
+                replication.final_flush()
+            })
+    }
+
+    /// Ship the backlog of closed tenant Harvest files within `within`. It
+    /// blocks, so call it on a blocking thread. The shutdown hook calls it
+    /// before [`release`](Self::release).
+    pub(crate) fn flush_replicas(&self, within: Duration) {
+        if let Some(replicas) = &self.shared.replicas {
+            replicas.flush_parked(within);
+        }
     }
 
     /// The leased handle of the open database `db`.
@@ -360,12 +445,27 @@ impl Shared {
             .ok_or_else(|| {
                 format!("the per-tenant Harvest has stopped, so {key} gets no driver")
             })?;
-        let runtime = Driver::open(&path, &registry)?;
+        let epoch = db.epoch().map(autumn_web::lock::FencingToken::get);
+        if let Some(replicas) = &self.replicas {
+            replicas.prepare(&key, &path, db.path(), epoch)?;
+        }
+        let runtime = Driver::open_with(&path, &registry, self.replicas.is_some())?;
+        if self.replicas.is_some()
+            && let Some(epoch) = epoch
+        {
+            runtime
+                .raise_fleet_epoch(epoch)
+                .map_err(|error| format!("cannot record the epoch of {key}: {error}"))?;
+        }
         // Each tenant file has its own retention status (issue #2471).
         let retention = Arc::new(Retention::new(&registry.retention));
         drop(registry);
         let reader = autumn_harvest_sqlite::SqliteReader::open(&path)
             .map_err(|error| format!("cannot open a reader on {}: {error}", path.display()))?;
+        if let Some(replicas) = &self.replicas {
+            super::replica::record_database(&path, db.path())?;
+            replicas.attach(&key, &path, epoch);
+        }
         let stop = CancellationToken::new();
         let weak = Arc::downgrade(self);
         let exit_key = key.clone();
@@ -389,7 +489,11 @@ impl Shared {
         db.register_worker(stop.clone(), task);
         if stop.is_cancelled() {
             // The fleet had begun to close the tenant, so it stopped the
-            // driver at once.
+            // driver at once. The fleet calls no `on_close` for a refused
+            // open, so ship the file here.
+            if let Some(replicas) = &self.replicas {
+                replicas.close(&key);
+            }
             return Err(format!("{key} closed while its Harvest started"));
         }
         Ok(
@@ -479,6 +583,16 @@ impl FleetLifecycle for TenantLifecycle {
     fn on_close(&self, db: &FleetDatabase) {
         if let Some(shared) = self.0.upgrade() {
             shared.forget(db.key());
+            // The driver has stopped, so the last frames ship now.
+            if let Some(replicas) = &shared.replicas {
+                replicas.close(db.key());
+            }
+        }
+    }
+
+    fn release(&self, key: &FleetDbKey) {
+        if let Some(replicas) = self.0.upgrade().and_then(|shared| shared.replicas.clone()) {
+            replicas.release(key);
         }
     }
 
@@ -486,6 +600,9 @@ impl FleetLifecycle for TenantLifecycle {
         if let Some(shared) = self.0.upgrade() {
             shared.forget(key);
             shared.erase(key);
+            if let Some(replicas) = &shared.replicas {
+                replicas.forget(key);
+            }
         }
     }
 }
@@ -531,7 +648,7 @@ mod tests {
             .expect("fleet config");
         let fleet = DatabaseFleet::builder(config).build().expect("fleet");
         let registry = Arc::new(Registry::empty());
-        HarvestFleet::new(fleet, registry, Duration::from_millis(250)).shared
+        HarvestFleet::new(fleet, registry, Duration::from_millis(250), None).shared
     }
 
     fn acme(shared: &Shared) -> FleetDbKey {
@@ -599,6 +716,7 @@ mod tests {
             fleet.clone(),
             Arc::clone(&registry),
             Duration::from_millis(250),
+            None,
         );
         harvest.install().await;
         assert_eq!(Arc::strong_count(&registry), 2);

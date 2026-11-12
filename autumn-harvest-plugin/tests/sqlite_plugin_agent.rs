@@ -339,8 +339,8 @@ async fn an_entity_agent_runs_through_signal_with_start() {
 
     let deadline = Instant::now() + LIMIT;
     let state: AgentState = loop {
-        // The run can get the query before its first decision registers the
-        // state handler. That race gives `QueryNotFound`, so the loop asks again.
+        // The agent reads its profile before it registers the query. Until
+        // the first decision records that read, the query has no handler.
         match handle.query(exec, ENTITY_STATE_QUERY, Value::Null).await {
             Ok(value) => {
                 let state: AgentState = serde_json::from_value(value).unwrap();
@@ -349,7 +349,7 @@ async fn an_entity_agent_runs_through_signal_with_start() {
                 }
             }
             Err(HarvestSqliteError::Sqlite(SqliteError::QueryNotFound { .. })) => {}
-            Err(e) => panic!("the state query failed: {e}"),
+            Err(error) => panic!("the state query failed: {error}"),
         }
         assert!(Instant::now() < deadline, "the op did not run");
         tokio::time::sleep(Duration::from_millis(25)).await;

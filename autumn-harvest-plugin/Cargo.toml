@@ -327,6 +327,12 @@ required-features = ["sqlite"]
 name = "sqlite_plugin_fleet"
 required-features = ["sqlite"]
 
+# The tenant Harvest file ships and restores with its tenant database. It
+# needs no Docker.
+[[test]]
+name = "sqlite_plugin_fleet_replica"
+required-features = ["sqlite"]
+
 # The durable agent under `HarvestPlugin` on SQLite. It needs no Docker.
 [[test]]
 name = "sqlite_plugin_agent"
