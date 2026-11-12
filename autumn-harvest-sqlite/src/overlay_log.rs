@@ -4,12 +4,16 @@
 //! Postgres. Each kind has immutable versions and one active pointer. The
 //! typed store is `SqliteOverlayStore` in `autumn-harvest-agent`.
 //!
-//! [`SqliteOverlayLog`] opens its own connection. It can share the file of
-//! a [`SqliteRuntime`](crate::SqliteRuntime). WAL mode lets the two
+//! [`SqliteOverlayLog::open`] keeps its own connection. It can share the
+//! file of a [`SqliteRuntime`](crate::SqliteRuntime). WAL mode lets the two
 //! connections work side by side.
+//!
+//! [`SqliteOverlayLog::with_connector`] opens a new connection for each
+//! call, and drops it after the call. Use it in a database that a
+//! replicator checkpoints.
 
 use std::path::Path;
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use autumn_harvest::overlay_log::{
     AUTHOR_AUTO, ActivateDecision, ActivateOutcome, ActivationRow, AutoAdoptRaw, AutoAdoptRequest,
@@ -124,6 +128,13 @@ BEGIN
 END;
 ";
 
+/// Opens one connection to the database of an overlay log.
+///
+/// Each call must open the same database. Set the pragmas of the app in
+/// the closure, such as `journal_mode`, `busy_timeout` and
+/// `wal_autocheckpoint`.
+pub type SqliteConnector = Arc<dyn Fn() -> rusqlite::Result<Connection> + Send + Sync>;
+
 /// The columns of one policy row.
 const POLICY_COLUMNS: &str = "seq, old_body, new_body, actor_kind, actor, changed_at_ms";
 
@@ -136,7 +147,15 @@ const ROW_COLUMNS: &str = "version, body, author_kind, author, created_at_ms";
 /// `autumn-harvest-agent`, which does.
 #[doc(hidden)]
 pub struct SqliteOverlayLog {
-    conn: Mutex<Connection>,
+    source: Mutex<Source>,
+}
+
+/// Where a call of the log gets its connection.
+enum Source {
+    /// One connection for the life of the log.
+    Held(Connection),
+    /// A new connection for each call.
+    Factory(SqliteConnector),
 }
 
 impl std::fmt::Debug for SqliteOverlayLog {
@@ -165,7 +184,30 @@ impl SqliteOverlayLog {
         Self::prepare(Connection::open_in_memory()?)
     }
 
-    fn prepare(conn: Connection) -> SqliteResult<Self> {
+    /// Open a log that gets a new connection from `connect` for each call.
+    ///
+    /// The log applies its schema through `connect`. Each later call opens
+    /// one connection, runs its statements and drops the connection. So the
+    /// log keeps no connection between calls. The log runs one call at a
+    /// time, so at most one of its connections is open.
+    ///
+    /// The log sets `foreign_keys = ON` on each connection, and no other
+    /// pragma. The app sets the rest in `connect`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqliteError::Sqlite`] if `connect` fails or the schema
+    /// cannot be applied.
+    pub fn with_connector(connect: SqliteConnector) -> SqliteResult<Self> {
+        let mut conn = connect_once(&connect)?;
+        apply_schema(&mut conn)?;
+        drop(conn);
+        Ok(Self {
+            source: Mutex::new(Source::Factory(connect)),
+        })
+    }
+
+    fn prepare(mut conn: Connection) -> SqliteResult<Self> {
         // As in `SqliteRuntime::open`: wait for another writer, keep a commit
         // across a crash, and turn on the foreign key of the pointer.
         conn.execute_batch(
@@ -174,16 +216,27 @@ impl SqliteOverlayLog {
              PRAGMA synchronous = FULL;\n\
              PRAGMA foreign_keys = ON;",
         )?;
-        conn.execute_batch(OVERLAY_SCHEMA)?;
+        apply_schema(&mut conn)?;
         Ok(Self {
-            conn: Mutex::new(conn),
+            source: Mutex::new(Source::Held(conn)),
         })
     }
 
-    /// Run `f` on the connection under its lock.
+    /// Run `f` on a connection under the lock of the log.
+    ///
+    /// A factory log opens the connection for this call only. The
+    /// connection closes before the lock is released.
     fn with_conn<T>(&self, f: impl FnOnce(&mut Connection) -> SqliteResult<T>) -> SqliteResult<T> {
-        let mut conn = self.conn.lock().unwrap_or_else(PoisonError::into_inner);
-        f(&mut conn)
+        let mut source = self.source.lock().unwrap_or_else(PoisonError::into_inner);
+        match &mut *source {
+            Source::Held(conn) => f(conn),
+            Source::Factory(connect) => {
+                let mut conn = connect_once(connect)?;
+                let out = f(&mut conn);
+                drop(conn);
+                out
+            }
+        }
     }
 
     /// Append `body` as the next version of `kind`. Returns the stored row,
@@ -355,6 +408,21 @@ impl SqliteOverlayLog {
             Ok(out)
         })
     }
+}
+
+/// One connection from `connect`, with the foreign key of the pointer on.
+fn connect_once(connect: &SqliteConnector) -> SqliteResult<Connection> {
+    let conn = connect()?;
+    conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+    Ok(conn)
+}
+
+/// Apply [`OVERLAY_SCHEMA`] in one `IMMEDIATE` transaction.
+fn apply_schema(conn: &mut Connection) -> SqliteResult<()> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    tx.execute_batch(OVERLAY_SCHEMA)?;
+    tx.commit()?;
+    Ok(())
 }
 
 /// The body of [`SqliteOverlayLog::append`].

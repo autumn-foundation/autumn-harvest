@@ -147,13 +147,13 @@ pub use agent::overlay::{
 pub use agent::overlay_diff::{OverlayChange, diff as overlay_diff};
 #[cfg(feature = "postgres")]
 pub use agent::overlay_store::PostgresOverlayStore;
-#[cfg(feature = "sqlite")]
-pub use agent::overlay_store::SqliteOverlayStore;
 pub use agent::overlay_store::{
     Activation, AutoAdoptOutcome, InMemoryOverlayStore, MAX_AUTHOR_LEN, OverlayStoreError,
     OverlayValidator, OverlayVersion, PolicyLogEntry, PolicyState, ProfileOverlayStore, Provenance,
     Rollback, StoreClock, StoredOverlay,
 };
+#[cfg(feature = "sqlite")]
+pub use agent::overlay_store::{SqliteConnector, SqliteOverlayStore};
 pub use agent::profile_read::{OverlayRead, ProfileRead};
 pub use agent::{
     AGENT_WORKFLOW_NAME, Agent, AgentHeartbeat, AgentId, AgentIdError, AgentMemory, AgentOp,

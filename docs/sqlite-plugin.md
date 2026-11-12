@@ -426,7 +426,10 @@ task declares. The agent keys its memory and its workspace by agent id,
 with no tenant. So the build refuses `agent` with `sqlite_per_tenant()`.
 
 The agent reads its profile overlays through the store of the harness,
-such as `SqliteOverlayStore` in a file of its own. The
+such as `SqliteOverlayStore` in a file of its own. In a fleet database that
+a replicator checkpoints, open it with `SqliteOverlayStore::with_connector`.
+Each call then opens its own connection with the pragmas of the fleet. See
+the profile overlay section of `docs/agent-adapter.md`. The
 `/agents/{kind}/profile` routes still need Postgres, so the build refuses
 `agent_overlay_store`.
 

@@ -39,6 +39,8 @@ use autumn_harvest::overlay_log::{
 };
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
 use autumn_harvest::overlay_log::{AutoAdoptRequest, PolicyAppend, PolicyRow, PolicyWrite};
+#[cfg(feature = "sqlite")]
+pub use autumn_harvest_sqlite::SqliteConnector;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -1583,9 +1585,10 @@ impl InMemoryOverlayStore {
 
 /// A [`ProfileOverlayStore`] in a `SQLite` file.
 ///
-/// It opens its own connection. It can share the file of a
-/// `SqliteRuntime`. A call runs its statements on the polling thread, and a
-/// busy file can hold that thread for up to 5 seconds.
+/// [`open`](Self::open) keeps its own connection. It can share the file of
+/// a `SqliteRuntime`. [`with_connector`](Self::with_connector) opens a new
+/// connection for each call. A call runs its statements on the polling
+/// thread, and a busy file can hold that thread for up to 5 seconds.
 #[cfg(feature = "sqlite")]
 pub struct SqliteOverlayStore {
     log: autumn_harvest_sqlite::SqliteOverlayLog,
@@ -1612,6 +1615,40 @@ impl SqliteOverlayStore {
         validator: Arc<dyn OverlayValidator>,
     ) -> Result<Self, OverlayStoreError> {
         let log = autumn_harvest_sqlite::SqliteOverlayLog::open(path).map_err(backend)?;
+        Ok(Self {
+            log,
+            validator,
+            clock: system_clock(),
+        })
+    }
+
+    /// Open the store on the connections that `connect` opens.
+    ///
+    /// Use it in a database that a replicator checkpoints, such as the
+    /// tenant database of an autumn-web fleet.
+    ///
+    /// - The store applies its schema through `connect`.
+    /// - Each call opens one connection, runs its statements and drops the
+    ///   connection. So the store keeps no connection between calls.
+    /// - The store runs one call at a time.
+    /// - The store sets `foreign_keys = ON` on each connection, and no
+    ///   other pragma. Set the pragmas of the app in `connect`, such as
+    ///   `wal_autocheckpoint = 0` and `busy_timeout`.
+    /// - Open a connection in `connect` only while another connection of
+    ///   the app stays open. Then a store connection never closes last.
+    ///
+    /// The guards of the tables do not change.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OverlayStoreError::Backend`] when `connect` fails or the
+    /// schema cannot be applied.
+    pub fn with_connector(
+        connect: SqliteConnector,
+        validator: Arc<dyn OverlayValidator>,
+    ) -> Result<Self, OverlayStoreError> {
+        let log =
+            autumn_harvest_sqlite::SqliteOverlayLog::with_connector(connect).map_err(backend)?;
         Ok(Self {
             log,
             validator,
