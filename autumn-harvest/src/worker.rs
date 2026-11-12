@@ -59841,9 +59841,9 @@ mod tests {
         assert!(later.is_err(), "a cut settle must owe its rest once only");
     }
 
-    /// A NOTIFY that cuts a settle late still gets a full margin. Its row
-    /// can be stamped ahead of the database clock, so the poll at the cut
-    /// and the poll at the original end can both come too early.
+    /// A NOTIFY that cuts a settle late still gets a full margin. A host
+    /// clock can stamp its row ahead of the database clock. Then the poll at
+    /// the cut and the poll at the original end both come too early.
     #[tokio::test(start_paused = true)]
     async fn a_late_cut_still_gives_its_notify_a_full_margin() {
         let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));
