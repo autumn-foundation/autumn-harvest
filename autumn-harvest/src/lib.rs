@@ -639,6 +639,8 @@ pub mod run_defaults;
 pub mod sandbox;
 #[cfg(feature = "db")]
 pub mod schedule_decision;
+/// Schedule herd forecast: which cron schedules fire at the same moment.
+pub mod schedule_herd;
 /// Operator overrides for code-declared schedules (issues #2385 and #2386).
 #[cfg(feature = "db")]
 pub mod schedule_override;
