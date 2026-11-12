@@ -321,7 +321,8 @@ impl Replicas {
         let target = read_target(path)?;
         // A file with no record predates the record. Only a target then
         // shows that the database changed.
-        let replaced = recorded.map_or(target.is_some(), |recorded| recorded.trim() != current);
+        let replaced =
+            recorded.map_or_else(|| target.is_some(), |recorded| recorded.trim() != current);
         if !path.exists() || replaced {
             self.drop_parked(key);
             match target {
