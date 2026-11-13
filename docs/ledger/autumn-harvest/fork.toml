@@ -29,7 +29,7 @@ driver = "per_request"
 backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_dead_letters", "harvest_events", "harvest_workflow_executions"]
-measured = "unmeasured"
+measured = "docs/performance-retention-pass-statement-cache.md"
 plan = "docs/ledger/plans/autumn-harvest/fork.md"
 
 ["load_fork_source"]

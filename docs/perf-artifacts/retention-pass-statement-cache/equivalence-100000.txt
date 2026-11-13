@@ -1,0 +1,22 @@
+CREATE FUNCTION
+BEGIN
+SET
+SELECT 100000
+COMMIT
+DISCARD PLANS
+BEGIN
+SET
+SELECT 100000
+COMMIT
+== rows compared, and rows that differ (must be 0)
+ rows_compared | custom_only | generic_only 
+---------------+-------------+--------------
+        100000 |           0 |            0
+(1 row)
+
+== the edge cases that the comparison covered
+ no_active_child | with_active_child | with_open_fork | with_chain_link | with_boundary_link | held 
+-----------------+-------------------+----------------+-----------------+--------------------+------
+           99379 |               621 |             10 |           13688 |              20487 |   97
+(1 row)
+

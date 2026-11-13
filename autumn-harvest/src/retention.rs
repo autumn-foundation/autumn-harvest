@@ -27,6 +27,8 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 #[cfg(feature = "db")]
+use crate::cached_stmt::CachePreparedDsl as _;
+#[cfg(feature = "db")]
 use crate::error::{HarvestError, HarvestResult, database_error};
 #[cfg(feature = "db")]
 use crate::models::NewExecutionSummary;
@@ -3900,7 +3902,10 @@ async fn delete_candidate_execution(
                 crate::schema::harvest_workflow_executions_unmapped::staging_vacated_state(),
             ))
             .for_update()
-            .first::<SummarySourceRow>(conn)
+            // A load by primary key has one plan. `first` adds this limit.
+            .limit(1)
+            .cache_prepared()
+            .get_result::<SummarySourceRow>(conn)
             .await
             .optional()
             .map_err(database_error)?;
@@ -4077,6 +4082,8 @@ async fn delete_candidate_execution(
                     ])),
             )
             .set(harvest_workflow_executions::parent_id.eq::<Option<uuid::Uuid>>(None))
+            // The state list is a fixed array, so the text is constant.
+            .cache_prepared()
             .execute(conn)
             .await
             .map_err(database_error)?;
@@ -4532,8 +4539,11 @@ async fn should_skip_candidate(
     candidate: &CandidateExecution,
     cutoff: DateTime<Utc>,
 ) -> HarvestResult<bool> {
+    // The candidate loop runs these probes once per candidate. Each text is
+    // constant, so each stays prepared and keeps one plan.
     let active_parent_ref_count = diesel::sql_query(active_child_count_sql())
         .bind::<SqlUuid, _>(candidate.id)
+        .cache_prepared()
         .get_result::<CountRow>(conn)
         .await
         .map_err(database_error)?
@@ -4587,6 +4597,7 @@ async fn should_skip_candidate(
         .bind::<Text, _>(&candidate.workflow_id)
         .bind::<SqlUuid, _>(candidate.id)
         .bind::<Timestamptz, _>(cutoff)
+        .cache_prepared()
         .get_result::<CountRow>(conn)
         .await
         .map_err(database_error)?
