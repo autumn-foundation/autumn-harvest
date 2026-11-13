@@ -57,17 +57,6 @@ fn boot(dir: &Path, harness: AgentHarness) -> TestClient {
         .build()
 }
 
-/// `true` when the run has not registered the state query yet.
-///
-/// The agent reads its profile in an activity before the entity registers
-/// the query. Until that activity completes, a query replay finds no handler.
-const fn not_ready(err: &HarvestSqliteError) -> bool {
-    matches!(
-        err,
-        HarvestSqliteError::Sqlite(SqliteError::QueryNotFound { .. })
-    )
-}
-
 fn handle_of(client: &TestClient) -> HarvestSqlite {
     client
         .state()
@@ -126,8 +115,9 @@ impl Plugin {
     async fn state(&self, id: &AgentId) -> Option<AgentState> {
         match agent::state(self.handle(), id).await {
             Ok(state) => state,
-            Err(err) if not_ready(&err) => None,
-            Err(err) => panic!("the state reads: {err}"),
+            // The agent reads its profile before it registers the query.
+            Err(HarvestSqliteError::Sqlite(SqliteError::QueryNotFound { .. })) => None,
+            Err(error) => panic!("the state reads: {error}"),
         }
     }
 }
@@ -152,6 +142,12 @@ impl Backend for Plugin {
         agent::send(self.handle(), id, op, None)
             .await
             .expect("the op is sent");
+    }
+
+    async fn reload_kind(&mut self, kind: &str) -> Vec<AgentId> {
+        agent::reload_profiles(self.handle(), kind)
+            .await
+            .expect("the reloads are sent")
     }
 
     async fn settle(
@@ -306,6 +302,16 @@ async fn a_rollback_after_an_auto_adoption_restores_v1() {
     overlay_read_suite::a_rollback_after_an_auto_adoption_restores_v1(&mut Plugin::new()).await;
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reload_reads_the_new_profile() {
+    overlay_read_suite::a_reload_reads_the_new_profile(&mut Plugin::new()).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reload_keeps_the_active_overlay() {
+    overlay_read_suite::a_reload_keeps_the_active_overlay(&mut Plugin::new()).await;
+}
+
 /// The text of each message, with its role.
 fn texts(state: &AgentState) -> Vec<(ChatRole, String)> {
     state
@@ -353,6 +359,8 @@ async fn an_entity_agent_runs_through_signal_with_start() {
 
     let deadline = Instant::now() + LIMIT;
     let state: AgentState = loop {
+        // The agent reads its profile before it registers the query. Until
+        // the first decision records that read, the query has no handler.
         match handle.query(exec, ENTITY_STATE_QUERY, Value::Null).await {
             Ok(value) => {
                 let state: AgentState = serde_json::from_value(value).unwrap();
@@ -360,8 +368,8 @@ async fn an_entity_agent_runs_through_signal_with_start() {
                     break state;
                 }
             }
-            Err(err) if not_ready(&err) => {}
-            Err(err) => panic!("the state reads: {err}"),
+            Err(HarvestSqliteError::Sqlite(SqliteError::QueryNotFound { .. })) => {}
+            Err(error) => panic!("the state query failed: {error}"),
         }
         assert!(Instant::now() < deadline, "the op did not run");
         tokio::time::sleep(Duration::from_millis(25)).await;

@@ -32,3 +32,5 @@ mod worker_queues;
 mod agent_vote;
 mod agent_stores;
 mod refine_rule;
+mod notify_settle;
+mod restore_target;

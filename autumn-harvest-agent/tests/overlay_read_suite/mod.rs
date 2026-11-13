@@ -20,7 +20,7 @@ use autumn_harvest::testing::{ReplayReport, ReplayStatus};
 use autumn_harvest_agent::approval::approval_signal;
 use autumn_harvest_agent::{
     AgentError, AgentHarness, AgentId, AgentModel, AgentOp, AgentProfile, AgentState, BoxFuture,
-    ChatMessage, ChatRequest, ChatResponse, ChatRole, ContentPart, FnTool, OverlayVersion,
+    ChatMessage, ChatRequest, ChatResponse, ChatRole, ContentPart, Control, FnTool, OverlayVersion,
     ProfileOverlay, ProfileOverlayStore, Provenance, Rule, StopReason, TokenUsage, ToolEffect,
     ToolRules,
 };
@@ -34,6 +34,9 @@ pub const PROMPT_V2: &str = "Prompt of version two.";
 
 /// The system text of the bare profile.
 pub const PROMPT_BASE: &str = "Prompt of the bare profile.";
+
+/// The system text of the bare profile after a deploy.
+pub const PROMPT_NEW: &str = "Prompt of the new profile.";
 
 /// The id of the gated tool call.
 pub const CALL_ID: &str = "w1";
@@ -136,6 +139,10 @@ pub trait Backend {
     /// Send `op` to the agent `id`.
     async fn send(&mut self, id: &AgentId, op: &AgentOp);
 
+    /// Send `Control::ReloadProfile` to each running agent of `kind`, with
+    /// the reload helper of the backend. Returns the agents.
+    async fn reload_kind(&mut self, kind: &str) -> Vec<AgentId>;
+
     /// Run the agent `id` until its state passes `done`. Returns the state.
     async fn settle(
         &mut self,
@@ -169,6 +176,12 @@ pub trait Backend {
 /// The base harness of `kind`: `model`, a gated `write` tool, and a
 /// profile with [`PROMPT_BASE`].
 pub fn base_harness(kind: &str, model: Arc<PromptModel>) -> AgentHarness {
+    prompt_harness(kind, model, PROMPT_BASE)
+}
+
+/// The base harness of `kind`, with a profile whose system text is
+/// `system`.
+pub fn prompt_harness(kind: &str, model: Arc<PromptModel>, system: &str) -> AgentHarness {
     let write = FnTool::new("write", "Write.", json!({"type": "object"}), |_| async {
         Ok(json!("saved"))
     })
@@ -179,7 +192,7 @@ pub fn base_harness(kind: &str, model: Arc<PromptModel>) -> AgentHarness {
         .policy(Arc::new(
             ToolRules::new().effect(ToolEffect::Write, Rule::Ask),
         ))
-        .agent(AgentProfile::new(kind).system(PROMPT_BASE))
+        .agent(AgentProfile::new(kind).system(system))
 }
 
 /// `base` with a store of `backend` that validates with `base`.
@@ -589,4 +602,93 @@ pub async fn a_rollback_after_an_auto_adoption_restores_v1<B: Backend>(backend: 
     assert_eq!(prompts.len(), 2);
     assert!(prompts[0].contains(PROMPT_V2), "{prompts:?}");
     assert!(prompts[1].contains(PROMPT_V1), "{prompts:?}");
+}
+
+/// A deploy alone does not change a running agent. After a
+/// `Control::ReloadProfile`, the next op runs on the new profile. On
+/// `SQLite`, each deploy is a new process. Replay asks no model.
+pub async fn a_reload_reads_the_new_profile<B: Backend>(backend: &mut B) {
+    let kind = backend.kind();
+    backend.serve(base_harness(&kind, PromptModel::new())).await;
+    let id = agent(&kind, "reload");
+    backend.send(&id, &AgentOp::message("one")).await;
+    backend.settle(&id, &segments(1)).await;
+
+    let model = PromptModel::new();
+    backend
+        .serve(prompt_harness(&kind, model.clone(), PROMPT_NEW))
+        .await;
+    backend.send(&id, &AgentOp::message("two")).await;
+    backend.settle(&id, &segments(2)).await;
+    assert_all(&model.prompts(), PROMPT_BASE);
+
+    backend
+        .send(&id, &AgentOp::Control(Control::ReloadProfile))
+        .await;
+    backend.send(&id, &AgentOp::message("three")).await;
+    let state = backend.settle(&id, &segments(3)).await;
+    assert_eq!(state.failures, 0, "{:?}", state.last_error);
+    let prompts = model.prompts();
+    assert_all(&prompts[1..], PROMPT_NEW);
+
+    // History holds the first run read, the reload read, and the read of
+    // the run that the reload started.
+    let events = backend.history(&id).await;
+    let reads = recorded(&events, "agent_profile");
+    assert_eq!(reads.len(), 3, "{reads:?}");
+    for (_, read) in &reads[1..] {
+        assert!(read.to_string().contains(PROMPT_NEW), "{read}");
+    }
+
+    // The replay holds a third profile, so a read outside history would
+    // change the turn input. The reload ended the first run, so the agent
+    // has two runs.
+    backend.delete(&id).await;
+    let replay_model = PromptModel::new();
+    let other = prompt_harness(&kind, replay_model.clone(), "Another prompt.");
+    let reports = backend.replay(&id, other).await;
+    assert_eq!(reports.len(), 2, "the reload ends the first run");
+    for report in reports {
+        assert!(
+            matches!(report.status, ReplayStatus::ReplaySucceeded),
+            "{report}"
+        );
+    }
+    assert_eq!(replay_model.calls(), 0, "the replay asks no model");
+}
+
+/// An active overlay applies to the reloaded profile.
+pub async fn a_reload_keeps_the_active_overlay<B: Backend>(backend: &mut B) {
+    let kind = backend.kind();
+    let guardrails = ProfileOverlay {
+        guardrails: Some("Keep it brief.".to_owned()),
+        ..ProfileOverlay::default()
+    };
+    let (harness, store) = with_store(backend, base_harness(&kind, PromptModel::new()));
+    let v1 = adopt(store.as_ref(), &kind, &guardrails, None).await;
+    backend.serve(harness).await;
+    let id = agent(&kind, "reload-overlay");
+    backend.send(&id, &AgentOp::message("one")).await;
+    backend.settle(&id, &segments(1)).await;
+
+    let model = PromptModel::new();
+    let (harness, _store) = with_store(backend, prompt_harness(&kind, model.clone(), PROMPT_NEW));
+    backend.serve(harness).await;
+    assert_eq!(backend.reload_kind(&kind).await, vec![id.clone()]);
+    backend.send(&id, &AgentOp::message("two")).await;
+    let state = backend.settle(&id, &segments(2)).await;
+    assert_eq!(state.failures, 0, "{:?}", state.last_error);
+    assert_eq!(state.profile_version, Some(v1));
+    assert_all(&model.prompts(), PROMPT_NEW);
+    assert_all(&model.prompts(), "Keep it brief.");
+
+    // The op read takes the reloaded profile as its run profile.
+    let events = backend.history(&id).await;
+    let reads = recorded(&events, "agent_profile_overlay");
+    assert_eq!(reads.len(), 2);
+    assert!(
+        reads[1].0.to_string().contains(PROMPT_NEW),
+        "{}",
+        reads[1].0
+    );
 }

@@ -931,6 +931,51 @@ pub fn pause_mesh(rt: &mut SqliteRuntime, mesh: &str, reason: &str) -> SqliteRes
     Ok(record)
 }
 
+/// Send `Control::ReloadProfile` to each running agent of `kind`. Returns
+/// the agents, sorted by id.
+///
+/// Register the new harness first. The reload reads the profile when the
+/// agent runs the op, so [`drive`] each agent after the call. The op goes
+/// to the listed run only, so an agent with no running run stays ended.
+/// Each call uses its own idempotency key.
+///
+/// The filter is the workflow id prefix `<kind>/`. So a run that has run no
+/// op yet gets the reload. An agent of a kind such as `<kind>2` does not.
+///
+/// # Errors
+///
+/// Returns a list or a send error. Agents that got the op before it keep
+/// it.
+pub fn reload_profiles(rt: &mut SqliteRuntime, kind: &str) -> SqliteResult<Vec<AgentId>> {
+    let filter = ExecutionFilter::new()
+        .workflow_name(AGENT_WORKFLOW_NAME)
+        .state("RUNNING")
+        .workflow_id_prefix(format!("{kind}/"));
+    let mut targets = Vec::new();
+    let mut cursor = None;
+    loop {
+        let page = cursor.map_or_else(|| filter.clone(), |cursor| filter.clone().before(cursor));
+        let found = rt.list_executions(&page)?;
+        targets.extend(found.executions.iter().filter_map(|summary| {
+            let id = AgentId::parse(summary.workflow_id.value()?).ok()?;
+            Some((summary.execution_id()?, id)).filter(|(_, id)| id.kind() == kind)
+        }));
+        match found.next {
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
+    }
+    targets.sort_by(|(_, a), (_, b)| a.as_str().cmp(b.as_str()));
+    let key = format!("reload-profiles:{kind}:{}", Utc::now().timestamp_millis());
+    let payload = Agent::payload(&AgentOp::Control(Control::ReloadProfile));
+    let mut agents = Vec::with_capacity(targets.len());
+    for (exec, id) in targets {
+        rt.send_signal_idempotent(exec, ENTITY_OP_SIGNAL, payload.clone(), Some(&key))?;
+        agents.push(id);
+    }
+    Ok(agents)
+}
+
 /// Decode `input`, run `body` to completion, and encode its result.
 fn call<I, O, F, Fut>(input: Value, body: F) -> Result<Value, String>
 where

@@ -13,7 +13,9 @@
 use autumn_harvest::ExecutionId;
 use autumn_harvest::WorkflowIdReusePolicy;
 use autumn_harvest::entity::{ENTITY_OP_SIGNAL, ENTITY_STATE_QUERY};
-use autumn_harvest_agent::{AGENT_WORKFLOW_NAME, Agent, AgentId, AgentOp, AgentState, Approval};
+use autumn_harvest_agent::{
+    AGENT_WORKFLOW_NAME, Agent, AgentId, AgentOp, AgentState, Approval, Control,
+};
 use serde_json::Value;
 
 use super::{
@@ -85,6 +87,69 @@ async fn signal(
             idempotency_key: idempotency_key.map(ToOwned::to_owned),
         })
         .await
+}
+
+/// Send `Control::ReloadProfile` to each running agent of `kind`. Returns
+/// the agents, sorted by id.
+///
+/// Register the new harness first. The driver of the plugin runs each
+/// reload. The op goes to the running run only, so an agent with no running
+/// run stays ended. Each call uses its own idempotency key. The filter is
+/// the workflow id prefix `<kind>/`, as in `autumn_harvest_agent::sqlite`.
+///
+/// # Errors
+///
+/// Returns a list or a send error, or [`HarvestSqliteError::Stopped`].
+/// Agents that got the op before it keep it.
+pub async fn reload_profiles(
+    harvest: &HarvestSqlite,
+    kind: &str,
+) -> Result<Vec<AgentId>, HarvestSqliteError> {
+    let filter = ExecutionFilter::new()
+        .workflow_name(AGENT_WORKFLOW_NAME)
+        .state("RUNNING")
+        .workflow_id_prefix(format!("{kind}/"));
+    let mut agents = Vec::new();
+    let mut cursor = None;
+    loop {
+        let page = cursor.map_or_else(|| filter.clone(), |cursor| filter.clone().before(cursor));
+        let found = harvest.list(page).await?;
+        agents.extend(found.executions.iter().filter_map(|summary| {
+            AgentId::parse(summary.workflow_id.value()?)
+                .ok()
+                .filter(|id| id.kind() == kind)
+        }));
+        match found.next {
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
+    }
+    agents.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+    agents.dedup();
+    let key = format!(
+        "reload-profiles:{kind}:{}",
+        chrono::Utc::now().timestamp_millis()
+    );
+    let payload = Agent::payload(&AgentOp::Control(Control::ReloadProfile));
+    for id in &agents {
+        match harvest
+            .signal_by_workflow_id(
+                AGENT_WORKFLOW_NAME,
+                id.as_str(),
+                ENTITY_OP_SIGNAL,
+                payload.clone(),
+                Some(key.clone()),
+            )
+            .await
+        {
+            Ok(_)
+            | Err(HarvestSqliteError::Sqlite(
+                SqliteError::WorkflowIdNotFound { .. } | SqliteError::WorkflowNotRunning { .. },
+            )) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(agents)
 }
 
 /// The running execution of the agent `id`, if it has one.

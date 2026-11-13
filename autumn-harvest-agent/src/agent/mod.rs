@@ -43,6 +43,7 @@ pub mod profile_read;
 pub mod wake;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::pin::Pin;
 use std::time::Duration;
 
 use autumn_harvest::entity::{ENTITY_OP_SIGNAL, Entity, EntityMessage, Wake};
@@ -75,7 +76,7 @@ use autumn_harvest::builder::DEFAULT_MAX_WORKFLOW_INPUT_BYTES;
 use dedupe::Inbound;
 use inbox::{Admit, InboxStatus, OpClass, admit};
 use overlay_store::OverlayVersion;
-use profile_read::{OverlayRead, ProfileRead, overlaid};
+use profile_read::{OverlayRead, ProfileRead, overlaid, reloaded};
 
 /// The registered workflow name of a durable agent.
 pub const AGENT_WORKFLOW_NAME: &str = "agent";
@@ -297,6 +298,13 @@ pub enum Control {
         /// The new setting.
         setting: HeartbeatSetting,
     },
+    /// Read the profile of the kind again. A good read ends the run at a
+    /// checkpoint, so the next op runs on the profile that the next run
+    /// reads. A failed read keeps the run and names the error.
+    ///
+    /// A waiting op that does not fit the checkpoint input runs first, on
+    /// the old profile. Send this op only after every worker can decode it.
+    ReloadProfile,
 }
 
 /// The heartbeat of one agent (issue #2266).
@@ -1237,6 +1245,10 @@ pub struct AgentState {
     /// #2454). `ConsolidationTrigger::Every` reads it.
     #[serde(skip_serializing_if = "is_zero_u32")]
     pub appends_since_pass: u32,
+    /// Set by a good `Control::ReloadProfile`. The entity loop clears it and
+    /// takes a checkpoint after the op, so no snapshot holds it.
+    #[serde(skip)]
+    pub(crate) reload_requested: bool,
 }
 
 /// Whether `value` is 0. A serde skip predicate.
@@ -1389,24 +1401,13 @@ struct AgentRun<'a> {
     member: Option<Member>,
 }
 
-/// The durable agent workflow. The workflow id is the [`AgentId`].
+/// Read the profile of `id` and discover its peers, through recorded
+/// activities.
 ///
-/// Each op runs one segment of the agent loop. See the [module
-/// docs](self).
-///
-/// # Errors
-///
-/// Returns an engine error of the entity loop, for example a cancel.
-#[workflow]
-// The entity future holds the op future inline. The engine keeps the
-// workflow future on the heap, so a box here adds only an allocation.
-#[allow(clippy::large_futures)]
-pub async fn agent(ctx: &WorkflowContext, input: serde_json::Value) -> Result<AgentState, String> {
-    // `format!` and not `to_string`: harvest-verify trusts `format`, but not
-    // the blanket `ToString` impl on a type of this crate.
-    let id = AgentId::parse(ctx.workflow_id()).map_err(|err| format!("{err}"));
-    // A failed lookup fails each work op of this run with a named error. The
-    // run and its carried state stay, so the next run looks again.
+/// A failed read or a failed discovery gives an `Err` profile. Each work op
+/// of the run then fails with a named error. The run and its carried state
+/// stay, so the next run or a reload reads again.
+async fn load_run(ctx: &WorkflowContext, id: Result<AgentId, String>) -> AgentRun<'_> {
     let read = match &id {
         Ok(id) => lookup_profile(ctx, id).await.unwrap_or_else(Err),
         Err(err) => Err(err.clone()),
@@ -1426,13 +1427,32 @@ pub async fn agent(ctx: &WorkflowContext, input: serde_json::Value) -> Result<Ag
         },
         _ => None,
     };
-    let run = AgentRun {
+    AgentRun {
         ctx,
         id,
         profile,
         overlays,
         member,
-    };
+    }
+}
+
+/// The durable agent workflow. The workflow id is the [`AgentId`].
+///
+/// Each op runs one segment of the agent loop. See the [module
+/// docs](self).
+///
+/// # Errors
+///
+/// Returns an engine error of the entity loop, for example a cancel.
+#[workflow]
+// The entity future holds the op future inline. The engine keeps the
+// workflow future on the heap, so a box here adds only an allocation.
+#[allow(clippy::large_futures)]
+pub async fn agent(ctx: &WorkflowContext, input: serde_json::Value) -> Result<AgentState, String> {
+    // `format!` and not `to_string`: harvest-verify trusts `format`, but not
+    // the blanket `ToString` impl on a type of this crate.
+    let id = AgentId::parse(ctx.workflow_id()).map_err(|err| format!("{err}"));
+    let run = load_run(ctx, id).await;
     let max_ops = run
         .profile
         .as_ref()
@@ -1444,8 +1464,10 @@ pub async fn agent(ctx: &WorkflowContext, input: serde_json::Value) -> Result<Ag
         None => entity,
     };
     let profile = run.profile.as_ref().ok();
+    // A good `Control::ReloadProfile` ends the run after its op. The next
+    // run then reads the profile at its start.
     entity
-        .run_with_wakes(
+        .run_with_wakes_and_checkpoints(
             |state, op: AgentOp| handle_op(&run, state, op),
             |state: &AgentState| {
                 let (at, op) = state.next_wake(profile)?;
@@ -1454,9 +1476,18 @@ pub async fn agent(ctx: &WorkflowContext, input: serde_json::Value) -> Result<Ag
                     op,
                 ))
             },
+            |state: &mut AgentState| std::mem::take(&mut state.reload_requested),
         )
         .await
         .map_err(|err| err.to_string())
+}
+
+/// Book the next heartbeat of `profile`. See [`wake::next_heartbeat`].
+fn schedule(state: &mut AgentState, profile: Option<&AgentProfile>, now: i64, ticked: bool) {
+    let every = state
+        .effective_heartbeat(profile)
+        .map(AgentHeartbeat::every_ms);
+    state.next_heartbeat_ms = wake::next_heartbeat(state.next_heartbeat_ms, every, now, ticked);
 }
 
 /// Read the profile of the kind of `id` through the recorded activity.
@@ -1483,10 +1514,14 @@ impl AgentRun<'_> {
         }
         // One recorded clock read per op. Replay reads the same time.
         let now = self.ctx.system_now().timestamp_millis();
-        self.publish(&state, "running", now);
+        self.publish(&state, self.profile.as_ref().ok(), "running", now);
         let mut ticked = false;
+        let mut reload = None;
         match admit(state.status.inbox(), op.class()) {
             Admit::Apply => match op {
+                AgentOp::Control(Control::ReloadProfile) => {
+                    reload = Some(self.boxed_reload_read().await);
+                }
                 AgentOp::Control(control) => state = self.control(state, control).await,
                 AgentOp::Unpark => state = self.unpark(state).await,
                 _ => {}
@@ -1510,10 +1545,55 @@ impl AgentRun<'_> {
         } else {
             now
         };
-        self.schedule(&mut state, booked_at, ticked);
+        // A good reload reads as the next run does. Its profile books the
+        // heartbeat and sets the search attributes of this op. A failed
+        // reload keeps the run profile, and the run goes on.
+        let mut profile = self.profile.as_ref().ok();
+        if let Some(read) = &reload {
+            let read = read.as_deref().map(Some).map_err(String::as_str);
+            let (next, error) = reloaded(profile, read);
+            if let Some(err) = error {
+                fail(&mut state, &format!("the profile reload failed: {err}"));
+            } else {
+                state.reload_requested = true;
+                // A new interval books a new tick, as `SetHeartbeat` does.
+                let every = |profile| {
+                    state
+                        .effective_heartbeat(profile)
+                        .map(AgentHeartbeat::every_ms)
+                };
+                if every(profile) != every(next) {
+                    state.next_heartbeat_ms = None;
+                }
+            }
+            profile = next;
+        }
+        schedule(&mut state, profile, booked_at, ticked);
         state.last_active_ms = Some(now);
-        self.publish(&state, state.status.name(), now);
+        self.publish(&state, profile, state.status.name(), now);
         Ok(state)
+    }
+
+    /// Read the profile of the kind again, as the next run reads it. A
+    /// failed read or a failed peer discovery gives the error.
+    async fn reload_read(&self) -> Result<Box<AgentProfile>, String> {
+        load_run(self.ctx, self.id.clone())
+            .await
+            .profile
+            .map(Box::new)
+    }
+
+    /// [`reload_read`](Self::reload_read) on the heap.
+    ///
+    /// A debug build makes a future in the frame of its caller before it
+    /// boxes it. This function owns that frame, and it returns before the
+    /// poll. So the frame of `handle` holds a pointer only. With the future
+    /// inline, each op needs more stack, and a 1 MiB main thread overflows.
+    #[inline(never)]
+    fn boxed_reload_read(
+        &self,
+    ) -> Pin<Box<impl Future<Output = Result<Box<AgentProfile>, String>> + '_>> {
+        Box::pin(self.reload_read())
     }
 
     /// The profile of one op and its overlay version (issue #2372).
@@ -1546,20 +1626,11 @@ impl AgentRun<'_> {
         Ok((op, read.overlay_version))
     }
 
-    /// Book the next heartbeat. See [`wake::next_heartbeat`].
-    fn schedule(&self, state: &mut AgentState, now: i64, ticked: bool) {
-        let every = state
-            .effective_heartbeat(self.profile.as_ref().ok())
-            .map(AgentHeartbeat::every_ms);
-        state.next_heartbeat_ms = wake::next_heartbeat(state.next_heartbeat_ms, every, now, ticked);
-    }
-
     /// Upsert the search attributes of the agent (issue #2267).
     ///
     /// A list query filters on them, for example by status and next wake.
     /// The upsert appends no event, so replay does not change.
-    fn publish(&self, state: &AgentState, status: &str, now: i64) {
-        let profile = self.profile.as_ref().ok();
+    fn publish(&self, state: &AgentState, profile: Option<&AgentProfile>, status: &str, now: i64) {
         let wake = state.next_wake(profile);
         let reason = wake.as_ref().map(|(_, op)| match op {
             AgentOp::FollowupDue => "followup",
@@ -1676,6 +1747,8 @@ impl AgentRun<'_> {
                     fail(&mut state, &err);
                 }
             }
+            // `handle` takes this op before `control`, so this arm never runs.
+            Control::ReloadProfile => {}
             Control::ClearTranscript => {
                 state.transcript.clear();
                 // The notes stand in for dropped turns, so they go too.
@@ -3196,6 +3269,12 @@ mod tests {
         assert_eq!(
             Agent::payload(&pause),
             serde_json::json!({"kind": "op", "op": {"type": "control", "action": "pause"}})
+        );
+        // `harvest agents reload` sends this form.
+        let reload = AgentOp::Control(Control::ReloadProfile);
+        assert_eq!(
+            Agent::payload(&reload),
+            serde_json::json!({"kind": "op", "op": {"type": "control", "action": "reload_profile"}})
         );
     }
 
