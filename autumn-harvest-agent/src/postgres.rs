@@ -717,7 +717,7 @@ pub async fn pending_approvals(
     exec: ExecutionId,
 ) -> HarvestResult<Vec<String>> {
     let mut conn = pg.conn(pg.shard_of(exec).await?).await?;
-    let queued = autumn_harvest::signal::load_pending_signals(&mut conn, exec).await?;
+    let queued = autumn_harvest::signal::load_pending_signals(&conn, exec).await?;
     let history =
         autumn_harvest::store::load_history_with_codecs(&mut conn, exec, &pg.codecs).await?;
     let mut open = open_approval_waits(&history.events);

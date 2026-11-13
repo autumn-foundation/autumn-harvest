@@ -468,7 +468,7 @@ async fn paused_prior_buffers_a_signal_but_rejects_an_update() {
         .expect("sws");
     assert_eq!(out.exec_id, prior);
     assert!(!out.started_fresh && out.signal_delivered);
-    let pending = autumn_harvest::signal::load_pending_signals(&mut conn, prior)
+    let pending = autumn_harvest::signal::load_pending_signals(&conn, prior)
         .await
         .expect("pending signals");
     assert_eq!(pending.len(), 2, "seed signal plus the buffered signal");

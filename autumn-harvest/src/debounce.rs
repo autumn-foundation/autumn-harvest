@@ -53,6 +53,8 @@
 
 use std::time::Duration;
 
+#[cfg(feature = "db")]
+use crate::cached_stmt::CachePreparedDsl as _;
 use chrono::{DateTime, Utc};
 
 /// Declarative debounce configuration attached to a [`crate::info::WorkflowInfo`].
@@ -760,6 +762,7 @@ async fn fire_due_on_conn(
     }
     let exists: TableExists =
         diesel::sql_query("SELECT to_regclass('harvest_debounce') IS NOT NULL AS present")
+            .cache_prepared()
             .get_result(conn)
             .await
             .map_err(crate::error::database_error)?;
@@ -797,6 +800,7 @@ async fn fire_due_on_conn(
                         let due_rows: Vec<FireDueRow> = diesel::sql_query(due_sql)
                             .bind::<diesel::sql_types::Timestamptz, _>(now)
                             .bind::<diesel::sql_types::BigInt, _>(DEBOUNCE_FIRE_BATCH_SIZE)
+                            .cache_prepared()
                             .load(conn)
                             .await
                             .map_err(crate::error::database_error)?;

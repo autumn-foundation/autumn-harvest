@@ -745,6 +745,8 @@ mod db {
     use std::collections::BTreeMap;
     use std::time::Duration;
 
+    use crate::cached_stmt::CachePreparedDsl as _;
+
     use chrono::{DateTime, Utc};
     use diesel::sql_types::{Array, BigInt, Double, Integer, Jsonb, Nullable, Text, Timestamptz};
     use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
@@ -2403,6 +2405,7 @@ mod db {
         let rows: Vec<ActiveKeyRow> = diesel::sql_query(
             "SELECT key_id FROM harvest_codec_key_state WHERE state = 'active' LIMIT 1",
         )
+        .cache_prepared()
         .load(conn)
         .await
         .map_err(database_error)?;
