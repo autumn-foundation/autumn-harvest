@@ -214,21 +214,16 @@ pub struct HarvestApiRuntime {
     retention: HarvestRetentionRuntime,
     router: ShardRouter,
     /// Secret-free effective-config snapshot (issue #695), served by
-    /// `GET /admin/config`. Carried on the runtime itself so the snapshot is
-    /// captured exactly where the resolved config is known — no separate
-    /// `set_effective_config` call the integrator must remember. The shared
-    /// `HarvestRunner::start` seam (which every `BuiltHarvest` consumer funnels
-    /// through) attaches the resolved snapshot via
-    /// [`HarvestApiRuntime::with_effective_config`], so any deployment that boots
-    /// through the runner/plugin path serves the real config.
+    /// `GET /admin/config`. The runtime carries it, so no integrator must
+    /// remember a separate `set_effective_config` call. Every `BuiltHarvest`
+    /// consumer goes through the shared `HarvestRunner::start` seam. That seam
+    /// attaches the snapshot via [`HarvestApiRuntime::with_effective_config`].
     ///
-    /// **`None` when never captured** — `HarvestApiRuntime::new` deliberately
-    /// leaves this unset so a runtime built directly through the public
-    /// constructor (bypassing the runner seam) *fails closed* on `GET
-    /// /admin/config` rather than serving a fabricated defaults placeholder. For
-    /// an incident-triage endpoint a plausible-but-wrong config is worse than an
-    /// honest error, so a snapshot is only ever served when it was genuinely
-    /// captured from the resolved configuration.
+    /// **`None` when never captured.** `HarvestApiRuntime::new` leaves this
+    /// unset. A runtime built directly through that constructor then *fails
+    /// closed* on `GET /admin/config` and serves no fabricated defaults. For
+    /// an incident-triage endpoint, a plausible but wrong config is worse than
+    /// an honest error.
     /// Wrapped in `Arc` so the per-request `runtime()` clone stays cheap.
     effective_config: Option<Arc<autumn_harvest::effective_config::EffectiveConfigView>>,
     /// The history archiver that retention writes to (issue #1983).
@@ -274,11 +269,9 @@ impl HarvestApiRuntime {
             scheduler,
             retention,
             router: router.clone(),
-            // Left unset here — the resolved snapshot is attached by the shared
-            // `HarvestRunner::start` seam via `with_effective_config`. A runtime
-            // built directly through this public constructor that skips the
-            // override fails closed on `GET /admin/config` (see the field doc)
-            // rather than serving a fabricated defaults placeholder.
+            // The shared `HarvestRunner::start` seam attaches the snapshot via
+            // `with_effective_config`. Without it, `GET /admin/config` fails
+            // closed (see the field doc).
             effective_config: None,
             history_archiver: None,
         };
@@ -339,13 +332,13 @@ impl HarvestApiRuntime {
 
     /// Attach the resolved, secret-free effective-config snapshot (issue #695).
     ///
-    /// Called by the shared `HarvestRunner::start` bring-up path — the one seam
-    /// every `BuiltHarvest` consumer (the `HarvestPlugin` web-app path and the
-    /// standalone runner) funnels through — so `GET /admin/config` serves the
-    /// resolved configuration on any deployment that installs this runtime,
-    /// without a separate `set_effective_config` call to remember. A runtime
-    /// built through [`HarvestApiRuntime::new`] without this call carries no
-    /// snapshot and fails closed on `GET /admin/config`.
+    /// The shared `HarvestRunner::start` bring-up path calls this. Every
+    /// `BuiltHarvest` consumer goes through it: the `HarvestPlugin` web-app
+    /// path and the standalone runner. So `GET /admin/config` serves the
+    /// resolved config with no separate `set_effective_config` call to
+    /// remember. A runtime built through
+    /// [`HarvestApiRuntime::new`] without this call fails closed on
+    /// `GET /admin/config`.
     #[must_use]
     pub fn with_effective_config(
         mut self,
@@ -357,11 +350,9 @@ impl HarvestApiRuntime {
 
     /// The resolved effective-config snapshot carried by this runtime (issue #695).
     ///
-    /// Returns `None` when the runtime was built through the public
-    /// [`HarvestApiRuntime::new`] constructor without
-    /// [`with_effective_config`](HarvestApiRuntime::with_effective_config) — the
-    /// `GET /admin/config` handler fails closed in that case rather than serving
-    /// a fabricated placeholder.
+    /// `None` when [`HarvestApiRuntime::new`] built the runtime without
+    /// [`with_effective_config`](HarvestApiRuntime::with_effective_config).
+    /// The `GET /admin/config` handler then fails closed.
     #[must_use]
     pub(crate) fn effective_config(
         &self,
@@ -478,9 +469,9 @@ pub struct HarvestApiState {
     /// `BuiltHarvest::ramp_guard` at startup. The default is disabled.
     ramp_guard_config: Arc<Mutex<autumn_harvest::ramp_guard::RampGuardConfig>>,
     /// SSRF policy for completion-callback targets (issue #605), mirrored
-    /// from `BuiltHarvest::completion_callback_config()` at startup so the
-    /// HTTP start route can validate a per-execution target the same way
-    /// `enqueue_completion_deliveries` re-validates at delivery time.
+    /// from `BuiltHarvest::completion_callback_config()` at startup. The HTTP
+    /// start route validates a target the same way that
+    /// `enqueue_completion_deliveries` does at delivery time.
     completion_callback_ssrf_policy: Arc<Mutex<autumn_harvest::completion_callback::SsrfPolicy>>,
     /// Codec registry mirrored from `BuiltHarvest::payload_codecs()` at
     /// startup (issue #608) so admin read surfaces can decode envelopes.
@@ -490,18 +481,16 @@ pub struct HarvestApiState {
     /// Default **off**: responses are byte-for-byte identical to a build
     /// without the feature.
     decode_payloads_on_read: Arc<Mutex<bool>>,
-    /// Retention window for request-scoped start idempotency keys (issue #808),
-    /// mirrored from `BuiltHarvest::start_idempotency_window` at startup so the
-    /// HTTP start route dedups a repeated `idempotency_key` within this window.
-    /// Defaults to 24h.
+    /// Retention window for start idempotency keys (issue #808), mirrored
+    /// from `BuiltHarvest::start_idempotency_window` at startup. The start
+    /// route dedups a repeated `idempotency_key` within it. Defaults to 24h.
     start_idempotency_window: Arc<Mutex<std::time::Duration>>,
     /// Thresholds for the rolled-up `GET /admin/status` verdict (issue #679).
     /// Starter defaults; overridable per deployment via the plugin builder.
     status_thresholds: Arc<Mutex<crate::status_summary::StatusThresholds>>,
-    /// Built-in synthetic liveness canary configuration (issue #796), mirrored
-    /// from the plugin builder at startup so the (follow-up) `GET /admin/canary`
-    /// read model can resolve the probe interval / staleness window. `None`
-    /// when the canary is disabled.
+    /// Synthetic liveness canary configuration (issue #796), mirrored from
+    /// the plugin builder at startup. `GET /admin/canary` reads the probe
+    /// interval and staleness window from it. `None` when the canary is off.
     canary_config: Arc<Mutex<Option<crate::canary::CanaryConfig>>>,
     /// The agent profile overlay store of the `/agents/{kind}/profile`
     /// routes (issue #2374). `None` makes each of those routes answer `404`.
@@ -648,9 +637,9 @@ impl HarvestApiState {
 
     /// Set the server-side ceiling for workflow execution timeouts (issue #243).
     ///
-    /// Call this during startup from the plugin to propagate
-    /// `BuiltHarvest::max_workflow_execution_timeout` into the API state so the
-    /// `POST /workflows` handler can apply the cap to every start request.
+    /// The plugin calls this at startup with
+    /// `BuiltHarvest::max_workflow_execution_timeout`. `POST /workflows` then
+    /// applies the cap to every start request.
     pub fn set_max_workflow_execution_timeout(&self, ceiling: Option<std::time::Duration>) {
         *self
             .max_workflow_execution_timeout
@@ -776,9 +765,8 @@ impl HarvestApiState {
 
     /// Enable or disable read-path payload decoding (issue #608).
     ///
-    /// Default **off**: with the flag off, no handler consults the codec
-    /// registry and responses are byte-for-byte identical to a deployment
-    /// that never heard of this feature.
+    /// Default **off**. With the flag off, no handler consults the codec
+    /// registry, and responses are byte-identical to those without the feature.
     pub fn set_decode_payloads_on_read(&self, enabled: bool) {
         *self
             .decode_payloads_on_read
@@ -1092,11 +1080,10 @@ impl HarvestApiState {
 
     /// Switch the gate cache to fail-closed mode during plugin boot.
     ///
-    /// The plugin calls this immediately after `new()` so any request that
-    /// arrives in the window between the HTTP server binding and the boot-time
-    /// gate load (see `initialize_gate_cache`) is rejected rather than allowed
-    /// through a transient DB error. Standalone routers that do not call this
-    /// start with an initialized-empty (fail-open) cache.
+    /// The plugin calls this immediately after `new()`. A request that arrives
+    /// before the boot-time gate load (see `initialize_gate_cache`) is then
+    /// rejected, not let through by a transient DB error. A standalone router
+    /// that skips this starts with an empty, fail-open cache.
     pub fn arm_gate_cache_fail_closed(&self) {
         self.gate_cache.set_fail_closed();
     }
@@ -1663,10 +1650,9 @@ pub enum StallReason {
 
 /// A workflow execution row augmented with stall-discovery fields (issue #486).
 ///
-/// The `#[serde(flatten)]` preserves all existing `WorkflowExecution` fields
-/// at the top level of the JSON object. The three new optional fields are
-/// omitted when `None` (via `skip_serializing_if`) so callers not using the
-/// stalled filter receive an identical response to the pre-#486 format.
+/// The `#[serde(flatten)]` keeps every `WorkflowExecution` field at the top
+/// level of the JSON object. The optional fields are omitted when `None`. A
+/// caller that does not use the stalled filter gets the pre-#486 response.
 #[derive(Debug, Clone, Serialize)]
 pub struct StalledWorkflowRow {
     #[serde(flatten)]
@@ -1678,15 +1664,12 @@ pub struct StalledWorkflowRow {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stall_reason: Option<StallReason>,
     /// The execution's current recorded `harvest_events` count, computed on
-    /// read (issue #704, AC2). Populated only when the request set the
-    /// dedicated `history_bloat_min_events` discovery parameter (served by
-    /// `load_history_bloat_workflows`) — omitted (never `null`) on every
-    /// other list response, INCLUDING the general-purpose, pre-existing
-    /// `min_history_events` filter (issue #493, served by
-    /// `load_stalled_workflows`/`load_workflows`), so this stays additive
-    /// and byte-for-byte backward compatible. See `docs/api-contract.json`
-    /// and PR #1139's review for the two parameters' deliberately distinct
-    /// contracts.
+    /// read (issue #704, AC2). Only the `history_bloat_min_events` discovery
+    /// parameter populates it (`load_history_bloat_workflows`). Every other
+    /// list response omits it, never `null`. That includes the older
+    /// `min_history_events` filter (issue #493). So the field stays additive
+    /// and backward compatible. See `docs/api-contract.json` and PR #1139 for
+    /// the distinct contracts of the two parameters.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub history_event_count: Option<i64>,
 }
@@ -1708,18 +1691,18 @@ impl From<WorkflowExecution> for StalledWorkflowRow {
 /// **Availability differs by activity kind, because retryable failures are not
 /// event-sourced (AC2-vs-AC5 reconciliation):**
 ///
-/// - **Regular (task-queue) activities** are the primary #773 target: a
-///   backing-off activity has NOT yet emitted an `ActivityFailed` event (that
-///   is appended only on a *terminal* failure — retry exhausted / non-retryable
-///   — which then drops out of the pending list). A *retryable* failure instead
-///   writes its message into the `harvest_task_queue.error` column and re-queues
-///   the row as `PENDING`. So `last_failure` for a regular activity is sourced
-///   from that task-row `error` column: `error` carries the message, `attempt`
-///   the task-row attempt counter, `error_type` defaults to `"Error"`,
-///   `non_retryable` to `false` (a backing-off task is retryable by
-///   definition), and `failed_at`/`details` are absent (the task row has no
-///   failure timestamp and no structured detail). No migration is added to
-///   event-source these (AC5), so the reduced set is deliberate.
+/// - **Regular (task-queue) activities** are the primary #773 target. A
+///   backing-off activity has NOT yet emitted an `ActivityFailed` event. Only
+///   a *terminal* failure appends one, and that activity leaves the pending
+///   list. A *retryable* failure writes its message into the
+///   `harvest_task_queue.error` column and re-queues the row as `PENDING`.
+///   So `last_failure` for a regular activity comes from that column.
+///   `error` carries the message and `attempt` the task-row attempt counter.
+///   `error_type` defaults to `"Error"`. `non_retryable` defaults to `false`,
+///   because a backing-off task is retryable by definition. `failed_at` and
+///   `details` are absent: the task row has no failure timestamp and no
+///   structured detail. No migration event-sources these (AC5), so the
+///   reduced set is deliberate.
 /// - **Local activities** (and any event-sourced failure) DO record a
 ///   `LocalActivityFailed` event per attempt, so the full typed set is present,
 ///   including `failed_at` (the event timestamp).
@@ -1743,17 +1726,15 @@ pub(crate) struct LastFailure {
     /// `false` for the regular-activity task-row path (a backing-off task is
     /// retryable by definition) and for local activities.
     pub(crate) non_retryable: bool,
-    /// When the failure was recorded. Populated from the
-    /// `harvest_events.timestamp` of the originating `LocalActivityFailed`
-    /// event; `None` (and omitted from the serialized form) for the regular
+    /// When the failure was recorded: the `harvest_events.timestamp` of the
+    /// `LocalActivityFailed` event. `None` and omitted for the regular
     /// task-row path, which has no failure timestamp.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) failed_at: Option<chrono::DateTime<chrono::Utc>>,
     /// Optional structured failure details (`ActivityFailure::with_details`).
-    /// Always `None` today from both sources — the regular task-row path has no
-    /// structured detail and `LocalActivityFailed` carries none — but the field
-    /// is retained for forward-compat. Omitted from the serialized form when
-    /// absent.
+    /// Both sources leave it `None` today: the task row has no structured
+    /// detail, and `LocalActivityFailed` carries none. The field stays for
+    /// forward compatibility. Omitted when absent.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) details: Option<serde_json::Value>,
 }
@@ -1764,16 +1745,15 @@ pub(crate) struct LastFailure {
 /// `event_id` wins per activity (AC4), independent of iteration order. Pure and
 /// DB-free so it is unit-testable without a database.
 ///
-/// This is the **local-activity** failure source only. Regular (task-queue)
-/// activities are handled inline from the `harvest_task_queue.error` column at
-/// the join site, because a *retryable* regular failure appends no
-/// `ActivityFailed` event (it re-queues the row with the message in the `error`
-/// column) — so an event-sourced map would miss exactly the backing-off
-/// activities #773 targets.
+/// This is the **local-activity** failure source only. The join site reads
+/// regular (task-queue) failures from the `harvest_task_queue.error` column.
+/// A *retryable* regular failure appends no `ActivityFailed` event. So an
+/// event-sourced map would miss exactly the backing-off activities that #773
+/// targets.
 ///
-/// `LocalActivityFailed` carries only `activity_id` / `error` / `attempt`, so
-/// its `error_type` defaults to `"Error"`, `non_retryable` to `false`, and
-/// `details` to `None`; `failed_at` is the event timestamp.
+/// `LocalActivityFailed` carries only `activity_id`, `error` and `attempt`.
+/// So `error_type` defaults to `"Error"`, `non_retryable` to `false`, and
+/// `details` to `None`. `failed_at` is the event timestamp.
 pub(crate) fn latest_failures_by_activity(
     events: &[(i64, WorkflowEvent, chrono::DateTime<chrono::Utc>)],
 ) -> std::collections::HashMap<uuid::Uuid, LastFailure> {
@@ -1822,30 +1802,26 @@ pub(crate) struct PendingActivity {
     pub(crate) task_status: String,
     pub(crate) claimed_by_worker_id: Option<String>,
     /// The pending task's input payload, tolerantly decoded (issue #608).
-    /// Present **only** when read-path payload decoding is active for this
-    /// request (deployment opt-in + harvest-admin access) — omitted
-    /// otherwise, so flag-off responses stay byte-identical to pre-#608
-    /// builds. `None` for external-handoff rows, and withheld (with
-    /// `input_truncated` / `input_omitted_for_budget` signaling why) when the
-    /// decoded payload exceeds the activity's effective input cap or the
-    /// cumulative per-response input budget — the same #503 policy that
-    /// bounds heartbeat checkpoints.
+    /// Present **only** when read-path decoding is active for this request:
+    /// deployment opt-in plus harvest-admin access. Otherwise omitted, so
+    /// flag-off responses stay byte-identical to pre-#608 builds. `None` for
+    /// external-handoff rows. Withheld when the decoded payload exceeds the
+    /// activity's input cap or the per-response input budget.
+    /// `input_truncated` and `input_omitted_for_budget` tell why. The #503
+    /// policy for heartbeat checkpoints is the same.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) input: Option<serde_json::Value>,
     /// `true` when the decoded input exceeded this activity's effective
-    /// input-payload cap (#252, per-activity override raised against the
-    /// global ceiling) and was withheld from the response; inspect
-    /// `input_bytes` for the size. Mirrors `heartbeat_details_truncated`.
-    /// `Option`-typed (unlike the checkpoint trio) purely so flag-off
-    /// responses omit the key and stay byte-identical to pre-#608 builds;
-    /// populated whenever decoding is active for the request.
+    /// input-payload cap (#252) and was withheld. `input_bytes` gives the
+    /// size. Mirrors `heartbeat_details_truncated`. It is an `Option`, unlike
+    /// the checkpoint trio, only so flag-off responses omit the key.
+    /// Populated whenever decoding is active for the request.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) input_truncated: Option<bool>,
-    /// `true` when this input was within its own cap but was withheld because
-    /// the cumulative per-response input budget was already exhausted by
-    /// earlier activities (issue #608, mirroring the #503 checkpoint budget).
-    /// `input_bytes` still reports its size. Present only when decoding is
-    /// active for the request.
+    /// `true` when this input was within its own cap, but earlier activities
+    /// had used up the per-response input budget (issue #608). Mirrors the
+    /// #503 checkpoint budget. `input_bytes` still reports its size. Present
+    /// only when decoding is active for the request.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) input_omitted_for_budget: Option<bool>,
     /// Observed serialized byte size of the decoded input. Present only when
@@ -1868,10 +1844,9 @@ pub(crate) struct PendingActivity {
     /// *individual* payload's own size only — see `heartbeat_details_omitted_for_budget`
     /// for the cross-activity response budget.
     pub(crate) heartbeat_details_truncated: bool,
-    /// `true` when this checkpoint was within its own cap but was withheld
-    /// because the cumulative per-response checkpoint budget was already
-    /// exhausted by earlier activities (#503 review). `heartbeat_details_bytes`
-    /// still reports its size.
+    /// `true` when this checkpoint was within its own cap, but earlier
+    /// activities had used up the per-response checkpoint budget (#503).
+    /// `heartbeat_details_bytes` still reports its size.
     pub(crate) heartbeat_details_omitted_for_budget: bool,
     /// Observed byte size of the stored heartbeat payload, when one exists.
     pub(crate) heartbeat_details_bytes: Option<u64>,
@@ -1907,11 +1882,10 @@ impl std::io::Write for ByteCountWriter {
 /// when a payload exists and exceeds `cap`; `bytes` is the observed serialized
 /// size whenever a payload exists. A `cap` of `0` means uncapped. Pure (#503).
 ///
-/// This is the borrow-based core shared by the API response projection
-/// (`project_heartbeat_details`) and the UI cell renderer so neither path
-/// clones an over-cap payload merely to discard it. The serialized size is
-/// measured with a non-allocating counting writer so an oversized checkpoint
-/// is never materialized into a second buffer just to be withheld.
+/// The API projection (`project_heartbeat_details`) and the UI cell renderer
+/// share this core, so neither clones an over-cap payload only to drop it. A
+/// non-allocating counting writer measures the size. So an oversized
+/// checkpoint is never copied into a second buffer only to be withheld.
 pub(crate) fn heartbeat_details_truncation(
     value: Option<&serde_json::Value>,
     cap: u64,
@@ -1923,21 +1897,19 @@ pub(crate) fn heartbeat_details_truncation(
     })
 }
 
-/// Project a stored heartbeat checkpoint payload onto the describe response,
-/// bounded by the activity-result payload cap (#252) so a pathological payload
-/// cannot bloat the stack response. Returns `(payload, truncated, bytes)`:
-/// `payload` is the verbatim value when present and within the cap, or `None`
-/// when absent or over-cap; `truncated` is `true` only in the over-cap case;
-/// `bytes` is the observed serialized size whenever a payload exists. A `cap`
-/// of `0` means uncapped. Pure and strictly non-mutating (issue #503).
+/// Bound a stored heartbeat checkpoint by the activity-result payload cap.
 ///
-/// Takes the payload by value so the owned value flows through to the response
-/// with **zero clones** on the API hot path (returned when within the cap,
-/// dropped when over-cap).
+/// The cap (#252) keeps a pathological payload out of the stack response.
+/// Returns `(payload, truncated, bytes)`. `payload` is the value when present
+/// and within the cap, else `None`. `truncated` is `true` only when over the
+/// cap. `bytes` is the serialized size whenever a payload exists. A `cap` of
+/// `0` means uncapped. Pure and non-mutating (issue #503).
 ///
-/// Despite the name this is a generic bounded-payload projection: the stack
-/// endpoint also reuses it to bound decoded pending-activity *inputs* against
-/// the activity's effective input cap (issue #608, PR #936 review).
+/// Takes the payload by value, so the API hot path makes **zero clones**.
+///
+/// Despite the name, this is a generic bounded-payload projection. The stack
+/// endpoint also bounds decoded pending-activity *inputs* with it (issue
+/// #608, PR #936).
 pub(crate) fn project_heartbeat_details(
     details: Option<serde_json::Value>,
     cap: u64,
@@ -1947,16 +1919,15 @@ pub(crate) fn project_heartbeat_details(
     (payload, truncated, bytes)
 }
 
-/// Pure cumulative checkpoint-budget core, shared by the stack API and the
-/// Vantage detail UI (#503 review). Given each entry's *included-checkpoint*
-/// byte size in order (`None` = no payload to budget — absent or already
-/// withheld by its own per-activity cap), return per-entry omit-for-budget
-/// decisions under a single cumulative `budget`.
+/// Pure cumulative checkpoint-budget core of the stack API and the Vantage UI.
 ///
-/// The first payload-bearing entry is always kept (decision `false`), even if
-/// it alone exceeds the budget, so a single legitimately large checkpoint from
-/// an activity with a raised per-activity cap stays visible. A `budget` of `0`
-/// disables budgeting (all decisions `false`).
+/// Takes each entry's *included-checkpoint* byte size in order (#503).
+/// `None` means no payload to budget: absent, or withheld by its own cap.
+/// Returns the omit-for-budget decision of each entry under one `budget`.
+///
+/// The first payload-bearing entry is always kept (decision `false`), even
+/// over the budget. So one large checkpoint under a raised per-activity cap
+/// stays visible. A `budget` of `0` disables budgeting.
 pub(crate) fn checkpoint_budget_decisions(sizes: &[Option<u64>], budget: u64) -> Vec<bool> {
     let mut running: u64 = 0;
     sizes
@@ -2068,16 +2039,13 @@ pub(crate) fn fold_pending_local_activities(
                             .and_then(serde_json::Value::as_str)
                             .unwrap_or("")
                             .to_string();
-                        // The local-activity id-space is the `activity_id`
-                        // string on the event, which is what
-                        // `LocalActivityFailed.activity_id` (and hence the
-                        // failure map key) also carries — parse it to look up
-                        // the most-recent failure (issue #773). Attach the RAW
-                        // (undecoded) failure here; decoding is deferred until
-                        // after the fold so an entry a later terminal event
-                        // removes is never decoded or audited, keeping the #608
-                        // read-path decode scoped to the local activities
-                        // actually surfaced (Codex P2, PR #1022).
+                        // `LocalActivityFailed.activity_id`, the failure map
+                        // key, carries the same `activity_id` string. Parse it
+                        // to find the latest failure (issue #773). Attach the
+                        // RAW failure here and decode after the fold. An entry
+                        // that a later terminal event removes is then never
+                        // decoded or audited. So the #608 read-path decode
+                        // covers only the surfaced local activities (PR #1022).
                         let last_failure = uuid::Uuid::parse_str(&activity_exec_id)
                             .ok()
                             .and_then(|aid| failures_by_activity.get(&aid).cloned());
@@ -2106,7 +2074,7 @@ pub(crate) fn fold_pending_local_activities(
                     // through and correctly stays pending. Without this, a
                     // workflow that catches a terminal local-activity failure
                     // and keeps running would report the exhausted activity as
-                    // pending forever (Codex review, PR #1022).
+                    // pending forever (PR #1022).
                     (
                         "LocalActivityCompleted" | "LocalActivityExhausted",
                         Some(activity_exec_id),
@@ -2260,11 +2228,10 @@ pub(crate) struct StartWorkflowResponse {
     /// The shard this execution was placed on (issue #697).
     ///
     /// Populated only when the request supplied an explicit `shard_id` or
-    /// `residency_key`, so an operator can audit that a residency-pinned start
-    /// actually landed where it was pinned without decoding the `execution_id`
-    /// UUID by hand. Omitted for unpinned starts, keeping their response
-    /// byte-identical to a pre-#697 build. The same value is durably visible on
-    /// the execution row's `shard_id` column and via `GET /workflows/{id}`.
+    /// `residency_key`. An operator then sees where a pinned start landed,
+    /// without decoding the `execution_id` UUID. Omitted for unpinned starts,
+    /// so their response stays byte-identical to a pre-#697 build. The
+    /// execution row's `shard_id` column and `GET /workflows/{id}` also show it.
     #[serde(skip_serializing_if = "Option::is_none")]
     shard_id: Option<i32>,
 }
@@ -2303,9 +2270,9 @@ impl SignalQuery {
 pub(crate) struct SignalAck {
     ok: bool,
     signal_delivered: bool,
-    /// The execution the signal was actually queued for, when it differs from
-    /// the requested id because the workflow-level retry chain (#523) had
-    /// advanced and the request was routed to the live attempt (issue #843).
+    /// The execution that received the signal, when it differs from the
+    /// requested id (issue #843). That happens when the workflow-level retry
+    /// chain (#523) has advanced and the request goes to the live attempt.
     ///
     /// Omitted entirely when no routing occurred, so an unretried workflow's
     /// response stays byte-identical to a pre-#843 build.
@@ -2563,10 +2530,9 @@ struct DagRetryRequest {
 
 /// Response body for a committed or dry-run DAG retry.
 ///
-/// `pub(crate)` (with `pub(crate)` fields) so the Vantage UI retry flow
-/// (`crate::ui`) can consume the same value the extracted `retry_dag_run_inner`
-/// returns, rendering `nodes_to_re_execute` in the confirmation dialog and
-/// `new_run_exec_id` in the success flash.
+/// `pub(crate)`, so the Vantage UI retry flow (`crate::ui`) consumes the value
+/// that `retry_dag_run_inner` returns. It shows `nodes_to_re_execute` in the
+/// confirmation dialog and `new_run_exec_id` in the success flash.
 #[derive(Debug, Serialize)]
 pub(crate) struct DagRetryResponse {
     /// `true` when this was a dry run (no write performed).
@@ -2610,9 +2576,9 @@ pub(crate) struct StartWorkflowRequest {
     /// priors). Omitted or `null` → `unspecified` (each reuse policy's native
     /// active behavior, byte-for-byte identical to today). One of:
     /// `unspecified`, `fail`, `use_existing`, `terminate_existing`. An unknown
-    /// value returns `400 Bad Request`. Not supported combined with a throttle /
-    /// debounce / batch policy (the start is deferred and has no active prior to
-    /// resolve at request time) — returns `400`.
+    /// value returns `400 Bad Request`. A throttle, debounce or batch policy
+    /// with it also returns `400`. Such a start is deferred, so it has no
+    /// active prior to resolve at request time.
     conflict_policy: Option<String>,
     #[serde(default)]
     start_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -2623,10 +2589,9 @@ pub(crate) struct StartWorkflowRequest {
     batch_max_wait: Option<String>,
     /// Per-execution completion-callback targets (issue #605): a JSON array
     /// of `{url, filter}` objects (see
-    /// `autumn_harvest::completion_callback::CallbackTarget`). Each target's
-    /// URL is validated against the operator-configured SSRF host allowlist
-    /// before the workflow is admitted; a non-allowlisted target rejects the
-    /// start with `422` and a machine-readable reason.
+    /// `autumn_harvest::completion_callback::CallbackTarget`). The operator's
+    /// SSRF host allowlist validates each URL before admission. A target off
+    /// the allowlist rejects the start with `422` and a machine-readable reason.
     completion_callbacks: Option<Value>,
     /// Caller-supplied trace/correlation headers threaded onto the execution row.
     context_headers: Option<std::collections::HashMap<String, String>>,
@@ -2634,10 +2599,10 @@ pub(crate) struct StartWorkflowRequest {
     priority: Option<autumn_harvest::types::Priority>,
     /// The fairness key of the run (issue #1976). Omitted takes the quota key.
     fairness_key: Option<String>,
-    /// Request-scoped idempotency key (issue #808). Two starts carrying the same
-    /// key (within the configured retention window, default 24h) converge on
-    /// exactly one execution — the second returns the same `execution_id` as a
-    /// no-op (`200`), with no second `WorkflowStarted` event. Dedup scope is
+    /// Request-scoped idempotency key (issue #808). Two starts with the same
+    /// key within the retention window (default 24h) converge on one
+    /// execution. The second returns the same `execution_id` as a no-op
+    /// (`200`), with no second `WorkflowStarted` event. Dedup scope is
     /// `(workflow_name, idempotency_key)`, independent of `workflow_id`. The
     /// `Idempotency-Key` request header takes precedence over this field.
     /// Mutually exclusive with a throttle / debounce / batch policy.
@@ -2646,10 +2611,10 @@ pub(crate) struct StartWorkflowRequest {
     /// Pin this workflow to a concrete shard (issue #697).
     ///
     /// Mutually exclusive with [`Self::residency_key`]. Omitting both keeps
-    /// today's rendezvous routing byte-for-byte. A shard outside the
-    /// deployment's `readable_shards`, one drained out of `writable_shards`,
-    /// a negative value, or the reserved routing sentinel all return `400` —
-    /// never a silent fallback to the default shard.
+    /// today's rendezvous routing byte-for-byte. Each of these returns `400`:
+    /// a shard outside the deployment's `readable_shards`, one drained out of
+    /// `writable_shards`, a negative value, or the reserved routing sentinel.
+    /// None of them silently falls back to the default shard.
     #[serde(default)]
     shard_id: Option<i32>,
     /// Pin this workflow via an operator-declared residency key (issue #697),
@@ -2661,21 +2626,21 @@ pub(crate) struct StartWorkflowRequest {
     /// process restarts and across any widening of the shard set.
     #[serde(default)]
     residency_key: Option<String>,
+    /// Internal opt-in marking `idempotency_key` as **engine-derived**, so the
+    /// reserved-namespace guard admits it (issue #944).
+    ///
+    /// A broker connector derives its dedupe key from stable broker
+    /// coordinates and delegates through this handler. The guard that stops a
+    /// *caller* from squatting that key would otherwise refuse the connector.
+    /// `#[serde(skip)]` keeps it out of the public JSON body, so a caller
+    /// cannot claim the exemption. Mirrors
+    /// `WorkflowResetRequest::allow_terminal_source`.
+    #[serde(default, skip)]
+    engine_derived_idempotency_key: bool,
     /// Internal workflow-start provenance override (issue #740). Set by
     /// [`Self::from_webhook`] so a webhook-delegated start records `webhook`
     /// provenance instead of the default `api`. `#[serde(skip)]` so it is
     /// never part of the public JSON request body.
-    /// Internal opt-in marking `idempotency_key` as **engine-derived**, so the
-    /// reserved-namespace guard admits it (issue #944 review).
-    ///
-    /// A broker connector derives its dedupe key from stable broker
-    /// coordinates and delegates through this very handler, so the guard that
-    /// stops a *caller* squatting that key would otherwise refuse the
-    /// connector's own dispatch. `#[serde(skip)]` so it is never part of the
-    /// public JSON request body — a caller cannot claim the exemption, which is
-    /// the whole point. Mirrors `WorkflowResetRequest::allow_terminal_source`.
-    #[serde(default, skip)]
-    engine_derived_idempotency_key: bool,
     #[serde(default, skip)]
     start_source_override: Option<autumn_harvest::StartSource>,
     /// Internal provenance correlation ref override (issue #740), paired with
@@ -2688,10 +2653,9 @@ impl StartWorkflowRequest {
     /// Minimal request carrying only the workflow input — used by the MCP
     /// start tool (issue #597), which exposes no other start options.
     ///
-    /// Only called from `mcp_tools.rs`, which is entirely excluded from the
-    /// build without the `mcp` cargo feature; without this, a default
-    /// (no-`mcp`) build sees zero callers and clippy's `-D warnings` treats
-    /// that as a hard error.
+    /// Only `mcp_tools.rs` calls this, and the `mcp` cargo feature gates that
+    /// file. A default build then has no caller. Without this `allow`, clippy
+    /// `-D warnings` rejects that.
     #[cfg_attr(not(feature = "mcp"), allow(dead_code))]
     pub(crate) const fn from_input(input: Value) -> Self {
         Self {
@@ -2722,18 +2686,17 @@ impl StartWorkflowRequest {
         }
     }
 
-    /// Request carrying the deterministic `workflow_id` a `#[webhook]`
-    /// mapping function returned (issue #344) -- unlike [`Self::from_input`]
-    /// (which lets `start_workflow` mint a random UUID, fine for the MCP
-    /// `start_{wf}` tool's always-fresh semantics), a webhook `Starts` target
-    /// needs the caller-chosen id so that redelivering the same logical event
+    /// Request carrying the `workflow_id` a `#[webhook]` mapping returned.
+    ///
+    /// [`Self::from_input`] lets `start_workflow` mint a random UUID, which
+    /// suits the always-fresh MCP `start_{wf}` tool. A webhook `Starts` target
+    /// needs the caller-chosen id (issue #344). A redelivered event then
     /// resolves to the same execution under the default `AllowDuplicate`
     /// reuse policy.
     ///
-    /// Only called from `webhook_receiver.rs`, which is entirely excluded
-    /// from the build without the `webhooks` cargo feature; without this,
-    /// a default (no-`webhooks`) build sees zero callers and clippy's
-    /// `-D warnings` treats that as a hard error.
+    /// Only `webhook_receiver.rs` calls this, and the `webhooks` cargo feature
+    /// gates that file. A default build then has no caller. Without this
+    /// `allow`, clippy `-D warnings` rejects that.
     #[cfg_attr(not(feature = "webhooks"), allow(dead_code))]
     pub(crate) const fn from_webhook(
         workflow_id: String,
@@ -2772,23 +2735,21 @@ impl StartWorkflowRequest {
     /// Request carrying the deterministic `workflow_id` a broker connector's
     /// mapping function returned (issue #944).
     ///
-    /// Differs from [`Self::from_webhook`] in one way: the connector may also
-    /// supply an explicit start `idempotency_key` (issue #808) derived from the
-    /// message's broker coordinates, so a redelivery converges on exactly one
-    /// execution even when the mapper's `workflow_id` is not itself a stable
-    /// event identity. It is `None` when the binding resolved to
-    /// `IdempotencyMode::WorkflowId` — a keyed start is mutually exclusive with
-    /// a throttle / debounce / batch admission policy (`400`), so a target with
-    /// deferred admission dedupes on the mapper's `workflow_id` instead.
+    /// Differs from [`Self::from_webhook`] in one way. The connector may also
+    /// supply a start `idempotency_key` (issue #808) from the message's broker
+    /// coordinates. A redelivery then converges on one execution, even when
+    /// the mapper's `workflow_id` is not a stable event identity. The key is
+    /// `None` when the binding resolved to `IdempotencyMode::WorkflowId`. A
+    /// keyed start with a throttle, debounce or batch policy returns `400`. So
+    /// a target with deferred admission dedupes on the mapper's `workflow_id`.
     ///
     /// `start_source_ref_override` carries the rendered broker coordinates
     /// (`orders:3:91`), so an operator can trace an execution back to the exact
     /// message that produced it.
     ///
-    /// Only called from `connector/dispatch.rs`, which is entirely excluded
-    /// from the build without the `connectors` cargo feature; without this,
-    /// a default build sees zero callers and clippy's `-D warnings` treats
-    /// that as a hard error.
+    /// Only `connector/dispatch.rs` calls this, and the `connectors` cargo
+    /// feature gates that file. A default build then has no caller. Without
+    /// this `allow`, clippy `-D warnings` rejects that.
     #[cfg_attr(not(feature = "connectors"), allow(dead_code))]
     pub(crate) const fn from_broker(
         workflow_id: String,
@@ -2861,44 +2822,43 @@ pub(crate) struct SignalWithStartRequest {
     /// GitHub `X-GitHub-Delivery`, etc.).
     #[serde(default)]
     idempotency_key: Option<String>,
+    /// Internal opt-in marking `idempotency_key` as **engine-derived**, so the
+    /// reserved-namespace guard admits it (issue #944).
+    ///
+    /// A broker connector derives its dedupe key from stable broker
+    /// coordinates and delegates through this handler. The guard that stops a
+    /// *caller* from squatting that key would otherwise refuse the connector.
+    /// `#[serde(skip)]` keeps it out of the public JSON body, so a caller
+    /// cannot claim the exemption. Mirrors
+    /// `WorkflowResetRequest::allow_terminal_source`.
+    #[serde(default, skip)]
+    engine_derived_idempotency_key: bool,
     /// Internal workflow-start provenance override (issue #740). Set by
     /// [`Self::from_webhook`] so a webhook-delegated `SignalsWithStart` fresh
     /// run records `webhook` instead of the default `signal_with_start`.
     /// `#[serde(skip)]` so it is never part of the public JSON body.
-    /// Internal opt-in marking `idempotency_key` as **engine-derived**, so the
-    /// reserved-namespace guard admits it (issue #944 review).
-    ///
-    /// A broker connector derives its dedupe key from stable broker
-    /// coordinates and delegates through this very handler, so the guard that
-    /// stops a *caller* squatting that key would otherwise refuse the
-    /// connector's own dispatch. `#[serde(skip)]` so it is never part of the
-    /// public JSON request body — a caller cannot claim the exemption, which is
-    /// the whole point. Mirrors `WorkflowResetRequest::allow_terminal_source`.
-    #[serde(default, skip)]
-    engine_derived_idempotency_key: bool,
     #[serde(default, skip)]
     start_source_override: Option<autumn_harvest::StartSource>,
     /// Internal workflow-start provenance *reference* override (issue #740).
-    /// Set by [`Self::from_broker`] to the rendered broker coordinates so a
+    /// [`Self::from_broker`] sets it to the rendered broker coordinates. So a
     /// broker-triggered fresh run records the same `start_source_ref` shape
-    /// whichever binding kind produced it (issue #944); without it the
-    /// signal-with-start path defaults to the connector's derived, bounded
-    /// idempotency key. `#[serde(skip)]` so it is never part of the public
-    /// JSON body.
+    /// for each binding kind (issue #944). Without it, the signal-with-start
+    /// path uses the connector's derived, bounded idempotency key.
+    /// `#[serde(skip)]` so it is never part of the public JSON body.
     #[serde(default, skip)]
     start_source_ref_override: Option<String>,
 }
 
 impl SignalWithStartRequest {
-    /// Request carrying the deterministic `workflow_id`, signal name/payload,
-    /// idempotency key (the verified webhook delivery ID), and optional queue
-    /// override -- used by the inbound webhook receiver (issue #344) for its
-    /// `SignalsWithStart` target.
+    /// Request for the `SignalsWithStart` target of the webhook receiver.
     ///
-    /// Only called from `webhook_receiver.rs`, which is entirely excluded
-    /// from the build without the `webhooks` cargo feature; without this,
-    /// a default (no-`webhooks`) build sees zero callers and clippy's
-    /// `-D warnings` treats that as a hard error.
+    /// It carries the deterministic `workflow_id`, the signal name and
+    /// payload, and an optional queue override (issue #344). The idempotency
+    /// key is the verified webhook delivery ID.
+    ///
+    /// Only `webhook_receiver.rs` calls this, and the `webhooks` cargo feature
+    /// gates that file. A default build then has no caller. Without this
+    /// `allow`, clippy `-D warnings` rejects that.
     #[cfg_attr(not(feature = "webhooks"), allow(dead_code))]
     pub(crate) fn from_webhook(
         workflow_id: String,
@@ -2931,11 +2891,11 @@ impl SignalWithStartRequest {
     /// Request built by a broker connector's `SignalsWithStart` binding
     /// (issue #944).
     ///
-    /// The `idempotency_key` is the connector's derived key, namespaced by the
-    /// binding and signal name exactly as the webhook receiver namespaces
-    /// `{path}:{signal_name}:{delivery_id}` — so a redelivery of the same
-    /// broker message delivers the signal exactly once, and two bindings that
-    /// happen to target the same `(workflow_name, workflow_id)` never collide.
+    /// The `idempotency_key` is the connector's derived key. The binding and
+    /// signal name namespace it, as the webhook receiver namespaces
+    /// `{path}:{signal_name}:{delivery_id}`. So a redelivered broker message
+    /// delivers the signal exactly once. Two bindings that target the same
+    /// `(workflow_name, workflow_id)` never collide.
     ///
     /// Only called from `connector/dispatch.rs`, which is entirely excluded
     /// from the build without the `connectors` cargo feature.
@@ -3067,10 +3027,9 @@ impl DagTriggerRequest {
     /// (`mcp_tools::start_dag_tool`), which receives the conf as an
     /// already-parsed `serde_json::Value`.
     ///
-    /// Only called from `mcp_tools.rs`, which is entirely excluded from the
-    /// build without the `mcp` cargo feature; without this, a default
-    /// (no-`mcp`) build sees zero callers and clippy's `-D warnings` treats
-    /// that as a hard error.
+    /// Only `mcp_tools.rs` calls this, and the `mcp` cargo feature gates that
+    /// file. A default build then has no caller. Without this `allow`, clippy
+    /// `-D warnings` rejects that.
     #[cfg_attr(not(feature = "mcp"), allow(dead_code))]
     pub(crate) const fn from_conf(conf: Option<Value>) -> Self {
         Self { conf }
@@ -3100,12 +3059,11 @@ struct TerminateWorkflowRequest {
 /// Optional body for `POST /workflows/{id}/rerun` (issue #777).
 ///
 /// `input` is a serde TRI-STATE (`Option<Option<Value>>` via
-/// [`deserialize_tristate`]) because the three cases are genuinely distinct
-/// and a plain `Option<Value>` cannot express them: an ABSENT field means
-/// "clone the source's stored input verbatim", while an explicit JSON `null`
-/// IS a real override that replaces the clone with `null`. Serde's stock
-/// `Option<Value>` deserializes JSON `null` to `None` — indistinguishable
-/// from absent — which would silently clone instead of overriding.
+/// [`deserialize_tristate`]). A plain `Option<Value>` cannot express the three
+/// distinct cases. An ABSENT field means "clone the source's stored input".
+/// An explicit JSON `null` is a real override that replaces the clone with
+/// `null`. Stock serde reads `null` as `None`, the same as absent. That would
+/// silently clone instead of overriding.
 #[derive(Debug, Default, Deserialize)]
 struct RerunWorkflowRequest {
     #[allow(clippy::option_option)] // deliberate serde tri-state: absent vs null vs value
@@ -3352,29 +3310,26 @@ struct ScheduleEntry {
     /// endpoint without silently clearing the stored policy.
     #[serde(skip_serializing_if = "Option::is_none")]
     retry_policy: Option<autumn_harvest::RetryPolicy>,
-    /// Whether this *active* schedule is overdue to fire relative to its own
-    /// cadence (issue #696): `now − next_run_at > grace`, where `grace` = the
-    /// schedule's own cadence step + configured jitter + the scheduler tick
-    /// interval. Intentionally-not-firing schedules (`is_paused`,
-    /// `auto_paused_at`, `Schedule::Manual`, `end_at`/`max_runs`-exhausted) and
-    /// schedules deliberately deferring because they are at `max_active_runs`
-    /// are never `true`. See the `harvest.schedule.overdue` gauge for the
-    /// alertable fleet-wide signal.
+    /// Whether this *active* schedule is overdue against its own cadence
+    /// (issue #696): `now − next_run_at > grace`. `grace` is the cadence step,
+    /// plus the configured jitter, plus the scheduler tick interval. It is
+    /// never `true` for a schedule that does not fire on purpose: `is_paused`,
+    /// `auto_paused_at`, `Schedule::Manual`, or `end_at`/`max_runs` exhausted.
+    /// It is never `true` for one deferring at `max_active_runs` either. The
+    /// `harvest.schedule.overdue` gauge is the alertable fleet-wide signal.
     overdue: bool,
     /// How long past its scheduled fire this schedule is (`now − next_run_at`)
     /// in whole seconds, or `null` when it is not overdue (issue #696).
     overdue_by_secs: Option<i64>,
-    /// Effective hard execution-timeout deadline (issue #743) that a run this
-    /// schedule fires will get, resolved from the registered workflow (or the
-    /// DAG's shadow `WorkflowInfo`, for `kind: "dag"`) `execution_timeout`,
-    /// in whole seconds. `null` when the workflow/DAG declares none or the
-    /// registry is unavailable.
+    /// Effective hard execution timeout of a run this schedule fires (issue
+    /// #743), in whole seconds. It comes from the `execution_timeout` of the
+    /// registered workflow, or of the DAG's shadow `WorkflowInfo`. `null` when
+    /// none is declared or the registry is unavailable.
     execution_timeout_secs: Option<i64>,
-    /// Effective soft SLA (issue #743) a run this schedule fires will get,
-    /// resolved from the registered workflow (or the DAG's shadow
-    /// `WorkflowInfo`) `sla`, clamped down to `execution_timeout_secs` when
-    /// declared larger than it (issue #743 AC5). In whole seconds; `null`
-    /// when the workflow/DAG declares none or the registry is unavailable.
+    /// Effective soft SLA of a run this schedule fires (issue #743), in whole
+    /// seconds. It comes from the `sla` of the registered workflow, or of the
+    /// DAG's shadow `WorkflowInfo`. It is clamped to `execution_timeout_secs`
+    /// (AC5). `null` when none is declared or the registry is unavailable.
     sla_secs: Option<i64>,
 }
 
@@ -3451,9 +3406,9 @@ struct CreateWorkflowScheduleRequest {
     /// `catchup` bool governs catchup behaviour and the policy columns are left
     /// NULL. `"window"` additionally reads `catchup_window_secs`.
     ///
-    /// Like every other field on this upsert endpoint, omitting it on an update
-    /// resets the stored policy to "unset" (legacy-bool semantics); send the
-    /// desired mode explicitly to retain a bounded policy.
+    /// As with every field on this upsert endpoint, omitting it on an update
+    /// resets the stored policy to "unset" (legacy-bool semantics). Send the
+    /// mode explicitly to keep a bounded policy.
     #[serde(default)]
     catchup_policy: Option<String>,
     /// Window length in seconds for `catchup_policy = "window"` (issue #484).
@@ -3463,17 +3418,18 @@ struct CreateWorkflowScheduleRequest {
     /// Schedule-level workflow retry policy (issue #523). When set, scheduler
     /// fires, backfills, and trigger-now runs for this schedule auto-retry a
     /// `FAILED` run per this policy (taking precedence over the workflow-type
-    /// default). Like every other field on this upsert endpoint, omitting it on
-    /// an update resets the stored policy to NULL (falling back to the
-    /// workflow-type default); send it explicitly to retain a schedule policy.
+    /// default). As with every field on this upsert endpoint, omitting it on
+    /// an update resets the stored policy to NULL. The workflow-type default
+    /// then applies. Send it explicitly to keep a schedule policy.
     #[serde(default)]
     retry_policy: Option<autumn_harvest::RetryPolicy>,
 }
 
-/// Deserialize helper for tri-state PATCH fields: a field that is absent from
-/// the JSON body deserializes to `None` (via `#[serde(default)]`, "leave
-/// unchanged"), while an explicit JSON `null` deserializes to `Some(None)`
-/// ("clear to NULL") and a value to `Some(Some(v))`.
+/// Deserialize helper for tri-state PATCH fields.
+///
+/// An absent field gives `None` via `#[serde(default)]` ("leave unchanged").
+/// An explicit JSON `null` gives `Some(None)` ("clear to NULL"). A value gives
+/// `Some(Some(v))`.
 #[allow(clippy::option_option)] // deliberate serde tri-state: absent vs null vs value
 pub(crate) fn deserialize_tristate<'de, T, D>(
     deserializer: D,
@@ -3492,20 +3448,19 @@ where
 /// `catchup_policy`, `retry_policy`) are tri-state: absent = unchanged,
 /// explicit JSON `null` = clear.
 ///
-/// `workflow_name` is accepted structurally only so the handler can reject it
-/// with a targeted 400 — the workflow type bound to a schedule is not
-/// editable (that is a new schedule, not an edit).
+/// `workflow_name` is accepted only so the handler can reject it with a
+/// targeted 400. The workflow type of a schedule is not editable. A new type
+/// is a new schedule.
 ///
-/// `Option<Option<T>>` (`clippy::option_option`) is the standard serde
-/// double-`Option` PATCH idiom: the outer `Option` distinguishes an absent
-/// field from an explicit JSON `null`, mirroring the core
-/// `WorkflowSchedulePatch` contract.
+/// `Option<Option<T>>` (`clippy::option_option`) is the serde double-`Option`
+/// PATCH idiom. The outer `Option` tells an absent field from an explicit
+/// JSON `null`, as in the core `WorkflowSchedulePatch` contract.
 ///
-/// `deny_unknown_fields`: because every field is optional, a typo'd field
-/// name (`"scheduleexpr"`) would otherwise deserialize to an all-`None` body
-/// and 200-no-op with a SUCCEEDED audit row — a silent failure. The rejection
-/// surfaces as a 400 via the handler's `Result<Json<…>, JsonRejection>`
-/// extractor (see [`update_schedule_handler`]).
+/// `deny_unknown_fields`: every field is optional. So a misspelled field name
+/// (`"scheduleexpr"`) would otherwise give an all-`None` body. That is a
+/// silent 200 no-op with a SUCCEEDED audit row. The handler's
+/// `Result<Json<…>, JsonRejection>` extractor turns the rejection into a 400
+/// (see [`update_schedule_handler`]).
 #[allow(clippy::option_option)]
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -3610,9 +3565,8 @@ pub(crate) const KNOWN_WORKFLOW_STATES: &[&str] = &[
     "TIMED_OUT",
     "CONTINUED_AS_NEW",
     "TERMINATED",
-    // Issue #964. Both are returned by `GET /workflows`, so both must be
-    // filterable: a state the API emits but rejects as a filter value is a
-    // listing an operator can see and cannot narrow.
+    // Issue #964. `GET /workflows` returns both, so both must be filterable.
+    // Otherwise an operator sees a state in a listing but cannot filter on it.
     "MIGRATING",
     "MIGRATED",
 ];
@@ -3653,9 +3607,9 @@ pub(crate) enum SearchAttrPredicate {
     /// `key:ne:value` — key present and typed value differs.
     Ne { key: String, value: JsonText },
     /// `key:{gt,gte,lt,lte}:value` — numeric comparison. `value` is the
-    /// validated, trimmed numeric *text* (not an f64): it is bound and cast
-    /// `::numeric` in SQL so the comparison stays exact even for integers
-    /// beyond f64's 2^53 mantissa (issue #506 review).
+    /// validated, trimmed numeric *text*, not an f64. SQL binds it and casts
+    /// it `::numeric`. So the comparison stays exact for integers beyond the
+    /// 2^53 mantissa of f64 (issue #506).
     Cmp {
         key: String,
         op: CmpOp,
@@ -3687,9 +3641,8 @@ pub struct WorkflowListPage {
     pub unavailable_shards: Vec<UnavailableShard>,
 }
 
-// A parsed query-param bag: each bool is an independent opt-in filter flag
-// (`?sla_breached=true`, `?nd_blocked=true`, ...), not encodable state — a
-// state machine or enums would obscure the 1:1 query-param mapping.
+// Each bool is an independent opt-in query flag (`?sla_breached=true`, ...).
+// Enums or a state machine would obscure the 1:1 query-param mapping.
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Default, Clone)]
 pub(crate) struct WorkflowFilters {
@@ -3731,16 +3684,14 @@ pub(crate) struct WorkflowFilters {
     /// Only return executions with at least this many recorded events (issue #493).
     /// General-purpose: composes freely with `state=`/`order=`/pagination and
     /// sorts in the caller's chosen order. Distinct from `history_bloat_min_events`
-    /// below (issue #704) — the two must never share a query-parameter name, or a
-    /// caller combining `state=COMPLETED&min_history_events=N` (or pagination)
-    /// would silently get the wrong results instead of the documented ones.
+    /// below (issue #704). The two must never share a query-parameter name.
+    /// Otherwise `state=COMPLETED&min_history_events=N`, or pagination, would
+    /// silently return the wrong results.
     pub(crate) min_history_events: Option<u64>,
-    /// Operator early-warning discovery for workflow history bloat (issue
-    /// #704, AC1): a dedicated, non-composable path returning only live
-    /// (non-terminal) executions with at least this many recorded events,
-    /// sorted by current history size descending. Deliberately a SEPARATE
-    /// field/query-param from `min_history_events` above — see its doc
-    /// comment for why reusing that name would be a regression.
+    /// Early-warning discovery for workflow history bloat (issue #704, AC1).
+    /// A dedicated, non-composable path returns only live executions with at
+    /// least this many recorded events, largest history first. It is SEPARATE
+    /// from `min_history_events` above. Its doc comment tells why.
     pub(crate) history_bloat_min_events: Option<u64>,
     /// Sort direction (issue #498). Default: `Desc`.
     pub(crate) order: WorkflowSortOrder,
@@ -3865,31 +3816,31 @@ struct HistoryExportCandidate {
     state: String,
     #[diesel(sql_type = diesel::sql_types::Timestamptz)]
     last_history_event_at: chrono::DateTime<chrono::Utc>,
-    // Issue #772: the per-execution deadline-aware replay budget, carried into
-    // the batch export document so `harvest-replay` / `replay_from_json` threads
-    // the continue-as-new deadline (parity with the single-execution export).
+    // Issue #772: the per-execution replay deadline budget. The batch export
+    // carries it, so `harvest-replay` / `replay_from_json` threads the
+    // continue-as-new deadline, as the single-execution export does.
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Interval>)]
     execution_timeout: Option<chrono::Duration>,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
     deadline_at: Option<chrono::DateTime<chrono::Utc>>,
-    // Issue #698: the spawning parent's execution id, carried into the batch
-    // export document so `harvest-replay` / `replay_from_json` threads the
-    // child's spawner into the replayed `WorkflowContext` (parity with the
-    // single-execution export). `parent_id` lives in no `WorkflowEvent`.
+    // Issue #698: the spawning parent's execution id. The batch export carries
+    // it, so `harvest-replay` / `replay_from_json` gives the replayed
+    // `WorkflowContext` its spawner, as the single-execution export does.
+    // `parent_id` lives in no `WorkflowEvent`.
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Uuid>)]
     parent_id: Option<uuid::Uuid>,
     // Issue #798: the per-execution `context_headers`, carried into the export
     // document so a header-branching workflow replays against the SAME ambient
-    // headers the live run saw. Headers live in no `WorkflowEvent`, so without
-    // this a replayed run sees an empty map and a workflow that branches on
-    // `ctx.header(..)` — or embeds one in an activity input — reports a FALSE
+    // headers the live run saw. Headers live in no `WorkflowEvent`. Without
+    // this, a replayed run sees an empty map. A workflow that branches on
+    // `ctx.header(..)`, or puts one in an activity input, then reports a FALSE
     // divergence. Parity with the single-execution export and the DB canary.
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Jsonb>)]
     context_headers: Option<serde_json::Value>,
-    // Issue #798: the execution's task queue, carried into the export document so
-    // a workflow that branches on `ctx.queue_name()` replays against the queue it
-    // really ran on. The live worker sets it from the claimed task row, so it
-    // lives in no `WorkflowEvent` — same family as `context_headers` above.
+    // Issue #798: the execution's task queue. The export document carries it,
+    // so a workflow that branches on `ctx.queue_name()` replays on its real
+    // queue. The live worker sets it from the claimed task row, so it lives in
+    // no `WorkflowEvent`, as with `context_headers` above.
     #[diesel(sql_type = diesel::sql_types::Text)]
     queue_name: String,
     // Issue #2082: the run's start source and predecessor, carried into the
@@ -3902,12 +3853,12 @@ struct HistoryExportCandidate {
 
 /// One in-flight execution selected by the stratified sample query (issue #798).
 ///
-/// Deliberately *not* the batch-export candidate: the sample query omits the
-/// `harvest_events` join that `HISTORY_EXPORT_CANDIDATES_SQL` needs for
-/// `last_history_event_at` (a per-execution `MAX()` over the whole event log),
-/// keeping the sample cheap enough to run against a large in-flight fleet. It
-/// instead carries `started_at` (the stratification key) and `in_flight_total`
-/// (the per-shard population of this workflow type, for AC2 coverage).
+/// Deliberately *not* the batch-export candidate. The sample query omits the
+/// `harvest_events` join of `HISTORY_EXPORT_CANDIDATES_SQL`. That join computes
+/// `last_history_event_at`, a per-execution `MAX()` over the whole event log.
+/// Without it, the sample stays cheap on a large in-flight fleet. It carries
+/// `started_at`, the stratification key, and `in_flight_total`. That is the
+/// per-shard population of this workflow type, for AC2 coverage.
 #[derive(Debug, Clone, diesel::QueryableByName)]
 struct HistorySampleCandidate {
     #[diesel(sql_type = diesel::sql_types::Uuid)]
@@ -3930,16 +3881,16 @@ struct HistorySampleCandidate {
     parent_id: Option<uuid::Uuid>,
     // Issue #798: the per-execution `context_headers`, carried into the export
     // document so a header-branching workflow replays against the SAME ambient
-    // headers the live run saw. Headers live in no `WorkflowEvent`, so without
-    // this a replayed run sees an empty map and a workflow that branches on
-    // `ctx.header(..)` — or embeds one in an activity input — reports a FALSE
+    // headers the live run saw. Headers live in no `WorkflowEvent`. Without
+    // this, a replayed run sees an empty map. A workflow that branches on
+    // `ctx.header(..)`, or puts one in an activity input, then reports a FALSE
     // divergence. Parity with the single-execution export and the DB canary.
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Jsonb>)]
     context_headers: Option<serde_json::Value>,
-    // Issue #798: the execution's task queue — same rationale as
-    // `context_headers`: it lives in no `WorkflowEvent`, so without it a
-    // `ctx.queue_name()`-branching workflow replays under "" and the gate reports
-    // a FALSE divergence.
+    // Issue #798: the execution's task queue. As with `context_headers`, it
+    // lives in no `WorkflowEvent`. Without it, a workflow that branches on
+    // `ctx.queue_name()` replays under "", and the gate reports a FALSE
+    // divergence.
     #[diesel(sql_type = diesel::sql_types::Text)]
     queue_name: String,
     // Issue #2082: the run's start source and predecessor, carried into the
@@ -3959,9 +3910,9 @@ impl HistorySampleCandidate {
     /// Reuse the whole batch-export pipeline (payload policy, #608 decoding,
     /// `max_bytes`, failure reporting) rather than forking it.
     ///
-    /// `last_history_event_at` is only ever a sort/filter key in the batch
-    /// export — it is never carried into the export document — so populating it
-    /// from `started_at` costs nothing and keeps one export path.
+    /// `last_history_event_at` is only a sort and filter key in the batch
+    /// export. The export document never carries it. So `started_at` fills it
+    /// at no cost, and one export path remains.
     fn into_export_candidate(self) -> HistoryExportCandidate {
         HistoryExportCandidate {
             id: self.id,
@@ -4011,15 +3962,15 @@ impl HistoryBatchExportWork {
     /// - `unavailable_shards` — "this shard is unhealthy", which flips the
     ///   response `status` to `partial`. The #798 gate honours that only under
     ///   the opt-in `require_complete_coverage`.
-    /// - `failures` — "the bundle is missing a row it was meant to hold", which
-    ///   the manifest surfaces as `export_failures > 0` and the gate blocks on
+    /// - `failures` — "the bundle is missing a row it was meant to hold". The
+    ///   manifest shows it as `export_failures > 0`, and the gate blocks on it
     ///   *unconditionally* (exit 2).
     ///
-    /// Recording only the first lets a bundle with at least one survivor exit 0
-    /// while silently dropping selected candidates — a biased subset presented
-    /// as a clean gate, the worst outcome this feature can produce. Every other
-    /// `note_unavailable` call site fails *before* selection, so this is the one
-    /// place both are owed.
+    /// With only the first, a bundle with one survivor exits 0 and silently
+    /// drops selected candidates. That presents a biased subset as a clean
+    /// gate, the worst outcome this feature can produce. Every other
+    /// `note_unavailable` call site fails *before* selection. So only this
+    /// place owes both.
     fn note_dropped_candidate(&mut self, shard_id: i32, exec_id: &ExecutionId, reason: &str) {
         self.note_unavailable(shard_id, reason.to_string());
         self.failures.push(HistoryExportFailure {
@@ -4083,14 +4034,13 @@ pub(crate) struct WorkflowChildrenResponse {
     /// Cross-shard completeness of this page (issue #756 contract, extended to
     /// this endpoint by issue #956).
     ///
-    /// `GET /workflows/{id}/children` has always fanned out across every shard —
-    /// a child could live anywhere even before cross-shard *placement* existed,
-    /// because the traversal follows `parent_id` across the whole fleet — but it
-    /// propagated a pool error with `?`, so one unreachable shard turned the
-    /// whole call into a `500`. Cross-shard children make that failure mode
-    /// routine rather than exotic, so the endpoint now degrades: it returns the
-    /// children it could see and names the shards it could not, exactly like
-    /// `GET /workflows/{id}/tree` and the other #756 endpoints.
+    /// `GET /workflows/{id}/children` has always fanned out across every shard.
+    /// The traversal follows `parent_id` across the whole fleet, so a child can
+    /// live anywhere. But it propagated a pool error with `?`, so one
+    /// unreachable shard turned the whole call into a `500`. Cross-shard
+    /// children make that failure routine. So the endpoint now degrades. It
+    /// returns the children it could see and names the shards it could not,
+    /// like `GET /workflows/{id}/tree` and the other #756 endpoints.
     ///
     /// Additive: always present, `complete` on the happy path.
     pub(crate) status: FanoutStatus,
@@ -4150,10 +4100,9 @@ async fn list_gates_handler(
     match admission_gate_db::list_gates(&mut conn).await {
         Ok(rows) => {
             let views: Vec<AdmissionGateView> = rows.iter().map(AdmissionGateView::from).collect();
-            // issue #618 (AC5): surface the discoverable start-producer contract
-            // alongside the active gates so an operator can see which in-process
-            // producers honour a gate and which are exempt-by-design (with a
-            // rationale) without reading source.
+            // Issue #618 (AC5): show the start-producer contract with the gates.
+            // An operator then sees which in-process producers honour a gate
+            // and which are exempt by design, with a rationale.
             let producers = autumn_harvest::admission_gate::producer_contract();
             (
                 StatusCode::OK,
@@ -4167,29 +4116,28 @@ async fn list_gates_handler(
 
 /// `POST /admin/gates` — create an admission gate.
 #[allow(clippy::too_many_lines)]
-/// Reconcile the in-memory admission-gate cache after a create/lift that was
-/// already persisted to the DB and written through to the snapshot
-/// (`apply_created`/`apply_lifted`), given the result of the follow-up full
-/// reload.
+/// Reconcile the admission-gate cache after a persisted create or lift.
 ///
-/// On a successful reload, `refresh()` the snapshot — replacing it with the
-/// authoritative active-gate list (reconciling other replicas' concurrent
-/// changes) and setting `initialized = true`, which RECOVERS from any prior
-/// fail-closed. Returns the reloaded active-gate count so the caller can emit the
+/// The change is already in the DB and written through to the snapshot
+/// (`apply_created`/`apply_lifted`). `reload` is the follow-up full reload.
+///
+/// On a successful reload, `refresh()` replaces the snapshot with the
+/// authoritative active-gate list. That reconciles concurrent changes of other
+/// replicas. It sets `initialized = true`, which RECOVERS from a prior
+/// fail-closed. Returns the reloaded active-gate count for the
 /// `admission_gates_active` metric.
 ///
-/// On a reload FAILURE, arm fail-closed (issue #618) and return `None`. An earlier
-/// design did NOT arm fail-closed here; this one supersedes it. While the gate
-/// table is momentarily unreadable, `check()` — the API / fresh-admission path,
-/// which CAN retry — must return the synthetic block until a successful refresh
-/// reconciles ALL active gates, rather than serving fresh admissions from a
-/// snapshot that reflects only this replica's local write-through delta and could
-/// be MISSING another replica's gate (e.g. a Fleet gate created on replica B just
-/// before this replica creates a narrower gate and then fails its own reload — a
-/// non-matching start would otherwise slip past B's gate uncounted). On the lift
-/// path this briefly re-blocks the just-lifted work; that OVER-BLOCK is the correct
-/// conservative behaviour for a safety control during a gate-table outage
-/// (over-block briefly rather than leak), bounded by the <=1s background refresh.
+/// On a reload FAILURE, arm fail-closed (issue #618) and return `None`. While
+/// the gate table is unreadable, `check()` must return the synthetic block.
+/// `check()` is the API and fresh-admission path, which CAN retry. It blocks
+/// until a successful refresh reconciles ALL active gates. The snapshot holds
+/// only this replica's write-through delta. It can be MISSING the gate of
+/// another replica. Example: replica B creates a Fleet gate. This replica then
+/// creates a narrower gate and fails its reload. A non-matching start would
+/// then slip past the gate of B uncounted. On the lift path, this briefly
+/// re-blocks the just-lifted work. For a safety control in a gate-table
+/// outage, that OVER-BLOCK is correct: over-block briefly rather than leak.
+/// The background refresh bounds it to 1s or less.
 ///
 /// The already-applied write-through delta is retained and load-bearing.
 /// `check_cached` is the completion-trigger / in-flight-continuation path, which
@@ -4230,9 +4178,8 @@ async fn create_gate_handler(
 ) -> axum::response::Response {
     let (actor, source, request_id) = audit_context(&headers, &api_state);
 
-    // Validate scope/value combination before parsing: fleet scope must not
-    // carry a scope_value (a caller who accidentally sends both intends a
-    // narrower scope but would create a fleet-wide gate instead).
+    // Fleet scope must not carry a scope_value. A caller who sends both likely
+    // wants a narrower scope, and would otherwise get a fleet-wide gate.
     if body.scope_kind == "fleet" && body.scope_value.is_some() {
         return (
             StatusCode::BAD_REQUEST,
@@ -4279,8 +4226,8 @@ async fn create_gate_handler(
             // the new gate even if the follow-up load fails. The gate was
             // persisted to the DB first (create_gate above), so the snapshot is now
             // accurate for this change regardless of the refresh outcome. This
-            // matters most for the completion-trigger path (check_cached), which
-            // does NOT retry after a synthetic fail-closed block — a stale-open
+            // matters most for the completion-trigger path (`check_cached`). It
+            // does NOT retry after a synthetic fail-closed block. A stale-open
             // snapshot here would durably MISS the new gate.
             api_state.gate_cache().apply_created(gate.clone());
             // Reconcile any OTHER concurrent changes with a full refresh. On a
@@ -4375,8 +4322,8 @@ async fn lift_gate_handler(
             // Write-through the lift into the in-memory snapshot (issue #618)
             // BEFORE the full refresh. The just-lifted gate then stops matching
             // on this replica, even if the follow-up load fails. The lift
-            // was persisted to the DB first (lift_gate above). This is what makes a
-            // lift durable for the completion-trigger path (check_cached): a
+            // was persisted to the DB first (lift_gate above). This makes a lift
+            // durable for the completion-trigger path (`check_cached`). A
             // stale-open snapshot here would keep dropping targets as
             // admission_blocked against a gate the operator already lifted.
             api_state.gate_cache().apply_lifted(id);
@@ -4556,9 +4503,8 @@ async fn create_token_handler(
                 source: &source,
             };
             let _ = session.insert_audit(&ar).await;
-            // Do NOT surface the raw DB error text (a unique-violation `DETAIL`
-            // echoes the row) into the HTTP response; the real error is captured
-            // in the audit `error_summary` above. Return a clean generic 500.
+            // Do NOT return the raw DB error text: a unique-violation `DETAIL`
+            // echoes the row. The audit `error_summary` above holds the error.
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({ "error": "failed to create api token" })),
@@ -4651,14 +4597,13 @@ async fn revoke_token_handler(
 // ── Business-id route variants (issue #805) ──────────────────────────────────
 //
 // Embedders assign a business `(workflow_name, workflow_id)` at start. These
-// routes let them act on the *current* run by that pair — no list-then-act
-// round-trip, and always the live run even after a continue-as-new/reset fork
-// (a cached `exec_id` targets the stale predecessor). Each handler resolves the
-// pair to an `ExecutionId` and DELEGATES to the existing `exec_id` handler so
-// the exec-id surface stays byte-for-byte backward compatible. Every response
-// carries the resolved `execution_id` — always in the `X-Harvest-Execution-Id`
-// header (uniform AC4 guarantee, covers empty-body cases), and in the JSON body
-// wherever there is one.
+// routes act on the *current* run of that pair, with no list-then-act round
+// trip. They reach the live run even after a continue-as-new or reset fork. A
+// cached `exec_id` targets the stale predecessor. Each handler resolves the
+// pair to an `ExecutionId` and DELEGATES to the `exec_id` handler. So the
+// exec-id surface stays backward compatible. Every response carries the
+// resolved `execution_id` in the `X-Harvest-Execution-Id` header (AC4), even
+// with an empty body. A JSON body carries it too.
 
 /// Response header carrying the resolved internal `execution_id` on every
 /// business-id (`/workflows/by-id/...`) response (issue #805, AC4).
@@ -4695,26 +4640,23 @@ fn finalize_by_id<T: IntoResponse>(
 /// (issue #805). Returns a clean `404` (never `500`) when the key is genuinely
 /// unknown, and `503` (never a false `404`) when a shard cannot be queried.
 ///
-/// **Shard strategy — fan out across every *expected* shard.** We deliberately
-/// query every shard rather than trusting a single rendezvous-hash fast path:
-/// `ShardRouter::pick_for_new_workflow` can drift from where a run actually
-/// lives once the writable shard subset changes (see the KNOWN LIMITATION on
-/// `pick_for_idempotency_key`), so a fast-path-then-miss design could resolve a
-/// live run to `404`. The shard set comes from
-/// [`shard_fanout::expected_shards`], which unions this process's live pools
-/// with the router's `readable_shards`/`default_shard` — so a shard the router
-/// knows about but for which this process has no pool yet (mid a shard-add
-/// rollout) is not silently skipped.
+/// **Shard strategy — fan out across every *expected* shard.** The function
+/// queries every shard and does not trust one rendezvous-hash fast path.
+/// `ShardRouter::pick_for_new_workflow` can drift from where a run lives once
+/// the writable shard subset changes. See the KNOWN LIMITATION on
+/// `pick_for_idempotency_key`. A fast path that misses could resolve a live run
+/// to `404`. [`shard_fanout::expected_shards`] gives the shard set. It unions
+/// the live pools of this process with the router's `readable_shards` and
+/// `default_shard`. So a known shard with no pool here yet, as in a shard-add
+/// rollout, is not silently skipped.
 ///
 /// **Correctness over availability (multi-shard degraded mode).** An *expected*
-/// shard with no pool in this process, or one whose connection cannot be
-/// acquired, yields a `503` for the whole resolution rather than a silent skip:
-/// we cannot rule out that the run lives on the un-queried shard, so returning
-/// `404` would be a false negative. On the single-shard default this never
-/// triggers (the one shard always has a pool), and `expected_shards` yields
-/// exactly one shard so this reduces to one query at no cost. A future
-/// refinement could try the rendezvous-hash shard first and only fan out on a
-/// miss, but that is out of scope for this slice.
+/// shard with no pool here, or with no connection, gives a `503` for the whole
+/// resolution, not a silent skip. The run can live on the un-queried shard, so
+/// a `404` would be a false negative. On the single-shard default this never
+/// triggers, because the one shard always has a pool. `expected_shards` then
+/// yields one shard, so this costs one query. A later refinement could try the
+/// rendezvous-hash shard first and fan out only on a miss.
 ///
 /// The fan-out is **sequential** — one connection held at a time — so it is
 /// safe against a pool sized down to a single connection. Per-shard candidates
@@ -4779,16 +4721,15 @@ pub(crate) async fn resolve_workflow_by_business_id(
 }
 
 /// Write a `STATUS_FAILED` audit row for a *mutating* by-id handler whose
-/// `(workflow_name, workflow_id)` resolution failed (issue #805, review FIX 4).
+/// `(workflow_name, workflow_id)` resolution failed (issue #805).
 ///
-/// Mirrors the exec-id handlers' failed-attempt audit posture (e.g.
-/// `cancel_workflow`'s malformed-id and cancel-error paths, which both write a
-/// `STATUS_FAILED` row before returning): without this, a signal/cancel/pause/
-/// resume against an unresolvable business id left no audit trail, an
-/// asymmetry with the exec-id surface. Best-effort — a failed audit write never
-/// fails the request. The audit `target_id` is the unresolved business id
-/// (`"{workflow_name}/{workflow_id}"`) and `route_or_command` is the by-id
-/// route so the failed attempt's provenance is accurate.
+/// Mirrors the failed-attempt audit of the exec-id handlers. For example, the
+/// malformed-id and cancel-error paths of `cancel_workflow` both write a
+/// `STATUS_FAILED` row before they return. Without this, a signal, cancel,
+/// pause or resume on an unresolvable business id left no audit trail.
+/// Best-effort: a failed audit write never fails the request. The audit
+/// `target_id` is the unresolved business id (`"{workflow_name}/{workflow_id}"`).
+/// `route_or_command` is the by-id route, so the provenance is accurate.
 async fn audit_by_id_resolution_failure(
     api_state: &HarvestApiState,
     headers: &axum::http::HeaderMap,
@@ -4875,14 +4816,12 @@ async fn get_workflow_result_by_id(
     headers: axum::http::HeaderMap,
     maybe_session: Option<Extension<Session>>,
 ) -> axum::response::Response {
-    // Issue #1151 review: reject a malformed query string up front, before
-    // the business-id resolution DB lookup below -- otherwise an unknown
-    // workflow_id or an unreachable shard would mask the malformed query
-    // behind a 404/503 instead of the documented 400, and the lookup would
-    // run for a request that was always going to be rejected. The delegate
-    // (`get_workflow_result`) decodes `raw_query` again once resolution
-    // succeeds; this is a cheap, side-effect-free re-parse, not a
-    // functional duplication.
+    // Issue #1151: reject a malformed query string before the business-id
+    // lookup. Otherwise an unknown workflow_id or an unreachable shard would
+    // hide it behind a 404/503 instead of the documented 400. The lookup
+    // would also run for a request that is always rejected. The delegate
+    // (`get_workflow_result`) decodes `raw_query` again after resolution.
+    // That re-parse is cheap and has no side effects.
     if let Err(response) =
         crate::strict_query::decode_or_autumn_error_response(raw_query.as_deref())
     {
@@ -5011,12 +4950,12 @@ async fn signal_workflow_by_id(
         // Forward the #843 routed-live-attempt marker when the inner handler
         // set it, so a by-id caller can also see that the retry chain moved.
         //
-        // The two ids are deliberately distinct and both correct:
-        // `execution_id` (and the `X-Harvest-Execution-Id` header) is what the
-        // BUSINESS KEY resolved to — the #805 contract, unchanged — while
-        // `routed_execution_id` is the live attempt the signal actually landed
-        // on. Rewriting the #805 id to the routed one would make a by-id
-        // caller's recorded handle drift to an inner attempt.
+        // The two ids are distinct on purpose, and both are correct.
+        // `execution_id` and the `X-Harvest-Execution-Id` header are what the
+        // BUSINESS KEY resolved to, per the unchanged #805 contract.
+        // `routed_execution_id` is the live attempt that got the signal.
+        // Rewriting the #805 id to the routed one would make the recorded
+        // handle of a by-id caller drift to an inner attempt.
         if let Some(routed) = ack.get("routed_execution_id").cloned()
             && let Some(map) = out.as_object_mut()
         {
@@ -5203,18 +5142,16 @@ async fn resume_workflow_by_id(
 
 /// Input-validation GUARD for the name-only by-id path (issue #805, AC3).
 ///
-/// A bare `/workflows/by-id/{workflow_name}` (missing the `{workflow_id}`
-/// segment) is not a valid business-id address: AC3 requires it be rejected
-/// with a literal `400`, not the structural `404` axum would otherwise return
-/// for a route that matches nothing. This handler always returns `400` with a
-/// helpful body pointing at the two-segment business-id form.
+/// A bare `/workflows/by-id/{workflow_name}`, without the `{workflow_id}`
+/// segment, is not a valid business-id address. AC3 requires a literal `400`
+/// for it, not the structural `404` of axum for an unmatched route. The body
+/// points at the two-segment business-id form.
 ///
-/// These guard routes are deliberately NOT registered in
-/// `management_api_routes()`, `docs/api-contract.json`, or `audit.rs`: they are
-/// not management operations, just an input-validation 400 — there is no DB
-/// access, no audit event, and nothing for the contract/classification
-/// registries to describe. The contract tests validate the const route lists,
-/// not the live router, so this omission is intentional and consistent.
+/// These guard routes are deliberately NOT in `management_api_routes()`,
+/// `docs/api-contract.json` or `audit.rs`. They are an input-validation 400,
+/// not management operations. They have no DB access, no audit event, and
+/// nothing for the contract and classification registries to describe. The
+/// contract tests check the const route lists, not the live router.
 async fn by_id_missing_workflow_id(Path(_workflow_name): Path<String>) -> axum::response::Response {
     (
         StatusCode::BAD_REQUEST,
@@ -5262,10 +5199,10 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<()> {
             "/workflows/batch_start",
             post(batch_start_workflows)
                 .route_layer(require_admin.clone())
-                // Replace Axum's 2 MiB default with the absolute hard ceiling so
-                // bodies are bounded before buffering while still allowing operators
-                // to raise BatchStartConfig.max_total_bytes up to 100 MiB. The
-                // handler enforces the configured cap via api_state.batch_start_max_bytes().
+                // Replace the 2 MiB default of Axum with the hard ceiling. Bodies
+                // stay bounded before buffering, and operators can still raise
+                // BatchStartConfig.max_total_bytes up to 100 MiB. The handler
+                // enforces the configured cap via api_state.batch_start_max_bytes().
                 .layer(axum::extract::DefaultBodyLimit::max(
                     usize::try_from(BATCH_START_BODY_HARD_LIMIT).unwrap_or(usize::MAX),
                 )),
@@ -5302,9 +5239,9 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<()> {
             get(list_workflow_summaries).route_layer(require_admin.clone()),
         )
         // Business-id ("latest run") route variants (issue #805). The literal
-        // `by-id` segment is distinct from `{id}`, but these are registered here
-        // alongside the other static /workflows/* routes (before /workflows/{id})
-        // to keep the block contiguous and collision-free. Each delegates to the
+        // `by-id` segment is distinct from `{id}`. These routes sit with the
+        // other static /workflows/* routes, before /workflows/{id}, so the block
+        // stays contiguous and free of collisions. Each delegates to the
         // exec-id handler after resolving (workflow_name, workflow_id). Admin
         // posture + audit classification mirror the exec-id counterparts exactly.
         // AC3 guard: a name-only (3-segment) by-id path is missing the required
@@ -5378,9 +5315,9 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<()> {
         .route("/workflows/{id}/result", get(get_workflow_result))
         .route("/workflows/{id}/children", get(list_workflow_children))
         // Recursive cross-shard lineage tree (issue #621). Deliberately NOT
-        // admin-gated: it returns the same class of execution-row data as
-        // `/children` (which already traverses depth across shards), so gating
-        // it would be an inconsistency rather than a hardening.
+        // admin-gated. It returns the same class of execution-row data as
+        // `/children`, which already traverses depth across shards. A gate
+        // here would be an inconsistency, not a hardening.
         .route("/workflows/{id}/tree", get(get_workflow_tree))
         .route("/workflows/{id}/stack", get(get_workflow_stack))
         .route("/workflows/{id}/timeline", get(get_workflow_timeline))
@@ -5397,18 +5334,19 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<()> {
             "/workflows/{id}/awaitables",
             get(get_workflow_awaitables).route_layer(require_admin.clone()),
         )
-        // Per-execution stall diagnosis (issue #809): admin-gated, same posture
-        // as the eligibility and awaitables triage endpoints — the response
-        // names queue / rate-limit / concurrency keys and fleet coverage state.
+        // Per-execution stall diagnosis (issue #809): admin-gated, as are the
+        // eligibility and awaitables triage endpoints. The response names
+        // queue, rate-limit and concurrency keys, and fleet coverage state.
         .route(
             "/workflows/{id}/diagnose",
             get(get_workflow_diagnose).route_layer(require_admin.clone()),
         )
         .route("/workflows/{id}/run-chain", get(get_run_chain))
         // Single-execution replay diagnosis (issue #614): admin-gated, read-only.
-        // POST (not GET) because it drives a replay of the workflow handler, but
-        // classified ReadOnly (RouteClass::ReadOnly / read_only:true +
-        // post_for_body_only) since it appends no events and performs no writes.
+        // POST, not GET, because it drives a replay of the workflow handler.
+        // It is still classified ReadOnly (`RouteClass::ReadOnly`, `read_only:
+        // true`, `post_for_body_only`), because it appends no events and writes
+        // nothing.
         .route(
             "/workflows/{id}/replay-diagnosis",
             post(replay_diagnosis).route_layer(require_admin.clone()),
@@ -5514,19 +5452,18 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<()> {
         )
         .route("/dags", get(list_dags))
         .route("/dags/{dag_name}/runs", get(list_dag_runs))
-        // Auth parity with `POST /workflows/{id}/reset` — the DAG retry endpoint
-        // is a DAG-scoped reset built on the same #148 internals, so it inherits
-        // the reset route's posture (no separate admin layer; issue #366).
+        // Auth parity with `POST /workflows/{id}/reset`. The DAG retry endpoint
+        // is a DAG-scoped reset on the same #148 internals. So it has the same
+        // posture as the reset route, with no separate admin layer (issue #366).
         .route(
             "/dags/{dag_name}/runs/{run_exec_id}/retry",
             post(retry_dag_run),
         )
         // DAG run graph view (issue #690): read-only, admin-guarded per AC1.
-        // Note the asymmetry with the sibling `/dags/*` read routes (e.g.
-        // GET /dags/{dag_name}/runs), which carry no `require_admin` layer and
-        // rely only on the embedder's optional `api_with_auth` boundary — a
-        // pre-existing posture left unchanged here. This route adds the admin
-        // layer because issue #690 AC1 explicitly mandates it.
+        // The sibling `/dags/*` read routes, such as GET /dags/{dag_name}/runs,
+        // carry no `require_admin` layer. They rely only on the optional
+        // `api_with_auth` boundary of the embedder, an older posture left as is.
+        // This route adds the admin layer because issue #690 AC1 mandates it.
         .route(
             "/dags/{dag_name}/runs/{run_exec_id}",
             get(get_dag_run_graph).route_layer(require_admin.clone()),
@@ -5699,11 +5636,11 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<()> {
         )
         .route(
             "/admin/usage",
-            // Historical per-tenant/per-workflow usage report (issue #596):
-            // admin-gated for the same reason as /admin/concurrency and
-            // /admin/debounce — group keys resolve from user/tenant-derived
-            // search_attrs fields, so an unauthenticated caller could
-            // otherwise enumerate tenant consumption across the fleet.
+            // Historical per-tenant and per-workflow usage report (issue #596).
+            // Admin-gated for the same reason as /admin/concurrency and
+            // /admin/debounce. Group keys come from user- or tenant-derived
+            // search_attrs fields. Without the gate, an unauthenticated caller
+            // could enumerate tenant consumption across the fleet.
             get(usage_report).route_layer(require_admin.clone()),
         )
         .route(
@@ -5759,11 +5696,11 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<()> {
             "/admin/rate-limits/{key}",
             post(set_rate_limit).route_layer(require_admin.clone()),
         )
-        // TTL'd runtime pacing overrides (issue #945): distinct from the
-        // permanent `/admin/rate-limits/{key}` route above — these overlay a
-        // *declared* per-activity rate limit / workflow-start throttle with a
-        // temporary quota change that self-expires, so a downstream-outage
-        // mitigation can never be forgotten.
+        // TTL runtime pacing overrides (issue #945), distinct from the permanent
+        // `/admin/rate-limits/{key}` route above. They overlay a *declared*
+        // per-activity rate limit or workflow-start throttle with a temporary
+        // quota change. It expires by itself, so a forgotten downstream-outage
+        // mitigation cannot linger.
         .route(
             "/admin/rate-limits/{activity_name}/override",
             post(set_rate_limit_pacing_override).route_layer(require_admin.clone()),
@@ -5780,10 +5717,9 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<()> {
             "/admin/start-throttle/{workflow_name}/override",
             delete(clear_start_throttle_pacing_override).route_layer(require_admin.clone()),
         )
-        // Read-only companion to the SET/DELETE routes above: surfaces an
-        // active override even when the workflow has no current deferred-
-        // start backlog, closing a visibility gap the backlog-driven
-        // `/admin/start-throttle` listing has by construction (issue #945).
+        // Read-only companion to the SET/DELETE routes above (issue #945). It
+        // shows an active override even when the workflow has no deferred-start
+        // backlog. The backlog-driven `/admin/start-throttle` listing cannot.
         .route(
             "/admin/start-throttle/{workflow_name}/override",
             get(get_start_throttle_pacing_override).route_layer(require_admin.clone()),
@@ -5829,10 +5765,10 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<()> {
                 .delete(clear_fairness_weight_handler)
                 .route_layer(require_admin.clone()),
         )
-        // Per-activity-type pause/resume (issue #807): the surgical sibling of
-        // the queue hold above — stop dispatching ONE broken activity without
-        // touching the healthy work sharing its queue. All four are admin-gated:
-        // the two mutations are a fleet-wide dispatch kill switch, and the two
+        // Per-activity-type pause/resume (issue #807), the surgical sibling of
+        // the queue hold above. It stops dispatch of ONE broken activity and
+        // leaves the healthy work on its queue alone. All four are admin-gated.
+        // The two mutations are a fleet-wide dispatch kill switch. The two
         // reads expose operator-authored hold reasons and the shape of the
         // registered activity catalogue.
         .route(
@@ -5946,9 +5882,9 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<()> {
             "/workers/{worker_id}/pinned",
             get(worker_pinned_executions_handler),
         )
-        // Batch operations (issue #102): operator-facing fleet-wide cancel /
-        // terminate / signal so an incident commander does not have to script
-        // a one-off loop over GET /workflows.
+        // Batch operations (issue #102): fleet-wide cancel, terminate and
+        // signal. An incident commander need not script a loop over
+        // GET /workflows.
         .route("/batch-operations", get(list_batch_operations))
         .route(
             "/batch-operations",
@@ -6456,10 +6392,9 @@ pub(crate) async fn require_harvest_admin(
 ) -> axum::response::Response {
     // Standalone-token admin mode (issue #942, AC6/D3): a request carrying a
     // verified `TokenPrincipal` (set by `enforce_token_scope`) is admitted
-    // without a session/embedder boundary. Scope enforcement already ran in the
-    // outer `enforce_token_scope` layer, so a `read` token attempting a mutating
-    // admin route was denied 403 before reaching here; any principal that
-    // reaches this point is authorized for the route it is on.
+    // without a session/embedder boundary. The outer `enforce_token_scope`
+    // layer already enforced the scope. It denies a `read` token on a mutating
+    // admin route with 403. So a principal here is authorized for its route.
     //
     // A standalone mount installs that outer layer with
     // `StandaloneAdminAuth::with_api_tokens` (issue #1608). The layer used to
@@ -6650,22 +6585,20 @@ async fn mutation_admitted(
 
 /// Whether the request established a session principal at all (issue #1284).
 ///
-/// Two shapes mean "this caller presented no credential", and they are NOT the
-/// same shape — a fix that handles only the first leaves the reported bug in
-/// place:
+/// Two different shapes mean "this caller presented no credential". A fix
+/// that handles only the first leaves the reported bug in place:
 ///
 ///   1. **No `Session` extension.** No session layer ran, so nothing could ever
 ///      have authenticated this caller. This is what a standalone integration
 ///      that mounts [`harvest_api_router`] directly produces.
 ///   2. **A `Session` that is not cookie-backed.** autumn-web installs its
-///      session layer *unconditionally* and that layer inserts a `Session` on
-///      every request — minting a fresh, empty one when the request carries no
-///      valid session cookie. `HarvestPlugin` mounts through `app.nest(..)`,
-///      i.e. *inside* that layer, so a cookieless CLI call against a real
-///      autumn-web app arrives as `Some(session)`, never `None`.
-///      [`Session::is_cookie_backed`] is autumn-web's own accessor for exactly
-///      this question: did the session id come from a valid request cookie, or
-///      was it generated for this request?
+///      session layer *unconditionally*. That layer inserts a `Session` on
+///      every request. Without a valid session cookie, it mints a fresh, empty
+///      one. `HarvestPlugin` mounts through `app.nest(..)`, *inside* that
+///      layer. So a cookieless CLI call arrives as `Some(session)`, never
+///      `None`. [`Session::is_cookie_backed`] answers exactly this question.
+///      Did the session id come from a valid request cookie, or was it
+///      generated for this request?
 ///
 /// A forged or stale cookie also lands here, correctly: it establishes no
 /// principal either.
@@ -6688,13 +6621,13 @@ pub(crate) async fn has_harvest_admin_access(
 
     // ── Unauthenticated local management API in the `dev` profile (#1284) ────
     //
-    // `set_deployment_profile`'s contract has always read "`dev` allows an
-    // unauthenticated local management API", and `check_admin_auth_boundary`
-    // reports the boundary as "optional for the dev profile" — but the code
-    // required a `Session` carrying `admin_auth_session_key` regardless of
-    // profile, so the quickstart's own documented Step 3
-    // (`harvest --base-url … preflight`, a bare cookieless request) answered
-    // 401 for everyone, always. This makes the code match its contract.
+    // The contract of `set_deployment_profile` reads "`dev` allows an
+    // unauthenticated local management API". `check_admin_auth_boundary`
+    // reports the boundary as "optional for the dev profile". But the code
+    // required a `Session` with `admin_auth_session_key` in every profile.
+    // So Step 3 of the quickstart (`harvest --base-url … preflight`, a bare
+    // cookieless request) always answered 401. This makes the code match its
+    // contract.
     //
     // The widening is bounded on three sides, and each bound is a test in
     // `tests/security.rs`:
@@ -6705,17 +6638,17 @@ pub(crate) async fn has_harvest_admin_access(
     //     still judged by `admin_auth_session_key`, so an embedder running its
     //     own auth middleware in `dev` keeps exactly the gate it has today.
     //     Read this as a compatibility bound, not a security barrier: a caller
-    //     is always free to simply omit its cookie. What keeps the posture safe
-    //     is the `dev`-only bound plus the network boundary, which is why the
-    //     startup warning says "do not expose this process beyond localhost".
+    //     can always omit its cookie. The `dev`-only bound and the network
+    //     boundary keep the posture safe. So the startup warning says "do not
+    //     expose this process beyond localhost".
     //   - An embedder-declared boundary still short-circuits above, and the
     //     scoped-token path (#942) short-circuits earlier still, in
     //     `require_harvest_admin`.
     //
-    // A `dev` deployment reaching this arm is announced at startup by
-    // `warn_if_dev_admin_api_is_open` and reported by `harvest preflight`'s
-    // `admin_auth_boundary` check (`unauthenticated_access: true`), so an open
-    // management API is never silent.
+    // `warn_if_dev_admin_api_is_open` announces a `dev` deployment that
+    // reaches this arm at startup. The `admin_auth_boundary` check of
+    // `harvest preflight` reports it (`unauthenticated_access: true`). So an
+    // open management API is never silent.
     let is_dev = api_state.deployment_profile() == "dev";
 
     let Some(session) = session else {
@@ -6765,12 +6698,12 @@ pub(crate) async fn has_harvest_admin_access(
 //      wrong (e.g. `/workflows/batch_start` matching `/workflows/{id}`) would
 //      be a privilege-escalation bug.
 //
-// `MatchedPath` is deliberately NOT used: it is unreliable when read from a
-// layer on a nested router (axum #1441), which is exactly the position this
-// layer occupies. Instead the layer keys on `request.method()` +
-// `request.uri().path()`, which axum has already stripped of the `/api/harvest`
-// mount prefix by the time the request reaches this nested router — so the path
-// is concrete and mount-relative, exactly the form `CLASSIFIED_ROUTES` uses.
+// `MatchedPath` is deliberately NOT used. It is unreliable when read from a
+// layer on a nested router (axum #1441), which is where this layer sits. The
+// layer keys on `request.method()` and `request.uri().path()` instead. Axum
+// strips the `/api/harvest` mount prefix before the request reaches this
+// nested router. So the path is concrete and mount-relative, the form that
+// `CLASSIFIED_ROUTES` uses.
 
 /// Session-claim marker keys that mark a principal as an **admin**. Any of
 /// these present (role value or truthy flag) means the principal is NOT
@@ -6789,14 +6722,14 @@ const READONLY_ROLE_VALUES: &[&str] = &[
 /// Session flag keys whose truthy value marks a principal as read-only.
 const READONLY_FLAG_KEYS: &[&str] = &["is_harvest_readonly", "is_harvest_operator"];
 
-/// Normalize a Session claim VALUE for case-insensitive marker matching
-/// (issue #776, F2): an embedder that authenticates a read-only user but sets
-/// `role = "ReadOnly"` / `"READONLY"` must still be recognized as read-only —
-/// a case mismatch that fell through to "unmarked → full access" would be a
-/// fail-OPEN security defect (a principal the embedder intended to restrict
-/// silently gets admin). Trims surrounding whitespace and lowercases. Marker
-/// key names are matched as-is (mirroring [`has_harvest_admin_access`], which
-/// does not normalize keys either).
+/// Normalize a Session claim VALUE for case-insensitive marker matching.
+///
+/// An embedder can set `role = "ReadOnly"` or `"READONLY"` for a read-only
+/// user (issue #776). That user must still count as read-only. A case
+/// mismatch that fell through to "unmarked → full access" would fail OPEN.
+/// A principal the embedder meant to restrict would silently get admin.
+/// Trims surrounding whitespace and lowercases. Marker key names match as-is,
+/// as in [`has_harvest_admin_access`].
 fn normalize_claim(v: &str) -> String {
     v.trim().to_ascii_lowercase()
 }
@@ -6812,9 +6745,9 @@ fn is_truthy(v: &str) -> bool {
 /// **only** when the embedder's auth middleware explicitly marks the Session
 /// read-only. Semantics:
 ///
-/// - **No session** → `false` (full access — a principal the auth boundary let
-///   through with no markers keeps today's boundary semantics; the read-only
-///   restriction is opt-in per-principal).
+/// - **No session** → `false` (full access). A principal that the auth
+///   boundary let through with no markers keeps the boundary semantics. The
+///   read-only restriction is opt-in per principal.
 /// - **Explicit admin marker present** (`role` ∈ {`admin`,`harvest_admin`} or
 ///   `is_harvest_admin`/`is_admin` truthy) → `false`. Admin wins: an admin is
 ///   never verb-restricted, even if also tagged read-only.
@@ -6860,12 +6793,12 @@ pub(crate) async fn has_harvest_readonly_access(session: Option<Session>) -> boo
 /// accepts the full set without a param-name conflict.
 ///
 /// `matchit` requires the same param NAME at a shared tree position across
-/// routes (e.g. `POST /workflows/{workflow_name}/start` and
-/// `POST /workflows/{id}/cancel` both have a param at segment 2) and distinct
-/// names WITHIN one route (e.g. `.../by-id/{workflow_name}/{workflow_id}/...`).
-/// Renaming positionally satisfies both. Param names are irrelevant to class
-/// lookup — only structure + static segments (which decide static-beats-param
-/// precedence) matter.
+/// routes. For example, `POST /workflows/{workflow_name}/start` and
+/// `POST /workflows/{id}/cancel` both have a param at segment 2. It also
+/// requires distinct names WITHIN one route, as in
+/// `.../by-id/{workflow_name}/{workflow_id}/...`. Positional names satisfy
+/// both. Class lookup ignores param names. Only structure and static
+/// segments matter, because they decide the static-beats-param precedence.
 fn normalize_route_template(path: &str) -> String {
     let mut out = String::with_capacity(path.len());
     let mut idx = 0u32;
@@ -6941,7 +6874,7 @@ pub(crate) fn build_route_matchers<T>(
 
 /// Look up `path` for `method` in `matchers`.
 ///
-/// `HEAD` is looked up under `GET` (F3): axum serves `HEAD` via the `GET`
+/// `HEAD` is looked up under `GET`: axum serves `HEAD` via the `GET`
 /// handler, so a `HEAD` probe inherits that route's value.
 pub(crate) fn match_route<'m, T>(
     matchers: &'m RouteMatchers<T>,
@@ -6969,10 +6902,10 @@ fn route_class_matchers() -> &'static RouteMatchers<RouteClass> {
 /// resolves to [`RouteClass::Mutating`], so a read-only principal is denied a
 /// route no one classified.
 ///
-/// `HEAD` is looked up under `GET` (F3): axum serves `HEAD` via the `GET`
-/// handler, so a `HEAD` probe of a readable resource must inherit that route's
-/// read class rather than fail closed to `Mutating` and 403 a read-only
-/// dashboard's existence/size probe.
+/// `HEAD` is looked up under `GET`, because axum serves `HEAD` via the `GET`
+/// handler. A `HEAD` probe of a readable resource inherits the read class.
+/// Otherwise it would fail closed to `Mutating`. A read-only dashboard's
+/// existence or size probe would then get a 403.
 pub(crate) fn classify_route(method: &axum::http::Method, path: &str) -> RouteClass {
     classified_route(method, path).unwrap_or(RouteClass::Mutating)
 }
@@ -7120,35 +7053,38 @@ pub(crate) fn read_only_forbidden_response() -> axum::response::Response {
 /// [`crate::HarvestPlugin::api_with_role_auth`]; the default and `api_with_auth`
 /// paths never see it, so their behavior is byte-for-byte unchanged (AC6).
 ///
-/// Request order under the role-auth mount: embedder auth middleware (sets the
-/// `Session` extension) → **this layer** (reads Session + method + path) →
-/// per-route `require_admin` (a no-op under the auth boundary) → handler. This
-/// layer therefore stops a read-only principal at the route boundary, before
-/// any handler's in-handler admin write-gate runs — which is why enabling the
-/// admin auth boundary (so read-only principals reach admin-gated `ReadOnly`
-/// routes and the SSE stream, AC1) is safe: the only extra capability the
-/// boundary grants a read-only principal is READS, and every state-writing
-/// handler sits on a `Mutating` (or unclassified→fail-closed→`Mutating`) route
-/// this layer already denies.
+/// Request order under the role-auth mount:
+///
+/// 1. Embedder auth middleware. It sets the `Session` extension.
+/// 2. **This layer**. It reads Session, method and path.
+/// 3. Per-route `require_admin`. It is a no-op under the auth boundary.
+/// 4. The handler.
+///
+/// So this layer stops a read-only principal at the route boundary. That
+/// happens before the admin write-gate inside any handler runs. This is why
+/// the admin auth boundary is safe to enable. It lets read-only principals
+/// reach admin-gated `ReadOnly` routes and the SSE stream (AC1). Its only
+/// extra grant to them is READS. Every state-writing handler sits on a
+/// `Mutating` route, and this layer already denies those. An unclassified
+/// route fails closed to `Mutating`.
 pub async fn enforce_read_only_class(
     request: axum::extract::Request,
     next: Next,
 ) -> axum::response::Response {
     let session = request.extensions().get::<Session>().cloned();
     // OPTIONS is a preflight/metadata verb, never a mutation. A credential-less
-    // CORS preflight carries no Session and already passes (below); this also
-    // lets a rare cookie-bearing same-origin OPTIONS from a read-only principal
-    // through instead of fail-closing it to 403 (F3).
+    // CORS preflight carries no Session and already passes (below). This also
+    // admits a rare cookie-bearing same-origin OPTIONS from a read-only
+    // principal, which would otherwise fail closed to 403.
     if *request.method() != axum::http::Method::OPTIONS
         && has_harvest_readonly_access(session).await
     {
         let class = classify_route(request.method(), request.uri().path());
         if deny_readonly_mutation(true, class) {
             // AC7 observability: a denied attempt is always logged so operators
-            // can detect a misconfigured or probing client. A best-effort DB
-            // audit row is deliberately NOT written here — this layer runs
-            // before a pooled connection is acquired, and forcing a write on
-            // every probe would be a DoS vector.
+            // can detect a misconfigured or probing client. No DB audit row is
+            // written here. This layer runs before a pooled connection is
+            // acquired, and a write on every probe would be a DoS vector.
             tracing::warn!(
                 method = %request.method(),
                 path = %request.uri().path(),
@@ -7161,22 +7097,23 @@ pub async fn enforce_read_only_class(
 }
 
 /// The class gate for a **known-mutating** generated MCP tool route (issue
-/// #776, F1).
+/// #776).
 ///
 /// The generated MCP tool routes are registered app-level (via
-/// `AppBuilder::routes`), outside the nested management router that
-/// [`enforce_read_only_class`] wraps, so they would otherwise be a fully
-/// unguarded write surface reachable by a read-only principal. Unlike that
-/// layer (which resolves the class from `CLASSIFIED_ROUTES` by path), the
-/// caller ([`crate::mcp_tools::build_tool_route`]) already knows this route is
-/// a mutation ([`crate::mcp_tools::ToolKind::is_mutation`]), so this hard-denies
-/// a read-only principal with `403` — no path lookup needed. Installed **only**
-/// on mutating tools and **only** when `api_with_role_auth` is used; read tools
+/// `AppBuilder::routes`). That is outside the nested management router that
+/// [`enforce_read_only_class`] wraps. Without this gate, a read-only principal
+/// could reach them as an unguarded write surface. That layer resolves the
+/// class from `CLASSIFIED_ROUTES` by path. Here the caller
+/// ([`crate::mcp_tools::build_tool_route`]) already knows the route is a
+/// mutation ([`crate::mcp_tools::ToolKind::is_mutation`]). So this denies a
+/// read-only principal with `403`, with no path lookup. Installed **only** on
+/// mutating tools and **only** under `api_with_role_auth`. Read tools
 /// (`status`/`watch`) never carry it.
 ///
-/// This single gate closes both invocation paths: the tool's direct HTTP path
-/// AND the `/mcp` JSON-RPC `tools/call` envelope (autumn-web re-dispatches the
-/// envelope through this same route with the caller's forwarded credential).
+/// This one gate closes both invocation paths. One is the direct HTTP path of
+/// the tool. The other is the `/mcp` JSON-RPC `tools/call` envelope.
+/// autumn-web re-dispatches that envelope through this route with the
+/// forwarded credential of the caller.
 pub async fn enforce_read_only_mcp_mutation(
     request: axum::extract::Request,
     next: Next,
@@ -7195,11 +7132,12 @@ pub async fn enforce_read_only_mcp_mutation(
 
 // ── Read-path payload decoding (issue #608) ───────────────────────────────────
 
-/// The pure decode-eligibility predicate (issue #608, AC1 + AC6): the
-/// read-path decoder is obtainable only when the deployment-level opt-in
-/// flag is set **and** the request has harvest-admin access. Kept as a
-/// standalone `const fn` so the security decision is pinned by a truth-table
-/// unit test without a session harness.
+/// The pure decode-eligibility predicate (issue #608, AC1 + AC6).
+///
+/// The read-path decoder is available only when the deployment opt-in flag is
+/// set **and** the request has harvest-admin access. It is a standalone
+/// `const fn`, so a truth-table unit test pins the security decision without a
+/// session harness.
 pub(crate) const fn decode_gate(flag: bool, is_admin: bool) -> bool {
     flag && is_admin
 }
@@ -7214,12 +7152,12 @@ fn undecodable_stored_payload() -> HarvestError {
 /// Resolve the codec registry for read-path decoding, or `None` when this
 /// request must see today's bytes (issue #608).
 ///
-/// This is the **only** way handlers obtain a decoder: it requires both the
-/// deployment opt-in ([`HarvestApiState::decode_payloads_on_read`]) and the
-/// exact same admin predicate the `require_admin` layer uses
-/// ([`has_harvest_admin_access`]), so ungated describe routes are never
-/// retro-gated — a non-admin caller simply receives the stored (possibly
-/// ciphertext) payloads, exactly as before.
+/// This is the **only** way handlers obtain a decoder. It requires the
+/// deployment opt-in ([`HarvestApiState::decode_payloads_on_read`]). It also
+/// requires the admin predicate of the `require_admin` layer
+/// ([`has_harvest_admin_access`]). So ungated describe routes are never gated
+/// after the fact. A non-admin caller gets the stored payloads, possibly
+/// ciphertext, as before.
 pub(crate) async fn read_path_decoder(
     api_state: &HarvestApiState,
     session: Option<Session>,
@@ -7229,19 +7167,19 @@ pub(crate) async fn read_path_decoder(
         return None;
     }
     let is_admin = has_harvest_admin_access(api_state, session).await;
-    // `flag` is known `true` here, so this re-check is redundant on purpose:
-    // it keeps the truth-table-pinned `decode_gate` predicate as the one
-    // authoritative production consumer of the security decision. Do not
-    // "simplify" this to `if !is_admin` — that would orphan the pinned gate.
+    // `flag` is known `true` here, so this re-check is redundant on purpose.
+    // It keeps the pinned `decode_gate` predicate as the one production
+    // consumer of the security decision. Do not "simplify" this to
+    // `if !is_admin`. That would orphan the pinned gate.
     if !decode_gate(flag, is_admin) {
         return None;
     }
     Some(api_state.payload_codecs())
 }
 
-/// `true` when a payload-bearing field holds a stored envelope this process
-/// has not yet inflated / decoded — either the payload-offload reference
-/// envelope (issue #524) or a codec envelope (issue #608).
+/// `true` when a payload-bearing field holds a stored envelope that this
+/// process has not yet inflated or decoded. That is a payload-offload
+/// reference envelope (issue #524) or a codec envelope (issue #608).
 ///
 /// Both predicates are the crates' own authoritative shape checks, so this can
 /// never drift from what the inflater / decoder actually recognises.
@@ -7257,18 +7195,18 @@ fn payload_field_is_opaque(value: &Value) -> bool {
 ///
 /// * `ActivityScheduled.input` — the issue #780 compensation-dispatch filter
 ///   (`dag_retry::is_compensation_dispatch`), which excludes a compensator's
-///   dispatch from a same-named forward node. Handed an opaque envelope the
-///   predicate returns `false`, so on a codec-encrypting or payload-offloading
-///   deployment the exclusion silently stops working and a never-executed node
-///   is reported with the old compensation's status, timings and attempts.
+///   dispatch from a same-named forward node. On an opaque envelope the
+///   predicate returns `false`. So with codec encryption or payload offload,
+///   the exclusion silently stops working. A never-executed node then shows
+///   the status, timings and attempts of the old compensation.
 /// * `MarkerRecorded.details` — the `dag_skip:{idx}` task fingerprint. That one
 ///   already degrades gracefully to index-only matching when the field is
 ///   opaque, so decoding merely restores its reorder-safety.
 ///
-/// Answering `false` (the default deployment: identity codecs, no payload
-/// store) lets the caller skip the pass entirely, so no history is
-/// re-serialized and the pre-#780 read path is byte-for-byte unchanged. The
-/// scan itself is one `get` per payload field, never a deep walk.
+/// The default deployment (identity codecs, no payload store) answers
+/// `false`. The caller then skips the pass, so no history is re-serialized,
+/// and the pre-#780 read path is unchanged. The scan is one `get` per payload
+/// field, never a deep walk.
 fn graph_history_needs_inflation(events: &[WorkflowEvent]) -> bool {
     events.iter().any(|event| match event {
         WorkflowEvent::ActivityScheduled { input, .. } => payload_field_is_opaque(input),
@@ -7277,48 +7215,48 @@ fn graph_history_needs_inflation(events: &[WorkflowEvent]) -> bool {
     })
 }
 
-/// Inflate offloaded payloads (issue #524) and decode codec envelopes (issue
-/// #608) for a history that was loaded RAW, **after** its pooled DB connection
-/// has been released.
+/// Inflate and decode a history that was loaded RAW, after its connection is
+/// released.
 ///
-/// This is the `api.rs` awaitables discipline (see the `drop(conn)` there)
-/// factored out: blob inflation is network I/O, so a slow or unavailable
-/// payload store must never hold a database pool slot. `store::load_history_inflated`
-/// deliberately does the opposite — it fetches every blob sequentially while
-/// still holding the connection it loaded the rows with — so a caller that
+/// It inflates offloaded payloads (issue #524) and decodes codec envelopes
+/// (issue #608). This is the awaitables discipline of `api.rs` (see the
+/// `drop(conn)` there). Blob inflation is network I/O. So a slow or
+/// unavailable payload store must never hold a database pool slot.
+/// `store::load_history_inflated` does the opposite. It fetches every blob in
+/// sequence while it holds the connection of the row load. So a caller that
 /// cares about pool pressure loads raw, drops, and calls this.
 ///
 /// Callers choose their own failure posture:
 ///
 /// * The DAG **retry** endpoint must fail CLOSED. Its issue #780 guard reads
-///   `ActivityScheduled.input` to recognise a compensation envelope; a decode
-///   failure that degraded to the raw history would hide the envelope and let
-///   an already-rolled-back run be retried onto rolled-back state.
-/// * The DAG **run graph** (API + UI) degrades to the raw history with a
-///   warning: it is a read-only observability surface, and failing the whole
-///   page is worse than the narrow cross-version display inaccuracy.
+///   `ActivityScheduled.input` to recognise a compensation envelope. A decode
+///   failure that fell back to the raw history would hide the envelope. An
+///   already-rolled-back run could then be retried onto rolled-back state.
+/// * The DAG **run graph** (API + UI) falls back to the raw history with a
+///   warning. It is a read-only observability surface. Failing the whole page
+///   is worse than the narrow cross-version display inaccuracy.
 ///
-/// No payload is ever surfaced by either caller — the retry plan carries only
-/// node names and an event id, and the run graph carries node names, statuses,
-/// timings, attempts, and a truncated `error` (which is not a payload-bearing
-/// field). So this needs no issue #608 read-decode opt-in or audit row, exactly
-/// like the awaitables endpoint's replay drive.
+/// Neither caller ever surfaces a payload. The retry plan carries only node
+/// names and an event id. The run graph carries node names, statuses,
+/// timings, attempts, and a truncated `error`, which is not a payload field.
+/// So, as with the replay drive of the awaitables endpoint, this needs no
+/// issue #608 read-decode opt-in or audit row.
 ///
 /// # Residual offload references are an error, not a pass-through
 ///
 /// A payload store is *optional*, so `offloader` is `None` on the default
 /// deployment — and on a deployment that used to have one. In the latter case
-/// the stored history still carries `_harvest_offload_envelope` references, the
-/// inflate pass is skipped entirely, and [`PayloadCodecs::decode_event`] returns
-/// the reference verbatim (it is not a codec envelope, so nothing rejects it).
+/// the stored history still carries `_harvest_offload_envelope` references.
+/// The inflate pass is skipped, and [`PayloadCodecs::decode_event`] returns the
+/// reference verbatim. It is not a codec envelope, so nothing rejects it.
 /// Every payload-reading guard downstream would then be looking at an opaque
 /// blob pointer while believing it had the real value.
 ///
-/// Any reference that survives the pass is therefore an error. When an offloader
-/// *is* configured this is unreachable — `inflate_event_value` either resolves
-/// the reference or rejects a foreign `store_id` — so the check only ever fires
-/// on the configuration-removal case, and costs a handful of key lookups per
-/// event otherwise.
+/// Any reference that survives the pass is therefore an error. With an
+/// offloader configured, this is unreachable. `inflate_event_value` resolves
+/// the reference or rejects a foreign `store_id`. So the check fires only when
+/// the configuration was removed. Otherwise it costs a few key lookups per
+/// event.
 async fn inflate_and_decode_events(
     events: &[WorkflowEvent],
     codecs: &PayloadCodecs,
@@ -7354,17 +7292,17 @@ async fn inflate_and_decode_events(
 /// Decode a timestamped run-graph history in place, degrading to the raw rows
 /// on any failure.
 ///
-/// Shared by the two DAG run-graph readers — the issue #690 API handler and the
-/// issue #957 Vantage UI page — so they can never disagree about whether the
-/// issue #780 compensation filter is looking at real payloads. Both load raw
-/// (`store::load_history_with_timestamps`, whose contract explicitly leaves
-/// payload fields undecoded) and must therefore decode before deriving.
+/// The two DAG run-graph readers share it: the issue #690 API handler and the
+/// issue #957 Vantage UI page. So they never disagree about whether the issue
+/// #780 compensation filter sees real payloads. Both load raw through
+/// `store::load_history_with_timestamps`, which leaves payload fields
+/// undecoded. So both must decode before deriving.
 ///
 /// Skips the pass entirely when nothing in the history is opaque, so the
-/// default deployment does no extra work. Degrades — never errors — because
-/// this is a read-only observability surface: the worst case is the narrow
-/// cross-version display inaccuracy the filter exists to fix, which is strictly
-/// better than failing the page.
+/// default deployment does no extra work. It degrades and never errors,
+/// because this is a read-only observability surface. The worst case is the
+/// narrow cross-version display inaccuracy that the filter exists to fix.
+/// That is strictly better than failing the page.
 pub(crate) async fn decode_graph_history(
     rows: Vec<(chrono::DateTime<chrono::Utc>, WorkflowEvent)>,
     exec_id: ExecutionId,
@@ -7412,22 +7350,21 @@ pub(crate) fn extension_session(maybe_session: Option<Extension<Session>>) -> Op
 /// records payload content (the outcome carries counts only, and none of the
 /// recorded fields derive from payload bytes).
 ///
-/// `source_override` pins the audit row's `source` for surfaces whose
-/// provenance is not header-derived: ui.rs call sites pass
-/// `Some(SOURCE_UI)` (matching every other audit row that file writes);
-/// API handlers pass `None` to keep the header-derived default.
+/// `source_override` pins the audit row's `source` where the headers do not
+/// give the provenance. ui.rs call sites pass `Some(SOURCE_UI)`, as every
+/// other audit row of that file does. API handlers pass `None` to keep the
+/// header-derived default.
 ///
-/// # Connection discipline (PR #936 review)
+/// # Connection discipline (PR #936)
 ///
-/// `conn` is the caller's already-held pooled connection, when it has one:
-/// the audit row is written through it, mirroring how the SSE stream-open
-/// audit reuses its handler's connection. A caller passing `Some` **must**
-/// hold a connection to the shard named by `shard` (every such caller reads
-/// the execution through `db_conn_for_execution` and passes
-/// `exec_id.shard()`). A caller passing `None` **must not** hold a live
-/// pooled connection across this await — with a pool sized to one connection
-/// the second acquire would stall until the pool timeout and then silently
-/// skip the audit.
+/// `conn` is the pooled connection the caller already holds, if any. The
+/// audit row is written through it, as the SSE stream-open audit reuses its
+/// handler's connection. A caller passing `Some` **must** hold a connection
+/// to the shard named by `shard` (every such caller reads the execution
+/// through `db_conn_for_execution` and passes `exec_id.shard()`). A caller
+/// passing `None` **must not** hold a live pooled connection across this
+/// await. With a pool of one connection, the second acquire would stall until
+/// the pool timeout. It would then silently skip the audit.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn audit_decoded_read(
     api_state: &HarvestApiState,
@@ -7487,9 +7424,9 @@ pub(crate) async fn audit_decoded_read(
 ///
 /// Extracts the inner payload from the adjacently-tagged envelope
 /// `{"type":"…","data":{…}}` (the `event:` field already carries the type).
-/// With no decoder this is byte-identical to the pre-#608 `sse_data`
-/// closure; with an active decoder the frame's payload copy is tolerantly
-/// decoded in place — the stored row is never touched.
+/// With no decoder, this is byte-identical to the pre-#608 `sse_data`
+/// closure. With an active decoder, the payload copy of the frame is
+/// tolerantly decoded in place. The stored row is never touched.
 pub(crate) fn sse_frame_data(
     event_data: &serde_json::Value,
     decoder: Option<&PayloadCodecs>,
@@ -7505,9 +7442,10 @@ pub(crate) fn sse_frame_data(
     )
 }
 
-/// Tolerantly decode a TEXT `error` field copy in place (issue #608):
-/// rewritten only when the stored string is exactly a serialized codec
-/// envelope ([`PayloadCodecs::decode_error_string_lossy`]); plain error text
+/// Tolerantly decode a TEXT `error` field copy in place (issue #608).
+///
+/// The field changes only when the stored string is exactly a serialized codec
+/// envelope ([`PayloadCodecs::decode_error_string_lossy`]). Plain error text
 /// and non-envelope JSON stay byte-identical.
 pub(crate) fn decode_error_field(codecs: &PayloadCodecs, error: &mut String) -> LossyDecodeOutcome {
     let (rewritten, outcome) = codecs.decode_error_string_lossy(error);
@@ -8410,6 +8348,7 @@ pub const fn management_api_request_fields()
             Some(&[]),
         ),
         // ── per-activity-type pause/resume (issue #807) ───────────────────
+        //
         // Both bodies are optional; resume carries no fields at all (it deletes
         // the pause row, so there is no provenance for a field to set).
         (
@@ -8492,11 +8431,10 @@ pub const fn management_api_response_fields()
         (
             "GET",
             "/workflows/{id}/children",
-            // `status` + `unavailable_shards` added additively (issue #756's
-            // contract, extended here by #956): the traversal already spans
-            // every shard, and cross-shard child placement makes an unreachable
-            // shard routine — so it degrades to `200 partial` naming the shard
-            // rather than a `500`.
+            // `status` + `unavailable_shards` added additively (the issue #756
+            // contract, extended here by #956). The traversal spans every shard,
+            // and cross-shard child placement makes an unreachable shard routine.
+            // So it degrades to a `200 partial` that names the shard, not a `500`.
             Some(&["items", "next_cursor", "status", "unavailable_shards"]),
         ),
         (
@@ -8534,8 +8472,8 @@ pub const fn management_api_response_fields()
         (
             "GET",
             "/workflows/{id}/tree",
-            // Issue #621. The body is polymorphic: the default is the nested
-            // tree (`root` carries `children`), `?summary=true` is the
+            // Issue #621. The body is polymorphic. The default is the nested
+            // tree (`root` carries `children`). `?summary=true` gives the
             // per-state descendant roll-up (`root` is a compact ref, plus
             // `counts`/`total_descendants`). Both shapes' top-level fields are
             // enumerated here so the registry ↔ contract cross-check covers
@@ -9151,12 +9089,11 @@ pub const fn management_api_response_fields()
         // ── batch operations ──────────────────────────────────────────────────
         ("GET", "/batch-operations", None), // Vec<BatchJobView> (external model)
         // Polymorphic: 202 `{batch_job_id}` (real submit) or 200 preview
-        // (`dry_run: true`, issue #769). Following the GET /workflows/{id}/stack
-        // and GET /admin/build-routing precedent, every TOP-LEVEL field of both
-        // response shapes is enumerated here AND in the contract's
-        // success_response.fields (the two must match exactly); `notes` is
-        // reserved for the 202-vs-200 polymorphism and the NESTED per_shard /
-        // sample / unavailable_shards object shapes.
+        // (`dry_run: true`, issue #769). As for GET /workflows/{id}/stack and
+        // GET /admin/build-routing, every TOP-LEVEL field of both shapes is
+        // listed here AND in the contract's success_response.fields. The two
+        // must match exactly. `notes` covers the 202-vs-200 polymorphism and the
+        // NESTED per_shard / sample / unavailable_shards object shapes.
         (
             "POST",
             "/batch-operations",
@@ -9230,9 +9167,9 @@ pub const fn management_api_response_fields()
             "GET",
             "/admin/queue-coverage",
             // `sample_task_ids`/`sample_execution_ids`/`shard_breakdown` (issue
-            // #774 AC3) are nested inside items[] and are documented in the
-            // contract description, not listed here — this list is top-level
-            // fields only (precedent: /admin/workflow-types/reachability).
+            // #774 AC3) are nested inside items[]. The contract description
+            // documents them. This list holds top-level fields only, as for
+            // /admin/workflow-types/reachability.
             Some(&[
                 "status",
                 "observed_at",
@@ -9307,10 +9244,9 @@ pub const fn management_api_response_fields()
         (
             "GET",
             "/admin/workflow-types/reachability",
-            // `sample_execution_ids` (issue #700 AC2) is nested inside items[]
-            // and is documented in the contract description, not listed here —
-            // this list is top-level fields only (precedent: next_retry_at/input
-            // on /stack).
+            // `sample_execution_ids` (issue #700 AC2) is nested inside items[].
+            // The contract description documents it. This list holds top-level
+            // fields only, as for next_retry_at/input on /stack.
             Some(&[
                 "status",
                 "observed_at",
@@ -9512,6 +9448,7 @@ pub const fn management_api_response_fields()
         ("GET", "/admin/rate-limits", None), // Vec<RateLimitBucketView> (declared baseline + effective/override state, issue #945)
         ("POST", "/admin/rate-limits/{key}", Some(&["ok"])),
         // ── TTL'd runtime pacing overrides (issue #945) ───────────────────────
+        //
         // Every route below returns the identical PacingOverrideResponse shape
         // on the happy 200 path; a partial-shard SET/CLEAR write instead
         // returns 207 with {"override": ..., "shard_errors": [...]}. The
@@ -10202,21 +10139,20 @@ async fn shards_health(
 /// `GET /admin/queue-coverage` — report task queues with pending work but
 /// zero live workers polling them (issue #774).
 ///
-/// Read-only, admin-gated, and infallible with respect to shard reachability:
-/// fans out across every readable shard and folds a per-shard failure into
-/// that shard's inspection error rather than failing the request wholesale
-/// (see [`crate::queue_coverage`]'s module docs for the coverage definition,
-/// paused-queue exclusion, and the distinction from build-id reachability
-/// (#171) and shard health (#522)).
+/// Read-only, admin-gated, and infallible with respect to shard reachability.
+/// It fans out across every readable shard. A per-shard failure becomes that
+/// shard's inspection error and does not fail the request. The module docs of
+/// [`crate::queue_coverage`] give the coverage definition and the paused-queue
+/// exclusion. They also tell it from build-id reachability (#171) and shard
+/// health (#522).
 ///
 /// The one thing this endpoint *does* reject outright is a malformed query
-/// string: the raw query is parsed via
-/// [`crate::strict_query::parse_raw_query_pairs_strict`] rather than axum's
-/// built-in `Query<Vec<(String, String)>>` extractor, so an invalid
-/// percent-encoded byte sequence (e.g. `?queue_name=%FF`) returns the
-/// documented `400` JSON error instead of silently substituting `U+FFFD`
-/// and reporting a false-clean result for a scoped deploy gate (issue #774
-/// review; swept to every other raw-pairs route by issue #1151).
+/// string. [`crate::strict_query::parse_raw_query_pairs_strict`] parses the
+/// raw query, not the `Query<Vec<(String, String)>>` extractor of axum. So an
+/// invalid percent-encoded byte sequence (e.g. `?queue_name=%FF`) returns the
+/// documented `400` JSON error. It does not silently become `U+FFFD` and give
+/// a false-clean result for a scoped deploy gate (issue #774). Issue #1151
+/// applied this to every other raw-pairs route.
 async fn queue_coverage(
     Extension(api_state): Extension<HarvestApiState>,
     axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
@@ -10248,18 +10184,16 @@ async fn admin_status(
 ///
 /// Read-only, admin-gated. Serves the [`EffectiveConfigView`] carried by the
 /// installed runtime. Secret-bearing configuration (notification URLs, sharded
-/// pool handle) is surfaced only as presence booleans/counts — never a value —
-/// so a connection string can never appear in the response.
+/// pool handle) appears only as presence booleans or counts, never a value. So
+/// a connection string never appears in the response.
 ///
-/// The snapshot lives *on* the [`HarvestApiRuntime`] (attached by the shared
-/// `HarvestRunner::start` bring-up seam every deployment funnels through). A
-/// genuinely un-started runtime fails closed with the standard "runtime not
-/// started" error. A runtime installed through the public
-/// [`HarvestApiRuntime::new`] constructor without
-/// [`HarvestApiRuntime::with_effective_config`] carries no captured snapshot and
-/// *also* fails closed — for an incident-triage endpoint a plausible-but-wrong
-/// fabricated config is worse than an honest error, so a placeholder is never
-/// served.
+/// The snapshot lives *on* the [`HarvestApiRuntime`]. The shared
+/// `HarvestRunner::start` bring-up seam of every deployment attaches it. An
+/// un-started runtime fails closed with the standard "runtime not started"
+/// error. A runtime from [`HarvestApiRuntime::new`] without
+/// [`HarvestApiRuntime::with_effective_config`] has no snapshot. It *also*
+/// fails closed. For an incident-triage endpoint, a plausible but wrong config
+/// is worse than an honest error.
 ///
 /// The body also carries `overrides`, the count of the stored operator
 /// overrides (issue #2388). It is `null` when the runtime has no storage pool.
@@ -10292,12 +10226,12 @@ struct EffectiveConfigResponse {
 /// `GET /admin/canary` — synthetic liveness canary freshness report (issue #796).
 ///
 /// Read-only and admin-gated. Reports, per `(queue, shard)`, the age of the
-/// most recent COMPLETED built-in probe run so an operator (or a staleness
-/// alert) can tell a live pipeline from a wedged one — a stale probe means
-/// workers on that queue/shard are polling but never completing, the scheduler
-/// tick stalled, or the shard is write-blocked. Fans out across every writable
-/// shard; an unreachable shard is named in `unavailable_shards` and drops
-/// `status` to `partial`/`unavailable` rather than failing the call wholesale.
+/// latest COMPLETED built-in probe run. An operator or a staleness alert can
+/// then tell a live pipeline from a wedged one. A stale probe means that
+/// workers on that queue and shard poll but never complete, the scheduler
+/// tick stalled, or the shard is write-blocked. Fans out across
+/// every writable shard. `unavailable_shards` names an unreachable shard, and
+/// `status` drops to `partial`/`unavailable`. The call does not fail.
 /// When the canary is disabled an empty `complete` report is returned.
 ///
 /// **Distinct from the #512 replay canary** (`POST /admin/workflows/replay-canary`),
@@ -10315,10 +10249,10 @@ async fn admin_canary(
 /// Read-only and side-effect-free: it runs the per-key census and reads the
 /// sweep's resume cursor; it never rewrites a row and never advances the sweep.
 ///
-/// Fails **closed** on partial availability, exactly like the retirement gate
-/// the operator uses this screen to decide about: a shard that cannot be read
-/// is reported in `unavailable_shards` with `status: "partial"`, never omitted
-/// and never counted as zero rows remaining.
+/// Fails **closed** on partial availability, like the retirement gate that
+/// the operator decides with this screen. An unreadable shard appears in
+/// `unavailable_shards` with `status: "partial"`. It is never omitted and
+/// never counted as zero rows remaining.
 ///
 /// The body carries operator-chosen key *identifiers* and row counts only —
 /// no key material and no payload content.
@@ -10327,12 +10261,12 @@ async fn codec_rotation_status(
 ) -> Result<Json<Value>, AutumnError> {
     let codecs = api_state.payload_codecs();
     // Pin the active key ONCE, before the fan-out. Each shard is read on its
-    // own connection, so reading the key per shard lets a concurrent
-    // `set_active_key` straddle the report: shards seen before the flip count
-    // their old-key rows as converted, shards seen after count the same key's
-    // rows as remaining, and the body advertises whichever key won the race.
+    // own connection. A key read per shard lets a concurrent `set_active_key`
+    // straddle the report. Shards seen before the flip count their old-key
+    // rows as converted. Shards seen after count the rows of the same key as
+    // remaining. The body then shows whichever key won the race.
     // The dangerous reading is `rows_remaining_total: 0` beside the *new*
-    // `active_key_id` -- which the runbook tells the operator means the
+    // `active_key_id`. The runbook tells the operator that this means the
     // outgoing key is safe to retire.
     let active_key_id = codecs.active_key_id();
     let observations = observe_shards(&api_state, |shard_id, mut conn| {
@@ -10487,11 +10421,12 @@ struct BatchOperationPreview {
     unavailable_shards: Vec<UnavailableShard>,
 }
 
-/// One shard's contribution to a dry-run preview (issue #769) — either an
-/// exact count with a (possibly empty) sample, or an unavailable shard with a
-/// reason. The plugin handler builds a `Vec` of these while doing the DB I/O
-/// (skipping the sample query once the global cap is filled) and hands it to
-/// the pure [`fold_batch_shard_previews`] for cross-shard accumulation.
+/// One shard's contribution to a dry-run preview (issue #769).
+///
+/// It is an exact count with a sample, possibly empty, or an unavailable shard
+/// with a reason. The plugin handler builds a `Vec` of these during the DB
+/// I/O. It skips the sample query once the global cap is full. The pure
+/// [`fold_batch_shard_previews`] then accumulates them across shards.
 #[derive(Debug)]
 enum ShardPreviewOutcome {
     /// A reachable shard: exact `count` of matched executions plus up to the
@@ -10505,10 +10440,11 @@ enum ShardPreviewOutcome {
     Unavailable { shard_id: i32, reason: String },
 }
 
-/// The cross-shard-accumulated parts of a dry-run preview (issue #769),
-/// produced purely (no DB) from per-shard [`ShardPreviewOutcome`]s so the
-/// multi-shard sum / global-sample-cap / partial-degradation logic is unit
-/// testable without a multi-shard database.
+/// The cross-shard parts of a dry-run preview (issue #769).
+///
+/// A pure fold of per-shard [`ShardPreviewOutcome`]s builds them, with no DB.
+/// So unit tests cover the multi-shard sum, the global sample cap and the
+/// partial degradation without a multi-shard database.
 #[derive(Debug)]
 struct FoldedBatchPreview {
     matched_count: usize,
@@ -10519,12 +10455,14 @@ struct FoldedBatchPreview {
     unavailable_shards: Vec<UnavailableShard>,
 }
 
-/// Fold per-shard preview outcomes into the cross-shard preview parts
-/// (issue #769): sum the exact counts of reachable shards, fill the GLOBAL
-/// `sample_cap` across shards (NOT per shard), compute `sample_truncated`, and
-/// degrade to `status = "partial"` naming any unavailable shard (mirroring
-/// `POST /workflows/batch_reset`). `matched_count` covers reachable shards
-/// only — a lower bound when any shard is unavailable.
+/// Fold per-shard preview outcomes into the cross-shard preview parts.
+///
+/// It sums the exact counts of reachable shards (issue #769). It fills the
+/// GLOBAL `sample_cap` across shards, NOT per shard, and computes
+/// `sample_truncated`. It degrades to `status = "partial"` and names each
+/// unavailable shard, as `POST /workflows/batch_reset` does. `matched_count`
+/// covers reachable shards only, so it is a lower bound when a shard is
+/// unavailable.
 fn fold_batch_shard_previews(
     outcomes: Vec<ShardPreviewOutcome>,
     sample_cap: usize,
@@ -10633,13 +10571,13 @@ async fn submit_batch_operation(
         }
     }
 
-    // Dry-run preview (issue #769): resolve the SAME filter across every shard
-    // via the shared `apply_batch_filters` predicate the real submit uses, and
-    // return a 200 preview with an exact matched_count, a per-shard breakdown,
-    // and a bounded sample. Performs ZERO writes — no job row, no transitions,
-    // no signals, and (per the read-only contract) no audit row. Deliberately
-    // skips the Signal `signal_name` requirement and the signal-payload cap:
-    // the preview reports blast radius, not signal validity.
+    // Dry-run preview (issue #769). Resolve the SAME filter across every shard
+    // with the `apply_batch_filters` predicate of the real submit. Return a
+    // 200 preview with an exact matched_count, a per-shard breakdown, and a
+    // bounded sample. It performs ZERO writes: no job row, no transitions, no
+    // signals, and, per the read-only contract, no audit row. It skips the
+    // Signal `signal_name` requirement and the signal-payload cap on purpose.
+    // The preview reports blast radius, not signal validity.
     if request.dry_run {
         if request.filter.is_empty() {
             return Err(AutumnError::bad_request_msg(batch::BATCH_EMPTY_FILTER_ERR));
@@ -10647,18 +10585,17 @@ async fn submit_batch_operation(
 
         // Fail-closed: a totally-unconfigured storage layer is an honest error,
         // not a partial-200 (mirrors `observe_shards`). `pools_by_shard` below
-        // returns the live per-shard pools; we still guard here so a boot-window
-        // / misconfigured storage returns the storage error rather than an empty
+        // returns the live per-shard pools. This guard still makes a boot-window
+        // or misconfigured storage return the storage error, not an empty
         // fan-out.
         let _pool = api_state.storage_pool().map_err(map_error)?;
         // Fan out across the ROUTER-KNOWN shard set — every shard with a live
         // pool AND every shard the router advertises via
-        // `readable_shards`/`default_shard`. A shard mid a shard-add rollout
-        // that this process has no pool for yet is folded into
-        // `unavailable_shards` (→ `status = "partial"`) rather than silently
-        // omitted, which would let `status` read `complete` even though that
-        // shard was never queried (issue #769 review; mirrors
-        // `observe_shards`/`workflow_count`).
+        // `readable_shards`/`default_shard`. In a shard-add rollout, a shard
+        // with no pool here yet goes into `unavailable_shards`, so `status`
+        // becomes `partial` (issue #769). Silently omitting it would let
+        // `status` read `complete` for a shard that was never queried. Mirrors
+        // `observe_shards`/`workflow_count`.
         let pools = crate::shard_fanout::pools_by_shard(&api_state);
         let expected = crate::shard_fanout::expected_shards(&api_state, &pools);
         // Track how many sample rows are already pulled, to SKIP the sample
@@ -10670,10 +10607,9 @@ async fn submit_batch_operation(
         let mut sample_pulled: usize = 0;
 
         for (sid, maybe_pool) in resolve_expected_shard_pools(&expected, &pools) {
-            // A shard the router advertises but this process has no pool for yet
-            // (mid a shard-add rollout) is reported unavailable here — never
-            // resolved through a default-shard fallback, which would query the
-            // wrong DB and falsely read `complete`.
+            // A shard that the router advertises, with no pool here yet (as in a
+            // shard-add rollout), is reported unavailable. A default-shard
+            // fallback would query the wrong DB and falsely read `complete`.
             let Some(shard_pool) = maybe_pool else {
                 outcomes.push(ShardPreviewOutcome::Unavailable {
                     shard_id: sid,
@@ -10702,9 +10638,8 @@ async fn submit_batch_operation(
                         continue;
                     }
                 };
-            // Global cap: only pull enough to fill the sample to the cap across
-            // ALL shards, not per shard — and skip the query entirely once
-            // full.
+            // The cap is global across ALL shards, not per shard. Pull only
+            // enough to fill it, and skip the query once it is full.
             let remaining = BATCH_DRY_RUN_SAMPLE_CAP.saturating_sub(sample_pulled);
             let sample_rows = if remaining > 0 {
                 match batch::sample_targets_on_shard(
@@ -10751,10 +10686,10 @@ async fn submit_batch_operation(
         return Ok((axum::http::StatusCode::OK, Json(preview)).into_response());
     }
 
-    // Enforce the signal payload cap at submission so oversized payloads are
-    // rejected before the job is persisted rather than silently bypassing the
-    // cap once per matched execution during dispatch (the single-signal API
-    // enforces the same cap before calling signal::send_signal).
+    // Enforce the signal payload cap at submission. An oversized payload is
+    // then rejected before the job is persisted. It does not silently bypass
+    // the cap once per matched execution during dispatch. The single-signal
+    // API enforces the same cap before it calls signal::send_signal.
     if action == BatchAction::Signal
         && let Some(payload) = &request.signal_payload
         && let Ok(rt) = api_state.runtime()

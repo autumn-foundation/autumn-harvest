@@ -65,8 +65,8 @@ pub struct StartWorkflowParams<'a> {
     /// [`WorkflowIdConflictPolicy::Unspecified`] preserves the reuse policy's
     /// native active behavior.
     pub conflict_policy: WorkflowIdConflictPolicy,
-    /// W3C trace context captured at the call site (e.g., from the HTTP handler's
-    /// `harvest.workflow.schedule` span) and stored on the task row so the worker
+    /// W3C trace context captured at the call site, e.g. the HTTP handler's
+    /// `harvest.workflow.schedule` span. The task row stores it, so the worker
     /// can stitch the trace across the queue boundary (ADR-0001 §3).
     pub trace_context: Option<TraceContextCarrier>,
     /// Server-side ceiling applied to `execution_timeout` (issue #243).
@@ -81,17 +81,17 @@ pub struct StartWorkflowParams<'a> {
     /// continue-as-new. `None` = the caller specified no chain cap for this start
     /// (a fleet-wide ceiling may still apply — see [`Self::max_workflow_chain_timeout_ceiling`]).
     pub chain_execution_timeout: Option<chrono::Duration>,
-    /// Server-side ceiling on the chain cap (issue #617). Unlike
-    /// [`Self::max_execution_timeout_ceiling`] (which only caps a *specified*
-    /// per-run timeout), this ceiling ALSO acts as a fleet-wide default: a
-    /// workflow that specifies no chain cap still inherits the ceiling as its
-    /// chain deadline. Typically populated from
-    /// `BuiltHarvest::max_workflow_chain_timeout` by the plugin layer.
+    /// Server-side ceiling on the chain cap (issue #617).
+    /// [`Self::max_execution_timeout_ceiling`] only caps a *specified* per-run
+    /// timeout. This ceiling ALSO acts as a fleet-wide default: a workflow that
+    /// specifies no chain cap still inherits the ceiling as its chain deadline.
+    /// Typically populated from `BuiltHarvest::max_workflow_chain_timeout` by
+    /// the plugin layer.
     pub max_workflow_chain_timeout_ceiling: Option<chrono::Duration>,
     /// Inherited absolute chain deadline for a continuation of the same logical
-    /// run (issue #617). When `Some`, it is used VERBATIM as `chain_deadline_at`
-    /// (workflow-level retry #523 carries the origin's chain deadline forward,
-    /// since a retry is the same logical run continuing). When `None`, the chain
+    /// run (issue #617). When `Some`, it is used VERBATIM as `chain_deadline_at`.
+    /// Workflow-level retry (#523) carries the origin's chain deadline forward,
+    /// since a retry continues the same logical run. When `None`, the chain
     /// deadline is computed fresh as `target_start_time + effective_chain_timeout`.
     /// Continue-as-new does not use this field: it carries the chain columns
     /// directly on the successor insert in the worker.
@@ -193,9 +193,9 @@ pub struct StartWorkflowParams<'a> {
     ///
     /// One of [`ORIGIN_SCHEDULED`], [`ORIGIN_BACKFILL`], or [`ORIGIN_MANUAL_TRIGGER`]
     /// for schedule-attributed runs (set alongside `schedule_id`); `None` for every
-    /// non-scheduled call site. Persisted as metadata only — it never affects replay,
-    /// carryover, or shard routing, and is surfaced solely by the per-schedule
-    /// run-history endpoint to distinguish normal cadence from backfill/manual fires.
+    /// non-scheduled call site. It is metadata only and never affects replay,
+    /// carryover, or shard routing. Only the per-schedule run-history endpoint
+    /// surfaces it, to tell normal cadence from backfill/manual fires.
     pub origin: Option<&'a str>,
     /// Per-execution completion-callback targets (issue #605): a JSON array
     /// of `{url, filter}` objects (see
@@ -266,32 +266,35 @@ pub const ORIGIN_BACKFILL: &str = "backfill";
 /// Origin marker for an ad-hoc operator `trigger-now` fire of a schedule (issue #534).
 pub const ORIGIN_MANUAL_TRIGGER: &str = "manual_trigger";
 
-/// Bounded retry cap for the active-conflict seal-race load (issue #685 review,
-/// Codex P2). Each retry's `FOR UPDATE` naturally blocks on whichever concurrent
-/// contender currently holds the row lock, so this caps the number of distinct
-/// serialized winners a single loser will wait behind before falling back to the
-/// pre-existing `NotFound`.
+/// Bounded retry cap for the active-conflict seal-race load (issue #685).
+///
+/// Each retry's `FOR UPDATE` blocks on the contender that holds the row lock.
+/// So this caps the number of distinct serialized winners that one loser waits
+/// behind before it falls back to the pre-existing `NotFound`.
 ///
 /// N concurrent replace-type starts (e.g. `terminate_existing`) against one key
-/// serialize: each seals the current survivor before inserting its own, so the
+/// serialize. Each seals the current survivor before it inserts its own. So the
 /// LAST loser can wait behind up to N-1 winners and needs up to N-1 retries to
 /// see the final survivor. Convergence is therefore guaranteed once the cap
-/// exceeds the concurrent-burst size (there are only ever N fixed contenders, so
+/// exceeds the concurrent-burst size. There are only N fixed contenders, so
 /// after at most N seals the last survivor is never sealed again and stays
-/// RUNNING). This cap is set generously above realistic concurrent-delivery
-/// bursts; because a retry BLOCKS on a real lock holder (forward progress, not a
-/// busy-loop), a high cap costs nothing in the common case — it only bounds the
-/// truly-stuck pathological case (a burst larger than the cap, or a prior sealed
-/// WITHOUT a replacement, e.g. a concurrent reset), which falls back to the
-/// pre-existing terminal `NotFound`.
+/// RUNNING.
+///
+/// The cap sits well above realistic concurrent-delivery bursts. A retry BLOCKS
+/// on a real lock holder (forward progress, not a busy-loop), so a high cap
+/// costs nothing in the common case. It only bounds the truly stuck case: a
+/// burst larger than the cap, or a prior sealed WITHOUT a replacement (e.g. a
+/// concurrent reset). That case falls back to the pre-existing terminal
+/// `NotFound`.
 const SEAL_RACE_MAX_LOAD_RETRIES: u32 = 64;
 
-/// Small fixed backoff (milliseconds) between seal-race load retries. In the
-/// contended case the re-issued `FOR UPDATE` already blocks on the current lock
-/// holder (so the winner is committed and this sleep is negligible); the backoff
-/// only prevents a tight busy-loop in the pathological "sealed without a
-/// replacement" case, where the re-issued load returns `None` immediately with no
-/// lock holder to block on.
+/// Small fixed backoff (milliseconds) between seal-race load retries.
+///
+/// In the contended case the re-issued `FOR UPDATE` already blocks on the
+/// current lock holder, so the winner is committed and this sleep is
+/// negligible. The backoff only prevents a tight busy-loop in the "sealed
+/// without a replacement" case. There the re-issued load returns `None` at
+/// once, with no lock holder to block on.
 const SEAL_RACE_LOAD_BACKOFF_MS: u64 = 1;
 
 impl<'a> StartWorkflowParams<'a> {
@@ -381,9 +384,9 @@ pub struct StartCancelledRun {
     pub workflow_name: String,
     /// Task queue the cancelled run was on.
     pub queue_name: String,
-    /// `true` when the cancellation was a latest-wins supersede (issue #811) —
-    /// i.e. a newer admission for the same `(workflow_name, concurrency_key)`
-    /// shed this run to respect the per-key limit. Drives
+    /// `true` when the cancellation was a latest-wins supersede (issue #811). A
+    /// newer admission for the same `(workflow_name, concurrency_key)` shed this
+    /// run to respect the per-key limit. Drives
     /// [`crate::telemetry::METRIC_CONCURRENCY_SUPERSEDED`] in addition to the
     /// ordinary cancelled-terminal counter.
     pub superseded: bool,
@@ -404,9 +407,9 @@ impl StartCancelledRun {
 
 /// Emit every metric owed for runs a start cancelled as a side effect.
 ///
-/// The ONE place that turns a start's cancelled-run list into samples, so a new
+/// The ONE place that turns a start's cancelled-run list into samples. So a new
 /// caller of [`start_or_load_workflow_execution_collect`] cannot emit the
-/// terminal counter while silently dropping
+/// terminal counter and silently drop
 /// [`crate::telemetry::METRIC_CONCURRENCY_SUPERSEDED`].
 ///
 /// MUST be called only **after** the caller's outer transaction commits — a
@@ -1034,9 +1037,9 @@ fn record_load_shed_rejected(
 }
 
 /// Record a `harvest.admission.blocked` count for a gated start (issue #618, PR
-/// #1014). Uses the caller-supplied recorder when present, else the process-global
-/// recorder the plugin publishes at boot — so a block on a metrics-less internal
-/// start path (cancel / terminate / parent-close cascade) is still counted.
+/// #1014). Prefer the caller-supplied recorder, else the process-global one the
+/// plugin publishes at boot. So a block on a metrics-less internal start path
+/// (cancel / terminate / parent-close cascade) is still counted.
 fn record_start_gate_block(
     metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
     scope_kind: &str,
@@ -1058,12 +1061,12 @@ fn record_start_gate_block(
 /// Emit `harvest.quota.rejected{workflow, resource}` (issue #946) for a fresh
 /// start rejected by a declared per-tenant [`crate::quota::QuotaPolicy`] cap.
 ///
-/// Mirrors [`record_start_gate_block`] exactly: prefer the caller-supplied
-/// `metrics` recorder (the live worker/HTTP-request path always has one),
-/// falling back to the process-global admission-metrics recorder the plugin
-/// publishes at boot for the rarer background-scanner call sites that carry
-/// no recorder of their own. The resolved tenant key is deliberately never
-/// passed here -- see [`crate::telemetry::METRIC_QUOTA_REJECTED`] for why.
+/// Mirrors [`record_start_gate_block`] exactly. It prefers the caller-supplied
+/// `metrics` recorder, which the live worker/HTTP-request path always has. It
+/// falls back to the process-global admission-metrics recorder the plugin
+/// publishes at boot. That serves the rarer background-scanner call sites that
+/// carry no recorder of their own. The resolved tenant key is deliberately
+/// never passed here -- see [`crate::telemetry::METRIC_QUOTA_REJECTED`] for why.
 fn record_quota_rejected_metric(
     metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
     workflow_name: &str,
@@ -1076,19 +1079,30 @@ fn record_quota_rejected_metric(
     }
 }
 
+/// A `cancel_running` supersede pass that has not run yet.
+///
+/// Described so [`enforce_quota_admission`] can dry-run its own credit, under
+/// its own quota lock. See that function's doc comment (issue #1228).
+pub(crate) struct PendingSupersede<'a> {
+    pub(crate) concurrency_key: &'a str,
+    pub(crate) concurrency_limit: u32,
+    pub(crate) self_exec_id: ExecutionId,
+}
+
 /// Enforce the declared per-tenant resource quota (issue #946) against a
 /// row this transaction just inserted, before its `WorkflowStarted` event is
-/// appended. **The single source of truth for quota enforcement** -- shared
-/// by BOTH row-creation branches inside
-/// [`start_or_load_workflow_execution_collect`]'s transaction: the
-/// `on_conflict_do_nothing()` fresh-insert branch, and [`replace_execution`]
-/// (reached by `AllowDuplicateFailedOnly`/`TerminateIfRunning`/a
-/// conflict-driven `Terminate` replacing a prior row). Before this helper
-/// existed, `replace_execution`'s three call sites bypassed enforcement
-/// entirely, letting a caller loop `TerminateIfRunning` or
-/// `AllowDuplicateFailedOnly` against one stable `workflow_id` to accumulate
-/// unbounded active executions/history/DLQ rows for a key well past its
-/// declared cap.
+/// appended.
+///
+/// **The single source of truth for quota enforcement.** Both row-creation
+/// branches inside [`start_or_load_workflow_execution_collect`]'s transaction
+/// share it: the `on_conflict_do_nothing()` fresh-insert branch, and
+/// [`replace_execution`]. The second is reached by
+/// `AllowDuplicateFailedOnly`/`TerminateIfRunning`/a conflict-driven
+/// `Terminate` replacing a prior row. Before this helper existed,
+/// `replace_execution`'s three call sites bypassed enforcement entirely. A
+/// caller could loop `TerminateIfRunning` or `AllowDuplicateFailedOnly`
+/// against one stable `workflow_id`. That accumulated unbounded active
+/// executions/history/DLQ rows for a key well past its declared cap.
 ///
 /// `pub(crate)` (not private) so `worker.rs`'s spawned-child insertion paths
 /// can call the SAME enforcement after inserting a child's row. These are
@@ -1100,23 +1114,14 @@ fn record_quota_rejected_metric(
 /// exactly like any other registry-aware start. So it must not be invisible
 /// to enforcement.
 ///
-/// `has_any_cap()` false (a declared `QuotaPolicy` with no `with_max_*`
-/// calls) and an unresolvable key (missing/null/non-object input field,
-/// mirroring the fail-open behavior `concurrency_key IS NULL` already has at
-/// claim time for issue #247) both skip enforcement entirely -- a no-policy
-/// workflow pays only the one cheap `Option` check (AC9's "zero default
-/// overhead").
+/// Two cases skip enforcement entirely. One is `has_any_cap()` false (a
+/// declared `QuotaPolicy` with no `with_max_*` calls). The other is an
+/// unresolvable key (missing/null/non-object input field). That mirrors the
+/// fail-open behavior `concurrency_key IS NULL` already has at claim time for
+/// issue #247. A no-policy workflow pays only the one cheap `Option` check
+/// (AC9's "zero default overhead").
 ///
-/// A `cancel_running` supersede pass that has not run yet. Described so
-/// [`enforce_quota_admission`] can dry-run its own credit, under its own
-/// quota lock. See that function's doc comment (issue #1228 review, P1).
-pub(crate) struct PendingSupersede<'a> {
-    pub(crate) concurrency_key: &'a str,
-    pub(crate) concurrency_limit: u32,
-    pub(crate) self_exec_id: ExecutionId,
-}
-
-/// `pending_supersede` (issue #1228, Finding 1): describes a `cancel_running`
+/// `pending_supersede` (issue #1228): describes a `cancel_running`
 /// admission's supersede pass, which has not run yet. It WILL shed some
 /// incumbents, and their history bytes, on the same key before the
 /// transaction commits. This function dry-runs that shed count itself (see
@@ -1126,13 +1131,13 @@ pub(crate) struct PendingSupersede<'a> {
 /// passes `None` (no effect).
 ///
 /// The dry run happens HERE, after taking the quota lock below, not in the
-/// caller (issue #1228 review, P1). A scan taken before the lock can go
+/// caller (issue #1228). A scan taken before the lock can go
 /// stale. A concurrent admission for the SAME quota key could consume the
 /// credited capacity between the scan and this function's check. Taking the
 /// lock first serializes every admission for this key through this
 /// function. No such race survives.
 ///
-/// `self_exec_id` (issue #1228 review) is always excluded from usage too,
+/// `self_exec_id` (issue #1228) is always excluded from usage too,
 /// via the SAME query as the credited incumbents -- see
 /// [`crate::quota::load_quota_usage_excluding`]. It is not necessarily the
 /// row `pending_supersede.self_exec_id` names. That field describes the
@@ -1143,11 +1148,10 @@ pub(crate) struct PendingSupersede<'a> {
 /// [`run_latest_wins_supersede`]'s post-supersede recheck, which always
 /// passes `None` for `pending_supersede`.
 ///
-/// Returns the exact execution ids this admission credited (issue #1228
-/// review, P2) -- empty when `pending_supersede` was `None` or credited
-/// nothing. The caller passes this on to
-/// [`run_latest_wins_supersede`], which reconciles it against the real
-/// supersede pass's actual outcome once that pass runs.
+/// Returns the exact execution ids this admission credited (issue #1228).
+/// The list is empty when `pending_supersede` was `None` or credited nothing.
+/// The caller passes it on to [`run_latest_wins_supersede`], which reconciles
+/// it against the real supersede pass's actual outcome once that pass runs.
 pub(crate) async fn enforce_quota_admission(
     conn: &mut AsyncPgConnection,
     quota_policy: Option<crate::quota::QuotaPolicy>,
@@ -1219,8 +1223,8 @@ pub(crate) async fn enforce_quota_admission(
 /// and any deferred completion-trigger starts **without spawning them**.
 ///
 /// This is the low-level primitive for callers that run the start inside a
-/// larger outer transaction: the `DeferredTriggerStart`s must only be spawned
-/// *after* that outer transaction commits, otherwise trigger workflows could
+/// larger outer transaction. The `DeferredTriggerStart`s must only be spawned
+/// *after* that outer transaction commits. Otherwise trigger workflows could
 /// start for a start that later rolls back (issue #499 debounce scanner).
 ///
 /// The plain [`start_or_load_workflow_execution`] wrapper spawns them itself for
@@ -1238,43 +1242,50 @@ pub(crate) async fn enforce_quota_admission(
 ///
 /// `in_outer_transaction` tells the function whether the caller is running it
 /// inside the caller's own transaction. It matters only for the
-/// `TerminateIfRunning` pre-check cancellation, which commits (Transaction 1)
-/// before the replacement start (Transaction 2): if the replacement start then
-/// fails, the prior run's completion-trigger / parent-close follow-up starts
-/// must still be spawned for a **top-level** caller (`false`), but must be
-/// **suppressed** for a caller inside an outer transaction (`true`) whose
-/// rollback reverts that cancellation. On success the follow-ups are always
-/// returned for the caller to spawn after its outer commit.
+/// `TerminateIfRunning` pre-check cancellation. That cancellation commits
+/// (Transaction 1) before the replacement start (Transaction 2). If the
+/// replacement start then fails, the prior run's completion-trigger /
+/// parent-close follow-up starts must still be spawned for a **top-level**
+/// caller (`false`). They must be **suppressed** for a caller inside an outer
+/// transaction (`true`), whose rollback reverts that cancellation. On success
+/// the follow-ups are always returned for the caller to spawn after its outer
+/// commit.
 ///
 /// `reject_fresh_if_debounced`, when `true`, makes the function return
-/// [`HarvestError::DebounceFreshStart`] (rolling the transaction back) if the
-/// reuse-policy decision under the `FOR UPDATE` lock would create a **fresh**
-/// execution (insert, or a `replace_execution` seal+insert). An attach /
-/// return-existing decision proceeds normally. This is the atomic gate the
-/// debounce-aware HTTP entry points use to allow attach/idempotent calls while
-/// routing or rejecting true fresh starts without a TOCTOU (issue #499).
+/// [`HarvestError::DebounceFreshStart`] (rolling the transaction back) in one
+/// case. That is when the reuse-policy decision under the `FOR UPDATE` lock
+/// would create a **fresh** execution (insert, or a `replace_execution`
+/// seal+insert). An attach / return-existing decision proceeds normally. The
+/// debounce-aware HTTP entry points use this atomic gate. It allows
+/// attach/idempotent calls and routes or rejects true fresh starts without a
+/// TOCTOU (issue #499).
 ///
-/// `gate`, when `Some`, enforces the admission gate AUTHORITATIVELY at the point
-/// this function decides — under a `FOR UPDATE` lock on any prior run — that it
-/// will CREATE a new execution (issue #618, PR #1014). This closes the entire
-/// unlocked-pre-read TOCTOU class in one place: a caller no longer needs an
-/// unlocked existence check to decide whether to gate. For a non-`TerminateIfRunning`
-/// policy the prior is locked via [`try_load_active_execution_for_update`] at the
-/// top of the start transaction, its state fed to [`start_will_create_new_execution`],
-/// and the gate applied iff a new execution will be created (an idempotent ATTACH
-/// admits nothing and is never gated). For `TerminateIfRunning` — which always
-/// creates — the gate is applied ONCE, unlocked (a constant decision), *before*
-/// the pre-check cancellation, so a blocked start never cancels a prior. A blocked
-/// start returns [`HarvestError::AdmissionBlocked`] (rolling the transaction back —
-/// no fresh row, no events) and records `harvest.admission.blocked` exactly once.
-/// [`GateMode`](crate::admission_gate::GateMode) selects the cache read (fail-closed
-/// `Check` for fresh admissions, snapshot-only `CheckCached` for continuation).
+/// `gate`, when `Some`, enforces the admission gate AUTHORITATIVELY (issue
+/// #618, PR #1014). It applies where this function decides, under a `FOR
+/// UPDATE` lock on any prior run, that it will CREATE a new execution. This
+/// closes the entire unlocked-pre-read TOCTOU class in one place: a caller no
+/// longer needs an unlocked existence check to decide whether to gate.
+///
+/// For a non-`TerminateIfRunning` policy,
+/// [`try_load_active_execution_for_update`] locks the prior at the top of the
+/// start transaction. Its state feeds [`start_will_create_new_execution`]. The
+/// gate applies iff a new execution will be created. An idempotent ATTACH
+/// admits nothing and is never gated.
+///
+/// `TerminateIfRunning` always creates. So the gate applies ONCE, unlocked (a
+/// constant decision), *before* the pre-check cancellation. A blocked start
+/// therefore never cancels a prior. A blocked start returns
+/// [`HarvestError::AdmissionBlocked`] and rolls the transaction back (no fresh
+/// row, no events). It records `harvest.admission.blocked` exactly once.
+/// [`GateMode`](crate::admission_gate::GateMode) selects the cache read
+/// (fail-closed `Check` for fresh admissions, snapshot-only `CheckCached` for
+/// continuation).
 ///
 /// The quota key (declared [`crate::quota::QuotaPolicy`] key expression) is
 /// always resolved against `request.input`. See
 /// [`start_or_load_workflow_execution_collect_with_codecs_and_quota_override`]
 /// for the crate-private variant [`crate::event_batch`] uses to override
-/// that (Codex review, issue #1230 Finding 1 follow-up).
+/// that (issue #1230).
 ///
 /// # Errors
 ///
@@ -1352,14 +1363,13 @@ pub async fn start_or_load_workflow_execution_collect_with_codecs(
 /// the public API would let an external embedder pass an arbitrary value,
 /// e.g. `Some(&json!({}))`. That could make quota key resolution silently
 /// return `None` for a request whose real `input` resolves one. Every
-/// declared cap on that request would then go unenforced (Codex review,
-/// issue #1230 Finding 1 follow-up). Only [`crate::event_batch`] calls
-/// this directly; every other caller goes through the public,
-/// override-free wrapper above.
+/// declared cap on that request would then go unenforced (issue #1230).
+/// Only [`crate::event_batch`] calls this directly; every other caller goes
+/// through the public, override-free wrapper above.
 ///
 /// `quota_key_input_override`, when `Some`, is resolved against instead of
 /// `request.input` for the declared [`crate::quota::QuotaPolicy`]'s key
-/// expression (issue #1230 Finding 1). A batched fire's `request.input` is
+/// expression (issue #1230). A batched fire's `request.input` is
 /// the whole merged array of every admitted payload. That is not the
 /// single admission a quota key expression is meant to resolve against.
 /// `event_batch.rs` passes the first buffered payload here instead. Every
@@ -1457,14 +1467,14 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
     let assigned_build = policy.map(|p| p.resolve_assigned_build(exec_id));
 
     // Resolve the declared per-tenant quota policy (issue #946) from the
-    // process-global workflow metadata mirror -- the same registry-aware
-    // surface `concurrency`/`sla`/`retry_policy` already use to reach a
-    // `WorkflowInfo`'s admission-relevant fields from this core-crate
-    // function, which has no access to the plugin's live `HandlerRegistry`.
-    // `QuotaPolicy` is `Copy`, so this is a cheap read-lock + hashmap lookup,
-    // not a query -- a no-policy workflow pays only this (AC9 "zero default
-    // overhead"). The key is resolved via the SAME dot-path resolver
-    // `ConcurrencyPolicy`/`ThrottlePolicy` use (AC1) -- no second resolver.
+    // process-global workflow metadata mirror. `concurrency`/`sla`/`retry_policy`
+    // already use this registry-aware surface to reach a `WorkflowInfo`'s
+    // admission-relevant fields. This core-crate function has no access to the
+    // plugin's live `HandlerRegistry`. `QuotaPolicy` is `Copy`, so this is a
+    // cheap read-lock + hashmap lookup, not a query. A no-policy workflow pays
+    // only this (AC9 "zero default overhead"). The key is resolved via the SAME
+    // dot-path resolver `ConcurrencyPolicy`/`ThrottlePolicy` use (AC1) -- no
+    // second resolver.
     //
     // Resolved HERE, before the TerminateIfRunning pre-check below (issue
     // #946). So `quota_key` is known in time to decide whether that pre-check
@@ -1481,7 +1491,7 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
                     .and_then(|meta| meta.quota)
             });
     // Resolve against `quota_key_input_override` when the caller supplies
-    // one, not `request.input` (issue #1230 Finding 1). `event_batch.rs`
+    // one, not `request.input` (issue #1230). `event_batch.rs`
     // merges every buffered admission's payload into one JSON array before
     // calling this function. So `request.input` is that merged array, not
     // an object, for a batched-start fire. `resolve_quota_key` requires an
@@ -1510,14 +1520,13 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
             )
         });
     // A resolved key is stamped onto the row for EVERY admission that has
-    // one -- including a retry-exempt admission below, which still tags its
-    // row for future usage accounting -- so this bound must be checked
+    // one. That includes a retry-exempt admission below, which still tags its
+    // row for future usage accounting. So this bound must be checked
     // unconditionally here, before that exemption is even computed. It must
-    // also run before ANY DB work: an unbounded caller-controlled string
-    // reaching the indexed `quota_key` column can otherwise raise a raw
-    // Postgres "index row size exceeds maximum" error instead of a clean,
-    // typed rejection (issue #946 Codex review, "bound resolved quota keys
-    // before indexing them"). Rejecting rather than truncating/hashing is
+    // also run before ANY DB work. Without it, an unbounded caller-controlled
+    // string can reach the indexed `quota_key` column. Postgres then raises a
+    // raw "index row size exceeds maximum" error instead of a clean, typed
+    // rejection (issue #946). Rejecting rather than truncating/hashing is
     // deliberate -- see `quota::MAX_QUOTA_KEY_BYTES`'s doc comment for why.
     // An explicit fairness key is caller input. Check it before any DB work.
     if let Some(key) = request.fairness_key.as_deref() {
@@ -1540,10 +1549,10 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
     // The `gate: None` and `concurrency_on_conflict: Defer` exemptions that
     // this function grants a retry continuation elsewhere follow the same rule.
     // `retry_of_exec_id` is set `Some` at exactly one call site in the whole
-    // codebase -- the retry continuation in `worker.rs` -- so it is an
+    // codebase: the retry continuation in `worker.rs`. So it is an
     // unambiguous signal here.
-    // `quota_key` itself stays resolved unconditionally above so the new
-    // row is still correctly tagged for FUTURE usage accounting; only the
+    // `quota_key` itself stays resolved unconditionally above, so the new
+    // row is still correctly tagged for FUTURE usage accounting. Only the
     // *enforcement* is skipped for this one admission.
     let quota_enforcement_policy = if request.retry_of_exec_id.is_some() {
         None
@@ -1553,42 +1562,47 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
 
     // For TerminateIfRunning: if there is an existing RUNNING execution, cancel
     // it (Transaction 1) before the start transaction below (Transaction 2). A
-    // crash between the two leaves the prior workflow CANCELLED with no new run;
-    // retrying with the same policy starts fresh on the next attempt because the
-    // CANCELLED row is treated as "start fresh" by TerminateIfRunning.
-    // Deferred follow-up starts produced by the TerminateIfRunning pre-check's
-    // cancellation (the prior run's completion-trigger / parent-close cascade).
-    // Collected here via the no-spawn cancel variant rather than spawned inline:
-    // this collect function may itself run inside a caller's transaction (e.g. the
-    // debounce scanner's fire transaction), where the spawning wrapper
-    // `cancel_workflow_execution` would launch follow-ups that a later rollback of
-    // that outer transaction could orphan. They are appended to the returned
-    // deferred list so the caller spawns them only after its outer commit.
+    // crash between the two leaves the prior workflow CANCELLED with no new run.
+    // A retry with the same policy then starts fresh, because TerminateIfRunning
+    // treats the CANCELLED row as "start fresh".
+    //
+    // These collect the deferred follow-up starts that the pre-check's
+    // cancellation produces (the prior run's completion-trigger / parent-close
+    // cascade). The no-spawn cancel variant collects them, so nothing spawns
+    // inline. This collect function may itself run inside a caller's
+    // transaction (e.g. the debounce scanner's fire transaction). There the
+    // spawning wrapper `cancel_workflow_execution` would launch follow-ups that
+    // a later rollback of that outer transaction could orphan. They are
+    // appended to the returned deferred list, so the caller spawns them only
+    // after its outer commit.
     let mut pre_check_deferred: Vec<DeferredTriggerStart> = Vec::new();
     let mut deferred_checks: Vec<(ExecutionId, String)> = Vec::new();
     let mut pre_check_cancel_metrics: Vec<StartCancelledRun> = Vec::new();
 
     // Effective active-prior behavior from the two orthogonal axes (issue #685).
-    // `terminate_via_pre_check` is the ONE case whose create-vs-attach decision is
-    // state-independent (`reuse == TerminateIfRunning` creates for BOTH active and
-    // terminal priors) AND resolves to Terminate — so it can use the unlocked
-    // POINT-1 gate + the two-transaction pre-check cancel. For `Unspecified` this is
-    // exactly `reuse == TerminateIfRunning`, so all four legacy reuse policies keep
-    // their pre-#685 admission/pre-check behavior byte-for-byte. Every other
-    // conflict-driven Terminate (e.g. `AllowDuplicate` + `TerminateExisting`) is
-    // handled atomically INSIDE the start transaction (the active branch's
-    // `inline_cancel` + `replace_execution`), where the create-vs-attach decision is
-    // made on the locked prior state — never via a pre-check cancel that would then
-    // route the just-cancelled prior through a reuse-policy attach branch.
+    // `terminate_via_pre_check` is the ONE case whose create-vs-attach decision
+    // is state-independent AND resolves to Terminate. The
+    // `reuse == TerminateIfRunning` policy creates for BOTH active and terminal
+    // priors. So this case can use the unlocked POINT-1 gate + the
+    // two-transaction pre-check cancel. For `Unspecified` this is exactly
+    // `reuse == TerminateIfRunning`. So all four legacy reuse policies keep
+    // their pre-#685 admission/pre-check behavior byte-for-byte.
+    //
+    // Every other conflict-driven Terminate (e.g. `AllowDuplicate` +
+    // `TerminateExisting`) is handled atomically INSIDE the start transaction,
+    // by the active branch's `inline_cancel` + `replace_execution`. There the
+    // create-vs-attach decision uses the locked prior state. It never uses a
+    // pre-check cancel, which would route the just-cancelled prior through a
+    // reuse-policy attach branch.
     let effective_conflict =
         effective_active_conflict_behavior(request.reuse_policy, request.conflict_policy);
     let terminate_via_pre_check = request.reuse_policy == WorkflowIdReusePolicy::TerminateIfRunning
         && effective_conflict == ActiveConflictBehavior::Terminate;
 
     // POINT 1 (issue #618, PR #1014): `terminate_via_pre_check` ALWAYS creates a
-    // replacement (state-independent), so its `will_create` is a constant `true`
-    // — the gate decision needs no lock. Apply it BEFORE the pre-check
-    // cancellation below so a blocked start never cancels the prior run first
+    // replacement (state-independent). So its `will_create` is a constant `true`,
+    // and the gate decision needs no lock. Apply it BEFORE the pre-check
+    // cancellation below, so a blocked start never cancels the prior run first
     // (cancel-then-block). A block records the count once and returns without
     // touching the DB.
     if let Some(mode) = gate
@@ -1693,10 +1707,9 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
         }
     }
 
-    // Apply the server-side ceiling (if any) before computing the deadline.
-    // The effective timeout is the minimum of the per-call value and the
-    // operator-configured ceiling; this prevents callers from requesting
-    // arbitrarily long SLA windows even when they supply an explicit timeout.
+    // The server-side ceiling caps the per-call timeout before the deadline is
+    // computed. So callers cannot request arbitrarily long SLA windows, even
+    // with an explicit timeout.
     let effective_timeout = match (
         request.execution_timeout,
         request.max_execution_timeout_ceiling,
@@ -1708,11 +1721,11 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
     // Compute deadline_at relative to target_start_time (issue #322).
     let deadline_at = effective_timeout.map(|d| target_start_time + d);
 
-    // Compute effective SLA — clamp down to the hard timeout when sla > deadline
-    // (issue #487): the hard timeout fires first so the soft signal can never fire.
-    // A non-positive SLA budget (<= 0) is treated as "no SLA": persisting an
-    // `sla_deadline_at` at or before `started_at` would flag the run as breached
-    // on the very next scan, which is never a meaningful budget.
+    // Clamp the SLA down to the hard timeout when sla > deadline (issue #487).
+    // The hard timeout fires first, so the soft signal could never fire.
+    // A non-positive SLA budget (<= 0) is treated as "no SLA". An
+    // `sla_deadline_at` at or before `started_at` would flag the run as
+    // breached on the very next scan, which is never a meaningful budget.
     let effective_sla = match (request.sla, effective_timeout) {
         (Some(sla), _) if sla <= chrono::Duration::zero() => None,
         (Some(sla), Some(hard)) => Some(sla.min(hard)),
@@ -1722,11 +1735,12 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
     let sla_deadline_at = effective_sla.map(|d| target_start_time + d);
 
     // Chain-scoped lifetime cap (issue #617). The ceiling here acts as BOTH a cap
-    // AND a fleet-wide default (AC4) — a workflow that under-specifies still gets
-    // capped — which diverges deliberately from #243's per-run ceiling (that only
-    // caps a *specified* value). See `effective_chain_timeout`. `chain_deadline_at`
-    // is inherited verbatim on a same-logical-run continuation (workflow retry #523)
-    // and computed fresh on a chain-origin start.
+    // AND a fleet-wide default (AC4): a workflow that under-specifies still gets
+    // capped. That diverges deliberately from #243's per-run ceiling, which only
+    // caps a *specified* value. See `effective_chain_timeout`.
+    // `chain_deadline_at` is inherited verbatim on a same-logical-run
+    // continuation (workflow retry #523) and computed fresh on a chain-origin
+    // start.
     let effective_chain_timeout = crate::timeout::effective_chain_timeout(
         request.chain_execution_timeout,
         request.max_workflow_chain_timeout_ceiling,
@@ -1828,9 +1842,8 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
         let mut tx_deferred_checks = Vec::new();
 
         // Serialize this whole admission decision against every other start
-        // racing the same business key (issue #948 Codex review, comment
-        // 4053489196, follow-up to c52d895). Taken unconditionally, before
-        // any occupant read. The occupant check below, the reconciled-seal
+        // racing the same business key (issue #948). Taken unconditionally,
+        // before any occupant read. The occupant check below, the reconciled-seal
         // lookup, and the fresh `INSERT`, are then all atomic. A concurrent
         // transaction deciding the same key cannot interleave with any of
         // them. The active-uniqueness index alone does not serialize that,
@@ -1841,10 +1854,10 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
 
         // `RejectDuplicate` must refuse against a reconciled `MIGRATED`
         // seal. `AllowDuplicateFailedOnly` must attach to one whose live
-        // copy did NOT fail, not silently create past either (fresh
-        // review, P1 follow-up x2). The active-uniqueness index below
-        // excludes an observed-terminal seal, so a fresh run succeeds
-        // with a plain `INSERT` under every OTHER case. See
+        // copy did NOT fail, not silently create past either. The
+        // active-uniqueness index below excludes an observed-terminal
+        // seal, so a fresh run succeeds with a plain `INSERT` under every
+        // OTHER case. See
         // `an_allow_duplicate_start_creates_a_fresh_run_too_once_the_
         // seal_is_reconciled`, which deliberately pins that outcome for
         // plain `AllowDuplicate` (attaching to the seal's own stale,
@@ -1932,8 +1945,8 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
                     refuse_other_tenant(&request, &seal)?;
                     if request.reuse_policy == WorkflowIdReusePolicy::RejectDuplicate {
                         // Report the effective terminal state, not the
-                        // seal's own `MIGRATED` marker (issue #1596 review,
-                        // P2), matching the attach path just below.
+                        // seal's own `MIGRATED` marker (issue #1596),
+                        // matching the attach path just below.
                         // `MIGRATED` is an internal forwarding state; a
                         // caller checking this refusal for a specific
                         // outcome must not be told the run is still
@@ -1945,8 +1958,8 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
                     }
                     if !matches!(seal.effective_terminal_state(), "FAILED" | "CANCELLED") {
                         // Report the live copy's effective terminal state,
-                        // not the seal's own `MIGRATED` marker (Codex P2
-                        // review, comment 4054062525). `MIGRATED` is an
+                        // not the seal's own `MIGRATED` marker (issue
+                        // #1317). `MIGRATED` is an
                         // internal forwarding state. A public start API
                         // must not leak it as if the run were nonterminal.
                         let mut attached_seal = seal;
@@ -1965,33 +1978,33 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
             }
         }
 
-        // Authoritative locked gate (issue #618, PR #1014). For every
-        // policy EXCEPT TerminateIfRunning (gated unlocked at POINT 1
-        // above), take the `FOR UPDATE` lock on any non-sealed prior
-        // FIRST — before the INSERT — so the create-vs-attach decision the
-        // gate keys on is made on ONE stable, locked state. This is the
-        // move that closes the seal-under-lock TOCTOU: a prior that seals
-        // (to CONTINUED_AS_NEW / TERMINATED) between an unlocked pre-read
-        // and the start is excluded by the `for_update()` filter, so the
-        // fresh replacement it would otherwise leak is caught here. The
-        // lock is reused by the INSERT / `..._by_key_for_update` load
-        // below. `reject_fresh_if_debounced` starts pass `gate = None`, so
-        // this never runs on the debounce path.
+        // Authoritative locked gate (issue #618, PR #1014).
+        // TerminateIfRunning is gated unlocked at POINT 1 above. Every other
+        // policy takes the `FOR UPDATE` lock on any non-sealed prior FIRST,
+        // before the INSERT. So the create-vs-attach decision the gate keys
+        // on is made on ONE stable, locked state. This closes the
+        // seal-under-lock TOCTOU. A prior can seal (to CONTINUED_AS_NEW /
+        // TERMINATED) between an unlocked pre-read and the start. The
+        // `for_update()` filter excludes it, so this catches the fresh
+        // replacement it would otherwise leak. The INSERT /
+        // `..._by_key_for_update` load below reuses the lock.
+        // `reject_fresh_if_debounced` starts pass `gate = None`, so this never
+        // runs on the debounce path.
         //
-        // Runs AFTER the reconciled-seal block above (issue #1596 review,
-        // comment_id 4055454416). That block already returned for the two
-        // outcomes that admit no new execution. Reaching here means one of
-        // two things: no reconciled seal applies, or one did and was
-        // FAILED/CANCELLED. Either way, the INSERT below is a genuine
-        // fresh create the gate may legitimately block.
+        // Runs AFTER the reconciled-seal block above (issue #1596). That
+        // block already returned for the two outcomes that admit no new
+        // execution. Reaching here means one of two things: no reconciled
+        // seal applies, or one did and was FAILED/CANCELLED. Either way, the
+        // INSERT below is a genuine fresh create the gate may legitimately
+        // block.
         //
-        // Recompute the fast-path predicate from the (cloned) request:
+        // Recompute the fast-path predicate from the (cloned) request.
         // POINT 1 + the pre-check already applied the unlocked gate for the
         // state-independent `terminate_via_pre_check` case, so skip it here.
-        // Every other policy (incl. conflict-driven Terminate with a
-        // non-`TerminateIfRunning` reuse, and `TerminateIfRunning` +
-        // `UseExisting`/`Fail`) takes the locked read and keys the gate on
-        // the create-vs-attach decision for the LOCKED prior state.
+        // Every other policy takes the locked read and keys the gate on the
+        // create-vs-attach decision for the LOCKED prior state. That includes
+        // conflict-driven Terminate with a non-`TerminateIfRunning` reuse, and
+        // `TerminateIfRunning` + `UseExisting`/`Fail`.
         let terminate_via_pre_check = request.reuse_policy
             == WorkflowIdReusePolicy::TerminateIfRunning
             && effective_active_conflict_behavior(request.reuse_policy, request.conflict_policy)
@@ -2027,10 +2040,10 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
         }
 
         // `on_conflict_do_nothing()` (no explicit target) lets Postgres
-        // arbitrate against the partial unique index installed by the
-        // continue-as-new migration, which only enforces uniqueness on
-        // rows whose state is not sealed (`CONTINUED_AS_NEW` or
-        // `TERMINATED`). A previously sealed continue-as-new chain or reset
+        // arbitrate against the partial unique index from the continue-as-new
+        // migration. That index only enforces uniqueness on rows whose state
+        // is not sealed (`CONTINUED_AS_NEW` or `TERMINATED`). A previously
+        // sealed continue-as-new chain or reset
         // source therefore does not block reusing the same
         // (workflow_name, workflow_id).
         let inserted = if encode_failure.is_some() {
@@ -2065,10 +2078,10 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
         };
 
         if let Some(execution) = inserted {
-            // Atomic debounce gate: this INSERT is a fresh start. For a
-            // debounced workflow that must go through debounce admission,
-            // roll it back and signal the caller (no TOCTOU — decided here
-            // under the inserted row, not via an unlocked pre-scan).
+            // Atomic debounce gate: this INSERT is a fresh start. A debounced
+            // workflow that must go through debounce admission rolls it back
+            // and signals the caller. There is no TOCTOU: the decision is made
+            // here under the inserted row, not via an unlocked pre-scan.
             if reject_fresh_if_debounced {
                 return Err(HarvestError::DebounceFreshStart {
                     workflow_name: request.workflow_name.to_string(),
@@ -2133,14 +2146,14 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
             } else {
                 None
             };
-            // Enforce the declared per-tenant resource quota (issue #946),
-            // scoped to the fresh-insert path exactly like the payload cap
-            // above -- an ATTACH to an existing execution never reaches
-            // here, so a reuse-policy attach can never be rejected by a cap
-            // meant to bound admission. See `enforce_quota_admission` --
-            // this is ALSO called from `replace_execution`, the other
-            // row-creation branch inside this same transaction, so the two
-            // paths can never enforce the cap differently. Pass
+            // Enforce the declared per-tenant resource quota (issue #946) on
+            // the fresh-insert path only, exactly like the payload cap above.
+            // An ATTACH to an existing execution never reaches here. So a
+            // reuse-policy attach can never be rejected by a cap meant to
+            // bound admission. `replace_execution`, the other row-creation
+            // branch inside this same transaction, ALSO calls
+            // `enforce_quota_admission`. So the two paths can never enforce
+            // the cap differently. Pass
             // `quota_enforcement_policy` (not the bare `quota_policy`) so a
             // workflow-level retry continuation is exempt (see its
             // definition above) while a genuinely fresh start is not.
@@ -2158,8 +2171,8 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
             // Runs inside the same transaction on the same shard-local
             // connection so the read is consistent with the just-inserted
             // row. Excludes the new row (`id != exec_id`) as a safety
-            // guard — the new row has state RUNNING, not COMPLETED, so it
-            // can never match, but the explicit exclusion is defensive.
+            // guard. The new row has state RUNNING, not COMPLETED, so it can
+            // never match. The explicit exclusion is defensive.
             let (carryover_result, carryover_error) = if let Some(sched_id) = request.schedule_id {
                 resolve_carryover(
                     conn,
@@ -2185,13 +2198,13 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
             // Latest-wins supersede (issue #811). Runs HERE -- inside the start
             // transaction, AFTER our own row + task are durable, and only on the
             // fresh-insert path -- so:
-            //   * we never cancel the incumbent and then attach to it, and
+            //   * a start never cancels the incumbent and then attaches to it, and
             //   * an attach (`created == false`) never cancels anything.
             // The advisory lock inside `supersede_running_for_key` serializes
-            // concurrent admissions for the same key, which is what makes AC6's
-            // "later-admitted run wins" a function of admission order rather than
-            // wall-clock. It re-acquires the SAME per-key lock the dry-run credit
-            // above already took, so this never contends with itself.
+            // concurrent admissions for the same key. That makes AC6's
+            // "later-admitted run wins" a function of admission order rather
+            // than wall-clock. It re-acquires the SAME per-key lock the dry-run
+            // credit above already took, so this never contends with itself.
             let started = StartedWorkflowExecution::from_row(execution, true);
             let (tx_cancel_metrics, supersede_deferred) = run_latest_wins_supersede(
                 conn,
@@ -2217,37 +2230,40 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
         // (the active-uniqueness partial index only covers non-sealed
         // states). Lock that prior row to decide what to do.
         //
-        // Seal-race retry (issue #685 review, Codex P2): under concurrent
-        // `terminate_existing` (or any replace-type) starts of the same
-        // `(workflow_name, workflow_id)`, a LOSER can reach this load AFTER
-        // a concurrent winner has sealed the prior it locked
-        // (-> CONTINUED_AS_NEW/TERMINATED, excluded by this load's
-        // non-sealed filter) and inserted a fresh RUNNING replacement. The
-        // loser's first `FOR UPDATE` SELECT took its statement snapshot
-        // before the winner committed, blocks on the prior's row lock, and
-        // -- on the winner's commit -- sees the prior filtered out via
-        // EvalPlanQual while the winner's freshly-inserted row is invisible
-        // to that same statement's snapshot, so the load returns `None`.
+        // Seal-race retry (issue #685). Concurrent `terminate_existing` (or
+        // any replace-type) starts can race on the same
+        // `(workflow_name, workflow_id)`. A LOSER can then reach this load
+        // AFTER a concurrent winner has sealed the prior it locked and
+        // inserted a fresh RUNNING replacement. The seal
+        // (-> CONTINUED_AS_NEW/TERMINATED) excludes the prior from this
+        // load's non-sealed filter.
         //
-        // Under READ COMMITTED each SELECT statement gets a FRESH snapshot,
-        // so re-issuing the load after the winner has committed picks up the
-        // replacement RUNNING row and the start CONVERGES (last-writer-wins)
-        // instead of surfacing a transient `NotFound`. The loser holds no
-        // conflicting lock after a `None` load: `ON CONFLICT DO NOTHING`
-        // never locks the conflicting row, and a `None` `FOR UPDATE` locks
-        // nothing -- so the retry is safe. Once a row IS found and
-        // `FOR UPDATE`-locked, the subsequent `inline_cancel` +
-        // `replace_execution` cannot be sealed out from under us (a rival
-        // must first take the same lock, which blocks until we commit). Each
-        // retry's `FOR UPDATE` naturally blocks on the current lock holder,
-        // so this is not a busy-loop; the small backoff only guards the
-        // pathological "sealed without a replacement" case (e.g. a
-        // concurrent reset), where the cap falls back to the pre-existing
-        // `NotFound`.
+        // The loser's first `FOR UPDATE` SELECT took its statement snapshot
+        // before the winner committed. It blocks on the prior's row lock. On
+        // the winner's commit, EvalPlanQual filters the prior out. The
+        // winner's freshly-inserted row is invisible to that same
+        // statement's snapshot, so the load returns `None`.
         //
-        // Non-racing requests never reach a `None` here (the prior is still
-        // non-sealed under the lock), so this is transparent to the common
-        // path across every reuse/conflict policy.
+        // Under READ COMMITTED each SELECT statement gets a FRESH snapshot.
+        // So a re-issued load after the winner's commit picks up the
+        // replacement RUNNING row. The start then CONVERGES
+        // (last-writer-wins) instead of surfacing a transient `NotFound`.
+        // The loser holds no conflicting lock after a `None` load.
+        // `ON CONFLICT DO NOTHING` never locks the conflicting row, and a
+        // `None` `FOR UPDATE` locks nothing. So the retry is safe.
+        //
+        // Once a row IS found and `FOR UPDATE`-locked, no rival can seal it
+        // out from under this transaction's `inline_cancel` +
+        // `replace_execution`. A rival must first take the same lock, which
+        // blocks until this transaction commits. Each retry's `FOR UPDATE`
+        // blocks on the current lock holder, so this is not a busy-loop. The
+        // small backoff only guards the "sealed without a replacement" case
+        // (e.g. a concurrent reset). There the cap falls back to the
+        // pre-existing `NotFound`.
+        //
+        // Non-racing requests never reach a `None` here, because the prior is
+        // still non-sealed under the lock. So this is transparent to the
+        // common path across every reuse/conflict policy.
         let existing = {
             let mut existing: Option<WorkflowExecution> = None;
             for attempt in 0..=SEAL_RACE_MAX_LOAD_RETRIES {
@@ -2263,8 +2279,8 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
                         break;
                     }
                     // Seal race: retry with a fresh statement snapshot until
-                    // the winner's replacement row is visible or the cap is
-                    // exhausted (then fall through to the terminal NotFound).
+                    // the winner's replacement row is visible. Once the cap is
+                    // exhausted, fall through to the terminal NotFound.
                     Err(HarvestError::NotFound(_)) if attempt < SEAL_RACE_MAX_LOAD_RETRIES => {
                         tokio::time::sleep(std::time::Duration::from_millis(
                             SEAL_RACE_LOAD_BACKOFF_MS,
@@ -2301,10 +2317,10 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
         let seal_observed_terminal =
             existing.state == "MIGRATED" && existing.migrated_run_terminal_at.is_some();
 
-        // Branch on active-vs-terminal FIRST (issue #685). An ACTIVE
-        // (RUNNING/PAUSED) prior is governed by the orthogonal conflict
-        // axis; a terminal non-sealed prior is governed by the reuse axis
-        // exactly as before (the conflict axis has no effect there).
+        // Branch on active-vs-terminal FIRST (issue #685). The orthogonal
+        // conflict axis governs an ACTIVE (RUNNING/PAUSED) prior. The reuse
+        // axis governs a terminal non-sealed prior exactly as before; the
+        // conflict axis has no effect there.
         if is_active_conflict_state(&existing.state) && !seal_observed_terminal {
             match effective_active_conflict_behavior(request.reuse_policy, request.conflict_policy)
             {
@@ -2328,22 +2344,22 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
                 // routed to admission instead. PAUSED is active and occupies
                 // the uniqueness slot, so it must be cancelled before
                 // `replace_execution` seals it (issue #383). Reaching this
-                // point after the two-transaction pre-check cancel is the
-                // extreme-concurrency race where the prior is still active
-                // under the lock; we inline the cancel here so the new start
-                // is not silently blocked.
+                // point after the two-transaction pre-check cancel means an
+                // extreme-concurrency race: the prior is still active under
+                // the lock. The cancel is inlined here, so the new start is
+                // not silently blocked.
                 //
-                // Concurrency note (issue #685 review, FIX 4 + Codex P2):
-                // concurrent `terminate_existing` starts of the SAME
+                // Concurrency note (issue #685): concurrent
+                // `terminate_existing` starts of the SAME
                 // `(workflow_name, workflow_id)` against one live prior are
                 // last-writer-wins and CONVERGE to a single surviving run.
                 // `terminate_existing` has no pre-check, so more contenders
                 // reach this inline branch than the pre-#685
-                // `TerminateIfRunning` path did; a loser that observed the
-                // winner seal the prior row it locked is retried internally
-                // by the seal-race loop around the load above (a fresh READ
+                // `TerminateIfRunning` path did. A loser can observe the
+                // winner seal the prior row it locked. The seal-race loop
+                // around the load above retries it internally: a fresh READ
                 // COMMITTED snapshot picks up the winner's replacement RUNNING
-                // row), so no transient `NotFound` is surfaced. It does NOT
+                // row. So no transient `NotFound` is surfaced. It does NOT
                 // corrupt data, deadlock, or double-run (the seal + insert is
                 // transactional; `use_existing` never enters this branch).
                 ActiveConflictBehavior::Terminate => {
@@ -2357,18 +2373,19 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
                     // FROM HERE, and replacing it would be actively unsafe.
                     //
                     // `MIGRATED`/`MIGRATING` are active conflicts because the
-                    // run is still live — just on another shard. But this
+                    // run is still live, just on another shard. But this
                     // branch's `inline_cancel` only matches `RUNNING`/`PAUSED`,
-                    // so it would no-op against the seal, and `replace_execution`
+                    // so it would no-op against the seal. `replace_execution`
                     // would then seal that row `CONTINUED_AS_NEW` and insert a
                     // fresh run here. `CONTINUED_AS_NEW` is excluded from the
-                    // active-uniqueness index, so the business key would be
+                    // active-uniqueness index. So the business key would be
                     // released while the real run keeps executing on its target
-                    // shard: TWO live runs for one key, the exact outcome
-                    // widening `is_active_conflict_state` exists to prevent.
+                    // shard. That gives TWO live runs for one key, the exact
+                    // outcome that widening `is_active_conflict_state` exists
+                    // to prevent.
                     //
-                    // Terminating the live copy is not this function's to do —
-                    // it holds one connection to one shard and the live copy is
+                    // Terminating the live copy is not this function's job. It
+                    // holds one connection to one shard, and the live copy is
                     // on another database. So refuse, retryably, naming where
                     // the run actually is. The caller cancels it there and
                     // starts again, or waits for the migration to settle.
@@ -2585,11 +2602,11 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
         }
         Err(e) => {
             // The replacement start failed. A TerminateIfRunning pre-check cancel may
-            // already be durable (Transaction 1 committed): for a top-level caller we
-            // spawn its follow-ups now, since the cancellation is permanent even
-            // though no new run started. For a caller inside an outer transaction the
-            // cancellation will be rolled back with that transaction, so we suppress
-            // the spawn and let the caller's rollback revert everything.
+            // already be durable (Transaction 1 committed). For a top-level caller,
+            // spawn its follow-ups now: the cancellation is permanent even though no
+            // new run started. For a caller inside an outer transaction, that
+            // transaction rolls the cancellation back. So suppress the spawn and let
+            // the caller's rollback revert everything.
             if !in_outer_transaction {
                 for start in pre_check_deferred {
                     start.spawn();
@@ -2632,7 +2649,7 @@ fn refuse_unencoded(held: &mut Option<HarvestError>) -> HarvestResult<()> {
 /// For `TerminateIfRunning` + RUNNING the cancel is performed in a separate
 /// transaction (Transaction 1) before the start transaction (Transaction 2). A
 /// failure between the two leaves the prior workflow CANCELLED with no new run
-/// started; the caller can retry with the same policy to get a fresh run.
+/// started. The caller can retry with the same policy to get a fresh run.
 ///
 /// # Errors
 ///
@@ -2665,9 +2682,10 @@ pub async fn start_or_load_workflow_execution_with_codecs(
     gate: Option<crate::admission_gate::GateMode>,
     codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<StartedWorkflowExecution> {
-    // Top-level caller (`in_outer_transaction = false`): if a TerminateIfRunning
-    // pre-check cancellation commits and the replacement start then fails, the
-    // collect fn spawns the cancellation's follow-ups itself before returning Err.
+    // Top-level caller (`in_outer_transaction = false`). A TerminateIfRunning
+    // pre-check cancellation can commit and the replacement start then fail.
+    // The collect fn then spawns the cancellation's follow-ups itself before
+    // returning Err.
     // The start writes a `PENDING` task row, so it raises a dispatch hint
     // (issue #1312). Buffer it here and publish after the call returns: this is
     // the self-owned transaction path, so the row is durable by then.
@@ -2760,12 +2778,12 @@ pub enum IdempotentStartOutcome {
 /// Start a workflow with request-scoped idempotency (issue #808).
 ///
 /// Reserves a `(workflow_name, idempotency_key)` claim and performs the start in
-/// a **single transaction** so the two are atomic: if the start fails (a
-/// reuse-policy conflict, a validation error, ...) the reservation rolls back so
-/// a retry can start fresh. When the same key was already claimed by an earlier
-/// start whose execution still exists, this is a no-op returning that run
-/// ([`IdempotentStartOutcome::Deduplicated`]) — no second `WorkflowStarted`
-/// event, no second enqueued task.
+/// a **single transaction**, so the two are atomic. If the start fails (a
+/// reuse-policy conflict, a validation error, ...), the reservation rolls back,
+/// so a retry can start fresh. An earlier start may already have claimed the
+/// same key, and its execution may still exist. Then this is a no-op that
+/// returns that run ([`IdempotentStartOutcome::Deduplicated`]): no second
+/// `WorkflowStarted` event, no second enqueued task.
 ///
 /// The idempotency dedupe **precedes and short-circuits** the reuse-policy
 /// matrix keyed on `workflow_id`: a duplicate key never even reaches
@@ -2867,12 +2885,12 @@ pub async fn start_or_load_workflow_execution_idempotent_with_codecs(
                         )
                         .await?;
                     // The reserve wrote the claim pointing at `new_exec_id`.
-                    // If the reuse policy resolved this fresh-key start to an
+                    // The reuse policy can resolve this fresh-key start to an
                     // *existing* run (e.g. AllowDuplicate attaching to a prior
-                    // workflow_id collision), `new_exec_id` was never inserted
-                    // — repoint the claim at the real run so a subsequent
-                    // same-key request deduplicates cleanly instead of hitting
-                    // the defensive reclaim path and re-running the start.
+                    // workflow_id collision). Then `new_exec_id` was never
+                    // inserted. Repoint the claim at the real run, so a later
+                    // same-key request deduplicates cleanly. Otherwise it hits
+                    // the defensive reclaim path and re-runs the start.
                     if started.exec_id != new_exec_id {
                         crate::start_idempotency::repoint_start_idempotency_claim(
                             conn,
@@ -2900,42 +2918,43 @@ pub async fn start_or_load_workflow_execution_idempotent_with_codecs(
 
 /// Will `start_or_load_workflow_execution_collect` CREATE a new execution (a new
 /// admission), given the locked prior run's state and the reuse policy? (Issue
-/// #618, F-round18.)
+/// #618.)
 ///
 /// Pure mirror of `start_or_load_workflow_execution_collect`'s attach-vs-create
-/// decision — used by [`gate_checked_start_or_load`] to apply the admission gate
-/// exactly when a NEW execution is created, and skip it only for a genuine
-/// idempotent ATTACH to an existing run.
+/// decision. [`gate_checked_start_or_load`] uses it to apply the admission gate
+/// exactly when a NEW execution is created. It skips the gate only for a
+/// genuine idempotent ATTACH to an existing run.
 ///
 /// `prior_state` is the state of the `(workflow_name, workflow_id)` row that
-/// occupies the active-uniqueness index — i.e. the value returned by
+/// occupies the active-uniqueness index. That is the value
 /// [`try_load_active_execution_for_update`] /
-/// [`load_workflow_execution_by_key_for_update`], which BOTH exclude the sealed
-/// `CONTINUED_AS_NEW`/`TERMINATED` states. So `None` means "no non-sealed prior"
-/// (no prior at all, or only a sealed one) — the `INSERT` succeeds and a fresh
-/// execution is created. `Some(state)` means the `INSERT` is a no-op and the
-/// reuse policy decides attach-vs-replace.
+/// [`load_workflow_execution_by_key_for_update`] return. BOTH exclude the
+/// sealed `CONTINUED_AS_NEW`/`TERMINATED` states. So `None` means "no
+/// non-sealed prior" (no prior at all, or only a sealed one): the `INSERT`
+/// succeeds and a fresh execution is created. `Some(state)` means the `INSERT`
+/// is a no-op and the reuse policy decides attach-vs-replace.
 ///
-/// The matrix mirrors `_collect` exactly (verified against the code, not the
-/// `SignalWithStart` matrix, which escalates terminal-prior attaches to fresh
-/// starts and is NOT what `_collect` — the path this primitive calls — does):
+/// The matrix mirrors `_collect` exactly. It was verified against the code,
+/// not the `SignalWithStart` matrix. That matrix escalates terminal-prior
+/// attaches to fresh starts, which `_collect` (the path this primitive calls)
+/// does NOT do:
 ///
 /// - `None` (no non-sealed prior) → CREATE.
 /// - `AllowDuplicate` + any non-sealed prior → ATTACH (`from_row(existing, false)`,
 ///   unconditional — including a terminal `COMPLETED`/`FAILED`/`CANCELLED`/`TIMED_OUT`
 ///   prior; no new admission).
-/// - `RejectDuplicate` + any non-sealed prior → `Err(AlreadyExists)`: no start at
-///   all, so no admission — treated as "no create" (the gate is irrelevant since
-///   nothing starts).
+/// - `RejectDuplicate` + any non-sealed prior → `Err(AlreadyExists)`. Nothing
+///   starts, so there is no admission. It counts as "no create" (the gate is
+///   irrelevant).
 /// - `AllowDuplicateFailedOnly` + prior `FAILED`/`CANCELLED` → CREATE
 ///   (`replace_execution`); any other non-sealed state → ATTACH.
 /// - `TerminateIfRunning` + any non-sealed prior → CREATE (`replace_execution`,
 ///   always; the live-prior pre-check cancels first, then it replaces).
 ///
 /// The `conflict_policy` axis (issue #685) overrides the behavior for an
-/// *active* (RUNNING/PAUSED) prior: `Fail`/`UseExisting` never create a fresh
-/// run; `TerminateExisting` always does; `Unspecified` defers to the reuse
-/// policy's native active behavior (so the matrix above is preserved exactly).
+/// *active* (RUNNING/PAUSED) prior. `Fail`/`UseExisting` never create a fresh
+/// run; `TerminateExisting` always does. `Unspecified` defers to the reuse
+/// policy's native active behavior, so the matrix above is preserved exactly.
 #[must_use]
 pub fn start_will_create_new_execution(
     prior_state: Option<&str>,
@@ -2991,8 +3010,8 @@ pub enum ActiveConflictBehavior {
 pub fn is_active_conflict_state(state: &str) -> bool {
     // `MIGRATED` and `MIGRATING` (issue #964) are active conflicts even though
     // neither row will ever run again where it sits. A `MIGRATED` row is the
-    // seal left behind when the run was rebalanced onto another shard: the run
-    // is still live, just elsewhere, so treating it as "terminal prior" would
+    // seal left behind when the run was rebalanced onto another shard. The run
+    // is still live, just elsewhere. Treating it as a "terminal prior" would
     // let a start of the same business key create a SECOND live run. A
     // `MIGRATING` row is a staged copy holding the identity mid-migration.
     matches!(state, "RUNNING" | "PAUSED" | "MIGRATED" | "MIGRATING")
@@ -3040,8 +3059,8 @@ mod start_will_create_tests {
     }
 
     // The four non-sealed terminal states + the three non-sealed active states that
-    // can occupy the uniqueness index (CONTINUED_AS_NEW/TERMINATED are excluded by
-    // the index, so they surface as `None` here).
+    // can occupy the uniqueness index. The index excludes CONTINUED_AS_NEW/TERMINATED,
+    // so they surface as `None` here.
     const TERMINAL: [&str; 4] = ["COMPLETED", "FAILED", "CANCELLED", "TIMED_OUT"];
     const ACTIVE: [&str; 3] = ["RUNNING", "SUSPENDED", "PAUSED"];
 
@@ -3398,12 +3417,12 @@ mod resolve_by_workflow_id_tests {
 
     #[test]
     fn resolve_terminal_states_matches_is_terminal_state() {
-        // The SQL filter list and the pure classification used by
-        // select_resolved_run both derive from crate::erase::TERMINAL_STATES, so
-        // they are equal *by construction* (RESOLVE_TERMINAL_STATES is an alias
-        // for that constant). This test asserts that identity plus exact set
-        // equality against is_terminal_state in both directions, so any future
-        // refactor that reintroduces a second literal list is caught.
+        // The SQL filter list and the pure classification in
+        // select_resolved_run both derive from crate::erase::TERMINAL_STATES.
+        // So they are equal *by construction* (RESOLVE_TERMINAL_STATES is an
+        // alias for that constant). This test asserts that identity plus exact
+        // set equality against is_terminal_state in both directions. So a
+        // future refactor that reintroduces a second literal list is caught.
         assert!(
             std::ptr::eq(
                 super::RESOLVE_TERMINAL_STATES,
@@ -3451,16 +3470,14 @@ mod resolve_by_workflow_id_tests {
     }
 }
 
-/// Transition `existing` to `CONTINUED_AS_NEW` (releasing the partial unique
-/// index slot) then insert `new_row` as a fresh execution with its own
-/// `WorkflowStarted` event and task queue entry.
 /// Run the latest-wins supersede pass for an admission that created a fresh run
 /// (issue #811).
 ///
-/// Called from EVERY fresh-admission path inside the start transaction: the
-/// plain `ON CONFLICT DO NOTHING` insert, and all three `replace_execution`
-/// arms (`ActiveConflictBehavior::Terminate`, `AllowDuplicateFailedOnly` over a
-/// FAILED/CANCELLED prior, and `TerminateIfRunning` over a terminal prior).
+/// Called from EVERY fresh-admission path inside the start transaction. These
+/// are the plain `ON CONFLICT DO NOTHING` insert and all three
+/// `replace_execution` arms. The arms are `ActiveConflictBehavior::Terminate`,
+/// `AllowDuplicateFailedOnly` over a FAILED/CANCELLED prior, and
+/// `TerminateIfRunning` over a terminal prior.
 ///
 /// A replacement is a fresh admission too (issue #811). It seals THIS
 /// `workflow_id`'s own prior. That says nothing about a *different*
@@ -3519,10 +3536,10 @@ async fn run_latest_wins_supersede(
     request: &StartWorkflowParams<'_>,
     exec_id: ExecutionId,
     tx_deferred_checks: &mut Vec<(ExecutionId, String)>,
-    // issue #1197, item 2: threaded through to `supersede_running_for_key` so
-    // a nested-admission residual (a key left transiently over its limit
-    // because the only over-limit runs were protected in-flight admissions)
-    // can be counted, not just logged.
+    // Issue #1197, item 2: passed on to `supersede_running_for_key`, so a
+    // nested-admission residual can be counted, not just logged. A residual
+    // is a key left transiently over its limit because the only over-limit
+    // runs were protected in-flight admissions.
     metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
     credited_ids: &[uuid::Uuid],
     quota_policy: Option<crate::quota::QuotaPolicy>,
@@ -3716,6 +3733,10 @@ pub async fn replaced_run_outcome_state(
     Ok(replaced_run_outcome(&history.events))
 }
 
+/// Seal `existing` as `CONTINUED_AS_NEW` and insert `new_row` as a fresh run.
+///
+/// The seal releases the partial unique index slot. The new row gets its own
+/// `WorkflowStarted` event and task queue entry.
 #[allow(clippy::too_many_arguments)]
 async fn replace_execution(
     conn: &mut AsyncPgConnection,
@@ -3742,9 +3763,9 @@ async fn replace_execution(
         ));
     }
 
-    // Seal the prior execution row as CONTINUED_AS_NEW. This removes it from
-    // the partial unique index scope (WHERE state NOT IN sealed states),
-    // allowing the new row to be inserted without violating the constraint.
+    // Seal the prior execution row as CONTINUED_AS_NEW. That removes it from
+    // the partial unique index scope (WHERE state NOT IN sealed states). The
+    // new row then inserts without violating the constraint.
     //
     // A MIGRATED seal is the one exception (issue #1317). Only
     // `TerminateIfRunning` can reach this function with `existing.state ==
@@ -3782,19 +3803,19 @@ async fn replace_execution(
         }
     }
     // Enforce the declared per-tenant resource quota (issue #946) on this
-    // replacement admission too -- `replace_execution` is a SECOND
-    // row-creation path (reached by `AllowDuplicateFailedOnly`,
-    // `TerminateIfRunning`, and a conflict-driven `Terminate`), and without
-    // this a caller could loop one of those reuse policies against a stable
-    // `workflow_id` to accumulate unbounded active executions/history/DLQ
-    // rows for a key well past its declared cap. `existing` is already
-    // sealed above (CONTINUED_AS_NEW) by the time this runs, so it
-    // contributes zero to `active_executions` -- no double-adjustment is
+    // replacement admission too. `replace_execution` is a SECOND
+    // row-creation path, reached by `AllowDuplicateFailedOnly`,
+    // `TerminateIfRunning`, and a conflict-driven `Terminate`. Without this,
+    // a caller could loop one of those reuse policies against a stable
+    // `workflow_id`. That would accumulate unbounded active
+    // executions/history/DLQ rows for a key well past its declared cap.
+    // `existing` is already sealed above (CONTINUED_AS_NEW) when this runs.
+    // So it contributes zero to `active_executions`. No double-adjustment is
     // needed beyond what `enforce_quota_admission` already does for the
     // just-inserted row.
     //
     // A `cancel_running` replacement can ALSO need the dry-run credit
-    // (issue #1228 review, P1). A DIFFERENT `workflow_id` can already
+    // (issue #1228). A DIFFERENT `workflow_id` can already
     // occupy the same concurrency key. Every caller of this function runs
     // `run_latest_wins_supersede` right after it returns, which would shed
     // that incumbent. Built the same way as the fresh-insert path's, using
@@ -3829,11 +3850,11 @@ async fn replace_execution(
     } else {
         Utc::now()
     };
-    // Resolve scheduled carryover on the replacement path too (issue #488): a reuse
-    // policy that replaces a prior row (e.g. AllowDuplicateFailedOnly retrying a failed
-    // scheduled slot, or TerminateIfRunning) still carries schedule_id/scheduled_for, so
-    // the rerun (and any continue-as-new fork from it) must see the previous fire's
-    // carryover rather than behaving like a first scheduled run.
+    // Resolve scheduled carryover on the replacement path too (issue #488). A reuse
+    // policy that replaces a prior row still carries schedule_id/scheduled_for, e.g.
+    // AllowDuplicateFailedOnly retrying a failed scheduled slot, or TerminateIfRunning.
+    // So the rerun (and any continue-as-new fork from it) must see the previous fire's
+    // carryover. It must not behave like a first scheduled run.
     let (carryover_result, carryover_error) = if let Some(sched_id) = request.schedule_id {
         resolve_carryover(
             conn,
@@ -3914,9 +3935,9 @@ async fn inline_cancel(
         .await?;
     let (mut deferred, closed_children) =
         Box::pin(apply_parent_close_cascade(conn, exec_id, codecs)).await?;
-    // issue #1197, item 1: this path never threads a metrics recorder, so the
-    // plain wrapper's own throwaway collector is already correct here — no
-    // collecting variant needed (there is nothing to collect).
+    // Issue #1197, item 1: this path never threads a metrics recorder. So the
+    // plain wrapper's own throwaway collector is already correct here. No
+    // collecting variant is needed, since there is nothing to collect.
     let triggers = crate::completion_trigger::evaluate_triggers_for_execution_with_codecs(
         conn,
         exec_id,
@@ -3940,19 +3961,6 @@ async fn inline_cancel(
     Ok(deferred)
 }
 
-/// Cancel a running workflow execution.
-///
-/// Cancellation is a durable terminal transition: this appends a
-/// `WorkflowCancelled` event, marks the execution `CANCELLED`, and fails every
-/// pending or running task associated with the execution. Repeating the same
-/// operation against an already-cancelled execution is idempotent and does not
-/// append another event.
-///
-/// # Errors
-///
-/// Returns [`HarvestError::NotFound`] when the execution does not exist,
-/// [`HarvestError::Config`] when the execution is already terminal for another
-/// reason, and [`HarvestError::Database`] for persistence failures.
 /// Notify an **awaited** parent that one of its children reached a terminal
 /// state out-of-band (operator cancel/terminate), waking the parked parent.
 ///
@@ -3962,25 +3970,25 @@ async fn inline_cancel(
 /// directly, bypassing the worker, so without this the parent parks forever.
 ///
 /// Only **awaited** children are handled here (`parent_id` set,
-/// `parent_close_policy` NULL); **detached** children (policy set) are the
-/// `apply_parent_close_cascade` parent→child path's responsibility and are
-/// skipped. There is no `ChildWorkflowCancelled` event variant, so a cancel and
-/// a terminate both surface to the parent as `ChildWorkflowFailed` (the
-/// child-await resolves `Err`) — matching the worker failure path and adding no
-/// new event variant.
+/// `parent_close_policy` NULL). **Detached** children (policy set) are the
+/// responsibility of the `apply_parent_close_cascade` parent→child path, so
+/// this skips them. There is no `ChildWorkflowCancelled` event variant. So a
+/// cancel and a terminate both surface to the parent as `ChildWorkflowFailed`
+/// (the child-await resolves `Err`). That matches the worker failure path and
+/// adds no new event variant.
 ///
 /// # Shard scope (issue #956)
 ///
 /// This appends on the **child's** connection, so it only reaches a parent that
 /// lives on the child's own shard. That was universally true before cross-shard
 /// child placement; it is now the common case rather than an invariant. A
-/// cross-shard child's parent row is simply absent from this connection, so the
+/// cross-shard child's parent row is simply absent from this connection. So the
 /// `parent_state` lookup below returns `None` and this function correctly does
-/// nothing — the wake is owed by the cross-shard relay
-/// (`cross_shard_child::deliver_terminal`), which pulls the child's terminal
-/// state and appends on the *parent's* shard. That handoff is by construction,
-/// not by luck: the relay polls a durable row on the parent's shard and does not
-/// depend on this path having run.
+/// nothing. The cross-shard relay (`cross_shard_child::deliver_terminal`) owes
+/// the wake. It pulls the child's terminal state and appends on the *parent's*
+/// shard. That handoff is by construction, not by luck. The relay polls a
+/// durable row on the parent's shard and does not depend on this path having
+/// run.
 async fn notify_awaited_parent_of_child_terminal(
     conn: &mut AsyncPgConnection,
     child_exec_id: ExecutionId,
@@ -3996,13 +4004,14 @@ async fn notify_awaited_parent_of_child_terminal(
     {
         let parent_exec_id = ExecutionId::from_uuid(parent_uuid);
         // Lock the parent row and skip the wake if it is already terminal (or
-        // gone): an awaited child can outlive its parent (e.g. the parent hit its
-        // execution timeout while the child kept running), and appending a
-        // command-consumable `ChildWorkflowFailed` after the parent's own terminal
-        // event would add replay-visible history past closure. The `FOR UPDATE`
-        // lock serializes against a concurrent parent termination — which holds
-        // the same row lock — so we either observe the parent terminal here and
-        // skip, or append before it seals and the parent consumes the event.
+        // gone). An awaited child can outlive its parent, e.g. when the parent
+        // hit its execution timeout while the child kept running. Appending a
+        // command-consumable `ChildWorkflowFailed` after the parent's own
+        // terminal event would add replay-visible history past closure. The
+        // `FOR UPDATE` lock serializes against a concurrent parent termination,
+        // which holds the same row lock. So this either observes the parent
+        // terminal here and skips, or appends before it seals and the parent
+        // consumes the event.
         let parent_state: Option<String> = harvest_workflow_executions::table
             .find(parent_exec_id.as_uuid())
             .select(harvest_workflow_executions::state)
@@ -4012,9 +4021,9 @@ async fn notify_awaited_parent_of_child_terminal(
             .optional()
             .map_err(database_error)?;
         if matches!(parent_state, Some(state) if !crate::erase::is_terminal_state(&state)) {
-            // #779 (Codex P2): order any DUE child-timeout deadline BEFORE the
+            // Issue #779: order any DUE child-timeout deadline BEFORE the
             // child terminal (mirrors worker::wake_parent_for_child_completion/
-            // _failure) so an over-deadline child that is operator-CANCELLED or
+            // _failure). So an over-deadline child that is operator-CANCELLED or
             // -TERMINATED resolves the parent's `spawn_child_workflow_timeout` to
             // the timeout branch (None), not Err. The parent row is already
             // locked FOR UPDATE above. `materialize_due_child_timeout_deadlines`
@@ -4045,8 +4054,8 @@ async fn notify_awaited_parent_of_child_terminal(
 ///
 /// This is the building block for callers that run the cancellation inside a
 /// larger outer transaction (the external-cancel inline persist and outbox
-/// paths): the `DeferredTriggerStart`s must only be spawned *after* that outer
-/// transaction commits, otherwise trigger workflows could start for a
+/// paths). The `DeferredTriggerStart`s must only be spawned *after* that outer
+/// transaction commits. Otherwise trigger workflows could start for a
 /// cancellation that later rolls back (issue #492). The plain
 /// [`cancel_workflow_execution`] wrapper spawns them and records the metric
 /// itself for the common standalone case.
@@ -4202,9 +4211,9 @@ async fn cancel_workflow_execution_collect_mode(
                     ));
                 }
                 // A rebalanced seal is NOT a terminal prior (issue #964). The
-                // run is alive on another shard, so answering `Config("already
-                // terminal")` here would be a lie with teeth: the cancel
-                // outbox maps that error to `ExternalCancelDelivered` and
+                // run is alive on another shard. So answering `Config("already
+                // terminal")` here would be a lie with teeth. The cancel
+                // outbox maps that error to `ExternalCancelDelivered`. It
                 // records a delivered cancellation in the sender's history for
                 // a workflow that goes on running, never retrying.
                 //
@@ -4274,11 +4283,11 @@ async fn cancel_workflow_execution_collect_mode(
 
             let completed_at = Utc::now();
             // Mirror resume_workflow_execution: if this execution was PAUSED,
-            // push sla_deadline_at forward by the pause span so the SLA scanner
+            // push sla_deadline_at forward by the pause span. So the SLA scanner
             // does not record a false breach for time spent paused before cancel
             // (issue #383 × #487). Only extend a deadline that was still ahead
-            // when the pause began — a deadline already elapsed while RUNNING
-            // stays in the past so its breach is still observed by the scanner.
+            // when the pause began. A deadline already elapsed while RUNNING
+            // stays in the past, so the scanner still observes its breach.
             let new_sla_deadline_at = if prior_state == "PAUSED" {
                 execution
                     .sla_deadline_at
@@ -4404,11 +4413,11 @@ async fn cancel_workflow_execution_collect_mode(
 
 /// Cancel a running workflow execution.
 ///
-/// Cancellation is a durable terminal transition: this appends a
+/// Cancellation is a durable terminal transition. It appends a
 /// `WorkflowCancelled` event, marks the execution `CANCELLED`, and fails every
-/// pending or running task associated with the execution. Repeating the same
-/// operation against an already-cancelled execution is idempotent and does not
-/// append another event.
+/// pending or running task of the execution. Repeating the same operation
+/// against an already-cancelled execution is idempotent and does not append
+/// another event.
 ///
 /// Completion-trigger / parent-close-cascade follow-up starts are spawned after
 /// the cancellation transaction commits, and the terminal metric is recorded.
@@ -4449,27 +4458,28 @@ pub async fn cancel_workflow_execution(
 /// Upper bound on how far [`resolve_live_attempt`] walks the workflow-level
 /// retry chain (issue #523).
 ///
-/// A cycle is impossible by construction — every retry is inserted with a fresh
-/// `exec_id` — so this is a defensive backstop, not a correctness dependency.
+/// A cycle is impossible by construction, because every retry is inserted with
+/// a fresh `exec_id`. So this is a defensive backstop, not a correctness
+/// dependency.
 /// It sits far above any realistic `max_attempts` for *workflow-level* retry,
 /// where each attempt is a whole fresh execution.
 ///
-/// The bound is **not** an enforced invariant: [`crate::policy::RetryPolicy`]
-/// accepts an arbitrary `u32` `max_attempts` and the builder's
-/// `max_workflow_attempts` ceiling is optional, so a chain deeper than this is
+/// The bound is **not** an enforced invariant. [`crate::policy::RetryPolicy`]
+/// accepts an arbitrary `u32` `max_attempts`, and the builder's
+/// `max_workflow_attempts` ceiling is optional. So a chain deeper than this is
 /// expressible. Exhausting the walk is therefore treated as a pathological
-/// chain and **fails closed** with [`HarvestError::Config`] rather than
-/// returning the deepest row reached: that row may itself be `FAILED` with a
-/// live successor beyond the bound, and returning it would silently route every
-/// routed operation to a stale attempt — the exact bug issue #843 fixes.
+/// chain and **fails closed** with [`HarvestError::Config`]. It does not
+/// return the deepest row reached. That row may itself be `FAILED` with a live
+/// successor beyond the bound. Returning it would silently route every routed
+/// operation to a stale attempt: the exact bug issue #843 fixes.
 pub const RETRY_CHAIN_MAX_DEPTH: usize = 256;
 
 /// Bound on how many times a mutating operation is re-driven when the retry
 /// chain advanced underneath it (see [`redrive_target`]).
 ///
 /// Each re-drive strictly descends the chain, so the walk terminates well
-/// before this bound; it exists only so a pathological database state can never
-/// spin an operator request forever.
+/// before this bound. The bound exists only so a pathological database state
+/// can never spin an operator request forever.
 pub const RETRY_CHAIN_MAX_REDRIVES: usize = RETRY_CHAIN_MAX_DEPTH;
 
 /// Follow the workflow-level retry chain (issue #523) from `exec_id` to the
@@ -4488,7 +4498,7 @@ pub const RETRY_CHAIN_MAX_REDRIVES: usize = RETRY_CHAIN_MAX_DEPTH;
 ///
 /// **There is no window in which the chain has no execution row.** The retry
 /// successor is inserted in the *same transaction* that seals the predecessor
-/// `FAILED` and appends `WorkflowRetryScheduled`, so an external reader either
+/// `FAILED` and appends `WorkflowRetryScheduled`. So an external reader either
 /// sees the predecessor still live, or sees it `FAILED` with its successor
 /// already present. The successor's *task* may still be delayed (a queued
 /// retry), but the row it routes to always exists.
@@ -4502,13 +4512,12 @@ pub const RETRY_CHAIN_MAX_REDRIVES: usize = RETRY_CHAIN_MAX_DEPTH;
 ///
 /// `pool`/`held_shard` name the shard `conn` is already checked out from.
 /// That lets a hop which has itself been rebalanced be followed to its live
-/// shard (issue #1596 review, PR #1596 comment 4052029175). See
-/// [`walk_retry_chain`] for why that residence check exists.
+/// shard (issue #1596). See [`walk_retry_chain`] for why that residence check
+/// exists.
 ///
-/// Also returns the shard the live attempt actually lives on (issue #1596
-/// follow-up review, comment 4052389744), which can differ from
-/// `held_shard`. `conn` itself is not moved. A caller that runs any
-/// follow-up query against the returned execution must first
+/// Also returns the shard the live attempt actually lives on (issue #1596),
+/// which can differ from `held_shard`. `conn` itself is not moved. A caller
+/// that runs any follow-up query against the returned execution must first
 /// [`crate::shard_rebalance::bind_to_shard`] using this shard. It must not
 /// reuse `conn` unconditionally. Otherwise a follow-up against a live
 /// attempt that hopped shards silently runs against the wrong database.
@@ -4532,10 +4541,10 @@ pub async fn resolve_live_attempt(
 ///
 /// This is the shared primitive behind [`resolve_live_attempt`] (which takes
 /// the last element) and [`retry_chain_ids`]. It costs exactly the same number
-/// of row loads the plain resolve already performed — the walk had to load
+/// of row loads the plain resolve already performed. The walk had to load
 /// every intermediate row anyway to read its `state`.
 ///
-/// # Residence, not just origin (issue #1596 review, comment 4052029175)
+/// # Residence, not just origin (issue #1596)
 ///
 /// A retry successor is minted on its predecessor's shard. Nothing stops it
 /// from being rebalanced away afterwards. Shard rebalancing (issue #964)
@@ -4666,9 +4675,9 @@ pub async fn walk_retry_chain(
         // Exactly one successor can exist: `update_workflow_execution_failed`
         // filters `state = 'RUNNING'`, so only one transaction can seal a row
         // `FAILED`, and only that transaction inserts its successor. The
-        // `ORDER BY` is defensive — it makes the walk total (and stable across
-        // the two resolutions of a re-drive loop) even if that invariant were
-        // ever broken, rather than picking arbitrarily and oscillating.
+        // `ORDER BY` is defensive. It makes the walk total, and stable across
+        // the two resolutions of a re-drive loop, even if that invariant were
+        // ever broken. Without it the walk could pick arbitrarily and oscillate.
         let next: Option<Uuid> = harvest_workflow_executions::table
             .filter(harvest_workflow_executions::retry_of_exec_id.eq(Some(current_id)))
             .order((
@@ -4722,11 +4731,11 @@ pub async fn walk_retry_chain(
         ));
     }
     // Unreachable for any real chain (see `RETRY_CHAIN_MAX_DEPTH`). Reaching it
-    // means the chain is pathological — a cycle, or a `max_attempts` far above
+    // means the chain is pathological: a cycle, or a `max_attempts` far above
     // the bound. FAIL CLOSED: the deepest row reached may itself be `FAILED`
-    // with a live successor beyond the bound, so returning it would silently
+    // with a live successor beyond the bound. Returning it would silently
     // route every signal / cancel / terminate / query / update / result to a
-    // stale attempt — exactly the bug issue #843 exists to fix. An operator
+    // stale attempt. That is exactly the bug issue #843 exists to fix. An operator
     // seeing this error has a corrupted chain (or a `max_attempts` that needs
     // capping), not a bad request.
     tracing::error!(
@@ -4977,27 +4986,27 @@ async fn load_execution_row(
 
 /// Pure decision helper for the mutating-operation re-drive loop (issue #843).
 ///
-/// A mutating operation resolves the live attempt, acts on it, and — only when
-/// the act provably did **not** take effect — asks whether to try again against
+/// A mutating operation resolves the live attempt and acts on it. Only when the
+/// act provably did **not** take effect does it ask whether to try again against
 /// a freshly resolved target. Re-driving is correct exactly when the chain
-/// advanced underneath the operation (the attempt we acted on sealed `FAILED`
-/// and spawned its successor between our resolution and our act).
+/// advanced underneath the operation. The attempt acted on sealed `FAILED` and
+/// spawned its successor between the resolution and the act.
 ///
-/// Returning `false` when the target is unchanged is what makes the loop
-/// terminate and what stops a genuine error (an unknown id, an exhausted chain
-/// whose final outcome really is `FAILED`) from being retried forever.
+/// Returning `false` when the target is unchanged makes the loop terminate. It
+/// also stops a genuine error from being retried forever: an unknown id, or an
+/// exhausted chain whose final outcome really is `FAILED`.
 ///
 /// This is deliberately **never** consulted after an operation that DID take
 /// effect: re-driving a delivered signal would double-deliver it.
 ///
 /// Every redrive site below drops its current `rebind` before calling
-/// [`resolve_live_attempt_id_best_effort`] again (fresh review, P1
-/// follow-up). The attempt just acted on can have moved shards, so `rebind`
-/// still holds that shard's connection open. A migrated attempt's retry
-/// successor is usually inserted on that SAME shard. Re-resolving while the
-/// old connection is still held would then need a second connection to that
-/// same pool. The documented single-connection configuration cannot supply
-/// one, so the resolve blocks until checkout times out instead of redriving.
+/// [`resolve_live_attempt_id_best_effort`] again. The attempt just acted on can
+/// have moved shards, so `rebind` still holds that shard's connection open. A
+/// migrated attempt's retry successor is usually inserted on that SAME shard.
+/// Re-resolving while the old connection is still held would then need a
+/// second connection to that same pool. The documented single-connection
+/// configuration cannot supply one, so the resolve blocks until checkout
+/// times out instead of redriving.
 #[must_use]
 pub const fn redrive_target(acted_on: ExecutionId, freshly_resolved: ExecutionId) -> bool {
     acted_on.as_uuid().as_u128() != freshly_resolved.as_uuid().as_u128()
@@ -5006,20 +5015,20 @@ pub const fn redrive_target(acted_on: ExecutionId, freshly_resolved: ExecutionId
 /// Cancel the **live attempt** of the logical run named by `exec_id` (#843).
 ///
 /// Resolves the workflow-level retry chain (#523) and cancels the deepest
-/// attempt, so a caller still holding the id returned by `start` stops the run
-/// that is actually executing rather than no-opping against a sealed `FAILED`
+/// attempt. So a caller still holding the id returned by `start` stops the run
+/// that is actually executing. It does not no-op against a sealed `FAILED`
 /// predecessor. For a workflow with no retry policy this is exactly
 /// [`cancel_workflow_execution`].
 ///
-/// The queued-retry case is covered by the same routing: a retry whose start
-/// delay has not elapsed has its delayed task row deleted by the cancel, and a
-/// retry whose task is already claimable is sealed `CANCELLED` before it can
-/// commit any non-cancelled terminal (both the completion and failure writers
-/// filter on `state = 'RUNNING'`), so the chain cannot escape the cancel.
+/// The same routing covers the queued-retry case. A retry whose start delay has
+/// not elapsed has its delayed task row deleted by the cancel. A retry whose
+/// task is already claimable is sealed `CANCELLED` before it can commit any
+/// non-cancelled terminal. Both the completion and failure writers filter on
+/// `state = 'RUNNING'`. So the chain cannot escape the cancel.
 ///
-/// Race handling: if the attempt we resolved seals `FAILED` between the
-/// resolution and the cancel, the cancel fails and the chain has advanced, so
-/// the operation is re-driven against the new live attempt.
+/// Race handling: the resolved attempt can seal `FAILED` between the resolution
+/// and the cancel. Then the cancel fails and the chain has advanced, so the
+/// operation is re-driven against the new live attempt.
 ///
 /// # Errors
 ///
@@ -5074,9 +5083,9 @@ pub async fn cancel_live_attempt(
 /// Terminate the **live attempt** of the logical run named by `exec_id` (#843).
 ///
 /// The routed sibling of [`terminate_workflow_execution`]. Terminate is an
-/// idempotent no-op against any already-terminal state, so without routing a
+/// idempotent no-op against any already-terminal state. So without routing, a
 /// terminate against a sealed `FAILED` predecessor would silently succeed while
-/// the retry kept running — the sharpest failure mode this routing closes.
+/// the retry kept running. That is the sharpest failure mode this routing closes.
 ///
 /// Terminate fails every open (`PENDING`/`RUNNING`) task row of the attempt it
 /// seals, so a queued retry cannot subsequently be claimed.
@@ -5150,10 +5159,11 @@ pub async fn terminate_live_attempt(
 /// Pause the **live attempt** of the logical run named by `exec_id` (#843).
 ///
 /// The routed sibling of [`pause_workflow_execution`]. Pause only accepts a
-/// `RUNNING`/`PAUSED` execution, so without routing an operator holding the id
+/// `RUNNING`/`PAUSED` execution. So without routing, an operator holding the id
 /// returned by `start` would be told a retried run "is already terminal
-/// (FAILED)" and could not reach for the reversible containment lever at all —
-/// leaving only the destructive cancel/terminate escalation.
+/// (FAILED)". The operator could not reach for the reversible containment
+/// lever at all, and only the destructive cancel/terminate escalation would
+/// remain.
 ///
 /// Race handling: pause errors against a terminal row, so an `Err` that
 /// coincides with a chain advance is re-driven against the new live attempt.
@@ -5209,14 +5219,14 @@ pub async fn pause_live_attempt(
 /// Resume the **live attempt** of the logical run named by `exec_id` (#843).
 ///
 /// The routed sibling of [`resume_workflow_execution`]. Resume is an idempotent
-/// success no-op against any non-paused execution (issue #609 AC7), so without
-/// routing a resume against a sealed `FAILED` predecessor would report success
-/// while the paused retry stayed parked — the same silent-no-op failure mode
-/// routing closes for terminate.
+/// success no-op against any non-paused execution (issue #609 AC7). So without
+/// routing, a resume against a sealed `FAILED` predecessor would report success
+/// while the paused retry stayed parked. That is the same silent-no-op failure
+/// mode that routing closes for terminate.
 ///
-/// Race handling: a no-op against a row that is `FAILED` (the only terminal
-/// state a chain advance can produce) is re-driven against the freshly resolved
-/// live attempt; every other outcome is final.
+/// Race handling: a no-op against a row that is `FAILED` is re-driven against
+/// the freshly resolved live attempt. `FAILED` is the only terminal state a
+/// chain advance can produce. Every other outcome is final.
 ///
 /// # Errors
 ///
@@ -5364,8 +5374,8 @@ fn reject_pause_with_pending_cancel(
 /// Pausing is a durable, **non-terminal** transition: it appends a
 /// [`WorkflowEvent::WorkflowExecutionPaused`] event, marks the execution
 /// `PAUSED`, and records the pause audit metadata. The executor enforces the
-/// pause at the claim layer — a workflow task belonging to a `PAUSED` execution
-/// is never claimed, so no new commands are dispatched. In-flight activities
+/// pause at the claim layer. A workflow task of a `PAUSED` execution is never
+/// claimed, so no new commands are dispatched. In-flight activities
 /// continue to completion; their results are recorded normally and remain
 /// queued behind the pause until [`resume_workflow_execution`].
 ///
@@ -5605,26 +5615,28 @@ mod workflow_pause_recheck_tests {
 /// execution's UUID. Only `PENDING`/`RUNNING` rows that actually carry a
 /// deadline are touched, mirroring the scanner's enforcement scope.
 ///
-/// **Frozen rows also get their `scheduled_at` shifted** (issue #609
-/// post-review hardening, finding 3, option (b)): a `PENDING` row whose
-/// pre-shift `schedule_to_close_at` has already elapsed was *frozen* for the
-/// remainder of the pause — unclaimable throughout (the claim query requires
-/// `schedule_to_close_at > NOW()`) and spared by both the pause-aware
-/// `ScheduleToClose` scanner and the frozen-row-aware `ScheduleToStart`
-/// scanner. Shifting its `scheduled_at` forward by the same span is harmless
-/// (nothing could have claimed it while frozen — claim ordering by
-/// `scheduled_at` is only perturbed for rows that were out of the running
-/// anyway) and restores both its `schedule_to_start` budget and its
-/// retry-backoff position relative to the resume instant; without it, the
-/// next `ScheduleToStart` scan would instantly kill the row post-resume
-/// because the pause consumed its entire `scheduled_at + schedule_to_start`
-/// window. The shift deliberately does NOT apply to unfrozen `PENDING` rows
-/// (they stayed claimable during the pause — activities are not pause-gated
-/// — so their queue position and genuine worker-capacity signal must stay
-/// untouched) nor to `RUNNING` rows (`scheduled_at` is meaningless
-/// in-flight). The `CASE` reads the pre-update `schedule_to_close_at` (SQL
-/// `UPDATE` semantics: every `SET` expression sees the old row), so the
-/// frozen test is evaluated against the pre-shift deadline.
+/// **Frozen rows also get their `scheduled_at` shifted** (issue #609). A
+/// `PENDING` row whose pre-shift `schedule_to_close_at` has already elapsed was
+/// *frozen* for the rest of the pause. It was unclaimable throughout, since the
+/// claim query requires `schedule_to_close_at > NOW()`. Both the pause-aware
+/// `ScheduleToClose` scanner and the frozen-row-aware `ScheduleToStart` scanner
+/// spared it.
+///
+/// Shifting its `scheduled_at` forward by the same span is harmless. Nothing
+/// could have claimed it while frozen. Claim ordering by `scheduled_at` is only
+/// perturbed for rows that were out of the running anyway. The shift restores
+/// both its `schedule_to_start` budget and its retry-backoff position relative
+/// to the resume instant. Without it, the next `ScheduleToStart` scan would
+/// instantly kill the row post-resume. The pause consumed its entire
+/// `scheduled_at + schedule_to_start` window.
+///
+/// The shift deliberately does NOT apply to unfrozen `PENDING` rows. They stayed
+/// claimable during the pause, because activities are not pause-gated. So their
+/// queue position and genuine worker-capacity signal must stay untouched. Nor
+/// does it apply to `RUNNING` rows, where `scheduled_at` is meaningless
+/// in-flight. The `CASE` reads the pre-update `schedule_to_close_at`, since
+/// every `SET` expression of an SQL `UPDATE` sees the old row. So the frozen
+/// test is evaluated against the pre-shift deadline.
 #[must_use]
 pub const fn shift_schedule_to_close_on_resume_query() -> &'static str {
     "UPDATE harvest_task_queue \
@@ -5640,33 +5652,34 @@ pub const fn shift_schedule_to_close_on_resume_query() -> &'static str {
 
 /// SQL to shift still-open **external** tasks' wall-clock deadline
 /// (`harvest_external_tasks.schedule_to_close_at`) forward by the pause span
-/// on resume (issue #609 post-review hardening, finding 2).
+/// on resume (issue #609).
 ///
 /// Binds: `$1` = pause span in microseconds (`BIGINT`), `$2` = the resumed
 /// execution's UUID. Mirrors [`shift_schedule_to_close_on_resume_query`] for
-/// the external-task table: only `PENDING` rows are open (every other
-/// external state — `COMPLETED`/`FAILED`/`TIMED_OUT`/`CANCELLED` — is
-/// terminal), and
+/// the external-task table. Only `PENDING` rows are open; every other external
+/// state (`COMPLETED`/`FAILED`/`TIMED_OUT`/`CANCELLED`) is terminal.
 /// `schedule_to_close_at` is `NOT NULL` there, so no null guard is needed.
 ///
-/// **Lock ordering (issue #609 post-review hardening, third bot-review
-/// round):** the `harvest_external_tasks` convention is *task row →
-/// execution row* (set by the completion paths in `external_task.rs` and
-/// followed by `timeout::enforce_external_task_timeouts`), but this query
+/// **Lock ordering (issue #609):** the `harvest_external_tasks` convention is
+/// *task row → execution row*. The completion paths in `external_task.rs` set
+/// it, and `timeout::enforce_external_task_timeouts` follows it. But this query
 /// runs inside the resume transaction, which already holds the execution row
-/// lock — the inverted (execution-first) order. Waiting on a task row from
-/// here would therefore be an ABBA deadlock against a concurrent
-/// completion/scanner holding that task row and waiting on our execution
-/// lock. The `FOR UPDATE SKIP LOCKED` subselect makes this shift *never
-/// wait* on a task row, so it cannot participate in a lock cycle. Skipping a
-/// locked row is semantically safe in every case: a row locked by
-/// `complete_externally`/`fail_externally` becomes terminal once we commit
-/// (no shift needed); a row locked by `extend_deadline` gets a fresh
-/// `NOW()`-anchored deadline (no paused time charged); and a row locked by
-/// the timeout scanner was already expired *before* the pause began (the
-/// scan excludes PAUSED executions), so the shift would not have rescued it
-/// anyway — a deadline elapsed before the pause is still elapsed after
-/// shifting by exactly the pause span.
+/// lock: the inverted (execution-first) order. Waiting on a task row from here
+/// would therefore be an ABBA deadlock. A concurrent completion/scanner could
+/// hold that task row and wait on this transaction's execution lock. The
+/// `FOR UPDATE SKIP LOCKED` subselect makes this shift *never wait* on a task
+/// row, so it cannot participate in a lock cycle.
+///
+/// Skipping a locked row is semantically safe in every case:
+///
+/// - A row locked by `complete_externally`/`fail_externally` becomes terminal
+///   once this transaction commits (no shift needed).
+/// - A row locked by `extend_deadline` gets a fresh `NOW()`-anchored deadline
+///   (no paused time charged).
+/// - A row locked by the timeout scanner was already expired *before* the pause
+///   began, because the scan excludes PAUSED executions. So the shift would not
+///   have rescued it anyway. A deadline elapsed before the pause is still
+///   elapsed after shifting by exactly the pause span.
 #[must_use]
 pub const fn shift_external_schedule_to_close_on_resume_query() -> &'static str {
     "UPDATE harvest_external_tasks \
@@ -5694,9 +5707,9 @@ fn resume_deadline_shifts(
     execution: &WorkflowExecution,
     resumed_at: chrono::DateTime<Utc>,
 ) -> ResumeDeadlineShifts {
-    // Clamp the pause span to a non-negative duration so a clock skew that
-    // puts `paused_at` ahead of `resumed_at` neither reports a negative pause
-    // nor rewinds the deadline.
+    // Clamp the pause span to a non-negative duration. A clock skew can put
+    // `paused_at` ahead of `resumed_at`. The clamp then neither reports a
+    // negative pause nor rewinds the deadline.
     let pause_span = execution
         .paused_at
         .map(|p| resumed_at - p)
@@ -5704,17 +5717,17 @@ fn resume_deadline_shifts(
         .unwrap_or_else(chrono::Duration::zero);
     let pause_duration_secs = pause_span.to_std().map_or(0.0, |d| d.as_secs_f64());
 
-    // Pause suspends the SLA clock (issue #383 × #243): push the absolute
-    // execution deadline forward by the time spent paused so paused
+    // Pause suspends the SLA clock (issue #383 × #243). Push the absolute
+    // execution deadline forward by the time spent paused, so paused
     // wall-clock does not count against the workflow's `execution_timeout`.
     // `None` (no deadline) stays `None`.
     let new_deadline_at = execution.deadline_at.map(|d| d + pause_span);
-    // Also push the soft SLA deadline forward (issue #487): a workflow paused
-    // mid-flight should not breach its SLA while paused — BUT only suspend a
+    // Also push the soft SLA deadline forward (issue #487). A workflow paused
+    // mid-flight should not breach its SLA while paused. BUT only suspend a
     // deadline that was still ahead when the pause began. A deadline already
-    // passed before the pause stays in the past so the breach (which occurred
-    // while RUNNING) is still observed by the scanner on the next tick after
-    // resume, rather than being silently pushed into the future.
+    // passed before the pause stays in the past. The scanner then still
+    // observes the breach (which occurred while RUNNING) on the next tick
+    // after resume. It is not silently pushed into the future.
     let new_sla_deadline_at = execution
         .sla_deadline_at
         .map(|d| match execution.paused_at {
@@ -5734,20 +5747,20 @@ fn resume_deadline_shifts(
 /// 100 years (~3.15e15 µs).
 ///
 /// `chrono::Duration::num_microseconds` returns `None` for a span too long to
-/// represent in `i64` microseconds (> ~292,471 years); binding an `i64::MAX`
-/// fallback into the `... * INTERVAL '1 microsecond'` shift SQL would raise a
-/// Postgres "timestamp/interval out of range" error and roll back the whole
-/// resume transaction. An unrepresentable (or merely astronomically long)
-/// span instead clamps to this finite bound — far below Postgres's
-/// interval/timestamp range (timestamps top out at year 294276) — so the
-/// shift SQL can never raise "out of range" and the resume always commits.
+/// represent in `i64` microseconds (> ~292,471 years). An `i64::MAX` fallback
+/// bound into the `... * INTERVAL '1 microsecond'` shift SQL would raise a
+/// Postgres "timestamp/interval out of range" error. That rolls back the whole
+/// resume transaction. An unrepresentable (or merely astronomically long) span
+/// instead clamps to this finite bound. The bound sits far below Postgres's
+/// interval/timestamp range (timestamps top out at year 294276). So the shift
+/// SQL can never raise "out of range", and the resume always commits.
 const MAX_PAUSE_SHIFT_MICROS: i64 = 100 * 365 * 24 * 3600 * 1_000_000;
 
 /// Pure clamp for the pause-span → microseconds conversion used by
-/// [`shift_schedule_to_close_for_resume`]: non-positive spans pass through
-/// (the caller skips the shift entirely for them); the upper end is bounded
-/// by [`MAX_PAUSE_SHIFT_MICROS`] so the bound value is always safe to add to
-/// a real timestamp in SQL.
+/// [`shift_schedule_to_close_for_resume`]. Non-positive spans pass through,
+/// because the caller skips the shift entirely for them. The upper end is
+/// bounded by [`MAX_PAUSE_SHIFT_MICROS`], so the bound value is always safe to
+/// add to a real timestamp in SQL.
 fn clamped_pause_shift_micros(pause_span: chrono::Duration) -> i64 {
     pause_span
         .num_microseconds()
