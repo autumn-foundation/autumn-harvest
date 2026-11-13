@@ -553,8 +553,6 @@ async fn stranded_demand_matches_the_reference_query() {
          ('q0', 'workflow', '{}', 'PENDING', now() - interval '1 minute', \
               '00000000-0000-0000-0000-000000000003', NULL, NULL, NULL, NULL, NULL, NULL, NULL), \
          ('q0', 'workflow', '{}', 'PENDING', now() - interval '1 minute', \
-              '00000000-0000-0000-0000-0000000000ff', NULL, NULL, NULL, NULL, NULL, NULL, NULL), \
-         ('q0', 'workflow', '{}', 'PENDING', now() - interval '1 minute', \
               NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL), \
          ('q1', 'activity', '{}', 'PENDING', now() - interval '1 minute', \
               '00000000-0000-0000-0000-000000000002', 'act', NULL, NULL, NULL, NULL, NULL, NULL), \
@@ -592,16 +590,16 @@ async fn stranded_demand_matches_the_reference_query() {
         .collect();
     reference.sort();
     actual.sort();
-    // Four q0 workflow rows count: RUNNING, COMPLETED, a missing execution and
-    // no execution. The PAUSED one does not. The q1 activity of the PAUSED
-    // run counts, as does the bucket with tokens.
+    // Three q0 workflow rows count: RUNNING, COMPLETED and no execution. The
+    // PAUSED one does not. A foreign key rules out a missing execution. The
+    // q1 activity of the PAUSED run counts, as does the bucket with tokens.
     assert_eq!(actual, reference);
     let q0: i64 = actual
         .iter()
         .filter(|r| r.queue_name == "q0")
         .map(|r| r.cnt)
         .sum();
-    assert_eq!(q0, 4, "only the PAUSED workflow row is held: {actual:?}");
+    assert_eq!(q0, 3, "only the PAUSED workflow row is held: {actual:?}");
     drop(conn);
     drop(db);
 }
