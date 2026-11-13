@@ -1,4 +1,4 @@
-## Population samplers get their own interval (issue #2668)
+## Population samplers get their own interval (issue #2668, PR #2671)
 
 Two worker samplers count the whole active population of each shard:
 `harvest.workflow.history_oversized` and `harvest.workflow.active`. They ran
