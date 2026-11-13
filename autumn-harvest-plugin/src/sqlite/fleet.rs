@@ -296,8 +296,17 @@ impl HarvestFleet {
     /// Harvest file to it, before the driver starts. When the Harvest
     /// replica cannot reach the target, each open refuses until a new
     /// restore. One restore runs at a time, so two restores never swap
-    /// their targets. A direct `DatabaseFleet::restore` restores the
-    /// Harvest file at its latest state.
+    /// their targets.
+    ///
+    /// The target names the database file that the restore published. A
+    /// later direct `DatabaseFleet::restore` replaces that file, so it
+    /// supersedes the target. The Harvest file then goes to its latest
+    /// state. A direct restore that fails keeps the target.
+    ///
+    /// Each release before the fleet restore returns counts as its own. The
+    /// last one comes from its drain. A direct restore that ends after that
+    /// drain and before the return can take the target. Do not run a direct
+    /// restore of the tenant while this one runs.
     ///
     /// # Errors
     ///
@@ -312,15 +321,35 @@ impl HarvestFleet {
             self.shared.wake_now(key);
             return Ok(restored);
         };
-        let _turn = self.shared.restore_turn.lock().await;
-        replicas.request_restore(key, target);
-        let restored = self.shared.fleet.restore(key, target).await;
-        replicas.end_restore(key, restored.is_ok());
-        if restored.is_ok() {
-            // The restored file can have an earlier deadline. The next sweep
-            // opens the tenant, and the open restores the Harvest file.
-            self.shared.wake_now(key);
-        }
+        // The steps run in an owned task. A dropped caller then never stops
+        // a restore between its request and its end.
+        let (shared, replicas, owned) =
+            (Arc::clone(&self.shared), Arc::clone(replicas), key.clone());
+        let task = tokio::spawn(async move {
+            let _turn = shared.restore_turn.lock().await;
+            replicas.request_restore(&owned, target);
+            let restored = shared.fleet.restore(&owned, target).await;
+            replicas.restore_returned(&owned);
+            // The end waits for an open that holds the target lock.
+            let (ended, ok) = (owned.clone(), restored.is_ok());
+            if let Err(error) =
+                tokio::task::spawn_blocking(move || replicas.end_restore(&ended, ok)).await
+            {
+                tracing::error!(tenant = %owned, %error, "the end of the Harvest restore did not run");
+            }
+            if ok {
+                // The restored file can have an earlier deadline. The next
+                // sweep opens the tenant, and the open restores the file.
+                shared.wake_now(&owned);
+            }
+            restored
+        });
+        let restored = task
+            .await
+            .map_err(|error| autumn_web::db::fleet::FleetError::Restore {
+                name: key.name(),
+                detail: error.to_string(),
+            })?;
         Ok(restored?)
     }
 

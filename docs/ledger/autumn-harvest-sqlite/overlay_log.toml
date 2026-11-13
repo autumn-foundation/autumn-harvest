@@ -35,6 +35,20 @@ kind = ["read"]
 tables = ["harvest_agent_overlays"]
 measured = "unmeasured"
 
+["apply_schema"]
+driver = "setup"
+backend = ["sqlite"]
+kind = ["ddl", "read"]
+tables = ["harvest_agent_overlay_activations", "harvest_agent_overlay_heads", "harvest_agent_overlays", "harvest_agent_refine_policies"]
+measured = "unmeasured"
+
+["connect_once"]
+driver = "per_request"
+backend = ["sqlite"]
+kind = ["read"]
+tables = []
+measured = "unmeasured"
+
 ["SqliteOverlayLog::prepare"]
 driver = "setup"
 backend = ["sqlite"]

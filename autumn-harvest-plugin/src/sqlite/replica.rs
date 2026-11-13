@@ -18,12 +18,16 @@
 //! restore, a re-create or an import of the database gives a new file, and
 //! so a new identity. The next open then makes the Harvest file follow it.
 //!
+//! A restore target also names the database file that it belongs to. It
+//! applies only while that file is current, so a later restore of the
+//! database supersedes it. `resolve_target` holds the rule.
+//!
 //! ```text
 //! on_open   ─► restore or replace the file ─► open it ─► raise its epoch
 //!              ─► record the database identity ─► attach a shipper
 //! loop      ─► each tick: check the ownership epoch, then ship
 //! on_close  ─► ship until caught up, or park the shipper and retry
-//! release   ─► drop a parked shipper, keep the target of a restore
+//! release   ─► drop a parked shipper, write or bind the restore target
 //! on_delete ─► forget the tenant
 //! ```
 //!
@@ -76,11 +80,17 @@ pub const IDENTITY_SUFFIX: &str = ".tenant-db";
 /// The suffix of the file that holds the target of a tenant restore.
 pub const TARGET_SUFFIX: &str = ".restore-target";
 
+/// The suffix of the lock around each change of the restore target.
+const TARGET_LOCK_SUFFIX: &str = ".restore-target.lock";
+
+/// The suffix of the lock held while a file is published.
+const PUBLISH_LOCK_SUFFIX: &str = ".publish.lock";
+
 /// The text of a restore target that asks for the latest state.
 const LATEST: &str = "latest";
 
-/// The prefix of a restore target whose database restore finished.
-const COMMITTED: &str = "committed ";
+/// The text of a missing database file, or of no previous target.
+const NONE: &str = "-";
 
 /// The replica prefix of the Harvest file of `key`, under the replication
 /// root `base`.
@@ -207,9 +217,13 @@ impl Shipper {
 
 /// A `HarvestFleet::restore` call in flight.
 struct Requested {
-    target: Option<DateTime<Utc>>,
-    /// The target of an earlier restore that waits for the next open.
-    previous: Option<String>,
+    target: Target,
+    /// The pending entry that the last release of this restore wrote.
+    written: Option<Entry>,
+    /// Set once a release ran for this restore, even when its write failed.
+    released: bool,
+    /// Set once the fleet restore returned. A later release is not ours.
+    returned: bool,
 }
 
 /// What the replica holds for a restore request.
@@ -310,7 +324,8 @@ impl Replicas {
     /// - A missing file restores from the replica, as the fleet restores a
     ///   missing database.
     /// - When the tenant database is a new file, the Harvest file follows
-    ///   it. `HarvestFleet::restore` sets the point in time.
+    ///   it. `HarvestFleet::restore` sets the point in time, until a later
+    ///   restore of the database supersedes it.
     /// - A file from an older epoch of another owner is replaced.
     ///
     /// It blocks the thread.
@@ -326,15 +341,41 @@ impl Replicas {
         database: &Path,
         epoch: Option<u64>,
     ) -> Result<(), String> {
+        // The open holds this lock until it ends. So a late `end_restore`
+        // never writes back a target that this open used.
+        let _target_lock = SideLock::acquire(path, TARGET_LOCK_SUFFIX)?;
         let current = database_identity(database)?;
         let recorded = std::fs::read_to_string(suffixed(path, IDENTITY_SUFFIX)).ok();
-        let target = read_target(path)?;
-        // A committed target follows a restore that the fleet finished. It
-        // applies even when the database identity did not change, as a
-        // rename on Windows can keep the creation time. A file with no
-        // record predates the record, so any target then applies.
-        let replaced = target_committed(path)
-            || recorded.map_or_else(|| target.is_some(), |recorded| recorded.trim() != current);
+        let entry = read_entry(path)?;
+        // A restore of this process that did not return can still publish.
+        // Its pending entry does not apply yet, so the open reads the entry
+        // from before the request, and keeps the pending entry.
+        let unreturned = entry
+            .as_ref()
+            .filter(|entry| self.unreturned(key).as_ref() == Some(*entry))
+            .cloned();
+        // The database moved after the release, so a publish ran. It can be
+        // the restore itself, before it returned, or a stale-epoch open. The
+        // pending target cannot tell them apart, so the open waits for the
+        // return. A refused open of a stale-epoch open also frees the drain.
+        if let Some(Entry::Pending { from, .. }) = &unreturned
+            && *from != current
+        {
+            return Err(format!(
+                "a restore of {key} is ending: open the tenant again once it returns"
+            ));
+        }
+        let seen = unreturned.as_ref().map_or(entry, before_request);
+        let resolution = resolve_target(held(seen, &current));
+        let superseded = matches!(resolution, Resolution::Superseded);
+        let target = match resolution {
+            Resolution::Apply(target) => Some(target),
+            Resolution::Nothing | Resolution::Superseded => None,
+        };
+        // A file with no record predates the record. A superseded target
+        // then shows that the database is a new file.
+        let replaced =
+            target.is_some() || recorded.map_or(superseded, |recorded| recorded.trim() != current);
         if !path.exists() || replaced {
             self.drop_parked(key);
             match target {
@@ -348,10 +389,32 @@ impl Replicas {
         } else if let Some(epoch) = epoch {
             self.replace_if_stale(key, path, epoch)?;
         }
-        // The open used the target, or a failed restore left it beside an
-        // unchanged database. It goes in both cases.
-        remove_quietly(&suffixed(path, TARGET_SUFFIX));
+        match unreturned {
+            // The open used the earlier target, so the pending entry drops it.
+            Some(Entry::Pending { target, from, .. }) => {
+                let kept = Entry::Pending {
+                    target,
+                    from,
+                    previous: None,
+                };
+                write_entry(path, Some(&kept))?;
+                if let Some(requested) = self.requested_map().get_mut(key) {
+                    requested.written = Some(kept);
+                }
+            }
+            // The open used the target, or the target does not apply to
+            // this database. It goes in both cases.
+            _ => remove_quietly(&suffixed(path, TARGET_SUFFIX)),
+        }
         Ok(())
+    }
+
+    /// The pending entry of a restore of `key` that did not return.
+    fn unreturned(&self, key: &FleetDbKey) -> Option<Entry> {
+        self.requested_map()
+            .get(key)
+            .filter(|requested| !requested.returned)
+            .and_then(|requested| requested.written.clone())
     }
 
     /// What the replica of `key` holds at `target`, or at its latest state.
@@ -653,20 +716,88 @@ impl Replicas {
     }
 
     /// A delete or a restore of the tenant database starts. Let go of the
-    /// file. For a `HarvestFleet::restore`, write its target beside the
-    /// Harvest file. The next open reads it once the database is a new file.
+    /// file, and bind the restore target to the database file.
+    ///
+    /// Each release before a `HarvestFleet::restore` returns writes its
+    /// pending target. The last one comes from the drain of that restore, so
+    /// it names the file that the restore replaces. Each other release binds
+    /// the target that applies now to the current database file, or drops
+    /// it. A later restore of the database then supersedes the target.
     pub fn release(&self, key: &FleetDbKey) {
         self.drop_parked(key);
-        let requested = self
-            .requested_map()
-            .get(key)
-            .map(|requested| requested.target);
-        if let Some(target) = requested {
-            let path = super::fleet::tenant_harvest_file(&self.fleet.path_of(key));
-            if let Err(error) = write_target(&path, target) {
-                tracing::error!(tenant = %key, %error, "cannot keep the restore target of the tenant Harvest file");
-            }
+        let database = self.fleet.path_of(key);
+        let path = super::fleet::tenant_harvest_file(&database);
+        // The fleet calls this hook from a task. The lock can wait for an
+        // open that restores the Harvest file.
+        if let Err(error) = blocking(|| self.rebind(key, &path, &database)) {
+            tracing::error!(tenant = %key, %error, "cannot keep the restore target of the tenant Harvest file");
         }
+    }
+
+    /// Bind the target beside `path` to the current file at `database`,
+    /// under the target lock. A restore of `key` that did not return writes
+    /// its pending target.
+    fn rebind(&self, key: &FleetDbKey, path: &Path, database: &Path) -> Result<(), String> {
+        let asked = self.unreturned_target(key).is_some();
+        if !asked && !suffixed(path, TARGET_SUFFIX).exists() {
+            return Ok(());
+        }
+        if asked && let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
+        }
+        let _lock = SideLock::acquire(path, TARGET_LOCK_SUFFIX)?;
+        // Read the request under the lock, as an open can change it.
+        let request = self
+            .requested_map()
+            .get_mut(key)
+            .filter(|requested| !requested.returned)
+            .map(|requested| {
+                requested.released = true;
+                (requested.target, requested.written.clone())
+            });
+        let current = identity_or_none(database)?;
+        let (entry, unreadable) = match read_entry(path) {
+            Ok(entry) => (entry, false),
+            Err(error) => {
+                tracing::warn!(tenant = %key, %error, "the release replaces an unreadable restore target");
+                (None, true)
+            }
+        };
+        let next = match &request {
+            Some((target, written)) => {
+                // An earlier release of this restore wrote the entry. Read
+                // the entry from before the request.
+                let before = match entry.clone() {
+                    Some(entry) if written.as_ref() == Some(&entry) => before_request(&entry),
+                    other => other,
+                };
+                Some(Entry::Pending {
+                    target: *target,
+                    from: current.clone(),
+                    previous: settle(before, &current).as_ref().map(Entry::target),
+                })
+            }
+            None => settle(entry.clone(), &current),
+        };
+        if unreadable || next != entry {
+            write_entry(path, next.as_ref())?;
+        }
+        if request.is_some()
+            && let Some(requested) = self.requested_map().get_mut(key)
+            && !requested.returned
+        {
+            requested.written = next;
+        }
+        Ok(())
+    }
+
+    /// The target of a restore of `key` that did not return.
+    fn unreturned_target(&self, key: &FleetDbKey) -> Option<Target> {
+        self.requested_map()
+            .get(key)
+            .filter(|requested| !requested.returned)
+            .map(|requested| requested.target)
     }
 
     /// The tenant is deleted.
@@ -676,40 +807,50 @@ impl Replicas {
 
     /// `HarvestFleet::restore` starts a restore of `key` to `target`.
     pub fn request_restore(&self, key: &FleetDbKey, target: Option<DateTime<Utc>>) {
-        let path = super::fleet::tenant_harvest_file(&self.fleet.path_of(key));
-        // An earlier restore can wait for the next open. Keep its target.
-        let previous = std::fs::read_to_string(suffixed(&path, TARGET_SUFFIX)).ok();
-        self.requested_map()
-            .insert(key.clone(), Requested { target, previous });
+        self.requested_map().insert(
+            key.clone(),
+            Requested {
+                target: Target::of(target),
+                written: None,
+                released: false,
+                returned: false,
+            },
+        );
+    }
+
+    /// The fleet restore that [`request_restore`](Self::request_restore)
+    /// started returned. Its drain ended, so a later release is not ours.
+    pub fn restore_returned(&self, key: &FleetDbKey) {
+        if let Some(requested) = self.requested_map().get_mut(key) {
+            requested.returned = true;
+        }
     }
 
     /// The restore that [`request_restore`](Self::request_restore) started
-    /// ended. A failed one leaves the database as it was, so the target of
-    /// an earlier restore comes back.
+    /// ended. It blocks the thread.
+    ///
+    /// A finished restore binds its target to the new database file. A
+    /// failed one leaves the database as it was, so the earlier target
+    /// comes back. When an open or another release already took the
+    /// pending target, nothing changes.
     pub fn end_restore(&self, key: &FleetDbKey, restored: bool) {
-        let requested = self.requested_map().remove(key);
-        let file = suffixed(
-            &super::fleet::tenant_harvest_file(&self.fleet.path_of(key)),
-            TARGET_SUFFIX,
-        );
-        if restored {
-            // The fleet replaced the database. The next open applies the
-            // target whatever the database identity says.
-            if let Ok(text) = std::fs::read_to_string(&file)
-                && !text.starts_with(COMMITTED)
-                && let Err(error) = write_atomic(&file, &format!("{COMMITTED}{}", text.trim()))
-            {
-                tracing::error!(tenant = %key, %error, "cannot commit the restore target of the tenant Harvest file");
-            }
+        let Some(requested) = self.requested_map().remove(key) else {
+            return;
+        };
+        // The fleet refused the restore before its drain.
+        if !requested.released {
             return;
         }
-        match requested.and_then(|requested| requested.previous) {
-            Some(previous) => {
-                if let Err(error) = write_atomic(&file, &previous) {
-                    tracing::error!(tenant = %key, %error, "cannot put back the earlier restore target of the tenant Harvest file");
-                }
-            }
-            None => remove_quietly(&file),
+        let database = self.fleet.path_of(key);
+        let path = super::fleet::tenant_harvest_file(&database);
+        let ended = match &requested.written {
+            Some(written) => finish(&path, &database, written, restored),
+            // The release could not write the target. Keep it now.
+            None if restored => commit_lost(&path, &database, requested.target),
+            None => Ok(()),
+        };
+        if let Err(error) = ended {
+            tracing::error!(tenant = %key, %error, "cannot commit the restore target of the tenant Harvest file");
         }
     }
 
@@ -852,8 +993,20 @@ fn tombstone_row(
 /// The identity of the tenant database file. A restore, a re-create or an
 /// import publishes a new file, so the identity changes.
 fn database_identity(database: &Path) -> Result<String, String> {
-    let meta = std::fs::metadata(database)
-        .map_err(|error| format!("cannot read {}: {error}", database.display()))?;
+    file_identity(database).map_err(|error| format!("cannot read {}: {error}", database.display()))
+}
+
+/// The identity of the tenant database file, or [`NONE`] when it is gone.
+fn identity_or_none(database: &Path) -> Result<String, String> {
+    match file_identity(database) {
+        Ok(identity) => Ok(identity),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(NONE.to_owned()),
+        Err(error) => Err(format!("cannot read {}: {error}", database.display())),
+    }
+}
+
+fn file_identity(database: &Path) -> std::io::Result<String> {
+    let meta = std::fs::metadata(database)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt as _;
@@ -861,10 +1014,8 @@ fn database_identity(database: &Path) -> Result<String, String> {
     }
     #[cfg(not(unix))]
     {
-        let created = meta
-            .created()
-            .map_err(|error| format!("cannot read {}: {error}", database.display()))?;
-        let nanos = created
+        let nanos = meta
+            .created()?
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |since| since.as_nanos());
         // Not the length: an ordinary checkpoint changes it.
@@ -882,48 +1033,296 @@ enum Target {
 }
 
 impl Target {
+    const fn of(time: Option<DateTime<Utc>>) -> Self {
+        match time {
+            Some(at) => Self::At(at),
+            None => Self::Latest,
+        }
+    }
+
     const fn time(self) -> Option<DateTime<Utc>> {
         match self {
             Self::Latest => None,
             Self::At(at) => Some(at),
         }
     }
+
+    fn render(self) -> String {
+        match self {
+            Self::Latest => LATEST.to_owned(),
+            Self::At(at) => at.to_rfc3339(),
+        }
+    }
+
+    fn parse(text: &str) -> Option<Self> {
+        if text == LATEST {
+            return Some(Self::Latest);
+        }
+        DateTime::parse_from_rfc3339(text)
+            .ok()
+            .map(|at| Self::At(at.with_timezone(&Utc)))
+    }
 }
 
-/// Whether the restore target beside `path` belongs to a finished restore.
-fn target_committed(path: &Path) -> bool {
-    std::fs::read_to_string(suffixed(path, TARGET_SUFFIX))
-        .is_ok_and(|text| text.starts_with(COMMITTED))
+/// The entry of a restore target file. Each one names the database file
+/// that it belongs to.
+///
+/// ```text
+/// committed <of> <target>
+/// pending <from> <target> <previous>
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Entry {
+    /// A finished restore that published the database file `of`.
+    Committed { target: Target, of: String },
+    /// A restore that started on the database file `from`. Its end did not
+    /// run. `previous` is the target that applied to `from`.
+    Pending {
+        target: Target,
+        from: String,
+        previous: Option<Target>,
+    },
+}
+
+impl Entry {
+    const fn target(&self) -> Target {
+        match self {
+            Self::Committed { target, .. } | Self::Pending { target, .. } => *target,
+        }
+    }
+
+    fn render(&self) -> String {
+        match self {
+            Self::Committed { target, of } => format!("committed {of} {}", target.render()),
+            Self::Pending {
+                target,
+                from,
+                previous,
+            } => format!(
+                "pending {from} {} {}",
+                target.render(),
+                previous.map_or_else(|| NONE.to_owned(), Target::render)
+            ),
+        }
+    }
+
+    fn parse(text: &str) -> Option<Self> {
+        let words: Vec<&str> = text.split_whitespace().collect();
+        match words.as_slice() {
+            ["committed", of, target] => Some(Self::Committed {
+                target: Target::parse(target)?,
+                of: (*of).to_owned(),
+            }),
+            ["pending", from, target, previous] => Some(Self::Pending {
+                target: Target::parse(target)?,
+                from: (*from).to_owned(),
+                previous: if *previous == NONE {
+                    None
+                } else {
+                    Some(Target::parse(previous)?)
+                },
+            }),
+            // An entry in the older format names no file. It applies at the
+            // next open.
+            [target] | ["committed", target] => Some(Self::Pending {
+                target: Target::parse(target)?,
+                from: NONE.to_owned(),
+                previous: None,
+            }),
+            _ => None,
+        }
+    }
+}
+
+/// What a target file holds, seen from the current database file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Held<T> {
+    /// No target.
+    Nothing,
+    /// A finished restore. `current` is true while its file is current.
+    Committed { target: T, current: bool },
+    /// A restore whose end did not run. `moved` is true when the database
+    /// file changed since its release.
+    Pending {
+        target: T,
+        moved: bool,
+        previous: Option<T>,
+    },
+}
+
+/// The target that applies to the current database file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Resolution<T> {
+    /// No target applies.
+    Nothing,
+    /// The open restores the Harvest file to this target.
+    Apply(T),
+    /// A later restore replaced the database file of the target.
+    Superseded,
+}
+
+/// Give the target that applies to the current database file.
+///
+/// A committed target applies only while its file is current. A pending
+/// target applies once the file moved. Until then, the target that
+/// applied before it still applies. `formal/verus/src/restore_target.rs`
+/// proves the function for every input. It also proves that each open
+/// applies the target of the last finished `HarvestFleet::restore`, and no
+/// target after a successful direct restore.
+fn resolve_target<T>(held: Held<T>) -> Resolution<T> {
+    match held {
+        Held::Nothing => Resolution::Nothing,
+        Held::Committed { target, current } => {
+            if current {
+                Resolution::Apply(target)
+            } else {
+                Resolution::Superseded
+            }
+        }
+        Held::Pending {
+            target,
+            moved,
+            previous,
+        } => match (moved, previous) {
+            (true, _) => Resolution::Apply(target),
+            (false, Some(previous)) => Resolution::Apply(previous),
+            (false, None) => Resolution::Nothing,
+        },
+    }
+}
+
+/// `entry`, seen from the database file `current`.
+fn held(entry: Option<Entry>, current: &str) -> Held<Target> {
+    match entry {
+        None => Held::Nothing,
+        Some(Entry::Committed { target, of }) => Held::Committed {
+            target,
+            current: of == current,
+        },
+        Some(Entry::Pending {
+            target,
+            from,
+            previous,
+        }) => Held::Pending {
+            target,
+            moved: from != current,
+            previous,
+        },
+    }
+}
+
+/// The target that applies to `current`, bound to `current`.
+fn settle(entry: Option<Entry>, current: &str) -> Option<Entry> {
+    match resolve_target(held(entry, current)) {
+        Resolution::Apply(target) => Some(Entry::Committed {
+            target,
+            of: current.to_owned(),
+        }),
+        Resolution::Nothing | Resolution::Superseded => None,
+    }
 }
 
 /// The restore target beside the Harvest file at `path`, if any.
-fn read_target(path: &Path) -> Result<Option<Target>, String> {
+fn read_entry(path: &Path) -> Result<Option<Entry>, String> {
     let file = suffixed(path, TARGET_SUFFIX);
-    let text = match std::fs::read_to_string(&file) {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(format!("cannot read {}: {error}", file.display())),
-    };
-    let text = text.trim();
-    let text = text.strip_prefix(COMMITTED).unwrap_or(text);
-    if text == LATEST {
-        return Ok(Some(Target::Latest));
+    match std::fs::read_to_string(&file) {
+        Ok(text) => Entry::parse(&text)
+            .map(Some)
+            .ok_or_else(|| format!("unreadable restore target in {}", file.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("cannot read {}: {error}", file.display())),
     }
-    DateTime::parse_from_rfc3339(text)
-        .map(|at| Some(Target::At(at.with_timezone(&Utc))))
-        .map_err(|error| format!("unreadable restore target in {}: {error}", file.display()))
 }
 
-/// Keep the restore target beside the Harvest file at `path`.
-fn write_target(path: &Path, target: Option<DateTime<Utc>>) -> Result<(), String> {
-    let text = target.map_or_else(|| LATEST.to_owned(), |at| at.to_rfc3339());
-    write_atomic(&suffixed(path, TARGET_SUFFIX), &text)
+/// Keep `entry` beside the Harvest file at `path`, or remove the target.
+fn write_entry(path: &Path, entry: Option<&Entry>) -> Result<(), String> {
+    let file = suffixed(path, TARGET_SUFFIX);
+    let Some(entry) = entry else {
+        return match std::fs::remove_file(&file) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(format!("cannot remove {}: {error}", file.display())),
+        };
+    };
+    write_atomic(&file, &entry.render())
 }
 
-/// Write `text` to `file` through a private file and a rename.
+/// The entry from before a request that wrote `entry`.
+fn before_request(entry: &Entry) -> Option<Entry> {
+    match entry {
+        Entry::Pending { from, previous, .. } => previous.map(|previous| Entry::Committed {
+            target: previous,
+            of: from.clone(),
+        }),
+        Entry::Committed { .. } => Some(entry.clone()),
+    }
+}
+
+/// Keep the target of a finished restore whose release wrote nothing.
+fn commit_lost(path: &Path, database: &Path, target: Target) -> Result<(), String> {
+    let _lock = SideLock::acquire(path, TARGET_LOCK_SUFFIX)?;
+    if read_entry(path).ok().flatten().is_some() {
+        return Ok(());
+    }
+    let committed = Entry::Committed {
+        target,
+        of: database_identity(database)?,
+    };
+    write_entry(path, Some(&committed))
+}
+
+/// Run `work`, which blocks, from any thread. On a worker thread of a
+/// multi-thread runtime, the runtime moves its other tasks away first.
+fn blocking<R>(work: impl FnOnce() -> R) -> R {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(work)
+        }
+        _ => work(),
+    }
+}
+
+/// End the restore that wrote `written`, under the target lock. When an
+/// open or another release took it, nothing changes.
+fn finish(path: &Path, database: &Path, written: &Entry, restored: bool) -> Result<(), String> {
+    let _lock = SideLock::acquire(path, TARGET_LOCK_SUFFIX)?;
+    if read_entry(path)?.as_ref() != Some(written) {
+        return Ok(());
+    }
+    let Entry::Pending {
+        target,
+        from,
+        previous,
+    } = written
+    else {
+        return Ok(());
+    };
+    let next = if restored {
+        // An error leaves the pending entry. The open then compares `from`
+        // with the database file.
+        Some(Entry::Committed {
+            target: *target,
+            of: database_identity(database)?,
+        })
+    } else {
+        previous.map(|previous| Entry::Committed {
+            target: previous,
+            of: from.clone(),
+        })
+    };
+    write_entry(path, next.as_ref())
+}
+
+/// Write `text` to `file` through a private file and a rename. The data
+/// reaches the disk before the rename.
 fn write_atomic(file: &Path, text: &str) -> Result<(), String> {
+    use std::io::Write as _;
     let staging = suffixed(file, &format!(".{}", unique()));
-    std::fs::write(&staging, text)
+    File::create(&staging)
+        .and_then(|mut created| {
+            created.write_all(text.as_bytes())?;
+            created.sync_all()
+        })
         .and_then(|()| std::fs::rename(&staging, file))
         .map_err(|error| {
             remove_quietly(&staging);
@@ -937,7 +1336,7 @@ fn set_aside(key: &FleetDbKey, path: &Path) -> Result<(), String> {
     if !path.exists() {
         return Ok(());
     }
-    let _publish = PublishLock::acquire(path)?;
+    let _publish = SideLock::acquire(path, PUBLISH_LOCK_SUFFIX)?;
     let _writer = autumn_harvest_sqlite::FileWriterLock::acquire(path)
         .map_err(|error| format!("cannot lock {} to set it aside: {error}", path.display()))?;
     let aside = suffixed(path, &format!(".aside-{}", unique()));
@@ -956,7 +1355,7 @@ fn set_aside(key: &FleetDbKey, path: &Path) -> Result<(), String> {
 /// Publish the restored file `staging` at `path`. See
 /// [`Replicas::publish_plan`].
 fn publish(staging: &Path, path: &Path, replace: bool) -> Result<(), String> {
-    let _publish = PublishLock::acquire(path)?;
+    let _publish = SideLock::acquire(path, PUBLISH_LOCK_SUFFIX)?;
     let _writer = if path.exists() {
         if !replace {
             // Another opener published the file first. Open that file.
@@ -977,14 +1376,14 @@ fn publish(staging: &Path, path: &Path, replace: bool) -> Result<(), String> {
     std::fs::rename(staging, path).map_err(|error| error.to_string())
 }
 
-/// The OS lock `<file>.publish.lock`, held while a file is published.
-struct PublishLock {
+/// An OS lock on `<file><suffix>`. It waits for another holder.
+struct SideLock {
     _file: File,
 }
 
-impl PublishLock {
-    fn acquire(path: &Path) -> Result<Self, String> {
-        let name = suffixed(path, ".publish.lock");
+impl SideLock {
+    fn acquire(path: &Path, suffix: &str) -> Result<Self, String> {
+        let name = suffixed(path, suffix);
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -1117,6 +1516,7 @@ mod tests {
         replicas.request_restore(&key, None);
         replicas.release(&key);
         replace_database(&db);
+        replicas.restore_returned(&key);
         replicas.end_restore(&key, true);
         std::fs::remove_file(&path).unwrap();
         replicas.prepare(&key, &path, &db, None).unwrap();
@@ -1127,25 +1527,78 @@ mod tests {
         );
     }
 
+    /// The target file beside the Harvest file at `path`.
+    fn entry(path: &Path) -> Option<Entry> {
+        read_entry(path).unwrap()
+    }
+
+    /// A target that no replica reaches. An open that applies it fails.
+    fn unreachable() -> Option<DateTime<Utc>> {
+        Some(DateTime::UNIX_EPOCH)
+    }
+
+    /// The key and the paths of the tenant `acme`. It writes a database
+    /// file.
+    fn acme(replicas: &Replicas) -> (FleetDbKey, PathBuf, PathBuf) {
+        let key = replicas.fleet.key_for("acme").unwrap();
+        let db = replicas.fleet.path_of(&key);
+        let path = super::super::fleet::tenant_harvest_file(&db);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&db, b"tenant").unwrap();
+        (key, path, db)
+    }
+
+    /// A Harvest file at epoch 1 beside its database, and a replica at
+    /// epoch 6 that the open can restore.
+    fn shipped_acme(dir: &Path, replicas: &Replicas) -> (FleetDbKey, PathBuf, PathBuf) {
+        let (key, path, db) = acme(replicas);
+        std::fs::create_dir_all(dir.join("b")).unwrap();
+        ship_at(replicas, &key, &dir.join("b/acme.harvest.db"), 6);
+        let runtime = autumn_harvest_sqlite::SqliteRuntime::open_replicated(&path).unwrap();
+        runtime.raise_fleet_epoch(1).unwrap();
+        drop(runtime);
+        record_database(&path, &db).unwrap();
+        (key, path, db)
+    }
+
+    /// A `HarvestFleet::restore` of `key` to `target` that publishes a new
+    /// database file.
+    fn harvest_restore(
+        replicas: &Replicas,
+        key: &FleetDbKey,
+        db: &Path,
+        target: Option<DateTime<Utc>>,
+    ) {
+        replicas.request_restore(key, target);
+        replicas.release(key);
+        replace_database(db);
+        replicas.restore_returned(key);
+        replicas.end_restore(key, true);
+    }
+
     /// A release with no `HarvestFleet::restore`, such as a delete, keeps no
     /// target. A failed restore drops its target.
     #[test]
     fn only_a_requested_restore_keeps_a_target() {
         let dir = tempfile::tempdir().unwrap();
         let replicas = replicas(dir.path());
-        let key = replicas.fleet.key_for("acme").unwrap();
-        let path = super::super::fleet::tenant_harvest_file(&replicas.fleet.path_of(&key));
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        let target = suffixed(&path, TARGET_SUFFIX);
+        let (key, path, db) = acme(&replicas);
         replicas.release(&key);
-        assert!(!target.exists(), "a plain release");
+        assert_eq!(entry(&path), None, "a plain release");
 
         let at = Utc::now();
         replicas.request_restore(&key, Some(at));
         replicas.release(&key);
-        assert_eq!(read_target(&path).unwrap(), Some(Target::At(at)));
+        assert_eq!(
+            entry(&path),
+            Some(Entry::Pending {
+                target: Target::At(at),
+                from: database_identity(&db).unwrap(),
+                previous: None,
+            })
+        );
         replicas.end_restore(&key, false);
-        assert!(!target.exists(), "a failed restore");
+        assert_eq!(entry(&path), None, "a failed restore");
     }
 
     /// A failed restore puts back the target of an earlier one that waits
@@ -1154,43 +1607,490 @@ mod tests {
     fn a_failed_restore_keeps_the_earlier_target() {
         let dir = tempfile::tempdir().unwrap();
         let replicas = replicas(dir.path());
-        let key = replicas.fleet.key_for("acme").unwrap();
-        let path = super::super::fleet::tenant_harvest_file(&replicas.fleet.path_of(&key));
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let (key, path, db) = acme(&replicas);
         let first = Utc::now();
-        replicas.request_restore(&key, Some(first));
-        replicas.release(&key);
-        replicas.end_restore(&key, true);
+        harvest_restore(&replicas, &key, &db, Some(first));
+        let committed = Some(Entry::Committed {
+            target: Target::At(first),
+            of: database_identity(&db).unwrap(),
+        });
+        assert_eq!(entry(&path), committed);
 
         replicas.request_restore(&key, None);
         replicas.release(&key);
         replicas.end_restore(&key, false);
-        assert_eq!(read_target(&path).unwrap(), Some(Target::At(first)));
+        assert_eq!(entry(&path), committed);
     }
 
     /// A finished restore applies its target even when the database
-    /// identity did not change.
+    /// identity did not change, as a rename on Windows can keep it.
     #[test]
     fn a_committed_target_applies_with_an_unchanged_identity() {
         let dir = tempfile::tempdir().unwrap();
         let replicas = replicas(dir.path());
-        let key = replicas.fleet.key_for("acme").unwrap();
-        let path = super::super::fleet::tenant_harvest_file(&replicas.fleet.path_of(&key));
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::create_dir_all(dir.path().join("b")).unwrap();
-        ship_at(&replicas, &key, &dir.path().join("b/acme.harvest.db"), 6);
-
-        let db = database(path.parent().unwrap(), "acme.db");
-        let runtime = autumn_harvest_sqlite::SqliteRuntime::open_replicated(&path).unwrap();
-        runtime.raise_fleet_epoch(1).unwrap();
-        drop(runtime);
-        record_database(&path, &db).unwrap();
+        let (key, path, db) = shipped_acme(dir.path(), &replicas);
         replicas.request_restore(&key, None);
         replicas.release(&key);
         replicas.end_restore(&key, true);
-        assert!(target_committed(&path));
+        assert!(matches!(entry(&path), Some(Entry::Committed { .. })));
         replicas.prepare(&key, &path, &db, None).unwrap();
         assert_eq!(autumn_harvest_sqlite::fleet_epoch::read(&path).unwrap(), 6);
+    }
+
+    /// A direct restore after a `HarvestFleet::restore` supersedes its
+    /// target. The open follows the latest replica.
+    #[test]
+    fn a_direct_restore_supersedes_a_committed_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let replicas = replicas(dir.path());
+        let (key, path, db) = shipped_acme(dir.path(), &replicas);
+        harvest_restore(&replicas, &key, &db, unreachable());
+
+        replicas.release(&key);
+        replace_database(&db);
+        replicas.prepare(&key, &path, &db, None).unwrap();
+        assert_eq!(autumn_harvest_sqlite::fleet_epoch::read(&path).unwrap(), 6);
+        assert_eq!(entry(&path), None);
+    }
+
+    /// A direct restore that fails leaves the database. The target still
+    /// applies, so this open refuses as the target asks.
+    #[test]
+    fn a_failed_direct_restore_keeps_the_committed_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let replicas = replicas(dir.path());
+        let (key, path, db) = shipped_acme(dir.path(), &replicas);
+        harvest_restore(&replicas, &key, &db, unreachable());
+
+        replicas.release(&key);
+        let refused = replicas.prepare(&key, &path, &db, None).unwrap_err();
+        assert!(
+            refused.contains("cannot reach the restore target"),
+            "{refused}"
+        );
+        assert!(matches!(entry(&path), Some(Entry::Committed { .. })));
+    }
+
+    /// A restart after the release keeps the pending target. The open
+    /// applies it once the database file changed, and drops it otherwise.
+    #[test]
+    fn a_restart_after_the_release_keeps_the_pending_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let replicas = replicas(dir.path());
+        let (key, path, db) = shipped_acme(dir.path(), &replicas);
+        replicas.request_restore(&key, unreachable());
+        replicas.release(&key);
+        let restarted = self::replicas(dir.path());
+        restarted.prepare(&key, &path, &db, None).unwrap();
+        assert_eq!(entry(&path), None, "the restore failed before the restart");
+
+        replicas.request_restore(&key, unreachable());
+        replicas.release(&key);
+        replace_database(&db);
+        let restarted = self::replicas(dir.path());
+        assert!(
+            restarted.prepare(&key, &path, &db, None).is_err(),
+            "the restore finished"
+        );
+    }
+
+    /// A release after a restore returned and before its `end_restore` binds
+    /// the pending target to the restored file. A later end changes nothing.
+    #[test]
+    fn a_later_release_binds_the_pending_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let replicas = replicas(dir.path());
+        let (key, path, db) = shipped_acme(dir.path(), &replicas);
+        replicas.request_restore(&key, unreachable());
+        replicas.release(&key);
+        replace_database(&db);
+        replicas.restore_returned(&key);
+
+        replicas.release(&key);
+        let bound = Some(Entry::Committed {
+            target: Target::of(unreachable()),
+            of: database_identity(&db).unwrap(),
+        });
+        assert_eq!(entry(&path), bound);
+        replace_database(&db);
+        replicas.end_restore(&key, true);
+        assert_eq!(entry(&path), bound, "the end found another entry");
+        replicas.prepare(&key, &path, &db, None).unwrap();
+        assert_eq!(autumn_harvest_sqlite::fleet_epoch::read(&path).unwrap(), 6);
+    }
+
+    /// An open holds the target lock. An end that waits on it never writes
+    /// back a target that the open used.
+    #[test]
+    fn a_late_end_never_writes_back_a_used_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let replicas = replicas(dir.path());
+        let (key, path, db) = acme(&replicas);
+        replicas.request_restore(&key, None);
+        replicas.release(&key);
+        replace_database(&db);
+        replicas.restore_returned(&key);
+
+        let open = SideLock::acquire(&path, TARGET_LOCK_SUFFIX).unwrap();
+        std::thread::scope(|scope| {
+            let end = scope.spawn(|| replicas.end_restore(&key, true));
+            std::thread::sleep(Duration::from_millis(100));
+            assert!(
+                matches!(entry(&path), Some(Entry::Pending { .. })),
+                "the end waits"
+            );
+            remove_quietly(&suffixed(&path, TARGET_SUFFIX));
+            drop(open);
+            end.join().unwrap();
+        });
+        assert_eq!(entry(&path), None);
+    }
+
+    /// An open holds the target lock while it restores. A release or an end
+    /// waits for it.
+    #[test]
+    fn an_open_holds_the_target_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let replicas = replicas(dir.path());
+        let (key, path, db) = shipped_acme(dir.path(), &replicas);
+        replicas.request_restore(&key, None);
+        replicas.release(&key);
+        replace_database(&db);
+        replicas.restore_returned(&key);
+
+        let held = SideLock::acquire(&path, TARGET_LOCK_SUFFIX).unwrap();
+        std::thread::scope(|scope| {
+            let open = scope.spawn(|| replicas.prepare(&key, &path, &db, None));
+            std::thread::sleep(Duration::from_millis(100));
+            assert!(!open.is_finished(), "the open waits");
+            assert_eq!(autumn_harvest_sqlite::fleet_epoch::read(&path).unwrap(), 1);
+            drop(held);
+            open.join().unwrap().unwrap();
+        });
+        assert_eq!(autumn_harvest_sqlite::fleet_epoch::read(&path).unwrap(), 6);
+        assert_eq!(entry(&path), None);
+    }
+
+    /// A release of another operation can come between the request and the
+    /// drain of a restore, as a stale-epoch open does. The last release
+    /// rebuilds the entry, so the target follows the restore.
+    #[test]
+    fn the_last_release_before_the_return_writes_the_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let replicas = replicas(dir.path());
+        let (key, path, db) = shipped_acme(dir.path(), &replicas);
+        replicas.request_restore(&key, unreachable());
+        // The stale-epoch open releases and replaces the database. Its
+        // Harvest open then refuses, so the drain of the restore can start.
+        replicas.release(&key);
+        replace_database(&db);
+        let refused = replicas.prepare(&key, &path, &db, None).unwrap_err();
+        assert!(refused.contains("is ending"), "{refused}");
+        assert!(matches!(entry(&path), Some(Entry::Pending { .. })), "kept");
+
+        // The restore drains, releases and publishes.
+        replicas.release(&key);
+        let from = database_identity(&db).unwrap();
+        replace_database(&db);
+        replicas.restore_returned(&key);
+        replicas.end_restore(&key, true);
+        assert_eq!(
+            entry(&path),
+            Some(Entry::Committed {
+                target: Target::of(unreachable()),
+                of: database_identity(&db).unwrap(),
+            })
+        );
+        assert_ne!(from, database_identity(&db).unwrap());
+        assert!(
+            replicas.prepare(&key, &path, &db, None).is_err(),
+            "the target applies"
+        );
+    }
+
+    /// An open during the drain of a restore keeps the pending target. It
+    /// uses the earlier target, so the pending entry drops that one.
+    #[test]
+    fn an_open_in_the_drain_keeps_the_pending_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let replicas = replicas(dir.path());
+        let (key, path, db) = shipped_acme(dir.path(), &replicas);
+        harvest_restore(&replicas, &key, &db, None);
+        replicas.request_restore(&key, unreachable());
+        replicas.release(&key);
+
+        replicas.prepare(&key, &path, &db, None).unwrap();
+        assert_eq!(autumn_harvest_sqlite::fleet_epoch::read(&path).unwrap(), 6);
+        let kept = Some(Entry::Pending {
+            target: Target::of(unreachable()),
+            from: database_identity(&db).unwrap(),
+            previous: None,
+        });
+        assert_eq!(entry(&path), kept);
+
+        replace_database(&db);
+        replicas.restore_returned(&key);
+        replicas.end_restore(&key, true);
+        assert!(matches!(entry(&path), Some(Entry::Committed { .. })));
+        assert!(
+            replicas.prepare(&key, &path, &db, None).is_err(),
+            "the target applies"
+        );
+    }
+
+    /// An open after the publish of a restore and before its return
+    /// refuses. It never serves the Harvest file of another point in time.
+    #[test]
+    fn an_open_before_the_return_waits_for_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let replicas = replicas(dir.path());
+        let (key, path, db) = shipped_acme(dir.path(), &replicas);
+        replicas.request_restore(&key, unreachable());
+        replicas.release(&key);
+        replace_database(&db);
+
+        let refused = replicas.prepare(&key, &path, &db, None).unwrap_err();
+        assert!(refused.contains("is ending"), "{refused}");
+        assert_eq!(autumn_harvest_sqlite::fleet_epoch::read(&path).unwrap(), 1);
+        replicas.restore_returned(&key);
+        assert!(
+            replicas.prepare(&key, &path, &db, None).is_err(),
+            "the target applies after the return"
+        );
+        assert!(matches!(entry(&path), Some(Entry::Pending { .. })));
+        replicas.end_restore(&key, true);
+        assert!(matches!(entry(&path), Some(Entry::Committed { .. })));
+    }
+
+    /// A release drops a target whose database file is gone. An inode number
+    /// that comes back then never revives it.
+    #[test]
+    fn a_release_drops_a_superseded_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let replicas = replicas(dir.path());
+        let (key, path, _db) = acme(&replicas);
+        let gone = Entry::Committed {
+            target: Target::Latest,
+            of: "1:1".to_owned(),
+        };
+        write_entry(&path, Some(&gone)).unwrap();
+        replicas.release(&key);
+        assert_eq!(entry(&path), None);
+    }
+
+    /// A superseded target restores the Harvest file only when the file has
+    /// no database record. A file that follows the database stays.
+    #[test]
+    fn a_superseded_target_restores_only_a_file_with_no_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let replicas = replicas(dir.path());
+        let (key, path, db) = shipped_acme(dir.path(), &replicas);
+        let gone = Entry::Committed {
+            target: Target::Latest,
+            of: "1:1".to_owned(),
+        };
+        write_entry(&path, Some(&gone)).unwrap();
+        replicas.prepare(&key, &path, &db, None).unwrap();
+        assert_eq!(
+            autumn_harvest_sqlite::fleet_epoch::read(&path).unwrap(),
+            1,
+            "kept"
+        );
+
+        write_entry(&path, Some(&gone)).unwrap();
+        std::fs::remove_file(suffixed(&path, IDENTITY_SUFFIX)).unwrap();
+        replicas.prepare(&key, &path, &db, None).unwrap();
+        assert_eq!(
+            autumn_harvest_sqlite::fleet_epoch::read(&path).unwrap(),
+            6,
+            "restored"
+        );
+    }
+
+    /// A restart after a failed restore keeps the earlier target that the
+    /// pending entry holds.
+    #[test]
+    fn a_restart_keeps_the_earlier_target_of_a_failed_restore() {
+        let dir = tempfile::tempdir().unwrap();
+        let replicas = replicas(dir.path());
+        let (key, path, db) = shipped_acme(dir.path(), &replicas);
+        let pending = Entry::Pending {
+            target: Target::Latest,
+            from: database_identity(&db).unwrap(),
+            previous: Some(Target::of(unreachable())),
+        };
+        write_entry(&path, Some(&pending)).unwrap();
+        let restarted = self::replicas(dir.path());
+        assert!(
+            restarted.prepare(&key, &path, &db, None).is_err(),
+            "the earlier target applies"
+        );
+    }
+
+    /// A restore of a deleted tenant has no database file at its release.
+    /// The entry names no file, so it applies to the restored one.
+    #[test]
+    fn a_release_with_no_database_names_no_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let replicas = replicas(dir.path());
+        let (key, path, db) = acme(&replicas);
+        std::fs::remove_file(&db).unwrap();
+        replicas.request_restore(&key, None);
+        replicas.release(&key);
+        assert_eq!(
+            entry(&path),
+            Some(Entry::Pending {
+                target: Target::Latest,
+                from: NONE.to_owned(),
+                previous: None,
+            })
+        );
+    }
+
+    /// A release replaces an unreadable target, so no restore stays stuck
+    /// on it.
+    #[test]
+    fn a_release_replaces_an_unreadable_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let replicas = replicas(dir.path());
+        let (key, path, _db) = acme(&replicas);
+        std::fs::write(suffixed(&path, TARGET_SUFFIX), "garbage text").unwrap();
+        replicas.release(&key);
+        assert_eq!(entry(&path), None, "a plain release drops it");
+
+        std::fs::write(suffixed(&path, TARGET_SUFFIX), "garbage text").unwrap();
+        replicas.request_restore(&key, None);
+        replicas.release(&key);
+        assert!(matches!(entry(&path), Some(Entry::Pending { .. })));
+    }
+
+    /// A restore whose release could not write its target still keeps it
+    /// at the end. A restore that the fleet refused before its drain keeps
+    /// nothing.
+    #[test]
+    fn the_end_keeps_a_target_that_the_release_lost() {
+        let dir = tempfile::tempdir().unwrap();
+        let replicas = replicas(dir.path());
+        let (key, path, db) = acme(&replicas);
+        replicas.request_restore(&key, None);
+        replicas.end_restore(&key, false);
+        assert_eq!(entry(&path), None, "refused before the drain");
+
+        replicas.request_restore(&key, None);
+        if let Some(requested) = replicas.requested_map().get_mut(&key) {
+            requested.released = true;
+        }
+        replace_database(&db);
+        replicas.restore_returned(&key);
+        replicas.end_restore(&key, true);
+        assert_eq!(
+            entry(&path),
+            Some(Entry::Committed {
+                target: Target::Latest,
+                of: database_identity(&db).unwrap(),
+            })
+        );
+    }
+
+    /// Each entry reads back unchanged. An entry in the older format names
+    /// no file. The parser refuses other text.
+    #[test]
+    fn a_target_entry_reads_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("acme.harvest.db");
+        let at = DateTime::parse_from_rfc3339("2026-11-12T05:00:00.250Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        for written in [
+            Entry::Committed {
+                target: Target::At(at),
+                of: "64768:42".to_owned(),
+            },
+            Entry::Pending {
+                target: Target::Latest,
+                from: NONE.to_owned(),
+                previous: Some(Target::At(at)),
+            },
+            Entry::Pending {
+                target: Target::At(at),
+                from: "64768:42".to_owned(),
+                previous: None,
+            },
+        ] {
+            write_entry(&path, Some(&written)).unwrap();
+            assert_eq!(entry(&path), Some(written));
+        }
+        for (text, target) in [
+            ("latest", Target::Latest),
+            ("committed 2026-11-12T05:00:00.250Z", Target::At(at)),
+        ] {
+            std::fs::write(suffixed(&path, TARGET_SUFFIX), text).unwrap();
+            let older = Entry::Pending {
+                target,
+                from: NONE.to_owned(),
+                previous: None,
+            };
+            assert_eq!(entry(&path), Some(older), "{text}");
+        }
+        for text in [
+            "",
+            "soon",
+            "committed 1:2 soon",
+            "pending 1:2 latest",
+            "pending 1:2 soon -",
+        ] {
+            std::fs::write(suffixed(&path, TARGET_SUFFIX), text).unwrap();
+            assert!(read_entry(&path).is_err(), "{text}");
+        }
+        write_entry(&path, None).unwrap();
+        assert_eq!(entry(&path), None);
+    }
+
+    /// The kernel gives the result of each row of the rule.
+    #[test]
+    fn resolve_target_gives_the_target_of_each_entry() {
+        use Held::{Committed, Nothing, Pending};
+        assert_eq!(resolve_target::<u8>(Nothing), Resolution::Nothing);
+        assert_eq!(
+            resolve_target(Committed {
+                target: 1,
+                current: true
+            }),
+            Resolution::Apply(1)
+        );
+        assert_eq!(
+            resolve_target(Committed {
+                target: 1,
+                current: false
+            }),
+            Resolution::Superseded
+        );
+        for previous in [None, Some(2)] {
+            assert_eq!(
+                resolve_target(Pending {
+                    target: 1,
+                    moved: true,
+                    previous
+                }),
+                Resolution::Apply(1)
+            );
+        }
+        assert_eq!(
+            resolve_target(Pending {
+                target: 1,
+                moved: false,
+                previous: Some(2)
+            }),
+            Resolution::Apply(2)
+        );
+        assert_eq!(
+            resolve_target(Pending {
+                target: 1_u8,
+                moved: false,
+                previous: None
+            }),
+            Resolution::Nothing
+        );
     }
 
     /// A target beside an unchanged database is stale. The open drops it
@@ -1206,10 +2106,15 @@ mod tests {
         runtime.raise_fleet_epoch(4).unwrap();
         drop(runtime);
         record_database(&path, &db).unwrap();
-        write_target(&path, None).unwrap();
+        let pending = Entry::Pending {
+            target: Target::Latest,
+            from: database_identity(&db).unwrap(),
+            previous: None,
+        };
+        write_entry(&path, Some(&pending)).unwrap();
         replicas.prepare(&key, &path, &db, None).unwrap();
         assert_eq!(autumn_harvest_sqlite::fleet_epoch::read(&path).unwrap(), 4);
-        assert!(!suffixed(&path, TARGET_SUFFIX).exists());
+        assert_eq!(entry(&path), None);
     }
 
     /// A file from before the database record still follows a requested
@@ -1227,7 +2132,12 @@ mod tests {
         let runtime = autumn_harvest_sqlite::SqliteRuntime::open_replicated(&path).unwrap();
         runtime.raise_fleet_epoch(1).unwrap();
         drop(runtime);
-        write_target(&path, None).unwrap();
+        let pending = Entry::Pending {
+            target: Target::Latest,
+            from: NONE.to_owned(),
+            previous: None,
+        };
+        write_entry(&path, Some(&pending)).unwrap();
         replicas.prepare(&key, &path, &db, None).unwrap();
         assert_eq!(autumn_harvest_sqlite::fleet_epoch::read(&path).unwrap(), 6);
     }
@@ -1246,14 +2156,19 @@ mod tests {
         let db = database(dir.path(), "acme.db");
         drop(autumn_harvest_sqlite::SqliteRuntime::open_replicated(&path).unwrap());
         record_database(&path, &db).unwrap();
+        let pending = Entry::Pending {
+            target: Target::Latest,
+            from: database_identity(&db).unwrap(),
+            previous: None,
+        };
         replace_database(&db);
-        write_target(&path, None).unwrap();
+        write_entry(&path, Some(&pending)).unwrap();
         replicas.prepare(&key, &path, &db, None).unwrap();
         assert_eq!(
             std::fs::read_to_string(suffixed(&path, IDENTITY_SUFFIX)).unwrap(),
             database_identity(&db).unwrap()
         );
-        assert!(!suffixed(&path, TARGET_SUFFIX).exists());
+        assert_eq!(entry(&path), None);
     }
 
     /// A new tenant database with no Harvest replica sets the old Harvest
