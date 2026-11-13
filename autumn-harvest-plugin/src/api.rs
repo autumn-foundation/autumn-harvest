@@ -49565,6 +49565,27 @@ fn project_herd_budgets(
     (active, budgets, unprojected)
 }
 
+/// The lookback of a herd walk and the time at which the walk starts.
+///
+/// A slot up to one jitter window before `from` can still start inside the
+/// window, so the walk looks back by the widest jitter of `candidates`.
+fn herd_lookback(
+    candidates: &[(&HarvestSchedule, Schedule)],
+    from: chrono::DateTime<chrono::Utc>,
+) -> (std::time::Duration, chrono::DateTime<chrono::Utc>) {
+    let widest = candidates
+        .iter()
+        .map(|(row, _)| row.jitter_secs.max(0).cast_unsigned())
+        .max()
+        .unwrap_or(0);
+    let lookback = std::time::Duration::from_secs(widest);
+    let walk_from = chrono::Duration::from_std(lookback)
+        .ok()
+        .and_then(|back| from.checked_sub_signed(back))
+        .unwrap_or(from);
+    (lookback, walk_from)
+}
+
 /// Split `rows` into the schedules that the scheduler fires and the rest.
 ///
 /// A paused, an auto-paused, an exhausted, a manual and an unparsable schedule
@@ -49611,7 +49632,7 @@ pub(crate) fn build_herd_report(
     min_herd: usize,
     limit: usize,
 ) -> ScheduleHerdReport {
-    use autumn_harvest::schedule_herd::forecast_shifted;
+    use autumn_harvest::schedule_herd::{Fire, forecast_shifted};
 
     let hours = hours.clamp(1, HERD_MAX_HOURS);
     let bucket_secs = bucket_secs.clamp(1, HERD_MAX_BUCKET_SECS);
@@ -49620,19 +49641,7 @@ pub(crate) fn build_herd_report(
     let until = from + chrono::Duration::hours(i64::from(hours));
 
     let (candidates, inactive) = partition_herd_rows(rows);
-    // A slot up to one jitter window before `from` can still start inside the
-    // window, so the walk looks back by the widest jitter.
-    let lookback = std::time::Duration::from_secs(
-        candidates
-            .iter()
-            .map(|(row, _)| row.jitter_secs.max(0).cast_unsigned())
-            .max()
-            .unwrap_or(0),
-    );
-    let walk_from = chrono::Duration::from_std(lookback)
-        .ok()
-        .and_then(|back| from.checked_sub_signed(back))
-        .unwrap_or(from);
+    let (lookback, walk_from) = herd_lookback(&candidates, from);
     let (active, mut budgets, unprojected) = project_herd_budgets(candidates, now, walk_from);
 
     // The forecast keys each schedule by its row id, so two rows with one
@@ -49652,17 +49661,23 @@ pub(crate) fn build_herd_report(
         lookback,
         |index, slot| {
             let row = active[index].0;
+            // The lookback can reach slots that the scheduler already
+            // processed. It dispatches from `next_run_at` on, so an earlier
+            // slot neither runs nor spends the budget.
+            if row.next_run_at.is_some_and(|next| slot < next) {
+                return Fire::Skip;
+            }
             // The scheduler exhausts a schedule at its last run, and at the
             // first slot whose slot time or jittered time reaches `end_at`.
             let fire = effective_fire_time(row.id, Some(slot), row.jitter_secs).unwrap_or(slot);
             let ended = row.end_at.is_some_and(|end| slot >= end || fire >= end);
             if ended || budgets[index] == Some(0) {
-                return None;
+                return Fire::Stop;
             }
             if let Some(left) = budgets[index].as_mut() {
                 *left -= 1;
             }
-            Some(fire)
+            Fire::Start(fire)
         },
     );
 
@@ -60166,6 +60181,28 @@ mod tests {
         );
         let report = build_herd_report(&rows, herd_epoch(), from, 1, 60, 2, 50);
         assert_eq!(report.fires, 2, "both 00:00 slots start inside the hour");
+    }
+
+    #[test]
+    fn the_herd_lookback_does_not_spend_a_budget_on_processed_slots() {
+        let now = herd_epoch() + chrono::Duration::minutes(630);
+        let eleven = herd_epoch() + chrono::Duration::hours(11);
+        let once = |n: u128| autumn_harvest::models::HarvestSchedule {
+            max_runs: Some(1),
+            next_run_at: Some(eleven),
+            ..herd_row(n, &format!("once{n}"), "cron:0 * * * *")
+        };
+        // A wide jitter on another schedule makes the walk start at 09:30.
+        let wide = autumn_harvest::models::HarvestSchedule {
+            jitter_secs: 3_600,
+            ..herd_row(3, "wide", "cron:0 0 1 1 *")
+        };
+        let report = build_herd_report(&[once(1), once(2), wide], now, now, 2, 60, 2, 50);
+        assert_eq!(
+            report.fires, 2,
+            "each budget is spent at 11:00, not at 10:00"
+        );
+        assert_eq!(report.spots[0].at, eleven);
     }
 
     #[test]

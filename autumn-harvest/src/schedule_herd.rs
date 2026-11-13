@@ -44,6 +44,17 @@ impl HerdSpot {
     }
 }
 
+/// What [`forecast_shifted`] does with one slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fire {
+    /// The run of the slot starts at this time.
+    Start(DateTime<Utc>),
+    /// The slot never runs. The walk goes on to the next slot.
+    Skip,
+    /// The schedule runs no more. The walk of this schedule ends.
+    Stop,
+}
+
 /// The result of a herd forecast.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HerdForecast {
@@ -111,7 +122,7 @@ pub fn forecast(
         bucket,
         min_herd,
         Duration::ZERO,
-        |_, fire| Some(fire),
+        |_, fire| Fire::Start(fire),
     )
 }
 
@@ -126,9 +137,10 @@ pub fn forecast(
 /// largest shift here. A start outside `[from, until)` is not counted, but
 /// `shift` still sees its slot.
 ///
-/// A `None` from `shift` ends the walk of that schedule, and the slot does not
-/// count. A run budget or an end time stops a schedule in this way. The calls
-/// for one schedule come in slot order.
+/// [`Fire::Skip`] passes over a slot that the scheduler never dispatches, such
+/// as one before its next pending slot. [`Fire::Stop`] ends the walk of that
+/// schedule. A run budget or an end time stops a schedule in this way. The
+/// calls for one schedule come in slot order.
 #[must_use]
 pub fn forecast_shifted(
     schedules: &[(&str, &Schedule)],
@@ -137,7 +149,7 @@ pub fn forecast_shifted(
     bucket: Duration,
     min_herd: usize,
     lookback: Duration,
-    mut shift: impl FnMut(usize, DateTime<Utc>) -> Option<DateTime<Utc>>,
+    mut shift: impl FnMut(usize, DateTime<Utc>) -> Fire,
 ) -> HerdForecast {
     // The width counts in milliseconds, so a fractional bucket keeps its size.
     let width = i64::try_from(bucket.as_millis())
@@ -178,8 +190,10 @@ pub fn forecast_shifted(
                 truncated.push(name.to_string());
                 break;
             }
-            let Some(start) = shift(index, next) else {
-                break;
+            let start = match shift(index, next) {
+                Fire::Start(start) => start,
+                Fire::Skip => continue,
+                Fire::Stop => break,
             };
             read += 1;
             if start < from || start >= until {
@@ -234,7 +248,7 @@ mod tests {
 
     use chrono::{DateTime, Utc};
 
-    use super::{MAX_FIRES_PER_SCHEDULE, forecast, forecast_shifted};
+    use super::{Fire, MAX_FIRES_PER_SCHEDULE, forecast, forecast_shifted};
     use crate::policy::Schedule;
 
     fn at(secs: i64) -> DateTime<Utc> {
@@ -404,7 +418,7 @@ mod tests {
         let b = cron("0 * * * *");
         let schedules = [("a", &a), ("b", &b)];
         let jitter = |index: usize, t: DateTime<Utc>| {
-            Some(if index == 1 {
+            Fire::Start(if index == 1 {
                 t + chrono::Duration::seconds(90)
             } else {
                 t
@@ -428,17 +442,23 @@ mod tests {
             MINUTE,
             2,
             Duration::ZERO,
-            |_, t| Some(t),
+            |_, t| Fire::Start(t),
         );
         assert_eq!(still, forecast(&schedules, at(0), at(HOUR), MINUTE, 2));
     }
 
     #[test]
-    fn a_shift_of_none_ends_the_walk_of_its_schedule() {
+    fn a_stop_ends_the_walk_of_its_schedule() {
         let a = cron("0 * * * *");
         let b = cron("0 * * * *");
         let schedules = [("a", &a), ("b", &b)];
-        let cap = |index: usize, t: DateTime<Utc>| (index == 0 || t < at(HOUR)).then_some(t);
+        let cap = |index: usize, t: DateTime<Utc>| {
+            if index == 0 || t < at(HOUR) {
+                Fire::Start(t)
+            } else {
+                Fire::Stop
+            }
+        };
         let report = forecast_shifted(
             &schedules,
             at(0),
@@ -470,7 +490,7 @@ mod tests {
         let a = cron("0 * * * *");
         let b = cron("0 * * * *");
         let schedules = [("a", &a), ("b", &b)];
-        let late = |_: usize, t: DateTime<Utc>| Some(t + chrono::Duration::minutes(5));
+        let late = |_: usize, t: DateTime<Utc>| Fire::Start(t + chrono::Duration::minutes(5));
         let back = Duration::from_secs(600);
         // The 00:00 slots are before the window but start at 00:05, inside it.
         let early = forecast_shifted(&schedules, at(60), at(HOUR), MINUTE, 2, back, late);
@@ -493,6 +513,35 @@ mod tests {
         let cut = forecast_shifted(&schedules, at(0), at(180), MINUTE, 2, back, late);
         assert_eq!(cut.fires, 0);
         assert_eq!(cut.spots, []);
+    }
+
+    #[test]
+    fn a_skip_passes_over_one_slot() {
+        let a = cron("0 * * * *");
+        let b = cron("0 * * * *");
+        let schedules = [("a", &a), ("b", &b)];
+        let skip_first = |index: usize, t: DateTime<Utc>| {
+            if index == 1 && t == at(0) {
+                Fire::Skip
+            } else {
+                Fire::Start(t)
+            }
+        };
+        let report = forecast_shifted(
+            &schedules,
+            at(0),
+            at(3 * HOUR),
+            MINUTE,
+            2,
+            Duration::ZERO,
+            skip_first,
+        );
+        assert_eq!(
+            report.fires, 5,
+            "b skips 00:00 and fires at 01:00 and 02:00"
+        );
+        let times: Vec<_> = report.spots.iter().map(|s| s.at).collect();
+        assert_eq!(times, vec![at(HOUR), at(2 * HOUR)]);
     }
 
     #[test]
