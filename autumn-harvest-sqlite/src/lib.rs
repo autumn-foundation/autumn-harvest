@@ -826,6 +826,7 @@ mod schema;
 mod store;
 mod update;
 mod visibility;
+mod wake;
 mod worker;
 mod workflow_log;
 
@@ -860,8 +861,8 @@ pub use crate::overlay_log::SqliteConnector;
 pub use crate::overlay_log::SqliteOverlayLog;
 pub use crate::query::{DEFAULT_QUERY_TIMEOUT, ReplayInput};
 pub use crate::runtime::{
-    ActivityBody, ActivitySpec, AdmittedUpdate, ExecutionOutcome, LedgerActivityBody, RunState,
-    SignalDelivery, SignalWithStart, SignalWithStartOutcome, SqliteRuntime, StartOptions,
+    ActivityBody, ActivitySpec, AdmittedUpdate, ExecutionOutcome, LedgerActivityBody, PassReport,
+    RunState, SignalDelivery, SignalWithStart, SignalWithStartOutcome, SqliteRuntime, StartOptions,
     StartOutcome, UNSUPPORTED_FEATURE_ERROR_TYPE,
 };
 // The depth cap is shared with the Postgres backend (issue #2225).

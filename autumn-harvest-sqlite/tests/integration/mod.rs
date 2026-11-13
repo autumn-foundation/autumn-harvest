@@ -28,6 +28,7 @@ mod history_caps;
 mod history_page;
 mod llm_ledger;
 mod local_activities;
+mod next_wake_at;
 mod operator_reads;
 mod overlay_log;
 mod overlay_log_connector;

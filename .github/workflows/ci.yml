@@ -2641,7 +2641,7 @@ jobs:
       # #2471). Each step uses the same features, so the lane builds the
       # crate once.
       - name: Clippy autumn-harvest-plugin (sqlite feature)
-        run: cargo clippy -p autumn-harvest-plugin --features sqlite,oidc,mcp,webhooks,connectors --lib --test sqlite_plugin --test sqlite_plugin_fleet --test sqlite_plugin_fleet_replica --test sqlite_plugin_split --test sqlite_plugin_agent -- -D warnings
+        run: cargo clippy -p autumn-harvest-plugin --features sqlite,oidc,mcp,webhooks,connectors --lib --test sqlite_plugin --test sqlite_plugin_fleet --test sqlite_plugin_fleet_replica --test sqlite_plugin_fleet_wake --test sqlite_plugin_split --test sqlite_plugin_agent -- -D warnings
       # The same targets with no `oidc` and no trigger features, for the
       # code that those features turn off.
       - name: Clippy autumn-harvest-plugin (sqlite feature only)
@@ -2657,6 +2657,9 @@ jobs:
       # Docker.
       - name: SQLite plugin fleet replica suite
         run: cargo test -p autumn-harvest-plugin --features sqlite,oidc,mcp,webhooks,connectors --test sqlite_plugin_fleet_replica
+      # A closed tenant wakes for its next timer or schedule slot. No Docker.
+      - name: SQLite plugin fleet wake suite
+        run: cargo test -p autumn-harvest-plugin --features sqlite,oidc,mcp,webhooks,connectors --test sqlite_plugin_fleet_wake
       # The durable agent under the plugin, with no runtime of its own.
       - name: SQLite plugin agent suite
         run: cargo test -p autumn-harvest-plugin --features sqlite,oidc,mcp,webhooks,connectors --test sqlite_plugin_agent
