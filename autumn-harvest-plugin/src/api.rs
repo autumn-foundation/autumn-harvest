@@ -49556,14 +49556,17 @@ pub(crate) fn build_herd_report(
         min_herd,
         |index, slot| {
             let row = active[index].0;
-            // The scheduler exhausts a schedule at its end or its last run.
-            if row.end_at.is_some_and(|end| slot >= end) || budgets[index] == Some(0) {
+            // The scheduler exhausts a schedule at its last run, and at the
+            // first slot whose slot time or jittered time reaches `end_at`.
+            let fire = effective_fire_time(row.id, Some(slot), row.jitter_secs).unwrap_or(slot);
+            let ended = row.end_at.is_some_and(|end| slot >= end || fire >= end);
+            if ended || budgets[index] == Some(0) {
                 return None;
             }
             if let Some(left) = budgets[index].as_mut() {
                 *left -= 1;
             }
-            Some(effective_fire_time(row.id, Some(slot), row.jitter_secs).unwrap_or(slot))
+            Some(fire)
         },
     );
 
@@ -59956,6 +59959,20 @@ mod tests {
         let report = build_herd_report(&ending, herd_epoch(), 24, 60, 2, 50);
         assert_eq!(report.fires, 24 + 2, "b fires at 00:00 and 01:00 only");
         assert_eq!(report.spot_count, 2);
+    }
+
+    #[test]
+    fn the_herd_report_drops_a_fire_that_jitter_pushes_past_the_end() {
+        let end_at = herd_epoch() + chrono::Duration::seconds(1);
+        let row = autumn_harvest::models::HarvestSchedule {
+            jitter_secs: 3_600,
+            end_at: Some(end_at),
+            ..herd_row(1, "late", "cron:0 * * * *")
+        };
+        let fire = effective_fire_time(row.id, Some(herd_epoch()), row.jitter_secs).unwrap();
+        assert!(fire >= end_at, "the fixture needs jitter past the end");
+        let report = build_herd_report(&[row], herd_epoch(), 24, 60, 2, 50);
+        assert_eq!(report.fires, 0, "the scheduler never dispatches this slot");
     }
 
     #[test]
