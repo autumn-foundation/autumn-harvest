@@ -49481,6 +49481,34 @@ fn herd_schedule_ref(row: &HarvestSchedule) -> HerdScheduleRef {
     }
 }
 
+/// The slots of `schedule` from `next_run_at` up to `from`, at most `cap`.
+///
+/// The scheduler spends a run of the budget on each of these slots before the
+/// window opens. With no `next_run_at`, or one at or after `from`, it is 0.
+fn slots_before(
+    schedule: &Schedule,
+    next_run_at: Option<chrono::DateTime<chrono::Utc>>,
+    from: chrono::DateTime<chrono::Utc>,
+    cap: i32,
+) -> i32 {
+    let Some(first) = next_run_at.filter(|&first| first < from) else {
+        return 0;
+    };
+    let walker = autumn_harvest::schedule_plan::SlotWalker::new(schedule);
+    let mut count = 1;
+    let mut cursor = first;
+    while count < cap {
+        match walker.next_after(cursor).filter(|&slot| slot < from) {
+            Some(slot) => {
+                count += 1;
+                cursor = slot;
+            }
+            None => break,
+        }
+    }
+    count.min(cap)
+}
+
 /// Split `rows` into the schedules that the scheduler fires and the rest.
 ///
 /// A paused, an auto-paused, an exhausted, a manual and an unparsable schedule
@@ -49546,7 +49574,10 @@ pub(crate) fn build_herd_report(
         .collect();
     let mut budgets: Vec<Option<i32>> = active
         .iter()
-        .map(|(row, _)| schedule_remaining_runs(row.max_runs, row.runs_started))
+        .map(|(row, schedule)| {
+            schedule_remaining_runs(row.max_runs, row.runs_started)
+                .map(|left| left - slots_before(schedule, row.next_run_at, from, left))
+        })
         .collect();
     let forecast = forecast_shifted(
         &pairs,
@@ -59965,6 +59996,27 @@ mod tests {
         let report = build_herd_report(&ending, herd_epoch(), 24, 60, 2, 50);
         assert_eq!(report.fires, 24 + 2, "b fires at 00:00 and 01:00 only");
         assert_eq!(report.spot_count, 2);
+    }
+
+    #[test]
+    fn the_herd_report_spends_the_budget_on_slots_before_the_window() {
+        let tomorrow = herd_epoch() + chrono::Duration::hours(24);
+        let row = |n: u128, max_runs: i32| autumn_harvest::models::HarvestSchedule {
+            max_runs: Some(max_runs),
+            next_run_at: Some(herd_epoch()),
+            ..herd_row(n, &format!("s{n}"), "cron:0 * * * *")
+        };
+        let spent = build_herd_report(&[row(1, 1), row(2, 1)], tomorrow, 24, 60, 2, 50);
+        assert_eq!(spent.fires, 0, "both runs happen before the window");
+        assert_eq!(spent.spot_count, 0);
+
+        let left = build_herd_report(&[row(1, 30), row(2, 30)], tomorrow, 24, 60, 2, 50);
+        assert_eq!(
+            left.fires,
+            2 * 6,
+            "24 of the 30 runs come before the window"
+        );
+        assert_eq!(left.spot_count, 6);
     }
 
     #[test]
