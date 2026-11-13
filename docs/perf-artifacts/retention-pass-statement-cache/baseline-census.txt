@@ -1,0 +1,35 @@
+== The candidate loop, by planning plus execution buffers
+20000 | 20000 | 1900293 | 13671 | 134 | 481 | 0 | WITH RECURSIVE descendant(id, depth) AS ( SELECT f.id, $2 FROM harvest_workflow_executions f WHERE f.start_source = $3 AND f.start_source_ref = $1 UNION SELECT 
+10000 | 8 | 593622 | 1 | 1570 | 6548672 | 0 | DELETE FROM "harvest_workflow_executions" WHERE ("harvest_workflow_executions"."id" = $1)
+10000 | 10000 | 301256 | 1120 | 153 | 540000 | 0 | SELECT "harvest_workflow_executions"."legal_hold_set_at", "harvest_workflow_executions"."legal_hold_until", "harvest_workflow_executions"."workflow_name", "harv
+10000 | 10000 | 293176 | 4529 | 183 | 65937 | 0 | SELECT COUNT(*) AS count FROM harvest_workflow_executions WHERE workflow_name = $1 AND workflow_id = $2 AND id <> $3 AND ( state NOT IN ($5, $6, $7, $8, $9, $10
+10000 | 10000 | 280085 | 2728 | 69 | 0 | 0 | SELECT COUNT(*) AS count FROM harvest_workflow_executions WHERE parent_id = $1 AND state NOT IN ($2, $3, $4, $5, $6, $7)
+10000 | 10000 | 280000 | 1387 | 38 | 0 | 0 | UPDATE "harvest_workflow_executions" SET "parent_id" = $1 WHERE (("harvest_workflow_executions"."parent_id" = $2) AND ("harvest_workflow_executions"."state" = A
+10000 | 6 | 230328 | 1 | 373 | 6008475 | 0 | DELETE FROM ONLY "public"."harvest_events" WHERE $1 OPERATOR(pg_catalog.=) "workflow_exec_id"
+10000 | 8 | 31738 | 1 | 91 | 0 | 0 | SELECT "harvest_workflow_executions"."legal_hold_set_at", "harvest_workflow_executions"."legal_hold_until" FROM "harvest_workflow_executions" WHERE ("harvest_wo
+10000 | 6 | 20622 | 2 | 62 | 0 | 0 | SELECT COUNT(*) FROM "harvest_task_queue" WHERE (("harvest_task_queue"."workflow_exec_id" = $1) AND ("harvest_task_queue"."state" = ANY($2)))
+10000 | 6 | 20139 | 0 | 12 | 0 | 0 | DELETE FROM ONLY "public"."harvest_external_tasks" WHERE $1 OPERATOR(pg_catalog.=) "workflow_exec_id"
+10000 | 6 | 20120 | 0 | 18 | 0 | 0 | DELETE FROM ONLY "public"."harvest_task_queue" WHERE $1 OPERATOR(pg_catalog.=) "workflow_exec_id"
+10000 | 6 | 20106 | 0 | 45 | 0 | 0 | SELECT COUNT(*) FROM "harvest_signals" WHERE (("harvest_signals"."workflow_exec_id" = $1) AND NOT ("harvest_signals"."consumed"))
+10000 | 6 | 20100 | 0 | 13 | 0 | 0 | DELETE FROM ONLY "public"."harvest_sessions" WHERE $1 OPERATOR(pg_catalog.=) "workflow_exec_id"
+10000 | 6 | 20084 | 0 | 54 | 0 | 0 | SELECT COUNT(*) FROM "harvest_timers" WHERE (("harvest_timers"."workflow_exec_id" = $1) AND ("harvest_timers"."fired" = $2))
+10000 | 6 | 20079 | 0 | 12 | 0 | 0 | DELETE FROM ONLY "public"."harvest_entity_state" WHERE $1 OPERATOR(pg_catalog.=) "execution_id"
+10000 | 6 | 20071 | 0 | 10 | 0 | 0 | DELETE FROM ONLY "public"."harvest_payload_refs" WHERE $1 OPERATOR(pg_catalog.=) "workflow_exec_id"
+10000 | 6 | 20066 | 0 | 11 | 0 | 0 | DELETE FROM ONLY "public"."harvest_llm_ledger" WHERE $1 OPERATOR(pg_catalog.=) "workflow_exec_id"
+10000 | 6 | 20055 | 0 | 12 | 0 | 0 | DELETE FROM ONLY "public"."harvest_workflow_logs" WHERE $1 OPERATOR(pg_catalog.=) "workflow_exec_id"
+10000 | 6 | 20053 | 0 | 12 | 0 | 0 | DELETE FROM ONLY "public"."harvest_stream_chunks" WHERE $1 OPERATOR(pg_catalog.=) "workflow_exec_id"
+10000 | 6 | 20042 | 0 | 39 | 0 | 0 | DELETE FROM "harvest_dead_letters" WHERE (("harvest_dead_letters"."workflow_exec_id" = $1) AND ("harvest_dead_letters"."task_type" != $2))
+10000 | 6 | 20024 | 0 | 27 | 0 | 0 | DELETE FROM "harvest_completion_deliveries" WHERE (("harvest_completion_deliveries"."workflow_exec_id" = $1) AND ("harvest_completion_deliveries"."state" = $2))
+10000 | 6 | 20024 | 0 | 16 | 0 | 0 | DELETE FROM ONLY "public"."harvest_signals" WHERE $1 OPERATOR(pg_catalog.=) "workflow_exec_id"
+10000 | 6 | 20018 | 0 | 10 | 0 | 0 | DELETE FROM ONLY "public"."harvest_timers" WHERE $1 OPERATOR(pg_catalog.=) "workflow_exec_id"
+== The loop totals. RI rows are the cascade actions of the execution delete.
+f | 12 | 130000 | 60046 | 3781048 | 23438 | 2463
+t | 11 | 110000 | 66 | 431053 | 2 | 499
+== The loop statements that Postgres plans on every call
+20000 | 20000 | 1900293 | 13671 | WITH RECURSIVE descendant(id, depth) AS ( SELECT f.id, $2 FROM harvest_workflow_executions f WHERE f.start_source = $3 AND f.start_source_ref = $1 UNION SELECT f.id, d.depth + $4 FROM descendant d JOIN harvest_workflow_executions f ON f.start_source = $5 AND f.start_source_ref = d.id::text WHERE d.depth < $6 ) SELECT f.id FROM descendant d JOIN harvest_workflow_executions f ON f.id = d.id WHERE (f.state IN ($7, $8, $9, $10) OR (f.state = $11 AND EXISTS (SELECT $12 FROM harvest_dead_letters dl WHERE dl.workflow_exec_id = f.id AND upper(dl.task_type) <> $13)))
+10000 | 10000 | 301256 | 1120 | SELECT "harvest_workflow_executions"."legal_hold_set_at", "harvest_workflow_executions"."legal_hold_until", "harvest_workflow_executions"."workflow_name", "harvest_workflow_executions"."workflow_id", "harvest_workflow_executions"."state", "harvest_workflow_executions"."started_at", "harvest_workflow_executions"."completed_at", "harvest_workflow_executions"."shard_id", "harvest_workflow_executions"."output", "harvest_workflow_executions"."error", "harvest_workflow_executions"."search_attrs", "harvest_workflow_executions"."parent_id", "harvest_workflow_executions"."migrated_from_shards", "harvest_workflow_executions"."staging_vacated_state" FROM "harvest_workflow_executions" WHERE ("harvest_workflow_executions"."id" = $1) LIMIT $2 FOR UPDATE
+10000 | 10000 | 293176 | 4529 | SELECT COUNT(*) AS count FROM harvest_workflow_executions WHERE workflow_name = $1 AND workflow_id = $2 AND id <> $3 AND ( state NOT IN ($5, $6, $7, $8, $9, $10, $11) OR completed_at IS NULL OR completed_at >= $4 )
+10000 | 10000 | 280085 | 2728 | SELECT COUNT(*) AS count FROM harvest_workflow_executions WHERE parent_id = $1 AND state NOT IN ($2, $3, $4, $5, $6, $7)
+10000 | 10000 | 280000 | 1387 | UPDATE "harvest_workflow_executions" SET "parent_id" = $1 WHERE (("harvest_workflow_executions"."parent_id" = $2) AND ("harvest_workflow_executions"."state" = ANY($3)))
+== The whole bench database, seed and load included
+865759 | 95301 | 11471871 | 233796075
