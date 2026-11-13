@@ -1676,6 +1676,8 @@ fn build_worker(queue: &str, registry: Arc<HandlerRegistry>) -> Arc<Worker> {
     Arc::new(
         Worker::new(
             WorkerRuntimeConfig {
+                population_sample_interval:
+                    autumn_harvest::worker::DEFAULT_POPULATION_SAMPLE_INTERVAL,
                 codec_rotation_batch_size: 0,
                 dr: autumn_harvest::replication::DrConfig::default(),
                 worker_id: format!("{queue}-worker"),
