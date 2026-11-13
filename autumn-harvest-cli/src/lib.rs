@@ -20766,7 +20766,15 @@ mod herd_tests {
         assert!(out.contains("billing, etl"), "{out}");
         assert!(out.contains("(2 more not shown; raise --limit)"), "{out}");
         assert!(out.contains("Move these schedules first:"), "{out}");
-        assert!(out.contains("billing  24"), "{out}");
+        let row = out
+            .lines()
+            .find(|line| line.starts_with("billing "))
+            .unwrap_or_default();
+        assert_eq!(
+            row.split_whitespace().collect::<Vec<_>>(),
+            ["billing", "24", "0s"],
+            "{out}"
+        );
         assert!(
             out.contains("Not forecast (interval schedules): poller"),
             "{out}"
