@@ -33,7 +33,7 @@ struct RedisFixture {
 /// by the other integration tests in the workspace.
 async fn try_start_redis() -> Option<RedisFixture> {
     // Use a unique prefix per fixture so parallel tests sharing the same
-    // Redis don't collide on stream / sorted set keys.
+    // Redis do not collide on stream / sorted set keys.
     let prefix = format!("test_{}", uuid::Uuid::new_v4().simple());
     let cfg = RedisTaskQueueConfig {
         key_prefix: prefix,

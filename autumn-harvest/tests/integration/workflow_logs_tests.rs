@@ -203,7 +203,7 @@ async fn re_driven_cycle_does_not_duplicate_or_reorder_lines() {
 
 #[tokio::test]
 async fn the_return_value_is_the_rows_actually_inserted_not_the_rows_admitted() {
-    // Regression (issue #790 review round 2, P2). The function documents its
+    // Regression (issue #790). The function documents its
     // return as "the number of real (non-marker) rows actually inserted", but
     // returned the *admitted* count — so a re-drive, whose rows are all
     // collapsed by `ON CONFLICT DO NOTHING`, reported writes that never

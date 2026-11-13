@@ -27,9 +27,9 @@
 //! | Method                        | Effect                                                     |
 //! |-------------------------------|------------------------------------------------------------|
 //! | `.compensate(undo_fn)`        | Typed — the name is derived from the fn item, so typo-proof |
-//! | `.compensate_named("undo")`   | Escape hatch when the fn item isn't in scope                |
+//! | `.compensate_named("undo")`   | Escape hatch when the fn item is not in scope               |
 //!
-//! ## What runs, and what doesn't
+//! ## What runs, and what does not
 //!
 //! On a terminal DAG failure (`Err("one or more DAG tasks failed")`) the engine
 //! unwinds **only** the nodes that BOTH succeeded AND declare a compensator, in

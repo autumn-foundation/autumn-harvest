@@ -98,7 +98,7 @@ const LIVE_DB_TOKENS: &[&str] = &[
 ];
 
 /// Drop whole-line comments (`//`, `///`, `//!`) so container tokens that
-/// appear only in prose don't classify a no-DB test as needing a live DB. A
+/// appear only in prose do not classify a no-DB test as needing a live DB. A
 /// leading-`//` check is enough: every observed false positive lives in a
 /// `//!` doc-comment block, and stripping only leading-comment lines never
 /// mangles mid-line code such as a `postgres://…` URL literal.
@@ -133,8 +133,8 @@ fn all_tests_ignored(source: &str) -> bool {
 }
 
 /// Meta-test files that are not DB tests but mention the classifier tokens as
-/// string literals (this guard defines `LIVE_DB_TOKENS`), so they'd otherwise
-/// be misclassified as needing a live DB.
+/// string literals (this guard defines `LIVE_DB_TOKENS`). Without this list they
+/// are misclassified as needing a live DB.
 const SELF_EXCLUDE: &[&str] = &["ci_run_coverage", "migration_hygiene"];
 
 /// True when a file carries live-DB machinery but declares no test that could
@@ -1174,8 +1174,8 @@ fn strip_line_comments_drops_prose_container_tokens() {
         !code.contains("testcontainers"),
         "leading `//!` line must be dropped"
     );
-    // A trailing inline comment survives (its line isn't a leading comment), but
-    // that's fine: real code markers are function calls / types, not prose.
+    // A trailing inline comment survives (its line is not a leading comment).
+    // That is fine: real code markers are function calls / types, not prose.
     assert!(code.contains("code();"));
 }
 
@@ -1383,7 +1383,7 @@ fn every_db_gated_test_has_a_ci_run_step_or_is_allowlisted() {
         let key = format!("plugin:{stem}");
         live_db_keys.insert(key.clone());
         let req = plugin_required_features(&src);
-        // A covering run can't credit an all-`#[ignore]`d target — it runs
+        // A covering run cannot credit an all-`#[ignore]`d target — it runs
         // nothing — so force it uncovered (→ must be allowlisted).
         let covered = plugin_covered(&rows, &stem, &req) && !all_tests_ignored(&src);
         if covered {

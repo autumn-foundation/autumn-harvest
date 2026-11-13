@@ -196,7 +196,7 @@ fn build_inputs(n: usize, now: DateTime<Utc>) -> DiagnosisInputs {
 /// reproducible number must not silently profile a *different*
 /// configuration than the one actually requested and report success as if
 /// nothing were wrong (the fixture's own sanity check would still pass,
-/// since it's computed from the same substituted value).
+/// since it is computed from the same substituted value).
 fn env_usize(key: &str, default: usize) -> usize {
     match std::env::var(key) {
         Ok(raw) => raw
@@ -212,7 +212,7 @@ fn env_usize(key: &str, default: usize) -> usize {
 /// Rejects a workload size that would silently stop exercising the
 /// documented "wide fan-out with a genuine root cause away from either end"
 /// shape this harness exists to measure -- so shortening a Valgrind run
-/// can't quietly produce measurements for a degenerate workload instead.
+/// cannot quietly produce measurements for a degenerate workload instead.
 fn validate_workload_params(n: usize, reps: usize) {
     // reps=0 skips the measured loop entirely -- the harness would exit 0
     // and print a plausible-looking summary line without ever profiling the
@@ -283,7 +283,7 @@ fn main() {
         *kind_tally.entry(blocked_on.kind()).or_insert(0) += 1;
     }
 
-    // Printed so the binary can't be trivially dead-code-eliminated and so a
+    // Printed so the binary cannot be trivially dead-code-eliminated and so a
     // regression that changes which verdict wins is loudly visible rather
     // than silently under- or over-measuring the fold.
     let mut kinds: Vec<(&str, u64)> = kind_tally.into_iter().collect();

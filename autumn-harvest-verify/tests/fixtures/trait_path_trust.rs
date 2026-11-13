@@ -1,4 +1,4 @@
-//! Fixture (review round 5): a body-less impl from a dependency, reached
+//! Fixture: a body-less impl from a dependency, reached
 //! through a STANDARD trait that rustc prints fully qualified.
 //!
 //! Compiled standalone with, from this directory:

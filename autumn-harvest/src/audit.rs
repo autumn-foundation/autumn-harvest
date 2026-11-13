@@ -1999,7 +1999,7 @@ pub async fn list_audit(
 /// timeout cannot distinguish "export was intentionally removed" from "the
 /// worker has been down since Friday", and it resolves that ambiguity by
 /// deleting audit records during exactly the outage where they matter most
-/// (issue #953, Codex review round 3 P1).
+/// (issue #953).
 ///
 /// Retiring export is therefore an explicit operator action —
 /// [`crate::audit_export::decommission_cursor`] — not an inferred one. The
@@ -2749,7 +2749,7 @@ mod tests {
     fn workflow_count_route_is_classified_read_only() {
         // The grouped workflow-count fleet snapshot (issue #544) is a
         // read-only fan-out projection, no different from the other cross-shard
-        // read models it's modeled after. This test — not just the general
+        // read models it is modeled after. This test — not just the general
         // exhaustiveness guards below, which only cross-check CLASSIFIED_ROUTES
         // and ALL_MUTATION_ROUTES against each other rather than against the
         // live router — is what actually catches a new route shipping with no
@@ -2801,7 +2801,7 @@ mod tests {
     fn queue_coverage_route_is_classified_read_only() {
         // The fleet-wide task-queue coverage read model (issue #774) is a
         // read-only fan-out projection, no different from the other cross-shard
-        // read models it's modeled after (workflow_reachability, workflow_count,
+        // read models it is modeled after (workflow_reachability, workflow_count,
         // shard_health). This pinned test — not just the general exhaustiveness
         // guards below, which only cross-check CLASSIFIED_ROUTES and
         // ALL_MUTATION_ROUTES against each other rather than against the live

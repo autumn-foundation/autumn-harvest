@@ -1349,9 +1349,9 @@ async fn two_saga_unwinds_in_one_workflow_count_independently() {
 
 /// Known pre-existing engine limitation, pinned (PR #973): a **durable
 /// (activity-backed) compensation cannot run once a `WorkflowCancelled` event
-/// is recorded in history** — the cancel event has no workflow-command
-/// counterpart and is never consumed by `match_activity`, so the compensation's
-/// `execute_activity_raw` dispatch diverges
+/// is recorded in history**. The cancel event has no workflow-command
+/// counterpart and is never consumed by `match_activity`. So the
+/// compensation's `execute_activity_raw` dispatch diverges
 /// (`expected ActivityScheduled(..), got WorkflowCancelled`) instead of
 /// scheduling the activity.
 ///

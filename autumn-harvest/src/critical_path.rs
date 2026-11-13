@@ -180,11 +180,11 @@ impl CriticalPathAnalyzer {
         // shape exactly.
         //
         // The pre-pass itself is one O(tasks) scan of a cheap
-        // `Option::is_none()` check -- no hashing, no allocation -- and is
-        // gated cheapest-first so it never runs for a DAG that could not
-        // possibly reach the threshold: `tasks.len()` (already known, O(1))
-        // upper-bounds `lookups_needed` (a task with `start_to_close` set
-        // only ever LOWERS the count), so `tasks.len() <
+        // `Option::is_none()` check -- no hashing, no allocation. It is gated
+        // cheapest-first, so it never runs for a DAG that could not possibly
+        // reach the threshold. `tasks.len()` (already known, O(1))
+        // upper-bounds `lookups_needed`, because a task with `start_to_close`
+        // set only ever LOWERS the count. So `tasks.len() <
         // MIN_LOOKUPS_TO_AMORTIZE_TABLE_BUILD` rules out the fast path with
         // no scan at all. For a large DAG that clears that bar but turns
         // out to be override-heavy (few tasks actually need a lookup), the

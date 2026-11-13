@@ -1091,10 +1091,10 @@ fn record_quota_rejected_metric(
 /// declared cap.
 ///
 /// `pub(crate)` (not private) so `worker.rs`'s spawned-child insertion paths
-/// ([`crate::worker::persist_all_started_child_workflows`]'s fan-out loop and
-/// [`crate::worker::insert_awaited_child_execution`]) can call the SAME
-/// enforcement after inserting a child's row, rather than duplicating the
-/// "subtract 1 for the row this call just inserted" contract documented
+/// can call the SAME enforcement after inserting a child's row. These are
+/// [`crate::worker::persist_all_started_child_workflows`]'s fan-out loop and
+/// [`crate::worker::insert_awaited_child_execution`]. They do not duplicate
+/// the "subtract 1 for the row this call just inserted" contract documented
 /// below (issue #946). A spawned child accumulates its own
 /// history/DLQ/active-execution footprint against its own declared quota,
 /// exactly like any other registry-aware start. So it must not be invisible
@@ -1171,10 +1171,10 @@ pub(crate) async fn enforce_quota_admission(
     let policy = crate::run_defaults::current_quota_policy(workflow_name, policy);
 
     // Serialize check-then-admit for this key under a transaction-scoped
-    // advisory lock (auto-released at commit or rollback) so concurrent
-    // starts for the same key cannot all observe stale pre-admission usage
-    // and jointly overshoot the cap -- the same race `lock_concurrency_key`
-    // closes for issue #247, under a namespace-disjoint key so the two
+    // advisory lock (auto-released at commit or rollback). Concurrent starts
+    // for the same key then cannot all observe stale pre-admission usage and
+    // jointly overshoot the cap. `lock_concurrency_key` closes the same race
+    // for issue #247. This lock uses a namespace-disjoint key, so the two
     // primitives' advisory locks can never collide.
     crate::quota::lock_quota_key(conn, workflow_name, key).await?;
     let credited_ids = if let Some(info) = pending_supersede {
@@ -1467,10 +1467,10 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
     // `ConcurrencyPolicy`/`ThrottlePolicy` use (AC1) -- no second resolver.
     //
     // Resolved HERE, before the TerminateIfRunning pre-check below (issue
-    // #946), so `quota_key` is known in time to decide whether
-    // that pre-check even runs -- a quota-governed key skips it entirely and
-    // falls through to the atomic replace path instead; see the pre-check
-    // block's own comment for the full rationale.
+    // #946). So `quota_key` is known in time to decide whether that pre-check
+    // even runs. A quota-governed key skips it entirely and falls through to
+    // the atomic replace path instead. See the pre-check block's own comment
+    // for the full rationale.
     let quota_policy: Option<crate::quota::QuotaPolicy> =
         crate::completion_trigger::GLOBAL_WORKFLOW_METADATA
             .read()
@@ -1535,13 +1535,13 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
         });
     }
     // A workflow-level retry (#523) continuation must never be blocked by a
-    // quota that has since filled up (issue #946): it
-    // is in-flight continuation of an already-admitted logical run, not a
-    // fresh admission, exactly like the `gate: None` and
-    // `concurrency_on_conflict: Defer` exemptions this same function already
-    // grants a retry continuation elsewhere. `retry_of_exec_id` is set
-    // `Some` at exactly one call site in the whole codebase -- the retry
-    // continuation in `worker.rs` -- so it is an unambiguous signal here.
+    // quota that has since filled up (issue #946). It is in-flight
+    // continuation of an already-admitted logical run, not a fresh admission.
+    // The `gate: None` and `concurrency_on_conflict: Defer` exemptions that
+    // this function grants a retry continuation elsewhere follow the same rule.
+    // `retry_of_exec_id` is set `Some` at exactly one call site in the whole
+    // codebase -- the retry continuation in `worker.rs` -- so it is an
+    // unambiguous signal here.
     // `quota_key` itself stays resolved unconditionally above so the new
     // row is still correctly tagged for FUTURE usage accounting; only the
     // *enforcement* is skipped for this one admission.
@@ -1613,23 +1613,25 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
     }
 
     // Route a quota-governed key through the fully atomic `inline_cancel` +
-    // `replace_execution` path instead (issue #946), by simply
-    // never entering this pre-check block when `quota_key.is_some()`: with
-    // the prior row left un-cancelled, the INSERT below is a no-op, which
-    // falls through to the FOR-UPDATE-locked `ActiveConflictBehavior::Terminate`
-    // branch (same `effective_active_conflict_behavior` result, since it is a
-    // pure function of `request.reuse_policy`/`request.conflict_policy`) --
-    // cancel-then-replace under ONE transaction and ONE row lock, so no
-    // concurrent admission for the same key can observe the freed slot
-    // between cancel and replace (P1), and `enforce_quota_admission` there
-    // runs strictly AFTER the prior row is sealed, so it is naturally
-    // excluded from every usage dimension -- not just `active_executions`
-    // (P2) -- with no separate self-exemption logic needed. A rejection
-    // there rolls the WHOLE sequence back, so the prior run is never left
-    // cancelled without a successor; this is strictly safer than the
-    // now-superseded pre-check-and-separately-commit shortcut below, whose
-    // `enforce_quota_before_terminate_pre_check` helper it replaced could not
-    // hold a lock across the gap to the later authoritative check. A
+    // `replace_execution` path instead (issue #946). The route is simple: never
+    // enter this pre-check block when `quota_key.is_some()`. With the prior row
+    // left un-cancelled, the INSERT below is a no-op. It falls through to the
+    // FOR-UPDATE-locked `ActiveConflictBehavior::Terminate` branch. The
+    // `effective_active_conflict_behavior` result is the same, because it is a
+    // pure function of `request.reuse_policy`/`request.conflict_policy`.
+    //
+    // That branch does cancel-then-replace under ONE transaction and ONE row
+    // lock. So no concurrent admission for the same key can observe the freed
+    // slot between cancel and replace. `enforce_quota_admission` there runs
+    // strictly AFTER the prior row is sealed. So the prior row is naturally
+    // excluded from every usage dimension, not just `active_executions`. No
+    // separate self-exemption logic is needed.
+    //
+    // A rejection there rolls the WHOLE sequence back, so the prior run is
+    // never left cancelled without a successor. This is strictly safer than
+    // the superseded pre-check-and-separately-commit shortcut. Its
+    // `enforce_quota_before_terminate_pre_check` helper could not hold a lock
+    // across the gap to the later authoritative check. A
     // non-quota-governed request (`quota_key.is_none()`, the common case)
     // keeps the pre-check-cancel shortcut byte-for-byte unchanged.
 
@@ -3460,8 +3462,8 @@ mod resolve_by_workflow_id_tests {
 /// arms (`ActiveConflictBehavior::Terminate`, `AllowDuplicateFailedOnly` over a
 /// FAILED/CANCELLED prior, and `TerminateIfRunning` over a terminal prior).
 ///
-/// A replacement is a fresh admission too (issue #811): it seals THIS
-/// `workflow_id`'s own prior, which says nothing about a *different*
+/// A replacement is a fresh admission too (issue #811). It seals THIS
+/// `workflow_id`'s own prior. That says nothing about a *different*
 /// `workflow_id` holding the same concurrency key. Skipping the pass there let a
 /// `limit = 1` group retain both runs despite `cancel_running`.
 ///
@@ -4015,12 +4017,12 @@ async fn notify_awaited_parent_of_child_terminal(
             // _failure) so an over-deadline child that is operator-CANCELLED or
             // -TERMINATED resolves the parent's `spawn_child_workflow_timeout` to
             // the timeout branch (None), not Err. The parent row is already
-            // locked FOR UPDATE above; `materialize_due_child_timeout_deadlines`
+            // locked FOR UPDATE above. `materialize_due_child_timeout_deadlines`
             // re-locks it (a same-transaction no-op) *before* it takes the due
-            // timers FOR UPDATE — the unified execution-row → timer lock order
-            // (see its convention comment, issue #779) — so this
-            // operator path and the worker-wake/child-timeout paths cannot ABBA
-            // against each other on the same overdue parent. It then appends
+            // timers FOR UPDATE. That is the unified execution-row → timer lock
+            // order (see its convention comment, issue #779). So this operator
+            // path and the worker-wake/child-timeout paths cannot ABBA against
+            // each other on the same overdue parent. It then appends
             // `TimerFired` under the same parent-row MAX(event_id) discipline as
             // the child terminal below, so the deadline is ordered first.
             crate::worker::materialize_due_child_timeout_deadlines(conn, parent_exec_id).await?;
@@ -4059,11 +4061,11 @@ pub async fn cancel_workflow_execution_collect(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
     reason: &str,
-    // issue #1197, item 2: threaded into this cancellation's
-    // own completion-trigger evaluation below so a nested self-referential
-    // admission recursing off of THIS cancel sees the real caller-supplied
-    // recorder instead of unconditionally falling back to the process-global
-    // one. `None` at every call site that never had a recorder in scope.
+    // issue #1197, item 2: threaded into this cancellation's own
+    // completion-trigger evaluation below. A nested self-referential admission
+    // recursing off of THIS cancel then sees the real caller-supplied recorder.
+    // It does not fall back to the process-global one. `None` at every call
+    // site that never had a recorder in scope.
     metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
 ) -> HarvestResult<CancelCollected> {
     cancel_workflow_execution_collect_mode(conn, exec_id, reason, metrics, true).await
@@ -4340,16 +4342,15 @@ async fn cancel_workflow_execution_collect_mode(
             let (mut deferred, closed_children) =
                 apply_parent_close_cascade(conn, exec_id, &crate::store::DEFAULT_PAYLOAD_CODECS)
                     .await?;
-            // issue #1197, item 1: this evaluation's own supersede/cancel
-            // metrics are still discarded by the plain wrapper's throwaway
-            // collector (this transaction is a nested SAVEPOINT from the
-            // caller's perspective in the common case, so nothing here could
-            // safely emit post-commit anyway) -- but `metrics`, when the
-            // caller has one, is now passed through rather than hardcoded to
-            // `None` (issue #1197, item 2), so a nested
-            // self-referential admission this cancellation's own trigger
-            // evaluation recurses into sees the real recorder instead of
-            // unconditionally falling back to the process-global one.
+            // issue #1197, item 1: the plain wrapper's throwaway collector still
+            // discards this evaluation's own supersede/cancel metrics. In the
+            // common case this transaction is a nested SAVEPOINT from the
+            // caller's perspective, so nothing here could safely emit
+            // post-commit anyway. But `metrics`, when the caller has one, is
+            // passed through rather than hardcoded to `None` (issue #1197, item
+            // 2). A nested self-referential admission that this cancellation's
+            // own trigger evaluation recurses into then sees the real recorder.
+            // It does not fall back to the process-global one.
             // Issue #1243: a completion trigger fired here can start a new
             // workflow. Its `WorkflowStarted.input` is payload-bearing, but
             // `cancel_workflow_execution_collect` has no configured registry
@@ -7834,9 +7835,9 @@ fn check_sws_payload_cap(
 /// Validate `input` against `workflow_info`'s published JSON Schema
 /// (issue #373), when one is registered. Called only on a genuine fresh
 /// start (see the two call sites in
-/// [`signal_with_start_workflow_execution_with_metrics`]) — an attach never
-/// writes `start_input`, so validating it there would reject a call that
-/// will never actually use the value it rejects (issue #918 review).
+/// [`signal_with_start_workflow_execution_with_metrics`]). An attach never
+/// writes `start_input`. Validation there would reject a call that never
+/// uses the value it rejects (issue #918 review).
 fn check_sws_input_schema(
     input: &serde_json::Value,
     workflow_info: Option<&WorkflowInfo>,
@@ -10895,10 +10896,10 @@ mod pause_helper_tests {
 
     #[test]
     fn external_resume_shift_query_never_waits_on_a_locked_task_row() {
-        // Issue #609 post-review hardening: the
-        // harvest_external_tasks lock convention is task row → execution row
-        // (completion paths, timeout scanner), but this shift runs with the
-        // execution row lock already held — the inverted order. It must
+        // Issue #609 post-review hardening: the harvest_external_tasks lock
+        // convention is task row → execution row (completion paths, timeout
+        // scanner). But this shift runs with the execution row lock already
+        // held, which is the inverted order. It must
         // therefore never *wait* on a task row (SKIP LOCKED), or a concurrent
         // completion/scanner holding the task row and waiting on our
         // execution lock would ABBA-deadlock. Skipped rows are safe by

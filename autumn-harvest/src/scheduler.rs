@@ -344,7 +344,7 @@ impl SchedulerMonitor {
         }
     }
 
-    /// Creates a dummy offline monitor for contexts where the scheduler isn't running.
+    /// Creates a dummy offline monitor for contexts where the scheduler is not running.
     #[must_use]
     pub fn offline() -> Self {
         Self {
@@ -3350,8 +3350,8 @@ async fn apply_workflow_schedule_update(
         // clear exhaustion when the schedule expression will actually produce a new
         // firing inside the new window.
         // Special case: Manual schedules have no automatic next slot (next_run_after
-        // returns None), so treat them as ok when the wall clock hasn't yet reached
-        // the cutoff (manual triggers are still allowed until end_at).
+        // returns None). So treat them as ok while the wall clock has not reached
+        // the cutoff. Manual triggers are still allowed until end_at.
         let end_at_ok = ws.end_at.is_none_or(|new_end| {
             if matches!(ws.schedule, crate::policy::Schedule::Manual) {
                 return now < new_end;
@@ -5600,9 +5600,9 @@ async fn tick_one_workflow_schedule(
             schedule.retry_policy.as_ref(),
             wf_info.and_then(|info| info.retry_policy.as_ref()),
         );
-        // Latest-wins supersede counters (issue #811, Codex round 1): the
-        // metrics-less wrapper discards the collected cancellations, so a
-        // scheduled fire that sheds an incumbent emitted neither
+        // Latest-wins supersede counters (issue #811): the metrics-less
+        // wrapper discards the collected cancellations. A scheduled fire that
+        // sheds an incumbent then emitted neither
         // `harvest.concurrency.superseded` nor the cancelled terminal.
         let start_result =
             crate::execution::start_or_load_workflow_execution_with_metrics_and_codecs(
@@ -6016,16 +6016,18 @@ pub struct OverdueInputs<'a> {
     /// basis: shard-local `RUNNING`/`PAUSED` + #607 pending throttle).
     pub at_capacity: bool,
     /// Calendar-adjusted effective fire time for the pinned `next_run_at` slot
-    /// (issue #696, Codex round 3). `Some(rebased)` when a calendar skip policy
+    /// (issue #696). `Some(rebased)` when a calendar skip policy
     /// (`run_next_business_day`/`run_prev_business_day`) has rebased an excluded
-    /// slot to a different business day; `None` when there is no calendar
+    /// slot to a different business day. `None` when there is no calendar
     /// deferral (no calendar, slot not excluded, `SkipPolicy::Skip`-suppressed,
-    /// or unparseable cadence). The predicate anchors the lag test on
-    /// `max(next_run_at, effective_fire_at)`, so a schedule the tick is
-    /// deliberately holding for a *future* calendar-adjusted fire is not falsely
-    /// flagged overdue, while one wedged **past** its adjusted fire still is. The
-    /// caller resolves this (it needs the calendar's exclusions) so the predicate
-    /// stays DB-free (AC2); see [`resolve_effective_fire_at`].
+    /// or unparseable cadence).
+    ///
+    /// The predicate anchors the lag test on `max(next_run_at,
+    /// effective_fire_at)`. So a schedule that the tick holds for a *future*
+    /// calendar-adjusted fire is not falsely flagged overdue. One wedged
+    /// **past** its adjusted fire still is. The caller resolves this, because it
+    /// needs the calendar's exclusions. So the predicate stays DB-free (AC2);
+    /// see [`resolve_effective_fire_at`].
     pub effective_fire_at: Option<DateTime<Utc>>,
 }
 
@@ -6038,17 +6040,17 @@ pub struct OverdueInputs<'a> {
 /// dispatch, and the tick term absorbs the scheduler's own poll latency — so a
 /// healthy schedule caught mid-tick, or deferred by jitter, is never flagged.
 ///
-/// **Bounded-out exclusion, derived from RAW fields (Codex P2-A).** `exhausted_at`
-/// is stamped *by* the tick — the very thing that may be wedged — so the
-/// predicate must also recognise a schedule the tick *would* exhaust but hasn't
-/// yet. Mirroring `tick_one_workflow_schedule` byte-for-byte
+/// **Bounded-out exclusion, derived from RAW fields.** The tick stamps
+/// `exhausted_at`, and the tick is the very thing that may be wedged. So the
+/// predicate must also recognise a schedule that the tick *would* exhaust but
+/// has not yet. It mirrors `tick_one_workflow_schedule` byte-for-byte
 /// (`now_budget_exhausted`/`end_at_now_exhausted`, scheduler.rs): bounded-out =
 /// `exhausted_at.is_some()` **or** `max_runs > 0 && runs_started >= max_runs`
-/// **or** `next_run_at >= end_at`. A slot with `next_run_at < end_at` that hasn't
-/// fired is a GENUINE missed slot (still overdue), only `next_run_at >= end_at`
-/// is bounded-out.
+/// **or** `next_run_at >= end_at`. A slot with `next_run_at < end_at` that has
+/// not fired is a GENUINE missed slot (still overdue). Only
+/// `next_run_at >= end_at` is bounded-out.
 ///
-/// **`at_capacity` suppression, gated to the tick's deferring config (Codex P2-B).**
+/// **`at_capacity` suppression, gated to the tick's deferring config.**
 /// The tick only retains `next_run_at` in the past under
 /// `retain_for_retry = catchup && reason == "max_active_runs_reached"`, and only
 /// `OverlapPolicy::Skip` produces that reason. Every other config *advances*
@@ -6111,15 +6113,15 @@ pub fn schedule_overdue(inputs: &OverdueInputs) -> OverdueVerdict {
     else {
         return OverdueVerdict::NOT_OVERDUE;
     };
-    // Calendar-deferred anchor (Codex round 3): a calendar skip policy can rebase
-    // an excluded slot to a later business day, and while that adjusted fire is
-    // still in the future the tick deliberately keeps `next_run_at` pinned to the
-    // (now past) original slot. Anchoring the lag on `max(next_run_at,
-    // effective_fire_at)` means a schedule waiting for a *future* calendar fire is
-    // not falsely flagged, while a schedule wedged **past** its adjusted fire is
-    // still caught (its `effective_fire_at` is itself now in the past). With no
-    // calendar, `effective_fire_at` is `None` ⇒ anchor == `next_run_at` (byte-for-
-    // byte unchanged). A backward rebase (`run_prev_business_day`, so
+    // Calendar-deferred anchor (issue #696): a calendar skip policy can rebase
+    // an excluded slot to a later business day. While that adjusted fire is
+    // still in the future, the tick deliberately keeps `next_run_at` pinned to
+    // the (now past) original slot. The lag anchors on `max(next_run_at,
+    // effective_fire_at)`. So a schedule that waits for a *future* calendar fire
+    // is not falsely flagged. A schedule wedged **past** its adjusted fire is
+    // still caught, because its `effective_fire_at` is itself in the past. With
+    // no calendar, `effective_fire_at` is `None` ⇒ anchor == `next_run_at`
+    // (byte-for-byte unchanged). A backward rebase (`run_prev_business_day`, so
     // `effective_fire_at < next_run_at`) also keeps the raw anchor via the `max`,
     // preserving detection.
     let anchor = inputs
@@ -6350,7 +6352,7 @@ pub fn resolve_effective_fire_at_pure(
 }
 
 /// Resolve the calendar-adjusted effective fire time for a schedule's pinned
-/// `next_run_at` slot (issue #696, Codex round 3).
+/// `next_run_at` slot (issue #696).
 ///
 /// Mirrors the tick's own calendar rebasing and feeds
 /// [`OverdueInputs::effective_fire_at`].
@@ -6402,8 +6404,8 @@ pub async fn resolve_effective_fire_at(
 /// One shard's overdue sampling pass (issue #696).
 ///
 /// Carries the per-schedule verdicts plus the minimum active cadence step on the
-/// shard, which the worker sampler uses to adapt its poll interval so a sub-30s
-/// schedule is still detected within its cadence-grace window (Codex round 4).
+/// shard. The worker sampler uses that step to adapt its poll interval. So a
+/// sub-30s schedule is still detected within its cadence-grace window.
 #[derive(Debug, Clone)]
 pub struct OverdueSamplePass {
     /// Per-schedule verdicts (all schedules, including not-overdue ones).
@@ -6519,12 +6521,12 @@ pub async fn overdue_schedule_pass(
             .schedule_expr
             .as_deref()
             .and_then(parse_schedule_from_expr);
-        // Track the fastest *active* cadence for the adaptive sampler interval
-        // (Codex round 4). "Active" = not intentionally dormant (paused /
-        // auto-paused / exhausted); a fast, currently-healthy schedule must still
-        // be sampled near its cadence because it could wedge right after a pass.
+        // Track the fastest *active* cadence for the adaptive sampler interval.
+        // "Active" = not intentionally dormant (paused / auto-paused /
+        // exhausted). A fast, currently-healthy schedule must still be sampled
+        // near its cadence, because it could wedge right after a pass.
         // Over-inclusion (e.g. a bounded-out-but-not-yet-exhausted fast schedule)
-        // only samples slightly faster — correctness-safe, never slower.
+        // only samples slightly faster. That is correctness-safe, never slower.
         if !s.is_paused
             && s.auto_paused_at.is_none()
             && s.exhausted_at.is_none()
@@ -6598,7 +6600,7 @@ pub async fn overdue_schedule_pass(
 /// Compute the overdue verdict for every schedule on one shard (issue #696).
 ///
 /// Thin wrapper over [`overdue_schedule_pass`] returning only the verdicts, for
-/// callers that don't need the adaptive-interval cadence (the DB tests and
+/// callers that do not need the adaptive-interval cadence (the DB tests and
 /// [`sample_overdue_schedules`]).
 ///
 /// # Errors
@@ -6961,7 +6963,7 @@ fn window_eligible_slots(
 
 // ── Overlap policy helpers ────────────────────────────────────────────────────
 
-/// The action the scheduler takes when a new firing can't start immediately
+/// The action the scheduler takes when a new firing cannot start immediately
 /// because `max_active_runs` is already reached.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum OverlapAction {
@@ -6989,7 +6991,7 @@ pub(crate) enum OverlapAction {
 /// keeps each phase well inside its claim lease.
 pub const ALLOW_ALL_MAX_STARTS_PER_TICK: u32 = 100;
 
-/// Decide what to do with a new firing that can't run immediately.
+/// Decide what to do with a new firing that cannot run immediately.
 ///
 /// `buffered` is the current set of already-buffered fire times.
 /// `buffer_all_max` is the cap for [`OverlapPolicy::BufferAll`].
@@ -7030,7 +7032,7 @@ pub(crate) fn apply_overlap_policy(
 
 /// Deserialize the `buffered_runs` JSONB column into a sorted list of fire times.
 ///
-/// Malformed entries are silently skipped so a partial JSON corruption can't
+/// Malformed entries are silently skipped, so a partial JSON corruption cannot
 /// permanently wedge a schedule.
 pub(crate) fn parse_buffered_runs(value: &serde_json::Value) -> Vec<DateTime<Utc>> {
     let Some(arr) = value.as_array() else {
@@ -7369,7 +7371,7 @@ async fn drain_claimed_buffered_schedule(
             all_buffered_past_end_at = true;
             break;
         }
-        // Budget cap (issue #478): don't let buffered drains exceed max_runs.
+        // Budget cap (issue #478): buffered drains must not exceed max_runs.
         if let Some(max_runs) = schedule.max_runs {
             let already = schedule
                 .runs_started
@@ -7588,7 +7590,7 @@ async fn drain_claimed_buffered_schedule(
             schedule.retry_policy.as_ref(),
             wf_info.and_then(|info| info.retry_policy.as_ref()),
         );
-        // Latest-wins supersede counters (issue #811, Codex round 1) --
+        // Latest-wins supersede counters (issue #811) --
         // the buffered drain shares the tick's gap.
         let start_result =
             crate::execution::start_or_load_workflow_execution_with_metrics_and_codecs(
@@ -8529,7 +8531,7 @@ mod tests {
     fn due_run_plan_without_catchup_anchors_next_slot_to_first_due() {
         // When now is only slightly past first_due (e.g. jitter delay of 3 min
         // inside a 60-min interval), next slot must be first_due + period, not
-        // now + period, so the schedule doesn't drift on every fired slot.
+        // now + period, so the schedule does not drift on every fired slot.
         let schedule = Schedule::Interval(Duration::from_secs(3600));
         let first_due = parse_utc("2026-04-06T10:00:00Z");
         let now = parse_utc("2026-04-06T10:03:00Z"); // 3 min jitter delay
@@ -9500,7 +9502,7 @@ mod tests {
         assert_eq!(past.overdue_by_secs, Some(302));
     }
 
-    // ── Calendar-deferred anchor (issue #696, Codex round 3) ──────────────────
+    // ── Calendar-deferred anchor (issue #696) ─────────────────────────────────
 
     #[test]
     fn calendar_deferred_future_fire_is_not_overdue() {

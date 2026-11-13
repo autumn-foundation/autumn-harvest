@@ -205,9 +205,9 @@ pub async fn publish_workflow_module(
         // republishing the same bytes revives it — which is the whole reason
         // retirement is a tombstone rather than a delete.
         //
-        // The SIGNATURE is written too (issue #967), and
-        // that is not cosmetic: it is the only way to introduce or rotate
-        // signing for a build that already exists. Clearing `retired_at` alone
+        // The SIGNATURE is written too (issue #967), and that is not cosmetic.
+        // It is the only way to introduce or rotate signing for a build that
+        // already exists. Clearing `retired_at` alone
         // left the old (or NULL) signature in place, so a republish carrying a
         // signature valid under a NEW key returned success and then made
         // `sync_build_into_registry(.., Some(new_key))` reject the very row it
@@ -222,17 +222,16 @@ pub async fn publish_workflow_module(
         // `(build_id, workflow_name, module_hash)` tuple — it cannot smuggle in
         // different code.
         //
-        // `COALESCE`, not a bare assignment (issue #967). A publisher that
-        // supplies no signature must not
-        // *erase* one: mid-rollout, an older or unsigned publisher re-seeding
-        // the same build would otherwise NULL a valid attestation, and every
-        // worker syncing with the signing key would then reject the row as
-        // unsigned — turning a harmless duplicate publish into a fleet-wide
-        // refusal of a build that was correctly signed a moment earlier. So an
-        // explicitly supplied (and therefore verified) signature replaces the
-        // stored one, and `None` leaves it alone. Removing a signature is
-        // deliberately not expressible here: it would be indistinguishable from
-        // this accident, and retirement already exists for withdrawing a module.
+        // `COALESCE`, not a bare assignment (issue #967). A publisher that supplies no
+        // signature must not *erase* one: mid-rollout, an older or unsigned publisher
+        // re-seeding the same build would otherwise NULL a valid attestation, and
+        // every worker syncing with the signing key would then reject the row as
+        // unsigned — turning a harmless duplicate publish into a fleet-wide refusal of
+        // a build that was correctly signed a moment earlier. So an explicitly
+        // supplied (and therefore verified) signature replaces the stored one, and
+        // `None` leaves it alone. Removing a signature is deliberately not expressible
+        // here: it would be indistinguishable from this accident, and retirement
+        // already exists for withdrawing a module.
         diesel::sql_query(
             "UPDATE harvest_workflow_modules \
              SET retired_at = NULL, signature = COALESCE($3, signature) \
@@ -475,14 +474,14 @@ pub async fn sync_build_into_registry(
         )));
     }
 
-    // Fetch, verify and compile ONE module at a time, then bind them all at
-    // once. The obvious shape — read every payload into a `Vec`, then compile —
-    // holds the whole build's source bytes resident simultaneously (issue #967).
-    // Each row is capped at 32 MiB by the table's CHECK,
-    // but nothing caps the number of workflow names in a build, so the aggregate
-    // is unbounded and a large enough build OOMs the worker during sync. Here a
-    // payload is dropped as soon as it has been compiled, so peak residency in
-    // source bytes is one module rather than the whole build.
+    // Fetch, verify and compile ONE module at a time, then bind them all at once.
+    // The obvious shape — read every payload into a `Vec`, then compile — holds the
+    // whole build's source bytes resident simultaneously (issue #967). Each row is
+    // capped at 32 MiB by the table's CHECK, but nothing caps the number of
+    // workflow names in a build, so the aggregate is unbounded and a large enough
+    // build OOMs the worker during sync. Here a payload is dropped as soon as it
+    // has been compiled, so peak residency in source bytes is one module rather
+    // than the whole build.
     //
     // Atomicity is unaffected: `prepare_module` verifies and compiles without
     // binding, and `commit_prepared` binds the whole batch or none of it — so a

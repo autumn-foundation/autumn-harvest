@@ -9,13 +9,13 @@
 //! - **FIX 2 (P2)** — a workflow that schedules an UNREGISTERED activity releases
 //!   the just-claimed task back to `PENDING` (instead of stranding it `RUNNING`),
 //!   so a later drain re-claims it once the body is registered — no DB reopen.
-//! - **FIX 3** — a PANICKING activity body is contained and routed
-//!   through the normal retryable-failure path (retry per policy, else terminal
-//!   `ActivityFailed`) instead of unwinding past the finalize and wedging the run.
+//! - **FIX 3** — a PANICKING activity body is contained. It goes through the
+//!   normal retryable-failure path (retry per policy, else terminal
+//!   `ActivityFailed`). It does not unwind past the finalize and wedge the run.
 //! - **FIX 4** — a single decision cycle emitting BOTH a timer and an
-//!   activity (`tokio::join!`) records its schedule events in command order and
-//!   replays cleanly on the core `WorkflowReplayer` (the matcher tolerates the
-//!   interleaved sibling terminals).
+//!   activity (`tokio::join!`) records its schedule events in command order. It
+//!   replays cleanly on the core `WorkflowReplayer`, because the matcher
+//!   tolerates the interleaved sibling terminals.
 //! - **`send_signal` validation (Codex #1069 P2)** — `send_signal` rejects a signal
 //!   to an unknown execution ([`SqliteError::ExecutionNotFound`]) or a terminal one
 //!   ([`SqliteError::WorkflowNotRunning`]) instead of staging a row no live

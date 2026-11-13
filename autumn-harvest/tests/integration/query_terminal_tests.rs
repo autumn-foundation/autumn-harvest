@@ -887,7 +887,7 @@ fn signal_handler_completed_run_serves_not_gone() {
     );
 }
 
-// ── Issue #772 (round 6): deadline-aware continue-as-new × query replay ──────
+// ── Issue #772: deadline-aware continue-as-new × query replay ────────────────
 //
 // A workflow with an `execution_timeout` that calls `should_continue_as_new()`
 // records a reserved `SideEffectRecorded { kind: Now, name:
@@ -1002,7 +1002,7 @@ fn deadline_probe_history(
 
 /// Build a replay context that threads the execution row's
 /// `execution_timeout`/`deadline_at` exactly as the fixed query hydration paths
-/// (`hydrate_ctx_for_query`, `execute_query_in_process`) do (#772 round 6).
+/// (`hydrate_ctx_for_query`, `execute_query_in_process`) do (#772).
 fn build_ctx_with_deadline(
     exec_id: ExecutionId,
     events: Vec<WorkflowEvent>,
@@ -1056,10 +1056,11 @@ fn deadline_probe_history_replays_and_serves_when_budget_is_threaded() {
 
 #[test]
 fn deadline_probe_history_diverges_when_budget_is_not_threaded() {
-    // RED (pre-fix behavior): a context that does NOT thread the budget — exactly
-    // what the query hydration paths did before #772 round 6 — leaves the recorded
-    // deadline probe UNCONSUMED, so the terminal-query drift check sees leftover
-    // non-lifecycle history and classifies the otherwise-valid history as 410.
+    // RED (pre-fix behavior): a context that does NOT thread the budget leaves
+    // the recorded deadline probe UNCONSUMED. The query hydration paths did
+    // exactly that before the #772 fix. The terminal-query drift check then
+    // sees leftover non-lifecycle history. It classifies the otherwise-valid
+    // history as 410.
     // This pins WHY threading is required at the hydration sites.
     let (exec_id, input, events, _budget, _deadline) = deadline_probe_history(&["a", "b", "c"]);
     let sealed = history_reached_terminal_seal(&events);

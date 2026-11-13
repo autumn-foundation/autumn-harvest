@@ -26,17 +26,17 @@
 //! `max_slots - initial_target` of them as owned permits it holds itself.
 //! **Grow** releases withheld permits (making them available for dispatch).
 //! **Shrink** first tries an opportunistic, non-blocking re-acquire on every
-//! tick; if that cannot land (e.g. a busy worker's dispatch queue keeps
-//! winning every released permit), it falls back to a background task that
-//! joins the semaphore's own fair FIFO wait queue, guaranteeing the shrink
-//! eventually lands on its turn rather than needing to win a race against
-//! `try_acquire` forever. Neither path ever revokes a permit already held by
-//! an in-flight task, so a shrink decision only withholds *new* permits
-//! until the in-flight count naturally falls to the new target (issue #548
-//! AC: graceful shutdown and draining are unaffected). On cancellation the
-//! loop drops every withheld permit (and cancels any in-flight background
-//! shrink acquire) before returning so `drain_in_flight`'s
-//! `acquire_many(max_slots)` can complete.
+//! tick. That can fail to land, e.g. when a busy worker's dispatch queue
+//! keeps winning every released permit. Then it falls back to a background
+//! task that joins the semaphore's own fair FIFO wait queue. That guarantees
+//! the shrink eventually lands on its turn, with no need to win a race
+//! against `try_acquire` forever. Neither path ever revokes a permit already
+//! held by an in-flight task. So a shrink decision only withholds *new*
+//! permits until the in-flight count naturally falls to the new target.
+//! Graceful shutdown and draining are unaffected (issue #548 AC). On
+//! cancellation the loop drops every withheld permit (and cancels any
+//! in-flight background shrink acquire) before returning. Then
+//! `drain_in_flight`'s `acquire_many(max_slots)` can complete.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -172,8 +172,8 @@ pub trait SlotTuner: Send + Sync {
 /// 2. **Saturated and waiting** — every current slot is in use *and* the
 ///    longest recent permit wait has reached [`Self::permit_wait_grow_threshold`]
 ///    — grow. Mere full occupancy with no observed wait is not, by itself, a
-///    signal to grow (a burst that drains within a tick should not ratchet
-///    capacity up).
+///    signal to grow. A burst that drains within a tick should not ratchet
+///    capacity up.
 /// 3. Otherwise — hold.
 #[derive(Debug, Clone, Copy)]
 pub struct DefaultSlotTuner {
@@ -428,15 +428,15 @@ pub struct TunedSlotRuntime {
     /// correctly releases only part of an entry when needed.
     withheld: Vec<OwnedSemaphorePermit>,
     /// The most recently requested target, independent of how much of it
-    /// has actually been achieved (issue #548 review). A shrink that cannot
-    /// fully land in one call — every slot at the current target is
-    /// occupied by in-flight work, so no permit is free to withhold — must
-    /// not be silently forgotten just because a *later* tick's fresh
-    /// observation no longer looks saturated: `tick_one` derives each new
-    /// tick's target from this field (not from `live_target`), so
+    /// has actually been achieved (issue #548 review). A shrink can fail to
+    /// fully land in one call. Then every slot at the current target is
+    /// occupied by in-flight work, so no permit is free to withhold. That
+    /// shrink must not be silently forgotten just because a *later* tick's
+    /// fresh observation no longer looks saturated. `tick_one` derives each
+    /// new tick's target from this field (not from `live_target`). So
     /// `resize_toward` keeps retrying the same standing intent on every
-    /// call until it is actually reached, rather than only on calls that
-    /// happen to repeat an unchanged `desired` argument.
+    /// call until it is actually reached. It does not retry only on calls
+    /// that happen to repeat an unchanged `desired` argument.
     desired_target: usize,
     min_slots: usize,
     max_slots: usize,
@@ -475,10 +475,10 @@ impl TunedSlotRuntime {
         let target = initial_target(configured_max, min_slots, max_slots);
         let to_withhold = max_slots.saturating_sub(target);
         // Tracks what was actually withheld, not just what was intended.
-        // The semaphore was constructed with fewer than `max_slots` permits
-        // (a caller bug) is the only way the acquire below can fail — stop
-        // withholding rather than panicking, but fall the live target back
-        // to the semaphore's true available count so `slot_occupancy`
+        // The acquire below can fail only when the semaphore was constructed
+        // with fewer than `max_slots` permits (a caller bug). Then stop
+        // withholding rather than panicking. Fall the live target back to
+        // the semaphore's true available count. Then `slot_occupancy`
         // accounting (which trusts `live_target`) cannot silently diverge
         // from the semaphore's actual, unconstrained capacity.
         let (withheld, actual_target) = match u32::try_from(to_withhold) {
@@ -590,8 +590,8 @@ impl TunedSlotRuntime {
     /// [`Self::desired_target`] independent of what this call achieves.
     ///
     /// Async (issue #548) only to reap an already-finished
-    /// background shrink-acquire (see [`Self::pending_shrink`]) — that
-    /// `.await` never actually suspends, since it is only reached after
+    /// background shrink-acquire (see [`Self::pending_shrink`]). That
+    /// `.await` never actually suspends. It is only reached after
     /// confirming the task [`JoinHandle::is_finished`]. This does not make
     /// `resize_toward` itself block on the semaphore.
     pub async fn resize_toward(&mut self, desired: usize) -> usize {
@@ -644,13 +644,13 @@ impl TunedSlotRuntime {
                         self.withheld.push(permit);
                         self.live_target.fetch_sub(1, Ordering::Relaxed);
                     }
-                    // No free permit right now — every remaining slot at
-                    // the current target is occupied by in-flight work, or
-                    // (issue #548) the semaphore has a
-                    // queued dispatch backlog and `try_acquire_owned` loses
-                    // to it every time. Stop the opportunistic loop either
-                    // way; the fallback below picks up the slack by
-                    // joining the semaphore's fair FIFO wait queue instead.
+                    // No free permit right now. One cause: every remaining
+                    // slot at the current target is occupied by in-flight
+                    // work. The other cause (issue #548): the semaphore has
+                    // a queued dispatch backlog, and `try_acquire_owned`
+                    // loses to it every time. Stop the opportunistic loop either way. The
+                    // fallback below picks up the slack by joining the
+                    // semaphore's fair FIFO wait queue instead.
                     Err(_) => break,
                 }
             }
@@ -663,13 +663,13 @@ impl TunedSlotRuntime {
         self.settle_pending_shrink(desired).await;
 
         // Still short of `desired` and no background acquire already in
-        // flight: join the semaphore's real (fair, FIFO) wait queue for
-        // one permit instead of only ever retrying `try_acquire` (issue
-        // #548). Once queued here, nothing can "cut in
-        // front" of this request — unlike `try_acquire`, which loses to
-        // any already-queued dispatch waiter every time a permit is
-        // released — so this guarantees eventual forward progress under a
-        // sustained backlog instead of indefinite starvation.
+        // flight (issue #548). So join the semaphore's real (fair, FIFO) wait
+        // queue for one permit, not only ever retry `try_acquire`. Once
+        // queued here, nothing can "cut in front" of this request. In
+        // contrast, `try_acquire` loses to any already-queued dispatch waiter
+        // every time a permit is released. So this guarantees eventual
+        // forward progress under a sustained backlog instead of indefinite
+        // starvation.
         if self.live_target() > desired && self.pending_shrink.is_none() {
             let semaphore = Arc::clone(&self.semaphore);
             self.pending_shrink = Some(crate::shuttle_sync::spawn(async move {
@@ -694,14 +694,14 @@ impl TunedSlotRuntime {
     /// shrunk target during shutdown. See "Known limitation" in
     /// `docs/operations/adaptive-slot-tuner.md`.
     pub fn release_all_withheld(&mut self) {
-        // Abort any in-flight background shrink-acquire first (issue #548):
-        // if it is still queued in the semaphore's FIFO
-        // wait list, it must be removed before the permits below are
-        // released, or it could win one of them ahead of
-        // `drain_in_flight`'s later request (which joins the same fair
-        // queue). `JoinHandle::abort` is asynchronous: the queued acquire
-        // drops on the task's next poll. A permit given to it before then
-        // goes back to the semaphore at that drop, so no permit is lost.
+        // Abort any in-flight background shrink-acquire first (issue #548). It
+        // can still be queued in the semaphore's FIFO wait list. Then it must
+        // be removed before the permits below are released. Otherwise it could
+        // win one of them ahead of `drain_in_flight`'s later request (which
+        // joins the same fair queue). `JoinHandle::abort` is asynchronous: the
+        // queued acquire drops on the task's next poll. A permit given to it
+        // before then goes back to the semaphore at that drop, so no permit is
+        // lost.
         if let Some(handle) = self.pending_shrink.take() {
             handle.abort();
         }
@@ -763,7 +763,8 @@ async fn tick_one(
     // Base the next target on the *desired* target for Shrink/Hold, but
     // always on the achieved `current_target` for Grow (issue #548). An unmet
     // shrink (every slot occupied when it was requested) must keep being
-    // retried by a later Hold/Shrink rather than silently dropped. That is what `desired_target` is for. But a *Grow* means the
+    // retried by a later Hold/Shrink rather than silently dropped. That is
+    // what `desired_target` is for. But a *Grow* means the
     // controller has just observed the live semaphore itself saturated and
     // backlogged (occupancy is computed from `current_target`, i.e.
     // `live_target`, not `desired_target`); basing that grow on a stale,
@@ -1322,10 +1323,10 @@ mod tests {
 
     #[tokio::test]
     async fn tick_one_retries_an_unmet_shrink_after_a_later_hold_decision() {
-        // Regression test (issue #548 review): a shrink that cannot fully
-        // land in one tick (every slot at the current target is occupied)
-        // must not be forgotten just because a later tick's fresh
-        // observation no longer looks saturated and reports Hold.
+        // Regression test (issue #548 review): a shrink can fail to fully
+        // land in one tick, because every slot at the current target is
+        // occupied. It must not be forgotten just because a later tick's
+        // fresh observation no longer looks saturated and reports Hold.
         struct ScriptedTuner {
             calls: AtomicUsize,
         }
@@ -1388,13 +1389,13 @@ mod tests {
 
     #[tokio::test]
     async fn tick_one_grow_after_unmet_shrink_rebases_on_live_not_stale_desired() {
-        // Regression test (issue #548): once a shrink is
-        // stuck unmet (desired_target below live_target), a later Grow
-        // decision must expand from the achieved live_target, not resume
-        // from the stale, lower desired_target — otherwise a controller
-        // that just observed saturation-and-backlog would get a target
-        // *below* the current live one, which reads as a further shrink
-        // instead of the requested grow.
+        // Regression test (issue #548): once a shrink is stuck unmet
+        // (desired_target below live_target), a later Grow decision must
+        // expand from the achieved live_target. It must not resume from the
+        // stale, lower desired_target. Otherwise a controller that just
+        // observed saturation-and-backlog would get a target *below* the
+        // current live one. That reads as a further shrink instead of the
+        // requested grow.
         struct ScriptedTuner {
             calls: AtomicUsize,
         }
@@ -1513,8 +1514,8 @@ mod tests {
             in_flight.pop();
         }
         // Let the background shrink-acquire spawned above (issue #548)
-        // actually complete before it is reaped: dropping
-        // the permits above wakes it but does not run it inline.
+        // actually complete before it is reaped. Dropping the permits above
+        // wakes it but does not run it inline.
         for _ in 0..50 {
             tokio::task::yield_now().await;
         }
@@ -1524,12 +1525,11 @@ mod tests {
 
     #[tokio::test]
     async fn resize_toward_shrink_eventually_succeeds_despite_losing_to_a_queued_waiter() {
-        // Regression test (issue #548): a plain
-        // `try_acquire`-only shrink can be starved indefinitely by a real
-        // dispatch-style queued waiter, since `tokio::sync::Semaphore`
-        // always hands a released permit to the oldest queued
-        // `.acquire()` waiter before a concurrent `try_acquire` can ever
-        // see it. Verifies shrink still lands by joining that same fair
+        // Regression test (issue #548): a plain `try_acquire`-only shrink
+        // can be starved indefinitely by a real dispatch-style queued waiter.
+        // `tokio::sync::Semaphore` always hands a released permit to the
+        // oldest queued `.acquire()` waiter before a concurrent
+        // `try_acquire` can ever see it. Verifies shrink still lands by joining that same fair
         // FIFO queue, even after initially losing a released permit to a
         // waiter that was already ahead of it in line.
         let semaphore = Arc::new(Semaphore::new(1));

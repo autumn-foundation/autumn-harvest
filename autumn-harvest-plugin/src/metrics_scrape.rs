@@ -119,7 +119,7 @@ struct Histogram(RwLock<HashMap<LabelValues, (u64, f64)>>);
 
 impl Histogram {
     // The write guard is held only for the two-statement bump below (bounded,
-    // uncontended in-process work); the lint's general "hold locks briefly"
+    // uncontended in-process work). The lint's general "hold locks briefly"
     // advice does not apply cleanly to `HashMap::entry`'s borrow shape here.
     #[allow(clippy::significant_drop_tightening)]
     fn observe(&self, labels: LabelValues, value: f64) {
@@ -848,8 +848,8 @@ fn push_catalogue_metrics(families: &mut Vec<MetricFamily>, inner: &Inner) {
 }
 
 /// Metrics the engine's own `is_enabled()`-gated background samplers already
-/// compute alongside the nine catalogue metrics above -- implemented so that
-/// sampler work is not silently discarded (see the module docs).
+/// compute alongside the nine catalogue metrics above. They are implemented
+/// so that sampler work is not silently discarded (see the module docs).
 fn push_sampler_adjacent_metrics(families: &mut Vec<MetricFamily>, inner: &Inner) {
     push_gauge(
         families,
@@ -1430,9 +1430,9 @@ mod tests {
     #[test]
     fn schedule_overdue_is_a_gauge_labeled_by_kind_and_name() {
         // Issue #696: the built-in scrape recorder must render
-        // `harvest_schedule_overdue` (1 = overdue, 0 = healthy) so the recommended
-        // `with_metrics_scrape()` path exposes the primary overdue gauge the alert
-        // consumes — not only the metrics-rs adapter.
+        // `harvest_schedule_overdue` (1 = overdue, 0 = healthy). Then the
+        // recommended `with_metrics_scrape()` path exposes the primary overdue
+        // gauge that the alert consumes, not only the metrics-rs adapter.
         let recorder = HarvestMetricsRecorder::new();
         recorder.record_schedule_overdue("workflow", "foo", true);
         recorder.record_schedule_overdue("dag", "bar", false);
@@ -1558,11 +1558,11 @@ mod tests {
 
     #[test]
     fn connector_metrics_reach_the_built_in_scrape_endpoint() {
-        // Issue #944: this recorder is per-metric
-        // hand-maintained, so a new family that is not overridden here falls
-        // through to the trait no-op and `.with_metrics_scrape()` DISCARDS every
-        // sample. The connector work shipped dashboard panels, which makes that
-        // silence indistinguishable from a healthy, idle consumer.
+        // Issue #944: this recorder is per-metric hand-maintained. A new family that
+        // is not overridden here falls through to the trait no-op, and
+        // `.with_metrics_scrape()` DISCARDS every sample. The connector work shipped
+        // dashboard panels, which makes that silence indistinguishable from a
+        // healthy, idle consumer.
         use autumn_harvest::telemetry::{ConnectorOutcome, PoisonReason};
 
         let recorder = HarvestMetricsRecorder::new();

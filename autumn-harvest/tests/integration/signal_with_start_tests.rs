@@ -545,9 +545,9 @@ async fn outcome_struct_distinguishes_started_vs_attached() {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Input schema validation (issue #373) — only on a genuine fresh start
-// (issue #918 review: it used to run unconditionally, pre-lock, in the HTTP
-// handler, and could reject a signal to an already-running execution whenever
-// the signal payload didn't match the *start*-input schema).
+// (issue #918). It used to run unconditionally, pre-lock, in the HTTP
+// handler. It could then reject a signal to an already-running execution
+// whenever the signal payload did not match the *start*-input schema.
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn dummy_handler(

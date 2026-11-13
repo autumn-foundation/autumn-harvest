@@ -1319,7 +1319,7 @@ mod tests {
         let horizon = date("2026-12-31");
 
         // Monday 2027-07-05 -- a real US federal holiday the calendar cannot
-        // see. Must REJECT rather than answer "it's a weekday, so business".
+        // see. Must REJECT rather than answer "it is a weekday, so business".
         assert_eq!(
             add_business_days_bounded(utc("2027-07-05T09:00:00Z"), 0, &holidays, Some(horizon)),
             Err(BusinessDayRejection::CoverageExhausted {

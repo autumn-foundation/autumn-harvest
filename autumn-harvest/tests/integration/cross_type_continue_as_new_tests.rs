@@ -1307,10 +1307,10 @@ async fn a_live_run_of_the_target_type_blocks_the_transition_terminally() {
 /// runs shares the `default` queue. A sibling test's worker therefore stays
 /// "live" for the whole freshness window after it stops — far longer than the
 /// gap between two tests — and reads as an untried peer that may hold the
-/// handler, which correctly *withholds* the escalation bound (issue #804,
-/// round-38 P1). In production those pods are gone and age out on their own;
-/// here the shared database keeps their last heartbeat, so the fleet is cleared
-/// explicitly to leave the single incapable worker this test is written for.
+/// handler, which correctly *withholds* the escalation bound (issue #804).
+/// In production those pods are gone and age out on their own. Here the shared
+/// database keeps their last heartbeat. So the test clears the fleet
+/// explicitly, to leave the single incapable worker it is written for.
 #[tokio::test]
 async fn continuing_into_an_unregistered_type_fails_terminally_without_a_successor() {
     let (url, _c) = setup_test_database_url_or_env().await;

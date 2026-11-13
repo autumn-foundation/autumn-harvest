@@ -97,8 +97,8 @@ fn payload_kind_all_variants_exist() {
 
 #[test]
 fn payload_kind_is_non_exhaustive() {
-    // The non-exhaustive attribute means we can construct known variants
-    // but a match without a wildcard arm won't compile. We test via
+    // The non-exhaustive attribute allows construction of known variants,
+    // but a match without a wildcard arm does not compile. So the test uses
     // the Display (Debug) representation.
     let kind = PayloadKind::ActivityInput;
     let debug_str = format!("{kind:?}");

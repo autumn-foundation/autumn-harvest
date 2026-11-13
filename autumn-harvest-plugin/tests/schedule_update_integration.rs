@@ -775,7 +775,7 @@ async fn explicit_null_clears_and_absence_preserves_nullable_fields() {
 }
 
 /// Write-path coverage for every remaining AC2 field: each PATCH round-trips
-/// through the row so a field silently dropped by the merge/changeset can't
+/// through the row so a field silently dropped by the merge/changeset cannot
 /// hide behind response-echo only.
 #[allow(clippy::too_many_lines)]
 #[tokio::test]

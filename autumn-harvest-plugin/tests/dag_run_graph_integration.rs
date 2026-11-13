@@ -180,7 +180,7 @@ fn reversing_codecs() -> autumn_harvest::payload_codec::PayloadCodecs {
 }
 
 /// Same app as [`build_app`] but with a non-identity codec registered, so the
-/// handler must decode before deriving the run graph (issue #780 round 5).
+/// handler must decode before deriving the run graph (issue #780).
 fn build_app_with_codec(pool: &DbPool) -> HarvestApiApp {
     let catalog = compile_dag_catalog(dags![graph_linear_dag, graph_fanout_dag])
         .expect("dag catalog compiles");
@@ -789,9 +789,9 @@ async fn dag_run_graph_skip_marker_with_opaque_codec_details_is_still_skipped() 
 
 #[tokio::test]
 async fn dag_run_graph_excludes_a_codec_encoded_compensation_dispatch() {
-    // Issue #780 round 5 (Codex): the run-graph readers load RAW history
+    // Issue #780: the run-graph readers load RAW history
     // (`load_history_with_timestamps` leaves payload fields undecoded), so on a
-    // codec-encrypting or payload-offloading deployment the round-4 compensation
+    // codec-encrypting or payload-offloading deployment the compensation-dispatch
     // exclusion silently stopped working — `is_compensation_dispatch` saw an
     // opaque envelope, returned false, and a never-executed forward node was
     // reported with the old compensation's status/timings/attempts.

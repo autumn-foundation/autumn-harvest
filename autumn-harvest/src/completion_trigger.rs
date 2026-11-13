@@ -947,19 +947,20 @@ async fn resolve_target_queues_batch(
 ///
 /// Mirrors how `enforce_completion_triggers_outbox` resolves the queue at fire
 /// time: on a fresh connection to the target shard's own pool, so the inline
-/// admission-gate check (issue #618, F2 re-review) evaluates the exact queue the
+/// admission-gate check (issue #618) evaluates the exact queue the
 /// deferred start will use.
 ///
 /// The source transaction connection is **deliberately not a parameter** (issue
-/// #618, F2 re-review round 2): the schedule-level queue override lives only on
-/// the target shard, and resolving it on the source connection would query the
-/// WRONG shard's `harvest_schedules` — for a target hashing to shard 0,
-/// `resolve_target_queue`'s directly-queryable branch would read the source
-/// connection and could return a wrong queue, silently mis-evaluating a Queue(q)
-/// gate (the exact bug F2 fixed, reintroduced in the connection-failure edge).
-/// When the target-shard pool/connection is unavailable we therefore fall back to
-/// the shard-INDEPENDENT `default_workflow_queue()`, never to the source
-/// connection. Fleet/name/owner/shard gates do not depend on the queue and still
+/// #618). The schedule-level queue override lives only on the target shard.
+/// Resolving it on the source connection would query the WRONG shard's
+/// `harvest_schedules`. Take a target that hashes to shard 0. The
+/// directly-queryable branch of `resolve_target_queue` would read the source
+/// connection and could return a wrong queue. It would then silently
+/// mis-evaluate a Queue(q) gate. That is the wrong-shard queue bug again, in the
+/// connection-failure edge. So when the target-shard pool/connection is
+/// unavailable, this falls back to the shard-INDEPENDENT
+/// `default_workflow_queue()`, never to the source connection.
+/// Fleet/name/owner/shard gates do not depend on the queue and still
 /// evaluate correctly in the fallback. Bounded double-fault edge (documented): a
 /// `Queue(schedule-override)` gate can be missed only while the target shard is
 /// unreachable — strictly better than returning a wrong-shard queue.
@@ -1090,10 +1091,9 @@ const RELAY_CLAIM_QUERY: &str = "SELECT id FROM harvest_completion_trigger_outbo
 
 /// Run the cross-shard completion-trigger relay's start/block decision through the
 /// existence-aware [`crate::execution::gate_checked_start_or_load`] primitive under
-/// a source-row claim, then apply the source-shard bookkeeping (issue #618,
-/// F-round13/15/18/19).
+/// a source-row claim, then apply the source-shard bookkeeping (issue #618).
 ///
-/// **Mutual exclusion (F-round19).** Both the immediate `DeferredTriggerStart::spawn()`
+/// **Mutual exclusion.** Both the immediate `DeferredTriggerStart::spawn()`
 /// relay and the scanner ([`enforce_completion_triggers_outbox`]) — and any two
 /// scanner replicas assigned the same shard — reach this one function. Without
 /// ownership of the source outbox row they could BOTH process it and reach
@@ -1107,16 +1107,16 @@ const RELAY_CLAIM_QUERY: &str = "SELECT id FROM harvest_completion_trigger_outbo
 /// (existence check → gate → cross-shard target start → source delete/block): only
 /// one path owns the row and makes the decision; a concurrent path's `SKIP LOCKED`
 /// returns nothing → [`RelayOutcome::Skipped`]. If the owner crashes mid-flight the
-/// claim transaction rolls back → the row stays present + unlocked, and the
-/// round-15 delivered-if-target-exists retry makes the next attempt correct. The
+/// claim transaction rolls back → the row stays present + unlocked. The
+/// delivered-if-target-exists retry then makes the next attempt correct. The
 /// claim is held across the cross-shard target start (a bounded, per-row
 /// source-shard row lock on a tiny transient row); a peer never waits on it
 /// (`SKIP LOCKED`) — it simply retries the row on the next tick.
 ///
-/// Under the claim, the decision (rounds 13/15/18 preserved):
-/// - target already exists in ANY state (round 15) → DELIVERED: delete the outbox
+/// Under the claim, the decision is:
+/// - target already exists in ANY state → DELIVERED: delete the outbox
 ///   row, fires stays `NULL`, count a bypass.
-/// - fresh + `will_create` + matching gate (round 18) → BLOCKED: delete the outbox
+/// - fresh + `will_create` + matching gate → BLOCKED: delete the outbox
 ///   row, mark fires `admission_blocked`, count a block.
 /// - fresh + no gate (or an attach `_collect` performs) → DELIVERED: delete + bypass.
 ///
@@ -1196,7 +1196,7 @@ async fn relay_gate_checked_start(
                 return Ok(RelayOutcome::Skipped);
             }
 
-            // round-15 any-state existence check on the TARGET shard (separate
+            // Any-state existence check on the TARGET shard (separate
             // connection; the source claim is held throughout). Exists in ANY
             // state → the fire was already delivered → drop the row, count a
             // bypass, leave fires `NULL`.
@@ -1456,13 +1456,14 @@ impl DeferredTriggerStart {
                 .await
             };
 
-            // Existence-aware relay-time start/block via the round-12
-            // `gate_checked_start_or_load` (issue #618, F-round13): the target-shard
-            // existence-lock + gate + start are atomic, so a stale outbox row whose
-            // target ALREADY exists (this relay started the target but then failed to
-            // delete the source outbox row) is treated as DELIVERED on retry rather
-            // than wrongly blocked. Uses the process-global recorder (spawn has no
-            // explicit metrics param), mirroring the scanner path.
+            // Existence-aware relay-time start/block via
+            // `gate_checked_start_or_load` (issue #618). The target-shard
+            // existence-lock + gate + start are atomic. So a stale outbox row
+            // whose target ALREADY exists is treated as DELIVERED on retry, not
+            // wrongly blocked. That happens when this relay started the target
+            // but then failed to delete the source outbox row. Uses the
+            // process-global recorder (spawn has no explicit metrics param),
+            // mirroring the scanner path.
             let Some(source_pool) = crate::shard::GLOBAL_SHARDED_POOL
                 .read()
                 .ok()
@@ -1979,7 +1980,7 @@ pub fn evaluate_triggers_for_execution_collecting_with_codecs<'a>(
             // common path / standalone integrations) the check is skipped and
             // resolution below is byte-identical to pre-#618.
             //
-            // Fail-closed handling (issue #618 F3 + Codex P1): consult the
+            // Fail-closed handling (issue #618): consult the
             // LAST-KNOWN cached snapshot via `check_cached`, which ignores the
             // fail-closed/initialized flag and returns only a REAL matching gate
             // (never the nil sentinel). `set_fail_closed()` retains the snapshot,
@@ -1995,8 +1996,8 @@ pub fn evaluate_triggers_for_execution_collecting_with_codecs<'a>(
             // initialized-and-healthy both see identical gates; under fail-closed
             // the API blocks everything (caller retries) while triggers honour
             // only known-cached gates. Bounded caveat: a gate ADDED during a
-            // gate-DB outage (never loaded into the snapshot) won't block triggers
-            // until the next successful refresh.
+            // gate-DB outage (never loaded into the snapshot) does not block
+            // triggers until the next successful refresh.
             // Resolve the target queue at most ONCE per trigger (issue #618, F9):
             // the gate check below and the same-shard start further down both
             // need it. `None` = not yet resolved (no gate cache installed, so the
@@ -2155,11 +2156,11 @@ pub fn evaluate_triggers_for_execution_collecting_with_codecs<'a>(
                 let target_exec_id = crate::types::ExecutionId::new_for_shard(target_shard);
                 // `_collect` (issue #1197, item 1): a latest-wins supersede
                 // performed by this same-shard target must still be counted
-                // (issue #811, Codex round 2's fix), but NOT emitted here —
-                // this call runs INSIDE the source execution's own still-open
-                // terminal transaction, and `_with_metrics` used to emit at
-                // return, so a rollback of that enclosing transaction left
-                // both `harvest.concurrency.superseded` and the incumbent's
+                // (issue #811), but NOT emitted here. This call runs INSIDE
+                // the source execution's own still-open terminal transaction.
+                // `_with_metrics` used to emit at return. So a rollback of
+                // that enclosing transaction left both
+                // `harvest.concurrency.superseded` and the incumbent's
                 // cancelled terminal counted for a cancellation that never
                 // became durable. `_collect` performs the identical start
                 // (including the nested supersede) but returns the collected
@@ -2260,7 +2261,7 @@ pub fn evaluate_triggers_for_execution_collecting_with_codecs<'a>(
                         }
                         continue;
                     }
-                    // issue #946 (Codex round-3 review): a same-shard target's
+                    // issue #946: a same-shard target's
                     // per-tenant quota is exhausted right now. This branch runs
                     // INLINE inside the SOURCE execution's own terminal
                     // transaction (see the fn's callers in worker.rs/timeout.rs/
@@ -2277,10 +2278,10 @@ pub fn evaluate_triggers_for_execution_collecting_with_codecs<'a>(
                     // source workflow that happens to fire a trigger at this
                     // target, forever, until the quota frees up on its own.
                     // `continue`-ing like the `PayloadTooLarge` arm above is
-                    // also wrong: unlike an oversized payload (which can never
-                    // succeed no matter how many times it's retried), a quota
-                    // is a TEMPORARY condition, so silently dropping the
-                    // trigger here would permanently lose it.
+                    // also wrong. An oversized payload can never succeed, no
+                    // matter how many retries. A quota is a TEMPORARY
+                    // condition. So silently dropping the trigger here would
+                    // permanently lose it.
                     //
                     // The fix: fall back to the exact same durable outbox +
                     // `DeferredTriggerStart` retry mechanism the cross-shard
@@ -3246,7 +3247,7 @@ mod tests {
     #[test]
     fn outcome_mapping_projection_missing_path_yields_null() {
         // Graceful degradation for the `Outcome` variant: a projection path
-        // that doesn't exist in the envelope resolves to `Null` (same as the
+        // that does not exist in the envelope resolves to `Null` (same as the
         // inline arm's `project_json_path(&envelope, path)`), never an error.
         let exec_id = crate::types::ExecutionId::new();
         let env = build_outcome_envelope(

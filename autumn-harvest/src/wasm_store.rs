@@ -247,7 +247,7 @@ pub struct PreparedWasmActivity {
     pub cancel: Option<CancellationToken>,
     /// The instant the activity's start-to-close clock began — the worker
     /// captures this as `ActivityStarted` is recorded, *before* dispatch
-    /// resolution (issue #965 review round 7). By the time the guest is about to
+    /// resolution (issue #965). By the time the guest is about to
     /// run, this clock has ticked through active-hash resolution, cold-cache
     /// byte fetch from Postgres, the async→blocking handoff, and (on a cache
     /// miss) module compilation. Measuring `dispatch_start.elapsed()` just
@@ -874,8 +874,8 @@ pub async fn resolve_wasm_dispatch(
     name: &str,
     deadline: Option<Duration>,
     cancel: Option<CancellationToken>,
-    // The instant the activity's start-to-close clock began (issue #965 review
-    // round 7). Threaded into the resolved `PreparedWasmActivity` so `invoke`
+    // The instant the activity's start-to-close clock began (issue #965).
+    // Threaded into the resolved `PreparedWasmActivity` so `invoke`
     // charges the whole resolution + fetch + compile interval against the
     // guest's deadline, not just compile.
     dispatch_start: Instant,
@@ -1052,7 +1052,7 @@ mod tests {
     #[test]
     fn effective_deadline_subtracts_total_pre_guest_elapsed() {
         // Total pre-guest overhead (resolution + fetch + compile) that ate part
-        // of the budget tightens the remaining deadline (issue #965 round 7).
+        // of the budget tightens the remaining deadline (issue #965).
         assert_eq!(
             effective_invoke_deadline(Some(Duration::from_secs(10)), Duration::from_secs(3)),
             InvokeBudget::Remaining(Duration::from_secs(7))
@@ -1087,7 +1087,7 @@ mod tests {
     #[test]
     fn effective_deadline_over_budget_is_exhausted() {
         // Pre-guest overhead that EXCEEDED the deadline must fail fast without
-        // invoking the guest (issue #965 round 9) — not hand it a zero deadline
+        // invoking the guest (issue #965) — not hand it a zero deadline
         // that clamps to one epoch tick a fast guest could win a race against.
         assert_eq!(
             effective_invoke_deadline(Some(Duration::from_secs(2)), Duration::from_secs(5)),
@@ -1154,11 +1154,11 @@ mod tests {
     fn over_budget_invoke_fails_fast_without_running_the_guest() {
         // An attempt whose pre-guest overhead already spent the whole
         // start-to-close budget must fail fast as ResourceExhausted BEFORE the
-        // guest is invoked (issue #965 review round 9). The module is a valid,
+        // guest is invoked (issue #965). The module is a valid,
         // trivially-fast ECHO guest: had it run under the old zero→1-tick
         // deadline it would have completed and returned Ok(input). Getting the
         // specific "before guest start" ResourceExhausted instead proves the
-        // guest never ran and the deadline race can't be lost.
+        // guest never ran and the deadline race cannot be lost.
         const ECHO_WAT: &str = r#"
             (module
               (memory (export "memory") 1)
@@ -1209,7 +1209,7 @@ mod tests {
     #[test]
     fn in_budget_invoke_runs_the_guest() {
         // The complement of the fail-fast case: with pre-guest overhead well
-        // under the deadline (round-7 behaviour preserved), the guest IS invoked
+        // under the deadline (in-budget behaviour preserved), the guest IS invoked
         // and the ECHO module returns Ok(input).
         const ECHO_WAT: &str = r#"
             (module

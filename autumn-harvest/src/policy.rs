@@ -1011,7 +1011,7 @@ pub enum CatchupPolicy {
     /// Drop all missed slots after the first (the oldest overdue slot fires).
     ///
     /// Identical to `catchup = false` today.  No drops are recorded because
-    /// the existing binary path doesn't enumerate them.
+    /// the existing binary path does not enumerate them.
     SkipAll,
     /// Fire exactly the **most recent** missed slot; count all others as
     /// dropped with reason `catchup_window_exceeded`.

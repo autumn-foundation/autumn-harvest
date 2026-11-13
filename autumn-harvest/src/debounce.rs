@@ -1143,9 +1143,9 @@ async fn fire_claimed_debounce_row(
     };
 
     // `in_outer_transaction = true`: this runs inside the scanner's fire
-    // transaction, so a TerminateIfRunning pre-check cancellation is a savepoint
-    // that rolls back with this transaction on error — the collect fn must not
-    // spawn its follow-ups (they would be orphaned). Deferred starts returned on
+    // transaction. So a TerminateIfRunning pre-check cancellation is a savepoint
+    // that rolls back with this transaction on error. The collect fn must not
+    // spawn its follow-ups, because they would be orphaned. Deferred starts returned on
     // success are spawned by the caller only after the fire transaction commits.
     match crate::execution::start_or_load_workflow_execution_collect_with_codecs(
         conn, params, true, false, None, None, codecs,

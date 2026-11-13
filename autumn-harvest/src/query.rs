@@ -132,7 +132,7 @@ impl QueryRegistry {
             .ok_or_else(|| HarvestError::QueryHandlerNotFound(name.to_string()))?;
 
         // Lock released; call handler outside the borrow.
-        // Wrap in catch_unwind so a panicking handler doesn't crash the worker.
+        // Wrap in catch_unwind so a panicking handler does not crash the worker.
         // Panics → QueryHandlerPanicked (503); intentional Err returns → QueryHandlerFailed (400).
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler(args)))
             .map_err(|e| HarvestError::QueryHandlerPanicked(panic_message(e)))?

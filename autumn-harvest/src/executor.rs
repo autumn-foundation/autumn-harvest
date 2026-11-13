@@ -2402,9 +2402,9 @@ fn execute_span(
     replay: Option<bool>,
 ) -> tracing::Span {
     // ADR-0001 §2.1: emit harvest.workflow.execute for every executor cycle.
-    // harvest.replay defaults to false at span creation so subscribers that only
-    // observe on_new_span (e.g. tests) see the correct value for callers that
-    // do not supply span_meta. The worker passes span_meta to override it and to
+    // harvest.replay defaults to false at span creation. Subscribers that only
+    // observe on_new_span (e.g. tests) then see the correct value for callers
+    // that do not supply span_meta. The worker passes span_meta to override it and to
     // populate the Empty fields (workflow.id, shard.id, queue) that only the
     // worker context knows.
     let span = tracing::info_span!(

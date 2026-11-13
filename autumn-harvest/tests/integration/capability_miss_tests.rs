@@ -256,10 +256,10 @@ fn build_worker(
 
 /// `build_worker` with the two issue #494 knobs exposed.
 ///
-/// Only the issue #494 timeout-budget regression guard needs them: it has to make the
-/// workflow decision cycle overrun a *short* budget and quarantine on the
-/// *first* strike, so the timeout path is reached deterministically rather
-/// than after 90 seconds and three redeliveries.
+/// Only the issue #494 timeout-budget regression guard needs them. It has to
+/// make the workflow decision cycle overrun a *short* budget and quarantine on
+/// the *first* strike. Then the timeout path is reached deterministically, not
+/// after 90 seconds and three redeliveries.
 fn build_worker_tuned(
     worker_id: &str,
     queues: &[&str],
@@ -432,9 +432,9 @@ async fn load_execution(url: &str, exec_id: ExecutionId) -> WorkflowExecution {
 /// establishing a fresh one per iteration. At a 25ms poll interval a 30s bound
 /// is up to 1,200 TCP+auth handshakes against the database for a single wait,
 /// and this suite runs against a *shared* Postgres. That storm competes for
-/// connection slots with the very worker the wait is waiting on — including its
-/// startup fleet registration, which gates task claiming (issue #804)
-/// — so the polling can starve the progress it is polling for.
+/// connection slots with the very worker the wait is waiting on. That includes
+/// its startup fleet registration, which gates task claiming (issue #804). So
+/// the polling can starve the progress it is polling for.
 async fn load_execution_on(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
@@ -507,9 +507,9 @@ async fn dead_letter_errors(url: &str, exec_id: ExecutionId) -> Vec<String> {
 /// The frontier key the direct-`queue` release tests below pass.
 ///
 /// These tests exercise clauses that are not about the frontier (cardinality,
-/// the error column, crash strikes, the claim guard), so they all use one key
-/// and seed it where the row's counters have to survive the release -- the
-/// SAME-frontier arm (issue #804).
+/// the error column, crash strikes, the claim guard). So they all use one key.
+/// They seed it where the row's counters have to survive the release, which
+/// is the SAME-frontier arm (issue #804).
 const TEST_FRONTIER: &str = "workflow:noop_wf";
 
 async fn seed_prior_missing_workers(
@@ -639,11 +639,11 @@ async fn wait_for_task_owner(
         return task;
     }
     // Dump what distinguishes the plausible causes rather than panicking bare
-    // (same rationale as `wait_for_terminal`): a row still `PENDING` with a
-    // future `scheduled_at` is a backoff, a row owned by someone else is a lost
-    // race, and an EMPTY worker registry is a registration that never committed
-    // — which gates claiming outright (issue #804) and is invisible
-    // from the task row alone.
+    // (same rationale as `wait_for_terminal`). A row still `PENDING` with a
+    // future `scheduled_at` is a backoff. A row owned by someone else is a lost
+    // race. An EMPTY worker registry is a registration that never committed.
+    // That gates claiming outright (issue #804) and is invisible from the
+    // task row alone.
     let mut diag = connect(url).await;
     let tasks = load_tasks_on(&mut diag, exec_id).await;
     let workers: Vec<(String, String)> = harvest_workers::table
@@ -771,9 +771,9 @@ async fn wait_for_terminal(
 /// *crash* accounting is touched (AC4), and the row is not marked as having
 /// failed.
 ///
-/// `attempt` is deliberately **not** asserted here, because it is the one
-/// clause that legitimately differs by phase: a
-/// pre-handler release restores it, a post-handler release must not. Use
+/// `attempt` is deliberately **not** asserted here. It is the one clause that
+/// legitimately differs by phase: a pre-handler release restores it, a
+/// post-handler release must not. Use
 /// [`assert_released_before_the_handler`] for the pre-handler case, which is
 /// where restoring it is the AC4 retry-budget guarantee.
 fn assert_released_for_a_peer(task: &TaskQueueItem) {
@@ -978,9 +978,10 @@ async fn prewarm_race_injection() {
         .expect("race pre-warm round-trips");
 }
 
-/// The deterministic injection point for the invalidate-then-miss race: a workflow body
-/// that clears a peer's capability-miss evidence **while its own dispatch holds
-/// the claim**, then misses on an activity this worker does not register.
+/// The deterministic injection point for the invalidate-then-miss race. A
+/// workflow body clears a peer's capability-miss evidence **while its own
+/// dispatch holds the claim**. Then it misses on an activity this worker does
+/// not register.
 ///
 /// This is the real interleaving, not a simulation of it. The body runs strictly
 /// between `claim_task` (which took the snapshot naming the peer) and
@@ -1052,9 +1053,9 @@ async fn prewarm_claim_theft_injection() {
         .expect("claim-theft pre-warm round-trips");
 }
 
-/// The deterministic injection point for the lost-claim hazard: a workflow
-/// body that hands its own task row to another worker **while its dispatch is
-/// still running**, then misses.
+/// The deterministic injection point for the lost-claim hazard. A workflow
+/// body hands its own task row to another worker **while its dispatch is
+/// still running**. Then it misses.
 ///
 /// This is what a concurrent poison-pill reclaim or an operator action looks
 /// like from the dispatcher's side, hit exactly rather than raced for: the body
@@ -1102,7 +1103,7 @@ fn workflow_calls_peer_activity(ctx: &WorkflowContext, input: serde_json::Value)
 }
 
 /// Sibling of [`workflow_calls_peer_activity`] on its own dedicated activity
-/// queue, so the started-once metric test cannot claim (or be blocked by) an
+/// queue. So the started-once metric test cannot claim (or be blocked by) an
 /// adjacent test's activity row in the shared database.
 fn workflow_calls_started_once_activity(
     ctx: &WorkflowContext,
@@ -1426,10 +1427,10 @@ async fn activity_capability_miss_is_released_for_a_capable_peer() {
 /// `task.attempt == 1 && no scheduling events in history`. A **post-handler**
 /// capability miss (the persist-time pre-pass finding an unregistered activity)
 /// happens *after* that gate has already fired, and its persistence transaction
-/// rolls back — so nothing lands in history either. If the release also rolled
-/// `attempt` back to `0`, the next capable claim would see `attempt == 1` with
-/// no scheduling events and emit the counter a **second** time, inflating
-/// workflow-start counts and every SLO derived from them.
+/// rolls back — so nothing lands in history either. The release could also
+/// roll `attempt` back to `0`. Then the next capable claim would see
+/// `attempt == 1` with no scheduling events and emit the counter a **second**
+/// time. That inflates workflow-start counts and every SLO derived from them.
 ///
 /// The fix is phase-gated: only a `BeforeHandler` release restores `attempt`
 /// (nothing ran, and the metric was never emitted, so the next dispatch *must*
@@ -2160,9 +2161,9 @@ async fn capability_miss_escalates_after_the_budget_with_no_capable_worker() {
 /// The concern that the distinct-worker budget fixes is "a capable peer may be
 /// live and merely losing the claim race". So the test has to run in a fleet
 /// where that is true.
-/// With the registry instead CONFIRMING that the lone worker is the whole live
-/// fleet there is provably no peer to protect, and the configured budget bounds
-/// total releases too — see
+/// The registry can instead CONFIRM that the lone worker is the whole live
+/// fleet. Then there is provably no peer to protect, and the configured budget
+/// bounds total releases too. See
 /// `single_worker_fleet_escalates_at_the_configured_budget` below and the pure
 /// `configured_total_bound_requires_confirmed_fleet_coverage`.
 ///
@@ -2194,8 +2195,8 @@ async fn one_incapable_worker_cannot_exhaust_the_shared_redelivery_budget() {
 
     // A live worker on this queue that never claims, so the registry can never
     // conclude the fleet has been swept. Without it the lone incapable pod IS
-    // the confirmed fleet, and the total-release bound would (correctly)
-    // escalate at BUDGET + 1 -- a different property, covered separately.
+    // the confirmed fleet. The total-release bound would then (correctly)
+    // escalate at BUDGET + 1. That is a different property, covered separately.
     seed_live_worker(&url, "pod-peer-live-never-claims", Q_ESCALATE).await;
 
     let metrics = Arc::new(CapabilityMetrics::default());
@@ -2268,16 +2269,16 @@ const Q_SOLO_FLEET: &str = "q804-solo-fleet";
 /// The budget's unit of account is DISTINCT workers, so a fleet of one can
 /// never satisfy `distinct_after > budget` however many times it bounces the
 /// task. Without the total-release bound, the only remaining bound is the
-/// absolute `10x` release ceiling: with the default budget of 5 that is 51 claims and,
-/// under the capped backoff, roughly 23 minutes before anyone is paged — for a
-/// knob documented as five releases and ~31 seconds.
+/// absolute `10x` release ceiling. With the default budget of 5 that is 51
+/// claims. Under the capped backoff that is roughly 23 minutes before anyone is
+/// paged, for a knob documented as five releases and ~31 seconds.
 ///
 /// The total-release bound applies the configured budget to *total* releases as
-/// well, but only once the worker registry CONFIRMS every live worker on the
-/// queue has missed the task (`AllLiveWorkersMissed`). That gate is what keeps
-/// the distinct-worker budget intact:
-/// on unconfirmed evidence the same total could have been run up by one pod
-/// while a capable peer merely kept losing the claim race.
+/// well. It applies only once the worker registry CONFIRMS that every live
+/// worker on the queue has missed the task (`AllLiveWorkersMissed`). That gate is what keeps
+/// the distinct-worker budget intact. On unconfirmed evidence, one pod could
+/// run up the same total while a capable peer merely kept losing the claim
+/// race.
 ///
 /// This is the exact contrast to
 /// `one_incapable_worker_cannot_exhaust_the_shared_redelivery_budget`: same
@@ -2650,18 +2651,18 @@ async fn restart_onto_a_capable_build_clears_its_stale_miss_evidence() {
 /// be made on a claim-time snapshot that a peer's re-registration has since
 /// invalidated.
 ///
-/// The same-id restart invalidation is deliberately **not** ownership-guarded — it has to
-/// reach a row another worker is mid-dispatch on, because that is precisely the
-/// row whose decision stale evidence poisons. That made it the one writer that
+/// The same-id restart invalidation is deliberately **not** ownership-guarded.
+/// It has to reach a row another worker is mid-dispatch on. That is precisely
+/// the row whose decision stale evidence poisons. That made it the one writer that
 /// can change these columns between a claim and its miss, breaking the invariant
 /// `frontier_miss_state` had documented and relied on.
 ///
-/// The consequence is that the invalidation fixes nothing in its own headline scenario
-/// whenever the restart lands mid-dispatch: `pod-b` claimed while the row still
-/// named `pod-a`, `pod-a` restarts onto a capable build and clears its entry,
-/// and `pod-b` — still deciding on its snapshot — reads `pod-a` as incapable
-/// *and* the registry reports it live, derives `AllLiveWorkersMissed`, and
-/// terminally fails the run. Same terminal failure, one layer down.
+/// The consequence is that the invalidation fixes nothing in its own headline
+/// scenario whenever the restart lands mid-dispatch. `pod-b` claimed while the
+/// row still named `pod-a`. `pod-a` restarts onto a capable build and clears
+/// its entry. `pod-b` is still deciding on its snapshot, so it reads `pod-a`
+/// as incapable. The registry also reports `pod-a` live. So `pod-b` derives
+/// `AllLiveWorkersMissed` and terminally fails the run. Same terminal failure, one layer down.
 ///
 /// The interleaving here is **deterministic, not timed**: the workflow body
 /// itself performs the invalidation, and a body runs strictly between
@@ -2892,11 +2893,11 @@ async fn a_claim_lost_mid_dispatch_makes_no_terminal_decision() {
 /// already moved to another worker would terminally fail the run regardless.
 ///
 /// The function now surfaces this as
-/// `Err(HarvestError::SuspendedClaimAmbiguous)` rather than performing a
-/// release and returning `Ok(())` itself -- it must never touch the row a
-/// genuine transfer already handed to a new owner, and propagating instead
-/// of writing lets a real caller's enclosing transaction (which is never
-/// present here) roll back cleanly first. This test therefore asserts the
+/// `Err(HarvestError::SuspendedClaimAmbiguous)`. It does not perform a
+/// release and return `Ok(())` itself. It must never touch the row a genuine
+/// transfer already handed to a new owner. Propagating instead of writing lets
+/// a real caller's enclosing transaction roll back cleanly first. That
+/// transaction is never present here. This test therefore asserts the
 /// error shape directly; the release path itself has its own dedicated test
 /// below.
 #[tokio::test]
@@ -2993,12 +2994,12 @@ async fn a_stale_dispatcher_with_zero_emitted_commands_makes_no_terminal_decisio
 /// which must succeed once the contending lock is released, since ownership
 /// never actually moved.
 ///
-/// The fix is split into two calls:
+/// The fix is split into two calls.
 /// [`fail_suspended_workflow_if_still_claimed`] itself must return
-/// **immediately**, without blocking on anything -- it only probes via
+/// **immediately**, without blocking on anything. It only probes via
 /// `SKIP LOCKED`, so it can never be the thing waiting inside a transaction
-/// that also holds another lock -- and the blocking, ownership-guarded
-/// release is a **separate**, standalone call
+/// that also holds another lock. The blocking, ownership-guarded release is a
+/// **separate**, standalone call
 /// ([`queue::release_suspended_workflow_claim`]) made only afterward. That
 /// standalone call later moved from `process_workflow_task`'s own
 /// post-transaction `match` arm out to `process_task`. That is one layer
@@ -3059,11 +3060,10 @@ async fn a_dispatcher_that_still_owns_the_claim_is_released_when_skip_locked_is_
 
             // The standalone release, exactly as `process_task` performs it
             // after `process_workflow_task`'s own transaction has already
-            // ended (it sits one layer further out, past the issue #494
-            // timeout budget too -- see
-            // `run_under_workflow_body_budget`'s doc comment) -- this is the
-            // call that actually blocks on `conn_lock`'s held lock, never
-            // the probe above.
+            // ended. It sits one layer further out, past the issue #494
+            // timeout budget too (see `run_under_workflow_body_budget`'s doc
+            // comment). This is the call that actually blocks on
+            // `conn_lock`'s held lock, never the probe above.
             let released = queue::release_suspended_workflow_claim(
                 &mut conn,
                 ambiguous_task_id,
@@ -3239,11 +3239,11 @@ async fn an_ambiguous_claim_rolls_back_every_earlier_write_in_the_same_transacti
     assert_eq!(reloaded.worker_id.as_deref(), Some("thief"));
 }
 
-/// A concurrent task-row-first actor (standing in for
+/// A concurrent task-row-first actor never deadlocks against this dispatch's
+/// claim-release path (issue #1182). The actor stands in for
 /// [`crate::poison_pill::quarantine_orphan`], which locks the task row and
-/// then goes on to touch the execution row) never deadlocks against this
-/// dispatch's claim-release path, because this dispatch never holds the
-/// execution row while it waits on the task row (issue #1182).
+/// then goes on to touch the execution row. This dispatch never holds the
+/// execution row while it waits on the task row.
 ///
 /// The doc comments on [`fail_suspended_workflow_if_still_claimed`] and
 /// [`queue::release_suspended_workflow_claim`] both describe the cycle a
@@ -3637,16 +3637,16 @@ async fn a_surviving_old_row_still_retries_the_failed_startup_registration() {
 /// what produces `AllLiveWorkersMissed` and a terminal failure of a task this
 /// worker can run.
 ///
-/// Not heartbeating is necessary but not sufficient: the
-/// capability-miss fleet window is floored at 120 s, so for that whole window
-/// the surviving row is still read as a live worker that has already missed.
+/// Not heartbeating is necessary but not sufficient. The capability-miss fleet
+/// window is floored at 120 s. For that whole window the surviving row is
+/// still read as a live worker that has already missed.
 /// The tick therefore *withdraws* the row outright, which is the truthful
 /// state while the registration is unverified — an absent worker is simply not
 /// part of the fleet read.
 ///
-/// The failure is injected the same way the registration atomicity test does —
-/// renaming `harvest_task_queue` out from under the invalidation on a separate
-/// connection, deterministic and reversible within the test. The DB suite runs
+/// The failure is injected the same way the registration atomicity test does.
+/// It renames `harvest_task_queue` out from under the invalidation on a
+/// separate connection, deterministic and reversible within the test. The DB suite runs
 /// `--test-threads=1`, so no sibling can observe it.
 #[tokio::test]
 async fn a_failed_retry_does_not_refresh_the_unverified_row() {
@@ -4875,11 +4875,12 @@ fn trivial_workflow(_ctx: &WorkflowContext, _input: serde_json::Value) -> BoxFut
 /// `process_task` must not weaken issue #494 itself.
 ///
 /// The budget used to be a `tokio::time::timeout` wrapped around the whole of
-/// `process_task`, which meant it also bounded the issue #804 capability-miss
-/// release/escalation that runs *after* the decision cycle — so a workflow that
-/// returned near its deadline and only then tripped the post-handler preflight
-/// could have that blameless cleanup cancelled, bank a timeout strike it never
-/// earned, and at `poison_pill_threshold` be terminally failed. It now wraps
+/// `process_task`. So it also bounded the issue #804 capability-miss
+/// release/escalation that runs *after* the decision cycle. Take a workflow
+/// that returned near its deadline and only then tripped the post-handler
+/// preflight. Its blameless cleanup could be cancelled. It could then bank a
+/// timeout strike it never earned, and at `poison_pill_threshold` be
+/// terminally failed. It now wraps
 /// the decision cycle alone, inside `process_task`.
 ///
 /// The scoping rule itself is pinned without a database by
@@ -4961,9 +4962,9 @@ async fn an_overrunning_decision_cycle_is_still_cut_by_the_workflow_task_budget(
 // The ownership check is ATOMIC with the terminal failure.
 //
 // Every earlier fix narrowed the window between an escalation's last
-// ownership check and its terminal write; none closed it, because the check and
-// the write stayed separate database operations and `queue::fail_task` accepts
-// any `PENDING`/`RUNNING` row regardless of `worker_id`. These two tests drive
+// ownership check and its terminal write. None closed it, because the check
+// and the write stayed separate database operations. Also `queue::fail_task`
+// accepts any `PENDING`/`RUNNING` row regardless of `worker_id`. These two tests drive
 // the guard directly, staging the transfer INSIDE the window with the
 // lock-holding pattern the pause/child-timeout suites already use: a second
 // connection holds the task row's `FOR UPDATE` lock, the terminal write queues
@@ -5323,9 +5324,9 @@ async fn a_claim_still_held_through_the_terminal_write_still_fails_the_task() {
 ///
 /// The escalation deliberately hoists the history load OUT of the window
 /// between its last evidence check and its terminal write. That makes the id it
-/// produces older, not fresher: a parallel activity completing in the widened
-/// window consumes the cached id, and appending `WorkflowFailed` at a consumed
-/// id aborts the whole terminal transaction on
+/// produces older, not fresher. A parallel activity completing in the widened
+/// window consumes the cached id. Appending `WorkflowFailed` at a consumed id
+/// aborts the whole terminal transaction on
 /// `UNIQUE(workflow_exec_id, event_id)`. The row is then left `RUNNING` under a
 /// LIVE incapable worker -- unclaimable, and invisible to orphan reclamation,
 /// which requires a dead heartbeat. That is a *worse* outcome than the
@@ -5407,9 +5408,9 @@ async fn a_terminal_write_appends_at_the_event_id_current_under_the_lock() {
 // The evidence re-decision must happen UNDER the task lock.
 //
 // A peer that re-registers clears itself from `capability_miss_workers` without
-// touching `worker_id` or `crash_strikes`, so the atomic claim guard is
-// blind to it: ownership is unchanged, the guard passes, and the escalation
-// commits -- terminally failing a run the newly-capable peer could serve. These
+// touching `worker_id` or `crash_strikes`. So the atomic claim guard is blind
+// to it: ownership is unchanged, the guard passes, and the escalation commits.
+// That terminally fails a run the newly-capable peer could serve. These
 // two drive the guard with an evidence recheck attached and stage the clear on
 // either side of the decision.
 // ---------------------------------------------------------------------------
@@ -5459,9 +5460,9 @@ async fn a_peer_that_re_registers_before_the_lock_withdraws_the_escalation() {
                 },
                 frontier_reset_committed: false,
                 // The frontier the seeded evidence is recorded against
-                // (issue #804): a mismatch would read as a fresh
-                // budget and the escalation these tests are about would
-                // never be reached.
+                // (issue #804). A mismatch would read as a fresh budget, and
+                // the escalation these tests are about would never be
+                // reached.
                 frontier: "workflow:round31_wf",
             },
             derive_reason: &|_| {
@@ -5536,9 +5537,9 @@ async fn evidence_that_still_supports_escalation_under_the_lock_still_commits() 
                 },
                 frontier_reset_committed: false,
                 // The frontier the seeded evidence is recorded against
-                // (issue #804): a mismatch would read as a fresh
-                // budget and the escalation these tests are about would
-                // never be reached.
+                // (issue #804). A mismatch would read as a fresh budget, and
+                // the escalation these tests are about would never be
+                // reached.
                 frontier: "workflow:round31_wf",
             },
             derive_reason: &|_| {
@@ -5624,9 +5625,9 @@ async fn the_persisted_reason_comes_from_the_in_transaction_resolution() {
                 },
                 frontier_reset_committed: false,
                 // The frontier the seeded evidence is recorded against
-                // (issue #804): a mismatch would read as a fresh
-                // budget and the escalation these tests are about would
-                // never be reached.
+                // (issue #804). A mismatch would read as a fresh budget, and
+                // the escalation these tests are about would never be
+                // reached.
                 frontier: "workflow:round31_wf",
             },
             derive_reason: &|_resolution| fresh_reason.clone(),
@@ -6138,14 +6139,14 @@ const RUNTIME_REREG_WORKER_ID: &str = "pod-runtime-rereg";
 /// arm heals a fleet row that vanishes later — an operator cleanup, a retention
 /// sweep, a truncated table — and when that heal fails it logged a warning and
 /// left the flag clear. The worker then kept claiming while absent from
-/// `harvest_workers`, which is the exact state the claim gate exists to prevent, and
-/// it is harmful twice over: the worker is invisible to a peer's fleet
-/// evidence (so an incapable claimant can derive `AllLiveWorkersMissed` and
-/// terminally fail work this worker can run), and its own claims match
-/// `orphaned_running_tasks_query()`, so `reclaim_orphaned_tasks` burns a
-/// `crash_strikes` increment on each until `poison_pill_threshold` quarantines
-/// the task — manufacturing a #367 quarantine out of a capability problem,
-/// which is the AC4 confusion in reverse.
+/// `harvest_workers`. That is the exact state the claim gate exists to
+/// prevent, and it is harmful twice over. First, the worker is invisible to a
+/// peer's fleet evidence. So an incapable claimant can derive
+/// `AllLiveWorkersMissed` and terminally fail work this worker can run.
+/// Second, its own claims match `orphaned_running_tasks_query()`. So
+/// `reclaim_orphaned_tasks` burns a `crash_strikes` increment on each until
+/// `poison_pill_threshold` quarantines the task. That manufactures a #367
+/// quarantine out of a capability problem, the AC4 confusion in reverse.
 ///
 /// This drives the **real** tick, because the defect is in that function's arm
 /// handling; recreating the arms would prove nothing. The failure is forced the

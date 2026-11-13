@@ -1139,10 +1139,10 @@ async fn detects_delivered_external_signal_rolled_back_on_the_target_shard() {
     assert_eq!(report.status, VerifyStatus::Incoherent);
 }
 
-/// The reference scan once filtered owning executions to
-/// non-terminal states -- a rule that belongs to the CHILD checks (a terminal
-/// parent's awaited child may legitimately have been collected by retention)
-/// but was wrongly applied to external effects too.
+/// The reference scan once filtered owning executions to non-terminal states.
+/// That rule belongs to the CHILD checks, because a terminal parent's awaited
+/// child may legitimately have been collected by retention. It was wrongly
+/// applied to external effects too.
 ///
 /// A caller that recorded `ExternalSignalDelivered` asserted durable state on
 /// the TARGET shard. That assertion does not expire when the caller completes;

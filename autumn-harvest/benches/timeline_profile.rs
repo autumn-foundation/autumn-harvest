@@ -108,12 +108,12 @@ fn build_workload(n: usize, start: DateTime<Utc>) -> (Vec<TimelineEventRow>, Dat
 
     // Regular activities: 9 of every 10 close out (1 of every 5 of those
     // retries once first); the rest stay open (scheduled, never started).
-    // The retry selector counts CLOSED activities, not `i` -- picking on `i
-    // % 5` directly would make every retry candidate (i % 5 == 4) land on an
-    // index that is ALSO open (i % 10 == 9, since 9 % 5 == 4 and the period-10
-    // open cycle never shifts that residue), so retries would fire on 1 in 10
-    // regular activities instead of the documented 1 in 5 of the CLOSED ones
-    // (Codex review on #1372).
+    // The retry selector counts CLOSED activities, not `i` (#1372). Picking on
+    // `i % 5` directly would make every retry candidate (i % 5 == 4) land on an
+    // index that is ALSO open. That index is i % 10 == 9, since 9 % 5 == 4 and
+    // the period-10 open cycle never shifts that residue. Retries would then
+    // fire on 1 in 10 regular activities. The documented rate is 1 in 5 of
+    // the CLOSED ones.
     let mut closed_count: usize = 0;
     for i in 0..n {
         let activity_id = ActivityExecId::new();
@@ -282,12 +282,12 @@ fn env_usize(key: &str, default: usize) -> usize {
 
 fn validate_workload_params(n: usize, reps: usize) {
     // Callgrind's `--collect-atstart` defaults to `yes` (see the Running
-    // section above), so the one-time, unmeasured-in-INTENT sanity
+    // section above). So the one-time, unmeasured-in-INTENT sanity
     // `derive_timeline` call in `main` below IS captured in the collected
-    // instruction count -- there is no in-process way to exclude it without
-    // a client-request crate this repo has not taken a dependency on. At
+    // instruction count. No in-process way excludes it without a
+    // client-request crate, and this repo has no dependency on one. At
     // reps=1 that one call is roughly HALF of the counted work, silently
-    // diluting the measured delta (Codex review on #1372). Requiring at
+    // diluting the measured delta (#1372). Requiring at
     // least 100 reps keeps the sanity call's fixed one-call cost under ~1%
     // of the total -- an order of magnitude below both the impact floor
     // (>=5% Ir) and this harness's own measured run-to-run noise

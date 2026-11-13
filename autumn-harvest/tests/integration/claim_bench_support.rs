@@ -1735,8 +1735,8 @@ mod pure_tests {
 
     #[test]
     fn claims_never_exceed_a_fifth_of_the_backlog() {
-        // Guards the "don't drain the queue" invariant: measuring must leave the
-        // backlog at >= 80% of its seeded depth, or we measure an empty queue.
+        // Guards the "do not drain the queue" invariant: measuring must leave the
+        // backlog at >= 80% of its seeded depth, or the bench measures an empty queue.
         for backlog in BACKLOG_SWEEP {
             let claims = measured_claims_for(backlog);
             assert!(
@@ -2079,8 +2079,8 @@ mod pure_tests {
     /// Splitting the form on whitespace therefore cuts `password='hunter two'`
     /// in half: the first token redacts, and the second has no `=` in it, so it
     /// is passed through as though it were a separator and the tail of the
-    /// password is printed. Round 13 advertised support for this form without
-    /// implementing its value grammar, which is the narrow gap this pins.
+    /// password is printed. Support for this form needs its value grammar, not
+    /// a whitespace split. This test pins that narrow gap.
     #[test]
     fn redact_url_removes_a_quoted_keyword_password_containing_spaces() {
         let redacted = redact_url("host=db.internal password='hunter two' sslmode=require");
@@ -2450,9 +2450,8 @@ mod pure_tests {
     /// `tokio-postgres`'s `UrlParser::parse` runs `parse_path` (`config.rs:997`)
     /// and *then* `parse_params` (`:998`), and both assign the same
     /// `Config::dbname` field — so the query wins. Carrying the query over
-    /// verbatim, which round 3 introduced to keep `sslmode` alive, therefore
-    /// pointed the sweep lock, the lease and the migration connection back at
-    /// the operator's admin database. The harness runs `TRUNCATE` there.
+    /// verbatim keeps `sslmode` alive, but it also points the sweep lock, the
+    /// lease and the migration connection back at the operator's admin database. The harness runs `TRUNCATE` there.
     #[test]
     fn with_db_name_removes_an_overriding_dbname_query_parameter() {
         assert_eq!(
@@ -2526,12 +2525,10 @@ mod pure_tests {
 
     /// `db_name_from_url` must invert `with_db_name` for **both** forms.
     ///
-    /// Round 14 taught `with_db_name` to emit a proper keyword/value string,
-    /// which made its inverse return `None` for exactly the strings it now
-    /// produces — and both existing-server tests `.expect()` that value, so the
-    /// documented gate suite panicked for a supported connection-string form.
-    /// (Before round 14 the rewrite emitted a stray `/`, which this parser
-    /// happened to read as a path; the inverse worked only by accident.)
+    /// `with_db_name` emits a proper keyword/value string. An inverse that reads
+    /// only the URL form returns `None` for exactly the strings it produces.
+    /// Both existing-server tests `.expect()` that value, so the documented gate
+    /// suite would panic for a supported connection-string form.
     #[test]
     fn db_name_from_url_reads_the_keyword_value_form() {
         assert_eq!(
@@ -2565,7 +2562,7 @@ mod pure_tests {
     /// The URL form must read `dbname` with the same precedence `with_db_name`
     /// strips it: query over path.
     ///
-    /// Round 14 established that `tokio-postgres` runs `parse_path` *before*
+    /// `tokio-postgres` runs `parse_path` *before*
     /// `parse_params`, so `?dbname=` wins — which is why `with_db_name` drops
     /// it. If the inverse still read only the path, the two neighbours would
     /// disagree about which parameter counts as the database for the same
@@ -2764,10 +2761,9 @@ mod pure_tests {
     /// All three dispositions were considered and only rejection is safe.
     /// *Dropping* it is the failure the URL branch is built to avoid: losing
     /// `sslmode=require` makes a TLS-requiring server unreachable through the
-    /// advertised existing-server mode. *Carrying* it — which this test asserted
-    /// until round 33 — is worse: the tail is an incomplete pair, so the value
-    /// reader consumes whatever follows it, and what follows is the selector we
-    /// just appended.
+    /// advertised existing-server mode. *Carrying* it is worse: the tail is an
+    /// incomplete pair, so the value reader consumes whatever follows it. What
+    /// follows is the selector the rewrite just appended.
     ///
     /// The error has to name the tail, because the operator's string is the only
     /// place the problem can be fixed.

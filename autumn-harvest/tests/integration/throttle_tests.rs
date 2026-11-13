@@ -1215,11 +1215,11 @@ async fn scanner_does_not_starve_other_keys_behind_one_hot_backlog() {
 /// bounds how many rows a *single* key can contribute to a scanner tick's
 /// candidate set, but with the original flat `ORDER BY deferred_at ASC LIMIT
 /// $2` outer selection, enough concurrently-exhausted keys can still fill
-/// the *entire* batch budget with rows that can never fire: 10 exhausted
+/// the *entire* batch budget with rows that can never fire. Take 10 exhausted
 /// keys, each with exactly `THROTTLE_FIRE_PER_KEY_CAP` (10) permanently-stuck
-/// rows, already exhausts a 100-row (`THROTTLE_FIRE_BATCH_SIZE`) batch --
-/// permanently starving an 11th key's single, genuinely ready row every
-/// tick, even though it's newer than all of them. Fixed by ordering the
+/// rows. They already exhaust a 100-row (`THROTTLE_FIRE_BATCH_SIZE`) batch.
+/// That permanently starves an 11th key's single, genuinely ready row every
+/// tick, even though it is newer than all of them. Fixed by ordering the
 /// candidate selection by per-key rank first (`rn ASC, deferred_at ASC`):
 /// every distinct key's oldest row is considered in the first "tier" before
 /// any key's second-oldest row is considered.
@@ -1428,10 +1428,10 @@ async fn scanner_readiness_filter_excludes_more_than_batch_size_distinct_exhaust
     );
 }
 
-// ── `skip_size_check` ordering fix (issue #607 round 4) ─────────────────────
+// ── `skip_size_check` ordering fix (issue #607) ─────────────────────────────
 //
-// Round 3 added an early oversized-input rejection at 4 call sites, running
-// *before* `reserve_or_defer` is ever called. That meant it could not see
+// An earlier fix added an early oversized-input rejection at 4 call sites,
+// running *before* `reserve_or_defer` is ever called. That meant it could not see
 // either of `reserve_or_defer`'s own two idempotent-retry shortcuts --
 // `Bypassed` (an active execution already satisfies the reuse policy) or an
 // idempotent attach to an already-pending row -- so a retry carrying a
@@ -1667,7 +1667,7 @@ async fn oversized_key_resolves_to_existing_pending_row() {
     assert_eq!(throttle_row_count(&mut conn, key).await, 1);
 }
 
-/// Code-review fix (issue #607 round 7): `ThrottleDeferOutcome::fresh` must
+/// Code-review fix (issue #607): `ThrottleDeferOutcome::fresh` must
 /// distinguish a brand-new pending row (this call durably inserted it) from
 /// an idempotent attach to an already-existing pending row (a retry for the
 /// same `workflow_id` resolved via `reserve_or_defer`'s own step-1
@@ -1761,7 +1761,7 @@ async fn oversized_key_still_rejected_for_a_genuinely_fresh_admission() {
 
 /// Code-review fix (issue #607): a pending row already past its
 /// `schedule_to_start` deadline must not be treated as an idempotent
-/// already-pending admission, even if the scanner hasn't dropped it yet
+/// already-pending admission, even if the scanner has not dropped it yet
 /// (e.g. a delayed tick, or the retry racing the timeout sweep). Without the
 /// fix, a retry for the same `workflow_id` would silently return the stale
 /// row's `Deferred` outcome; the scanner then times out and deletes that row
@@ -2051,7 +2051,7 @@ async fn scheduler_tick_rejects_oversized_input_before_deferring() {
     // `tick_one_workflow_schedule`'s error, logs it, clears the schedule's
     // fire claim, and continues to the next schedule -- it never propagates
     // to `tick_once`'s own `Result` (so one misconfigured/oversized schedule
-    // can't halt every other schedule sharing the tick). The real proof that
+    // cannot halt every other schedule sharing the tick). The real proof that
     // THIS schedule's dispatch failed-without-advancing lives in the
     // execution/throttle-row/last_run_at assertions below, not in the tick's
     // overall return value.
@@ -2176,7 +2176,7 @@ async fn throttled_scheduled_deferral_counts_against_max_active_runs() {
     // Second tick: without the fix, `running` (computed only from
     // harvest_workflow_executions) is still 0, so max_active_runs=1 would
     // not block a second dispatch -- the schedule would defer a *second*
-    // pending row even though the first deferred fire hasn't started yet.
+    // pending row even though the first deferred fire has not started yet.
     tick_once(
         pool.clone(),
         registry.clone(),

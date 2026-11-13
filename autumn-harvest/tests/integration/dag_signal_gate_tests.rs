@@ -194,9 +194,9 @@ fn classic_dag_with_gate_is_rejected_at_build_time() {
     );
 }
 
-/// Issue #746: a gate stores its signal name in `activity_name`, so
-/// the local-activity validator (`validate_dags_do_not_use_local_activities`)
-/// must skip gate tasks — a gate never dispatches that activity. Registering a
+/// Issue #746: a gate stores its signal name in `activity_name`. So the
+/// local-activity validator (`validate_dags_do_not_use_local_activities`)
+/// must skip gate tasks, because a gate never dispatches that activity. Registering a
 /// LOCAL activity named `approval` alongside a unified DAG `signal_gate("approval")`
 /// must therefore still build; before the fix it false-rejected with
 /// `HarvestBuilderError::LocalActivityInDag`.

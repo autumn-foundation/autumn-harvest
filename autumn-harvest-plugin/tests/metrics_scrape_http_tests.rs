@@ -68,8 +68,8 @@ async fn scrape_endpoint_renders_all_catalogue_metrics_after_recording() {
     recorder.record_retention_deleted("onboarding", 42);
     // These four back the engine's own is_enabled()-gated background
     // samplers (queue depth/DLQ depth samplers' oldest-age query, the
-    // stranded-work scanner, the worker-slot sampler) -- implemented so
-    // that already-paid-for sampler work is not silently discarded once
+    // stranded-work scanner, the worker-slot sampler). They exist so that
+    // already-paid-for sampler work is not silently discarded once
     // .with_metrics_scrape() flips is_enabled() to true.
     recorder.record_queue_oldest_pending_age("default", 12.5);
     recorder.record_worker_slots(SlotType::Workflow, 3, 7);
@@ -143,8 +143,8 @@ async fn scrape_endpoint_omits_harvest_families_when_metrics_source_not_register
     // No plugin, no `metrics_source` registration -- mirrors an app that
     // never calls `HarvestPlugin::with_metrics_scrape()`. `/actuator/prometheus`
     // still exists (it is the app's own endpoint, always mounted by
-    // default) but carries no `harvest_*` family, and there is zero runtime
-    // cost paid for the unused aggregator (issue #355 AC3/AC8).
+    // default) but carries no `harvest_*` family. The unused aggregator
+    // costs nothing at runtime (issue #355 AC3/AC8).
     let client = TestApp::new().build();
     let body = scrape(&client).await;
     assert!(

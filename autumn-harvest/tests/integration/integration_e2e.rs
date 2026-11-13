@@ -161,7 +161,7 @@ const LEGACY_INIT_SQL: &str = concat!(
     // harvest_task_queue.*` deserializes into) references capability_misses on
     // every claim, so the legacy start path's enqueue+claim needs it too.
     "ALTER TABLE harvest_task_queue ADD COLUMN IF NOT EXISTS capability_misses INT NOT NULL DEFAULT 0;\n",
-    // issue #804 (round 6): `TaskQueueItem` selects the companion distinct-misser
+    // issue #804: `TaskQueueItem` selects the companion distinct-misser
     // set on the same claim, so omitting it fails the legacy path's claim exactly
     // as omitting `capability_misses` would.
     "ALTER TABLE harvest_task_queue ADD COLUMN IF NOT EXISTS capability_miss_workers TEXT[] NOT NULL DEFAULT '{}';\n",
@@ -4719,8 +4719,8 @@ fn slow_fan_child_workflow<'a>(
 /// strictly heavier than any single child's, since it replays the full,
 /// ever-growing history and re-awaits every already-resolved child future
 /// on each reclaim -- occasionally starved for minutes even past the 60s
-/// internal `workflow_task_timeout`, because under severe-enough contention
-/// even tokio's own timer wheel can't service the deadline promptly. Fewer
+/// internal `workflow_task_timeout`. Under severe-enough contention even
+/// tokio's own timer wheel cannot service the deadline promptly. Fewer
 /// concurrent decision cycles (6 total instead of 11) directly shrinks both
 /// the contention surface and the parent's per-cycle replay cost, while
 /// still meaningfully proving genuine concurrent dispatch (distinct from
@@ -4929,8 +4929,8 @@ async fn wait_for_completion_with_diagnostics(
 /// be load-bearing on constrained hardware.
 ///
 /// **Root cause of five subsequent CI failures, finally found via the
-/// diagnostic dump in [`wait_for_completion_with_diagnostics`] (PR #901
-/// review rounds 2-8):** the original version of `slow_fan_child_workflow`
+/// diagnostic dump in [`wait_for_completion_with_diagnostics`] (PR #901):**
+/// the original version of `slow_fan_child_workflow`
 /// used a raw `tokio::time::sleep` inside the workflow body instead of
 /// `ctx.timer(...)`. That was invalid workflow code for this engine. The
 /// live-execution poll in `drive_workflow` then used a hard 100ms
@@ -4946,8 +4946,8 @@ async fn wait_for_completion_with_diagnostics(
 /// suspends via a real oneshot after pushing `StartTimer` instead of
 /// blocking the poll.
 ///
-/// **Continued flakiness after the above fix (issue #604 PR, unrelated
-/// review round):** even with the timer fix in place, this test still
+/// **Continued flakiness after the above fix (found on the issue #604 PR):**
+/// even with the timer fix in place, this test still
 /// intermittently failed on `ubuntu-latest` with a single decision cycle
 /// (the parent, or exactly one of the ten children) sitting `RUNNING`
 /// (claimed, `worker_id`/`started_at` populated) for 2+ minutes with zero
@@ -5667,7 +5667,7 @@ async fn worker_completes_workflow_after_signal_delivery() {
     .await
     .expect("send_signal should succeed");
 
-    // Wake the parked task immediately so the test doesn't wait for the 1 s
+    // Wake the parked task immediately so the test does not wait for the 1 s
     // requeue delay.
     queue::wake_workflow_task(&mut conn, exec_id)
         .await
@@ -6270,7 +6270,7 @@ async fn wake_workflow_task_retries_after_losing_the_park_row_lock_race() {
         .expect("park should succeed inside the open transaction");
 
     // Wake concurrently on a separate connection while the park above is
-    // still uncommitted. Its primary re-pend UPDATE won't match (the row's
+    // still uncommitted. Its primary re-pend UPDATE does not match (the row's
     // committed snapshot still shows worker_id NOT NULL), so it falls
     // through to the fallback UPDATE, which blocks on the row lock
     // `conn_park` is holding.
@@ -10657,8 +10657,8 @@ async fn overlap_policy_cancel_other_reaches_a_cross_type_successor() {
     // OverlapPolicy::CancelOther and this cron cadence, every subsequent tick
     // cancels the current run and dispatches a new one, so wf_name's total
     // execution count grows monotonically for as long as the scheduler keeps
-    // ticking -- an equality assertion taken while it's still running would
-    // be flaky by construction.
+    // ticking. An equality assertion taken while it still runs would be
+    // flaky by construction.
     scheduler.shutdown();
     let _ = scheduler.join().await;
 
@@ -11297,14 +11297,14 @@ async fn per_key_concurrency_does_not_block_other_keys() {
                 "any task claimed while loud is saturated must be a quiet-key task"
             );
             quiet_claimed += 1;
-            // Immediately complete quiet tasks so they don't hold state.
+            // Immediately complete quiet tasks so they do not hold state.
             let claim = TaskClaim::of(&task).expect("a claimed task");
             queue::complete_task(&mut conn, &claim, serde_json::json!(null))
                 .await
                 .expect("complete quiet task failed");
         } else {
             // No task available right now; the loud cap is blocking the loud
-            // tasks and quiet tasks haven't been claimed yet — should not happen.
+            // tasks and quiet tasks have not been claimed yet — should not happen.
             break;
         }
         attempts += 1;

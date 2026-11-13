@@ -1076,7 +1076,7 @@ async fn child_fan_out_raw_replay_ignores_current_payload_cap_for_already_record
 /// case, its recorded children), silently misattributing unrelated data
 /// instead of cleanly diverging. Burning the number instead produces an
 /// honest "expected `fan_out:1`, got `fan_out:2`" divergence on replay -- which
-/// still doesn't gracefully reproduce the CAUGHT error (a failure the workflow
+/// still does not gracefully reproduce the CAUGHT error (a failure the workflow
 /// catches and continues past leaves no history footprint at all, so replay
 /// re-decides it against live configuration — explicitly deferred by issue
 /// #952, which fixed the uncaught half: see

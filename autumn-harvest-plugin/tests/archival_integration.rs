@@ -550,14 +550,13 @@ async fn archival_hook_times_out_and_preserves_execution() {
     runner.stop().await;
 }
 
-/// Issue #921 review (Codex P2, follow-up): a `task_type = "CALLBACK"`
-/// dead-letter row (issue #605) must survive retention alongside its
-/// `FAILED` `harvest_completion_deliveries` row -- an earlier review round
-/// already scoped the completion-deliveries delete to `state = 'DELIVERED'`
-/// so a `FAILED` delivery survives for redrive, but the *separate*
-/// `harvest_dead_letters` delete was still unconditional, silently dropping
-/// the same delivery's DLQ entry from `GET /dead-letters` discovery even
-/// though the delivery row (and its redrive path) still exists.
+/// Issue #921: a `task_type = "CALLBACK"` dead-letter row (issue #605) must
+/// survive retention alongside its `FAILED` `harvest_completion_deliveries`
+/// row. An earlier fix scoped the completion-deliveries delete to
+/// `state = 'DELIVERED'`, so a `FAILED` delivery survives for redrive. But the
+/// *separate* `harvest_dead_letters` delete was still unconditional. It
+/// silently dropped the same delivery's DLQ entry from `GET /dead-letters`
+/// discovery, though the delivery row (and its redrive path) still exists.
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
 async fn retention_preserves_a_failed_callback_delivery_and_its_dead_letter() {

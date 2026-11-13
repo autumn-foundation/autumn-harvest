@@ -198,7 +198,7 @@ pub enum TargetLocation {
         /// The winning run under the [`select_resolved_run`] ranking.
         run: ResolvedRun,
         /// Shards that could not be inspected, if any. **Non-empty means this
-        /// answer is a live run found over a partial view**, and the caller must
+        /// answer is a live run found over a partial view.** The caller must
         /// decide whether its operation may act on that (issue #1146).
         ///
         /// A **signal** may. Delivering to a live run in hand is real delivery,
@@ -1076,10 +1076,10 @@ enum ProbeOutcome {
 /// `Err` is the single "this shard could not be inspected" outcome, carrying the
 /// operator-facing reason — a failed or timed-out acquisition, a failed query,
 /// or a probe that never returned. Collapsing all four into one error means the
-/// caller cannot forget to memoize one of them, which is exactly the bug this
-/// shape replaced: only the acquisition failures were recorded, so a peer whose
-/// *query* failed slowly was re-probed once per pending row instead of once per
-/// sweep (issue #1146).
+/// caller cannot forget to memoize one of them. That is exactly the bug this
+/// shape replaced. Only the acquisition failures were recorded, so a peer whose
+/// *query* failed slowly was re-probed once per pending row, not once per sweep
+/// (issue #1146).
 ///
 /// A query that returns an error is `Err` and never `Ok(None)`: a shard that
 /// answered with a failure has not told us the key is absent.
@@ -1190,12 +1190,12 @@ pub(crate) fn peer_acquire_bound(pool: &DbPool) -> std::time::Duration {
 /// Record that `shard` could not be inspected, in the fan-out's own list **and**
 /// in the per-sweep memo.
 ///
-/// The single funnel for every uninspected outcome. It exists because the
-/// previous shape had four of them written out separately and one — a failed
-/// resolution query — silently skipped the memo, so a peer failing slowly just
-/// under the probe bound was re-probed once per pending row instead of once per
-/// sweep (issue #1146). Routing them all through one place
-/// removes the class rather than the instance.
+/// The single funnel for every uninspected outcome. The previous shape had four
+/// of them written out separately. One of them, a failed resolution query,
+/// silently skipped the memo. So a peer failing slowly just under the probe
+/// bound was re-probed once per pending row, not once per sweep (issue #1146).
+/// Routing them all through one place removes the class rather than the
+/// instance.
 fn mark_uninspected(
     uninspected: &mut Vec<UninspectedShard>,
     memo: Option<&UninspectableShards>,

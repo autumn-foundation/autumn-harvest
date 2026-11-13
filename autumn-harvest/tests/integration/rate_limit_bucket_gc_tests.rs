@@ -1167,14 +1167,13 @@ async fn the_throttle_path_registers_through_the_same_interlocked_statement() {
 
 #[tokio::test]
 async fn the_throttle_backlog_append_path_also_interlocks_the_bucket() {
-    // Codex review round 1, P1. `reserve_or_defer`'s FIFO fast path used to
-    // skip `ensure_throttle_bucket` whenever a backlog already existed, so the
-    // append path touched the bucket not at all: an observed backlog row that
-    // the scanner drops between the check and the insert leaves the sweep
-    // seeing an idle, full, dependent-free bucket — and the pending row that
-    // commits a moment later references a bucket that no longer exists.
-    // `fire_claimed_throttle_row` fails closed on a missing bucket, so that
-    // start sits deferred forever.
+    // `reserve_or_defer`'s FIFO fast path used to skip `ensure_throttle_bucket`
+    // whenever a backlog already existed. So the append path did not touch the
+    // bucket at all. Suppose the scanner drops an observed backlog row between
+    // the check and the insert. The sweep then sees an idle, full,
+    // dependent-free bucket. The pending row that commits a moment later
+    // references a bucket that no longer exists. `fire_claimed_throttle_row`
+    // fails closed on a missing bucket, so that start sits deferred forever.
     let (url, _c) = setup_db().await;
     let pool = build_pool(&url);
     let mut conn = connect(&url).await;
@@ -1240,11 +1239,10 @@ async fn the_throttle_backlog_append_path_also_interlocks_the_bucket() {
 
 #[tokio::test]
 async fn the_dry_run_preview_forecasts_the_whole_per_tick_budget() {
-    // Codex review round 1, P2. A preview deletes nothing, so without a keyset
-    // cursor it re-reads its first batch forever and can only ever forecast
-    // `batch_size` — against a real pass that spends the whole per-tick budget.
-    // An operator derisking a 50k-row tick by previewing 1k of it is being
-    // misled by exactly the tool meant to prevent that.
+    // A preview deletes nothing. Without a keyset cursor it re-reads its first
+    // batch forever and can only forecast `batch_size`. A real pass spends the
+    // whole per-tick budget. An operator who previews 1k rows of a 50k-row tick
+    // is then misled by exactly the tool meant to prevent that.
     let (url, _c) = setup_db().await;
     let pool = build_pool(&url);
     let mut conn = connect(&url).await;
@@ -1286,11 +1284,11 @@ async fn the_dry_run_preview_forecasts_the_whole_per_tick_budget() {
 
 #[tokio::test]
 async fn retained_buckets_sorting_first_do_not_starve_the_batches_behind_them() {
-    // Codex review round 4, P2. The sweep now pages by a keyset cursor instead
-    // of restarting its ordered scan every batch, so a retained prefix is walked
-    // once per tick rather than once per batch. The risk that buys is a paging
-    // bug: a cursor that advances wrongly would skip collectable rows entirely,
-    // and the rows most exposed are the ones sorting AFTER a retained block.
+    // The sweep pages by a keyset cursor and does not restart its ordered scan
+    // every batch. So a retained prefix is walked once per tick, not once per
+    // batch. The risk that buys is a paging bug. A cursor that advances wrongly
+    // would skip collectable rows entirely. The rows most exposed are the ones
+    // sorting AFTER a retained block.
     let (url, _c) = setup_db().await;
     let pool = build_pool(&url);
     let mut conn = connect(&url).await;
@@ -1328,14 +1326,14 @@ async fn retained_buckets_sorting_first_do_not_starve_the_batches_behind_them() 
 
 #[tokio::test]
 async fn the_page_boundary_follows_the_database_collation_not_rust_byte_order() {
-    // Codex review round 5, P2. The cursor's next page is `key > $3` evaluated
-    // in the DATABASE's collation, so the boundary has to be the page's last row
-    // in THAT order. Deriving it in Rust compares bytewise, and the two orders
-    // disagree under any locale-aware collation: bytewise `B` (0x42) precedes
-    // `a` (0x61), while `en-US-x-icu` puts `a` first. A boundary below the
-    // page's true end re-serves rows the previous page already returned — which
-    // in a dry run, where nothing is deleted, inflates the forecast and burns
-    // the per-tick budget re-counting the same keys.
+    // The cursor's next page is `key > $3`, evaluated in the DATABASE's
+    // collation. So the boundary has to be the page's last row in THAT order.
+    // Deriving it in Rust compares bytewise. The two orders disagree under any
+    // locale-aware collation: bytewise `B` (0x42) precedes `a` (0x61), while
+    // `en-US-x-icu` puts `a` first. A boundary below the page's true end
+    // re-serves rows the previous page already returned. In a dry run, where
+    // nothing is deleted, that inflates the forecast. It also burns the
+    // per-tick budget re-counting the same keys.
     let (url, _c) = setup_db().await;
     let pool = build_pool(&url);
     let mut conn = connect(&url).await;
@@ -1391,7 +1389,7 @@ async fn the_page_boundary_follows_the_database_collation_not_rust_byte_order() 
 }
 
 // ---------------------------------------------------------------------------
-// Upgrade safety — the migration's two backfills (Codex review round 2, P1s)
+// Upgrade safety — the migration's two backfills
 // ---------------------------------------------------------------------------
 
 /// The migration's backfill statements, read from the migration itself so this
@@ -1458,9 +1456,9 @@ fn migration_statements() -> Vec<String> {
 
 /// The lock profile itself, asserted against the migration text.
 ///
-/// Codex review round 3, P1: the grace must come from the column default, and
-/// no statement in this migration may rewrite the whole bucket table while the
-/// ALTERs hold `ACCESS EXCLUSIVE` on it.
+/// The grace must come from the column default. No statement in this migration
+/// may rewrite the whole bucket table while the ALTERs hold `ACCESS EXCLUSIVE`
+/// on it.
 #[test]
 fn the_migration_grants_the_grace_without_rewriting_the_bucket_table() {
     let statements = migration_statements();
@@ -1512,11 +1510,11 @@ async fn make_pre_upgrade(conn: &mut AsyncPgConnection, key: &str) {
 
 #[tokio::test]
 async fn the_migration_preserves_an_operator_baseline_that_predates_the_column() {
-    // Codex review round 2, P1. `POST /admin/rate-limits/{key}` accepts any key
-    // and validates nothing against the registry, so an operator may already
-    // have clamped a per-tenant key before this release. Without the backfill
-    // that intent is indistinguishable from an ordinary bucket, and the first
-    // sweep after upgrade reverts the clamp to the code-declared rate.
+    // `POST /admin/rate-limits/{key}` accepts any key and validates nothing
+    // against the registry. So an operator may already have clamped a
+    // per-tenant key before this release. Without the backfill, that intent is
+    // indistinguishable from an ordinary bucket. The first sweep after upgrade
+    // then reverts the clamp to the code-declared rate.
     let (url, _c) = setup_db().await;
     let pool = build_pool(&url);
     let mut conn = connect(&url).await;
@@ -1580,14 +1578,14 @@ async fn the_migration_preserves_an_operator_baseline_that_predates_the_column()
 
 #[tokio::test]
 async fn the_migration_grants_every_pre_upgrade_bucket_one_full_window_of_grace() {
-    // Codex review round 2, P1. The GC's interlock is taken by the WRITER, and
-    // a worker still running the previous binary does not take it — its dynamic
-    // enqueue is a bare `INSERT ... ON CONFLICT DO NOTHING` and its throttle
-    // backlog append ensured no bucket at all. But the janitor starts sweeping
-    // as soon as the first upgraded instance runs, so a rolling restart would
-    // otherwise have a new janitor collecting while old workers write
-    // unprotected. Stamping `last_registered_at` at migration time makes every
-    // pre-upgrade row ineligible for a full retention window.
+    // The WRITER takes the GC's interlock. A worker that still runs the
+    // previous binary does not take it. Its dynamic enqueue is a bare
+    // `INSERT ... ON CONFLICT DO NOTHING`, and its throttle backlog append
+    // ensured no bucket at all. But the janitor starts sweeping as soon as the
+    // first upgraded instance runs. So during a rolling restart a new janitor
+    // would collect while old workers write unprotected. Stamping
+    // `last_registered_at` at migration time makes every pre-upgrade row
+    // ineligible for a full retention window.
     let (url, _c) = setup_db().await;
     let pool = build_pool(&url);
     let mut conn = connect(&url).await;

@@ -16,10 +16,10 @@
 //! `load_workflow_children_tree_from_shards` is exactly that naive
 //! recursion: it calls the single-parent `store::load_workflow_children`
 //! inside a `for parent in &frontier { for shard { .. } }` loop instead of a
-//! batched `parent_id = ANY($1)` call. This is precisely the class of bug
-//! Harvest's own performance-agent playbook calls out by name: "bookkeeping
-//! queries that are individually trivial but collectively dominant -- these
-//! won't show up in a buffers ranking, only in a `calls` ranking."
+//! batched `parent_id = ANY($1)` call. Harvest's own performance-agent
+//! playbook calls out this class of bug by name: bookkeeping queries that are
+//! individually trivial but collectively dominant. They do not show up in a
+//! buffers ranking, only in a `calls` ranking.
 //!
 //! This file is the harness + evidence generator for that investigation, and
 //! (in its non-skipped test) a permanent regression guard for the fix's
@@ -713,7 +713,7 @@ async fn zz_capture_children_traversal_perf_evidence() {
 /// parents exist at every depth level, spread across both shards** -- the
 /// exact shape that exercises the fix's batched-frontier query differently
 /// from a single-branch chain (which a `parent_id = ANY($1)` call over a
-/// one-element frontier can't meaningfully distinguish from the old
+/// one-element frontier cannot meaningfully distinguish from the old
 /// single-parent call). Asserts the full descendant set, per-depth stamps,
 /// and the FAILED subset are exactly right by `workflow_id`, independent of
 /// row order.
@@ -758,7 +758,7 @@ async fn depth_traversal_with_branching_frontiers_returns_the_exact_descendant_s
 
     // `WorkflowChildResponse` carries `exec_id` (not the business
     // `workflow_id` string) -- `exec_id` is just as good a unique identity
-    // key for this comparison, since it's the primary key every node was
+    // key for this comparison, since it is the primary key every node was
     // generated with.
     let mut by_depth: std::collections::HashMap<u64, Vec<String>> =
         std::collections::HashMap::new();

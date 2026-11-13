@@ -11,8 +11,8 @@
 //!
 //! Coverage means *a poller exists*, not *capacity is available*. A queue
 //! whose assigned workers are all saturated at `max_concurrency` is still
-//! covered — that's a capacity/saturation concern (issues #531/#742),
-//! deliberately out of scope here. Only **zero** live workers polling a
+//! covered. Saturation is a capacity concern (issues #531/#742), deliberately
+//! out of scope here. Only **zero** live workers polling a
 //! queue makes it "uncovered".
 //!
 //! A worker is "live" for coverage purposes when its heartbeat is fresh
@@ -1585,7 +1585,7 @@ mod tests {
     #[test]
     fn parse_raw_query_pairs_strict_duplicate_and_unknown_keys_survive_to_from_query_pairs() {
         // The strict decoder itself must not reject a duplicate/unknown
-        // key -- that's `QueueCoverageQuery::from_query_pairs`'s job (last-
+        // key -- that is `QueueCoverageQuery::from_query_pairs`'s job (last-
         // value-wins / ignore), matching `duplicate_and_unknown_query_params_do_not_400`.
         let pairs = parse_raw_query_pairs_strict(
             "queue_name=typo_queue_a&queue_name=typo_queue_b&unknown_param=1",

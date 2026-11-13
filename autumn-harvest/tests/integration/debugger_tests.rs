@@ -200,7 +200,7 @@ fn from_history_opens_timer_and_child_awaitables() {
 
 #[test]
 fn a_signal_win_closes_its_event_less_reserved_race_timer() {
-    // Codex round 4, P2. A signal-win of a signal-or-deadline race (#476) tears
+    // A signal-win of a signal-or-deadline race (#476) tears
     // the reserved deadline timer down through an EVENT-LESS `CancelRaceLosers`
     // row delete — no `TimerFired`, no `TimerCancelled`. Closing timers only on
     // those two events leaves the loser open for every later step, rendering a
@@ -604,15 +604,15 @@ async fn diff_identifies_the_first_divergent_command_step() {
     assert!(right_step.commands[0].summary.contains("step_b"));
 }
 
-// ── Codex round 1 regressions: dispatch options are part of a command's identity
+// ── Regressions: dispatch options are part of a command's identity
 //
 // A `CommandSnapshot` is the diff key. If it carries only a command's *name*
 // and *input*, two builds that dispatch the same activity with different
 // scheduling options compare EQUAL and the debugger reports a false clean —
 // the single worst outcome for a divergence-finding tool. These pin the
-// classes Codex found (`ScheduleExternalActivity` queue/deadline,
-// `ScheduleActivity` per-call retry/timeout overrides), which the summary
-// label alone does not distinguish.
+// known classes (`ScheduleExternalActivity` queue/deadline,
+// `ScheduleActivity` per-call retry/timeout overrides). The summary label
+// alone does not distinguish them.
 
 fn external_on_queue_a<'a>(
     ctx: &'a WorkflowContext,
@@ -775,7 +775,7 @@ async fn a_start_to_close_only_change_on_an_activity_is_a_divergence() {
     assert_ne!(l.commands[0].payload, r.commands[0].payload);
 }
 
-// ── Codex round 2 regressions ───────────────────────────────────────────────
+// ── Regressions: timeouts, builder defaults and caller-chosen keys ──────────
 
 /// A local activity whose per-call timeout is sub-second. Only the typed
 /// `_with_opts` path carries a full `Duration` — the public `_raw` escape
@@ -1033,7 +1033,7 @@ async fn snapshot_replay_metadata_reaches_the_prefix_context() {
     );
 }
 
-// ── Codex round 1 regression: a mutex park is an open awaitable ─────────────
+// ── Regression: a mutex park is an open awaitable ───────────────────────────
 
 fn mutex_park<'a>(
     ctx: &'a WorkflowContext,
@@ -1795,7 +1795,7 @@ async fn a_panicking_workflow_is_contained() {
 
 #[tokio::test]
 async fn a_spinning_build_is_not_certified_as_replaying_cleanly() {
-    // Codex round 4, P1. A step that timed out reports `divergence: None`
+    // A step that timed out reports `divergence: None`
     // because the replay never finished, not because the build agreed — so the
     // old documented check (scan for `divergence.is_some()`) certified a
     // workflow that spins forever as replaying cleanly. `is_clean()` refuses.
@@ -1886,7 +1886,7 @@ fn a_handler_free_projection_is_never_clean() {
 
 #[tokio::test]
 async fn two_builds_that_fail_the_same_way_diff_as_inconclusive_not_equal() {
-    // Codex round 4, P1 (the diff half). Two builds that both spin compare
+    // The diff half of the timeout guard. Two builds that both spin compare
     // equal at every field — same outcome, same (empty) commands — so the walk
     // finds no divergence. But neither was ever successfully replayed, so
     // "they agree" is a claim about two non-answers.
@@ -2015,9 +2015,9 @@ fn dispatches_a_big_input<'a>(
 
 #[tokio::test]
 async fn the_candidate_payload_cap_is_applied_during_prefix_replay() {
-    // Codex round 4, P1. Payload caps live in no `WorkflowEvent` — the live
-    // worker supplies its own from `BuiltHarvest` — so a replay left at the
-    // library defaults answers a question about a worker that does not exist.
+    // Payload caps live in no `WorkflowEvent`. The live worker supplies its
+    // own from `BuiltHarvest`. So a replay left at the library defaults
+    // answers a question about a worker that does not exist.
     // The cap is consulted at the frontier, which is where every prefix step
     // lands. `WorkflowReplayer` threads these (#798); so must this path.
     let history = vec![started()];
@@ -2304,7 +2304,7 @@ fn a_one_sided_divergence_is_reported_as_its_own_kind_not_a_history_fact() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Codex round 3
+// Per-run noise, workflow identity and inconclusive diffs
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[test]
@@ -2337,9 +2337,9 @@ fn two_recordings_differing_only_in_worker_id_do_not_diverge() {
 fn an_operator_chosen_worker_label_is_compared_not_normalized() {
     // The inverse control. `WorkerRuntimeConfig::worker_id` is a `pub` field,
     // so an embedder may set a stable human label. A label does not parse as a
-    // UUID, so the value guard must keep it comparable — otherwise adding
-    // `worker_id` to the allowlist would have silently discarded a real
-    // difference (the round-2 `idempotency_key` mistake, one field over).
+    // UUID, so the value guard must keep it comparable. Otherwise adding
+    // `worker_id` to the allowlist would silently discard a real difference.
+    // That is the `idempotency_key` normalization mistake, one field over.
     let run = |label: &str| {
         let id = ActivityExecId::new();
         vec![
@@ -2504,7 +2504,7 @@ fn a_signal_breakpoint_matches_a_multi_word_name_at_a_waiting_frontier() {
     );
 }
 
-// ── Codex round 5/6: per-run identity and missing replay inputs ──────────────
+// ── Per-run identity and missing replay inputs ──────────────────────────────
 
 #[test]
 fn an_activity_breakpoint_matches_a_multi_word_name_at_a_dispatching_frontier() {

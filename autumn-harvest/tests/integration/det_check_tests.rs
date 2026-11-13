@@ -1456,10 +1456,10 @@ fn det011_select_macro_is_flagged_exactly_once_no_double_count() {
 #[test]
 fn det011_does_not_flag_macros_whose_name_merely_ends_in_select() {
     // An unrelated macro whose name merely ENDS in `select!` / `select_biased!`
-    // must NOT be flagged — the backward path walk absorbs the leading ident
-    // bytes into a non-matching path (`sql_select` / `my_select`), keeping
-    // det_check in agreement with the compile-time HVG010 guardrail (which
-    // matches macro paths exactly and accepts these) (#980).
+    // must NOT be flagged. The backward path walk absorbs the leading ident
+    // bytes into a non-matching path (`sql_select` / `my_select`). That keeps
+    // det_check in agreement with the compile-time HVG010 guardrail, which
+    // matches macro paths exactly and accepts these (#980).
     for call in [
         "sql_select! { columns }",
         "let _ = my_select!();",
@@ -1591,9 +1591,9 @@ fn det011_flags_bare_distinctive_combinators() {
 #[test]
 fn det011_does_not_flag_qualified_non_futures_combinator_paths() {
     // A qualified call whose full path is outside the futures allowed set must
-    // NOT be flagged — det_check now extracts the FULL path ending at the call
-    // and matches it exactly against the same set as the macro lint's
-    // `is_select_combinator_path`, so a same-tail-name helper under a different
+    // NOT be flagged. det_check now extracts the FULL path ending at the call.
+    // It matches that path exactly against the same set as the macro lint's
+    // `is_select_combinator_path`. So a same-tail-name helper under a different
     // root is rejected exactly as the compile-time HVG010 guardrail rejects it
     // (#980).
     for call in [
@@ -1759,8 +1759,8 @@ fn det011_does_not_flag_absolute_non_futures_combinator_paths() {
 #[test]
 fn det011_does_not_flag_method_call_forms_of_combinators() {
     // Method calls (`.select_all()`, `.try_select(..)`) are NOT the futures
-    // free-function combinators — they must not be flagged, mirroring the AST
-    // visitor's structural exclusion of method-call receivers (#799).
+    // free-function combinators. They must not be flagged. This mirrors the
+    // structural exclusion of method-call receivers in the AST visitor (#799).
     for call in [
         "let _ = x.select_all();",
         "let _ = q.try_select(a, b);",
@@ -2233,8 +2233,8 @@ fn bad_time_helper() -> i64 {
 const WF_UTC: &str = "#[workflow]\nasync fn wf(ctx: &WorkflowContext) -> Result<(), String> {\n    let _ = chrono::Utc::now();\n    Ok(())\n}\n";
 
 // AC8: a bare repo-root scan must exclude the deliberately-broken
-// `compile_fail/` trybuild fixtures (they are not real workflow source and
-// carry committed `.stderr` snapshots that must not be edited).
+// `compile_fail/` trybuild fixtures. They are not real workflow source. They
+// carry committed `.stderr` snapshots that must not be edited.
 #[test]
 fn check_dir_excludes_compile_fail_fixtures() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -2295,8 +2295,8 @@ fn check_dir_skips_target_and_hidden_dirs() {
 }
 
 // Zero false positives: a call bound to a fn-pointer PARAMETER of the same name
-// must NOT resolve to a same-named first-party free helper (#386 excludes
-// function pointers). Reproducer A.
+// must NOT resolve to a same-named first-party free helper. #386 excludes
+// function pointers. Reproducer A.
 #[test]
 fn fn_pointer_param_call_is_not_resolved_to_free_helper() {
     let src = "\
@@ -2318,8 +2318,8 @@ fn transform(n: i64) -> i64 {
 }
 
 // Zero false positives: a call bound to a LOCAL closure of the same name must
-// NOT resolve to a same-named first-party free helper (#386 excludes
-// closures). Reproducer B.
+// NOT resolve to a same-named first-party free helper. #386 excludes
+// closures. Reproducer B.
 #[test]
 fn local_closure_call_is_not_resolved_to_free_helper() {
     let src = "\

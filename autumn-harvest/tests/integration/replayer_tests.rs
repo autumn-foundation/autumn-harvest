@@ -850,8 +850,8 @@ fn activity_then_cancel_timer_workflow<'a>(
     })
 }
 
-/// Timer-reuse LOOP (issue #768): the core sliding-window / idle-session loop
-/// that reuses the SAME timer id (arm; await→Fired; arm again) N times, with a
+/// Timer-reuse LOOP (issue #768): the core sliding-window / idle-session loop.
+/// It reuses the SAME timer id (arm; await→Fired; arm again) N times, with a
 /// fresh duration each iteration. Consuming a fire must CLEAR the Armed logical
 /// state. Then each iteration's `start_timer` records a FRESH `TimerStarted`
 /// (N `TimerStarted` + N `TimerFired`, balanced). Before the fix the stale Armed
@@ -3674,9 +3674,9 @@ async fn start_then_cancel_no_activity_replays_succeeded() {
     );
 }
 
-/// Timer-reuse LOOP (issue #768): the sliding-window / idle-session loop that
-/// reuses the SAME timer id must replay cleanly (arm; await→Fired; arm again,
-/// with a DIFFERENT duration each iteration). Consuming a fire clears the Armed
+/// Timer-reuse LOOP (issue #768): the sliding-window / idle-session loop must
+/// replay cleanly. It reuses the SAME timer id (arm; await→Fired; arm again),
+/// with a DIFFERENT duration each iteration. Consuming a fire clears the Armed
 /// logical state. So each iteration records a FRESH `TimerStarted`
 /// (N `TimerStarted` + N `TimerFired`, balanced). Before the fix the stale Armed
 /// state made the second+ `start_timer` a duplicate no-op. The recorded
@@ -5778,9 +5778,9 @@ async fn a_pre_fix_history_with_dropped_dispatches_replays_without_reinterpretat
 }
 
 /// A `patched()` gate ADDED by the candidate build lands inside the transparent
-/// tail and takes the `NewlyPatched` branch (issue #952): the
-/// live-frontier `debug_assert` there must read the cursor-only frontier, not
-/// `is_replaying()`, which now reports `true` for a sealed-failed run. Without
+/// tail and takes the `NewlyPatched` branch (issue #952). The live-frontier
+/// `debug_assert` there must read the cursor-only frontier, not
+/// `is_replaying()`. That now reports `true` for a sealed-failed run. Without
 /// the fix this test panics in a debug build.
 fn newly_patched_then_fail_workflow<'a>(
     ctx: &'a WorkflowContext,
@@ -9846,10 +9846,10 @@ async fn interleaved_sibling_multi_timer_reversed_fire_order_replays_succeeded()
 // (timer positional-anchor mismatch), which likewise stays green.
 // ---------------------------------------------------------------------------
 
-/// Signal-site park-forever guard (issue #768, preserved by #1071):
-/// a plain `wait_for_signal("go")` whose history ends in a STRAY unconsumed
-/// `TimerStarted` with NO matching `TimerFired` and NO signal must still be a
-/// divergence. A `WaitForSignal` command here would park the run forever on a
+/// Signal-site park-forever guard (issue #768, preserved by #1071). Take a
+/// plain `wait_for_signal("go")` whose history ends in a STRAY unconsumed
+/// `TimerStarted`, with NO matching `TimerFired` and NO signal. It must still
+/// be a divergence. A `WaitForSignal` command here would park the run forever on a
 /// signal that will never arrive. The #1071 TimerFired-tolerance
 /// fix must not suppress this (there is no `TimerFired` to cross here).
 #[tokio::test]

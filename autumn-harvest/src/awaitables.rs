@@ -789,12 +789,12 @@ fn project_replayed(index: &HistoryIndex, commands: &[WorkflowCommand]) -> Vec<A
                 }
                 awaitables.push(awaitable);
             }
-            // Known approximation: a cancellable timer's real deadline is
-            // anchored at `await_fire` time (issue #768), but the
-            // recorded `TimerStarted` is at ARM time — so an
-            // `ArmTimer { for_await: true }` deadline computed from the arm's
-            // recorded `since` can UNDERSTATE the true fire time by the
-            // arm-to-await gap. The await instant is not recoverable from
+            // Known approximation: the real deadline of a cancellable timer
+            // is anchored at `await_fire` time (issue #768). The recorded
+            // `TimerStarted` is at ARM time. So an
+            // `ArmTimer { for_await: true }` deadline computed from the
+            // recorded `since` of the arm can UNDERSTATE the true fire time
+            // by the arm-to-await gap. The await instant is not recoverable from
             // history, so the earlier (conservative) deadline is reported.
             WorkflowCommand::StartTimer {
                 timer_id,

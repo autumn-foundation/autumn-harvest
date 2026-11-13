@@ -409,7 +409,8 @@ async fn test_queue_and_task_eligibility_scenarios() {
             .any(|v| v.as_str().unwrap() == "v2")
     );
 
-    // Eligible workers check: worker-eligible passes all gates for at least one task (specifically Task A and C, wait, Task C has concurrency key saturated, but Task A doesn't).
+    // Eligible workers check: worker-eligible passes all gates for at least one
+    // task. Task C has its concurrency key saturated, but Task A does not.
     let eligible_list = body["eligible_workers"].as_array().unwrap();
     let eligible_ids: Vec<&str> = eligible_list
         .iter()
@@ -770,7 +771,8 @@ async fn test_eligibility_optimizations_and_resilience() {
     let (status_cap, body_cap) =
         get_json_with_auth(&app_cap, "/admin/queues/test-queue-cap/eligibility", true).await;
     assert_eq!(status_cap, StatusCode::OK);
-    // worker-at-capacity should be in eligible_workers, but because it's full, diagnosis should be "all_capacity_full"
+    // worker-at-capacity should be in eligible_workers. It is full, so the
+    // diagnosis should be "all_capacity_full"
     let eligible_cap = body_cap["eligible_workers"].as_array().unwrap();
     assert!(
         eligible_cap

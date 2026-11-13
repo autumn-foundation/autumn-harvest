@@ -603,13 +603,13 @@ async fn rollback_leaves_neither_domain_row_nor_workflow() {
 /// row are either ALL present or ALL absent — never a partial, orphaned state
 /// in any of the four artifacts, in either direction.
 ///
-/// Ordering is deliberately NOT independently randomized here (an earlier
-/// revision of this test carried a `domain_write_first` flag that computed a
-/// value but never actually took a different code path — a real,
-/// since-fixed review finding, H1). The reason a second ordering doesn't
-/// belong in *this* loop is structural, not an oversight: `place_order_after`
-/// in `docs/transactional-start.md`/`examples/transactional_start_order.rs`
-/// — the API's own canonical usage pattern — has the domain write reference
+/// Ordering is deliberately NOT independently randomized here. An earlier
+/// revision of this test carried a `domain_write_first` flag. It computed a
+/// value but never took a different code path. The reason a second ordering
+/// does not belong in *this* loop is structural, not an oversight.
+/// `place_order_after` in
+/// `docs/transactional-start.md`/`examples/transactional_start_order.rs` is
+/// the API's own canonical usage pattern. In it the domain write references
 /// `outcome.exec_id` as a foreign key, which can only exist *after* the start
 /// call returns it. `atomicity_holds_when_domain_row_is_written_before_the_start`
 /// below covers the one *legitimate* alternative ordering (a domain row
@@ -1777,11 +1777,11 @@ async fn idempotency_key_at_exactly_the_length_cap_is_accepted() {
 }
 
 /// A key with leading/trailing whitespace must be TRIMMED before use, and the
-/// trimmed form must be what's actually stored/matched — proven by starting
-/// once with a padded key and once with its already-trimmed equivalent, and
-/// asserting they dedupe to the SAME execution (if trimming didn't happen,
-/// `"  key  "` and `"key"` would be treated as two distinct keys and would
-/// NOT dedupe, landing two separate executions instead of one).
+/// trimmed form must be what is actually stored/matched. The test starts once
+/// with a padded key and once with its already-trimmed equivalent. It asserts
+/// that they dedupe to the SAME execution. Without trimming, `"  key  "` and
+/// `"key"` would be two distinct keys. They would NOT dedupe, and two separate
+/// executions would land instead of one.
 #[tokio::test]
 async fn idempotency_key_is_trimmed_before_use() {
     let (database_url, _container) = setup_database().await;

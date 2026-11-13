@@ -183,7 +183,7 @@ async fn insert_schedule_bounded(
             dsl::buffered_runs.eq(serde_json::json!([])),
             dsl::buffer_all_max.eq(100),
             dsl::skip_policy.eq("skip"),
-            dsl::exhausted_at.eq(Option::<DateTime<Utc>>::None), // NULL — tick hasn't stamped it
+            dsl::exhausted_at.eq(Option::<DateTime<Utc>>::None), // NULL — tick has not stamped it
             dsl::max_runs.eq(max_runs),
             dsl::runs_started.eq(runs_started),
             dsl::end_at.eq(end_at),
@@ -195,7 +195,7 @@ async fn insert_schedule_bounded(
 }
 
 /// Insert a daily-cron workflow schedule attached to a calendar + skip policy
-/// (Codex round 3 calendar-deferral test). `calendar_name = None` disables the
+/// for the calendar-deferral tests. `calendar_name = None` disables the
 /// calendar (the control case). Uses a daily midnight cron so a slot on an
 /// excluded (weekend) day is rebased to the next business day.
 async fn insert_calendar_schedule(
@@ -544,7 +544,7 @@ async fn non_deferring_policy_at_capacity_is_overdue() {
     );
 }
 
-/// Codex round 3: a calendar `run_next_business_day` schedule whose slot fell on
+/// A calendar `run_next_business_day` schedule whose slot fell on
 /// an excluded (weekend) day is deliberately deferred by the tick to the next
 /// business day; while that adjusted fire is still in the FUTURE the tick keeps
 /// `next_run_at` pinned to the (past) original slot. The sampler must NOT flag it
@@ -590,7 +590,7 @@ async fn calendar_deferred_weekend_schedule_is_not_overdue_via_sampler() {
     );
 }
 
-/// Codex round 3: detection is preserved for a calendar schedule genuinely wedged
+/// Detection is preserved for a calendar schedule genuinely wedged
 /// PAST its calendar-adjusted fire. Here `now` is a Tuesday well after the rebased
 /// Monday fire, so the effective fire is itself in the past by > grace → overdue.
 #[tokio::test]
@@ -623,8 +623,8 @@ async fn calendar_schedule_wedged_past_adjusted_fire_is_overdue_via_sampler() {
 }
 
 /// Run ONE overdue sampling pass for a single shard connection and emit into
-/// `metrics`, mirroring the worker sampler loop's per-pass reconciliation
-/// (Codex round 5): run [`overdue_schedule_pass`], emit each verdict, then zero
+/// `metrics`, mirroring the worker sampler loop's per-pass reconciliation:
+/// run [`overdue_schedule_pass`], emit each verdict, then zero
 /// any label from `previous_emitted` that disappeared from this COMPLETE pass via
 /// [`autumn_harvest::worker::labels_to_clear`]. Returns `(current keys,
 /// pass_complete)`. Single-shard, so a pass is complete iff the read succeeded.
@@ -656,7 +656,7 @@ async fn run_and_emit_overdue_pass(
     (current, complete)
 }
 
-/// Codex round 5 F2: a schedule that was overdue and is then deleted has its
+/// A schedule that was overdue and is then deleted has its
 /// gauge series zeroed on the next COMPLETE pass, so `harvest.schedule.overdue`
 /// cannot stick at `1` for a schedule that no longer exists. Drives the real
 /// `overdue_schedule_pass` + `worker::labels_to_clear` reconciliation the sampler

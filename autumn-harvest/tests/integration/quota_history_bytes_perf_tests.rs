@@ -467,7 +467,7 @@ async fn zz_capture_quota_history_bytes_evidence() {
         // this column `mean_time`, renamed to `mean_exec_time` only in PG13.
         // Queried as `Result` rather than a version probe, so it folds into
         // the same skip path as the others instead of adding a second way to
-        // detect "can't get this snapshot here".
+        // detect "cannot get this snapshot here".
         let stats_result: Result<Vec<StatRow>, _> = diesel::sql_query(
             "SELECT calls, shared_blks_hit, shared_blks_read, \
                     (shared_blks_hit + shared_blks_read) AS total_buffers, mean_exec_time \

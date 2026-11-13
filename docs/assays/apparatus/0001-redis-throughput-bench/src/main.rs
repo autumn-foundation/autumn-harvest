@@ -24,7 +24,7 @@ const QUEUE_NAME: &str = "bench-shared";
 /// would let stale state from one measurement bleed into the next -- e.g. a
 /// steady-state cell that hits its deadline with an enqueued-but-unclaimed
 /// entry still sitting on the stream would hand the next cell (or the
-/// backlog-drain scenario) a "seed exactly N" precondition that wasn't
+/// backlog-drain scenario) a "seed exactly N" precondition that was not
 /// actually true. Mirrors the crate's own integration tests
 /// (`format!("test_{}", uuid::Uuid::new_v4().simple())`), without adding a
 /// `uuid` dependency to this throwaway apparatus.

@@ -634,7 +634,7 @@ async fn two_logical_shards_sharing_one_database_do_not_double_count() {
 }
 
 /// A shard the **router** knows about but this process has no pool for must be
-/// reported `unavailable`, never silently omitted (Codex round-19 P1).
+/// reported `unavailable`, never silently omitted.
 ///
 /// This is the mid-rollout topology from the `docs/architecture.md` "add a shard"
 /// procedure:
@@ -1458,8 +1458,8 @@ async fn workflow_name_filter_narrows_the_sample() {
     assert_eq!(manifest.per_workflow.len(), 1);
 }
 
-/// Round-23 P2: discovery must not materialize the whole per-type superset, and
-/// bounding it must not cost the population census.
+/// Discovery must not materialize the whole per-type superset, and bounding it
+/// must not cost the population census.
 ///
 /// The per-type limit is `per_workflow`, but nothing bounds the number of
 /// *types*, so discovery returned `types × per_workflow` rows for the
@@ -1541,7 +1541,7 @@ async fn many_types_keep_their_population_census_under_the_discovery_bound() {
 ///
 /// `sampled` alone accepts any substitution that preserves the count, so the
 /// gate cannot tell the bundle it was handed apart from a bundle of the right
-/// shape (round-23 P1). The identities are what
+/// shape. The identities are what
 /// `ReplayDriftReport::bundle_inventory_mismatches` reconciles against, so an
 /// exporter that stopped recording them would silently disarm that check.
 #[tokio::test]

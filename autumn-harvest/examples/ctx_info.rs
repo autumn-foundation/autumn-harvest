@@ -10,7 +10,7 @@
 //! the DLQ, reset/pause/cancel, and the ADR-0001 `execution.id` span attribute.
 //! So a workflow could log `workflow_id = "cart-42"`, but an operator paging from
 //! that log line had no run UUID to open the execution or build a correlated
-//! trace query, and authors couldn't mint run-scoped idempotency keys.
+//! trace query, and authors could not mint run-scoped idempotency keys.
 //!
 //! ## The solution: `ctx.info()`
 //!

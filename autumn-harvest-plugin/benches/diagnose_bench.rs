@@ -382,7 +382,7 @@ async fn seed_pending_activities(conn: &mut AsyncPgConnection, exec_id: Executio
 /// Bulk-insert `m` live workers covering the `default` queue, set-based like
 /// `claim_bench_support.rs::seed_workers`. `queues` deliberately includes
 /// `"default"` (unlike `claim_bench`'s workers, whose `claim_task` predicate
-/// doesn't need it) because `eligible_worker_ids`' queue-coverage check does.
+/// does not need it) because `eligible_worker_ids`' queue-coverage check does.
 async fn seed_workers(conn: &mut AsyncPgConnection, m: u32) {
     diesel::sql_query(
         "INSERT INTO harvest_workers \

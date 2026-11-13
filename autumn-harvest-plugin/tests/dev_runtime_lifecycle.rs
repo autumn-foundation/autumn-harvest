@@ -360,7 +360,7 @@ async fn a_busy_http_port_is_refused_before_any_cluster_is_created() {
 #[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn a_port_taken_during_provisioning_is_refused_and_takes_the_cluster_with_it() {
-    // Codex round 3 (P2). The reservation above cannot be *held* across
+    // The reservation above cannot be *held* across
     // provisioning — autumn-web binds the same port itself — and provisioning
     // is the long step. Two `cargo dev` runs that both found the port free
     // therefore both get past the first check, and the loser would reach

@@ -65,13 +65,12 @@ use uuid::Uuid;
 
 /// Reads `key` as a `usize`, using `default` only when the variable is
 /// genuinely *absent*. A *present but malformed* value (a typo, e.g.
-/// `DLQ_PROFILE_N=2000O`, or non-Unicode content) is a configuration error,
-/// not silently substituted for the default -- a harness whose whole point
-/// is producing a specific, documented, reproducible number must not
-/// silently profile a *different* configuration than the one actually
-/// requested and report success as if nothing were wrong (its own
-/// cardinality self-check would still pass, since it is computed from the
-/// same substituted value).
+/// `DLQ_PROFILE_N=2000O`, or non-Unicode content) is a configuration error.
+/// It is not silently substituted for the default. This harness exists to
+/// produce a specific, documented, reproducible number. It must not silently
+/// profile a *different* configuration than the one requested and then
+/// report success. Its own cardinality self-check would still pass, since it
+/// is computed from the same substituted value.
 fn env_usize(key: &str, default: usize) -> usize {
     match std::env::var(key) {
         Ok(raw) => raw

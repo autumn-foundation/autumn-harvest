@@ -3388,11 +3388,11 @@ async fn test_invalid_stored_condition_fails_closed() {
 }
 
 /// issue #810 registration surface: invalid condition JSON is rejected with a
-/// 400 JSON error — unknown operator, over-cap, and malformed-path all via the
-/// handler's explicit `decode_trigger_condition` (the field rides the request
-/// as raw JSON precisely so axum's typed Json extractor cannot surface an
-/// unknown operator as a 422 plain-text rejection) — never silently dropped;
-/// a valid condition round-trips through GET.
+/// 400 JSON error, never silently dropped. An unknown operator, an over-cap
+/// condition and a malformed path all go through the handler's explicit
+/// `decode_trigger_condition`. The field rides the request as raw JSON. So
+/// axum's typed Json extractor cannot surface an unknown operator as a 422
+/// plain-text rejection. A valid condition round-trips through GET.
 #[tokio::test]
 async fn test_condition_registration_rejects_invalid_with_400() {
     let _lock = TEST_MUTEX

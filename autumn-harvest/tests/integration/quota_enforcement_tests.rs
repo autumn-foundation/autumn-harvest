@@ -56,9 +56,9 @@
     clippy::missing_panics_doc,
     clippy::missing_errors_doc,
     // Diesel `#[derive(QueryableByName)] struct XxxRow { .. }` helpers are
-    // conventionally defined right where they are used, mid-function, across
-    // every integration-test file in this repo that reads a raw column via
-    // `sql_query` (see e.g. `child_policy_tests.rs`, `pause_tests.rs`).
+    // conventionally defined right where they are used, mid-function. Every
+    // integration-test file in this repo that reads a raw column via
+    // `sql_query` does so (see e.g. `child_policy_tests.rs`, `pause_tests.rs`).
     clippy::items_after_statements
 )]
 
@@ -1283,9 +1283,9 @@ async fn continue_as_new_cross_type_to_no_quota_workflow_clears_quota_key() {
 }
 
 // ---------------------------------------------------------------------------
-// Issue #946 — a `SpawnDetachedChildWorkflow` command
-// (issue #347) resolves and enforces the TARGET workflow type's own declared
-// quota exactly like a fresh admission, worker-driven end to end.
+// Issue #946 — a `SpawnDetachedChildWorkflow` command (issue #347) resolves
+// and enforces the declared quota of the TARGET workflow type. It does so
+// exactly like a fresh admission, worker-driven end to end.
 // `ParentClosePolicy` governs the detached child's *lifecycle*; the target
 // type's tenant-quota footprint is an orthogonal concern this exercises.
 // ---------------------------------------------------------------------------
@@ -1324,10 +1324,10 @@ pub fn detached_quota_child<'a>(
 /// must not terminally fail the PARENT -- that would seal a healthy
 /// execution over an UNRELATED tenant's capacity signal. Instead the
 /// parent's own workflow task is parked and woken (`worker.rs`'s
-/// `recover_from_child_quota_exceeded`) so a later poll re-drives the
-/// identical decision cycle; once the blocking execution frees its slot,
-/// the retry succeeds and the detached child is created with the resolved
-/// `quota_key` stamped on its own row -- the exact
+/// `recover_from_child_quota_exceeded`). A later poll then re-drives the
+/// identical decision cycle. Once the blocking execution frees its slot,
+/// the retry succeeds. The detached child is then created with the resolved
+/// `quota_key` stamped on its own row. That is the exact
 /// `create_detached_child_executions` code path (issue #946).
 #[tokio::test]
 async fn detached_child_spawn_honors_target_quota_parks_parent_then_succeeds() {
@@ -1580,15 +1580,14 @@ async fn detached_child_spawn_in_mixed_batch_honors_target_quota_parks_parent_th
 }
 
 // ---------------------------------------------------------------------------
-// Issue #946 — `enforce_quota_admission`'s documented
-// "the just-inserted row has appended no events yet" contract was violated
-// at all three child-spawn call sites: each appended the child's own
+// Issue #946 — `enforce_quota_admission` documents a contract: "the
+// just-inserted row has appended no events yet". All three child-spawn call
+// sites violated it. Each appended the child's own
 // `WorkflowStarted`/`ChildWorkflowStarted` event BEFORE calling
-// `enforce_quota_admission`, so `load_quota_usage`'s `history_bytes` SUM
+// `enforce_quota_admission`. So the `history_bytes` SUM of `load_quota_usage`
 // counted that just-appended event against the very admission deciding
-// whether to allow it -- an off-by-one that could wrongly REJECT a child
-// spawn that should have succeeded (usage BEFORE this admission was truly
-// zero). Fixed by reordering each site to insert-the-row -> enforce-quota ->
+// whether to allow it. That off-by-one could wrongly REJECT a child spawn
+// that should have succeeded (usage BEFORE this admission was truly zero). Fixed by reordering each site to insert-the-row -> enforce-quota ->
 // THEN append the event, matching the plain start path's established
 // ordering (`start_or_load_workflow_execution_collect`: `enforce_quota_
 // admission` runs before `WorkflowStarted` is appended). A
@@ -1791,12 +1790,11 @@ async fn detached_child_multi_spawn_batch_locks_every_distinct_key_and_admits_al
 }
 
 // ---------------------------------------------------------------------------
-// Issue #946 — an AWAITED child spawn (`ctx.
-// spawn_child_workflow_raw`, whether a lone spawn or one of a genuine
-// fan-out, both dispatch through the same `persist_all_started_child_workflows`
-// suspension-batch handler) resolves and enforces the TARGET workflow type's
-// own declared quota, exactly like the detached-spawn path above, worker-
-// driven end to end.
+// Issue #946 — an AWAITED child spawn (`ctx.spawn_child_workflow_raw`)
+// resolves and enforces the declared quota of the TARGET workflow type. A lone
+// spawn and one of a genuine fan-out both dispatch through the same
+// `persist_all_started_child_workflows` suspension-batch handler. The test
+// runs exactly like the detached-spawn path above, worker-driven end to end.
 // ---------------------------------------------------------------------------
 
 fn awaited_quota_parent<'a>(
@@ -1964,11 +1962,11 @@ async fn awaited_child_spawn_honors_target_quota_parks_parent_then_succeeds() {
 }
 
 /// An awaited child spawn (`persist_all_started_child_workflows`) must not
-/// be wrongly rejected by its OWN just-appended `WorkflowStarted` event
-/// counting toward the `history_bytes` admission it is itself part of
-/// (issue #946 — see the section comment above
+/// be wrongly rejected by its OWN just-appended `WorkflowStarted` event.
+/// That event must not count toward the `history_bytes` admission the spawn
+/// is part of (issue #946). See the section comment above
 /// [`detached_child_spawn_quota_check_excludes_its_own_just_appended_history_bytes`]
-/// for the full rationale).
+/// for the full rationale.
 #[tokio::test]
 async fn awaited_child_spawn_quota_check_excludes_its_own_just_appended_history_bytes() {
     let _serial = serial().await;

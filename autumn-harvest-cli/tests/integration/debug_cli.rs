@@ -826,8 +826,8 @@ fn an_event_facts_divergence_renders_both_normalized_events() {
     // difference no curated projection names (here, a timer's duration). If the
     // CLI did not render it, the operator would be told the histories differ
     // and shown nothing — the exact failure mode the field vocabulary exists to
-    // avoid. Codex round 1 found this class as a *false clean*; this pins both
-    // the detection and the rendering.
+    // avoid. That class of failure is a *false clean*. This test pins both the
+    // detection and the rendering.
     let timer = |secs: u64| {
         vec![
             started(),
@@ -853,7 +853,7 @@ fn an_event_facts_divergence_renders_both_normalized_events() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Codex round 3 — CLI surface
+// CLI surface
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[test]

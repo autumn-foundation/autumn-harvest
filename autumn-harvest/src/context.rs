@@ -2870,10 +2870,10 @@ impl Session<'_> {
     /// [`WorkflowContext::create_session`]'s identical mapping for the
     /// acquire step. Any other error passes through unchanged.
     ///
-    /// This is the actually-reachable place a `SessionBroken` outcome is
-    /// first observed (member-activity or `complete()` failure, unlike
-    /// `create_session`'s own defensive mapping, which can never fire since
-    /// the acquire task never carries `session_id`), so the
+    /// This is the actually-reachable place where a `SessionBroken` outcome
+    /// is first observed (a member-activity or `complete()` failure). The
+    /// defensive mapping in `create_session` can never fire, because the
+    /// acquire task never carries `session_id`. So the
     /// `harvest.session.acquisition{outcome="broken"}` metric is emitted
     /// here. A guard on `!is_replaying()` stops a replay of the same recorded
     /// failure from incrementing it again.
@@ -7935,10 +7935,10 @@ impl WorkflowContext {
 
     /// Clear the logical lifecycle entry for `timer_id` (issue #768).
     ///
-    /// Called when an awaited fire is CONSUMED. A subsequent
-    /// `start_timer(id, ..)` that reuses the id (a sliding-window / idle-session
-    /// loop) is then a FRESH arm, which records a new `TimerStarted` with the
-    /// new duration. It is not a duplicate active arm of the now-fired arming.
+    /// Called when an awaited fire is CONSUMED. A sliding-window / idle-session
+    /// loop can call `start_timer(id, ..)` again with the same id. That call is
+    /// then a FRESH arm, which records a new `TimerStarted` with the new
+    /// duration. It is not a duplicate active arm of the now-fired arming.
     /// The `Cancelled` state is deliberately NOT
     /// cleared: a bare re-await must stay `Cancelled`, and a genuine reuse goes
     /// through `start_timer`, which overwrites the entry to `Armed`.
@@ -8680,10 +8680,10 @@ impl WorkflowContext {
                         return Ok(TimerOutcome::Cancelled);
                     }
                     self.check_strict_replay_no_match(&format!("TimerFired({timer_id})"))?;
-                    // A BLOCKED scan (`match_timer_or_cancel` stopped at an
-                    // unconsumed command with the recorded `TimerFired`/`TimerCancelled`
-                    // still ahead) means the await was moved before a command
-                    // that history recorded first. That is a non-determinism
+                    // A BLOCKED scan means the await was moved before a
+                    // command that history recorded first. In that scan
+                    // `match_timer_or_cancel` stopped at an unconsumed command,
+                    // with the recorded `TimerFired`/`TimerCancelled` still ahead. That is a non-determinism
                     // divergence in NORMAL worker replay too, not only in strict
                     // `WorkflowReplayer` mode (issue #768). Record a deferred nd
                     // (→ #603 nd-block) and return an error. Re-arming and parking
@@ -15346,12 +15346,13 @@ impl WorkflowContext {
     /// `system_now`/`new_uuid`/`side_effect`, etc.), and at the latest once
     /// more when the workflow-task cycle finishes, so a handler is always
     /// guaranteed to have run by the time this cycle's outcome is decided.
-    /// This is deliberate, not a limitation of "immediate" dispatch: an
-    /// eager per-registration pump cannot know about a *different* handler
-    /// about to register on the next line, so it cannot order the two
-    /// correctly against interleaved history for different signal names --
-    /// see [`register_and_dispatch_signal_handler`](Self::register_and_dispatch_signal_handler)'s
-    /// doc comment for the full rationale. A workflow that reads
+    /// This is deliberate, not a limitation of "immediate" dispatch. An eager
+    /// per-registration pump cannot know about a *different* handler that
+    /// registers on the next line. So it cannot order the two correctly
+    /// against interleaved history for different signal names. See the doc
+    /// comment of
+    /// [`register_and_dispatch_signal_handler`](Self::register_and_dispatch_signal_handler)
+    /// for the full rationale. A workflow that reads
     /// handler-mutated state should do so after at least one such call (a
     /// loop with an activity/timer between registration and the read is the
     /// idiomatic shape); reading it on the literal next line with nothing
@@ -25264,10 +25265,10 @@ mod tests {
         );
     }
 
-    /// When a child's `ChildWorkflowStarted` event is in history but its terminal
-    /// has not arrived yet, the context must re-emit a `StartChildWorkflow` command
-    /// carrying the **existing** `child_id` (not a fresh one) so the worker can
-    /// re-park the parent idempotently.
+    /// A child's `ChildWorkflowStarted` event can be in history before its
+    /// terminal arrives. The context must then re-emit a `StartChildWorkflow`
+    /// command that carries the **existing** `child_id`, not a fresh one. So
+    /// the worker can re-park the parent idempotently.
     #[tokio::test]
     async fn context_child_in_progress_re_emits_with_existing_child_id() {
         let child_id = ExecutionId::new();
@@ -25492,8 +25493,9 @@ mod tests {
     /// This used to return `HarvestError::NonDeterministic` synchronously.
     /// Issue #950 moved the verdict. At match time the scan cannot tell a stray
     /// timer from the timer of a `join!(wait_for_signal, ctx.timer)` mixed
-    /// batch whose sibling branch has not been polled yet. An early verdict
-    /// nd-blocked that advertised composition on its first wake (PR #1245).
+    /// batch. The sibling branch of that batch may not be polled yet. An
+    /// early verdict nd-blocked that advertised composition on its first wake
+    /// (PR #1245).
     /// The signal scan is a lookahead. A lookahead must not return a verdict
     /// on events it merely passed over.
     ///
@@ -29582,9 +29584,9 @@ mod tests {
     #[test]
     fn queued_log_commands_are_bounded_by_the_line_cap() {
         // Regression (issue #790). `max_lines` was enforced ONLY at the database
-        // write. So a workflow that logs in a large loop without suspending
-        // retained one capped `String` per call in the in-memory command queue
-        // for the whole decision cycle. That was hundreds of thousands of
+        // write. A workflow could log in a large loop without suspending. It
+        // then retained one capped `String` per call in the in-memory command
+        // queue for the whole decision cycle. That was hundreds of thousands of
         // strings, despite the advertised 1,000-line cap. The bound must bite at
         // ENQUEUE, before the message is even cloned.
         //

@@ -2225,11 +2225,10 @@ pub(crate) fn build_mcp_routes(
     if !(mcp_tools_enabled || mcp_tasks_enabled) {
         return None;
     }
-    // Codex review (PR #908, P1): `HarvestPlugin` cannot detect or
-    // intercept `AppBuilder::secure_mcp(...)` -- that is configured on
-    // the outer app builder, after this `Plugin::build` call returns
-    // -- so there is no way to *guarantee* these routes are
-    // protected. `secure_mcp` only gates the `/mcp` JSON-RPC
+    // PR #908: `HarvestPlugin` cannot detect or intercept
+    // `AppBuilder::secure_mcp(...)`. That is configured on the outer app
+    // builder, after this `Plugin::build` call returns. So there is no
+    // way to *guarantee* these routes are protected. `secure_mcp` only gates the `/mcp` JSON-RPC
     // envelope, not a generated tool route's own direct HTTP path
     // (these are registered via `AppBuilder::routes`, not `nest`).
     // Surface the gap loudly at startup instead of leaving it silent.

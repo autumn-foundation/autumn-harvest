@@ -1434,9 +1434,9 @@ mod tests {
     }
 
     /// Issue #798: a history export must carry the execution's
-    /// `queue_name` at the TOP LEVEL — sourced from the row's `queue_name` column,
-    /// present in no `WorkflowEvent` — in the same wire shape a
-    /// `testing::HistorySnapshot` expects.
+    /// `queue_name` at the TOP LEVEL, in the same wire shape a
+    /// `testing::HistorySnapshot` expects. The value comes from the row's
+    /// `queue_name` column and is present in no `WorkflowEvent`.
     ///
     /// Without it the replay-drift gate (and every other `replay_from_json`
     /// caller) replays under `queue_name == ""`, so an **unchanged** workflow that

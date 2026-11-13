@@ -280,7 +280,7 @@ pub fn try_acquire_session_slot(
 /// Release a previously claimed session slot.
 ///
 /// Idempotent: releasing a `session_id` this registry does not (or no
-/// longer) hold is a no-op, so a defensive double-release (e.g. a
+/// longer) hold is a no-op. So a defensive double-release (e.g. a
 /// reconcile sweep racing an in-flight `Session::complete()`) is safe.
 pub fn release_session_slot(registry: &SessionSlotRegistry, session_id: crate::types::SessionId) {
     registry
@@ -586,11 +586,11 @@ pub async fn record_session_completed(
 
 /// Push a session's lease (`expires_at`) forward from now (issue #606).
 ///
-/// Called after each member-activity completion so a long-running, still
-/// legitimately active pipeline is not reclaimed by the broken-session
-/// scanner's `expires_at < NOW()` check purely because its member activities
-/// individually take longer than one [`SESSION_MEMBER_STICKY_TIMEOUT`]
-/// window to finish. Idempotent-shaped: only an `ACTIVE` row is refreshed —
+/// Called after each member-activity completion. A long-running, still
+/// legitimately active pipeline is then not reclaimed by the `expires_at <
+/// NOW()` check of the broken-session scanner. Without the push, a member
+/// activity that takes longer than one [`SESSION_MEMBER_STICKY_TIMEOUT`]
+/// window to finish would trip that check. Idempotent-shaped: only an `ACTIVE` row is refreshed —
 /// a session already `BROKEN`/`COMPLETED` is left alone (there is nothing to
 /// extend, and refreshing a `BROKEN` row's lease could otherwise race the
 /// scanner into believing a just-reclaimed session is still alive).

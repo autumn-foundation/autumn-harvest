@@ -5968,8 +5968,8 @@ mod tests {
     #[test]
     fn dlq_entries_gauge_has_default_noop_impl() {
         // record_dlq_entries must exist on MetricsRecorder with (shard: u16, depth: u64).
-        // METRIC_DLQ_ENTRIES is the registered constant; this verifies it's
-        // actually wired to a callable method with the right shape.
+        // METRIC_DLQ_ENTRIES is the registered constant. This verifies that it
+        // is wired to a callable method with the right shape.
         let rec = NoOpMetrics;
         rec.record_dlq_entries(0, 0);
         rec.record_dlq_entries(1, 42);
@@ -6224,7 +6224,7 @@ mod tests {
         rec.record_schedule_to_start("default", 1.5);
         rec.record_queue_oldest_pending_age("default", 30.0);
         rec.record_worker_slots(SlotType::Workflow, 3, 5);
-        // If any method silently accepted execution.id we'd see it here.
+        // A method that silently accepted execution.id shows up here.
     }
 
     #[test]

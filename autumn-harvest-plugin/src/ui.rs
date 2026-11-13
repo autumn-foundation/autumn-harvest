@@ -2351,14 +2351,15 @@ async fn render_workflow_detail_page(
 }
 
 /// Decode only the workflow-detail fields the renderer actually displays
-/// (PR #936): the execution row's payload fields (the
-/// Input/Output/Memo/Search-attributes cards + the error banner), the
-/// timeline page's event payloads (rendered in full under "view payload"),
-/// and the blocked-on panel's heartbeat checkpoints. Hidden fields are
-/// deliberately NOT decoded — the pending-activity `input`, pending-signal
-/// payloads, and the attempts/signals panel event copies render only
-/// names / error strings / timestamps, never payload fields, so decoding
-/// them would burn codec/KMS work and count envelopes in the
+/// (PR #936). The first is the execution row's payload fields: the
+/// Input/Output/Memo/Search-attributes cards and the error banner. The second
+/// is the timeline page's event payloads, rendered in full under "view
+/// payload". The third is the blocked-on panel's heartbeat checkpoints.
+///
+/// Hidden fields are deliberately NOT decoded. The pending-activity `input`,
+/// pending-signal payloads, and the attempts/signals panel event copies render
+/// only names / error strings / timestamps, never payload fields. Decoding them
+/// would burn codec/KMS work. It would also count envelopes in the
 /// `payload.decode_read` audit outcome for plaintext the operator is never
 /// shown. Returns the merged outcome for the page's single audit row, so the
 /// audit accounting covers exactly the surfaced fields.
@@ -2658,9 +2659,9 @@ async fn terminate_workflow_ui(
     Ok(axum::response::Redirect::to(&redirect_url).into_response())
 }
 
-/// Flash text for the pause action: an idempotent repeat (`newly_paused:
-/// false`) is called out so the operator is not misled into thinking their
-/// click performed the transition (issue #609).
+/// Flash text for the pause action (issue #609). An idempotent repeat
+/// (`newly_paused: false`) is called out so the operator is not misled into
+/// thinking their click performed the transition.
 const fn pause_flash_message(newly_paused: bool) -> &'static str {
     if newly_paused {
         "Workflow paused"
@@ -5968,10 +5969,10 @@ fn build_query_string(
         let _ = write!(out, "&search_attr_key={}", url_encode(key));
         let _ = write!(out, "&search_attr_value={}", url_encode(value));
     }
-    // Carries the raw text through, valid or not — a bound the operator is
-    // still correcting (an invalid value with its inline error, see
-    // `parse_started_bound`) must not silently vanish from a Next/Previous
-    // link before they have resolved it.
+    // Carries the raw text through, valid or not. A bound the operator is
+    // still correcting must not silently vanish from a Next/Previous link
+    // before they have resolved it. Such a bound is an invalid value with its
+    // inline error (see `parse_started_bound`).
     if !started_after_raw.is_empty() {
         let _ = write!(out, "&started_after={}", url_encode(started_after_raw));
     }
@@ -6777,11 +6778,12 @@ enum CheckpointCellState {
     OmittedForBudget(u64),
 }
 
-/// Build the per-row checkpoint decisions for the pending-activities table,
-/// mirroring the stack API (#503 review): each checkpoint is judged against its
-/// activity's effective cap (per-activity `max_result_bytes` raised against the
-/// global ceiling), then a cumulative per-page budget — the global cap — bounds
-/// the total rendered bytes so a large fan-out cannot generate a huge HTML page.
+/// Build the per-row checkpoint decisions for the pending-activities table.
+/// This mirrors the stack API (#503 review). Each checkpoint is judged against
+/// its activity's effective cap: the per-activity `max_result_bytes`, raised
+/// against the global ceiling. Then a cumulative per-page budget (the global
+/// cap) bounds the total rendered bytes, so a large fan-out cannot generate a
+/// huge HTML page.
 /// The first payload-bearing checkpoint is always shown. The byte size is
 /// measured once here via the shared non-allocating counter; the renderer reads
 /// the resulting state without re-serializing.
@@ -7527,10 +7529,10 @@ const fn dag_node_status_label(status: DagNodeStatus) -> &'static str {
     }
 }
 
-/// Whether a "Retry from this node" action should be offered: the run must be
-/// terminally retryable (matching #366's accepted source states) and the node
-/// must be an attempted-but-not-succeeded node (so the #366 resolver will not
-/// reject it as never-attempted / already-succeeded).
+/// Whether a "Retry from this node" action should be offered. The run must be
+/// terminally retryable (matching #366's accepted source states). The node
+/// must be an attempted-but-not-succeeded node, so the #366 resolver will not
+/// reject it as never-attempted / already-succeeded.
 fn node_retry_offered(run_state: &str, status: DagNodeStatus) -> bool {
     matches!(run_state, "FAILED" | "CANCELLED" | "TIMED_OUT")
         && matches!(
@@ -15964,12 +15966,11 @@ mod tests {
         }
     }
 
-    /// PR #936: the pending-activity `input` and pending-signal
-    /// payloads are never rendered by the detail page, so they must not be
-    /// decoded and must not count toward the `payload.decode_read` audit
-    /// outcome — envelopes there stay untouched and the outcome stays empty
-    /// (no audit row would be written for a page whose only envelopes are
-    /// hidden).
+    /// PR #936: the pending-activity `input` and pending-signal payloads are
+    /// never rendered by the detail page. So they must not be decoded and must
+    /// not count toward the `payload.decode_read` audit outcome. Envelopes there
+    /// stay untouched and the outcome stays empty. No audit row is written for
+    /// a page whose only envelopes are hidden.
     #[test]
     fn hidden_detail_fields_are_not_decoded_and_never_touch_the_audit_outcome() {
         let codecs = ui_test_codecs();

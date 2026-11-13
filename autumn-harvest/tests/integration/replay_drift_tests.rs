@@ -767,10 +767,10 @@ async fn require_complete_coverage_fails_closed_without_a_manifest() {
 
 /// Same fail-closed rule when the manifest exists but cannot be parsed.
 ///
-/// The rung moved from `4` to `2`, and the move is the point:
-/// a corrupt manifest disables the rung-`2` and rung-`3` guards for *every*
-/// caller, so blocking only under the opt-in `require_complete_coverage` left the
-/// default gate green on a damaged bundle. Rung `2` ("the gate could not fully
+/// The rung moved from `4` to `2`, and the move is the point. A corrupt
+/// manifest disables the rung-`2` and rung-`3` guards for *every* caller. So
+/// blocking only under the opt-in `require_complete_coverage` left the default
+/// gate green on a damaged bundle. Rung `2` ("the gate could not fully
 /// run") both describes it correctly and dominates rung `4`, so this bundle is
 /// now refused whether or not the flag is set — see
 /// `corrupt_manifest_blocks_the_default_gate`.
@@ -2650,10 +2650,10 @@ async fn readable_manifest_is_not_reported_as_unreadable() {
 /// handlers *before any workflow code runs* (`executor.rs`, "Auto-register
 /// declarative handlers before any workflow code runs"), and
 /// `ctx.list_query_names()` merges the declarative map into its result. So this
-/// branch is genuinely observable from workflow code — the same class as the
-/// candidate payload caps tested above: **candidate configuration that lives in no
-/// `WorkflowEvent`**, which replay must mirror or it is not replaying the
-/// candidate at all.
+/// branch is genuinely observable from workflow code. It is the same class as
+/// the candidate payload caps tested above: **candidate configuration that
+/// lives in no `WorkflowEvent`**. Replay must mirror it, or it is not replaying
+/// the candidate at all.
 fn query_branching_workflow<'a>(
     ctx: &'a WorkflowContext,
     _input: Value,
@@ -3678,9 +3678,9 @@ async fn a_random_range_at_the_in_flight_frontier_is_not_drift() {
 // `run_workflow_canary` has two terminal arms that both reach the frontier
 // with recorded history fully consumed: the `Err(_elapsed)` (suspended) arm
 // and the `Ok(Ok(output))` (completing) arm. The suspended arm tolerates a
-// command emitted at the frontier (that is `workflow_system_now_then_park`
-// above: the tests pass because the workflow *parks* on `step_two` after
-// reading the clock). The completing arm did not: a workflow that reads the
+// command emitted at the frontier. `workflow_system_now_then_park` above shows
+// this: the tests pass because the workflow *parks* on `step_two` after
+// reading the clock. The completing arm did not: a workflow that reads the
 // clock at the frontier and then returns `Ok` — rather than parking on
 // another activity — used to reject with "new commands emitted beyond
 // recorded history", even though nothing about finishing instead of parking

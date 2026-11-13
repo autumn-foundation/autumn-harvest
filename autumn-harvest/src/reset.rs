@@ -1591,9 +1591,9 @@ pub(crate) async fn insert_fork_row(
     // RUNNING execution (the documented escalation path for a stuck block),
     // whose search_attrs still carries the diagnostic — the fresh fork itself
     // has never diverged, so it must not display a phantom "blocked" reason.
-    // Guarded on `Some` so a source with no search_attrs at all does not gain
-    // a stray `{}` object (`apply_raw_search_attrs_patch_in_memory` always
-    // returns `Some`, mirroring `store::update_search_attrs`'s DB semantics).
+    // Guarded on `Some`, so a source with no search_attrs at all does not gain
+    // a stray `{}` object. `apply_raw_search_attrs_patch_in_memory` always
+    // returns `Some`, mirroring `store::update_search_attrs`'s DB semantics.
     let fork_search_attrs = source.search_attrs.as_ref().map(|_| {
         crate::worker::apply_raw_search_attrs_patch_in_memory(
             source.search_attrs.clone(),

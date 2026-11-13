@@ -328,11 +328,12 @@ async fn snapshot_statements(conn: &mut AsyncPgConnection, db_name: &str) -> Vec
     )
 }
 
-/// Whether `row` is one of the statement shapes this investigation targets:
-/// the running-basis count on `harvest_workflow_executions`, the throttle
-/// existence-check (`to_regclass`) and count on `harvest_start_throttle`, and
-/// the calendar-exclusions lookup on `harvest_calendar_exclusions` -- each
-/// identified by a distinctive table/function + column substring so this
+/// Whether `row` is one of the statement shapes this investigation targets.
+/// These are the running-basis count on `harvest_workflow_executions`, the
+/// throttle existence-check (`to_regclass`), the count on
+/// `harvest_start_throttle`, and the calendar-exclusions lookup on
+/// `harvest_calendar_exclusions`. A
+/// distinctive table/function + column substring identifies each one. So this
 /// cannot accidentally match an unrelated statement shape (e.g. the
 /// schedule-list's own `SELECT * FROM harvest_schedules`).
 ///
@@ -575,12 +576,12 @@ async fn schedule_running_basis_batch_matches_per_schedule_loop() {
     }
 }
 
-/// (issue #1160) A cross-type continue-as-new successor -- a RUNNING execution
-/// carrying schedule A's `schedule_id` but schedule B's `workflow_name` -- must
-/// count toward BOTH the batched and per-schedule running basis for schedule
-/// A, additively on top of A's own same-type count (which still includes a
-/// manual-trigger run of A's own type, proving the disjunct does not regress
-/// existing same-type counting).
+/// (issue #1160) A cross-type continue-as-new successor is a RUNNING execution
+/// that carries schedule A's `schedule_id` but schedule B's `workflow_name`.
+/// It must count toward BOTH the batched and per-schedule running basis for
+/// schedule A, additively on top of A's own same-type count. That count still
+/// includes a manual-trigger run of A's own type. This proves that the
+/// disjunct does not regress existing same-type counting.
 #[tokio::test]
 async fn schedule_running_basis_counts_a_cross_type_successor_additively() {
     let (admin, _guard) = setup_server().await;

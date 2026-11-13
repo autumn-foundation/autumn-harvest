@@ -347,10 +347,10 @@ pub enum HarvestError {
     /// [`crate::execution::signal_with_start_workflow_execution`].
     ///
     /// Raised from inside the start transaction's `FOR UPDATE` lock, only
-    /// when the call actually creates a new execution -- a call that merely
+    /// when the call actually creates a new execution. A call that merely
     /// attaches to an already-running execution never validates `start_input`
-    /// (it is never written), closing the TOCTOU window a caller-side,
-    /// pre-lock check would otherwise need to work around. Carries the same
+    /// (it is never written). This closes the TOCTOU window that a
+    /// caller-side, pre-lock check would otherwise need to work around. Carries the same
     /// structured violations `POST /workflows/{name}/start` returns.
     #[error("input validation failed: {} violation(s)", violations.len())]
     InputValidationFailed {
@@ -1214,9 +1214,9 @@ impl CapabilityMissPhase {
     /// activity or child type — happens *after* the start metric fired, and its
     /// persistence transaction rolls back, so no scheduling event lands either.
     /// Restoring `attempt` there would leave the next capable claim looking
-    /// exactly like a first dispatch, and `harvest.workflow.started` would be
-    /// emitted a **second** time for one execution, inflating start counts and
-    /// every SLO derived from them.
+    /// exactly like a first dispatch. `harvest.workflow.started` would then be
+    /// emitted a **second** time for one execution. That inflates start counts
+    /// and every SLO derived from them.
     ///
     /// Splitting on the phase satisfies both roles at once, because the two
     /// populations do not overlap:
@@ -2459,8 +2459,8 @@ mod tests {
     fn capability_miss_phase_clears_panic_strike_only_after_the_handler_ran() {
         // Issue #782's strike map counts consecutive panics of this execution's
         // BODY. A capability miss detected before/during the handler is
-        // non-terminal (the task is released for a capable peer), so it must not
-        // reset a streak it observed nothing about -- otherwise a worker
+        // non-terminal (the task is released for a capable peer). So it must
+        // not reset a streak it observed nothing about. Otherwise a worker
         // alternating "panic" and "unregistered local activity" resets
         // `workflow_panic_max_attempts` forever.
         assert!(

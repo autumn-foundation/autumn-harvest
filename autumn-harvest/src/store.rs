@@ -2308,11 +2308,12 @@ fn workflow_child_row_from_parts(
 /// level — the latter costs `O(nodes × shards)` round trips for a depth-`D`
 /// tree, this costs `O(D × shards)`. See the "Cross-shard lineage tree
 /// loaders" doc comment below for the same argument as applied to
-/// `load_workflow_children_batch`, which this mirrors exactly except for
-/// returning `WorkflowChildRow` (this endpoint's flat, non-parent-tagged
-/// projection) instead of `LineageChildRow` (the nested `/tree` endpoint's
-/// parent-tagged one) — the caller here does not need to know *which* parent
-/// in the frontier produced a given child, only the whole next frontier and
+/// `load_workflow_children_batch`. This function mirrors it exactly, except
+/// that it returns `WorkflowChildRow` instead of `LineageChildRow`.
+/// `WorkflowChildRow` is the flat, non-parent-tagged projection of this
+/// endpoint. `LineageChildRow` is the parent-tagged one of the nested `/tree`
+/// endpoint. The caller here does not need to know *which* parent in the
+/// frontier produced a given child. It needs only the whole next frontier and
 /// the whole set of matching rows.
 ///
 /// Returns an empty vec without querying when `parent_ids` is empty.

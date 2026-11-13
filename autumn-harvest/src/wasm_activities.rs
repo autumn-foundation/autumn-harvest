@@ -922,9 +922,9 @@ fn invoke_wasm_activity_inner(
         limits: StoreLimitsBuilder::new()
             .memory_size(limits.memory_bytes)
             // Cap every store resource dimension, not just linear-memory bytes
-            // (issue #965): a table lives in host storage outside
-            // the byte ceiling, and multiple memories/instances would each be
-            // individually sub-cap yet collectively exceed the sandbox.
+            // (issue #965). A table lives in host storage outside the byte
+            // ceiling. Multiple memories/instances can each be individually
+            // sub-cap yet collectively exceed the sandbox.
             .memories(WASM_MAX_MEMORIES)
             .instances(WASM_MAX_INSTANCES)
             .tables(WASM_MAX_TABLES)

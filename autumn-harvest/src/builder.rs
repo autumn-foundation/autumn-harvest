@@ -2192,10 +2192,11 @@ impl HarvestBuilder {
     /// targets set via a start option are unioned with these defaults).
     ///
     /// The target is validated against the configured SSRF host allowlist
-    /// at [`try_build`](Self::try_build) time — call
+    /// at [`try_build`](Self::try_build) time. If the target's host is not
+    /// allowlisted yet, call
     /// [`completion_callback_allowlist`](Self::completion_callback_allowlist)
-    /// first if the target's host is not already allowlisted, or `try_build`
-    /// returns [`HarvestBuilderError::CallbackTargetRejected`].
+    /// first. Otherwise `try_build` returns
+    /// [`HarvestBuilderError::CallbackTargetRejected`].
     #[must_use]
     pub fn completion_callback_default(
         mut self,
@@ -3519,10 +3520,10 @@ pub(crate) const RESERVED_RATE_LIMIT_KEY_PREFIXES: [&str; 2] = ["dyn-rate:", "st
 /// This is the single, comprehensive rate-limit gate. It is called from
 /// [`HarvestBuilder::try_build`] (the builder path) **and** from
 /// [`crate::worker::Worker::new`] (the direct-`HandlerRegistry` / worker-startup
-/// path), so a worker constructed without going through the builder still
-/// fails loud, once, before its poll loop and first enqueue — rather than
-/// slipping an invalid config past the piecemeal schedule-time guards in
-/// `persist_scheduled_activities` (issue #699 review).
+/// path). So a worker constructed without the builder still fails loud, once,
+/// before its poll loop and first enqueue. It does not slip an invalid config
+/// past the piecemeal schedule-time guards in `persist_scheduled_activities`
+/// (issue #699 review).
 ///
 /// Checks, per activity:
 /// - a dynamic `rate_limit(key = …)` on a **local** activity — local activities
@@ -3654,10 +3655,10 @@ pub(crate) fn validate_activity_rate_limits<'a>(
         // rate/burst.
         //
         // Checked on the EFFECTIVE key, not on `rate_limit_key` alone (issue
-        // #1127): the static bucket a worker registers
-        // falls back to the activity NAME when no key is given, so a hand-built
-        // `ActivityInfo` named `start-throttle:reports` would otherwise pass
-        // validation and register a squatting bucket. (The `#[activity]` macro
+        // #1127). The static bucket a worker registers falls back to the
+        // activity NAME when no key is given. A hand-built `ActivityInfo` named
+        // `start-throttle:reports` would otherwise pass validation and
+        // register a squatting bucket. (The `#[activity]` macro
         // cannot produce such a name — a Rust identifier holds neither `-` nor
         // `:` — so this reaches only a directly-constructed `ActivityInfo`.)
         //
@@ -8958,10 +8959,10 @@ mod tests {
             .audit_export_webhook("https://evil.com/audit")
             .audit_export_secret(b"k".to_vec())
             .try_build();
-        // The URL is carried REDACTED to its origin: a SIEM ingest endpoint's
+        // The URL is carried REDACTED to its origin. A SIEM ingest endpoint's
         // path can be its credential, and this error's Display goes to the
-        // startup log (issue #953). The host still
-        // identifies what was rejected, which is all the rejection is about.
+        // startup log (issue #953). The host still identifies what was
+        // rejected, which is all the rejection is about.
         assert!(
             matches!(
                 result,
@@ -9175,11 +9176,11 @@ mod tests {
         );
     }
 
-    /// The plugin runner publishes the global itself after its build succeeds,
-    /// so the conversion must not write it at all — not write it and have it
-    /// repaired later (issue #953). A live runtime's
-    /// scanner ticking mid-build would otherwise export records to a sink that
-    /// never came into service, and no restore un-sends those.
+    /// The plugin runner publishes the global itself after its build succeeds.
+    /// So the conversion must not write it at all, not even to have it repaired
+    /// later (issue #953). A live runtime's scanner ticking mid-build would
+    /// otherwise export records to a sink that never came into service, and no
+    /// restore un-sends those.
     ///
     /// Asserts an **absence**, deliberately. `GLOBAL_AUDIT_EXPORT_CONFIG` is a
     /// process-wide static and 33 other tests in this binary call

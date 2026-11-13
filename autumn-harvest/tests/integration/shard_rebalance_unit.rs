@@ -768,7 +768,7 @@ fn the_fingerprint_separates_an_empty_history_from_a_started_one() {
     );
 }
 
-// ── Codex round 5: schedule-attributed runs are out of scope ────────────────
+// ── schedule-attributed runs are out of scope ───────────────────────────────
 
 #[test]
 fn a_schedule_attributed_execution_is_blocked_from_migrating() {

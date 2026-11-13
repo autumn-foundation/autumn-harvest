@@ -750,13 +750,13 @@ fn resolved_upstream_status(
         if has_skip_marker(events, idx, &up.activity_name, &up.upstreams) {
             return Some(TaskStatus::Skipped);
         }
-        // Reachability BEFORE resolution (Codex round-3 P2, mirroring
-        // `gate_status`): the unified walker only calls `wait_for_signal(_timeout)`
-        // AFTER `dispatch_decision` passes, so a matching `SignalReceived` / gate
+        // Reachability BEFORE resolution (issue #746, mirroring `gate_status`):
+        // the unified walker only calls `wait_for_signal(_timeout)` AFTER
+        // `dispatch_decision` passes. So a matching `SignalReceived` / gate
         // race-timer `TimerFired` merely *present* in history does NOT prove the
         // walker awaited this gate. A gate whose own trigger rule skipped it (an
-        // upstream failed) is resolved to `Skipped` even though a buffered signal
-        // for it may exist; an unreached gate (an upstream still in flight) is not
+        // upstream failed) resolves to `Skipped`, even if a buffered signal for
+        // it exists. An unreached gate (an upstream still in flight) is not
         // "done" → None. Only a gate the walker actually reached is classified from
         // its recorded signal/timer resolution.
         return match task_reach(events, up, tasks, depth, dispatched) {
@@ -2111,7 +2111,7 @@ mod tests {
         );
     }
 
-    // ── Issue #746 Codex round-2 P2: reachability BEFORE resolution, and
+    // ── Issue #746: reachability BEFORE resolution, and
     // trigger-rule / condition skips of upstreams count as resolved for a
     // downstream gate's reachability. ────────────────────────────────────────
 
@@ -2215,14 +2215,14 @@ mod tests {
     #[test]
     fn downstream_onesuccess_gate_unreachable_when_upstream_gate_trigger_skipped_with_stray_signal()
     {
-        // Codex round-3 P2 (dag_graph.rs:713): `resolved_upstream_status` must
-        // check an upstream GATE's reachability BEFORE resolving it from a
-        // signal/timer, exactly as `gate_status` already does for a gate's own
-        // status. Here upstream gate1("approval") is skipped by its default
-        // AllSuccess trigger rule because activity `a` FAILED — the unified walker
-        // never awaited it — yet a matching `SignalReceived("approval")` is
-        // buffered in history (signals are durable and land even for a skipped
-        // gate). An existence-only classifier resolves gate1 to `Succeeded`, so a
+        // Issue #746: `resolved_upstream_status` must check an upstream GATE's
+        // reachability BEFORE resolving it from a signal/timer. `gate_status`
+        // already does exactly that for a gate's own status. Here upstream
+        // gate1("approval") is skipped by its default AllSuccess trigger rule,
+        // because activity `a` FAILED. The unified walker never awaited it. Yet
+        // a matching `SignalReceived("approval")` is buffered in history.
+        // Signals are durable and land even for a skipped gate. An
+        // existence-only classifier resolves gate1 to `Succeeded`, so a
         // downstream `OneSuccess` gate2 is wrongly reported reachable → `waiting`.
         // With reachability-first, gate1 resolves to `Skipped`, gate2's
         // OneSuccess([Skipped]) fails → gate2 is trigger-skipped → `pending`.

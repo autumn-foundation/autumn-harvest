@@ -1068,8 +1068,8 @@ pub fn mean_inflight(samples: &[usize]) -> Option<f64> {
 /// Reasons a closed-loop throughput figure is feeder-bound on **any** shard.
 ///
 /// The per-shard form of [`inflight_soundness`], and the same lesson the
-/// pacing gate learned earlier in PR #1282: a mean over
-/// every shard's samples lets well-fed shards hide a starved one. Four shards
+/// pacing gate learned earlier in PR #1282. A mean over every shard's samples
+/// lets well-fed shards hide a starved one. Four shards
 /// at 32, 32, 32 and 28 average 31 against a floor of 28.8 and pass — while the
 /// shard that missed its target is the one bounding the aggregate rate the cell
 /// publishes. Each shard is judged against the target it was actually given.
@@ -2637,10 +2637,10 @@ mod tests {
 
     #[test]
     fn a_single_feeder_bound_shard_cannot_hide_behind_its_peers() {
-        // The regression this exists to catch (PR #1282):
-        // 32/32/32/28 averages 31 against a floor of 28.8, so a flattened mean
-        // passes while the starved shard is the one bounding the aggregate rate
-        // the cell publishes.
+        // The regression this exists to catch (PR #1282): 32/32/32/28 averages
+        // 31 against a floor of 28.8, so a flattened mean passes. But the
+        // starved shard is the one bounding the aggregate rate the cell
+        // publishes.
         let flattened = mean_inflight(&[32, 32, 32, 28]).expect("non-empty");
         assert!(
             inflight_soundness(32, Some(flattened)).is_empty(),
@@ -4568,10 +4568,10 @@ pub mod db {
     /// Abort the accept loop when a `SignalServer` is dropped without
     /// [`SignalServer::stop`].
     ///
-    /// The panic path, one layer further out than `Fleet`'s (PR #1282): if
-    /// `run_signal_roundtrip` panics after the server is
-    /// spawned, unwinding merely *drops* this handle, and dropping a
-    /// `JoinHandle` detaches its task. The accept loop would keep running --
+    /// The panic path, one layer further out than `Fleet`'s (PR #1282).
+    /// `run_signal_roundtrip` can panic after the server is spawned. Then
+    /// unwinding merely *drops* this handle, and dropping a `JoinHandle`
+    /// detaches its task. The accept loop would keep running --
     /// holding its `ShardedDbPool` clone and its idle connections -- through
     /// every later cell of the sweep, which is exactly the per-cell containment
     /// this and `Fleet`'s `Drop` exist to make real.
@@ -4736,12 +4736,12 @@ pub mod db {
     /// The `version()` of the server this run actually provisioned against.
     ///
     /// Recorded during provisioning rather than probed from an environment
-    /// variable, because on the testcontainer path there is no such variable:
-    /// the probe returned `None` and the published environment block simply
-    /// omitted the Postgres version for an otherwise perfectly good run (PR
-    /// #1282). `postgres:16` is a moving tag, and the doc
-    /// treats the exact version as reproduction metadata, so "unknown" is not
-    /// an acceptable answer for a run that had a server in front of it.
+    /// variable, because on the testcontainer path there is no such variable
+    /// (PR #1282). The probe returned `None`. The published environment block
+    /// then simply omitted the Postgres version for an otherwise good run.
+    /// `postgres:16` is a moving tag, and the doc treats the exact version as
+    /// reproduction metadata. So "unknown" is not an acceptable answer for a
+    /// run that had a server in front of it.
     /// Every DISTINCT server version this run provisioned against.
     ///
     /// A set rather than a single value (PR #1282): in
@@ -5112,12 +5112,12 @@ pub mod db {
         deadline: Instant,
         census: &super::TaskCensus,
     ) -> Vec<LoopOutcome> {
-        // A `JoinSet`, not loose `JoinHandle`s: if one shard's loop panics, the
-        // `expect` below unwinds and dropping loose handles would DETACH the
-        // siblings, leaving them inserting rows and holding connections until
-        // the 900s deadline while later cells of the sweep are being measured
-        // (PR #1282). Dropping a `JoinSet` aborts what it
-        // owns, so the containment in `benches/e2e_bench.rs` actually contains.
+        // A `JoinSet`, not loose `JoinHandle`s (PR #1282). If one shard's loop
+        // panics, the `expect` below unwinds. Dropping loose handles would
+        // then DETACH the siblings. They would keep inserting rows and holding
+        // connections until the 900s deadline, while later cells of the sweep
+        // are being measured. Dropping a `JoinSet` aborts what it owns, so the
+        // containment in `benches/e2e_bench.rs` actually contains.
         //
         // Each task also holds a `census` guard. Dropping the `JoinSet` on a
         // forced abort only requests cancellation, same as `Fleet`'s

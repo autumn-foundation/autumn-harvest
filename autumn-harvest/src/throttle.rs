@@ -30,9 +30,9 @@
 //! `harvest_rate_limit_buckets`, the same battle-tested machinery the activity
 //! rate limiter (#332) uses.
 //!
-//! **Defer, don't drop:** when the bucket is empty, the start is **durably
-//! deferred** — a row is written to `harvest_start_throttle` *before*
-//! `WorkflowStarted` is appended — and a background scanner
+//! **Defer, do not drop:** when the bucket is empty, the start is **durably
+//! deferred**. A row is written to `harvest_start_throttle` *before*
+//! `WorkflowStarted` is appended. A background scanner
 //! ([`fire_due_throttled_starts`]) admits it later as tokens refill. Nothing is
 //! dropped (contrast debounce, #499) and nothing is rejected (contrast
 //! `RejectDuplicate`).
@@ -413,11 +413,11 @@ pub enum ThrottleAdmission {
     /// workflow_id)` under a reuse policy that makes admission a no-op
     /// (`AllowDuplicate`, `RejectDuplicate`) or resolves against a
     /// non-terminal prior (`AllowDuplicateFailedOnly` when the existing row
-    /// isn't FAILED/CANCELLED). No token was reserved and no pending row was
-    /// written — the caller must proceed straight to
+    /// is not FAILED/CANCELLED). No token was reserved and no pending row was
+    /// written. The caller must proceed straight to
     /// `start_or_load_workflow_execution*`, which resolves the reuse policy
-    /// itself (returns the existing run, or rejects it under
-    /// `RejectDuplicate`).
+    /// itself. It returns the existing run, or rejects it under
+    /// `RejectDuplicate`.
     Bypassed,
 }
 
@@ -569,11 +569,11 @@ async fn pending_backlog_exists(
 /// original (retried) caller.
 ///
 /// A row already past its `schedule_to_start` deadline is never returned,
-/// even if the scanner hasn't dropped it yet (code review, issue #607) --
-/// otherwise a retry would land on a row the scanner is about to time out
-/// and delete without ever starting a workflow, reporting `Deferred` for a
-/// start that will never actually run. Ignoring it here lets the retry
-/// proceed to a genuinely fresh admission instead.
+/// even if the scanner has not dropped it yet (issue #607). Otherwise a retry
+/// would land on a row that the scanner is about to time out and delete
+/// without ever starting a workflow. The retry would then report `Deferred`
+/// for a start that never runs. Ignoring the row here lets the retry proceed
+/// to a genuinely fresh admission instead.
 #[cfg(feature = "db")]
 async fn existing_pending_throttle_for_workflow_id(
     conn: &mut diesel_async::AsyncPgConnection,
@@ -589,11 +589,11 @@ async fn existing_pending_throttle_for_workflow_id(
         #[diesel(sql_type = diesel::sql_types::Timestamptz)]
         deferred_at: DateTime<Utc>,
     }
-    // Exclude a row already past its schedule_to_start deadline even if the
-    // scanner hasn't deleted it yet (code review, issue #607): otherwise a
-    // retry lands on a row the scanner is about to drop without ever
-    // starting a workflow, silently reporting `Deferred` for a start that
-    // will never run.
+    // Exclude a row already past its schedule_to_start deadline, even if the
+    // scanner has not deleted it yet (issue #607). Otherwise a retry lands on
+    // a row that the scanner is about to drop without ever starting a
+    // workflow. It then silently reports `Deferred` for a start that never
+    // runs.
     let row: Option<Row> = diesel::sql_query(
         "SELECT throttle_key, deferred_at FROM harvest_start_throttle \
          WHERE workflow_name = $1 AND workflow_id = $2 \
@@ -870,7 +870,7 @@ async fn admit(
     // (0) Bypass entirely when an active execution already makes this
     // admission a no-op or an immediate reject under the caller's reuse
     // policy. TerminateIfRunning always starts fresh (cancel + replace), so
-    // it's excluded from the lookup and always proceeds to normal pacing.
+    // it is excluded from the lookup and always proceeds to normal pacing.
     let reuse_policy = params
         .start_options
         .reuse_policy
@@ -917,24 +917,24 @@ async fn admit(
     // (2) Ensure the bucket BEFORE either outcome below, backlog or not.
     //
     // It has to be before the FIFO guard, not inside its no-backlog branch
-    // (issue #1127, Codex review round 1 P1). Every path from here persists a
-    // dependent on this bucket — a reserved token, or a pending row the scanner
-    // will later debit — and the idle-bucket GC's anti-join can only see
-    // dependents that were already COMMITTED when it took its snapshot. On the
-    // append path the old code touched the bucket not at all: an observed
-    // backlog row that the scanner drops (a `schedule_to_start` stale-out
-    // debits no token) between the check and this insert leaves the sweep
-    // seeing an idle, full, dependent-free bucket, and the pending row we then
-    // commit references a bucket that no longer exists. `fire_claimed_throttle_row`
-    // fails closed on a missing bucket, so that start would sit deferred
-    // forever.
+    // (issue #1127). Every path from here persists a dependent on this bucket:
+    // a reserved token, or a pending row that the scanner later debits. The
+    // idle-bucket GC's anti-join can only see dependents that were already
+    // COMMITTED when it took its snapshot. On the append path the old code did
+    // not touch the bucket at all. Suppose the scanner drops an observed
+    // backlog row between the check and this insert. (A `schedule_to_start`
+    // stale-out debits no token.) The sweep then sees an idle, full,
+    // dependent-free bucket. The pending row that this transaction commits
+    // then references a bucket that no longer exists.
+    // `fire_claimed_throttle_row` fails closed on a missing bucket, so that
+    // start would sit deferred forever.
     //
-    // Ensuring here closes it the same way the enqueue path does: the
+    // Ensuring here closes it the same way the enqueue path does. The
     // registration touch locks any GC-eligible row for the rest of this
-    // transaction, so the sweep skips it (and an ensure that lost the race
-    // re-inserts the bucket). It is also a robustness win in its own right —
-    // the append path previously appended to a backlog whose bucket might not
-    // exist at all, which nothing would ever have created.
+    // transaction, so the sweep skips it. An ensure that lost the race
+    // re-inserts the bucket. It is also a robustness win in its own right. The
+    // append path previously appended to a backlog whose bucket might not
+    // exist at all, and nothing would ever have created it.
     ensure_throttle_bucket(conn, &key, params.refill_per_sec, params.burst).await?;
 
     // (3) FIFO fast-path guard: an existing backlog means we must append, not
@@ -1348,9 +1348,9 @@ async fn fire_claimed_throttle_row(
                 is_scheduled_fire && started.created,
             )))
         }
-        // The workflow_id is already taken under the reuse policy — drop the row
-        // (so the scanner doesn't retry a doomed start forever) and refund the
-        // reserved token (no run was admitted).
+        // The workflow_id is already taken under the reuse policy. Drop the row,
+        // so that the scanner does not retry a doomed start forever. Refund the
+        // reserved token, because no run was admitted.
         Err(crate::error::HarvestError::AlreadyExists { .. }) => {
             delete_throttle_row(conn, row_id).await?;
             crate::queue::refund_rate_limit_token(conn, &bucket).await?;
@@ -2022,9 +2022,9 @@ pub async fn throttle_backlog_by_key(
 /// scanner fires it. A caller enforcing a workflow-name-scoped concurrency
 /// bound (e.g. a schedule's `max_active_runs`/overlap policy, issue #241/#478)
 /// against a plain `COUNT(*) ... WHERE state IN ('RUNNING','PAUSED')` query
-/// would therefore under-count: a deferred fire is a logically in-flight run
-/// that just hasn't materialized yet, and omitting it lets the caller admit
-/// more concurrent runs than its own limit allows (code review, issue #607).
+/// would therefore under-count. A deferred fire is a logically in-flight run
+/// that has not materialized yet. Omitting it lets the caller admit more
+/// concurrent runs than its own limit allows (issue #607).
 /// Callers should add this count to their own running-count before
 /// comparing against a `max_active_runs`-style ceiling.
 ///

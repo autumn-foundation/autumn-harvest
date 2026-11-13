@@ -2291,9 +2291,9 @@ pub async fn fleet_health(
 ///
 /// `$1` = the staleness window in seconds, `$2` = the queue name.
 ///
-/// The predicate — a fresh `last_heartbeat_at` inside a caller-supplied window
-/// — is the same *shape* the poison-pill orphan reclaimer uses
-/// ([`crate::poison_pill::orphaned_running_tasks_query`]), but the **window is
+/// The predicate is a fresh `last_heartbeat_at` inside a caller-supplied
+/// window. It is the same *shape* the poison-pill orphan reclaimer uses
+/// ([`crate::poison_pill::orphaned_running_tasks_query`]). But the **window is
 /// not the same value**, and that divergence is deliberate.
 ///
 /// The reclaimer judges a row it is entitled to judge, with a window derived
@@ -2900,8 +2900,8 @@ async fn withdraw_unverified_worker_row(
 /// claim gate matching the outcome.
 ///
 /// Registration is atomic with the capability-miss invalidation, exactly as
-/// startup is: republishing this id without clearing the evidence it may still
-/// carry would make it affirmative fleet evidence against itself (issue #804).
+/// startup is (issue #804). Republishing this id without clearing the evidence
+/// it may still carry would make it affirmative fleet evidence against itself.
 /// This is also the retry that heals a startup registration whose invalidation
 /// failed and rolled the pair back.
 ///
@@ -3022,13 +3022,13 @@ async fn retry_pending_startup_registration(
             // likewise skipped for this tick; a worker that cannot register
             // is already invisible to the fleet.
             //
-            // Ageing out is not fast enough on its own (issue #804): the
-            // capability-miss fleet window is floored at
-            // 120 s, and for that whole window the surviving row is still
-            // read as a LIVE worker carrying this id's stale miss evidence
-            // — i.e. as a worker that has already missed — which is what
-            // lets a peer derive `AllLiveWorkersMissed`. So withdraw the
-            // row now rather than waiting for it to expire.
+            // Ageing out is not fast enough on its own (issue #804). The
+            // capability-miss fleet window is floored at 120 s. For that whole
+            // window the surviving row is still read as a LIVE worker that
+            // carries this id's stale miss evidence. So it reads as a worker
+            // that has already missed, and that lets a peer derive
+            // `AllLiveWorkersMissed`. So withdraw the row now rather than
+            // waiting for it to expire.
             //
             // Best-effort and deliberately narrow: a single-table DELETE
             // on `harvest_workers`, which can still succeed when the
@@ -3051,9 +3051,9 @@ async fn retry_pending_startup_registration(
 /// Execute one heartbeat DB tick: update `last_heartbeat_at`, handle
 /// re-registration / drain transitions, and refresh the drain deadline.
 ///
-/// `#[doc(hidden)] pub` so the reused-`worker_id` regression test can drive the real tick
-/// against a live database rather than a reimplementation of it — the defect it
-/// guards lives in this function's arm selection, so a test that recreated the
+/// `#[doc(hidden)] pub` so the reused-`worker_id` regression test can drive the
+/// real tick against a live database, not a reimplementation of it. The defect
+/// it guards lives in this function's arm selection. A test that recreated the
 /// arms would prove nothing.
 #[doc(hidden)]
 #[allow(clippy::too_many_arguments)]
@@ -3118,10 +3118,10 @@ pub async fn do_heartbeat_tick(
                 // the fan-out missed it (e.g. shard recovered after the drain was
                 // issued).  Guarded to Active rows only so it never reverts a row
                 // that already reached Draining or Stopped.
-                // Also write the current monotonic drain deadline so the
-                // dedup-by-freshest layer does not mask the effective drain
-                // window when this row's heartbeat is the most recent one
-                // (issue #522 review).
+                // Also write the current monotonic drain deadline (issue #522
+                // review). Then the dedup-by-freshest layer does not mask the
+                // effective drain window when this row's heartbeat is the most
+                // recent one.
                 let current_deadline = drain_deadline_max.lock().ok().and_then(|g| *g);
                 if let Err(error) =
                     transition_active_to_draining(conn, &registration.worker_id, current_deadline)
@@ -3425,9 +3425,9 @@ async fn sync_drain_deadline(
             .to_std()
             .unwrap_or(Duration::ZERO);
         let candidate = std::time::Instant::now() + remaining;
-        // Update the cell while still holding `max_guard`, so two shards observing
-        // distinct new deadlines concurrently cannot reorder their writes (lock
-        // order max_applied→cell is the only place both are held).
+        // Update the cell while still holding `max_guard`. Then two shards that
+        // observe distinct new deadlines concurrently cannot reorder their
+        // writes. Lock order max_applied→cell is the only place both are held.
         if let Ok(mut guard) = cell.lock() {
             *guard = Some(candidate);
         }

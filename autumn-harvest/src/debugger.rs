@@ -2634,14 +2634,14 @@ mod tests {
     ];
 
     /// `normalized_event_facts` strips per-run identity by **field name**, and
-    /// that list is hand-written — so an engine-minted field added to
-    /// `WorkflowEvent` later would silently start being compared verbatim,
-    /// making two independent recordings of one scenario diff as different.
+    /// that list is hand-written. An engine-minted field added to
+    /// `WorkflowEvent` later would silently start being compared verbatim.
+    /// Two independent recordings of one scenario would then diff as different.
     /// That noise buries the signal, as a missed `worker_id` once did.
     /// Re-derive the set from `event.rs` itself so the omission fails here
     /// instead.
     ///
-    /// The inverse direction matters just as much: a field the engine does
+    /// The inverse direction matters just as much. A field the engine does
     /// *not* mint must never be in the list, because normalizing a semantic
     /// field is a false clean. The `idempotency_key` (#521) field is the case
     /// that showed this.

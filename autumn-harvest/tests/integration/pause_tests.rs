@@ -1407,9 +1407,9 @@ async fn retry_path_requeues_when_a_concurrent_resume_shifted_the_deadline() {
 /// `wake_workflow_task_retries_after_losing_the_park_row_lock_race`. A hold
 /// connection takes the `FOR UPDATE` lock of the execution row in an explicit
 /// open `BEGIN`. A second connection queues the *real*
-/// `pause_workflow_execution` behind it. The hold is released only after the
-/// retryable failure of this attempt has passed the gate (reading the still
-/// committed-RUNNING snapshot) and blocked on the row lock. So the pause
+/// `pause_workflow_execution` behind it. The retryable failure of this attempt
+/// first passes the gate, which reads the still committed-RUNNING snapshot. It
+/// then blocks on the row lock. Only then is the hold released. So the pause
 /// commits first in the lock queue. The timeout transaction then observes a
 /// now-PAUSED execution whose row deadline IS exceeded. Only the
 /// in-transaction PAUSED re-check can save the task from being
@@ -1490,16 +1490,17 @@ fn self_pausing_activity<'a>(
 #[allow(clippy::too_many_lines)]
 async fn retry_path_requeues_when_a_concurrent_pause_committed_after_the_gate() {
     // Issue #609 hardening: the `owning_execution_is_paused` gate of the
-    // retry path is a non-locking read taken BEFORE
+    // retry path is a non-locking read. It is taken BEFORE
     // `record_schedule_to_close_activity_timeout` opens its transaction and
     // takes the execution row lock. A pause committing in that gap used to
     // be deadline-failed anyway (the transaction only re-checked task state
     // and the row-current deadline). That violated the
     // pause-suspends-schedule_to_close contract for the race window. The
     // authoritative PAUSED re-check under the execution row lock is the
-    // guarantee. This test constructs the race window: the activity itself
-    // queues a real pause of its own execution behind a held row lock
-    // mid-attempt (released only after the failure reaches the retry path).
+    // guarantee. This test constructs the race window. Mid-attempt, the
+    // activity itself queues a real pause of its own execution behind a held
+    // row lock. The lock is released only after the failure reaches the retry
+    // path.
     // Both the claim-time snapshot deadline AND the row-current deadline are
     // exceeded. So neither the snapshot gate nor the resume-shift staleness
     // re-check can save the task, only the new PAUSED re-check.

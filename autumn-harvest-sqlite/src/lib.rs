@@ -650,10 +650,10 @@
 //!
 //! There is deliberately **no import/seed-a-foreign-history API**. The
 //! cross-backend guarantee (a history written here replays on the core engine) is
-//! export-shaped and needs none. A future edge → hub sync path that ingests an
-//! in-flight history would have to rebuild the derived task/timer rows from any
-//! open scheduled work, or reject such histories, so that no run wedges. That is
-//! a follow-up.
+//! export-shaped and needs none. A future edge → hub sync path could ingest an
+//! in-flight history. It would then have to rebuild the derived task/timer rows
+//! from any open scheduled work, or reject such histories, so that no run
+//! wedges. That is a follow-up.
 //!
 //! # Updates (issue #2025)
 //!

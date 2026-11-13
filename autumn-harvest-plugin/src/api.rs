@@ -19104,8 +19104,8 @@ pub(crate) async fn start_workflow(
     // execution. The plain / keyed (#808) start calls below pass
     // `Some(GateMode::Check)`; a blocked fresh admission returns
     // `HarvestError::AdmissionBlocked` (recorded once by the primitive) which the
-    // match arms map to `503`. This removed the round-20/21 unlocked pre-read gate
-    // decision (which had a residual seal-under-lock TOCTOU) entirely. The
+    // match arms map to `503`. This replaced an earlier unlocked pre-read gate
+    // decision entirely. That decision had a residual seal-under-lock TOCTOU. The
     // debounce / batch / throttle mutual-exclusion 400s and the #808 committed-
     // replay probe above are unaffected. NOTE: the auto-generated-workflow_id and
     // throttle paths reach the same gated plain/keyed start below.
@@ -20264,7 +20264,7 @@ pub(crate) async fn start_workflow(
         // pending throttle row) — is NOT a fresh admission (`reserve_or_defer`
         // resolves it to the existing run / same pending row without inserting
         // anything new), so the gate must not block it (preserves #808
-        // keyed-replay and the round-7 pending-throttle-row bypass). The bypass
+        // keyed-replay and the pending-throttle-row bypass). The bypass
         // is reuse-policy-AWARE (Codex P1): a policy that genuinely CREATES a
         // fresh execution on retry — `AllowDuplicateFailedOnly` over a
         // FAILED/CANCELLED prior, or `TerminateIfRunning` — is a real admission
@@ -20881,8 +20881,9 @@ pub(crate) async fn start_workflow(
     // issue #618 (PR #1014): the admission gate is enforced AUTHORITATIVELY inside
     // the core start primitive. `Some(GateMode::Check)` makes `_collect` apply the
     // gate at the point — under a `FOR UPDATE` lock on any prior run — where it
-    // decides it will CREATE a new execution, closing the entire unlocked-pre-read
-    // TOCTOU class (incl. the round-20 seal-under-lock race) in one place. A blocked
+    // decides it will CREATE a new execution. That closes the entire
+    // unlocked-pre-read TOCTOU class in one place, including the race where a
+    // prior run seals between an unlocked read and the create. A blocked
     // fresh admission returns `HarvestError::AdmissionBlocked` (recorded once by the
     // primitive), handled by the `match result` arm below as `503`. An idempotent
     // attach admits nothing and is never gated (returns the existing run). This path
@@ -20992,12 +20993,12 @@ pub(crate) async fn start_workflow(
                 idempotency_key: None,
                 status: STATUS_FAILED,
                 error_summary: Some("quota exceeded"),
-                // Codex round-5 review: routing has already resolved `shard`
-                // and this audit row is written on that shard's own
-                // connection, matching every other failure arm here (and the
-                // signal-with-start/update-with-start quota arms) -- record
-                // it so a quota incident is attributable by shard in the
-                // audit trail precisely where enforcement is shard-local.
+                // Routing has already resolved `shard`, and this audit row is
+                // written on the connection of that shard. Every other failure
+                // arm here (and the signal-with-start/update-with-start quota
+                // arms) does the same. Record it so a quota incident is
+                // attributable by shard in the audit trail, precisely where
+                // enforcement is shard-local.
                 shard_id: Some(shard.as_i32()),
                 source: &source,
             };
@@ -24784,7 +24785,7 @@ const fn rerun_failure_record<'a>(
 /// silently no-ops), and on a multi-shard deployment the pool-acquiring form
 /// lands the row on the DEFAULT shard instead of the execution's own. Mirrors
 /// the connection-threading `audit_decoded_read` adopted for the same reason
-/// (issue #608 round 2).
+/// (issue #608).
 async fn audit_rerun_failure_on(
     conn: &mut AsyncPgConnection,
     ctx: &RerunAuditCtx<'_>,
@@ -27976,7 +27977,7 @@ async fn hydrate_or_project(
         runtime.registry.shared_state(),
         runtime.registry.history_policy(),
     )
-    // Issue #772 (round 6): thread the execution row's execution_timeout /
+    // Issue #772: thread the execution row's execution_timeout /
     // deadline_at into the query replay context. A workflow with an
     // execution_timeout records a `__harvest_deadline_probe` side-effect whenever
     // it calls `should_continue_as_new()`; without the budget threaded here,
@@ -28853,7 +28854,7 @@ async fn list_schedules(
     // Best-effort: load the most recent backfill log row for each schedule.
     let recent_backfills = load_recent_backfills(&api_state, &schedule_ids).await;
     // Shard-local overdue inputs (at-capacity §2 + calendar-adjusted fire time,
-    // issue #696 / Codex round 3), keyed by schedule id so the read agrees with
+    // issue #696), keyed by schedule id so the read agrees with
     // the gauge and the tick.
     let overdue_aux = load_schedule_overdue_aux_by_shard(&api_state).await;
     // issue #743 AC9: resolved once (not per row) and threaded through so the
@@ -28928,7 +28929,7 @@ async fn get_schedule(
     // Computed shard-locally on the schedule's OWN shard (issue #696 §2), so the
     // read agrees with the gauge and the tick — never a cross-shard sum.
     let mut at_capacity = false;
-    // Calendar-adjusted fire time (Codex round 3), resolved on the same shard.
+    // Calendar-adjusted fire time (issue #696), resolved on the same shard.
     let mut effective_fire_at: Option<chrono::DateTime<chrono::Utc>> = None;
     for (_shard, shard_pool) in pool.iter_shards() {
         let mut conn = acquire_conn(shard_pool).await?;
@@ -29567,7 +29568,7 @@ async fn upsert_workflow_schedule_and_read_back(
     // capacity would otherwise report `overdue == true` here (the hardcoded
     // `false` skipped the at-capacity suppression) while the list/get reads and
     // the `harvest.schedule.overdue` gauge correctly suppress it to `false` —
-    // breaking the read == gauge == tick invariant (issue #696, Codex round 2).
+    // breaking the read == gauge == tick invariant (issue #696).
     // Reuse the single-source `scheduler::schedule_running_basis` (shard-local
     // `RUNNING`/`PAUSED` count, cross-type #1160 successors of this schedule_id
     // included, + #607 pending-throttle backlog) that list/get use; a count
@@ -29580,7 +29581,7 @@ async fn upsert_workflow_schedule_and_read_back(
     let at_capacity = autumn_harvest::scheduler::schedule_running_basis(conn, name, row.id)
         .await
         .is_ok_and(|basis| basis >= i64::from(row.max_active_runs));
-    // Calendar-adjusted fire time (Codex round 3), resolved on the same shard
+    // Calendar-adjusted fire time (issue #696), resolved on the same shard
     // conn, so a re-registered calendar-deferred schedule is not falsely flagged.
     let effective_fire_at = autumn_harvest::scheduler::resolve_effective_fire_at(
         conn,
@@ -29940,7 +29941,7 @@ fn schedule_entry_from_row(
     // The exclusions mirror the scheduler tick's exact semantics (Codex P2-A/B):
     // bounded-out from raw end_at/max_runs/runs_started (not just exhausted_at),
     // and the at-capacity suppression is gated to the tick's deferring config
-    // (Skip + catchup). The caller-resolved `effective_fire_at` (Codex round 3)
+    // (Skip + catchup). The caller-resolved `effective_fire_at`
     // carries the tick's calendar rebasing so a schedule deferred to a future
     // business day is not falsely flagged overdue.
     let overdue_schedule = s
@@ -30049,8 +30050,7 @@ struct ScheduleOverdueAux {
 
 /// Build a per-schedule overdue-aux map (keyed by schedule id) for the overdue
 /// read's §2 suppression + calendar deferral, computed **shard-locally** so the
-/// read agrees with the gauge and the tick (issue #696 review BLOCKER 1+2 +
-/// Codex round 3).
+/// read agrees with the gauge and the tick (issue #696).
 ///
 /// A schedule row lives on exactly one shard, and the scheduler tick enforces
 /// `max_active_runs` shard-locally: it holds `next_run_at` in the past only when
@@ -30150,7 +30150,7 @@ async fn load_schedule_overdue_aux_by_shard(
             // successors of this schedule_id included, + #607 pending throttle).
             let at_capacity =
                 basis.get(&s.id).copied().unwrap_or(0) >= i64::from(s.max_active_runs);
-            // Calendar-adjusted fire time (Codex round 3), computed in-memory
+            // Calendar-adjusted fire time (issue #696), computed in-memory
             // against this shard's preloaded exclusions map -- or the raw
             // anchor (`None`) if that load failed, never a silent "no
             // exclusions" guess.
@@ -30623,7 +30623,7 @@ async fn update_schedule_handler(
                 .map(BackfillSummary::from);
             // A non-cadence patch preserves `next_run_at`, so the row may still
             // be overdue; compute the shard-local overdue inputs (at-capacity §2 +
-            // calendar-adjusted fire time, #696 / Codex round 3) so the field is
+            // calendar-adjusted fire time, #696) so the field is
             // accurate. Keyed by id from the same shard-local pass the read uses,
             // so it agrees with the gauge.
             let aux = load_schedule_overdue_aux_by_shard(&api_state)
@@ -31798,7 +31798,7 @@ async fn trigger_schedule_now(
                 per.max(runtime.registry.max_workflow_input_bytes)
             });
         // Mirrors the size-check-ordering fix applied at every other call
-        // site (issue #607 round 4): skip the cap check when
+        // site (issue #607): skip the cap check when
         // `reserve_or_defer` would resolve via `Bypassed` or an idempotent
         // attach to an already-pending row. `workflow_id` here is always
         // freshly generated per request, so this is mostly defensive, but
@@ -33302,7 +33302,7 @@ pub(crate) async fn schedule_backfill_inner(
                 // deferral) and is admitted later by the throttle scanner. Mirrors
                 // `tick_one_workflow_schedule`'s throttle block (scheduler.rs) and
                 // the size-check-ordering fix applied there and at the other three
-                // call sites (issue #607 round 4).
+                // call sites (issue #607).
                 let mut backfill_throttle_bucket: Option<String> = None;
                 if let Some((throttle_policy, resolved_throttle_key)) =
                     workflow_resolving_throttle(&runtime.registry, &wf_name, &input)
@@ -36837,7 +36837,7 @@ async fn get_start_throttle_pacing_override(
         Err(e) => return e.into_response(),
     };
 
-    // Issue #945 review (round 4, P2): the previous merge picked a single
+    // Issue #945: the previous merge picked a single
     // "representative" row across shards by raw `tokens` count alone --
     // e.g. `existing.tokens <= b.tokens => existing`. That is the right
     // heuristic for `list_rate_limits`'s worst-case-capacity diagnostic, but
@@ -36901,8 +36901,8 @@ async fn get_start_throttle_pacing_override(
     // multi-shard override report a false "disagreement". Instead defer to
     // `queue::pacing_shards_disagree`, comparing each shard's *resolved
     // effective* `(refill_rate, burst)` rather than the raw
-    // `override_refill_rate`/`override_burst` columns (issue #945 review,
-    // round 5): a partial legacy `POST /admin/rate-limits/{key}` fan-out
+    // `override_refill_rate`/`override_burst` columns (issue #945): a
+    // partial legacy `POST /admin/rate-limits/{key}` fan-out
     // (issue #332) can leave shards with divergent persisted BASELINES, so
     // two shards can carry byte-identical override columns yet enforce
     // genuinely different pacing once an omitted override field falls back
@@ -37700,7 +37700,7 @@ async fn list_rate_limits(
     // partial write or an outage recovery. Collect EVERY shard's row per key
     // -- not just a single "representative" pick -- so cross-shard override
     // disagreement can be detected rather than silently hidden behind
-    // whichever shard's row happened to be kept (issue #945 review, round 5).
+    // whichever shard's row happened to be kept (issue #945).
     let mut per_key: std::collections::BTreeMap<String, Vec<RateLimitBucket>> =
         std::collections::BTreeMap::new();
 
@@ -37728,7 +37728,7 @@ async fn list_rate_limits(
 
 /// Merges one key's per-shard `RateLimitBucket` rows into a single
 /// [`RateLimitBucketView`], reporting cross-shard override disagreement
-/// (issue #945 review, round 5) alongside the pre-existing worst-case
+/// (issue #945) alongside the pre-existing worst-case
 /// (lowest-tokens) representative-row selection.
 ///
 /// `shard_count` is the number of reachable shards queried by
@@ -37777,14 +37777,14 @@ fn build_rate_limit_bucket_view(
     let disagreement = queue::pacing_shards_disagree(&effective_per_shard);
 
     // Representative row: prefer an ACTIVE override row whenever any shard
-    // has one -- an operator scanning this list for "which keys are
-    // currently overridden right now?" must never silently miss one just
-    // because a *different*, non-overridden shard happened to have fewer
-    // tokens (issue #945 review, round 5; mirrors
-    // `get_start_throttle_pacing_override`'s round-4 fix). Among a
-    // homogeneous set (all active, or all inactive), keep the pre-existing
-    // worst-case (lowest tokens) heuristic so operators still see the most
-    // depleted shard rather than an optimistically full one.
+    // has one. An operator scanning this list for "which keys are currently
+    // overridden right now?" must never silently miss one just because a
+    // *different*, non-overridden shard happened to have fewer tokens
+    // (issue #945). This mirrors the active-override preference of
+    // `get_start_throttle_pacing_override`. Among a homogeneous set (all
+    // active, or all inactive), keep the pre-existing worst-case (lowest
+    // tokens) heuristic. Operators then still see the most depleted shard
+    // rather than an optimistically full one.
     let is_active =
         |b: &RateLimitBucket| b.override_expires_at.is_some_and(|expires| expires > now);
     #[expect(clippy::expect_used, reason = "callers pass a non-empty `rows`")]
@@ -38112,7 +38112,7 @@ impl PacingOverrideResponse {
 /// consumer parsing e.g. `entry["burst"]` keeps working -- plus four new
 /// computed fields: `override_active`, `effective_refill_rate`,
 /// `effective_burst` resolve what dispatch is actually enforcing right now;
-/// `shard_disagreement` (round 5) reports whether the fleet's shards
+/// `shard_disagreement` reports whether the fleet's shards
 /// disagree on that state.
 ///
 /// This is purely additive on top of the raw `RateLimitBucket` shape;
@@ -38139,7 +38139,7 @@ struct RateLimitBucketView {
     /// `override_active`, else the declared baseline `burst`.
     effective_burst: f64,
     /// Whether the shards backing this key's rows disagree on override
-    /// state or resolved effective pacing (issue #945 review, round 5).
+    /// state or resolved effective pacing (issue #945).
     /// `false` for a single-shard row on its own -- this field is only ever
     /// set `true` by [`build_rate_limit_bucket_view`], which has the
     /// multi-shard context [`From<RateLimitBucket>`] lacks. When `true`,
@@ -44516,7 +44516,7 @@ fn workflow_list_query(
 /// this exact function rather than a second copy of the rule: iterating only
 /// `pool.iter_shards()` there would give a router-known-but-poolless shard no
 /// future at all, so it could never be reported unreadable — the same
-/// presence-vs-coverage gap, reached from the UI side (issue #619 round 11).
+/// presence-vs-coverage gap, reached from the UI side (issue #619).
 pub(crate) fn resolve_expected_shard_pools<'a>(
     expected: &std::collections::BTreeSet<i32>,
     pools: &'a BTreeMap<i32, DbPool>,
@@ -45694,7 +45694,7 @@ async fn export_history_candidate(
         Err(error) => {
             // This candidate was already *selected*, so an unhealthy-shard note
             // alone would leave `export_failures = 0` and let a bundle holding a
-            // silently biased subset exit 0 (Codex round-11 P1).
+            // silently biased subset exit 0.
             work.note_dropped_candidate(shard_id, &exec_id, &error.to_string());
             return;
         }
@@ -52977,12 +52977,12 @@ async fn evaluate_eligibility_for_shard(
             effective_tokens: f64,
         }
 
-        // Issue #945 review (round 4, P2): this used to re-derive "tokens
+        // Issue #945: this used to re-derive "tokens
         // available right now" in Rust via a flat `elapsed *
         // effective.refill_rate`, applying whichever rate is effective AT
         // THE MOMENT OF THE READ to the WHOLE elapsed interval. That is
         // exactly the class of bug `queue::token_accrual_expr` was written
-        // to fix (issue #945 round-1 P1) for the claim-time SQL gate: once
+        // to fix (issue #945) for the claim-time SQL gate: once
         // an operator override has expired mid-interval with no intervening
         // write to settle the bucket, retroactively applying the reverted
         // baseline rate to the portion of the interval the override was
@@ -54210,8 +54210,7 @@ mod tests {
         assert_eq!(fields["override"], Value::Null);
     }
 
-    // ── issue #811 (Codex round 1, P2): activity concurrency groups always defer
-    // ───────────────────────────────────────────────────────────────────────
+    // ── issue #811: activity concurrency groups always defer ────────────────
 
     /// Latest-wins is a *workflow-start* admission control: the supersede runs
     /// inside `start_or_load_workflow_execution_collect` and sheds workflow
@@ -54717,7 +54716,7 @@ mod tests {
     /// A pause must be REFUSED for an activity registered `local = true`, and
     /// still ALLOWED for an unregistered name.
     ///
-    /// Issue #807 review, Codex round 16. A local activity runs inline on the
+    /// Issue #807. A local activity runs inline on the
     /// workflow worker and never takes a `harvest_task_queue` row, so the
     /// claim-path gate this feature is built on can never hold one. The pause
     /// route nevertheless wrote its rows and answered `ok: true` /
@@ -55438,13 +55437,13 @@ mod tests {
         }
     }
 
-    /// issue #618 (F-round22): after a create's post-mutation full reload FAILS,
-    /// `reconcile_gate_cache_after_mutation` arms fail-closed so `check()` (the
-    /// API / fresh-admission path, retryable) blocks EVERY start — including one
-    /// that does not match this replica's local write-through delta — protecting
-    /// against a missing other-replica gate while the gate table is unreadable.
-    /// The round-16 write-through is retained: `check_cached` (completion triggers,
-    /// non-retryable) ignores the fail-closed flag (round 3) and still honours the
+    /// issue #618: after a create's post-mutation full reload FAILS,
+    /// `reconcile_gate_cache_after_mutation` arms fail-closed. So `check()` (the
+    /// API / fresh-admission path, retryable) blocks EVERY start, including one
+    /// that does not match the local write-through delta of this replica. That
+    /// protects against a missing other-replica gate while the gate table is
+    /// unreadable. The write-through is retained: `check_cached` (completion
+    /// triggers, non-retryable) ignores the fail-closed flag and still honours the
     /// delta, so no in-flight work is permanently dropped. A successful reload
     /// recovers.
     #[test]
@@ -55452,9 +55451,9 @@ mod tests {
         use autumn_harvest::admission_gate::sentinel_gate_id;
         use autumn_harvest::{AdmissionGate, AdmissionGateCache};
 
-        // RED baseline (the round-21 handler Err-arm behaviour: write-through delta
-        // only, NO fail-closed) — check() reads the initialized snapshot and ADMITS
-        // a non-matching start, the leak this round closes.
+        // RED baseline (the earlier handler Err-arm behaviour: write-through delta
+        // only, NO fail-closed). check() reads the initialized snapshot and ADMITS
+        // a non-matching start. Fail-closed closes that leak.
         let leak = AdmissionGateCache::new();
         leak.refresh(vec![]); // initialized, empty
         leak.apply_created(queue_gate()); // delta only, no set_fail_closed
@@ -57616,7 +57615,7 @@ mod tests {
         );
     }
 
-    /// Codex P2 finding (issue #605/#777 review, PR #1152): during the
+    /// Issue #605/#777 (PR #1152): during the
     /// plugin-startup boot window (storage pool installed, `install(runtime)`
     /// not yet complete) `rerun_workflow`'s runtime lookup returned an error
     /// WITHOUT writing the failed `workflow.rerun` audit row -- unlike every
@@ -57780,7 +57779,7 @@ mod tests {
         Some((database_url, container))
     }
 
-    // ── #798 round 14: the exported deadline is re-read, never trusted ──────
+    // ── #798: the exported deadline is re-read, never trusted ───────────────
 
     /// Candidate discovery and the per-candidate history fetch are separate
     /// round-trips, and `deadline_at` moves in between when a `PAUSED`
@@ -58687,7 +58686,7 @@ mod tests {
     ///
     /// Recording only the shard note let a bundle with at least one survivor
     /// replay clean and exit `0` while silently omitting selected executions —
-    /// a biased subset presented as a passing gate (Codex round-11 P1). The
+    /// a biased subset presented as a passing gate. The
     /// reacquire race that triggers this is not injectable in a DB test, so the
     /// decision is pinned here instead.
     #[test]
@@ -60719,7 +60718,7 @@ mod tests {
     }
 
     /// The forward dispatch of node `a`, which is what makes the compensation
-    /// envelope's `dag_compensate` corroborate (issue #780 round 4: the
+    /// envelope's `dag_compensate` corroborate (issue #780: the
     /// corroboration is *dispatch*, not completion).
     fn forward_dispatch_event(name: &str) -> autumn_harvest::WorkflowEvent {
         autumn_harvest::WorkflowEvent::ActivityScheduled {
@@ -60776,7 +60775,7 @@ mod tests {
     }
 
     /// An offload reference that survives the pass must FAIL the retry, not
-    /// silently pass through as an opaque payload (issue #780 round 9).
+    /// silently pass through as an opaque payload (issue #780).
     ///
     /// The reachable shape is a *configuration removal*: a deployment that had a
     /// `PayloadStore` registered offloaded an oversized compensation envelope,
@@ -60820,7 +60819,7 @@ mod tests {
     }
 
     /// The default deployment — no payload store, no offloaded payloads — must
-    /// stay byte-for-byte on the pre-round-9 path.
+    /// stay byte-for-byte on the path that predates the surviving-reference check.
     #[tokio::test]
     async fn a_plain_history_still_passes_with_no_store_configured() {
         let codecs = autumn_harvest::payload_codec::PayloadCodecs::default();
@@ -60910,7 +60909,7 @@ mod tests {
         }
     }
 
-    // ── issue #809 / PR #1188 round 6: decode exactly what is surfaced ─────
+    // ── issue #809 / PR #1188: decode exactly what is surfaced ──────────────
     //
     // The per-row activity facts carry `last_error` RAW so a LOSING row's
     // encrypted error is never decrypted and never written to the
@@ -63331,8 +63330,9 @@ mod tests {
             "a worker on another build must not be rejected on OUR registry's requirement"
         );
 
-        // Control 1 -- round 11 preserved. A worker on the SAME build is still
-        // gated by the fallback, because our registry does describe its handler.
+        // Control 1 -- the registry fallback (issue #809) still applies. A worker
+        // on the SAME build is still gated by the fallback, because the local
+        // registry does describe its handler.
         let same_build = vec![eligibility_worker(
             "w-new",
             &["payments"],
@@ -63430,8 +63430,8 @@ mod tests {
             "",
         ));
 
-        // Vacuously TRUE for no eligible workers (issue #1190 review round
-        // 2): with no candidate worker there is no OTHER build to disagree
+        // Vacuously TRUE for no eligible workers (issue #1190): with no
+        // candidate worker there is no OTHER build to disagree
         // with, and `contributing_reason_codes` still needs a genuine
         // rate-limit fact to survive even when `activity_no_worker` wins the
         // headline verdict.

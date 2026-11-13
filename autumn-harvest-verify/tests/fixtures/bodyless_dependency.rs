@@ -1,5 +1,5 @@
-//! Fixture: a body-less callee from a dependency
-//! that was never asked for MIR must NOT be trusted just because a type at the
+//! Fixture: a body-less callee from a dependency that was never asked for MIR.
+//! It must NOT be trusted just because a type at the
 //! call site is std-rooted.
 //!
 //! Compiled standalone (no workspace deps) with, from this directory:

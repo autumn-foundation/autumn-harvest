@@ -1582,7 +1582,7 @@ async fn rerun_clones_start_params_verbatim() {
     // `completion_callbacks` against the live SSRF policy, so this app must
     // allowlist the seeded target — `build_app`'s default empty allowlist
     // would otherwise reject it and this test would exercise R-64's
-    // rejection path instead of the verbatim-clone path it's named for.
+    // rejection path instead of the verbatim-clone path it is named for.
     let app = build_app_allowing_hook_example(&pool, vec![plain_info(wf)]);
     let mut conn = pool.get().await.unwrap();
 
@@ -3664,8 +3664,8 @@ async fn concurrent_reruns_of_one_source_start_exactly_one_run() {
 /// Pinned with a SIZE-1 pool, which is what makes the assertion load-bearing:
 /// the previous pool-acquiring form asked for a second connection while this
 /// handler still held the only one, so the checkout blocked until the pool
-/// timeout and the audit was silently dropped (`let _ =`). Mirrors the #608
-/// round-2 `decode_audit_reuses_callers_connection_under_single_connection_pool`.
+/// timeout and the audit was silently dropped (`let _ =`). Mirrors the #608 test
+/// `decode_audit_reuses_callers_connection_under_single_connection_pool`.
 #[tokio::test]
 async fn failure_audits_ride_the_callers_connection_under_a_size_one_pool() {
     let (url, _c) = setup_database().await;

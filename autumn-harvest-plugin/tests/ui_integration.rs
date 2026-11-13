@@ -4282,10 +4282,10 @@ async fn ui_schedules_pause_redirect_resolves_to_the_list() {
     );
 }
 
-/// An auto-paused schedule (#360 sets `auto_paused_at`
-/// **without** `is_paused`) must be resumable from Vantage — per row and in
-/// bulk — and the resume must clear the auto-pause state the way the API's does,
-/// or the next tick immediately re-pauses it.
+/// An auto-paused schedule (#360 sets `auto_paused_at` **without**
+/// `is_paused`) must be resumable from Vantage, per row and in bulk. The resume
+/// must clear the auto-pause state the way the API's does, or the next tick
+/// immediately re-pauses it.
 #[tokio::test]
 async fn ui_schedules_auto_paused_row_can_be_resumed() {
     let (database_url, _container) = setup_test_database_url().await;
@@ -4391,9 +4391,9 @@ async fn ui_schedules_bulk_resume_reaches_auto_paused_rows() {
     );
 }
 
-/// The preview drill-down must render for a schedule on a
-/// healthy shard even when an earlier shard is unreachable — the resilient
-/// resolver found the row, so a second fragile lookup must not undo that.
+/// The preview drill-down must render for a schedule on a healthy shard even
+/// when an earlier shard is unreachable. The resilient resolver found the row,
+/// so a second fragile lookup must not undo that.
 #[tokio::test]
 async fn ui_schedules_preview_survives_an_unreachable_earlier_shard() {
     let (good_url, _container) = setup_test_database_url().await;
@@ -6516,14 +6516,13 @@ async fn workflow_detail_ui_renders_decoded_input() {
     // envelope-bearing timeline event, a pending activity whose stored
     // heartbeat checkpoint is an envelope, and an unconsumed signal whose
     // payload is an envelope. The panel renders the checkpoint and the
-    // timeline renders each event's data; the blocked-on activity *input*
+    // timeline renders each event's data. The blocked-on activity *input*
     // and signal *payload* are never rendered, so they are deliberately NOT
-    // decoded (PR #936) — their plaintext must not appear
-    // anywhere in the page.
+    // decoded (PR #936). Their plaintext must not appear anywhere in the page.
     {
         // `load_history_undecoded`: the seeded `WorkflowStarted` input is a
-        // "reverse"-codec envelope, and the strict `load_history` (identity-only
-        // registry) hard-errors `UnknownPayloadCodec` on it — the exact
+        // "reverse"-codec envelope. The strict `load_history` (identity-only
+        // registry) hard-errors `UnknownPayloadCodec` on it, which is the
         // strict-loader behavior PR #936 documented. The raw loader is
         // the correct fixture tool for reading `next_event_id` here.
         let history = autumn_harvest::store::load_history_undecoded(&mut conn, exec_id)
@@ -6743,11 +6742,11 @@ async fn rejected_signal_render_attributes_decode_audit_to_the_post_route() {
     );
 }
 
-/// Issue #608 / PR #936: a detail render whose *only* envelopes live
-/// in fields the page never displays — the pending-activity `input`, the
-/// pending-signal payload, and the attempts/signals panel event copies
-/// (isolated from the timeline via `?event_page=1`) — must do zero decode
-/// work and write NO `payload.decode_read` audit row.
+/// Issue #608 / PR #936: a detail render whose *only* envelopes live in fields
+/// the page never displays must do zero decode work. It must write NO
+/// `payload.decode_read` audit row. Those fields are the pending-activity
+/// `input`, the pending-signal payload, and the attempts/signals panel event
+/// copies (isolated from the timeline via `?event_page=1`).
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
 async fn workflow_detail_ui_writes_no_audit_row_when_only_hidden_fields_carry_envelopes() {

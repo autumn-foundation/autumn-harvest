@@ -145,7 +145,7 @@ async fn chaos_db() -> (
     Option<ContainerAsync<Postgres>>,
 ) {
     // Held for the caller's whole body (bound as `_body`): serialises shared-DB
-    // access across chaos tests, so a concurrent test's scrub can't erase this
+    // access across chaos tests, so a concurrent test's scrub cannot erase this
     // test's live workflows. Must be acquired before the scrub below.
     let body = DB_BODY_SERIAL.lock().await;
     if let Ok(url) = std::env::var("HARVEST_TEST_DATABASE_URL") {

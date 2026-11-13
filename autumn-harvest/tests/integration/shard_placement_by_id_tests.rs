@@ -1716,7 +1716,7 @@ async fn outbox_does_not_wait_on_a_peer_shard_whose_query_never_answers() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// 7. Codex round 1 regressions
+// 7. Regression: the fan-out never waits on a busy peer shard
 // ─────────────────────────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -1727,13 +1727,13 @@ async fn outbox_does_not_wait_on_a_peer_shard_whose_only_connection_is_busy() {
     autumn_harvest::shard::install_global_router(router.clone());
     let _topology = GlobalTopologyGuard::new(shards.pools[&ShardId::new(0)].clone());
 
-    // Codex round 1 P1: `Worker` spawns one timeout checker per assigned shard,
-    // and each holds its own shard pool's connection for the whole
-    // `enforce_timeouts_once` pass. With one connection per pool, checker 0
-    // waiting on pool 1 while checker 1 waits on pool 0 is a circular wait.
-    // Bounding it at `SHARD_ACQUIRE_BOUND` (5s) made it survivable but still
-    // cost both scanners that stall on every tick; `FANOUT_ACQUIRE_BOUND` makes
-    // the fan-out decline to wait at all, so the cycle cannot form.
+    // `Worker` spawns one timeout checker per assigned shard. Each holds its own
+    // shard pool's connection for the whole `enforce_timeouts_once` pass. With
+    // one connection per pool, checker 0 waiting on pool 1 while checker 1
+    // waits on pool 0 is a circular wait. A bound at `SHARD_ACQUIRE_BOUND` (5s)
+    // made it survivable, but both scanners still stalled on every tick.
+    // `FANOUT_ACQUIRE_BOUND` makes the fan-out decline to wait at all, so the
+    // cycle cannot form.
     //
     // Modelled here by holding shard 1's only connection for the whole sweep —
     // standing in for the peer checker that would be holding it.
@@ -1806,7 +1806,7 @@ async fn outbox_does_not_wait_on_a_peer_shard_whose_only_connection_is_busy() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// 8. Codex round 2 regressions
+// 8. Regressions: a by-id cancel over a partial view
 // ─────────────────────────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -1821,8 +1821,8 @@ async fn outbox_cancel_by_id_withholds_its_terminal_while_a_shard_is_uninspected
     autumn_harvest::shard::install_global_router(router.clone());
     let _topology = GlobalTopologyGuard::new(shards.pools[&ShardId::new(0)].clone());
 
-    // Codex round 2 P1. `ExternalCancelDelivered` asserts something about the
-    // whole business key — "nothing is running under it". Uniqueness is
+    // `ExternalCancelDelivered` asserts something about the whole business
+    // key: "nothing is running under it". Uniqueness is
     // shard-local, so a shard that could not be inspected may hold another live
     // run this cancellation never touched. Recording success over a partial view
     // durably closes the request and the outbox never looks again.
@@ -1992,7 +1992,7 @@ async fn outbox_cancel_by_id_reports_once_every_shard_can_be_inspected() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// 9. Codex round 3 regression: two live runs of one key
+// 9. Regression: two live runs of one key
 // ─────────────────────────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -2003,14 +2003,14 @@ async fn outbox_cancel_by_id_cancels_every_live_copy_before_reporting() {
     autumn_harvest::shard::install_global_router(router.clone());
     let _topology = GlobalTopologyGuard::new(shards.pools[&ShardId::new(0)].clone());
 
-    // Codex round 3 P1. `(workflow_name, workflow_id)` uniqueness is shard-local,
-    // so pinning a key to one shard (#697) while an unpinned start of the same
-    // key hashes to another produces TWO live runs that no single shard's unique
-    // index can see. A complete fan-out sees both; the ranking picks the most
+    // `(workflow_name, workflow_id)` uniqueness is shard-local. Suppose a key is
+    // pinned to one shard (#697) while an unpinned start of the same key hashes
+    // to another. That produces TWO live runs that no single shard's unique
+    // index can see. A complete fan-out sees both. The ranking picks the most
     // recently started as the current run. Cancelling only that one and
-    // recording `ExternalCancelDelivered` would leave the older run live — and
-    // the instant the newer is cancelled, that older one IS the current run for
-    // the key.
+    // recording `ExternalCancelDelivered` would leave the older run live. The
+    // instant the newer is cancelled, that older one IS the current run for the
+    // key.
     let workflow_id = key_hashing_to(&router, "twin_live_wf", "twin", ShardId::new(0));
     let older = ExecutionId::new_for_shard(ShardId::new(0));
     let mut conn0 = shards.conn(ShardId::new(0)).await;
@@ -2121,7 +2121,7 @@ async fn outbox_cancel_by_id_cancels_every_live_copy_before_reporting() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// 10. Codex round 5 regression: colocated shard aliases
+// 10. Regression: colocated shard aliases
 // ─────────────────────────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -2132,11 +2132,11 @@ async fn outbox_by_id_resolves_when_two_logical_shards_share_one_physical_pool()
     autumn_harvest::shard::install_global_router(router.clone());
     let _topology = GlobalTopologyGuard::new(shards.pools[&ShardId::new(0)].clone());
 
-    // Codex round 5 P1. Several logical shard ids backed by clones of ONE
-    // physical pool is a supported topology — it is what a pre-split staging
-    // deployment looks like, and what `ShardedDbPool::from_map` produces when
-    // the same `DbPool` is inserted under more than one id (the shape
-    // `workflow_id_targeted_tests` already uses).
+    // Several logical shard ids backed by clones of ONE physical pool is a
+    // supported topology. A pre-split staging deployment looks like that.
+    // `ShardedDbPool::from_map` produces it when the same `DbPool` is inserted
+    // under more than one id (the shape `workflow_id_targeted_tests` already
+    // uses).
     //
     // With one connection, the caller holds it as shard 0 and the fan-out then
     // tried to acquire "shard 1" — which is the same pool. That acquisition
@@ -2233,17 +2233,17 @@ async fn outbox_by_id_resolves_when_the_caller_holds_the_higher_aliased_shard() 
     autumn_harvest::shard::install_global_router(router.clone());
     let _topology = GlobalTopologyGuard::new(shards.pools[&ShardId::new(0)].clone());
 
-    // Codex round 6, on the round-5 fix. The fan-out visits shards in ASCENDING
-    // order, and round 5 seeded the already-probed set inside the "this is the
-    // held shard" branch — too late whenever an alias sorts before the held
-    // shard. A checker holding shard 1 of an aliased {0, 1} pair therefore tried
-    // to acquire "shard 0", which is the pool it is itself holding, timed out,
-    // and marked it uninspected on every sweep — reinstating exactly the
-    // permanent withholding round 5 set out to fix.
+    // The fan-out visits shards in ASCENDING order. The first alias fix seeded
+    // the already-probed set inside the "this is the held shard" branch. That is
+    // too late whenever an alias sorts before the held shard. A checker holding
+    // shard 1 of an aliased {0, 1} pair therefore tried to acquire "shard 0".
+    // That is the pool it is itself holding. It timed out and marked the shard
+    // uninspected on every sweep. That brought back exactly the permanent
+    // withholding that the alias fix set out to remove.
     //
-    // The round-5 test pinned the caller to shard 0, the one ordering where
-    // seeding late still works, so it could not see this. This is that test with
-    // the caller on the OTHER side of the ordering.
+    // The test above pins the caller to shard 0, the one ordering where late
+    // seeding still works, so it could not see this. This is that test with the
+    // caller on the OTHER side of the ordering.
     let one_conn = build_pool_with_max_size(&shards.urls[&ShardId::new(0)], 1);
     let mut aliased: BTreeMap<ShardId, DbPool> = BTreeMap::new();
     aliased.insert(ShardId::new(0), one_conn.clone());

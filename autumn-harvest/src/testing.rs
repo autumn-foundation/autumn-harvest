@@ -513,7 +513,7 @@ pub struct WorkflowReplayer {
     /// `continue_as_new_deadline_fraction` — replays byte-faithfully to the live
     /// worker instead of surfacing false non-determinism.
     history_policy: crate::context::WorkflowHistoryPolicy,
-    /// The **candidate** worker's payload limits (issue #798, Codex round 20).
+    /// The **candidate** worker's payload limits (issue #798).
     ///
     /// Same category as `build_id` and `history_policy` above, and deliberately
     /// **not** sourced from the fixture: payload caps and the offload threshold
@@ -540,8 +540,8 @@ pub struct WorkflowReplayer {
     declarative_queries: Vec<crate::info::QueryHandlerInfo>,
     /// The candidate's declarative update handlers. See `declarative_queries`.
     declarative_updates: Vec<crate::info::UpdateHandlerInfo>,
-    /// Per-workflow `#[workflow(max_input_bytes = …)]` overrides (issue #798,
-    /// Codex round 22), keyed by workflow type name.
+    /// Per-workflow `#[workflow(max_input_bytes = …)]` overrides (issue #798),
+    /// keyed by workflow type name.
     ///
     /// The same class as `payload_limits` above, one level finer. The live worker
     /// does not apply a single fleet-wide workflow-input cap: it resolves the
@@ -876,7 +876,7 @@ impl WorkflowReplayer {
         }
     }
 
-    /// Resolve the payload limits for one workflow type (issue #798, round 22).
+    /// Resolve the payload limits for one workflow type (issue #798).
     ///
     /// Mirrors the live worker's own arithmetic verbatim:
     ///
@@ -1033,8 +1033,8 @@ impl WorkflowReplayer {
         // corresponding `WorkflowReplayer::with_*` builder call on the bundle
         // path and replays under a different context — reporting drift for a
         // workflow that never drifted. Issue #614 established this for
-        // `history_policy`; Codex round-10 P2 extended it to the four
-        // `HistorySnapshot`-metadata fallbacks, which matter for any fixture
+        // `history_policy`. Issue #798 extended it to the four
+        // `HistorySnapshot`-metadata fallbacks. Those matter for any fixture
         // that omits the metadata (hand-built, or exported before #698).
         verifier.replay_defaults = FixtureReplayDefaults {
             context_headers: self.context_headers.clone(),
@@ -1045,19 +1045,19 @@ impl WorkflowReplayer {
             queue_name: self.queue_name.clone(),
             build_id: self.build_id.clone(),
             history_policy: self.history_policy,
-            // Codex round 20 extended the same rule to the candidate worker's
-            // payload limits: dropping them here would replay the bundle under
-            // the library defaults and certify a cap-lowering build.
+            // The same rule covers the candidate worker's payload limits.
+            // Dropping them here replays the bundle under the library defaults
+            // and certifies a cap-lowering build.
             payload_limits: self.payload_limits,
-            // Codex round 21 extended it again to the candidate's declarative
-            // handlers: dropping them replays with an empty registry, so a
-            // workflow branching on `ctx.list_query_names()` takes the other
-            // branch and is reported as drift it never had.
+            // It also covers the candidate's declarative handlers. Dropping
+            // them replays with an empty registry. A workflow that branches on
+            // `ctx.list_query_names()` then takes the other branch and is
+            // reported as drift it never had.
             declarative_queries: self.declarative_queries.clone(),
             declarative_updates: self.declarative_updates.clone(),
-            // Codex round 22 extended it once more to the per-workflow input-cap
-            // overrides: dropping them replays a cap-raising workflow under the
-            // global cap the promoted worker will not enforce for it.
+            // It also covers the per-workflow input-cap overrides. Dropping them
+            // replays a cap-raising workflow under the global cap, which the
+            // promoted worker does not enforce for it.
             workflow_input_caps: self.workflow_input_caps.clone(),
         };
         verifier.replay_bundle(dir).await
@@ -1074,7 +1074,7 @@ impl WorkflowReplayer {
     #[must_use]
     pub fn register(mut self, workflows: Vec<WorkflowInfo>) -> Self {
         for wf in workflows {
-            // Issue #798 (Codex round 22): retain the per-workflow input-cap
+            // Issue #798: retain the per-workflow input-cap
             // override. The live worker raises its global cap by this value for
             // this workflow type; dropping it replayed a cap-raising workflow
             // under a cap the promoted worker never enforces.
@@ -1220,7 +1220,7 @@ impl WorkflowReplayer {
             };
         };
 
-        // Issue #798 (Codex round 21): borrow the candidate's declarative
+        // Issue #798: borrow the candidate's declarative
         // handlers for the duration of the executor call.
         let mut declarative = self.declarative_handlers();
         declarative.start_provenance = start_provenance;
@@ -1228,7 +1228,7 @@ impl WorkflowReplayer {
         // Issue #698: the workflow type name (mechanism 1 — the handler-lookup key)
         // applied to the replayed context via `.with_workflow_name(...)`.
         let workflow_name = snapshot.workflow_name.clone();
-        // Issue #798 (Codex round 22): resolve the cap for THIS workflow type,
+        // Issue #798: resolve the cap for THIS workflow type,
         // raising the global by its declared override exactly as the worker does.
         // Bound before `workflow_name` is moved into the executor call below.
         let payload_limits = self.payload_limits_for(&workflow_name);
@@ -1298,12 +1298,12 @@ impl WorkflowReplayer {
                 // replay of a `should_continue_as_new`-branching workflow stays
                 // faithful to the live worker (which uses `registry.history_policy()`).
                 self.history_policy,
-                // Issue #798 (Codex round 20): the candidate worker's payload
+                // Issue #798: the candidate worker's payload
                 // limits, for the same reason as the build id above — a build
                 // that lowers a cap breaks the very in-flight runs the gate
                 // sampled, and the library default would certify it.
                 payload_limits,
-                // Issue #798 (Codex round 21): the candidate's declarative
+                // Issue #798: the candidate's declarative
                 // `#[query]`/`#[update]` handlers. The live worker registers
                 // these before the body runs, so a workflow that branches on
                 // `ctx.list_query_names()` needs them to replay the same path.
@@ -1334,12 +1334,12 @@ impl WorkflowReplayer {
                 // replay of a `should_continue_as_new`-branching workflow stays
                 // faithful to the live worker (which uses `registry.history_policy()`).
                 self.history_policy,
-                // Issue #798 (Codex round 20): the candidate worker's payload
+                // Issue #798: the candidate worker's payload
                 // limits, for the same reason as the build id above — a build
                 // that lowers a cap breaks the very in-flight runs the gate
                 // sampled, and the library default would certify it.
                 payload_limits,
-                // Issue #798 (Codex round 21): the candidate's declarative
+                // Issue #798: the candidate's declarative
                 // `#[query]`/`#[update]` handlers. The live worker registers
                 // these before the body runs, so a workflow that branches on
                 // `ctx.list_query_names()` needs them to replay the same path.
@@ -1416,14 +1416,14 @@ impl WorkflowReplayer {
             };
         };
 
-        // Issue #798 (Codex round 21): borrow the candidate's declarative
+        // Issue #798: borrow the candidate's declarative
         // handlers for the duration of the executor call.
         let mut declarative = self.declarative_handlers();
         declarative.start_provenance = start_provenance;
         let exec_id = snapshot.execution_id;
         // Issue #698: the workflow type name (mechanism 1 — the handler-lookup key).
         let workflow_name = snapshot.workflow_name.clone();
-        // Issue #798 (Codex round 22): per-workflow-type cap; see the strict path.
+        // Issue #798: per-workflow-type cap; see the strict path.
         let payload_limits = self.payload_limits_for(&workflow_name);
         let total_events = snapshot.events.len();
         // Issue #952: computed before `snapshot.events` is moved into the runner.
@@ -1456,13 +1456,13 @@ impl WorkflowReplayer {
             // of a `should_continue_as_new`-branching workflow stays faithful to
             // the live worker (which uses `registry.history_policy()`).
             self.history_policy,
-            // Issue #798 (Codex round 20): the candidate worker's payload limits.
+            // Issue #798: the candidate worker's payload limits.
             // This is the in-flight gate's own path, and an in-flight fixture
             // parks at the frontier — exactly where a fresh dispatch consults the
             // cap — so the library default here is what turns a cap-lowering
             // build into a false GREEN.
             payload_limits,
-            // Issue #798 (Codex round 21): the candidate's declarative handlers
+            // Issue #798: the candidate's declarative handlers
             // (see the strict path). This is the in-flight gate's own call.
             declarative.as_params(),
         )
@@ -1545,13 +1545,13 @@ impl WorkflowReplayer {
         // `ctx.info().execution_id` in a command-affecting value.
         let (name, &handler) = self.handlers.iter().next().unwrap();
         let workflow_name = name.clone();
-        // Issue #798 (Codex round 22): per-workflow-type cap; see the strict path.
+        // Issue #798: per-workflow-type cap; see the strict path.
         let payload_limits = self.payload_limits_for(&workflow_name);
         let workflow_id = self.workflow_id.clone();
         // Issue #798: a raw-events fixture carries no `queue_name` either, so use
         // the replayer's global (`with_queue_name`) when set.
         let queue_name = self.queue_name.clone();
-        // Issue #798 (Codex round 21): borrow the candidate's declarative
+        // Issue #798: borrow the candidate's declarative
         // handlers for the duration of the executor call.
         let declarative = self.declarative_handlers();
         let exec_id = self.execution_id.unwrap_or_default();
@@ -1615,12 +1615,12 @@ impl WorkflowReplayer {
                 // replay of a `should_continue_as_new`-branching workflow stays
                 // faithful to the live worker (which uses `registry.history_policy()`).
                 self.history_policy,
-                // Issue #798 (Codex round 20): the candidate worker's payload
+                // Issue #798: the candidate worker's payload
                 // limits, for the same reason as the build id above — a build
                 // that lowers a cap breaks the very in-flight runs the gate
                 // sampled, and the library default would certify it.
                 payload_limits,
-                // Issue #798 (Codex round 21): the candidate's declarative
+                // Issue #798: the candidate's declarative
                 // `#[query]`/`#[update]` handlers. The live worker registers
                 // these before the body runs, so a workflow that branches on
                 // `ctx.list_query_names()` needs them to replay the same path.
@@ -1650,12 +1650,12 @@ impl WorkflowReplayer {
                 // replay of a `should_continue_as_new`-branching workflow stays
                 // faithful to the live worker (which uses `registry.history_policy()`).
                 self.history_policy,
-                // Issue #798 (Codex round 20): the candidate worker's payload
+                // Issue #798: the candidate worker's payload
                 // limits, for the same reason as the build id above — a build
                 // that lowers a cap breaks the very in-flight runs the gate
                 // sampled, and the library default would certify it.
                 payload_limits,
-                // Issue #798 (Codex round 21): the candidate's declarative
+                // Issue #798: the candidate's declarative
                 // `#[query]`/`#[update]` handlers. The live worker registers
                 // these before the body runs, so a workflow that branches on
                 // `ctx.list_query_names()` needs them to replay the same path.
@@ -4006,7 +4006,7 @@ struct FixtureReplayDefaults {
     /// and hide candidate-only drift.
     build_id: Option<String>,
     history_policy: crate::context::WorkflowHistoryPolicy,
-    /// The **candidate** worker's payload limits (issue #798, Codex round 20).
+    /// The **candidate** worker's payload limits (issue #798).
     ///
     /// Same category as `build_id` above: not a fixture fallback. Payload caps
     /// and the offload threshold live in no `WorkflowEvent` and the live worker
@@ -4023,7 +4023,7 @@ struct FixtureReplayDefaults {
     /// See `declarative_queries`.
     declarative_updates: Vec<crate::info::UpdateHandlerInfo>,
     /// Per-workflow `#[workflow(max_input_bytes = …)]` overrides, keyed by
-    /// workflow type name (issue #798, Codex round 22).
+    /// workflow type name (issue #798).
     ///
     /// Populated by [`ReplayVerifier::register`] from the registered
     /// [`WorkflowInfo`](crate::info::WorkflowInfo)s. Carried per fixture because
@@ -4184,7 +4184,7 @@ impl ReplayVerifier {
     #[must_use]
     pub fn register(mut self, workflows: Vec<crate::info::WorkflowInfo>) -> Self {
         for wf in workflows {
-            // Issue #798 (Codex round 22): retain the per-workflow input-cap
+            // Issue #798: retain the per-workflow input-cap
             // override so each fixture replays under the cap the promoted worker
             // resolves for *its* workflow type, not one bundle-wide value.
             if let Some(per) = wf.max_input_bytes {
@@ -4936,7 +4936,7 @@ enum FixtureReplayMode {
 /// Build the single-use replayer one bundle fixture is replayed on.
 ///
 /// Every replay-context value here is a *fallback* carried from the caller's
-/// builder (Codex round-10 P2): the real #798 export writes `workflow_id`,
+/// builder (issue #798). The real #798 export writes `workflow_id`,
 /// `parent_execution_id`, `execution_timeout` and `context_headers` onto the
 /// snapshot, and `replay_from_snapshot` prefers the snapshot's own value — so
 /// these only take effect for a hand-built or legacy fixture that omits the
@@ -4980,16 +4980,16 @@ fn fixture_replayer(
         // it via `ReplayVerifier::with_history_policy`. Defaults to the default
         // policy — unchanged pre-#614 behavior for anyone who never customized it.
         history_policy: defaults.history_policy,
-        // Issue #798 (Codex round 20): like the build id, authoritative rather
+        // Issue #798: like the build id, authoritative rather
         // than a fallback — the bundle describes executions, not the runtime that
         // will resume them, so the candidate's limits come from the caller.
         payload_limits: defaults.payload_limits,
-        // Issue #798 (Codex round 21): same authoritative treatment — the live
+        // Issue #798: same authoritative treatment — the live
         // worker registers these before any workflow code runs, so a replay that
         // omits them is not replaying the candidate.
         declarative_queries: defaults.declarative_queries.clone(),
         declarative_updates: defaults.declarative_updates.clone(),
-        // Issue #798 (Codex round 22): the per-workflow input-cap overrides the
+        // Issue #798: the per-workflow input-cap overrides the
         // verifier retained from `register`. Each fixture resolves its own cap
         // from this map by workflow type, mirroring the live worker.
         workflow_input_caps: defaults.workflow_input_caps.clone(),
@@ -5371,7 +5371,7 @@ fn virtual_now(start_time: DateTime<Utc>, events: &[WorkflowEvent]) -> DateTime<
 /// id has at most one pending arm at a time (arm → fire/cancel → re-arm → …), so
 /// this counts exactly the fired arms and excludes cancelled / reset ones.
 ///
-/// The `max`-of-deadlines model (round 16) handles both timer shapes correctly:
+/// The `max`-of-deadlines model (issue #768) handles both timer shapes correctly:
 /// - **Sequential** timers (each armed *after* the previous fired) have a later
 ///   anchor, so their deadlines chain and the result is the SUM of durations —
 ///   including every classic `ctx.timer` (each parks the workflow, so it always
@@ -5465,16 +5465,16 @@ impl TestRunOutcome {
     /// **actually fired** along the taken path — each `TimerStarted` anchors a
     /// deadline (`now-at-arm + duration`) and every matching `TimerFired` (per id,
     /// FIFO) advances the virtual clock to `max(now, deadline)`. Sequential timers
-    /// therefore SUM (each armed after the previous fired) and concurrently-armed
-    /// cancellable timers take the MAX (they share an anchor, matching production
-    /// where all deadlines in one `await_fire` batch start at the same instant —
-    /// issue #768, Codex P2 round 16). A `TimerStarted` that was cancelled or reset
-    /// never fired, so its deadline is **excluded** — otherwise a cancelled/reset
+    /// therefore SUM (each armed after the previous fired). Concurrently-armed
+    /// cancellable timers take the MAX: they share an anchor. That matches
+    /// production, where all deadlines in one `await_fire` batch start at the
+    /// same instant (issue #768). A `TimerStarted` that was cancelled or reset
+    /// never fired, so its deadline is **excluded**. Otherwise a cancelled/reset
     /// arm would advance the virtual clock even though the workflow never observed
-    /// its fire, disagreeing with `ctx.now()` (Codex P2 round 8). Signal-preempted
-    /// timers produce no `TimerStarted` event and likewise do not advance this
-    /// clock. The classic `ctx.timer` path always fires and is always sequential,
-    /// so the sum is unchanged from the pre-round-16 model.
+    /// its fire, and disagree with `ctx.now()`. Signal-preempted timers produce no
+    /// `TimerStarted` event and likewise do not advance this clock. The classic
+    /// `ctx.timer` path always fires and is always sequential. So the sum is
+    /// unchanged from the earlier sum-of-durations model.
     #[must_use]
     pub fn final_now(&self) -> DateTime<Utc> {
         virtual_now(self.start_time, &self.events)
@@ -7181,7 +7181,7 @@ impl BatchFlags {
             .any(WorkflowTestEnv::is_competing_suspension);
 
         // Deadline-ordered firing for concurrent awaited cancellable timers
-        // (issue #768, Codex P2 round 15). Production inserts every
+        // (issue #768). Production inserts every
         // `for_await: true` row, reschedules the parked task to the MINIMUM
         // `fires_at`, and on the next claim ingests only DUE timers in `fires_at`
         // order. So in a bookkeeping-only batch with multiple awaited arms, only
@@ -7591,8 +7591,8 @@ impl WorkflowTestEnv {
                 Ok(made_progress)
             }
 
-            // Cancellable/renewable durable timer arm (issue #768, Codex P2
-            // round 4). Two roles by `for_await`, mirroring the real worker's
+            // Cancellable/renewable durable timer arm (issue #768). Two roles by
+            // `for_await`, mirroring the real worker's
             // `plan_timer_lifecycle`:
             //
             // - `for_await: false` (fresh arm from `start_timer`/`reset`): record
@@ -7625,7 +7625,7 @@ impl WorkflowTestEnv {
                         // fires on a later bookkeeping-only cycle.
                         return Ok(false);
                     }
-                    // Deadline order (round 15): only the minimum-deadline awaited
+                    // Deadline order: only the minimum-deadline awaited
                     // timer(s) fire this cycle. A strictly-later awaited timer stays
                     // parked (no progress from it) and fires when a subsequent
                     // bookkeeping-only cycle re-arms it against the (now smaller) set
@@ -8108,11 +8108,11 @@ mod tests {
 
     #[test]
     fn concurrently_armed_timers_advance_to_the_max_deadline_not_the_sum() {
-        // Issue #768, Codex P2 round 16. Two cancellable timers armed in one
-        // `await_fire` batch (both `TimerStarted` before either `TimerFired`) share
-        // a deadline anchor of `now = 0`, so the fired result is MAX(10, 1) = 10,
-        // NOT the SUM 11. Round-15 fires the smaller deadline first, so the recorded
-        // order is TS(slow), TS(fast), TF(fast), TF(slow).
+        // Issue #768. Two cancellable timers armed in one `await_fire` batch
+        // (both `TimerStarted` before either `TimerFired`) share a deadline
+        // anchor of `now = 0`. So the fired result is MAX(10, 1) = 10, NOT the
+        // SUM 11. Deadline-ordered firing fires the smaller deadline first, so
+        // the recorded order is TS(slow), TS(fast), TF(fast), TF(slow).
         assert_eq!(
             fired_timer_duration_secs(&[ts("slow", 10), ts("fast", 1), tf("fast"), tf("slow")]),
             10,
@@ -8747,7 +8747,7 @@ mod tests {
         // tombstone (issue #495), built via the same canonical helper
         // production erasure code uses, must still be caught after routing
         // through the combined wrapper -- confirming the shared prefix scan
-        // doesn't accidentally reject what erased_fixture_reason alone
+        // does not accidentally reject what erased_fixture_reason alone
         // would have caught.
         let snapshot = HistorySnapshot {
             workflow_name: "erased_wf".to_string(),

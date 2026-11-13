@@ -441,10 +441,9 @@ async fn schedule_backfill_paces_admissions_and_defers_the_excess() {
     );
 }
 
-/// Issue #607: an oversized backfilled slot must be skipped (not
-/// durably deferred into a pending row that could never successfully fire)
-/// -- mirroring the fix already applied to the single-start, batch, and
-/// scheduler-tick call sites.
+/// Issue #607: an oversized backfilled slot must be skipped. It must not be
+/// durably deferred into a pending row that could never successfully fire.
+/// The single-start, batch, and scheduler-tick call sites already do this.
 #[tokio::test]
 async fn schedule_backfill_skips_oversized_input_before_deferring() {
     let (url, _container) = setup_database().await;

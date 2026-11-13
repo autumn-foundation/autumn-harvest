@@ -444,8 +444,8 @@ fn parent_race_activity_loser_then_local_activity(
 /// AC1 wait-**all** with a SIGNAL branch: `join!` of a plain
 /// `ctx.wait_for_signal` and an activity. `futures::join!` polls in declaration
 /// order, so the `WaitForSignal` command is pushed first and the batch records
-/// only the sibling's `ActivityScheduled` — the shape Codex round 1 flagged as
-/// nd-blocking on its first wake.
+/// only the sibling's `ActivityScheduled`. Before the `match_signal`
+/// mixed-batch fix, this shape nd-blocked on its first wake.
 fn parent_join_signal_and_activity(ctx: &WorkflowContext, _input: Value) -> WfFuture<'_> {
     Box::pin(async move {
         let (signal, activity) = futures::join!(
@@ -1452,10 +1452,9 @@ async fn race_resolved_by_activity_with_an_open_activity_loser_then_local_activi
 /// ctx.execute_activity(..))` must complete through a real worker — both
 /// branches resolve independently and the workflow finishes.
 ///
-/// Codex round 1 (P1): before the `match_signal` mixed-batch fix this shape
-/// persisted fine and then nd-blocked on its very first wake, because the plain
-/// signal matcher treated the sibling's recorded `ActivityScheduled` as a
-/// divergence.
+/// Before the `match_signal` mixed-batch fix, this shape persisted fine and
+/// then nd-blocked on its very first wake. The plain signal matcher treated the
+/// sibling's recorded `ActivityScheduled` as a divergence.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn join_of_a_signal_wait_and_an_activity_resolves_both_branches() {
     let (database_url, _guard) = setup_test_database_url_or_env().await;

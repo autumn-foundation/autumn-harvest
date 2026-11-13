@@ -968,12 +968,12 @@ impl ModuleRegistry {
         //
         // Two checks, not one. The first compares each entry against what is
         // *already* bound. The second compares the entries against **each
-        // other** (issue #967): a batch carrying two
-        // different modules for one `(build_id, workflow_name)` passes the first
-        // check trivially when nothing is bound yet — `bindings` does not know
-        // about the batch — and the insert loop below would then let the last
-        // entry silently overwrite the first, which is precisely the immutable-
-        // binding guarantee this method exists to enforce. Rejecting it as a
+        // other** (issue #967). Take a batch carrying two different modules for
+        // one `(build_id, workflow_name)`. It passes the first check trivially
+        // when nothing is bound yet, because `bindings` does not know about the
+        // batch. The insert loop below would then let the last entry silently
+        // overwrite the first. That breaks the immutable-binding guarantee this
+        // method exists to enforce. Rejecting it as a
         // `DuplicateRegistration` keeps one answer to "what does this build id
         // mean for this workflow" regardless of how the modules were submitted.
         // Scoped so the borrows of `prepared` end before the insert loop moves it.
@@ -1092,8 +1092,8 @@ impl ModuleRegistry {
     /// Pair with [`load_generation`](Self::load_generation) and
     /// [`commit_prepared`](Self::commit_prepared) to load a whole build
     /// atomically **without holding every module's source bytes at once**
-    /// (issue #967): fetch a payload, prepare it, drop the
-    /// payload, repeat, then commit. [`load_modules`](Self::load_modules) is the
+    /// (issue #967). Fetch a payload, prepare it, drop the payload, repeat,
+    /// then commit. [`load_modules`](Self::load_modules) is the
     /// convenience form for callers that already hold the whole batch.
     ///
     /// # Errors
@@ -1254,8 +1254,8 @@ pub struct ModuleHost {
 /// Hard ceiling on the NUMBER of entries in a registry's decision cache.
 ///
 /// A count alone is **not** a memory bound, and reading it as one was a real bug
-/// (issue #967): the key is a 32-byte digest, but the
-/// *value* is a whole `DecideResponse`, which a guest may return at up to
+/// (issue #967). The key is a 32-byte digest. The *value* is a whole
+/// `DecideResponse`, which a guest may return at up to
 /// [`WASM_MAX_OUTPUT_BYTES`](crate::wasm_activities::WASM_MAX_OUTPUT_BYTES)
 /// — 4 MiB. A guest returning a distinct large response per request could
 /// therefore have filled 4096 entries with ~16 GiB and OOM'd the worker,
@@ -1979,24 +1979,24 @@ pub fn module_workflow_handler(
                 None
             };
             // The budget is charged for a step whether it was recomputed or
-            // served from cache (issue #967). A cache hit
-            // used to be free, which made the run's TERMINAL OUTCOME depend on
-            // cache residency: the same workflow, with the same history, would
-            // complete when its earlier decisions happened to still be resident
-            // and fail when unrelated executions had evicted them — or when one
-            // response exceeded `MAX_CACHED_RESPONSE_BYTES` and was never cached
-            // at all. That is precisely the class of defect `MAX_DECIDE_STEPS`
-            // is a compile-time constant to avoid, arriving through the
-            // optimisation instead. The cache is allowed to make a run
-            // *cheaper*; it is not allowed to change what the run *decides*.
+            // served from cache (issue #967). A cache hit used to be free,
+            // which made the run's TERMINAL OUTCOME depend on cache residency:
+            // the same workflow, with the same history, would complete when its
+            // earlier decisions happened to still be resident and fail when
+            // unrelated executions had evicted them — or when one response
+            // exceeded `MAX_CACHED_RESPONSE_BYTES` and was never cached at all.
+            // That is precisely the class of defect `MAX_DECIDE_STEPS` is a
+            // compile-time constant to avoid, arriving through the optimisation
+            // instead. The cache is allowed to make a run *cheaper*; it is not
+            // allowed to change what the run *decides*.
             // ONE order for both paths: charge the cost, check the budget, then
             // act on the response (issue #967). The first cut of this charged
-            // cache hits — which was the
-            // point — but kept the miss path's check *before* the decision and
-            // never re-checked after adding its cost. So a fresh decision that
-            // pushed the run over budget was accepted while the same total
-            // served from cache was rejected: the residency dependence survived
-            // its own fix, in the asymmetry of the fix.
+            // cache hits — which was the point — but kept the miss path's check
+            // *before* the decision and never re-checked after adding its cost.
+            // So a fresh decision that pushed the run over budget was accepted
+            // while the same total served from cache was rejected: the
+            // residency dependence survived its own fix, in the asymmetry of
+            // the fix.
             //
             // The post-charge check also has to come before the response is
             // *used*, not merely before the next iteration. An over-budget

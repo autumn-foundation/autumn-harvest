@@ -1,4 +1,4 @@
-//! Fixture (review round 2, finding 1): two statics that share a LAST path
+//! Fixture: two statics that share a LAST path
 //! segment but differ in module and in type.
 //!
 //! Compiled standalone (no workspace deps) with:

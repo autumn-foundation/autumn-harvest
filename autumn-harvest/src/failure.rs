@@ -196,7 +196,7 @@ pub const ERROR_TYPE_WASM_MODULE_INVALID: &str = "WasmModuleInvalid";
 pub const ERROR_TYPE_WASM_MODULE_LOOKUP_FAILED: &str = "WasmModuleLookupFailed";
 
 /// Stable error-type name for a WASM guest whose returned output exceeds the
-/// host's maximum output-buffer size (issue #965 review round 8).
+/// host's maximum output-buffer size (issue #965).
 ///
 /// Synthesised when the guest's `(out_ptr, out_len)` claims more bytes than
 /// [`crate::wasm_activities::WASM_MAX_OUTPUT_BYTES`], *before* the host parses
@@ -447,7 +447,7 @@ impl ActivityFailure {
 
     /// Construct the non-retryable failure used when a WASM guest's returned
     /// output exceeds the host's maximum output-buffer size
-    /// (issue #965 review round 8).
+    /// (issue #965).
     ///
     /// The `error_type` is always [`ERROR_TYPE_WASM_OUTPUT_TOO_LARGE`] and the
     /// failure is non-retryable: an oversized output is a deterministic guest

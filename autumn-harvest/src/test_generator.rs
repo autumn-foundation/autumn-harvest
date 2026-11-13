@@ -13,7 +13,7 @@
 //! (`simulator.rs`) is not safe input here: its non-terminal retry-attempt
 //! `ActivityFailed` events intentionally use a synthetic id with no matching
 //! `ActivityScheduled`, and the id-keyed lookups below silently drop any
-//! event whose id they don't recognize.
+//! event whose id they do not recognize.
 
 use crate::event::WorkflowEvent;
 use crate::types::ActivityExecId;

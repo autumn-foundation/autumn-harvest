@@ -8,7 +8,7 @@
 //! every `#[workflow]` function on each replay cycle.
 //!
 //! Handlers are **fire-and-forget** by contract (issue #546 explicitly puts
-//! validators/rejection out of scope — that's the `update` primitive's job)
+//! validators/rejection out of scope — that is the `update` primitive's job)
 //! and synchronous: they run inline on the workflow's replay/live cycle, so a
 //! mutation of author-captured state (e.g. `Arc<Mutex<T>>`) is visible to the
 //! rest of the workflow body within the same cycle. There is no suspension

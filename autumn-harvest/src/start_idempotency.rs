@@ -290,8 +290,8 @@ pub const fn window_to_secs_f64(window: Duration) -> f64 {
 }
 
 /// Serializes tests that mutate and read back the process-global
-/// [`PURGE_WINDOW_SECS_BITS`] static so they do not race each other in the shared
-/// lib-test binary (issue #808, Codex P2). Any test that calls
+/// [`PURGE_WINDOW_SECS_BITS`] static. They then do not race each other in the
+/// shared lib-test binary (issue #808). Any test that calls
 /// `set_purge_window_secs` and then asserts on `purge_window_secs()` — here or in
 /// `builder.rs` — must hold this lock for the set→read span.
 #[cfg(test)]
@@ -552,9 +552,9 @@ mod db_impl {
             }
             ReserveClassification::Dangling => {
                 // Defensive reclaim path: the claim row exists but points at an
-                // execution that no longer exists (a dangling pointer — only
+                // execution that no longer exists. That dangling pointer is only
                 // reachable if the idempotency window exceeds execution retention
-                // and the sweep has not run yet). Delete the stale claim, but ONLY
+                // and the sweep has not run yet. Delete the stale claim, but ONLY
                 // if it still points at a non-existent execution: the `NOT EXISTS`
                 // guard makes this safe against a concurrent same-key request that
                 // repointed the claim to a real new run between our classifying

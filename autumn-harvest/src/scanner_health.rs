@@ -7,11 +7,10 @@
 //! external signal/cancel outboxes, the retention janitor, the schedule
 //! ticker, the bounded-pause auto-resumer, and the dedicated audit-export
 //! task (issue #1269). If one of them panics, deadlocks on a poisoned
-//! connection, or stalls on a never-returning query, it fails **silently**
-//! — and the
-//! operator only finds out when a downstream correctness symptom (a workflow
-//! that should have timed out but did not, an SLA that never fired) surfaces
-//! minutes to hours later.
+//! connection, or stalls on a never-returning query, it fails **silently**.
+//! The operator only finds out when a downstream correctness symptom
+//! surfaces minutes to hours later. Examples are a workflow that should have
+//! timed out but did not, and an SLA that never fired.
 //!
 //! The pre-existing loop metrics cannot catch this: `record_retention_tick`,
 //! `record_schedule_fire_attempt`, and the timeout/SLA/quarantine counters

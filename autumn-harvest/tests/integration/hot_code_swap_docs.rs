@@ -298,18 +298,18 @@ const CITED_TESTS: &[&str] = &[
     "the_hosts_encoder_never_reorders_keys_the_way_a_json_value_would",
     "an_activity_failure_is_handed_to_the_guest_rather_than_failing_the_run",
     "only_activity_outcomes_are_handed_to_the_guest",
-    // Codex review round 1.
+    // Decision-cache isolation and the decision trampoline.
     "the_decision_cache_never_serves_one_builds_answer_to_another",
     "the_trampoline_never_yields_between_decisions",
-    // Codex review round 2.
+    // Timeout scoping and cache eviction order.
     "activity_scoped_timeouts_are_the_guests_business_but_run_scoped_ones_are_not",
     "the_decision_cache_evicts_oldest_first",
-    // Codex review round 3.
+    // The cache byte bound.
     "the_decision_cache_is_bounded_in_bytes_not_just_entries",
-    // Codex review round 4.
+    // Cache-hit budget charging and signing rotation.
     "a_cache_hit_is_charged_to_the_run_budget_like_a_recomputation",
     "signing_can_be_introduced_and_rotated_on_an_existing_build",
-    // Codex review round 5.
+    // Single budget check and module signing integrity.
     "the_run_budget_is_charged_and_checked_once_for_both_cache_paths",
     "an_unsigned_republish_does_not_erase_an_existing_signature",
     "a_signed_module_cannot_be_rebound_under_another_build_id",
@@ -530,7 +530,7 @@ fn every_guest_response_is_valid_json_for_the_decide_abi() {
     }
 }
 
-// ── Codex review round 1: keep the report's numbers and its C9 claim honest ────
+// ── keep the report's numbers and its C9 claim honest ─────────────────────────
 
 /// Every `(constant, value)` the report quotes as a number in prose.
 ///

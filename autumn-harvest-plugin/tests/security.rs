@@ -1495,7 +1495,7 @@ async fn eris_readonly_role_auth_reaches_admin_reads_and_403s_mutations_through_
     // is reachable by a read-only principal. A valid uuid gets past the id
     // parse to the in-handler admin gate, which passes under the boundary; the
     // stream then fails closed on the missing runtime. Timeout-guarded so a
-    // (theoretical) DB connect can't hang the test — a timeout still proves the
+    // (theoretical) DB connect cannot hang the test — a timeout still proves the
     // request passed auth (a 401/403 returns immediately).
     let sse = tokio::time::timeout(
         std::time::Duration::from_secs(5),

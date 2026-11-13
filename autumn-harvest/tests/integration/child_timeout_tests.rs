@@ -1182,12 +1182,12 @@ async fn race_loser_child_cancel_materializing_deadline_advances_event_id_past_a
     );
 }
 
-/// #779 (HEALTHY-RUN-KILLER): the child-timeout SUSPENSION
-/// persist path ([`persist_child_timeout_race`]) must append its parent events
-/// with `append_single_event` (parent-row `FOR UPDATE` + `MAX(event_id)`
-/// re-read per insert), byte-for-byte like the plain
-/// `persist_all_started_child_workflows` path — NOT a batch `append_events` at
-/// the stale pre-handler `next_event_id`.
+/// #779 (HEALTHY-RUN-KILLER): the child-timeout SUSPENSION persist path
+/// ([`persist_child_timeout_race`]) must append its parent events with
+/// `append_single_event` (parent-row `FOR UPDATE` + `MAX(event_id)` re-read
+/// per insert). It matches the plain `persist_all_started_child_workflows`
+/// path byte for byte. It must NOT use a batch `append_events` at the stale
+/// pre-handler `next_event_id`.
 ///
 /// A resolved `ctx.race()` over children may push a `CancelRaceLosers` for a
 /// still-RUNNING loser child and, in the SAME cycle, `spawn_child_workflow_timeout`

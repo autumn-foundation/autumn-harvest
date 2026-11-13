@@ -33,18 +33,18 @@
 //!   discovery) and `history_bloat_min_events` are mutually-exclusive
 //!   discovery paths and must be rejected with `400` when combined, rather
 //!   than letting one silently win;
-//! - finding B: `min_history_events` (issue #493) must
-//!   still compose with `history_bloat_min_events` when both are supplied at
-//!   once -- `AND`ing the two `>=` thresholds together (equivalent to the
-//!   stricter/maximum of the two), not silently dropping one;
-//! - finding C: the per-shard candidate query is
-//!   bounded to `filters.limit`, ordered by history size descending, *before*
-//!   any full execution row is loaded -- proven correct even when a single
-//!   shard alone has more matching candidates than the global limit;
-//! - finding b: `history_event_count` must stay ABSENT
-//!   on the legacy `no_progress_minutes` (stalled-workflow) discovery path
-//!   even when the composed `min_history_events` filter is ALSO satisfied --
-//!   the field is exclusive to the dedicated `history_bloat_min_events` path.
+//! - finding B: `min_history_events` (issue #493) must still compose with
+//!   `history_bloat_min_events` when both are supplied at once. The two `>=`
+//!   thresholds are `AND`ed together (the stricter of the two), and neither
+//!   is silently dropped;
+//! - finding C: the per-shard candidate query is bounded to `filters.limit`
+//!   and ordered by history size descending, *before* any full execution row
+//!   is loaded. This holds even when a single shard alone has more matching
+//!   candidates than the global limit;
+//! - finding b: `history_event_count` must stay ABSENT on the legacy
+//!   `no_progress_minutes` (stalled-workflow) discovery path. That holds even
+//!   when the composed `min_history_events` filter is ALSO satisfied. The
+//!   field is exclusive to the dedicated `history_bloat_min_events` path.
 
 use std::collections::BTreeMap;
 
@@ -546,8 +546,8 @@ async fn history_bloat_min_events_merges_and_sorts_globally_across_shards() {
     let _shard0_small =
         seed_workflow_with_history_size(&shard0_url, ShardId::new(0), "hb-shard0-small", 1).await; // total 2
 
-    // Shard 1: one above-threshold row that is *larger* than shard 0's, so a
-    // correct global sort must place it first -- proving the merge is not
+    // Shard 1: one above-threshold row that is *larger* than shard 0's. A
+    // correct global sort must place it first. That proves the merge is not
     // just "shard 0's page, then shard 1's page".
     let _shard1_larger = seed_workflow_with_history_size(
         &shard1_url,
@@ -596,8 +596,8 @@ async fn history_bloat_min_events_merges_and_sorts_globally_across_shards() {
     );
 
     // Global descending sort: shard 1's larger row (12) must precede shard
-    // 0's row (6) -- a per-shard-then-concatenate merge would get this
-    // backwards (shard 0 first, since it is the default shard queried first).
+    // 0's row (6). A per-shard-then-concatenate merge gets this backwards. It
+    // puts shard 0 first, since that is the default shard queried first.
     let shard1_pos = ids.iter().position(|id| id == "hb-shard1-larger").unwrap();
     let shard0_pos = ids.iter().position(|id| id == "hb-shard0-large").unwrap();
     assert!(

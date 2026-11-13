@@ -627,7 +627,7 @@ async fn a_zero_batch_size_disables_the_sweep() {
 
 #[tokio::test]
 async fn a_converted_shard_stops_rewriting_its_cursor_every_tick() {
-    // Codex round 9 (P2). On a fully-converted shard the batch query returns
+    // On a fully-converted shard the batch query returns
     // nothing, the pass is already stamped complete, and the computed cursor is
     // byte-identical to the stored one -- but the sweep upserted it anyway on
     // every scanner tick. For a deployment that simply keeps a keyed codec
@@ -2755,12 +2755,12 @@ async fn retirement_refuses_an_unregistered_key_id() {
 /// actually run from `enforce_timeouts_once`, not only when called directly.
 #[tokio::test]
 async fn a_failing_sweep_does_not_strand_the_later_timeout_residents() {
-    // Codex round 5 (P1): the sweep runs before `reclaim_expired_leases_and_wake`
-    // in `enforce_timeouts_once`. Propagating its error would return from the
-    // pass early, so a PERSISTENT rotation failure -- missing grants on the
-    // cursor table or on `UPDATE harvest_events`, which repeat identically
-    // every tick -- would stop expired durable-mutex leases being reclaimed on
-    // that shard, stranding the workflows waiting on them. Rotation is new and
+    // The sweep runs before `reclaim_expired_leases_and_wake` in
+    // `enforce_timeouts_once`. Propagating its error would return from the
+    // pass early. Take a PERSISTENT rotation failure, such as missing grants on
+    // the cursor table or on `UPDATE harvest_events`. It repeats identically
+    // every tick. It would stop the reclaim of expired durable-mutex leases on
+    // that shard and strand the workflows waiting on them. Rotation is new and
     // optional; mutex reclamation is neither, and a new feature must not be
     // able to break an old one by failing.
     //

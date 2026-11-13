@@ -37,10 +37,10 @@ use uuid::Uuid;
 
 /// One id the primary resume pass captured into its scratch table.
 ///
-/// The second pass excludes the rows the first one actually shifted rather than
-/// re-deriving them from a predicate (issue #619 round 19), and since round 23
-/// that set is handed over inside Postgres rather than through this process, so
-/// a test driving the two passes by hand reads it back from the scratch table.
+/// The second pass excludes the rows the first one actually shifted. It does not
+/// re-derive them from a predicate (issue #619). That set is handed over inside
+/// Postgres, not through this process. So a test that drives the two passes by
+/// hand reads it back from the scratch table.
 #[derive(diesel::QueryableByName)]
 struct ShiftedTaskIdRow {
     #[diesel(sql_type = diesel::sql_types::Uuid)]
@@ -161,11 +161,11 @@ async fn backdate_scheduled_at(conn: &mut AsyncPgConnection, id: Uuid, secs: i64
     // `created_at = NOW(), scheduled_at = NOW() + delay`, so a task that has
     // been *due* for N seconds was necessarily *created* at least N seconds
     // ago. Backdating `scheduled_at` alone would fabricate a row that claims to
-    // have been waiting since before it existed — invisible while the resume
-    // partition keyed on `transaction_timestamp()`, but it decides the row's
-    // side now that the split is `created_at` vs `paused_at` (issue #619
-    // round-16 review), and would silently move a pre-pause backlog row onto the
-    // late-arrival side.
+    // have been waiting since before it existed. That was invisible while the
+    // resume partition keyed on `transaction_timestamp()`. Now the split is
+    // `created_at` vs `paused_at` (issue #619), so `created_at` decides the
+    // row's side. A backdated `scheduled_at` alone would silently move a
+    // pre-pause backlog row onto the late-arrival side.
     //
     // A row whose `created_at` is already `NULL` keeps it: that is the legacy
     // pre-`20260619000000` shape one test deliberately constructs, and the
@@ -820,7 +820,7 @@ async fn resume_credits_a_task_enqueued_between_the_two_shift_passes() {
     );
 }
 
-/// Issue #619 round-16 review — the partition between the two resume passes must
+/// Issue #619 — the partition between the two resume passes must
 /// be decided by values that are **fixed on the row**, not by when a statement
 /// happens to *see* it.
 ///
@@ -989,7 +989,7 @@ async fn resume_credits_a_legacy_task_with_no_created_at() {
     );
 }
 
-/// Issue #619 round-17 review — a resume must **wake parked workers**, not just
+/// Issue #619 — a resume must **wake parked workers**, not just
 /// make the backlog claimable and wait for the next poll tick.
 ///
 /// A worker configured with `notification_database_url` parks in
@@ -1895,7 +1895,7 @@ async fn a_pause_committed_mid_claim_still_holds_the_task() {
     );
 }
 
-/// Issue #619 round-17 review — the post-claim pause re-check must be **atomic
+/// Issue #619 — the post-claim pause re-check must be **atomic
 /// with the claim**, so a re-check that fails cannot strand the task.
 ///
 /// The re-check has to run in its own statement (a fresh `READ COMMITTED`
@@ -1910,13 +1910,13 @@ async fn a_pause_committed_mid_claim_still_holds_the_task() {
 /// - `start_to_close` / `heartbeat_timeout` would eventually reclaim it, but
 ///   both are optional — an activity declaring neither strands indefinitely.
 ///
-/// So the claim and the re-check run inside one `READ COMMITTED` transaction:
-/// each statement still gets its own snapshot (the re-check keeps working),
-/// and a re-check failure rolls the claim back. The isolation level is
-/// **pinned on the `BEGIN`** rather than inherited, because under `REPEATABLE
-/// READ` both statements would share one snapshot and the re-check would go
-/// blind to the pause — silently reinstating the round-2 P1 this guard exists
-/// to close.
+/// So the claim and the re-check run inside one `READ COMMITTED` transaction.
+/// Each statement still gets its own snapshot, so the re-check keeps working.
+/// A re-check failure rolls the claim back. The isolation level is **pinned on
+/// the `BEGIN`** and not inherited. Under `REPEATABLE READ` both statements
+/// would share one snapshot, and the re-check would go blind to the pause. A
+/// claim would then silently run on a paused queue, which is the very bug this
+/// guard exists to close.
 ///
 /// Injection: the same mid-claim harness as above (hold the rate-limit bucket
 /// row so the pause commits while the claim is blocked, which is what makes the
@@ -2044,7 +2044,7 @@ async fn a_failed_pause_recheck_rolls_the_claim_back_instead_of_stranding_it() {
 }
 
 /// `paused_at` must be stamped when the hold becomes effective, not at
-/// transaction start (round 11 P2).
+/// transaction start.
 ///
 /// The column defaults to `NOW()`, which Postgres freezes at transaction
 /// start — before `lock_queue_for_pause` waits. A pause that queues behind a
@@ -2166,14 +2166,13 @@ async fn a_repause_preserves_the_original_paused_at() {
         second.paused_at, original,
         "the echoed paused_at must be the preserved value, not the re-pause instant"
     );
-    // Provenance is preserved too (the round-1 idempotency rule).
+    // Provenance is preserved too: a re-pause is idempotent.
     assert_eq!(second.reason, "stripe outage");
     assert_eq!(second.paused_by, "alice");
 }
 
 /// A queue pause committing after the scan must also suppress the **workflow**
-/// schedule-to-start timeout, not just the activity one (issue #619 round-15
-/// review).
+/// schedule-to-start timeout, not just the activity one (issue #619).
 ///
 /// `find_timed_out_tasks` does not filter on `task_type`, so a PENDING workflow
 /// task carrying `schedule_to_start` is routed to `enforce_workflow_timeout`
@@ -2386,24 +2385,7 @@ async fn an_unpaused_workflow_task_is_still_schedule_to_start_timed_out() {
     );
 }
 
-/// Round-18 P1 — a claim must never commit *after* a pause has been
-/// acknowledged.
-///
-/// Round 17 wrapped the claim and its authoritative pause re-check in one
-/// transaction so a re-check error could no longer strand a `RUNNING` row. That
-/// moved the claim's commit *after* the re-check's snapshot, opening a window:
-/// a pause committing in between is invisible to the re-check, the pause API
-/// returns success, and the claim commits afterwards anyway — a worker
-/// dispatching into an outage the operator has already been told is contained.
-///
-/// The barrier is `try_lock_queue_for_claim`, the **shared** mode of the key
-/// `pause_queue` takes exclusively. This test holds that exclusive lock from a
-/// second connection (an in-flight, uncommitted pause transaction) and asserts
-/// the claim declines rather than dispatching.
-///
-/// Note what makes this a genuine regression test rather than a restatement of
-/// the round-2 guard: **no pause row is committed**, so the anti-join and the
-/// Round-23 P2: a pause on one queue must not stall a queue whose name merely
+/// A pause on one queue must not stall a queue whose name merely
 /// **hash-collides** with it.
 ///
 /// This is the money test for the collision fix, and it reproduces the reported
@@ -2552,9 +2534,25 @@ async fn a_pause_does_not_stall_a_hashtext_colliding_queue() {
     }
 }
 
-/// re-check both legitimately see an unpaused queue. Before the barrier the
-/// task is claimed; after it, the claim is given back untouched — same state,
-/// same attempt, immediately re-claimable once the pause transaction settles.
+/// A claim must never commit *after* a pause has been acknowledged.
+///
+/// The claim and its authoritative pause re-check run in one transaction, so a
+/// re-check error cannot strand a `RUNNING` row. That moved the claim's commit
+/// *after* the re-check's snapshot, and opened a window. A pause that commits
+/// in between is invisible to the re-check. The pause API returns success, and
+/// the claim commits afterwards anyway. A worker then dispatches into an outage
+/// that the operator has already been told is contained.
+///
+/// The barrier is `try_lock_queue_for_claim`, the **shared** mode of the key
+/// `pause_queue` takes exclusively. This test holds that exclusive lock from a
+/// second connection (an in-flight, uncommitted pause transaction). It asserts
+/// that the claim declines and does not dispatch.
+///
+/// This is a genuine regression test, not a restatement of the committed-pause
+/// guard: **no pause row is committed**. So the anti-join and the re-check both
+/// legitimately see an unpaused queue. Before the barrier the task is claimed.
+/// After it, the claim is given back untouched: same state, same attempt,
+/// immediately re-claimable once the pause transaction settles.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_claim_declines_while_a_pause_transaction_is_committing() {
     use diesel_async::RunQueryDsl;
@@ -2623,7 +2621,7 @@ async fn a_claim_declines_while_a_pause_transaction_is_committing() {
     );
 }
 
-/// Round-18 P2 — a stale scan result must not time out a task whose deadline a
+/// A stale scan result must not time out a task whose deadline a
 /// completed resume has already credited forward.
 ///
 /// `find_timed_out_tasks` produces a snapshot and a large batch takes time, so
@@ -2736,10 +2734,10 @@ async fn a_resume_shift_after_the_scan_suppresses_the_stale_timeout() {
     );
 }
 
-/// Round-19 P2 (issue #619): a row whose enqueue *executed* before the pause but
-/// *committed* after the primary resume shift's snapshot must still be credited.
+/// Issue #619: a row whose enqueue *executed* before the pause but *committed*
+/// after the primary resume shift's snapshot must still be credited.
 ///
-/// This is the case the round-16 semantic partition could not reach. The
+/// The `created_at` vs `paused_at` partition alone could not reach this case. The
 /// partition is total and visibility-independent — every due `PENDING` row
 /// belongs to exactly one side whenever it becomes visible — but totality of the
 /// *predicates* is not coverage by the *passes*. Such a row is on pass 1's side
@@ -2857,18 +2855,18 @@ async fn a_pre_pause_enqueue_committing_after_the_first_pass_is_still_credited()
     );
 }
 
-/// Round-20 P2: the backlog scan's own duration must be credited back on resume.
+/// The backlog scan's own duration must be credited back on resume.
 ///
 /// The queue becomes effectively held the instant `lock_queue_for_pause` is
-/// granted — round 18's `try_lock_queue_for_claim` takes the **shared** mode of
-/// that very key, so from then on every claim fails its `try` and gives the task
-/// back. Round 14 nonetheless stamped `paused_at` *after* the
-/// `held_task_count_query` backlog `COUNT(*)`, on the (then-true, now-false)
-/// premise that claimers share neither the lock nor visibility of the uncommitted
-/// pause row. That scan is unbounded in principle on a large `PENDING` backlog,
-/// so its whole duration was held-but-uncredited: a task with a short
-/// `schedule_to_start` could be timed out immediately after the thaw for time the
-/// pause transaction itself blocked it.
+/// granted. The claim barrier `try_lock_queue_for_claim` takes the **shared**
+/// mode of that very key. So from then on every claim fails its `try` and gives
+/// the task back. An earlier revision still stamped `paused_at` *after* the
+/// `held_task_count_query` backlog `COUNT(*)`. Its premise was that claimers
+/// share neither the lock nor visibility of the uncommitted pause row. The
+/// barrier made that premise false. That scan is unbounded in principle on a
+/// large `PENDING` backlog. So its whole duration was held but uncredited. A task
+/// with a short `schedule_to_start` could time out immediately after the thaw,
+/// for time that the pause transaction itself blocked it.
 ///
 /// Made deterministic rather than hoped for: a second connection holds an
 /// `ACCESS EXCLUSIVE` lock on `harvest_task_queue`, which blocks the `COUNT(*)`
@@ -2948,24 +2946,25 @@ async fn pause_credits_the_backlog_scan_interval() {
     );
 }
 
-/// Round-21 P2: a timeout enforcement must not stall dispatch on an unpaused queue.
+/// A timeout enforcement must not stall dispatch on an unpaused queue.
 ///
-/// The `schedule_to_start` enforcer takes the queue advisory lock so a pause
+/// The `schedule_to_start` enforcer takes the queue advisory lock, so a pause
 /// committing after its scan still suppresses the timeout. It originally took the
-/// **exclusive** mode — the same one `pause_queue`/`resume_queue` take. From round
-/// 18 onward that is a dispatch outage: `try_lock_queue_for_claim` takes the
-/// **shared** mode of that key on every claim, and exclusive blocks shared, so for
+/// **exclusive** mode, the same one `pause_queue`/`resume_queue` take. With the
+/// claim barrier that is a dispatch outage. `try_lock_queue_for_claim` takes the
+/// **shared** mode of that key on every claim, and exclusive blocks shared. So for
 /// the whole enforcement transaction every claim on the queue fails its `try` and
-/// releases its task — on a queue with no pause at all. The workflow sibling holds
+/// releases its task, on a queue with no pause at all. The workflow sibling holds
 /// the lock across `append_events`, the parent-close cascade and trigger
-/// evaluation, so a backlog of expired tasks can halt unrelated work repeatedly.
+/// evaluation. So a backlog of expired tasks can halt unrelated work repeatedly.
 ///
 /// Shared mode is exactly enough: it still mutually excludes the exclusive
 /// pause/resume (the ordering the re-check depends on) while being compatible with
 /// the claim barrier.
 ///
-/// Both halves are asserted, because dropping the lock entirely would also make
-/// the first half pass while silently destroying the round-2/round-15 guarantee.
+/// Both halves are asserted. Dropping the lock entirely would also make the
+/// first half pass, but silently destroy the pause-suppression guarantee: a
+/// pause committed after the scan still suppresses the timeout.
 ///
 /// Parking the enforcer *inside* the window is the whole difficulty. A table lock
 /// on `harvest_queue_pauses` does not work: `find_timed_out_tasks` consults it for
@@ -3085,18 +3084,19 @@ async fn timeout_enforcement_does_not_block_claims_on_an_unpaused_queue() {
         .expect("enforcement must succeed");
 }
 
-/// Round-22 P2: a `schedule_to_start` sweep must not deadlock a concurrent
-/// per-execution resume.
+/// A `schedule_to_start` sweep must not deadlock a concurrent per-execution
+/// resume.
 ///
 /// The documented `harvest_task_queue` order is **execution row -> task row**.
 /// `resume_workflow_execution` follows it: it holds the execution row
 /// `FOR UPDATE` and then shifts this execution's task rows with a plain,
 /// *waiting* `UPDATE` (unlike its external-task sibling, that shift has no
-/// `SKIP LOCKED` escape). Round 18's locked `schedule_to_start` re-read ran
-/// before the execution lock and inverted the order, so enforcement held a task
-/// row while waiting on the execution row exactly as the resume held the
-/// execution row and waited on that task row. Postgres detects the cycle and
-/// aborts one side — failing either the timeout sweep or the operator's resume.
+/// `SKIP LOCKED` escape). An earlier locked `schedule_to_start` re-read ran
+/// before the execution lock and inverted the order. So enforcement held a task
+/// row while it waited on the execution row. At the same time the resume held
+/// the execution row and waited on that task row. Postgres detects the cycle
+/// and aborts one side. That fails either the timeout sweep or the operator's
+/// resume.
 ///
 /// Sequenced deterministically rather than raced. A holder takes the execution
 /// row `FOR UPDATE` (standing in for a resume that has just entered its

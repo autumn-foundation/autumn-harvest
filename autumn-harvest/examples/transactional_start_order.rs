@@ -121,7 +121,7 @@ async fn place_order_after(
     // the run's first task. `finish()` is an optional latency optimization
     // (eagerly dispatches any deferred completion-trigger follow-ups) — never
     // a correctness requirement, since a periodic scanner delivers the same
-    // follow-ups if it's skipped.
+    // follow-ups if it is skipped.
     let exec_id = outcome.exec_id;
     outcome.finish().await;
     Ok(exec_id)
@@ -129,7 +129,7 @@ async fn place_order_after(
 
 /// A validation failure AFTER the domain insert rolls back BOTH writes — the
 /// workflow start never happened, and the `orders` row it would have referenced
-/// doesn't exist either. There is no half-written state to clean up.
+/// does not exist either. There is no half-written state to clean up.
 async fn place_order_rejected(
     conn: &mut AsyncPgConnection,
     client: &WorkflowHandleClient,

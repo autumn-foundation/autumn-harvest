@@ -4152,9 +4152,9 @@ mod tests {
 
     #[test]
     fn a_keyed_envelope_naming_the_wrong_codec_is_refused() {
-        // Codex round 8 (P2). The round-2 fix required the codec_id to match
-        // for KID-LESS envelopes and left the keyed branch short-circuiting on
-        // `parts.kid.is_some()`, so an explicit kid that resolved was decoded
+        // An earlier fix required the codec_id to match for KID-LESS
+        // envelopes. It left the keyed branch short-circuiting on
+        // `parts.kid.is_some()`. So an explicit kid that resolved was decoded
         // without ever checking the algorithm the envelope named.
         //
         // That is the hazard `resolve_decoder`'s own doc describes: an

@@ -592,7 +592,7 @@ async fn context_awaiting_external_re_emits_same_token_idempotently() {
     else {
         panic!("expected ScheduleExternalActivity");
     };
-    // Crucially, the token and activity_id must match what's already in history.
+    // Crucially, the token and activity_id must match what is already in history.
     assert_eq!(*emitted_token, token, "token must be reused from history");
     assert_eq!(
         *emitted_id, activity_id,

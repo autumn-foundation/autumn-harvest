@@ -879,10 +879,10 @@ fn worker_startup_rejects_dynamic_key_without_rps() {
     );
 }
 
-/// A STATIC `rate_limit_key` beginning with the reserved `dyn-rate:` prefix
-/// reaching the worker via a direct `HandlerRegistry` must fail loud at the
-/// startup gate rather than register a bucket colliding with the generated
-/// dynamic per-key namespace. This gate is the primary one (issue #699). The
+/// A STATIC `rate_limit_key` can begin with the reserved `dyn-rate:` prefix
+/// and reach the worker via a direct `HandlerRegistry`. It must fail loud at
+/// the startup gate. It must not register a bucket that collides with the
+/// generated dynamic per-key namespace. This gate is the primary one (issue #699). The
 /// schedule-time guard in `persist_scheduled_activities` stays as
 /// defense-in-depth behind it.
 #[test]

@@ -149,7 +149,7 @@ pub const fn supersede_count(existing_others: usize, limit: u32) -> usize {
     existing_others.saturating_sub(cap - 1)
 }
 
-/// Shed decision for one latest-wins supersede pass (issue #811, Codex round 2).
+/// Shed decision for one latest-wins supersede pass (issue #811).
 ///
 /// `candidates` are the shed-eligible non-terminal runs on the key; `protected`
 /// are in-flight admissions whose start transaction is still open on this task
@@ -168,9 +168,9 @@ pub const fn supersede_count(existing_others: usize, limit: u32) -> usize {
 /// ordinary admission, which sees those runs unprotected — the same bounded-shed
 /// philosophy as `SUPERSEDE_SCAN_LIMIT`.
 ///
-/// Counting `protected` is what fixes the nested case: excluding it entirely (the
-/// first cut) computed `supersede_count(0, 1) == 0` for a nested admission and
-/// preserved BOTH runs on a `limit = 1` key.
+/// Counting `protected` is what fixes the nested case. Excluding it entirely
+/// computed `supersede_count(0, 1) == 0` for a nested admission and preserved
+/// BOTH runs on a `limit = 1` key.
 #[must_use]
 pub const fn supersede_plan(candidates: usize, protected: usize, limit: u32) -> SupersedePlan {
     let target = {
@@ -378,8 +378,7 @@ async fn lock_concurrency_key(
 ///
 /// Only `self_exec_id` is excluded. An outer admission whose start transaction is
 /// still open on this task (see `ADMITTING`) IS returned, so the caller can count
-/// it toward the population while filtering it out of the shed set (issue #811,
-/// Codex round 2).
+/// it toward the population while filtering it out of the shed set (issue #811).
 ///
 /// # Bounded fetch
 ///
@@ -408,7 +407,7 @@ async fn active_runs_for_key(
     }
 
     // Only the admitted run itself is excluded from the scan. A protected
-    // in-flight admission (issue #811, Codex round 2) is deliberately RETURNED
+    // in-flight admission (issue #811) is deliberately RETURNED
     // here so it still counts toward the key's population; the caller filters it
     // out of the shed set. Excluding it from the query too would under-count the
     // group and let a nested admission preserve an over-limit population.
@@ -830,11 +829,11 @@ async fn supersede_inner(
     .await?;
 
     // Protected in-flight admissions COUNT toward the population but are never
-    // shed (issue #811, Codex round 2).
+    // shed (issue #811).
     //
     // `inherited` holds the outer admission(s) whose start transaction is still
     // open on this task -- see `ADMITTING`. Excluding them from the population
-    // entirely (as the first cut did) under-counted the group: a nested
+    // entirely under-counted the group: a nested
     // admission spawned while cancelling an incumbent would compute
     // `supersede_count(0, 1) == 0` and preserve BOTH the outer run and itself on
     // a `limit = 1` key. Counting them here makes the shed target honest, so
@@ -1158,10 +1157,10 @@ mod tests {
     }
 
     // `supersede_count(existing_others, limit)` is the whole latest-wins
-    // decision: after our own execution is admitted, how many of the OTHER
+    // decision: after this execution is admitted, how many of the OTHER
     // non-terminal runs for this key must be cancelled so that the post-admit
     // in-flight count is <= limit.
-    // ── issue #811 Codex round 2: protected in-flight admissions count ────
+    // ── issue #811: protected in-flight admissions count ─────────────────
 
     #[test]
     fn plan_counts_protected_toward_the_population() {

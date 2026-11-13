@@ -590,7 +590,7 @@ pub struct AuditExportBuilderConfig {
 /// A webhook URL reduced to its origin, for diagnostics.
 ///
 /// A SIEM ingest endpoint routinely carries its credential in the path or the
-/// query string (`.../services/collector/<token>`, `?api_key=...`), so the full
+/// query string (`.../services/collector/<token>`, `?api_key=...`). So the full
 /// URL is a secret in the same way the HMAC key is (issue #953). The `Debug`
 /// impl of `AuditExportBuilderConfig` is hand-written to keep secrets out of
 /// logs and panic messages. It already redacts the HMAC key and the sink, but
@@ -1192,9 +1192,9 @@ pub async fn ensure_cursor_row(
     // 1. The row is retired rather than deleted ([`decommission_cursor`]), so
     //    `last_assigned_seq` survives even when retention later purges every
     //    stamped row (issue #953).
-    // 2. The INSERT arm still seeds from `MAX(export_seq)` rather than 0, for
-    //    the paths where the row genuinely went missing anyway: a manual
-    //    DELETE, a partial restore. Restarting at 0 there would also violate
+    // 2. The INSERT arm still seeds from `MAX(export_seq)` rather than 0. That
+    //    covers the paths where the row genuinely went missing anyway: a
+    //    manual DELETE, a partial restore. Restarting at 0 there would also violate
     //    the cursor's `last_acked_seq <= last_assigned_seq` CHECK the moment a
     //    retained batch is acknowledged.
     //
@@ -3291,9 +3291,9 @@ async fn deliver_within_lease(
 /// records delivered.
 /// Discard a delivery whose sink was replaced while it was in flight.
 ///
-/// `read_global_audit_export_config` clones the `Arc` at the top of a tick, so
-/// a second runtime publishing a different sink does not disturb that clone and
-/// the batch reaches the OLD destination (issue #953). `apply_outcome` is
+/// `read_global_audit_export_config` clones the `Arc` at the top of a tick. A
+/// second runtime that publishes a different sink does not disturb that clone.
+/// So the batch reaches the OLD destination (issue #953). `apply_outcome` is
 /// guarded on `claim_epoch`, which a config swap does
 /// not change, so a 2xx from the old sink would advance the cursor: the records
 /// would be delivered, marked delivered, and absent from the SIEM the operator
@@ -5173,7 +5173,7 @@ mod tests {
     }
 
     /// A delivery whose sink was swapped mid-flight must not advance the
-    /// cursor: the records went to the OLD destination, and marking them
+    /// cursor. The records went to the OLD destination. Marking them
     /// delivered would leave the newly configured SIEM without them (issue
     /// #953).
     ///

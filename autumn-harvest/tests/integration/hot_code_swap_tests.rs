@@ -1797,8 +1797,9 @@ async fn an_unsigned_republish_does_not_erase_an_existing_signature() {
     // supplying none would then NULL a valid one. Mid-rollout, an older or
     // unsigned publisher re-seeding the same build would turn a harmless
     // duplicate publish into a fleet-wide refusal. Every worker syncing with
-    // the key would reject a row that was correctly signed a moment earlier. An explicit (verified) signature replaces; `None` leaves
-    // the stored attestation alone.
+    // the key would reject a row that was correctly signed a moment earlier.
+    // An explicit (verified) signature replaces; `None` leaves the stored
+    // attestation alone.
     let (mut conn, _c) = db().await;
     let bytes = pipeline_v1_bytes();
     let signature = sign_module_binding(
@@ -2880,9 +2881,9 @@ fn the_decision_cache_is_bounded_in_bytes_not_just_entries() {
 #[test]
 fn a_cache_hit_is_charged_to_the_run_budget_like_a_recomputation() {
     // A free hit would make the run's TERMINAL OUTCOME depend on cache
-    // residency: the same workflow with the same history
-    // would complete when its earlier decisions were still resident and fail
-    // when unrelated executions had evicted them, or when one response exceeded
+    // residency. The same workflow with the same history would complete when
+    // its earlier decisions were still resident. It would fail when unrelated
+    // executions had evicted them, or when one response exceeded
     // `MAX_CACHED_RESPONSE_BYTES` and was never cached. That is the class of
     // defect `MAX_DECIDE_STEPS` is a compile-time constant to avoid, arriving
     // through the optimisation instead. The cache may make a run cheaper; it may

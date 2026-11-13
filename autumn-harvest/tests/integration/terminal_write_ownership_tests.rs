@@ -805,14 +805,15 @@ async fn a_dispatcher_that_still_owns_the_claim_is_released_when_skip_locked_is_
 }
 
 // ---------------------------------------------------------------------------
-// fail_execution_on_error -- this shared
-// error-handling glue passed `SuspendedClaimAmbiguous` through un-failed but
-// not `TerminalWriteClaimAmbiguous`, so a #1184-guarded write's ambiguity
-// (e.g. from `persist_workflow_continue_as_new`'s seal transaction) fell
-// through to an ordinary `fail_task_and_execution` call here -- which, if the
-// transient contention that caused the ambiguity had cleared by then, would
-// actually find the claim still held and commit a real `WorkflowFailed`,
-// turning a blameless "no decision" into a genuine terminal failure.
+// fail_execution_on_error -- this shared error-handling glue passed
+// `SuspendedClaimAmbiguous` through un-failed but not
+// `TerminalWriteClaimAmbiguous`. So a #1184-guarded write's ambiguity fell
+// through to an ordinary `fail_task_and_execution` call here. An example is
+// the ambiguity from `persist_workflow_continue_as_new`'s seal transaction.
+// The transient contention that caused the ambiguity could clear by then.
+// The call would then find the claim still held and commit a real
+// `WorkflowFailed`. That turns a blameless "no decision" into a genuine
+// terminal failure.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]

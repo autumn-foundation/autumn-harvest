@@ -140,9 +140,9 @@ fn main() {
         }
     }
 
-    // Printed so LTO cannot dead-code-eliminate the loop and so a run
-    // accidentally producing violations (a fixture bug) is loudly visible
-    // rather than silently under-measuring the validator.
+    // Printed so LTO cannot dead-code-eliminate the loop. A run that
+    // accidentally produces violations (a fixture bug) is then loudly
+    // visible rather than silently under-measuring the validator.
     println!("schema_validate_profile: n={n} ok={ok_count} violations={violation_count}");
     assert_eq!(
         ok_count, n,

@@ -21,9 +21,10 @@ pub fn scheduled_zset_key(prefix: &str, queue_name: &str) -> String {
 /// Per-queue HASH used by the scheduled set to store the full envelope payload
 /// keyed by stable `task_id`.
 ///
-/// We can't put the payload directly on the sorted set because the score is
-/// the only ordering primitive there; instead we ZADD `task_id` with the score
-/// and HSET the payload alongside, then HDEL when promoting or cancelling.
+/// The payload cannot go directly on the sorted set, because the score is the
+/// only ordering primitive there. Instead the store ZADDs `task_id` with the
+/// score and HSETs the payload alongside, then HDELs when promoting or
+/// cancelling.
 #[must_use]
 pub fn scheduled_payloads_key(prefix: &str, queue_name: &str) -> String {
     format!("{prefix}:scheduled:{queue_name}:payloads")

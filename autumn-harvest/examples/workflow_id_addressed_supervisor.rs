@@ -74,7 +74,7 @@ async fn job_pool(ctx: &WorkflowContext, processed_so_far: u32) -> Result<(), St
     let mut processed = processed_so_far;
     loop {
         // Block until the supervisor delivers a job — addressed by
-        // `workflow_id`, so it doesn't matter which rotation of this entity
+        // `workflow_id`, so it does not matter which rotation of this entity
         // is currently live.
         let job: Job = ctx
             .receive_signal("add_job")

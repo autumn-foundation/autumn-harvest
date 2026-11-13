@@ -53,7 +53,7 @@
 //! - A static, immutable run summary set once at start time (fast-follow).
 //! - A dedicated query handler or SSE push for the field (SSE already covers
 //!   live updates via #324; this is a pull field on describe).
-//! - Indexing/filtering executions *by* `current_details` (that's the
+//! - Indexing/filtering executions *by* `current_details` (that is the
 //!   search-attributes surface, #506/#159).
 //!
 //! Run with:

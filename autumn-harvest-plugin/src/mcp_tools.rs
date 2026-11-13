@@ -1989,9 +1989,9 @@ mod tests {
         );
     }
 
-    /// The reverse direction: the first registration IS `mcp`-flagged, so
-    /// its schema/hint must be what is advertised even if a later duplicate
-    /// for the same `(workflow, name)` differs.
+    /// The reverse direction: the first registration IS `mcp`-flagged. So
+    /// its schema/hint is what is advertised, even if a later duplicate for
+    /// the same `(workflow, name)` differs.
     #[test]
     fn collect_descriptors_update_first_mcp_registration_wins_over_later_duplicate() {
         let first_mcp = UpdateHandlerInfo {

@@ -250,7 +250,7 @@ pub const fn release_lock_stmt() -> &'static str {
 }
 
 /// Release by `(key, holder)` with **no** `lock_seq` fence — for the terminal
-/// sweep / release-all path where the seq isn't threaded. `$1` = `lock_key`,
+/// sweep / release-all path where the seq is not threaded. `$1` = `lock_key`,
 /// `$2` = `holder_exec_id`. `RETURNING acquired_at`.
 #[must_use]
 pub const fn release_lock_by_holder_key_stmt() -> &'static str {
@@ -599,7 +599,7 @@ mod db_ops {
     ///
     /// Feeds the `harvest.mutex.wait_duration`
     /// and `harvest.mutex.contention_depth` metrics. Returns `None` if the
-    /// waiter row is gone (shouldn't happen at grant time). **Not**
+    /// waiter row is gone (should not happen at grant time). **Not**
     /// `table_present`-guarded — called only on the acquire/grant path.
     ///
     /// # Errors
@@ -742,7 +742,7 @@ mod db_ops {
     /// Remove every waiter row for `exec_id` across all keys and wake each key's
     /// new head of line.
     ///
-    /// Guarded. A spurious wake (the exec wasn't actually the
+    /// Guarded. A spurious wake (the exec was not actually the
     /// head) is safe — the woken task simply re-parks.
     ///
     /// # Errors
@@ -912,7 +912,7 @@ mod pure_tests {
     use super::*;
 
     /// Serializes the mutex-lease-TTL global setter tests against each other so
-    /// they don't race in the shared lib-test binary (mirrors
+    /// they do not race in the shared lib-test binary (mirrors
     /// `start_idempotency::PURGE_WINDOW_TEST_LOCK`).
     static LEASE_TTL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -940,7 +940,7 @@ mod pure_tests {
         set_mutex_lease_ttl(Duration::ZERO);
         assert!((effective_mutex_lease_ttl().as_secs_f64() - 1.5).abs() < 1e-9);
 
-        // Restore the default so ordering-independent test runs don't leak state.
+        // Restore the default so ordering-independent test runs do not leak state.
         set_mutex_lease_ttl(DEFAULT_MUTEX_LEASE_TTL);
         assert_eq!(effective_mutex_lease_ttl(), DEFAULT_MUTEX_LEASE_TTL);
     }

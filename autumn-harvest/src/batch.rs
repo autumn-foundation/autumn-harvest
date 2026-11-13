@@ -456,8 +456,8 @@ mod db {
         };
 
         // Single UPDATE = single transaction = atomic. Appending an empty
-        // JSON array via `||` is a no-op, so it is safe to always include the
-        // errors and processed_ids set clauses regardless of input length.
+        // JSON array via `||` is a no-op. So the errors and processed_ids set
+        // clauses are always safe to include, whatever the input length.
         diesel::update(harvest_batch_jobs::table.find(id))
             .set((
                 harvest_batch_jobs::completed.eq(harvest_batch_jobs::completed + delta_completed),
@@ -596,13 +596,13 @@ mod db {
     /// drops the per-call limit so a 10k batch can drain over multiple ticks.
     ///
     /// `action` is consulted only to pick the default state filter when the
-    /// caller did not supply one: Cancel/Signal default to the active states
-    /// `RUNNING`/`PAUSED` (terminal rows are no-ops, and a paused execution is
-    /// still active — cancel accepts it and a signal queues for delivery on
-    /// resume); Terminate defaults to "every non-terminal-sealed state"
-    /// (excludes `CANCELLED` and `TERMINATED`) because its whole purpose is to
-    /// seal stuck live rows as `TERMINATED` (already-terminal rows are
-    /// idempotent no-ops).
+    /// caller did not supply one. Cancel/Signal default to the active states
+    /// `RUNNING`/`PAUSED`. Terminal rows are no-ops, and a paused execution is
+    /// still active: cancel accepts it and a signal queues for delivery on
+    /// resume. Terminate defaults to "every non-terminal-sealed state"
+    /// (excludes `CANCELLED` and `TERMINATED`). Its whole purpose is to seal
+    /// stuck live rows as `TERMINATED`, and already-terminal rows are
+    /// idempotent no-ops.
     /// Apply the per-action state defaults, `workflow_name`, and each
     /// `search_attrs @> $jsonb` containment predicate onto a boxed
     /// `harvest_workflow_executions` query.

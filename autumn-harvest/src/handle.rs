@@ -2420,8 +2420,8 @@ impl WorkflowHandle {
     /// # Errors
     ///
     /// Returns query execution or hydration errors.
-    // Already at the clippy line limit before #772 round 6 added the two-line
-    // deadline-budget threading below; an allow is cheaper than refactoring an
+    // Already at the clippy line limit before #772 added the two-line
+    // deadline-budget threading below. An allow is cheaper than refactoring an
     // unrelated large function for a 2-line fix.
     #[allow(clippy::too_many_lines)]
     pub async fn execute_query_in_process(
@@ -2489,7 +2489,7 @@ impl WorkflowHandle {
             self.client.inner.shared_state.clone(),
             self.client.inner.history_policy,
         )
-        // #772 round 6: thread the deadline budget (see `hydrate_ctx_for_query`).
+        // #772: thread the deadline budget (see `hydrate_ctx_for_query`).
         .with_execution_timeout(execution.execution_timeout)
         .with_deadline(execution.deadline_at)
         // #1405: thread the row's current shard (mirrors the deadline

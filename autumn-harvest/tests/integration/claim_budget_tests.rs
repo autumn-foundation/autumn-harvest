@@ -1412,7 +1412,7 @@ async fn a_dbname_query_parameter_cannot_redirect_the_connection() {
 }
 
 // ---------------------------------------------------------------------------
-// Setup-deadline bound (issue #786, round 19).
+// Setup-deadline bound (issue #786).
 //
 // These need no database, but they are async: a `#[tokio::test]` in
 // `claim_bench_support.rs` would reclassify that shared harness as a suite
@@ -1556,7 +1556,7 @@ async fn provision_deadline_preserves_a_step_that_finishes_in_time() {
 }
 
 // ---------------------------------------------------------------------------
-// Version-neutral database drop (issue #786, round 20).
+// Version-neutral database drop (issue #786).
 // ---------------------------------------------------------------------------
 
 /// Terminate-then-drop must evict a live backend, exactly as `WITH (FORCE)` did.
@@ -1655,7 +1655,7 @@ async fn version_neutral_drop_evicts_a_live_backend() {
 }
 
 // ---------------------------------------------------------------------------
-// Provisioning connects through the fixed database (issue #786, round 21).
+// Provisioning connects through the fixed database (issue #786).
 // ---------------------------------------------------------------------------
 
 /// The provisioning session never sits on the database the operator named.
@@ -1957,7 +1957,7 @@ async fn zz_capture_queue_pause_claim_evidence() {
     // Fresh connection + fresh seed at the published headline scale.
     let mut stats_conn = db::connect(&bench.url).await;
     // A failure here is caught downstream: if the extension genuinely
-    // couldn't be created, the SELECT against `pg_stat_statements` below
+    // could not be created, the SELECT against `pg_stat_statements` below
     // (guarded by its own `.expect(...)`) fails with "relation does not
     // exist" -- so discarding this particular result does not let a broken
     // capture pass.
@@ -2084,7 +2084,7 @@ async fn zz_capture_queue_pause_claim_evidence() {
     // `%harvest_task_queue%`. Unlike a missing preload (already guarded by
     // the `.expect()` on the query above), a zero-row result here means the
     // extension is loaded but not tracking (e.g.
-    // `pg_stat_statements.track = none`, which doesn't error, it just
+    // `pg_stat_statements.track = none`, which does not error, it just
     // silently returns nothing) or some other scoping problem -- either way
     // this must abort the capture, not fall back to a placeholder the shell
     // harness's marker-only success check would accept.

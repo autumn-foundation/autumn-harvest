@@ -683,7 +683,7 @@ mod tests {
     }
 
     // The exact `is_busygroup` path is exercised end-to-end against a real
-    // Redis instance in the integration tests under `tests/`. It is hard to
-    // construct a `RedisError` with a `BUSYGROUP` code outside of an actual
-    // server reply, so this module does not try to fake one.
+    // Redis instance in the integration tests under `tests/`. A `RedisError`
+    // with a `BUSYGROUP` code is hard to construct outside a real server reply.
+    // So this module does not try to fake one.
 }

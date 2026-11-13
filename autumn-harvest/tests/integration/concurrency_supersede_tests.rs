@@ -1963,15 +1963,15 @@ async fn nested_self_referential_admission_emits_residual_over_limit_counter() {
     )
     .await;
 
-    // Issue #1197 item 2: `cancel_workflow_execution_collect`
-    // used to hardcode `metrics: None` for its own completion-trigger
-    // evaluation, so a nested admission recursing off of it could only ever
-    // reach a recorder through the process-global fallback, dropping the
-    // sample entirely for any caller that supplies its own recorder without
-    // also installing a global one. Fixed by threading the real caller
-    // recorder through instead. Install a *poisoned* global recorder here —
-    // if the fix regresses, the residual sample would land here instead of on
-    // `dummy_metrics` below, and the negative assertion at the end catches it.
+    // Issue #1197 item 2: `cancel_workflow_execution_collect` used to
+    // hardcode `metrics: None` for its own completion-trigger evaluation. A
+    // nested admission recursing off of it could then reach a recorder only
+    // through the process-global fallback. A caller that supplies its own
+    // recorder without also installing a global one lost the sample entirely.
+    // Fixed by threading the real caller recorder through instead. Install a
+    // *poisoned* global recorder here — if the fix regresses, the residual
+    // sample would land here instead of on `dummy_metrics` below, and the
+    // negative assertion at the end catches it.
     let previous_global_metrics = global_admission_metrics();
     let poisoned_global_metrics = Arc::new(CapturingMetrics::default());
     set_global_admission_metrics(Some(

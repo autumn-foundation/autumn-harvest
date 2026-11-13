@@ -459,7 +459,7 @@ async fn api_revoke_compat_works() {
     assert_eq!(status, StatusCode::OK, "revoke must return 200: {json}");
     assert_eq!(json["revoked"], true, "revoked must be true");
 
-    // Verify it's gone.
+    // Verify it is gone.
     let entries = list_build_compat(&mut conn).await.unwrap();
     assert!(entries.is_empty(), "entry must be removed after revoke");
 }

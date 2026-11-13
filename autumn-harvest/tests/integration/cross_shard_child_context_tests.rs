@@ -582,7 +582,7 @@ async fn sequential_placed_spawns_do_not_all_collide_on_one_shard() {
     }
 
     // Assert the DETERMINISTIC property, not a distribution one: child N must
-    // hash as the Nth invocation. "they didn't all land on one shard" would be a
+    // hash as the Nth invocation. "they did not all land on one shard" would be a
     // flaky assertion — three keys over four shards legitimately collide about 6
     // times in 100 — and it would also pass by luck under the very bug this test
     // exists to catch.
@@ -688,7 +688,7 @@ async fn a_placed_childs_shard_does_not_depend_on_which_cycle_dispatched_it() {
     );
 }
 
-// ── Replay must never re-resolve placement (issue #956, Codex round 6) ────────
+// ── Replay must never re-resolve placement (issue #956) ────────
 
 /// A fan-out pinned to shard 2, so a router that no longer contains shard 2
 /// makes the placement genuinely unresolvable rather than merely differently
