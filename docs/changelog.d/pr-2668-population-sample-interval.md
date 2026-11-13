@@ -11,7 +11,7 @@ used 77% of the buffers of the workload.
   samplers now make 30 times fewer calls.
 - Every other sampler keeps `poll_interval`.
 - The gauge semantics do not change. Each worker still emits the fleet-wide
-  value, so `sum`, `max` and `last` queries read as before.
+  value, so `max` and `last` queries read as before.
 - The first sample comes one interval after the worker starts.
 - `HarvestBuilder::build` and `WorkerRuntimeConfig::validate` reject a zero
   interval. A zero interval spins the samplers.
@@ -19,9 +19,9 @@ used 77% of the buffers of the workload.
 - The oversized query no longer names `'SUSPENDED'`. No row stores that
   state, so the result does not change.
 
-**Upgrade note.** `WorkerRuntimeConfig` has a new public field. A struct
-literal must set `population_sample_interval`. Use
-`DEFAULT_POPULATION_SAMPLE_INTERVAL` to keep the default.
+**Upgrade note.** `WorkerConfig` and `WorkerRuntimeConfig` have the new
+public field `population_sample_interval`. A struct literal must set it. Use
+`worker::DEFAULT_POPULATION_SAMPLE_INTERVAL` to keep the default.
 
 No migration. No new `WorkflowEvent` variant. Design record:
 `docs/design/DESIGN-2668.md`.

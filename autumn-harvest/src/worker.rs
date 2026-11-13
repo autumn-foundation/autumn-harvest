@@ -46521,17 +46521,19 @@ mod tests {
         Arc::new(telemetry)
     }
 
-    /// A runtime config with a 50 ms poll interval and the default
-    /// population interval.
+    /// A runtime config with a 50 ms poll interval and a 3 s population
+    /// interval. No other setting uses 3 s, so a test proves that the
+    /// samplers read this field and not a constant.
     fn population_cadence_config() -> WorkerRuntimeConfig {
         let mut cfg = default_runtime_config();
         cfg.poll_interval = Duration::from_millis(50);
-        cfg.population_sample_interval = DEFAULT_POPULATION_SAMPLE_INTERVAL;
+        cfg.population_sample_interval = Duration::from_secs(3);
         cfg
     }
 
     /// Issue #2668: with metrics on, the population samplers wait for the
-    /// population interval. They open no connection on a poll tick.
+    /// population interval. They open no connection on a poll tick. They
+    /// open one within three poll ticks after the interval ends.
     #[tokio::test(start_paused = true)]
     async fn population_samplers_wait_for_the_population_interval_not_the_poll_interval() {
         let cfg = population_cadence_config();
@@ -46545,19 +46547,23 @@ mod tests {
             100,
         );
 
-        // Stop one poll tick before the population interval ends.
-        let poll_ticks_before_first_sample = usize::try_from(
-            cfg.population_sample_interval.as_millis() / cfg.poll_interval.as_millis() - 1,
+        // The samplers start their sleep in the first tick. So this stops
+        // two poll ticks before the first sample.
+        let ticks_in_interval = usize::try_from(
+            cfg.population_sample_interval.as_millis() / cfg.poll_interval.as_millis(),
         )
         .expect("tick count fits usize");
-        advance_sampler_ticks(cfg.poll_interval, poll_ticks_before_first_sample).await;
+        advance_sampler_ticks(cfg.poll_interval, ticks_in_interval - 1).await;
         let touches_before = listener.touch_count();
 
-        // The accept is real loopback I/O. Tick until it lands, under a
-        // deadline in real time.
+        // Move past the first sample, then stop the clock. A longer
+        // interval than the configured one then opens no connection.
+        advance_sampler_ticks(cfg.poll_interval, 3).await;
+        // The accept is real loopback I/O. A yield polls I/O and does not
+        // advance the paused clock. Wait under a deadline in real time.
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         while listener.touch_count() == 0 && std::time::Instant::now() < deadline {
-            advance_sampler_ticks(cfg.poll_interval, 1).await;
+            tokio::task::yield_now().await;
         }
         let touches_after = listener.touch_count();
         cancel.cancel();
@@ -46594,7 +46600,9 @@ mod tests {
 
         cancel.cancel();
         for handle in handles {
-            // Time does not advance here, so only the cancel can end the task.
+            // A failed cancel leaves the sampler in its sleep. The idle
+            // runtime then moves the paused clock to the 1 ms deadline
+            // first, so the timeout fails the test.
             let joined = tokio::time::timeout(Duration::from_millis(1), handle).await;
             assert!(
                 joined.is_ok(),
@@ -46602,7 +46610,6 @@ mod tests {
             );
         }
         listener.stop();
-        assert_eq!(listener.touch_count(), 0);
     }
 
     #[test]

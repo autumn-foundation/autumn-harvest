@@ -41,7 +41,7 @@ metric.**
 | R3 | A long sleep delays shutdown. | The sleep selects on the cancel token. A test cancels in the sleep and the task ends. |
 | R4 | The new knob is not visible to an operator. | `WorkerConfigView` (`GET /api/harvest/admin/config`, key `worker.population_sample_interval_ms`) reports it. The exhaustive destructure forces this. |
 | R5 | A dashboard or alert needs a value faster than 15 s. | The starter alert reads `harvest_workflow_active` over one hour. The history-ceiling runbook alerts on `harvest_workflow_history_oversized > 0`. Both are coarse. An operator can lower the interval. |
-| R6 | A `sum` across workers changes. | Option A keeps one emitter per worker, so `sum`, `max` and `last` give the same value as before. |
+| R6 | A query across workers changes. | Option A keeps one emitter per worker, so `sum`, `max` and `last` give the same value as before. Use `max`: each worker emits the fleet-wide value. |
 | R7 | The docs still say "poll interval". | The telemetry table and the history-ceiling runbook change in the same commit. |
 | R8 | The name suggests that the knob governs every metric sampler. | The name is `population_sample_interval`. It governs the two population samplers only. |
 
