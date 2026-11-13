@@ -619,7 +619,24 @@ async fn a_point_in_time_restore_takes_both_files_back() {
     let a = host(dir.path(), &clock, &options).await;
     let key = a.key();
     let harvest = a.harvest();
-    drop(harvest.open(&key).await.expect("open acme"));
+    let (kept, later, target) = runs_around_a_target(&a).await;
+
+    harvest
+        .restore(&key, Some(target))
+        .await
+        .expect("restore acme to the target");
+    drop(harvest.open(&key).await.expect("reopen acme"));
+    absent(&a.client, &later).await;
+    signal(&a.client, &kept).await;
+    completed(&a.client, &kept).await;
+    a.fleet.close_all().await;
+}
+
+/// Ship a run before a point in time and a run after it, then close the
+/// tenant. Returns the two runs and the point in time.
+async fn runs_around_a_target(a: &Host) -> (String, String, chrono::DateTime<chrono::Utc>) {
+    let key = a.key();
+    drop(a.harvest().open(&key).await.expect("open acme"));
     let kept = start(&a.client, true).await;
     waiting(&a.client, &kept).await;
     a.ship().await;
@@ -630,11 +647,97 @@ async fn a_point_in_time_restore_takes_both_files_back() {
     waiting(&a.client, &later).await;
     a.ship().await;
     a.fleet.close(&key).await;
+    (kept, later, target)
+}
 
-    harvest
+/// The text of the restore target beside the Harvest file of `a`.
+fn restore_target(a: &Host) -> String {
+    let mut name = a.harvest_file().into_os_string();
+    name.push(".restore-target");
+    std::fs::read_to_string(PathBuf::from(name)).unwrap_or_default()
+}
+
+/// A direct restore after a `HarvestFleet::restore` and before an open
+/// supersedes the waiting target. The Harvest file opens at its latest
+/// state.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_direct_restore_supersedes_a_waiting_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = TickingClock::starting_at(chrono::Utc::now());
+    let a = host(dir.path(), &clock, &Options::owned("a")).await;
+    let key = a.key();
+    let (kept, later, target) = runs_around_a_target(&a).await;
+
+    a.harvest()
         .restore(&key, Some(target))
         .await
         .expect("restore acme to the target");
+    assert!(
+        restore_target(&a).starts_with("committed "),
+        "the target waits"
+    );
+    a.fleet
+        .restore(&key, None)
+        .await
+        .expect("restore acme to its latest state");
+    drop(a.harvest().open(&key).await.expect("reopen acme"));
+    assert!(state_of(&a.client, &later).await.is_some(), "latest state");
+    signal(&a.client, &kept).await;
+    completed(&a.client, &kept).await;
+    a.fleet.close_all().await;
+}
+
+/// A direct restore that fails after its release leaves the database at
+/// the target. The next open still takes the Harvest file to the target.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_direct_restore_keeps_the_waiting_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = TickingClock::starting_at(chrono::Utc::now());
+    let a = host(dir.path(), &clock, &Options::owned("a")).await;
+    let key = a.key();
+    let (kept, later, target) = runs_around_a_target(&a).await;
+
+    a.harvest()
+        .restore(&key, Some(target))
+        .await
+        .expect("restore acme to the target");
+    // No replica reaches 1970. The fleet drains and releases the tenant,
+    // then refuses the restore.
+    let refused = a
+        .fleet
+        .restore(&key, Some(chrono::DateTime::UNIX_EPOCH))
+        .await
+        .expect_err("no replica reaches the target");
+    assert!(
+        matches!(refused, autumn_web::db::fleet::FleetError::Restore { .. }),
+        "{refused}"
+    );
+    drop(a.harvest().open(&key).await.expect("reopen acme"));
+    absent(&a.client, &later).await;
+    signal(&a.client, &kept).await;
+    completed(&a.client, &kept).await;
+    a.fleet.close_all().await;
+}
+
+/// A caller that drops `HarvestFleet::restore` does not stop it. Both files
+/// still go to the target.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dropped_restore_call_still_restores_both_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = TickingClock::starting_at(chrono::Utc::now());
+    let a = host(dir.path(), &clock, &Options::owned("a")).await;
+    let key = a.key();
+    let (kept, later, target) = runs_around_a_target(&a).await;
+
+    let harvest = a.harvest();
+    let call = harvest.restore(&key, Some(target));
+    drop(tokio::time::timeout(Duration::from_millis(1), call).await);
+    // Wait until the restore of the dropped call ends.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !restore_target(&a).starts_with("committed ") {
+        assert!(Instant::now() < deadline, "the dropped restore never ended");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     drop(harvest.open(&key).await.expect("reopen acme"));
     absent(&a.client, &later).await;
     signal(&a.client, &kept).await;
