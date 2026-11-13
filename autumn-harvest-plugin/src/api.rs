@@ -10979,9 +10979,9 @@ mod operator_reason_tests {
         assert!(truncated.chars().all(|c| c == '\u{2603}'));
     }
 
-    /// Issue #619: truncating a reason that was validated *before* normalization
-    /// can produce a whitespace-only value, which the core then rejects on every
-    /// shard — an opaque 500 with the queue still dispatching, where the route
+    /// Issue #619: truncating a reason validated *before* normalization can
+    /// produce a whitespace-only value. The core then rejects it on every
+    /// shard: an opaque 500 with the queue still dispatching, where the route
     /// promises an audited 400.
     ///
     /// `parse_pause_request` closes this by trimming at the point of validation.
@@ -11056,16 +11056,13 @@ async fn list_workflows(
     use axum::response::IntoResponse as _;
     let pairs = crate::strict_query::decode_or_autumn_error(raw_query.as_deref())?;
     let filters = parse_workflow_filters(&pairs)?;
-    // PR #1139 review: `no_progress_minutes` (stalled-workflow discovery,
-    // issue #486) and `history_bloat_min_events` (history-bloat discovery,
-    // issue #704) are two dedicated, mutually-exclusive discovery paths —
-    // each computes and sorts by a *different* value (staleness vs. current
-    // history size) that the other loader neither computes nor honors.
-    // Silently letting one win (whichever branch is checked first) would
-    // drop the other filter without telling the caller. Reject the
-    // combination up front with a clear `400`, matching the existing
-    // pagination-combo precedent below (AC7: never a silent, mis-filtered
-    // page).
+    // PR #1139: `no_progress_minutes` (stalled-workflow discovery, issue #486)
+    // and `history_bloat_min_events` (history-bloat discovery, issue #704) are
+    // mutually exclusive discovery paths. Each sorts by a different value
+    // (staleness vs. current history size) that the other loader ignores.
+    // Letting one win would silently drop the other filter. Reject the
+    // combination with a clear `400`, as the pagination combo below does
+    // (AC7: never a silent, mis-filtered page).
     if filters.no_progress_minutes.is_some() && filters.history_bloat_min_events.is_some() {
         return Err(AutumnError::bad_request_msg(
             "no_progress_minutes and history_bloat_min_events are two separate discovery paths \
@@ -11073,10 +11070,10 @@ async fn list_workflows(
         ));
     }
     if filters.no_progress_minutes.is_some() {
-        // Stalled-workflow discovery (issue #486). On the happy path this is a
-        // bare array (cursor pagination is not supported here); when a shard is
-        // unreachable (issue #756) it degrades to the `{ workflows, status,
-        // unavailable_shards }` envelope instead of a `500`.
+        // Stalled-workflow discovery (issue #486). The happy path returns a
+        // bare array, with no cursor pagination. An unreachable shard (issue
+        // #756) degrades it to the `{ workflows, status, unavailable_shards }`
+        // envelope instead of a `500`.
         let page = load_stalled_workflows_from_shards(&api_state, &filters).await?;
         return Ok(fanout_list_json(
             "workflows",
@@ -11087,15 +11084,14 @@ async fn list_workflows(
         .into_response());
     }
     if filters.history_bloat_min_events.is_some() {
-        // Operator early-warning discovery for workflow history bloat (issue
-        // #704, AC1). A dedicated non-terminal-only, sorted-by-size path — see
-        // the `load_history_bloat_workflows` doc comment. This is a SEPARATE
-        // query param from the general-purpose `min_history_events` (issue
-        // #493) precisely so that filter keeps composing with `state=`/
-        // pagination unchanged — see `WorkflowFilters::min_history_events`.
-        // Sorting is by a *computed* value (no stored keyset column), so
-        // combining with cursor pagination is rejected up front (AC7: never a
-        // silent, wrongly-ordered page — always a clear `400`).
+        // Early-warning discovery for history bloat (issue #704, AC1). A
+        // dedicated non-terminal-only path, sorted by size; see
+        // `load_history_bloat_workflows`. It is a separate param from
+        // `min_history_events` (issue #493), so that filter still composes with
+        // `state=`/pagination; see `WorkflowFilters::min_history_events`.
+        // The sort value is computed, with no keyset column. So cursor
+        // pagination fails up front with a clear `400`, never a silent,
+        // wrongly-ordered page (AC7).
         if filters.paginated {
             return Err(AutumnError::bad_request_msg(
                 "history_bloat_min_events is not supported together with cursor/page_size/order \
@@ -11148,10 +11144,10 @@ const MAX_SUMMARY_LIMIT: i64 = 500;
 
 /// Parsed query params for `GET /workflows/summaries` (issue #752).
 ///
-/// Mirrors the `GET /workflows` filter vocabulary (`workflow_name`,
-/// `workflow_id`, `state`, completed-time-range, `search_attr` containment)
-/// against the summary tier, plus the same keyset-cursor pagination contract
-/// (issue #498) — here keyed on `(completed_at, execution_id)`.
+/// Mirrors the `GET /workflows` filter vocabulary against the summary tier:
+/// `workflow_name`, `workflow_id`, `state`, a completed-time range and
+/// `search_attr` containment. It uses the same keyset-cursor pagination
+/// (issue #498), keyed on `(completed_at, execution_id)`.
 #[derive(Debug, Default, Clone)]
 pub(crate) struct SummaryListFilters {
     pub(crate) limit: i64,
@@ -11430,10 +11426,10 @@ async fn count_workflows(
 /// `GET /admin/usage` — historical per-tenant/per-workflow usage report (issue #596).
 ///
 /// The historical companion to the point-in-time `GET /admin/concurrency`
-/// endpoint. Aggregates already-durable data (`harvest_workflow_executions`
-/// and `harvest_events`) over a required `[from, to]` window, grouped by
-/// `workflow_name` (default) or by a `search_attr:<key>` tenant key, fanned
-/// out across every shard. An unreachable shard is named in
+/// endpoint. It aggregates durable data (`harvest_workflow_executions` and
+/// `harvest_events`) over a required `[from, to]` window, fanned out across
+/// every shard. It groups by `workflow_name` (default) or by a
+/// `search_attr:<key>` tenant key. An unreachable shard is named in
 /// `unavailable_shards` rather than failing the call wholesale.
 async fn usage_report(
     Extension(api_state): Extension<HarvestApiState>,
@@ -11499,16 +11495,15 @@ async fn get_registered_workflow_schema(
     )
 }
 
-/// `GET /workflows/registered/{name}/interface` — enumerate a registered
-/// workflow type's published interaction surface: its signal, query, and update
-/// handlers, each with an optional argument/response JSON Schema and description
-/// (issue #610).
+/// `GET /workflows/registered/{name}/interface`: a registered workflow type's
+/// signal, query and update handlers (issue #610).
 ///
-/// Returns `200` with a [`WorkflowInterfaceRecord`] whose `signals`/`queries`/
-/// `updates` arrays are each sorted by handler name (so the response is
-/// deterministic across calls), or `404` when the workflow name is not
-/// registered. Handlers without a published schema simply omit the
-/// `arg_schema`/`response_schema`/`description` fields.
+/// Each handler carries an optional argument/response JSON Schema and
+/// description. Returns `200` with a [`WorkflowInterfaceRecord`], or `404`
+/// when the workflow name is not registered. The `signals`/`queries`/`updates`
+/// arrays are each sorted by handler name, so the response is deterministic.
+/// A handler without a published schema omits `arg_schema`/`response_schema`/
+/// `description`.
 ///
 /// [`WorkflowInterfaceRecord`]: autumn_harvest::WorkflowInterfaceRecord
 async fn get_registered_workflow_interface(
@@ -11592,9 +11587,9 @@ fn schema_validation_response(
 ///
 /// A token that parses as a number becomes a number with all its digits. The
 /// exact literals `true`/`false` become a `Bool`. Everything else stays a
-/// `String`. This is the documented typed-coercion rule that lets
-/// `eq`/`ne`/`in` compare against the stored JSONB value by type (so
-/// `amount:eq:100` matches numeric `100`, not the string `"100"`).
+/// `String`. This typed-coercion rule lets `eq`/`ne`/`in` compare against the
+/// stored JSONB value by type. So `amount:eq:100` matches numeric `100`, not
+/// the string `"100"`.
 pub(crate) fn coerce_scalar(raw: &str) -> JsonText {
     // A number keeps every digit. One leading `+`, as in `+5`, is allowed.
     // A second sign, as in `+-5`, makes the token a string.
@@ -11660,10 +11655,10 @@ pub(crate) fn parse_search_attr_filter(raw: &str) -> Result<SearchAttrPredicate,
     let cmp = |op_name: &str, op: CmpOp| -> Result<SearchAttrPredicate, AutumnError> {
         let v = require_value(raw, op_name)?;
         let trimmed = v.trim();
-        // Validate it is a finite number so a bad value fails fast with 400
-        // rather than as a runtime `::numeric` cast error, but keep the original
-        // trimmed text — it is bound and cast `::numeric` in SQL, preserving full
-        // precision for integers beyond f64's 2^53 mantissa.
+        // Validate a finite number, so a bad value fails fast with 400 and not
+        // as a runtime `::numeric` cast error. Keep the original trimmed text:
+        // SQL casts it `::numeric`, which keeps full precision for integers
+        // beyond the 2^53 mantissa of f64.
         let parsed = trimmed.parse::<f64>().map_err(|_| {
             AutumnError::bad_request_msg(format!(
                 "search_attr_filter '{raw}': operator '{op_name}' requires a numeric value, got '{v}'"
@@ -11969,9 +11964,8 @@ pub(crate) fn parse_workflow_filters(
     crate::visibility_query::check_anchor(&filters.filter)
         .map_err(|message| AutumnError::bad_request_msg(format!("invalid filter: {message}")))?;
 
-    // `page_size` takes precedence over `limit` whenever it is present, so the
-    // documented "page_size overrides limit" contract holds independent of the
-    // order the two parameters appear in the query string.
+    // `page_size` overrides `limit` whenever it is present, whatever the
+    // order of the two parameters in the query string.
     let limit = page_size_raw
         .or(limit_raw)
         .unwrap_or(DEFAULT_WORKFLOW_LIMIT)
@@ -12132,9 +12126,9 @@ fn parse_history_sample_export_query(
         }
     }
 
-    // A terminal or unknown state is rejected here rather than silently
-    // dropped: the gate replays *in-flight* histories, so a request for
-    // `COMPLETED` is a caller error, not an empty result set.
+    // Reject a terminal or unknown state, do not drop it silently. The gate
+    // replays *in-flight* histories, so a request for `COMPLETED` is a caller
+    // error, not an empty result set.
     let states = normalize_sample_states(&raw_states).map_err(AutumnError::bad_request_msg)?;
 
     Ok(HistorySampleExportQuery {
@@ -12152,22 +12146,23 @@ fn parse_history_sample_export_query(
 ///
 /// The sample export checks
 /// [`MAX_SAMPLE_RESPONSE_BYTES`](autumn_harvest::replay_sample::MAX_SAMPLE_RESPONSE_BYTES)
-/// *before* each fetch, because a document's size is not knowable until it is
-/// loaded — so peak retained bytes are the budget plus at most one document.
+/// *before* each fetch. A document's size is not knowable until it is loaded.
+/// So peak retained bytes are the budget plus at most one document.
 /// That is a bound only if one document is itself bounded, and `max_bytes` is
 /// caller-supplied. With no ceiling the budget starts at zero, so the first
-/// candidate is always fetched and retained however large it is, and a single
-/// multi-gigabyte history exhausts the management API despite the aggregate cap.
+/// candidate is always fetched and retained, however large it is. A single
+/// multi-gigabyte history then exhausts the management API despite the
+/// aggregate cap.
 ///
-/// Rejected rather than silently clamped: asking for one document larger than
-/// the entire response budget is incoherent (it can never be returned within
-/// that budget), and quietly shrinking the caller's limit would surface later as
-/// a mystifying per-candidate size failure naming a number they never set.
+/// Rejected rather than silently clamped. One document larger than the whole
+/// response budget can never be returned within that budget. A quietly shrunk
+/// limit would surface later as a mystifying per-candidate size failure. That
+/// failure names a number the caller never set.
 ///
 /// Scoped to this route deliberately. The single-execution and batch export
-/// routes predate #798, return a different shape, and carry no aggregate budget
-/// for a per-document limit to be coherent against; changing their contract is
-/// not this change's business.
+/// routes predate #798 and return a different shape. They carry no aggregate
+/// budget for a per-document limit to be coherent against. Changing their
+/// contract is out of scope here.
 fn parse_sample_max_bytes(value: &str) -> Result<usize, AutumnError> {
     let parsed = parse_history_max_bytes(value)?;
     let ceiling = autumn_harvest::replay_sample::MAX_SAMPLE_RESPONSE_BYTES;
@@ -12205,9 +12200,9 @@ fn parse_history_datetime(value: &str) -> Result<chrono::DateTime<chrono::Utc>, 
 
 fn states_for_history_state_group(value: &str) -> Result<Vec<String>, AutumnError> {
     match value {
-        // PAUSED is a non-terminal active state (issue #383): it must be
-        // enumerated everywhere active runs are, so the `active` group includes
-        // it alongside RUNNING rather than silently omitting paused executions.
+        // PAUSED is a non-terminal active state (issue #383). The `active`
+        // group includes it alongside RUNNING, so paused executions are not
+        // silently omitted.
         "active" => Ok(vec!["RUNNING".to_string(), "PAUSED".to_string()]),
         "terminal" => Ok(terminal_workflow_states()),
         "all" => Ok(Vec::new()),
@@ -12253,24 +12248,24 @@ async fn export_workflow_history(
         Ok(execution) => execution,
         Err(error) => return map_error(error).into_response(),
     };
-    // Load raw (codec-untransformed) history: the export policy is applied
-    // downstream — Redacted replaces payload fields wholesale (envelope
-    // included) and Full + read-path decoder decodes tolerantly — so the
+    // Load raw (codec-untransformed) history: the export policy applies
+    // downstream. Redacted replaces payload fields wholesale, envelope
+    // included. Full with a read-path decoder decodes tolerantly. So the
     // strict identity-only `load_history` must not pre-empt either with an
-    // `UnknownPayloadCodec` error on an encrypted deployment (PR #936
-    // review). Identity deployments store no envelopes, so this is
-    // byte-identical to the strict loader for them.
+    // `UnknownPayloadCodec` error on an encrypted deployment (PR #936).
+    // Identity deployments store no envelopes, so this is byte-identical to
+    // the strict loader for them.
     let history = match store::load_history_undecoded(&mut conn, exec_id).await {
         Ok(history) => history,
         Err(error) => return map_error(error).into_response(),
     };
 
-    // Read-path payload decoding (issue #608): Full policy only — decoding
-    // only to redact would be pointless plaintext exposure, so Redacted
-    // exports skip the decoder (and the audit) entirely. The decoder is
-    // resolved *before* the export and threaded into it so decoding happens
-    // ahead of the `max_bytes` measurement (PR #936 review) — the size
-    // enforcement and `size_limit.actual_bytes` reflect the decoded document.
+    // Read-path payload decoding (issue #608) is for the Full policy only.
+    // Decoding only to redact would expose plaintext for nothing, so Redacted
+    // exports skip the decoder and the audit. The decoder is resolved *before*
+    // the export and threaded into it (PR #936). So decoding happens before
+    // the `max_bytes` check, and `size_limit.actual_bytes` reflects the
+    // decoded document.
     let decoder = if query.payload_policy == HistoryPayloadPolicy::Full {
         read_path_decoder(&api_state, extension_session(maybe_session)).await
     } else {
@@ -12327,10 +12322,10 @@ async fn export_workflow_histories(
         Err(error) => return error.into_response(),
     };
     // Read-path payload decoding (issue #608): Full policy only; one audit
-    // row per request, accumulated across every export entry. The decoder is
-    // threaded into each per-candidate export so decoding happens ahead of
-    // that entry's `max_bytes` measurement (PR #936 review) — size
-    // enforcement and `size_limit.actual_bytes` reflect the decoded bytes.
+    // row per request, accumulated across every export entry. Each
+    // per-candidate export gets the decoder (PR #936), so decoding happens
+    // before that entry's `max_bytes` check. Size enforcement and
+    // `size_limit.actual_bytes` reflect the decoded bytes.
     let decoder = if query.payload_policy == HistoryPayloadPolicy::Full {
         read_path_decoder(&api_state, extension_session(maybe_session)).await
     } else {
@@ -12951,11 +12946,11 @@ async fn get_workflow_result(
 /// 2. `ContinuedAsNew` → successor chains (issue #527) so callers get the
 ///    row that actually carries the final logical output/error.
 ///
-/// Only a `NotFound` on a mid-chain successor row is swallowed (returns the
-/// last-seen `CONTINUED_AS_NEW` row rather than a confusing 404); all other
-/// errors propagate so callers see the 5xx. Shared by the `/result` HTTP
-/// endpoint (issue #527) and the MCP `{wf}_status`/`{wf}_watch` tools (issue
-/// #597) so both surfaces resolve a continued-as-new chain identically.
+/// Only a `NotFound` on a mid-chain successor row is swallowed. It returns the
+/// last-seen `CONTINUED_AS_NEW` row rather than a confusing 404. All other
+/// errors propagate, so callers see the 5xx. The `/result` HTTP endpoint (issue
+/// #527) and the MCP `{wf}_status`/`{wf}_watch` tools (issue #597) share it.
+/// So both surfaces resolve a continued-as-new chain identically.
 pub(crate) async fn resolve_terminal_workflow_execution(
     api_state: &HarvestApiState,
     exec_id: ExecutionId,
@@ -12972,9 +12967,9 @@ pub(crate) async fn resolve_terminal_workflow_execution(
         if execution.state != "CONTINUED_AS_NEW" {
             return Ok(execution);
         }
-        // load_execution_following_retries may have advanced past current_id via
-        // the retry chain; the ContinuedAsNew event lives on the effective
-        // (retried) execution, so read history from its id, not current_id.
+        // `load_execution_following_retries` may have advanced past `current_id`
+        // along the retry chain. The `ContinuedAsNew` event lives on the
+        // effective (retried) execution, so read history from its id.
         let effective_id = ExecutionId::from_uuid(execution.id);
         match load_continue_as_new_successor(api_state, effective_id).await? {
             Some(next_id) => {
@@ -13012,9 +13007,10 @@ async fn workflow_result_snapshot_following_can(
     Ok(WorkflowResult::from_execution(&execution))
 }
 
-/// Load the effective execution for `exec_id` by following the workflow-level
-/// retry chain (issue #523): while the current row is `FAILED` and a successor
-/// with `retry_of_exec_id = id` exists, advance to that successor. Returns the
+/// Load the effective execution for `exec_id` along the retry chain (issue #523).
+///
+/// While the current row is `FAILED` and a successor with
+/// `retry_of_exec_id = id` exists, it advances to that successor. Returns the
 /// deepest (most recent) execution. Uses only DB reads — no listener required.
 ///
 /// Delegates to the single canonical walker
@@ -13053,9 +13049,9 @@ async fn load_continue_as_new_successor(
 ) -> Result<Option<ExecutionId>, AutumnError> {
     let mut conn = db_conn_for_execution(api_state, exec_id).await?;
     // Raw (codec-untransformed) load: only the typed `new_exec_id` field is
-    // read here — never a payload field — so codec envelopes ride along as
-    // opaque `Value`s and an encrypted history cannot fail the `/result` /
-    // MCP status chain walk with `UnknownPayloadCodec` (PR #936 review).
+    // read, never a payload field. Codec envelopes ride along as opaque
+    // `Value`s, so an encrypted history cannot fail the `/result` / MCP status
+    // chain walk with `UnknownPayloadCodec` (PR #936).
     let history = store::load_history_undecoded(&mut conn, exec_id)
         .await
         .map_err(map_error)?;
@@ -13069,11 +13065,12 @@ async fn load_continue_as_new_successor(
     Ok(successor)
 }
 
-/// Decode the compact result's `output` (JSONB) and `error` (TEXT) fields
-/// when read-path decoding is active, write the best-effort
-/// `payload.decode_read` audit row when ≥1 envelope was touched, and build
-/// the HTTP response (issue #608). A `None` decoder is byte-identical to
-/// calling [`workflow_result_response`] directly.
+/// Decode and audit a compact result, then build its HTTP response (issue #608).
+///
+/// With read-path decoding active, it decodes the `output` (JSONB) and `error`
+/// (TEXT) fields. It writes the best-effort `payload.decode_read` audit row
+/// when ≥1 envelope was touched. A `None` decoder is byte-identical to calling
+/// [`workflow_result_response`] directly.
 async fn respond_with_workflow_result(
     api_state: &HarvestApiState,
     headers: &axum::http::HeaderMap,
@@ -13089,15 +13086,15 @@ async fn respond_with_workflow_result(
         if let Some(error) = result.error.as_mut() {
             outcome = outcome.merged(decode_error_field(codecs, error));
         }
-        // The audit target is deliberately the *requested* exec id — the
-        // durable handle the operator asked about — even when the snapshot
-        // belongs to a ContinuedAsNew/retry successor the chain walk resolved
-        // (same logical run, same shard). Documented in the audit-contract
+        // The audit target is deliberately the *requested* exec id, the
+        // durable handle the operator asked about. It stays so even when the
+        // snapshot belongs to a ContinuedAsNew/retry successor that the chain
+        // walk resolved (same logical run, same shard). Documented in the audit-contract
         // section of docs/operations/read-path-decode.md.
         let target = exec_id.to_string();
-        // No caller of this helper holds a live pooled connection at this
-        // point (the chain-walk helpers scope theirs internally), so the
-        // pool-acquiring branch is safe (PR #936 review).
+        // No caller of this helper holds a live pooled connection here. The
+        // chain-walk helpers scope theirs internally, so the pool-acquiring
+        // branch is safe (PR #936).
         audit_decoded_read(
             api_state,
             None,
@@ -13331,9 +13328,9 @@ async fn load_workflow_children_tree_from_shards(
     let mut rows = Vec::new();
     let mut frontier = vec![parent_id];
     let mut seen = HashSet::new();
-    // A shard is degraded for the WHOLE traversal the moment any depth level
-    // fails against it: a missed level's children are missed descendants, so
-    // reporting `complete` afterwards would understate the gap.
+    // A shard is degraded for the WHOLE traversal once any depth level fails
+    // against it. A missed level's children are missed descendants, so a
+    // later `complete` would understate the gap.
     let mut shard_errors: std::collections::BTreeMap<i32, String> =
         std::collections::BTreeMap::new();
     let mut observed: std::collections::BTreeSet<i32> = std::collections::BTreeSet::new();
@@ -13347,14 +13344,13 @@ async fn load_workflow_children_tree_from_shards(
         }
 
         // Batch the WHOLE frontier into one `parent_id = ANY($1)` query per
-        // shard per depth level, instead of one query per *parent* per shard
-        // per depth level -- `O(depth × shards)` round trips instead of
-        // `O(nodes × shards)`, mirroring `load_workflow_children_batch`
-        // (the same batching `GET /workflows/{id}/tree`, issue #621, already
-        // does for this exact traversal shape). Which specific parent in the
-        // frontier produced a given child is never needed here: the next
-        // frontier is just the union of everyone's children, deduped by
-        // `seen`, and result filters only ever inspect the row itself.
+        // shard per depth level, not one query per *parent*. That costs
+        // `O(depth × shards)` round trips instead of `O(nodes × shards)`. It
+        // mirrors `load_workflow_children_batch`, the batching that
+        // `GET /workflows/{id}/tree` (issue #621) uses for this traversal shape.
+        // The parent of a given child is never needed here. The next frontier
+        // is the union of all children, deduped by `seen`, and result filters
+        // inspect only the row itself.
         let parent_uuids: Vec<uuid::Uuid> = frontier.iter().map(ExecutionId::as_uuid).collect();
         let mut next_frontier = Vec::new();
         let observations = futures::future::join_all(expected.iter().map(|shard_id| {
@@ -13418,17 +13414,17 @@ async fn load_workflow_children_tree_from_shards(
 /// `GET /workflows/{id}/tree` — the full recursive descendant tree rooted at
 /// `id`, across all readable shards.
 ///
-/// The bounded, cycle-safe walk itself is
-/// [`crate::lineage::LineageWalk`] (pure, unit-tested); this handler owns the
-/// HTTP contract: root resolution (`404`/`400`), bound validation (`400`), and
-/// the tree-vs-summary response selection.
+/// [`crate::lineage::LineageWalk`] (pure, unit-tested) is the bounded,
+/// cycle-safe walk. This handler owns the HTTP contract: root resolution
+/// (`404`/`400`), bound validation (`400`), and the tree-vs-summary response
+/// selection.
 ///
 /// **Not admin-gated**, matching its closest siblings `GET
 /// /workflows/{id}/children` (which already performs a cross-shard depth
 /// traversal over the same rows) and `GET /workflows/{id}/run-chain`. This
-/// route exposes strictly the same class of data — execution rows' identity,
-/// state, and topology — with no payloads, so gating it while `/children`
-/// stays open would be an inconsistency, not a hardening.
+/// route exposes the same class of data: execution rows' identity, state and
+/// topology, with no payloads. Gating it while `/children` stays open would
+/// be an inconsistency, not a hardening.
 async fn get_workflow_tree(
     Extension(api_state): Extension<HarvestApiState>,
     Path(id): Path<String>,
@@ -13439,9 +13435,9 @@ async fn get_workflow_tree(
     let params = parse_lineage_query(&pairs)?;
 
     // Root lookup is O(1) shard-routed off the id's embedded shard — only the
-    // *descendant* walk needs a fan-out. Deliberately the **exact** variant:
-    // the lenient `db_conn_for_execution` would fall back to the default shard
-    // when the owning shard has no pool on this node, turning "I cannot see
+    // *descendant* walk needs a fan-out. Deliberately the **exact** variant.
+    // The lenient `db_conn_for_execution` falls back to the default shard when
+    // the owning shard has no pool on this node. That turns "I cannot see
     // that shard" into a confident `404`. That would contradict this very
     // response, whose `unavailable_shards` reports exactly such a shard as
     // unreachable for the descendant walk.
@@ -13487,7 +13483,7 @@ pub(crate) struct LineageQueryParams {
 /// Parse and validate `?max_depth=`, `?max_nodes=`, `?summary=`.
 ///
 /// An out-of-range or non-numeric bound is a `400` naming the offending
-/// parameter rather than a silent clamp — the response echoes the `limits` it
+/// parameter, not a silent clamp. The response echoes the `limits` it
 /// applied, so clamping would make that echo lie.
 pub(crate) fn parse_lineage_query(
     pairs: &[(String, String)],
@@ -13509,10 +13505,10 @@ pub(crate) fn parse_lineage_query(
                 })?);
             }
             "summary" => {
-                // Rejected rather than defaulted to `false`: a caller who
-                // typos the value and silently receives a full tree with a
-                // 200 has no way to notice, and every other bound on this
-                // route is a hard 400 on an invalid value.
+                // Rejected rather than defaulted to `false`. A caller who typos
+                // the value and silently receives a full tree with a 200 cannot
+                // notice. Every other bound on this route is a hard 400 on an
+                // invalid value.
                 let v = value.trim();
                 summary = match v {
                     _ if v.eq_ignore_ascii_case("true") || v == "1" => true,
@@ -13535,15 +13531,15 @@ pub(crate) fn parse_lineage_query(
 
 /// Drive the bounded lineage walk level by level across every expected shard.
 ///
-/// Two batched queries per level (children of the whole frontier, then — once —
-/// an existence probe over the unexpanded leaves) rather than one query per
-/// parent per shard: that is what keeps a ~200-node/8-shard tree inside the
-/// issue's p95 < 500 ms budget.
+/// Each level runs two batched queries, not one query per parent per shard. The
+/// first reads the children of the whole frontier. The second, run once, is an
+/// existence probe over the unexpanded leaves. That keeps a ~200-node/8-shard
+/// tree inside the issue's p95 < 500 ms budget.
 ///
-/// Never fails wholesale on an unreachable shard (issue #756): the reachable
+/// Never fails wholesale on an unreachable shard (issue #756). The reachable
 /// shards' rows still flow, the shard is named in `unavailable_shards`, and
-/// `status` degrades to `partial`/`unavailable` — a cross-shard triage read
-/// must not 500 during exactly the incident it exists to diagnose.
+/// `status` degrades to `partial`/`unavailable`. A cross-shard triage read
+/// must not 500 during the very incident it exists to diagnose.
 ///
 /// **Consistency:** shards are read independently, so a deep tree may be
 /// marginally time-skewed across shards. That is acceptable for triage and is
@@ -13560,9 +13556,9 @@ async fn build_lineage_report(
     let mut frontier = vec![root_row.exec_id.as_uuid()];
     let mut shard_errors: BTreeMap<i32, String> = BTreeMap::new();
     // Evidence, not arithmetic: a shard is only "inspected" once it has
-    // actually answered. Deriving this as `expected - errors` would claim a
-    // complete read on a path where zero shards were queried (a budget that
-    // only fits the root breaks the loop before the first round).
+    // actually answered. `expected - errors` would claim a complete read on a
+    // path where zero shards were queried. A budget that only fits the root
+    // breaks the loop before the first round.
     let mut observed: BTreeSet<i32> = BTreeSet::new();
 
     for depth in 1..=limits.max_depth {
@@ -13599,9 +13595,9 @@ async fn build_lineage_report(
     // children, so a childless leaf is never reported as a dropped subtree.
     //
     // The live `frontier` is the authoritative unexpanded set on every exit
-    // path — empty when the tree completed naturally, the deepest admitted
-    // level on a depth exit, and `[root]` when the budget was spent before a
-    // single round ran.
+    // path. It is empty when the tree completed naturally, and the deepest
+    // admitted level on a depth exit. It is `[root]` when the budget was spent
+    // before a single round ran.
     let probe_targets = frontier;
     if !probe_targets.is_empty() {
         let observations = futures::future::join_all(expected.iter().map(|shard_id| {
@@ -13617,11 +13613,11 @@ async fn build_lineage_report(
         walk.record_probe_result(&parents);
     }
 
-    // Retained-summary probe (issue #752). A terminal child can be demoted into
-    // `harvest_execution_summaries` and have its execution row collected while
-    // its parent is still live, so it is invisible to the walk above. Probing
-    // EVERY admitted id (not just the unexpanded frontier) is required: such a
-    // child can hang off any node in the tree, not only a leaf.
+    // Retained-summary probe (issue #752). A terminal child can be demoted
+    // into `harvest_execution_summaries` while its parent is still live. Its
+    // execution row is then collected, so the walk above cannot see it. Probe
+    // EVERY admitted id, not just the unexpanded frontier. Such a child can
+    // hang off any node in the tree, not only a leaf.
     let summary_targets = walk.admitted_ids();
     if !summary_targets.is_empty() {
         let observations = futures::future::join_all(expected.iter().map(|shard_id| {
@@ -13649,10 +13645,9 @@ async fn build_lineage_report(
 
 /// Why a shard could not contribute to the lineage walk.
 ///
-/// Folding every failure mode (no pool for a router-known shard, connection
-/// acquire, query) into a `ShardObservation` error rather than propagating is
-/// what lets an unreachable shard degrade the report to `partial` instead of
-/// failing the whole call (#756).
+/// It folds every failure mode into a `ShardObservation` error: no pool for a
+/// router-known shard, connection acquire, and query. So an unreachable shard
+/// degrades the report to `partial` instead of failing the whole call (#756).
 const fn lineage_shard_unavailable<R>(shard_id: i32, reason: String) -> ShardObservation<R> {
     ShardObservation {
         shard_id,
@@ -13720,13 +13715,13 @@ async fn lineage_probe_on_shard(
     }
 }
 
-/// One shard's contribution to the **retained-summary** probe (issue #752):
-/// which of the given nodes have a child that was demoted into
-/// `harvest_execution_summaries` and so is absent from the tree.
+/// One shard's contribution to the **retained-summary** probe (issue #752).
 ///
-/// Structurally identical to [`lineage_probe_on_shard`] — same degrade-to-
-/// `partial` failure handling — but against the summaries table, so a shard
-/// that predates the summaries migration degrades rather than 500s.
+/// It names the given nodes with a child demoted into
+/// `harvest_execution_summaries`, which is absent from the tree.
+/// Structurally identical to [`lineage_probe_on_shard`], with the same
+/// degrade-to-`partial` failure handling, but against the summaries table. So
+/// a shard that predates the summaries migration degrades rather than 500s.
 async fn lineage_summary_probe_on_shard(
     shard_id: i32,
     pool: Option<DbPool>,
@@ -14294,13 +14289,13 @@ fn unavailable_shards_summary(shards: &[UnavailableShard]) -> String {
 /// into ordered per-step durations (queue-wait vs execution split, slowest step,
 /// busy/wait rollup) via [`autumn_harvest::derive_timeline`]. No new events are
 /// appended and no state is recomputed. Shard routing is O(1) from the
-/// `ExecutionId`; an unknown execution (including a classic DAG run, which is not
-/// on the standard execution path) returns a clear 404.
+/// `ExecutionId`. An unknown execution returns a clear 404, including a classic
+/// DAG run, which is not on the standard execution path.
 ///
-/// The timeline surfaces only durations, names, ids, and outcomes — never any
-/// `input`/`output`/`payload`/`error`/`value` field — so read-path payload
-/// decoding (issue #608) is a no-op here and is deliberately skipped (no
-/// `read_path_decoder`, no `audit_decoded_read`).
+/// The timeline surfaces only durations, names, ids, and outcomes. It never
+/// carries an `input`/`output`/`payload`/`error`/`value` field. So read-path
+/// payload decoding (issue #608) is a no-op here and is deliberately skipped
+/// (no `read_path_decoder`, no `audit_decoded_read`).
 async fn get_workflow_timeline(
     Extension(api_state): Extension<HarvestApiState>,
     Path(id): Path<String>,
@@ -14387,9 +14382,9 @@ type WorkflowLogsQueryParams = (
 
 /// Parse query parameters for `GET /workflows/{id}/logs`.
 ///
-/// An unknown `level=` value is rejected rather than silently ignored: a typo
-/// would otherwise answer "no lines" for a run that has plenty, which is the
-/// worst possible outcome for a triage endpoint.
+/// An unknown `level=` value is rejected, not silently ignored. A typo would
+/// otherwise answer "no lines" for a run that has plenty. That is the worst
+/// possible outcome for a triage endpoint.
 pub(crate) fn parse_workflow_logs_query(
     pairs: &[(String, String)],
 ) -> Result<WorkflowLogsQueryParams, AutumnError> {
@@ -14464,13 +14459,13 @@ pub(crate) fn parse_workflow_logs_query(
 /// across workers.
 ///
 /// Admin-gated, matching the sibling per-execution diagnostic reads
-/// (`/awaitables`, the eligibility endpoints): a log message is free-form
-/// author text that routinely carries business detail, so it gets the stricter
+/// (`/awaitables`, the eligibility endpoints). A log message is free-form
+/// author text that routinely carries business detail. So it gets the stricter
 /// posture rather than the plain-execution-row one.
 ///
-/// Shard routing uses the **exact** (no default-shard fallback) resolver: an
-/// empty log list is a legitimate answer for a run that simply never logged, so
-/// a mis-routed read would be indistinguishable from "this run has no logs".
+/// Shard routing uses the **exact** resolver, with no default-shard fallback.
+/// An empty log list is a legitimate answer for a run that never logged. So a
+/// mis-routed read would be indistinguishable from "this run has no logs".
 /// Failing closed with a 503 keeps the answer honest.
 ///
 /// Logs are observational only (AC7): they are not part of the event history,
@@ -14503,11 +14498,11 @@ async fn get_workflow_logs(
 
     let level_refs: Vec<&str> = levels.iter().map(String::as_str).collect();
     // Fetch `limit + 1` and compare, the repo's pagination idiom (see the
-    // schedule-runs / audit / dead-letter loaders). Emitting a cursor purely
-    // because the page came back full would hand the caller a non-null
-    // `next_cursor` whose follow-up page is empty whenever the remaining line
-    // count is an exact multiple of `limit` -- and, on a capped run, that
-    // spurious cursor is the `i64::MAX` marker slot.
+    // schedule-runs / audit / dead-letter loaders). A cursor emitted only
+    // because the page came back full hands the caller a non-null
+    // `next_cursor` with an empty follow-up page. That happens whenever the
+    // remaining line count is an exact multiple of `limit`. On a capped run,
+    // that spurious cursor is the `i64::MAX` marker slot.
     let mut rows = autumn_harvest::store::load_workflow_logs(
         &mut conn,
         exec_id,
@@ -14607,21 +14602,26 @@ pub(crate) struct WorkflowAwaitablesResponse {
     pub category_cap: usize,
 }
 
-/// Builds the open-awaitables report for one execution (issue #615): loads the
-/// recorded history from the owning shard, replays it read-only to the current
-/// suspension point (the #612 `drive_query_replay` machinery), and projects the
-/// drained pending-command buffer — the authoritative "what is this run parked
-/// on" set, including awaited-but-unsent signals and `await_condition` parks
-/// that no side table can see — into a bounded, payload-free awaitables list.
+/// Builds the open-awaitables report for one execution (issue #615).
+///
+/// It loads the recorded history from the owning shard. It replays it
+/// read-only to the current suspension point (the #612 `drive_query_replay`
+/// machinery). It projects the drained pending-command buffer into a bounded,
+/// payload-free awaitables list. That buffer is the authoritative "what is
+/// this run parked on" set. It includes awaited-but-unsent signals and
+/// `await_condition` parks that no side table can see.
 ///
 /// Shared by the HTTP handler and the Vantage UI blocked-on panel so the two
 /// can never disagree.
 ///
-/// Degradation contract (this is a triage endpoint — it degrades, it does not
-/// error): an unregistered handler, a classic DAG run, an encrypted history
-/// (identity-codec `UnknownPayloadCodec`), or a replay that times out /
-/// panics / reaches terminal on a non-terminal run falls back to a best-effort
-/// history-only scan with `wait_set_reason` naming why.
+/// Degradation contract: this triage endpoint degrades, it does not error.
+/// These cases fall back to a best-effort history-only scan:
+///
+/// - An unregistered handler or a classic DAG run.
+/// - An encrypted history (identity-codec `UnknownPayloadCodec`).
+/// - A replay that times out, panics, or reaches terminal on a non-terminal run.
+///
+/// `wait_set_reason` names the case.
 ///
 /// Read-only by construction: no events appended, no state mutated, no audit
 /// row (classified `RouteClass::ReadOnly`). Shard-local via
@@ -14666,12 +14666,12 @@ pub(crate) async fn build_awaitables_report(
         });
     }
 
-    // Raw timestamped rows: the SINGLE full-history load. They feed both the
-    // projection's `since`/`deadline` metadata index and — re-derived in
-    // memory below — the replay drive's event history, so the endpoint never
-    // reads `harvest_events` twice (PR review). Raw deserialization — payload
-    // fields ride along as opaque Values (codec envelopes included) and are
-    // never read here, so this load cannot fail on an encrypted deployment.
+    // Raw timestamped rows: the SINGLE full-history load. They feed the
+    // projection's `since`/`deadline` metadata index. Re-derived in memory
+    // below, they also feed the replay drive's event history. So the endpoint
+    // never reads `harvest_events` twice. Payload fields ride along as opaque
+    // Values (codec envelopes included) and are never read here. So this load
+    // cannot fail on an encrypted deployment.
     let rows = store::load_history_with_timestamps(&mut conn, exec_id)
         .await
         .map_err(map_error)?;
@@ -14679,16 +14679,16 @@ pub(crate) async fn build_awaitables_report(
     // Task-row deadline enrichment for open activity awaitables: the earliest
     // of the cross-retry `schedule_to_close_at` (#378) and the current
     // attempt's start-to-close deadline (`started_at + start_to_close`).
-    // Best-effort: this query exists only to *enrich* activity awaitables
-    // with a deadline, so its failure degrades to no-deadline rather than
-    // failing the whole triage report (PR review).
+    // Best-effort: this query only *enriches* activity awaitables with a
+    // deadline. Its failure degrades to no-deadline rather than failing the
+    // whole triage report.
     let activity_deadlines: std::collections::HashMap<String, chrono::DateTime<chrono::Utc>> =
         harvest_task_queue::table
             .filter(harvest_task_queue::workflow_exec_id.eq(Some(exec_id.as_uuid())))
             .filter(harvest_task_queue::task_type.eq("activity"))
             // Open task-row states: backoff is PENDING with a future
-            // scheduled_at, and claimed work is RUNNING — there are no other
-            // non-terminal states in the task-queue vocabulary.
+            // scheduled_at, and claimed work is RUNNING. The task-queue
+            // vocabulary has no other non-terminal states.
             .filter(harvest_task_queue::state.eq_any(["PENDING", "RUNNING"]))
             .select(autumn_harvest::models::TaskQueueItem::as_select())
             .load::<autumn_harvest::models::TaskQueueItem>(&mut conn)
@@ -14716,18 +14716,19 @@ pub(crate) async fn build_awaitables_report(
             })
             .collect();
 
-    // Live unfired timer ids for the history-only fire-eligibility filter: a
-    // history-only scan reports every unclosed `TimerStarted`, but a cancellable
-    // `ctx.start_timer` arm (issue #768, `ArmTimer { for_await: false }`)
-    // records a `TimerStarted` with NO `harvest_timers` row and cannot fire
-    // until `await_fire()`. The live table is the authoritative fire-eligibility
-    // signal, threaded into the projection via
-    // `WaitSetInput::HistoryOnly { fire_eligible_timers }` below so dormant arms
-    // are dropped BEFORE the per-category cap (a fire-eligible timer beyond the
-    // cap position is never crowded out by dormant arms ahead of it). Unused by
-    // the replayed projection, which excludes dormant arms by construction.
-    // Best-effort: on failure the filter is skipped (`None`, a dormant arm may
-    // be over-reported) rather than failing the whole triage report (PR review).
+    // Live unfired timer ids for the history-only fire-eligibility filter. A
+    // history-only scan reports every unclosed `TimerStarted`. But a
+    // cancellable `ctx.start_timer` arm (issue #768,
+    // `ArmTimer { for_await: false }`) records a `TimerStarted` with NO
+    // `harvest_timers` row. It cannot fire until `await_fire()`. The live
+    // table is the authoritative fire-eligibility signal. It reaches the
+    // projection through `WaitSetInput::HistoryOnly { fire_eligible_timers }`
+    // below. So dormant arms are dropped BEFORE the per-category cap, and
+    // never crowd out a fire-eligible timer beyond the cap position. The
+    // replayed projection does not use it: it excludes dormant arms by
+    // construction. Best-effort: on failure the filter is skipped (`None`, a
+    // dormant arm may be over-reported) rather than failing the whole triage
+    // report.
     let fire_eligible_timer_ids: Option<std::collections::HashSet<String>> = harvest_timers::table
         .filter(harvest_timers::workflow_exec_id.eq(exec_id.as_uuid()))
         .filter(harvest_timers::fired.eq(false))
@@ -14745,24 +14746,25 @@ pub(crate) async fn build_awaitables_report(
         .map(|ids| ids.into_iter().collect());
 
     // No further DB reads: release the pool slot before any payload-store
-    // fetch or user-code drive below (the #612 pool-slot discipline, widened —
-    // offload inflation is network I/O too).
+    // fetch or user-code drive below. This widens the #612 pool-slot
+    // discipline, since offload inflation is network I/O too.
     drop(conn);
 
     let workflow = runtime.registry.workflows.get(&execution.workflow_name);
     let (wait_set, wait_set_reason, mut projection) = if let Some(workflow) = workflow {
         // Derive the replay-fidelity event history IN MEMORY from the rows
-        // already loaded: re-serialize each event (lossless — payload fields
-        // are opaque Values), inflate offloaded payloads (#524), and decode
-        // codec envelopes with the runtime-mirrored registry (#608) so an
-        // encrypted deployment still gets the full replayed wait-set. Using
-        // the real codecs here is deliberate and needs no #608 read-decode
-        // opt-in or audit row: decoded plaintext only feeds the replay drive
-        // (exactly as every live worker cycle does) and the response is
+        // already loaded. Re-serialize each event (lossless, since payload
+        // fields are opaque Values) and inflate offloaded payloads (#524).
+        // Decode codec envelopes with the runtime-mirrored registry (#608), so
+        // an encrypted deployment still gets the full replayed wait-set.
+        // The real codecs here are deliberate and need no #608 read-decode
+        // opt-in or audit row. Decoded plaintext only feeds the replay drive,
+        // exactly as every live worker cycle does. The response is
         // payload-free by construction, so nothing decoded is ever surfaced.
-        // ANY failure in this pass — an unknown codec id, a blob-store outage,
-        // a checksum mismatch — degrades to the history-only scan (which needs
-        // no payloads) rather than erroring: this is a triage endpoint.
+        // ANY failure in this pass, such as an unknown codec id, a blob-store
+        // outage or a checksum mismatch, degrades to the history-only scan.
+        // That scan needs no payloads. This is a triage endpoint, so it does
+        // not error.
         let offloader = runtime.registry.payload_offloader();
         let codecs = api_state.payload_codecs();
         let mut events = Vec::with_capacity(rows.len());
@@ -14929,14 +14931,13 @@ pub(crate) fn classify_replayed_wait_set(
 ) {
     use autumn_harvest::awaitables::{AWAITABLE_CATEGORY_CAP, WaitSetInput, project_awaitables};
     match outcome {
-        // A deferred non-determinism error (an infallible primitive —
-        // `system_now`/`new_uuid`/`random_*` — absorbed a divergence
-        // and parked anyway) means the suspension point and its
-        // drained commands are NOT trustworthy: degrade to the
-        // history-only scan rather than serving a wait-set derived
-        // from diverged code (replay review). A broader
-        // unconsumed-history drift check is deliberately NOT applied:
-        // a delivered-but-not-yet-awaited signal legitimately leaves
+        // A deferred non-determinism error means an infallible primitive
+        // (`system_now`/`new_uuid`/`random_*`) absorbed a divergence and
+        // parked anyway. The suspension point and its drained commands are
+        // then NOT trustworthy. Degrade to the history-only scan rather than
+        // serve a wait-set derived from diverged code. A broader
+        // unconsumed-history drift check is deliberately NOT applied: a
+        // delivered-but-not-yet-awaited signal legitimately leaves
         // unconsumed history on a healthy parked run.
         QueryReplayOutcome::Suspended if ctx.take_deferred_nd_error().is_some() => (
             "history_only",
@@ -14965,11 +14966,11 @@ pub(crate) fn classify_replayed_wait_set(
                 ),
             )
         }
-        // A NON-terminal execution whose replay reaches Poll::Ready
-        // is either about to complete (the worker has not persisted
-        // the terminal yet) or has diverged from its recorded
-        // history (code drift / nd-block). Either way the drained
-        // command set is not a trustworthy wait-set.
+        // A NON-terminal execution whose replay reaches Poll::Ready is in one
+        // of two cases. Either it is about to complete, and the worker has not
+        // persisted the terminal yet. Or it has diverged from its recorded
+        // history (code drift / nd-block). Either way the drained command set
+        // is not a trustworthy wait-set.
         QueryReplayOutcome::ReachedTerminal => (
             "history_only",
             Some("replay_reached_terminal"),
@@ -15027,13 +15028,13 @@ pub(crate) fn enrich_activity_deadlines(
 
 /// `GET /workflows/{id}/awaitables` — enumerate what the execution is parked on.
 ///
-/// Read-only open-awaitables diagnostic (issue #615): names every open
-/// awaitable across the six categories (pending activities, unfired timers,
+/// Read-only open-awaitables diagnostic (issue #615). It replays recorded
+/// history to the current suspension point. It names every open awaitable
+/// across six categories: pending activities, unfired timers,
 /// awaited-but-unfulfilled signals, pending child workflows, unresolved
-/// `await_condition` parks, pending updates) by replaying recorded history to
-/// the current suspension point. Admin-gated (`require_admin`), same posture as
-/// the eligibility endpoints. Payload-free: names/ids/timestamps only, so
-/// read-path payload decoding (issue #608) is deliberately skipped.
+/// `await_condition` parks and pending updates. Admin-gated (`require_admin`),
+/// same posture as the eligibility endpoints. Payload-free: names/ids/timestamps
+/// only, so read-path payload decoding (issue #608) is deliberately skipped.
 async fn get_workflow_awaitables(
     Extension(api_state): Extension<HarvestApiState>,
     Path(id): Path<String>,
@@ -15096,62 +15097,18 @@ pub(crate) struct WorkflowDiagnoseResponse {
     /// non-activity verdict.
     pub contributing_reason_codes: Vec<String>,
     /// How the awaited-signal set was derived: `"replayed"`, `"history_only"`,
-    /// or `"not_consulted"` when the verdict was already decided by a
-    /// higher-precedence category and the replay drive was deliberately skipped.
+    /// or `"not_consulted"`. The last means a higher-precedence category
+    /// already decided the verdict, so the replay drive was skipped.
     pub wait_set: String,
     /// Why the wait-set degraded to `history_only`, when it did.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wait_set_reason: Option<String>,
 }
 
-/// Sentinel `wait_set` value for the fast path: the verdict was fully decided by
-/// a category that outranks an awaited signal, so the replay drive was skipped.
+/// Sentinel `wait_set` value for the fast path. A category that outranks an
+/// awaited signal fully decided the verdict, so the replay drive was skipped.
 const WAIT_SET_NOT_CONSULTED: &str = "not_consulted";
 
-/// Builds the stall-diagnosis report for one execution (issue #809).
-///
-/// Correlates, in a single shard-local read, the five signals an operator would
-/// otherwise gather from four separate endpoints: the pending work itself
-/// (`/stack`), per-queue worker liveness (`/workers/health`, `/admin/queue-coverage`),
-/// the in-process circuit registry (`/admin/circuits`), rate-limit and per-key
-/// concurrency saturation (`/admin/rate-limits`, `/admin/concurrency`), plus the
-/// operator queue-pause table and the task row's own retry timing. The pure
-/// [`autumn_harvest::stall_diagnosis::classify_execution`] collapses them into
-/// one verdict.
-///
-/// ## Read-only by construction
-///
-/// No events are appended, no task-queue row is touched, no state is
-/// recomputed, and no migration is involved. The circuit registry is consulted
-/// through `list()` only — never `on_dispatch` / `on_result` / `force_*` — so
-/// diagnosing cannot itself advance a breaker's phase. Safe to call repeatedly.
-///
-/// ## Shard-local
-///
-/// A single execution lives on a single shard, so the read routes O(1) from the
-/// `ExecutionId` via `db_conn_for_execution`. There is no cross-shard fan-out.
-///
-/// ## Replay is consulted only when it can change the answer
-///
-/// An awaited-but-unsent signal exists solely as a parked command inside the
-/// coroutine — no side table can see it — so observing one requires the #615
-/// replay drive. That drive is comparatively expensive, and an awaited signal
-/// ranks *below* pending activities, external handoffs and pending children in
-/// the category ladder. So the drive runs **only** when the database-observable
-/// categories could not already decide the verdict (i.e. the run would otherwise
-/// report `sleeping_timer` or `no_pending_work`, the two verdicts an awaited
-/// signal outranks). The final verdict is identical either way; the common
-/// triage path — a wedged pending activity — never pays for a replay.
-///
-/// ## Payload-free
-///
-/// Names, ids, timestamps, queue/bucket keys and the task row's own error text
-/// only — never an activity input, signal payload or activity output. The one
-/// exception is the task row's `error` text surfaced as
-/// `ActivityRetrying.last_error`, which IS routed through read-path payload
-/// decoding (issue #608) exactly as `/stack` routes the same column for its own
-/// `last_failure`; otherwise an admin would read plaintext there and a
-/// ciphertext envelope here for the same column of the same row.
 /// The column tuple [`build_diagnosis_report`]'s narrow task projection loads.
 type DiagnoseTaskRow = (
     String,                        // state
@@ -15197,8 +15154,8 @@ type WorkflowTaskRow = (
 /// The narrow task-queue projection [`build_diagnosis_report`] reads.
 ///
 /// Deliberately not `TaskQueueItem`: that model carries five jsonb payload
-/// columns this report never touches, and loading them on a wide fan-out of
-/// large activity inputs would move hundreds of megabytes to answer a triage
+/// columns this report never touches. Loading them on a wide fan-out of large
+/// activity inputs would move hundreds of megabytes to answer a triage
 /// question.
 struct DiagnoseTask {
     state: String,
@@ -15261,25 +15218,11 @@ impl TaskClaimRequirements<'_> {
     }
 }
 
-/// Can this worker claim a NEW task right now?
-///
-/// Deliberately stricter than [`crate::queue_coverage::worker_covers_queue`]:
-/// that predicate (issue #774) counts `Active` **or** `Draining`, which is the
-/// right, broader answer to the deploy-oriented "is anything still attached to
-/// this queue?" but the wrong answer to "can anything claim this row?".
-/// `Worker::run` leaves `run_poll_loop` **before** it transitions to
-/// `Draining` and then only waits for in-flight work, so a draining worker
-/// claims no new task for the whole drain window -- and a long drain would
-/// otherwise read as healthy progress on a queue nothing can pick up.
-///
-/// Queue/shard coverage itself still goes through the canonical #774 predicate
-/// so this surface and `GET /admin/queue-coverage` can never disagree about
-/// what a worker is attached to; only the liveness half is narrowed.
 /// Whether the worker currently HOLDING a task row is still alive.
 ///
-/// A held row's progress question is not "can this queue be claimed right now?"
-/// but "is the claimant still running it?" -- and `Worker::run` transitions a
-/// worker to `Draining` BEFORE awaiting `drain_in_flight`, so an activity on a
+/// A held row's progress question is not "can this queue be claimed right
+/// now?" but "is the claimant still running it?". `Worker::run` transitions a
+/// worker to `Draining` BEFORE awaiting `drain_in_flight`. So an activity on a
 /// gracefully-shutting-down worker is still legitimately progressing.
 ///
 /// This therefore reuses the canonical #774 predicate verbatim (which admits
@@ -15301,6 +15244,21 @@ fn claimant_is_live(
     }))
 }
 
+/// Can this worker claim a NEW task right now?
+///
+/// Deliberately stricter than [`crate::queue_coverage::worker_covers_queue`].
+/// That predicate (issue #774) counts `Active` **or** `Draining`. It is the
+/// right answer to the deploy-oriented "is anything still attached to this
+/// queue?". It is the wrong answer to "can anything claim this row?".
+/// `Worker::run` leaves `run_poll_loop` **before** it transitions to
+/// `Draining`, and then only waits for in-flight work. So a draining worker
+/// claims no new task for the whole drain window. A long drain would
+/// otherwise read as healthy progress on a queue nothing can pick up.
+///
+/// Queue/shard coverage itself still goes through the canonical #774
+/// predicate. So this surface and `GET /admin/queue-coverage` can never
+/// disagree about what a worker is attached to. Only the liveness half is
+/// narrowed.
 fn worker_can_claim_now(worker: &WorkerRow, queue_name: &str, shard_id: i32) -> bool {
     crate::queue_coverage::worker_covers_queue(worker, queue_name, shard_id)
         && worker.worker.status == autumn_harvest::workers::WorkerStatus::Active.as_str()
@@ -15309,16 +15267,16 @@ fn worker_can_claim_now(worker: &WorkerRow, queue_name: &str, shard_id: i32) -> 
 /// The capability requirements `claim_task` will enforce for this row, plus
 /// where they came from.
 ///
-/// The row's own `required_capabilities` snapshot is authoritative when present
-/// -- `claim_task_query` short-circuits its ineligible-activities gate on
-/// `required_capabilities IS NOT NULL`, so the snapshot is what gates the claim
-/// and the registry must never override it (the registry may have changed since
-/// the row was enqueued). A snapshotted requirement is enforced **row-side**, so
+/// The row's own `required_capabilities` snapshot is authoritative when
+/// present. `claim_task_query` short-circuits its ineligible-activities gate
+/// on `required_capabilities IS NOT NULL`, so the snapshot gates the claim.
+/// The registry must never override it, since it may have changed since the
+/// row was enqueued. A snapshotted requirement is enforced **row-side**, so
 /// it applies to every worker regardless of build.
 ///
-/// When the snapshot is **absent** the gate is NOT skipped: `claim_task` rejects
-/// any worker whose `ineligible_activities` list contains this row's
-/// `activity_name`, and that list is computed **on each worker** from **that
+/// When the snapshot is **absent** the gate is NOT skipped. `claim_task`
+/// rejects any worker whose `ineligible_activities` list contains this row's
+/// `activity_name`. That list is computed **on each worker**, from **that
 /// worker's own** registry (`Worker::new`). Reading an absent snapshot as "no
 /// requirements" would report `healthy_in_progress` for a task no live worker
 /// can claim (issue #809). But the local registry describes only the build of
@@ -15360,33 +15318,35 @@ struct ResolvedCapabilities<'a> {
 /// Only when the worker runs the same build this process does. `claim_task`'s
 /// NULL-snapshot gate is `NOT (activity_name = ANY($6))`, and `$6` is the
 /// claiming worker's **own** `ineligible_activities`, built in `Worker::new`
-/// from **its own** registry's `ActivityInfo::requires`. During a rolling
-/// deployment those requirements differ by build: an old-build worker whose
-/// handler declares nothing has an empty ineligible list and IS admitted, even
-/// though this replica's newer handler demands a label that worker lacks.
-/// Rejecting it on our requirement would produce a false `activity_no_worker`
-/// -- the flagship stall verdict, and the worst error a triage tool can make.
+/// from **its own** registry's `ActivityInfo::requires`. Those requirements
+/// differ by build during a rolling deployment. An old-build worker whose
+/// handler declares nothing has an empty ineligible list and IS admitted. That
+/// holds even when this replica's newer handler demands a label that worker
+/// lacks.
+/// Rejecting it on the local requirement would produce a false
+/// `activity_no_worker` -- the flagship stall verdict, and the worst error a
+/// triage tool can make.
 ///
 /// Build identity is the only fleet-visible evidence of a shared build, so
 /// equality of the advertised `build_id` is the discriminator. Two consequences
 /// are deliberate:
 ///
-/// - A deployment that configures **no** build ids (the default -- build
-///   routing is opt-in, issue #171) has `""` everywhere, so every worker
+/// - A deployment that configures **no** build ids has `""` everywhere. Build
+///   routing is opt-in (issue #171) and off by default. So every worker
 ///   compares equal and the fallback binds exactly as it did before. Such a
 ///   deployment has no build signal at all, which is a pre-existing consequence
 ///   of not configuring one.
-/// - Where the local build is **unknown** (an API-only replica, or a co-located
-///   worker that has not registered its row yet) it resolves to `""`, so the
-///   fallback binds for workers that also advertise no build -- the
-///   no-build-routing case above -- and not for any worker that does. A
+/// - The local build can be **unknown**: an API-only replica, or a co-located
+///   worker that has not registered its row yet. It then resolves to `""`. So
+///   the fallback binds for workers that also advertise no build (the
+///   no-build-routing case above) and not for any worker that does. A
 ///   deployment that advertises builds therefore never has an unidentified
 ///   replica reject a worker on a requirement it cannot attribute.
 ///
-/// The residual: a rolling deploy in a deployment that configures **no** build
-/// ids is invisible here, so the false positive this guards against can still
-/// occur there. Configuring `WorkerConfig::build_id` (issue #171) is what makes
-/// a build skew observable at all.
+/// The residual: a rolling deploy in a deployment with **no** build ids is
+/// invisible here. So the false positive this guards against can still occur
+/// there. Configuring `WorkerConfig::build_id` (issue #171) is what makes a
+/// build skew observable at all.
 fn registry_fallback_binds(worker_build_id: &str, local_build_id: &str) -> bool {
     worker_build_id == local_build_id
 }
@@ -15420,28 +15380,28 @@ fn local_build_id_from_workers(workers: &[WorkerRow], local_worker_id: Option<&s
 /// healthy progress.
 ///
 /// Every dimension is checked against the **same** worker, exactly as the
-/// stranded-work sampler does (`worker.rs`): a task needing both a build and a
-/// label is not covered by two workers that each satisfy only one of them, and
-/// a session member is not covered by a peer that satisfies everything except
-/// being the pinned host.
+/// stranded-work sampler does (`worker.rs`). Two workers that each satisfy one
+/// of a build and a label do not cover a task that needs both. A peer that
+/// satisfies everything except being the pinned host does not cover a session
+/// member.
 ///
 /// # What is deliberately NOT modelled
 ///
 /// An **ordinary sticky lease** (issue #235). Its claim clause is
 /// `sticky_worker_id IS NULL OR sticky_worker_id = $1 OR sticky_until IS NULL
-/// OR sticky_until <= NOW()`, so it releases to the whole fleet the moment
-/// `sticky_until` passes: a dead owner makes the row unclaimable only until
+/// OR sticky_until <= NOW()`. So it releases to the whole fleet the moment
+/// `sticky_until` passes. A dead owner makes the row unclaimable only until
 /// that instant. Reporting a self-healing, seconds-long condition as
 /// `activity_no_worker`/`stalled` would be a false positive on the flagship
-/// verdict, which is the worst outcome for a triage tool -- so an unexpired
-/// lease is ignored and the transient over-optimism is accepted. A **session**
-/// pin has no such expiry, which is exactly why it IS modelled.
+/// verdict. That is the worst outcome for a triage tool. So an unexpired lease
+/// is ignored and the transient over-optimism is accepted. A **session** pin
+/// has no such expiry, which is exactly why it IS modelled.
 /// `GET /admin/queues/{queue}/eligibility` (issue #611) remains the per-worker
 /// surface that reports `sticky_owned_by_other_worker`.
 ///
-/// Unparseable `required_capabilities` fall back to the other dimensions rather
-/// than reporting a stall, so a value this endpoint cannot read can never
-/// fabricate a false `no_worker` verdict.
+/// Unparseable `required_capabilities` fall back to the other dimensions, not
+/// to a stall. So a value this endpoint cannot read can never fabricate a
+/// false `no_worker` verdict.
 fn task_has_eligible_worker(
     workers: &[WorkerRow],
     shard_id: i32,
@@ -15455,10 +15415,10 @@ fn task_has_eligible_worker(
 /// WHICH workers could claim this task — the identities behind
 /// [`task_has_eligible_worker`]'s boolean.
 ///
-/// Needed because the in-process circuit registry describes exactly one
-/// worker's breaker, so the endpoint must know whether that worker is the only
-/// one that could pick this row up before it treats the local phase as the
-/// answer (see [`local_circuit_snapshot_is_authoritative`]).
+/// The in-process circuit registry describes exactly one worker's breaker. So
+/// the endpoint must know whether that worker is the only one that could pick
+/// this row up. Only then does it treat the local phase as the answer (see
+/// [`local_circuit_snapshot_is_authoritative`]).
 fn eligible_worker_ids<'a>(
     workers: &'a [WorkerRow],
     shard_id: i32,
@@ -15504,24 +15464,24 @@ fn eligible_worker_ids<'a>(
 /// task whose eligible workers are `eligible_ids`?
 ///
 /// The registry is deliberately **in-process and per-shard**
-/// (`circuit_breaker.rs`): every worker process constructs its own via
-/// `HandlerRegistry::new`, there is no table backing it, and the breaker that
-/// actually gates a dispatch is the one belonging to whichever worker ends up
-/// claiming the task (`process_activity_task`). A multi-replica fleet therefore
-/// has N independent breakers for one activity, and this API replica can only
-/// see its own.
+/// (`circuit_breaker.rs`). Every worker process constructs its own via
+/// `HandlerRegistry::new`, and no table backs it. The breaker that gates a
+/// dispatch belongs to whichever worker claims the task
+/// (`process_activity_task`). A multi-replica fleet therefore has N
+/// independent breakers for one activity, and this API replica can only see
+/// its own.
 ///
 /// So the local phase is authoritative only when the local worker is the
 /// **sole** worker that could claim the row. Otherwise a peer whose breaker is
-/// closed can still dispatch it, and reporting `activity_circuit_open` /
-/// `stalled` would be a false positive on the flagship stall verdict — the
-/// worst outcome for a triage tool, and the same principle that keeps a
-/// self-healing sticky lease out of `task_has_eligible_worker`.
+/// closed can still dispatch it. Reporting `activity_circuit_open` / `stalled`
+/// would then be a false positive on the flagship stall verdict. That is the
+/// worst outcome for a triage tool. The same principle keeps a self-healing
+/// sticky lease out of `task_has_eligible_worker`.
 ///
-/// The cost is a deliberate false *negative*: a genuinely fleet-wide outage
-/// (every replica open) is not reported as `activity_circuit_open`, and the run
-/// degrades to the next-ranked verdict instead. That is the safe direction for
-/// a stall verdict, and `GET /admin/circuits` remains the per-replica surface
+/// The cost is a deliberate false *negative*. A genuinely fleet-wide outage
+/// (every replica open) is not reported as `activity_circuit_open`, and the
+/// run degrades to the next-ranked verdict instead. That is the safe direction
+/// for a stall verdict. `GET /admin/circuits` remains the per-replica surface
 /// that shows each breaker's real phase.
 fn local_circuit_snapshot_is_authoritative(
     eligible_ids: &[&str],
@@ -15535,33 +15495,32 @@ fn local_circuit_snapshot_is_authoritative(
 
 /// Is `local_build_id` shared by every worker in `eligible_ids`?
 ///
-/// The circuit-tracked-activity set, like the capability-registry fallback it
-/// reuses [`registry_fallback_binds`] from, is a compile-time
-/// `#[activity(circuit_breaker = ...)]` declaration -- identical across every
-/// worker on the SAME build, but possibly different on another. So a fact
-/// this process's registry holds about an activity (tracked or not) describes
-/// every eligible worker only when none of them could be running a different
-/// build.
+/// This check reuses [`registry_fallback_binds`] from the capability-registry
+/// fallback. Like that fallback, the circuit-tracked-activity set is a
+/// compile-time `#[activity(circuit_breaker = ...)]` declaration. It is
+/// identical across every worker on the SAME build, but can differ on another.
+/// So a local registry fact about an activity (tracked or not) holds for every
+/// eligible worker only when none can run a different build.
 ///
 /// `worker_build_ids` maps worker id -> advertised build id (issue #1190).
 /// The caller builds it ONCE from the same `workers` slice that
-/// [`eligible_worker_ids`] already scanned to produce `eligible_ids`. Looking a
-/// worker's build up here is therefore an O(1) map hit rather than a second
-/// O(workers) linear scan per eligible id, which would otherwise make a wide
-/// fan-out with many eligible workers quadratic in fleet size.
+/// [`eligible_worker_ids`] already scanned to produce `eligible_ids`. So a
+/// worker's build lookup here is an O(1) map hit. A second O(workers) linear
+/// scan per eligible id would make a wide fan-out with many eligible workers
+/// quadratic in fleet size.
 ///
 /// Vacuously `true` for an empty `eligible_ids` (issue #1190). With no
 /// candidate worker, there is no OTHER build the local fact could disagree
 /// with. So the "every worker agrees" claim holds trivially. That is the
 /// standard reading of a universally-quantified statement over an empty set.
-/// This matters for a reason distinct from the headline verdict --
-/// `activity_no_worker` outranks the rate-limit verdicts there regardless
-/// (issue #809) -- but `contributing_reason_codes` is a union of every
-/// impediment, not just the winner, and a `rate_limit_exhausted` fact stays
-/// true (the bucket is still what would refuse a worker the moment one
-/// appears) even while no worker exists yet to be refused. Returning `false`
-/// here would silently drop that fact from the union purely because a
-/// worker-liveness check unrelated to build agreement also failed.
+/// This matters for a reason distinct from the headline verdict. There,
+/// `activity_no_worker` outranks the rate-limit verdicts regardless (issue
+/// #809). But `contributing_reason_codes` is a union of every impediment, not
+/// just the winner. A `rate_limit_exhausted` fact stays true even while no
+/// worker exists yet to be refused. The bucket is still what would refuse a
+/// worker the moment one appears. Returning `false` here would silently drop
+/// that fact from the union. The only cause would be a failed worker-liveness
+/// check unrelated to build agreement.
 fn every_eligible_worker_is_on_the_local_build(
     eligible_ids: &[&str],
     worker_build_ids: &std::collections::HashMap<&str, &str>,
@@ -15578,28 +15537,28 @@ fn every_eligible_worker_is_on_the_local_build(
 /// task (issue #1190)?
 ///
 /// A circuit-breaker-tracked activity enforces its rate limit at DISPATCH
-/// rather than at claim (issue #369), so `locally_tracked` -- read from THIS
-/// process's own registry -- decides whether the bucket is even a claim-time
+/// rather than at claim (issue #369). So `locally_tracked`, read from THIS
+/// process's own registry, decides whether the bucket is even a claim-time
 /// impediment. But that registry is in-process, exactly like the breaker
-/// phase itself ([`local_circuit_snapshot_is_authoritative`]): during a
+/// phase itself ([`local_circuit_snapshot_is_authoritative`]). During a
 /// rolling deploy an eligible peer on a DIFFERENT build may declare the
-/// breaker differently, and there is no cross-process registry to settle
-/// which of them is right (`CircuitBreakerRegistry` has no table backing it).
+/// breaker differently. No cross-process registry settles which of them is
+/// right (`CircuitBreakerRegistry` has no table backing it).
 ///
 /// So the local tracked/untracked fact is trustworthy only when every
 /// eligible worker shares this replica's build
 /// ([`every_eligible_worker_is_on_the_local_build`]). When it does not, the
-/// direction-of-safety rule this endpoint already applies elsewhere -- an
-/// unknown worker is assumed capable, never assumed blocked -- makes the
-/// answer `false`: NEITHER `activity_rate_limited` NOR
-/// `activity_rate_limit_bucket_missing` is reported for it, the same
-/// conservative bias that keeps a genuinely fleet-wide breaker outage from
-/// reporting `activity_circuit_open` off one replica's snapshot.
+/// endpoint's direction-of-safety rule makes the answer `false`. That rule,
+/// applied elsewhere too, assumes an unknown worker capable, never blocked.
+/// NEITHER `activity_rate_limited` NOR `activity_rate_limit_bucket_missing`
+/// is then reported for it. The same conservative bias keeps a genuinely
+/// fleet-wide breaker outage from reporting `activity_circuit_open` off one
+/// replica's snapshot.
 ///
-/// `locally_tracked` short-circuits the build check entirely: when it is
-/// `true` the answer is always `false` regardless of build agreement, so the
-/// bucket for a locally-tracked activity's key is never queried in the first
-/// place -- see the `rate_limit_keys` filter at this function's call site.
+/// `locally_tracked` short-circuits the build check entirely. When it is
+/// `true` the answer is always `false`, whatever the build agreement. So the
+/// bucket for a locally-tracked activity's key is never queried at all; see
+/// the `rate_limit_keys` filter at this function's call site.
 fn rate_limit_gate_applies(
     locally_tracked: bool,
     eligible_ids: &[&str],
@@ -15617,17 +15576,16 @@ fn rate_limit_gate_applies(
 /// Decode the one activity error this response actually surfaces (issue #608).
 ///
 /// `PendingActivityFacts::last_error` is carried RAW on purpose. The classifier
-/// only needs the error's *presence* — it is the failure-evidence discriminator
-/// that separates `activity_retrying` from `activity_deferred` — and at most one
-/// row's error ever reaches the caller, on the winning
-/// [`BlockedOn::ActivityRetrying`]. Decoding every row up front would decrypt a
-/// losing row's error and write a `payload.decode_read` audit record for data
-/// the caller never sees, breaking the #608 "decode exactly what is surfaced"
-/// contract.
+/// only needs the error's *presence*: it is the failure-evidence discriminator
+/// between `activity_retrying` and `activity_deferred`. At most one row's error
+/// ever reaches the caller, on the winning [`BlockedOn::ActivityRetrying`].
+/// Decoding every row up front would decrypt a losing row's error. It would
+/// also write a `payload.decode_read` audit record for data the caller never
+/// sees. That breaks the #608 "decode exactly what is surfaced" contract.
 ///
-/// Returns the outcome to merge into the request's decode accumulator; a
-/// non-retrying verdict, an absent error, or an inactive decoder all yield the
-/// empty outcome, leaving the audit row untouched.
+/// Returns the outcome to merge into the request's decode accumulator. A
+/// non-retrying verdict, an absent error, or an inactive decoder yields the
+/// empty outcome and leaves the audit row untouched.
 fn decode_surfaced_activity_error(
     blocked_on: &mut autumn_harvest::stall_diagnosis::BlockedOn,
     decoder: Option<&PayloadCodecs>,
@@ -15645,6 +15603,54 @@ fn decode_surfaced_activity_error(
     decode_error_field(codecs, error)
 }
 
+/// Builds the stall-diagnosis report for one execution (issue #809).
+///
+/// Correlates, in a single shard-local read, the five signals an operator would
+/// otherwise gather from four separate endpoints:
+///
+/// - the pending work itself (`/stack`);
+/// - per-queue worker liveness (`/workers/health`, `/admin/queue-coverage`);
+/// - the in-process circuit registry (`/admin/circuits`);
+/// - rate-limit and per-key concurrency saturation (`/admin/rate-limits`,
+///   `/admin/concurrency`);
+/// - the operator queue-pause table and the task row's own retry timing.
+///
+/// The pure [`autumn_harvest::stall_diagnosis::classify_execution`] collapses
+/// them into one verdict.
+///
+/// ## Read-only by construction
+///
+/// No events are appended, no task-queue row is touched, no state is
+/// recomputed, and no migration is involved. The circuit registry is consulted
+/// through `list()` only — never `on_dispatch` / `on_result` / `force_*` — so
+/// diagnosing cannot itself advance a breaker's phase. Safe to call repeatedly.
+///
+/// ## Shard-local
+///
+/// A single execution lives on a single shard, so the read routes O(1) from the
+/// `ExecutionId` via `db_conn_for_execution`. There is no cross-shard fan-out.
+///
+/// ## Replay is consulted only when it can change the answer
+///
+/// An awaited-but-unsent signal exists solely as a parked command inside the
+/// coroutine. No side table can see it, so observing one requires the #615
+/// replay drive. That drive is comparatively expensive, and an awaited signal
+/// ranks *below* pending activities, external handoffs and pending children in
+/// the category ladder. So the drive runs **only** when the database-observable
+/// categories could not decide the verdict. The run would then report
+/// `sleeping_timer` or `no_pending_work`, the two verdicts an awaited signal
+/// outranks. The final verdict is identical either way. The common triage
+/// path, a wedged pending activity, never pays for a replay.
+///
+/// ## Payload-free
+///
+/// Names, ids, timestamps, queue/bucket keys and the task row's own error text
+/// only. It never carries an activity input, signal payload or activity output.
+/// The one exception is the task row's `error` text surfaced as
+/// `ActivityRetrying.last_error`. It IS routed through read-path payload
+/// decoding (issue #608), exactly as `/stack` routes the same column for its
+/// own `last_failure`. Otherwise an admin would read plaintext there and a
+/// ciphertext envelope here for the same column of the same row.
 #[allow(clippy::too_many_lines)]
 pub(crate) async fn build_diagnosis_report(
     api_state: &HarvestApiState,
@@ -15709,10 +15715,10 @@ pub(crate) async fn build_diagnosis_report(
             terminal_outcome: Some(TerminalOutcomeResponse {
                 state: execution.state,
                 // Decode the TEXT `error` exactly as the pending-activity path
-                // below decodes a task row's `error` (issue #608): on a
+                // below decodes a task row's `error` (issue #608). On a
                 // codec-encrypting deployment a failed execution's error is a
-                // serialized envelope, and returning it verbatim would hand an
-                // admin ciphertext while the decode audit recorded nothing.
+                // serialized envelope. Returned verbatim, it would hand an admin
+                // ciphertext while the decode audit recorded nothing.
                 error: execution.error.map(|mut error| {
                     if let Some(codecs) = decoder {
                         *decode_outcome =
@@ -15728,21 +15734,20 @@ pub(crate) async fn build_diagnosis_report(
         });
     }
 
-    // ── Pending activity task rows ─────────────────────────────────────────
-    // Mirrors `/stack`'s own pending-task predicate and deterministic ordering,
-    // so the two surfaces always talk about the same rows in the same order
-    // (equal-precedence ties therefore resolve identically call to call).
-    // A NARROW projection on purpose. `TaskQueueItem::as_select()` would drag in
-    // five jsonb columns (`input`, `output`, `heartbeat_details`, `retry_policy`,
-    // `trace_context`) that this report never reads — on a wide fan-out of large
-    // activity inputs, exactly the stalled shape this endpoint exists to
-    // diagnose, that is hundreds of megabytes moved to answer a triage question.
-    // The ten scalars below are everything the classifier consumes.
+    // Pending activity task rows. This mirrors `/stack`'s own pending-task
+    // predicate and deterministic ordering. So the two surfaces always talk
+    // about the same rows in the same order, and equal-precedence ties resolve
+    // identically call to call.
+    // A NARROW projection on purpose. `TaskQueueItem::as_select()` would drag
+    // in five jsonb columns (`input`, `output`, `heartbeat_details`,
+    // `retry_policy`, `trace_context`) that this report never reads. On a wide
+    // fan-out of large activity inputs, the stalled shape this endpoint
+    // diagnoses, they are hundreds of megabytes moved to answer a triage
+    // question. The ten scalars below are everything the classifier consumes.
     //
-    // Deliberately UNBOUNDED: the worst-of fold must see every row or it can
-    // miss the one wedged slot behind a healthy majority, so a `LIMIT` would
-    // trade a correctness guarantee for a cost the narrow projection has
-    // already removed.
+    // Deliberately UNBOUNDED: the worst-of fold must see every row, or it can
+    // miss the one wedged slot behind a healthy majority. A `LIMIT` would trade
+    // a correctness guarantee for a cost the narrow projection already removed.
     let task_rows: Vec<DiagnoseTaskRow> = harvest_task_queue::table
         .filter(harvest_task_queue::workflow_exec_id.eq(Some(exec_uuid)))
         .filter(harvest_task_queue::task_type.eq("activity"))
@@ -15765,14 +15770,14 @@ pub(crate) async fn build_diagnosis_report(
             harvest_task_queue_ext::required_build_id,
             harvest_task_queue_ext::required_capabilities,
             // Worker sessions (issue #606): the claim predicate admits a
-            // session member ONLY from `sticky_worker_id`, with no expiry, so
-            // a session whose host is gone is a permanent stall.
+            // session member ONLY from `sticky_worker_id`, with no expiry. So a
+            // session whose host is gone is a permanent stall.
             harvest_task_queue::session_id,
             harvest_task_queue::sticky_worker_id,
-            // The CLAIMANT of a held row. A worker that has begun a graceful
-            // shutdown claims nothing new but is still finishing held work, so
-            // a `RUNNING` row's liveness must be answered from its own
-            // claimant, not from queue-level claim eligibility.
+            // The CLAIMANT of a held row. A worker in graceful shutdown claims
+            // nothing new but still finishes held work. So a `RUNNING` row's
+            // liveness comes from its own claimant, not from queue-level claim
+            // eligibility.
             harvest_task_queue::worker_id,
         ))
         .load::<DiagnoseTaskRow>(&mut conn)
@@ -15817,19 +15822,19 @@ pub(crate) async fn build_diagnosis_report(
         )
         .collect();
 
-    // ── The run's OWN workflow task row ────────────────────────────────────
-    // A non-terminal run always has exactly one, and it is the only place three
-    // states are visible: the handler EXECUTING right now (`worker_id` held),
-    // the decision cycle AWAITING DISPATCH (`PENDING`), and the genuinely
-    // PARKED row that is the lost-task shape. Without it, a run whose handler is
-    // mid-flight — canonically one running a long local activity (issue #98),
-    // which schedules no queue row at all — falls through every category below
-    // and reports the alarming `no_pending_work`/`stalled`.
+    // The run's OWN workflow task row. A non-terminal run always has exactly
+    // one. It is the only place where three states are visible. The handler
+    // can be EXECUTING right now (`worker_id` held). The decision cycle can be
+    // AWAITING DISPATCH (`PENDING`). Or the row can be genuinely PARKED, the
+    // lost-task shape. Without it, a run whose handler is mid-flight falls
+    // through every category below. It then reports the alarming
+    // `no_pending_work`/`stalled`. The canonical case is a long local activity
+    // (issue #98), which schedules no queue row at all.
     //
-    // A separate single-row indexed lookup rather than widening the query above:
-    // that query's projection, ordering, and PENDING/`queues_in_play`
-    // partitioning are all activity-shaped, and one more cheap round trip is far
-    // safer than threading a second task type through all of it.
+    // A separate single-row indexed lookup, not a wider query above. That
+    // query's projection, ordering, and PENDING/`queues_in_play` partitioning
+    // are all activity-shaped. One more cheap round trip is far safer than
+    // threading a second task type through all of it.
     let workflow_task_row: Option<WorkflowTaskRow> = harvest_task_queue::table
         .filter(harvest_task_queue::workflow_exec_id.eq(Some(exec_uuid)))
         .filter(harvest_task_queue::task_type.eq("workflow"))
@@ -15840,10 +15845,10 @@ pub(crate) async fn build_diagnosis_report(
             harvest_task_queue::worker_id,
             harvest_task_queue::queue_name,
             harvest_task_queue::scheduled_at,
-            // Build routing applies to workflow tasks too (the claim
-            // predicate's `required_build_id` clause has no task-type guard),
-            // so its liveness answer needs the same eligibility check an
-            // activity row gets.
+            // Build routing applies to workflow tasks too: the claim
+            // predicate's `required_build_id` clause has no task-type guard. So
+            // its liveness answer needs the same eligibility check as an
+            // activity row.
             harvest_task_queue_ext::required_build_id,
             harvest_task_queue_ext::required_capabilities,
             harvest_task_queue::session_id,
@@ -15866,8 +15871,8 @@ pub(crate) async fn build_diagnosis_report(
     let pending_tasks: Vec<&DiagnoseTask> = tasks.iter().filter(|t| t.state == "PENDING").collect();
 
     // Circuit-breaker phases. `list()` prunes each breaker's rolling window and
-    // reads its phase but NEVER transitions it (Open→HalfOpen is driven solely
-    // by dispatch), so consulting it here cannot perturb enforcement. A
+    // reads its phase but NEVER transitions it; only dispatch drives
+    // Open→HalfOpen. So consulting it here cannot perturb enforcement. A
     // cooled-down breaker therefore still reads "open" until a real probe is
     // admitted — a deliberate, documented read-only conservatism.
     //
@@ -15906,8 +15911,8 @@ pub(crate) async fn build_diagnosis_report(
     );
 
     // This process's own worker, when one is co-located. The breaker registry
-    // above belongs to exactly this worker, so its phase is only ever the
-    // answer for a task nothing else could claim -- see
+    // above belongs to exactly this worker. So its phase is only ever the
+    // answer for a task nothing else could claim; see
     // `local_circuit_snapshot_is_authoritative`. `None` on an API-only replica:
     // nothing drives that registry, so it describes no dispatcher at all.
     let local_worker_id: Option<String> = api_state
@@ -15929,18 +15934,18 @@ pub(crate) async fn build_diagnosis_report(
         .unwrap_or_default();
 
     // Rate-limit saturation. A circuit-breaker-tracked activity enforces its
-    // rate limit at DISPATCH rather than at claim (issue #369), so its bucket
-    // is never a claim-time impediment for it -- `rate_limit_gate_applies`
-    // (issue #1190) short-circuits to `false` on `locally_tracked` alone,
-    // with no build check at all, so a locally-tracked activity's key can
-    // never surface regardless of what its eligible workers' builds are.
-    // Filtering it out here (issue #1190) therefore loses no coverage. It
-    // also avoids sending a large, unfiltered fan-out of dynamic bucket keys
-    // to Postgres, for lookups that the per-task gate discards
-    // unconditionally anyway. Only the OTHER direction -- untracked here but
-    // possibly tracked on an eligible peer's different build -- depends on
-    // that peer's build, which is a per-task question resolved once
-    // eligibility is known below; that activity's key IS still included here.
+    // rate limit at DISPATCH rather than at claim (issue #369). So its bucket
+    // is never a claim-time impediment for it. `rate_limit_gate_applies`
+    // (issue #1190) short-circuits to `false` on `locally_tracked` alone, with
+    // no build check. So a locally-tracked activity's key never surfaces,
+    // whatever the builds of its eligible workers. Filtering it out here
+    // (issue #1190) therefore loses no coverage. It also avoids sending a
+    // large, unfiltered fan-out of dynamic bucket keys to Postgres, for
+    // lookups that the per-task gate discards unconditionally anyway. Only
+    // the OTHER direction depends on a peer's build: untracked here, but
+    // possibly tracked on an eligible peer's different build. That is a
+    // per-task question, resolved once eligibility is known below. That
+    // activity's key IS still included here.
     let rate_limit_keys: Vec<String> = pending_tasks
         .iter()
         .filter(|t| {
@@ -15967,8 +15972,8 @@ pub(crate) async fn build_diagnosis_report(
     let running_by_key = running_counts_for_concurrency_keys(&mut conn, &concurrency_keys).await?;
 
     // Operator queue pauses (issue #619). Propagates on failure rather than
-    // defaulting to "nothing is held": this endpoint exists to answer "why is
-    // nothing happening?", and swallowing the read would answer it with a
+    // defaulting to "nothing is held". This endpoint exists to answer "why is
+    // nothing happening?". Swallowing the read would answer it with a
     // confident, wrong "nothing is holding this queue".
     let paused_queues: std::collections::HashSet<String> =
         autumn_harvest::queue_pause::paused_queue_names(&mut conn)
@@ -15978,11 +15983,11 @@ pub(crate) async fn build_diagnosis_report(
             .collect();
 
     // Operator ACTIVITY pauses (issue #807), the per-activity-type sibling of
-    // the read above. Load-bearing for the same reason: `claim_task`'s
-    // `paused_activities` anti-join rejects a held activity type on EVERY queue
-    // on the shard, so without this a paused activity on a well-covered queue
-    // would fall through to `healthy_in_progress` — a confident wrong answer.
-    // Deliberately unfiltered by queue, matching that CTE.
+    // the read above. Load-bearing for the same reason. `claim_task`'s
+    // `paused_activities` anti-join rejects a held activity type on EVERY
+    // queue on the shard. Without this, a paused activity on a well-covered
+    // queue would fall through to `healthy_in_progress`, a confident wrong
+    // answer. Deliberately unfiltered by queue, matching that CTE.
     let paused_activities: std::collections::HashSet<String> =
         autumn_harvest::activity_pause::paused_activity_names(&mut conn)
             .await
@@ -15990,21 +15995,20 @@ pub(crate) async fn build_diagnosis_report(
             .into_iter()
             .collect();
 
-    // Worker eligibility inputs. Queue coverage goes through the SAME predicate
-    // `GET /admin/queue-coverage` uses (issue #774) so the two surfaces can
-    // never disagree about whether a queue has a live poller — the exact drift
-    // that bit `shard_health` in #1150 — but coverage alone is NOT the claim
-    // predicate: `task_has_eligible_worker` also applies each row's own
-    // `required_build_id` and `required_capabilities` against the SAME worker,
-    // so a task no live poller can actually claim is reported as a stall rather
-    // than as healthy progress.
+    // Worker eligibility inputs. Queue coverage goes through the SAME
+    // predicate `GET /admin/queue-coverage` uses (issue #774). So the two
+    // surfaces can never disagree about whether a queue has a live poller,
+    // the exact drift that bit `shard_health` in #1150. But coverage alone is
+    // NOT the claim predicate. `task_has_eligible_worker` also applies each
+    // row's own `required_build_id` and `required_capabilities` against the
+    // SAME worker. So a task no live poller can claim is reported as a stall,
+    // not as healthy progress.
     //
-    // Evaluated for EVERY loaded row, not just the PENDING ones: a claimed
-    // (`RUNNING`) row also needs a truthful liveness answer, because a claimed
-    // row whose fleet is gone is an orphan rather than healthy work. Includes
-    // the workflow task's OWN row: its liveness answer is what separates "about
-    // to be claimed" from the workflow-task analogue of AC3's flagship
-    // no-live-worker stall.
+    // Evaluated for EVERY loaded row, not just the PENDING ones. A claimed
+    // (`RUNNING`) row also needs a truthful liveness answer: if its fleet is
+    // gone, it is an orphan, not healthy work. Includes the workflow task's
+    // OWN row. Its liveness answer separates "about to be claimed" from the
+    // workflow-task analogue of AC3's flagship no-live-worker stall.
     let (live_workers, compat_set) = if tasks.is_empty() && workflow_task_row.is_none() {
         (
             Vec::new(),
@@ -16016,21 +16020,21 @@ pub(crate) async fn build_diagnosis_report(
             crate::queue_coverage::fetch_potentially_live_workers(&mut conn, stale_threshold)
                 .await
                 .map_err(map_error)?;
-        // Cross-build declarations, so a worker running a NEWER build that has
-        // declared itself compatible still counts as coverage for a task
-        // assigned an older build (issue #171). On load failure fall back to an
-        // empty set: exact-match and legacy-worker rules still apply, exactly
-        // as the stranded-work sampler degrades.
+        // Cross-build declarations: a worker on a NEWER build that declared
+        // itself compatible still covers a task assigned an older build
+        // (issue #171). On load failure fall back to an empty set.
+        // Exact-match and legacy-worker rules still apply, exactly as the
+        // stranded-work sampler degrades.
         let compat = autumn_harvest::build_routing::load_compat_set(&mut conn)
             .await
             .unwrap_or_default();
         (workers, compat)
     };
     // This process's build identity, read from the co-located worker's own
-    // advertised row. It scopes the registry capability fallback: a requirement
-    // recovered from THIS registry describes only workers running THIS build,
-    // and `claim_task` asks each worker's own registry instead (see
-    // [`registry_fallback_binds`]). `None` for an API-only replica.
+    // advertised row. It scopes the registry capability fallback. A
+    // requirement recovered from THIS registry describes only workers running
+    // THIS build, and `claim_task` asks each worker's own registry instead
+    // (see [`registry_fallback_binds`]). `None` for an API-only replica.
     let local_build_id = local_build_id_from_workers(&live_workers, local_worker_id.as_deref());
     // Worker id -> advertised build id, built ONCE for the
     // `rate_limit_gate_applies` call of every task (issue #1190). It replaces a
@@ -16042,10 +16046,10 @@ pub(crate) async fn build_diagnosis_report(
         .collect();
     // The row's OWN recorded shard, not `exec_id.shard()`. A pre-sharding (or
     // `ExecutionId::new()`) id carries the `ShardId::UNENCODED` sentinel
-    // (0xFFFF), which the router resolves to the default shard — but a worker
-    // registers `shard_assignments` with its real shard number, so comparing
-    // against the raw sentinel would match no worker and report a false
-    // `activity_no_worker` for a perfectly covered queue.
+    // (0xFFFF), which the router resolves to the default shard. But a worker
+    // registers `shard_assignments` with its real shard number. So a
+    // comparison against the raw sentinel would match no worker. It would
+    // report a false `activity_no_worker` for a perfectly covered queue.
     // `harvest_workflow_executions.shard_id` is the same value the worker
     // itself is registered against, so the two always agree.
     let shard_id = execution.shard_id;
@@ -16088,9 +16092,9 @@ pub(crate) async fn build_diagnosis_report(
                 &local_build_id,
             );
             // The breaker registry is in-process, so its phase describes only
-            // THIS replica. Treat it as the verdict only when our own worker is
-            // the sole worker that could claim the row -- otherwise a peer whose
-            // breaker is closed can still dispatch it and a fleet-wide
+            // THIS replica. Treat it as the verdict only when the local worker
+            // is the sole worker that could claim the row. Otherwise a peer
+            // whose breaker is closed can still dispatch it, and a fleet-wide
             // `activity_circuit_open`/`stalled` would be a false positive.
             let snapshot = if local_circuit_snapshot_is_authoritative(
                 &eligible_ids,
@@ -16122,9 +16126,8 @@ pub(crate) async fn build_diagnosis_report(
             let circuit_forced_open = snapshot.is_some_and(|s| s.forced_open);
             // Whether the local tracked/untracked fact about this activity's
             // breaker is trustworthy for THIS row's own eligible workers (see
-            // `rate_limit_gate_applies`, issue #1190) -- computed per task
-            // because eligibility (and therefore build agreement) is itself
-            // per task.
+            // `rate_limit_gate_applies`, issue #1190). Computed per task,
+            // because eligibility, and so build agreement, is per task.
             let gate_applies =
                 rate_limit_gate_applies(has_cb, &eligible_ids, &worker_build_ids, &local_build_id);
             let concurrency_saturated = match (t.concurrency_key.as_ref(), t.concurrency_cap) {
@@ -16143,14 +16146,14 @@ pub(crate) async fn build_diagnosis_report(
                 task_state: t.state.clone(),
                 attempt: t.attempt,
                 // RAW on purpose (issue #608: decode exactly what is surfaced).
-                // Classification only needs the error's PRESENCE — it is the
-                // failure-evidence discriminator that separates
-                // `activity_retrying` from `activity_deferred` — and at most one
-                // row's error ever reaches the response, on the winning
-                // `ActivityRetrying`. Decoding here would decrypt every losing
-                // row's error and write a `payload.decode_read` audit row for
-                // data the caller never sees. The winner is decoded after
-                // `classify_execution` picks it.
+                // Classification only needs the error's PRESENCE: it is the
+                // failure-evidence discriminator between `activity_retrying`
+                // and `activity_deferred`. At most one row's error ever reaches
+                // the response, on the winning `ActivityRetrying`. Decoding here
+                // would decrypt every losing row's error and write a
+                // `payload.decode_read` audit row for data the caller never
+                // sees. The winner is decoded after `classify_execution` picks
+                // it.
                 last_error: t.error.clone(),
                 scheduled_at: t.scheduled_at,
                 rate_limit_key: t.rate_limit_key.clone(),
@@ -16201,14 +16204,14 @@ pub(crate) async fn build_diagnosis_report(
             .collect();
 
     // AWAITED children only. A DETACHED child (issue #347) keeps `parent_id`
-    // but carries a non-null `parent_close_policy`, and the engine uses exactly
-    // that discriminator (`worker.rs`'s `is_detached_child`) to decide a child
-    // does NOT wake its parent on completion or failure. A fire-and-forget child
-    // is therefore never something the parent is waiting on, so counting it
-    // would report a healthy `pending_child` for a parent that is genuinely
-    // parked elsewhere -- masking an awaited signal or condition (which only the
-    // replay drive, ranked BELOW children, can see) and even masking a lost
-    // workflow task as healthy for as long as the detached child runs.
+    // but carries a non-null `parent_close_policy`. The engine uses exactly
+    // that discriminator (`worker.rs`'s `is_detached_child`): such a child
+    // does NOT wake its parent on completion or failure. So the parent is
+    // never waiting on a fire-and-forget child. Counting it would report a
+    // healthy `pending_child` for a parent genuinely parked elsewhere. That
+    // masks an awaited signal or condition, which only the replay drive,
+    // ranked BELOW children, can see. It even masks a lost workflow task as
+    // healthy for as long as the detached child runs.
     let children: Vec<PendingChildFacts> = harvest_workflow_executions::table
         .filter(harvest_workflow_executions::parent_id.eq(Some(exec_uuid)))
         .filter(harvest_workflow_executions::parent_close_policy.is_null())
@@ -16269,10 +16272,9 @@ pub(crate) async fn build_diagnosis_report(
                         queue_name: &queue_name,
                         required_build_id: required_build_id.as_deref(),
                         // Deliberately NOT backfilled from the registry, unlike
-                        // the activity site: `claim_task`'s
-                        // ineligible-activities gate is guarded by
-                        // `task_type != 'activity'`, so a workflow task is only
-                        // ever gated by its own snapshot.
+                        // the activity site. `task_type != 'activity'` guards
+                        // the ineligible-activities gate of `claim_task`. So
+                        // only its own snapshot gates a workflow task.
                         required_capabilities: required_capabilities.as_ref(),
                         capabilities_from_registry_fallback: false,
                         is_session_member: session_id.is_some(),
@@ -16334,10 +16336,10 @@ pub(crate) async fn build_diagnosis_report(
         Some("sleeping_timer" | "no_pending_work")
     );
     if replay_could_win {
-        // Deadline the whole replay. `build_awaitables_report` inflates offloaded
-        // payloads per event (issue #524) OUTSIDE the query timeout, so on a long
-        // history with a remote `PayloadStore` it can run for minutes. The
-        // degrade path below is exactly the right answer when it does.
+        // Deadline the whole replay. `build_awaitables_report` inflates
+        // offloaded payloads per event (issue #524) OUTSIDE the query timeout.
+        // So on a long history with a remote `PayloadStore` it can run for
+        // minutes. The degrade path below is the right answer when it does.
         let replay = tokio::time::timeout(
             api_state.query_timeout(),
             build_awaitables_report(api_state, exec_id),
@@ -16346,10 +16348,10 @@ pub(crate) async fn build_diagnosis_report(
         match replay {
             Ok(Ok(report)) => {
                 // `build_awaitables_report` can answer `terminal` if the run
-                // reached a terminal state between our own load and this replay.
-                // That is a real TOCTOU, but this response has already committed
-                // to a non-terminal verdict, so surface it as an unavailable
-                // wait set rather than leaking a fourth vocabulary value the
+                // reached a terminal state between the earlier load and this
+                // replay. That is a real TOCTOU. But this response has already
+                // committed to a non-terminal verdict. So surface it as an
+                // unavailable wait set, not a fourth vocabulary value the
                 // contract does not document.
                 if report.wait_set == "terminal" {
                     wait_set = "history_only".to_string();
@@ -16370,14 +16372,14 @@ pub(crate) async fn build_diagnosis_report(
                     })
                     .collect();
                 // Every OTHER kind replay can name. Signals have their own,
-                // more specific verdict above; the rest — a command-less
-                // `ctx.await_condition` park, a durable mutex acquire (#691),
-                // an admitted update awaiting its handler, a parked
-                // external-workflow operation (#492/#757/#751) — leave no row in
-                // any side table this endpoint reads, so replay is the ONLY
-                // source that can see them. Dropping them (as this filter once
-                // did) meant a run legitimately parked on any of them reported
-                // the alarming `no_pending_work`/`stalled`.
+                // more specific verdict above. The rest leave no row in any
+                // side table this endpoint reads, so replay is the ONLY source
+                // that can see them. They are a command-less
+                // `ctx.await_condition` park, a durable mutex acquire (#691), an
+                // admitted update awaiting its handler, and a parked
+                // external-workflow operation (#492/#757/#751).
+                // If they were dropped, a run legitimately parked on any of
+                // them would report the alarming `no_pending_work`/`stalled`.
                 //
                 // Recorded/command order is deterministic, so taking them in
                 // order keeps the verdict stable call to call. The classifier
@@ -16446,13 +16448,14 @@ pub(crate) async fn build_diagnosis_report(
 /// Every claim-time impediment holding ANY of this execution's activity rows.
 ///
 /// Deliberately a UNION across all rows rather than the single row `blocked_on`
-/// names. `blocked_on` is one triage verdict chosen by precedence, so a
-/// higher-ranked sibling would otherwise HIDE a lower-ranked one — in a fan-out
-/// where slot A sits on a paused queue (rank 6) and slot B has no live poller
-/// (rank 5), the `no_live_worker` condition holds but would appear nowhere in
-/// the response. Unioning is what makes the endpoint's "surfaced 100% of the
-/// time it holds" guarantee true, and what makes the runbook's promise that a
-/// task both rate-limited AND on a paused queue "shows both" literally correct.
+/// names. `blocked_on` is one triage verdict chosen by precedence. So a
+/// higher-ranked sibling would otherwise HIDE a lower-ranked one. Take a
+/// fan-out where slot A sits on a paused queue (rank 6) and slot B has no live
+/// poller (rank 5). The `no_live_worker` condition holds but would appear
+/// nowhere in the response. The union makes the endpoint's "surfaced 100% of
+/// the time it holds" guarantee true. It also makes the runbook's promise
+/// literally correct: a task both rate-limited AND on a paused queue "shows
+/// both".
 ///
 /// Delegates to the eligibility explainer's own pure
 /// [`task_intrinsic_impediment_reasons`] (issue #611) so this list and
@@ -16468,11 +16471,11 @@ fn contributing_reasons_for(
     activities: &[autumn_harvest::stall_diagnosis::PendingActivityFacts],
     now: chrono::DateTime<chrono::Utc>,
 ) -> Vec<String> {
-    // Derived from the FACTS, never from the raw in-process snapshot: a phase
+    // Derived from the FACTS, never from the raw in-process snapshot. A phase
     // reaches a fact only when the local breaker is authoritative for that row
-    // (`local_circuit_snapshot_is_authoritative`). Reading the raw map here
-    // would put `circuit_open` next to a `healthy` headline whenever a peer
-    // replica could still dispatch the task -- the same two-surfaces-disagree
+    // (`local_circuit_snapshot_is_authoritative`). The raw map would put
+    // `circuit_open` next to a `healthy` headline whenever a peer replica
+    // could still dispatch the task. That is the same two-surfaces-disagree
     // bug the held-row liveness split fixed below.
     let phases: std::collections::HashMap<String, &'static str> = activities
         .iter()
@@ -16492,8 +16495,8 @@ fn contributing_reasons_for(
     let mut reasons: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for facts in activities {
         // Worker liveness is a property of the fleet, not a claim-time *task*
-        // gate, so the shared helper does not model it — but it is the one cause
-        // that never self-heals, and it is equally real for a claimed row whose
+        // gate, so the shared helper does not model it. But it is the one cause
+        // that never self-heals. It is equally real for a claimed row whose
         // fleet has gone (a poison-pill orphan, issue #367).
         //
         // WHICH liveness question applies depends on the row's state, and must
@@ -16501,12 +16504,12 @@ fn contributing_reasons_for(
         // contradict the headline verdict:
         //   * a PENDING row asks "can any worker CLAIM this?" (Active only), and
         //   * a HELD row asks "is its own recorded CLAIMANT alive?" (Active OR
-        //     Draining — a gracefully-shutting-down worker claims nothing new
-        //     but IS finishing exactly this row).
+        //     Draining). A gracefully-shutting-down worker claims nothing new
+        //     but IS finishing exactly this row.
         // Without the split, a row held by a live draining claimant reports
-        // `healthy` yet carries `no_live_worker`, and an orphan held by a dead
-        // claimant OMITS it whenever a live Active peer happens to cover the
-        // queue — the one case the reason exists to surface.
+        // `healthy` yet carries `no_live_worker`. And an orphan held by a dead
+        // claimant OMITS it whenever a live Active peer covers the queue. That
+        // is the one case the reason exists to surface.
         let held = facts.task_state != "PENDING";
         let worker_alive = if held {
             facts.claimant_is_live.unwrap_or(facts.has_live_worker)
@@ -16526,11 +16529,11 @@ fn contributing_reasons_for(
         // The classifier already resolved which impediments hold, so the
         // saturation sets handed to the shared helper are this row's own
         // answers.
-        // A MISSING bucket row is folded in here on purpose: the headline
+        // A MISSING bucket row is folded in here on purpose. The headline
         // verdict distinguishes permanence, but the reason code names *which
-        // gate* refuses the row, and that gate is the rate-limit gate either
-        // way. Omitting it would leave a task blocked solely by a missing
-        // bucket with an empty reason set.
+        // gate* refuses the row. That gate is the rate-limit gate either way.
+        // Omitting it would leave a task blocked solely by a missing bucket
+        // with an empty reason set.
         let mut saturated_rate_limits = std::collections::HashSet::new();
         if (facts.rate_limit_saturated || facts.rate_limit_bucket_missing)
             && let Some(key) = facts.rate_limit_key.as_ref()
@@ -16541,9 +16544,9 @@ fn contributing_reasons_for(
             facts.activity_name.as_deref(),
             facts.rate_limit_key.as_deref(),
             // `rate_limit_saturated` is already false for a breaker-tracked
-            // activity (dispatch-time enforcement, issue #369), so the
-            // suppression flag is redundant here and passing `false` keeps the
-            // two paths consistent.
+            // activity (dispatch-time enforcement, issue #369). So the
+            // suppression flag is redundant here, and `false` keeps the two
+            // paths consistent.
             false,
             &saturated_rate_limits,
             facts.concurrency_saturated,
@@ -16559,19 +16562,16 @@ fn contributing_reasons_for(
     reasons
 }
 
-/// Which of `keys` currently have fewer than one token available.
-///
-/// Uses the canonical refill expression Postgres itself evaluates in
 /// Absolute `cooldown_until` instant for an open circuit breaker.
 ///
 /// [`autumn_harvest::circuit_breaker::CircuitSnapshot`] reports the remaining
 /// cooldown as *fractional seconds* (`time_until_probe_secs`), not an absolute
 /// timestamp, so the endpoint derives one. Every failure mode resolves to
-/// `None` rather than a panic or a wrapped instant: a NaN / negative / absurdly
-/// large value (`try_from_secs_f64`), a duration outside `chrono`'s range
-/// (`from_std`), or an instant that would overflow (`checked_add_signed`). A
-/// missing `cooldown_until` is already the documented shape for a
-/// force-opened breaker, so degrading to `None` is never a lie.
+/// `None`, never a panic or a wrapped instant. The modes are a NaN, negative
+/// or huge value (`try_from_secs_f64`), a duration outside `chrono`'s range
+/// (`from_std`), and an overflowing instant (`checked_add_signed`). A missing
+/// `cooldown_until` is already the documented shape for a force-opened
+/// breaker, so `None` is never a lie.
 fn circuit_cooldown_until(
     now: chrono::DateTime<chrono::Utc>,
     secs: f64,
@@ -16599,9 +16599,10 @@ struct RateLimitGateStatus {
     missing: std::collections::HashSet<String>,
 }
 
-/// `claim_task`'s rate-limit gate, decomposed, so a key this reports as
-/// refused is exactly a key the claim query would refuse — and the *reason*
-/// is preserved rather than flattened.
+/// `claim_task`'s rate-limit gate, decomposed, with the *reason* preserved.
+///
+/// A key this reports as refused is exactly a key the claim query would
+/// refuse. The reason is kept, not flattened.
 ///
 /// One query: it asks which rows exist and, for each, whether the canonical
 /// refill expression currently admits it. A key absent from the result has no
@@ -16622,14 +16623,13 @@ async fn rate_limit_gate_status(
         return Ok(RateLimitGateStatus::default());
     }
     // Mirrors the gate's own refill expression exactly, so the two can never
-    // disagree about whether a present bucket admits a claim. Reuses
-    // `queue::effective_available_tokens_expr` (issue #945) rather than a
-    // hand-copied literal, so a live TTL'd operator override is honored here
-    // too -- otherwise this diagnostic would keep reporting a key as
-    // rate-limited (or admissible) after an operator raised (or lowered) its
-    // limit via the pacing-override endpoints, exactly the class of
-    // diagnostic-vs-gate divergence this function's own doc comment exists to
-    // rule out.
+    // disagree about whether a present bucket admits a claim. It reuses
+    // `queue::effective_available_tokens_expr` (issue #945), not a
+    // hand-copied literal. So a live TTL'd operator override is honored here
+    // too. Otherwise, after an operator raised or lowered a limit through the
+    // pacing-override endpoints, this diagnostic would keep its old answer.
+    // That is the diagnostic-vs-gate divergence the doc comment above rules
+    // out.
     let effective_tokens = queue::effective_available_tokens_expr("harvest_rate_limit_buckets");
     let rows: Vec<KeyRow> = diesel::sql_query(format!(
         "SELECT key, ({effective_tokens} >= 1.0) AS admissible \
@@ -16661,8 +16661,8 @@ async fn rate_limit_gate_status(
 
 /// `RUNNING` task counts per `(concurrency_key, task_type)`.
 ///
-/// Shaped exactly like `claim_task`'s own cap subquery — `state = 'RUNNING'` and
-/// `worker_id IS NOT NULL`, grouped by key *and* task type — so a key this
+/// Shaped exactly like `claim_task`'s own cap subquery: `state = 'RUNNING'`
+/// and `worker_id IS NOT NULL`, grouped by key *and* task type. So a key this
 /// reports as at-cap is exactly a key the claim query would defer.
 async fn running_counts_for_concurrency_keys(
     conn: &mut diesel_async::AsyncPgConnection,
@@ -16703,14 +16703,15 @@ async fn running_counts_for_concurrency_keys(
 ///
 /// Per-execution stall diagnosis (issue #809): the root-cause complement to
 /// issue #486's fleet-wide "which runs look stalled?" discovery. Returns one
-/// triage `health` verdict plus a discriminated `blocked_on` cause, correlating
-/// pending work with per-queue worker liveness, circuit-breaker phase,
-/// rate-limit and concurrency saturation, operator queue pauses, and task-queue
-/// retry timing — the four-endpoint correlation an operator does by hand today.
+/// triage `health` verdict plus a discriminated `blocked_on` cause. It
+/// correlates pending work with per-queue worker liveness, circuit-breaker
+/// phase, rate-limit and concurrency saturation, operator queue pauses, and
+/// task-queue retry timing. That is the four-endpoint correlation an operator
+/// does by hand today.
 ///
-/// Admin-gated, matching the eligibility and `/awaitables` triage endpoints:
-/// the response names queue, bucket and concurrency keys (which can embed tenant
-/// identifiers) and the fleet's worker-coverage state.
+/// Admin-gated, matching the eligibility and `/awaitables` triage endpoints.
+/// The response names queue, bucket and concurrency keys, which can embed
+/// tenant identifiers, and the fleet's worker-coverage state.
 ///
 /// Read-only: appends no events, mutates no task-queue row, adds no migration.
 async fn get_workflow_diagnose(
@@ -16721,8 +16722,8 @@ async fn get_workflow_diagnose(
 ) -> Result<Json<WorkflowDiagnoseResponse>, AutumnError> {
     let exec_id = parse_execution_id(&id)?;
     // Read-path payload decoding (issue #608). This report is payload-free
-    // EXCEPT for the task row's `error` text, which `/stack` already decodes for
-    // its own `last_failure` — without this an admin would see plaintext there
+    // EXCEPT for the task row's `error` text. `/stack` already decodes it for
+    // its own `last_failure`. Without this, an admin would see plaintext there
     // and a ciphertext envelope here, for the same column of the same row.
     let decoder = read_path_decoder(&api_state, extension_session(maybe_session)).await;
     let mut outcome = LossyDecodeOutcome::default();
@@ -16754,14 +16755,14 @@ async fn get_workflow_diagnose(
 pub(crate) const MAX_RUN_CHAIN_HOPS: usize = 128;
 
 /// Upper bound on same-`workflow_id` candidate rows the legacy backward
-/// reconstruction (issue #701, Codex P2) will scan. A pre-feature chain queried
-/// from its tail has no back-link metadata, so reconstruction loads each
-/// candidate's history to read its `WorkflowContinuedAsNew` linkage — bounded by
-/// this cap so a heavily id-reused `workflow_id` can never trigger an unbounded
-/// scan. Above the cap the chain is served best-effort with `head_unknown = true`.
+/// reconstruction (issue #701) will scan. A pre-feature chain queried from its
+/// tail has no back-link metadata. So reconstruction loads each candidate's
+/// history to read its `WorkflowContinuedAsNew` linkage. This cap bounds that,
+/// so a heavily id-reused `workflow_id` can never trigger an unbounded scan.
+/// Above the cap the chain is served best-effort with `head_unknown = true`.
 pub(crate) const MAX_LEGACY_CANDIDATES: usize = 256;
 
-/// Outcome of legacy backward reconstruction (issue #701, Codex P2).
+/// Outcome of legacy backward reconstruction (issue #701).
 enum LegacyReconstruction {
     /// The chain was reconstructed from `WorkflowContinuedAsNew` linkage. `rows`
     /// are the ordered members and `head` is the resolved origin `exec_id`.
@@ -16776,21 +16777,22 @@ enum LegacyReconstruction {
 }
 
 /// Reconstruct a legacy continue-as-new chain by walking `WorkflowContinuedAsNew`
-/// linkage across same-`workflow_id` rows, id-reuse-safe (issue #701, Codex P2).
+/// linkage across same-`workflow_id` rows, id-reuse-safe (issue #701).
 ///
 /// Triggered only for a run with no back-link metadata (`first_exec_id` and
-/// `continued_from_exec_id` both `NULL`) that the indexed gather could not resolve
-/// into a multi-run chain — i.e. a pre-feature chain queried from its tail or a
-/// middle run, or a genuine standalone run. Post-feature chains never reach here
-/// (their successors carry `first_exec_id`, so the fast indexed gather is
-/// complete).
+/// `continued_from_exec_id` both `NULL`). The indexed gather also could not
+/// resolve it into a multi-run chain. That is a pre-feature chain queried from
+/// its tail or a middle run, or a genuine standalone run. Post-feature chains
+/// never reach here: their successors carry `first_exec_id`, so the fast
+/// indexed gather is complete.
 ///
 /// All members of a continue-as-new chain share the same `(workflow_name,
-/// workflow_id)`, so candidates are gathered by that pair on the caller's already
-/// held, shard-local connection (never a second acquire — the pool-size-1 safety
-/// the whole run-chain gather relies on). Each candidate's history is loaded
-/// (undecoded — only the typed `new_exec_id` is read) to build the CAN linkage,
-/// then [`reconstruct_legacy_chain_order`](autumn_harvest::run_chain::reconstruct_legacy_chain_order)
+/// workflow_id)`. So candidates are gathered by that pair on the caller's
+/// already held, shard-local connection. There is never a second acquire: the
+/// whole run-chain gather relies on that pool-size-1 safety. Each candidate's
+/// history is loaded undecoded, and only the typed `new_exec_id` is read, to
+/// build the CAN linkage. Then
+/// [`reconstruct_legacy_chain_order`](autumn_harvest::run_chain::reconstruct_legacy_chain_order)
 /// walks backward to the origin and forward to the tail. A same-`workflow_id` run
 /// reused for an unrelated logical run points its CAN event at a different
 /// successor, so it is excluded by construction.
@@ -16802,13 +16804,13 @@ async fn reconstruct_legacy_run_chain(
     queried: &WorkflowExecution,
 ) -> HarvestResult<LegacyReconstruction> {
     // Gather same-(workflow_name, workflow_id) candidates on the queried row's
-    // logical shard, capped. The `shard_id` filter is required because multiple
-    // logical shards can share one physical Postgres database, so an unscoped
-    // scan would see same-id rows from other logical shards; since continue-as-new
-    // chains are shard-local, another shard's chain could consume the candidate
-    // cap and wrongly overflow this shard's reconstruction. `shard_id` is
-    // `Int4` (NOT NULL) so a plain equality filter is correct. Fetch one over
-    // the cap so an overflow is detectable.
+    // logical shard, capped. The `shard_id` filter is required: several
+    // logical shards can share one physical Postgres database. An unscoped
+    // scan would see same-id rows from other logical shards. Continue-as-new
+    // chains are shard-local, so another shard's chain could consume the
+    // candidate cap and wrongly overflow this shard's reconstruction.
+    // `shard_id` is `Int4` (NOT NULL), so a plain equality filter is correct.
+    // Fetch one over the cap so an overflow is detectable.
     let candidates: Vec<WorkflowExecution> = harvest_workflow_executions::table
         .filter(harvest_workflow_executions::workflow_name.eq(&queried.workflow_name))
         .filter(harvest_workflow_executions::workflow_id.eq(&queried.workflow_id))
@@ -16881,11 +16883,11 @@ fn run_row_from_execution(execution: &WorkflowExecution) -> autumn_harvest::run_
 /// Read the successor execution id from a `WorkflowContinuedAsNew` event in
 /// `exec_id`'s recorded history, reusing the caller's already-held connection.
 ///
-/// Deliberately does NOT call [`load_continue_as_new_successor`] (which acquires
-/// its own pool connection): the run-chain gather holds a connection across the
-/// whole walk, so a nested acquire would self-deadlock at pool size 1 (the
-/// issue #601 F4 precedent). Codec-untransformed load — only the typed
-/// `new_exec_id` field is read, never a payload — so an encrypted history's
+/// Deliberately does NOT call [`load_continue_as_new_successor`], which
+/// acquires its own pool connection. The run-chain gather holds a connection
+/// across the whole walk, so a nested acquire would self-deadlock at pool
+/// size 1 (the issue #601 precedent). Codec-untransformed load: only the typed
+/// `new_exec_id` field is read, never a payload. So an encrypted history's
 /// codec envelopes ride along as opaque values and cannot fail the walk.
 async fn continue_as_new_successor_on_conn(
     conn: &mut AsyncPgConnection,
@@ -16905,19 +16907,19 @@ async fn continue_as_new_successor_on_conn(
 /// `head_exec_id`, shard-locally (issue #701).
 ///
 /// Primary path (post-feature rows): one indexed query selects the origin
-/// (`id = head`) plus every successor (`first_exec_id = head`) — this is
-/// complete for any chain written after the feature landed, and for a
-/// standalone never-continued run it returns just that one row.
+/// (`id = head`) plus every successor (`first_exec_id = head`). This is
+/// complete for any chain written after the feature landed. For a standalone
+/// never-continued run it returns just that one row.
 ///
 /// Legacy forward-fallback (AC5): rows written before issue #701 carry no
-/// back-links, so a `CONTINUED_AS_NEW` run that no gathered row continues from
-/// is walked forward through its `WorkflowContinuedAsNew` events to pick up the
-/// legacy successors. Each `CONTINUED_AS_NEW` frontier run is walked at most
-/// once (tracked in `walked`), so the walk is linear in chain length and
-/// bounded overall by [`MAX_RUN_CHAIN_HOPS`]; a post-feature chain never enters
-/// the walk (every `CONTINUED_AS_NEW` run already has an in-set back-linked
-/// successor). A mid-chain missing successor is swallowed — the chain is served
-/// best-effort, never a 500.
+/// back-links. So a `CONTINUED_AS_NEW` run that no gathered row continues from
+/// is walked forward through its `WorkflowContinuedAsNew` events. That picks up
+/// the legacy successors. Each `CONTINUED_AS_NEW` frontier run is walked at
+/// most once (tracked in `walked`). So the walk is linear in chain length and
+/// bounded overall by [`MAX_RUN_CHAIN_HOPS`]. A post-feature chain never
+/// enters the walk: every `CONTINUED_AS_NEW` run already has an in-set
+/// back-linked successor. A mid-chain missing successor is swallowed: the
+/// chain is served best-effort, never a 500.
 async fn gather_run_chain_rows(
     conn: &mut AsyncPgConnection,
     head_exec_id: ExecutionId,
@@ -17010,14 +17012,15 @@ async fn get_run_chain(
         .await
         .map_err(map_error)?;
 
-    // Legacy backward reconstruction (issue #701, Codex P2). A pre-feature chain
-    // queried from its TAIL (or a MIDDLE run) has no back-link metadata, so the
-    // indexed gather above only finds the queried run (plus any legacy successors
-    // reachable via its own forward CAN events) — never its predecessors. Fall
-    // back to `workflow_id`-scoped reconstruction, but only when the queried run
-    // carries no back-link metadata AND the fast gather did not already resolve a
-    // post-feature chain (a post-feature origin's successors carry
-    // `first_exec_id = queried.id`, so it stays on the cheap indexed path).
+    // Legacy backward reconstruction (issue #701). A pre-feature chain
+    // queried from its TAIL (or a MIDDLE run) has no back-link metadata. So the
+    // indexed gather above finds only the queried run, plus any legacy
+    // successors reachable via its own forward CAN events, never its
+    // predecessors. Fall back to `workflow_id`-scoped reconstruction only when
+    // two conditions hold. The queried run carries no back-link metadata. The
+    // fast gather did not already resolve a post-feature chain. A post-feature
+    // origin's successors carry `first_exec_id = queried.id`, so it stays on
+    // the cheap indexed path.
     let mut head_uuid = head_exec_id.as_uuid();
     let mut force_head_unknown = false;
     let mut rows = rows;
@@ -17033,14 +17036,15 @@ async fn get_run_chain(
                 rows: recon_rows,
                 head,
             } => {
-                // Merge — never shrink. Reconstruction adds any chain member the
-                // indexed gather could not reach (the predecessors of a tail
-                // query, the whole point of this fallback), while the fast
-                // path's forward-walked successors are kept. When reconstruction
-                // finds nothing new (e.g. a head query the fast path already
-                // resolved) this is a no-op. The resolved origin (`head`) is
-                // never worse than the fast-path head: for a tail it walks back
-                // to the true origin, otherwise it equals the queried run.
+                // Merge — never shrink. Reconstruction adds any chain member
+                // the indexed gather could not reach, such as the predecessors
+                // of a tail query, the whole point of this fallback. The fast
+                // path's forward-walked successors are kept. When
+                // reconstruction finds nothing new (e.g. a head query the fast
+                // path already resolved) this is a no-op. The resolved origin
+                // (`head`) is never worse than the fast-path head. For a tail it
+                // walks back to the true origin; otherwise it equals the
+                // queried run.
                 let existing: std::collections::BTreeSet<uuid::Uuid> =
                     rows.iter().map(|r| r.exec_id).collect();
                 for r in recon_rows {
@@ -17126,10 +17130,10 @@ async fn get_workflow_stack(
         .map_err(database_error)?;
 
     // Most-recent LOCAL-activity failure per activity (issue #773). One
-    // read-only query over the `LocalActivityFailed` events for this execution —
-    // regular (task-queue) activities are handled inline from the task-row
-    // `error` column below, because a retryable regular failure appends no
-    // `ActivityFailed` event (it re-queues with the message in `error`). Keyed
+    // read-only query over the `LocalActivityFailed` events for this
+    // execution. Regular (task-queue) activities are handled inline from the
+    // task-row `error` column below. A retryable regular failure appends no
+    // `ActivityFailed` event: it re-queues with the message in `error`. Keyed
     // by the event's `activity_id`, which equals the `LocalActivityScheduled`
     // /`LocalActivityFailed` id-space. Restricting the query to
     // `LocalActivityFailed` also keeps the #608 read-path decode scoped to the
@@ -17172,7 +17176,7 @@ async fn get_workflow_stack(
             key: String,
         }
         // Honors a live TTL'd rate-limit override (issue #945) via
-        // `queue::effective_available_tokens_expr` -- otherwise a task the
+        // `queue::effective_available_tokens_expr`. Otherwise a task the
         // operator just unblocked by raising its limit would keep showing as
         // `activity_rate_limited` here.
         let effective_tokens = queue::effective_available_tokens_expr("harvest_rate_limit_buckets");
@@ -17190,20 +17194,20 @@ async fn get_workflow_stack(
         }
     }
 
-    // Reuse the #252 activity-result payload cap as the response-side guard for
-    // heartbeat checkpoints (issue #503); fall back to the documented default
-    // when no runtime is installed (read-only mount). The effective cap is
-    // resolved per-activity below so an activity configured with a higher
-    // `max_result_bytes` keeps full checkpoint visibility.
+    // Reuse the #252 activity-result payload cap as the response-side guard
+    // for heartbeat checkpoints (issue #503). Fall back to the documented
+    // default when no runtime is installed (read-only mount). The effective
+    // cap is resolved per activity below. So an activity configured with a
+    // higher `max_result_bytes` keeps full checkpoint visibility.
     let stack_runtime = api_state.runtime().ok();
     let default_heartbeat_cap = stack_runtime.as_ref().map_or(
         autumn_harvest::builder::DEFAULT_MAX_ACTIVITY_RESULT_BYTES,
         |rt| rt.registry.max_activity_result_bytes,
     );
     // The decoded pending-activity inputs (issue #608) are bounded the same
-    // way, against the #252 activity-*input* cap (per-activity override
-    // resolved below; this global value doubles as the cumulative
-    // per-response input budget, mirroring the checkpoint budget).
+    // way, against the #252 activity-*input* cap. The per-activity override is
+    // resolved below. This global value doubles as the cumulative
+    // per-response input budget, mirroring the checkpoint budget.
     let default_input_cap = stack_runtime.as_ref().map_or(
         autumn_harvest::builder::DEFAULT_MAX_ACTIVITY_INPUT_BYTES,
         |rt| rt.registry.max_activity_input_bytes,
@@ -17213,20 +17217,20 @@ async fn get_workflow_stack(
     let now = chrono::Utc::now();
     // Accumulated across every decoded field on this response (issue #608).
     // The surfaced #773 `last_failure` errors are decoded inline at each join
-    // site below (regular: from the task-row `error`; local: from the failure
-    // map, restricted to the surfaced local activities), so a ciphertext error
-    // is rewritten exactly for the rows actually returned and every decode is
-    // folded into this outcome for the best-effort audit row.
+    // site below. A regular one comes from the task-row `error`. A local one
+    // comes from the failure map, restricted to the surfaced local activities.
+    // So a ciphertext error is rewritten exactly for the rows returned. Every
+    // decode folds into this outcome for the best-effort audit row.
     let mut decode_outcome = LossyDecodeOutcome::default();
     let pending_activities = tasks
         .into_iter()
         .map(|t| {
             // Read-path payload decoding (issue #608): the task input is
             // surfaced (decoded) only when the decoder is active for this
-            // request; heartbeat checkpoints are decoded in place before the
+            // request. Heartbeat checkpoints are decoded in place before the
             // cap projection. Both operate on the response copy only. The
             // decoded input is projected against the effective input cap of
-            // the activity further below (PR #936 review). That mirrors the
+            // the activity further below (PR #936). That mirrors the
             // checkpoint projection, so a large fan-out cannot bloat the
             // response.
             let mut heartbeat_details = t.heartbeat_details;
@@ -17240,13 +17244,13 @@ async fn get_workflow_stack(
             } else {
                 None
             };
-            // Populate next_retry_at for backing-off tasks (issue #516): a
-            // PENDING task whose scheduled_at is in the future AND that is not
-            // gated by a rate-limit bucket is waiting out a retry backoff.
-            // Rate-limited tasks show task_status="waiting on rate_limit_key=…"
-            // rather than a retry countdown, so we suppress next_retry_at for
-            // them to avoid misleading the operator. Must be computed before
-            // task_status moves t.state.
+            // Populate next_retry_at for backing-off tasks (issue #516). A
+            // PENDING task waits out a retry backoff when its scheduled_at is in
+            // the future AND no rate-limit bucket gates it. A rate-limited task
+            // shows task_status="waiting on rate_limit_key=…" instead of a retry
+            // countdown. So next_retry_at is suppressed for it, to avoid
+            // misleading the operator. Compute it before task_status moves
+            // t.state.
             let next_retry_at = (t.state == "PENDING"
                 && t.scheduled_at > now
                 && t.rate_limit_key
@@ -17298,10 +17302,10 @@ async fn get_workflow_stack(
                     (payload, Some(truncated), bytes)
                 });
             let input_omitted_for_budget = input_truncated.map(|_| false);
-            // Regular (task-queue) activity last_failure (issue #773): sourced
-            // from the task-row `error` column, which `requeue_for_retry` sets
-            // on every RETRYABLE (backing-off) failure — the primary #773 case,
-            // which appends no `ActivityFailed` event. When the row has no
+            // Regular (task-queue) activity last_failure (issue #773). It comes
+            // from the task-row `error` column. `requeue_for_retry` sets that on
+            // every RETRYABLE (backing-off) failure. That is the primary #773
+            // case, which appends no `ActivityFailed` event. When the row has no
             // recorded error (never failed / external-handoff synthetic), it is
             // omitted (AC3). Decoded inline (issue #608) when the decoder is
             // active, folding into `decode_outcome` for the audit row.
@@ -17386,8 +17390,8 @@ async fn get_workflow_stack(
             schedule_to_start_deadline: None,
             start_to_close_deadline: Some(task.deadline_at),
             heartbeat_deadline: None,
-            // External-handoff rows are a different id-space (the handoff PK is
-            // surfaced as activity_exec_id) and carry no ActivityFailed events
+            // External-handoff rows are a different id-space: the handoff PK is
+            // surfaced as activity_exec_id. They carry no ActivityFailed events
             // keyed by a task-queue activity_id, so no failure joins here (#773).
             last_failure: None,
         })
@@ -17403,11 +17407,11 @@ async fn get_workflow_stack(
     // The per-response budget reuses the global activity-result cap.
     let checkpoints_truncated_for_budget =
         apply_checkpoint_response_budget(&mut pending_activities, default_heartbeat_cap);
-    // Same cumulative bound for the decoded inputs (issue #608, PR #936
-    // review), reusing the global input cap as the per-response budget. Gated
-    // on the decoder so flag-off responses omit the field entirely and stay
-    // byte-identical to pre-#608 builds (with decoding off every `input` is
-    // `None`, so there would be nothing to budget anyway).
+    // Same cumulative bound for the decoded inputs (issue #608, PR #936),
+    // reusing the global input cap as the per-response budget. Gated on the
+    // decoder, so flag-off responses omit the field entirely. They stay
+    // byte-identical to pre-#608 builds. With decoding off every `input` is
+    // `None`, so there would be nothing to budget anyway.
     let inputs_truncated_for_budget = decoder
         .as_ref()
         .map(|_| apply_input_response_budget(&mut pending_activities, default_input_cap));
@@ -17431,14 +17435,14 @@ async fn get_workflow_stack(
         .into_iter();
     let mut pending_local_activities =
         fold_pending_local_activities(local_rows, &failures_by_activity);
-    // Decode each SURVIVING pending local activity's `last_failure` error inline
-    // (issue #608), folding into `decode_outcome` for the audit row. Deferred to
-    // here — rather than inside the fold's `LocalActivityScheduled` arm — so a
-    // failure whose pending entry a later `LocalActivityCompleted`/`Exhausted`
-    // event removed is never decoded or audited (a removed entry is not
-    // surfaced, so touching `decode_outcome` for it would write a spurious
-    // `payload.decode_read` audit row for data that never left the handler —
-    // Codex P2, PR #1022).
+    // Decode each SURVIVING pending local activity's `last_failure` error
+    // inline (issue #608), folding into `decode_outcome` for the audit row.
+    // This runs here, not inside the fold's `LocalActivityScheduled` arm. A
+    // later `LocalActivityCompleted`/`Exhausted` event can remove a pending
+    // entry. A removed entry is not surfaced, so it is never decoded or
+    // audited. Otherwise `decode_outcome` would get a spurious
+    // `payload.decode_read` audit row for data that never left the handler
+    // (PR #1022).
     if let Some(codecs) = decoder.as_ref() {
         for pla in &mut pending_local_activities {
             if let Some(failure) = pla.last_failure.as_mut() {
@@ -17616,10 +17620,10 @@ pub(crate) fn clamp_info_default_sla(
 /// Whether `workflow_name` has a debounce policy whose key resolves for `input`.
 ///
 /// Debounce admission (issue #499) is owned exclusively by
-/// `POST /workflows/{name}/start`. The other start entry points
-/// (signal-with-start, update-with-start, `batch_start`) and the typed client
-/// stubs reject debounced workflows rather than silently bypassing the
-/// quiet-window collapse — there is no coherent way to defer an atomic
+/// `POST /workflows/{name}/start`. The other start entry points reject
+/// debounced workflows rather than silently bypass the quiet-window collapse.
+/// They are signal-with-start, update-with-start, `batch_start` and the typed
+/// client stubs. No coherent way exists to defer an atomic
 /// start+signal/start+update or a bulk start through the trailing-edge gate.
 fn workflow_has_resolving_debounce(
     registry: &HandlerRegistry,
@@ -17644,7 +17648,7 @@ fn workflow_has_resolving_debounce(
 ///   (`resolved_key` = `""`).
 ///
 /// Returns `None` when there is no throttle policy, or a keyed throttle whose
-/// key does not resolve — in which case the start proceeds on the normal path.
+/// key does not resolve. The start then proceeds on the normal path.
 fn workflow_resolving_throttle(
     registry: &HandlerRegistry,
     workflow_name: &str,
@@ -17664,11 +17668,11 @@ fn workflow_resolving_throttle(
 /// `idempotency_key` (issue #808).
 ///
 /// The key is half of the composite PRIMARY KEY `(workflow_name,
-/// idempotency_key)` on `harvest_start_idempotency`; an oversized key would
-/// exceed Postgres's ~2704-byte btree index tuple limit and error at INSERT,
-/// leaking a `500` on client-controlled input. Cap it conservatively so
-/// `workflow_name` + key stays well under that limit and a too-long key is a
-/// clean `400` at the API boundary instead.
+/// idempotency_key)` on `harvest_start_idempotency`. An oversized key would
+/// exceed Postgres's ~2704-byte btree index tuple limit and error at INSERT.
+/// That leaks a `500` on client-controlled input. Cap it conservatively, so
+/// `workflow_name` + key stays well under that limit. A too-long key is then
+/// a clean `400` at the API boundary instead.
 const MAX_START_IDEMPOTENCY_KEY_LEN: usize = 512;
 
 /// Reject an explicitly-empty `workflow_id` (issue #1353), shared by
@@ -17697,11 +17701,11 @@ pub(crate) fn reject_empty_workflow_id(raw: Option<&str>) -> Result<(), axum::re
     Ok(())
 }
 
-/// Shared trim + empty-`400` + length-cap validation for a request-scoped
-/// `idempotency_key` (issue #808), used by both the `Idempotency-Key` header
-/// and the body-field source so the two never diverge. `Ok(None)` = no key;
-/// `Ok(Some(k))` = a valid trimmed key; `Err(resp)` = a `400` for an empty or
-/// over-long key.
+/// Trims and validates a request-scoped `idempotency_key` (issue #808).
+///
+/// The `Idempotency-Key` header and the body field both use it, so the two never diverge.
+/// `Ok(None)` means no key. `Ok(Some(k))` is a valid trimmed key. `Err(resp)` is a `400`
+/// for an empty or over-long key.
 #[allow(clippy::result_large_err)]
 fn validate_start_idempotency_key(
     raw: Option<String>,
@@ -17716,10 +17720,9 @@ fn validate_start_idempotency_key(
             .into_response()),
         Some(s) => {
             let trimmed = s.trim();
-            // Cap the key length: it is half of the composite PK on
-            // harvest_start_idempotency, so an oversized key would overflow the
-            // btree tuple limit and 500 at INSERT on client-controlled input.
-            // Reject it cleanly at the boundary instead.
+            // Cap the key length. It is half of the composite PK on
+            // harvest_start_idempotency. An oversized client key would overflow the
+            // btree tuple limit and fail with a 500 at INSERT. Reject it at the boundary.
             if trimmed.len() > MAX_START_IDEMPOTENCY_KEY_LEN {
                 return Err((
                     axum::http::StatusCode::BAD_REQUEST,
@@ -17742,14 +17745,14 @@ fn validate_start_idempotency_key(
 
 /// Refuse an engine-reserved idempotency key from a caller (issue #944 review).
 ///
-/// A broker connector derives its dedupe key from stable broker coordinates
-/// and needs that key to be unclaimable from outside: the derived keys share a
-/// durable uniqueness scope with caller-supplied ones — `(workflow_name,
-/// idempotency_key)` on `harvest_start_idempotency`, `(workflow_exec_id,
-/// idempotency_key)` on `harvest_signals` — and they are *predictable* (Kafka
-/// coordinates are `{topic}:{partition}:{offset}`). A caller who landed one
-/// first would make the broker's own delivery read as an idempotent replay,
-/// acknowledged without ever dispatching its payload.
+/// A broker connector derives its dedupe key from stable broker coordinates. That key
+/// must be unclaimable from outside. The derived keys share a durable uniqueness scope
+/// with caller-supplied ones: `(workflow_name, idempotency_key)` on
+/// `harvest_start_idempotency` and `(workflow_exec_id, idempotency_key)` on
+/// `harvest_signals`. They are also *predictable*: Kafka coordinates are
+/// `{topic}:{partition}:{offset}`. A caller who lands one first makes the broker's own
+/// delivery read as an idempotent replay. That delivery is then acknowledged without
+/// ever dispatching its payload.
 ///
 /// Returns `Some(400)` when the key is reserved, `None` when it is fine. Uses
 /// the core predicate and message so every path refuses identically.
@@ -17800,16 +17803,17 @@ fn extract_start_idempotency_header_key(
     validate_start_idempotency_key(raw, false)
 }
 
-/// Read-only committed-replay dedup probe (issue #808). On `shard`, look up a
-/// live idempotency claim for `(workflow_name, key)`; on a hit, load the claimed
-/// execution and return a `200` no-op response (writing a best-effort dedup
-/// audit row). Returns `None` on a miss, a vanished row (retention-deleted in
-/// the gap), or any read error — the caller then falls through to the
-/// fresh-start path (or, for a malformed body, the extractor rejection).
+/// Read-only committed-replay dedup probe (issue #808).
 ///
-/// Standard idempotency-key semantics: on a hit the original execution is
-/// returned verbatim, the retry's body is irrelevant, and there is no
-/// body-mismatch detection (out of scope for #808).
+/// On `shard`, look up a live idempotency claim for `(workflow_name, key)`. On a hit,
+/// load the claimed execution and return a `200` no-op response. A hit also writes a
+/// best-effort dedup audit row. Returns `None` on a miss, a vanished row
+/// (retention-deleted in the gap), or any read error. The caller then falls through to
+/// the fresh-start path, or to the extractor rejection for a malformed body.
+///
+/// Standard idempotency-key semantics apply. A hit returns the original execution
+/// verbatim, and the retry's body is irrelevant. Body-mismatch detection is out of scope
+/// for #808.
 #[allow(clippy::too_many_arguments)]
 async fn probe_committed_start_replay(
     api_state: &HarvestApiState,
@@ -17831,13 +17835,13 @@ async fn probe_committed_start_replay(
     use axum::response::IntoResponse as _;
     let pool = api_state.storage_pool().ok()?;
     // A PINNED probe must never fall back to the default shard's pool. `pool_for`
-    // does exactly that when the requested shard has no pool of its own (a real
-    // state mid a shard-add rollout / removal), so a same-name/key claim living
-    // on the DEFAULT database would be returned as a successful replay and
-    // echoed as belonging to the requested residency shard -- the same silent
+    // does exactly that when the requested shard has no pool of its own. That is a
+    // real state during a shard-add rollout or removal. A same-name/key claim on the
+    // DEFAULT database would then be returned as a successful replay. It would be
+    // echoed as belonging to the requested residency shard. That is the same silent
     // breach `db_conn_for_pinned_shard` closes on the fresh-start path. Returning
-    // `None` here is a probe MISS, so the caller falls through to that fresh
-    // pinned path and fails closed with a `503` rather than inventing a replay.
+    // `None` here is a probe MISS. The caller falls through to that fresh pinned
+    // path and fails closed with a `503` rather than inventing a replay.
     let probe_pool = if report_shard.is_some() {
         pool.exact_pool_for(shard)?
     } else {
@@ -17871,10 +17875,9 @@ async fn probe_committed_start_replay(
     if tenant.is_some() && dup_tenant.as_deref() != tenant {
         return None;
     }
-    // Best-effort dedup audit (intentional asymmetry with the fresh-start arm's
-    // 503-on-audit-failure): the original start was already audited when it
-    // created the run, so a failed audit here is a no-op read and never fails
-    // the reply.
+    // Best-effort dedup audit. This is an intentional asymmetry with the fresh-start
+    // arm's 503-on-audit-failure. The original start was already audited when it
+    // created the run. So a failed audit here is a no-op read and never fails the reply.
     let exec_id_str = claim_exec_id.to_string();
     let ar = NewAuditRecord {
         actor,
@@ -17909,24 +17912,26 @@ async fn probe_committed_start_replay(
 
 /// Read-only committed-replay probe for `signal-with-start` (keyed requests only).
 ///
-/// INVARIANT (mirrors the plain `start_workflow` probe, issue #808, and the
-/// plain signal route, PR #1092): a retry of an already-committed keyed
-/// signal-with-start must replay to its documented `200 signal_delivered: false`
-/// no-op BEFORE any fresh-start-only validation runs (the #610 signal-payload
-/// schema gate, the #373 `start_input` schema gate, the #252 cap). Otherwise a
-/// tightened schema/cap between the original delivery and the retry would
-/// wrongly reject a retry that creates no new work. This probe runs only when an
-/// `idempotency_key` is present; on a miss the caller falls through to the
-/// untouched authoritative in-lock path (which reserves the exactly-once row and
-/// remains the source of truth for the concurrent-first-delivery race). It never
-/// starts, attaches, or enqueues anything — it is a read-only fast path.
+/// INVARIANT: a retry of an already-committed keyed signal-with-start replays to its
+/// documented `200 signal_delivered: false` no-op. It does so BEFORE any
+/// fresh-start-only validation runs: the #610 signal-payload schema gate, the #373
+/// `start_input` schema gate, and the #252 cap. Otherwise a schema or cap tightened
+/// between the original delivery and the retry would wrongly reject a retry that
+/// creates no new work. This mirrors the plain `start_workflow` probe (issue #808) and
+/// the plain signal route (PR #1092).
 ///
-/// Fans out across shards using the SAME `lookup_idempotent_signal_dedupe` the
-/// in-lock authoritative dedup uses, so the two can never drift. On the first
-/// hit it writes a best-effort SUCCEEDED audit (intentional asymmetry with the
-/// fresh-start arm's 503-on-audit-failure: the original start was already
-/// audited, so a failed dedup audit is a no-op read that never fails the reply)
-/// and returns the documented `200` response.
+/// This probe runs only when an `idempotency_key` is present. On a miss the caller falls
+/// through to the untouched authoritative in-lock path. That path reserves the
+/// exactly-once row and remains the source of truth for the concurrent-first-delivery
+/// race. This probe never starts, attaches, or enqueues anything. It is a read-only fast
+/// path.
+///
+/// It fans out across shards with the SAME `lookup_idempotent_signal_dedupe` that the
+/// in-lock authoritative dedup uses, so the two can never drift. On the first hit it
+/// writes a best-effort SUCCEEDED audit and returns the documented `200` response. The
+/// audit is an intentional asymmetry with the fresh-start arm's 503-on-audit-failure. The
+/// original start was already audited, so a failed dedup audit is a no-op read that never
+/// fails the reply.
 #[allow(clippy::too_many_arguments)]
 async fn probe_committed_sws_replay(
     api_state: &HarvestApiState,
@@ -17942,16 +17947,16 @@ async fn probe_committed_sws_replay(
     let pool = api_state.storage_pool().ok()?;
     // Fail CLOSED on an inconclusive shard error (three-state: hit / clean-miss /
     // inconclusive). A transient conn-acquire or lookup failure on the shard that
-    // owns a committed key must NOT masquerade as a dedup miss — that would fall
-    // through to fresh-start validation and could wrongly reject THIS PR's core
-    // invariant (a committed replay is never rejected by tightened validation)
-    // under a transient error. Deliberately MORE conservative than #808's
-    // plain-start probe (which swallows): (a) the sibling `found_shard` scan in
-    // this handler already fails closed (503) on the same error class, and (b)
-    // fail-closed preserves the never-reject invariant even under a transient
-    // owning-shard error; a keyed client retries 503 idempotently. Keep scanning
-    // the remaining shards first — a later shard may hold the hit — and only 503
-    // when the whole fan-out found no hit at all.
+    // owns a committed key must NOT masquerade as a dedup miss. That would fall
+    // through to fresh-start validation. It could then reject a committed replay
+    // under a transient error, which breaks THIS PR's core invariant: tightened
+    // validation never rejects a committed replay. This is deliberately MORE
+    // conservative than #808's plain-start probe, which swallows the error. (a) The
+    // sibling `found_shard` scan in this handler already fails closed (503) on the
+    // same error class. (b) Failing closed keeps the never-reject invariant under a
+    // transient owning-shard error. A keyed client retries a 503 idempotently. Keep
+    // scanning the remaining shards first, because a later shard may hold the hit.
+    // Return 503 only when the whole fan-out found no hit at all.
     let mut had_error = false;
     for (shard, shard_pool) in pool.iter_shards() {
         let Ok(mut probe_conn) = acquire_conn(shard_pool).await else {
@@ -18021,30 +18026,30 @@ async fn probe_committed_sws_replay(
 
 /// Read-only committed-replay probe for `update-with-start` (keyed requests only).
 ///
-/// INVARIANT (mirrors [`probe_committed_sws_replay`]): a retry of an
-/// already-committed keyed update-with-start must replay to its cached admission
-/// BEFORE any fresh-start-only validation runs (the #373 `start_input` schema
-/// gate, the #610 update-arg schema gate, the #684 semantic validator).
-/// Otherwise a tightened schema — or a validator that would now reject the same
-/// args — would wrongly reject a retry that admits no new update. Keyed-only; a
-/// miss falls through to the authoritative in-lock path.
+/// INVARIANT (mirrors [`probe_committed_sws_replay`]): a retry of an already-committed
+/// keyed update-with-start replays to its cached admission. It does so BEFORE any
+/// fresh-start-only validation runs: the #373 `start_input` schema gate, the #610
+/// update-arg schema gate, and the #684 semantic validator. Otherwise a tightened
+/// schema, or a validator that would now reject the same args, would wrongly reject a
+/// retry that admits no new update. Keyed-only. A miss falls through to the
+/// authoritative in-lock path.
 ///
-/// Unlike the signal probe it returns the resolved [`UpdateWithStartOutcome`]
-/// (not a full response) so the outcome flows through the handler's existing
-/// `Ok` arm — which polls for the cached update result under `wait_for_stage =
-/// "completed"` and writes the SUCCEEDED audit — giving a committed replay the
-/// SAME behavior as a fresh admission. `update_admitted: false` marks the cache
-/// hit.
+/// Unlike the signal probe it returns the resolved [`UpdateWithStartOutcome`], not a
+/// full response. The outcome then flows through the handler's existing `Ok` arm. That
+/// arm polls for the cached update result under `wait_for_stage = "completed"` and
+/// writes the SUCCEEDED audit. So a committed replay gets the SAME behavior as a fresh
+/// admission. `update_admitted: false` marks the cache hit.
 ///
-/// Three-state result: `Ok(Some(outcome))` = committed-replay HIT (flows through
-/// the handler's `Ok` arm); `Ok(None)` = a genuine clean all-shard MISS (falls
-/// through to the authoritative in-lock path); `Err(resp)` = an INCONCLUSIVE
-/// shard error (fail closed with a 503). Failing closed on a transient conn/lookup
-/// error is deliberately MORE conservative than #808's plain-start probe (which
-/// swallows): (a) the sibling `found_shard` scan in this handler already fails
-/// closed (503) on the same error class, and (b) fail-closed preserves THIS PR's
-/// core invariant — a committed replay is never rejected by tightened validation —
-/// even under a transient owning-shard error; a keyed client retries 503
+/// Three-state result. `Ok(Some(outcome))` is a committed-replay HIT and flows through
+/// the handler's `Ok` arm. `Ok(None)` is a genuine clean all-shard MISS and falls
+/// through to the authoritative in-lock path. `Err(resp)` is an INCONCLUSIVE shard
+/// error and fails closed with a 503.
+///
+/// Failing closed on a transient conn/lookup error is deliberately MORE conservative
+/// than the plain-start probe of #808, which swallows it. (a) The sibling `found_shard`
+/// scan in this handler already fails closed (503) on the same error class. (b) Failing
+/// closed keeps THIS PR's core invariant under a transient owning-shard error: tightened
+/// validation never rejects a committed replay. A keyed client retries a 503
 /// idempotently.
 #[allow(clippy::result_large_err)]
 async fn probe_committed_uws_replay(
@@ -18103,27 +18108,27 @@ async fn probe_committed_uws_replay(
     Ok(None)
 }
 
-/// Handle a `start_workflow` request whose JSON body failed to deserialize
-/// (issue #808, Codex P2). axum rejects a malformed `Json<T>` body before the
-/// handler runs, but a retry that carries its exactly-once key in the
-/// `Idempotency-Key` HEADER (body irrelevant on a committed-key hit) must still
-/// return the advertised `200` no-op rather than the extractor's `400`/`422`.
+/// Handle a `start_workflow` request whose JSON body failed to deserialize (issue #808).
 ///
-/// If a valid header key is present we probe the committed claim routed by the
-/// KEY — the body is unparsed so `workflow_id` is unknown, and the
-/// `workflow_id`-aware routing rule cannot be applied here (see the residual
-/// documented at the call site). On a hit we return the `200` no-op; on a miss
-/// (or no header key / an over-long or invalid-UTF-8 header key surfaced as its
-/// own `400`) we return the exact axum rejection, so the malformed-body wire
-/// response is byte-for-byte what axum produces today (AC1: the no-key path is
-/// unchanged).
+/// axum rejects a malformed `Json<T>` body before the handler runs. A retry may carry
+/// its exactly-once key in the `Idempotency-Key` HEADER, and its body is irrelevant on a
+/// committed-key hit. Such a retry must still return the advertised `200` no-op rather
+/// than the extractor's `400`/`422`.
 ///
-/// This fallback recognizes only the HEADER key. A key supplied solely in the
-/// body `idempotency_key` field cannot be recovered from an undeserializable
-/// body (`JsonRejection` carries no raw bytes), so by design a body-field key
-/// requires a structurally-valid body to be recognized on retry — use the
-/// `Idempotency-Key` header for body-independent replay recognition. See the
-/// no-header-key arm below and docs/getting-started/06-idempotency.md.
+/// With a valid header key, the probe reads the committed claim routed by the KEY. The
+/// body is unparsed, so `workflow_id` is unknown and the `workflow_id`-aware routing
+/// rule cannot apply here. The call site documents that residual. On a hit the function
+/// returns the `200` no-op. On a miss or with no header key, it returns the exact axum
+/// rejection. An over-long or invalid-UTF-8 header key surfaces as its own `400`. So the
+/// malformed-body wire response is byte-for-byte what axum produces today (AC1: the
+/// no-key path is unchanged).
+///
+/// This fallback recognizes only the HEADER key. A key supplied only in the body
+/// `idempotency_key` field cannot be recovered from an undeserializable body, because
+/// `JsonRejection` carries no raw bytes. So by design a body-field key needs a
+/// structurally-valid body to be recognized on retry. Use the `Idempotency-Key` header
+/// for body-independent replay recognition. See the no-header-key arm below and
+/// docs/getting-started/06-idempotency.md.
 async fn handle_malformed_start_body(
     api_state: &HarvestApiState,
     workflow_name: &str,
@@ -18140,16 +18145,13 @@ async fn handle_malformed_start_body(
         // No header key → the exact axum rejection (AC1: byte-for-byte no-key
         // malformed-body behavior).
         //
-        // NOTE (issue #808, Codex P2): this fallback probes the HEADER key ONLY.
-        // A key supplied solely in the body `idempotency_key` field is NOT
-        // recovered here: `JsonRejection` does not carry the raw request bytes,
-        // so an otherwise-undeserializable body cannot be parsed to read that
-        // field without abandoning the clean `Result<Json, JsonRejection>`
-        // extractor for raw-byte parsing plus manually replicating axum's exact
-        // per-variant rejection responses (preserving the AC1 byte-for-byte
-        // no-key wire behavior). By design, a body-field key therefore requires a
-        // structurally-valid (deserializable) body to be recognized on retry;
-        // the `Idempotency-Key` header is the body-independent mechanism. See
+        // NOTE (issue #808): this fallback probes the HEADER key ONLY. A key supplied
+        // solely in the body `idempotency_key` field is NOT recovered here.
+        // `JsonRejection` does not carry the raw request bytes. Reading that field would
+        // mean dropping the clean `Result<Json, JsonRejection>` extractor for raw-byte
+        // parsing. It would also mean replicating axum's exact per-variant rejection
+        // responses to keep the AC1 byte-for-byte no-key wire behavior. The
+        // `Idempotency-Key` header is the body-independent mechanism. See
         // docs/getting-started/06-idempotency.md.
         return rejection.into_response();
     };
@@ -18158,17 +18160,16 @@ async fn handle_malformed_start_body(
         // route without the router.
         return rejection.into_response();
     };
-    // NOTE (issue #808, Codex P2 residual): route the probe by the KEY only —
-    // the body is unparsed so `workflow_id` is unknown, so the explicit-
-    // `workflow_id` → route-by-`workflow_id` rule (see the shard resolution at
-    // the main call site) cannot be applied here. A committed replay whose
-    // ORIGINAL delivery supplied an explicit `workflow_id` (and was therefore
-    // routed to, and claimed on, the `workflow_id`-derived shard) is not found
-    // by this key-routed fallback and still returns the extractor rejection.
-    // This is safe (never a false dedup, never a duplicate run) and narrow: the
-    // common header-key usage omits `workflow_id` (auto-generated), which routes
-    // by the key and IS found. A well-behaved client sends a consistent valid
-    // body on retries.
+    // NOTE (issue #808, residual): route the probe by the KEY only. The body is
+    // unparsed, so `workflow_id` is unknown. So the explicit-`workflow_id` →
+    // route-by-`workflow_id` rule (see the shard resolution at the main call site)
+    // cannot apply here. Suppose the ORIGINAL delivery supplied an explicit
+    // `workflow_id`. It was then routed to, and claimed on, the `workflow_id`-derived
+    // shard. This key-routed fallback does not find that committed replay, so it still
+    // returns the extractor rejection. This is safe: never a false dedup, never a
+    // duplicate run. It is also narrow. The common header-key usage omits
+    // `workflow_id` (auto-generated), which routes by the key and IS found. A
+    // well-behaved client sends a consistent valid body on retries.
     let shard = runtime.router.pick_for_idempotency_key(workflow_name, &key);
     let (actor, source, request_id) = audit_context(headers, api_state);
     let route = "POST /workflows/{workflow_name}/start";
@@ -18207,12 +18208,12 @@ pub(crate) async fn start_workflow(
     // #1977). The new run is stamped with it. The body cannot set a tenant.
     let tenant: Option<&str> = verified_tenant.as_ref().map(|Extension(t)| t.as_str());
 
-    // issue #808 (Codex P2): take the body as a `Result` so a malformed JSON
-    // body no longer short-circuits with axum's `400`/`422` before the handler
-    // runs. A retry that carries its exactly-once key in the `Idempotency-Key`
-    // HEADER (its body being irrelevant on a committed-key hit) is routed to the
-    // committed-replay probe; otherwise the exact axum rejection is returned so
-    // the no-key malformed-body wire response is unchanged (AC1).
+    // issue #808: take the body as a `Result`, so a malformed JSON body no longer
+    // short-circuits with axum's `400`/`422` before the handler runs. A retry that
+    // carries its exactly-once key in the `Idempotency-Key` HEADER goes to the
+    // committed-replay probe. Its body is irrelevant on a committed-key hit.
+    // Otherwise the exact axum rejection is returned, so the no-key malformed-body
+    // wire response is unchanged (AC1).
     let request = match body {
         Ok(Json(req)) => req,
         Err(rejection) => {
@@ -18242,65 +18243,62 @@ pub(crate) async fn start_workflow(
         .unwrap_or(autumn_harvest::StartSource::Api);
     let effective_start_source_ref = request.start_source_ref_override.clone();
 
-    // issue #685 review (Codex P2): the early gate must NOT pre-empt a request
-    // that carries an idempotency key. The #808 committed-replay claim is keyed
-    // on `(workflow_name, idempotency_key)` ALONE — independent of the
-    // reuse/conflict policy and of the caller's auth — so a committed KEYED
-    // `Terminate` start (which an ADMIN may legitimately have made) can be
-    // replayed by a later NON-admin retry carrying the same key, which must
-    // return the #808 `200` no-op, not a `401`. A presence-only boolean
-    // (below) therefore defers any keyed request past this early gate to the
-    // downstream path. Presence only — no validation/erroring here; the
-    // downstream resolver (`extract_start_idempotency_header_key` /
-    // `validate_start_idempotency_key`) still `400`s an empty/over-long key
-    // unchanged. Header-present counts even if it is empty/invalid: such a key
-    // resolves to a downstream `400`, which is the correct answer for a caller
-    // that signalled idempotent intent — never an early `401` and never a
-    // false `200`.
+    // issue #685: the early gate must NOT pre-empt a request that carries an
+    // idempotency key. The #808 committed-replay claim is keyed on
+    // `(workflow_name, idempotency_key)` ALONE. It is independent of the
+    // reuse/conflict policy and of the caller's auth. So a later NON-admin retry with
+    // the same key can replay a committed KEYED `Terminate` start, which an ADMIN may
+    // legitimately have made. That retry must return the #808 `200` no-op, not a
+    // `401`. A presence-only boolean (below) therefore defers any keyed request past
+    // this early gate to the downstream path. It checks presence only and never
+    // validates or errors here. The downstream resolver
+    // (`extract_start_idempotency_header_key` / `validate_start_idempotency_key`)
+    // still returns `400` for an empty or over-long key. A header counts as present
+    // even if it is empty or invalid. Such a key resolves to a downstream `400`. That
+    // is the correct answer for a caller that signalled idempotent intent: never an
+    // early `401` and never a false `200`.
     let idempotency_key_present = headers.contains_key(HEADER_IDEMPOTENCY_KEY)
         || request
             .idempotency_key
             .as_deref()
             .is_some_and(|k| !k.trim().is_empty());
 
-    // A start that can forcibly cancel a live prior requires admin auth. The
-    // gate is NARROWED (issue #685 review) to the precise "can cancel a live
-    // run" capability — the resolved active-prior behavior being `Terminate` —
-    // rather than a raw-string match on the reuse/conflict wire values. The
-    // flagship non-admin idempotent-starter shape `reuse = terminate_if_running`
-    // + `conflict = use_existing` resolves to `Attach` (return the existing
-    // handle) and provably CANNOT cancel a live run — gating it on the raw
-    // `terminate_if_running` string would wrongly force admin and defeat the
-    // non-admin webhook/cron user story.
+    // A start that can forcibly cancel a live prior requires admin auth. The gate is
+    // NARROWED (issue #685 review) to the precise "can cancel a live run" capability:
+    // the resolved active-prior behavior is `Terminate`. It does not match raw strings
+    // on the reuse/conflict wire values. The flagship non-admin idempotent-starter
+    // shape is `reuse = terminate_if_running` + `conflict = use_existing`. It resolves
+    // to `Attach` (return the existing handle) and provably CANNOT cancel a live run.
+    // Gating it on the raw `terminate_if_running` string would wrongly force admin.
+    // That would defeat the non-admin webhook/cron user story.
     //
     // This gate is enforced in TWO places:
     //
-    //  1. EARLY (here) — an observable, KEY-ABSENT-ONLY auth check before the
-    //     fail-closed `api_state.runtime()` check below. The auth decision is a
-    //     pure function of the two request-body strings, the key-presence
-    //     boolean, and `api_state` config; it needs neither the runtime nor a
-    //     DB. Evaluating it first means an unauthenticated caller that could
-    //     cancel a live run with NO idempotency key is rejected with `401`
-    //     regardless of runtime readiness (defense in depth — authorize before
-    //     the fail-closed resource check — and it restores the pre-#685 property
-    //     that the gate is observable without a running DB). It is LENIENT in
-    //     two ways: an unparseable policy string makes the `Ok`/`Ok` guard fail
-    //     (a fresh invalid string still `400`s at the real parse), and a KEYED
-    //     request (`idempotency_key_present`) always defers. Deferring a keyed
-    //     request is what preserves BOTH #808 outcomes: a committed-replay hit
-    //     returns its `200` at the probe below (caller/body-independent), while
-    //     a genuinely-fresh keyed `Terminate` by a non-admin is still rejected
-    //     `401` by the authoritative gate below (which runs AFTER that probe).
-    //     A cleanly-parsed non-`Terminate` combo (e.g. the flagship
-    //     `terminate_if_running` + `use_existing` → `Attach`) is a no-op here.
+    //  1. EARLY (here): an observable, KEY-ABSENT-ONLY auth check before the
+    //     fail-closed `api_state.runtime()` check below. The auth decision is a pure
+    //     function of the two request-body strings, the key-presence boolean, and
+    //     `api_state` config. It needs neither the runtime nor a DB. It runs first, so
+    //     an unauthenticated caller that could cancel a live run with NO idempotency
+    //     key gets a `401` regardless of runtime readiness. That is defense in depth:
+    //     authorize before the fail-closed resource check. It also restores the
+    //     pre-#685 property that the gate is observable without a running DB. It is
+    //     LENIENT in two ways. An unparseable policy string makes the `Ok`/`Ok` guard
+    //     fail, and a fresh invalid string still returns `400` at the real parse. A
+    //     KEYED request (`idempotency_key_present`) always defers. Deferring a keyed
+    //     request preserves BOTH #808 outcomes. A committed-replay hit returns its
+    //     `200` at the probe below, independent of caller and body. A genuinely-fresh
+    //     keyed `Terminate` by a non-admin still gets a `401` from the authoritative
+    //     gate below, which runs AFTER that probe. A cleanly-parsed non-`Terminate`
+    //     combo (e.g. the flagship `terminate_if_running` + `use_existing` → `Attach`)
+    //     is a no-op here.
     //
     //  2. AUTHORITATIVE (below, after both parses AND the #808 committed-replay
-    //     probe) — the belt-and-suspenders backstop on the cleanly-parsed
-    //     policies. Reachable for requests the early gate let through: admin,
-    //     non-`Terminate`, OR keyed. For a keyed request it runs after the probe
-    //     that already returned `200` for a committed replay, so it only ever
-    //     sees a genuinely-fresh keyed `Terminate` — which it correctly `401`s
-    //     for a non-admin. It never changes a running deployment's outcome.
+    //     probe): the belt-and-suspenders backstop on the cleanly-parsed policies. It
+    //     is reachable for requests the early gate let through: admin,
+    //     non-`Terminate`, or keyed. For a keyed request it runs after the probe that
+    //     already returned `200` for a committed replay. So it only ever sees a
+    //     genuinely-fresh keyed `Terminate`, and it correctly returns `401` for a
+    //     non-admin. It never changes a running deployment's outcome.
     if let (Ok(early_reuse), Ok(early_conflict)) = (
         parse_reuse_policy(request.reuse_policy.as_deref()),
         parse_conflict_policy(request.conflict_policy.as_deref()),
@@ -18402,50 +18400,48 @@ pub(crate) async fn start_workflow(
 
     // Compute target shard early so the gate check can filter by shard-scoped gates.
     //
-    // issue #808: a request-scoped `idempotency_key` routes by the KEY
-    // (rendezvous over `(workflow_name, idempotency_key)`) — but ONLY when the
-    // `workflow_id` was auto-generated (omitted). In that case there is no
-    // stable business identity to preserve, and the per-request `workflow_id`
-    // varies per retry, so routing by `workflow_id` would scatter same-key
-    // retries across shards in a multi-shard deployment (a separate
-    // `harvest_start_idempotency` claim row per shard, hence a separate
-    // execution per shard), defeating dedup — routing by the key is what
-    // co-locates them.
+    // issue #808: a request-scoped `idempotency_key` routes by the KEY (rendezvous
+    // over `(workflow_name, idempotency_key)`), but ONLY when the `workflow_id` was
+    // auto-generated (omitted). Then there is no stable business identity to
+    // preserve. The per-request `workflow_id` varies per retry. Routing by
+    // `workflow_id` would scatter same-key retries across shards in a multi-shard
+    // deployment. Each shard would get its own `harvest_start_idempotency` claim row
+    // and its own execution, which defeats dedup. Routing by the key co-locates them.
     //
-    // When the caller supplies an EXPLICIT `workflow_id`, route by
-    // `workflow_id` instead (the pre-#808 behavior). An explicit `workflow_id`
-    // is a stable business identity: routing by it *also* co-locates same-key
-    // retries (the `workflow_id` is constant across them) AND keeps the start
-    // on the shard that owns `(workflow_name, workflow_id)`, which the
-    // reuse-policy matrix and the shard-local `(name, workflow_id)` uniqueness
-    // invariant depend on. Routing a keyed-and-explicit start by the key would
-    // land it on the key-derived shard, where `start_or_load_workflow_execution`
-    // cannot see an existing `(name, workflow_id)` run living on the
-    // `workflow_id`-derived shard — silently breaking `RejectDuplicate` /
-    // `AllowDuplicate` and the uniqueness invariant. This branch is the
-    // resolution of the P1↔P2 routing tension (see docs/getting-started/
-    // 06-idempotency.md): always-route-by-key reintroduces the P1 duplicate-run
-    // for explicit-`workflow_id` starts, and always-route-by-`workflow_id`
-    // breaks the P2/AC3 auto-gen dedup case — the two cannot coexist under
-    // #808's shard-local, no-cross-shard-probe scope. Consistency caveat: for
-    // keyed dedup to converge, a client must supply a consistent `workflow_id`
-    // (same value, or consistently omitted) across retries of the same delivery
-    // — a retry that changes its explicit `workflow_id` is not a retry of the
-    // same delivery and can route to a different shard. The no-key path is
-    // byte-for-byte unchanged.
+    // When the caller supplies an EXPLICIT `workflow_id`, route by `workflow_id`
+    // instead (the pre-#808 behavior). An explicit `workflow_id` is a stable business
+    // identity. Routing by it *also* co-locates same-key retries, because the
+    // `workflow_id` is constant across them. It also keeps the start on the shard
+    // that owns `(workflow_name, workflow_id)`. The reuse-policy matrix and the
+    // shard-local `(name, workflow_id)` uniqueness invariant depend on that. Routing a
+    // keyed-and-explicit start by the key would land it on the key-derived shard.
+    // There `start_or_load_workflow_execution` cannot see an existing
+    // `(name, workflow_id)` run on the `workflow_id`-derived shard. That silently
+    // breaks `RejectDuplicate` / `AllowDuplicate` and the uniqueness invariant.
+    //
+    // This branch resolves the P1↔P2 routing tension (see
+    // docs/getting-started/06-idempotency.md). Always routing by key reintroduces the
+    // P1 duplicate run for explicit-`workflow_id` starts. Always routing by
+    // `workflow_id` breaks the P2/AC3 auto-gen dedup case. The two cannot coexist
+    // under the shard-local, no-cross-shard-probe scope of #808. Consistency caveat:
+    // for keyed dedup to converge, a client must supply a consistent `workflow_id`
+    // across retries of the same delivery (same value, or consistently omitted). A
+    // retry that changes its explicit `workflow_id` is not a retry of the same
+    // delivery. It can route to a different shard. The no-key path is byte-for-byte
+    // unchanged.
+    //
     // issue #697: an explicit placement (`shard_id` or `residency_key`) OVERRIDES
-    // both hash routes below. Residency is a hard placement contract — a
-    // tenant's state must land on its designated database — so it outranks the
-    // keyed-dedup co-location heuristic, which is only an optimisation for
-    // finding the claim row. `Auto` (the default, and the only possibility when
-    // neither field is sent) leaves the two branches byte-for-byte unchanged.
+    // both hash routes below. Residency is a hard placement contract: a tenant's
+    // state must land on its designated database. So it outranks the keyed-dedup
+    // co-location heuristic, which is only an optimisation for finding the claim
+    // row. `Auto` (the default, and the only possibility when neither field is sent)
+    // leaves the two branches byte-for-byte unchanged.
     //
-    // Resolution happens BEFORE the #808 committed-replay probe because the
-    // probe cannot run without knowing which shard to probe. Consequence,
-    // documented in `docs/sharding.md` and the api-contract: a retry must carry
-    // the SAME placement as the original delivery — exactly the existing #808
-    // consistency caveat for `workflow_id`, for the same reason (both determine
-    // where the claim row lives).
+    // Resolution happens BEFORE the #808 committed-replay probe, because the probe
+    // must know which shard to probe. Consequence, documented in `docs/sharding.md`
+    // and the api-contract: a retry must carry the SAME placement as the original
+    // delivery. That is exactly the existing #808 consistency caveat for
+    // `workflow_id`, for the same reason: both determine where the claim row lives.
     let placement = match parse_shard_placement(request.shard_id, request.residency_key.as_deref())
     {
         Ok(placement) => placement,
@@ -18478,16 +18474,15 @@ pub(crate) async fn start_workflow(
                 .pick_for_new_workflow(&workflow_name, &workflow_id)
         }
     } else {
-        // Resolve WITHOUT the writable check here: this shard is also what the
-        // #808 committed-replay probe below reads, and writability is a
-        // fresh-start-only concern. Enforcing it now would make a retry of an
-        // already-committed keyed start return `400` instead of its mandated
-        // `200` no-op merely because the operator started draining the pinned
-        // shard in between — rejecting work that creates nothing. The writable
-        // check is enforced further down, after the probe, on the genuine
-        // fresh-start path. Every other validation (unknown shard, undeclared
-        // residency key, blank key) still rejects here, so an unresolvable
-        // placement can never fall through to a silent re-hash.
+        // Resolve WITHOUT the writable check here. The #808 committed-replay probe
+        // below also reads this shard, and writability is a fresh-start-only concern.
+        // Enforcing it now would make a retry of an already-committed keyed start
+        // return `400` instead of its mandated `200` no-op. The only cause would be
+        // that the operator started draining the pinned shard in between. That
+        // rejects work that creates nothing. The writable check runs further down,
+        // after the probe, on the genuine fresh-start path. Every other validation
+        // (unknown shard, undeclared residency key, blank key) still rejects here. So
+        // an unresolvable placement can never fall through to a silent re-hash.
         match runtime
             .router
             .resolve_placement_for_lookup(&placement, &workflow_name, &workflow_id)
@@ -18510,11 +18505,11 @@ pub(crate) async fn start_workflow(
                 // An unknown shard or an undeclared residency key is a caller
                 // error, never a silent re-hash onto the default shard.
                 //
-                // The client gets the terse `client_message` -- naming what THEY
-                // got wrong -- while the enumerating form (shard topology, live
-                // drain state, every declared residency key) stays server-side.
-                // Residency keys are frequently tenant-identifying, so echoing
-                // the declared set would let one probe enumerate other tenants.
+                // The client gets the terse `client_message`, which names what THEY
+                // got wrong. The enumerating form stays server-side: shard topology,
+                // live drain state, and every declared residency key. Residency keys
+                // are often tenant-identifying. Echoing the declared set would let
+                // one probe enumerate other tenants.
                 tracing::warn!(
                     workflow_name = %workflow_name,
                     error = %e,
@@ -18529,49 +18524,49 @@ pub(crate) async fn start_workflow(
     // but ENFORCED after the #808 probe -- see the two uses below.
     let pin_is_writable = placement.is_auto() || runtime.router.is_writable(shard);
 
-    // issue #808 (Codex P2): when a keyed start OMITS `workflow_id`, the server
-    // auto-generates it AND (per the routing rule above) routes the start by the
-    // KEY onto `shard`. But a random auto-generated `workflow_id` hashes via
-    // `pick_for_new_workflow` to a potentially DIFFERENT shard than `shard` (the
-    // key-shard). If a later request then uses the RETURNED `workflow_id`
-    // explicitly — a client echoing the response's `workflow_id`, or a fresh
-    // no-key `RejectDuplicate` start on that id — it routes via
-    // `pick_for_new_workflow` to the `workflow_id`-shard, cannot see the
-    // execution (which lives on the key-shard), and creates a SECOND active run
-    // with the same `workflow_id`, breaking the shard-local `(workflow_name,
-    // workflow_id)` uniqueness invariant. Mint the auto-generated `workflow_id`
-    // by bounded rejection sampling so it hashes to the key-shard, making its
-    // later explicit reuse route consistently to the shard the execution lives
-    // on. Both `pick_for_new_workflow` and `pick_for_idempotency_key` apply the
-    // writable-subset redirect, so `shard` is comparable. Single-shard (default)
-    // converges on the first candidate (`pick_for_new_workflow` returns the one
-    // shard); multi-shard converges in ~N expected iterations (cheap seahash) —
-    // the cap is a safety backstop only. Explicit client-chosen `workflow_id`s
-    // (routed by `workflow_id`, subject to the documented consistency caveat) and
-    // the no-key path are UNCHANGED.
+    // issue #808: a keyed start that OMITS `workflow_id` gets an auto-generated
+    // one. Per the routing rule above, the start routes by the KEY onto `shard`.
+    // But a random auto-generated `workflow_id` hashes via `pick_for_new_workflow`
+    // to a possibly DIFFERENT shard than `shard` (the key-shard). A later request may
+    // then use the RETURNED `workflow_id` explicitly. Examples are a client that
+    // echoes the response's `workflow_id`, or a fresh no-key `RejectDuplicate` start
+    // on that id. It routes via `pick_for_new_workflow` to the `workflow_id`-shard
+    // and cannot see the execution, which lives on the key-shard. It then creates a
+    // SECOND active run with the same `workflow_id`. That breaks the shard-local
+    // `(workflow_name, workflow_id)` uniqueness invariant.
     //
-    // issue #697 extends the SAME rejection sampling to an explicitly PINNED
-    // start whose `workflow_id` was auto-generated, for the identical reason:
-    // a pin moves the run off its hash-derived shard, so a later request that
-    // reuses the RETURNED `workflow_id` without repeating the pin would route by
-    // hash to a different shard, miss the execution, and create a second active
-    // run under the same `workflow_id`. Minting the id onto the pinned shard
-    // closes that hole for every auto-generated id. The pinned shard is always
-    // in `writable_shards` (`resolve_placement` rejects a drained shard), so
-    // `pick_for_new_workflow` can return it and the loop converges.
+    // So mint the auto-generated `workflow_id` by bounded rejection sampling until it
+    // hashes to the key-shard. Its later explicit reuse then routes to the shard the
+    // execution lives on. Both `pick_for_new_workflow` and `pick_for_idempotency_key`
+    // apply the writable-subset redirect, so `shard` is comparable. Single-shard
+    // (default) converges on the first candidate, because `pick_for_new_workflow`
+    // returns the one shard. Multi-shard converges in ~N expected iterations (cheap
+    // seahash). The cap is a safety backstop only. Explicit client-chosen
+    // `workflow_id`s (routed by `workflow_id`, subject to the documented consistency
+    // caveat) and the no-key path are UNCHANGED.
     //
-    // The hole CANNOT be closed for an EXPLICIT caller-chosen `workflow_id`,
-    // because the id is the caller's business identity and cannot be re-minted.
-    // For that case the caller must pin consistently across every start for a
-    // given `workflow_id` — the same consistency contract #808 already documents
-    // for keyed dedup. See `docs/sharding.md`.
+    // issue #697 extends the SAME rejection sampling to an explicitly PINNED start
+    // whose `workflow_id` was auto-generated, for the identical reason. A pin moves
+    // the run off its hash-derived shard. A later request that reuses the RETURNED
+    // `workflow_id` without repeating the pin would route by hash to a different
+    // shard. It would miss the execution and create a second active run under the
+    // same `workflow_id`. Minting the id onto the pinned shard closes that hole for
+    // every auto-generated id. The pinned shard is always in `writable_shards`
+    // (`resolve_placement` rejects a drained shard), so `pick_for_new_workflow` can
+    // return it and the loop converges.
     //
-    // `pin_is_writable` gates the loop because `pick_for_new_workflow` applies
-    // the writable-subset redirect and therefore can NEVER return a drained
-    // shard: without this guard a pin at a drained shard would spin the full
-    // `MINT_CAP` and warn, only for the start to be rejected moments later on
-    // the fresh-start path anyway. A dedup hit never uses the minted id (it
-    // returns the original execution), so skipping the mint costs nothing.
+    // The hole CANNOT be closed for an EXPLICIT caller-chosen `workflow_id`, because
+    // the id is the caller's business identity and cannot be re-minted. For that case
+    // the caller must pin consistently across every start for a given `workflow_id`.
+    // That is the same consistency contract #808 already documents for keyed dedup.
+    // See `docs/sharding.md`.
+    //
+    // `pin_is_writable` gates the loop. `pick_for_new_workflow` applies the
+    // writable-subset redirect, so it can NEVER return a drained shard. Without this
+    // guard a pin at a drained shard would spin the full `MINT_CAP` and warn. The
+    // fresh-start path would reject the start moments later anyway. A dedup hit never
+    // uses the minted id (it returns the original execution), so skipping the mint
+    // costs nothing.
     //
     // A reserved (cell) shard is writable, but unpinned placement never picks
     // it (issue #1837). No minted id can hash there, so the loop skips it.
@@ -18601,47 +18596,46 @@ pub(crate) async fn start_workflow(
         }
     }
 
-    // issue #697 (AC5): echo the resolved shard so an operator can audit that a
-    // residency-pinned start landed where it was pinned, without decoding the
-    // `execution_id` UUID by hand. Populated ONLY for a pinned request, so an
-    // unpinned start's response stays byte-identical to a pre-#697 build.
+    // issue #697 (AC5): echo the resolved shard, so an operator can audit that a
+    // residency-pinned start landed where it was pinned. The operator then need not
+    // decode the `execution_id` UUID by hand. Only a pinned request populates it, so
+    // an unpinned start's response stays byte-identical to a pre-#697 build.
     let pinned_shard_id: Option<i32> = (!placement.is_auto()).then(|| shard.as_i32());
 
-    // INVARIANT (issue #808, Codex P2): the committed-replay dedup probe must
-    // precede ALL fresh-start-only rejections (reuse-policy parse,
-    // throttle/debounce/batch mutual-exclusion, input-schema #373,
-    // completion-callback SSRF #605, delay/`start_at`, admission gate #377) so a
-    // retry of an already-successful key always returns the `200` no-op
-    // regardless of a now-invalid replay body or a policy tightened after the
-    // original delivery. Those rules govern *fresh* work; a retry of an
-    // already-successful keyed start creates no new work, so tightening any of
-    // them — or sending a now-invalid `reuse_policy` string, or the workflow
-    // gaining a throttle/debounce/batch policy — between the original delivery
-    // and a retry must not reject the retry. The probe therefore runs before
-    // `parse_reuse_policy` and before the debounce/batch/throttle applicability
-    // is even computed; those apply only to a genuine fresh keyed start (a probe
-    // miss). Only genuine prerequisites run above it: key validation, the
-    // registry/DAG 404/400 existence check, and workflow_id + shard resolution
-    // (needed to know which shard to probe). The capability-precise admin gate
-    // (issue #685 review) is computed from the PARSED reuse+conflict policies, so
-    // it runs after them and hence after this probe. That is safe: a committed
-    // replay returns the already-committed run and performs no NEW cancel, and a
-    // non-admin can never commit a `Terminate` start in the first place (the
-    // fresh-start path always gates before creating one), so there is never a
-    // committed replay for a non-admin to bypass the gate through.
+    // INVARIANT (issue #808): the committed-replay dedup probe must precede ALL
+    // fresh-start-only rejections. Those are the reuse-policy parse,
+    // throttle/debounce/batch mutual exclusion, input-schema #373, completion-callback
+    // SSRF #605, delay/`start_at`, and admission gate #377. So a retry of an
+    // already-successful key always returns the `200` no-op. That holds even for a
+    // now-invalid replay body or a policy tightened after the original delivery.
+    // Those rules govern *fresh* work. A retry of an already-successful keyed start
+    // creates no new work. So a retry must not fail on a change made since the
+    // original delivery. Such a change is a tightened rule, a now-invalid
+    // `reuse_policy` string, or a new throttle/debounce/batch policy. The probe
+    // therefore runs before `parse_reuse_policy` and before the
+    // debounce/batch/throttle applicability is even computed. Those apply only to a
+    // genuine fresh keyed start (a probe miss). Only genuine prerequisites run above
+    // it: key validation, the registry/DAG 404/400 existence check, and workflow_id +
+    // shard resolution (needed to know which shard to probe).
     //
-    // We probe the keyed claim read-only on the same key-derived `shard` the
-    // reserve below uses (so we observe the claim the original delivery wrote),
-    // and a hit returns the original execution verbatim — standard
-    // idempotency-key semantics: the retry's body is irrelevant, no body-mismatch
-    // detection (out of scope for #808). A miss falls through to the full
-    // fresh-start path unchanged, whose reserve+start transaction's `ON CONFLICT`
-    // upsert (with a row lock) remains the *authoritative* dedup for the
-    // concurrent-first-delivery race: two simultaneous first deliveries both miss
-    // this probe (nothing committed yet), both proceed, and the reserve
-    // serializes them → one creates, one dedups. This early probe is an
-    // additional fast-path for COMMITTED replays only, never a replacement for
-    // the reserve.
+    // The capability-precise admin gate (issue #685 review) is computed from the
+    // PARSED reuse+conflict policies. So it runs after them, and hence after this
+    // probe. That is safe. A committed replay returns the already-committed run and
+    // performs no NEW cancel. A non-admin can never commit a `Terminate` start in the
+    // first place, because the fresh-start path always gates before creating one. So
+    // there is never a committed replay through which a non-admin bypasses the gate.
+    //
+    // The probe reads the keyed claim on the same key-derived `shard` that the
+    // reserve below uses, so it observes the claim the original delivery wrote. A hit
+    // returns the original execution verbatim. That is standard idempotency-key
+    // semantics: the retry's body is irrelevant. Body-mismatch detection is out of
+    // scope for #808. A miss falls through to the full fresh-start path unchanged.
+    // That path's reserve+start transaction runs an `ON CONFLICT` upsert with a row
+    // lock. It remains the *authoritative* dedup for the concurrent-first-delivery
+    // race. Two simultaneous first deliveries both miss this probe, because nothing
+    // is committed yet. Both proceed, and the reserve serializes them: one creates,
+    // one dedups. This early probe is an additional fast path for COMMITTED replays
+    // only, never a replacement for the reserve.
     if let Some(ref key) = idempotency_key
         && let Some(resp) = probe_committed_start_replay(
             &api_state,
@@ -18683,19 +18677,17 @@ pub(crate) async fn start_workflow(
         return resp;
     }
 
-    // issue #697: enforce writability HERE, not at resolution time. Placing new
-    // work on a shard the operator is draining contradicts the drain, so a
-    // fresh pinned start at a drained shard is a `400` — but this is a
-    // fresh-start-only concern, so it must sit after the #808 committed-replay
-    // probe above. Otherwise an at-least-once retry of a keyed start that
-    // already committed would flip from its mandated `200` no-op to a `400`
-    // the moment the operator began draining the pinned shard, rejecting a
-    // delivery that creates no new work.
+    // issue #697: enforce writability HERE, not at resolution time. Placing new work
+    // on a shard the operator is draining contradicts the drain. So a fresh pinned
+    // start at a drained shard is a `400`. This is a fresh-start-only concern, so it
+    // must sit after the #808 committed-replay probe above. Otherwise consider an
+    // at-least-once retry of an already-committed keyed start. Its mandated `200`
+    // no-op would flip to a `400` the moment the operator began draining the
+    // pinned shard. That rejects a delivery that creates no new work.
     //
-    // The check itself is delegated back to `resolve_placement` (the FULL
-    // readable+writable resolution) rather than hand-built here, so the router
-    // stays the single source of truth for what "placeable" means and the two
-    // call sites can never drift.
+    // `resolve_placement` (the FULL readable+writable resolution) does the check,
+    // not a hand-built copy here. So the router stays the single source of truth for
+    // what "placeable" means, and the two call sites can never drift.
     if !pin_is_writable
         && let Err(err) = runtime
             .router
@@ -18722,12 +18714,11 @@ pub(crate) async fn start_workflow(
         return AutumnError::bad_request_msg(err.client_message()).into_response();
     }
 
-    // Fresh-start-only validation: parse the reuse policy. Runs AFTER the
-    // committed-replay probe above (issue #808, Codex P2) so a retry of an
-    // already-successful keyed start with a now-invalid `reuse_policy` string
-    // returns the `200` no-op rather than a `400` — the retry's body is
-    // irrelevant on a dedup hit. The parsed `reuse_policy` is only consumed by
-    // the reserve+start path further down.
+    // Fresh-start-only validation: parse the reuse policy. It runs AFTER the
+    // committed-replay probe above (issue #808). So a retry of an already-successful
+    // keyed start with a now-invalid `reuse_policy` string returns the `200` no-op,
+    // not a `400`. The retry's body is irrelevant on a dedup hit. Only the
+    // reserve+start path further down consumes the parsed `reuse_policy`.
     let reuse_policy = match parse_reuse_policy(request.reuse_policy.as_deref()) {
         Ok(p) => p,
         Err(e) => {
@@ -18754,12 +18745,12 @@ pub(crate) async fn start_workflow(
     };
 
     // Fresh-start-only validation: parse the active-prior conflict policy
-    // (issue #685). Runs AFTER the committed-replay probe (like `reuse_policy`
-    // above) so a retry of an already-successful keyed start with a now-invalid
-    // `conflict_policy` string returns the `200` no-op rather than a `400`. The
-    // parsed `conflict_policy` is threaded into the `StartWorkflowParams` built
-    // below (both the plain and the #808 keyed paths) and consulted by the
-    // throttle admission-gate bypass; it governs a RUNNING/PAUSED prior only.
+    // (issue #685). Like `reuse_policy` above, it runs AFTER the committed-replay
+    // probe. So a retry of an already-successful keyed start with a now-invalid
+    // `conflict_policy` string returns the `200` no-op, not a `400`. The parsed
+    // `conflict_policy` goes into the `StartWorkflowParams` built below, on both the
+    // plain and the #808 keyed paths. The throttle admission-gate bypass also reads
+    // it. It governs a RUNNING/PAUSED prior only.
     let conflict_policy = match parse_conflict_policy(request.conflict_policy.as_deref()) {
         Ok(p) => p,
         Err(e) => {
@@ -18785,29 +18776,31 @@ pub(crate) async fn start_workflow(
         }
     };
 
-    // Capability-precise admin gate (issue #685 review). Admin is required iff
-    // this request could cancel a currently-active (RUNNING/PAUSED) prior — i.e.
-    // the resolved active-prior behavior is `Terminate`. `Terminate` is the ONLY
-    // active-prior resolution that cancels live work; the other two (`Attach` →
-    // return the existing handle, `Fail` → `Err(AlreadyExists)`) touch nothing.
-    // Reachable Terminate combos (all admin-gated here): `conflict =
+    // Capability-precise admin gate (issue #685 review). Admin is required iff this
+    // request could cancel a currently-active (RUNNING/PAUSED) prior, i.e. the
+    // resolved active-prior behavior is `Terminate`. `Terminate` is the ONLY
+    // active-prior resolution that cancels live work. The other two touch nothing:
+    // `Attach` returns the existing handle, and `Fail` returns `Err(AlreadyExists)`.
+    //
+    // Reachable Terminate combos (all admin-gated here) are `conflict =
     // terminate_existing` (any reuse), or `reuse = terminate_if_running` with the
-    // default/omitted conflict (`Unspecified` falls back to the reuse policy's
-    // native `Terminate`). Deliberately NON-admin (the fix): `reuse =
-    // terminate_if_running` + `conflict = use_existing` (→ Attach) or `+ fail`
-    // (→ Fail) — the flagship non-admin idempotent-starter, which cannot cancel a
-    // live run. A `terminate_if_running` + `use_existing` start over a TERMINAL
-    // prior does a fresh-replace of an already-dead run (no live work touched) —
-    // equivalent to the already-non-admin `allow_duplicate_failed_only` replace
-    // path — so it is correctly not admin-gated. This runs after both parses (an
-    // invalid value now returns `400` before reaching the gate, which is more
-    // correct); for a keyed start it runs AFTER the #808 committed-replay probe,
-    // so a committed replay has already returned its `200` and this gate only
-    // ever sees a genuinely-fresh keyed `Terminate` — which it correctly `401`s
-    // for a non-admin. This is the authoritative backstop for keyed
-    // cancel-capable requests, which the early gate deliberately defers (a keyed
-    // request may be a committed replay of an ADMIN's start, so it must reach the
-    // probe before any auth rejection).
+    // default/omitted conflict. `Unspecified` falls back to the reuse policy's native
+    // `Terminate`. Deliberately NON-admin (the fix): `reuse = terminate_if_running`
+    // with `conflict = use_existing` (→ Attach) or `fail` (→ Fail). That is the
+    // flagship non-admin idempotent starter, which cannot cancel a live run. A
+    // `terminate_if_running` + `use_existing` start over a TERMINAL prior
+    // fresh-replaces an already-dead run and touches no live work. That equals the
+    // already-non-admin `allow_duplicate_failed_only` replace path, so it is
+    // correctly not admin-gated.
+    //
+    // This runs after both parses. An invalid value now returns `400` before it
+    // reaches the gate, which is more correct. For a keyed start it runs AFTER the
+    // #808 committed-replay probe, which has already returned `200` for a committed
+    // replay. So this gate only ever sees a genuinely-fresh keyed `Terminate`, and it
+    // correctly returns `401` for a non-admin. This is the authoritative backstop for
+    // keyed cancel-capable requests, which the early gate deliberately defers. A
+    // keyed request may be a committed replay of an ADMIN's start, so it must reach
+    // the probe before any auth rejection.
     if autumn_harvest::execution::effective_active_conflict_behavior(reuse_policy, conflict_policy)
         == autumn_harvest::execution::ActiveConflictBehavior::Terminate
         && !has_harvest_admin_access(&api_state, maybe_session.map(|Extension(session)| session))
@@ -18821,9 +18814,9 @@ pub(crate) async fn start_workflow(
     // starts. Otherwise a gate on that shard could reject a request whose work
     // is created elsewhere. The debounce block below enforces the gate on the
     // correct (debounce-key) shard transactionally. This is safe: a debounced
-    // request only creates NEW work on the debounce shard — the fall-through to
-    // the normal start path happens solely for an already-live execution
-    // (idempotent return, no new work) (issue #499).
+    // request only creates NEW work on the debounce shard. It falls through to the
+    // normal start path solely for an already-live execution (idempotent return, no
+    // new work) (issue #499).
     let is_debounced_start =
         workflow_has_resolving_debounce(&runtime.registry, &workflow_name, &input);
 
@@ -18901,8 +18894,8 @@ pub(crate) async fn start_workflow(
     }
 
     // Start-throttle applicability (issue #607). A throttle is mutually exclusive
-    // with debounce/batch: those collapse a burst into one run, a throttle paces
-    // and defers every start — combining them has no coherent semantics.
+    // with debounce/batch. Those collapse a burst into one run, while a throttle
+    // paces and defers every start. Combining them has no coherent semantics.
     let throttle_applies =
         workflow_resolving_throttle(&runtime.registry, &workflow_name, &input).is_some();
     if throttle_applies && (is_debounced_start || has_batch_policy) {
@@ -18916,14 +18909,13 @@ pub(crate) async fn start_workflow(
     }
 
     // issue #808: a request-scoped idempotency key requires a synchronous, single
-    // execution id to converge on. Throttle / debounce / batch all defer the
-    // start and return no exec id up front, so "converge on the same exec id" has
-    // no coherent meaning combined with them — reject the combination. This only
-    // reaches a *genuine fresh* keyed start: the committed-replay probe above
-    // already short-circuited an at-least-once retry of an earlier keyed start to
-    // a `200` no-op before this check, so a workflow that gained a throttle/
-    // debounce/batch policy after an original keyed start still returns the
-    // existing execution rather than a `400` on retry.
+    // execution id to converge on. Throttle / debounce / batch all defer the start
+    // and return no exec id up front. So "converge on the same exec id" has no
+    // coherent meaning with them. Reject the combination. Only a *genuine fresh*
+    // keyed start reaches this check. The committed-replay probe above already
+    // turned an at-least-once retry of an earlier keyed start into a `200` no-op. So
+    // a workflow that gained a throttle/debounce/batch policy after an original
+    // keyed start still returns the existing execution on retry, not a `400`.
     // Issue #1977: a deferred start creates its run later, through a path
     // that carries no tenant. Refuse it for a tenant-bound caller rather
     // than start a run the caller then cannot reach.
@@ -18971,16 +18963,16 @@ pub(crate) async fn start_workflow(
 
     // issue #685: a non-default `conflict_policy` resolves a collision with an
     // *active* (RUNNING/PAUSED) prior at request time (attach / fail / cancel +
-    // start fresh). Throttle / debounce / batch all DEFER the start — no start
-    // happens synchronously and there is no active prior to resolve at request
-    // time — so a `use_existing` / `fail` / `terminate_existing` decision is
-    // undefined combined with them. Reject the combination (mirrors the
-    // `idempotency_key`-vs-deferred-start mutual-exclusion above). `unspecified`
-    // (the default) is unaffected, so a throttled/debounced/batched workflow
-    // that omits the field — or sends `unspecified` — is byte-for-byte
-    // unchanged (AC-6/AC-7). `conflict_policy` combined with `idempotency_key`
-    // is allowed — those compose (the keyed path still resolves an active-prior
-    // collision under the reservation transaction).
+    // start fresh). Throttle / debounce / batch all DEFER the start. No start
+    // happens synchronously, and there is no active prior to resolve at request
+    // time. So a `use_existing` / `fail` / `terminate_existing` decision is undefined
+    // with them. Reject the combination, which mirrors the
+    // `idempotency_key`-vs-deferred-start mutual exclusion above. `unspecified` (the
+    // default) is unaffected. So a throttled/debounced/batched workflow that omits
+    // the field, or sends `unspecified`, is byte-for-byte unchanged (AC-6/AC-7).
+    // `conflict_policy` with `idempotency_key` is allowed, because those compose.
+    // The keyed path still resolves an active-prior collision under the reservation
+    // transaction.
     if conflict_policy != WorkflowIdConflictPolicy::Unspecified
         && (throttle_applies || is_debounced_start || has_batch_policy)
     {
@@ -18996,16 +18988,16 @@ pub(crate) async fn start_workflow(
     }
 
     // issue #697: an explicit shard placement pins where the execution's data
-    // lands. Debounce (#499) and batch (#518) DEFER the start and derive their
-    // own shard from the debounce/batch KEY -- that co-location is load-bearing
-    // (the `UNIQUE (workflow_name, debounce_key)` upsert collapse only works if
-    // every admission for a key lands on the same shard), so honouring a
-    // per-request pin would break the collapse whenever two admissions for one
-    // key pinned different shards. Rejecting is therefore the correct outcome,
-    // and it is mandatory rather than cosmetic: silently accepting the request
-    // and re-hashing would place residency-bound data in the wrong database
-    // while returning `202` with no `shard_id` for the caller to check -- the
-    // exact silent-fallback failure mode this feature exists to remove.
+    // lands. Debounce (#499) and batch (#518) DEFER the start and derive their own
+    // shard from the debounce/batch KEY. That co-location is load-bearing: the
+    // `UNIQUE (workflow_name, debounce_key)` upsert collapse only works if every
+    // admission for a key lands on the same shard. Honouring a per-request pin would
+    // break the collapse whenever two admissions for one key pinned different
+    // shards. So rejecting is the correct outcome, and it is mandatory rather than
+    // cosmetic. Silently accepting the request and re-hashing would place
+    // residency-bound data in the wrong database. It would also return `202` with no
+    // `shard_id` for the caller to check. That is the exact silent-fallback failure
+    // mode this feature exists to remove.
     // Throttle (#607) is NOT included: it threads the resolved `shard` through
     // to `reserve_or_defer`, so a pinned throttled start is honoured.
     if !placement.is_auto() && (is_debounced_start || has_batch_policy) {
@@ -19033,17 +19025,17 @@ pub(crate) async fn start_workflow(
             .into_response();
     }
 
-    // issue #377 / issue #618 (PR #1014): the admission gate is now enforced
-    // AUTHORITATIVELY inside the core start primitive at the point it decides —
-    // under a `FOR UPDATE` lock on any prior run — that it will CREATE a new
-    // execution. The plain / keyed (#808) start calls below pass
-    // `Some(GateMode::Check)`; a blocked fresh admission returns
-    // `HarvestError::AdmissionBlocked` (recorded once by the primitive) which the
-    // match arms map to `503`. This replaced an earlier unlocked pre-read gate
-    // decision entirely. That decision had a residual seal-under-lock TOCTOU. The
-    // debounce / batch / throttle mutual-exclusion 400s and the #808 committed-
-    // replay probe above are unaffected. NOTE: the auto-generated-workflow_id and
-    // throttle paths reach the same gated plain/keyed start below.
+    // issue #377 / issue #618 (PR #1014): the core start primitive now enforces the
+    // admission gate AUTHORITATIVELY. It does so where it decides to CREATE a new
+    // execution, under a `FOR UPDATE` lock on any prior run. The
+    // plain / keyed (#808) start calls below pass `Some(GateMode::Check)`. A blocked
+    // fresh admission returns `HarvestError::AdmissionBlocked`, which the primitive
+    // records once and the match arms map to `503`. This replaced an earlier unlocked
+    // pre-read gate decision entirely. That decision had a residual seal-under-lock
+    // TOCTOU. The debounce / batch / throttle mutual-exclusion 400s and the #808
+    // committed-replay probe above are unaffected. NOTE: the
+    // auto-generated-workflow_id and throttle paths reach the same gated plain/keyed
+    // start below.
 
     // issue #373: validate input against the workflow's published JSON Schema (if any).
     // Runs before the delayed-start checks so bad inputs fail fast and never
@@ -19301,8 +19293,8 @@ pub(crate) async fn start_workflow(
             },
         );
 
-    // Capture trace context for debounced starts — must be before the debounce
-    // branch returns 202 since the normal path captures it inside a later OTel span.
+    // Capture trace context for debounced starts. It must happen before the debounce
+    // branch returns 202, because the normal path captures it inside a later OTel span.
     let debounce_trace_ctx = runtime.registry.telemetry().capture_trace_context();
 
     // Debounce admission gate (issue #499): collapse trigger bursts into one run.
@@ -19318,9 +19310,9 @@ pub(crate) async fn start_workflow(
                 .map(|key| (policy, key))
         })
     {
-        // Debounce defers the start until the burst settles, so an explicit
-        // scheduled start (`start_at`/`delay`) is contradictory — the requested
-        // timing would be silently dropped at fire time. Reject the combination.
+        // Debounce defers the start until the burst settles. So an explicit scheduled
+        // start (`start_at`/`delay`) is contradictory: the requested timing would be
+        // silently dropped at fire time. Reject the combination.
         if request.start_at.is_some() || delay.is_some() {
             // Failed-start audit (parity with the normal delayed-start validation).
             if let Ok(pool) = api_state.storage_pool()
@@ -19347,19 +19339,19 @@ pub(crate) async fn start_workflow(
             .into_response();
         }
 
-        // No pre-admission idempotency bypass for debounced starts: a debounced
-        // start always goes through admission and returns 202. Reuse-policy
-        // idempotency is resolved correctly at *fire time* on the debounce-key
-        // shard — the scanner calls start_or_load with the stored workflow_id and
-        // applies the policy (AllowDuplicate returns the existing run; an
-        // AlreadyExists conflict under RejectDuplicate deletes the pending row). A
-        // pre-admission probe was both shard-wrong (debounced runs live on the
-        // debounce-key shard, not the workflow-id shard — Codex 5916) and
-        // state-incomplete (Codex 5927), so it is omitted (issue #499).
+        // No pre-admission idempotency bypass for debounced starts. A debounced start
+        // always goes through admission and returns 202. Reuse-policy idempotency is
+        // resolved correctly at *fire time* on the debounce-key shard. The scanner
+        // calls start_or_load with the stored workflow_id and applies the policy.
+        // AllowDuplicate returns the existing run. An AlreadyExists conflict under
+        // RejectDuplicate deletes the pending row. A pre-admission probe was both
+        // shard-wrong and state-incomplete, so it is omitted (issue #499). It was
+        // shard-wrong because debounced runs live on the debounce-key shard, not the
+        // workflow-id shard.
         {
-            // Reject an oversized input at admission (mirrors the cap the core start
-            // path enforces) so it fails fast with 400 here instead of being
-            // persisted and then failing on every scanner tick at fire time.
+            // Reject an oversized input at admission. This mirrors the cap that the
+            // core start path enforces. The input then fails fast with 400 here,
+            // instead of being persisted and failing on every scanner tick at fire time.
             if effective_wf_cap > 0 {
                 let observed = serde_json::to_string(&input).map_or(0u64, |s| s.len() as u64);
                 if observed > effective_wf_cap {
@@ -19422,10 +19414,10 @@ pub(crate) async fn start_workflow(
                 .into_response();
             }
 
-            // Resolve the same effective operator metadata / timeout defaults the
+            // Resolve the same effective operator metadata / timeout defaults that the
             // normal start path resolves below, so a debounced run is not a
-            // second-class start: the fire path (in core) has no registry access,
-            // so these must be captured at admission time.
+            // second-class start. The fire path (in core) has no registry access, so
+            // admission must capture these.
             let (
                 info_owner,
                 info_runbook,
@@ -19496,20 +19488,20 @@ pub(crate) async fn start_workflow(
                 .map(|d| d.num_seconds());
 
             // Route to the shard that owns this debounce key (shard-local, consistent with #247).
-            // The eventual execution is created on this shard, so it — not the
-            // workflow_id-derived shard checked earlier — is the authoritative shard
+            // The eventual execution is created on this shard. So this shard, not the
+            // workflow_id-derived shard checked earlier, is the authoritative shard
             // for a debounced run's home and identity.
             let debounce_shard = runtime
                 .router
                 .pick_for_new_workflow(&workflow_name, &resolved_key);
 
             // Admission-gate check against the debounce key's shard, BEFORE acquiring
-            // the shard connection: a debounced admission is always rejected when its
-            // scope is gated, so compute and return the gate rejection up front (the
-            // normal start path's gate-before-DB behavior). Acquiring the connection
-            // first would surface a raw pool error during an incident instead of the
-            // gate rejection + metric/audit (issue #499). The in-memory gate check is
-            // the same one the normal path uses before touching the DB.
+            // the shard connection. A debounced admission is always rejected when its
+            // scope is gated. So compute and return the gate rejection up front, as
+            // the normal start path does its gate check before the DB. Acquiring the
+            // connection first would surface a raw pool error during an incident
+            // instead of the gate rejection + metric/audit (issue #499). The in-memory
+            // gate check is the same one the normal path uses before touching the DB.
             if let Some((gate_id, reason, scope_kind)) = {
                 let wf_owner = runtime
                     .registry
@@ -19658,7 +19650,7 @@ pub(crate) async fn start_workflow(
                         source: &source,
                     };
                     // Parity with the normal start path: a successful admission must
-                    // have a succeeded audit record, so a failed audit write makes the
+                    // have a succeeded audit record. So a failed audit write makes the
                     // admission non-successful (503) rather than silently returning 202.
                     if let Err(audit_err) = audit::insert_audit(&mut debounce_conn, &ar).await {
                         tracing::error!(
@@ -19844,14 +19836,13 @@ pub(crate) async fn start_workflow(
             .router
             .pick_for_new_workflow(&workflow_name, resolved_key);
 
-        // issue #618 (F12): gate pre-check before acquiring the DB connection, the
-        // same non-atomic check-then-admit shape the debounce path uses. There is
-        // a bounded TOCTOU window between this in-memory check and the batch
-        // upsert during which a gate could be raised. That window does NOT produce
-        // an un-counted admission: a start that slips it is durably deferred, and
-        // its later scanner fire is counted as an exempt bypass
-        // (harvest.admission.bypassed{producer="event_batch"}). Documented in
-        // docs/operations/admission-gate-producers.md.
+        // issue #618 (F12): gate pre-check before acquiring the DB connection. It is
+        // the same non-atomic check-then-admit shape the debounce path uses. A gate
+        // could be raised in the bounded TOCTOU window between this in-memory check
+        // and the batch upsert. That window does NOT produce an un-counted admission.
+        // A start that slips it is durably deferred, and its later scanner fire counts
+        // as an exempt bypass (harvest.admission.bypassed{producer="event_batch"}).
+        // Documented in docs/operations/admission-gate-producers.md.
         if let Some((gate_id, reason, scope_kind)) = {
             let wf_owner = runtime
                 .registry
@@ -20036,10 +20027,10 @@ pub(crate) async fn start_workflow(
 
     // shard computed above (before gate check); reuse it here.
     let exec_id = ExecutionId::new_for_shard(shard);
-    // An explicitly PINNED start must never fall back to the default shard's
-    // pool (issue #697) -- that would write residency-bound data to the wrong
-    // database while reporting the pinned shard. An unpinned start keeps the
-    // pre-#697 fallback behaviour byte-for-byte.
+    // An explicitly PINNED start must never fall back to the default shard's pool
+    // (issue #697). That would write residency-bound data to the wrong database
+    // while reporting the pinned shard. An unpinned start keeps the pre-#697
+    // fallback behaviour byte-for-byte.
     let conn_result = if placement.is_auto() {
         db_conn_for_shard(&api_state, shard).await
     } else {
@@ -20113,11 +20104,11 @@ pub(crate) async fn start_workflow(
         });
 
     // Start-throttle admission (issue #607): pace admissions, defer the excess.
-    // Runs after the admission gate (checked above) so halt (gate) always beats
-    // pace (throttle), and after the effective SLA/timeout are resolved so a
-    // deferred start carries the same effective options as an immediate one.
-    // On reserve the token is refunded below if the start short-circuits under a
-    // reuse policy (a start that consumed no admission consumes no token, AC-a).
+    // It runs after the admission gate (checked above), so halt (gate) always beats
+    // pace (throttle). It also runs after the effective SLA/timeout are resolved, so
+    // a deferred start carries the same effective options as an immediate one. On
+    // reserve, the token is refunded below if the start short-circuits under a reuse
+    // policy. A start that consumed no admission consumes no token (AC-a).
     let mut throttle_reserved: Option<String> = None;
     if let Some((throttle_policy, resolved_throttle_key)) =
         workflow_resolving_throttle(&runtime.registry, &workflow_name, &input)
@@ -20145,12 +20136,11 @@ pub(crate) async fn start_workflow(
             .into_response();
         }
         // Fail fast on an oversized input rather than persisting a pending row
-        // that would fail at fire time on every scanner tick. Skipped when
-        // `reserve_or_defer` would resolve this call via `Bypassed` (an
-        // active execution already satisfies the reuse policy) or an
-        // idempotent attach to an already-pending row -- neither inserts a
-        // fresh row, so a retry carrying a stale/oversized body must not be
-        // rejected (code-review fix, issue #607).
+        // that would fail at fire time on every scanner tick. Skip the check when
+        // `reserve_or_defer` would resolve this call via `Bypassed` (an active
+        // execution already satisfies the reuse policy). Also skip it for an
+        // idempotent attach to an already-pending row. Neither inserts a fresh row,
+        // so a retry carrying a stale/oversized body must not be rejected (issue #607).
         let skip_cap_check = match autumn_harvest::throttle::skip_size_check(
             &mut conn,
             &workflow_name,
@@ -20188,28 +20178,30 @@ pub(crate) async fn start_workflow(
 
         // Admission gate (issue #377 / issue #618, PR #1014): halt beats pace.
         // A throttle DEFER returns `202` from this branch *before* the core start
-        // primitive's authoritative gated create path (`GateMode::Check`, reached
-        // only on the fall-through plain/keyed start below) ever runs, so without
-        // this check a fresh throttled start would silently slip an armed gate.
-        // Mirror the batch route: check the gate here, before `reserve_or_defer`,
-        // and reject a genuinely-fresh admission with `503`. An idempotent retry
-        // is NOT a fresh admission. Such a retry has an explicit caller-supplied
-        // `workflow_id`. Its resolved reuse policy ATTACHES to an existing prior
-        // (or errors `AlreadyExists`) rather than creating a fresh execution. Or
-        // it is already durably deferred (a pending throttle row).
+        // primitive's authoritative gated create path ever runs. That path
+        // (`GateMode::Check`) is reached only on the fall-through plain/keyed start
+        // below. Without this check, a fresh throttled start would silently slip an
+        // armed gate. Mirror the batch route: check the gate here, before
+        // `reserve_or_defer`, and reject a genuinely-fresh admission with `503`.
+        //
+        // An idempotent retry is NOT a fresh admission. Such a retry has an explicit
+        // caller-supplied `workflow_id`. Its resolved reuse policy ATTACHES to an
+        // existing prior (or errors `AlreadyExists`) rather than creating a fresh
+        // execution. Or it is already durably deferred (a pending throttle row).
         // `reserve_or_defer` resolves it to the existing run / same pending row
         // without inserting anything new. So the gate must not block it. That
-        // preserves #808 keyed-replay and the pending-throttle-row bypass. The bypass
-        // is reuse-policy-AWARE (Codex P1): a policy that genuinely CREATES a
-        // fresh execution on retry — `AllowDuplicateFailedOnly` over a
-        // FAILED/CANCELLED prior, or `TerminateIfRunning` — is a real admission
-        // and must face the gate, or the token-empty `Deferred` path would let a
-        // fresh replacement start slip an armed gate. This keys the decision on
-        // the SAME `start_will_create_new_execution` predicate the authoritative
-        // core locked gate uses (see `execution.rs`). We already know this
-        // workflow resolves a throttle policy (the enclosing `if let`), so the
-        // batch route's extra `workflow_resolving_throttle(...).is_some()` guard
-        // is redundant here.
+        // preserves #808 keyed-replay and the pending-throttle-row bypass.
+        //
+        // The bypass is reuse-policy-AWARE (issue #607). A policy that genuinely
+        // CREATES a fresh execution on retry is a real admission and must face the
+        // gate. Such policies are `AllowDuplicateFailedOnly` over a FAILED/CANCELLED
+        // prior, and `TerminateIfRunning`. Otherwise the token-empty `Deferred` path
+        // would let a fresh replacement start slip an armed gate. The decision keys
+        // on the SAME `start_will_create_new_execution` predicate that the
+        // authoritative core locked gate uses (see `execution.rs`). This workflow
+        // already resolves a throttle policy (the enclosing `if let`). So the batch
+        // route's extra `workflow_resolving_throttle(...).is_some()` guard is
+        // redundant here.
         // Load shedding (issue #1794) follows the same rule. A deferred start
         // never reaches the primitive's shed check, and its later fire is exempt.
         let gate_hit = {
@@ -20253,17 +20245,17 @@ pub(crate) async fn start_workflow(
                     .optional()
                     .unwrap_or(None);
                 // Bypass the gate only when the resolved reuse policy would NOT
-                // create a fresh execution (attach, or `AlreadyExists`) — the
+                // create a fresh execution (attach, or `AlreadyExists`). That is the
                 // exact question the core gate keys on. A `None` prior, or a
-                // create-on-retry policy (`AllowDuplicateFailedOnly` +
-                // FAILED/CANCELLED prior, `TerminateIfRunning`), returns `true`
-                // here, so `attaches_to_existing` is `false` and the gate blocks.
-                // Pass the request's `conflict_policy` so the create-vs-attach
-                // decision matches the authoritative core gate exactly (issue
-                // #685). In practice this is always `Unspecified` on the throttle
-                // path — the mutual-exclusion guard above rejects a non-default
-                // `conflict_policy` combined with a throttle — but threading it
-                // keeps this predicate byte-identical to the core one.
+                // create-on-retry policy (`AllowDuplicateFailedOnly` + FAILED/CANCELLED
+                // prior, `TerminateIfRunning`), returns `true` here. Then
+                // `attaches_to_existing` is `false` and the gate blocks. Pass the
+                // request's `conflict_policy` so the create-vs-attach decision matches
+                // the authoritative core gate exactly (issue #685). On the throttle
+                // path it is always `Unspecified` in practice, because the
+                // mutual-exclusion guard above rejects a non-default `conflict_policy`
+                // with a throttle. Threading it keeps this predicate byte-identical to
+                // the core one.
                 let attaches_to_existing =
                     !autumn_harvest::execution::start_will_create_new_execution(
                         prior_state.as_deref(),
@@ -20447,15 +20439,14 @@ pub(crate) async fn start_workflow(
                     "throttle_key": outcome.throttle_key,
                     "deferred_at": outcome.deferred_at,
                 });
-                // issue #697 (AC5): a throttled start HONOURS an explicit pin --
-                // the resolved shard is threaded into `reserve_or_defer` and the
-                // scanner fires there -- so the accepted placement must be
-                // echoed here too. Without it a caller has no way to audit a
-                // deferred pinned start (there is no `execution_id` to decode
-                // yet), contradicting the contract that every start response
-                // reports the resolved shard whenever placement was requested.
-                // Omitted for an unpinned start, keeping its body byte-identical
-                // to a pre-#697 build.
+                // issue #697 (AC5): a throttled start HONOURS an explicit pin. The
+                // resolved shard is threaded into `reserve_or_defer`, and the scanner
+                // fires there. So the accepted placement must be echoed here too.
+                // Without it a caller has no way to audit a deferred pinned start,
+                // because there is no `execution_id` to decode yet. That contradicts
+                // the contract that every start response reports the resolved shard
+                // whenever placement was requested. It is omitted for an unpinned
+                // start, which keeps its body byte-identical to a pre-#697 build.
                 if let Some(pinned) = pinned_shard_id
                     && let Some(obj) = body.as_object_mut()
                 {
@@ -20503,16 +20494,16 @@ pub(crate) async fn start_workflow(
     }
 
     // issue #808: request-scoped idempotency. The reserve + start run in a single
-    // transaction (reserve short-circuits the reuse-policy matrix entirely); a
-    // same-key retry converges on the same execution as a `200` no-op. This is
-    // mutually exclusive with throttle/debounce/batch (rejected above), so
-    // `throttle_reserved` is always `None` here and no token refund is needed.
+    // transaction, and the reserve short-circuits the reuse-policy matrix entirely.
+    // A same-key retry converges on the same execution as a `200` no-op. This is
+    // mutually exclusive with throttle/debounce/batch (rejected above). So
+    // `throttle_reserved` is always `None` here, and no token refund is needed.
     if let Some(ref key) = idempotency_key {
-        // Validate execution_timeout_secs BEFORE building params: the range
-        // guard inside the debounce/batch blocks is skipped for keyed starts
-        // (they are mutually exclusive), and `chrono::Duration::seconds` panics
-        // on an out-of-range i64. Mirror the existing 400 guard so an untrusted
-        // value is a clean bad request, never a 500. (issue #808)
+        // Validate execution_timeout_secs BEFORE building params (issue #808). The
+        // range guard inside the debounce/batch blocks is skipped for keyed starts,
+        // because they are mutually exclusive. `chrono::Duration::seconds` panics on
+        // an out-of-range i64. Mirror the existing 400 guard, so an untrusted value is
+        // a clean bad request, never a 500.
         if let Some(secs) = request.execution_timeout_secs
             && (secs < 0 || chrono::Duration::try_seconds(secs).is_none())
         {
@@ -20636,8 +20627,9 @@ pub(crate) async fn start_workflow(
                     //                                          → started_fresh:false, deduplicated:false
                     //  - same key hit is handled by the Deduplicated arm below
                     //                                          → started_fresh:false, deduplicated:true
+                    //
                     // `deduplicated` is false here because no *idempotency-key*
-                    // dedup occurred (this request won the claim); `started_fresh`
+                    // dedup occurred (this request won the claim). `started_fresh`
                     // reflects whether a new WorkflowStarted event was written.
                     Json(StartWorkflowResponse {
                         execution_id: start.exec_id.to_string(),
@@ -20672,10 +20664,10 @@ pub(crate) async fn start_workflow(
                     shard_id: Some(shard.as_i32()),
                     source: &source,
                 };
-                // Intentional asymmetry with the Started arm (which returns 503
-                // on audit-insert failure): a dedup replay is a no-op read — the
-                // original start was already audited when it created the run — so
-                // a failed audit here is best-effort and never fails the reply.
+                // Intentional asymmetry with the Started arm, which returns 503 on
+                // audit-insert failure. A dedup replay is a no-op read, because the
+                // original start was already audited when it created the run. So a
+                // failed audit here is best-effort and never fails the reply.
                 let _ = audit::insert_audit(&mut conn, &ar).await;
                 (
                     axum::http::StatusCode::OK,
@@ -20709,8 +20701,8 @@ pub(crate) async fn start_workflow(
                     shard_id: Some(shard.as_i32()),
                     source: &source,
                 };
-                // Best-effort audit on the failure paths (intentional asymmetry
-                // with the Started arm's 503-on-audit-failure): the reserve
+                // Best-effort audit on the failure paths. This is an intentional
+                // asymmetry with the Started arm's 503-on-audit-failure. The reserve
                 // rolled back, so there is no persisted start to keep consistent.
                 let _ = audit::insert_audit(&mut conn, &ar).await;
                 (
@@ -20908,13 +20900,13 @@ pub(crate) async fn start_workflow(
             limit,
             current,
         }) => {
-            // A fresh admission rejected by a declared per-tenant resource
-            // quota (issue #946, AC4): a typed 429 naming the exhausted
-            // resource/key/limit/current — never a silent drop, never the
-            // generic 503 catch-all `map_error` would otherwise apply. The
-            // rejection was already counted on `harvest.quota.rejected`
-            // (AC6) inside `start_or_load_workflow_execution_collect`
-            // itself, so no metric emission is needed at this HTTP layer.
+            // A declared per-tenant resource quota rejected a fresh admission
+            // (issue #946, AC4). Return a typed 429 naming the exhausted
+            // resource/key/limit/current. It is never a silent drop, and never the
+            // generic 503 catch-all that `map_error` would otherwise apply.
+            // `start_or_load_workflow_execution_collect` already counted the
+            // rejection on `harvest.quota.rejected` (AC6). So this HTTP layer emits
+            // no metric.
             if let Some(ref bucket) = throttle_reserved {
                 let _ = autumn_harvest::queue::refund_rate_limit_token(&mut conn, bucket).await;
             }
@@ -21013,12 +21005,12 @@ pub(crate) async fn start_workflow(
                     workflow_name: start.workflow_name,
                     workflow_id: start.workflow_id,
                     state: start.state,
-                    // issue #685 (AC-4/AC-7): surface `started_fresh` — the
-                    // attach-vs-fresh distinguisher — ONLY when the caller opted
-                    // into the conflict axis by sending a `conflict_policy` field
-                    // (even `"unspecified"`). Omitting the field keeps the
-                    // response byte-for-byte identical to a pre-#685/#808 build
-                    // (both #808 flags omitted via `skip_serializing_if`).
+                    // issue #685 (AC-4/AC-7): surface `started_fresh`, the
+                    // attach-vs-fresh distinguisher, ONLY when the caller opted into
+                    // the conflict axis by sending a `conflict_policy` field (even
+                    // `"unspecified"`). Omitting the field keeps the response
+                    // byte-for-byte identical to a pre-#685/#808 build. Both #808
+                    // flags are then omitted via `skip_serializing_if`.
                     started_fresh: if request.conflict_policy.is_some() {
                         Some(start.created)
                     } else {
@@ -21121,12 +21113,12 @@ async fn batch_start_workflows(
     // ── Pre-validate all items in-memory (issue #357) ───────────────────────
     // Check: workflow name registered, no DAG collision.
     // Schema validation (issue #373) is intentionally deferred to the per-shard
-    // execution loop rather than done here. batch_start always uses AllowDuplicate,
-    // so any item whose (workflow_name, workflow_id) already exists is returned as-is
-    // without storing or deserializing the submitted input; rejecting those items in
-    // pre-validation would cause spurious 400s on idempotent retries that carry stale
-    // or omitted input — the same reason payload-size checks are deferred to
-    // start_or_load_workflow_execution.
+    // execution loop. batch_start always uses AllowDuplicate. So any item whose
+    // (workflow_name, workflow_id) already exists is returned as-is, without
+    // storing or deserializing the submitted input. Rejecting those items in
+    // pre-validation would cause spurious 400s on idempotent retries that carry
+    // stale or omitted input. Payload-size checks are deferred to
+    // start_or_load_workflow_execution for the same reason.
     let mut pre_rejected: Vec<BatchStartItemResult> = Vec::new();
     for (idx, item) in request.items.iter().enumerate() {
         let err = if !runtime.registry.workflows.contains_key(&item.workflow_name) {
@@ -21154,7 +21146,7 @@ async fn batch_start_workflows(
             // A debounced item with no explicit workflow_id is *definitely* a fresh
             // start (a generated id cannot collide), which batch cannot debounce-admit.
             // Reject it in pre-validation so an atomic batch aborts before any earlier
-            // item is started + committed (Codex 6929). A debounced item *with* a
+            // item is started + committed (issue #499). A debounced item *with* a
             // workflow_id may attach to an existing run, so it is resolved per-item
             // below (reject_fresh_if_debounced rejects only the fresh case).
             Some(format!(
@@ -21171,10 +21163,10 @@ async fn batch_start_workflows(
             .is_some()
         {
             // A start-throttle admission (issue #607) can durably defer before any
-            // execution row exists, and the per-item throttle block below reports a
-            // deferral as `Deferred`, not `Started`/`Rejected` -- a third outcome
-            // atomic batches have no way to express (they are all-or-nothing
-            // synchronous inserts; a deferral is neither a commit nor a rejection).
+            // execution row exists. The per-item throttle block below reports a
+            // deferral as `Deferred`, not `Started`/`Rejected`. Atomic batches cannot
+            // express that third outcome. They are all-or-nothing synchronous
+            // inserts, and a deferral is neither a commit nor a rejection.
             // Debounce is rejected only when a fresh start is certain, i.e. no
             // workflow_id. Throttle differs. A throttled item can attach to an
             // already-active execution (bypassing the bucket, same as a plain start)
@@ -21182,11 +21174,11 @@ async fn batch_start_workflows(
             // in-memory pre-validation pass deliberately does not perform one
             // (issue #357). So every atomic item for a throttled workflow is
             // rejected unconditionally. That conservative choice closes the bypass
-            // without a false admit. Reject here (not
-            // silently skip the throttle check as before) so an atomic batch can
-            // never circumvent a workflow's rate policy by simply setting
-            // atomic=true; use a non-atomic (atomic=false) batch or the standalone
-            // start route instead, both of which honor the throttle.
+            // without a false admit. Reject here rather than silently skip the
+            // throttle check. Then an atomic batch can never circumvent a workflow's
+            // rate policy by simply setting atomic=true. Use a non-atomic
+            // (atomic=false) batch or the standalone start route instead. Both honor
+            // the throttle.
             Some(format!(
                 "workflow '{0}' has a start-throttle policy; a throttled start \
                  cannot be expressed atomically (it may durably defer rather than \
@@ -21284,9 +21276,9 @@ async fn batch_start_workflows(
         .max_workflow_chain_timeout()
         .map(|d| chrono::Duration::from_std(d).unwrap_or(chrono::Duration::MAX));
 
-    // ── OTel batch span — created before any DB work (issue #357 telemetry AC) ─
-    // Dynamic attributes (shards_touched, rejected_count) are recorded via
-    // span.record() after the loop; the span is dropped at end of scope.
+    // ── OTel batch span (issue #357 telemetry AC) ──────────────────────────────
+    // Created before any DB work. Code after the loop records the dynamic
+    // attributes (shards_touched, rejected_count) via span.record().
     let batch_span = tracing::info_span!(
         "harvest.batch.start",
         "batch.size" = request.items.len(),
@@ -21307,8 +21299,8 @@ async fn batch_start_workflows(
     let mut rejected_count = pre_rejected_idxs.len();
 
     // ── Phase 1: compute routing data, gate-check with actual shard, group by shard ──
-    // Precomputing workflow_ids here ensures the same value is used for shard
-    // selection and for start_or_load_workflow_execution below.
+    // Precompute workflow_ids here. Shard selection and
+    // start_or_load_workflow_execution below then use the same value.
     let item_queue = runtime
         .queues
         .as_slice()
@@ -21353,41 +21345,40 @@ async fn batch_start_workflows(
         if gate_hit.is_some() || shed_hit.is_some() {
             // Idempotent retry bypass: if the caller supplied an explicit
             // workflow_id, check whether an active (RUNNING/SUSPENDED) execution
-            // already exists on this shard.  AllowDuplicate would return the
+            // already exists on this shard. AllowDuplicate would return the
             // existing run without creating anything new, so the gate must not
-            // block an idempotent re-attach.  The DB call is made lazily — only
-            // when the gate is actually active — so there is no overhead on the
-            // common path where no gate is set.
+            // block an idempotent re-attach. The DB call is lazy. It runs only
+            // when the gate is actually active, so the common path with no gate
+            // set has no overhead.
             //
             // A retry can equally land on an already-pending *throttle* row
-            // (code review, issue #607, mirroring the same fix on the single-
-            // start route): `reserve_or_defer`'s own idempotency shortcut in
-            // Phase 2 below would resolve it to that same pending row without
-            // creating anything new — also not a fresh admission — so the gate
-            // must not block that case either. Checked only when this item's
-            // workflow actually resolves a throttle policy.
+            // (issue #607, mirroring the same fix on the single-start route).
+            // `reserve_or_defer`'s own idempotency shortcut in Phase 2 below would
+            // resolve it to that same pending row without creating anything new.
+            // That is also not a fresh admission, so the gate must not block it
+            // either. Checked only when this item's workflow actually resolves a
+            // throttle policy.
             let is_idempotent_retry = if item.workflow_id.is_some() {
                 match api_state.storage_pool() {
                     Ok(pool) => match acquire_conn(pool.pool_for(shard)).await {
                         Ok(mut pre_conn) => {
                             // Load the prior run's STATE (not a bare existence
                             // boolean) using the SAME non-sealed filter the
-                            // authoritative locked gate applies, then decide the
-                            // bypass with `start_will_create_new_execution` —
-                            // mirroring the single-start route (issue #1051).
-                            // The batch route starts every item under
-                            // AllowDuplicate (Phase 2 hardcodes it below;
-                            // `BatchStartItem` has no reuse-policy field), so the
-                            // predicate agrees with the old bare-existence
-                            // heuristic for every prior state today — this is a
-                            // structural/defensive change that stays correct if a
+                            // authoritative locked gate applies. Then decide the
+                            // bypass with `start_will_create_new_execution`, as the
+                            // single-start route does (issue #1051).
+                            // The batch route starts every item under AllowDuplicate.
+                            // Phase 2 hardcodes it below, and `BatchStartItem` has no
+                            // reuse-policy field. So the predicate agrees with the old
+                            // bare-existence heuristic for every prior state today.
+                            // This structural/defensive change stays correct if a
                             // per-item reuse policy is ever added (issue #1053).
-                            // The substantive residual (a bypass-prior
-                            // force-terminated between this unlocked read and the
-                            // deferred throttle fire) is closed authoritatively
-                            // at fire time by the throttle scanner's CheckCached
-                            // gate (issue #1053, item 2) — the deferred batch item
-                            // fires through the SAME `fire_claimed_throttle_row`.
+                            // One residual remains: a bypass prior force-terminated
+                            // between this unlocked read and the deferred throttle
+                            // fire. The throttle scanner's CheckCached gate closes it
+                            // authoritatively at fire time (issue #1053, item 2). The
+                            // deferred batch item fires through the SAME
+                            // `fire_claimed_throttle_row`.
                             let prior_state = harvest_workflow_executions::table
                                 .filter(
                                     harvest_workflow_executions::workflow_name
@@ -21806,12 +21797,12 @@ async fn batch_start_workflows(
                 && let Some((throttle_policy, resolved_throttle_key)) =
                     workflow_resolving_throttle(&runtime.registry, &item.workflow_name, &input)
             {
-                // Mutual exclusion mirrors the single-start endpoint (issue #607):
-                // debounce collapses a burst into one run, throttle paces and
-                // defers every start — combining them has no coherent semantics.
-                // Reject the item explicitly rather than silently reserving (and
-                // then wasting) a throttle token that the debounce gate would
-                // reject the fresh start under anyway.
+                // Mutual exclusion mirrors the single-start endpoint (issue #607).
+                // Debounce collapses a burst into one run, and throttle paces and
+                // defers every start. Combining them has no coherent semantics.
+                // Reject the item explicitly. Otherwise it would reserve and then
+                // waste a throttle token, and the debounce gate would reject the
+                // fresh start anyway.
                 if workflow_has_resolving_debounce(&runtime.registry, &item.workflow_name, &input) {
                     rejected_count += 1;
                     results.push(BatchStartItemResult {
@@ -21827,12 +21818,11 @@ async fn batch_start_workflows(
                 }
                 // Fail fast on an oversized input rather than persisting a
                 // pending row that would fail at fire time on every scanner
-                // tick (code-review fix, issue #607): mirrors the single-start
-                // throttle path's early cap check. Skipped when
-                // `reserve_or_defer` would resolve via `Bypassed` or an
-                // idempotent attach to an already-pending row -- neither
-                // inserts a fresh row, so a retry with a stale/oversized body
-                // must not be rejected.
+                // tick (issue #607). This mirrors the single-start throttle path's
+                // early cap check. Skip it when `reserve_or_defer` would resolve via
+                // `Bypassed` or an idempotent attach to an already-pending row.
+                // Neither inserts a fresh row, so a retry with a stale/oversized
+                // body must not be rejected.
                 let skip_cap_check = match autumn_harvest::throttle::skip_size_check(
                     &mut conn,
                     &item.workflow_name,
@@ -22058,10 +22048,10 @@ async fn batch_start_workflows(
                     // issue #618 (PR #1014): gate each batch item authoritatively under
                     // the primitive's `FOR UPDATE` lock. This closes the batch TOCTOU
                     // (Phase 1's policy-blind pre-check can skip the gate for an item
-                    // whose prior seals before Phase 2 starts it). A blocked item's
-                    // `Err(AdmissionBlocked)` is mapped to a per-item rejection by the
-                    // `Err(e)` arm below (never a hard batch failure) — the block is
-                    // counted once by the primitive.
+                    // whose prior seals before Phase 2 starts it). The `Err(e)` arm
+                    // below maps a blocked item's `Err(AdmissionBlocked)` to a per-item
+                    // rejection, never a hard batch failure. The primitive counts the
+                    // block once.
                     Some(autumn_harvest::admission_gate::GateMode::Check),
                     runtime.registry.payload_codecs(),
                 )
@@ -22082,11 +22072,11 @@ async fn batch_start_workflows(
                         .await;
                     }
                     let m = runtime.registry.telemetry().metrics.as_ref();
-                    // Route through the single choke point so a synthetic
-                    // liveness canary (issue #796, AC8) never leaks into
-                    // harvest.workflow.terminal via a batch cancel, and so a
-                    // latest-wins supersede (issue #811) can never be emitted as
-                    // a plain cancel with its own counter dropped.
+                    // Route through the single choke point. Then a synthetic liveness
+                    // canary (issue #796, AC8) never leaks into
+                    // harvest.workflow.terminal via a batch cancel. A latest-wins
+                    // supersede (issue #811) also can never be emitted as a plain
+                    // cancel with its own counter dropped.
                     autumn_harvest::execution::emit_start_cancel_metrics(m, &cancel_metrics);
                     Ok(started)
                 }
@@ -22562,9 +22552,9 @@ async fn batch_reset_workflows(
                         skip_reason: None,
                     });
                 } else {
-                    // Perform the actual reset. Pass the original `reset_point` so
+                    // Perform the actual reset. Pass the original `reset_point`, so
                     // `reset_workflow_execution` re-resolves it to a concrete event id
-                    // under its `FOR UPDATE` row lock, eliminating the TOCTOU window
+                    // under its `FOR UPDATE` row lock. That eliminates the TOCTOU window
                     // between `resolve_batch_reset_one` and the actual fork transaction.
                     let reset_req = WorkflowResetRequest {
                         reset_to_event_id: None,
@@ -22790,9 +22780,9 @@ pub(crate) async fn signal_with_start_workflow(
     }
 
     // A connector's `SignalsWithStart` binding derives its key into this same
-    // `(workflow_exec_id, idempotency_key)` scope on `harvest_signals`, so a
-    // caller must not be able to claim one (issue #944 review). Placed before
-    // the committed-replay probe below — the first thing that consumes the key.
+    // `(workflow_exec_id, idempotency_key)` scope on `harvest_signals`. So a caller
+    // must not be able to claim one (issue #944 review). This check sits before the
+    // committed-replay probe below, which is the first thing that consumes the key.
     if !request.engine_derived_idempotency_key
         && let Some(key) = request.idempotency_key.as_deref()
         && let Some(resp) = reject_reserved_idempotency_key(key)
@@ -22850,17 +22840,17 @@ pub(crate) async fn signal_with_start_workflow(
 
     // INVARIANT (this PR): keyed committed-replay short-circuit. A retry of an
     // already-committed keyed signal-with-start must replay to its documented
-    // `200 signal_delivered: false` no-op BEFORE any fresh-start-only validation
-    // (the #610 signal-payload schema gate immediately below, the #252 cap, and
-    // the #373 start_input schema enforced inside the core primitive). Otherwise
+    // `200 signal_delivered: false` no-op BEFORE any fresh-start-only validation.
+    // That validation is the #610 signal-payload schema gate immediately below, the
+    // #252 cap, and the #373 start_input schema inside the core primitive. Otherwise
     // a schema/cap tightened between the original delivery and the retry would
-    // wrongly reject a retry that creates no new work. Keyed-only; a miss falls
+    // wrongly reject a retry that creates no new work. Keyed-only. A miss falls
     // through to the untouched authoritative in-lock path
-    // (`signal_with_start_workflow_execution_with_metrics`), which reserves the
+    // (`signal_with_start_workflow_execution_with_metrics`). That path reserves the
     // exactly-once signal row and remains the source of truth for the
-    // concurrent-first-delivery race — this probe is an additive fast path for
-    // COMMITTED replays only, never a replacement. Mirrors #808 (plain start)
-    // and #1092 (plain signal route).
+    // concurrent-first-delivery race. This probe is an additive fast path for
+    // COMMITTED replays only, never a replacement. Mirrors #808 (plain start) and
+    // #1092 (plain signal route).
     if !promise_signal
         && let Some(key) = request.idempotency_key.as_deref()
         && let Some(resp) = probe_committed_sws_replay(
@@ -22922,18 +22912,18 @@ pub(crate) async fn signal_with_start_workflow(
         return schema_validation_response("signal payload validation failed", violations);
     }
 
-    // Debounce admission is owned by POST /workflows/{name}/start; an atomic
-    // start+signal cannot be deferred through the trailing-edge gate. Rather than
-    // rejecting up front (which would block legitimate *attach* calls to a live
-    // run), we ask the core primitive to reject only a **fresh start** under its
-    // lock, so an attach/idempotent signal-with-start still succeeds (issue #499).
+    // Debounce admission is owned by POST /workflows/{name}/start. An atomic
+    // start+signal cannot be deferred through the trailing-edge gate. An up-front
+    // rejection would block legitimate *attach* calls to a live run. So the core
+    // primitive rejects only a **fresh start** under its lock, and an
+    // attach/idempotent signal-with-start still succeeds (issue #499).
     let reject_fresh_if_debounced =
         workflow_has_resolving_debounce(&runtime.registry, &workflow_name, &start_input);
 
-    // Issue #252: resolve cap values. Both caps are enforced inside
-    // signal_with_start_workflow_execution — after idempotency dedupe and
-    // only on the fresh-start path for start_input — to avoid spurious 413s
-    // on attach requests where start_input is never written.
+    // Issue #252: resolve cap values. signal_with_start_workflow_execution enforces
+    // both caps after idempotency dedupe. The start_input cap applies only on the
+    // fresh-start path. That avoids spurious 413s on attach requests, where
+    // start_input is never written.
     let effective_wf_cap = runtime
         .registry
         .workflows
@@ -22943,25 +22933,25 @@ pub(crate) async fn signal_with_start_workflow(
             per_wf.max(runtime.registry.max_workflow_input_bytes)
         });
 
-    // In multi-shard deployments with read-only shards the rendezvous hash can
-    // map a (workflow_name, workflow_id) to a different writable shard than the
-    // one that already holds the live execution. Search every readable shard
-    // for an existing non-terminal execution first; only fall back to a fresh
-    // shard when none is found. This ensures signal-with-start always attaches
-    // to the correct run rather than accidentally starting a second one.
+    // Consider a multi-shard deployment with read-only shards. There the rendezvous
+    // hash can map a (workflow_name, workflow_id) to a writable shard other than the
+    // one that holds the live execution. Search every readable shard for an existing
+    // non-terminal execution first. Fall back to a fresh shard only when none is
+    // found. So signal-with-start always attaches to the correct run rather than
+    // accidentally starting a second one.
     //
     // Two correctness rules apply here:
     //
     //   1. Fail closed on shard scan errors. A transient lookup failure on the
     //      shard that owns the live run must not silently fall through to
-    //      `pick_for_new_workflow`, otherwise a narrowed-writable-shard
-    //      deployment can race into a duplicate start on a different shard.
+    //      `pick_for_new_workflow`. Otherwise a narrowed-writable-shard deployment
+    //      can race into a duplicate start on a different shard.
     //
-    //   2. Reuse the existing execution UUID *only* when we expect to attach
-    //      to a live run. For terminal priors, or for `TerminateIfRunning`
-    //      against a RUNNING/SUSPENDED prior, the core start path takes the
-    //      `replace_execution` branch which seals the existing row and inserts
-    //      a new one keyed by `request.exec_id`. Passing back the existing
+    //   2. Reuse the existing execution UUID *only* when an attach to a live run
+    //      is expected. Some priors take the `replace_execution` branch of the
+    //      core start path: a terminal prior, or a RUNNING/SUSPENDED prior under
+    //      `TerminateIfRunning`. That branch seals the existing row and inserts a
+    //      new one keyed by `request.exec_id`. Passing back the existing
     //      UUID would hit the primary-key constraint and the request would
     //      fail with a database error instead of replacing as documented.
     let pool = match api_state.storage_pool() {
@@ -23020,13 +23010,13 @@ pub(crate) async fn signal_with_start_workflow(
         };
         if let Some((existing_uuid, existing_state)) = hit {
             // A rebalanced SEAL is not the run (issue #964). It matches this
-            // query — `MIGRATED` is neither CONTINUED_AS_NEW nor TERMINATED —
-            // and shards iterate in id order, so the seal on the origin shard is
-            // found before the live copy on the target. Selecting it sends the
-            // whole operation to a row that will never run again: the resolver
-            // sees a non-RUNNING prior, upgrades to `TerminateIfRunning`, and
-            // the start path refuses a rebalanced prior, so the request 503s
-            // forever while the live run sits available on the next shard.
+            // query, because `MIGRATED` is neither CONTINUED_AS_NEW nor TERMINATED.
+            // Shards iterate in id order, so the seal on the origin shard is found
+            // before the live copy on the target. Selecting it sends the whole
+            // operation to a row that will never run again. The resolver sees a
+            // non-RUNNING prior and upgrades to `TerminateIfRunning`. The start path
+            // refuses a rebalanced prior, so the request 503s forever while the live
+            // run sits available on the next shard.
             //
             // Keep scanning instead, remembering the seal only so a live copy
             // this node cannot see is refused rather than silently duplicated.
@@ -23089,8 +23079,8 @@ pub(crate) async fn signal_with_start_workflow(
 
     // A seal but no live copy anywhere this node can reach: the run is alive on
     // a shard with no pool here. Falling through would start a FRESH run for a
-    // business key that is already held, which is the duplicate the seal exists
-    // to prevent — so refuse retryably instead.
+    // business key that is already held. The seal exists to prevent that
+    // duplicate, so refuse retryably instead.
     if found_shard.is_none()
         && let Some(seal_shard) = seal_only
     {
@@ -23119,11 +23109,12 @@ pub(crate) async fn signal_with_start_workflow(
     };
 
     // issue #377: check admission gates unconditionally.
-    // Although `will_attach = true` means we observed an existing RUNNING execution,
-    // that pre-scan is unlocked — the resolver can still start a fresh execution if
-    // the RUNNING run completes before the FOR UPDATE lock is taken. Always checking
-    // the gate closes that TOCTOU window at the cost of also blocking signals to
-    // existing runs during an incident (use POST /workflows/{id}/signal instead).
+    // `will_attach = true` means the pre-scan observed an existing RUNNING
+    // execution. But that pre-scan is unlocked. The resolver can still start a
+    // fresh execution if the RUNNING run completes before the FOR UPDATE lock is
+    // taken. Always checking the gate closes that TOCTOU window. The cost is that it
+    // also blocks signals to existing runs during an incident (use POST
+    // /workflows/{id}/signal instead).
     {
         let wf_owner = runtime
             .registry
@@ -23172,10 +23163,10 @@ pub(crate) async fn signal_with_start_workflow(
         }
     }
 
-    // issue #373: start_input schema validation (when the workflow has one)
-    // now runs *inside* signal_with_start_workflow_execution_with_metrics,
-    // under its FOR UPDATE lock, and only on a genuine fresh start -- not
-    // here, unconditionally, before the lock. The old unconditional pre-lock
+    // issue #373: start_input schema validation (when the workflow has one) runs
+    // *inside* signal_with_start_workflow_execution_with_metrics. It runs under
+    // its FOR UPDATE lock, and only on a genuine fresh start, not here before the
+    // lock. The old unconditional pre-lock
     // check closed a TOCTOU window. An unlocked pre-scan could observe a live
     // execution that completes before the lock of the core resolver, which
     // escalates to a fresh start. But the check cost a real bug. It rejected a
@@ -23289,12 +23280,11 @@ pub(crate) async fn signal_with_start_workflow(
         // issue #618 (PR #1014): gate a FRESH create AUTHORITATIVELY under the
         // primitive's `FOR UPDATE` lock, not just at the unlocked pre-check above.
         // The pre-check catches the common case (gate already active when the
-        // request lands) and additionally blocks attaches; this closes the
-        // residual request-internal TOCTOU where a gate is raised between that
-        // pre-check and the locked create — mirroring the plain `api` start route,
-        // which was moved off an unlocked pre-read for exactly this window. A
-        // pre-check block short-circuits before this call, so a fresh create is
-        // never double-counted.
+        // request lands) and also blocks attaches. This call closes the residual
+        // request-internal TOCTOU where a gate is raised between that pre-check and
+        // the locked create. It mirrors the plain `api` start route, which moved off
+        // an unlocked pre-read for exactly this window. A pre-check block
+        // short-circuits before this call, so a fresh create is never double-counted.
         Some(autumn_harvest::admission_gate::GateMode::Check),
         runtime.registry.payload_codecs(),
     )
@@ -23353,10 +23343,10 @@ pub(crate) async fn signal_with_start_workflow(
             )
                 .into_response()
         }
-        // issue #373 (moved inside the core primitive under its lock, per the
-        // issue #918 review above): a genuine fresh start whose start_input
-        // fails the target workflow's published schema. Never raised for an
-        // attach, since start_input is never validated there.
+        // issue #373: a genuine fresh start whose start_input fails the target
+        // workflow's published schema. The check moved inside the core primitive,
+        // under its lock, per the issue #918 review above. It is never raised for
+        // an attach, since start_input is never validated there.
         Err(HarvestError::InputValidationFailed { violations }) => {
             let ar = NewAuditRecord {
                 actor: &actor,
@@ -23381,13 +23371,12 @@ pub(crate) async fn signal_with_start_workflow(
             )
                 .into_response()
         }
-        // A genuine fresh admission rejected by a declared per-tenant
-        // resource quota (issue #946, AC4): a typed 429 naming the
-        // exhausted resource/key/limit/current, mirroring the plain start
-        // route's arm exactly. Never raised for an attach, since the quota
-        // check runs only on the fresh-insert branch inside
-        // `start_or_load_workflow_execution_collect`. Already counted on
-        // `harvest.quota.rejected` (AC6) inside the primitive itself.
+        // A declared per-tenant resource quota rejected a genuine fresh admission
+        // (issue #946, AC4). Return a typed 429 naming the exhausted
+        // resource/key/limit/current, exactly like the plain start route's arm. It
+        // is never raised for an attach, since the quota check runs only on the
+        // fresh-insert branch inside `start_or_load_workflow_execution_collect`.
+        // The primitive itself already counted it on `harvest.quota.rejected` (AC6).
         Err(HarvestError::QuotaExceeded {
             workflow_name,
             key,
@@ -23487,9 +23476,9 @@ const UPDATE_ID_NAMESPACE: uuid::Uuid = uuid::Uuid::NAMESPACE_DNS;
 
 /// `POST /workflows/{workflow_name}/update-with-start`
 ///
-/// Atomically starts a workflow if no live run for `(workflow_name, workflow_id)`
-/// exists (subject to `id_reuse_policy`), or attaches to the existing run, and
-/// admits exactly one update against the resolved execution.
+/// Atomically starts a workflow, or attaches to the existing run, and admits exactly
+/// one update against the resolved execution. It starts a run only if no live run
+/// exists for `(workflow_name, workflow_id)`, subject to `id_reuse_policy`.
 ///
 /// Mirrors the `signal-with-start` contract: same reuse-policy × prior-state
 /// matrix, same shard-routing and idempotency semantics.
@@ -23622,10 +23611,10 @@ async fn update_with_start_workflow(
     let start_input = request.start_input.unwrap_or(Value::Null);
     let update_args = request.update_args.unwrap_or(Value::Null);
 
-    // Derive update_id — deterministic from idempotency_key if provided. Hoisted
-    // here (mirroring the signal-with-start probe placement) so the committed-
-    // replay probe below can run BEFORE the #377 admission gate and the
-    // found-shard scan, as well as before the #373/#610/#684 validation blocks.
+    // Derive update_id, deterministic from idempotency_key if provided. It is
+    // hoisted here, as in the signal-with-start probe placement. So the
+    // committed-replay probe below can run BEFORE the #377 admission gate and the
+    // found-shard scan, and before the #373/#610/#684 validation blocks.
     let update_id = request
         .idempotency_key
         .as_ref()
@@ -23635,25 +23624,27 @@ async fn update_with_start_workflow(
 
     // INVARIANT (this PR + #377): keyed committed-replay short-circuit. A retry of
     // an already-committed keyed update-with-start must replay to its cached
-    // admission BEFORE any fresh-start-only rejection — the #373 start_input schema
-    // gate, the #610 update-arg schema gate + #684 validator further down, AND the
-    // #377 admission gate below. This mirrors both the signal-with-start route
-    // (whose probe likewise precedes the found-shard scan and the admission gate)
-    // and the #808 invariant that a committed replay precedes ALL fresh-start-only
-    // rejections, INCLUDING a raised admission gate: otherwise a retry that admits
-    // no new update — but hits an operator-raised gate or a schema/validator
-    // tightened since the original delivery — would wrongly return 503/400/422.
-    // Keyed-only; a miss (`None`) falls through to the untouched authoritative
-    // in-lock path (`update_with_start_workflow_execution_with_metrics`), which
+    // admission BEFORE any fresh-start-only rejection. Those rejections are the
+    // #373 start_input schema gate, the #610 update-arg schema gate + #684
+    // validator further down, AND the #377 admission gate below. The
+    // signal-with-start route does the same: its probe also precedes the
+    // found-shard scan and the admission gate. So does the #808 invariant: a
+    // committed replay precedes ALL fresh-start-only rejections, INCLUDING a raised
+    // admission gate. Otherwise a retry that admits no new update would wrongly
+    // return 503/400/422. That happens when it hits an operator-raised gate, or a
+    // schema/validator tightened since the original delivery.
+    //
+    // Keyed-only. A miss (`None`) falls through to the untouched authoritative
+    // in-lock path (`update_with_start_workflow_execution_with_metrics`). That path
     // reserves the exactly-once update and remains the source of truth. On a hit
-    // the outcome flows through the existing `Ok` arm (which polls for the cached
-    // update result and writes the SUCCEEDED audit), giving a committed replay the
+    // the outcome flows through the existing `Ok` arm, which polls for the cached
+    // update result and writes the SUCCEEDED audit. So a committed replay gets the
     // SAME behavior as a fresh admission. Mirrors #808 (plain start) and #1092
     // (plain signal route).
     let probe_outcome = if request.idempotency_key.is_some() {
-        // `Err(resp)` = an inconclusive shard error → fail closed (503) rather than
-        // risk a spurious fresh-start rejection of a committed replay; `Ok(outcome)`
-        // = hit (Some) or clean miss (None).
+        // `Err(resp)` is an inconclusive shard error. Fail closed (503) rather than
+        // risk a spurious fresh-start rejection of a committed replay. `Ok(outcome)`
+        // is a hit (Some) or a clean miss (None).
         match probe_committed_uws_replay(&api_state, &workflow_name, &workflow_id, update_id).await
         {
             Ok(outcome) => outcome,
@@ -23693,8 +23684,8 @@ async fn update_with_start_workflow(
         return resp;
     }
 
-    // Debounce admission is owned by POST /workflows/{name}/start. Ask the core
-    // primitive to reject only a *fresh start* under its lock so an attach /
+    // Debounce admission is owned by POST /workflows/{name}/start. The core
+    // primitive rejects only a *fresh start* under its lock. So an attach /
     // idempotent update-with-start to a live run still succeeds (issue #499).
     let reject_fresh_if_debounced =
         workflow_has_resolving_debounce(&runtime.registry, &workflow_name, &start_input);
@@ -23717,22 +23708,21 @@ async fn update_with_start_workflow(
 
     // Resolve the `(shard, conn, exec_id)` the rest of the handler consumes.
     //
-    // On a committed-replay HIT (`probe_outcome.is_some()`) there is NO
-    // fresh-start work, so a committed replay needs no fresh-start routing:
-    // audit + polling run on the hit execution's OWN shard, resolvable O(1) from
-    // `outcome.exec_id`. Acquire ONLY that shard's connection and SKIP the
-    // multi-shard scan, the admission gate, and `pick_for_new_workflow` entirely.
-    // This closes a residual undoing of the earlier admission-gate hoist: a
-    // fresh-shard partial outage — a shard-scan `Err`, or `pick_for_new_workflow`
+    // On a committed-replay HIT (`probe_outcome.is_some()`) there is NO fresh-start
+    // work, so a committed replay needs no fresh-start routing. Audit and polling
+    // run on the hit execution's OWN shard, resolvable O(1) from `outcome.exec_id`.
+    // Acquire ONLY that shard's connection. SKIP the multi-shard scan, the
+    // admission gate, and `pick_for_new_workflow` entirely. Otherwise a fresh-shard
+    // partial outage could still return 503 on a dedupe hit that does no fresh
+    // work. Such an outage is a shard-scan `Err`, or `pick_for_new_workflow`
     // selecting an unavailable shard (multi-shard partial outage / terminal-prior
-    // case) — could otherwise still return 503 on a dedupe hit that does no fresh
-    // work (Codex P2 / #808 invariant: a committed replay is never rejected by
-    // fresh-start-only infrastructure).
+    // case). That would undo the earlier admission-gate hoist. It would break the #808
+    // invariant: no fresh-start-only infrastructure ever rejects a committed replay.
     //
     // On a MISS the full fresh-start routing runs exactly as before
-    // (byte-identical): find any existing non-terminal execution for
-    // (workflow_name, workflow_id) to determine the target shard and exec_id,
-    // else `pick_for_new_workflow`.
+    // (byte-identical). It finds any existing non-terminal execution for
+    // (workflow_name, workflow_id) to determine the target shard and exec_id. Else
+    // it uses `pick_for_new_workflow`.
     let (shard, mut conn, exec_id) = if let Some(outcome) = probe_outcome.as_ref() {
         let hit_exec_id = outcome.exec_id;
         let conn = match db_conn_for_execution(&api_state, hit_exec_id).await {
@@ -23856,14 +23846,14 @@ async fn update_with_start_workflow(
         }
     };
 
-    // issue #377: admission gate. Skipped on a committed-replay hit
-    // (`probe_outcome.is_some()`): a retry admits no new update, so — per the #808
-    // invariant, mirroring the fresh-start-only validation gates below — a
-    // committed replay must return its cached admission even while an operator has
-    // raised a gate, rather than a spurious 503. On a miss the gate runs
-    // unconditionally for genuinely-fresh work (same rationale as
-    // signal-with-start: the pre-scan is unlocked, so the resolver may still
-    // create fresh even when we observed an existing RUNNING execution).
+    // issue #377: admission gate. It is skipped on a committed-replay hit
+    // (`probe_outcome.is_some()`), because a retry admits no new update. Per the
+    // #808 invariant, a committed replay must return its cached admission even
+    // while an operator has raised a gate, not a spurious 503. The fresh-start-only
+    // validation gates below follow the same rule. On a miss the gate runs
+    // unconditionally for genuinely-fresh work. The rationale matches
+    // signal-with-start: the pre-scan is unlocked, so the resolver may still create
+    // fresh even after the scan observed an existing RUNNING execution.
     if probe_outcome.is_none() {
         let wf_owner = runtime
             .registry
@@ -23992,11 +23982,11 @@ async fn update_with_start_workflow(
     let uws_workflow_retry_policy =
         info_retry_policy_uws.and_then(|p| serde_json::to_value(&p).ok());
 
-    // Resolve the registered update handler once and reuse it for both the
-    // #610 schema-400 check and the #684 validator-422 check, mirroring the
-    // plain `admit_update` route so the two entry points stay consistent.
-    // Skipped entirely on a committed-replay hit (`probe_outcome.is_some()`):
-    // both gates are fresh-start-only, and a retry admits no new update.
+    // Resolve the registered update handler once. Both the #610 schema-400 check
+    // and the #684 validator-422 check reuse it. This mirrors the plain
+    // `admit_update` route, so the two entry points stay consistent. Skipped
+    // entirely on a committed-replay hit (`probe_outcome.is_some()`): both gates
+    // are fresh-start-only, and a retry admits no new update.
     if probe_outcome.is_none()
         && let Some(update_info) = runtime
             .registry
@@ -24005,13 +23995,13 @@ async fn update_with_start_workflow(
             .find(|h| h.workflow == workflow_name && h.name == request.update_name)
     {
         // issue #610: structural schema validation of the update argument
-        // against the handler's published `arg_schema` (if any). Runs *before*
-        // the semantic validator below so a malformed payload is rejected at
-        // the edge with a field-level 400 rather than reaching the validator
-        // (422) or becoming durable history. A handler with no published schema
-        // validates Ok (today's behavior, unchanged). Closes the bypass where
-        // `update-with-start` durably admitted an unvalidated payload while the
-        // plain `admit_update` route already gated it.
+        // against the handler's published `arg_schema` (if any). It runs *before*
+        // the semantic validator below. So a malformed payload gets a field-level
+        // 400 at the edge, rather than reaching the validator (422) or becoming
+        // durable history. A handler with no published schema validates Ok (today's
+        // behavior, unchanged). Closes the bypass where `update-with-start` durably
+        // admitted an unvalidated payload while the plain `admit_update` route
+        // already gated it.
         if let Err(violations) = update_info.validate_arg(&update_args) {
             let ar = NewAuditRecord {
                 actor: &actor,
@@ -24108,11 +24098,11 @@ async fn update_with_start_workflow(
         tenant: None,
     };
 
-    // A committed-replay hit short-circuits the authoritative in-lock call and
-    // feeds the cached outcome straight through the shared result match below
-    // (whose `Ok` arm polls for the cached update result and audits). A miss runs
-    // the authoritative path, which reserves the exactly-once update and stays
-    // the source of truth for the concurrent-first-delivery race.
+    // A committed-replay hit short-circuits the authoritative in-lock call. It
+    // feeds the cached outcome straight through the shared result match below,
+    // whose `Ok` arm polls for the cached update result and audits. A miss runs the
+    // authoritative path, which reserves the exactly-once update and stays the
+    // source of truth for the concurrent-first-delivery race.
     let result = match probe_outcome {
         Some(outcome) => Ok(outcome),
         None => {
@@ -24210,14 +24200,13 @@ async fn update_with_start_workflow(
             )
                 .into_response()
         }
-        // A genuine fresh admission rejected by a declared per-tenant
-        // resource quota (issue #946, AC4): a typed 429 naming the
-        // exhausted resource/key/limit/current, mirroring the plain start
-        // and signal-with-start routes' arms exactly. Never raised for an
-        // attach, since the quota check runs only on the fresh-insert
-        // branch inside `start_or_load_workflow_execution_collect`.
-        // Already counted on `harvest.quota.rejected` (AC6) inside the
-        // primitive itself.
+        // A declared per-tenant resource quota rejected a genuine fresh admission
+        // (issue #946, AC4). Return a typed 429 naming the exhausted
+        // resource/key/limit/current, exactly like the arms of the plain start and
+        // signal-with-start routes. It is never raised for an attach, since the
+        // quota check runs only on the fresh-insert branch inside
+        // `start_or_load_workflow_execution_collect`. The primitive itself already
+        // counted it on `harvest.quota.rejected` (AC6).
         Err(HarvestError::QuotaExceeded {
             workflow_name,
             key,
@@ -24282,8 +24271,8 @@ async fn update_with_start_workflow(
             let timeout_secs = request.timeout_secs.unwrap_or(30);
 
             // An idempotent retry (!update_admitted) should still poll when
-            // wait_for_stage = "completed" — the update was previously admitted
-            // with the same update_id and may already have a result in history.
+            // wait_for_stage = "completed". The update was previously admitted with
+            // the same update_id and may already have a result in history.
             if wait_for_stage == "admitted" {
                 // Return immediately with the update_id for the caller to poll.
                 let ar = NewAuditRecord {
@@ -24364,9 +24353,9 @@ async fn update_with_start_workflow(
                 }
                 (status_code, Json(base)).into_response()
             } else {
-                // Update failed or timed out — return a structured error body that
-                // still carries execution_id and update_id so callers can retry or
-                // inspect history without losing the context from the admitted update.
+                // Update failed or timed out. Return a structured error body that
+                // still carries execution_id and update_id. Callers can then retry or
+                // inspect history without losing the context of the admitted update.
                 let poll_status = poll_resp.0.status;
                 let body_val = axum::body::to_bytes(poll_resp.1, usize::MAX)
                     .await
@@ -24447,9 +24436,9 @@ pub(crate) async fn cancel_workflow(
     // Issue #843: route to the LIVE attempt of the workflow-level retry chain
     // (#523). Without this, a cancel issued against the id returned by `start`
     // no-ops against the sealed `FAILED` predecessor while the retry keeps
-    // running — the sharpest correctness gap this routing closes. The response's
-    // `execution_id` reports the attempt actually cancelled. For a workflow with
-    // no retry policy this is exactly `cancel_workflow_execution`.
+    // running. That is the sharpest correctness gap this routing closes. The
+    // response's `execution_id` reports the attempt actually cancelled. For a
+    // workflow with no retry policy this is exactly `cancel_workflow_execution`.
     //
     // `cancel_live_attempt` binds each resolved hop to its own real shard
     // internally (issue #1596 follow-up review, comment 4052389744), rather
@@ -24483,11 +24472,11 @@ pub(crate) async fn cancel_workflow(
         Ok(cancelled) => {
             // Issue #843: the audit record's subject is the execution actually
             // mutated, which after routing may be a retry successor rather than
-            // the addressed id. Keying on the mutated row is what lets an
-            // auditor asking "who terminated/cancelled A3?" find this row; the
-            // addressed id stays reconstructible either way, because the
-            // `retry_of_exec_id` chain is durable. The failure path above keeps
-            // the addressed id, since nothing was mutated.
+            // the addressed id. Keying on the mutated row lets an auditor who asks
+            // "who terminated/cancelled A3?" find this row. The addressed id stays
+            // reconstructible either way, because the `retry_of_exec_id` chain is
+            // durable. The failure path above keeps the addressed id, since nothing
+            // was mutated.
             let cancelled_id_str = cancelled.exec_id.to_string();
             let ar = NewAuditRecord {
                 actor: &actor,
@@ -24558,24 +24547,23 @@ mod metrics_recorder_or_noop_tests {
 
 /// Force-terminate a single workflow execution (issue #504).
 ///
-/// The forceful sibling of `cancel_workflow`: it delegates to the
-/// `terminate_workflow_execution` core primitive, sealing a live run in the
-/// `TERMINATED` state without requiring the workflow body to observe
-/// cancellation. Shard-aware (resolves the owning shard from the
-/// `ExecutionId`), audited via `OP_WORKFLOW_TERMINATE`, and idempotent against
-/// an already-terminal execution (non-mutating no-op, `newly_terminated:
-/// false`).
+/// The forceful sibling of `cancel_workflow`. It delegates to the
+/// `terminate_workflow_execution` core primitive, which seals a live run in the
+/// `TERMINATED` state without requiring the workflow body to observe cancellation.
+/// It is shard-aware (resolves the owning shard from the `ExecutionId`) and audited
+/// via `OP_WORKFLOW_TERMINATE`. It is idempotent against an already-terminal
+/// execution (non-mutating no-op, `newly_terminated: false`).
 async fn terminate_workflow(
     Extension(api_state): Extension<HarvestApiState>,
     Path(id): Path<String>,
     headers: axum::http::HeaderMap,
     // The request body is optional (the contract marks it `required: false`).
-    // Take raw `Bytes` rather than `Option<Json<…>>`: axum 0.8's optional-JSON
+    // Take raw `Bytes` rather than `Option<Json<…>>`. axum 0.8's optional-JSON
     // extractor still parses (and rejects with an EOF error) when a client sends
-    // `Content-Type: application/json` with a zero-byte body, so a body-less
-    // terminate would 422 before the defaulted-reason path runs. Parsing the
-    // bytes ourselves treats both an omitted body and an empty body as the
-    // default reason, and still rejects a genuinely malformed non-empty body.
+    // `Content-Type: application/json` with a zero-byte body. So a body-less
+    // terminate would 422 before the defaulted-reason path runs. Parsing the bytes
+    // here treats both an omitted body and an empty body as the default reason. It
+    // still rejects a genuinely malformed non-empty body.
     body: axum::body::Bytes,
 ) -> Result<(axum::http::StatusCode, Json<TerminateWorkflowResponse>), AutumnError> {
     let (actor, source, request_id) = audit_context(&headers, &api_state);
@@ -24715,13 +24703,12 @@ const fn rerun_failure_record<'a>(
 
 /// Best-effort failed-audit on the CALLER'S connection (issue #777).
 ///
-/// Every rejection that happens after `db_conn_for_execution` succeeded must
-/// use this form: acquiring a second pool connection while the caller still
-/// holds one stalls a size-1 pool until the checkout times out (the audit then
-/// silently no-ops), and on a multi-shard deployment the pool-acquiring form
-/// lands the row on the DEFAULT shard instead of the execution's own. Mirrors
-/// the connection-threading `audit_decoded_read` adopted for the same reason
-/// (issue #608).
+/// Every rejection after `db_conn_for_execution` succeeded must use this form. A
+/// second pool connection, acquired while the caller still holds one, stalls a
+/// size-1 pool until the checkout times out. The audit then silently no-ops. On a
+/// multi-shard deployment the pool-acquiring form also lands the row on the DEFAULT
+/// shard instead of the execution's own. This mirrors the connection-threading
+/// `audit_decoded_read` adopted for the same reason (issue #608).
 async fn audit_rerun_failure_on(
     conn: &mut AsyncPgConnection,
     ctx: &RerunAuditCtx<'_>,
@@ -24761,9 +24748,9 @@ async fn rerun_workflow(
     Extension(api_state): Extension<HarvestApiState>,
     Path(id): Path<String>,
     headers: axum::http::HeaderMap,
-    // Optional body (the contract marks it `required: false`). Raw `Bytes`
-    // rather than `Option<Json<…>>`: axum 0.8's optional-JSON extractor still
-    // rejects a zero-byte body sent with `Content-Type: application/json`, so a
+    // Optional body (the contract marks it `required: false`). Use raw `Bytes`
+    // rather than `Option<Json<…>>`. axum 0.8's optional-JSON extractor still
+    // rejects a zero-byte body sent with `Content-Type: application/json`. So a
     // body-less re-run would 422 before the defaulted path runs.
     body: axum::body::Bytes,
 ) -> axum::response::Response {
@@ -24778,13 +24765,12 @@ async fn rerun_workflow(
         route,
     };
 
-    // Parse the execution id FIRST (issue #777 review, Codex): once a
-    // well-formed shard-encoded id is known, every later rejection — including
-    // a malformed body, below — can audit through the execution's OWNING shard
-    // via `db_conn_for_execution` rather than the pool-acquiring default-shard
-    // fallback, which is the only form usable before an id is known at all. A
-    // malformed id (or a request malformed in both ways) still audits via the
-    // pool, unchanged.
+    // Parse the execution id FIRST (issue #777). Once a well-formed shard-encoded
+    // id is known, every later rejection can audit through the execution's OWNING
+    // shard via `db_conn_for_execution`. That includes a malformed body, below. The
+    // pool-acquiring default-shard fallback is the only form usable before an id is
+    // known at all. A malformed id (or a request malformed in both ways) still
+    // audits via the pool, unchanged.
     let exec_id = match parse_execution_id(&id) {
         Ok(eid) => eid,
         Err(e) => {
@@ -24807,15 +24793,14 @@ async fn rerun_workflow(
             Ok(r) => r,
             Err(e) => {
                 // The id is well-formed, so route this audit through the
-                // execution's own shard rather than the default-shard pool
-                // fallback (issue #777 review, Codex): in a multi-shard
-                // deployment where the source shard is healthy but the
-                // default shard is unavailable, the pool-acquiring form
-                // would silently drop this audit even though the owning
-                // connection could have recorded it. If the owning shard
-                // itself is unreachable there is genuinely no connection to
-                // audit through — skip, matching every other
-                // `db_conn_for_execution` failure in this handler (below).
+                // execution's own shard rather than the default-shard pool fallback
+                // (issue #777). Suppose a multi-shard deployment has a healthy source
+                // shard but an unavailable default shard. The pool-acquiring form
+                // would then silently drop this audit, even though the owning
+                // connection could have recorded it. If the owning shard itself is
+                // unreachable, there is genuinely no connection to audit through.
+                // Skip, matching every other `db_conn_for_execution` failure in this
+                // handler (below).
                 if let Ok(mut c) = db_conn_for_execution(&api_state, exec_id).await {
                     audit_rerun_failure_on(
                         &mut c,
@@ -24848,10 +24833,10 @@ async fn rerun_workflow(
         return resp;
     }
 
-    // From here on every failure audit rides the CALLER'S connection: acquiring
-    // a second pool connection while this one is held deadlocks a size-1 pool
-    // (the audit then silently no-ops), and on a multi-shard deployment the
-    // pool-acquiring form writes the row to the DEFAULT shard rather than the
+    // From here on every failure audit rides the CALLER'S connection. Acquiring a
+    // second pool connection while this one is held deadlocks a size-1 pool, and
+    // the audit then silently no-ops. On a multi-shard deployment the
+    // pool-acquiring form also writes the row to the DEFAULT shard, not the
     // execution's own. Mirrors `audit_decoded_read`'s conn-threading (#608).
     let mut conn = match db_conn_for_execution(&api_state, exec_id).await {
         Ok(c) => c,
@@ -24868,11 +24853,11 @@ async fn rerun_workflow(
         }
     };
 
-    // Fail closed if the runtime is not installed (the boot window). `conn`
-    // and `exec_id_str` are already in scope, so — like every other
-    // rejection path in this handler — this audits through the caller's own
-    // connection rather than silently dropping an observable mutation
-    // attempt from the trail (issue #605/#777 review, Codex).
+    // Fail closed if the runtime is not installed (the boot window). `conn` and
+    // `exec_id_str` are already in scope. So, like every other rejection path in
+    // this handler, this audits through the caller's own connection. It never
+    // silently drops an observable mutation attempt from the trail
+    // (issue #605/#777).
     let runtime = match api_state.runtime() {
         Ok(rt) => rt,
         Err(e) => {
@@ -24924,10 +24909,10 @@ async fn rerun_workflow(
     // issue #373: validate an explicitly supplied OVERRIDE against the target
     // workflow's published input schema, at the edge, before anything is
     // started. "Validate the override, not the clone": a VERBATIM clone is
-    // deliberately never re-validated, because a run started under an older or
-    // looser schema must stay re-runnable — re-validating the clone would
-    // silently strand every historical run of that workflow type the moment an
-    // author tightened the schema, which is exactly when re-running matters.
+    // deliberately never re-validated. A run started under an older or looser
+    // schema must stay re-runnable. Re-validating the clone would silently strand
+    // every historical run of that workflow type once an author tightened the
+    // schema. That is exactly when re-running matters.
     if let Some(ref override_input) = input_override
         && let Some(info) = runtime.registry.workflows.get(&source.workflow_name)
         && let Err(violations) = info.validate_input(override_input)
@@ -24967,9 +24952,9 @@ async fn rerun_workflow(
         return map_error(undecodable_stored_payload()).into_response();
     };
 
-    // Deferred-start policies are incompatible with a re-run: they admit the
-    // start without creating an execution, so there is no execution_id to
-    // return and the 201 contract cannot be honoured.
+    // Deferred-start policies are incompatible with a re-run. They admit the start
+    // without creating an execution. So there is no execution_id to return, and
+    // the 201 contract cannot be honoured.
     let deferred_reason = if workflow_has_resolving_debounce(
         &runtime.registry,
         &source.workflow_name,
@@ -25015,29 +25000,28 @@ async fn rerun_workflow(
         .into_response();
     }
 
-    // issue #605 review (Codex, PR #1152): a re-run clones the source's
-    // stored `completion_callbacks` VERBATIM (below), so a target that was
-    // admissible when the source started but has since been dropped from
-    // the SSRF allowlist must be re-validated here — otherwise the rerun
-    // silently succeeds (201, possibly sealing the source) while the actual
-    // delivery attempt is skipped without error at
-    // `enqueue_completion_deliveries`'s own live-policy re-validation (a
-    // `tracing::warn!` only, never surfaced to the caller). Both
+    // issue #605 (PR #1152): a re-run clones the source's stored
+    // `completion_callbacks` VERBATIM (below). A target may have been admissible
+    // when the source started but has since been dropped from the SSRF allowlist.
+    // Such a target must be re-validated here. Otherwise the rerun silently
+    // succeeds (201, possibly sealing the source), while the actual delivery
+    // attempt is skipped without error. That skip happens in the live-policy
+    // re-validation inside `enqueue_completion_deliveries`, which only emits a
+    // `tracing::warn!` and never tells the caller. Both
     // `api_state.completion_callback_ssrf_policy()` and the process-global
-    // `GLOBAL_CALLBACK_CONFIG` that scanner consults are installed from the
-    // SAME `built.completion_callback_config()` at plugin startup, so this
-    // check predicts the delivery-time outcome exactly.
+    // `GLOBAL_CALLBACK_CONFIG` that scanner consults are installed from the SAME
+    // `built.completion_callback_config()` at plugin startup. So this check
+    // predicts the delivery-time outcome exactly.
     //
-    // This is deliberately the OPPOSITE call from the input-schema decision
-    // above ("validate the override, not the clone"): a run started under a
-    // now-looser input schema is still perfectly re-runnable with its old,
-    // valid input — re-validating it would only strand a legitimate re-run
-    // for no safety benefit. A stale callback target has no such benign
-    // fallback: silently accepting it just defers a real failure to a place
-    // nobody is watching, so the clone IS re-validated here and the whole
-    // re-run is rejected (mirroring the normal start route's own
-    // all-or-nothing target validation) before anything is started or the
-    // source is touched.
+    // This is deliberately the OPPOSITE call from the input-schema decision above
+    // ("validate the override, not the clone"). A run started under a now-looser
+    // input schema is still perfectly re-runnable with its old, valid input.
+    // Re-validating it would only strand a legitimate re-run for no safety
+    // benefit. A stale callback target has no such benign fallback. Silently
+    // accepting it just defers a real failure to a place nobody is watching. So the
+    // clone IS re-validated here, and the whole re-run is rejected before anything
+    // is started or the source is touched. This mirrors the normal start route's
+    // own all-or-nothing target validation.
     if let Some(raw) = source.completion_callbacks.clone() {
         let targets: Vec<autumn_harvest::completion_callback::CallbackTarget> =
             match serde_json::from_value(raw) {
@@ -25143,18 +25127,16 @@ async fn rerun_workflow(
 
     match result {
         Ok(outcome) => {
-            // Propagate a success-audit write failure (issue #777 review,
-            // Codex — matches `cancel_workflow`/`terminate_workflow`, the
-            // adjacent single-execution admin mutations, both of which
-            // `.map_err(map_error)?` this same insert rather than swallowing
-            // it): the re-run is already durable by this point, but an
-            // unrecorded success is an admin mutation missing from the audit
-            // trail, and this row is the ONLY durable place
-            // `source_prior_state` survives once the source is sealed to
-            // CONTINUED_AS_NEW — losing the write silently would lose that
-            // detail for good. A client that sees this 500 and retries hits
-            // the state gate cleanly (the source is already sealed), so this
-            // can never double-start a run.
+            // Propagate a success-audit write failure (issue #777). This matches
+            // `cancel_workflow`/`terminate_workflow`, the adjacent single-execution
+            // admin mutations. Both `.map_err(map_error)?` this same insert rather
+            // than swallowing it. The re-run is already durable by this point. But
+            // an unrecorded success is an admin mutation missing from the audit
+            // trail. This row is also the ONLY durable place `source_prior_state`
+            // survives once the source is sealed to CONTINUED_AS_NEW. Losing the
+            // write silently would lose that detail for good. A client that sees
+            // this 500 and retries hits the state gate cleanly (the source is
+            // already sealed). So this can never double-start a run.
             //
             // `error_summary` is the free-text detail column on a succeeded
             // row (precedent: the scheduler's `skipped_overlap` / `deferred`
@@ -25284,10 +25266,9 @@ async fn pause_workflow(
     Extension(api_state): Extension<HarvestApiState>,
     Path(id): Path<String>,
     headers: axum::http::HeaderMap,
-    // The request body is optional (issue #383): pausing without a reason is the
-    // common case, so a no-body / no-content-type POST must still pause rather
-    // than be rejected by the required-`Json` extractor before reaching the
-    // defaulted `reason`.
+    // The body is optional (issue #383). A pause without a reason is the
+    // common case. A required `Json` extractor would reject a POST with no
+    // body or no content type.
     request: Option<Json<PauseWorkflowRequest>>,
 ) -> Result<(axum::http::StatusCode, Json<PauseWorkflowResponse>), AutumnError> {
     let (actor, source, request_id) = audit_context(&headers, &api_state);
@@ -25311,9 +25292,9 @@ async fn pause_workflow(
     let metrics_ref = metrics_recorder_or_noop(&api_state);
 
     // Issue #843: route to the live attempt of the retry chain (#523). Pause
-    // only accepts a `RUNNING`/`PAUSED` row, so an unrouted pause of a retried
-    // run 409s against its sealed `FAILED` predecessor — denying the operator
-    // the one reversible containment lever.
+    // accepts only a `RUNNING`/`PAUSED` row. An unrouted pause of a retried
+    // run gets 409 from its sealed `FAILED` predecessor. That denies the
+    // operator the one reversible containment lever.
     //
     // `pause_live_attempt` binds each resolved hop to its own real shard
     // internally (issue #1596 follow-up review, comment 4052389744), rather
@@ -25368,11 +25349,10 @@ async fn pause_workflow(
 }
 
 /// `POST /workflows/{id}/resume` — re-arm a paused execution (issue #383).
-/// Returns 200 on success and 404 if not found. Resuming a non-paused
-/// execution (running or terminal) is a 200 success no-op reporting
-/// `newly_resumed: false` (issue #609, AC7) so an operator retry after the
-/// run already resumed — or completed post-resume — never errors, mirroring
-/// terminate's `newly_terminated: false` precedent.
+/// Returns 200 on success and 404 if not found. A resume of a running or
+/// terminal execution is a 200 no-op with `newly_resumed: false` (issue #609,
+/// AC7). So an operator retry never errors after the run resumed or
+/// completed. Terminate's `newly_terminated: false` sets the precedent.
 async fn resume_workflow(
     Extension(api_state): Extension<HarvestApiState>,
     Path(id): Path<String>,
@@ -25387,9 +25367,8 @@ async fn resume_workflow(
     let metrics_ref = metrics_recorder_or_noop(&api_state);
 
     // Issue #843: route to the live attempt of the retry chain (#523). Resume is
-    // an idempotent success no-op against a non-paused row, so an unrouted
-    // resume of a retried run would report success while the paused live
-    // attempt stayed parked.
+    // an idempotent no-op on a non-paused row. An unrouted resume of a retried
+    // run reports success while the paused live attempt stays parked.
     //
     // `resume_live_attempt` binds each resolved hop to its own real shard
     // internally (issue #1596 follow-up review, comment 4052389744), rather
@@ -25445,28 +25424,24 @@ async fn resume_workflow(
 
 /// Request body for `PATCH /workflows/{id}/triage` (issue #759).
 ///
-/// Each field is independently optional and tri-state, mirroring the
-/// `UpdateWorkflowScheduleRequest` (issue #771) PATCH contract: absent from
-/// the request = unchanged; explicit JSON `null` = clear; a value = set.
+/// Each field is optional and tri-state, like the
+/// `UpdateWorkflowScheduleRequest` (issue #771) PATCH contract. Absent means
+/// unchanged, JSON `null` means clear, and a value means set.
 ///
-/// `deny_unknown_fields`: a typo'd field name (`"onwer"`) would otherwise
-/// silently deserialize to an all-`None` (no-op) body and 200-succeed with
-/// nothing changed — the rejection surfaces as a structured 400 instead (see
-/// [`annotate_workflow_handler`]).
+/// `deny_unknown_fields`: a misspelt field name (`"onwer"`) otherwise
+/// deserializes to an all-`None` body and returns 200 with no change. The
+/// rejection is a structured 400 instead (see [`annotate_workflow_handler`]).
 ///
-/// A set (non-clear, non-absent) value is truncated to
-/// [`OPERATOR_REASON_MAX_CHARS`] at the `From<TriageWorkflowRequest> for
-/// TriagePatch` boundary before it reaches the core — these fields are now
-/// runtime, HTTP-caller-controlled strings (unlike the compile-time
-/// `&'static str` `owner`/`severity` defaults from issue #372) and are
-/// persisted durably and echoed into the audit log, so they get the same cap
-/// every other free-text operator field on this router already applies.
+/// The `From<TriageWorkflowRequest> for TriagePatch` boundary truncates a set
+/// value to [`OPERATOR_REASON_MAX_CHARS`]. These fields are runtime strings
+/// from the HTTP caller, unlike the `&'static str` defaults from issue #372.
+/// They persist durably and go into the audit log. So they get the same cap
+/// as every other free-text operator field on this router.
 ///
-/// `owner`/`severity` are additionally trimmed and, if empty after
+/// `owner`/`severity` are also trimmed and, if empty after
 /// trimming, folded into an explicit clear -- see [`normalize_triage_label`].
-/// `note` is deliberately left untrimmed: unlike the two label fields it has
-/// no filtering requirement (issue #759 scope), so there is no read-side
-/// trim contract it needs to stay symmetric with.
+/// `note` is not trimmed. It has no filter (issue #759 scope), so no
+/// read-side trim contract applies to it.
 #[allow(clippy::option_option)]
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -25483,19 +25458,15 @@ struct TriageWorkflowRequest {
 /// persisted (issue #759 review).
 ///
 /// `GET /workflows?owner=...&severity=...` (`parse_workflow_filters`) trims
-/// the query value and treats an all-whitespace value as "no filter" — so an
-/// untrimmed or all-whitespace stored label would be permanently
-/// unaddressable via the advertised list filter. Trimming here keeps the
-/// write and read sides symmetric: a whitespace-only `Set` folds into an
-/// explicit `Clear` (`Some(None)`) rather than persisting a phantom,
-/// unfilterable value; an explicit `Clear` (`Some(None)`) or an absent field
-/// (`None`) both pass through the outer `Option` untouched via `and_then`.
+/// the query value and treats an all-whitespace value as "no filter". So the
+/// list filter can never match an untrimmed or all-whitespace stored label.
+/// Trimming here keeps the write and read sides symmetric. A whitespace-only
+/// `Set` folds into an explicit `Clear` (`Some(None)`). An explicit `Clear`
+/// or an absent field (`None`) passes through unchanged.
 ///
-/// `Option<Option<String>>` is the tri-state PATCH shape shared with
-/// `TriageWorkflowRequest` above (which already carries the same
-/// `#[allow(clippy::option_option)]`); this is a standalone helper (not
-/// inlined at its two call sites) because it is independently documented
-/// and exercised by
+/// `Option<Option<String>>` is the tri-state PATCH shape of
+/// `TriageWorkflowRequest`. This helper stands alone so that tests exercise
+/// it directly:
 /// `whitespace_padded_owner_and_severity_are_trimmed_and_filterable` and
 /// `all_whitespace_owner_set_is_folded_into_a_clear` in
 /// `triage_integration.rs`.
@@ -25515,14 +25486,12 @@ fn normalize_triage_label(value: Option<Option<String>>) -> Option<Option<String
 
 impl From<TriageWorkflowRequest> for TriagePatch {
     fn from(request: TriageWorkflowRequest) -> Self {
-        // Bound each set value at the API boundary before it becomes a
-        // durable, unbounded-length Postgres TEXT column and an audit-log
-        // old->new summary -- the same `truncate_operator_reason` cap every
-        // other free-text operator field on this router already applies (pause's
-        // `reason`, legal-hold's `reason`, the queue-pause `reason`). A tri-
-        // state "clear" (`Some(None)`) is unaffected by the inner `.map`/
-        // `and_then`. `owner`/`severity` are additionally trimmed via
-        // `normalize_triage_label`; `note` keeps the plain length-only cap.
+        // Bound each set value before it becomes an unbounded Postgres TEXT
+        // column and an audit-log old->new summary. Every other free-text
+        // operator field on this router has the same cap (pause, legal-hold
+        // and queue-pause `reason`). A tri-state "clear" (`Some(None)`) is
+        // unaffected. `normalize_triage_label` also trims `owner`/`severity`.
+        // `note` keeps the plain length-only cap.
         Self {
             owner: normalize_triage_label(request.owner),
             severity: normalize_triage_label(request.severity),
@@ -25544,9 +25513,10 @@ struct TriageWorkflowResponse {
     severity: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     note: Option<String>,
-    /// Field names this call actually changed (empty on a true no-op /
-    /// idempotent repeat, e.g. re-setting an identical value or an empty
-    /// patch — issue #759 AC4).
+    /// Field names this call changed (issue #759 AC4).
+    ///
+    /// Empty on an idempotent repeat, such as an identical value or an empty
+    /// patch.
     changed_fields: Vec<&'static str>,
 }
 
@@ -25566,13 +25536,10 @@ impl From<TriageOutcome> for TriageWorkflowResponse {
 /// (issue #759 review).
 ///
 /// Every real value is double-quoted with `"` and `\` escaped; the unset
-/// sentinel renders as the bare, unquoted `(none)`. Two ambiguities this
-/// closes: (1) a free-text value containing `"; field: a -> b"` (most
-/// plausibly `note`) can no longer be mistaken for a second, bogus
-/// field-change entry once the whole value is wrapped in quotes; (2) a
-/// value that is literally the string `"(none)"` renders as the quoted
-/// `"(none)"`, visibly distinct from the unquoted `(none)` sentinel used
-/// for "unset".
+/// sentinel renders as the bare, unquoted `(none)`. This closes two
+/// ambiguities. First, a free-text value that contains `"; field: a -> b"`
+/// cannot pass for a second field-change entry. Second, the literal string
+/// `"(none)"` renders quoted, distinct from the unquoted `(none)` sentinel.
 fn escape_triage_audit_value(value: Option<&str>) -> String {
     value.map_or_else(
         || "(none)".to_string(),
@@ -25628,22 +25595,18 @@ async fn annotate_workflow_handler(
     let route = "PATCH /workflows/{id}/triage";
 
     let exec_id = parse_execution_id(&id)?;
-    // Deliberately the **exact** shard resolver, not the lenient
-    // `db_conn_for_execution` (issue #759 review): this route MUTATES, and
-    // the lenient resolver falls back to the default shard when the id's
-    // owning shard has no configured pool on this node -- the documented
-    // mid-shard-add rollout state. For a write that fallback is strictly
-    // worse than the false-404 a read would produce: it can either report a
-    // false 404 for an execution that genuinely exists on the unreachable
-    // shard, or -- if the default shard happens to hold an unrelated row
-    // sharing the same UUID -- silently mutate the wrong database. Mirrors
-    // `GET /workflows/{id}/tree` (see the `db_conn_for_execution_exact` doc
-    // comment): `Err` -> `503` when the owning shard is known but
-    // unreachable (propagated by `?`); `Ok(None)` when the id encodes a
-    // shard this deployment does not know about at all -- nothing here
-    // could ever host it, and there is no shard to audit the attempt
-    // against, so this returns the honest `404` directly rather than
-    // through the audited-failure path below.
+    // This uses the exact shard resolver, not the lenient
+    // `db_conn_for_execution` (issue #759 review), because this route mutates.
+    // The lenient resolver falls back to the default shard when the owning
+    // shard has no pool on this node, as during a shard add. For a write,
+    // that fallback is worse than a false 404 on a read. It can report a
+    // false 404 for a real execution on the unreachable shard. Or, if the
+    // default shard holds an unrelated row with the same UUID, it mutates
+    // the wrong database. This mirrors `GET /workflows/{id}/tree` (see
+    // `db_conn_for_execution_exact`). `Err` maps to `503` when the owning
+    // shard is known but unreachable. `Ok(None)` means that no known shard
+    // can host the id. There is then no shard to audit against, so this
+    // returns `404` directly, not through the audited-failure path.
     let Some(mut conn) = db_conn_for_execution_exact(&api_state, exec_id).await? else {
         return Err(AutumnError::not_found_msg(format!(
             "workflow execution {exec_id} not found"
@@ -25651,13 +25614,12 @@ async fn annotate_workflow_handler(
     };
     let exec_id_str = exec_id.to_string();
 
-    // Body deserialization is unwrapped in-handler (rather than by a bare
-    // `Json` extractor) so a rejected body -- most importantly an unknown
-    // field, rejected via `deny_unknown_fields` since every real field is
-    // optional and a typo'd name would otherwise silently no-op -- surfaces
-    // as this route's structured 400 JSON error with a failed audit row,
-    // never as axum's default plain-text 422 (mirrors
-    // `update_schedule_handler`, issue #771).
+    // The handler unwraps the body itself, not through a bare `Json`
+    // extractor. So a rejected body becomes this route's structured 400 with
+    // a failed audit row, not axum's plain-text 422. The key case is an
+    // unknown field: every real field is optional, so a misspelt name would
+    // otherwise silently do nothing. This mirrors `update_schedule_handler`
+    // (issue #771).
     let request = match request {
         Ok(Json(request)) => request,
         Err(rejection) => {
@@ -25707,12 +25669,10 @@ async fn annotate_workflow_handler(
 
     match result {
         Ok(outcome) => Ok(Json(outcome.into())),
-        // `conflict_from` (not the bare `map_error`) matches every sibling
-        // audited-mutation handler (pause/resume/legal-hold/terminate/cancel/
-        // reset): `annotate_workflow_execution` today only ever returns
-        // `NotFound`/`Database`, both of which flow through unchanged, but a
-        // future `Config` ("execution is redacted/purged") would then map to
-        // 409 automatically rather than the misleading `map_error` default.
+        // `conflict_from`, not the bare `map_error`, matches every sibling
+        // audited-mutation handler. `annotate_workflow_execution` returns only
+        // `NotFound`/`Database` today, and both pass through unchanged. A
+        // future `Config` error ("execution is purged") then maps to 409.
         Err(e) => Err(conflict_from(e)),
     }
 }
@@ -25761,19 +25721,15 @@ async fn erase_workflow_payloads_handler(
     let exec_id_str = exec_id.to_string();
 
     // Cross-residence (issue #964): a rebalanced execution's payloads exist on
-    // the sealed source shard as well as the live target, and an erasure that
-    // scrubbed only the shard the id routes to would leave a complete readable
-    // copy of the subject's data behind on another database.
+    // the sealed source shard and on the live target. An erasure of only the
+    // routed shard leaves a readable copy of the data on another database.
     //
-    // NOTE the deliberate absence of a held connection around this call. The
-    // helper checks out its own connection PER RESIDENCE, starting with the
-    // live one — so holding the audit connection across it would have this
-    // request waiting on a pool slot it is itself holding whenever the live
-    // shard's pool is the supported minimum size of one. That would wedge every
-    // erasure, migrated or not, until checkout timed out. The audit connection
-    // is therefore acquired AFTER the erase returns, which is the same
-    // one-connection-at-a-time discipline the cross-shard cancel path keeps for
-    // issue #688's precedent.
+    // No connection is held around this call. The helper checks out its own
+    // connection for each residence, the live one first. With a live pool of
+    // the minimum size of one, a held audit connection makes the request wait
+    // on its own slot. That wedges every erasure until checkout times out. So
+    // the audit connection is acquired after the erase returns. The
+    // cross-shard cancel path keeps the same one-connection rule (issue #688).
     let result = match api_state.storage_pool() {
         Ok(pool) => {
             autumn_harvest::erase::erase_workflow_payloads_all_residences(
@@ -25867,11 +25823,10 @@ async fn set_legal_hold_handler(
         ),
     };
 
-    // Reject a `hold_until` already in the past (issue #747 MAJOR): for a
-    // compliance primitive, silently reporting `held: true` for a hold that is
-    // immediately inactive (eligible for deletion/erasure) is the worst failure
-    // mode. A clear 400 is returned before any DB round-trip, mirroring the
-    // malformed-RFC3339 rejection above.
+    // Reject a `hold_until` already in the past (issue #747). For a compliance
+    // primitive, the worst failure is `held: true` for a hold that is already
+    // inactive, so open to deletion or erasure. A clear 400 returns before any
+    // DB round-trip.
     if let Some(until) = hold_until
         && until <= now
     {
@@ -25918,7 +25873,7 @@ async fn set_legal_hold_handler(
     // success the write already reports the shard it landed on, so this
     // reuses that instead of re-walking the forwarding pointer from
     // scratch. `ShardUnavailable` means the write itself could not resolve
-    // a working shard (Codex review). Retrying that same resolution here
+    // a working shard. Retrying that same resolution here
     // would cost the caller a second pool-checkout wait on an
     // already-unavailable shard. This skips the audit write in that one
     // case. Every other error is cheap to retry a checkout for and still
@@ -26111,11 +26066,11 @@ async fn retry_activity_now(
             // next_retry_at is the new scheduled_at only when the task was
             // actually advanced (it will be ≈ now, backdated by the skew
             // allowance). Omit it for both no-op cases (already eligible or
-            // concurrent claim) so callers can detect the three distinct
-            // outcomes via (advanced, already_eligible):
-            //   (true,  _)     → task was advanced, now immediately eligible
-            //   (false, true)  → was already eligible, no change needed
-            //   (false, false) → concurrent worker claimed it; it is RUNNING
+            // concurrent claim). Callers then tell the three outcomes apart
+            // by (advanced, already_eligible).
+            //   (true,  _)     → task was advanced, now immediately eligible.
+            //   (false, true)  → was already eligible, no change needed.
+            //   (false, false) → concurrent worker claimed it; it is RUNNING.
             let next_retry_at = outcome.advanced.then_some(outcome.scheduled_at);
             Ok((
                 axum::http::StatusCode::ACCEPTED,
@@ -26136,19 +26091,22 @@ async fn retry_activity_now(
 
 /// `POST /workflows/{id}/activities/{activity_exec_id}/fail-now` — force-fail
 /// exactly one hung in-flight (RUNNING) activity task (issue #765).
-/// Admin-guarded. Appends `ActivityFailed` with the distinct
-/// `OperatorForceFailed` error type (no new event variant), skips every
-/// remaining retry attempt, and wakes the parked workflow task so the owning
-/// workflow advances to its own failure/compensation path — it is NOT
-/// terminated. Returns 202 Accepted with `forced: true` when this call
-/// performed the force-fail, or `forced: false, already_forced: true` for an
-/// idempotent repeat on an already-forced task — including after the owning
-/// run has since sealed (the idempotent short-circuit wins over the
-/// terminal-execution guard, so a lost-response retry never flips to a 409).
-/// Returns 404 for unknown task IDs or wrong workflow, 409 for tasks that
-/// are not force-failable (not RUNNING, genuinely failed, a workflow task,
-/// or a non-already-forced task whose owning execution is already terminal —
-/// a sealed run's history must never grow another `ActivityFailed`).
+/// Admin-guarded.
+///
+/// Appends `ActivityFailed` with the `OperatorForceFailed` error type and no
+/// new event variant. It skips every remaining retry. It wakes the parked
+/// workflow task, so the workflow takes its own failure or compensation path.
+/// The workflow is not terminated.
+///
+/// Returns 202 with `forced: true` when this call force-failed the task. An
+/// idempotent repeat returns `forced: false, already_forced: true`, even after
+/// the run sealed. The idempotent short-circuit wins over the terminal guard,
+/// so a lost-response retry never gets 409.
+///
+/// Returns 404 for an unknown task ID or the wrong workflow. Returns 409 for a
+/// task that cannot be force-failed: not RUNNING, already failed, a workflow
+/// task, or an unforced task of a terminal execution. A sealed run's
+/// history must never grow another `ActivityFailed`.
 ///
 /// The optional `reason` is truncated to 500 chars at this boundary (see
 /// `truncate_operator_reason`) before it is durably recorded.
@@ -26160,10 +26118,10 @@ async fn fail_activity_now(
     Extension(api_state): Extension<HarvestApiState>,
     Path((id, activity_exec_id)): Path<(String, String)>,
     headers: axum::http::HeaderMap,
-    // Optional body ({"reason": "…"}): mirror `terminate_workflow`'s raw-Bytes
-    // handling so a body-less POST (or an empty body with a JSON content-type)
-    // still force-fails with the defaulted reason instead of 422-ing in the
-    // extractor, while a genuinely malformed non-empty body is rejected.
+    // Optional body ({"reason": "…"}), read as raw bytes like
+    // `terminate_workflow`. An empty body force-fails with the default
+    // reason, not a 422 from the extractor. A malformed non-empty body is
+    // rejected.
     body: axum::body::Bytes,
 ) -> Result<(axum::http::StatusCode, Json<FailActivityNowResponse>), AutumnError> {
     use autumn_harvest::models::NewAuditRecord;
@@ -26177,9 +26135,8 @@ async fn fail_activity_now(
         serde_json::from_slice(&body)
             .map_err(|e| AutumnError::bad_request_msg(format!("invalid JSON body: {e}")))?
     };
-    // Truncate the reason at the API boundary (mirrors erase-payloads): it is
-    // written durably into the forced event's message, `details.reason`, and
-    // the task-row envelope, so it must be bounded server-side.
+    // Truncate the reason at the API boundary. It is written durably into the
+    // forced event's message, `details.reason` and the task-row envelope.
     let reason = request.reason.as_deref().map(truncate_operator_reason);
 
     let exec_id = match parse_execution_id(&id) {
@@ -26881,10 +26838,10 @@ fn dag_retry_resolve_error_response(
     use crate::dag_retry::DagRetryResolveError as E;
     use axum::response::IntoResponse as _;
 
-    // Issue #780: a run that already unwound its compensations is a STATE
-    // conflict about the run (its carried-over side effects were rolled back),
-    // not a malformed node request — so it is the one resolver rejection that
-    // maps to `409`, alongside the sibling COMPLETED/RUNNING state conflicts.
+    // Issue #780: a run that already unwound its compensations is a state
+    // conflict, not a malformed node request. Its carried-over side effects
+    // were rolled back. So it is the one resolver rejection that maps to
+    // `409`, like the COMPLETED/RUNNING state conflicts.
     if matches!(error, E::CompensatedRun) {
         return (
             axum::http::StatusCode::CONFLICT,
@@ -26969,8 +26926,10 @@ fn dag_retry_invalid_point_response(invalid: &ResetInvalidPoint) -> axum::respon
 }
 
 /// Map a `WorkflowResetError` raised during DAG retry onto the DAG-retry HTTP
-/// contract: the invalid-boundary case is a `409` (not the `400` the standalone
-/// reset uses), everything else mirrors the standalone reset mapping.
+/// contract.
+///
+/// The invalid-boundary case is a `409`, not the `400` of the standalone
+/// reset. Every other case mirrors the standalone reset mapping.
 fn dag_retry_reset_error_response(error: WorkflowResetError) -> axum::response::Response {
     use axum::response::IntoResponse as _;
 
@@ -26996,11 +26955,12 @@ fn dag_retry_reset_error_response(error: WorkflowResetError) -> axum::response::
     }
 }
 
-/// A DAG-retry failure, shared by the HTTP handler (which maps it back to the
-/// exact #366 rich response bodies, byte-for-byte, via [`into_http_response`])
-/// and the Vantage UI (which renders [`human_message`] as an operator flash).
-/// The mutation flow — state gating, resolve, dry-run preview, commit, and
-/// audit — lives once in [`retry_dag_run_inner`]; both surfaces call it.
+/// A DAG-retry failure, shared by the HTTP handler and the Vantage UI.
+///
+/// The handler maps it back to the exact #366 response bodies through
+/// [`into_http_response`]. The UI renders [`human_message`] as an operator
+/// flash. The mutation flow lives once in [`retry_dag_run_inner`], and both
+/// surfaces call it.
 ///
 /// [`into_http_response`]: DagRetryFailure::into_http_response
 /// [`human_message`]: DagRetryFailure::human_message
@@ -27017,10 +26977,9 @@ pub(crate) enum DagRetryFailure {
     /// The reset primitive rejected the fork (rich `409`/`400`).
     Reset(WorkflowResetError),
     /// The fork **committed** (a new run exists) but the audit insert failed
-    /// (`503`). This is a partial success: `new_exec_id` names the run that
-    /// actually started so operator surfaces (the Vantage UI) can point at it
-    /// instead of misreporting the retry as a hard failure. The HTTP wire
-    /// contract is unchanged — only `message` is surfaced there.
+    /// (`503`). This is a partial success. `new_exec_id` names the run that
+    /// started, so the Vantage UI can point at it and not report a hard
+    /// failure. The HTTP wire contract shows only `message`.
     AuditFailed {
         message: String,
         new_exec_id: String,
@@ -27134,12 +27093,12 @@ async fn retry_dag_run(
     }
 }
 
-/// Shared implementation behind the classic HTTP retry route (`retry_dag_run`,
-/// passing `source_override = None` so the audit `source` is header-derived) and
-/// the Vantage UI retry flow (`crate::ui`, passing `Some(SOURCE_UI)` plus a
-/// distinct `route` label). The state gate, resolve, dry-run preview, commit,
-/// and audit all live here so the two surfaces can never drift, mirroring the
-/// `trigger_dag_run` -> `trigger_dag_run_inner` precedent.
+/// Shared implementation of the HTTP retry route and the Vantage UI retry flow.
+///
+/// `retry_dag_run` passes `source_override = None`, so the audit `source`
+/// comes from the headers. `crate::ui` passes `Some(SOURCE_UI)` and its own
+/// `route` label. The whole mutation flow lives here, so the two surfaces
+/// cannot drift. `trigger_dag_run_inner` follows the same pattern.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(crate) async fn retry_dag_run_inner(
     api_state: &HarvestApiState,
@@ -27163,11 +27122,9 @@ pub(crate) async fn retry_dag_run_inner(
         ));
     }
 
-    // `operator_id` is the mandatory, authoritative "who" for this endpoint, so
-    // it is the audit actor unless an explicit `X-Harvest-Actor` was supplied
-    // (i.e. the actor extractor returned something other than the anonymous
-    // default). This keeps committed retries attributable instead of recording
-    // `anonymous` when the runbook curl / CLI only sets `operator_id`.
+    // `operator_id` is the mandatory "who" for this endpoint. It is the audit
+    // actor unless the caller sent an explicit `X-Harvest-Actor`. So a retry
+    // from the runbook curl or CLI does not record `anonymous`.
     let actor = if actor == "anonymous" {
         operator_id.trim().to_string()
     } else {
@@ -27238,17 +27195,16 @@ pub(crate) async fn retry_dag_run_inner(
     //  1. The issue #780 compensated-run guard goes BLIND. Erasure tombstones
     //     every payload field, so `ActivityScheduled.input` is
     //     `{"_harvest_erased": true}` and the compensation envelope is gone
-    //     (signal 2). Signal 1 normally still holds — the marker's *name* is not
+    //     (signal 2). Signal 1 normally still holds. The marker's *name* is not
     //     a payload field, and the positional "dispatch after the marker" check
-    //     needs no payload — but a DAG that unwound at a drained signal frontier
-    //     (issue #801) recorded no marker at all, so on that intersection BOTH
-    //     signals are blind and an already-rolled-back run would look retryable.
-    //     Nothing downstream can recover this: erasure is irreversible.
+    //     needs no payload. But a DAG that unwound at a drained signal frontier
+    //     (issue #801) recorded no marker at all. There BOTH signals are blind,
+    //     and an already-rolled-back run looks retryable. Nothing downstream
+    //     can recover this, because erasure is irreversible.
     //  2. Independent of compensation, the retry itself would produce garbage.
-    //     The #148 fork CARRIES OVER the upstream events, whose `output` fields
-    //     are now tombstones, so a re-executing downstream node with an
-    //     `input_from` binding (issue #702) would be handed
-    //     `{"_harvest_erased": true}` as its input.
+    //     The #148 fork carries over the upstream events, and their `output`
+    //     fields are now tombstones. A re-executing node with an `input_from`
+    //     binding (issue #702) gets `{"_harvest_erased": true}` as its input.
     //
     // O(1) row check, matching the issue #612 terminal-query precedent: erasure
     // always tombstones the execution row's own `input` column first.
@@ -27264,20 +27220,20 @@ pub(crate) async fn retry_dag_run_inner(
     // Walk the recorded history and resolve the node request to a reset point.
     //
     // NOTE (v1 limitation, issue #366): this resolves the cut and node sets from
-    // the *currently registered* `dag.definition`, while the #148 fork preserves
-    // the source run's pinned `assigned_build_id` (reset.rs). If worker build-id
-    // routing is in use (Phase 3.7, opt-in) AND the DAG topology changed across
-    // an incompatible deploy, the worker that replays the fork may run a
-    // different definition than the one used to pick the cut. v1 does not gate on
-    // build compatibility; see docs/runbooks/dag-retry-from-failed-node.md.
+    // the *currently registered* `dag.definition`. The #148 fork keeps the
+    // source run's pinned `assigned_build_id` (reset.rs). Worker build-id
+    // routing (Phase 3.7) is opt-in. With it on and a topology change across
+    // an incompatible deploy, the fork can replay a different definition than
+    // the one that picked the cut. v1 does not gate on build compatibility;
+    // see docs/runbooks/dag-retry-from-failed-node.md.
     // Load INFLATED + codec-decoded history: `resolve_retry_plan`'s
     // compensated-run guard (issue #780) reads `ActivityScheduled.input` to
     // recognise a compensation envelope, and `input` is a payload-bearing field.
-    // Plain `store::load_history` would hand the resolver an
+    // Plain `store::load_history` hands the resolver an
     // `_harvest_offload_envelope` reference (issue #524) or a codec envelope
-    // (issue #608) instead of the real value, hiding the envelope signal — a
-    // silent fail-OPEN that lets an already-rolled-back run be retried onto
-    // rolled-back state. The resolver cannot compensate for this itself: an
+    // (issue #608), not the real value. That hides the envelope signal. It
+    // fails open: an already-rolled-back run can be retried onto rolled-back
+    // state. The resolver cannot compensate for this itself: an
     // offloaded input is indistinguishable from a large ordinary forward input
     // (see `dag_retry::tests::
     // an_offloaded_compensation_envelope_is_invisible_and_must_be_inflated_by_the_caller`).
@@ -27285,19 +27241,18 @@ pub(crate) async fn retry_dag_run_inner(
     // With no `PayloadStore` registered the inflate pass is a pure in-memory
     // codec decode, so the default deployment costs no blob fetch. Only
     // oversized payloads do, and this is a low-frequency operator endpoint.
-    // Passing the runtime's real codecs (rather than the identity default
-    // `load_history` uses) additionally lets the guard see envelopes on a
-    // codec-encrypting deployment, where the endpoint previously failed closed
-    // with `UnknownPayloadCodec`. No payload is surfaced to the caller — the
-    // plan carries only node names and an event id.
+    // The runtime's real codecs, not the identity default of `load_history`,
+    // let the guard see envelopes on a codec-encrypting deployment. There the
+    // endpoint once failed closed with `UnknownPayloadCodec`. No payload
+    // reaches the caller, because the plan carries only node names and an
+    // event id.
     //
-    // Deliberately NOT `store::load_history_inflated`: that fetches every blob
-    // sequentially while still holding the connection it loaded the rows with,
-    // so a slow or unavailable payload store (or a few concurrent retries over
-    // large histories) would pin database pool slots and stall unrelated API and
-    // worker work. Load raw, release the pool slot, inflate/decode in memory,
-    // then reacquire for the preview/reset below — the same discipline the
-    // awaitables endpoint established.
+    // This is not `store::load_history_inflated`. That fetches every blob in
+    // sequence while it holds the connection that loaded the rows. A slow
+    // payload store, or a few concurrent retries over large histories, then
+    // pins pool slots and stalls unrelated API and worker work. So this loads
+    // raw rows, releases the pool slot and inflates in memory. It reacquires
+    // for the preview and reset below, as the awaitables endpoint does.
     let codecs = api_state.payload_codecs();
     let offloader = runtime.registry.payload_offloader();
     let raw = store::load_history_undecoded(&mut conn, exec_id)
@@ -27305,10 +27260,9 @@ pub(crate) async fn retry_dag_run_inner(
         .map_err(|e| DagRetryFailure::Other(map_error(e)))?;
     drop(conn);
 
-    // Fails CLOSED on any inflate/decode error: the issue #780 compensated-run
-    // guard reads `ActivityScheduled.input`, so degrading to the raw history
-    // would hide a compensation envelope and let an already-rolled-back run be
-    // retried onto rolled-back state.
+    // Fails closed on any inflate or decode error. The issue #780
+    // compensated-run guard reads `ActivityScheduled.input`. Raw history hides
+    // a compensation envelope, so an already-rolled-back run could be retried.
     let events = inflate_and_decode_events(&raw.events, &codecs, offloader)
         .await
         .map_err(|e| DagRetryFailure::Other(map_error(e)))?;
@@ -27431,11 +27385,10 @@ pub(crate) async fn signal_workflow(
     let route = "POST /workflows/{id}/signal/{signal_name}";
 
     // Exactly-once delivery key. A present `Idempotency-Key` header wins
-    // outright: an empty or non-UTF-8 value is rejected with 400 rather than
-    // silently degraded to at-least-once, so a client that intended exactly-once
-    // is never fooled. The `?idempotency_key=` query param is consulted only
-    // when the header is absent (an empty param there is treated as omitted).
-    // No key at all reproduces today's at-least-once behavior exactly.
+    // outright. An empty or non-UTF-8 value gets 400, not a silent fall back to
+    // at-least-once. The `?idempotency_key=` query param counts only when the
+    // header is absent, and an empty param counts as omitted. No key at all
+    // gives at-least-once delivery.
     let idempotency_key: Option<String> = if let Some(raw) = headers.get(HEADER_IDEMPOTENCY_KEY) {
         let Ok(key) = raw.to_str() else {
             return AutumnError::bad_request_msg("Idempotency-Key header is not valid UTF-8")
@@ -27450,7 +27403,7 @@ pub(crate) async fn signal_workflow(
     };
 
     // A connector's `SignalsWithStart` binding derives its key into this same
-    // `(workflow_exec_id, idempotency_key)` scope on `harvest_signals`, so a
+    // `(workflow_exec_id, idempotency_key)` scope on `harvest_signals`. So a
     // caller must not be able to claim one (issue #944 review).
     if let Some(key) = idempotency_key.as_deref()
         && let Some(resp) = reject_reserved_idempotency_key(key)
@@ -27501,10 +27454,10 @@ pub(crate) async fn signal_workflow(
     let exec_id_str = exec_id.to_string();
 
     // Issue #843: a signal names the LOGICAL run, so it is routed to the live
-    // attempt of the workflow-level retry chain (#523). Without this, a signal
-    // sent after attempt 1 sealed `FAILED` was inserted against — and dropped
-    // with — the sealed predecessor while the retry ran on. For a workflow with
-    // no retry policy this resolves to `exec_id` and is a strict no-op.
+    // attempt of the workflow-level retry chain (#523). Unrouted, a signal sent
+    // after attempt 1 sealed `FAILED` went to the sealed predecessor and was
+    // lost while the retry ran on. Without a retry policy this resolves to
+    // `exec_id` and is a no-op.
     //
     // Issue #1596 review: a retry successor can itself have been rebalanced
     // off `shard` after being minted. Residence is re-resolved at this hop
@@ -27547,19 +27500,18 @@ pub(crate) async fn signal_workflow(
     let target = ExecutionId::from_uuid(execution.id);
 
     // Issues #521 / #610: committed keyed-replay short-circuit. A keyed retry
-    // whose `(exec_id, idempotency_key)` row already landed must return the
-    // documented dedup no-op (202, `signal_delivered: false`) *before* the #610
-    // schema gate or the #252 payload cap runs below -- those may have been
-    // published or tightened since the original delivery, and rejecting an
-    // already-accepted signal with a 400 would regress #521's exactly-once
-    // contract (including the "retry after the run went terminal" case). A known
-    // duplicate needs neither the runtime nor validation, so this also works
-    // during the startup window before `install(runtime)`. The authoritative
-    // dedup stays in `send_signal_idempotent`'s insert-time `ON CONFLICT`; this
-    // read-only probe is a fast path for already-committed rows, so a concurrent
-    // first-delivery race (neither request sees a row yet) still falls through
-    // to validation + the `ON CONFLICT` insert. Skipped when no key is present,
-    // so fresh + unkeyed deliveries are still fully validated before enqueue.
+    // whose `(exec_id, idempotency_key)` row already landed returns the dedup
+    // no-op (202, `signal_delivered: false`). It returns before the #610 schema
+    // gate and the #252 payload cap below. Either may have changed since the
+    // original delivery. A 400 for an accepted signal would break the #521
+    // exactly-once contract, also for a retry after the run went terminal. A
+    // known duplicate needs neither the runtime nor validation. So this also
+    // works in the startup window before `install(runtime)`. The authoritative
+    // dedup stays in the insert-time `ON CONFLICT` of `send_signal_idempotent`.
+    // This read-only probe is a fast path for committed rows. A concurrent
+    // first-delivery race, where neither request sees a row, still goes to
+    // validation and the `ON CONFLICT` insert. With no key, a delivery is
+    // fully validated before enqueue.
     if let Some(key) = idempotency_key.as_deref() {
         // Issue #1596 follow-up review, comment 4052389744: `target` can
         // live on a different shard than `conn`. `conn` is still resolved
@@ -27636,13 +27588,11 @@ pub(crate) async fn signal_workflow(
 
     // Fail closed if the runtime is not installed yet, rather than silently
     // skipping the schema/cap checks below. `install_storage_pool` runs before
-    // `install(runtime)` during plugin startup (with a genuine `.await` -- the
-    // boot-time admission-gate load -- in between), so a request can reach this
-    // handler with a working storage pool while `runtime()` still errors.
-    // Without this check, that narrow startup window would let a payload slip
-    // through unvalidated (#610 schema gate) and uncapped (#252) into a durable
-    // signal row instead of being rejected at the edge. Mirrors `admit_update`
-    // and `update_with_start_workflow`'s identical hard requirement.
+    // `install(runtime)` during plugin startup, with a real `.await` between
+    // them (the admission-gate load). So a request can arrive with a working
+    // storage pool while `runtime()` still errors. In that window, a payload
+    // could reach a durable signal row unvalidated (#610) and uncapped (#252).
+    // `admit_update` and `update_with_start_workflow` have the same rule.
     let runtime = match api_state.runtime() {
         Ok(r) => r,
         Err(e) => return map_error(e).into_response(),
@@ -27669,10 +27619,10 @@ pub(crate) async fn signal_workflow(
     }
 
     // Signal payload is intentionally not stored in the audit record (no PII).
-    // `target` was resolved above and is what the #610 schema check validated
-    // against, so hand it straight to the delivery rather than walking the chain
-    // a second time (one full row load per hop, on the highest-volume mutating
-    // route). A re-drive inside still re-resolves from `exec_id`.
+    // The #610 schema check validated against `target`, so the delivery takes
+    // it directly. A second chain walk costs one row load per hop on the
+    // busiest mutating route. A re-drive inside still re-resolves from
+    // `exec_id`.
     //
     // Bound to `target_shard`, not `conn` directly (issue #1596 follow-up
     // review, comment 4052389744). Same reason as the idempotency-key probe
@@ -27823,13 +27773,12 @@ async fn hydrate_or_project(
     .await
     .map_err(map_error)?;
 
-    // Terminal executions are now queryable for post-mortem state inspection
-    // (issue #612): the workflow function is driven through replay and the query
-    // is served against its reconstructed state — the final state for a run that
-    // returned cooperatively, or the partial state at the recorded terminal point
-    // for a run the engine sealed while its function was parked mid-command
-    // (TIMED_OUT / CONTINUED_AS_NEW / mid-await CANCELLED/FAILED). See the
-    // classify_terminal_query call below.
+    // A terminal execution is queryable for post-mortem inspection (issue
+    // #612). Replay drives the workflow function, and the query reads its
+    // reconstructed state. A run that returned gives its final state. A run
+    // the engine sealed while parked mid-command gives its partial state at
+    // the terminal point (TIMED_OUT / CONTINUED_AS_NEW / mid-await
+    // CANCELLED/FAILED). See the classify_terminal_query call below.
     // Running/suspended executions keep the pre-#612 behaviour byte-for-byte:
     // the drive stops at the first genuine suspension and the query reads the
     // current partial state.
@@ -27838,9 +27787,9 @@ async fn hydrate_or_project(
     // A PII-erased terminal execution (issue #495) replays structurally but over
     // `{"_harvest_erased": true}` payloads, which would compute a misleading
     // answer. `erase_workflow_payloads` always tombstones the row's own `input`
-    // column, so this O(1) check is authoritative and far cheaper than
-    // re-scanning the full event history on every terminal query (#612). This
-    // takes precedence over the terminal-seal check below.
+    // column. So this O(1) check is authoritative and avoids a history scan on
+    // every terminal query (#612). It takes precedence over the terminal-seal
+    // check below.
     if terminal && erase::execution_input_is_erased(&execution.input) {
         return Err(map_error(HarvestError::HistoryUnavailable {
             exec_id: target,
@@ -27901,10 +27850,10 @@ async fn hydrate_or_project(
     // Whether the recorded history reached a terminal seal (issue #612). A run
     // the engine seals while its function is parked mid-command (TIMED_OUT,
     // CONTINUED_AS_NEW, mid-await CANCELLED/FAILED) replays to a suspension, not
-    // Poll::Ready — but its history DOES carry the terminal lifecycle event, so
-    // this distinguishes a legitimately sealed run (serve the partial state) from
-    // a genuinely truncated one (pruned/released → 410). Computed before the
-    // history is moved into the context below.
+    // Poll::Ready. But its history does carry the terminal lifecycle event. So
+    // this tells a sealed run (serve the partial state) from a truncated one
+    // (pruned or released, 410). It runs before the history moves into the
+    // context below.
     let sealed = terminal && history_reached_terminal_seal(&history.events);
 
     let ctx = WorkflowContext::for_replay_with_state_and_history_policy(
@@ -27915,32 +27864,29 @@ async fn hydrate_or_project(
     )
     // Issue #772: thread the execution row's execution_timeout /
     // deadline_at into the query replay context. A workflow with an
-    // execution_timeout records a `__harvest_deadline_probe` side-effect whenever
-    // it calls `should_continue_as_new()`; without the budget threaded here,
-    // `ctx.deadline()` is None, the deadline branch returns before its tolerant
-    // clock read, and the recorded probe is left UNCONSUMED at the cursor —
-    // diverging the next replayed command (running/in-process query) or the
-    // terminal-query drift check (`has_unconsumed_history` below → spurious 410).
+    // execution_timeout records a `__harvest_deadline_probe` side-effect on
+    // each call to `should_continue_as_new()`. Without the budget here,
+    // `ctx.deadline()` is None. The deadline branch then returns before its
+    // tolerant clock read, and the recorded probe stays unconsumed. That
+    // diverges the next replayed command, or makes the terminal drift check
+    // (`has_unconsumed_history` below) return a spurious 410.
     .with_execution_timeout(execution.execution_timeout)
     .with_deadline(execution.deadline_at)
     // Issue #698: thread the execution row's parent id so a query replayed on a
     // child run reports the spawning parent via `ctx.info().parent_execution_id`.
-    // Same class as execution_timeout/deadline_at above — the column lives on the
-    // execution row, absent from history, so this context (which sources those
-    // from the row) must source parent from the row too.
+    // Like execution_timeout/deadline_at above, the column lives on the
+    // execution row and not in history. So the parent comes from the row too.
     .with_parent_execution_id(execution.parent_id.map(ExecutionId::from_uuid))
     // Issue #2082: the query replays the body, so it needs the row's start source.
     .with_start_provenance(autumn_harvest::types::StartProvenance::from_row(
         execution.start_source.as_deref(),
         execution.continued_from_exec_id,
     ))
-    // Issue #698: thread the execution row's workflow type name and business
-    // `workflow_id` so a query replayed on this run reports the real values via
+    // Issue #698: thread the workflow type name and the business `workflow_id`
+    // from the execution row. A replayed query then reports the real
     // `ctx.info().workflow_type` / `ctx.info().workflow_id`. Both live on the
-    // execution row (`workflow_name` is the handler-lookup key, `workflow_id` the
-    // business id) and are absent from history, so this row-sourced context must
-    // apply them here — otherwise a query handler that reads them, or a workflow
-    // that branched on them during the drive, sees "".
+    // row and not in history. Without them, a query handler or a workflow that
+    // branched on them during the drive sees "".
     .with_workflow_name(execution.workflow_name.clone())
     .with_workflow_id(execution.workflow_id.clone());
 
@@ -27959,9 +27905,8 @@ async fn hydrate_or_project(
     // Drive the workflow future in replay, bounded by `query_timeout`. The
     // shared driver stops at either `Poll::Ready` (full history drained), a
     // genuine workflow-command suspension, or the deadline. Recorded events
-    // resolve via pre-sent oneshot channels so the entire history replays
-    // synchronously; this is read-only and appends no events / performs no
-    // writes (issue #612 AC4).
+    // resolve through pre-sent oneshot channels, so the history replays
+    // synchronously. This is read-only and writes nothing (issue #612 AC4).
     // The replayed handler gets the plaintext input (issue #1979).
     let input = api_state
         .payload_codecs()
@@ -27971,31 +27916,26 @@ async fn hydrate_or_project(
         drive_query_replay_async(&ctx, workflow.handler, input, api_state.query_timeout()).await;
 
     if terminal {
-        // Drift guard (Codex P2, PR #986 follow-up): if the driven handler
-        // settled to a servable state while genuine recorded non-lifecycle
-        // history remains unmatched, the workflow code changed since the run
-        // executed — the reconstructed state is misleading. `has_non_lifecycle_unconsumed`
-        // excludes trailing terminal-lifecycle events, so a truthfully replayed
-        // completed / sealed-while-parked run still reports false and Serves.
-        // Computed after the drive advances the replay cursor; read-only.
+        // Drift guard (PR #986 follow-up). The handler can settle to a servable
+        // state while recorded non-lifecycle history stays unmatched. Then the
+        // workflow code changed since the run, and the state is misleading.
+        // `has_non_lifecycle_unconsumed` excludes trailing terminal-lifecycle
+        // events. So a faithful replay of a completed or sealed run still
+        // reports false and serves. Computed after the drive moves the cursor.
         let has_unconsumed_history = ctx.history_has_unconsumed_events();
         match classify_terminal_query(outcome, sealed, has_unconsumed_history) {
-            // Full drive to Poll::Ready, OR a run the engine sealed while its
-            // function was parked mid-command (TIMED_OUT / CONTINUED_AS_NEW /
-            // mid-await CANCELLED / FAILED), with all recorded non-lifecycle
-            // history faithfully consumed: serve the reconstructed state at the
-            // recorded terminal point.
+            // A full drive to Poll::Ready, or a run sealed while parked
+            // mid-command. All recorded non-lifecycle history is consumed.
+            // Serve the reconstructed state at the recorded terminal point.
             TerminalQueryDecision::Serve => Ok(QueryTarget::Replay(Box::new(ctx))),
             TerminalQueryDecision::TimedOut => Err(map_error(HarvestError::QueryTimedOut {
                 query_name: query_label.to_string(),
                 timeout_ms: u64::try_from(api_state.query_timeout().as_millis())
                     .unwrap_or(u64::MAX),
             })),
-            // The recorded history has no terminal seal at all (pruned by
-            // retention / released on reset), or the drifted handler stopped
-            // short leaving recorded non-lifecycle history unconsumed (code
-            // drift). Never serve a partial/misleading answer; surface a
-            // distinct 410.
+            // The history has no terminal seal (pruned by retention or released
+            // on reset). Or a drifted handler stopped short of recorded
+            // non-lifecycle history. Never serve a misleading answer; return 410.
             TerminalQueryDecision::HistoryUnavailable => {
                 Err(map_error(HarvestError::HistoryUnavailable {
                     exec_id: target,
@@ -28006,16 +27946,14 @@ async fn hydrate_or_project(
             }
         }
     } else {
-        // Running/suspended: serve whatever state the drive reconstructed,
-        // exactly as before #612 — the drive naturally stops at the first
-        // suspension (or the deadline) for a partial, still-growing history.
+        // Running or suspended: serve the state the drive reconstructed, as
+        // before #612. The drive stops at the first suspension or the deadline.
         //
-        // Issue #782: the shared driver catches a workflow-handler panic
-        // regardless of terminal/running state (a code-changed in-flight run
-        // whose query-drive panics). The reconstructed context is untrustworthy,
-        // so surface a clean `QueryHandlerPanicked` (503) rather than serving
-        // torn/partial state with a 200 — matching how the terminal path routes
-        // `Panicked` to an error via `classify_terminal_query`.
+        // Issue #782: the shared driver catches a workflow-handler panic in
+        // any state, such as a code-changed in-flight run. The reconstructed
+        // context is then untrustworthy. So return `QueryHandlerPanicked`
+        // (503), not torn state with a 200. The terminal path does the same
+        // through `classify_terminal_query`.
         if matches!(outcome, QueryReplayOutcome::Panicked) {
             return Err(map_error(HarvestError::QueryHandlerPanicked(format!(
                 "workflow handler panicked during query replay for execution {target}"
@@ -28367,8 +28305,8 @@ async fn get_dag_run_graph(
     };
 
     // No further DB reads: release the pool slot before any payload-store fetch
-    // below (the awaitables pool-slot discipline — offload inflation is network
-    // I/O and must never hold a database connection).
+    // below. Offload inflation is network I/O and must never hold a database
+    // connection.
     drop(conn);
 
     let codecs = api_state.payload_codecs();
@@ -28407,11 +28345,11 @@ pub(crate) async fn trigger_dag_run(
     .await
 }
 
-/// Shared implementation behind both the classic HTTP trigger route
-/// (`trigger_dag_run`, always passing its own route string) and the MCP
-/// `start_{dag}` tool (`mcp_tools::start_dag_tool`), which passes a distinct
-/// `route` label so the audit trail records the call's true origin instead
-/// of always attributing it to the classic HTTP route.
+/// Shared implementation of the HTTP trigger route and the MCP `start_{dag}`
+/// tool.
+///
+/// `trigger_dag_run` passes its own route string. `mcp_tools::start_dag_tool`
+/// passes a distinct `route` label, so the audit trail records the true origin.
 #[allow(clippy::too_many_lines)]
 pub(crate) async fn trigger_dag_run_inner(
     api_state: &HarvestApiState,
@@ -28747,11 +28685,12 @@ pub(crate) fn effective_fire_time(
 }
 
 /// Derived remaining run budget (issue #478 / #543): `max_runs - runs_started`,
-/// clamped to zero. Single source of truth for every `harvest_schedules` read
-/// site that surfaces this value — keep the live scheduler's exhaustion check
-/// (`scheduler.rs`, `tick_one_workflow_schedule`) in sync with this formula
-/// when either changes. Callers map this over an `Option<i32> max_runs`
-/// (`None` = unlimited, so there is no budget to derive).
+/// clamped to zero.
+///
+/// Every `harvest_schedules` read site that surfaces this value uses it. Keep
+/// the scheduler's exhaustion check (`tick_one_workflow_schedule` in
+/// `scheduler.rs`) in sync with this formula. Callers map this over an
+/// `Option<i32> max_runs`, where `None` means unlimited.
 pub(crate) fn remaining_runs_budget(max_runs: i32, runs_started: i32) -> i32 {
     (max_runs - runs_started).max(0)
 }
@@ -28763,10 +28702,10 @@ pub(crate) fn remaining_runs_budget(max_runs: i32, runs_started: i32) -> i32 {
 /// That convention is applied at every bound check in the engine
 /// (`schedule_backfill_inner`, `trigger_schedule_now`, the scheduler's
 /// reservation predicate and `schedule_overdue`) and is pinned by
-/// `backfill_max_runs_zero_is_treated_as_unlimited`. Mapping
-/// [`remaining_runs_budget`] over the raw `Option<i32>` instead yields `Some(0)`
-/// for a legacy `max_runs = 0` row, which reads as "exhausted" everywhere it is
-/// consumed — including the preview's zero-entry short-circuit.
+/// `backfill_max_runs_zero_is_treated_as_unlimited`. A plain map of
+/// [`remaining_runs_budget`] over the raw `Option<i32>` yields `Some(0)` for a
+/// legacy `max_runs = 0` row. That reads as "exhausted" everywhere, the
+/// preview's zero-entry short-circuit included.
 pub(crate) fn schedule_remaining_runs(max_runs: Option<i32>, runs_started: i32) -> Option<i32> {
     max_runs
         .filter(|max| *max > 0)
@@ -28989,24 +28928,17 @@ async fn get_schedule_decisions(
     Ok(Json(records))
 }
 
-/// `GET /admin/schedules/{id}/runs` — per-schedule run history (issue #534).
+/// Resolve the schedule row on whichever shard owns it (issue #762).
 ///
-/// Lists the executions a schedule launched, newest-first, each with its terminal
-/// outcome and dispatch `origin` (`scheduled`/`backfill`/`manual_trigger`), plus a
-/// cadence summary that counts only `scheduled`-origin runs so a backfill storm or
-/// ad-hoc trigger never inflates the failure ratio. Fans out across shards and
-/// flags partial results when a shard is unavailable (never a hard 500).
-/// Resolve the schedule row (on whichever shard owns it) so the runs handler can
-/// echo `next_run_at` and, critically, `404` an unknown id rather than returning a
-/// silently-empty run list (issue #762).
+/// The runs handler then echoes `next_run_at`. It also returns `404` for an
+/// unknown id, not a silently empty run list.
 ///
-/// A not-found result is `404` only when every *expected* shard — every shard
-/// with a live pool **and** every shard the router already knows about — was
-/// queried successfully; if any expected shard could not be checked (no
-/// configured pool yet mid a shard-add rollout, an unreachable connection, or a
-/// per-shard lookup error) the row's existence is indeterminate, so it returns
-/// `503` rather than lying with a definitive `404` (issue #762 review). Never
-/// `500`.
+/// A not-found result is `404` only when every *expected* shard answered.
+/// The expected shards are every shard with a live pool **and** every shard
+/// the router knows. If any expected shard could not be checked, existence is
+/// indeterminate. So it returns `503`, not a false `404` (issue #762 review).
+/// A shard goes unchecked when it has no pool yet during a shard add, when its
+/// connection is unreachable, or when its lookup fails. Never `500`.
 ///
 /// The 404-vs-503 decision itself is the pure [`resolve_not_found_outcome`] so
 /// it can be unit-tested without a database or shard fan-out.
@@ -29022,10 +28954,9 @@ async fn resolve_schedule_for_runs(
 /// [`resolve_schedule_for_runs`], also reporting which shard the row was found
 /// on.
 ///
-/// Shared with the Vantage schedule drill-downs (issue #951) so a page opened
-/// during a shard outage reports `503 indeterminate` exactly as the API does,
-/// rather than telling an operator mid-incident that a schedule they can see in
-/// the list does not exist.
+/// Shared with the Vantage schedule drill-downs (issue #951). A page opened
+/// during a shard outage then reports `503 indeterminate` like the API. It
+/// never tells an operator that a schedule in the list does not exist.
 ///
 /// # Errors
 ///
@@ -29037,10 +28968,10 @@ pub(crate) async fn resolve_schedule_with_shard(
 ) -> Result<(HarvestSchedule, autumn_harvest::types::ShardId), AutumnError> {
     use autumn_harvest::schema::harvest_schedules::dsl;
 
-    // Consult every shard the router knows about, not just those with a live
-    // pool — a shard mid a shard-add rollout (readable_shards widened before
-    // this process has its pool wired up) must count as unreachable, not be
-    // silently omitted. Mirrors `workflow_reachability`/`workflow_count`.
+    // Consult every shard the router knows, not only those with a live pool.
+    // During a shard add, readable_shards can widen before this process has
+    // the pool. Such a shard counts as unreachable, not omitted. This mirrors
+    // `workflow_reachability`/`workflow_count`.
     let pools = crate::shard_fanout::pools_by_shard(api_state);
     let expected = crate::shard_fanout::expected_shards(api_state, &pools);
 
@@ -29069,9 +29000,8 @@ pub(crate) async fn resolve_schedule_with_shard(
             Ok(Some(row)) => return Ok((row, autumn_harvest::types::ShardId::new(*shard_id))),
             Ok(None) => {}
             // A per-shard lookup error (DB restarted after checkout, shard
-            // mid-migration) is treated like an unreachable shard: mark it and
-            // keep scanning, so a schedule living on a *later* healthy shard is
-            // still resolved instead of returning a blanket 503.
+            // mid-migration) counts as an unreachable shard. Mark it and keep
+            // scanning. A schedule on a *later* healthy shard still resolves.
             Err(_) => any_shard_unreachable = true,
         }
     }
@@ -29143,13 +29073,11 @@ fn validate_run_filters(params: &schedule_runs::ScheduleRunsParams) -> Result<()
 
 /// Query one shard for its run list + cadence summary (issue #762).
 ///
-/// Returns a [`schedule_runs::ShardRunsObservation`] rather than propagating
-/// errors so a single unreachable shard never fails the whole fan-out — the
-/// caller folds it into `build_runs_response`'s partial/unavailable status. A
-/// `None` pool (a shard the router knows about but for which this process has
-/// no pool wired up yet, mid a shard-add rollout) yields an unavailable
-/// observation rather than being silently omitted, mirroring
-/// `workflow_count::observe_shard`.
+/// Returns a [`schedule_runs::ShardRunsObservation`], not an error. So one
+/// unreachable shard never fails the whole fan-out. The caller folds it into
+/// the partial/unavailable status of `build_runs_response`. A `None` pool is
+/// a router-known shard with no pool here yet, during a shard add. It gives an
+/// unavailable observation, like `workflow_count::observe_shard`.
 async fn observe_schedule_runs_shard(
     shard_id: i32,
     pool: Option<DbPool>,
@@ -29200,6 +29128,14 @@ async fn observe_schedule_runs_shard(
     }
 }
 
+/// `GET /admin/schedules/{id}/runs` — per-schedule run history (issue #534).
+///
+/// Lists the executions a schedule launched, newest-first, each with its
+/// terminal outcome and dispatch `origin` (`scheduled`/`backfill`/
+/// `manual_trigger`). The cadence summary counts only `scheduled`-origin runs.
+/// So a backfill storm or an ad-hoc trigger never inflates the failure ratio.
+/// Fans out across shards and flags partial results when a shard is
+/// unavailable (never a hard 500).
 async fn list_schedule_runs_handler(
     Extension(api_state): Extension<HarvestApiState>,
     Path(id_str): Path<String>,
@@ -29215,20 +29151,19 @@ async fn list_schedule_runs_handler(
     ))
 }
 
-/// The body of `GET /admin/schedules/{id}/runs`, factored out so the Vantage
-/// run-history drill-down (issue #951) consumes exactly the response the API
-/// serves — the same keyset merge, the same scheduled-origin-only cadence
-/// summary, and above all the same `complete`/`partial`/`unavailable` status,
-/// so the page can never render a cross-shard-truncated list as if it were
-/// whole.
+/// The body of `GET /admin/schedules/{id}/runs`.
+///
+/// The Vantage run-history drill-down (issue #951) shares it. So the page gets
+/// the same keyset merge, cadence summary and `complete`/`partial`/`unavailable`
+/// status as the API. It never renders a truncated cross-shard list as whole.
 ///
 /// Read-only.
 ///
 /// # Errors
 ///
-/// Returns `400` for an invalid state/origin filter, `404` when every expected
-/// shard was reachable and none had the schedule, and `503` when the row's
-/// existence is indeterminate because a shard could not be checked.
+/// Returns `400` for an invalid state/origin filter. Returns `404` when every
+/// expected shard was reachable and none had the schedule. Returns `503` when
+/// a shard could not be checked, so existence is indeterminate.
 pub(crate) async fn load_schedule_runs(
     api_state: &HarvestApiState,
     schedule_id: uuid::Uuid,
@@ -29255,11 +29190,11 @@ pub(crate) async fn load_schedule_runs(
         limit: params.limit.saturating_add(1),
     };
 
-    // Fan out across every shard the router knows about (not just those with a
-    // live pool) — a router-known but poolless shard (mid a shard-add rollout)
-    // becomes an unavailable observation rather than being silently omitted, so
-    // `build_runs_response` reports `partial`/`unavailable` and never a false
-    // `complete`. Mirrors `workflow_count`/`workflow_reachability`.
+    // Fan out across every shard the router knows, not only those with a live
+    // pool. A router-known shard with no pool (during a shard add) becomes an
+    // unavailable observation. So `build_runs_response` reports
+    // `partial`/`unavailable`, never a false `complete`. This mirrors
+    // `workflow_count`/`workflow_reachability`.
     let pools = crate::shard_fanout::pools_by_shard(api_state);
     let expected = crate::shard_fanout::expected_shards(api_state, &pools);
 
@@ -29497,10 +29432,10 @@ async fn upsert_workflow_schedule_and_read_back(
         .map_err(database_error)
         .map_err(map_error)?;
     // Compute the tick-exact, shard-local `at_capacity` for the returned row on
-    // its own shard (`conn` is already the schedule's shard connection — it was
-    // used for the register + read-back). A same-cadence re-register preserves
-    // the existing `next_run_at` (`apply_workflow_schedule_update` only recomputes
-    // it on a cadence change). Consider a wedged-in-the-past Skip+catchup schedule
+    // its own shard. `conn` is already the schedule's shard connection. A
+    // same-cadence re-register keeps the existing `next_run_at`
+    // (`apply_workflow_schedule_update` recomputes it only on a cadence
+    // change). Consider a wedged-in-the-past Skip+catchup schedule
     // at capacity. It would otherwise report `overdue == true` here, because the
     // hardcoded `false` skipped the at-capacity suppression. The list/get reads
     // and the `harvest.schedule.overdue` gauge correctly suppress it to `false`.
@@ -29814,33 +29749,30 @@ fn reanchor_schedule_timezone(existing: &Schedule, tz: &str) -> Schedule {
     }
 }
 
-/// Build a [`ScheduleEntry`] from a raw `harvest_schedules` row.
-/// Resolve the effective hard `execution_timeout`/soft `sla` (issue #743,
-/// whole seconds) a run this schedule fires would get, from the registered
-/// `WorkflowInfo` for `name`. For `kind: Dag` this is the DAG's own shadow
-/// `WorkflowInfo` -- auto-registered under the DAG's name in
-/// `registry.workflows` when the `unified-dag-execution` feature is on, with
-/// `#[dag(execution_timeout = ...)]`/`#[dag(sla = ...)]` propagated onto it
-/// verbatim by `DagInfo::as_workflow_info()` -- so ONE lookup covers both
-/// schedule kinds identically (AC9); a classic (non-unified) DAG has no
-/// shadow entry and correctly resolves to `(None, None)`.
+/// Resolve the effective hard `execution_timeout`/soft `sla` of a run this
+/// schedule fires (issue #743, whole seconds).
 ///
-/// `sla` is clamped down to `execution_timeout` (AC5) via the SAME
-/// `clamp_info_default_sla` helper the start path applies, so the read-back
-/// value can never disagree with what a real fire would set on
-/// `deadline_at`/`sla_deadline_at`.
+/// The source is the registered `WorkflowInfo` for `name`. For `kind: Dag`
+/// this is the DAG's shadow `WorkflowInfo`. The `unified-dag-execution`
+/// feature registers it under the DAG's name in `registry.workflows`.
+/// `DagInfo::as_workflow_info()` copies `#[dag(execution_timeout = ...)]` and
+/// `#[dag(sla = ...)]` onto it. So one lookup covers both schedule kinds
+/// (AC9). A classic DAG has no shadow entry and resolves to `(None, None)`.
+///
+/// `sla` is clamped down to `execution_timeout` (AC5) by the same
+/// `clamp_info_default_sla` helper as the start path. So the read-back value
+/// always matches what a real fire sets on `deadline_at`/`sla_deadline_at`.
 ///
 /// The fleet-wide `HandlerRegistry::max_workflow_execution_timeout` ceiling
-/// (issue #743 review, PR #1141 Finding #3) is applied BEFORE the sla clamp,
-/// exactly mirroring `start_or_load_workflow_execution`'s own
-/// `(Some(t), Some(ceiling)) => Some(t.min(ceiling))` rule -- so an
-/// operator-configured ceiling narrower than the declared `execution_timeout`
-/// is reflected in both the advertised `execution_timeout_secs` AND the
-/// `sla_secs` clamp, never the raw declared value.
+/// (issue #743 review, PR #1141 Finding #3) applies before the sla clamp. This
+/// mirrors the `(Some(t), Some(ceiling)) => Some(t.min(ceiling))` rule of
+/// `start_or_load_workflow_execution`. A ceiling narrower than the declared
+/// `execution_timeout` shows in `execution_timeout_secs` and in the
+/// `sla_secs` clamp.
 ///
-/// `(None, None)` when the registry is unavailable (e.g. a scheduler-only
-/// process with no live runtime installed) or the workflow/DAG declares
-/// neither -- never a panic, never a stale/guessed value.
+/// `(None, None)` when the registry is unavailable, as in a scheduler-only
+/// process, or when the workflow/DAG declares neither. Never a panic, never
+/// a guessed value.
 fn resolve_schedule_deadline_secs(
     registry: Option<&HandlerRegistry>,
     name: &str,
@@ -29864,6 +29796,7 @@ fn resolve_schedule_deadline_secs(
     (execution_timeout_secs, sla_secs)
 }
 
+/// Build a [`ScheduleEntry`] from a raw `harvest_schedules` row.
 fn schedule_entry_from_row(
     s: HarvestSchedule,
     last_backfill: Option<BackfillSummary>,
@@ -29874,9 +29807,9 @@ fn schedule_entry_from_row(
     // Overdue detection (issue #696): computed from the schedule's own
     // `next_run_at` + cadence, never an externally-supplied interval. Rides the
     // shared read fan-out, so it surfaces on both list and get automatically.
-    // The exclusions mirror the scheduler tick's exact semantics (Codex P2-A/B):
-    // bounded-out from raw end_at/max_runs/runs_started (not just exhausted_at),
-    // and the at-capacity suppression is gated to the tick's deferring config
+    // The exclusions mirror the scheduler tick's exact semantics. A schedule is
+    // bounded out by raw end_at/max_runs/runs_started, not only by exhausted_at.
+    // The at-capacity suppression applies only to the tick's deferring config
     // (Skip + catchup). The caller-resolved `effective_fire_at`
     // carries the tick's calendar rebasing so a schedule deferred to a future
     // business day is not falsely flagged overdue.
@@ -29972,12 +29905,13 @@ fn schedule_entry_from_row(
     }
 }
 
-/// Shard-resolved overdue inputs for one schedule row (issue #696): the tick's
-/// `at_capacity` and the calendar-adjusted `effective_fire_at`, both resolved on
-/// the schedule's OWN shard connection so the read agrees with the gauge and the
-/// tick. `Default` (`at_capacity = false`, `effective_fire_at = None`) is the
-/// safe fallback for a schedule on an unreachable shard: not-at-capacity + raw
-/// anchor = the wedge signal is preserved, never falsely suppressed.
+/// Shard-resolved overdue inputs for one schedule row (issue #696).
+///
+/// Both the tick's `at_capacity` and the calendar-adjusted `effective_fire_at`
+/// resolve on the schedule's own shard connection. So the read agrees with the
+/// gauge and the tick. `Default` (`at_capacity = false`, no
+/// `effective_fire_at`) is the fallback for an unreachable shard. It keeps the
+/// wedge signal and never falsely suppresses it.
 #[derive(Clone, Copy, Default)]
 struct ScheduleOverdueAux {
     at_capacity: bool,
@@ -29988,22 +29922,20 @@ struct ScheduleOverdueAux {
 /// read's §2 suppression + calendar deferral. It is computed **shard-locally**,
 /// so the read agrees with the gauge and the tick (issue #696).
 ///
-/// A schedule row lives on exactly one shard, and the scheduler tick enforces
-/// `max_active_runs` shard-locally: it holds `next_run_at` in the past only when
-/// the schedule's OWN shard count reaches capacity. Summing across shards (the
-/// prior approach) over-suppressed and could hide a genuine wedge on the
-/// schedule's own shard behind unrelated same-named executions elsewhere, so the
-/// read disagreed with the alert-source gauge. Here each schedule's `at_capacity`
-/// is computed against the tick's exact basis
-/// (`scheduler::schedule_running_basis` = shard-local `RUNNING`/`PAUSED` count +
-/// #607 pending-throttle backlog) on the connection to its own shard, and its
-/// `effective_fire_at` is resolved via `scheduler::resolve_effective_fire_at`
-/// (the tick's own calendar rebasing — loads the calendar's exclusions on that
-/// same shard conn). Iterating `iter_shards()` and reading each shard's OWN
-/// schedule rows keys the result by schedule id with no cross-shard divergence.
-/// An unreachable shard is skipped (its schedules are simply absent → the
-/// `Default` aux at the read = not-at-capacity + raw anchor = the wedge signal is
-/// preserved, never falsely suppressed).
+/// A schedule row lives on exactly one shard. The scheduler tick enforces
+/// `max_active_runs` shard-locally. It holds `next_run_at` in the past only
+/// when the count on the schedule's own shard reaches capacity. A sum across
+/// shards over-suppressed. Same-named executions elsewhere could hide a real
+/// wedge, so the read disagreed with the alert-source gauge.
+///
+/// Here each schedule's `at_capacity` uses the tick's exact basis on its own
+/// shard. That basis (`scheduler::schedule_running_basis`) is the shard-local
+/// `RUNNING`/`PAUSED` count plus the #607 pending-throttle backlog. Its
+/// `effective_fire_at` comes from `scheduler::resolve_effective_fire_at`, the
+/// tick's own calendar rebasing on the same shard conn. Each shard reads only
+/// its own schedule rows, so the result has no cross-shard divergence.
+/// An unreachable shard is skipped. Its schedules then get the `Default` aux,
+/// which keeps the wedge signal.
 async fn load_schedule_overdue_aux_by_shard(
     api_state: &HarvestApiState,
 ) -> std::collections::HashMap<uuid::Uuid, ScheduleOverdueAux> {
@@ -30024,24 +29956,18 @@ async fn load_schedule_overdue_aux_by_shard(
             continue;
         };
 
-        // Batched, once per shard: replaces what used to be up to three DB
-        // round trips *per schedule row* (`schedule_running_basis`'s two
-        // queries plus `resolve_effective_fire_at`'s calendar-exclusions
-        // load) with exactly two grouped queries covering every schedule on
-        // the shard at once (issue #786-class N+1; Ledger perf pass). A
-        // failed running-basis batch degrades to "0 running" for every
-        // schedule via `unwrap_or_default()`, the same as the old per-row
-        // `Err(_) => false` arm: it never *suppresses* an overdue wedge
-        // signal, only fails to hide one. The exclusions batch below is
-        // handled differently -- see the comment at its call site.
+        // Batched, once per shard. Two grouped queries cover every schedule
+        // on the shard, in place of up to three round trips per row (issue
+        // #786-class N+1; Ledger perf pass). A failed running-basis batch
+        // degrades to "0 running" for every schedule. So it never suppresses
+        // an overdue wedge signal. The exclusions batch below is handled
+        // differently -- see the comment at its call site.
         //
-        // Keyed by (schedule_id, name) rather than name alone (issue #1160):
-        // `schedule_running_basis_batch`'s cross-type disjunct means the
-        // result is looked up per schedule, not per name. No BTreeSet dedup
-        // needed here (unlike the pre-#1160 name-only batch): a dag_name and
-        // a different row's workflow_name can collide on the same string,
-        // but keying by `s.id` (unique) rather than by name means a
-        // collision no longer risks two schedules sharing one basis lookup.
+        // Keyed by (schedule_id, name), not name alone (issue #1160). The
+        // cross-type disjunct of `schedule_running_basis_batch` gives a
+        // result per schedule. A dag_name and another row's workflow_name can
+        // be the same string. The unique `s.id` key keeps two such schedules
+        // from sharing one basis lookup, so no BTreeSet dedup is needed.
         let schedule_names: Vec<(uuid::Uuid, &str)> = schedules
             .iter()
             .map(|s| {
@@ -30065,17 +29991,14 @@ async fn load_schedule_overdue_aux_by_shard(
             .collect::<std::collections::BTreeSet<_>>()
             .into_iter()
             .collect();
-        // `Err` here (as opposed to a successful load that simply has no rows
-        // for a given calendar) must NOT fall through to "treat every
-        // calendar as exclusion-free": `calendar_excludes_weekends` is a pure
-        // name check independent of whatever the query returned, so an empty
-        // map on a genuine query failure could still let a "weekends-off"
-        // calendar rebase a weekend slot away from its raw anchor -- exactly
-        // the wedge-hiding the old per-schedule `.unwrap_or(None)` fallback
-        // was written to prevent (Codex review, PR #1314). So a failed batch
-        // is tracked explicitly and every calendar-bearing schedule on this
-        // shard falls back to the raw anchor (`effective_fire_at = None`),
-        // matching what `resolve_effective_fire_at`'s own failure arm did.
+        // An `Err` here must not mean "every calendar is exclusion-free".
+        // `calendar_excludes_weekends` is a pure name check, whatever the
+        // query returned. So an empty map after a query failure could still
+        // let a "weekends-off" calendar rebase a weekend slot off its raw
+        // anchor. That hides a wedge (PR #1314). So a failed batch is tracked.
+        // Every calendar-bearing schedule on this shard then falls back to
+        // the raw anchor (`effective_fire_at = None`), like the failure arm
+        // of `resolve_effective_fire_at`.
         let exclusions =
             autumn_harvest::calendar::load_exclusions_for_calendars(&mut conn, &calendar_names)
                 .await
@@ -30170,8 +30093,8 @@ fn check_override_fields(
 /// carryover lineage, the `sched:{schedule_id}:…` workflow-id namespace, and
 /// #534 run history) is never changed. `workflow_name` is not editable
 /// (400). DAG schedule rows are owned by `PATCH /dags/{dag_name}` (400).
-/// The merged spec is validated before any write (400 writes nothing), and a
-/// live #350 fire claim yields 409 so an edit never races an in-flight fire.
+/// The merged spec is validated before any write, and a 400 writes nothing.
+/// A live #350 fire claim yields 409, so an edit never races an in-flight fire.
 ///
 /// A schedule declared in code converges to its code value on every tick.
 /// So a patch of one writes an operator override instead of a row edit
@@ -30203,13 +30126,12 @@ async fn update_schedule_handler(
     };
     let id_str_owned = id.to_string();
 
-    // Body deserialization is unwrapped in-handler (rather than by a bare
-    // `Json` extractor) so a rejected body — most importantly an unknown
-    // field, rejected via `deny_unknown_fields` since every real field is
-    // optional and a typo'd name would otherwise silently no-op — surfaces
-    // as this route's structured 400 JSON error with a failed audit row,
-    // never as axum's default plain-text 422 (a status this route's contract
-    // does not document) and never as a 200 no-op.
+    // The handler unwraps the body itself, not through a bare `Json`
+    // extractor. So a rejected body becomes this route's structured 400 with
+    // a failed audit row. It is never axum's plain-text 422, which this
+    // contract does not document, and never a 200 no-op. The key case is an
+    // unknown field: every real field is optional, so a misspelt name would
+    // otherwise silently do nothing.
     let request = match request {
         Ok(Json(request)) => request,
         Err(rejection) => {
@@ -30316,17 +30238,16 @@ async fn update_schedule_handler(
         }
         (None, Some(tz)) => {
             // Timezone-only edit: re-anchor the stored cron expression. A
-            // stored expression that is NULL or unparseable is rejected
-            // rather than leniently coerced to Manual — the coercion would
-            // silently rewrite the corrupt row to `manual` and NULL its
-            // `next_run_at` as a side effect of an edit that never asked to
-            // change the cadence. The operator repairs the row by sending
+            // NULL or unparseable stored expression is rejected, not coerced
+            // to Manual. The coercion would rewrite the corrupt row to
+            // `manual` and NULL its `next_run_at`, though the edit never asked
+            // for a cadence change. The operator repairs the row by sending
             // `schedule_expr` explicitly.
             let parsed_stored = match existing.schedule_expr.as_deref() {
-                // "manual" deliberately has no parse_schedule_from_expr
-                // mapping (the tick treats it as "no automatic slot"); a
-                // timezone edit is a documented no-op for it, matching the
-                // interval case in `reanchor_schedule_timezone`.
+                // "manual" has no parse_schedule_from_expr mapping, because
+                // the tick treats it as "no automatic slot". A timezone edit
+                // is a documented no-op for it, like the interval case in
+                // `reanchor_schedule_timezone`.
                 Some("manual") => Some(Schedule::Manual),
                 Some(stored) => parse_schedule_from_expr_pub(stored),
                 None => None,
@@ -30411,10 +30332,10 @@ async fn update_schedule_handler(
         None => None,
     };
 
-    // Catchup policy (issue #484): tri-state with window merging — a provided
-    // mode picks up the provided window, falling back to the stored one; a
-    // window-only change re-windows an already-"window" policy and is ignored
-    // otherwise (create parity: window_secs is ignored for other modes).
+    // Catchup policy (issue #484): tri-state with window merging. A provided
+    // mode takes the provided window, else the stored one. A window-only
+    // change re-windows an already-"window" policy and is otherwise ignored,
+    // as on create.
     let catchup_policy = match &request.catchup_policy {
         Some(Some(mode)) => {
             let window = request.catchup_window_secs.or(existing.catchup_window_secs);
@@ -30440,11 +30361,11 @@ async fn update_schedule_handler(
         Some(None) => Some(None),
         None => match request.catchup_window_secs {
             Some(window) if existing.catchup_policy.as_deref() == Some("window") => {
-                // Re-window an already-"window" policy. `from_user_input` is
-                // currently infallible for the "window" mode, but match the
-                // sibling branch's explicit 400 rather than `.ok()` — an
-                // `.ok()` here would produce `Some(None)` on a future
-                // validation failure, silently CLEARING the stored policy.
+                // Re-window an already-"window" policy. `from_user_input`
+                // cannot fail for the "window" mode today. This still returns
+                // an explicit 400 like the sibling branch. An `.ok()` would give
+                // `Some(None)` on a future validation failure and silently clear
+                // the stored policy.
                 match autumn_harvest::CatchupPolicy::from_user_input("window", Some(window)) {
                     Ok(p) => Some(Some(p)),
                     Err(v) => {
@@ -30666,12 +30587,12 @@ pub struct CreateCompletionTriggerRequest {
     pub input_mapping: Option<InputMapping>,
     pub queue_name: Option<String>,
     /// Optional output guard (issue #810), carried as raw JSON and decoded
-    /// explicitly by the handler (`decode_trigger_condition`). Typing this
-    /// field as `TriggerCondition` would hand an unknown operator to axum's
-    /// `Json` extractor, which rejects data-shape errors with a **422** and a
-    /// plain-text body — the handler-level decode is what produces the
-    /// documented `400` JSON error for unknown operators, over-cap trees, and
-    /// malformed paths alike. `None` = unconditional (legacy behavior).
+    /// explicitly by the handler (`decode_trigger_condition`). As a
+    /// `TriggerCondition`, an unknown operator would reach axum's `Json`
+    /// extractor. That rejects data-shape errors with a **422** and a
+    /// plain-text body. The handler-level decode gives the documented `400`
+    /// JSON error for unknown operators, over-cap trees and malformed paths.
+    /// `None` = unconditional (legacy behavior).
     #[serde(default)]
     pub condition: Option<serde_json::Value>,
 }
@@ -30960,10 +30881,9 @@ async fn set_schedule_paused(
         let mut conn = acquire_conn(shard_pool).await?;
 
         // Atomic conditional UPDATE: only applies when `is_paused` differs from
-        // the requested state.  The `filter(dsl::is_paused.ne(paused))` predicate
-        // makes the idempotency check part of the UPDATE itself, eliminating the
-        // SELECT-then-UPDATE race condition that would otherwise let two
-        // concurrent requests both overwrite paused_at/paused_by.
+        // the requested state. The `filter(dsl::is_paused.ne(paused))` predicate
+        // puts the idempotency check inside the UPDATE. So no SELECT-then-UPDATE
+        // race lets two concurrent requests both overwrite paused_at/paused_by.
         let rows_updated: usize = if paused {
             // Pause: set metadata only on the transition false → true.
             diesel::update(
@@ -31372,9 +31292,9 @@ async fn trigger_schedule_now(
 
     // Reject exhausted schedules (issue #478). Manual triggers cannot bypass
     // end_at / max_runs limits — the schedule has reached its terminal state.
-    // Also check live bounds: the scheduler may not have processed the row yet
-    // (e.g. next_run_at > end_at, or max_runs was tightened mid-flight), so
-    // exhausted_at can be NULL even though the bounds are already violated.
+    // Also check live bounds. The scheduler may not have processed the row yet,
+    // as when next_run_at > end_at or max_runs was tightened mid-flight. So
+    // exhausted_at can be NULL while the bounds are already violated.
     {
         let trigger_now = chrono::Utc::now();
         let live_end_at_exceeded = schedule.end_at.is_some_and(|end| trigger_now >= end);
@@ -31548,10 +31468,10 @@ async fn trigger_schedule_now(
     // pool.default_pool() here would target zero rows (issue #478).
     let sched_pool = pool.pool_for(schedule_shard);
     let mut sched_conn = acquire_conn(sched_pool).await?;
-    // Acquire a connection on the execution shard so the start call lands on the
-    // correct Postgres database (trigger_exec_shard was resolved above via the
-    // ShardRouter — using pool.default_pool() here would silently misroute in
-    // multi-shard deployments).
+    // Acquire a connection on the execution shard, so the start call lands on
+    // the correct Postgres database. The ShardRouter resolved
+    // trigger_exec_shard above. pool.default_pool() would silently misroute in
+    // a multi-shard deployment.
     let mut exec_conn = acquire_conn(pool.pool_for(trigger_exec_shard)).await?;
 
     // For Skip policy, fail closed: if the running-count query fails on any shard,
@@ -31594,16 +31514,16 @@ async fn trigger_schedule_now(
     }
 
     // Atomically reserve one run slot against the max_runs budget before starting
-    // the workflow (issue #478). The WHERE guard prevents concurrent manual triggers
-    // from racing past the earlier in-memory admission check: only one of them
-    // increments successfully when runs_started is at the limit.
+    // the workflow (issue #478). The WHERE guard stops concurrent manual triggers
+    // from racing past the earlier in-memory admission check. At the limit, only
+    // one of them increments.
     //
     // For unlimited schedules (max_runs IS NULL) the WHERE always matches, so
     // runs_started is incremented for observability and rows_affected = 1.
     //
-    // If rows_affected = 0, either exhausted_at was set by a concurrent scheduler
-    // tick/trigger between our admission check and this point, or a concurrent
-    // trigger already consumed the last slot.
+    // rows_affected = 0 has two causes. A concurrent tick or trigger set
+    // exhausted_at after the admission check. Or a concurrent trigger already
+    // consumed the last slot.
     {
         use autumn_harvest::schema::harvest_schedules::dsl as sdsl;
         let reserved = diesel::update(
@@ -31709,14 +31629,13 @@ async fn trigger_schedule_now(
         );
 
     // Start-throttle admission (issue #607 code review): a manual trigger-now
-    // must pace like scheduled/backfilled fires rather than always admitting
-    // immediately -- otherwise an operator repeatedly hitting this route
-    // could bypass a throttled workflow's declared rate/burst entirely. DAG
-    // schedules resolve no throttle policy here (`DagInfo` has no `throttle`
-    // field, and a unified DAG's auto-registered shadow `WorkflowInfo` never
-    // carries one either), so this is a no-op for the DAG branch by
-    // construction -- unlike `schedule_backfill`, no explicit kind check is
-    // needed. A deferred trigger still counts as a spent run-budget slot. That
+    // paces like scheduled and backfilled fires. Otherwise an operator who
+    // repeats this route bypasses the declared rate/burst of a throttled
+    // workflow. DAG schedules resolve no throttle policy here. `DagInfo` has no
+    // `throttle` field, and the shadow `WorkflowInfo` of a unified DAG has none
+    // either. So this is a no-op for the DAG branch by construction, and no
+    // explicit kind check is needed (unlike `schedule_backfill`).
+    // A deferred trigger still counts as a spent run-budget slot. That
     // mirrors the scheduler-tick/backfill precedent: the pre-incremented
     // `runs_started` above is NOT rolled back. So a repeatedly-triggered
     // throttled schedule cannot also bypass its own `max_runs` budget by
@@ -31984,14 +31903,14 @@ async fn trigger_schedule_now(
             runbook_url,
             severity,
             sla,
-            // Manual trigger-now is *attributed* to its schedule (issue #534) so it shows
-            // up in GET /admin/schedules/{id}/runs, but is marked origin=manual_trigger so
-            // it never masquerades as normal cadence. It deliberately does NOT participate
-            // in scheduled carryover (issue #488): scheduled_for stays None, so
-            // resolve_carryover short-circuits to (None, None) before any DB query (it never
-            // runs the cross-shard carryover lookup on this default-pool connection). The UI
-            // trigger path also lacks the budget/exhaustion checks the automated lineage
-            // relies on — only scheduled fires and backfills advance the carryover cursor.
+            // Manual trigger-now is *attributed* to its schedule (issue #534), so it shows
+            // up in GET /admin/schedules/{id}/runs. Its origin=manual_trigger keeps it
+            // apart from normal cadence. It takes no part in scheduled carryover (issue
+            // #488). scheduled_for stays None, so resolve_carryover returns (None, None)
+            // before any DB query. It never runs the cross-shard carryover lookup on this
+            // default-pool connection. The UI trigger path also lacks the budget and
+            // exhaustion checks of the automated lineage. Only scheduled fires and
+            // backfills advance the carryover cursor.
             schedule_id: Some(schedule_id),
             workflow_retry_policy: manual_trigger_retry_policy,
             workflow_retry_source: manual_trigger_retry_source,
@@ -32016,9 +31935,9 @@ async fn trigger_schedule_now(
 
     let (exec_id_out, outcome) = match result {
         Ok(exec_result) => {
-            // AC-a (issue #607): an id-reuse short-circuit that attached to an
-            // existing run instead of creating one must refund its reserved
-            // token, mirroring every other admission call site.
+            // AC-a (issue #607): an id-reuse short-circuit attached to an
+            // existing run and created none. So it refunds its reserved token,
+            // like every other admission call site.
             if !exec_result.created
                 && let Some(ref bucket) = trigger_throttle_bucket
             {
@@ -32030,12 +31949,10 @@ async fn trigger_schedule_now(
         Err(e) => {
             // Undo the pre-increment so the budget reflects actual started workflows.
             rollback_manual_trigger_budget(&mut sched_conn, schedule.id, triggered_at).await;
-            // Refund the reserved throttle token too (code review, issue #607):
-            // a failed start never admitted anything, so leaving the token
-            // spent would drain the bucket for every repeated transient/
-            // configuration failure, artificially deferring later manual or
-            // scheduled fires behind a bucket that never actually paced a
-            // successful start.
+            // Refund the reserved throttle token too (issue #607). A failed
+            // start admitted nothing. A spent token would drain the bucket on
+            // each repeated failure. Later manual or scheduled fires would
+            // then defer behind a bucket that never paced a real start.
             if let Some(ref bucket) = trigger_throttle_bucket {
                 let _ =
                     autumn_harvest::queue::refund_rate_limit_token(&mut exec_conn, bucket).await;
@@ -32121,17 +32038,18 @@ async fn trigger_schedule_now(
     }))
 }
 
-/// Undo `trigger_schedule_now`'s pre-incremented `runs_started` budget slot
-/// when the trigger did not end up producing a run — a start failure, or
-/// (issue #607) an oversized input / throttle-admission error caught before
-/// the start primitive is ever called. Do NOT guard the decrement on
-/// `exhausted_at IS NULL`: a scheduler tick could have raced and set
-/// `exhausted_at` after the pre-increment, so the guard would silently skip
-/// the rollback and leave `runs_started` inflated (issue #478). If the
-/// decrement brought `runs_started` below `max_runs`, clear any exhaustion the
-/// (now-reversed) pre-increment may have caused; `next_run_at` is
-/// intentionally not restored here — a future `upsert_workflow_schedule` call
-/// (e.g. on server restart for code-declared schedules) will recalculate it.
+/// Undo the pre-incremented `runs_started` slot of `trigger_schedule_now` when
+/// the trigger produced no run.
+///
+/// The causes are a start failure, or an oversized input or throttle-admission
+/// error before the start primitive runs (issue #607). Do not guard the
+/// decrement on `exhausted_at IS NULL`. A scheduler tick can set
+/// `exhausted_at` after the pre-increment. The guard would then skip the
+/// rollback and leave `runs_started` inflated (issue #478). If the decrement
+/// brought `runs_started` below `max_runs`, clear any exhaustion the
+/// pre-increment caused. `next_run_at` is not restored here. A later
+/// `upsert_workflow_schedule` call recalculates it, such as on restart for a
+/// code-declared schedule.
 async fn rollback_manual_trigger_budget(
     sched_conn: &mut diesel_async::AsyncPgConnection,
     schedule_id: uuid::Uuid,
@@ -32167,17 +32085,18 @@ async fn rollback_manual_trigger_budget(
 }
 
 /// Build the atomic reservation UPDATE statement for a backfill dispatch
-/// (issue #688). A macro rather than a function because diesel's
-/// `UpdateStatement` return type (with `.set(..).returning(..)`) is not cleanly
-/// nameable and cannot be boxed here; a macro lets the live path
-/// (`reserve_backfill_budget_slot`) and the no-DB shape test share one source of
-/// truth, so editing the guard, the increment, or the RETURNING clause breaks the
-/// shape test rather than silently drifting. The statement increments
+/// (issue #688).
+///
+/// This is a macro because the diesel `UpdateStatement` type with
+/// `.set(..).returning(..)` cannot be named cleanly or boxed here. The live
+/// path (`reserve_backfill_budget_slot`) and the no-DB shape test share it. So
+/// an edit to the guard, the increment or the RETURNING clause breaks the shape
+/// test instead of drifting silently. The statement increments
 /// `runs_started`, guards on `exhausted_at IS NULL` and the `max_runs` budget,
-/// and RETURNs the post-increment `runs_started`. A non-positive `max_runs`
-/// (`max_runs <= 0`) is treated as UNLIMITED here — matching
-/// `transition_backfill_exhausted_stmt!`, the up-front exhaustion check, and the
-/// dry-run projection — so a row with `max_runs = 0` never wrongly reserves 0 rows.
+/// and RETURNs the post-increment `runs_started`. A non-positive `max_runs` is
+/// UNLIMITED here. `transition_backfill_exhausted_stmt!`, the up-front
+/// exhaustion check and the dry-run projection agree. So a row with
+/// `max_runs = 0` never wrongly reserves 0 rows.
 macro_rules! reserve_backfill_budget_slot_stmt {
     ($schedule_id:expr, $at:expr) => {{
         use autumn_harvest::schema::harvest_schedules::dsl as sdsl;
@@ -32201,15 +32120,15 @@ macro_rules! reserve_backfill_budget_slot_stmt {
 
 /// Build the "clear a stale `max_runs_exhausted` exhaustion" UPDATE used by
 /// `release_backfill_budget_slot` when a decrement drops `runs_started` back
-/// below the cap (issue #688 review, Codex). A macro (like
+/// below the cap (issue #688 review). A macro (like
 /// `reserve_backfill_budget_slot_stmt!`) so the live path and the no-DB shape
-/// test share one source of truth. Guarded on `exhausted_reason =
-/// 'max_runs_exhausted'` so an `end_at` exhaustion set by a concurrent tick is
-/// NEVER resurrected, on `exhausted_at IS NOT NULL`, and on the below-cap
-/// predicate (with the same `max_runs <= 0` = unlimited handling as the
-/// reservation guard). Clears `exhausted_at`/`exhausted_reason` only; does NOT
-/// touch `next_run_at` (backfill's own transition no longer nulls it, so it
-/// retains the tick's last valid forward pointer).
+/// test share one source of truth. It is guarded on `exhausted_reason =
+/// 'max_runs_exhausted'`, so an `end_at` exhaustion set by a concurrent tick is
+/// NEVER resurrected. It is also guarded on `exhausted_at IS NOT NULL` and on
+/// the below-cap predicate, where `max_runs <= 0` means unlimited as in the
+/// reservation guard. It clears `exhausted_at`/`exhausted_reason` only. It does
+/// NOT touch `next_run_at`. The backfill transition no longer nulls it, so it
+/// keeps the tick's last valid forward pointer.
 macro_rules! clear_stale_max_runs_exhaustion_stmt {
     ($schedule_id:expr, $at:expr) => {{
         use autumn_harvest::schema::harvest_schedules::dsl as sdsl;
@@ -32233,17 +32152,19 @@ macro_rules! clear_stale_max_runs_exhaustion_stmt {
 }
 
 /// Build the "re-arm `next_run_at`" UPDATE used by `release_backfill_budget_slot`
-/// (issue #688 review, Codex F3) after the clear above actually un-exhausts a
-/// `max_runs_exhausted` row. A scheduler *tick* that exhausts the schedule nulls
-/// `next_run_at` (`tick_one_workflow_schedule` in scheduler.rs), and the due-list
-/// query requires `next_run_at IS NOT NULL` — so when a concurrent tick exhausts
-/// the row DURING a backfill and the backfill then releases below cap, clearing
-/// the exhaustion alone would leave the schedule un-exhausted yet off the
-/// due-list. This restores the forward pointer to the next slot after now (an
-/// approximation the tick later refines with calendar/skip adjustments on its
-/// next firing). Guarded on `next_run_at IS NULL` so the common intra-backfill
-/// case (where our own transition never nulled it) is a no-op, and on
-/// `exhausted_at IS NULL` so we only re-arm a row we just un-exhausted.
+/// (issue #688 review) after the clear above un-exhausts a
+/// `max_runs_exhausted` row.
+///
+/// A scheduler *tick* that exhausts the schedule nulls `next_run_at`
+/// (`tick_one_workflow_schedule` in scheduler.rs). The due-list query requires
+/// `next_run_at IS NOT NULL`. A concurrent tick can exhaust the row during a
+/// backfill, and the backfill then releases below cap. A clear alone then
+/// leaves the schedule un-exhausted yet off the due-list. This restores the
+/// forward pointer to the next slot after now. The tick refines that
+/// approximation with calendar/skip adjustments on its next firing. It is
+/// guarded on `next_run_at IS NULL`. So the common intra-backfill case, where
+/// the backfill transition never nulled it, is a no-op. It is also guarded on
+/// `exhausted_at IS NULL`, so it re-arms only a row just un-exhausted.
 macro_rules! rearm_backfill_next_run_stmt {
     ($schedule_id:expr, $next:expr, $at:expr) => {{
         use autumn_harvest::schema::harvest_schedules::dsl as sdsl;
@@ -32279,35 +32200,35 @@ async fn reserve_backfill_budget_slot(
 /// then a *guarded* clear of a `max_runs_exhausted` exhaustion when the decrement
 /// drops back below the cap.
 ///
-/// The clear is guarded on `exhausted_reason = 'max_runs_exhausted'` so an
-/// `end_at` exhaustion set by a concurrent tick is NEVER resurrected — unlike a
-/// blanket clear, which could revive a *foreign* exhaustion. It targets the case
-/// where two concurrent near-cap backfill reservations both increment
-/// `runs_started`, one transitions the row to `max_runs_exhausted` on the
-/// temporary count, and the other's slot then releases (`AlreadyExists` /
-/// oversized input / admission error) back below the cap — without this, the
-/// decrement-only release would leave the schedule stuck exhausted with a free
-/// slot. Neither UPDATE touches `next_run_at`: `transition_backfill_exhausted_if_reached`
-/// no longer nulls it (Fix 2a), so the row retains the tick's last valid forward
-/// pointer and returns to the due-list correctly once un-exhausted.
+/// The clear is guarded on `exhausted_reason = 'max_runs_exhausted'`. So an
+/// `end_at` exhaustion set by a concurrent tick is NEVER resurrected. A blanket
+/// clear could revive a *foreign* exhaustion. The target case is two
+/// concurrent near-cap backfill reservations that both increment
+/// `runs_started`. One transitions the row to `max_runs_exhausted` on the
+/// temporary count. The other slot then releases back below the cap
+/// (`AlreadyExists`, oversized input or admission error). A decrement-only
+/// release would leave the schedule stuck exhausted with a free slot.
+/// Neither UPDATE touches `next_run_at`. `transition_backfill_exhausted_if_reached`
+/// no longer nulls it. So the row keeps the tick's last valid forward pointer
+/// and returns to the due-list once un-exhausted.
 ///
 /// Conservative by design: at worst a released slot leaves the schedule marked
 /// exhausted with a spare slot (never an over-run). All UPDATEs are best-effort
 /// and warn on error so a leaked `+1` or a stale exhaustion is diagnosable rather
 /// than silently drifting.
 ///
-/// `rearm_next` (issue #688 review, Codex F3/F5): when the clear above actually
-/// un-exhausts a `max_runs_exhausted` row that a concurrent scheduler *tick*
-/// nulled `next_run_at` on while exhausting it mid-backfill, re-arm the forward
-/// pointer so the schedule returns to the due-list rather than being stranded
-/// off it until an unrelated PATCH/restart. `rearm_next` is the pre-tick due
-/// `next_run_at` snapshot loaded at backfill request start — NOT a recompute from
-/// the release's timestamp (`None` for a manual schedule with no due slot → no
-/// re-arm). Recomputing from `now` would advance PAST an already-due slot the tick
-/// skipped, dropping that run for a catchup schedule; the snapshot restores the
-/// exact slot to retry, which the tick refines with calendar/skip on its next
-/// firing. Guarded (see `rearm_backfill_next_run_stmt!`) so the common
-/// intra-backfill case (our own transition never nulls `next_run_at`) is a no-op.
+/// `rearm_next` (issue #688 review): a concurrent scheduler *tick* can exhaust
+/// a row mid-backfill and null its `next_run_at`. When the clear above
+/// un-exhausts that row, re-arm the forward pointer. The schedule then returns
+/// to the due-list and is not stranded until an unrelated PATCH or restart.
+/// `rearm_next` is the pre-tick due `next_run_at` snapshot from backfill
+/// request start. It is NOT a recompute from the release timestamp. It is
+/// `None` for a manual schedule with no due slot, so there is no re-arm.
+/// A recompute from `now` would advance PAST an already-due slot the tick
+/// skipped. That drops the run for a catchup schedule. The snapshot restores
+/// the exact slot to retry, and the tick refines it on its next firing. The
+/// guard (see `rearm_backfill_next_run_stmt!`) makes the common intra-backfill
+/// case a no-op, because the backfill transition never nulls `next_run_at`.
 async fn release_backfill_budget_slot(
     sched_conn: &mut diesel_async::AsyncPgConnection,
     schedule_id: uuid::Uuid,
@@ -32330,19 +32251,19 @@ async fn release_backfill_budget_slot(
         );
     }
     // If the decrement dropped runs_started back below the cap, clear a
-    // max_runs exhaustion the row may have picked up from a *concurrent* near-cap
-    // backfill reservation's transition (issue #688 review, Codex). Guarded so an
-    // end_at exhaustion is never resurrected.
+    // max_runs exhaustion from the transition of a *concurrent* near-cap
+    // backfill reservation (issue #688 review). Guarded so an end_at
+    // exhaustion is never resurrected.
     match clear_stale_max_runs_exhaustion_stmt!(schedule_id, at)
         .execute(sched_conn)
         .await
     {
         Ok(cleared_rows) => {
-            // Only when we ACTUALLY un-exhausted a max_runs exhaustion (F3): a
-            // concurrent tick that exhausted+nulled next_run_at mid-backfill would
-            // otherwise leave the un-exhausted schedule off the due-list. Re-arm
-            // the forward pointer (guarded on next_run_at IS NULL so the common
-            // case where our own transition never nulled it is a no-op).
+            // Only when this call un-exhausted a max_runs exhaustion. A
+            // concurrent tick that exhausted the row and nulled next_run_at
+            // mid-backfill would otherwise leave it off the due-list. The
+            // re-arm is guarded on next_run_at IS NULL, so the common case is
+            // a no-op.
             if cleared_rows > 0
                 && let Some(next) = rearm_next
                 && let Err(e) = rearm_backfill_next_run_stmt!(schedule_id, next, at)
@@ -32366,24 +32287,24 @@ async fn release_backfill_budget_slot(
     }
 }
 
-/// Build the "transition a backfill schedule to exhausted" UPDATE (issue #688,
-/// Codex F6). A macro (like `reserve_backfill_budget_slot_stmt!` /
+/// Build the "transition a backfill schedule to exhausted" UPDATE (issue #688).
+///
+/// A macro (like `reserve_backfill_budget_slot_stmt!` /
 /// `clear_stale_max_runs_exhaustion_stmt!` / `rearm_backfill_next_run_stmt!`) so
 /// the live path (`transition_backfill_exhausted_if_reached`) and the no-DB shape
-/// test share one source of truth. The WHERE clause reads `max_runs`/`runs_started`
-/// FROM THE ROW ITSELF (`max_runs IS NOT NULL AND max_runs > 0 AND runs_started >=
-/// max_runs`) rather than a request-start snapshot, so it always matches the same
-/// live row the reservation UPDATE already evaluated. That makes exhaustion
-/// race-safe against a concurrent `PATCH /admin/schedules/{id}` (issue #771) that
-/// changes `max_runs` between the reservation and this call: a raised/removed cap
-/// no longer wrongly exhausts, and a lowered cap correctly exhausts an at-cap row.
+/// test share one source of truth. The WHERE clause reads `max_runs` and
+/// `runs_started` FROM THE ROW ITSELF, not a request-start snapshot. So it
+/// matches the same live row as the reservation UPDATE. That makes exhaustion
+/// race-safe against a concurrent `PATCH /admin/schedules/{id}` (issue #771)
+/// between the reservation and this call. A raised or removed cap no longer
+/// wrongly exhausts. A lowered cap correctly exhausts an at-cap row.
 /// `max_runs <= 0`/NULL are UNLIMITED (never exhaust), matching the reservation
-/// guard. Guarded on `exhausted_at IS NULL` (no double-exhaust race with the tick);
-/// `next_run_at` is deliberately NOT touched (backfill dispatches historical slots
-/// and does not own the forward-cadence pointer — that is the scheduler tick's job;
-/// the `exhausted_at IS NULL` due-list filter already excludes an exhausted row, and
-/// nulling it would strand the schedule off the due-list if the exhaustion is later
-/// cleared by `release_backfill_budget_slot` dropping below cap).
+/// guard. Guarded on `exhausted_at IS NULL`, so there is no double-exhaust race
+/// with the tick. `next_run_at` is NOT touched. Backfill dispatches historical
+/// slots and does not own the forward-cadence pointer; the scheduler tick does.
+/// The `exhausted_at IS NULL` due-list filter already excludes an exhausted
+/// row. A null pointer would strand the schedule off the due-list once
+/// `release_backfill_budget_slot` clears the exhaustion.
 macro_rules! transition_backfill_exhausted_stmt {
     ($schedule_id:expr, $at:expr) => {{
         use autumn_harvest::schema::harvest_schedules::dsl as sdsl;
@@ -32404,15 +32325,15 @@ macro_rules! transition_backfill_exhausted_stmt {
 }
 
 /// After a successful `reserve_backfill_budget_slot`, transition the schedule to
-/// exhausted iff the LIVE row is at/over its LIVE `max_runs` cap (issue #688,
-/// Codex F6). Evaluating `max_runs` and `runs_started` from the row inside the
-/// UPDATE — rather than a request-start snapshot — makes this race-safe against a
-/// concurrent `PATCH /admin/schedules/{id}` (issue #771) that changes `max_runs`
-/// between the reservation and this call; the reservation UPDATE already used live
-/// row values, so both budget decisions are now snapshot-free. Best-effort but
-/// visible: a failed transition is self-healing (the next tick/backfill re-detects
-/// `runs_started >= max_runs`), yet the failure should be diagnosable rather than
-/// silent (issue #688).
+/// exhausted iff the LIVE row is at/over its LIVE `max_runs` cap (issue #688).
+///
+/// The UPDATE reads `max_runs` and `runs_started` from the row, not from a
+/// request-start snapshot. That makes it race-safe against a concurrent
+/// `PATCH /admin/schedules/{id}` (issue #771) between the reservation and this
+/// call. The reservation UPDATE also uses live row values, so both budget
+/// decisions are snapshot-free. Best-effort but visible. A failed transition
+/// heals itself, because the next tick or backfill re-detects
+/// `runs_started >= max_runs`. The failure is still logged (issue #688).
 async fn transition_backfill_exhausted_if_reached(
     sched_conn: &mut diesel_async::AsyncPgConnection,
     schedule_id: uuid::Uuid,
@@ -32539,11 +32460,11 @@ fn backfill_max_active(schedule: &autumn_harvest::models::HarvestSchedule) -> i6
 /// The backfill implementation, with the audited `route_or_command` supplied by
 /// the caller.
 ///
-/// The Vantage backfill launcher (issue #951) shares this body so it inherits
-/// every guard, the `harvest_backfill_log` row and the audit record — but it
-/// passes its **own** route string, so a dashboard-initiated backfill is
-/// recorded as `POST /ui/schedules/{id}/backfill` rather than masquerading as an
-/// API call. Mirrors how `retry_dag_run_inner` is shared with `dag_retry_commit_ui`.
+/// The Vantage backfill launcher (issue #951) shares this body. So it inherits
+/// every guard, the `harvest_backfill_log` row and the audit record. It passes
+/// its **own** route string. A dashboard backfill is then recorded as
+/// `POST /ui/schedules/{id}/backfill`, not as an API call. Mirrors how
+/// `retry_dag_run_inner` is shared with `dag_retry_commit_ui`.
 ///
 /// # Errors
 ///
@@ -32609,10 +32530,10 @@ pub(crate) async fn schedule_backfill_inner(
             "backfill window contains more than {limit} timestamps; lower the window or pass a higher max_count"
         )),
     };
-    // Each entry is (original_slot, fire_time). original_slot is the raw cron timestamp
-    // used for deterministic workflow-ID generation so that calendar rebasing (e.g.
-    // RunNextBusinessDay / RunPrevBusinessDay) cannot cause two distinct logical slots
-    // that adjust to the same day to collide on the derived workflow ID.
+    // Each entry is (original_slot, fire_time). original_slot is the raw cron
+    // timestamp that seeds the deterministic workflow ID. Calendar rebasing (e.g.
+    // RunNextBusinessDay) can move two logical slots to the same day. The raw
+    // slot keeps their derived workflow IDs distinct.
     let timestamp_pairs: Vec<BackfillSlot> = if let Some(ref cal_name) = schedule.calendar_name {
         let mut conn = acquire_conn(pool.default_pool()).await?;
         let excluded_dates = load_exclusions_for_calendar(&mut conn, cal_name)
@@ -32643,10 +32564,9 @@ pub(crate) async fn schedule_backfill_inner(
         .collect()
     };
     // Filter out any timestamp pairs whose effective fire time is at or past
-    // end_at (issue #478). This is a belt-and-suspenders guard: the exhaustion
-    // check above already rejects schedules whose end_at has passed at request
-    // time, but a tight end_at window could still contain some past-cutoff slots
-    // among an otherwise valid batch.
+    // end_at (issue #478). This is a second guard. The exhaustion check above
+    // already rejects a schedule whose end_at passed at request time. But a
+    // tight end_at window can still hold some past-cutoff slots in a valid batch.
     let timestamp_pairs: Vec<_> = if let Some(end_at) = schedule.end_at {
         timestamp_pairs
             .into_iter()
@@ -32872,19 +32792,17 @@ pub(crate) async fn schedule_backfill_inner(
             }
         }
     };
-    // A throttled scheduled/backfill fire (issue #607) durably defers before any
-    // `harvest_workflow_executions` row exists, so `running_at_start` above alone
-    // undercounts a workflow schedule's true in-flight commitment: a separate,
-    // later backfill request recomputing it from scratch would not see an
-    // earlier request's still-pending deferred slots (they never became a
-    // RUNNING/PAUSED execution) and could dispatch past `max_active_runs` --
-    // the throttle scanner later fires those pending rows without re-checking
-    // the schedule's overlap gate, so the violation would otherwise go uncaught
-    // (code review, issue #607). DAG schedules have no throttle field at all
-    // (`DagInfo` carries none), so this only applies to workflow schedules,
-    // matching the earlier fix's precedent of scoping throttle-aware overlap
-    // counting (`tick_one_workflow_schedule`/`drain_buffered_schedule_runs` in
-    // scheduler.rs) to workflows only.
+    // A throttled scheduled or backfill fire (issue #607) durably defers before
+    // any `harvest_workflow_executions` row exists. So `running_at_start` alone
+    // undercounts the in-flight commitment of a workflow schedule. A later
+    // backfill request would not see the pending deferred slots of an earlier
+    // one, because they never became RUNNING/PAUSED executions. It could then
+    // dispatch past `max_active_runs`. The throttle scanner later fires those
+    // pending rows without the overlap gate, so nothing else catches it (issue
+    // #607). DAG schedules have no throttle field (`DagInfo` carries none). So
+    // this applies only to workflow schedules. Throttle-aware overlap counting
+    // in scheduler.rs (`tick_one_workflow_schedule`,
+    // `drain_buffered_schedule_runs`) has the same scope.
     let running_at_start = if kind == ScheduleKind::Workflow && !uncapped {
         match query_pending_throttle_count(&pool, &name).await {
             Ok(pending) => running_at_start + pending,
@@ -32945,20 +32863,20 @@ pub(crate) async fn schedule_backfill_inner(
     let mut dispatched_this_call: i64 = 0;
     let mut budget_hit = false;
     // Atomic per-slot max_runs reservation runs on the schedule's OWN shard
-    // (issue #688); schedule rows may live on a different shard than the
-    // execution shard, exactly like trigger_schedule_now's budget accounting.
+    // (issue #688). A schedule row may live on another shard than the
+    // execution, as in the budget accounting of trigger_schedule_now.
     //
-    // Pool-connection safety (issue #688 review, Codex F4): the schedule-shard
-    // connection used for budget accounting is chosen per loop arm below. In a
-    // SINGLE-shard deployment the schedule shard and the execution shard are the
-    // SAME pool, so we must NOT hold a second dedicated schedule connection across
-    // the loop while each slot also checks out a per-slot exec `conn` — with a web
-    // pool of size 1 (pool.rs only forbids size 0) that self-deadlocks (the route
-    // waits on a connection it already holds). The original pre-#688 backfill held
-    // exactly one connection at a time and was pool-size-1 safe; to keep that, when
-    // `schedule_shard == exec_shard` (`same_pool`) budget ops reuse the per-slot
-    // exec `conn` — all budget statements are sequential, never two concurrent
-    // connections. Only a GENUINELY different pool (multi-shard) holds a separate
+    // Pool-connection safety (issue #688 review): each loop arm below chooses
+    // the schedule-shard connection for budget accounting. In a SINGLE-shard
+    // deployment the schedule shard and the execution shard are the SAME pool.
+    // So the loop must NOT hold a second schedule connection while each slot
+    // also checks out a per-slot exec `conn`. With a web pool of size 1
+    // (pool.rs forbids only size 0), that self-deadlocks. The route waits on a
+    // connection it already holds. The pre-#688 backfill held one connection at
+    // a time and was safe at pool size 1. To keep that, when
+    // `schedule_shard == exec_shard` (`same_pool`), budget ops reuse the
+    // per-slot exec `conn`. All budget statements are then sequential, never two
+    // concurrent connections. Only a GENUINELY different pool (multi-shard) holds a separate
     // schedule connection across the loop. Concurrent holds across distinct pools
     // do not contend. Assumption: distinct ShardIds map to distinct
     // pools in standard single/multi-shard topologies (single-shard always has
@@ -32969,19 +32887,19 @@ pub(crate) async fn schedule_backfill_inner(
             let wf_name = name.clone();
             // Workflow schedules are always dispatched through the scheduler's own
             // connection, which uses `ExecutionId::new()` (ShardId::UNENCODED → default
-            // shard). The backfill must write to the same shard so that the partial
-            // unique index on (workflow_name, workflow_id) prevents the scheduler from
-            // creating a second run for the same timestamp after the backfill window.
+            // shard). The backfill writes to the same shard. The partial unique index
+            // on (workflow_name, workflow_id) then stops the scheduler from creating a
+            // second run for the same timestamp after the backfill window.
             let wf_shard_pool = pool.default_pool();
-            // Budget-connection selection (Codex F4): the per-slot exec `conn` is drawn
-            // from `pool.default_pool()`, which is backed by the pool's own default
-            // shard — source `exec_shard` from there (not the router's default shard, a
-            // separate field not asserted equal) so `same_pool` compares against the
-            // shard that actually backs `conn`, keeping this arm self-consistent with
-            // the DAG arm. When it equals the schedule shard, budget ops run on that
-            // per-slot exec `conn` (pool-size-1 safe); otherwise hold a separate
-            // schedule-pool connection across the loop (a distinct pool, safe to hold
-            // concurrently with the exec pool).
+            // Budget-connection selection: the per-slot exec `conn` comes from
+            // `pool.default_pool()`, backed by the pool's own default shard. So
+            // `exec_shard` comes from there too, not from the router's default
+            // shard, a separate field that is not asserted equal. `same_pool` then
+            // compares against the shard that backs `conn`, like the DAG arm.
+            // When it equals the schedule shard, budget ops run on that per-slot
+            // exec `conn`, which is safe at pool size 1. Otherwise a separate
+            // schedule-pool connection is held across the loop. That pool is
+            // distinct, so it is safe to hold with the exec pool.
             let exec_shard = pool.sharded_pool().default_shard();
             let same_pool = schedule_shard == exec_shard;
             let mut sched_conn_opt = if same_pool {
@@ -32991,23 +32909,22 @@ pub(crate) async fn schedule_backfill_inner(
             };
             for (original_slot, _fire_time) in &timestamp_pairs {
                 // Once the atomic DB max_runs reservation (issue #688) fails for one
-                // slot the budget is exhausted for every remaining slot too; report
+                // slot, the budget is exhausted for every remaining slot too. Report
                 // each as skipped without another DB round-trip. The authoritative
-                // budget check is the atomic conditional UPDATE below (after the
-                // admission gate), which is race-safe against a concurrent backfill
-                // or `trigger_schedule_now` (both use the same guarded UPDATE), but
-                // NOT against the scheduler tick — the tick still gates `max_runs`
-                // with an in-memory `live_runs_started` snapshot
-                // (`scheduler.rs` `tick_one_workflow_schedule`), so a tick firing a
-                // due slot concurrently on a near-capacity schedule can still jointly
-                // over-run the budget. That is a pre-existing gap (identical for
-                // `trigger_schedule_now`-vs-tick), out of scope for #688 (which fixes
-                // the backfill-vs-backfill race); a complete fix would convert the
-                // tick's in-loop budget gate to the same atomic reserve. The atomic
-                // UPDATE replaces the prior stale in-memory
-                // `runs_started + dispatched_this_call` snapshot check that could let
-                // two concurrent requests both pass the gate with one remaining slot
-                // (Codex P2, PR #677).
+                // budget check is the atomic conditional UPDATE below, after the
+                // admission gate. It is race-safe against a concurrent backfill or
+                // `trigger_schedule_now`, because both use the same guarded UPDATE.
+                // It is NOT race-safe against the scheduler tick. The tick still gates
+                // `max_runs` with an in-memory `live_runs_started` snapshot
+                // (`tick_one_workflow_schedule` in `scheduler.rs`). So a tick that
+                // fires a due slot on a near-capacity schedule can still jointly
+                // over-run the budget. That gap predates #688 and also exists for
+                // `trigger_schedule_now` against the tick. #688 fixes only the
+                // backfill-vs-backfill race. A complete fix converts the in-loop
+                // budget gate of the tick to the same atomic reserve. The atomic
+                // UPDATE replaces a stale in-memory
+                // `runs_started + dispatched_this_call` check. That check let two
+                // concurrent requests both pass with one slot left (PR #677).
                 if budget_hit {
                     skipped += 1;
                     *skipped_reasons
@@ -33017,12 +32934,12 @@ pub(crate) async fn schedule_backfill_inner(
                 }
                 // In-memory budget attribution gate (issue #688): the atomic reservation below
                 // is the authoritative race-safe gate, but it runs after the prior-run/max_active/
-                // admission checks. Keep this cheap snapshot gate at loop position 1 so a slot
-                // blocked purely because the (single-request) budget is spent is attributed
-                // `max_runs_exhausted` and short-circuited BEFORE those later gates — preserving
-                // the pre-#688 single-request skipped_reasons/status envelope. Stale under
-                // concurrency (a concurrent request's reservations are invisible here), which is
-                // exactly why the atomic reservation + `budget_hit` fast-path remain.
+                // admission checks. Keep this cheap snapshot gate at loop position 1. A slot
+                // blocked only because the single-request budget is spent is then attributed
+                // `max_runs_exhausted` and skipped BEFORE those later gates. That keeps the
+                // pre-#688 single-request skipped_reasons/status envelope. The gate is stale
+                // under concurrency, because it cannot see the reservations of another
+                // request. So the atomic reservation and the `budget_hit` fast path remain.
                 if schedule.max_runs.is_some_and(|max| {
                     max > 0
                         && i64::from(schedule.runs_started) + dispatched_this_call >= i64::from(max)
@@ -33071,10 +32988,10 @@ pub(crate) async fn schedule_backfill_inner(
                 };
 
                 // Pre-check across ALL states including CONTINUED_AS_NEW / TERMINATED.
-                // `start_or_load_workflow_execution` uses a partial unique index that
-                // excludes sealed rows, so a sealed prior execution does not conflict
-                // and would allow a duplicate to be created. Backfill must not reuse
-                // sealed workflow IDs because the timestamp was already dispatched.
+                // The partial unique index of `start_or_load_workflow_execution`
+                // excludes sealed rows. So a sealed prior execution does not conflict,
+                // and a duplicate could be created. Backfill must not reuse sealed
+                // workflow IDs, because the timestamp was already dispatched.
                 let prior_check = harvest_workflow_executions::table
                     .filter(harvest_workflow_executions::workflow_name.eq(&wf_name))
                     .filter(
@@ -33160,10 +33077,9 @@ pub(crate) async fn schedule_backfill_inner(
 
                 // issue #377: check admission gates before firing a backfill run.
                 // Workflow backfill writes to pool.default_pool() and creates
-                // ExecutionId::new() (ShardId::UNENCODED) which resolves to the
-                // configured default shard — use that shard ID here, not a
-                // hard-coded 0 which is wrong when the default shard has a
-                // different ID.
+                // ExecutionId::new() (ShardId::UNENCODED). That resolves to the
+                // configured default shard, so use that shard ID here. A
+                // hard-coded 0 is wrong when the default shard has another ID.
                 if let Some((gate_id, gate_reason, scope_kind)) = api_state.gate_cache().check(
                     &wf_name,
                     dispatch_queue,
@@ -33188,23 +33104,23 @@ pub(crate) async fn schedule_backfill_inner(
                 }
 
                 // Atomically reserve one max_runs slot on the schedule's own shard
-                // BEFORE committing to a start (issue #688). Placed after the prior-run
-                // and admission checks so a slot is reserved only for a run that will
-                // actually attempt to start; every non-committing path below releases
-                // it via `release_backfill_budget_slot`.
+                // BEFORE committing to a start (issue #688). It follows the prior-run
+                // and admission checks, so only a run that will try to start reserves
+                // a slot. Every non-committing path below releases it through
+                // `release_backfill_budget_slot`.
                 let now = chrono::Utc::now();
-                // Re-arm target for a release that clears a tick-nulled exhaustion
-                // (F3/F5): restore the pre-tick due `next_run_at` snapshot loaded at
-                // backfill request start, NOT a recompute from `now`. Recomputing from
-                // `now` would advance PAST an already-due slot the tick skipped, dropping
-                // that run for a catchup schedule; the snapshot is the exact slot to retry.
-                // The re-arm UPDATE stays guarded on `next_run_at IS NULL`, so the common
-                // intra-backfill case is a no-op and this only fires after the clear
-                // un-exhausted a `max_runs_exhausted` row.
+                // Re-arm target for a release that clears a tick-nulled exhaustion.
+                // Restore the pre-tick due `next_run_at` snapshot from backfill request
+                // start, NOT a recompute from `now`. A recompute advances PAST an
+                // already-due slot the tick skipped. That drops the run for a catchup
+                // schedule. The snapshot is the exact slot to retry. The re-arm UPDATE
+                // stays guarded on `next_run_at IS NULL`. So the common intra-backfill
+                // case is a no-op. It fires only after the clear un-exhausted a
+                // `max_runs_exhausted` row.
                 let rearm_next = schedule.next_run_at;
-                // The reserved `runs_started` value is intentionally unused: the
-                // exhaustion transition below re-evaluates the LIVE row (issue #688,
-                // Codex F6), so no request-start snapshot is threaded through.
+                // The reserved `runs_started` value is unused. The exhaustion
+                // transition below re-evaluates the LIVE row (issue #688). So no
+                // request-start snapshot is threaded through.
                 {
                     // same_pool → reuse the per-slot exec `conn`; else the separate
                     // schedule connection. `conn` is not otherwise borrowed here.
@@ -33232,13 +33148,13 @@ pub(crate) async fn schedule_backfill_inner(
 
                 // Start-throttle admission (issue #607): pace backfill admissions,
                 // defer the excess rather than admitting an entire backfill window
-                // at once. A deferred slot counts as dispatched (the timestamp is
-                // consumed; schedule_id/scheduled_for/origin=backfill are persisted
-                // so carryover (#488) and run-history (#534) lineage survive the
-                // deferral) and is admitted later by the throttle scanner. Mirrors
-                // `tick_one_workflow_schedule`'s throttle block (scheduler.rs) and
-                // the size-check-ordering fix applied there and at the other three
-                // call sites (issue #607).
+                // at once. A deferred slot counts as dispatched, and the throttle
+                // scanner admits it later. Its timestamp is consumed. Its
+                // schedule_id/scheduled_for/origin=backfill persist, so carryover
+                // (#488) and run-history (#534) lineage survive the deferral. Mirrors
+                // the throttle block of `tick_one_workflow_schedule` (scheduler.rs)
+                // and its size-check ordering, as at the other three call sites
+                // (issue #607).
                 let mut backfill_throttle_bucket: Option<String> = None;
                 if let Some((throttle_policy, resolved_throttle_key)) =
                     workflow_resolving_throttle(&runtime.registry, &wf_name, &input)
@@ -33299,10 +33215,9 @@ pub(crate) async fn schedule_backfill_inner(
                         reuse_policy: Some("reject_duplicate".to_string()),
                         // Issue #743 review (PR #1141, Finding #5): a throttled
                         // (deferred) backfill fire must ALSO carry the declared
-                        // execution_timeout + fleet-wide ceiling -- parity with
-                        // the non-throttled backfill start path fixed above, and
-                        // with the `chain_execution_timeout_secs` field below,
-                        // which was already threaded correctly.
+                        // execution_timeout and the fleet-wide ceiling. This
+                        // matches the non-throttled backfill start path above
+                        // and the `chain_execution_timeout_secs` field below.
                         execution_timeout_secs: workflow_execution_timeout.map(|d| d.num_seconds()),
                         memo: None,
                         search_attrs: None,
@@ -33317,10 +33232,10 @@ pub(crate) async fn schedule_backfill_inner(
                         severity: severity.map(str::to_string),
                         max_execution_timeout_ceiling_secs: workflow_max_execution_timeout_ceiling
                             .map(|d| d.num_seconds()),
-                        // Chain-scoped lifetime cap (issue #617): workflow-type
-                        // default + fleet-wide ceiling captured so a throttled
-                        // backfill fire keeps the cap (parity with the non-throttled
-                        // backfill start path).
+                        // Chain-scoped lifetime cap (issue #617): capture the
+                        // workflow-type default and the fleet-wide ceiling. A
+                        // throttled backfill fire then keeps the cap, like the
+                        // non-throttled backfill start path.
                         chain_execution_timeout_secs: info_chain_execution_timeout
                             .and_then(|d| chrono::Duration::from_std(d).ok())
                             .map(|d| d.num_seconds()),
@@ -33381,11 +33296,11 @@ pub(crate) async fn schedule_backfill_inner(
                                 )
                                 .await;
                             } else {
-                                // A repeated backfill call for a window whose
-                                // slot is still durably deferred from an
-                                // earlier call resolves to the *same* pending
-                                // row (`reserve_or_defer`'s idempotency
-                                // shortcut), not a new admission. Report it as
+                                // A repeated backfill call can cover a slot
+                                // still durably deferred from an earlier call.
+                                // It resolves to the *same* pending row through
+                                // the idempotency shortcut of
+                                // `reserve_or_defer`, not a new admission. Report it as
                                 // already-consumed rather than a fresh
                                 // dispatch. A repeated identical backfill
                                 // request then cannot double-count the slot
@@ -33452,8 +33367,8 @@ pub(crate) async fn schedule_backfill_inner(
                         reuse_policy: WorkflowIdReusePolicy::RejectDuplicate,
                         max_execution_timeout_ceiling: workflow_max_execution_timeout_ceiling,
                         // Chain-scoped lifetime cap (issue #617): backfilled runs
-                        // inherit the workflow-type default + fleet-wide
-                        // ceiling-as-default so a whole scheduled chain is capped
+                        // inherit the workflow-type default and the fleet-wide
+                        // ceiling-as-default. So a whole scheduled chain is capped
                         // even when a workflow under-specifies (AC4).
                         chain_execution_timeout: info_chain_execution_timeout
                             .and_then(|d| chrono::Duration::from_std(d).ok()),
@@ -33511,10 +33426,10 @@ pub(crate) async fn schedule_backfill_inner(
                             .await;
                     }
                     Ok(_) | Err(HarvestError::AlreadyExists { .. }) => {
-                        // AC-a: an id-reuse short-circuit consumed no admission —
-                        // refund the reserved throttle token FIRST (that `&mut conn`
-                        // borrow must end before `budget_conn` may re-borrow `conn`
-                        // in the same_pool case), then release the reserved max_runs
+                        // AC-a: an id-reuse short-circuit consumed no admission.
+                        // Refund the reserved throttle token FIRST. That `&mut conn`
+                        // borrow must end before `budget_conn` re-borrows `conn` in
+                        // the same_pool case. Then release the reserved max_runs
                         // slot (issue #688).
                         if let Some(ref bucket) = backfill_throttle_bucket {
                             let _ =
@@ -33554,9 +33469,9 @@ pub(crate) async fn schedule_backfill_inner(
             let dag_name = name.clone();
             let shard_id = runtime.router().pick_for_dag(&dag_name);
             let shard_pool = pool.pool_for(shard_id);
-            // Budget-connection selection (Codex F4): when the DAG exec shard equals
-            // the schedule shard, budget ops run on the per-slot exec `conn`
-            // (pool-size-1 safe); otherwise hold a separate schedule-pool connection.
+            // Budget-connection selection: when the DAG exec shard equals the
+            // schedule shard, budget ops run on the per-slot exec `conn`. That is
+            // safe at pool size 1. Otherwise hold a separate schedule-pool connection.
             let same_pool = schedule_shard == shard_id;
             let mut sched_conn_opt = if same_pool {
                 None
@@ -33566,12 +33481,12 @@ pub(crate) async fn schedule_backfill_inner(
 
             for (original_slot, _fire_time) in &timestamp_pairs {
                 // Once the atomic DB max_runs reservation (issue #688) fails for one
-                // slot the budget is exhausted for every remaining slot too — see the
-                // workflow loop. The authoritative atomic reservation below is race-safe
-                // against a concurrent backfill or `trigger_schedule_now`, but NOT the
-                // scheduler tick (its in-memory `live_runs_started` gate can still jointly
-                // over-run a near-capacity schedule — a pre-existing gap, out of scope for
-                // #688). Replaces the prior stale in-memory snapshot check.
+                // slot, the budget is exhausted for every remaining slot too. See the
+                // workflow loop. The atomic reservation below is race-safe against a
+                // concurrent backfill or `trigger_schedule_now`, but NOT the scheduler
+                // tick. Its in-memory `live_runs_started` gate can still jointly over-run
+                // a near-capacity schedule. That gap predates #688 and is out of its
+                // scope. Replaces the prior stale in-memory snapshot check.
                 if budget_hit {
                     skipped += 1;
                     *skipped_reasons
@@ -33581,12 +33496,12 @@ pub(crate) async fn schedule_backfill_inner(
                 }
                 // In-memory budget attribution gate (issue #688): the atomic reservation below
                 // is the authoritative race-safe gate, but it runs after the prior-run/max_active/
-                // admission checks. Keep this cheap snapshot gate at loop position 1 so a slot
-                // blocked purely because the (single-request) budget is spent is attributed
-                // `max_runs_exhausted` and short-circuited BEFORE those later gates — preserving
-                // the pre-#688 single-request skipped_reasons/status envelope. Stale under
-                // concurrency (a concurrent request's reservations are invisible here), which is
-                // exactly why the atomic reservation + `budget_hit` fast-path remain.
+                // admission checks. Keep this cheap snapshot gate at loop position 1. A slot
+                // blocked only because the single-request budget is spent is then attributed
+                // `max_runs_exhausted` and skipped BEFORE those later gates. That keeps the
+                // pre-#688 single-request skipped_reasons/status envelope. The gate is stale
+                // under concurrency, because it cannot see the reservations of another
+                // request. So the atomic reservation and the `budget_hit` fast path remain.
                 if schedule.max_runs.is_some_and(|max| {
                     max > 0
                         && i64::from(schedule.runs_started) + dispatched_this_call >= i64::from(max)
@@ -33732,18 +33647,18 @@ pub(crate) async fn schedule_backfill_inner(
                 // BEFORE committing to a start (issue #688). Placed after the prior-run
                 // and admission checks; every non-committing path below releases it.
                 let now = chrono::Utc::now();
-                // Re-arm target for a release that clears a tick-nulled exhaustion
-                // (F3/F5): restore the pre-tick due `next_run_at` snapshot loaded at
-                // backfill request start, NOT a recompute from `now`. Recomputing from
-                // `now` would advance PAST an already-due slot the tick skipped, dropping
-                // that run for a catchup schedule; the snapshot is the exact slot to retry.
-                // The re-arm UPDATE stays guarded on `next_run_at IS NULL`, so the common
-                // intra-backfill case is a no-op and this only fires after the clear
-                // un-exhausted a `max_runs_exhausted` row.
+                // Re-arm target for a release that clears a tick-nulled exhaustion.
+                // Restore the pre-tick due `next_run_at` snapshot from backfill request
+                // start, NOT a recompute from `now`. A recompute advances PAST an
+                // already-due slot the tick skipped. That drops the run for a catchup
+                // schedule. The snapshot is the exact slot to retry. The re-arm UPDATE
+                // stays guarded on `next_run_at IS NULL`. So the common intra-backfill
+                // case is a no-op. It fires only after the clear un-exhausted a
+                // `max_runs_exhausted` row.
                 let rearm_next = schedule.next_run_at;
-                // The reserved `runs_started` value is intentionally unused: the
-                // exhaustion transition below re-evaluates the LIVE row (issue #688,
-                // Codex F6), so no request-start snapshot is threaded through.
+                // The reserved `runs_started` value is unused. The exhaustion
+                // transition below re-evaluates the LIVE row (issue #688). So no
+                // request-start snapshot is threaded through.
                 {
                     // same_pool → reuse the per-slot exec `conn`; else the separate
                     // schedule connection. `conn` is not otherwise borrowed here.
@@ -34202,15 +34117,14 @@ async fn load_schedule_by_id(
 /// Like [`load_schedule_by_id`] but also returns the [`ShardId`] of the shard
 /// the schedule was found on, so callers can route subsequent writes correctly.
 ///
-/// Delegates to [`resolve_schedule_with_shard`] so every schedule lookup in the
-/// plugin obeys one rule. The previous implementation `?`-propagated the first
-/// shard's `acquire_conn` failure, so a schedule living on a *later* healthy
-/// shard could not be found at all while an earlier shard was down — which took
-/// down `GET /admin/schedules/{id}/preview` and `POST /admin/schedules/{id}/backfill`
-/// (and, through them, the Vantage drill-downs) for rows that were perfectly
-/// readable. The shared resolver keeps scanning, returns the row when any shard
-/// has it, and distinguishes an authoritative `404` from a `503` when a shard
-/// could not be checked — never an unqualified "not found" during an outage.
+/// Delegates to [`resolve_schedule_with_shard`], so one rule governs every
+/// schedule lookup. A down shard must not hide a schedule on a later healthy
+/// shard. The earlier code `?`-propagated the first `acquire_conn` failure. That
+/// broke `GET /admin/schedules/{id}/preview` and `POST /admin/schedules/{id}/backfill`
+/// (and the Vantage drill-downs) for readable rows. The shared resolver keeps
+/// scanning and returns the row when any shard has it. It tells an authoritative
+/// `404` from a `503` when a shard could not be checked. It never returns a bare
+/// "not found" during an outage.
 async fn load_schedule_by_id_with_shard(
     api_state: &HarvestApiState,
     schedule_id: uuid::Uuid,
@@ -34267,9 +34181,8 @@ pub(crate) fn parse_schedule_expr_with_tz(
             }
         }
     };
-    // Validate cron expressions eagerly (including timezone names) so callers
-    // receive a 400 rather than silently persisting an expression that will
-    // never fire or an unknown timezone that would misfire.
+    // Validate cron expressions and timezone names eagerly. A caller then gets a
+    // 400, not a stored expression that never fires or a timezone that misfires.
     autumn_harvest::validate_schedule(&schedule)?;
     Ok(schedule)
 }
@@ -34343,10 +34256,9 @@ async fn list_dead_letters(
         for (shard, ids) in by_shard {
             use autumn_harvest::schema::harvest_workflow_executions::dsl as wf_dsl;
             let shard_pool = pool.pool_for(shard);
-            // Best-effort runbook enrichment (issue #756): a shard that goes
-            // unreachable between the DLQ load and this secondary lookup must
-            // not `500` the whole request — skip it; the dead-letter rows still
-            // return, just without their runbook links.
+            // Best-effort runbook enrichment (issue #756). A shard that becomes
+            // unreachable after the DLQ load must not `500` the whole request.
+            // Skip it. The dead-letter rows still return, without runbook links.
             let Ok(mut conn) = acquire_conn(shard_pool).await else {
                 continue;
             };
@@ -34386,16 +34298,15 @@ async fn list_dead_letters(
 /// `GET /dead-letters/aggregate` — root-cause aggregation for DLQ triage
 /// (issue #385).
 ///
-/// Groups dead-letter rows along a small named set of dimensions (`workflow_name`,
-/// `activity_name`, `queue_name`, `task_type`, `time_bucket`, `failure_signature`)
-/// and returns per-group counts plus a handful of representative
-/// `dead_letter_id`s, fanning out across shards and merging the partials.
+/// Groups dead-letter rows by a named set of dimensions (`workflow_name`,
+/// `activity_name`, `queue_name`, `task_type`, `time_bucket`, `failure_signature`).
+/// Returns per-group counts and a few representative `dead_letter_id`s. Fans out
+/// across shards and merges the partials.
 ///
-/// Partial availability (issue #756): the initial cut hard-`?`d each shard,
-/// turning one unreachable shard into a `500`. It now collects-and-continues —
-/// the merge runs over the reachable shards' partials and the response object
-/// carries additive `status` + `unavailable_shards` fields (empty/`complete`
-/// on the happy path).
+/// Partial availability (issue #756): an unreachable shard does not turn the
+/// request into a `500`. The merge runs over the partials of reachable shards.
+/// The response carries additive `status` and `unavailable_shards` fields
+/// (empty and `complete` on the happy path).
 async fn aggregate_dead_letters(
     Extension(api_state): Extension<HarvestApiState>,
     axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
@@ -34628,11 +34539,11 @@ impl BulkDlqApiBody {
             filter: dlq::BulkDlqFilter {
                 activity_name: self.activity_name,
                 workflow_name: self.workflow_name,
-                // `queue_name` is a plain positive-equality filter — treat empty
-                // exactly like `activity_name`/`workflow_name` (a harmless
-                // matches-nothing predicate), not like the strict-reject cause
-                // dimensions (whose empty value would dangerously skip the
-                // filter and widen the cohort).
+                // `queue_name` is a plain positive-equality filter. Treat empty
+                // like `activity_name`/`workflow_name`, as a harmless
+                // matches-nothing predicate. The strict-reject cause dimensions
+                // differ: their empty value would skip the filter and widen the
+                // cohort.
                 queue_name: self.queue_name,
                 min_attempts: self
                     .min_attempts
@@ -34654,10 +34565,11 @@ impl BulkDlqApiBody {
     }
 }
 
-/// Normalize a compute-on-read cause filter value (issue #613): an absent
-/// value stays absent; a present value is trimmed and, if empty after
-/// trimming, rejected with `400` rather than silently downgraded to "no
-/// filter" (which would replay/discard a far larger cohort than intended).
+/// Normalize a compute-on-read cause filter value (issue #613).
+///
+/// An absent value stays absent. A present value is trimmed. An empty trimmed
+/// value gets `400` and is never silently downgraded to "no filter". "No
+/// filter" would replay or discard a far larger cohort than intended.
 fn normalize_cause_filter(value: Option<String>) -> Result<Option<String>, AutumnError> {
     value.map_or_else(
         || Ok(None),
@@ -34674,16 +34586,16 @@ fn normalize_cause_filter(value: Option<String>) -> Result<Option<String>, Autum
     )
 }
 
-/// Validate a bulk-DLQ `min_attempts` filter (issue #613). The aggregate read
-/// parser (`DlqAggregateParams::from_query_pairs`) only rejects negatives
-/// (accepting `>= 0`), but the bulk replay/discard paths are DESTRUCTIVE so we
-/// are stricter: attempt counts are 1-based, so a `min_attempts` of `0` or a
-/// negative value produces the predicate `attempts >= 0` (or lower) which
-/// matches EVERY DLQ row. That is not a genuine narrowing criterion, so it must
-/// not satisfy the substantive-filter safety guard (AC8) — otherwise a
-/// malformed request slips past `BulkDlqFilter::is_empty()` and acts on the
-/// whole DLQ. Reject at the request boundary (mirroring `normalize_cause_filter`)
-/// rather than touching the SQL predicate; require `>= 1`.
+/// Validate a bulk-DLQ `min_attempts` filter (issue #613).
+///
+/// The aggregate read parser (`DlqAggregateParams::from_query_pairs`) rejects
+/// only negatives. The bulk replay and discard paths are destructive, so they
+/// are stricter. Attempt counts are 1-based, so a `min_attempts` below `1`
+/// matches every DLQ row. That is no real narrowing criterion. It must not
+/// satisfy the substantive-filter safety guard (AC8). Otherwise a malformed
+/// request slips past `BulkDlqFilter::is_empty()` and acts on the whole DLQ.
+/// Reject it at the request boundary, like `normalize_cause_filter`, and leave
+/// the SQL predicate alone. Require `>= 1`.
 fn validate_bulk_min_attempts(value: i32) -> Result<i32, AutumnError> {
     if value < 1 {
         Err(AutumnError::bad_request_msg(format!(
@@ -35834,9 +35746,9 @@ async fn bulk_discard_dead_letters_for_selector(
     // `MAX_BULK_LIMIT` -- costs one round trip, not 1,000. See
     // `docs/performance-dlq-bulk-discard.md`.
     //
-    // A batch failure (statement timeout, lock contention) is captured into
-    // `result.failures` instead of propagated with `?` (Codex review, PR
-    // #1422). `bulk_discard_from_shards` calls this once per shard and stops
+    // A batch failure (statement timeout, lock contention) goes into
+    // `result.failures` and does not propagate with `?` (PR #1422).
+    // `bulk_discard_from_shards` calls this once per shard and stops
     // at the first `Err`. Raising here would abort every later shard. It
     // would also discard already-accumulated totals from earlier shards, for
     // a single Postgres-side hiccup on one shard's one statement, not a
@@ -36002,18 +35914,17 @@ async fn retention_run_now(
 /// The build id **this process** is configured with, for the two in-process
 /// replay gates (issue #798).
 ///
-/// Both the deploy replay canary and the replay-diagnosis endpoint run inside the
-/// deployed candidate and ask what *the currently deployed code* does with a
-/// recorded history — so the replay context must report the same
-/// [`WorkerConfig::build_id`] the live worker puts on span metadata. Sourcing it
-/// from the execution's recorded `assigned_build_id` instead would replay the
-/// branch the **old** build took, which is exactly the blind spot these gates
-/// exist to remove.
+/// The deploy replay canary and the replay-diagnosis endpoint run inside the
+/// deployed candidate. They ask what *the currently deployed code* does with a
+/// recorded history. So the replay context must report the same
+/// [`WorkerConfig::build_id`] that the live worker puts on span metadata. The
+/// execution's recorded `assigned_build_id` would replay the branch the **old**
+/// build took. That is exactly the blind spot these gates exist to remove.
 ///
 /// Returns `None` when no snapshot was captured (a runtime booted without the
-/// `with_effective_config` seam) or when the configured build id is empty (the
-/// default for a deployment that does not use build routing at all) — in both
-/// cases `ctx.build_id()` correctly reports `None`, matching the live worker.
+/// `with_effective_config` seam). Also returns `None` when the configured build
+/// id is empty, the default for a deployment without build routing. In both
+/// cases `ctx.build_id()` reports `None`, matching the live worker.
 fn running_build_id(runtime: &HarvestApiRuntime) -> Option<String> {
     normalize_running_build_id(runtime.effective_config().map(|view| view.worker.build_id))
 }
@@ -36021,11 +35932,10 @@ fn running_build_id(runtime: &HarvestApiRuntime) -> Option<String> {
 /// The pure half of [`running_build_id`]: an absent snapshot **or** an empty
 /// configured build id both resolve to `None`.
 ///
-/// Split out so the rule is unit-testable without constructing a full
-/// [`HarvestApiRuntime`] (which needs eight collaborators). Empty is the default
-/// for a deployment that does not use build routing at all, and the live worker
-/// reports no build in that case — so mapping it to `Some("")` would make the
-/// gate replay under a build id no worker ever reports.
+/// Split out so the rule is unit-testable without a full [`HarvestApiRuntime`],
+/// which needs eight collaborators. Empty is the default for a deployment
+/// without build routing, and the live worker then reports no build. `Some("")`
+/// would make the gate replay under a build id that no worker reports.
 fn normalize_running_build_id(configured: Option<String>) -> Option<String> {
     configured.filter(|build_id| !build_id.is_empty())
 }
@@ -36046,20 +35956,20 @@ async fn run_replay_canary_handler(
     let pool = api_state.storage_pool().map_err(map_error)?;
     let runtime = api_state.runtime().map_err(map_error)?;
 
-    // Issue #806: thread the runtime's shared state, mirroring the single-execution
-    // replay-diagnosis route below. A workflow that reads typed shared state during
-    // replay — `ctx.state::<BusinessCalendars>()` is the motivating case — sees an
-    // empty map without this and fails a prologue guard, so the canary would report
+    // Issue #806: thread the runtime's shared state, like the single-execution
+    // replay-diagnosis route below. A workflow can read typed shared state during
+    // replay, as `ctx.state::<BusinessCalendars>()` does. Without this it sees an
+    // empty map and fails a prologue guard. The canary would then report
     // `workflow_failed` for code that replays cleanly on every real worker.
     let mut replayer = WorkflowReplayer::new().with_shared_state(runtime.registry().shared_state());
     // Issue #798: thread this process's own configured build id. The canary runs
     // *inside* the deployed candidate, so `WorkerConfig::build_id` here IS the
-    // candidate build — and the live worker reports that same value through span
-    // metadata (never the execution's recorded `assigned_build_id`). Without it
-    // `ctx.build_id()` is `None` during the canary, so a candidate-only branch
-    // such as `if ctx.build_id() == Some("v2")` is unreachable, the historical
-    // path replays clean, and the canary reports success for code that diverges
-    // the moment it takes traffic.
+    // candidate build. The live worker reports that same value through span
+    // metadata, never the execution's recorded `assigned_build_id`. Without it,
+    // `ctx.build_id()` is `None` during the canary. A candidate-only branch such
+    // as `if ctx.build_id() == Some("v2")` is then unreachable, and the historical
+    // path replays clean. The canary reports success for code that diverges the
+    // moment it takes traffic.
     if let Some(build_id) = running_build_id(&runtime) {
         replayer = replayer.with_build_id(build_id);
     }
@@ -36128,18 +36038,18 @@ async fn run_replay_canary_handler(
 /// `POST /workflows/{id}/replay-diagnosis` (issue #614) — read-only, single-
 /// execution replay diagnosis.
 ///
-/// Loads ONE execution's recorded history from its owning shard and replays it
-/// against the currently-registered `#[workflow]` handler via
-/// [`WorkflowReplayer`](autumn_harvest::testing::WorkflowReplayer), returning a
-/// structured verdict (clean / diverged / `workflow_failed` / `not_registered` /
-/// `not_replayable_dag`). This is the operator's on-demand answer to "will — or
-/// did — this specific run diverge under the code I have deployed right now?" —
-/// the same question the #480/#603 non-determinism-block incident signal raises
-/// fleet-wide, but scoped to one execution: a PAUSED or nd-blocked RUNNING run
-/// (the headline diagnosability use case), or a terminal FAILED run for
-/// retroactive forensics (AC4). The `divergence` object mirrors the #603 block
-/// diagnostic vocabulary (`kind` / `event_index` / `expected` / `actual`) so an
-/// operator can compare it directly against a blocked run's `search_attrs`.
+/// Loads ONE execution's recorded history from its owning shard. Replays it
+/// against the currently registered `#[workflow]` handler via
+/// [`WorkflowReplayer`](autumn_harvest::testing::WorkflowReplayer). Returns a
+/// structured verdict: clean, diverged, `workflow_failed`, `not_registered` or
+/// `not_replayable_dag`. It tells an operator whether this run will diverge, or
+/// did, under the code deployed right now. The #480/#603 non-determinism-block
+/// incident signal raises that question fleet-wide. This route scopes it to one
+/// execution. The headline use is a PAUSED or nd-blocked RUNNING run. A terminal
+/// FAILED run also qualifies, for retroactive forensics (AC4). The `divergence`
+/// object mirrors the #603 block diagnostic vocabulary (`kind` / `event_index` /
+/// `expected` / `actual`). An operator can compare it directly against a blocked
+/// run's `search_attrs`.
 ///
 /// Status contract:
 ///   * `200` — a structured verdict for EVERY reachable diagnosis, including the
@@ -36148,29 +36058,29 @@ async fn run_replay_canary_handler(
 ///   * `400` — malformed execution id.
 ///   * `404` — unknown execution.
 ///   * `408` — replay exceeded the bounded budget (`WorkerConfig::query_timeout`).
-///     The `query_timeout` bound applies to async-yielding replays; a workflow
-///     function that busy-loops synchronously without ever `.await`-ing is out of
-///     scope, exactly as for the live executor. A large but healthy history is
+///     The `query_timeout` bound applies to async-yielding replays. A workflow
+///     function that busy-loops synchronously without ever `.await`-ing is out
+///     of scope, as for the live executor. A large but healthy history is
 ///     not at risk. The executor suspends only when the handler is pending on
 ///     a parked Harvest future (issue #1797). It never cuts off a CPU-bound
 ///     replay that consumes recorded events. A completed history therefore
 ///     replays to its verdict, bounded only by this outer `query_timeout`. That
 ///     gives ample headroom for the ~<200 ms/10k-event replay budget (issue #135).
-///   * `410` — history unavailable: a terminal execution whose recorded history
-///     is incomplete (truncated before its terminal seal — pruned by retention
-///     or released on reset), or a terminal execution whose payloads were
-///     PII-erased (issue #495). Both would yield a misleading verdict, so they
+///   * `410` — history unavailable. Either a terminal execution has an
+///     incomplete recorded history, or its payloads were PII-erased (issue #495).
+///     Retention pruning, or a release on reset, can truncate a history before
+///     its terminal seal. Both cases would yield a misleading verdict. So they
 ///     are refused, mirroring the #612 terminal-query path.
 ///
-/// Read-only (AC3): the DB connection is dropped before user code is driven, and
-/// the replay itself is pure in-memory replay that appends no events and performs
-/// no writes. No audit row is written.
+/// Read-only (AC3): the DB connection is dropped before user code runs. The
+/// replay is pure and in memory. It appends no events and performs no writes.
+/// No audit row is written.
 #[allow(clippy::too_many_lines)]
 async fn replay_diagnosis(
     Extension(api_state): Extension<HarvestApiState>,
     Path(id): Path<String>,
-    // Issue #608 (PR #1107 Codex review): needed to gate + audit read-path codec
-    // decoding of this execution's payloads (see the load block below).
+    // Issue #608 (PR #1107): gates and audits read-path codec decoding of this
+    // execution's payloads (see the load block below).
     headers: axum::http::HeaderMap,
     maybe_session: Option<Extension<Session>>,
 ) -> Result<Json<crate::replay_diagnosis::ReplayDiagnosisResponse>, AutumnError> {
@@ -36191,10 +36101,10 @@ async fn replay_diagnosis(
     let workflow_name = execution.workflow_name.clone();
     let state = execution.state.clone();
 
-    // 410 — a PII-erased terminal execution (issue #495) replays structurally but
-    // over `{"_harvest_erased": true}` payload tombstones, so any verdict would be
-    // computed against scrubbed inputs and be misleading. Erasure is terminal-only
-    // and always tombstones the row's own `input` column, so this O(1) check is
+    // 410 — a PII-erased terminal execution (issue #495) replays structurally,
+    // but over `{"_harvest_erased": true}` payload tombstones. Any verdict would
+    // use scrubbed inputs and mislead. Erasure is terminal-only and always
+    // tombstones the row's own `input` column, so this O(1) check is
     // authoritative. Mirrors hydrate_ctx_for_query (#612).
     if is_terminal_state(&execution.state) && erase::execution_input_is_erased(&execution.input) {
         return Err(map_error(HarvestError::HistoryUnavailable {
@@ -36238,44 +36148,43 @@ async fn replay_diagnosis(
         .expect("workflow presence just checked above")
         .handler;
 
-    // Load the recorded history exactly as the live worker loads it for replay:
-    // codec-decode payloads (#608) and inflate offloaded payloads via the
-    // registry's offloader (#524), so an encrypted or offloaded history replays
-    // faithfully rather than hard-erroring on ciphertext / false-diverging on an
+    // Load the recorded history as the live worker loads it for replay.
+    // Codec-decode payloads (#608) and inflate offloaded payloads via the
+    // registry's offloader (#524). An encrypted or offloaded history then replays
+    // faithfully. It does not hard-error on ciphertext or false-diverge on an
     // offload reference envelope. Then DROP the DB connection before driving user
-    // code — WorkflowReplayer needs no DB, and holding a pool slot for the whole
-    // replay would starve other management/worker DB operations (the #612
-    // pool-slot discipline).
+    // code. WorkflowReplayer needs no DB. Holding a pool slot for the whole replay
+    // would starve other management and worker DB operations (the #612 pool-slot
+    // discipline).
     //
-    // #608 read-path decode gate (PR #1107 Codex review): decoding is gated
-    // behind the deployment opt-in (`decode_payloads_on_read`) + admin — the
-    // exact `read_path_decoder` predicate every other #608 read surface uses.
-    // The merged endpoint decoded with the runtime's codecs UNCONDITIONALLY,
-    // which on a non-identity-codec deployment (a) decoded — and surfaced, via
-    // `failure.error` / `divergence.expected` / `divergence.actual` — encrypted
-    // payloads even with the operator's decode gate OFF, and (b) dropped the
-    // connection without writing the required `payload.decode_read` audit row.
-    // This route is already admin-gated (`require_admin`), so the gate resolves
-    // to the `decode_payloads_on_read` flag in practice. Offload inflation (#524)
-    // is NOT a #608 concern (a storage indirection, not decryption) and is kept
-    // in BOTH branches so an offloaded history replays faithfully regardless of
-    // the decode gate — matching the closest #608 replay-driving sibling.
+    // #608 read-path decode gate (PR #1107): decoding is gated behind the
+    // deployment opt-in (`decode_payloads_on_read`) and admin. That is the exact
+    // `read_path_decoder` predicate of every other #608 read surface. The merged
+    // endpoint decoded with the runtime's codecs UNCONDITIONALLY. On a
+    // non-identity-codec deployment that had two faults. (a) It decoded encrypted
+    // payloads with the decode gate OFF and surfaced them via `failure.error`,
+    // `divergence.expected` and `divergence.actual`. (b) It dropped the connection
+    // without the required `payload.decode_read` audit row. This route is already
+    // admin-gated (`require_admin`), so in practice the gate is the
+    // `decode_payloads_on_read` flag. Offload inflation (#524) is NOT a #608
+    // concern: it is a storage indirection, not decryption. Both branches keep it,
+    // so an offloaded history replays faithfully regardless of the decode gate.
+    // That matches the closest #608 replay-driving sibling.
     //
-    // Design choice: build a HistorySnapshot from the already-loaded execution
-    // row + this history and replay via `replay_canary_snapshot` (drop-first),
-    // rather than `WorkflowReplayer::replay_from_db`, which reloads history + meta
-    // and holds its connection across the whole replay. Both are correct;
-    // drop-first keeps the pool slot free for the ~bounded replay duration.
+    // Design choice: build a HistorySnapshot from the loaded execution row and
+    // this history, and replay via `replay_canary_snapshot` (drop-first).
+    // `WorkflowReplayer::replay_from_db` instead reloads history and meta and
+    // holds its connection across the whole replay. Both are correct. Drop-first
+    // keeps the pool slot free for the bounded replay duration.
     let offloader = runtime.registry.payload_offloader();
     // Decode ON (deployment opt-in + admin): decode with the runtime's real
-    // codecs exactly as the live worker does, and write the audit row when ≥1
-    // codec envelope was decoded. `load_history_inflated` strict-decodes
-    // (matching the worker's replay fidelity); the audit count is derived from a
-    // lossy scan of the raw stored payloads (never used for the replay itself).
-    // Offloaded-then-encrypted payloads (PayloadStore + non-identity codec both
-    // configured) are not offload-inflated for the count, so the audit
-    // conservatively counts inline-encrypted envelopes only — a rare-combo edge
-    // that under-counts, never a leak.
+    // codecs as the live worker does. Write the audit row when ≥1 codec envelope
+    // was decoded. `load_history_inflated` strict-decodes, matching the worker's
+    // replay fidelity. The audit count comes from a lossy scan of the raw stored
+    // payloads and never feeds the replay. Offloaded-then-encrypted payloads
+    // (PayloadStore and a non-identity codec both configured) are not inflated
+    // for the count. So the audit counts inline-encrypted envelopes only. This
+    // rare edge under-counts and never leaks.
     let decode_codecs = read_path_decoder(&api_state, extension_session(maybe_session)).await;
     let history = if let Some(codecs) = decode_codecs.as_ref() {
         let history = store::load_history_inflated(&mut conn, exec_id, codecs, offloader)
@@ -36297,9 +36206,9 @@ async fn replay_diagnosis(
             outcome = outcome.merged(codecs.decode_value_lossy(&mut cell));
         }
         let target = exec_id.to_string();
-        // Reuse the handler's own (execution-shard) connection, mirroring the
-        // history-export audit — a second pool acquire while it is live can
-        // stall a size-1 pool (PR #936 review).
+        // Reuse the handler's own (execution-shard) connection, like the
+        // history-export audit. A second pool acquire while it is live can stall
+        // a size-1 pool (PR #936 review).
         audit_decoded_read(
             &api_state,
             Some(&mut conn),
@@ -36317,15 +36226,15 @@ async fn replay_diagnosis(
         history
     } else {
         // Decode OFF (or non-admin): do NOT codec-decode. Load with the identity
-        // codec (still inflating offloaded refs). On an identity-codec deployment
-        // this is byte-identical to the merged behavior — no envelopes exist, so
-        // all 16 identity-deployment integration tests are unaffected. On a
-        // non-identity deployment the identity decode hard-errors
-        // `UnknownPayloadCodec` on the first encrypted envelope; map that to an
-        // HONEST 410 (via `HistoryUnavailable`, the endpoint's existing "history
-        // not diagnosable" contract) rather than leaking ciphertext into the
-        // verdict, false-diverging, or 503-ing — the operator must enable
-        // read-path decoding (admin) to diagnose an encrypted execution.
+        // codec, which still inflates offloaded refs. On an identity-codec
+        // deployment this is byte-identical to the merged behavior. No envelopes
+        // exist, so all 16 identity-deployment integration tests are unaffected.
+        // On a non-identity deployment the identity decode hard-errors
+        // `UnknownPayloadCodec` on the first encrypted envelope. Map that to an
+        // HONEST 410 via `HistoryUnavailable`, the endpoint's existing "history
+        // not diagnosable" contract. Never leak ciphertext into the verdict,
+        // false-diverge, or return 503. The operator must enable read-path
+        // decoding (admin) to diagnose an encrypted execution.
         let identity = PayloadCodecs::default();
         match store::load_history_inflated(&mut conn, exec_id, &identity, offloader).await {
             Ok(history) => {
@@ -36344,26 +36253,26 @@ async fn replay_diagnosis(
         }
     };
 
-    // Whether the recorded history reached its terminal seal — needed by the
-    // sealed-mid-await reclassification below, computed before `history.events`
-    // is moved into the snapshot (issue #614 FIX 3).
+    // Whether the recorded history reached its terminal seal (issue #614 FIX 3).
+    // The sealed-mid-await reclassification below needs it. Compute it before
+    // `history.events` moves into the snapshot.
     let history_reached_seal = history_reached_terminal_seal(&history.events);
     let terminal_state = is_terminal_state(&state);
 
-    // 410 — a TERMINAL execution whose recorded event rows are truncated BEFORE
-    // the terminal lifecycle event (pruned by retention / released on reset /
+    // 410 — a TERMINAL execution whose recorded event rows end BEFORE the
+    // terminal lifecycle event (pruned by retention, released on reset, or
     // otherwise incomplete). Such a prefix-only history replays to a frontier
-    // suspension, which canary treats as `clean` — falsely implying "no
-    // divergence, safe to rule out" for a run whose real seal we can no longer
-    // see. Refuse it exactly as the #612 sibling terminal-query path does
-    // (`classify_terminal_query` maps a terminal execution with no seal to
-    // `HistoryUnavailable`), rather than serving a misleading verdict.
+    // suspension, which canary treats as `clean`. That falsely implies "no
+    // divergence, safe to rule out" for a run whose real seal is no longer
+    // visible. Refuse it, as the #612 sibling terminal-query path does, and
+    // serve no misleading verdict. There `classify_terminal_query` maps a
+    // terminal execution with no seal to `HistoryUnavailable`.
     //
-    // Gate ONLY terminal executions: a seal-less prefix is the NORMAL, expected
-    // shape of a healthy in-flight RUNNING/PAUSED/SUSPENDED run (the endpoint's
-    // headline case) — those must still proceed to the canary replay and report
-    // `clean`/`diverged`. Ordered after the O(1) erased-guard (which already
-    // 410s the terminal-erased subset before history is even loaded), so this
+    // Gate ONLY terminal executions. A seal-less prefix is the NORMAL shape of a
+    // healthy in-flight RUNNING/PAUSED/SUSPENDED run, the endpoint's headline
+    // case. Those runs still proceed to the canary replay and report
+    // `clean`/`diverged`. This check runs after the O(1) erased-guard, which
+    // already 410s the terminal-erased subset before history loads. So it
     // catches the remaining truncated-but-not-erased terminal histories.
     if terminal_state && !history_reached_seal {
         return Err(map_error(HarvestError::HistoryUnavailable {
@@ -36372,11 +36281,11 @@ async fn replay_diagnosis(
         }));
     }
 
-    // Thread the execution row's own execution_timeout / deadline_at / parent id /
-    // workflow_id / context headers into the snapshot (issues #772, #698, #481) —
-    // exactly the values hydrate_ctx_for_query threads for the query path — so a
-    // deadline-aware, parent-aware, or header-branching run replays cleanly instead
-    // of surfacing FALSE non-determinism.
+    // Thread the execution row's own execution_timeout, deadline_at, parent id,
+    // workflow_id and context headers into the snapshot (issues #772, #698,
+    // #481). hydrate_ctx_for_query threads exactly these values for the query
+    // path. A deadline-aware, parent-aware, or header-branching run then replays
+    // cleanly, without FALSE non-determinism.
     // The headers decode under the same gate as the history. A cell this
     // caller may not decode makes the run undiagnosable. It never replays
     // without its headers (issue #2043).
@@ -36410,37 +36319,35 @@ async fn replay_diagnosis(
         queue_name: None,
     };
 
-    // Register ONLY the target handler and replay in CANARY mode. Canary — not
-    // strict — is required: strict replay classifies a frontier suspension (every
-    // healthy in-flight RUNNING/SUSPENDED/PAUSED run parked mid-flight, the
-    // endpoint's headline use case) as `NonDeterminismDetected`, a false
-    // `diverged`. Canary excepts exactly that frontier suspension → `clean`, while
-    // a genuine mid-history divergence still surfaces (it resolves synchronously
-    // during the drive, not as a frontier suspension). Bound by `query_timeout`
-    // (the #612 contract): on the timer winning, return 408.
-    // Thread the runtime registry's shared state into the diagnosis replay so it
-    // sees the SAME typed state the live worker's replay path sees
-    // (`registry.shared_state()`, `worker.rs`). Without this the replayer defaults
-    // to `empty_shared_state()`, so a workflow that reads `ctx.state::<T>()` during
-    // replay would find nothing under diagnosis and spuriously report
-    // `workflow_failed`/`diverged` for state-registering deployments — even though
-    // the same execution replays cleanly on the worker (Codex review, PR #1107).
-    // Thread the runtime registry's history policy so the diagnosis replay uses
-    // the SAME `continue_as_new_threshold` / `continue_as_new_deadline_fraction`
-    // the live worker's replay uses (`registry.history_policy()`, worker.rs).
-    // Without this the canary replay defaults to `WorkflowHistoryPolicy::default()`,
-    // so a workflow that branches command-affecting control flow on
-    // `ctx.should_continue_as_new()` would emit a different command set under
-    // diagnosis than it did live and spuriously report `diverged` /
-    // `workflow_failed` for deployments that configure a non-default policy —
-    // even though the same execution replays cleanly on the worker (Codex review,
-    // PR #1107).
+    // Register ONLY the target handler and replay in CANARY mode. Strict replay
+    // classifies a frontier suspension as `NonDeterminismDetected`, a false
+    // `diverged`. Every healthy in-flight RUNNING/SUSPENDED/PAUSED run parks at
+    // such a frontier, and that is the endpoint's headline use case. Canary
+    // excepts exactly that frontier suspension as `clean`. A genuine mid-history
+    // divergence still surfaces, because it resolves synchronously during the
+    // drive. Bound by `query_timeout` (the #612 contract): when the timer wins,
+    // return 408.
+    // Thread the runtime registry's shared state into the diagnosis replay. It
+    // then sees the SAME typed state as the live worker's replay path
+    // (`registry.shared_state()`, `worker.rs`). Without this the replayer
+    // defaults to `empty_shared_state()`. A workflow that reads `ctx.state::<T>()`
+    // during replay would find nothing and falsely report `workflow_failed` or
+    // `diverged`. The same execution replays cleanly on the worker (PR #1107).
+    // Thread the runtime registry's history policy as well (PR #1107). The
+    // diagnosis replay then uses the SAME `continue_as_new_threshold` and
+    // `continue_as_new_deadline_fraction` as the live worker's replay
+    // (`registry.history_policy()`, worker.rs). Without this the canary replay
+    // defaults to `WorkflowHistoryPolicy::default()`. A workflow that branches
+    // command-affecting control flow on `ctx.should_continue_as_new()` would
+    // emit a different command set than it did live. Under a non-default policy
+    // it would falsely report `diverged` or `workflow_failed`, though the same
+    // execution replays cleanly on the worker.
     let mut replayer = autumn_harvest::testing::WorkflowReplayer::new()
         .with_shared_state(runtime.registry().shared_state())
         .with_history_policy(runtime.registry().history_policy())
         .register_fn(execution.workflow_name.clone(), handler);
-    // Issue #798: same reasoning as the replay canary — diagnosis asks "does this
-    // execution diverge under the code deployed *right now*", so the replay
+    // Issue #798: same reasoning as the replay canary. Diagnosis asks whether
+    // this execution diverges under the code deployed *right now*. So the replay
     // context must report the build id this process is configured with. Left
     // unset, `ctx.build_id()` is `None` and a build-gated branch takes the wrong
     // path, so the diagnosis verdict describes code that will not run.
@@ -36463,15 +36370,15 @@ async fn replay_diagnosis(
         }
     };
 
-    // Reclassify a false `diverged` on a terminal run that was externally sealed
-    // mid-await (TIMED_OUT / externally-cancelled / terminated) into `clean`
-    // (issue #614 FIX 3): the workflow replayed its recorded history faithfully
-    // and then issued the next command exactly where the external terminal seal
-    // sits — no code divergence, the run was killed by an outside force. A genuine
-    // mid-history divergence, or new code that does MORE work than a COMPLETED /
-    // FAILED run, is never masked (the divergence's `actual` names a real command
-    // event or the workflow's own outcome seal, not an external seal — see
-    // `reclassify_sealed_mid_await`).
+    // Reclassify a false `diverged` into `clean` on a terminal run that was
+    // externally sealed mid-await: TIMED_OUT, externally cancelled, or
+    // terminated (issue #614 FIX 3). The workflow replayed its recorded history
+    // faithfully. It then issued the next command exactly where the external
+    // terminal seal sits. That is no code divergence: an outside force killed
+    // the run. A genuine mid-history divergence is never masked. Nor is new code
+    // that does MORE work than a COMPLETED or FAILED run. There the divergence's
+    // `actual` names a real command event or the workflow's own outcome seal,
+    // not an external seal. See `reclassify_sealed_mid_await`.
     let response = crate::replay_diagnosis::reclassify_sealed_mid_await(
         crate::replay_diagnosis::report_to_response(exec_id, workflow_name, state, report),
         terminal_state,
@@ -36610,16 +36517,16 @@ fn admin_concurrency_limits(
 
 /// Effective `on_conflict` to report for one `/admin/concurrency` row (issue #811).
 ///
-/// Latest-wins is a **workflow-start admission control**: the supersede runs
+/// Latest-wins is a **workflow-start admission control**. The supersede runs
 /// inside `start_or_load_workflow_execution_collect` and sheds workflow
-/// *executions*. An activity task can carry a `concurrency_key` too, but it is
-/// gated purely at claim time (issue #247) and always defers — nothing sheds an
+/// *executions*. An activity task can carry a `concurrency_key` too. But it is
+/// gated purely at claim time (issue #247) and always defers. Nothing sheds an
 /// in-flight activity for a newcomer.
 ///
 /// So a `task_type = "activity"` row reports `Defer` even when its owning
-/// workflow declares `cancel_running`, because reporting the workflow's
-/// strategy there would advertise behaviour the engine does not enforce for
-/// that group. Only a `task_type = "workflow"` row reports the declared policy.
+/// workflow declares `cancel_running`. Reporting the workflow's strategy there
+/// would advertise behaviour that the engine does not enforce for that group.
+/// Only a `task_type = "workflow"` row reports the declared policy.
 fn effective_admin_on_conflict(
     task_type: &str,
     declared: autumn_harvest::concurrency::ConcurrencyOnConflict,
@@ -36659,10 +36566,12 @@ async fn debounce_status(
 }
 
 /// `GET /admin/start-throttle` — per-`(workflow, throttle_key)` deferred-start
-/// backlog, so an operator can confirm a throttle is active and watch the
-/// backlog drain (issue #607). Cross-shard: concatenates each shard's
-/// per-key rows (not summed — a key's backlog on shard A and shard B remain
-/// separate entries, each keeping its own `shard_id`).
+/// backlog (issue #607).
+///
+/// An operator can confirm a throttle is active and watch the backlog drain.
+/// Cross-shard: concatenates the per-key rows of each shard and does not sum
+/// them. A key's backlog on shard A and shard B stays two entries, each with
+/// its own `shard_id`.
 async fn start_throttle_status(
     Extension(api_state): Extension<HarvestApiState>,
 ) -> Result<Json<Vec<autumn_harvest::throttle::ThrottleBacklogEntry>>, AutumnError> {
@@ -36692,47 +36601,42 @@ async fn start_throttle_status(
 /// TTL'd pacing-override state directly, independent of any current
 /// deferred-start backlog (issue #945).
 ///
-/// `GET /admin/start-throttle` above is driven by `harvest_start_throttle`
-/// backlog rows and therefore only surfaces a workflow's override state
-/// *while it currently has pending backlog* -- an operator who sets a
-/// preemptive override before any pressure exists, or checks back once the
-/// backlog has already drained (the common case: the override is still
-/// running for the rest of its TTL, but nothing is deferred any more), would
-/// otherwise see no trace of a still-live override on ANY read surface. This
-/// route answers the narrower, always-reliable question directly: it
-/// resolves the exact same bucket key the SET/DELETE override routes use
-/// (`throttle::bucket_key(workflow_name, "")`) and reads
-/// `harvest_rate_limit_buckets` straight, with zero dependency on backlog
-/// state.
+/// `GET /admin/start-throttle` above reads `harvest_start_throttle` backlog
+/// rows. So it shows a workflow's override state only *while it has pending
+/// backlog*. An operator may set a preemptive override before any pressure
+/// exists. Or the operator checks back after the backlog drained, while the
+/// override still runs for the rest of its TTL. That is the common case.
+/// Without this route, no read surface would show that live override. This
+/// route resolves the same bucket key as the SET/DELETE override routes
+/// (`throttle::bucket_key(workflow_name, "")`). It reads
+/// `harvest_rate_limit_buckets` directly, with no dependency on backlog state.
 ///
-/// Aggregates across shards using the same "worst-case" (fewest remaining
-/// tokens) merge [`list_rate_limits`] uses -- buckets are shard-local (issue
-/// #607/#247, see `docs/sharding.md`), so a partial multi-shard write
-/// (surfaced as `207` by the SET/DELETE routes on a partial failure) can in
-/// principle leave shards disagreeing about the override; this route reports
-/// one representative view rather than one row per shard.
+/// Aggregates across shards with the same "worst-case" (fewest remaining
+/// tokens) merge as [`list_rate_limits`]. Buckets are shard-local (issue
+/// #607/#247, see `docs/sharding.md`). A partial multi-shard write (a `207`
+/// from the SET/DELETE routes) can leave shards disagreeing about the
+/// override. This route reports one representative view, not one row per
+/// shard.
 ///
-/// **A total shard outage returns `503`, and a partial outage returns `207`
-/// naming the unreachable shard(s) in `shard_errors`** -- an incident-
-/// response status read that silently degraded a real live override (or one
-/// living only on the unreachable shard) into a bare `200
-/// {"override_active": false}` would be worse than an explicit failure
-/// (issue #945 review, P2).
+/// **A total shard outage returns `503`. A partial outage returns `207` and
+/// names the unreachable shard(s) in `shard_errors`.** This is an
+/// incident-response status read (issue #945). A silent `200
+/// {"override_active": false}` would hide a live override, or one on the
+/// unreachable shard. That is worse than an explicit failure.
 ///
 /// `declared_*` reflects the *persisted* bucket-row baseline
-/// (`refill_rate`/`burst`) when a row is found on any reachable shard -- the
-/// same value dispatch actually enforces, since the separate, permanent
+/// (`refill_rate`/`burst`) when any reachable shard has a row. Dispatch
+/// enforces that same value. The separate, permanent
 /// `POST /admin/rate-limits/{key}` route can change it independently of the
-/// registry (see [`PacingOverrideResponse`]) -- and falls back to the live
-/// registry declaration only when no bucket row exists yet on any reachable
-/// shard, matching a fresh bucket's seeded value.
+/// registry (see [`PacingOverrideResponse`]). With no bucket row on any
+/// reachable shard, it falls back to the live registry declaration, matching a
+/// fresh bucket's seeded value.
 ///
 /// `404`/`409` mirror [`set_start_throttle_pacing_override`]'s registry
-/// validation. A registered, statically-throttled workflow whose bucket row
-/// does not exist yet (never touched by an admission attempt or an
-/// override) reports the declared baseline with `override_active: false`
-/// rather than `404` -- "no override configured" is a valid, common answer,
-/// not an error.
+/// validation. A registered, statically-throttled workflow may have no bucket
+/// row yet, if no admission attempt or override touched it. It then reports
+/// the declared baseline with `override_active: false`, not `404`. "No
+/// override configured" is a valid, common answer, not an error.
 #[allow(clippy::too_many_lines)]
 async fn get_start_throttle_pacing_override(
     Extension(api_state): Extension<HarvestApiState>,
@@ -36774,19 +36678,17 @@ async fn get_start_throttle_pacing_override(
         Err(e) => return e.into_response(),
     };
 
-    // Issue #945: the previous merge picked a single
-    // "representative" row across shards by raw `tokens` count alone --
-    // e.g. `existing.tokens <= b.tokens => existing`. That is the right
-    // heuristic for `list_rate_limits`'s worst-case-capacity diagnostic, but
-    // WRONG for reporting whether an OPERATOR OVERRIDE is active: after a
-    // documented partial SET/DELETE, shards can genuinely disagree about
-    // override state (one shard still under a live override, another
-    // cleared or never written), and picking by token count can silently
-    // surface the WRONG shard's `override_active` in either direction --
-    // reporting "no override" while one is still live elsewhere, or the
-    // reverse. Collect every reachable shard's row instead, and derive
-    // `override_active` from an explicit per-shard tally rather than a
-    // proxy metric that has nothing to do with override state.
+    // Issue #945: the previous merge picked one "representative" row across
+    // shards by raw `tokens` count alone, as in
+    // `existing.tokens <= b.tokens => existing`. That heuristic suits the
+    // worst-case-capacity diagnostic of `list_rate_limits`. It is WRONG for
+    // reporting whether an OPERATOR OVERRIDE is active. After a documented
+    // partial SET/DELETE, shards can genuinely disagree about override state.
+    // One shard may still run a live override while another is cleared or never
+    // written. A pick by token count can then surface the WRONG shard's
+    // `override_active`, in either direction. Collect every reachable shard's
+    // row instead. Derive `override_active` from an explicit per-shard tally,
+    // not from a proxy metric unrelated to override state.
     let mut snapshots: Vec<(i32, Option<RateLimitBucket>)> = Vec::new();
     let mut any_reachable = false;
     let mut shard_errors: Vec<String> = Vec::new();
@@ -36813,10 +36715,9 @@ async fn get_start_throttle_pacing_override(
         }
     }
 
-    // A total shard outage must not be misreported as "no override
-    // configured" (issue #945 review, P2) -- this is an incident-response
-    // status read, and a silent false negative here is worse than an
-    // explicit failure.
+    // A total shard outage must not read as "no override configured"
+    // (issue #945). This is an incident-response status read, and a silent
+    // false negative here is worse than an explicit failure.
     if !shard_errors.is_empty() && !any_reachable {
         return (
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
@@ -36831,20 +36732,19 @@ async fn get_start_throttle_pacing_override(
             .is_some_and(|b| b.override_expires_at > Some(now))
     };
 
-    // Disagreement is deliberately NOT "do the raw `override_expires_at`
-    // timestamps match exactly" -- a normal, fully successful multi-shard
-    // SET writes each shard's TTL from that shard's own `NOW()`, so
-    // millisecond clock skew alone would make virtually every healthy
-    // multi-shard override report a false "disagreement". Instead defer to
-    // `queue::pacing_shards_disagree`. It compares the *resolved effective*
-    // `(refill_rate, burst)` of each shard, not the raw
-    // `override_refill_rate`/`override_burst` columns (issue #945). A partial
-    // legacy `POST /admin/rate-limits/{key}` fan-out (issue #332) can leave
-    // shards with divergent persisted BASELINES. Two shards can then carry
-    // byte-identical override columns yet enforce genuinely different pacing.
-    // That happens once an omitted override field falls back to the own
-    // (diverged) baseline of each shard. Comparing raw columns alone would
-    // miss exactly that case.
+    // Disagreement deliberately does NOT mean "the raw `override_expires_at`
+    // timestamps differ". A fully successful multi-shard SET writes the TTL of
+    // each shard from that shard's own `NOW()`. Millisecond clock skew alone
+    // would then make almost every healthy multi-shard override report a false
+    // "disagreement". Instead defer to `queue::pacing_shards_disagree`.
+    // It compares the *resolved effective* `(refill_rate, burst)` of each
+    // shard, not the raw `override_refill_rate`/`override_burst` columns
+    // (issue #945). A partial legacy `POST /admin/rate-limits/{key}` fan-out
+    // (issue #332) can leave shards with divergent persisted BASELINES. Two
+    // shards can then carry byte-identical override columns yet enforce
+    // genuinely different pacing. That happens once an omitted override field
+    // falls back to the own (diverged) baseline of each shard. Comparing raw
+    // columns alone would miss exactly that case.
     let active_rows: Vec<&RateLimitBucket> = snapshots
         .iter()
         .filter(|(_, row)| is_active(row))
@@ -36882,22 +36782,20 @@ async fn get_start_throttle_pacing_override(
         .collect();
     let disagreement = queue::pacing_shards_disagree(&effective_per_shard);
 
-    // Representative row for the top-level (flattened, 200/207-body)
-    // response: prefer an ACTIVE row whenever any shard has one -- an
-    // incident-response "is my override active?" check should never
-    // silently answer "no" while a live override still governs dispatch on
-    // ANY shard -- else fall back to whatever row was found (all inactive),
-    // else `None` (no row anywhere -- report the registry-declared
-    // baseline, matching a fresh bucket's seeded value).
+    // Representative row for the top-level (flattened, 200/207-body) response.
+    // Prefer an ACTIVE row whenever any shard has one. An incident-response
+    // "is my override active?" check must never answer "no" while a live
+    // override still governs dispatch on ANY shard. Else fall back to any found
+    // row (all inactive). Else `None`: no row anywhere, so report the
+    // registry-declared baseline, matching a fresh bucket's seeded value.
     //
     // `.iter().next()` rather than `.first()`, with an explicit
-    // `#[allow(clippy::iter_next_slice)]`: diesel's `RunQueryDsl` is
-    // blanket-implemented for every type (including `Vec<&RateLimitBucket>`
-    // itself, before any deref-to-slice occurs), so a bare `.first()` call
-    // here is resolved to `RunQueryDsl::first` -- a DB query method -- not
-    // the slice method, and fails to compile against a plain in-memory Vec
-    // (confirmed: applying clippy's own suggested `.first()` fix reintroduces
-    // that exact compile error).
+    // `#[allow(clippy::iter_next_slice)]`. Diesel's `RunQueryDsl` is
+    // blanket-implemented for every type, `Vec<&RateLimitBucket>` included,
+    // before any deref to a slice. So a bare `.first()` here resolves to
+    // `RunQueryDsl::first`, a DB query method, not the slice method. It fails
+    // to compile against a plain in-memory Vec. Clippy's own suggested
+    // `.first()` fix reintroduces that exact compile error.
     #[allow(clippy::iter_next_slice)]
     let representative: Option<&RateLimitBucket> = active_rows
         .iter()
@@ -36908,9 +36806,8 @@ async fn get_start_throttle_pacing_override(
     let build_response = |b: Option<&RateLimitBucket>| {
         b.map_or_else(
             || {
-                // No row on any *reachable* shard: nothing has been
-                // persisted yet, so the registry's declared value is exactly
-                // what a fresh bucket would be seeded at.
+                // No row on any *reachable* shard: nothing is persisted yet. A
+                // fresh bucket would be seeded at exactly the registry's value.
                 PacingOverrideResponse::build(
                     key.clone(),
                     declared_refill_rate,
@@ -36922,10 +36819,10 @@ async fn get_start_throttle_pacing_override(
             },
             |b| {
                 // A row was found: report the *persisted* baseline, not the
-                // registry's -- the separate, permanent `POST
-                // /admin/rate-limits/{key}` route can have changed
-                // `refill_rate`/`burst` independently, and dispatch reads
-                // the row, not the registry (issue #945 review, P2).
+                // registry's (issue #945). The separate, permanent
+                // `POST /admin/rate-limits/{key}` route can change
+                // `refill_rate`/`burst` independently. Dispatch reads the row,
+                // not the registry.
                 PacingOverrideResponse::build(
                     key.clone(),
                     b.refill_rate,
@@ -37297,11 +37194,10 @@ async fn set_start_throttle_pacing_override(
         }
     }
 
-    // Attempt the audit write *before* deciding the response -- including on
-    // total shard failure (issue #945 review, P2). A fully-failed
-    // administrative override attempt must still leave an audit trail; the
-    // early `503` below is deferred until after this write is attempted so it
-    // can never bypass it.
+    // Attempt the audit write *before* deciding the response, even on total
+    // shard failure (issue #945). A fully failed administrative override
+    // attempt must still leave an audit trail. So the early `503` below waits
+    // until this write is attempted and can never bypass it.
     let status = if shard_errors.is_empty() {
         STATUS_SUCCEEDED
     } else {
@@ -37356,10 +37252,10 @@ async fn set_start_throttle_pacing_override(
             .into_response();
     }
 
-    // Report the persisted baseline the write just confirmed (issue #945
-    // review, P2), falling back to the registry only in the pathological
-    // case where every reachable shard's write raced past the
-    // `!any_success` guard above without ever returning a row.
+    // Report the persisted baseline that the write just confirmed (issue #945).
+    // Fall back to the registry only in the pathological case: every reachable
+    // shard's write raced past the `!any_success` guard above without ever
+    // returning a row.
     let (baseline_refill_rate, baseline_burst) =
         persisted_baseline.unwrap_or((declared_refill_rate, declared_burst));
     let response = PacingOverrideResponse::build(
@@ -37508,11 +37404,10 @@ async fn clear_start_throttle_pacing_override(
         }
     }
 
-    // Attempt the audit write *before* deciding the response -- including on
-    // total shard failure (issue #945 review, P2). A fully-failed
-    // administrative override attempt must still leave an audit trail; the
-    // early `503` below is deferred until after this write is attempted so it
-    // can never bypass it.
+    // Attempt the audit write *before* deciding the response, even on total
+    // shard failure (issue #945). A fully failed administrative override
+    // attempt must still leave an audit trail. So the early `503` below waits
+    // until this write is attempted and can never bypass it.
     let status = if shard_errors.is_empty() {
         STATUS_SUCCEEDED
     } else {
@@ -37567,12 +37462,11 @@ async fn clear_start_throttle_pacing_override(
             .into_response();
     }
 
-    // Report the persisted (now-reverted) baseline the clear just confirmed
-    // (issue #945 review, P2). `persisted_baseline` is `None` only when the
-    // bucket never existed on any reachable shard -- the documented
-    // idempotent-clear-of-an-unset-bucket case -- in which case the registry
-    // declaration is exactly correct, since a bucket that has never been
-    // written can only ever agree with it.
+    // Report the persisted (now-reverted) baseline that the clear just
+    // confirmed (issue #945). `persisted_baseline` is `None` only when the
+    // bucket never existed on any reachable shard. That is the documented
+    // idempotent clear of an unset bucket. The registry declaration is then
+    // exactly correct, since a never-written bucket can only agree with it.
     let (baseline_refill_rate, baseline_burst) =
         persisted_baseline.unwrap_or((declared_refill_rate, declared_burst));
     let response =
@@ -37632,10 +37526,10 @@ async fn list_rate_limits(
     let shard_count = pool.iter_shards().count();
 
     // Aggregate across all shards so operators see every configured key.
-    // Rate-limit config is written to all shards by `set_rate_limit`; a TTL'd
-    // pacing override (issue #945) can also diverge across shards after a
-    // partial write or an outage recovery. Collect EVERY shard's row per key,
-    // not just a single "representative" pick. Cross-shard override
+    // `set_rate_limit` writes rate-limit config to all shards. A TTL'd pacing
+    // override (issue #945) can still diverge across shards after a partial
+    // write or an outage recovery. Collect EVERY shard's row per key, not just
+    // a single "representative" pick. Cross-shard override
     // disagreement is then detected, not silently hidden behind whichever
     // shard's row happened to be kept (issue #945).
     let mut per_key: std::collections::BTreeMap<String, Vec<RateLimitBucket>> =
@@ -37680,9 +37574,9 @@ async fn list_rate_limits(
 ///
 /// # Panics
 ///
-/// Never in practice: `rows` is always non-empty here, built from the
+/// Never in practice. `rows` is always non-empty here. It comes from the
 /// `BTreeMap<String, Vec<RateLimitBucket>>` entries in [`list_rate_limits`],
-/// which only ever inserts a key alongside at least one row.
+/// which only inserts a key with at least one row.
 fn build_rate_limit_bucket_view(
     rows: &[RateLimitBucket],
     shard_count: usize,
@@ -37860,13 +37754,12 @@ async fn set_rate_limit(
 
     // `baseline_set_at` marks this bucket as carrying a PERMANENT operator
     // baseline, which exempts it from the idle-bucket GC (issue #1127). This
-    // route validates nothing against the registry, so an operator can (and, to
-    // clamp a noisy tenant, would) target a per-tenant `dyn-rate:`/
-    // `start-throttle:` key — and collecting such a row would silently revert
-    // the clamp to the code-declared rate the next time that tenant appeared.
-    // Same principle as the sweep's refusal to collect a bucket under a live
-    // TTL'd pacing override (issue #945): deliberate operator intent is never
-    // destroyed by a background pass.
+    // route validates nothing against the registry. An operator can target a
+    // per-tenant `dyn-rate:`/`start-throttle:` key, for example to clamp a noisy
+    // tenant. A GC of such a row would silently revert the clamp to the
+    // code-declared rate the next time that tenant appeared. The sweep likewise
+    // refuses to collect a bucket under a live TTL'd pacing override (issue
+    // #945). A background pass never destroys deliberate operator intent.
     let upsert_sql = "INSERT INTO harvest_rate_limit_buckets \
          (key, refill_rate, burst, tokens, last_refilled_at, created_at, updated_at, baseline_set_at) \
          VALUES ($1, $2, $3, $3, NOW(), NOW(), NOW(), NOW()) \
@@ -37940,22 +37833,22 @@ async fn set_rate_limit(
 // ── TTL'd Pacing Overrides (rate limits + start throttles, issue #945) ─────
 //
 // A temporary, self-expiring layer on top of an already-*declared* rate
-// limit / start throttle. Distinct from the legacy `POST
-// /admin/rate-limits/{key}` above, which permanently rewrites a bucket's
-// baseline: these routes never touch `refill_rate`/`burst`, only the
-// additive `override_*` columns, and require no worker restart (the
-// effective-value SQL in `queue::effective_refill_rate_expr`/
-// `effective_burst_expr` is consulted fresh on every claim/dispatch) and no
-// operator action to revert (a plain `override_expires_at > NOW()` check).
+// limit or start throttle. The legacy `POST /admin/rate-limits/{key}` above
+// permanently rewrites a bucket's baseline. These routes never touch
+// `refill_rate`/`burst`, only the additive `override_*` columns. They need no
+// worker restart: every claim and dispatch reads the effective-value SQL in
+// `queue::effective_refill_rate_expr`/`effective_burst_expr` fresh. They need
+// no operator action to revert: a plain `override_expires_at > NOW()` check
+// expires them.
 
 /// Validates a pacing-override TTL and computes its absolute expiry
 /// (issue #945).
 ///
-/// `ttl_secs` must be non-zero — an override with no lifetime is meaningless
-/// (use the permanent `POST /admin/rate-limits/{key}` route for a durable
-/// change) — and must not exceed [`queue::MAX_PACING_OVERRIDE_TTL_SECS`], the
-/// server-side ceiling that guards against a forgotten override silently
-/// outliving the incident it was meant to mitigate.
+/// `ttl_secs` must be non-zero, because an override with no lifetime is
+/// meaningless. Use the permanent `POST /admin/rate-limits/{key}` route for a
+/// durable change. It must not exceed [`queue::MAX_PACING_OVERRIDE_TTL_SECS`].
+/// That server-side ceiling stops a forgotten override from silently outliving
+/// the incident it was meant to mitigate.
 fn pacing_override_expiry(ttl_secs: u64) -> Result<chrono::DateTime<chrono::Utc>, AutumnError> {
     if ttl_secs == 0 {
         return Err(AutumnError::bad_request_msg(
@@ -37977,26 +37870,25 @@ fn pacing_override_expiry(ttl_secs: u64) -> Result<chrono::DateTime<chrono::Utc>
 /// Response body for the TTL'd pacing-override SET/CLEAR/GET routes (issue
 /// #945).
 ///
-/// `declared_*` is the baseline `effective_*`/`override_active` are computed
-/// against. It MUST be the persisted bucket row's own `refill_rate`/`burst`
-/// columns whenever a row exists, never passed through unread from the
+/// `declared_*` is the baseline that `effective_*`/`override_active` are
+/// computed against. It MUST be the persisted bucket row's own
+/// `refill_rate`/`burst` columns whenever a row exists. It is never the
 /// registered `#[activity(rate_limit(...))]` / `#[workflow(throttle(...))]`
-/// policy — the two can diverge, because the separate, permanent
+/// policy passed through unread. The two can diverge. The separate, permanent
 /// `POST /admin/rate-limits/{key}` route (issue #332/#699) can change a
-/// bucket's baseline columns independently, and this override's upsert/clear
-/// SQL deliberately never touches `refill_rate`/`burst` itself. Reporting
-/// the registry value in that situation would compute an `effective_*`
-/// dispatch is not actually enforcing (issue #945 review, P2). Every SET/
-/// CLEAR call site therefore reads the row's baseline back via the shared
-/// SQL builders' `RETURNING refill_rate, burst` clause
-/// ([`PersistedBaseline`]) and passes *that* here, falling back to the live
-/// registry declaration only when no bucket row exists yet on any reachable
-/// shard — a fresh bucket is always seeded at the registry's declared value
-/// (see [`pacing_override_upsert_sql`]), so the two necessarily agree there.
+/// bucket's baseline columns independently. This override's upsert/clear SQL
+/// deliberately never touches `refill_rate`/`burst`. The registry value would
+/// then yield an `effective_*` that dispatch does not enforce (issue #945).
+/// So every SET/CLEAR call site reads the row's baseline back via the
+/// `RETURNING refill_rate, burst` clause of the shared SQL builders
+/// ([`PersistedBaseline`]) and passes *that* here. It falls back to the live
+/// registry declaration only when no reachable shard has a bucket row yet. A
+/// fresh bucket is always seeded at the registry's declared value (see
+/// [`pacing_override_upsert_sql`]), so the two agree there.
 /// `override_*` reports the raw override state just written (`None` after a
 /// clear). `effective_*`/`override_active` mirror
-/// [`queue::resolve_effective_rate_limit`] — what dispatch is actually
-/// enforcing right now, computed without a second query round-trip.
+/// [`queue::resolve_effective_rate_limit`]: what dispatch enforces right now,
+/// computed without a second query round-trip.
 #[derive(Debug, Serialize)]
 struct PacingOverrideResponse {
     key: String,
@@ -38077,12 +37969,12 @@ struct RateLimitBucketView {
     effective_burst: f64,
     /// Whether the shards backing this key's rows disagree on override
     /// state or resolved effective pacing (issue #945).
-    /// `false` for a single-shard row on its own -- this field is only ever
-    /// set `true` by [`build_rate_limit_bucket_view`], which has the
-    /// multi-shard context [`From<RateLimitBucket>`] lacks. When `true`,
-    /// the other fields above still reflect a best-effort representative
-    /// shard (preferring an active override), but an operator should not
-    /// treat them as authoritative for every shard.
+    /// `false` for a single-shard row on its own. Only
+    /// [`build_rate_limit_bucket_view`] sets it `true`, because it has the
+    /// multi-shard context that [`From<RateLimitBucket>`] lacks. When `true`,
+    /// the other fields above still reflect a best-effort representative shard
+    /// that prefers an active override. An operator should not treat them as
+    /// authoritative for every shard.
     shard_disagreement: bool,
     /// When an operator last wrote this bucket's permanent baseline through
     /// `POST /admin/rate-limits/{key}`. Non-`null` also means the row is
@@ -38199,30 +38091,26 @@ mod rate_limit_bucket_view_tests {
 /// (or replaces) a bucket's TTL'd pacing override (issue #945).
 ///
 /// **Settles the token bucket in the same statement that rewrites the
-/// effective rate.** Neither `tokens` nor `last_refilled_at` may be left
-/// untouched here: [`queue::effective_available_tokens_expr`] re-rates the
-/// *entire* elapsed-since-last-refill window at whichever rate happens to be
-/// effective at the *next read* -- so a write that only flips the
-/// `override_*` columns would let a bucket that has been idle for hours
-/// suddenly "accrue" hours' worth of tokens under a brand-new, much higher
-/// override rate the instant it is set (an unbounded phantom credit bounded
-/// only by the newly-set burst). Settling first -- computing how many tokens
-/// had genuinely accrued under the OLD effective rate, capped at the NEW
-/// effective burst, and stamping `last_refilled_at = NOW()` -- closes that
-/// gap. This is safe as one atomic `UPDATE`/`INSERT ... ON CONFLICT`
-/// statement because Postgres evaluates every `SET`-clause expression
-/// against the row's pre-update values, so the settle expression (which
-/// still reads the OLD `override_*` columns) and the `override_*` columns
-/// being overwritten by this same statement cannot race each other.
-/// Mirrors the pre-existing `set_rate_limit` legacy handler's identical
-/// settle-on-rewrite pattern.
+/// effective rate.** It must update `tokens` and `last_refilled_at` too.
+/// [`queue::effective_available_tokens_expr`] re-rates the *entire* window
+/// since the last refill at whichever rate is effective at the *next read*.
+/// Suppose a write only flips the `override_*` columns. A bucket idle for hours
+/// would then suddenly "accrue" hours' worth of tokens under a new, much higher
+/// override rate. That phantom credit is bounded only by the newly set burst.
+/// Settling first closes that gap. It computes the tokens genuinely accrued
+/// under the OLD effective rate, caps them at the NEW effective burst, and
+/// stamps `last_refilled_at = NOW()`. One atomic statement is safe here
+/// (`UPDATE`/`INSERT ... ON CONFLICT`). Postgres evaluates every `SET`-clause
+/// expression against the row's pre-update values. So the settle expression,
+/// which still reads the OLD `override_*` columns, cannot race the
+/// `override_*` columns that this statement overwrites. Mirrors the
+/// settle-on-rewrite pattern of the legacy `set_rate_limit` handler.
 ///
-/// On first-ever bucket creation (the `VALUES` branch, no prior row to
-/// settle from), `tokens` seeds at `COALESCE($5, $3)` -- the just-set
-/// override burst if one was supplied in this same call, else the declared
-/// baseline burst -- so a bucket created with a simultaneous override starts
-/// fully topped up under the override's cap, not the (possibly lower or
-/// higher) declared one.
+/// On first-ever bucket creation (the `VALUES` branch, with no prior row to
+/// settle from), `tokens` seeds at `COALESCE($5, $3)`. That is the override
+/// burst set in this same call, else the declared baseline burst. So a bucket
+/// created with a simultaneous override starts fully topped up under the
+/// override's cap, not the (possibly lower or higher) declared one.
 fn pacing_override_upsert_sql() -> String {
     let effective_tokens = queue::effective_available_tokens_expr("harvest_rate_limit_buckets");
     format!(
@@ -38242,13 +38130,14 @@ fn pacing_override_upsert_sql() -> String {
 }
 
 /// Row returned by the `RETURNING refill_rate, burst` clause on
-/// [`pacing_override_upsert_sql`]/[`pacing_override_clear_sql`] -- the
-/// bucket's *persisted* baseline immediately after the write, which the
-/// SET/CLEAR handlers thread into [`PacingOverrideResponse::build`] instead
-/// of the registry-declared value (issue #945 review, P2: the separate,
-/// permanent `POST /admin/rate-limits/{key}` route can have changed these
-/// columns independently, and this override's `ON CONFLICT`/`UPDATE` never
-/// touches them).
+/// [`pacing_override_upsert_sql`]/[`pacing_override_clear_sql`].
+///
+/// It holds the bucket's *persisted* baseline right after the write. The
+/// SET/CLEAR handlers pass it to [`PacingOverrideResponse::build`] in place of
+/// the registry-declared value (issue #945). The separate, permanent
+/// `POST /admin/rate-limits/{key}` route can change these columns
+/// independently, and this override's `ON CONFLICT`/`UPDATE` never touches
+/// them.
 #[derive(diesel::QueryableByName)]
 struct PersistedBaseline {
     #[diesel(sql_type = diesel::sql_types::Double)]
@@ -38260,15 +38149,14 @@ struct PersistedBaseline {
 /// Builds the `UPDATE ... WHERE key = $1` statement that clears a bucket's
 /// pacing override (issue #945).
 ///
-/// Settles the bucket for the identical reason [`pacing_override_upsert_sql`]
-/// does, in the opposite direction: without settling, clearing a
-/// high-refill-rate override on a bucket that has been idle leaves the
-/// *pre-clear* elapsed window to be re-rated at the (usually much lower)
-/// declared baseline rate the instant it is cleared, discarding tokens the
-/// bucket had genuinely earned under the override that was in effect right
-/// up until this statement runs. The settle expression still reads the OLD
-/// (about-to-be-cleared) `override_*` columns -- Postgres evaluates every
-/// `SET`-clause expression against pre-update values -- then the outer
+/// Settles the bucket for the same reason as [`pacing_override_upsert_sql`],
+/// in the opposite direction. Suppose a high-refill-rate override is cleared on
+/// an idle bucket without a settle. The *pre-clear* elapsed window is then
+/// re-rated at the (usually much lower) declared baseline rate. That discards
+/// tokens the bucket genuinely earned under the override, which held until this
+/// statement runs. The settle expression still reads the OLD
+/// (about-to-be-cleared) `override_*` columns, because Postgres evaluates every
+/// `SET`-clause expression against pre-update values. Then the outer
 /// `LEAST(harvest_rate_limit_buckets.burst, ...)` re-caps to the *post-clear*
 /// declared burst, since the override may have granted a higher cap than the
 /// baseline.
@@ -38512,11 +38400,10 @@ async fn set_rate_limit_pacing_override(
         }
     }
 
-    // Attempt the audit write *before* deciding the response -- including on
-    // total shard failure (issue #945 review, P2). A fully-failed
-    // administrative override attempt must still leave an audit trail; the
-    // early `503` below is deferred until after this write is attempted so it
-    // can never bypass it.
+    // Attempt the audit write *before* deciding the response, even on total
+    // shard failure (issue #945). A fully failed administrative override
+    // attempt must still leave an audit trail. So the early `503` below waits
+    // until this write is attempted and can never bypass it.
     let status = if shard_errors.is_empty() {
         STATUS_SUCCEEDED
     } else {
@@ -38571,10 +38458,10 @@ async fn set_rate_limit_pacing_override(
             .into_response();
     }
 
-    // Report the persisted baseline the write just confirmed (issue #945
-    // review, P2), falling back to the registry only in the pathological
-    // case where every reachable shard's write raced past the
-    // `!any_success` guard above without ever returning a row.
+    // Report the persisted baseline that the write just confirmed (issue #945).
+    // Fall back to the registry only in the pathological case: every reachable
+    // shard's write raced past the `!any_success` guard above without ever
+    // returning a row.
     let (baseline_refill_rate, baseline_burst) =
         persisted_baseline.unwrap_or((declared_refill_rate, declared_burst));
     let response = PacingOverrideResponse::build(
@@ -38724,11 +38611,10 @@ async fn clear_rate_limit_pacing_override(
         }
     }
 
-    // Attempt the audit write *before* deciding the response -- including on
-    // total shard failure (issue #945 review, P2). A fully-failed
-    // administrative override attempt must still leave an audit trail; the
-    // early `503` below is deferred until after this write is attempted so it
-    // can never bypass it.
+    // Attempt the audit write *before* deciding the response, even on total
+    // shard failure (issue #945). A fully failed administrative override
+    // attempt must still leave an audit trail. So the early `503` below waits
+    // until this write is attempted and can never bypass it.
     let status = if shard_errors.is_empty() {
         STATUS_SUCCEEDED
     } else {
@@ -38783,12 +38669,11 @@ async fn clear_rate_limit_pacing_override(
             .into_response();
     }
 
-    // Report the persisted (now-reverted) baseline the clear just confirmed
-    // (issue #945 review, P2). `persisted_baseline` is `None` only when the
-    // bucket never existed on any reachable shard -- the documented
-    // idempotent-clear-of-an-unset-bucket case -- in which case the registry
-    // declaration is exactly correct, since a bucket that has never been
-    // written can only ever agree with it.
+    // Report the persisted (now-reverted) baseline that the clear just
+    // confirmed (issue #945). `persisted_baseline` is `None` only when the
+    // bucket never existed on any reachable shard. That is the documented
+    // idempotent clear of an unset bucket. The registry declaration is then
+    // exactly correct, since a never-written bucket can only agree with it.
     let (baseline_refill_rate, baseline_burst) =
         persisted_baseline.unwrap_or((declared_refill_rate, declared_burst));
     let response =
@@ -38962,13 +38847,13 @@ async fn queues_scaling_signal(
 
 /// Body of `POST /admin/queues/{queue_name}/pause`.
 ///
-/// `deny_unknown_fields` because `shard_id`'s **absence** is meaningful here: it
-/// selects the fleet-wide default. Serde's default leniency would accept a typo
-/// like `{"reason": "…", "shard": 1}` as `shard_id: None`, silently widening a
-/// shard-scoped request to the whole fleet — and on the resume sibling that
-/// releases every hold mid-outage while reporting success (issue #619 review).
-/// The body is parsed with `serde_json::from_slice`, so the resulting error
-/// already flows through this route's audited `400`.
+/// `deny_unknown_fields` because the **absence** of `shard_id` is meaningful
+/// here: it selects the fleet-wide default. Serde's default leniency would
+/// accept a typo like `{"reason": "…", "shard": 1}` as `shard_id: None`. That
+/// silently widens a shard-scoped request to the whole fleet. On the resume
+/// sibling it releases every hold mid-outage and reports success (issue #619
+/// review). The body is parsed with `serde_json::from_slice`, so the resulting
+/// error already flows through this route's audited `400`.
 #[derive(Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct PauseQueueRequest {
@@ -38986,10 +38871,10 @@ pub(crate) struct PauseQueueRequest {
 ///
 /// `deny_unknown_fields` for the reason on [`PauseQueueRequest`], which bites
 /// harder here: this is the *destructive* direction. A typo'd `shard` field
-/// would release every shard's hold rather than the one named, so the blast
-/// radius of a one-character mistake is the entire fleet's dispatch resuming
-/// into an outage. An empty body is still accepted (fleet-wide by design) — it
-/// never reaches the deserializer.
+/// would release the hold of every shard, not the one named. A one-character
+/// mistake would resume dispatch across the entire fleet into an outage. An
+/// empty body is still accepted (fleet-wide by design). It never reaches the
+/// deserializer.
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ResumeQueueRequest {
@@ -39009,17 +38894,16 @@ type QueuePauseTargets = (Vec<(i32, ::autumn_harvest::worker::DbPool)>, Vec<i32>
 /// `None` → every shard (fleet-wide, the default). `Some(n)` → shard `n` only.
 ///
 /// The expected-shard set comes from [`shard_fanout::expected_shards`], not
-/// from the local pool map, for the reason that helper documents: a shard the
-/// router knows but this process has no pool for yet (mid a shard-add rollout)
-/// must be *reported*, never silently omitted. Omitting it would let a
-/// fleet-wide pause return an unqualified success while that shard kept
-/// dispatching into the outage — with no diagnostic at all, which is strictly
+/// from the local pool map, for the reason that helper documents. The router
+/// may know a shard that this process has no pool for yet, during a shard-add
+/// rollout. Such a shard must be *reported*, never silently omitted. Otherwise
+/// a fleet-wide pause returns an unqualified success while that shard keeps
+/// dispatching into the outage. With no diagnostic at all, that is strictly
 /// worse than the partial-failure signal.
 ///
-/// A poolless-but-known shard named explicitly is a `503`, not a `400`: the
-/// shard id is real, this process just cannot reach it, and "unknown
-/// `shard_id`" would point the operator at a typo instead of the actual
-/// condition.
+/// A poolless-but-known shard named explicitly is a `503`, not a `400`. The
+/// shard id is real, but this process cannot reach it. "Unknown `shard_id`"
+/// would point the operator at a typo instead of the actual condition.
 fn queue_pause_target_pools(
     api_state: &HarvestApiState,
     shard_id: Option<i32>,
@@ -39061,13 +38945,13 @@ fn queue_pause_target_pools(
     }
 }
 
-/// A hold that did not reach every target shard is NOT in effect fleet-wide:
-/// the shards it missed keep dispatching into exactly the outage the operator
-/// is trying to ride out. Reporting that as `200 {"ok": true}` (with the detail
-/// buried in a string field) is the one way this feature can silently fail an
-/// incident, so a partial application is `207` with `ok: false` and the same
-/// `status` / `partial_failures` vocabulary the read side already uses.
-/// Re-issuing is safe — both operations are idempotent.
+/// A hold that did not reach every target shard is NOT in effect fleet-wide.
+/// The shards it missed keep dispatching into the outage the operator is trying
+/// to ride out. A `200 {"ok": true}` with the detail buried in a string field
+/// is the one way this feature can silently fail an incident. So a partial
+/// application is `207` with `ok: false`. It uses the same `status` /
+/// `partial_failures` vocabulary as the read side. Re-issuing is safe, because
+/// both operations are idempotent.
 const fn queue_pause_partial_status(partial: Option<&str>) -> (StatusCode, bool, &'static str) {
     if partial.is_some() {
         (StatusCode::MULTI_STATUS, false, "partial")
@@ -39090,9 +38974,9 @@ type QueuePauseAuditCtx = (String, String, Option<String>);
 
 /// Audit a rejected pause/resume and turn the error into a response.
 ///
-/// A rejected hold attempt on a fleet-wide dispatch kill switch is exactly what
-/// an incident review needs to see, so every rejection path is audited
-/// (symmetric with `fail_activity_now`'s malformed-id handling).
+/// An incident review needs to see each rejected hold attempt on a fleet-wide
+/// dispatch kill switch. So every rejection path is audited, symmetric with the
+/// malformed-id handling of `fail_activity_now`.
 async fn reject_queue_pause(
     api_state: &HarvestApiState,
     audit: &QueuePauseAuditCtx,
@@ -39215,21 +39099,21 @@ async fn parse_pause_request(
         )
         .await);
     }
-    // Normalize here, in the same place the non-empty rule is enforced, so the
-    // value we validated IS the value we store.
+    // Normalize here, where the non-empty rule is enforced, so the validated
+    // value IS the stored value.
     //
     // The handler bounds this reason with `truncate_operator_reason` before the
     // core sees it, and the core independently re-rejects a whitespace-only
     // reason. Validating the raw string and then truncating a *different* one
-    // lets the two disagree: a reason of 500+ leading spaces followed by real
-    // text passes the check above (it trims to something), truncates to pure
-    // whitespace, and is then rejected by every shard — surfacing as an opaque
-    // 500 with the queue still dispatching, instead of the audited 400 this
-    // route promises. Trimming first makes that impossible by construction
-    // rather than by a second check: the trimmed string is non-empty and starts
-    // with a non-whitespace character, so any non-empty prefix of it still
-    // contains one. It also stops leading whitespace from eating the operator's
-    // actual words out of the 500-character budget.
+    // lets the two disagree. Take a reason of 500+ leading spaces and then real
+    // text. It passes the check above, because it trims to something. It
+    // truncates to pure whitespace, and every shard rejects it. That surfaces
+    // as an opaque 500 with the queue still dispatching, not the audited 400
+    // this route promises. Trimming first makes that impossible by
+    // construction, not by a second check. The trimmed string is non-empty and
+    // starts with a non-whitespace character, so any non-empty prefix of it
+    // still contains one. It also stops leading whitespace from eating the
+    // operator's actual words out of the 500-character budget.
     request.reason = request.reason.trim().to_string();
     Ok(request)
 }
@@ -39242,17 +39126,16 @@ struct PauseApplication {
     held_task_count: i64,
     /// Every shard that applied the hold, with its own effective row.
     ///
-    /// Kept per-shard rather than collapsed to the first success: a re-pause
-    /// preserves each shard's ORIGINAL provenance, so a fleet-wide request
-    /// landing over pre-existing scoped holds leaves the shards disagreeing.
-    /// Labelling the fleet-wide `held_task_count` with one shard's reason,
-    /// actor, timestamp and scope would then be untrue for the rest of the
-    /// fleet (issue #619 review).
+    /// Kept per-shard, not collapsed to the first success. A re-pause keeps
+    /// each shard's ORIGINAL provenance. So a fleet-wide request over
+    /// pre-existing scoped holds leaves the shards disagreeing. One shard's
+    /// reason, actor, timestamp and scope on the fleet-wide `held_task_count`
+    /// would then be untrue for the rest of the fleet (issue #619 review).
     per_shard: Vec<(i32, ::autumn_harvest::queue_pause::PauseOutcome)>,
 }
 
-/// Apply the hold on every target shard, appending any per-shard error to
-/// `failures` rather than aborting — one unreachable shard must not stop the
+/// Apply the hold on every target shard. A per-shard error goes into
+/// `failures` and does not abort, so one unreachable shard cannot stop the
 /// others from being held.
 async fn apply_pause_across_shards(
     targets: &[(i32, ::autumn_harvest::worker::DbPool)],
@@ -39306,21 +39189,21 @@ struct PauseProvenance<'a> {
     /// Every hold in effect, deduplicated by `(reason, operator)` and ordered
     /// earliest first.
     ///
-    /// [`Self::shards`] goes only to the transient HTTP response; this is what
-    /// the durable audit row carries, so an idempotent re-pause records the
-    /// provenance actually holding the fleet rather than the request's.
+    /// [`Self::shards`] goes only to the transient HTTP response. The durable
+    /// audit row carries this. So an idempotent re-pause records the provenance
+    /// actually holding the fleet, not the request's.
     held_groups: Vec<HeldHoldGroup>,
 }
 
 /// Summarise a fleet-wide pause without discarding any shard's provenance.
 ///
-/// The top-level summary is the **earliest** hold, tie-broken by shard id — the
-/// same rule `merge_paused_queue_rows` and the Vantage banner use, so the
-/// mutation response, the read endpoint and the UI can never tell an operator
+/// The top-level summary is the **earliest** hold, tie-broken by shard id.
+/// `merge_paused_queue_rows` and the Vantage banner use the same rule. So the
+/// mutation response, the read endpoint and the UI never tell an operator
 /// three different stories about one hold. `uniform` compares
-/// `(reason, paused_by, scope_shard_id)` and deliberately **not** `paused_at`:
-/// each shard stamps its own `NOW()`, so including it would flag essentially
-/// every healthy fleet-wide hold as divergent.
+/// `(reason, paused_by, scope_shard_id)` and deliberately **not** `paused_at`.
+/// Each shard stamps its own `NOW()`, so `paused_at` would flag almost every
+/// healthy fleet-wide hold as divergent.
 ///
 /// Returns `None` only when every target shard failed.
 fn summarise_pause_provenance(
@@ -39414,10 +39297,10 @@ async fn apply_resume_across_shards(
                 applied.paused_duration_secs = applied
                     .paused_duration_secs
                     .max(outcome.paused_duration_secs);
-                // The pause row is deleted by the resume, so this is the last
-                // moment the *why* is recoverable — keep EVERY shard's, not
-                // just the first, so an operator closing out an incident sees
-                // all the holds they released.
+                // The resume deletes the pause row, so this is the last moment
+                // the *why* is recoverable. Keep EVERY shard's, not just the
+                // first, so an operator closing out an incident sees all the
+                // holds they released.
                 applied.per_shard.push((*shard_id, outcome));
             }
             Err(error) => failures.push(format!("shard {shard_id}: {error}")),
@@ -39434,9 +39317,9 @@ type ReleasedHoldKey = (String, Option<String>);
 
 /// Cross-shard accumulator for one [`ReleasedHoldKey`].
 ///
-/// The hold's identity lives in the map key, so this carries only the parts that
-/// have to be folded across shards; [`ReleasedHoldGroup`] is assembled from the
-/// two together by [`Self::finish`].
+/// The hold's identity lives in the map key, so this carries only the parts
+/// that must be folded across shards. [`Self::finish`] assembles
+/// [`ReleasedHoldGroup`] from the two together.
 struct HoldGroupFold {
     shard_ids: Vec<i32>,
     anchor_secs: i64,
@@ -39482,9 +39365,9 @@ impl HoldGroupFold {
 /// One distinct released hold — a `(reason, operator)` pair — and the shards it
 /// covered.
 ///
-/// Shards paused independently for the *same* incident collapse into one entry,
-/// so the durable audit row grows with the number of genuinely distinct holds (a
-/// small, operator-authored quantity) rather than with the shard count, and the
+/// Shards paused independently for the *same* incident collapse into one
+/// entry. So the durable audit row grows with the number of genuinely distinct
+/// holds (a small, operator-authored quantity), not with the shard count. The
 /// common fleet-wide case still renders as a single line.
 struct ReleasedHoldGroup {
     /// Always `Some` at the source (the group is built only from outcomes that
@@ -39535,19 +39418,18 @@ impl ReleasedHoldGroup {
 
 /// A held `(reason, operator)` pair — the identity of one hold in effect.
 ///
-/// The pause mirror of [`ReleasedHoldKey`]. `paused_by` is a plain `String`
-/// rather than an `Option`: a pause row always records an operator (the route
-/// falls back to the authenticated actor when the body supplies no label),
-/// whereas a *released* hold can come from a row written before that guarantee
-/// existed.
+/// The pause mirror of [`ReleasedHoldKey`]. `paused_by` is a plain `String`,
+/// not an `Option`. A pause row always records an operator: the route falls
+/// back to the authenticated actor when the body supplies no label. A
+/// *released* hold can come from a row written before that guarantee existed.
 type HeldHoldKey = (String, String);
 
 /// Cross-shard accumulator for one [`HeldHoldKey`].
 ///
-/// The pause mirror of [`HoldGroupFold`], anchored on the EARLIEST stamp rather
-/// than the longest duration: at pause time nothing has been held for a
-/// measurable span yet, and the earliest hold is what the response's top-level
-/// provenance reports.
+/// The pause mirror of [`HoldGroupFold`], anchored on the EARLIEST stamp, not
+/// the longest duration. At pause time nothing has been held for a measurable
+/// span yet. The earliest hold is what the response's top-level provenance
+/// reports.
 struct HeldGroupFold {
     shard_ids: Vec<i32>,
     anchor_at: chrono::DateTime<chrono::Utc>,
@@ -39566,8 +39448,8 @@ impl HeldGroupFold {
     }
 
     /// Fold in one shard's hold, keeping the group's EARLIEST stamp as the
-    /// anchor (lowest shard id on a tie, matching the `min_by_key` the
-    /// response's top-level provenance uses).
+    /// anchor. A tie goes to the lowest shard id, matching the `min_by_key`
+    /// that the response's top-level provenance uses.
     fn observe(&mut self, shard_id: i32, paused_at: chrono::DateTime<chrono::Utc>) {
         self.shard_ids.push(shard_id);
         if (paused_at, shard_id) < (self.anchor_at, self.anchor_shard_id) {
@@ -39591,11 +39473,11 @@ impl HeldGroupFold {
 /// One distinct hold in effect — a `(reason, operator)` pair — and the shards
 /// carrying it.
 ///
-/// The pause mirror of [`ReleasedHoldGroup`]: shards holding for the *same*
-/// incident collapse into one entry, so the durable audit row grows with the
-/// number of genuinely distinct holds (a small, operator-authored quantity)
-/// rather than with the shard count, and the common fleet-wide case still
-/// renders as a single line.
+/// The pause mirror of [`ReleasedHoldGroup`]. Shards holding for the *same*
+/// incident collapse into one entry. So the durable audit row grows with the
+/// number of genuinely distinct holds (a small, operator-authored quantity),
+/// not with the shard count. The common fleet-wide case still renders as a
+/// single line.
 struct HeldHoldGroup {
     reason: String,
     paused_by: String,
@@ -39636,9 +39518,9 @@ impl HeldHoldGroup {
 /// Group the shards carrying a hold by the `(reason, operator)` they actually
 /// hold it for, earliest hold first.
 ///
-/// Feature-neutral (`&str`s and a timestamp) so the queue pause (#619) and the
-/// per-activity pause (#807) share one definition and can never drift on what
-/// their audit rows say about the same situation.
+/// Feature-neutral (`&str`s and a timestamp), so the queue pause (#619) and the
+/// per-activity pause (#807) share one definition. Their audit rows can never
+/// drift on the same situation.
 fn group_held_holds<'a>(
     per_shard: impl IntoIterator<Item = (i32, &'a str, &'a str, chrono::DateTime<chrono::Utc>)>,
 ) -> Vec<HeldHoldGroup> {
@@ -39663,21 +39545,21 @@ fn group_held_holds<'a>(
 
 /// Render the holds actually IN EFFECT for the durable audit trail.
 ///
-/// The pause mirror of [`released_holds_audit_reason`], and the reason a pause
-/// audit row does not simply echo the request: `pause_queue` / `pause_activity`
-/// preserve each shard's ORIGINAL provenance on an idempotent re-pause, so the
-/// request's reason can be in effect on no shard at all — most starkly when the
-/// re-pause omits a reason and resolves to the default while every shard is
-/// still held for the original incident. The response body already reports the
-/// effective provenance for exactly this reason (issue #619 review); this keeps
-/// the durable row — which outlives the response, since the resume `DELETE`s
-/// the pause rows — from telling a different story (issue #807 review).
+/// The pause mirror of [`released_holds_audit_reason`]. It is also why a pause
+/// audit row does not simply echo the request. `pause_queue` / `pause_activity`
+/// keep each shard's ORIGINAL provenance on an idempotent re-pause. So the
+/// request's reason can be in effect on no shard at all. The starkest case is a
+/// re-pause that omits a reason and resolves to the default, while every shard
+/// is still held for the original incident. The response body already reports
+/// the effective provenance for exactly this reason (issue #619 review). This
+/// keeps the durable row from telling a different story (issue #807 review).
+/// That row outlives the response, since the resume `DELETE`s the pause rows.
 ///
-/// A single hold — the overwhelmingly common case, including a fleet-wide hold
-/// placed by one operator for one incident — keeps the plain single-line form.
-/// Its shard list is deliberately omitted there, for the same reason the resume
-/// sibling omits it: with one `(reason, operator)` group there is nothing
-/// distinguishing to attribute, and the response already reports the counts.
+/// A single hold keeps the plain single-line form. That is the overwhelmingly
+/// common case, including a fleet-wide hold placed by one operator for one
+/// incident. Its shard list is deliberately omitted there, as in the resume
+/// sibling. With one `(reason, operator)` group there is nothing distinguishing
+/// to attribute, and the response already reports the counts.
 fn held_holds_audit_reason(groups: &[HeldHoldGroup]) -> Option<String> {
     let (leading, rest) = groups.split_first()?;
     if rest.is_empty() {
@@ -39705,9 +39587,9 @@ struct ResumeProvenance {
     /// Every released hold, deduplicated by `(reason, operator)` and ordered
     /// longest-held first.
     ///
-    /// The pause rows are already deleted by the time this exists, so this — not
-    /// the transient [`Self::shards`] response array — is what the durable audit
-    /// row must carry.
+    /// The pause rows are already deleted by the time this exists. So the
+    /// durable audit row must carry this, not the transient [`Self::shards`]
+    /// response array.
     released_groups: Vec<ReleasedHoldGroup>,
     /// Per-shard detail for the HTTP response. The pause rows are already
     /// deleted, so this is the only surviving record of the other shards'
@@ -39730,14 +39612,14 @@ impl ResumeProvenance {
 /// Summarise a fleet-wide resume without discarding any shard's provenance.
 ///
 /// The top-level reason/operator come from the **longest** hold released,
-/// tie-broken by shard id. That is deliberately the same shard the existing
+/// tie-broken by shard id. That is deliberately the same shard that the
 /// `paused_duration_secs` maximum describes, so the summary is internally
-/// coherent — previously the duration could come from one shard while the
-/// reason came from another.
+/// coherent. Earlier, the duration could come from one shard and the reason
+/// from another.
 ///
-/// Only shards that actually released a hold carry provenance (a shard that
-/// was not paused returns `None`), so both the summary and the grouping consider
-/// just those.
+/// Only shards that actually released a hold carry provenance. A shard that
+/// was not paused returns `None`. So the summary and the grouping consider just
+/// those shards.
 fn summarise_resume_provenance(
     per_shard: &[(i32, ::autumn_harvest::queue_pause::ResumeOutcome)],
 ) -> ResumeProvenance {
@@ -39795,19 +39677,19 @@ fn summarise_resume_provenance(
 /// Build the durable audit `error_summary` for a queue pause/resume, carrying
 /// the effective **reason** alongside any partial-failure text.
 ///
-/// `harvest_queue_pauses` holds the reason only while the hold is in effect —
-/// a resume `DELETE`s the row — so without this the audit trail could say who
-/// paused a queue but never *why*, which is precisely the question a
-/// post-incident review asks. `harvest_audit_log` has no metadata/details
-/// column, and adding one would touch all ~188 `NewAuditRecord` construction
-/// sites for a shared primitive (out of scope here), so the reason is carried
-/// in the one free-text field the record already has. It is labelled so the
-/// two contributions stay distinguishable, and the reason is already bounded by
-/// [`truncate_operator_reason`] at the request boundary.
+/// `harvest_queue_pauses` holds the reason only while the hold is in effect,
+/// because a resume `DELETE`s the row. Without this, the audit trail could say
+/// who paused a queue but never *why*. A post-incident review asks exactly
+/// that. `harvest_audit_log` has no metadata/details column. Adding one would
+/// touch all ~188 `NewAuditRecord` construction sites for a shared primitive,
+/// which is out of scope here. So the reason goes in the one free-text field
+/// the record already has. A label keeps the two contributions distinct.
+/// [`truncate_operator_reason`] already bounds the reason at the request
+/// boundary.
 ///
-/// `error_summary` is non-`None` on a fully successful pause as a result. That
-/// is deliberate: `status` (`STATUS_SUCCEEDED` / `STATUS_FAILED`) remains the
-/// outcome discriminator, and the labelled prefixes keep a `reason:` context
+/// As a result, `error_summary` is non-`None` on a fully successful pause.
+/// That is deliberate. `status` (`STATUS_SUCCEEDED` / `STATUS_FAILED`) remains
+/// the outcome discriminator. The labelled prefixes keep a `reason:` context
 /// row from reading as a failure.
 fn queue_pause_audit_context(reason: Option<&str>, partial: Option<&str>) -> Option<String> {
     let mut parts: Vec<String> = Vec::new();
@@ -39822,22 +39704,22 @@ fn queue_pause_audit_context(reason: Option<&str>, partial: Option<&str>) -> Opt
 
 /// Every hold released by a resume, rendered for the durable audit trail.
 ///
-/// The resume `DELETE`s the pause rows, so once the HTTP response is gone this
-/// audit row is the *only* surviving record of the holds' provenance. It
-/// therefore carries **every** released `(reason, operator)` with the shards it
-/// covered, not just the longest hold plus a "shards disagreed" marker — the
-/// per-shard array in the response body is transient, so a later post-incident
-/// review could not otherwise recover why the other shards were held (issue
-/// #619 review).
+/// The resume `DELETE`s the pause rows. Once the HTTP response is gone, this
+/// audit row is the *only* surviving record of the holds' provenance. So it
+/// carries **every** released `(reason, operator)` with the shards it covered.
+/// A "shards disagreed" marker next to the longest hold is not enough. The
+/// per-shard array in the response body is transient. Without this, a later
+/// post-incident review could not recover why the other shards were held
+/// (issue #619 review).
 ///
 /// The longest hold leads, so the row stays coherent with the response's
 /// top-level `released_reason` / `paused_duration_secs`.
 ///
-/// A single released hold — the overwhelmingly common case, including a
-/// fleet-wide hold placed by one operator for one incident — keeps the plain
-/// single-line form. Its shard list is deliberately omitted there: with one
-/// `(reason, operator)` group there is nothing distinguishing to attribute, and
-/// the response already reports the counts.
+/// A single released hold keeps the plain single-line form. That is the
+/// overwhelmingly common case, including a fleet-wide hold placed by one
+/// operator for one incident. Its shard list is deliberately omitted there.
+/// With one `(reason, operator)` group there is nothing distinguishing to
+/// attribute, and the response already reports the counts.
 fn resume_released_audit_reason(provenance: &ResumeProvenance) -> Option<String> {
     released_holds_audit_reason(&provenance.released_groups)
 }
@@ -39846,7 +39728,7 @@ fn resume_released_audit_reason(provenance: &ResumeProvenance) -> Option<String>
 ///
 /// Extracted from [`resume_released_audit_reason`] so the per-activity-type
 /// resume (issue #807) renders a byte-identical line for a byte-identical
-/// situation — the two features present the same information to the same
+/// situation. The two features show the same information to the same
 /// operator, so they must never drift on how it reads.
 fn released_holds_audit_reason(groups: &[ReleasedHoldGroup]) -> Option<String> {
     let (leading, rest) = groups.split_first()?;
@@ -39870,7 +39752,7 @@ fn released_holds_audit_reason(groups: &[ReleasedHoldGroup]) -> Option<String> {
 
 /// Best-effort audit row for a queue pause/resume.
 ///
-/// Written on the first reachable target shard — the operation is a fleet-wide
+/// Written on the first reachable target shard. The operation is a fleet-wide
 /// control, so one row per request (not per shard) is the honest record.
 #[allow(clippy::too_many_arguments)]
 async fn write_queue_pause_audit(
@@ -39908,12 +39790,12 @@ async fn write_queue_pause_audit(
 
 /// Best-effort `STATUS_FAILED` audit row for a *rejected* pause/resume.
 ///
-/// A rejection happens before any shard target is resolved, so it cannot reuse
-/// [`write_queue_pause_audit`]'s target list — it writes to the first shard
-/// pool it can reach. Rejected attempts on a fleet-wide dispatch kill switch
-/// are exactly what an incident review needs, so a malformed body, a bad queue
-/// name, a missing reason, or an unroutable shard all leave a trail (symmetric
-/// with `fail_activity_now`'s malformed-id handling).
+/// A rejection happens before any shard target is resolved. So it cannot reuse
+/// the target list of [`write_queue_pause_audit`], and it writes to the first
+/// shard pool it can reach. An incident review needs each rejected attempt on a
+/// fleet-wide dispatch kill switch. So a malformed body, a bad queue name, a
+/// missing reason, or an unroutable shard all leave a trail. That is symmetric
+/// with the malformed-id handling of `fail_activity_now`.
 ///
 /// `queue_name` is the raw path segment, deliberately un-canonicalised: on the
 /// rejection path it may be the very thing that was invalid.
@@ -39965,10 +39847,10 @@ async fn pause_queue_handler(
         Ok(request) => request,
         Err(response) => return response,
     };
-    // Bound the durable operator reason at the API boundary so the core never
-    // sees an arbitrarily long string — it is stored, re-serialized on every
-    // read poll, and rendered into the Vantage Workers page (the very page an
-    // operator lands on during a queue-pause incident). Same cap and rationale
+    // Bound the durable operator reason at the API boundary, so the core never
+    // sees an arbitrarily long string. The reason is stored, re-serialized on
+    // every read poll, and rendered into the Vantage Workers page. An operator
+    // lands on that page during a queue-pause incident. Same cap and rationale
     // as every other operator reason on this router.
     let reason = truncate_operator_reason(&request.reason);
 
@@ -40023,11 +39905,11 @@ async fn pause_queue_handler(
     };
 
     let partial = (!failures.is_empty()).then(|| failures.join("; "));
-    // Carry the reason into the audit row: the pause row that holds it is
-    // deleted on resume, so this is its only permanent home. It is the
-    // EFFECTIVE provenance, not the request's — an idempotent re-pause
-    // preserves each shard's original row, so echoing the request would record
-    // a reason in effect on no shard at all (issue #807 review).
+    // Carry the reason into the audit row. The resume deletes the pause row that
+    // holds it, so this is its only permanent home. It is the EFFECTIVE
+    // provenance, not the request's. An idempotent re-pause keeps each shard's
+    // original row. Echoing the request would record a reason in effect on no
+    // shard at all (issue #807 review).
     let audit_context = queue_pause_audit_context(
         held_holds_audit_reason(&provenance.held_groups).as_deref(),
         partial.as_deref(),
@@ -40056,12 +39938,12 @@ async fn pause_queue_handler(
         "status": status,
         "queue_name": canonical_queue,
         "newly_paused": newly_paused,
-        // The EFFECTIVE provenance, not the request's, and the EARLIEST hold
-        // rather than whichever shard the fan-out reached first. `pause_queue`
-        // preserves each shard's original row on an idempotent re-pause, so
-        // echoing the request (or a first-success pick) would pair one story
-        // with a fleet-wide `held_task_count` that is true for other shards
-        // (issue #619 review). `shards` keeps every shard's own row and
+        // The EFFECTIVE provenance, not the request's, and the EARLIEST hold,
+        // not whichever shard the fan-out reached first. `pause_queue` keeps
+        // each shard's original row on an idempotent re-pause. Echoing the
+        // request, or a first-success pick, would pair one story with a
+        // fleet-wide `held_task_count` that is true for other shards (issue
+        // #619 review). `shards` keeps every shard's own row, and
         // `provenance_uniform` flags the divergence in one field.
         "reason": provenance.effective.reason,
         "paused_by": provenance.effective.paused_by,
@@ -40077,9 +39959,9 @@ async fn pause_queue_handler(
 
 /// `POST /admin/queues/{queue_name}/resume` — release the hold.
 ///
-/// Held tasks become immediately claimable again, and the time they spent held
-/// is credited back to `scheduled_at` so the thaw does not retroactively
-/// schedule-to-start-time-out the whole backlog (AC4/AC5). Idempotent —
+/// Held tasks become claimable again at once. The time they spent held is
+/// credited back to `scheduled_at`. So the thaw does not make the whole backlog
+/// hit its schedule-to-start timeout retroactively (AC4/AC5). Idempotent:
 /// resuming a queue that is not paused is a `200` no-op.
 async fn resume_queue_handler(
     Extension(api_state): Extension<HarvestApiState>,
@@ -40155,12 +40037,12 @@ async fn resume_queue_handler(
     }
 
     // A resume that did not reach every target shard leaves work still held on
-    // the shards it missed. That is the safe direction, but reporting it as an
-    // unqualified success would leave an operator believing the thaw is
-    // complete while a backlog silently sits frozen, so it is surfaced with the
-    // same 207 / `status` vocabulary as a partial pause.
+    // the shards it missed. That is the safe direction. But an unqualified
+    // success would leave an operator believing the thaw is complete, while a
+    // backlog silently sits frozen. So it is surfaced with the same 207 /
+    // `status` vocabulary as a partial pause.
     let partial = (!failures.is_empty()).then(|| failures.join("; "));
-    // The resume DELETEs the pause row, so record what was released here: this
+    // The resume DELETEs the pause row, so record what was released here. This
     // audit row and the response body are the only surviving record of it.
     let audit_context = queue_pause_audit_context(
         resume_released_audit_reason(&provenance).as_deref(),
@@ -40190,7 +40072,7 @@ async fn resume_queue_handler(
 /// Build the `POST /admin/queues/{queue_name}/resume` response body.
 ///
 /// Split out of the handler so the (already long) handler stays under the
-/// line cap; the response shape is also the interesting part to read on its own.
+/// line cap. The response shape is also worth reading on its own.
 fn resume_queue_response(
     canonical_queue: &str,
     applied: &ResumeApplication,
@@ -40206,9 +40088,9 @@ fn resume_queue_response(
         "released_task_count": applied.released_task_count,
         "paused_duration_secs": applied.paused_duration_secs,
         // The resume DELETES the pause rows, so this is the only surviving
-        // record of what was released. The summary describes the LONGEST hold
-        // (the same shard `paused_duration_secs` reports, so the two are
-        // coherent), `shards` keeps every shard's own released provenance, and
+        // record of what was released. The summary describes the LONGEST hold.
+        // That is the shard `paused_duration_secs` reports, so the two are
+        // coherent. `shards` keeps every shard's own released provenance, and
         // `provenance_uniform` flags divergence (issue #619 review).
         "released_reason": provenance.released_reason,
         "released_paused_by": provenance.released_paused_by,
@@ -40241,10 +40123,10 @@ async fn list_paused_queues_handler(
 
     let collected = shard_fanout::collect_fanout_rows(observations);
 
-    // A fleet-wide pause that only reached some shards persists
-    // `scope_shard_id = NULL` on the shards it reached and no row on the ones it
-    // missed, so real coverage is derived from the EXPECTED shard set rather
-    // than the stored intent (issue #619 review).
+    // A fleet-wide pause that reached only some shards persists
+    // `scope_shard_id = NULL` on the shards it reached and no row on the rest.
+    // So real coverage comes from the EXPECTED shard set, not the stored intent
+    // (issue #619 review).
     let expected = expected_shard_ids(&api_state);
 
     Ok(Json(serde_json::json!({
@@ -40658,32 +40540,31 @@ async fn clear_fairness_weight_handler(
 /// Merge per-shard pause rows into one entry per queue, preserving each shard's
 /// own provenance (issue #619 review).
 ///
-/// A fleet-wide pause writes one row per shard, so the common case must read as
+/// A fleet-wide pause writes one row per shard. So the common case must read as
 /// "the payments queue is held", not N copies of it. But the shards' rows are
-/// **not** guaranteed to agree: `pause_queue` is idempotent and deliberately
-/// preserves the *original* reason and operator on a re-pause, so a fleet-wide
-/// hold landing over a pre-existing shard-scoped hold leaves that shard with
-/// the older story — as does pausing the same queue on two shards separately,
-/// which the `shard_id` parameter explicitly supports. Keeping whichever shard
-/// happened to be iterated first would then show the operator a reason and
-/// scope that are simply not true for part of the fleet.
+/// **not** guaranteed to agree. `pause_queue` is idempotent and deliberately
+/// keeps the *original* reason and operator on a re-pause. So a fleet-wide hold
+/// over a pre-existing shard-scoped hold leaves that shard with the older
+/// story. So does pausing the same queue on two shards separately, which the
+/// `shard_id` parameter explicitly supports. The first shard iterated would
+/// then show the operator a reason and scope that are not true for part of
+/// the fleet.
 ///
-/// So: the top-level provenance is the **earliest** hold (a deterministic rule,
-/// and the same one the Vantage banner uses, so the two surfaces never
-/// disagree), `shards` carries every shard's own provenance, and
+/// So the top-level provenance is the **earliest** hold. That rule is
+/// deterministic, and the Vantage banner uses the same one, so the two surfaces
+/// never disagree. `shards` carries every shard's own provenance.
 /// `provenance_uniform` is a single field a script can gate on.
 ///
 /// Uniformity compares `(reason, paused_by, scope_shard_id)` and deliberately
-/// **not** `paused_at`: each shard stamps its own `NOW()`, so including it would
+/// **not** `paused_at`. Each shard stamps its own `NOW()`, so `paused_at` would
 /// report almost every healthy fleet-wide hold as divergent.
 ///
-/// `effective_scope` is derived from `expected_shards` rather than from the
-/// stored `scope_shard_id`, because a fleet-wide pause that only reached some
-/// shards writes `scope_shard_id = NULL` on the shards it reached and **no row**
-/// on the ones it missed — so intent alone cannot distinguish a complete hold
-/// from a partially-applied one that leaves part of the fleet dispatching
-/// (issue #619 review). `scope_shard_id` is still reported verbatim as the
-/// recorded intent.
+/// `effective_scope` is derived from `expected_shards`, not from the stored
+/// `scope_shard_id`. A fleet-wide pause that reached only some shards writes
+/// `scope_shard_id = NULL` on the shards it reached and **no row** on the rest.
+/// So intent alone cannot tell a complete hold from a partial one that leaves
+/// part of the fleet dispatching (issue #619 review). `scope_shard_id` is still
+/// reported verbatim as the recorded intent.
 fn merge_paused_queue_rows(
     rows: Vec<(i32, ::autumn_harvest::queue_pause::PausedQueue)>,
     expected_shards: &[i32],
@@ -40759,21 +40640,20 @@ fn merge_paused_queue_rows(
 /// `GET /admin/quotas` — usage-vs-limit per resolved `(workflow_name,
 /// quota_key)` pair (issue #946 AC5).
 ///
-/// Cross-shard, `shard_fanout`-based like every other sensitive per-key admin
-/// read (`/admin/concurrency`, `/admin/debounce`, `/admin/start-throttle`): an
-/// unreachable shard degrades the response to `partial`/`unavailable` rather
-/// than failing the whole read (never a `500`).
+/// Cross-shard and `shard_fanout`-based, like every other sensitive per-key
+/// admin read (`/admin/concurrency`, `/admin/debounce`, `/admin/start-throttle`).
+/// An unreachable shard degrades the response to `partial`/`unavailable` and
+/// never fails the whole read with a `500`.
 ///
-/// **Quota enforcement is shard-LOCAL by design (issue #946 AC8)** — unlike a
+/// **Quota enforcement is shard-LOCAL by design (issue #946 AC8).** Unlike a
 /// fleet-wide pause, the SAME `(workflow_name, quota_key)` pair can carry
-/// genuinely independent usage on every shard a tenant's traffic happens to
-/// land on (shard routing hashes on `workflow_id`, not the quota key), so the
-/// effective cap across the whole fleet is `per-shard-limit × shards touched`.
-/// The response therefore does NOT collapse a key's shards into one count —
-/// it sums for a fleet-wide-total convenience field (mirroring
-/// `/admin/concurrency`'s cross-shard sum) but always also lists the full
-/// per-shard breakdown, so an operator can see exactly which shard(s) a
-/// tenant is actually capped on.
+/// genuinely independent usage on every shard that a tenant's traffic lands on.
+/// Shard routing hashes on `workflow_id`, not the quota key. So the effective
+/// cap across the fleet is `per-shard-limit × shards touched`. The response
+/// therefore does NOT collapse a key's shards into one count. It sums them for
+/// a fleet-wide-total convenience field, like the cross-shard sum of
+/// `/admin/concurrency`. It also always lists the full per-shard breakdown. An
+/// operator can then see exactly which shard(s) a tenant is capped on.
 ///
 /// `limits` holds the effective caps, after the operator override of issue
 /// #2408. `code_limits` and `override` show where each cap comes from.
@@ -40969,9 +40849,9 @@ fn quota_workflow_types(
 /// quota_key)` pair, summing for a fleet-wide total while preserving each
 /// shard's own count (issue #946 AC5).
 ///
-/// The declared `limits` are resolved from the CURRENT registered
-/// `WorkflowInfo.quota` for `workflow_name` (never persisted with the usage
-/// rows themselves), so a policy edited after a key accrued usage is reported
+/// The declared `limits` resolve from the CURRENT registered
+/// `WorkflowInfo.quota` for `workflow_name`. They are never persisted with the
+/// usage rows. So a policy edited after a key accrued usage is reported
 /// against the live policy, not a stale snapshot. The operator override of
 /// issue #2408 then applies, as at admission.
 fn merge_quota_rows(
@@ -41052,15 +40932,15 @@ fn merge_quota_rows(
 /// `GET /admin/audit-export` — per-shard audit-export cursor position, lag,
 /// delivery state, and last error (issue #953 AC7).
 ///
-/// Cross-shard and `shard_fanout`-based like every other admin read: an
-/// unreachable shard degrades the response to `partial` (naming it in
-/// `unavailable_shards`) rather than failing the whole read, so one bad shard
-/// never hides the other shards' compliance posture.
+/// Cross-shard and `shard_fanout`-based like every other admin read. An
+/// unreachable shard degrades the response to `partial` and is named in
+/// `unavailable_shards`. The whole read does not fail, so one bad shard never
+/// hides the compliance posture of the other shards.
 ///
-/// A shard with no cursor row yet reports `delivery_state: "NOT_STARTED"` —
-/// deliberately *with* its live `pending_records`/`lag_seconds`, because "the
-/// exporter has never run here and 40k records are waiting" is precisely the
-/// state an operator needs to see, and omitting the shard would hide it.
+/// A shard with no cursor row yet reports `delivery_state: "NOT_STARTED"`. It
+/// deliberately keeps its live `pending_records`/`lag_seconds`. "The exporter
+/// has never run here and 40k records are waiting" is precisely the state an
+/// operator needs to see. Omitting the shard would hide it.
 ///
 /// Admin-gated and read-only: the response carries `actor`-adjacent
 /// compliance posture but no audit record contents.
@@ -41104,9 +40984,8 @@ async fn audit_export_status_handler(
 
     Ok(Json(serde_json::json!({
         // Whether THIS process has an audit sink installed. A `false` here
-        // with a growing `pending_records` is the signature of "export was
-        // configured on the web app but not on the worker fleet", which is
-        // otherwise invisible.
+        // with a growing `pending_records` signals that export was configured
+        // on the web app but not on the worker fleet. Nothing else shows that.
         "sink_configured": ::autumn_harvest::audit_export::is_configured(),
         "shards": collected.rows,
         "status": collected.status,
@@ -41149,34 +41028,34 @@ struct RedriveApplied {
 /// (issue #953 AC6).
 ///
 /// Exactly one of `to_seq` or `before` must be supplied. Re-exported records
-/// are **byte-identical** — the export sequence is never re-stamped, so a
-/// record carries the same `(shard, seq)` and the same JSON on every delivery
-/// and the receiver dedupes.
+/// are **byte-identical**. The export sequence is never re-stamped. So a record
+/// carries the same `(shard, seq)` and the same JSON on every delivery, and the
+/// receiver dedupes.
 ///
-/// A cursor may only ever move **backwards**: a request that would move it
-/// forward, or leave it where it is, is refused with `400` rather than
-/// applied, because advancing it would mark records delivered that never were
-/// — the exact gap this feature exists to make impossible.
+/// A cursor may only ever move **backwards**. A request that would move it
+/// forward, or leave it in place, is refused with `400`. Advancing it would
+/// mark records as delivered that never were. That is the exact gap this
+/// feature exists to make impossible.
 ///
 /// **The rewind and its audit record are one transaction on one connection**
-/// (issue #953, Codex review P1/P2). The audit row is written through the very
-/// connection holding the cursor lock, into the *target shard's*
-/// `harvest_audit_log` — deliberately not the default shard's, which is the
-/// house pattern for every other audited route here. Two reasons:
+/// (issue #953). The audit row goes through the connection that holds the
+/// cursor lock, into the `harvest_audit_log` of the *target shard*. Every
+/// other audited route here writes to the default shard instead. This route
+/// deliberately does not, for two reasons:
 ///
 /// 1. **Atomicity is real, not approximate.** A second connection's insert
-///    commits independently, so the two could disagree in either direction: a
-///    committed `SUCCEEDED` row claiming a rewind that then failed to commit,
-///    or a rewind with no trail. Same connection, same transaction, one
-///    outcome.
+///    commits independently, so the two could disagree in either direction. A
+///    committed `SUCCEEDED` row could claim a rewind that then failed to
+///    commit. Or a rewind could have no trail. Same connection, same
+///    transaction, one outcome.
 /// 2. **It cannot self-deadlock.** `acquire_conn` is an unbounded `pool.get()`.
-///    Asking the default pool for a second connection while already holding one
-///    from it — which is what a redrive of the *default* shard does — parks
-///    forever on a small pool, while holding the cursor lock.
+///    A redrive of the *default* shard already holds one connection from the
+///    default pool. Asking that pool for a second one parks forever on a small
+///    pool, while it holds the cursor lock.
 ///
-/// The audit row is shard-local anyway: it describes a shard-scoped mutation,
-/// carries that shard's id, and is picked up by that shard's own exporter, so
-/// it reaches the SIEM like every other audit record.
+/// The audit row is shard-local anyway. It describes a shard-scoped mutation
+/// and carries that shard's id. That shard's own exporter picks it up, so it
+/// reaches the SIEM like every other audit record.
 ///
 /// **The response reports what it can actually deliver, not the full window
 /// asked for** (issue #1267). Retention does not take the cursor row's lock.
@@ -41212,9 +41091,9 @@ async fn audit_export_redrive_handler(
         }
     };
 
-    // Mirrors `observe_shards`: a missing storage pool is a 503, not a 400 —
-    // the two audit-export routes must agree about what "storage is not
-    // configured" looks like.
+    // Mirrors `observe_shards`: a missing storage pool is a 503, not a 400. The
+    // two audit-export routes must agree on what "storage is not configured"
+    // looks like.
     let Ok(pool) = api_state.storage_pool() else {
         return AutumnError::service_unavailable_msg("harvest storage pool is not configured")
             .into_response();
@@ -41223,9 +41102,8 @@ async fn audit_export_redrive_handler(
     let route = "POST /admin/audit-export/redrive";
 
     // The audit row's target names BOTH the shard and the position asked for.
-    // A redrive is the one operation here that can trigger a mass re-export,
-    // so "alice redrove shard 5" without the position is not an answer an
-    // auditor can use.
+    // A redrive is the one operation here that can trigger a mass re-export.
+    // "alice redrove shard 5" without the position is no use to an auditor.
     let target_label = format!("shard={};{requested}", request.shard);
 
     let shard_pool = pool.exact_pool_for(::autumn_harvest::types::ShardId::new(request.shard));
@@ -41282,7 +41160,7 @@ async fn audit_export_redrive_handler(
                     .await?;
 
                     // Only a rewind that actually moved the cursor is a
-                    // SUCCEEDED privileged action; a refused request changed
+                    // SUCCEEDED privileged action. A refused request changed
                     // nothing and must not read as one in the trail.
                     let (status, detail) = match &outcome {
                         ::autumn_harvest::audit_export::RewindOutcome::Rewound { from, to } => {
@@ -41452,10 +41330,9 @@ struct AuditExportShardRequest {
 /// requests that had an effect.
 ///
 /// **The atomic record above lands on the shard whose own exporter this
-/// call just stopped** (Codex review, issue #1273 P1). So it can never
-/// reach the SIEM. In a single-shard deployment that shard is also the only
-/// one there is, so there is no other exportable destination to fall back
-/// to.
+/// call just stopped** (issue #1273). So it can never reach the SIEM. In a
+/// single-shard deployment that shard is also the only one there is, so there
+/// is no other exportable destination to fall back to.
 ///
 /// What makes this route's guarantee true anyway is
 /// [`crate::audit::purge_old_audit_records`]: it never purges an
@@ -41587,12 +41464,11 @@ async fn audit_export_decommission_handler(
     };
 
     // A genuine retirement stops the TARGET shard's own exporter. So the
-    // atomic record above can never reach the SIEM from there (Codex
-    // review, issue #1273 P1). `purge_old_audit_records` never purges this
-    // operation, on any shard, so that record is permanent regardless. This
-    // is a durability guarantee, not an export one. In a single-shard
-    // deployment the target IS the only shard, so permanence is all this
-    // route can ever promise there.
+    // atomic record above can never reach the SIEM from there (issue #1273).
+    // `purge_old_audit_records` never purges this operation, on any shard, so
+    // that record is permanent regardless. This is a durability guarantee, not
+    // an export one. In a single-shard deployment the target IS the only shard,
+    // so permanence is all this route can ever promise there.
     //
     // Where a DIFFERENT shard still exports, attempt a second, best-effort
     // copy there for an actual shot at reaching the SIEM. A failure here is
@@ -41818,26 +41694,26 @@ async fn audit_export_reactivate_handler(
 // this block. The shapes are deliberately identical, one granularity down. They
 // share the fleet-wide fan-out and the per-shard loop that collects rather than
 // aborts. They share the 207 partial-application contract, the earliest-hold /
-// longest-hold provenance rules and the audited-rejection path. Where a helper is genuinely
-// feature-neutral it is REUSED rather than copied (see
+// longest-hold provenance rules and the audited-rejection path. A genuinely
+// feature-neutral helper is REUSED, not copied. See
 // `queue_pause_partial_status`, `queue_pause_attach_partial`,
-// `HoldGroupFold`/`ReleasedHoldGroup`, `released_holds_audit_reason`), so the
+// `HoldGroupFold`/`ReleasedHoldGroup` and `released_holds_audit_reason`. So the
 // two features can never drift on the parts an operator reads.
 //
-// The one structural difference is the read side: a queue is only ever visible
-// through its pause row, whereas an activity **type** has a registered
-// catalogue, so `GET /activities` is driven by the registry and the pause table
-// is a cross-reference. See `merge_activity_catalog_rows`.
+// The one structural difference is the read side. A queue is visible only
+// through its pause row. An activity **type** has a registered catalogue, so
+// the registry drives `GET /activities`, and the pause table is a
+// cross-reference. See `merge_activity_catalog_rows`.
 
 /// Body of `POST /activities/{activity_name}/pause` — entirely optional.
 ///
-/// Unlike the queue-pause sibling, which *requires* a reason, both fields here
-/// are optional and a bare `POST` with no body at all is a valid fleet-wide
-/// hold. During an incident the operator's first move is to stop the bleeding;
-/// rejecting that with a `400` because a reason was not typed would put
-/// paperwork ahead of containment. The reason still has a durable home — it
-/// defaults to [`DEFAULT_ACTIVITY_PAUSE_REASON`] so the read API, the CLI and
-/// the audit row always have *something* to show, and the row is never `NULL`.
+/// The queue-pause sibling *requires* a reason. Here both fields are optional,
+/// and a bare `POST` with no body at all is a valid fleet-wide hold. During an
+/// incident the operator's first move is to stop the bleeding. A `400` for a
+/// missing reason would put paperwork ahead of containment. The reason still
+/// has a durable home. It defaults to [`DEFAULT_ACTIVITY_PAUSE_REASON`], so the
+/// read API, the CLI and the audit row always have *something* to show. The
+/// row is never `NULL`.
 ///
 /// `deny_unknown_fields` for the reason the queue sibling documents: a field
 /// this route silently ignores is a field an operator believes took effect.
@@ -41851,12 +41727,12 @@ pub(crate) struct PauseActivityRequest {
     pub reason: Option<String>,
     /// Operator identity to record as `paused_by`.
     ///
-    /// This is a **label**, not authentication: it lets an automation
+    /// This is a **label**, not authentication. It lets an automation
     /// ("oncall-bot") attribute a hold to the human it acted for. The durable
-    /// audit row always carries the *authenticated* actor derived from the
-    /// request headers, and records the on-behalf-of relationship when the two
-    /// differ, so a body field can never rewrite the security trail. Defaults
-    /// to the authenticated actor.
+    /// audit row always carries the *authenticated* actor from the request
+    /// headers. It records the on-behalf-of relationship when the two differ,
+    /// so a body field can never rewrite the security trail. Defaults to the
+    /// authenticated actor.
     #[serde(default)]
     pub actor: Option<String>,
 }
@@ -41874,28 +41750,28 @@ pub(crate) struct ResumeActivityRequest {}
 
 /// Reason stored when an operator pauses without supplying one.
 ///
-/// A pause row's `reason` is `NOT NULL` and is the only durable record of *why*
-/// dispatch is held (the row is deleted on resume), so the optional-body
-/// contract above needs a default rather than an empty string — "(no reason
-/// given)" tells the next operator that nobody typed one, where `""` would read
-/// as a rendering bug.
+/// A pause row's `reason` is `NOT NULL`. It is the only durable record of *why*
+/// dispatch is held, and the resume deletes the row. So the optional-body
+/// contract above needs a default, not an empty string. "(no reason given)"
+/// tells the next operator that nobody typed one. `""` would read as a
+/// rendering bug.
 const DEFAULT_ACTIVITY_PAUSE_REASON: &str = "operator pause (no reason given)";
 
 /// Resolve every shard an activity pause/resume must touch, plus any shard the
 /// router knows about that this process has no pool for.
 ///
 /// Always fleet-wide. Issue #807's contract is that a hold "applies on every
-/// shard and every worker", so — unlike the queue sibling, which exposes a
-/// `shard_id` scope — there is no per-shard variant to resolve here and no
-/// `unknown shard_id` rejection. The core still carries a `scope_shard_id`
-/// column (a future scoped surface, and the CLI, can write it), so the read and
-/// mutation responses report it verbatim; this route always writes `NULL`.
+/// shard and every worker". The queue sibling exposes a `shard_id` scope. Here
+/// there is no per-shard variant to resolve and no `unknown shard_id`
+/// rejection. The core still carries a `scope_shard_id` column, which a future
+/// scoped surface or the CLI can write. So the read and mutation responses
+/// report it verbatim. This route always writes `NULL`.
 ///
 /// The expected-shard set comes from [`shard_fanout::expected_shards`], not the
-/// local pool map: a shard the router knows but this process has no pool for
-/// (mid a shard-add rollout) must be *reported*, never silently omitted.
-/// Omitting it would let a hold return an unqualified success while that shard
-/// kept dispatching into the outage.
+/// local pool map. The router may know a shard that this process has no pool
+/// for yet, during a shard-add rollout. Such a shard must be *reported*, never
+/// silently omitted. Omitting it would let a hold return an unqualified success
+/// while that shard kept dispatching into the outage.
 fn activity_pause_target_pools(
     api_state: &HarvestApiState,
 ) -> Result<QueuePauseTargets, AutumnError> {
@@ -41920,9 +41796,9 @@ fn activity_pause_target_pools(
 
 /// Audit a rejected activity pause/resume and turn the error into a response.
 ///
-/// Every rejection path is audited: a *refused* attempt on a fleet-wide
-/// dispatch kill switch is exactly what an incident review needs to see, and
-/// without it a mistyped activity name during an outage leaves no trace at all.
+/// Every rejection path is audited. A refused attempt on a fleet-wide dispatch
+/// kill switch is what an incident review needs to see. Without the row, a
+/// mistyped activity name during an outage leaves no trace.
 async fn reject_activity_pause(
     api_state: &HarvestApiState,
     audit: &QueuePauseAuditCtx,
@@ -41963,11 +41839,10 @@ async fn reject_activity_pause(
 /// router knows about but this process cannot reach.
 ///
 /// The name is validated but **not** required to be registered on this node.
-/// A management API process need not register every activity the fleet runs
-/// (a heterogeneous deployment is the norm), so 404-ing an unregistered name
-/// would make a legitimately-remote activity unpausable during exactly the
-/// outage the operator is containing. The invisible-typo hazard that trade
-/// creates is closed on the read side instead: `GET /activities` surfaces a
+/// A management API process need not register every activity the fleet runs.
+/// A heterogeneous deployment is the norm. A 404 on an unregistered name would
+/// make a remote activity unpausable during the outage the operator contains.
+/// The read side closes the resulting typo hazard: `GET /activities` surfaces a
 /// paused-but-unregistered activity with `registered: false` rather than
 /// dropping it (see [`merge_activity_catalog_rows`]).
 #[allow(clippy::result_large_err)]
@@ -42026,12 +41901,11 @@ async fn prepare_activity_pause_targets(
 
 /// Best-effort audit row for an activity pause/resume.
 ///
-/// Written on the first reachable target shard — the operation is a fleet-wide
+/// Written on the first reachable target shard. The operation is a fleet-wide
 /// control, so one row per request (not per shard) is the honest record.
-/// Mirrors [`write_queue_pause_audit`]; a separate function rather than a
-/// parameterised one only because the target type differs
-/// ([`TARGET_ACTIVITY`] vs [`TARGET_QUEUE`]) and that helper is already at its
-/// argument limit.
+/// Mirrors [`write_queue_pause_audit`]. It is a separate function only because
+/// the target type differs ([`TARGET_ACTIVITY`] vs [`TARGET_QUEUE`]) and that
+/// helper is already at its argument limit.
 ///
 /// `shard_id` is always `None`: this route is fleet-wide by construction, so
 /// there is no single shard the record belongs to.
@@ -42077,9 +41951,9 @@ async fn write_activity_pause_audit(
 /// hold. On a fleet-wide fan-out "genuinely flipped" means *any* shard flipped,
 /// which is exactly what the response's own `newly_*` field reports.
 ///
-/// Telemetry must never decide whether an outage can be contained, so a runtime
-/// that is not installed yet (the boot window) is skipped silently rather than
-/// failing the hold — the same posture as the audit write above.
+/// Telemetry must never decide whether an outage can be contained. A runtime
+/// that is not installed yet (the boot window) is skipped silently, so the hold
+/// never fails on it. The audit write above takes the same posture.
 ///
 /// [`METRIC_ACTIVITY_PAUSE_ACTIONS`]: ::autumn_harvest::telemetry::METRIC_ACTIVITY_PAUSE_ACTIONS
 fn record_activity_pause_metric(
@@ -42093,14 +41967,14 @@ fn record_activity_pause_metric(
     }
     if let Ok(runtime) = api_state.runtime() {
         // Bucket an UNREGISTERED name to the sentinel before it becomes a metric
-        // label. The pause routes accept unregistered names on purpose (an
+        // label. The pause routes accept unregistered names on purpose. An
         // operator must be able to pre-pause an activity before its fleet rolls
-        // out, and a paused-but-unregistered hold must stay inspectable), so the
-        // raw name is caller-controlled free text — bounded in length, but not
-        // in CARDINALITY, which is what ADR-0001 §7 actually forbids. A
-        // remediation script templating a tenant id into the name would
-        // otherwise mint one permanent series per tenant. Same fix as the #684
-        // update-name label. The durable row and the read API keep the raw name.
+        // out, and a paused-but-unregistered hold must stay inspectable. So the
+        // raw name is caller-controlled free text. It is bounded in length, but
+        // not in CARDINALITY, which is what ADR-0001 §7 forbids. A remediation
+        // script templating a tenant id into the name would otherwise mint one
+        // permanent series per tenant. Same fix as the #684 update-name label.
+        // The durable row and the read API keep the raw name.
         let label = if runtime.registry.activities.contains_key(activity_name) {
             activity_name
         } else {
@@ -42122,17 +41996,18 @@ struct ActivityPauseApplication {
     held_task_count: i64,
     /// Every shard that applied the hold, with its own effective row.
     ///
-    /// Kept per-shard rather than collapsed to the first success: a re-pause
-    /// preserves each shard's ORIGINAL provenance, so a request landing over a
-    /// pre-existing hold leaves the shards disagreeing, and labelling the
-    /// fleet-wide `held_task_count` with one shard's reason, actor and
-    /// timestamp would then be untrue for the rest of the fleet.
+    /// Kept per-shard rather than collapsed to the first success. A re-pause
+    /// preserves each shard's ORIGINAL provenance, so a request over a
+    /// pre-existing hold leaves the shards disagreeing. One shard's reason,
+    /// actor and timestamp on the fleet-wide `held_task_count` would then be
+    /// untrue for the rest of the fleet.
     per_shard: Vec<(i32, ::autumn_harvest::activity_pause::ActivityPauseOutcome)>,
 }
 
-/// Apply the hold on every target shard, appending any per-shard error to
-/// `failures` rather than aborting — one unreachable shard must not stop the
-/// others from being held.
+/// Apply the hold on every target shard.
+///
+/// A per-shard error goes to `failures` rather than aborting. One unreachable
+/// shard must not stop the others from being held.
 async fn apply_activity_pause_across_shards(
     targets: &[(i32, ::autumn_harvest::worker::DbPool)],
     canonical_activity: &str,
@@ -42191,13 +42066,12 @@ struct ActivityPauseProvenance<'a> {
 /// Summarise a fleet-wide activity pause without discarding any shard's
 /// provenance.
 ///
-/// The top-level summary is the **earliest** hold, tie-broken by shard id — the
-/// same rule [`merge_activity_catalog_rows`] uses, so the mutation response and
-/// the read endpoints can never tell an operator two different stories about
-/// one hold. `uniform` compares `(reason, paused_by, scope_shard_id)` and
-/// deliberately **not** `paused_at`: each shard stamps its own `NOW()`, so
-/// including it would flag essentially every healthy fleet-wide hold as
-/// divergent.
+/// The top-level summary is the **earliest** hold, tie-broken by shard id.
+/// [`merge_activity_catalog_rows`] uses the same rule, so the mutation response
+/// and the read endpoints never tell an operator two stories about one hold.
+/// `uniform` compares `(reason, paused_by, scope_shard_id)` and deliberately
+/// **not** `paused_at`. Each shard stamps its own `NOW()`, so including it
+/// would flag almost every healthy fleet-wide hold as divergent.
 ///
 /// Returns `None` only when every target shard failed.
 fn summarise_activity_pause_provenance(
@@ -42307,9 +42181,9 @@ struct ActivityResumeProvenance {
     /// Every released hold, deduplicated by `(reason, operator)` and ordered
     /// longest-held first.
     ///
-    /// The pause rows are already deleted by the time this exists, so this —
-    /// not the transient [`Self::shards`] response array — is what the durable
-    /// audit row must carry. Reuses the queue sibling's
+    /// The pause rows are already deleted by the time this exists. So this, not
+    /// the transient [`Self::shards`] response array, is what the durable audit
+    /// row must carry. Reuses the queue sibling's
     /// [`ReleasedHoldGroup`]/[`HoldGroupFold`] so the two features render an
     /// identical audit line for an identical situation.
     released_groups: Vec<ReleasedHoldGroup>,
@@ -42333,13 +42207,11 @@ impl ActivityResumeProvenance {
 /// provenance.
 ///
 /// The top-level reason/operator come from the **longest** hold released,
-/// tie-broken by shard id — deliberately the same shard the
-/// `paused_duration_secs` maximum describes, so the duration and the story it
-/// is paired with always come from one shard.
+/// tie-broken by shard id. That is the shard the `paused_duration_secs`
+/// maximum describes, so the duration and its story come from one shard.
 ///
-/// Only shards that actually released a hold carry provenance (a shard that was
-/// not paused returns `None`), so both the summary and the grouping consider
-/// just those.
+/// Only shards that released a hold carry provenance. A shard that was not
+/// paused returns `None`, so the summary and the grouping consider just those.
 fn summarise_activity_resume_provenance(
     per_shard: &[(i32, ::autumn_harvest::activity_pause::ActivityResumeOutcome)],
 ) -> ActivityResumeProvenance {
@@ -42392,8 +42264,8 @@ fn summarise_activity_resume_provenance(
 /// Resolve the operator LABEL stored on the pause row, and the audit note that
 /// records an on-behalf-of relationship.
 ///
-/// The label is body-supplied when present; the audit row always carries the
-/// AUTHENTICATED actor, and names the relationship when the two differ, so a
+/// The label is body-supplied when present. The audit row always carries the
+/// AUTHENTICATED actor and names the relationship when the two differ. So a
 /// body field can never rewrite the security trail. A blank or whitespace-only
 /// label falls back to the actor rather than storing `""`.
 fn resolve_pause_operator_label(requested: Option<&str>, actor: &str) -> (String, Option<String>) {
@@ -42484,12 +42356,11 @@ async fn pause_activity_handler(
     let partial = (!failures.is_empty()).then(|| failures.join("; "));
     // Carry the reason into the audit row: the pause row that holds it is
     // deleted on resume, so this is its only permanent home. It is the
-    // EFFECTIVE provenance, not the request's — `pause_activity` preserves each
-    // shard's original row on an idempotent re-pause, so echoing the request
-    // would record a reason in effect on no shard at all (issue #807 review).
-    // `on_behalf_of` stays request-scoped by contrast: it records what THIS
-    // caller claimed, which is a security fact about the request rather than a
-    // description of the hold.
+    // EFFECTIVE provenance, not the request's. `pause_activity` preserves each
+    // shard's original row on an idempotent re-pause. Echoing the request would
+    // record a reason in effect on no shard at all (issue #807 review).
+    // `on_behalf_of` stays request-scoped by contrast. It records what THIS
+    // caller claimed, a security fact about the request, not the hold.
     let audit_context = activity_pause_audit_context(
         held_holds_audit_reason(&provenance.held_groups).as_deref(),
         on_behalf_of.as_deref(),
@@ -42530,10 +42401,10 @@ async fn pause_activity_handler(
 /// Parse the optional `POST /activities/{activity_name}/pause` body.
 ///
 /// An absent body is the documented fleet-wide default, not an error. A body
-/// that is present but malformed (including one carrying an unknown field — see
-/// [`PauseActivityRequest`]) is an audited `400`, matching the queue sibling's
-/// `parse_pause_request` contract: on rejection the audit row is written here
-/// and a ready-to-send response is returned in `Err`.
+/// that is present but malformed is an audited `400`. That includes one with an
+/// unknown field (see [`PauseActivityRequest`]). This matches the queue
+/// sibling's `parse_pause_request` contract: on rejection the audit row is
+/// written here and a ready-to-send response is returned in `Err`.
 #[allow(clippy::result_large_err)]
 async fn parse_activity_pause_request(
     api_state: &HarvestApiState,
@@ -42565,12 +42436,11 @@ async fn parse_activity_pause_request(
 
 /// Resolve the durable pause reason from the optional body field.
 ///
-/// Trims **before** truncating so the value that was checked for emptiness IS
-/// the value that gets stored, and so leading whitespace cannot eat the
-/// operator's actual words out of the 500-character budget. A missing or
-/// whitespace-only reason falls back to [`DEFAULT_ACTIVITY_PAUSE_REASON`]
-/// rather than storing `""`, which would read as a rendering bug on every
-/// surface that shows it.
+/// Trims **before** truncating, so the value checked for emptiness IS the
+/// value stored. Leading whitespace then cannot eat the operator's words out of
+/// the 500-character budget. A missing or whitespace-only reason falls back to
+/// [`DEFAULT_ACTIVITY_PAUSE_REASON`]. Storing `""` would read as a rendering
+/// bug on every surface that shows it.
 fn resolve_activity_pause_reason(reason: Option<&str>) -> String {
     reason
         .map(str::trim)
@@ -42583,9 +42453,8 @@ fn resolve_activity_pause_reason(reason: Option<&str>) -> String {
 
 /// Build the `POST /activities/{activity_name}/pause` response body.
 ///
-/// Split out of the handler so the handler stays under the line cap (the same
-/// treatment `resume_queue_response` gives its sibling); the response shape is
-/// also the interesting part to read on its own.
+/// Split out of the handler so the handler stays under the line cap, as
+/// `resume_queue_response` does for its sibling.
 fn activity_pause_response(
     canonical_activity: &str,
     newly_paused: bool,
@@ -42602,11 +42471,11 @@ fn activity_pause_response(
         "status": status,
         "activity_name": canonical_activity,
         "newly_paused": newly_paused,
-        // The EFFECTIVE provenance, not the request's, and the EARLIEST hold
-        // rather than whichever shard the fan-out reached first: `pause_activity`
-        // preserves each shard's original row on an idempotent re-pause, so
-        // echoing the request would pair one story with a fleet-wide
-        // `held_task_count` that is untrue for other shards.
+        // The EFFECTIVE provenance, not the request's. And the EARLIEST hold,
+        // not whichever shard the fan-out reached first. `pause_activity`
+        // preserves each shard's original row on an idempotent re-pause. Echoing
+        // the request would pair one story with a fleet-wide `held_task_count`
+        // that is untrue for other shards.
         "reason": provenance.effective.reason,
         "paused_by": provenance.effective.paused_by,
         "paused_at": provenance.effective.paused_at,
@@ -42621,13 +42490,12 @@ fn activity_pause_response(
 
 /// Build the durable audit `error_summary` for an activity pause/resume.
 ///
-/// The pause row holds the reason only while the hold is in effect — a resume
-/// `DELETE`s it — so without this the audit trail could say who paused an
-/// activity but never *why*, which is precisely the question a post-incident
-/// review asks. `harvest_audit_log` has no metadata column, so the reason
-/// (plus the on-behalf-of label and any partial-failure text) is carried in the
-/// one free-text field the record already has, each contribution labelled so
-/// they stay distinguishable.
+/// The pause row holds the reason only while the hold is in effect. A resume
+/// `DELETE`s it. Without this, the audit trail could say who paused an activity
+/// but never *why*, the question a post-incident review asks.
+/// `harvest_audit_log` has no metadata column. So the reason, the on-behalf-of
+/// label and any partial-failure text go in the one free-text field the record
+/// has. Each contribution is labelled so they stay distinguishable.
 ///
 /// `error_summary` is therefore non-`None` on a fully successful pause. That is
 /// deliberate: `status` remains the outcome discriminator, and the labelled
@@ -42654,9 +42522,9 @@ fn activity_pause_audit_context(
 
 /// `POST /activities/{activity_name}/resume` — release the hold (issue #807).
 ///
-/// Held tasks become immediately claimable again, and the time they spent held
-/// is credited back to `scheduled_at` so the thaw does not retroactively
-/// schedule-to-start-time-out the whole backlog. Idempotent — resuming an
+/// Held tasks become claimable again at once. The time they spent held is
+/// credited back to `scheduled_at`, so the thaw does not retroactively
+/// schedule-to-start-time-out the whole backlog. Idempotent: resuming an
 /// activity that is not paused is a `200` no-op (`newly_resumed: false`).
 async fn resume_activity_handler(
     Extension(api_state): Extension<HarvestApiState>,
@@ -42729,10 +42597,10 @@ async fn resume_activity_handler(
     }
 
     // A resume that did not reach every shard leaves work still held on the
-    // shards it missed. That is the safe direction, but reporting it as an
-    // unqualified success would leave an operator believing the thaw is
-    // complete while a backlog sits frozen, so it is surfaced with the same
-    // 207 / `status` vocabulary as a partial pause.
+    // shards it missed. That is the safe direction. But an unqualified success
+    // would leave an operator believing the thaw is complete while a backlog
+    // sits frozen. So it is surfaced with the same 207 / `status` vocabulary as
+    // a partial pause.
     let partial = (!failures.is_empty()).then(|| failures.join("; "));
     let audit_context = activity_pause_audit_context(
         released_holds_audit_reason(&provenance.released_groups).as_deref(),
@@ -42800,9 +42668,9 @@ fn activity_resume_response(
 /// type, independent of whether it is paused.
 #[derive(Clone, Copy)]
 struct ActivityCatalogEntry {
-    /// The queue this activity dispatches on (`"default"` when undeclared) —
-    /// the context an operator needs to decide between this per-type hold and
-    /// the coarser queue pause (#619).
+    /// The queue this activity dispatches on (`"default"` when undeclared).
+    /// An operator needs it to choose between this per-type hold and the
+    /// coarser queue pause (#619).
     queue_name: &'static str,
     /// Local activities run inline on the workflow worker and never take a
     /// `harvest_task_queue` row, so a pause cannot hold one. Reported so the
@@ -42837,27 +42705,27 @@ fn registered_activity_catalog(
 /// # Why a pause on a local activity must be refused, not recorded
 ///
 /// A `local = true` activity (issue #98) runs **inline on the workflow worker**
-/// inside the workflow task. It never takes a `harvest_task_queue` row, so the
-/// claim-path gate this whole feature is built on has nothing to skip: the
-/// pause row is written, the read model dutifully reports a hold, and every new
-/// invocation keeps running. Answering `ok: true` / `newly_paused: true` there
-/// is worse than answering nothing — during an incident it is the single call
-/// an operator makes to stop a broken dependency, and nobody re-reads a
-/// mutation that said it worked.
+/// inside the workflow task. It never takes a `harvest_task_queue` row. So the
+/// claim-path gate this feature is built on has nothing to skip. The pause row
+/// is written, the read model reports a hold, and every new invocation keeps
+/// running. Answering `ok: true` / `newly_paused: true` there is worse than
+/// answering nothing. During an incident it is the single call an operator
+/// makes to stop a broken dependency, and nobody re-reads a mutation that said
+/// it worked.
 ///
-/// This is the same reasoning [`::autumn_harvest::activity_pause::validate_activity_name`]
-/// gives for rejecting a whitespace-padded name rather than trimming it: only
-/// rejecting cannot lie, and during an outage a `400` naming the problem beats
-/// a false green.
+/// [`::autumn_harvest::activity_pause::validate_activity_name`] rejects a
+/// whitespace-padded name rather than trimming it, for the same reason. Only
+/// rejecting cannot lie. During an outage a `400` naming the problem beats a
+/// false green.
 ///
 /// # Why an unregistered name still passes
 ///
 /// These routes deliberately accept names this management node does not
-/// register — a management node need not register every activity the fleet
-/// runs, which is the same remote/unregistered case the read endpoints' 404-vs-
-/// 503 rule preserves. Refusing an unknown name would break pausing a genuinely
-/// remote activity, i.e. the feature's primary use. Only a name the node
-/// registers **and** knows to be local is refused.
+/// register. A management node need not register every activity the fleet
+/// runs. The read endpoints' 404-vs-503 rule preserves the same case.
+/// Refusing an unknown name would break pausing a genuinely remote activity,
+/// the feature's primary use. Only a name the node registers **and** knows to
+/// be local is refused.
 fn local_activity_pause_refusal(
     catalog: &std::collections::BTreeMap<String, ActivityCatalogEntry>,
     activity_name: &str,
@@ -42881,19 +42749,19 @@ fn local_activity_pause_refusal(
 /// activity a hold could not possibly reach (issue #807 review).
 ///
 /// The refusal runs AFTER name validation, so a malformed name still reports
-/// the malformation rather than this, and BEFORE any pause row is written, so a
-/// refusal leaves no phantom hold behind. The decision itself lives in the pure
-/// [`local_activity_pause_refusal`] so it is testable without a runtime.
+/// the malformation rather than this. It runs BEFORE any pause row is written,
+/// so a refusal leaves no phantom hold behind. The decision itself lives in the
+/// pure [`local_activity_pause_refusal`] so it is testable without a runtime.
 ///
 /// Resume deliberately does **not** get this check: a local pause row written
 /// by an older build must stay removable.
 ///
-/// Deliberately fails **open** when the runtime is not installed yet: without
-/// it we cannot tell local from remote, and treating an unknowable activity as
-/// remote matches how an unregistered name is already handled. Failing closed
-/// would refuse EVERY pause during the boot window — including the ordinary
-/// remote ones an operator needs most mid-incident — to guard a case that is
-/// merely today's behaviour.
+/// Deliberately fails **open** when the runtime is not installed yet. Without
+/// it, local and remote cannot be told apart. Treating an unknowable activity
+/// as remote matches how an unregistered name is already handled. Failing
+/// closed would refuse EVERY pause during the boot window. That includes the
+/// ordinary remote ones an operator needs most mid-incident. The case it would
+/// guard is merely today's behaviour.
 #[allow(clippy::result_large_err)]
 async fn prepare_activity_pause_targets_checked(
     api_state: &HarvestApiState,
@@ -42933,9 +42801,10 @@ async fn prepare_activity_pause_targets_checked(
     .await)
 }
 
-/// Write one activity entry's pause block: the paused arm and the not-paused
-/// arm write the **same key set**, so a consumer never has to branch on which
-/// arm produced the entry.
+/// Write one activity entry's pause block.
+///
+/// The paused arm and the not-paused arm write the **same key set**, so a
+/// consumer never branches on which arm produced the entry.
 fn insert_activity_pause_fields(
     map: &mut serde_json::Map<String, Value>,
     shard_rows: &[(i32, ::autumn_harvest::activity_pause::PausedActivity)],
@@ -43016,18 +42885,17 @@ fn insert_activity_pause_fields(
 /// A single-activity read found nothing: is that a definitive "does not exist",
 /// or an unanswerable question?
 ///
-/// Returning `404` asserts nonexistence. That assertion is only true when every
-/// expected shard was inspected — a pause row living **only** on an unreachable
-/// shard produces exactly the same empty result, and the routes deliberately
-/// accept unregistered names (a management node need not register every
-/// activity the fleet runs), so this is a reachable state, not a theoretical
-/// one. Answering `404` there tells an operator the hold does not exist while
-/// it is actively holding work on the shard that could not be read.
+/// Returning `404` asserts nonexistence. That holds only when every expected
+/// shard was inspected. A pause row living **only** on an unreachable shard
+/// produces the same empty result. The routes deliberately accept unregistered
+/// names, since a management node need not register every activity the fleet
+/// runs. So this state is reachable, not theoretical. A `404` there tells an
+/// operator the hold does not exist while it holds work on the unread shard.
 ///
 /// So the read fails **closed** with `503` while any shard is unaccounted for,
-/// naming them — the same rule the `(workflow_name, workflow_id)` resolver
-/// (issue #805) applies for the same reason: "fail closed with 503 rather than
-/// risk a false 404".
+/// and names those shards. The `(workflow_name, workflow_id)` resolver (issue
+/// #805) applies the same rule for the same reason: "fail closed with 503
+/// rather than risk a false 404".
 fn activity_missing_error(
     activity_name: &str,
     status: shard_fanout::FanoutStatus,
@@ -43053,10 +42921,9 @@ fn activity_missing_error(
 /// The shard set a hold is expected to span, as a sorted `Vec`.
 ///
 /// One definition shared by the queue-pause (#619) and activity-pause (#807)
-/// read models: both derive real coverage from the shards the fleet is
-/// *supposed* to have, and computing that two ways is exactly how the two
-/// surfaces would come to disagree about whether the same partially-applied
-/// hold is fleet-wide.
+/// read models. Both derive real coverage from the shards the fleet is
+/// *supposed* to have. Computing that two ways is how the two surfaces would
+/// come to disagree on whether one partially-applied hold is fleet-wide.
 fn expected_shard_ids(api_state: &HarvestApiState) -> Vec<i32> {
     let pools = shard_fanout::pools_by_shard(api_state);
     shard_fanout::expected_shards(api_state, &pools)
@@ -43067,33 +42934,35 @@ fn expected_shard_ids(api_state: &HarvestApiState) -> Vec<i32> {
 /// Merge the registered activity catalogue with the cross-shard pause rows into
 /// one entry per activity type.
 ///
-/// The list is driven by the **registered catalogue**, not the pause table, so a
-/// healthy activity appears with `paused: false` — the read is a fleet
-/// inventory an operator scans during an incident, and one that only listed the
-/// already-broken things could not answer "is `charge_card` held?".
+/// The list is driven by the **registered catalogue**, not the pause table. So
+/// a healthy activity appears with `paused: false`. The read is a fleet
+/// inventory an operator scans during an incident. A list of only the broken
+/// things could not answer "is `charge_card` held?".
 ///
 /// A paused activity that this process does **not** have registered is still
 /// listed, flagged `registered: false`. Pause deliberately does not require
-/// registration (a management node need not register every activity the fleet
-/// runs — see [`prepare_activity_pause_targets`]), so without this a mistyped
-/// hold would be invisible on the one surface an operator uses to find it, and
-/// would keep silently holding nothing forever.
+/// registration, since a management node need not register every activity the
+/// fleet runs (see [`prepare_activity_pause_targets`]). Without this, a
+/// mistyped hold would be invisible on the one surface an operator uses to find
+/// it, and would keep silently holding nothing forever.
 ///
 /// Per-activity pause provenance follows the same rules as the mutation
-/// response: the top-level summary is the **earliest** hold (tie-broken by
-/// shard id), `held_task_count` is the fleet-wide sum, `shards` carries every
-/// shard's own row, and `provenance_uniform` compares
-/// `(reason, paused_by, scope_shard_id)` — deliberately not `paused_at`, since
-/// each shard stamps its own `NOW()`.
+/// response:
+///
+/// - The top-level summary is the **earliest** hold (tie-broken by shard id).
+/// - `held_task_count` is the fleet-wide sum.
+/// - `shards` carries every shard's own row.
+/// - `provenance_uniform` compares `(reason, paused_by, scope_shard_id)`. It
+///   deliberately skips `paused_at`, since each shard stamps its own `NOW()`.
 ///
 /// `effective_scope` reports how much of the fleet the hold is **actually** in
-/// effect on, derived from `expected_shards` rather than from the stored
-/// `scope_shard_id` (issue #807 review). The distinction is load-bearing: a
-/// fleet-wide pause that only reached some shards returns 207 at mutation time,
-/// but the rows it *did* write are byte-identical to a complete hold
-/// (`scope_shard_id = NULL`) and the shards it missed hold no row at all — so a
-/// later read that reaches every shard has a `complete` status and rows that
-/// agree, and reading intent alone would present a clean fleet-wide hold while
+/// effect on. It derives from `expected_shards`, not from the stored
+/// `scope_shard_id` (issue #807 review). The distinction is load-bearing. A
+/// fleet-wide pause that only reached some shards returns 207 at mutation time.
+/// But the rows it *did* write are byte-identical to a complete hold
+/// (`scope_shard_id = NULL`), and the shards it missed hold no row at all. A
+/// later read that reaches every shard then has a `complete` status and rows
+/// that agree. Reading intent alone would present a clean fleet-wide hold while
 /// part of the fleet keeps dispatching the very activity the operator believes
 /// they stopped. An activity that is not held reports `null`: there is no hold,
 /// so there is no coverage, mirroring the other null provenance fields.
@@ -43150,9 +43019,9 @@ fn merge_activity_catalog_rows(
 /// Read every activity's pause state across the fleet, degrading gracefully.
 ///
 /// An unreachable shard is named in `unavailable_shards` and drops `status` to
-/// `partial` rather than failing the read — but a `paused: false` on a partial
-/// read is only "not paused on the shards we could reach", which is why both
-/// read endpoints surface `status` alongside the data.
+/// `partial` rather than failing the read. But a `paused: false` on a partial
+/// read only means "not paused on the reachable shards". So both read
+/// endpoints surface `status` alongside the data.
 async fn observe_activity_pause_rows(
     api_state: &HarvestApiState,
 ) -> Result<FanoutRows<(i32, ::autumn_harvest::activity_pause::PausedActivity)>, AutumnError> {
@@ -43191,11 +43060,10 @@ async fn list_activities_handler(
 /// (issue #807).
 ///
 /// `404` when the name is neither registered on this node **nor** currently
-/// paused anywhere the read could reach. The pause arm of that rule matters: an
-/// activity that is actively holding work is a real thing an operator must be
-/// able to inspect (and then resume), so 404-ing it merely because this
-/// process does not have its handler registered would be a lie told during
-/// exactly the incident the endpoint exists for.
+/// paused anywhere the read could reach. The pause arm of that rule matters. An
+/// activity that is holding work is a real thing an operator must be able to
+/// inspect, and then resume. A 404 only because this process lacks its handler
+/// would be a lie told during the incident the endpoint exists for.
 async fn get_activity_handler(
     Extension(api_state): Extension<HarvestApiState>,
     Path(activity_name): Path<String>,
@@ -43203,10 +43071,10 @@ async fn get_activity_handler(
     let runtime = api_state.runtime()?;
     // Validate before looking anything up, so the read and the two writes agree
     // on what a valid name is. Without this, `GET /activities/%20charge_card%20`
-    // answers 404 ("not registered and not paused") while
-    // `POST /activities/%20charge_card%20/pause` answers 400 — the same input
-    // diagnosed two different ways, and the 404 is the misleading one: it
-    // implies the activity does not exist rather than that the name is invalid.
+    // answers 404 ("not registered and not paused"). But
+    // `POST /activities/%20charge_card%20/pause` answers 400. The same input
+    // gets two diagnoses, and the 404 misleads: it implies the activity does
+    // not exist, not that the name is invalid.
     let activity_name = ::autumn_harvest::activity_pause::validate_activity_name(&activity_name)
         .map_err(|e| AutumnError::bad_request_msg(e.to_string()))?;
     let catalog = registered_activity_catalog(&runtime);
@@ -43228,9 +43096,9 @@ async fn get_activity_handler(
     let mut merged = merge_activity_catalog_rows(&narrowed_catalog, rows, &expected);
 
     // `merge_activity_catalog_rows` emits one entry per name in the union of
-    // (catalogue, pause rows); both are already narrowed to this name, so an
-    // empty result means the name is unknown *on the shards that answered* --
-    // which is only the same as "unknown" when every shard answered.
+    // (catalogue, pause rows). Both are already narrowed to this name. So an
+    // empty result means the name is unknown *on the shards that answered*.
+    // That equals "unknown" only when every shard answered.
     let Some(activity) = merged.pop() else {
         return Err(activity_missing_error(
             &activity_name,
@@ -43263,7 +43131,6 @@ async fn prometheus_metrics(
 fn format_prometheus_metrics(signals: &[::autumn_harvest::queue::QueueScalingSignal]) -> String {
     let mut out = String::new();
 
-    // 1. backlog
     writeln!(out, "# HELP harvest_queue_backlog Count of pending tasks ready for execution (scheduled_at <= NOW)").unwrap();
     writeln!(out, "# TYPE harvest_queue_backlog gauge").unwrap();
     for sig in signals {
@@ -43276,7 +43143,6 @@ fn format_prometheus_metrics(signals: &[::autumn_harvest::queue::QueueScalingSig
         .unwrap();
     }
 
-    // 2. in_flight
     writeln!(
         out,
         "# HELP harvest_queue_in_flight Count of currently executing tasks"
@@ -43293,7 +43159,6 @@ fn format_prometheus_metrics(signals: &[::autumn_harvest::queue::QueueScalingSig
         .unwrap();
     }
 
-    // 3. scheduled
     writeln!(
         out,
         "# HELP harvest_queue_scheduled Count of future-scheduled tasks (scheduled_at > NOW)"
@@ -43310,7 +43175,6 @@ fn format_prometheus_metrics(signals: &[::autumn_harvest::queue::QueueScalingSig
         .unwrap();
     }
 
-    // 4. active_workers
     writeln!(out, "# HELP harvest_queue_active_workers Count of healthy, non-draining worker processes polling this queue").unwrap();
     writeln!(out, "# TYPE harvest_queue_active_workers gauge").unwrap();
     for sig in signals {
@@ -43337,7 +43201,6 @@ async fn get_aggregated_scaling_signals(
     let pool = api_state.storage_pool().map_err(map_error)?;
     let stale_threshold = api_state.worker_stale_threshold();
 
-    // Group the stats by queue name in memory.
     let mut task_stats: std::collections::HashMap<
         String,
         ::autumn_harvest::queue::QueueTaskCounts,
@@ -43347,7 +43210,6 @@ async fn get_aggregated_scaling_signals(
     for (_shard, shard_pool) in pool.iter_shards() {
         let mut conn = acquire_conn(shard_pool).await?;
 
-        // 1. Fetch task counts per queue on this shard
         let shard_counts = ::autumn_harvest::queue::queue_task_counts(&mut conn)
             .await
             .map_err(map_error)?;
@@ -43365,7 +43227,6 @@ async fn get_aggregated_scaling_signals(
             entry.scheduled += stat.scheduled;
         }
 
-        // 2. Fetch workers on this shard
         let workers = harvest_workers::table
             .select(HarvestWorker::as_select())
             .load::<HarvestWorker>(&mut conn)
@@ -43390,7 +43251,6 @@ async fn get_aggregated_scaling_signals(
         }
     }
 
-    // Merge task stats and worker stats
     let mut all_queues: std::collections::HashSet<String> = std::collections::HashSet::new();
     all_queues.extend(task_stats.keys().cloned());
     all_queues.extend(worker_stats.keys().cloned());
@@ -43756,16 +43616,16 @@ pub(crate) async fn acquire_conn(pool: &DbPool) -> Result<PoolConn, AutumnError>
 
 /// Resolve a connection to the shard that currently hosts `exec_id`.
 ///
-/// Routes through `shard_rebalance::conn_for_execution_forwarded` (issue #964)
-/// so an execution an operator has rebalanced onto another shard is still found
-/// by the `ExecutionId` a caller captured before the move — the identity
-/// contract that makes shard rebalancing safe is *"any id captured before the
-/// migration continues to resolve after it"*, and this is the chokepoint the
-/// ~40 single-execution management routes reach it through.
+/// Routes through `shard_rebalance::conn_for_execution_forwarded` (issue #964).
+/// So an execution an operator rebalanced onto another shard is still found by
+/// the `ExecutionId` a caller captured before the move. The identity contract
+/// that makes shard rebalancing safe is *"any id captured before the migration
+/// continues to resolve after it"*. The ~40 single-execution management routes
+/// reach it through this chokepoint.
 ///
-/// A single-shard deployment pays nothing: with one pool there is nowhere to
-/// migrate to, so the forwarding probe is skipped and this is byte-for-byte the
-/// pre-#964 `pool_for_execution` checkout. A multi-shard deployment pays one
+/// A single-shard deployment pays nothing. With one pool there is nowhere to
+/// migrate to, so the forwarding probe is skipped. This is then byte-for-byte
+/// the pre-#964 `pool_for_execution` checkout. A multi-shard deployment pays one
 /// primary-key lookup against a partial index that is empty until an operator
 /// rebalances.
 pub(crate) async fn db_conn_for_execution(
@@ -43903,24 +43763,26 @@ fn shard_fence_error_event() -> axum::response::sse::Event {
 /// [`db_conn_for_execution`] routes through `ShardedDbPool::pool_for_execution`,
 /// which falls back to the **default** shard when the id's encoded shard has no
 /// configured pool. For an existence question that fallback is a correctness
-/// hazard: mid a shard-add rollout (step 2 of the documented procedure widens
-/// `readable_shards` *before* this process has the new pool) the lookup
+/// hazard. Take a shard-add rollout: step 2 of the documented procedure widens
+/// `readable_shards` *before* this process has the new pool. The lookup then
 /// silently queries the wrong database, finds nothing, and answers a confident
 /// `404` for a run that may exist on its own shard.
 ///
-/// This variant fails closed instead, mirroring the business-id resolver
-/// (#805): `Err` → `503` when the owning shard is one this deployment claims
-/// but cannot query, so existence is genuinely undetermined; `Ok(None)` when
-/// the id encodes a shard neither the pools nor the router know about — nothing
-/// here could ever host it, so the caller's `404` is honest. Membership is
-/// decided by [`shard_fanout::expected_shards`], the same helper the lineage
-/// fan-out uses, so a single request can never call one shard `unavailable` for
+/// This variant fails closed instead, mirroring the business-id resolver (#805):
+///
+/// - `Err` → `503` when the owning shard is one this deployment claims but
+///   cannot query, so existence is undetermined.
+/// - `Ok(None)` when the id encodes a shard neither the pools nor the router
+///   know about. Nothing here could host it, so the caller's `404` is honest.
+///
+/// [`shard_fanout::expected_shards`] decides membership. The lineage fan-out
+/// uses the same helper. So one request never calls a shard `unavailable` for
 /// descendants while implying "does not exist" for the root.
 ///
 /// Only `GET /workflows/{id}/tree` uses this today. The lenient
-/// [`db_conn_for_execution`] is left in place for the ~40 other
-/// single-execution routes: switching them all is a behaviour change across the
-/// whole management API and belongs in its own slice.
+/// [`db_conn_for_execution`] stays for the ~40 other single-execution routes.
+/// Switching them all changes behaviour across the whole management API and
+/// belongs in its own slice.
 pub(crate) async fn db_conn_for_execution_exact(
     api_state: &HarvestApiState,
     exec_id: ExecutionId,
@@ -43929,9 +43791,9 @@ pub(crate) async fn db_conn_for_execution_exact(
     if let Some(shard_pool) = pool.sharded_pool().exact_pool_for_execution(exec_id) {
         // Issue #964: the origin shard is reachable, but the run may have been
         // rebalanced off it. Follow the durable forwarding pointer, preserving
-        // this helper's exact/no-default contract — without it `/tree`, `/logs`
-        // and `PATCH /triage` read (and, for triage, WRITE) the sealed source
-        // instead of the live copy, and report success for doing so.
+        // this helper's exact/no-default contract. Without it, `/tree`, `/logs`
+        // and `PATCH /triage` read the sealed source instead of the live copy.
+        // Triage even WRITES it, and each reports success.
         let _ = shard_pool;
         return ::autumn_harvest::shard_rebalance::conn_for_execution_forwarded(
             pool.sharded_pool(),
@@ -43967,11 +43829,11 @@ pub(crate) async fn db_conn_for_shard(
 /// [`db_conn_for_shard`] resolves through `pool_for`, which silently returns
 /// the default shard's pool when `shard` has no pool of its own. For an
 /// explicitly *pinned* start that fallback is a correctness failure, not a
-/// convenience: the execution id, the response, and the row's `shard_id`
-/// column would all report the pinned shard while the data physically landed
-/// in the default shard's database — a silent residency breach that only
-/// surfaces later, when the pinned shard's pool is finally wired up and those
-/// executions become invisible. Fail loudly instead.
+/// convenience. The execution id, the response and the row's `shard_id` column
+/// would all report the pinned shard. But the data would land in the default
+/// shard's database. That silent residency breach surfaces only later, when the
+/// pinned shard's pool is wired up and those executions become invisible. Fail
+/// loudly instead.
 async fn db_conn_for_pinned_shard(
     api_state: &HarvestApiState,
     shard: ShardId,
@@ -43994,17 +43856,18 @@ async fn db_conn_for_dag(
     db_conn_for_shard(api_state, runtime.router.pick_for_dag(dag_name)).await
 }
 
-/// Apply the `min_history_events` threshold filter -- "this execution's
-/// recorded `harvest_events` count is `>= min_events`" -- to a boxed
-/// `harvest_workflow_executions` query, without ever reading more of a
-/// workflow's history than the threshold itself requires.
+/// Apply the `min_history_events` threshold filter to a boxed
+/// `harvest_workflow_executions` query.
 ///
-/// Shared by `load_workflows`, `load_stalled_workflows`, and the WHERE-clause
-/// threshold check in `load_history_bloat_workflows` so all three apply the
-/// identical, bounded predicate rather than three hand-copied instances of an
-/// unbounded one (they used to be exactly that: `(SELECT COUNT(*) FROM
-/// harvest_events WHERE workflow_exec_id = id) >= min_events`, duplicated
-/// three times).
+/// The filter keeps an execution whose recorded `harvest_events` count is
+/// `>= min_events`. It never reads more of a workflow's history than the
+/// threshold requires.
+///
+/// `load_workflows`, `load_stalled_workflows` and the WHERE-clause threshold
+/// check in `load_history_bloat_workflows` share it. So all three apply one
+/// bounded predicate. They used to hold three hand-copied instances of an
+/// unbounded one: `(SELECT COUNT(*) FROM harvest_events WHERE workflow_exec_id
+/// = id) >= min_events`.
 ///
 /// # Why `COUNT(*)` was the wrong tool
 ///
@@ -44025,22 +43888,22 @@ async fn db_conn_for_dag(
 /// depends on whether the visibility map of the table is fresh.
 /// `docs/performance-history-bloat-filter.md#the-problem` shows a fixture
 /// state in which the identical query read 158,593 buffers via a Parallel
-/// Seq Scan instead. What is *not* sensitive to that: `COUNT(*)` has no early exit
-/// regardless of which access path answers it, so every one of the 448,175
-/// matching rows still has to be visited to confirm the threshold.
+/// Seq Scan instead. One fact does not depend on the access path: `COUNT(*)`
+/// has no early exit. So every one of the 448,175 matching rows still has to
+/// be visited to confirm the threshold.
 ///
 /// # The fix
 ///
 /// `EXISTS (SELECT 1 FROM harvest_events WHERE workflow_exec_id = id ORDER BY
-/// event_id OFFSET min_events - 1 LIMIT 1)` is boolean-equivalent to the
-/// threshold check `COUNT(*) >= min_events` for every `min_events` (verified
-/// for `0`, `1`, `actual_count - 1`, `actual_count`, `actual_count + 1`, and
-/// values far past `actual_count`), but only ever needs to read
-/// `min(actual_count, min_events)` rows to answer it. On the same fixture
-/// this reads 94 total buffers against the identical 448,175-event
-/// execution -- a 97.64% reduction -- and is unchanged for an ordinary,
-/// un-bloated execution (5 buffers either way, both forms using an Index
-/// Only Scan since the whole history fits in a handful of rows).
+/// event_id OFFSET min_events - 1 LIMIT 1)` is the replacement. It is
+/// boolean-equivalent to `COUNT(*) >= min_events` for every `min_events`. That
+/// is verified for `0`, `1`, `actual_count - 1`, `actual_count`,
+/// `actual_count + 1`, and values far past `actual_count`. But it only reads
+/// `min(actual_count, min_events)` rows. On the same fixture it reads 94 total
+/// buffers against the identical 448,175-event execution, a 97.64% reduction.
+/// It is unchanged for an ordinary, un-bloated execution: 5 buffers either way.
+/// Both forms use an Index Only Scan there, since the whole history fits in a
+/// handful of rows.
 ///
 /// **The `ORDER BY event_id` is insurance against stale table statistics, not
 /// a guaranteed buffer-count win.** Against this fixture's current,
@@ -44052,19 +43915,18 @@ async fn db_conn_for_dag(
 /// 228x worse than the `ORDER BY`'d form. An un-set visibility map does not
 /// just inflate `Heap Fetches` within a fixed plan. It can also make the
 /// planner's *cost estimate* for an Index Only Scan look bad. The planner then
-/// rejects that access path shape entirely. `ORDER BY event_id`
-/// gives the planner a sort target that makes the intended composite index --
-/// the same one `store::load_history` already relies on -- the correct
-/// choice regardless of whether the visibility map happens to be fresh, at
-/// zero cost when it already is. See
-/// `docs/performance-history-bloat-filter.md#why-order-by-is-load-bearing`
+/// rejects that access path shape entirely. `ORDER BY event_id` gives the
+/// planner a sort target. The intended composite index is then the correct
+/// choice whether or not the visibility map is fresh. `store::load_history`
+/// already relies on the same index. The cost is zero when the map is fresh.
+/// See `docs/performance-history-bloat-filter.md#why-order-by-is-load-bearing`
 /// for the full before/after.
 ///
-/// `min_events == 0` (`COUNT(*) >= 0`, always true for a non-negative count)
-/// and `min_events == None` (filter not requested) both leave `query`
-/// unfiltered, matching the pre-existing `COUNT(*)` form's behavior exactly
-/// -- `min_events == 0` is handled explicitly rather than emitting `OFFSET
-/// -1`, which Postgres rejects.
+/// `min_events == 0` and `min_events == None` both leave `query` unfiltered. A
+/// zero threshold is always true for a non-negative count. `None` means the
+/// filter was not requested. That matches the old `COUNT(*)` form exactly.
+/// `min_events == 0` is handled explicitly rather than emitting `OFFSET -1`,
+/// which Postgres rejects.
 fn apply_min_history_events_filter(
     query: harvest_workflow_executions::BoxedQuery<'_, diesel::pg::Pg>,
     min_events: Option<u64>,
@@ -44101,9 +43963,9 @@ fn apply_min_history_events_filter(
 /// same way. Before issue #506, the `no_progress_minutes` (stalled) path
 /// ignored every search-attribute filter.
 ///
-/// Every fragment stays on an index path: `@>` (containment) and `?` (key
-/// existence) both hit the existing `idx_harvest_we_search` GIN index;
-/// comparison ops narrow on `?` then recheck a `::numeric` cast. The key is
+/// Every fragment stays on an index path. `@>` (containment) and `?` (key
+/// existence) both hit the existing `idx_harvest_we_search` GIN index.
+/// Comparison ops narrow on `?`, then recheck a `::numeric` cast. The key is
 /// always a *bound* `Text` param (never interpolated), so dynamic keys are
 /// injection-safe; the `Cmp` operator literal comes from the fixed `CmpOp` enum.
 /// Columns are qualified with `harvest_workflow_executions.` so the fragments
@@ -44135,9 +43997,9 @@ fn apply_search_attr_filters<'a>(
 /// Whether the default `GET /workflows` list should hide synthetic liveness
 /// canary runs (issue #796, AC8).
 ///
-/// Canary rows are excluded by default; a caller that explicitly filters to a
-/// canary `workflow_name` (i.e. one that [`autumn_harvest::canary::is_canary_workflow`]
-/// matches) opts back in and sees them.
+/// Canary rows are excluded by default. A caller that explicitly filters to a
+/// canary `workflow_name` opts back in and sees them. Such a name is one that
+/// [`autumn_harvest::canary::is_canary_workflow`] matches.
 fn exclude_canary_from_list(workflow_name: Option<&str>) -> bool {
     !workflow_name.is_some_and(autumn_harvest::canary::is_canary_workflow)
 }
@@ -44300,21 +44162,20 @@ fn workflow_list_query(
     }
 
     if filters.states.is_empty() {
-        // Issue #964: a completed migration leaves TWO rows carrying the same
-        // `id` and the same copied `created_at` — `MIGRATED` on the source and
-        // the live `RUNNING` copy on the target — and this listing fans out
+        // Issue #964: a completed migration leaves TWO rows with the same `id`
+        // and the same copied `created_at`. One is `MIGRATED` on the source; the
+        // other is the live `RUNNING` copy on the target. This listing fans out
         // across every shard. Returning both would show one logical execution
-        // twice, and worse: the keyset cursor is derived from `(created_at, id)`,
-        // which is byte-identical for the two copies, so a page boundary landing
-        // between them makes the strict next-page predicate skip the other one
-        // permanently — possibly leaving only the stale `MIGRATED` state visible.
+        // twice. Worse, the keyset cursor derives from `(created_at, id)`, which
+        // is byte-identical for the two copies. A page boundary between them
+        // makes the strict next-page predicate skip the other one permanently.
+        // That can leave only the stale `MIGRATED` state visible.
         //
         // The sealed source is a forwarding tombstone, not a workflow, so the
         // DEFAULT listing collapses residences to the live row by excluding it.
-        // An explicit `state=MIGRATED` filter still returns it: the diagnostic
-        // view an operator needs mid-decommission is deliberately preserved,
-        // and that branch cannot double-count because it excludes the live copy
-        // by the same predicate.
+        // An explicit `state=MIGRATED` filter still returns it. That keeps the
+        // diagnostic view an operator needs mid-decommission. That branch cannot
+        // double-count, because it excludes the live copy by the same predicate.
         //
         // `MIGRATING` has the identical hazard during the staging window
         // (issue #1317). The source still holds the live `RUNNING`/`PAUSED`
@@ -44397,9 +44258,9 @@ fn workflow_list_query(
     }
     if let Some(src) = &filters.start_source {
         // Issue #740: provenance filter. "unknown" matches NULL / pre-upgrade
-        // rows *or* a literal "unknown" (a workflow-level retry of a pre-upgrade
+        // rows *or* a literal "unknown". A workflow-level retry of a pre-upgrade
         // NULL predecessor round-trips through from_str→Unknown→as_str()="unknown"
-        // and could store the literal string); any other value is an exact column
+        // and could store the literal string. Any other value is an exact column
         // match. Plain column predicate, cross-shard safe.
         if src == "unknown" {
             query = query.filter(
@@ -44422,31 +44283,22 @@ fn workflow_list_query(
 //
 // A single unreachable shard used to `?`-propagate into a whole-request `500`
 // on every cross-shard *read* endpoint (`GET /workflows`, `/workers`,
-// `/admin/schedules`, `/dead-letters`, …). These helpers refactor those
-// fan-outs to collect-and-continue: a reachable shard's rows still flow, an
-// unreachable shard is named in `unavailable_shards`, and the endpoint returns
-// `200 OK` with the union plus a `status` verdict rather than failing
-// wholesale. Writes keep strict `?` semantics.
+// `/admin/schedules`, `/dead-letters`, …). These helpers make those fan-outs
+// collect-and-continue. A reachable shard's rows still flow, and an unreachable
+// shard is named in `unavailable_shards`. The endpoint returns `200 OK` with
+// the union plus a `status` verdict rather than failing wholesale. Writes keep
+// strict `?` semantics.
 
-/// Fan out a per-shard query across every shard the router knows about,
-/// collecting each shard's rows or its error into a [`ShardObservation`]
-/// (never propagating a single shard's failure).
-///
-/// Iterates [`shard_fanout::expected_shards`] — every shard with a live pool
-/// *and* every shard the router advertises via `readable_shards`/`default_shard`
-/// — so a shard mid a shard-add rollout that has no pool wired up yet is
-/// reported `unavailable` rather than silently omitted (which would let
-/// `status` read `complete` while a known shard was never queried).
 /// Resolve each expected shard to its EXACT pool (no default fallback).
 ///
 /// [`shard_fanout::expected_shards`] deliberately surfaces a shard the router
 /// advertises even when this process has no pool for it yet (mid a shard-add
-/// rollout); that shard resolves to `None` here so the caller folds it into
+/// rollout). That shard resolves to `None` here, so the caller folds it into
 /// `unavailable_shards`. Resolving through [`ShardedDbPool::pool_for`] instead
-/// would be a bug: its default-shard fallback would silently query the DEFAULT
-/// shard's DB in the poolless shard's place, duplicating default-shard rows and
-/// letting a completeness `status` read `complete` even though that shard was
-/// never inspected (issue #756 review). This mirrors the exact-resolution
+/// would be a bug. Its default-shard fallback would silently query the DEFAULT
+/// shard's DB in the poolless shard's place. That duplicates default-shard rows
+/// and lets `status` read `complete` though that shard was never inspected
+/// (issue #756 review). This mirrors the exact-resolution
 /// `pools.get(&shard_id)` guard `resolve_workflow_by_business_id` already uses.
 ///
 /// `pub(crate)` so the Vantage Workers-page pause loader resolves shards through
@@ -44464,6 +44316,16 @@ pub(crate) fn resolve_expected_shard_pools<'a>(
         .collect()
 }
 
+/// Fan out a per-shard query across every shard the router knows about.
+///
+/// Each shard's rows or error go into a [`ShardObservation`]. A single shard's
+/// failure never propagates.
+///
+/// Iterates [`shard_fanout::expected_shards`]: every shard with a live pool
+/// *and* every shard the router advertises via `readable_shards`/`default_shard`.
+/// So a shard mid a shard-add rollout with no pool yet is reported
+/// `unavailable`, not silently omitted. Omitting it would let `status` read
+/// `complete` while a known shard was never queried.
 async fn observe_shards<R, F, Fut>(
     api_state: &HarvestApiState,
     query_shard: F,
@@ -44472,13 +44334,13 @@ where
     F: Fn(i32, PoolConn) -> Fut,
     Fut: std::future::Future<Output = Result<Vec<R>, String>>,
 {
-    // Total storage-layer unavailability (no pool installed at all — a
-    // misconfiguration or the boot window) is an honest 503, NOT "one shard
-    // down": we cannot even enumerate shards, so degrading to a bare `200 []`
+    // Total storage-layer unavailability is an honest 503, NOT "one shard
+    // down". It means no pool is installed at all: a misconfiguration or the
+    // boot window. Shards cannot even be enumerated then, so a bare `200 []`
     // would silently mask a whole-storage outage. Trunk `?`-propagated the
-    // `storage_pool()` error here; we keep that fail-closed behavior and make
-    // it an explicit 503 (issue #756 review). Per-SHARD unreachability below
-    // still degrades to `200 partial`.
+    // `storage_pool()` error here. This keeps that fail-closed behavior and
+    // makes it an explicit 503 (issue #756 review). Per-SHARD unreachability
+    // below still degrades to `200 partial`.
     if api_state.storage_pool().is_err() {
         return Err(AutumnError::service_unavailable_msg(
             "harvest storage pool is not configured".to_string(),
@@ -44490,9 +44352,9 @@ where
     let mut observations = Vec::with_capacity(expected.len());
     for (shard_id, maybe_pool) in resolve_expected_shard_pools(&expected, &pools) {
         // A shard the router advertises but this process has no pool for yet
-        // (mid a shard-add rollout) is folded into `unavailable_shards` here —
-        // never resolved through `pool_for`'s default-shard fallback, which
-        // would query the wrong DB and falsely read `complete`.
+        // (mid a shard-add rollout) is folded into `unavailable_shards` here.
+        // It is never resolved through `pool_for`'s default-shard fallback,
+        // which would query the wrong DB and falsely read `complete`.
         let Some(shard_pool) = maybe_pool else {
             observations.push(ShardObservation {
                 shard_id,
@@ -44528,19 +44390,19 @@ where
 
 /// Serialize a list-style cross-shard fan-out result (issue #756).
 ///
-/// On the happy path (`status == Complete` — every expected shard inspected)
-/// the **bare array** is returned unchanged, so existing clients and the legacy
+/// On the happy path (`status == Complete`, every expected shard inspected),
+/// the **bare array** is returned unchanged. So existing clients and the legacy
 /// response contract are byte-for-byte preserved (AC3). Otherwise a degraded
-/// envelope `{ <items_key>: [...], "status": "...", "unavailable_shards": [...] }`
-/// is returned instead (still `200 OK`, AC1/AC2) — the machine-readable
-/// partiality indicator appears on every degraded response, exactly as AC2
-/// specifies ("*every degraded* response carries [the indicator]").
+/// envelope is returned, still `200 OK` (AC1/AC2):
+/// `{ <items_key>: [...], "status": "...", "unavailable_shards": [...] }`.
+/// The machine-readable partiality indicator appears on every degraded response.
+/// AC2 specifies exactly that: "*every degraded* response carries [the indicator]".
 ///
 /// Keying on `status != Complete` (not `unavailable_shards.is_empty()`) is
-/// deliberate and load-bearing: a `Unavailable` verdict with an *empty*
-/// `unavailable_shards` list (e.g. no expected shard could even be resolved)
-/// must still surface as an envelope rather than a silently-empty bare `[]`
-/// (issue #756 review).
+/// deliberate and load-bearing. An `Unavailable` verdict can carry an *empty*
+/// `unavailable_shards` list, for example when no expected shard could be
+/// resolved. It must still surface as an envelope, not a silently-empty bare
+/// `[]` (issue #756 review).
 fn fanout_list_json<T: serde::Serialize>(
     items_key: &'static str,
     rows: Vec<T>,
@@ -44577,8 +44439,8 @@ fn fanout_list_json<T: serde::Serialize>(
 /// page but at most `limit` rows are returned.
 ///
 /// Partial availability (issue #756): a single unreachable shard no longer
-/// fails the whole request — its `unavailable_shards` entry rides on the
-/// returned [`WorkflowFanoutPage`] and reachable shards' rows still merge and
+/// fails the whole request. Its `unavailable_shards` entry rides on the
+/// returned [`WorkflowFanoutPage`], and reachable shards' rows still merge and
 /// paginate normally.
 pub(crate) async fn load_workflows_from_shards(
     api_state: &HarvestApiState,
@@ -44644,9 +44506,9 @@ fn dedupe_staging_migration_pairs(rows: Vec<WorkflowExecution>) -> Vec<WorkflowE
 
 /// Merge, sort, and paginate per-shard workflow observations (pure, no DB).
 ///
-/// Ordering, keyset cursor, and truncation are applied over the union of
-/// **reachable** shards' rows — identical to the pre-#756 behavior when every
-/// shard is reachable — while a folded [`FanoutStatus`]/`unavailable_shards`
+/// Ordering, keyset cursor and truncation apply over the union of
+/// **reachable** shards' rows. That is identical to the pre-#756 behavior when
+/// every shard is reachable. A folded [`FanoutStatus`]/`unavailable_shards`
 /// lets the caller answer `200 partial` instead of `500` on an unreachable
 /// shard.
 pub(crate) fn build_workflow_fanout_page(
@@ -44686,8 +44548,8 @@ pub(crate) fn build_workflow_fanout_page(
 
     let limit = usize::try_from(limit_raw).unwrap_or(usize::MAX);
     // Guard `limit > 0` so a hand-built filter with `limit == 0` can never
-    // underflow `limit - 1` (the HTTP path always clamps to >= 1, but this is
-    // a `pub(crate)` entry point).
+    // underflow `limit - 1`. The HTTP path always clamps to >= 1, but this is a
+    // `pub(crate)` entry point.
     let next_cursor = if limit > 0 && rows.len() > limit {
         let last_kept = &rows[limit - 1];
         let cursor = encode_workflow_list_cursor(last_kept);
@@ -44751,9 +44613,9 @@ pub(crate) async fn load_stalled_workflows(
     }
 
     // ── Step 1: find stalled candidate executions ──────────────────────────
-    // No per-shard limit here; the global limit is applied after cross-shard
-    // sorting in load_stalled_workflows_from_shards, so oldest stalls are
-    // never dropped by a premature per-shard truncation.
+    // No per-shard limit here. The global limit is applied after cross-shard
+    // sorting in load_stalled_workflows_from_shards. So oldest stalls are never
+    // dropped by a premature per-shard truncation.
     let mut query = harvest_workflow_executions::table
         .into_boxed()
         .filter(harvest_workflow_executions::state.eq_any(active_states))
@@ -44776,9 +44638,10 @@ pub(crate) async fn load_stalled_workflows(
     }
     // Issue #796 (AC8): hide synthetic liveness canary runs from the stalled
     // view too, unless the caller explicitly filters to a canary workflow name.
-    // Without this, a canary stuck RUNNING (e.g. when the timeout scanner is
-    // itself wedged — a failure the canary exists to detect) would surface in
+    // Without this, a canary stuck RUNNING would surface in
     // `GET /workflows?no_progress_minutes=N`, the same endpoint AC8 excludes.
+    // A wedged timeout scanner, a failure the canary exists to detect, causes
+    // exactly that.
     query = apply_canary_list_exclusion(query, filters);
     if let Some(owner) = &filters.owner {
         query = query.filter(harvest_workflow_executions::owner.eq(owner.as_str()));
@@ -44827,9 +44690,9 @@ pub(crate) async fn load_stalled_workflows(
         }
     }
     // Honor the time-range and exec-id-prefix filters (issue #498) on the
-    // stalled path too: without these, `?no_progress_minutes=N&started_after=…`
-    // (or `&exec_id_prefix=…`) would return rows outside the requested bounds
-    // because this loader bypasses `load_workflows`.
+    // stalled path too. This loader bypasses `load_workflows`. Without these,
+    // `?no_progress_minutes=N&started_after=…` (or `&exec_id_prefix=…`) would
+    // return rows outside the requested bounds.
     if let Some(after) = filters.started_after {
         query = query.filter(harvest_workflow_executions::started_at.ge(after));
     }
@@ -44846,9 +44709,9 @@ pub(crate) async fn load_stalled_workflows(
     query = apply_min_history_events_filter(query, filters.min_history_events);
 
     // Honor the search-attribute filters on the stalled path too (issue #506
-    // review): without this, `?no_progress_minutes=N&search_attr_filter=…` (or
-    // the legacy `&search_attr=…`) returned every stalled row because this
-    // loader bypasses `load_workflows`.
+    // review). This loader bypasses `load_workflows`. Without this,
+    // `?no_progress_minutes=N&search_attr_filter=…` (or the legacy
+    // `&search_attr=…`) returned every stalled row.
     query = apply_search_attr_filters(
         query,
         &filters.search_attrs,
@@ -44857,11 +44720,11 @@ pub(crate) async fn load_stalled_workflows(
     );
 
     if !filters.include_sleeping {
-        // Include an execution if it has any non-timer pending work, OR has no
-        // future-dated unfired timer (nothing to sleep on), OR has an overdue
-        // unfired timer (should have progressed).  The only excluded case is
-        // "correctly sleeping": a future-dated timer is the sole pending item
-        // and no timers are overdue.
+        // Include an execution if it has any non-timer pending work. Also
+        // include it if it has no future-dated unfired timer (nothing to sleep
+        // on), or an overdue unfired timer (it should have progressed). The only
+        // excluded case is "correctly sleeping": a future-dated timer is the
+        // sole pending item and no timers are overdue.
         query = query.filter(sql::<Bool>(
             "(\
                 EXISTS(\
@@ -44922,26 +44785,25 @@ pub(crate) async fn load_stalled_workflows(
         .filter_map(|(id, ts)| ts.map(|t| (id, t)))
         .collect();
 
-    // Issue #704 (PR #1139 review, Codex P2): `history_event_count` is
-    // documented (`docs/api-contract.json`) as populated ONLY when the
-    // request set `history_bloat_min_events` -- the dedicated AC2 discovery
-    // path served by `load_history_bloat_workflows`, a completely separate
-    // loader `list_workflows` routes to *instead of* this one (the two are
-    // mutually exclusive with `no_progress_minutes`, rejected 400 together).
-    // This function (`load_stalled_workflows`, the `no_progress_minutes`
-    // path) must therefore NEVER populate the field -- not even when the
-    // pre-existing, general-purpose `min_history_events` filter (issue #493)
-    // is also supplied, which composes as a pure row FILTER here (applied
-    // above) and was never meant to change the response shape. An earlier
-    // cut incorrectly ran an extra batch `COUNT(*)` query and populated
-    // `history_event_count` whenever `min_history_events` was set, silently
-    // changing the JSON shape for existing
-    // `?no_progress_minutes=N&min_history_events=M` callers and paying for a
-    // query the response never needed.
+    // Issue #704 (PR #1139 review): `history_event_count` is populated ONLY
+    // when the request set `history_bloat_min_events`, per
+    // `docs/api-contract.json`. That is the dedicated AC2 discovery path,
+    // served by `load_history_bloat_workflows`. `list_workflows` routes to that
+    // loader *instead of* this one. The two are mutually exclusive: a request
+    // with both `history_bloat_min_events` and `no_progress_minutes` gets 400.
+    //
+    // This function (`load_stalled_workflows`, the `no_progress_minutes` path)
+    // must therefore NEVER populate the field. That holds even when the general
+    // `min_history_events` filter (issue #493) is also supplied. It composes as
+    // a pure row FILTER here (applied above) and never changes the response
+    // shape. An earlier cut ran an extra batch `COUNT(*)` query and populated
+    // `history_event_count` whenever `min_history_events` was set. That changed
+    // the JSON shape for existing `?no_progress_minutes=N&min_history_events=M`
+    // callers and paid for a query the response never needed.
 
     // ── Step 3: any runnable task queue row (activity or workflow type) ────────
-    // Checking all task_type values mirrors the sleeping-filter predicate so that
-    // an execution with a stuck workflow task is not mislabelled no_pending_work.
+    // Checking all task_type values mirrors the sleeping-filter predicate. So an
+    // execution with a stuck workflow task is not mislabelled no_pending_work.
     let has_activity: HashSet<uuid::Uuid> = harvest_task_queue::table
         .filter(
             harvest_task_queue::workflow_exec_id
@@ -44997,10 +44859,10 @@ pub(crate) async fn load_stalled_workflows(
     let now = chrono::Utc::now();
 
     // ── Step 6: any unfired timer (future-dated OR overdue) ─────────────────
-    // The sleeping-filter SQL already restricts "correctly sleeping" to
-    // fires_at > NOW(), so overdue timers are never excluded from candidates.
-    // Checking fired = false without a fires_at bound ensures those executions
-    // are classified as SleepingTimer rather than falling through to NoPendingWork.
+    // The sleeping-filter SQL restricts "correctly sleeping" to fires_at > NOW().
+    // So overdue timers are never excluded from candidates. Checking
+    // fired = false without a fires_at bound classifies those executions as
+    // SleepingTimer rather than letting them fall through to NoPendingWork.
     let has_unfired_timer: HashSet<uuid::Uuid> = harvest_timers::table
         .filter(harvest_timers::workflow_exec_id.eq_any(&exec_ids))
         .filter(harvest_timers::fired.eq(false))
@@ -45035,8 +44897,8 @@ pub(crate) async fn load_stalled_workflows(
                 last_event_at,
                 last_event_age_seconds,
                 stall_reason,
-                // Never populated on this (`no_progress_minutes`) path --
-                // see the removed Step 2.5 block's doc comment above.
+                // Never populated on this (`no_progress_minutes`) path. See the
+                // issue #704 note above.
                 history_event_count: None,
             }
         })
@@ -45046,45 +44908,42 @@ pub(crate) async fn load_stalled_workflows(
 // ── Issue #704: operator early-warning discovery for workflow history bloat
 // ─────────────────────────────────────────────────────────────────────────
 //
-// A dedicated `history_bloat_min_events` discovery path, using a query
-// parameter DISTINCT from the pre-existing general-purpose `min_history_events`
-// filter already composable on `load_workflows`/`load_stalled_workflows`
-// (issue #493): AC1 specifically requires the response be (a) restricted to
-// live (non-terminal) executions and (b) sorted by history size descending —
-// neither of which the general filter does (it composes with the caller's
-// own `state=`/`order=`/pagination choice, and must keep doing so). Using a
-// separate param — rather than repurposing `min_history_events` for this
-// incompatible behavior — is deliberate: hijacking the existing param broke
-// callers combining it with `state=`/pagination (see the PR #1139 review).
-// Mirrors `load_stalled_workflows`'s multi-step-query shape rather than
-// retrofitting these two behaviors into the general-purpose loader, so the
-// existing `min_history_events` composition on the default/stalled paths is
-// left byte-for-byte unchanged.
+// A dedicated `history_bloat_min_events` discovery path. Its query parameter
+// is DISTINCT from the general `min_history_events` filter (issue #493), which
+// already composes on `load_workflows`/`load_stalled_workflows`. AC1 requires
+// the response be (a) restricted to live (non-terminal) executions and (b)
+// sorted by history size descending. The general filter does neither. It
+// composes with the caller's own `state=`/`order=`/pagination choice, and must
+// keep doing so. A separate param is deliberate: repurposing
+// `min_history_events` for this behavior broke callers combining it with
+// `state=`/pagination (see the PR #1139 review). This path mirrors
+// `load_stalled_workflows`'s multi-step-query shape rather than retrofitting
+// the general loader. So the existing `min_history_events` composition on the
+// default/stalled paths stays byte-for-byte unchanged.
 
 /// Per-shard history-bloat discovery query (issue #704, AC1/AC2).
 ///
 /// Returns non-terminal (live) executions whose current recorded
-/// `harvest_events` count is `>= filters.history_bloat_min_events` (and, when
-/// also supplied, `>= filters.min_history_events` -- PR #1139 review finding
-/// B: the two count thresholds compose rather than one silently overriding
-/// the other), each carrying its `history_event_count` so the caller can
+/// `harvest_events` count is `>= filters.history_bloat_min_events`. When
+/// `filters.min_history_events` is also supplied, the count must meet it too.
+/// The two thresholds compose; neither silently overrides the other (PR #1139
+/// review). Each row carries its `history_event_count`, so the caller can
 /// rank/triage without a second round-trip. Returns `Ok(vec![])` immediately
 /// when `history_bloat_min_events` is unset.
 ///
 /// Non-terminal is enforced unconditionally (`state NOT IN` the six terminal
-/// states) in addition to — not instead of — any caller-supplied `state=`
-/// filter: the two AND together, so a `state=RUNNING` request narrows
-/// further as expected, while a `state=COMPLETED` request yields zero rows
-/// (an incompatible combination) rather than silently overriding the
-/// caller's explicit choice.
+/// states), in addition to any caller-supplied `state=` filter. The two AND
+/// together. So a `state=RUNNING` request narrows further as expected. A
+/// `state=COMPLETED` request yields zero rows (an incompatible combination)
+/// rather than silently overriding the caller's explicit choice.
 ///
-/// Bounded per-shard (PR #1139 review finding C): ordered by the current
-/// event count descending (with an `id` ascending tie-break matching
-/// [`build_history_bloat_fanout`]'s cross-shard merge order) and limited to
-/// `filters.limit` rows *before* any full [`WorkflowExecution`] row is
-/// loaded, so a shard with a large live population cannot force this query
-/// to materialize (and transfer, and JSON-decode) more candidate rows than
-/// the caller could ever see in the final, truncated response.
+/// Bounded per-shard (PR #1139 review). Rows are ordered by the current event
+/// count descending, with an `id` ascending tie-break matching
+/// [`build_history_bloat_fanout`]'s cross-shard merge order. They are limited
+/// to `filters.limit` rows *before* any full [`WorkflowExecution`] row loads.
+/// Otherwise a shard with a large live population could make this query
+/// materialize, transfer and JSON-decode rows that the final, truncated
+/// response never shows.
 #[allow(clippy::too_many_lines)]
 pub(crate) async fn load_history_bloat_workflows(
     conn: &mut AsyncPgConnection,
@@ -45094,27 +44953,25 @@ pub(crate) async fn load_history_bloat_workflows(
     use diesel::sql_types::{BigInt, Bool, Jsonb, Text};
 
     // Correlated subquery computing each candidate's EXACT current recorded
-    // event count, for the `SELECT`/`ORDER BY` pair below (AC2 needs the real
-    // number for ranking/reporting, so this instance is inherent -- there is
-    // no threshold to bound it against). `ORDER BY` references the `SELECT`'s
-    // output alias (`HISTORY_EVENT_COUNT_ALIAS`, below) rather than
-    // re-stating the subquery text, so the two share exactly one evaluation.
+    // event count, for the `SELECT`/`ORDER BY` pair below. AC2 needs the real
+    // number for ranking/reporting, so this instance is inherent: there is no
+    // threshold to bound it against. `ORDER BY` references the `SELECT`'s
+    // output alias (`HISTORY_EVENT_COUNT_ALIAS`, below) rather than re-stating
+    // the subquery text, so the two share exactly one evaluation.
     //
-    // The WHERE-clause threshold check below is a SEPARATE, bounded
-    // predicate (`apply_min_history_events_filter`) -- Postgres evaluates
-    // WHERE before the SELECT list/ORDER BY in logical processing order, so
-    // sharing one physical scan across that boundary would need restructuring
-    // this query as a `LATERAL`/CTE join, judged too invasive a rewrite for
-    // this fix (PR #1139 review, third round). The two count-threshold
-    // filters that used to live in WHERE (this parameter and the composed
-    // `min_history_events`) are collapsed into ONE combined, bounded
-    // existence check before either is applied, so a non-bloated candidate
-    // (the common case) is rejected from a scan capped at `effective_min_events`
-    // rows rather than two unbounded `COUNT(*)` scans; a genuinely bloated
-    // candidate still pays one EXACT count afterward, for ranking, which is
-    // inherent to what this endpoint reports (see
+    // The WHERE-clause threshold check below is a SEPARATE, bounded predicate
+    // (`apply_min_history_events_filter`). Postgres evaluates WHERE before the
+    // SELECT list/ORDER BY in logical processing order. Sharing one physical
+    // scan across that boundary would need a `LATERAL`/CTE join. That rewrite
+    // was judged too invasive for this fix (PR #1139 review). The two
+    // count-threshold filters in WHERE (this parameter and the composed
+    // `min_history_events`) collapse into ONE combined, bounded existence
+    // check. So a non-bloated candidate (the common case) is rejected by a scan
+    // capped at `effective_min_events` rows, not two unbounded `COUNT(*)`
+    // scans. A bloated candidate still pays one EXACT count afterward, for
+    // ranking. That is inherent to what this endpoint reports. See
     // `apply_min_history_events_filter`'s doc comment for the mechanism and
-    // measurements).
+    // measurements.
     const HISTORY_EVENT_COUNT_SUBQUERY: &str = "(SELECT COUNT(*) FROM harvest_events \
          WHERE workflow_exec_id = harvest_workflow_executions.id)";
     const HISTORY_EVENT_COUNT_ALIAS: &str = "history_event_count";
@@ -45122,40 +44979,37 @@ pub(crate) async fn load_history_bloat_workflows(
     let Some(min_events) = filters.history_bloat_min_events else {
         return Ok(vec![]);
     };
-    // PR #1139 review (finding B, prior round): `count >= a AND count >= b`
-    // is exactly `count >= max(a, b)`, so the stricter of the two
-    // count-threshold filters always wins regardless of which parameter
-    // supplies it. Computed here (in Rust, before the query is built) rather
-    // than as two separate ANDed SQL predicates (PR #1139 review, third
-    // round) -- collapsing to one predicate halves the WHERE-clause
-    // evaluation count for the common "both filters supplied" case, on top
-    // of the semantics being identical either way.
+    // PR #1139 review: `count >= a AND count >= b` is exactly
+    // `count >= max(a, b)`. So the stricter of the two count-threshold filters
+    // always wins, whichever parameter supplies it. It is computed here, in
+    // Rust, rather than as two ANDed SQL predicates. One predicate halves the
+    // WHERE-clause evaluation count when both filters are supplied. The
+    // semantics are identical either way.
     let effective_min_events = filters
         .min_history_events
         .map_or(min_events, |min_history| min_history.max(min_events));
 
     // ── Step 1: find candidate executions, bounded per-shard (AC1/AC2) ──────
-    // PR #1139 review (finding C): this used to `.load()` every matching live
-    // row on a shard with no `LIMIT`, truncating only after the cross-shard
-    // merge -- a shard with a large live population could materialize
-    // thousands of full `WorkflowExecution` rows (JSON payload columns
-    // included) just to discard all but `filters.limit` of them. Ordering by
-    // the same count expression the final merge sorts by
-    // (`build_history_bloat_fanout`), with the identical `id` ASC tie-break,
-    // and applying `.limit(filters.limit)` per shard is a correct
-    // top-K-per-partition-then-merge: any row excluded from a shard's own
-    // local top-`filters.limit` under this exact order has `filters.limit`
-    // other rows on that same shard ranked at or above it, so it can never be
-    // part of the global top-K after merging every shard's contribution --
-    // excluding it here changes nothing about the final, truncated result.
+    // PR #1139 review: each shard used to `.load()` every live match, unbounded.
+    // It truncated only after the cross-shard merge. A shard with a large live
+    // population could then materialize thousands of full `WorkflowExecution`
+    // rows, JSON payload columns included. All but `filters.limit` of them were
+    // then discarded.
+    //
+    // The fix orders by the same count expression the final merge sorts by
+    // (`build_history_bloat_fanout`), with the identical `id` ASC tie-break. It
+    // applies `.limit(filters.limit)` per shard. That is a correct
+    // top-K-per-partition-then-merge. A row outside a shard's local
+    // top-`filters.limit` under this order has `filters.limit` rows on that
+    // shard ranked at or above it. So it can never be in the global top-K after
+    // the merge, and excluding it here changes nothing in the final result.
     let mut query = harvest_workflow_executions::table
         .into_boxed()
-        // AC1: "live (non-terminal)" — unconditional, ANDed with any explicit
+        // AC1: "live (non-terminal)", unconditional, ANDed with any explicit
         // `state=` filter below. Derives from `erase::TERMINAL_STATES`, the
-        // engine's single source of truth for terminal-state classification
-        // (see its doc comment), so this filter can never silently drift from
-        // the states `is_terminal_state`/`resolve_execution_id_by_workflow_id`
-        // (issue #805) recognize as terminal.
+        // engine's single source of truth for terminal states. So this filter
+        // never drifts from the states that `is_terminal_state` and
+        // `resolve_execution_id_by_workflow_id` (issue #805) treat as terminal.
         .filter(harvest_workflow_executions::state.ne_all(erase::TERMINAL_STATES));
     // Bounded existence check — see `apply_min_history_events_filter`. Reads
     // at most `effective_min_events` rows from `harvest_events` regardless of
@@ -45184,10 +45038,10 @@ pub(crate) async fn load_history_bloat_workflows(
         &filters.search_attr_predicates,
         &filters.filter,
     );
-    // PR #1139 review: mirror `load_workflows`'s `failure_cause` handling --
-    // omitting it here silently broadened the result to unrelated bloated
-    // executions instead of narrowing to the ones actually blocked by the
-    // named cause (e.g. non-determinism) when the two filters are combined.
+    // PR #1139 review: mirror `load_workflows`'s `failure_cause` handling.
+    // Omitting it broadened the result to unrelated bloated executions when the
+    // two filters are combined. It must narrow to the ones blocked by the named
+    // cause (e.g. non-determinism).
     if let Some(cause) = &filters.failure_cause {
         let predicate = serde_json::json!({ "failure_cause": cause });
         query = query.filter(sql::<Bool>("search_attrs @> ").bind::<Jsonb, _>(predicate));
@@ -45233,15 +45087,14 @@ pub(crate) async fn load_history_bloat_workflows(
     }
 
     // ── Step 2: order by history size, bound, and fetch the count alongside
-    // each row in the SAME query (AC2) -- no separate batch-count round trip,
-    // and no full row materialized beyond the per-shard `LIMIT`. `ORDER BY`
-    // references the `SELECT`'s output alias by name (PR #1139 review, third
-    // round) rather than re-stating the correlated subquery: Postgres
-    // documents that a bare, simple-name `ORDER BY` expression matching an
-    // output column resolves to that output column (falling back to a
-    // same-named input column only when no output alias matches), so the two
-    // clauses share exactly one evaluation of the subquery per candidate row
-    // instead of each independently re-evaluating it.
+    // each row in the SAME query (AC2). There is no separate batch-count round
+    // trip, and no full row materializes beyond the per-shard `LIMIT`.
+    // `ORDER BY` references the `SELECT`'s output alias by name (PR #1139
+    // review) rather than re-stating the correlated subquery. Postgres
+    // documents that a bare, simple-name `ORDER BY` expression resolves to a
+    // matching output column. It falls back to a same-named input column only
+    // when no output alias matches. So the two clauses share exactly one
+    // evaluation of the subquery per candidate row.
     let rows: Vec<(WorkflowExecution, i64)> = query
         .order(sql::<BigInt>(HISTORY_EVENT_COUNT_ALIAS).desc())
         .then_order_by(harvest_workflow_executions::id.asc())
@@ -45273,7 +45126,7 @@ pub(crate) async fn load_history_bloat_workflows(
 /// `filters.limit` (issue #704, AC1).
 ///
 /// Partial availability (issue #756): an unreachable shard is folded into the
-/// returned [`FanoutRows`] rather than failing the whole request; reachable
+/// returned [`FanoutRows`] rather than failing the whole request. Reachable
 /// shards' rows still merge, sort, and truncate normally.
 pub(crate) async fn load_history_bloat_workflows_from_shards(
     api_state: &HarvestApiState,
@@ -45296,9 +45149,9 @@ pub(crate) async fn load_history_bloat_workflows_from_shards(
 /// history-bloat observations (pure, no DB) — issue #704.
 ///
 /// Ties break on `execution.id` for a total, deterministic order across
-/// repeated calls. A row with no computed count (unreachable in practice —
-/// every candidate is fetched alongside its count in the same loader pass)
-/// sorts as `0`, never panics.
+/// repeated calls. A row with no computed count sorts as `0` and never panics.
+/// That is unreachable in practice: every candidate is fetched with its count
+/// in the same loader pass.
 pub(crate) fn build_history_bloat_fanout(
     observations: Vec<ShardObservation<StalledWorkflowRow>>,
     limit_raw: i64,
@@ -45327,7 +45180,7 @@ pub(crate) fn build_history_bloat_fanout(
 /// results sorted oldest-stall-first, truncated to `filters.limit`.
 ///
 /// Partial availability (issue #756): an unreachable shard is folded into the
-/// returned [`FanoutRows`] rather than failing the whole request; reachable
+/// returned [`FanoutRows`] rather than failing the whole request. Reachable
 /// shards' rows still merge, sort, and truncate normally.
 pub(crate) async fn load_stalled_workflows_from_shards(
     api_state: &HarvestApiState,
@@ -45373,10 +45226,10 @@ pub(crate) fn build_stalled_fanout(
 }
 
 // `decoder`/`outcome`: read-path payload decoding (issue #608) is applied
-// *inside* the export — before the `max_bytes` measurement — so
+// *inside* the export, before the `max_bytes` measurement. So
 // `size_limit.actual_bytes` and the size rejection always reflect the decoded
-// bytes the caller actually receives, never a stale pre-decode measurement
-// (PR #936 review). The decoder is ignored under the Redacted policy.
+// bytes the caller receives, never a stale pre-decode measurement (PR #936
+// review). The decoder is ignored under the Redacted policy.
 fn export_history_for_execution(
     execution: &WorkflowExecution,
     events: Vec<WorkflowEvent>,
@@ -45394,15 +45247,15 @@ fn export_history_for_execution(
     export_history_decoded(
         HistoryExportRequest {
             workflow_name: execution.workflow_name.clone(),
-            // Issue #698: carry the business `workflow_id` so an exported history
-            // round-trips `ctx.info().workflow_id` into the JSON / `harvest-replay`
-            // replay path (mirrors `parent_execution_id`; the column lives in no
-            // `WorkflowEvent`).
+            // Issue #698: carry the business `workflow_id`, so an exported
+            // history round-trips `ctx.info().workflow_id` into the JSON /
+            // `harvest-replay` replay path. Like `parent_execution_id`, the
+            // column lives in no `WorkflowEvent`.
             workflow_id: Some(execution.workflow_id.clone()),
-            // Issue #798: carry the execution's task queue so a workflow that
-            // branches on `ctx.queue_name()` replays against the queue it really
-            // ran on, not "" (the live worker sets it from the task row, so it
-            // lives in no `WorkflowEvent`).
+            // Issue #798: carry the execution's task queue. A workflow that
+            // branches on `ctx.queue_name()` then replays against the queue it
+            // ran on, not "". The live worker sets it from the task row, so it
+            // lives in no `WorkflowEvent`.
             queue_name: Some(execution.queue_name.clone()),
             execution_id: ExecutionId::from_uuid(execution.id),
             shard_id: execution.shard_id,
@@ -45417,15 +45270,16 @@ fn export_history_for_execution(
             // JSON / `harvest-replay` replay path.
             execution_timeout: execution.execution_timeout,
             deadline_at: execution.deadline_at,
-            // Issue #698: carry the spawning parent's execution id so an exported
-            // child history round-trips its parent into the JSON / `harvest-replay`
-            // replay path (mirrors `execution_timeout`/`deadline_at`; `parent_id`
-            // lives in no `WorkflowEvent`). `None` for a top-level run.
             // Issue #2082: carry the row's start source and predecessor.
             start_provenance: Some(autumn_harvest::types::StartProvenance::from_row(
                 execution.start_source.as_deref(),
                 execution.continued_from_exec_id,
             )),
+            // Issue #698: carry the spawning parent's execution id, so an
+            // exported child history round-trips its parent into the JSON /
+            // `harvest-replay` replay path. Like `execution_timeout` and
+            // `deadline_at`, `parent_id` lives in no `WorkflowEvent`. `None` for
+            // a top-level run.
             parent_execution_id: execution.parent_id.map(ExecutionId::from_uuid),
         },
         decoder,
@@ -45443,10 +45297,10 @@ fn export_history_for_candidate(
     export_history_decoded(
         HistoryExportRequest {
             workflow_name: candidate.workflow_name.clone(),
-            // Issue #698: carry the business `workflow_id` (the batch candidate
-            // query now SELECTs `workflow_id`) so a batch-exported history
-            // round-trips `ctx.info().workflow_id` into the replay path — parity
-            // with the single-execution export.
+            // Issue #698: carry the business `workflow_id`, which the batch
+            // candidate query now SELECTs. A batch-exported history then
+            // round-trips `ctx.info().workflow_id` into the replay path, as the
+            // single-execution export does.
             workflow_id: Some(candidate.workflow_id.clone()),
             // Issue #798: carry the execution's task queue — parity with the
             // single-execution export.
@@ -45458,25 +45312,25 @@ fn export_history_for_candidate(
             exported_at: chrono::Utc::now(),
             payload_policy: query.payload_policy,
             max_bytes: Some(query.max_bytes),
-            // Issue #798: carry the execution's own ambient headers so a
-            // header-branching workflow replays against what the live run saw
-            // instead of an empty map (which would be a FALSE divergence).
+            // Issue #798: carry the execution's own ambient headers. A
+            // header-branching workflow then replays against what the live run
+            // saw. An empty map would be a FALSE divergence.
             context_headers: autumn_harvest::history_export::export_headers(
                 candidate.context_headers.as_ref(),
                 decoder.filter(|_| query.payload_policy != HistoryPayloadPolicy::Redacted),
                 outcome,
             ),
-            // Issue #772: carry the deadline-aware replay metadata (the batch
-            // candidate query now SELECTs `execution_timeout`/`deadline_at`) so a
-            // batch-exported deadline-aware history round-trips its continue-as-new
-            // budget into the JSON / `harvest-replay` replay path — parity with the
-            // single-execution export (`export_history_for_execution`).
+            // Issue #772: carry the deadline-aware replay metadata, which the
+            // batch candidate query now SELECTs (`execution_timeout`/`deadline_at`).
+            // A batch-exported deadline-aware history then round-trips its
+            // continue-as-new budget into the JSON / `harvest-replay` replay path,
+            // as `export_history_for_execution` does.
             execution_timeout: candidate.execution_timeout,
             deadline_at: candidate.deadline_at,
-            // Issue #698: carry the spawning parent's execution id (the batch
-            // candidate query now SELECTs `parent_id`) so a batch-exported child
-            // history round-trips its parent into the JSON / `harvest-replay`
-            // replay path — parity with the single-execution export.
+            // Issue #698: carry the spawning parent's execution id, which the
+            // batch candidate query now SELECTs (`parent_id`). A batch-exported
+            // child history then round-trips its parent into the JSON /
+            // `harvest-replay` replay path, as the single-execution export does.
             parent_execution_id: candidate.parent_id.map(ExecutionId::from_uuid),
             // Issue #2082: carry the start source and predecessor — parity with
             // the single-execution export.
@@ -45572,27 +45426,27 @@ async fn export_selected_history_candidates(
 /// `deadline_at` is the one candidate field that moves after discovery: pause
 /// (#383) suspends the SLA clock and resume pushes `deadline_at` forward by the
 /// pause span. Candidate discovery and the per-candidate fetch are separate
-/// round-trips with the whole export loop between them (up to `MAX_SAMPLE_TOTAL`
-/// candidates), so a `PAUSED` execution resumed inside that window leaves the
-/// discovery-time value *stale and earlier* than the history it is paired with.
+/// round-trips. The whole export loop runs between them (up to
+/// `MAX_SAMPLE_TOTAL` candidates). So a `PAUSED` execution resumed inside that
+/// window leaves the discovery-time value *stale and earlier* than its history.
 ///
 /// That direction is the harmful one. `should_continue_as_new()` (#772) reads
-/// the live shifted `deadline_at`, and an earlier deadline reports **less**
-/// remaining budget — so replay can trip the checkpoint fraction and emit
+/// the live shifted `deadline_at`. An earlier deadline reports **less**
+/// remaining budget. So replay can trip the checkpoint fraction and emit
 /// `ContinueAsNew` where the resumed live worker, seeing the extended deadline,
-/// did not. A sampled execution is non-terminal by definition, so its recorded
-/// history can never contain that command: the gate reports a divergence the
-/// candidate build did not cause and goes falsely red.
+/// did not. A sampled execution is non-terminal by definition. So its recorded
+/// history can never contain that command. The gate then reports a divergence
+/// the candidate build did not cause, and goes falsely red.
 ///
 /// Calling this *after* the history load is therefore not merely a narrower
 /// window — it flips the residual READ COMMITTED race into the safe direction. A
 /// deadline fresher than the history makes the checkpoint **less** likely to
 /// fire, which always matches a history carrying no `ContinueAsNew`.
 ///
-/// `execution_timeout` is re-read alongside it because it is the fallback the
-/// same deadline branch uses; it is not known to be mutated after start, but
-/// reading both from one row is cheaper to reason about than justifying why one
-/// of the pair is exempt.
+/// `execution_timeout` is re-read alongside it, because the same deadline
+/// branch uses it as the fallback. It is not known to change after start. But
+/// reading both from one row is easier to reason about than proving one of the
+/// pair exempt.
 async fn reload_execution_deadline(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
@@ -45637,8 +45491,8 @@ async fn export_history_candidate(
         }
     };
     // Raw (codec-untransformed) load, mirroring the single-execution export
-    // handler: the batch export applies the same downstream payload policy,
-    // so an encrypted history must not fail the whole entry with
+    // handler. The batch export applies the same downstream payload policy. So
+    // an encrypted history must not fail the whole entry with
     // `UnknownPayloadCodec` before that policy runs (PR #936 review).
     let history = match store::load_history_undecoded(&mut conn, exec_id).await {
         Ok(history) => history,
@@ -45653,9 +45507,9 @@ async fn export_history_candidate(
             return;
         }
     };
-    // Read *after* the history (see `reload_execution_deadline`): pairing a
-    // newer history with the discovery-time deadline is what makes the gate
-    // falsely red, and reading last flips the residual race the safe way.
+    // Read *after* the history (see `reload_execution_deadline`). A newer
+    // history paired with the discovery-time deadline makes the gate falsely
+    // red. Reading last flips the residual race the safe way.
     let refreshed = match reload_execution_deadline(&mut conn, exec_id).await {
         Ok(Some((execution_timeout, deadline_at))) => {
             let mut refreshed = candidate.clone();
@@ -45663,11 +45517,11 @@ async fn export_history_candidate(
             refreshed.deadline_at = deadline_at;
             refreshed
         }
-        // The row vanished between the two reads — retention collected the
-        // execution *and* its events in one transaction, so the history in hand
-        // describes something that no longer exists. Fail the candidate rather
-        // than shipping a fixture for it: `export_failures` then blocks the gate
-        // at rung 2 instead of letting a silently biased bundle exit 0.
+        // The row vanished between the two reads. Retention collected the
+        // execution *and* its events in one transaction, so the history in
+        // hand describes something that no longer exists. Fail the candidate
+        // rather than ship a fixture for it. `export_failures` then blocks the
+        // gate at rung 2, instead of letting a silently biased bundle exit 0.
         Ok(None) => {
             work.note_dropped_candidate(
                 shard_id,
@@ -45803,31 +45657,31 @@ async fn load_history_export_candidates(
 ///
 /// One statement, two window functions:
 /// * `ROW_NUMBER() OVER (PARTITION BY workflow_name …)` performs the
-///   stratification — without it a plain `LIMIT` returns the noisiest workflow
-///   type's rows and nothing else, which is the exact failure this route
-///   exists to prevent.
+///   stratification. Without it a plain `LIMIT` returns only the noisiest
+///   workflow type's rows. That is the exact failure this route exists to
+///   prevent.
 /// * `COUNT(*) OVER (PARTITION BY workflow_name)` reports the population the
-///   sample was drawn from. Computing it in the *same* statement is what makes
-///   `sampled <= in_flight_total` true by construction — a second query could
+///   sample was drawn from. Computing it in the *same* statement makes
+///   `sampled <= in_flight_total` true by construction. A second query could
 ///   observe a different snapshot and report a sample larger than its own
 ///   population (AC2).
 ///
-/// Deliberately no `harvest_events` join: the batch export needs one for
-/// `last_history_event_at`, but that column is only ever a sort key there and
-/// is never carried into the export document, so the sample orders by the
-/// indexed `started_at` instead and stays cheap on a large in-flight fleet.
+/// Deliberately no `harvest_events` join. The batch export needs one for
+/// `last_history_event_at`, but only as a sort key; the column never reaches
+/// the export document. So the sample orders by the indexed `started_at`
+/// instead, and stays cheap on a large in-flight fleet.
 ///
 /// Two clauses in the `WHERE` are load-bearing beyond the caller's filters:
-/// * `w.shard_id = $4::INT4` — two **logical** shards may share one physical
-///   database, so a fan-out that omitted it would run this statement twice over
-///   the same rows: `in_flight_total` would double (corrupting the very
-///   denominator AC2 exists to state honestly) and every execution would be
-///   sampled twice, halving real per-type coverage. Mirrors the same predicate
-///   on `execution::COUNT_WHERE_CLAUSE` and `schedule_run_state_summary`.
-/// * `NOT starts_with(w.workflow_name, '__harvest_canary_probe')` — the built-in
-///   liveness canary (issue #796) is engine-internal and is registered by no
-///   user gate binary, so a sampled probe would land in `blocked` and pin the
-///   gate at exit 2 on every deployment that enables it. `starts_with`, not
+/// * `w.shard_id = $4::INT4`. Two **logical** shards may share one physical
+///   database. A fan-out without it would run this statement twice over the
+///   same rows. `in_flight_total` would double, corrupting the denominator AC2
+///   exists to state honestly. And every execution would be sampled twice,
+///   halving real per-type coverage. Mirrors the same predicate on
+///   `execution::COUNT_WHERE_CLAUSE` and `schedule_run_state_summary`.
+/// * `NOT starts_with(w.workflow_name, '__harvest_canary_probe')`. The built-in
+///   liveness canary (issue #796) is engine-internal, and no user gate binary
+///   registers it. So a sampled probe would land in `blocked` and pin the gate
+///   at exit 2 on every deployment that enables it. `starts_with`, not
 ///   `LIKE '…%'`: the prefix is underscore-heavy and `_` is a single-character
 ///   `LIKE` wildcard, so a `LIKE` form would over-match real workflow names.
 ///   The literal mirrors `canary::CANARY_WORKFLOW_NAME_PREFIX`, kept in sync by
@@ -45839,10 +45693,10 @@ async fn load_history_export_candidates(
 /// so the returned set is `types × per_workflow`. `stratify_sample_rows` then
 /// discards all but `MAX_SAMPLE_TOTAL` of it — after the whole superset has
 /// been decoded into `HistorySampleCandidate`s, strings and `context_headers`
-/// JSON included. At 2,000 in-flight types and `per_workflow = 500` that is a
-/// million rows materialized per shard to keep 2,000, and the management API is
-/// a shared service: a routine authenticated CI export must not be able to
-/// exhaust it.
+/// JSON included. At 2,000 in-flight types and `per_workflow = 500`, a shard
+/// materializes a million rows to keep 2,000. The management API is a shared
+/// service, so a routine authenticated CI export must not be able to exhaust
+/// it.
 ///
 /// So the per-type limit applied here is the *effective* share the global
 /// budget will allow — `LEAST(per_workflow, GREATEST(MAX_SAMPLE_TOTAL / types,
@@ -45853,21 +45707,21 @@ async fn load_history_export_candidates(
 /// Three properties make this safe rather than merely smaller:
 ///
 /// * **The sample is unchanged.** A shard sees at most the types the union
-///   sees, so its share (`MAX/types_shard`) is never *smaller* than the global
+///   sees. So its share (`MAX/types_shard`) is never *smaller* than the global
 ///   share (`MAX/types_union`) the stratifier will apply. Each shard therefore
 ///   still returns a superset of its contribution to the global top-N, which is
 ///   exactly the property the cross-shard union already relied on.
 /// * **The population census survives.** `GREATEST(…, 1)` floors the limit at
-///   one row per type, and `shard_population` reads `in_flight_total` from the
-///   first row of each name partition — so no type can drop out of the
-///   manifest, which is what `zero_coverage_types` and the coverage denominator
-///   depend on.
+///   one row per type. `shard_population` reads `in_flight_total` from the
+///   first row of each name partition. So no type can drop out of the
+///   manifest, and `zero_coverage_types` and the coverage denominator depend
+///   on that.
 /// * **The common case is byte-identical.** The global budget only binds at
 ///   `types × per_workflow > MAX_SAMPLE_TOTAL`; below that `LEAST` selects
 ///   `per_workflow` and the statement behaves exactly as before.
 ///
-/// The database-side work is unchanged either way — `COUNT(*) OVER (PARTITION
-/// BY …)` already scans every in-flight row — so this narrows what crosses the
+/// The database-side work is unchanged either way: `COUNT(*) OVER (PARTITION
+/// BY …)` already scans every in-flight row. So this narrows what crosses the
 /// wire and lands in process memory, which is where the cost was.
 const HISTORY_SAMPLE_CANDIDATES_OLDEST_SQL: &str = r"
 WITH ranked AS (
@@ -45972,7 +45826,7 @@ async fn load_history_sample_candidates(
 ) -> HarvestResult<Vec<HistorySampleCandidate>> {
     let per_workflow = i64::try_from(filters.per_workflow).unwrap_or(i64::MAX);
     // Bound so this shard cannot return a superset the global stratifier will
-    // only throw away — see the statement's own "why the row limit is not
+    // only throw away. See the statement's own "why the row limit is not
     // simply `rn <= per_workflow`".
     let max_sample_total =
         i64::try_from(autumn_harvest::replay_sample::MAX_SAMPLE_TOTAL).unwrap_or(i64::MAX);
@@ -46000,16 +45854,17 @@ struct HistorySampleExportWork {
     /// Sample rows from every shard, globally re-stratified before export.
     sample_rows: Vec<HistorySampleCandidate>,
     /// Set when the export stopped early on
-    /// [`autumn_harvest::replay_sample::MAX_SAMPLE_RESPONSE_BYTES`], so the
-    /// manifest can report the cut rather than presenting a quietly-trimmed
-    /// bundle as the sample that was asked for.
+    /// [`autumn_harvest::replay_sample::MAX_SAMPLE_RESPONSE_BYTES`].
+    ///
+    /// The manifest then reports the cut, rather than presenting a
+    /// quietly-trimmed bundle as the sample that was asked for.
     truncated_by_size: bool,
 }
 
 /// Extract the per-workflow-type in-flight population from one shard's rows.
 ///
-/// The window `COUNT(*)` is constant within a workflow-name partition, so the
-/// first row per name carries the whole population for that shard — including
+/// The window `COUNT(*)` is constant within a workflow-name partition. So the
+/// first row per name carries the whole population for that shard, including
 /// the part beyond `per_workflow` that this shard did not return.
 fn shard_population(
     rows: &[HistorySampleCandidate],
@@ -46036,11 +45891,11 @@ fn shard_population(
 
 /// Re-apply the per-type cap **globally** after the cross-shard union.
 ///
-/// Each shard already returned its own top-`per_workflow`, so the union is a
-/// superset of the global top-`per_workflow` (an execution in the global top-N
-/// is necessarily in its own shard's top-N). Re-sorting by the same key and
-/// truncating therefore yields exactly the global stratified sample, and the
-/// per-type cap in AC1 is a fleet-wide cap rather than a per-shard one.
+/// Each shard already returned its own top-`per_workflow`. So the union is a
+/// superset of the global top-`per_workflow`: an execution in the global top-N
+/// is necessarily in its own shard's top-N. Re-sorting by the same key and
+/// truncating therefore yields exactly the global stratified sample. The
+/// per-type cap in AC1 is then a fleet-wide cap, not a per-shard one.
 ///
 /// `MAX_SAMPLE_TOTAL` additionally bounds the whole response; the resulting
 /// shortfall is visible in the manifest as `sampled < in_flight_total` (AC2).
@@ -46063,15 +45918,15 @@ fn stratify_sample_rows(
     // Spread the global budget across types instead of letting the
     // alphabetically-earliest ones drink it dry.
     //
-    // Rows are sorted by `workflow_name` first, so a naive running `total`
-    // guard hands the whole `MAX_SAMPLE_TOTAL` budget to the types that sort
-    // first and leaves the rest with ZERO fixtures — while the manifest still
-    // reports `complete` (its status is shard-derived, not coverage-derived)
-    // and the gate exits 0. That is a silent false pass: a release certified
-    // against workflow types the gate never looked at. It is the same "noisy
-    // type crowds out the quiet ones" failure the per-type cap exists to
-    // prevent, reintroduced on the alphabetical axis, and it triggers at
-    // `types * per_workflow > MAX_SAMPLE_TOTAL` — i.e. 41 types at the default
+    // Rows are sorted by `workflow_name` first. A naive running `total` guard
+    // hands the whole `MAX_SAMPLE_TOTAL` budget to the types that sort first,
+    // and leaves the rest with ZERO fixtures. The manifest still reports
+    // `complete` (its status is shard-derived, not coverage-derived), and the
+    // gate exits 0. That is a silent false pass: a release certified against
+    // workflow types the gate never looked at. It is the same "noisy type
+    // crowds out the quiet ones" failure the per-type cap exists to prevent,
+    // reintroduced on the alphabetical axis. It triggers at
+    // `types * per_workflow > MAX_SAMPLE_TOTAL`, i.e. 41 types at the default
     // `per_workflow = 50`.
     //
     // Giving every type an equal floor is a no-op whenever the global budget
@@ -46136,20 +45991,20 @@ impl<'a, I: Iterator<Item = &'a str>> DedupCountSorted<'a> for I {
 /// to have, not merely every shard this process holds a pool for.
 ///
 /// The distinction is load-bearing for the gate. `pool.iter_shards()` yields
-/// only shards wired up in *this* process, but during a shard-add rollout the
-/// router's `readable_shards` is widened first (see `docs/architecture.md`
-/// "add a shard" procedure), so a shard can be routable — and already holding
-/// in-flight executions — while this node has no pool for it. Enumerating only
-/// the pools would omit that shard *silently*: it would appear in neither
+/// only shards wired up in *this* process. But during a shard-add rollout the
+/// router's `readable_shards` is widened first (see the `docs/architecture.md`
+/// "add a shard" procedure). So a shard can be routable, and already hold
+/// in-flight executions, while this node has no pool for it. Enumerating only
+/// the pools would omit that shard *silently*. It would appear in neither
 /// `inspected_shards` nor `unavailable_shards`, and `SampleStatus::from_counts`
 /// derives `Complete` from `unavailable == 0`. The manifest would then claim
-/// complete coverage, and even `require_complete_coverage(true)` would certify
-/// a candidate build without replaying a single one of that shard's workflows —
+/// complete coverage. Even `require_complete_coverage(true)` would certify a
+/// candidate build without replaying one of that shard's workflows. That is
 /// the exact false green the coverage record exists to prevent.
 ///
-/// So this iterates `shard_fanout::expected_shards` (pools ∪ router-known) and
-/// records a shard with no resolvable pool as `unavailable`, which is the same
-/// treatment every other cross-shard read in the repo gives it.
+/// So this iterates `shard_fanout::expected_shards` (pools ∪ router-known). It
+/// records a shard with no resolvable pool as `unavailable`, the same treatment
+/// every other cross-shard read in the repo gives it.
 async fn collect_history_sample_candidates_from_shards(
     api_state: &HarvestApiState,
     query: &HistorySampleExportQuery,
@@ -46186,12 +46041,12 @@ async fn collect_history_sample_candidates_from_shards(
             }
         };
         // Recorded only once the query succeeded. Counting a shard as inspected
-        // the moment its connection was acquired puts a failed shard in *both*
-        // lists, and `SampleStatus::from_counts` reads `inspected == 0` as its
-        // "unavailable" signal — so on a single-shard deployment a failing query
-        // would report `partial` (with one shard supposedly inspected) instead
-        // of `unavailable`, understating the outage in the very record the gate
-        // uses to decide whether coverage was proven.
+        // when its connection was acquired puts a failed shard in *both* lists.
+        // `SampleStatus::from_counts` reads `inspected == 0` as its
+        // "unavailable" signal. So on a single-shard deployment a failing query
+        // would report `partial` (one shard supposedly inspected), not
+        // `unavailable`. That understates the outage in the record the gate uses
+        // to decide whether coverage was proven.
         work.batch.inspected_shards.push(shard_id);
         if !rows.is_empty() {
             work.batch.matched_shards.push(shard_id);
@@ -46232,8 +46087,8 @@ async fn export_sampled_history_candidates(
         )
         .await;
         // A candidate that failed (size limit, unreadable shard) records a
-        // failure instead of an export, so charge the budget from what was
-        // actually retained rather than assuming every row costs something.
+        // failure instead of an export. So charge the budget from what was
+        // retained, rather than assuming every row costs something.
         let retained = (work.batch.exports.len() > before)
             .then(|| {
                 work.batch
@@ -46249,13 +46104,13 @@ async fn export_sampled_history_candidates(
 /// Running total of the bytes one sample export has accumulated in memory.
 ///
 /// [`autumn_harvest::replay_sample::MAX_SAMPLE_TOTAL`] bounds the fixture
-/// *count*, but `max_bytes` is per-document and caller-raisable, so the count
-/// cap alone leaves the aggregate unbounded — ~20 GiB at the defaults, on a
+/// *count*, but `max_bytes` is per-document and caller-raisable. So the count
+/// cap alone leaves the aggregate unbounded: ~20 GiB at the defaults, on a
 /// shared management API. This is the aggregate bound.
 ///
-/// Split out as a value rather than inlined so the two rules that matter are
-/// unit-testable without a database: the budget must actually *stop* the loop,
-/// and a candidate that produced no document must not be charged for one.
+/// Split out as a value rather than inlined, so the two rules that matter are
+/// unit-testable without a database. The budget must actually *stop* the loop.
+/// A candidate that produced no document must not be charged for one.
 #[derive(Debug, Default, Clone, Copy)]
 struct SampleByteBudget {
     used: usize,
@@ -46264,7 +46119,7 @@ struct SampleByteBudget {
 impl SampleByteBudget {
     /// Whether no further history should be fetched.
     ///
-    /// Checked *before* a fetch: a document's size is not knowable until it is
+    /// Checked *before* a fetch. A document's size is not knowable until it is
     /// loaded, so peak retained bytes are the budget plus at most one document.
     const fn exhausted(self) -> bool {
         self.used >= autumn_harvest::replay_sample::MAX_SAMPLE_RESPONSE_BYTES
@@ -46274,10 +46129,9 @@ impl SampleByteBudget {
     ///
     /// `retained` is `None` when the attempt produced a *failure* rather than a
     /// document (over `max_bytes`, unreadable shard). Such an attempt holds no
-    /// bytes, so charging it would shrink the budget for histories that were
-    /// never retained and cut the sample short for free — which is why the
-    /// "did this attempt retain anything?" rule lives here, where it is
-    /// testable, rather than in the loop.
+    /// bytes. Charging it would shrink the budget for histories never retained,
+    /// and cut the sample short for free. So the "did this attempt retain
+    /// anything?" rule lives here, where it is testable, not in the loop.
     ///
     /// Saturating, so a pathological `max_bytes` cannot wrap the running total
     /// back under the budget and reopen an exhausted export.
@@ -46291,7 +46145,7 @@ impl SampleByteBudget {
 /// Merge the per-shard populations and count what was actually exported.
 ///
 /// A workflow type whose entire sample failed the size limit still appears with
-/// `sampled: 0` and its real `in_flight_total`, so an operator can never mistake
+/// `sampled: 0` and its real `in_flight_total`. So an operator never mistakes
 /// "nothing was exported for this type" for "this type has nothing in flight"
 /// (AC2).
 fn build_sample_manifest(
@@ -46302,11 +46156,10 @@ fn build_sample_manifest(
         autumn_harvest::replay_sample::merge_coverage(&work.per_shard_population);
 
     // Identities, not just a tally. `sampled` alone accepts any substitution
-    // that preserves the count — swap one execution of a type for a duplicate
-    // of another and the number still matches — so the gate cannot tell the
-    // bundle it was handed apart from a bundle of the right shape. Recording
-    // what was actually written lets it (see
-    // `ReplayDriftReport::bundle_inventory_mismatches`).
+    // that preserves the count. Swap one execution of a type for a duplicate of
+    // another, and the number still matches. The gate then cannot tell the
+    // bundle it got from a bundle of the right shape. Recording what was
+    // written lets it (see `ReplayDriftReport::bundle_inventory_mismatches`).
     let mut exported: std::collections::BTreeMap<&str, Vec<autumn_harvest::ExecutionId>> =
         std::collections::BTreeMap::new();
     for document in &work.batch.exports {
@@ -46350,11 +46203,10 @@ fn build_sample_manifest(
             .collect(),
         inspected_shards: work.batch.inspected_shards.clone(),
         truncated_by_size: work.truncated_by_size,
-        // A selected candidate that failed to export produces a failure instead
-        // of a document, so `sampled_total` above counts only the survivors and
-        // therefore agrees exactly with the bundle. Carrying the count is the
-        // only way the gate can tell that the sample it replayed is a subset of
-        // the sample that was chosen.
+        // A selected candidate that failed to export produces a failure, not a
+        // document. So `sampled_total` above counts only the survivors and
+        // agrees exactly with the bundle. Only this count tells the gate that
+        // the sample it replayed is a subset of the sample that was chosen.
         export_failures: work.batch.failures.len() as u64,
     }
 }
@@ -46371,8 +46223,8 @@ async fn load_history_sample_from_shards(
     collect_history_sample_candidates_from_shards(api_state, query, &mut work).await;
     export_sampled_history_candidates(&pool, query, &mut work, decoder, outcome).await;
     // Only reachable when an explicit `shard_id` names a shard that is neither
-    // pooled nor router-known; a router-known-but-poolless shard is already
-    // recorded as unavailable by the discovery loop itself.
+    // pooled nor router-known. The discovery loop already records a
+    // router-known-but-poolless shard as unavailable.
     if let Some(shard_id) = query.shard_id
         && !work.batch.saw_requested_shard
     {
@@ -46439,10 +46291,10 @@ pub(crate) fn history_export_error_response(error: HistoryExportError) -> axum::
 /// name (issue #756).
 ///
 /// Partial availability: an unreachable shard is folded into the returned
-/// [`FanoutRows`] rather than failing the whole request — the single source of
-/// truth shared by `GET /admin/schedules` (`list_schedules`) and `GET /dags`
-/// (`list_dags`), so both degrade to `200 partial` instead of `500` and neither
-/// duplicates the query + effective-name sort.
+/// [`FanoutRows`] rather than failing the whole request. This is the single
+/// source of truth for `GET /admin/schedules` (`list_schedules`) and
+/// `GET /dags` (`list_dags`). So both degrade to `200 partial` instead of
+/// `500`, and neither duplicates the query + effective-name sort.
 async fn load_schedules_from_shards(
     api_state: &HarvestApiState,
 ) -> Result<FanoutRows<HarvestSchedule>, AutumnError> {
@@ -46560,11 +46412,6 @@ fn parse_conflict_policy(raw: Option<&str>) -> Result<WorkflowIdConflictPolicy, 
     }
 }
 
-/// Write a best-effort `FAILED` audit row for a rejected workflow start.
-///
-/// Mirrors the inline audit blocks the reuse-policy / conflict-policy `400`
-/// paths already use; extracted so the issue-#697 placement rejections record
-/// the same trail without a third copy of the boilerplate.
 /// Request-scoped identity for a failed workflow-start audit row.
 ///
 /// Bundled rather than passed positionally because every call site supplies the
@@ -46579,11 +46426,16 @@ struct StartFailureAudit<'a> {
     ///
     /// Recorded so an operator can answer "who repeatedly tried to pin
     /// EU-tagged work at the US shard and was refused?" from the audit log
-    /// alone — the success path already records the resolved shard, so a
-    /// hardcoded `None` here would make rejections forensically silent.
+    /// alone. The success path already records the resolved shard. A hardcoded
+    /// `None` here would make rejections forensically silent.
     requested_shard_id: Option<i32>,
 }
 
+/// Write a best-effort `FAILED` audit row for a rejected workflow start.
+///
+/// Mirrors the inline audit blocks the reuse-policy / conflict-policy `400`
+/// paths already use. It is extracted so the issue-#697 placement rejections
+/// record the same trail without a third copy of the boilerplate.
 async fn audit_start_failure(
     api_state: &HarvestApiState,
     ctx: &StartFailureAudit<'_>,
@@ -46609,16 +46461,15 @@ async fn audit_start_failure(
     }
 }
 
-/// Parse the optional explicit shard placement (issue #697).
-///
 /// Cap on a caller-supplied `residency_key`.
 ///
 /// A residency key names a declared jurisdiction/tenant bucket, so a legitimate
-/// one is short. Capping it keeps an unbounded caller-supplied string from being
-/// reflected back in the `400` body — `input` has a payload cap, this field
-/// otherwise had none.
+/// one is short. The cap keeps an unbounded caller-supplied string out of the
+/// `400` body. `input` has a payload cap; this field otherwise had none.
 const MAX_RESIDENCY_KEY_LEN: usize = 128;
 
+/// Parse the optional explicit shard placement (issue #697).
+///
 /// `shard_id` and `residency_key` are mutually exclusive placement sources;
 /// supplying both is ambiguous and rejected rather than silently preferring
 /// one. Omitting both yields [`ShardPlacement::Auto`] — today's rendezvous
@@ -46650,9 +46501,9 @@ fn parse_shard_placement(
                 )));
             }
             // Above `0xFFFE` the value cannot round-trip through an
-            // `ExecutionId` (the encoder masks to 16 bits), so the row would be
-            // written to one database while every id-based lookup routed to the
-            // truncated shard. The router rejects it too; catching it at the
+            // `ExecutionId`, because the encoder masks to 16 bits. The row would
+            // be written to one database while every id-based lookup routed to
+            // the truncated shard. The router rejects it too. Catching it at the
             // request boundary gives the caller the precise reason.
             if !autumn_harvest::shard::is_encodable_shard(ShardId::new(raw)) {
                 return Err(AutumnError::bad_request_msg(format!(
@@ -46747,11 +46598,12 @@ pub(crate) fn parse_execution_id(raw: &str) -> Result<ExecutionId, AutumnError> 
 /// the API boundary before truncation.
 pub(crate) const OPERATOR_REASON_MAX_CHARS: usize = 500;
 
-/// Truncate an operator-supplied `reason` at the API boundary so the core
-/// never persists an arbitrarily long string (the reason is written durably
-/// into event messages, `details.reason`, task-row envelopes, and audit
-/// rows). Char-based (`.chars().take(..)`), so multi-byte UTF-8 input can
-/// never be split mid-codepoint. Shared by the erase-payloads (#495) and
+/// Truncate an operator-supplied `reason` at the API boundary.
+///
+/// The core then never persists an arbitrarily long string. The reason is
+/// written durably into event messages, `details.reason`, task-row envelopes
+/// and audit rows. Char-based (`.chars().take(..)`), so multi-byte UTF-8 input
+/// can never be split mid-codepoint. Shared by the erase-payloads (#495) and
 /// activity fail-now (#765) handlers.
 pub(crate) fn truncate_operator_reason(reason: &str) -> String {
     reason.chars().take(OPERATOR_REASON_MAX_CHARS).collect()
@@ -46809,10 +46661,10 @@ fn terminal_event_type_to_state(event_type: &str) -> &'static str {
 ///
 /// The `WorkflowCancelled` event is reused for both cooperative cancel
 /// (`CANCELLED`) and force-terminate (`TERMINATED`) (issue #504, no new event
-/// variant), so the event type alone cannot distinguish them — only the
-/// execution-row `state` column can. The event-derived label is used only as a
-/// fallback for the pre-existing not-yet-committed race (a terminal event
-/// observed before the state column flipped) or when the row read fails.
+/// variant). So the event type alone cannot distinguish them; only the
+/// execution-row `state` column can. The event-derived label is only a
+/// fallback. It covers the pre-existing not-yet-committed race (a terminal
+/// event observed before the state column flipped) and a failed row read.
 fn stream_end_reason(authoritative_state: Option<&str>, event_derived: &str) -> String {
     match authoritative_state {
         Some(state) if is_terminal_state(state) => state.to_lowercase().replace('_', "-"),
@@ -46894,9 +46746,9 @@ mod stream_end_reason_tests {
 
     #[test]
     fn authoritative_terminated_state_overrides_cancelled_event_label() {
-        // The reused WorkflowCancelled event yields "cancelled", but a force-
-        // terminated run's row state is TERMINATED — the authoritative state
-        // must win so stream-end surfaces "terminated" (issue #504).
+        // The reused WorkflowCancelled event yields "cancelled". But a
+        // force-terminated run's row state is TERMINATED, and the authoritative
+        // state must win, so stream-end surfaces "terminated" (issue #504).
         assert_eq!(
             stream_end_reason(Some("TERMINATED"), "cancelled"),
             "terminated"
@@ -47002,7 +46854,6 @@ async fn stream_execution_events(
     use axum::response::sse::{Event, KeepAlive, Sse};
     use futures::SinkExt as _;
 
-    // Parse execution ID
     let exec_id = match parse_execution_id(&exec_id_raw) {
         Ok(id) => id,
         Err(e) => return e.into_response(),
@@ -47075,11 +46926,11 @@ async fn stream_execution_events(
     // sent. It also falls open on `Ok(None)`, when the cursor names no
     // event on this shard.
     //
-    // A real `Err` is a different case (Codex review, P2): the connection
-    // is still usable but the lookup itself failed. The response has not
-    // started yet at this point, so return the database error instead of
-    // masking it as "no cursor". Silently falling open here would resend
-    // the client its full history, not merely miss a resume optimization.
+    // A real `Err` is a different case: the connection is still usable but
+    // the lookup itself failed. The response has not started yet at this
+    // point, so return the database error instead of masking it as "no
+    // cursor". Silently falling open here would resend the client its full
+    // history, not merely miss a resume optimization.
     let last_row_id: i64 = match last_event_id {
         Some(event_id) => match store::row_id_for_event_id(&mut conn, exec_id, event_id).await {
             Ok(row_id) => row_id.unwrap_or(-1),
@@ -47089,9 +46940,9 @@ async fn stream_execution_events(
     };
 
     // NOTE: a not-configured URL here is `HarvestError::Config` → 400 via
-    // `map_error`. That latent misclassification (server misconfig should be
-    // 503) is a pre-existing #324 behavior and out of scope for #791 — the
-    // sibling progress stream below returns 503 for the same case.
+    // `map_error`. A server misconfig should be 503. That latent
+    // misclassification is a pre-existing #324 behavior and out of scope for
+    // #791. The sibling progress stream below returns 503 for the same case.
     let notification_url = match api_state.sse_notification_url(shard) {
         Ok(url) => url,
         Err(e) => return map_error(e).into_response(),
@@ -47155,13 +47006,13 @@ async fn stream_execution_events(
             source: &audit_source,
         };
         let _ = audit::insert_audit(&mut conn, &ar).await;
-        // Decode audit (issue #608): frame counts are unknowable up front on
-        // a stream, so one payload.decode_read row is written at stream open
-        // whenever decode mode is active — a deliberate, documented superset
-        // of the ≥1-envelope predicate the request/response surfaces use.
-        // Every stream (re)open writes its own row, including automatic
-        // EventSource reconnects (each reconnect is a fresh HTTP request
-        // through this handler), so reconnect-happy clients multiply rows.
+        // Decode audit (issue #608): frame counts are unknowable up front on a
+        // stream. So one payload.decode_read row is written at stream open
+        // whenever decode mode is active. That is a deliberate, documented
+        // superset of the ≥1-envelope predicate the request/response surfaces
+        // use. Every stream (re)open writes its own row, including automatic
+        // EventSource reconnects. Each reconnect is a fresh HTTP request through
+        // this handler, so reconnect-happy clients multiply rows.
         if decoder.is_some() {
             let decode_ar = NewAuditRecord {
                 actor: &audit_actor,
@@ -47198,26 +47049,25 @@ async fn stream_execution_events(
     // reconnect is authorized against the live shard. See `FencedCheckout`.
     let fence = ::autumn_harvest::shard_fence::current();
 
-    // Producer task: runs independently of the HTTP handler after we return
+    // The producer task runs on after the handler returns.
     tokio::spawn(::autumn_harvest::shard_fence::scoped(fence, async move {
         use autumn_harvest::audit::OP_EXECUTION_STREAM_CLOSE;
 
-        // Frames are built by sse_frame_data: the inner payload of the
-        // adjacently-tagged envelope `{"type":"...","data":{...}}` — the
-        // `event:` field already carries the type — tolerantly decoded when
-        // read-path payload decoding is active (issue #608).
+        // Frames are built by sse_frame_data. Each frame holds the inner payload
+        // of the adjacently-tagged envelope `{"type":"...","data":{...}}`; the
+        // `event:` field already carries the type. The payload is tolerantly
+        // decoded when read-path payload decoding is active (issue #608).
 
         // Helper: flush a slice of DB rows into the SSE channel.
         // Returns the last `row.id`/`row.event_id` actually SENT and the
         // first terminal state name found, or breaks early if the channel
         // is full / dropped. `cur_last_seen_event_id` tracks in step with
         // `cur_last_seen`. Both update only after a row is sent. A
-        // caller-side `rows.last()` read (Codex review) would report a row
-        // this call never sent, when `try_send` fails partway through.
-        // That would hand a reconnecting client a cursor past events it
-        // never received.
-        // Using a macro-style closure here because closures cannot easily `break 'notify`.
-        // We use a boolean return: (last_id, last_event_id, terminal_state, should_break).
+        // caller-side `rows.last()` read would report a row this call never
+        // sent, when `try_send` fails partway through. That would hand a
+        // reconnecting client a cursor past events it never received.
+        // Closures cannot easily `break 'notify`, so the closure returns a
+        // `should_break` flag: (last_id, last_event_id, terminal_state, should_break).
         let send_rows =
             |rows: &[autumn_harvest::models::HarvestEvent],
              mut cur_last_seen: i64,
@@ -47248,7 +47098,7 @@ async fn stream_execution_events(
             };
 
         // ── 1. Send backfill events (events already committed before this request) ──
-        // Also track whether a terminal event appears in the backfill: the execution
+        // Also track whether a terminal event appears in the backfill. The execution
         // may have transitioned between load_execution and load_events_after_row_id.
         let mut backfill_terminal: Option<&'static str> = None;
         for row in &backfill {
@@ -47790,19 +47640,22 @@ async fn stream_workflow_changes(
 }
 
 /// Terminal-close poll cadence / keepalive ceiling for the workflow progress SSE
-/// stream (issue #791). Bounds how long after a workflow reaches a terminal
-/// state the final `event: end` frame is emitted (there is no terminal *chunk*,
-/// so the close is driven by a periodic terminal-state poll on the idle tick).
-/// Capped by the configured `sse_keepalive_interval` so operators (and tests)
-/// can shorten it; a modest default keeps close latency bounded.
+/// stream (issue #791).
+///
+/// It bounds how long after a workflow reaches a terminal state the final
+/// `event: end` frame is emitted. There is no terminal *chunk*, so a periodic
+/// terminal-state poll on the idle tick drives the close. The configured
+/// `sse_keepalive_interval` caps it, so operators (and tests) can shorten it. A
+/// modest default keeps close latency bounded.
 pub(crate) const PROGRESS_STREAM_KEEPALIVE: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Bounded producer→SSE channel capacity for the progress stream. Progress is a
-/// best-effort side channel: chunks are sent non-blocking (`try_send`), so a
-/// slow client that fills this buffer causes the *excess* chunks to be DROPPED
-/// (never buffered unboundedly, and — critically — never back-pressured into the
-/// shared Postgres async NOTIFY queue). The monotonic `seq` lets the client
-/// detect the resulting gap. A disconnected receiver ends the stream.
+/// Bounded producer→SSE channel capacity for the progress stream.
+///
+/// Progress is a best-effort side channel. Chunks are sent non-blocking
+/// (`try_send`). So when a slow client fills this buffer, the *excess* chunks
+/// are DROPPED. They are never buffered unboundedly, and never back-pressured
+/// into the shared Postgres async NOTIFY queue. The monotonic `seq` lets the
+/// client detect the resulting gap. A disconnected receiver ends the stream.
 const PROGRESS_STREAM_CHANNEL_CAPACITY: usize = 256;
 
 /// Short, non-zero grace window used to drain any progress chunk still in flight
@@ -47812,7 +47665,7 @@ const PROGRESS_STREAM_CHANNEL_CAPACITY: usize = 256;
 /// The terminal close is driven by an idle keepalive tick that polls terminal
 /// state. When that tick fires, the workflow's FINAL published chunk may have
 /// been delivered on the listener socket but not yet forwarded by the driver
-/// task. A `Duration::ZERO` poll would race and drop it; a short non-zero grace
+/// task. A `Duration::ZERO` poll would race and drop it. A short non-zero grace
 /// gives the driver time to forward a just-delivered notification, so the last
 /// chunk is not lost on close.
 const PROGRESS_STREAM_FINAL_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_millis(75);
@@ -47860,7 +47713,6 @@ async fn progress_stream_end_reason(
         // Row gone: retention only deletes terminal executions, so end the stream.
         None => ProgressPoll::End("deleted".to_string()),
         Some(s) if is_terminal_state(&s) => ProgressPoll::End(s.to_lowercase().replace('_', "-")),
-        // Still running — keep the live loop open.
         Some(_) => ProgressPoll::Wait,
     }
 }
@@ -47929,9 +47781,9 @@ impl ShardRecheck {
 /// held between chunks.
 ///
 /// **Auth**: this route inherits the management API's configured auth middleware
-/// (`HarvestPlugin::api_with_auth`); it is deliberately **NOT** admin-gated
-/// (issue #791 AC5 — an app's end-users stream their own workflows). If no
-/// middleware is configured the route is open — embedders exposing streams to
+/// (`HarvestPlugin::api_with_auth`). It is deliberately **NOT** admin-gated
+/// (issue #791 AC5: an app's end-users stream their own workflows). With no
+/// middleware configured, the route is open. Embedders exposing streams to
 /// untrusted end-users should configure `api_with_auth` or front it with their
 /// own auth.
 ///
@@ -47956,7 +47808,7 @@ impl ShardRecheck {
 ///
 /// **Progress chunks are EPHEMERAL**: never recorded in `harvest_events`, never
 /// replayed, and there is **no backfill** on (re)connect. A subscriber that
-/// connects after a chunk was published will not see it — deliberate, since
+/// connects after a chunk was published will not see it. That is deliberate:
 /// chunk content may be non-deterministic precisely because it is never stored.
 ///
 /// **Authorization**: this route only checks that the execution exists (→ 404
@@ -47965,13 +47817,18 @@ impl ShardRecheck {
 /// own per-execution authorization on top. `exec_id` is a random `UUIDv4` (not
 /// enumerable), which mitigates blind probing but is not an access-control
 /// substitute. Each subscriber also holds one dedicated (non-pooled) Postgres
-/// `LISTEN` connection for the stream's lifetime, so embedders should rate-limit
-/// and/or cap concurrent streams per user to avoid DB connection exhaustion.
+/// `LISTEN` connection for the stream's lifetime. So embedders should
+/// rate-limit and/or cap concurrent streams per user to avoid DB connection
+/// exhaustion.
 ///
-/// Responses: `404` if the execution does not exist; `503` if the LISTEN/NOTIFY
-/// database URL is not configured or the notification database is unreachable
-/// (both server-side conditions, retriable); a single `event: end` frame (then
-/// close) if the execution is already terminal at connect.
+/// Responses:
+///
+/// - `404` if the execution does not exist.
+/// - `503` if the LISTEN/NOTIFY database URL is not configured or the
+///   notification database is unreachable. Both are server-side conditions,
+///   and retriable.
+/// - A single `event: end` frame (then close) if the execution is already
+///   terminal at connect.
 #[allow(clippy::too_many_lines)]
 async fn stream_workflow_progress(
     Extension(api_state): Extension<HarvestApiState>,
@@ -48048,10 +47905,10 @@ async fn stream_workflow_progress(
         .sse_keepalive_interval()
         .min(PROGRESS_STREAM_KEEPALIVE);
 
-    // Bounded channel: chunks are pushed non-blocking (`try_send`) so a slow
-    // client can only ever cause chunk DROPS (best-effort), never unbounded
-    // buffering and never back-pressure into Postgres' NOTIFY queue. A dropped
-    // receiver (client disconnect) ends the producer cleanly.
+    // Bounded channel. `try_send` pushes chunks without blocking, so a slow
+    // client can only cause chunk drops. It never causes unbounded buffering or
+    // back-pressure into the Postgres NOTIFY queue. A dropped receiver ends the
+    // producer cleanly.
     let (mut tx, rx) = futures::channel::mpsc::channel::<Result<Event, std::convert::Infallible>>(
         PROGRESS_STREAM_CHANNEL_CAPACITY,
     );
@@ -48067,15 +47924,13 @@ async fn stream_workflow_progress(
         // client reconnects and the reconnect is authorized against the
         // live shard. See `FencedCheckout`.
         let fence = ::autumn_harvest::shard_fence::current();
-        // Producer task: runs independently of the HTTP handler after we return.
         tokio::spawn(::autumn_harvest::shard_fence::scoped(fence, async move {
-            // Emit a progress chunk NON-BLOCKING. Returns `false` when the
-            // receiver has been dropped (client disconnected) so the caller
-            // ends the stream; a full channel (slow consumer) DROPS the chunk
-            // and returns `true` (keep going — the monotonic seq lets the
-            // client detect the gap). A blocking `send().await` here would
-            // back-pressure a slow client into the shared Postgres NOTIFY queue
-            // and stall the terminal-close poll below, so it must not block.
+            // Emit a progress chunk without blocking. Return `false` when the
+            // client disconnects, so the caller ends the stream. A full channel
+            // drops the chunk and returns `true`. The monotonic seq lets the
+            // client detect the gap. A blocking `send().await` would let a slow
+            // client back-pressure the shared Postgres NOTIFY queue. It would
+            // also stall the terminal-close poll below. So it must not block.
             let emit_chunk = |tx: &mut futures::channel::mpsc::Sender<
                 Result<Event, std::convert::Infallible>,
             >,
@@ -48083,9 +47938,7 @@ async fn stream_workflow_progress(
              -> bool {
                 match tx.try_send(Ok(progress_stream_event(&payload))) {
                     Ok(()) => true,
-                    // Slow consumer: drop this chunk, keep the stream alive.
                     Err(e) if e.is_full() => true,
-                    // Receiver dropped (client disconnected): end the stream.
                     Err(_) => false,
                 }
             };
@@ -48140,9 +47993,9 @@ async fn stream_workflow_progress(
                         }
                     }
                     Ok(ProgressWaitOutcome::TimedOut) => {
-                        // Detect a client that disconnected while idle (send /
-                        // try_send only observe a drop on a write attempt); the
-                        // axum KeepAlive wrapper emits the `: ping` comment.
+                        // Detect a client that disconnected while idle. `send` and
+                        // `try_send` see a drop only on a write. The axum KeepAlive
+                        // wrapper emits the `: ping` comment.
                         if tx.is_closed() {
                             break;
                         }
@@ -48157,15 +48010,12 @@ async fn stream_workflow_progress(
                                 break;
                             }
                         };
-                        // Bounded final-chunk drain: the workflow's LAST
-                        // published chunk may have arrived on the listener
-                        // socket but not yet been forwarded by the driver
-                        // task when this idle tick fired. Drain (non-blocking)
-                        // with a short grace so the primary "here is your
-                        // answer" frame is not dropped on close. A non-Chunk
-                        // outcome (no more chunks in flight, timeout, or the
-                        // listener dropped) exits the drain and proceeds to
-                        // close.
+                        // Bounded final-chunk drain. The last chunk can be on the
+                        // listener socket but not yet forwarded when this idle tick
+                        // fires. Drain it without blocking, with a short grace, so
+                        // the close does not drop the answer frame. A non-Chunk
+                        // outcome (no chunk in flight, a timeout, or a dropped
+                        // listener) exits the drain and closes.
                         while let Ok(ProgressWaitOutcome::Chunk(payload)) = listener
                             .wait_for_progress_timeout(PROGRESS_STREAM_FINAL_DRAIN_GRACE)
                             .await
@@ -48541,15 +48391,13 @@ async fn stream_workflow_progress_durable(
         .into_response()
 }
 
-/// Shared flat JSON body for a `HarvestError::QuotaExceeded` 429 response
-/// (issue #946, AC4) -- the single source of truth for the wire shape used
-/// by every bespoke route arm (`start_workflow`, `signal_with_start_workflow`,
-/// `update_with_start_workflow`) that constructs its own `(StatusCode,
-/// Json<..>)` response (rather than going through [`map_error`], since each
-/// of those routes must also perform a route-specific audit-record insert
-/// and throttle-token refund the shared [`map_error`] fallback below cannot
-/// do). Extracted so the three previously hand-duplicated `serde_json::json!`
-/// literals can never silently drift apart.
+/// Flat JSON body for a `HarvestError::QuotaExceeded` 429 response (issue #946, AC4).
+///
+/// The bespoke route arms (`start_workflow`, `signal_with_start_workflow`,
+/// `update_with_start_workflow`) build their own `(StatusCode, Json<..>)`
+/// response. Each must also insert a route-specific audit record and refund a
+/// throttle token, which the shared [`map_error`] fallback cannot do. One
+/// builder keeps their three wire shapes from drifting apart.
 fn quota_exceeded_body(
     workflow_name: &str,
     key: &str,
@@ -48589,9 +48437,8 @@ pub(crate) fn map_error(error: HarvestError) -> AutumnError {
             "query '{query_name}' timed out after {timeout_ms}ms"
         ))
         .with_status(axum::http::StatusCode::REQUEST_TIMEOUT),
-        // The execution row is present but its history is unqueryable (pruned by
-        // retention, released on reset, or payloads erased) — distinct from a
-        // fully-deleted row (404). Issue #612.
+        // The execution row exists, but retention, reset or erasure made its
+        // history unqueryable. A fully deleted row is a 404 instead. Issue #612.
         HarvestError::HistoryUnavailable { reason, .. } => {
             AutumnError::bad_request_msg(format!("history unavailable: {reason}"))
                 .with_status(axum::http::StatusCode::GONE)
@@ -48639,24 +48486,16 @@ pub(crate) fn map_error(error: HarvestError) -> AutumnError {
         // Issue #1977: the message names the key the caller sent, never a run.
         e @ HarvestError::TenantConflict { .. } => AutumnError::bad_request_msg(e.to_string())
             .with_status(axum::http::StatusCode::CONFLICT),
-        // Safety-net fallback for a per-tenant resource quota rejection
-        // (issue #946) reached from a route that has no bespoke structured
-        // 429 arm of its own (every request-time `map_error` call site not
-        // already special-cased for `QuotaExceeded` above -- e.g. the manual
-        // schedule-trigger route). AC4 requires this surface as a typed 429
-        // naming the exhausted resource with STRUCTURED (not just prose)
-        // fields, never a fall-through to the generic `other => 503`
-        // catch-all. `map_error` returns `AutumnError`, which always
-        // serializes through the RFC 7807 Problem Details envelope (see
-        // `autumn_web::error::AutumnError::into_response`) -- there is no
-        // way to emit the bespoke arms' flat `quota_exceeded_body` shape
-        // from here without widening `map_error`'s signature across its
-        // ~100 other call sites, so this reuses the framework's OWN
-        // established idiom for attaching structured, field-keyed data to
-        // an error response (`AutumnError::validation`'s `errors: [{field,
-        // messages}]` extension, the same mechanism every validation-style
-        // 4xx elsewhere in this codebase already relies on), with the
-        // status overridden from its 422 default to 429.
+        // Fallback for a per-tenant quota rejection (issue #946) from a route
+        // with no bespoke 429 arm, such as the manual schedule-trigger route.
+        // AC4 requires a typed 429 that names the exhausted resource in
+        // structured fields, never the generic `other => 503` catch-all.
+        // `AutumnError` always serializes as an RFC 7807 Problem Details
+        // envelope, so the flat `quota_exceeded_body` shape is not available
+        // here. Emitting it would widen the `map_error` signature across about
+        // 100 call sites. So this uses the framework idiom for field-keyed error
+        // data: the `errors: [{field, messages}]` extension of
+        // `AutumnError::validation`, with the status changed from 422 to 429.
         HarvestError::QuotaExceeded {
             workflow_name,
             key,
@@ -49104,25 +48943,21 @@ fn build_preview_entry(
     }
 }
 
-/// Truncate preview entries to reflect a schedule's `end_at` cutoff and remaining
-/// run budget (`max_runs - runs_started`) (issue #543 / #478).
+/// Truncate preview entries at a schedule's `end_at` and run budget (issue #543 / #478).
 ///
-/// Entries at or after `end_at` are dropped, along with everything after them
-/// (entries are chronologically ordered, so once the cutoff is crossed nothing
-/// later can fire either). When `remaining_budget` is `Some(n)`, only the first
-/// `n` *actually-firing* entries (`effective_at.is_some()`) are kept; a
-/// calendar-suppressed entry (`effective_at.is_none()`) passes through without
-/// consuming budget, mirroring the scheduler's live "skipped firings do not
-/// consume a remaining action" contract.
+/// Entries are in time order, so the first entry at or after `end_at` drops
+/// with everything after it. `remaining_budget` is `max_runs - runs_started`.
+/// When it is `Some(n)`, the first `n` firing entries (`effective_at.is_some()`)
+/// stay. A calendar-suppressed
+/// entry passes through without consuming budget. That mirrors the scheduler
+/// contract: a skipped firing does not consume a remaining action.
 ///
 /// **Known approximation:** the preview is stateless (see `would_skip_if_active`
-/// on [`ScheduleFirePreviewEntry`]) and cannot see future concurrency, so it has
-/// no way to know which entries an `OverlapPolicy::Skip`/`BufferOne` schedule
-/// will actually drop at dispatch time without consuming budget. Every
-/// calendar-visible entry is conservatively assumed to consume one unit of
-/// budget here, which is a worst case: a schedule whose overlap policy skips
-/// some firings at runtime may end up covering *more* wall-clock time than this
-/// truncation shows, never less.
+/// on [`ScheduleFirePreviewEntry`]) and cannot see future concurrency. So it
+/// cannot know which entries an `OverlapPolicy::Skip`/`BufferOne` schedule will
+/// drop at dispatch. Each calendar-visible entry is assumed to consume one unit
+/// of budget. That is a worst case: at runtime the schedule can cover *more*
+/// wall-clock time than this truncation shows, never less.
 fn truncate_preview_entries_by_bounds(
     entries: Vec<ScheduleFirePreviewEntry>,
     end_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -49131,10 +48966,8 @@ fn truncate_preview_entries_by_bounds(
     let mut budget = remaining_budget;
     let mut out = Vec::with_capacity(entries.len());
     for entry in entries {
-        // Checked unconditionally, not just for budget-consuming entries: once the
-        // budget is spent the schedule is permanently terminal, so even a
-        // calendar-suppressed entry (which itself never consumes budget) must not
-        // be shown past that point.
+        // Check this for every entry. A spent budget makes the schedule terminal,
+        // so even a calendar-suppressed entry must not show past that point.
         if let Some(remaining) = budget
             && remaining <= 0
         {
@@ -49165,13 +48998,15 @@ fn format_in_timezone(utc: chrono::DateTime<chrono::Utc>, tz_name: &str) -> Stri
     )
 }
 
-/// Parse an optional ISO-8601 `from` string. Returns the parsed instant when
-/// present, `Utc::now()` when absent, and `Err(String)` when the string is
-/// malformed or too far in the future (caller maps this to a 400 response).
+/// Parse an optional ISO-8601 `from` string.
 ///
-/// Years above 9000 are rejected: interval schedules compute `from + period`
-/// repeatedly, and very large `from` values can overflow `DateTime` arithmetic or
-/// produce RFC 3339 strings (year > 9999) that most clients cannot parse.
+/// Returns the instant when present, `Utc::now()` when absent, and
+/// `Err(String)` when malformed or too far in the future. The caller maps the
+/// error to a 400.
+///
+/// Years above 9000 are rejected. Interval schedules add `period` to `from`
+/// repeatedly, and a very large `from` can overflow `DateTime` arithmetic. It
+/// can also produce RFC 3339 strings (year > 9999) that most clients cannot parse.
 fn parse_from_param(from: Option<&str>) -> Result<chrono::DateTime<chrono::Utc>, String> {
     from.map_or_else(
         || Ok(chrono::Utc::now()),
@@ -49192,18 +49027,16 @@ fn parse_from_param(from: Option<&str>) -> Result<chrono::DateTime<chrono::Utc>,
 /// Build the zero-entry preview response shared by the paused, exhausted, and
 /// unparsable-schedule short-circuits in [`preview_schedule_firings_handler`].
 ///
-/// `pause_reason` is only surfaced when `is_paused` is true. Some legacy pause
-/// paths (e.g. `PATCH /dags/{dag_name}`) clear `is_paused` without also
-/// clearing `pause_reason`, so reading the raw column unconditionally could
-/// leak a stale reason for a schedule that is not actually paused.
+/// `pause_reason` shows only when `is_paused` is true. Some legacy pause paths,
+/// such as `PATCH /dags/{dag_name}`, clear `is_paused` but keep `pause_reason`.
+/// An unconditional read of the column could leak a stale reason.
 /// The `GET /admin/schedules/{id}/preview` payload (issue #348).
 ///
-/// Typed rather than an ad-hoc `serde_json::json!` object so the Vantage
-/// schedules page (issue #951) can render exactly what the API returns instead
-/// of re-deriving bounded-run truncation and pause/exhaustion handling — the
-/// one thing that would let the UI and the API disagree about *why a schedule
-/// will not fire*. The field set (and its JSON key names) are unchanged from
-/// the original hand-built object, so the public response shape is identical.
+/// Typed, so the Vantage schedules page (issue #951) renders exactly what the
+/// API returns. It does not re-derive bounded-run truncation or pause and
+/// exhaustion handling. So the UI and the API cannot disagree about *why a
+/// schedule will not fire*. The field set and JSON key names match the original
+/// hand-built object.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct SchedulePreview {
     /// The projected fire times, already truncated by `end_at` / the remaining
@@ -49234,10 +49067,9 @@ fn empty_preview_response(
     from: chrono::DateTime<chrono::Utc>,
     count: usize,
 ) -> SchedulePreview {
-    // `is_paused` keeps mirroring the column. An auto-paused row has it `false`
-    // yet still previews empty, so the reason carries the explanation rather
-    // than leaving a caller to guess why a healthy-looking schedule projects
-    // nothing (#360).
+    // `is_paused` mirrors the column. An auto-paused row has it `false` but
+    // still previews empty, so the reason explains why a healthy-looking
+    // schedule projects nothing (#360).
     let pause_reason = if schedule.is_paused {
         schedule.pause_reason.clone()
     } else if schedule.auto_paused_at.is_some() {
@@ -49273,11 +49105,11 @@ async fn preview_schedule_firings_handler(
     Ok((StatusCode::OK, Json(preview)))
 }
 
-/// The body of `GET /admin/schedules/{id}/preview`, factored out so the Vantage
-/// preview drill-down (issue #951) renders the *same* projection the API
-/// returns — including the #478/#543 bounded-run truncation and the
-/// paused/exhausted zero-entry branches — rather than a second implementation
-/// of them.
+/// The body of `GET /admin/schedules/{id}/preview`.
+///
+/// The Vantage preview drill-down (issue #951) renders the *same* projection
+/// the API returns, not a second implementation. That includes the #478/#543
+/// bounded-run truncation and the paused/exhausted zero-entry branches.
 ///
 /// Read-only: it loads the schedule row and (when a calendar is attached) that
 /// calendar's exclusions, and writes nothing.
@@ -49298,12 +49130,11 @@ pub(crate) async fn compute_schedule_preview(
 
 /// [`compute_schedule_preview`] for a caller that has already resolved the row.
 ///
-/// `load_schedule_by_id` stops at the first shard whose connection fails, so a
-/// caller that resolved the schedule through the resilient
-/// [`resolve_schedule_with_shard`] — the Vantage drill-downs (issue #951) — must
-/// not hand the id back for a second, fragile lookup: in a multi-shard
-/// deployment where an earlier shard is down and the schedule lives on a later
-/// healthy one, that second lookup fails on a row we already hold.
+/// `load_schedule_by_id` stops at the first shard whose connection fails. A
+/// caller that resolved the row through the resilient
+/// [`resolve_schedule_with_shard`], such as the Vantage drill-downs (issue #951),
+/// must not look it up again by id. In a multi-shard deployment with an earlier
+/// shard down, that second lookup fails on a row the caller already holds.
 ///
 /// # Errors
 ///
@@ -49325,21 +49156,17 @@ pub(crate) async fn compute_schedule_preview_for(
 
     // Paused schedules return zero entries with a paused reason summary.
     //
-    // Exhausted schedules (issue #478 / #543 — end_at reached or run budget spent)
-    // are permanently terminal: they will never fire again, so the preview must
-    // report zero entries rather than projecting fire times the live scheduler
-    // will never actually dispatch. A budget that has already reached zero is
-    // handled the same way, even if the row has not transitioned to
-    // `exhausted_at` yet. The live scheduler sets it eagerly. This check is an
-    // inexpensive, harmless belt-and-suspenders match.
-    // `truncate_preview_entries_by_bounds` would produce an empty list for
-    // `Some(0)` regardless. So this only skips the unnecessary schedule-parsing
-    // and calendar-exclusion work.
-    // `auto_paused_at` is as terminal as `is_paused` for firing: the scheduler's
-    // due-list filters on `auto_paused_at IS NULL` (#360), so an auto-paused
-    // schedule will not fire even though its `is_paused` column is false.
-    // Projecting fire times for it would tell an operator a stopped schedule has
-    // upcoming firings.
+    // Exhausted schedules (issue #478 / #543: `end_at` reached or run budget
+    // spent) never fire again. So the preview reports zero entries, not fire
+    // times the scheduler will never dispatch. A budget already at zero takes
+    // the same path, even before the row gets `exhausted_at`. The scheduler
+    // sets that eagerly, so this check is a cheap safeguard.
+    // `truncate_preview_entries_by_bounds` returns an empty list for `Some(0)`
+    // anyway. This check only skips the schedule parsing and calendar reads.
+    // `auto_paused_at` stops firing just as `is_paused` does. The due-list
+    // filters on `auto_paused_at IS NULL` (#360), so an auto-paused schedule
+    // does not fire although its `is_paused` is false. Fire times for it would
+    // tell an operator that a stopped schedule has upcoming firings.
     if schedule.is_paused
         || schedule.auto_paused_at.is_some()
         || schedule.exhausted_at.is_some()
@@ -49418,9 +49245,8 @@ pub(crate) async fn compute_schedule_preview_for(
         })
         .collect();
 
-    // Truncate at the end_at cutoff and remaining run budget (issue #543 / #478) so
-    // the preview never projects fire times the live scheduler would refuse to
-    // dispatch.
+    // Truncate at `end_at` and the run budget (issue #543 / #478). The preview
+    // then never shows a fire time the scheduler would refuse to dispatch.
     let entries = truncate_preview_entries_by_bounds(entries, schedule.end_at, remaining_runs);
 
     Ok(SchedulePreview {
@@ -49532,10 +49358,9 @@ async fn preview_candidate_schedule_handler(
         }
     }
 
-    // Paused candidate schedules return no entries. All validations above
-    // (schedule_expr, timezone, skip_policy, overlap_policy, jitter, calendar)
-    // run first so the preview rejects the same configs that POST /admin/schedules/workflow
-    // would reject, regardless of pause state.
+    // A paused candidate returns no entries. Every validation above runs first,
+    // so the preview rejects the same configs as POST /admin/schedules/workflow,
+    // whatever the pause state.
     if body.paused {
         return Ok((
             StatusCode::OK,
@@ -49558,11 +49383,10 @@ async fn preview_candidate_schedule_handler(
     } else {
         vec![]
     };
-    // Use the timezone embedded in the schedule variant so local_at always
-    // reflects what the DB will store after saving. CronInTimezone carries the
-    // timezone explicitly; Interval and Manual are always UTC-based (Schedule::timezone_str()
-    // returns "UTC" for those variants), so using body.timezone there would show a
-    // timezone that the persisted schedule would not honour.
+    // Use the timezone of the schedule variant, so `local_at` matches what the
+    // DB stores. `CronInTimezone` carries its timezone. `Interval` and `Manual`
+    // are UTC (`Schedule::timezone_str()` returns "UTC"), so `body.timezone`
+    // there would show a timezone the persisted schedule does not honour.
     let effective_timezone: &str = match &schedule {
         autumn_harvest::policy::Schedule::CronInTimezone { tz, .. } => tz.as_str(),
         _ => "UTC",
@@ -49864,9 +49688,9 @@ async fn heartbeat_external_activity(
                     current_state: task.state,
                 }));
             }
-            // Default to the original configured duration so that omitting
-            // extend_by_secs resets the deadline by the same fixed window every
-            // time, regardless of how many heartbeats have already fired.
+            // Default to the original duration. An omitted `extend_by_secs` then
+            // resets the deadline by the same window each time, however many
+            // heartbeats have fired.
             let original_secs = u64::try_from(task.schedule_to_close_secs).unwrap_or(1);
             let extend_by = request.extend_by_secs.unwrap_or(original_secs);
             external_task::extend_deadline(&mut conn, token, extend_by)
@@ -49934,18 +49758,16 @@ where
 // Worker fleet observability (issue #100)
 // ---------------------------------------------------------------------------
 
-/// Deduplicate worker rows fanned out across shards, keeping the **freshest**
-/// snapshot per `worker_id` (the row with the most recent `last_heartbeat_at`).
+/// Deduplicate worker rows across shards, keeping the freshest snapshot per `worker_id`.
 ///
-/// A multi-shard worker registers a row in every assigned shard's
-/// `harvest_workers` table and heartbeats each independently, so the same
-/// `worker_id` appears once per shard with possibly different shard-local
-/// health. Keeping the first-seen row (lowest shard from `iter_shards()`) could
-/// let a stale copy on a lower shard mask a healthy heartbeat on a higher one,
-/// and — since the per-shard filter matches the advertised `shard_assignments`
-/// JSON rather than the source shard — could even return a non-source-shard copy
-/// for `?shard_id=` queries (issue #522 review). The freshest snapshot reflects
-/// the worker's true liveness regardless of which shard it was read from.
+/// A multi-shard worker has a row in each assigned shard's `harvest_workers`
+/// table, with its own heartbeat. So the same `worker_id` appears once per
+/// shard, with possibly different health. The first-seen row could let a stale
+/// copy on a lower shard mask a healthy heartbeat on a higher one. The
+/// per-shard filter matches the advertised `shard_assignments` JSON, not the
+/// source shard. So it could even return a non-source copy for `?shard_id=`
+/// queries (issue #522). The freshest row has the latest `last_heartbeat_at`
+/// and shows the true liveness.
 pub(crate) fn dedup_workers_by_freshest(rows: Vec<WorkerRow>) -> Vec<WorkerRow> {
     dedup_worker_sources_by_freshest(rows.into_iter().map(|row| (0, row)).collect())
         .into_iter()
@@ -50014,20 +49836,18 @@ async fn list_workers_handler(
     let filters = parse_worker_filters_api(&pairs)?;
     let stale_threshold = api_state.worker_stale_threshold();
 
-    // Per-shard load drops the snapshot-dependent filters (status, health,
-    // build_id, deployment_name) and applies them globally AFTER dedup
-    // (issue #522 review). A multi-shard worker's shard rows can disagree on
-    // status/health, so filtering per-shard could let a stale Active copy on one
-    // shard survive while the freshest Draining row on another is dropped before
-    // dedup — returning the obsolete snapshot. The queue filter (read from the
-    // worker's advertised JSON, identical across rows) is kept here. `shard_id`
-    // is deliberately dropped from the per-shard query below. It is reapplied
-    // after, source-aware (issue #1213). It is NOT shard-invariant. An
-    // empty-array (auto/legacy) row means "covers whatever shard it was read
-    // from". The fan-out also reads such rows from every OTHER shard. An
-    // evaluation of those rows against the caller's requested shard would
-    // falsely match. Use i64::MAX as the per-shard limit so list_workers
-    // performs no truncation before the global sort+truncate below.
+    // The per-shard load drops the snapshot filters (status, health, build_id,
+    // deployment_name) and applies them after dedup (issue #522). The shard
+    // rows of one worker can disagree on status or health. A per-shard filter
+    // could keep a stale Active copy and drop the freshest Draining row. That
+    // returns the obsolete snapshot. The queue filter stays here, because it
+    // reads the advertised JSON, which is the same on every row. `shard_id` is
+    // dropped here and reapplied later, source-aware (issue #1213). It is NOT
+    // shard-invariant. An empty-array (auto/legacy) row covers whatever shard
+    // it was read from. The fan-out reads such rows from every other shard too,
+    // so a check against the requested shard would match falsely. The
+    // per-shard limit is i64::MAX, so `list_workers` truncates nothing before
+    // the global sort and truncate below.
     let requested_shard_id = filters.shard_id;
     let per_shard_filters = WorkerFilters {
         limit: i64::MAX,
@@ -50147,13 +49967,12 @@ async fn get_worker_handler(
     let stale_threshold = api_state.worker_stale_threshold();
     let pool = api_state.storage_pool().map_err(map_error)?;
 
-    // Fan out across all shards: a multi-shard worker has a row per shard, each
-    // carrying its own status/health snapshot and its own RUNNING task ids. Keep
-    // the freshest row (max last_heartbeat_at) and union active_task_ids across
-    // every shard so the detail view is current and complete rather than the
-    // first-reachable shard's partial snapshot (issue #522 review). Skip
-    // unavailable shards rather than returning 500; the worker may live on a
-    // reachable shard even when others are down.
+    // Fan out across all shards. A multi-shard worker has a row per shard, each
+    // with its own status, health and RUNNING task ids. Keep the freshest row
+    // (max last_heartbeat_at) and union active_task_ids over every shard. The
+    // detail view is then current and complete (issue #522). Skip an
+    // unavailable shard rather than return 500. The worker may live on a
+    // reachable shard.
     let mut freshest: Option<WorkerRow> = None;
     let mut active_task_ids: Vec<uuid::Uuid> = Vec::new();
     for (_shard, shard_pool) in pool.iter_shards() {
@@ -50189,11 +50008,10 @@ async fn get_worker_handler(
 
 /// `GET /workers/{worker_id}/pinned`
 ///
-/// Lists workflow executions currently soft-pinned to the given worker by the
-/// sticky-routing affinity mechanism (issue #235). An execution appears here
-/// while its `sticky_worker_id` column points at this worker — i.e., after the
-/// worker most recently parked a follow-up task for it and before the execution
-/// either completes or is reclaimed by another worker after lease expiry.
+/// Lists executions soft-pinned to the worker by sticky routing (issue #235).
+/// An execution appears while its `sticky_worker_id` points at this worker.
+/// That starts when the worker parks a follow-up task for it. It ends when the
+/// execution completes, or another worker reclaims it after lease expiry.
 ///
 /// Returns an empty array (not 404) if the worker exists but has no pinned
 /// executions.
@@ -50225,16 +50043,14 @@ async fn workers_health(
         ..WorkerFilters::default()
     };
 
-    // Collect all worker rows from every shard, tagged with the shard each row
-    // was read from. Dedup by worker_id so a multi-shard worker (which
-    // registers a row in each of its shard DBs) is counted exactly once in
-    // the healthy/stale/draining/by_shard totals. The source tag survives
-    // dedup (issue #1208): `by_shard` needs it below, to attribute an
-    // empty-array (auto/legacy) row to the shard it actually came from.
+    // Collect worker rows from every shard, tagged with the source shard. Dedup
+    // by worker_id, so a multi-shard worker counts once in the
+    // healthy/stale/draining/by_shard totals. The source tag survives dedup
+    // (issue #1208). `by_shard` needs it to attribute an empty-array
+    // (auto/legacy) row to its real shard.
     //
-    // Issue #756: collect-and-continue — an unreachable shard is named in
-    // `unavailable_shards` and the totals reflect the reachable shards rather
-    // than failing the whole health check with a `500`.
+    // Issue #756: an unreachable shard is named in `unavailable_shards`. The
+    // totals cover the reachable shards, and the check does not fail with `500`.
     let observations = observe_shards(&api_state, |source_shard_id, mut conn| {
         let per_shard_filters = per_shard_filters.clone();
         async move {
@@ -50251,9 +50067,8 @@ async fn workers_health(
         unavailable_shards,
     } = collect_fanout_rows(observations);
 
-    // Dedup by worker_id, keeping the freshest per-shard snapshot so a stale
-    // copy on one shard never masks a healthy heartbeat on another in the
-    // healthy/stale/draining totals (issue #522 review).
+    // Keep the freshest snapshot per worker_id. A stale copy on one shard then
+    // never masks a healthy heartbeat on another (issue #522).
     let all_workers = dedup_worker_sources_by_freshest(all_workers);
 
     let mut combined = FleetHealth {
@@ -50333,9 +50148,10 @@ const fn drain_outcome_rank(outcome: autumn_harvest::workers::DrainOutcome) -> u
     }
 }
 
-/// Merge the drain results from two shard rows of the same worker into one
-/// aggregate response: keep the most significant outcome, the larger in-flight
-/// count, the union of served shard ids, and the first non-null deadline.
+/// Merge the drain results of two shard rows of one worker.
+///
+/// Keep the most significant outcome, the larger in-flight count, the union of
+/// served shard ids, and the first non-null deadline.
 fn merge_drain_responses(mut acc: DrainResponse, other: DrainResponse) -> DrainResponse {
     if drain_outcome_rank(other.outcome) > drain_outcome_rank(acc.outcome) {
         acc.outcome = other.outcome;
@@ -50382,12 +50198,11 @@ async fn request_drain_handler(
         (computed, false)
     };
 
-    // For non-explicit re-drains (omitted or computed default deadline), reuse the
-    // earliest drain deadline already stored on any Draining shard row for this
-    // worker. A lagging-shard Active row receiving a fresh-computed default would
-    // otherwise extend the drain window: the heartbeat task treats any new
-    // drain_deadline_at value as a new drain command and resets its local
-    // shutdown Instant to the new value, silently pushing the deadline out.
+    // A non-explicit re-drain (omitted or default deadline) reuses the earliest
+    // deadline stored on any Draining shard row of this worker. A fresh default
+    // on a lagging Active row would extend the drain window. The heartbeat task
+    // treats a new drain_deadline_at as a new drain command. It resets its local
+    // shutdown Instant to that value and pushes the deadline out silently.
     let deadline_at = if deadline_is_explicit {
         deadline_at
     } else {
@@ -50403,15 +50218,12 @@ async fn request_drain_handler(
         earliest.or(deadline_at)
     };
 
-    // Fan the drain transition out to EVERY reachable shard that has a row for
-    // this worker (issue #522 review). A multi-shard worker registers a row in
-    // each assigned shard's DB and runs an independent heartbeat per shard, any
-    // of which triggers graceful shutdown the moment it observes `Draining`.
-    // Updating only the first-hit row would leave the worker polling if its
-    // heartbeat to that shard happens to be broken while another shard's
-    // heartbeat is healthy (and its row still `Active`). Connection failures on
-    // individual shards are recorded as unavailable rather than aborting the
-    // whole request (AC #8).
+    // Fan the drain out to EVERY reachable shard with a row for this worker
+    // (issue #522). A multi-shard worker runs one heartbeat per shard, and any
+    // of them starts graceful shutdown when it sees `Draining`. If only the
+    // first row changed, a broken heartbeat to that shard could leave the worker
+    // polling while another shard's row stays `Active`. A connection failure on
+    // one shard is recorded as unavailable and does not abort the request (AC #8).
     let mut unavailable_shards: Vec<i32> = Vec::new();
     let mut aggregate: Option<DrainResponse> = None;
     for (shard_id, shard_pool) in pool.iter_shards() {
@@ -50608,13 +50420,11 @@ pub(crate) struct AdmitUpdateRequest {
 }
 
 impl AdmitUpdateRequest {
-    /// Request carrying the update input — used by the MCP update tools
-    /// (issue #597).
+    /// Request that carries the update input, for the MCP update tools (issue #597).
     ///
-    /// Only called from `mcp_tools.rs`, which is entirely excluded from the
-    /// build without the `mcp` cargo feature; without this, a default
-    /// (no-`mcp`) build sees zero callers and clippy's `-D warnings` treats
-    /// that as a hard error.
+    /// Only `mcp_tools.rs` calls it, and the build drops that file without the
+    /// `mcp` cargo feature. A default build then sees zero callers, and clippy's
+    /// `-D warnings` makes that a hard error.
     #[cfg_attr(not(feature = "mcp"), allow(dead_code))]
     pub(crate) const fn new(input: Value) -> Self {
         Self { input }
@@ -50657,10 +50467,10 @@ struct UpdateOrphanedResponse {
 
 /// `POST /workflows/{id}/update/{update_name}`
 ///
-/// Durably appends an `UpdateAdmitted` event for the named handler, wakes the
-/// workflow worker, then either returns immediately (`?wait=admitted`) or polls
-/// for the terminal `UpdateCompleted`/`UpdateFailed` event (`?wait=completed`,
-/// the default) until the configurable timeout fires.
+/// Durably appends an `UpdateAdmitted` event for the named handler and wakes the
+/// workflow worker. With `?wait=admitted` it returns at once. With
+/// `?wait=completed`, the default, it polls for the terminal
+/// `UpdateCompleted`/`UpdateFailed` event until the configurable timeout fires.
 // Grew past the 100-line cap when `poll_update_result` gained the codec
 // registry argument, which turned a one-line tail call into a seven-line one.
 // The body is a flat sequence of validation steps, not nested logic.
@@ -50682,37 +50492,33 @@ pub(crate) async fn admit_update(
         Err(e) => return e.into_response(),
     };
 
-    // Fail closed if the runtime is not installed yet, rather than silently
-    // skipping the validator check below. `install_storage_pool` runs before
-    // `install(runtime)` during plugin startup (with a genuine `.await` --
-    // the boot-time admission-gate load -- in between), so a request can
-    // reach this handler with a working storage pool while `runtime()` still
-    // errors. Without this check, that narrow startup window would let a
-    // validator-bearing update slip through unvalidated into durable history
-    // instead of being rejected at the edge (code-review finding, PR #908).
-    // Mirrors `update_with_start_workflow`'s identical hard requirement.
+    // Fail closed if the runtime is not installed yet. Do not skip the validator
+    // check below. Plugin startup runs `install_storage_pool` before
+    // `install(runtime)`, with a real `.await` between them (the boot-time
+    // admission-gate load). So a request can reach this handler with a working
+    // storage pool while `runtime()` still errors. Without this check, a
+    // validator-bearing update could enter durable history unvalidated in that
+    // window (PR #908). `update_with_start_workflow` has the same requirement.
     let runtime = match api_state.runtime() {
         Ok(r) => r,
         Err(e) => return map_error(e).into_response(),
     };
 
-    // Run the registered update handler's validator (if any) before
-    // admitting -- mirrors the validator check `update_with_start_workflow_execution`
-    // already runs, so an invalid payload is rejected at the edge instead of
-    // becoming durable history that runs/fails deep inside the workflow.
-    // Scoped by (workflow_name, update_name), not update_name alone, since two
-    // different workflows may register update handlers with the same name.
+    // Run the validator of the registered update handler, if any, before
+    // admission. `update_with_start_workflow_execution` runs the same check. So
+    // an invalid payload is rejected at the edge and does not become durable
+    // history that fails deep inside the workflow. The scope is
+    // (workflow_name, update_name), because two workflows can register update
+    // handlers with the same name.
     //
-    // Issue #843: an update addresses the LOGICAL run, so follow the
-    // workflow-level retry chain (#523/#842) to the live attempt before both
-    // validating and admitting.
+    // Issue #843: an update addresses the LOGICAL run. So follow the
+    // workflow-level retry chain (#523/#842) to the live attempt before
+    // validation and admission.
     //
-    // A retry successor is minted on the predecessor's shard. Nothing stops
-    // it from being rebalanced away afterwards (issue #1596 review).
-    // `resolve_live_attempt` re-resolves residence at each hop, rather than
-    // trusting `conn` to already own the whole chain. `resolve_live_attempt`
-    // returns the resolved row, so the validation below reuses it rather than
-    // re-loading the identical row by id.
+    // A retry successor is minted on the predecessor's shard. It can still be
+    // rebalanced away later (issue #1596). `resolve_live_attempt` re-resolves
+    // residence at each hop and does not trust `conn` to own the whole chain.
+    // It returns the resolved row, so the validation below reuses that row.
     let pool = match api_state.storage_pool() {
         Ok(pool) => pool,
         Err(e) => return map_error(e).into_response(),
@@ -50742,12 +50548,11 @@ pub(crate) async fn admit_update(
             .iter()
             .find(|h| h.workflow == execution.workflow_name && h.name == update_name)
     {
-        // issue #610: structural schema validation of the update argument
-        // against the handler's published `arg_schema` (if any). Runs *before*
-        // the semantic validator below so a malformed payload is rejected at
-        // the edge with a field-level 400 rather than reaching the validator
-        // (422) or becoming durable history. A handler with no published schema
-        // validates Ok (today's behavior, unchanged).
+        // Issue #610: validate the update argument against the handler's
+        // published `arg_schema`, if any. This runs before the semantic validator
+        // below, so a malformed payload gets a field-level 400 at the edge. It
+        // does not reach the validator (422) or durable history. A handler with
+        // no published schema validates Ok.
         if let Err(violations) = update_info.validate_arg(&request.input) {
             return schema_validation_response("update payload validation failed", violations);
         }
@@ -50774,23 +50579,21 @@ pub(crate) async fn admit_update(
 
     let update_id = UpdateId::new();
 
-    // Durably append the UpdateAdmitted event inside a FOR UPDATE transaction
-    // that also verifies the execution is still RUNNING.  Doing the state check
-    // and the insert under the same row-level lock prevents a TOCTOU race where
-    // the workflow could complete between a separate state read and the insert.
-    // UpdateRejected is returned if the execution is no longer RUNNING. The
-    // recorder emits harvest.update.admitted post-commit (issue #684).
+    // Append the UpdateAdmitted event in a FOR UPDATE transaction that also
+    // checks the execution is still RUNNING. The check and the insert share one
+    // row lock. That prevents a TOCTOU race in which the workflow completes
+    // between a separate read and the insert. A non-RUNNING execution returns
+    // UpdateRejected. The recorder emits harvest.update.admitted after commit
+    // (issue #684).
     //
-    // Issue #843: if the resolved attempt failed and the chain advanced under
-    // us between the resolve above and the admit, re-drive onto the fresh live
-    // attempt. `admit_update_event` verifies RUNNING under the same FOR UPDATE
-    // lock and rolls back on rejection, so a re-driven admit can never
-    // double-admit.
+    // Issue #843: if the resolved attempt fails and the chain advances before
+    // the admit, re-drive onto the fresh live attempt. `admit_update_event`
+    // checks RUNNING under the same FOR UPDATE lock and rolls back on
+    // rejection, so a re-driven admit can never double-admit.
     //
-    // Bound to `target_shard`, not `conn` directly (issue #1596 follow-up
-    // review, comment 4052389744). The resolved attempt, and each
-    // re-drive's fresh one, can live on a different shard than `conn`.
-    // `conn` stays on `exec_id`'s own shard throughout.
+    // Bound to `target_shard`, not `conn` (issue #1596, comment 4052389744).
+    // The resolved attempt, and each re-drive's fresh one, can live on a
+    // different shard than `conn`. `conn` stays on the shard of `exec_id`.
     let mut bound = match autumn_harvest::shard_rebalance::bind_to_shard(
         &mut conn,
         pool.sharded_pool(),
@@ -50918,9 +50721,8 @@ pub async fn poll_update_result(
     update_id: UpdateId,
     timeout_secs: u64,
     // The update's `output` is a payload field returned verbatim to the HTTP
-    // caller, so this must be the configured registry: the identity one would
-    // either raise `UnknownCodecKey` or serve a ciphertext envelope as the
-    // update result.
+    // caller. So this must be the configured registry. The identity registry
+    // would raise `UnknownCodecKey` or serve a ciphertext envelope as the result.
     codecs: &autumn_harvest::payload_codec::PayloadCodecs,
 ) -> axum::response::Response {
     use axum::response::IntoResponse as _;
@@ -50930,14 +50732,14 @@ pub async fn poll_update_result(
     let poll_result = tokio::time::timeout(Duration::from_secs(timeout_secs), async {
         loop {
             let result = {
-                // Scope the connection so it is returned to the pool before sleeping.
-                // Forwarding-aware (issue #964): the admit-and-wake half of an
-                // update routes through `db_conn_for_execution`, which follows
-                // the durable pointer to the live copy. If the poll did not, a
-                // rebalanced workflow would have its update run on the target
-                // while this loop read the sealed source's frozen history —
-                // never observing `UpdateCompleted`/`UpdateFailed`, and
-                // answering 504 for an update that in fact completed.
+                // Scope the connection so it returns to the pool before the sleep.
+                // Forwarding-aware (issue #964). The admit-and-wake half of an
+                // update follows the durable pointer to the live copy through
+                // `db_conn_for_execution`. Without forwarding, a rebalanced
+                // workflow runs its update on the target while this loop reads
+                // the frozen history of the sealed source. The loop then never
+                // sees `UpdateCompleted`/`UpdateFailed` and answers 504 for a
+                // completed update.
                 let mut c = autumn_harvest::shard_rebalance::conn_for_execution_forwarded(
                     pool.sharded_pool(),
                     exec_id,
@@ -51052,24 +50854,23 @@ async fn get_update_result(
         Err(e) => return map_error(e).into_response(),
     };
 
-    // Issue #843: `admit_update` routes admission to the live attempt of the
-    // workflow-level retry chain, and its `wait=admitted` 202 carries only the
-    // `update_id` — no execution id. So this paired read MUST follow the same
-    // chain, or the caller's only follow-up would 404 forever.
+    // Issue #843: `admit_update` admits to the live attempt of the
+    // workflow-level retry chain. Its `wait=admitted` 202 carries only the
+    // `update_id`, with no execution id. So this read MUST follow the same
+    // chain, or the only follow-up of the caller would 404 forever.
     //
-    // Resolving *straight to the live attempt* is not enough, though. An
-    // `update_id` is minted per admission, so it lives on exactly ONE attempt;
-    // if the update was admitted (and possibly already completed) on attempt N
-    // and N then failed and scheduled N+1, the durable `UpdateAdmitted` /
-    // `UpdateCompleted` pair stays on N while the live attempt N+1 replays an
-    // empty history. So search the CHAIN for the attempt that actually carries
-    // this admission — deepest first, because the live attempt is the common
-    // case (an update admitted moments ago) and a workflow that never retried
-    // has a one-element chain, i.e. exactly today's single history load.
+    // Resolving *straight to the live attempt* is not enough. Each admission
+    // mints an `update_id`, so it lives on exactly ONE attempt. Suppose attempt
+    // N admitted (and maybe completed) the update, then failed and scheduled
+    // N+1. The durable `UpdateAdmitted` / `UpdateCompleted` pair stays on N,
+    // and N+1 replays an empty history. So search the CHAIN for the attempt
+    // that carries this admission, deepest first. The live attempt is the
+    // common case, and a workflow that never retried has a one-element chain.
+    // That is exactly one history load.
     //
-    // Issue #1596 review: `retry_chain_ids` re-resolves residence at each
-    // hop. A chain member rebalanced onto another shard is still discovered
-    // here, instead of the walk stopping at its stale origin-side seal.
+    // Issue #1596: `retry_chain_ids` re-resolves residence at each hop. So the
+    // walk finds a chain member rebalanced onto another shard and does not stop
+    // at its stale origin-side seal.
     let chain = match autumn_harvest::execution::retry_chain_ids(
         &mut conn,
         pool.sharded_pool(),
@@ -51379,12 +51180,12 @@ async fn list_build_routing_handler(
 
 /// `POST /admin/build-routing/policies` — set the active build policy for a queue.
 ///
-/// Fans out to all shards so every shard's `get_build_policy()` call sees the new
-/// policy when evaluating `assigned_build_id` at workflow-start time.
+/// Fans out to all shards, so the `get_build_policy()` call of each shard sees
+/// the new policy when it evaluates `assigned_build_id` at workflow start.
 ///
-/// Uses fail-forward fan-out: attempts every shard and collects errors rather than
-/// aborting on first failure, so a transient shard outage does not leave routing
-/// state diverged across the remaining shards.
+/// The fan-out is fail-forward: it tries every shard and collects errors. So a
+/// transient shard outage does not leave routing state diverged across the
+/// other shards.
 #[allow(clippy::too_many_lines)]
 async fn set_build_policy_handler(
     headers: axum::http::HeaderMap,
@@ -52498,18 +52299,17 @@ pub struct TaskEligibilityResponse {
 
 /// Order a merged `reason_codes` array for the eligibility explainer.
 ///
-/// The operator's own deliberate holds ([`OPERATOR_PAUSE_REASON_CODES`]) lead;
-/// everything else is alphabetical so the array is stable across polls. Within
-/// the leading group the order is alphabetical too, so a task held by *both* a
-/// queue pause and an activity pause reports them deterministically.
+/// The operator's own holds ([`OPERATOR_PAUSE_REASON_CODES`]) lead, and the
+/// rest is alphabetical, so the array is stable across polls. The leading group
+/// is alphabetical too, so a task held by *both* a queue pause and an activity
+/// pause reports them deterministically.
 ///
-/// This exists because [`task_intrinsic_impediment_reasons`] pushes the pause
-/// codes first but *both* eligibility merges collapse the per-task reason lists
-/// through a `HashSet` — destroying insertion order — and then re-sort. A plain
-/// `sort()` puts `concurrency_saturated` ahead of `queue_paused`, so the
-/// helper's documented priority never reached the response an operator actually
-/// reads (issue #619 review). Both merge sites call *this* function rather than
-/// sorting by hand, so they cannot drift.
+/// [`task_intrinsic_impediment_reasons`] pushes the pause codes first. But
+/// *both* eligibility merges collapse the per-task lists through a `HashSet`,
+/// which destroys insertion order, and then re-sort. A plain `sort()` puts
+/// `concurrency_saturated` ahead of `queue_paused`, so the documented priority
+/// never reached the response (issue #619). Both merge sites call *this*
+/// function, so they cannot drift.
 fn sort_reason_codes(reason_codes: &mut [String]) {
     reason_codes.sort_by(|a, b| {
         let rank = |code: &str| u8::from(!is_operator_pause_reason(code));
@@ -52528,13 +52328,12 @@ const QUEUE_PAUSED_REASON_CODE: &str = "queue_paused";
 /// [`QUEUE_PAUSED_REASON_CODE`].
 const ACTIVITY_PAUSED_REASON_CODE: &str = "activity_paused";
 
-/// Every reason code that represents a deliberate *operator hold* rather than a
-/// capacity or compatibility impediment.
+/// Every reason code that is a deliberate *operator hold*, not a capacity or
+/// compatibility impediment.
 ///
-/// These share two behaviours — they lead [`sort_reason_codes`], and they are
-/// excluded from [`is_worker_draining_only`] — so they are listed once here
-/// rather than enumerated at each site, where a future third hold would
-/// otherwise have to be remembered twice.
+/// These codes lead [`sort_reason_codes`] and are excluded from
+/// [`is_worker_draining_only`]. One list means a future third hold is added
+/// in one place, not two.
 const OPERATOR_PAUSE_REASON_CODES: [&str; 2] =
     [QUEUE_PAUSED_REASON_CODE, ACTIVITY_PAUSED_REASON_CODE];
 
@@ -52545,20 +52344,19 @@ fn is_operator_pause_reason(code: &str) -> bool {
 
 /// Whether an activity pause holds this task (issue #807).
 ///
-/// **Mirrors the authoritative claim gate in `queue::claim_task` exactly**, and
-/// must keep doing so or the explainer lies about why a task is not moving:
+/// **Mirrors the authoritative claim gate in `queue::claim_task` exactly.** If
+/// it drifts, the explainer lies about why a task is not moving:
 ///
-/// - Scoped by `task_type == "activity"`. A **workflow** task can legitimately
-///   carry a non-NULL `activity_name` — the engine stamps the
-///   `'mixed_signal_suspension'` sentinel there — so keying on `activity_name`
-///   alone would report `activity_paused` on mixed-signal-suspended workflow
-///   tasks the gate never holds. The core pins this with
+/// - Scoped by `task_type == "activity"`. A **workflow** task can carry a
+///   non-NULL `activity_name`, because the engine stamps the
+///   `'mixed_signal_suspension'` sentinel there. A key on `activity_name` alone
+///   would report `activity_paused` on mixed-signal-suspended workflow tasks
+///   that the gate never holds. The core pins this with
 ///   `anti_join_is_scoped_by_task_type_not_by_a_null_activity_name`.
-/// - Not filtered by `scope_shard_id`. That column records operator *intent*
-///   and is consulted by neither the claim gate nor the anti-join; the row's
-///   presence on *this shard's database* is the hold, and
-///   `evaluate_eligibility_for_shard` already runs per-shard on that shard's
-///   connection.
+/// - Not filtered by `scope_shard_id`. That column records operator *intent*,
+///   and neither the claim gate nor the anti-join reads it. The row on *this
+///   shard's database* is the hold. `evaluate_eligibility_for_shard` already
+///   runs per shard on the connection of that shard.
 fn task_is_activity_paused(
     task_type: &str,
     activity_name: Option<&str>,
@@ -52571,12 +52369,11 @@ fn task_is_activity_paused(
 /// Which operator holds apply to one task, for
 /// [`task_intrinsic_impediment_reasons`].
 ///
-/// Grouped into a struct rather than passed as two more positional `bool`s
-/// because the helper already takes three (`has_cb`, `concurrency_saturated`,
-/// and formerly `queue_paused`): a fourth would put four bare booleans in a row
-/// at every call site, where transposing two is a silent semantic bug no type
-/// check catches. It also keeps the argument count at clippy's default
-/// `too_many_arguments` threshold instead of needing an `allow`.
+/// A struct, not two more positional `bool`s. The helper already takes three
+/// (`has_cb`, `concurrency_saturated`, and formerly `queue_paused`). A fourth
+/// bare boolean in a row invites a silent transposition that no type check
+/// catches. The struct also keeps the argument count at the clippy
+/// `too_many_arguments` threshold, with no `allow`.
 #[derive(Debug, Clone, Copy, Default)]
 struct OperatorPauseHolds {
     /// The task's queue is held by an operator queue pause (issue #619).
@@ -52589,18 +52386,16 @@ struct OperatorPauseHolds {
 /// Whether a worker's only *worker-level* impediment is that it is draining.
 ///
 /// The [`OPERATOR_PAUSE_REASON_CODES`] are filtered out because they describe
-/// the WORK, not the worker: the `all_draining` diagnosis is a statement about
-/// fleet state, and it stays true when an operator additionally holds the queue
-/// (issue #619) or one of its activity types (issue #807). Reporting a pause
-/// therefore never silently downgrades the diagnosis — the independent facts
-/// surface on their own channels, the diagnosis and the worker's
-/// `reason_codes`.
+/// the WORK, not the worker. The `all_draining` diagnosis is about fleet state.
+/// It stays true when an operator also holds the queue (issue #619) or one of
+/// its activity types (issue #807). So a pause never silently downgrades the
+/// diagnosis. The independent facts surface on their own channels: the
+/// diagnosis and the worker's `reason_codes`.
 ///
-/// `activity_paused` is filtered for the same reason as `queue_paused` even
-/// though it is a *task*-level rather than a queue-level fact: on the
-/// worker-reason short-circuit there is no per-task context anyway, and the
-/// question this predicate answers ("is the fleet merely draining?") is about
-/// workers either way.
+/// `activity_paused` is a *task*-level fact, not a queue-level one. It is
+/// filtered for the same reason as `queue_paused`. The worker-reason
+/// short-circuit has no per-task context, and this predicate asks about
+/// workers ("is the fleet merely draining?").
 fn is_worker_draining_only(reason_codes: &[String]) -> bool {
     let worker_level: Vec<&str> = reason_codes
         .iter()
@@ -52611,27 +52406,25 @@ fn is_worker_draining_only(reason_codes: &[String]) -> bool {
 }
 
 /// Compute the reason codes that depend only on the task and shared runtime
-/// state — not on any particular worker (issue #611).
+/// state, not on a worker (issue #611).
 ///
-/// These are the impediments that block *every* worker equally: a saturated
-/// per-key concurrency cap, an exhausted rate-limit bucket, and an OPEN /
-/// HALF-OPEN circuit breaker on the task's next activity. The worker-specific
-/// reasons (`build_incompatible`, `sticky_owned_by_other_worker`,
-/// `unsatisfied_requirement:*`) are computed separately by the caller and
-/// appended alongside these, preserving the existing multi-reason behaviour
-/// (AC5).
+/// These impediments block *every* worker equally. They are a saturated
+/// per-key concurrency cap, an exhausted rate-limit bucket, and an OPEN or
+/// HALF-OPEN circuit breaker on the next activity. The caller computes the
+/// worker-specific reasons (`build_incompatible`,
+/// `sticky_owned_by_other_worker`, `unsatisfied_requirement:*`) and appends
+/// them, which keeps the multi-reason behaviour (AC5).
 ///
-/// Rate-limit suppression (issue #369): an activity that carries a circuit
-/// breaker (`has_cb`) enforces rate limiting at dispatch, not at claim, so a
-/// stale `rate_limit_exhausted` reason is never surfaced for it — its
-/// impediment is the circuit reason instead.
+/// Rate-limit suppression (issue #369): an activity with a circuit breaker
+/// (`has_cb`) is rate-limited at dispatch, not at claim. So a stale
+/// `rate_limit_exhausted` reason never surfaces for it. Its impediment is the
+/// circuit reason.
 ///
-/// Operator pauses (issues #619 and #807): a held queue is reported as
-/// `queue_paused` and a held activity type as `activity_paused`. They are
-/// listed first because they are the *operator's own deliberate action* — the
-/// impediments a triaging operator should see before anything else. Both are
-/// reported when both apply; a pause reorders the array, it never suppresses a
-/// co-occurring impediment.
+/// Operator pauses (issues #619 and #807): a held queue reports
+/// `queue_paused` and a held activity type reports `activity_paused`. They come
+/// first, because they are the *operator's own deliberate action*. A triaging
+/// operator should see them first. Both are reported when both apply. A pause
+/// reorders the array and never suppresses a co-occurring impediment.
 fn task_intrinsic_impediment_reasons(
     activity_name: Option<&str>,
     rate_limit_key: Option<&str>,
@@ -52643,14 +52436,14 @@ fn task_intrinsic_impediment_reasons(
 ) -> Vec<String> {
     let mut reasons = Vec::new();
 
-    // Issues #619 / #807: an operator pause blocks every worker equally, so
-    // without these the explainer would report an EMPTY reason set for a held
-    // task — a false "no impediment" during exactly the idle-worker triage
-    // this endpoint exists for.
+    // Issues #619 / #807: an operator pause blocks every worker equally. Without
+    // these codes, the explainer would report an EMPTY reason set for a held
+    // task. That is a false "no impediment" during the idle-worker triage this
+    // endpoint exists for.
     //
-    // Pushed in the same alphabetical order `sort_reason_codes` restores after
-    // the merges, so the producer and the response agree even for a task held
-    // by both.
+    // Push them in the alphabetical order that `sort_reason_codes` restores
+    // after the merges. The producer and the response then agree even for a
+    // task held by both.
     if pauses.activity {
         reasons.push(ACTIVITY_PAUSED_REASON_CODE.to_string());
     }
@@ -52662,9 +52455,9 @@ fn task_intrinsic_impediment_reasons(
         reasons.push("concurrency_saturated".to_string());
     }
 
-    // Rate limiting for CB activities is enforced at dispatch, not at claim
-    // (issue #369), so a saturated bucket never surfaces here for them — the
-    // circuit reason below is the accurate impediment.
+    // CB activities are rate-limited at dispatch, not at claim (issue #369). So
+    // a saturated bucket never surfaces here for them. The circuit reason below
+    // is the accurate impediment.
     if !has_cb
         && let Some(rlk) = rate_limit_key
         && saturated_rate_limits.contains(rlk)
@@ -52873,12 +52666,11 @@ async fn evaluate_eligibility_for_shard(
         .unwrap_or_default();
 
     // Observable circuit-breaker phase per tracked activity (issue #611).
-    // `list()` prunes each breaker's rolling failure window and reads its phase;
-    // it never transitions phase (Open→HalfOpen is driven exclusively by
-    // dispatch), so an open breaker reads "open" through the cooldown until a
-    // probe is admitted — safe to consult read-only from this diagnostic
-    // endpoint (`list()`/`snapshot` only, never `on_dispatch`/`on_result`/
-    // `force_*`).
+    // `list()` prunes the rolling failure window of each breaker and reads its
+    // phase. It never transitions phase, because only dispatch drives
+    // Open→HalfOpen. So an open breaker reads "open" through the cooldown until
+    // a probe is admitted. This diagnostic endpoint can read it safely. It
+    // calls only `list()`/`snapshot`, never `on_dispatch`/`on_result`/`force_*`.
     let cb_phase: HashMap<String, &'static str> = api_state
         .runtime()
         .ok()
@@ -52915,24 +52707,21 @@ async fn evaluate_eligibility_for_shard(
             effective_tokens: f64,
         }
 
-        // Issue #945: this used to re-derive "tokens available right now" in
-        // Rust via a flat `elapsed * effective.refill_rate`. That applies
-        // whichever rate is effective AT THE MOMENT OF THE READ to the WHOLE
-        // elapsed interval. `queue::token_accrual_expr` fixes exactly that
-        // class of bug for the claim-time SQL gate. An operator override can
-        // expire mid-interval with no intervening write to settle the bucket.
-        // The reverted baseline rate is then applied retroactively to the part
-        // of the interval that the override was still throttling. That
-        // produces a phantom refill. This diagnostic could then report a key
-        // as available while `claim_task` still treats it as saturated (or
-        // the reverse). Delegating the whole
-        // computation to `queue::effective_available_tokens_expr` -- the
-        // SAME expression the claim-time gate, the dispatch-time debit, and
-        // the refund all use -- makes this diagnostic structurally unable to
-        // drift from what `claim_task` is actually enforcing, mirroring
-        // `check_throttled_keys`'s convention of doing the whole
-        // override-and-accrual computation in SQL rather than re-deriving it
-        // in Rust.
+        // Issue #945: this used to compute "tokens available now" in Rust with
+        // a flat `elapsed * effective.refill_rate`. That applies the rate in
+        // effect AT THE READ to the WHOLE elapsed interval.
+        // `queue::token_accrual_expr` fixes that class of bug for the claim-time
+        // SQL gate. An operator override can expire mid-interval with no write
+        // to settle the bucket. The baseline rate then applies retroactively to
+        // the part of the interval that the override still throttled. That
+        // produces a phantom refill. This diagnostic could then report a key as
+        // available while `claim_task` still treats it as saturated (or the
+        // reverse). So the whole computation goes to
+        // `queue::effective_available_tokens_expr`. The claim-time gate, the
+        // dispatch-time debit and the refund use the SAME expression. So this
+        // diagnostic cannot drift from what `claim_task` enforces. That follows
+        // the `check_throttled_keys` convention of doing the override and
+        // accrual computation in SQL.
         let effective_tokens_expr =
             queue::effective_available_tokens_expr("harvest_rate_limit_buckets");
         let rows: Vec<RateLimitRow> = diesel::sql_query(format!(
@@ -52952,15 +52741,14 @@ async fn evaluate_eligibility_for_shard(
         }
     }
 
-    // Issue #619: a queue held by an operator pause is unclaimable for a reason
-    // that has nothing to do with worker capacity, so surface it explicitly
-    // rather than reporting an empty (falsely "unimpeded") reason set.
+    // Issue #619: an operator pause makes a queue unclaimable for a reason
+    // unrelated to worker capacity. So surface it, not an empty (falsely
+    // "unimpeded") reason set.
     //
-    // The lookup PROPAGATES on failure rather than defaulting to empty: this
-    // explainer exists to answer "why is nothing being claimed?" during an
-    // incident, and swallowing a database error would answer it with a
-    // confident, wrong "nothing is holding this queue". Matches the sibling
-    // rate-limit read above.
+    // The lookup PROPAGATES a failure and does not default to empty. This
+    // explainer answers "why is nothing being claimed?" during an incident. A
+    // swallowed database error would answer with a confident, wrong "nothing
+    // is holding this queue". The sibling rate-limit read above does the same.
     let paused_queues: std::collections::HashSet<String> =
         autumn_harvest::queue_pause::paused_queue_names(&mut conn)
             .await
@@ -52979,9 +52767,8 @@ async fn evaluate_eligibility_for_shard(
             .into_iter()
             .collect();
 
-    // Hoisted out of the worker loop: the pause is a property of the queue under
-    // evaluation, so both the worker-reason short-circuit and the per-task loop
-    // below read the same answer.
+    // Hoisted out of the worker loop. The pause is a property of the queue, so
+    // the worker-reason short-circuit and the per-task loop read one answer.
     let queue_is_paused = paused_queues.contains(queue_name);
 
     let mut eligible_workers = Vec::new();
@@ -52999,11 +52786,10 @@ async fn evaluate_eligibility_for_shard(
         })
         .collect();
 
-    // Issue #807, for the worker-reason short-circuit below, which has no
-    // per-task context the way the per-task loop does. The queue-level analogue
-    // of "this task is held" is "the backlog under evaluation contains a held
-    // task", which is a true and actionable statement about why nothing is
-    // dispatching.
+    // Issue #807, for the worker-reason short-circuit below. It has no per-task
+    // context, unlike the per-task loop. The queue-level form of "this task is
+    // held" is "the backlog contains a held task". That is a true and
+    // actionable reason why nothing dispatches.
     let any_pending_task_activity_paused = pending_tasks.iter().any(|t| {
         task_is_activity_paused(&t.task_type, t.activity_name.as_deref(), &paused_activities)
     });
@@ -53051,15 +52837,14 @@ async fn evaluate_eligibility_for_shard(
         }
 
         // Issue #1150 / #961: the canonical predicate, not literal membership.
-        // An empty array is the auto (no sharded pool) / legacy shape and means
-        // "covers whatever shard this row was read from"; treating it as
-        // covering nothing would report a healthy worker polling this very
-        // database as `wrong_shard_assignment`.
-        // Deliberately reads the raw JSON value, not the decoded `Vec<i32>`
-        // above: that decode maps a *malformed* (non-array) value to an empty
-        // vec, which the predicate would then read as the permissive
-        // empty/legacy shape. Passing the value through keeps malformed ==
-        // covers nothing, matching every other consumer.
+        // An empty array is the auto (no sharded pool) / legacy shape. It
+        // covers whatever shard the row was read from. Reading it as covering
+        // nothing would report a healthy worker on this database as
+        // `wrong_shard_assignment`.
+        // This reads the raw JSON value, not the decoded `Vec<i32>` above. That
+        // decode maps a *malformed* (non-array) value to an empty vec, which the
+        // predicate would read as the permissive empty/legacy shape. The raw
+        // value keeps malformed == covers nothing, like every other consumer.
         if !autumn_harvest::workers::shard_assignments_cover(
             &w.worker.shard_assignments,
             shard_id.as_i32(),
@@ -53076,16 +52861,16 @@ async fn evaluate_eligibility_for_shard(
         }
 
         if !worker_reasons.is_empty() {
-            // Issue #619: a queue pause blocks every worker equally, so it has
-            // to be reported on this path too. It returns before the per-task
-            // loop below, so a fleet that is entirely unsubscribed / off-shard /
-            // draining / stopped — e.g. drained for the very outage the operator
-            // paused for — would otherwise never surface the operator's own hold
-            // on the one endpoint that answers "why is nothing being claimed?".
+            // Issue #619: a queue pause blocks every worker equally, so this
+            // path reports it too. This path returns before the per-task loop
+            // below. Without it, a fleet that is all unsubscribed, off-shard,
+            // draining or stopped would never show the operator's own hold. That
+            // fleet can be drained for the same outage the operator paused for.
+            // This endpoint is the one that answers "why is nothing being claimed?".
             //
-            // `queue_name` is the right key in both call paths: the queue
+            // `queue_name` is the right key in both call paths. The queue
             // endpoint filters tasks to it, and the single-task endpoint passes
-            // that task's own `queue_name`.
+            // the `queue_name` of that task.
             if queue_is_paused {
                 worker_reasons.push(QUEUE_PAUSED_REASON_CODE.to_string());
             }
@@ -53518,11 +53303,9 @@ mod eligibility_reason_tests {
         pairs.iter().map(|(n, s)| ((*n).to_string(), *s)).collect()
     }
 
-    // AC1: a task deferred solely because its rate-limit bucket is exhausted
-    // reports `rate_limit_exhausted` — never `concurrency_saturated`.
-    /// Issue #619: a queue held by an operator pause must surface as
-    /// `queue_paused`, listed first, and must not suppress the other
-    /// task-intrinsic impediments that also apply.
+    /// Issue #619: a queue held by an operator pause surfaces first as
+    /// `queue_paused`. It must not suppress the other task-intrinsic
+    /// impediments.
     #[test]
     fn queue_paused_is_reported_first_and_composes_with_other_reasons() {
         let saturated = std::collections::HashSet::new();
@@ -53561,9 +53344,9 @@ mod eligibility_reason_tests {
         assert!(unpaused.is_empty(), "an unpaused queue contributes nothing");
     }
 
-    /// Issue #807: an activity held by an operator pause must surface as
-    /// `activity_paused`, lead the array like its queue-level sibling, and
-    /// never suppress a co-occurring impediment.
+    /// Issue #807: an activity held by an operator pause surfaces as
+    /// `activity_paused` and leads the array, like its queue-level sibling. It
+    /// never suppresses a co-occurring impediment.
     #[test]
     fn activity_paused_is_reported_first_and_composes_with_other_reasons() {
         let saturated = std::collections::HashSet::new();
@@ -53619,10 +53402,10 @@ mod eligibility_reason_tests {
 
     /// A task held by BOTH pauses reports BOTH codes (issue #807).
     ///
-    /// The two holds are independent — an operator can pause a queue and an
-    /// activity type during the same incident — so surfacing one must never
-    /// mask the other, or resuming the reported hold leaves the task still
-    /// stuck with no explanation on the endpoint built to give one.
+    /// The two holds are independent. An operator can pause a queue and an
+    /// activity type in one incident. So one code must never mask the other.
+    /// Otherwise a resume of the reported hold leaves the task stuck, with no
+    /// explanation on the endpoint built to give one.
     #[test]
     fn both_pauses_report_both_codes_ahead_of_other_impediments() {
         let reasons = task_intrinsic_impediment_reasons(
@@ -53654,11 +53437,11 @@ mod eligibility_reason_tests {
     /// The explainer must key on `task_type` exactly as `queue::claim_task`'s
     /// gate does (issue #807).
     ///
-    /// A **workflow** task can legitimately carry a non-NULL `activity_name` —
-    /// the engine stamps the `'mixed_signal_suspension'` sentinel there — and
-    /// the claim gate is scoped by `task_type = 'activity'` precisely so a
-    /// pause never holds those. An explainer keyed on `activity_name` alone
-    /// would report `activity_paused` on tasks that are not held at all.
+    /// A **workflow** task can carry a non-NULL `activity_name`, because the
+    /// engine stamps the `'mixed_signal_suspension'` sentinel there. The claim
+    /// gate is scoped by `task_type = 'activity'` so that a pause never holds
+    /// those. An explainer keyed on `activity_name` alone would report
+    /// `activity_paused` on tasks that are not held at all.
     #[test]
     fn activity_pause_predicate_matches_the_claim_gate_scoping() {
         let held: HashSet<String> = ["charge_card", "mixed_signal_suspension"]
@@ -53689,6 +53472,8 @@ mod eligibility_reason_tests {
         ));
     }
 
+    // AC1: a task deferred solely because its rate-limit bucket is exhausted
+    // reports `rate_limit_exhausted` — never `concurrency_saturated`.
     #[test]
     fn rate_limit_only_reports_rate_limit_exhausted() {
         let reasons = task_intrinsic_impediment_reasons(
@@ -53832,11 +53617,11 @@ mod eligibility_reason_tests {
         assert!(reasons.is_empty(), "expected no reasons, got {reasons:?}");
     }
 
-    // Documented #369 boundary: a CB activity whose breaker is CLOSED but whose
-    // rate-limit bucket is exhausted surfaces NO claim-time impediment — rate
-    // limiting for a CB activity is enforced at dispatch, not claim, so its
-    // stall is dispatch-side (visible via `GET /admin/circuits/{activity}` + the
-    // token bucket), never through this claim-time eligibility explainer.
+    // Documented #369 boundary: a CB activity with a CLOSED breaker and an
+    // exhausted rate-limit bucket shows NO claim-time impediment. A CB activity
+    // is rate-limited at dispatch, not at claim. Its stall shows on the dispatch
+    // side (`GET /admin/circuits/{activity}` and the token bucket), never in
+    // this explainer.
     #[test]
     fn cb_activity_closed_breaker_with_exhausted_bucket_reports_nothing() {
         let reasons = task_intrinsic_impediment_reasons(
@@ -53905,9 +53690,9 @@ mod eligibility_reason_tests {
 mod reserved_idempotency_key_tests {
     use super::*;
 
-    /// The plugin's HTTP-shaped validator must refuse an engine-derived key,
-    /// or a caller can squat it and the broker's own delivery is acked as an
-    /// idempotent replay without ever dispatching (issue #944 review).
+    /// The plugin's HTTP-shaped validator must refuse an engine-derived key.
+    /// Otherwise a caller can squat it, and the broker's own delivery is acked
+    /// as an idempotent replay that never dispatches (issue #944).
     #[test]
     fn the_start_route_validator_refuses_a_derived_key() {
         let derived = "conn:L6:orders:L0::L10:orders:0:7".to_string();
@@ -53942,11 +53727,11 @@ mod reserved_idempotency_key_tests {
         }
     }
 
-    /// The exemption exists only so the connector's own dispatch — which
-    /// delegates through this same handler — is not refused by the guard that
-    /// stops a caller squatting its key. It must be unreachable from a request
-    /// body: `engine_derived_idempotency_key` is `#[serde(skip)]`, so JSON
-    /// carrying it still deserializes to `false` and the key is refused.
+    /// The exemption exists so the connector's own dispatch, which delegates
+    /// through this handler, passes the guard against key squatting. A request
+    /// body must not reach it. `engine_derived_idempotency_key` is
+    /// `#[serde(skip)]`, so JSON that carries it still deserializes to `false`
+    /// and the key is refused.
     #[test]
     fn the_engine_exemption_cannot_be_claimed_from_the_request_body() {
         let derived = "conn:L6:orders:L0::L10:orders:0:7";
@@ -54149,12 +53934,12 @@ mod tests {
 
     // ── issue #811: activity concurrency groups always defer ────────────────
 
-    /// Latest-wins is a *workflow-start* admission control: the supersede runs
+    /// Latest-wins is a *workflow-start* admission control. The supersede runs
     /// inside `start_or_load_workflow_execution_collect` and sheds workflow
-    /// *executions*. An activity task that carries a concurrency key is gated
-    /// purely at claim time and always defers, so reporting its owning
-    /// workflow's declared `cancel_running` on the `task_type = "activity"`
-    /// admin row advertises a strategy nothing enforces.
+    /// *executions*. An activity task with a concurrency key is gated only at
+    /// claim time and always defers. So the declared `cancel_running` of its
+    /// workflow, on the `task_type = "activity"` admin row, advertises a
+    /// strategy nothing enforces.
     /// Issue #2407: only a `workflow` group of a type with a policy reports
     /// limits. A latest-wins type reports its code limit as effective.
     #[test]
@@ -54218,14 +54003,13 @@ mod tests {
 
     // ── #798 running build id for the in-process replay gates (pure, no DB) ──
 
-    /// The deploy canary and replay-diagnosis endpoints both run *inside* the
-    /// deployed candidate, so they must replay under this process's own
-    /// configured build id — not the execution's recorded `assigned_build_id`.
+    /// The deploy canary and replay-diagnosis endpoints run *inside* the
+    /// deployed candidate. So they replay under the configured build id of this
+    /// process, not the recorded `assigned_build_id` of the execution.
     ///
-    /// A runtime with no captured config snapshot, or one whose build id is the
-    /// empty default (no build routing configured), must resolve to `None` so
-    /// `ctx.build_id()` matches what the live worker reports rather than an
-    /// empty string no worker ever reports.
+    /// A runtime with no config snapshot, or with the empty default build id
+    /// (no build routing), must resolve to `None`. Then `ctx.build_id()` matches
+    /// what the live worker reports, not an empty string no worker reports.
     #[test]
     fn running_build_id_treats_absent_and_empty_config_as_none() {
         assert_eq!(
@@ -54297,11 +54081,10 @@ mod tests {
 
     /// Divergent provenance must not be silently dropped.
     ///
-    /// This state is produced by our own idempotency rule: a re-pause preserves
-    /// the ORIGINAL reason/actor, so a fleet-wide hold landing over a
-    /// pre-existing shard-scoped hold leaves that shard telling a different
-    /// story. Showing only one of them would hand the operator a reason and
-    /// scope that are not true for part of the fleet.
+    /// The idempotency rule produces this state: a re-pause keeps the ORIGINAL
+    /// reason and actor. So a fleet-wide hold over an existing shard-scoped hold
+    /// leaves that shard with a different story. One of them alone would give
+    /// the operator a reason and scope that are false for part of the fleet.
     #[test]
     fn merge_paused_queues_preserves_divergent_per_shard_provenance() {
         let merged = merge_paused_queue_rows(
@@ -54440,12 +54223,12 @@ mod tests {
         assert!(summarise_pause_provenance(&[]).is_none());
     }
 
-    /// Issue #619 review: a fleet-wide RESUME deletes every pause row, so any
-    /// provenance dropped here is gone for good.
+    /// Issue #619: a fleet-wide RESUME deletes every pause row, so provenance
+    /// dropped here is gone for good.
     ///
-    /// Independently-paused shards legitimately carry different reasons and
-    /// operators; an operator closing out an incident needs all of them, and
-    /// the summary must describe the same shard `paused_duration_secs` does.
+    /// Shards paused independently can carry different reasons and operators.
+    /// An operator closing an incident needs all of them. The summary must
+    /// describe the same shard as `paused_duration_secs`.
     #[test]
     fn resume_summary_keeps_every_shards_released_provenance() {
         let per_shard = vec![
@@ -54533,13 +54316,13 @@ mod tests {
         );
     }
 
-    /// Issue #619 review: `effective_scope` must be derived from the shards that
-    /// actually hold the queue, not from the stored `scope_shard_id`.
+    /// Issue #619: `effective_scope` must come from the shards that hold the
+    /// queue, not from the stored `scope_shard_id`.
     ///
-    /// A fleet-wide pause that only reached some shards writes
+    /// A fleet-wide pause that reached only some shards writes
     /// `scope_shard_id = NULL` on the shards it reached and **no row** on the
-    /// ones it missed — so the stored intent is byte-identical to a complete
-    /// hold, while the missed shards keep dispatching.
+    /// rest. So the stored intent is byte-identical to a complete hold, while
+    /// the missed shards keep dispatching.
     #[test]
     fn effective_scope_reflects_real_coverage_not_stored_intent() {
         // One of two expected shards holds it: intent says fleet, reality does not.
@@ -54605,16 +54388,16 @@ mod tests {
         }
     }
 
-    /// Issue #807 review: a single-activity read must not assert nonexistence
-    /// while a shard is unaccounted for.
+    /// Issue #807: a single-activity read must not assert nonexistence while a
+    /// shard is unaccounted for.
     ///
-    /// The routes deliberately accept **unregistered** names — a management node
-    /// need not register every activity the fleet runs — so "not in this
-    /// process's catalogue, and no pause row on the shards that answered" is
-    /// reachable with a live hold sitting on the shard that did not answer. A
-    /// `404` there tells an operator the hold does not exist while it is
-    /// actively holding work. Same rule as the `(workflow_name, workflow_id)`
-    /// resolver (#805): fail closed rather than risk a false 404.
+    /// The routes accept **unregistered** names on purpose. A management node
+    /// need not register every activity the fleet runs. Take a name that is
+    /// not in this catalogue, with no pause row on the shards that answered.
+    /// A live hold can still sit on the shard that did not answer. A `404`
+    /// there tells an operator the hold does not exist while it holds work. The
+    /// `(workflow_name, workflow_id)` resolver (#805) has the same rule: fail
+    /// closed rather than risk a false 404.
     #[test]
     fn single_activity_read_fails_closed_while_a_shard_is_unaccounted_for() {
         let down = vec![shard_fanout::UnavailableShard {
@@ -54653,20 +54436,19 @@ mod tests {
     /// A pause must be REFUSED for an activity registered `local = true`, and
     /// still ALLOWED for an unregistered name.
     ///
-    /// Issue #807. A local activity runs inline on the
-    /// workflow worker and never takes a `harvest_task_queue` row, so the
-    /// claim-path gate this feature is built on can never hold one. The pause
-    /// route nevertheless wrote its rows and answered `ok: true` /
-    /// `newly_paused: true` — during an incident, the one call an operator
-    /// makes to stop a broken dependency reported containment while every new
-    /// invocation kept running. The read model already labelled it a no-op, but
-    /// nobody re-reads a mutation that said it worked.
+    /// Issue #807. A local activity runs inline on the workflow worker and never
+    /// takes a `harvest_task_queue` row. So the claim-path gate of this feature
+    /// can never hold one. The pause route still wrote its rows and answered
+    /// `ok: true` / `newly_paused: true`. In an incident, the one call that
+    /// stops a broken dependency reported containment while each new
+    /// invocation kept running. The read model labelled it a no-op, but nobody
+    /// re-reads a mutation that said it worked.
     ///
-    /// The unregistered arm is the load-bearing half of the fix: these routes
-    /// deliberately accept names this management node does not register (the
-    /// same remote/unregistered case the 404-vs-503 read fix preserves), so a
-    /// blanket "must be registered" check would break pausing a genuinely
-    /// remote activity — the feature's primary use.
+    /// The unregistered arm is the load-bearing half of the fix. These routes
+    /// accept names this management node does not register on purpose. That is
+    /// the remote, unregistered case the 404-vs-503 read fix also preserves. A
+    /// blanket "must be registered" check would break the pause of a real
+    /// remote activity, the primary use of the feature.
     #[test]
     fn a_pause_is_refused_for_a_registered_local_activity_but_not_a_remote_one() {
         let catalog = std::collections::BTreeMap::from([
@@ -54708,17 +54490,16 @@ mod tests {
         );
     }
 
-    /// Issue #807 review: the activity read model must report real coverage for
-    /// exactly the reason its queue-level sibling does.
+    /// Issue #807: the activity read model must report real coverage, for the
+    /// same reason as its queue-level sibling.
     ///
-    /// A fleet-wide activity pause that only reached some shards returns 207 at
-    /// mutation time, but the pause rows it *did* write are byte-identical to a
+    /// A fleet-wide activity pause that reached only some shards returns 207 at
+    /// mutation time. But the rows it *did* write are byte-identical to a
     /// complete hold (`scope_shard_id = NULL`), and the missed shards hold no
-    /// row at all. A later read that reaches every shard therefore has a
-    /// `complete` status and rows that agree — so without comparing the holding
-    /// shards against the expected set, `GET /activities` presents a clean
-    /// fleet-wide hold while part of the fleet is still dispatching the very
-    /// activity an operator believes they stopped.
+    /// row. A later read that reaches every shard then has a `complete` status
+    /// and rows that agree. Without a check of the holding shards against the
+    /// expected set, `GET /activities` shows a clean fleet-wide hold. Part of
+    /// the fleet still dispatches the activity an operator believes is stopped.
     #[test]
     fn activity_effective_scope_reflects_real_coverage_not_stored_intent() {
         let catalog = std::collections::BTreeMap::from([(
@@ -54786,10 +54567,9 @@ mod tests {
         );
     }
 
-    /// Issue #619 review: the operator's reason must reach the durable audit
-    /// row, because `harvest_queue_pauses` (its only other home) is `DELETE`d on
-    /// resume — leaving a post-incident review able to see *who* paused a queue
-    /// but never *why*.
+    /// Issue #619: the operator's reason must reach the durable audit row. Its
+    /// only other home, `harvest_queue_pauses`, is `DELETE`d on resume. A
+    /// post-incident review could then see *who* paused a queue but never *why*.
     #[test]
     fn pause_audit_context_carries_the_reason_on_full_success() {
         let ctx = queue_pause_audit_context(Some("stripe outage"), None)
@@ -54857,11 +54637,10 @@ mod tests {
     /// EVERY released reason must survive in the durable audit row, not just
     /// the longest hold's.
     ///
-    /// `resume_queue` has already `DELETE`d every pause row by the time this
-    /// renders, and the per-shard detail goes only to the transient HTTP
-    /// response body, so an audit row that keeps one shard's story plus a
-    /// generic "shards disagreed" marker leaves the other shards' *why*
-    /// permanently unrecoverable (issue #619 review).
+    /// `resume_queue` has already `DELETE`d every pause row when this renders.
+    /// The per-shard detail goes only to the transient HTTP response body. So an
+    /// audit row with one shard's story and a generic "shards disagreed" marker
+    /// loses the *why* of the other shards for good (issue #619).
     #[test]
     fn resume_audit_reason_preserves_every_released_hold() {
         let provenance = summarise_resume_provenance(&[
@@ -54944,16 +54723,15 @@ mod tests {
         }
     }
 
-    /// The pause audit row must record the hold that is actually IN EFFECT, not
-    /// the reason the request happened to carry (issue #807 review).
+    /// The pause audit row must record the hold IN EFFECT, not the reason the
+    /// request carried (issue #807).
     ///
-    /// `pause_activity` / `pause_queue` preserve each shard's ORIGINAL
-    /// provenance on an idempotent re-pause, so a second pause -- most starkly
-    /// one that omits the reason entirely and resolves to the default -- would
-    /// otherwise write an audit row claiming a reason that is in effect on no
-    /// shard at all. The response body already reports the effective provenance
-    /// for exactly this reason; the durable row must not tell a different story
-    /// than the response the operator just read.
+    /// `pause_activity` / `pause_queue` keep each shard's ORIGINAL provenance on
+    /// an idempotent re-pause. A second pause could then write an audit row with
+    /// a reason in effect on no shard. The starkest case omits the reason, which
+    /// resolves to the default. The response body reports the effective
+    /// provenance for this reason. The durable row must tell the same story as
+    /// the response the operator just read.
     #[test]
     fn pause_audit_reason_records_the_effective_hold_not_the_request() {
         // Both features, because the bug and the fix are identical and the two
@@ -54977,15 +54755,14 @@ mod tests {
         );
     }
 
-    /// EVERY reason actually holding some part of the fleet must survive in the
-    /// durable row, not just the earliest one (issue #807 review).
+    /// EVERY reason that holds some part of the fleet must survive in the
+    /// durable row, not just the earliest one (issue #807).
     ///
-    /// This is the retry-a-partial-fleet case: the first attempt reached shard 0
-    /// and stamped its reason there; the retry reaches shard 1 and stamps a
-    /// different one, while shard 0 idempotently keeps the original. Recording
-    /// only the request's reason hides shard 0's; recording only the earliest
-    /// hides shard 1's. The resume `DELETE`s both rows, so whichever is dropped
-    /// here is unrecoverable.
+    /// This is the retry-a-partial-fleet case. The first attempt reached shard 0
+    /// and stamped its reason there. The retry reaches shard 1 and stamps a
+    /// different one, while shard 0 keeps the original. The request's reason
+    /// alone hides shard 0's, and the earliest alone hides shard 1's. The resume
+    /// `DELETE`s both rows, so a reason dropped here is unrecoverable.
     #[test]
     fn pause_audit_reason_preserves_every_divergent_shard_reason() {
         let per_shard = [
@@ -55075,14 +54852,13 @@ mod tests {
     }
 
     /// `queue_paused` keeps its documented first position in the FINAL response
-    /// (issue #619 review).
+    /// (issue #619).
     ///
-    /// `task_intrinsic_impediment_reasons` pushes it first, but both eligibility
-    /// merges collapse reasons through a `HashSet` and re-sort — and
-    /// `concurrency_saturated` sorts before `queue_paused` alphabetically. The
-    /// helper's own doc comment and `harvest-alerts.md` both promise the operator
-    /// sees the deliberate hold first, so the ordering has to survive the merge,
-    /// not just the helper.
+    /// `task_intrinsic_impediment_reasons` pushes it first. But both
+    /// eligibility merges collapse reasons through a `HashSet` and re-sort, and
+    /// `concurrency_saturated` sorts before `queue_paused`. The helper's doc
+    /// comment and `harvest-alerts.md` both promise the deliberate hold first.
+    /// So the order has to survive the merge, not just the helper.
     #[test]
     fn queue_paused_stays_first_through_the_reason_code_merge() {
         let mut merged = vec![
@@ -55129,9 +54905,8 @@ mod tests {
         sort_reason_codes(&mut empty);
         assert_eq!(empty, [] as [std::string::String; 0]);
 
-        // Issue #807: the activity-level hold leads too, and a task held by
-        // BOTH reports them in a deterministic order rather than whichever the
-        // HashSet merge happened to yield.
+        // Issue #807: the activity-level hold leads too. A task held by BOTH
+        // reports them in a fixed order, not the order the HashSet merge yields.
         let mut both = vec![
             "concurrency_saturated".to_string(),
             "queue_paused".to_string(),
@@ -55359,9 +55134,9 @@ mod tests {
         assert!(validate_bulk_min_attempts(i32::MIN).is_err());
     }
 
-    /// A narrow, NON-fleet (queue-scoped) gate on `gated-q`, so a start on a
-    /// different queue does NOT match it — letting us prove `check()` blocks a
-    /// non-matching start only via fail-closed, never because the gate matched.
+    /// A narrow, NON-fleet (queue-scoped) gate on `gated-q`. A start on another
+    /// queue does NOT match it. That proves `check()` blocks a non-matching
+    /// start only through fail-closed, never because the gate matched.
     fn queue_gate() -> autumn_harvest::AdmissionGate {
         autumn_harvest::AdmissionGate {
             id: autumn_harvest::admission_gate::AdmissionGateId(uuid::Uuid::new_v4()),
@@ -55457,11 +55232,11 @@ mod tests {
         );
     }
 
-    /// issue #618 (F-round22): on the LIFT path, a failed post-mutation reload also
-    /// arms fail-closed — `check()` briefly OVER-BLOCKS (re-blocking even the
-    /// just-lifted target), the correct conservative behaviour for a safety control
-    /// during a gate-table outage. The write-through delta already removed the gate
-    /// from `check_cached`, so in-flight continuation is unaffected (no durable
+    /// Issue #618: on the LIFT path, a failed post-mutation reload also arms
+    /// fail-closed. `check()` briefly OVER-BLOCKS, even the just-lifted target.
+    /// That is the correct conservative behaviour for a safety control during a
+    /// gate-table outage. The write-through delta already removed the gate from
+    /// `check_cached`, so in-flight continuation is unaffected (no durable
     /// false-block).
     #[test]
     fn reconcile_gate_cache_lift_fails_closed_but_check_cached_drops_the_lifted_gate() {
@@ -55501,9 +55276,9 @@ mod tests {
     }
 
     /// A not-found schedule is an authoritative 404 only when every expected
-    /// shard was successfully checked; if any expected shard could not be
-    /// checked (unreachable, per-shard lookup error, or no configured pool) the
-    /// row's existence is indeterminate → 503, never a lying 404 (issue #762).
+    /// shard was checked. If an expected shard could not be checked
+    /// (unreachable, per-shard lookup error, or no configured pool), the row's
+    /// existence is indeterminate. That is a 503, never a lying 404 (issue #762).
     #[test]
     fn resolve_not_found_outcome_maps_reachability_to_404_or_503() {
         assert_eq!(
@@ -55518,11 +55293,11 @@ mod tests {
         );
     }
 
-    /// A router-known-but-poolless expected shard (mid a shard-add rollout) must
-    /// become an *unavailable* run observation — never be silently omitted — so
-    /// the fan-out's `build_runs_response` status reads `partial`/`unavailable`
-    /// rather than a false `complete` (issue #762 review). No DB needed: the
-    /// `None`-pool arm returns synchronously without touching a pool.
+    /// A router-known but poolless expected shard (mid shard-add rollout) must
+    /// become an *unavailable* run observation, never a silent omission. Then the
+    /// `build_runs_response` status reads `partial`/`unavailable`, not a false
+    /// `complete` (issue #762). No DB needed: the `None`-pool arm returns
+    /// synchronously without a pool.
     #[tokio::test]
     async fn observe_schedule_runs_shard_poolless_shard_is_unavailable_not_complete() {
         let query = autumn_harvest::ScheduleRunQuery {
@@ -55953,9 +55728,9 @@ mod tests {
         }
     }
 
-    /// A decode-active pending activity carrying an included decoded input of
-    /// the given observed size (`None` = no input surfaced, e.g. an
-    /// external-handoff row or an input already withheld by its own cap).
+    /// A decode-active pending activity with an included decoded input of the
+    /// given size. `None` means no input surfaced, such as an external-handoff
+    /// row or an input already withheld by its own cap.
     fn pending_with_input(bytes: Option<u64>) -> PendingActivity {
         PendingActivity {
             input: bytes.map(|_| serde_json::json!({"card": "4242"})),
@@ -55976,9 +55751,9 @@ mod tests {
 
     #[test]
     fn input_budget_withholds_past_total_in_order() {
-        // Budget 250: first two (100+100) fit; third pushes over and is
-        // withheld — the same policy the checkpoint budget applies (#503),
-        // mirrored for decoded inputs (issue #608, PR #936 review).
+        // Budget 250: the first two (100+100) fit, and the third goes over and
+        // is withheld. The checkpoint budget applies the same policy (#503), here
+        // for decoded inputs (issue #608, PR #936).
         let mut items = vec![pending_with_input(Some(100)); 3];
         let withheld = apply_input_response_budget(&mut items, 250);
         assert!(withheld);
@@ -55994,9 +55769,9 @@ mod tests {
 
     #[test]
     fn input_budget_always_keeps_first_even_if_oversized() {
-        // A single input larger than the whole budget is still shown so a
-        // raised per-activity input cap keeps full visibility, matching the
-        // checkpoint budget's first-kept rule.
+        // A single input larger than the whole budget still shows. A raised
+        // per-activity input cap then keeps full visibility, like the first-kept
+        // rule of the checkpoint budget.
         let mut items = vec![
             pending_with_input(Some(10_000)),
             pending_with_input(Some(10)),
@@ -57290,15 +57065,13 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
     }
 
-    /// Code-review regression test (issue #597, PR #908): `Plugin::build`'s
-    /// `start_harvest_runtime` calls `install_storage_pool` before an
-    /// `.await` (the boot-time admission-gate load) that yields control,
-    /// then calls `install(runtime)` only afterward -- so a request can
-    /// reach `admit_update` with a working storage pool while
-    /// `api_state.runtime()` still errors. Reproduce that exact state
-    /// directly (storage pool installed, runtime never installed) and
-    /// assert `admit_update` fails closed instead of silently skipping the
-    /// validator check and admitting the update anyway.
+    /// Regression test (issue #597, PR #908). `start_harvest_runtime` in
+    /// `Plugin::build` calls `install_storage_pool` before an `.await` that
+    /// yields (the boot-time admission-gate load). It calls `install(runtime)`
+    /// only after that. So a request can reach `admit_update` with a working
+    /// storage pool while `api_state.runtime()` still errors. This test builds
+    /// that state (storage pool installed, runtime never installed). It asserts
+    /// that `admit_update` fails closed and does not skip the validator check.
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn admit_update_fails_closed_when_storage_pool_ready_but_runtime_not_installed() {
@@ -57416,14 +57189,14 @@ mod tests {
         );
     }
 
-    /// Codex P1 regression test (issue #610, PR #1092): the plain signal-send
-    /// route (`POST /workflows/{id}/signal/{name}`) gates its #610 payload
-    /// schema validation and #252 payload cap on `api_state.runtime()`. During
-    /// the plugin-startup window (storage pool installed, `install(runtime)`
-    /// not yet complete) `runtime()` errors -- so an `if let Ok(runtime)` guard
-    /// would skip both checks and let `send_signal_idempotent` durably enqueue
-    /// an unvalidated/uncapped payload. Reproduce that exact state and assert
-    /// `signal_workflow` fails closed instead, mirroring `admit_update` above.
+    /// Regression test (issue #610, PR #1092). The plain signal-send route
+    /// (`POST /workflows/{id}/signal/{name}`) gates its #610 payload schema
+    /// validation and #252 payload cap on `api_state.runtime()`. During plugin
+    /// startup (storage pool installed, `install(runtime)` not complete),
+    /// `runtime()` errors. An `if let Ok(runtime)` guard would skip both checks.
+    /// `send_signal_idempotent` would then durably enqueue an unvalidated,
+    /// uncapped payload. This test builds that state and asserts that
+    /// `signal_workflow` fails closed, like `admit_update` above.
     #[tokio::test]
     #[allow(clippy::too_many_lines)] // #685: required conflict_policy field tips this pre-existing literal-heavy test to 101 lines
     async fn signal_workflow_fails_closed_when_storage_pool_ready_but_runtime_not_installed() {
@@ -57527,11 +57300,11 @@ mod tests {
             "expected the runtime-not-started error, got: {body_text}"
         );
 
-        // And the signal must NOT have been durably enqueued -- no
-        // `harvest_signals` row should exist for this execution. (This is the
-        // load-bearing "did not fall through to send_signal_idempotent" check:
-        // without the fail-closed guard the handler would insert a signal row
-        // here and return 202 instead of the 400 asserted above.)
+        // The signal must NOT be durably enqueued: no `harvest_signals` row may
+        // exist for this execution. This is the load-bearing check that the
+        // handler did not fall through to `send_signal_idempotent`. Without the
+        // fail-closed guard, the handler inserts a signal row here and returns
+        // 202, not the 400 asserted above.
         let rows: Vec<CountRow> = diesel::sql_query(
             "SELECT COUNT(*) AS n FROM harvest_signals WHERE workflow_exec_id = $1",
         )
@@ -57661,9 +57434,9 @@ mod tests {
             "expected the runtime-not-started error, got: {body_text}"
         );
 
-        // The regression under test: a failed `workflow.rerun` audit row must
-        // exist for this rejection, matching every other rejection path in
-        // the handler -- previously this branch returned before ever calling
+        // The regression under test: this rejection must write a failed
+        // `workflow.rerun` audit row, like each other rejection path in the
+        // handler. This branch used to return before it called
         // `audit_rerun_failure_on`.
         let rows: Vec<AuditRow> = diesel::sql_query(
             "SELECT status FROM harvest_audit_log WHERE operation = $1 AND target_id = $2",
@@ -57719,16 +57492,16 @@ mod tests {
     // ── #798: the exported deadline is re-read, never trusted ───────────────
 
     /// Candidate discovery and the per-candidate history fetch are separate
-    /// round-trips, and `deadline_at` moves in between when a `PAUSED`
-    /// execution resumes (#383 shifts it forward by the pause span). A fixture
-    /// carrying the stale, *earlier* value reports less remaining budget than
-    /// the live worker saw, so `should_continue_as_new()` (#772) can fire in
-    /// replay and emit a `ContinueAsNew` the recorded history cannot contain —
-    /// a false divergence that blocks an unchanged candidate build.
+    /// round-trips. `deadline_at` moves between them when a `PAUSED` execution
+    /// resumes (#383 shifts it forward by the pause span). A fixture with the
+    /// stale, *earlier* value reports less remaining budget than the live
+    /// worker saw. So `should_continue_as_new()` (#772) can fire in replay and
+    /// emit a `ContinueAsNew` that the recorded history cannot contain. That
+    /// false divergence blocks an unchanged candidate build.
     ///
-    /// This drives the export with a candidate whose deadline is deliberately
-    /// wrong. The exported document must carry the row's *current* value, which
-    /// is only true if the export re-reads it rather than trusting the
+    /// This drives the export with a candidate whose deadline is wrong on
+    /// purpose. The exported document must carry the *current* value of the
+    /// row. That holds only if the export re-reads it and does not trust the
     /// discovery-time copy.
     #[tokio::test]
     async fn the_exported_deadline_is_re_read_not_taken_from_the_stale_candidate() {
@@ -57742,9 +57515,9 @@ mod tests {
         // Unique per run: the active-uniqueness index spans
         // (workflow_name, workflow_id) and this row is left RUNNING.
         let workflow_id = format!("deadline-{exec_id}");
-        // Whole seconds: Postgres `timestamptz` is microsecond-precision, so a
-        // nanosecond-precision `Utc::now()` would not round-trip exactly and the
-        // comparison below would fail on precision rather than on staleness.
+        // Whole seconds: Postgres `timestamptz` has microsecond precision. A
+        // nanosecond `Utc::now()` would not round-trip exactly, and the
+        // comparison below would fail on precision, not on staleness.
         let started_at = chrono::DateTime::from_timestamp(
             (chrono::Utc::now() - chrono::Duration::hours(2)).timestamp(),
             0,
@@ -57991,9 +57764,9 @@ mod tests {
             .with_timezone(&chrono::Utc)
     }
 
-    /// AC1: the per-type cap is applied **per workflow name**, so a noisy type
-    /// can never crowd a quiet one out of the sample — the exact failure a
-    /// plain global `LIMIT` produces.
+    /// AC1: the per-type cap applies **per workflow name**. So a noisy type can
+    /// never crowd a quiet one out of the sample, which a plain global `LIMIT`
+    /// does.
     #[test]
     fn stratify_sample_rows_caps_each_workflow_type_independently() {
         let base = sample_base();
@@ -58089,13 +57862,13 @@ mod tests {
     /// The global `MAX_SAMPLE_TOTAL` budget must be spread across workflow
     /// types, not consumed alphabetically by whichever types sort first.
     ///
-    /// Rows arrive sorted by `workflow_name`, so a naive running `total` guard
-    /// hands the whole budget to the alphabetically-earliest types and leaves the
-    /// rest with **zero** fixtures — while the manifest still reports `complete`
-    /// (its status is shard-derived) and the gate exits `0`. That is a silent
-    /// false pass: a release certified against a fleet the gate never looked at.
-    /// It is the same "noisy type crowds out the quiet ones" failure the
-    /// per-type stratification exists to prevent, on the alphabetical axis.
+    /// Rows arrive sorted by `workflow_name`. A naive running `total` guard
+    /// gives the whole budget to the alphabetically earliest types. The rest get
+    /// **zero** fixtures, while the manifest still reports `complete` (its
+    /// status is shard-derived) and the gate exits `0`. That is a silent false
+    /// pass: a release certified against a fleet the gate never looked at. The
+    /// per-type stratification prevents this "noisy type crowds out the quiet
+    /// ones" failure; here it is on the alphabetical axis.
     #[test]
     fn stratify_sample_rows_spreads_the_global_cap_across_every_type() {
         let base = sample_base();
@@ -58177,9 +57950,9 @@ mod tests {
         assert_eq!(rows.len(), 12, "3 types x the per-type cap of 4");
     }
 
-    /// The window `COUNT(*)` is constant within a workflow-name partition, so
-    /// the population is read once per name — including the part beyond the cap
-    /// that the shard did not return (AC2).
+    /// The window `COUNT(*)` is constant within a workflow-name partition. So
+    /// the population is read once per name, with the part beyond the cap that
+    /// the shard did not return (AC2).
     #[test]
     fn shard_population_reports_the_full_partition_count_per_type() {
         let base = sample_base();
@@ -58215,16 +57988,16 @@ mod tests {
         );
     }
 
-    /// Two logical shards may share one physical database — a supported
-    /// topology this repo scopes for everywhere else (`COUNT_WHERE_CLAUSE`,
-    /// `schedule_run_state_summary`, `non_terminal_counts_by_workflow_name` all
-    /// carry `WHERE shard_id = $N`).
+    /// Two logical shards can share one physical database. This repo scopes for
+    /// that topology everywhere else (`COUNT_WHERE_CLAUSE`,
+    /// `schedule_run_state_summary` and `non_terminal_counts_by_workflow_name`
+    /// all carry `WHERE shard_id = $N`).
     ///
-    /// Without the predicate the cross-shard fan-out runs the same statement
-    /// twice against the same rows, which corrupts the manifest in both
-    /// directions at once: `in_flight_total` is doubled (the denominator AC2
-    /// exists to state honestly becomes a lie), and every execution is sampled
-    /// twice, halving real per-type coverage while the count looks unchanged.
+    /// Without the predicate, the cross-shard fan-out runs the same statement
+    /// twice against the same rows. That corrupts the manifest in both
+    /// directions. `in_flight_total` doubles, so the denominator AC2 exists to
+    /// state honestly becomes a lie. Each execution is sampled twice, which
+    /// halves real per-type coverage while the count looks unchanged.
     #[test]
     fn history_sample_sql_scopes_to_one_logical_shard() {
         for order in [
@@ -58240,12 +58013,11 @@ mod tests {
         }
     }
 
-    /// The built-in liveness canary (issue #796) is engine-internal: no user
-    /// gate binary registers `__harvest_canary_probe*`, so sampling one would
-    /// land it in `blocked` and pin the gate at exit 2 forever on any
-    /// deployment with the canary enabled.
+    /// The built-in liveness canary (issue #796) is engine-internal. No user
+    /// gate binary registers `__harvest_canary_probe*`. A sampled canary lands in
+    /// `blocked` and pins the gate at exit 2 forever when the canary is enabled.
     ///
-    /// `starts_with`, not `LIKE '…%'` — the prefix is underscore-heavy and `_`
+    /// `starts_with`, not `LIKE '…%'`. The prefix has many underscores, and `_`
     /// is a single-character wildcard in `LIKE`, so a `LIKE` form over-matches
     /// real workflow names. Mirrors `execution::COUNT_WHERE_CLAUSE`.
     #[test]
@@ -58269,20 +58041,19 @@ mod tests {
 
     /// Discovery must not materialize a superset the stratifier will discard.
     ///
-    /// `rn <= $3` bounds each *type* but nothing bounds the number of types, so
-    /// the returned set is `types × per_workflow` — a million rows per shard at
-    /// 2,000 types and `per_workflow = 500`, decoded into owned strings and
-    /// `context_headers` JSON, only for `stratify_sample_rows` to keep 2,000 of
-    /// them. On a shared management API that is a memory-exhaustion vector for
-    /// a routine authenticated CI export.
+    /// `rn <= $3` bounds each *type*, but nothing bounds the number of types. So
+    /// the returned set is `types × per_workflow`. At 2,000 types and
+    /// `per_workflow = 500`, that is a million rows per shard. Each is decoded
+    /// into owned strings and `context_headers` JSON, and `stratify_sample_rows`
+    /// keeps 2,000 of them. On a shared management API, a routine authenticated
+    /// CI export becomes a memory-exhaustion vector.
     ///
-    /// The statement must therefore apply the same *effective* per-type share
-    /// the global budget allows. `GREATEST(…, 1)` is the load-bearing half of
-    /// it: without the floor, a deployment with more types than
-    /// `MAX_SAMPLE_TOTAL` gets an integer-divided limit of zero and the export
-    /// returns nothing at all — no candidates *and* no per-type population
-    /// census, which is what `zero_coverage_types` and the coverage denominator
-    /// read.
+    /// So the statement must apply the same *effective* per-type share that
+    /// the global budget allows. `GREATEST(…, 1)` is the load-bearing half.
+    /// Without the floor, a deployment with more types than `MAX_SAMPLE_TOTAL`
+    /// gets an integer-divided limit of zero. The export then returns nothing:
+    /// no candidates *and* no per-type population census. `zero_coverage_types`
+    /// and the coverage denominator read that census.
     #[test]
     fn history_sample_sql_bounds_discovery_by_the_effective_per_type_share() {
         for order in [
@@ -58308,12 +58079,12 @@ mod tests {
         }
     }
 
-    /// The bound is only correct if it is at least as generous as what the
-    /// global stratifier will keep, or a shard would withhold rows the union
-    /// needed and silently shrink real coverage.
+    /// The bound is correct only if it is at least as generous as what the
+    /// global stratifier keeps. Otherwise a shard withholds rows the union
+    /// needed and silently shrinks real coverage.
     ///
     /// A shard sees at most the types the union sees, so `MAX / types_shard >=
-    /// MAX / types_union`: the per-shard share is never smaller than the global
+    /// MAX / types_union`. The per-shard share is never smaller than the global
     /// one. This pins that arithmetic rather than trusting the prose.
     #[test]
     fn the_per_shard_share_is_never_smaller_than_the_global_share() {
@@ -58327,8 +58098,8 @@ mod tests {
                 );
             }
         }
-        // And every type keeps at least one row, so the population census — the
-        // manifest's `in_flight_total` and `zero_coverage_types` — survives even
+        // Every type keeps at least one row. So the population census (the
+        // manifest's `in_flight_total` and `zero_coverage_types`) survives even
         // when types outnumber the whole budget.
         assert_eq!(share(max * 3), 1);
     }
@@ -58356,17 +58127,16 @@ mod tests {
         }
     }
 
-    /// AC2, the load-bearing half: a workflow type whose **entire** sample
-    /// failed to export (every candidate blew the per-execution size ceiling)
-    /// must still appear in the manifest with `sampled: 0` and its **real**
-    /// `in_flight_total`.
+    /// AC2, the load-bearing half: a type whose **entire** sample failed to
+    /// export (each candidate blew the size ceiling) must still appear in the
+    /// manifest. It shows `sampled: 0` and its **real** `in_flight_total`.
     ///
-    /// The failure mode this pins is the worst one a coverage record can have.
-    /// If such a type were dropped from `per_workflow` instead, the manifest
-    /// would read as though the type has nothing in flight — an operator would
-    /// see a clean gate and no row, and conclude the type was covered. Stating
-    /// `sampled: 0, in_flight_total: 40` is the honest answer: "there are forty
-    /// of these running and this gate verified none of them."
+    /// This pins the worst failure mode a coverage record can have. If
+    /// `per_workflow` dropped such a type, the manifest would read as if the
+    /// type had nothing in flight. An operator would see a clean gate and no
+    /// row, and conclude the type was covered. `sampled: 0, in_flight_total: 40`
+    /// is the honest answer: "forty of these are running and this gate verified
+    /// none of them."
     #[test]
     fn a_type_whose_whole_sample_failed_to_export_still_reports_its_population() {
         let base = sample_base();
@@ -58411,10 +58181,10 @@ mod tests {
 
     /// The aggregate byte budget must actually stop the export loop.
     ///
-    /// `MAX_SAMPLE_TOTAL` bounds the fixture count, but `max_bytes` is
-    /// per-document and caller-raisable, so without an aggregate bound a routine
-    /// authenticated CI export can accumulate ~20 GiB before the management API
-    /// serializes a single response — on a shared service.
+    /// `MAX_SAMPLE_TOTAL` bounds the fixture count. But `max_bytes` is
+    /// per-document and the caller can raise it. Without an aggregate bound, a
+    /// routine authenticated CI export on a shared service can accumulate ~20 GiB
+    /// before the management API serializes one response.
     #[test]
     fn sample_byte_budget_stops_the_export_when_exhausted() {
         let cap = autumn_harvest::replay_sample::MAX_SAMPLE_RESPONSE_BYTES;
@@ -58436,9 +58206,9 @@ mod tests {
 
     /// A candidate that produced no document must not be charged for one.
     ///
-    /// A failed export (over `max_bytes`, unreadable shard) records a failure
-    /// rather than a document, so charging it would shrink the budget for
-    /// histories that were never retained — cutting the sample short for free.
+    /// A failed export (over `max_bytes`, unreadable shard) records a failure,
+    /// not a document. A charge for it would shrink the budget for histories
+    /// never retained, and cut the sample short for nothing.
     #[test]
     fn sample_byte_budget_charges_only_retained_documents() {
         let cap = autumn_harvest::replay_sample::MAX_SAMPLE_RESPONSE_BYTES;
@@ -58475,16 +58245,16 @@ mod tests {
         assert!(budget.exhausted(), "saturating add must stay exhausted");
     }
 
-    /// The aggregate budget is checked *before* a fetch, so peak retained bytes
-    /// are the budget plus at most one document. That is only a bound if one
-    /// document is itself bounded — and `max_bytes` is caller-supplied.
+    /// The aggregate budget is checked *before* a fetch. So peak retained bytes
+    /// are the budget plus at most one document. That is a bound only if one
+    /// document is itself bounded, and `max_bytes` is caller-supplied.
     ///
-    /// Without a ceiling the budget starts at zero, so the very first candidate
-    /// is always fetched and retained whatever its size: a single multi-gigabyte
-    /// history exhausts the management API despite `MAX_SAMPLE_RESPONSE_BYTES`.
-    /// Asking for one document larger than the entire response budget is also
-    /// incoherent — it can never be returned within that budget — so it is
-    /// rejected at the edge rather than accepted and then failed after the load.
+    /// Without a ceiling, the budget starts at zero, so the first candidate is
+    /// always fetched and retained whatever its size. One multi-gigabyte history
+    /// then exhausts the management API despite `MAX_SAMPLE_RESPONSE_BYTES`. A
+    /// request for one document larger than the whole response budget is also
+    /// incoherent, because it can never fit that budget. So the edge rejects it,
+    /// rather than accepting it and failing after the load.
     #[test]
     fn sample_max_bytes_above_the_response_budget_is_rejected() {
         let cap = autumn_harvest::replay_sample::MAX_SAMPLE_RESPONSE_BYTES;
@@ -58511,10 +58281,10 @@ mod tests {
         assert_eq!(at_cap.max_bytes, cap);
     }
 
-    /// The bound the ceiling actually buys, stated as an invariant rather than a
-    /// single example: every query this parser accepts caps one document at or
-    /// below the aggregate budget, so peak retained bytes are bounded by
-    /// `budget + one document` = 2x the budget rather than by caller input.
+    /// The bound the ceiling buys, as an invariant, not one example. Every
+    /// query this parser accepts caps one document at or below the aggregate
+    /// budget. So peak retained bytes stay under `budget + one document`, 2x the
+    /// budget, whatever the caller sends.
     #[test]
     fn every_accepted_sample_query_bounds_one_document_by_the_response_budget() {
         let cap = autumn_harvest::replay_sample::MAX_SAMPLE_RESPONSE_BYTES;
@@ -58538,9 +58308,9 @@ mod tests {
         }
     }
 
-    /// The manifest must carry the size-truncation flag, so a bundle cut short
-    /// by the byte budget cannot read back as the full sample that was asked
-    /// for. `is_truncated()` alone cannot say this: it reports the *intended*
+    /// The manifest must carry the size-truncation flag. Then a bundle cut short
+    /// by the byte budget cannot read back as the full sample requested.
+    /// `is_truncated()` alone cannot say this. It reports the *intended*
     /// truncation of sampling `per_workflow` out of a larger population.
     #[test]
     fn manifest_reports_a_size_truncated_export() {
@@ -58569,11 +58339,10 @@ mod tests {
     /// A candidate the sample selected but the export could not fetch (over
     /// `max_bytes`, unreadable shard) must reach the manifest as a count.
     ///
-    /// This is the one shortfall no other manifest field can express: the failed
-    /// candidate produces no document, so `sampled_total` counts only survivors
-    /// and agrees *exactly* with the fixture count in the bundle. Without this
-    /// count the gate replays a biased subset — biased against the largest
-    /// histories — and exits `0`.
+    /// No other manifest field can express this shortfall. The failed candidate
+    /// produces no document, so `sampled_total` counts only survivors and
+    /// agrees *exactly* with the bundle's fixture count. Without this count, the
+    /// gate replays a subset biased against the largest histories and exits `0`.
     #[test]
     fn manifest_reports_candidates_the_export_dropped() {
         let base = sample_base();
@@ -58615,17 +58384,16 @@ mod tests {
     /// A shard that dies **after** discovery selected a candidate must be
     /// recorded as a dropped candidate, not merely an unhealthy shard.
     ///
-    /// The two signals gate differently, which is the whole point: the shard
-    /// note only flips `status` to `partial`, which the #798 replay gate honours
-    /// solely under the opt-in `require_complete_coverage(true)`. The failure
-    /// entry is what makes `export_failures > 0`, which blocks the gate
-    /// unconditionally (exit 2).
+    /// The two signals gate differently, and that is the point. The shard note
+    /// only flips `status` to `partial`. The #798 replay gate honours that only
+    /// under the opt-in `require_complete_coverage(true)`. The failure entry
+    /// makes `export_failures > 0`, which blocks the gate unconditionally
+    /// (exit 2).
     ///
-    /// Recording only the shard note let a bundle with at least one survivor
-    /// replay clean and exit `0`. It silently omitted selected executions: a
-    /// biased subset presented as a passing gate. The
-    /// reacquire race that triggers this is not injectable in a DB test, so the
-    /// decision is pinned here instead.
+    /// With only the shard note, a bundle with at least one survivor replayed
+    /// clean and exited `0`. It silently omitted selected executions: a biased
+    /// subset presented as a passing gate. A DB test cannot inject the
+    /// reacquire race that triggers this, so the decision is pinned here.
     #[test]
     fn a_candidate_dropped_after_selection_is_counted_as_an_export_failure() {
         let base = sample_base();
@@ -58663,12 +58431,12 @@ mod tests {
         );
     }
 
-    /// The control: `note_unavailable` on its own — the correct call for every
-    /// *pre*-selection failure — must NOT fabricate a dropped candidate.
+    /// The control: `note_unavailable` alone, the correct call for each
+    /// *pre*-selection failure, must NOT fabricate a dropped candidate.
     ///
     /// Six of the seven `note_unavailable` call sites fail before any candidate
-    /// is selected; counting those as export failures would block the gate for a
-    /// shard that never owed the bundle a row.
+    /// is selected. Counting those as export failures would block the gate for
+    /// a shard that never owed the bundle a row.
     #[test]
     fn an_unavailable_shard_before_selection_is_not_an_export_failure() {
         let base = sample_base();
@@ -59294,9 +59062,9 @@ mod tests {
 
     #[test]
     fn remaining_runs_budget_clamps_to_zero_when_runs_started_exceeds_max() {
-        // Defensive clamp: runs_started should never exceed max_runs in practice
-        // (the live scheduler only increments it under a budget-checked guard),
-        // but a stale read must not report a negative remaining budget.
+        // Defensive clamp: the live scheduler increments runs_started only under
+        // a budget-checked guard, so it should never exceed max_runs. But a stale
+        // read must not report a negative remaining budget.
         assert_eq!(remaining_runs_budget(3, 5), 0);
     }
 
@@ -59304,13 +59072,13 @@ mod tests {
 
     #[test]
     fn transition_backfill_exhausted_generates_the_live_row_guarded_update() {
-        // Shape-check the exhaustion transition UPDATE without a DB (issue #688,
-        // Codex F6): it must evaluate max_runs/runs_started FROM THE ROW (not a
-        // request-start snapshot), guarding on
+        // Shape-check the exhaustion transition UPDATE without a DB (issue #688).
+        // It must read max_runs/runs_started FROM THE ROW, not from a
+        // request-start snapshot. It guards on
         // `max_runs IS NOT NULL AND max_runs > 0 AND runs_started >= max_runs`
-        // plus exhausted_at IS NULL, and set exhausted_at/exhausted_reason. Built
-        // via the SAME macro the live `transition_backfill_exhausted_if_reached`
-        // executes, so editing the guard or the SET clause there breaks this test.
+        // plus exhausted_at IS NULL, and sets exhausted_at/exhausted_reason. The
+        // live `transition_backfill_exhausted_if_reached` runs the SAME macro, so
+        // an edit to the guard or the SET clause there breaks this test.
         let at = chrono::Utc::now();
         let stmt = transition_backfill_exhausted_stmt!(uuid::Uuid::nil(), at);
         let sql = diesel::debug_query::<diesel::pg::Pg, _>(&stmt).to_string();
@@ -59334,12 +59102,12 @@ mod tests {
 
     #[test]
     fn reserve_backfill_budget_slot_generates_the_guarded_conditional_update() {
-        // Shape-check the atomic reservation UPDATE without a DB: it must
-        // increment runs_started, guard on both exhausted_at IS NULL and the
-        // max_runs budget, and RETURN the post-increment runs_started so the
-        // caller can decide exhaustion (issue #688). Built via the SAME macro the
-        // live `reserve_backfill_budget_slot` executes, so editing the guard, the
-        // increment, or the RETURNING clause there breaks this test.
+        // Shape-check the atomic reservation UPDATE without a DB (issue #688).
+        // It must increment runs_started and guard on exhausted_at IS NULL and
+        // the max_runs budget. It must RETURN the post-increment runs_started,
+        // so the caller can decide exhaustion. The live
+        // `reserve_backfill_budget_slot` runs the SAME macro, so an edit to the
+        // guard, the increment or the RETURNING clause there breaks this test.
         let at = chrono::Utc::now();
         let stmt = reserve_backfill_budget_slot_stmt!(uuid::Uuid::nil(), at);
         let sql = diesel::debug_query::<diesel::pg::Pg, _>(&stmt).to_string();
@@ -59363,13 +59131,13 @@ mod tests {
 
     #[test]
     fn clear_stale_max_runs_exhaustion_generates_the_guarded_clear_update() {
-        // Shape-check the release-path clear UPDATE without a DB (issue #688
-        // review, Codex F2b): it must guard on exhausted_reason =
-        // 'max_runs_exhausted' (so an end_at exhaustion is never resurrected),
-        // exhausted_at IS NOT NULL, and the below-cap predicate, and must NULL
-        // exhausted_at/exhausted_reason. Built via the SAME macro the live
-        // `release_backfill_budget_slot` executes, so editing the guard or the
-        // SET clause there breaks this test.
+        // Shape-check the release-path clear UPDATE without a DB (issue #688).
+        // It must guard on exhausted_reason = 'max_runs_exhausted', so an end_at
+        // exhaustion never comes back. It also guards on exhausted_at IS NOT NULL
+        // and the below-cap predicate, and must NULL
+        // exhausted_at/exhausted_reason. The live `release_backfill_budget_slot`
+        // runs the SAME macro, so an edit to the guard or the SET clause there
+        // breaks this test.
         let at = chrono::Utc::now();
         let stmt = clear_stale_max_runs_exhaustion_stmt!(uuid::Uuid::nil(), at);
         let sql = diesel::debug_query::<diesel::pg::Pg, _>(&stmt).to_string();
@@ -59397,12 +59165,12 @@ mod tests {
 
     #[test]
     fn rearm_backfill_next_run_generates_the_guarded_rearm_update() {
-        // Shape-check the release-path re-arm UPDATE without a DB (issue #688
-        // review, Codex F3): after the clear un-exhausts a max_runs_exhausted row,
-        // it must re-arm next_run_at only when it is currently NULL and the row is
-        // now un-exhausted (exhausted_at IS NULL), and must SET next_run_at. Built
-        // via the SAME macro the live `release_backfill_budget_slot` executes, so
-        // editing the guard or the SET clause there breaks this test.
+        // Shape-check the release-path re-arm UPDATE without a DB (issue #688).
+        // After the clear un-exhausts a max_runs_exhausted row, it re-arms
+        // next_run_at only when that is NULL and the row is un-exhausted
+        // (exhausted_at IS NULL). It must SET next_run_at. The live
+        // `release_backfill_budget_slot` runs the SAME macro, so an edit to the
+        // guard or the SET clause there breaks this test.
         let at = chrono::Utc::now();
         let next = at + chrono::Duration::seconds(120);
         let stmt = rearm_backfill_next_run_stmt!(uuid::Uuid::nil(), next, at);
@@ -59615,11 +59383,10 @@ mod tests {
 
     #[test]
     fn truncate_preview_entries_would_skip_if_active_entries_still_consume_budget() {
-        // Documents the deliberate worst-case approximation: the preview cannot see
-        // future concurrency, so an entry flagged `would_skip_if_active` (overlap
-        // policy could drop it at dispatch time) is still treated as consuming
-        // budget here — never optimistically assumed to be free. See the doc
-        // comment on `truncate_preview_entries_by_bounds`.
+        // Pins the deliberate worst-case approximation. The preview cannot see
+        // future concurrency. So an entry flagged `would_skip_if_active` (the
+        // overlap policy could drop it at dispatch) still consumes budget here.
+        // See the doc comment on `truncate_preview_entries_by_bounds`.
         use chrono::TimeZone as _;
         let t0 = chrono::Utc.with_ymd_and_hms(2026, 6, 1, 9, 0, 0).unwrap();
         let t1 = t0 + chrono::Duration::hours(1);
@@ -59653,9 +59420,9 @@ mod tests {
     #[test]
     fn truncate_preview_entries_calendar_skipped_entry_after_budget_exhausted_is_dropped() {
         // Regression test: a calendar-suppressed entry (effective_at.is_none())
-        // never itself consumes budget, but that must not let it slip past the
-        // budget-exhausted cutoff once a prior entry has already spent the last
-        // unit — the schedule is permanently terminal at that point, skipped or not.
+        // consumes no budget. But it must not slip past the budget-exhausted
+        // cutoff once a prior entry spent the last unit. The schedule is
+        // terminal at that point, skipped or not.
         use chrono::TimeZone as _;
         let t0 = chrono::Utc.with_ymd_and_hms(2026, 6, 1, 9, 0, 0).unwrap();
         let t1 = t0 + chrono::Duration::hours(1);
@@ -60320,9 +60087,9 @@ mod tests {
         use axum::http::Method;
 
         // Static-beats-param precedence: /workflows/count is ReadOnly and must
-        // NOT be captured by the /workflows/{id} ReadOnly matcher (both read,
-        // but the precedence is the load-bearing property that a mutation like
-        // /workflows/batch_start is never mistaken for /workflows/{id}).
+        // NOT be captured by the /workflows/{id} ReadOnly matcher. Both read, but
+        // the precedence is load-bearing: a mutation like /workflows/batch_start
+        // is never mistaken for /workflows/{id}.
         assert_eq!(
             classify_route(&Method::POST, "/workflows/batch_start"),
             RouteClass::Mutating,
@@ -60391,8 +60158,8 @@ mod tests {
     #[test]
     fn classify_route_head_inherits_get_class() {
         use axum::http::Method;
-        // F3: HEAD is served by axum via the GET handler, so it must inherit
-        // the GET route's read class rather than fail closed to Mutating — a
+        // HEAD is served by axum through the GET handler. So it inherits the
+        // read class of the GET route and does not fail closed to Mutating. A
         // read-only principal must be able to HEAD-probe readable resources.
         assert_eq!(
             classify_route(&Method::HEAD, "/health"),
@@ -60441,10 +60208,10 @@ mod tests {
 
     #[test]
     fn route_class_matchers_build_without_conflict() {
-        // Building the matchers panics on any matchit insert conflict; simply
-        // resolving them proves the whole CLASSIFIED_ROUTES set registers
-        // (positional param normalization avoids name-conflict panics) and
-        // parses cleanly (every template splits into a known method).
+        // Building the matchers panics on any matchit insert conflict. So
+        // resolving them proves that the whole CLASSIFIED_ROUTES set registers
+        // and parses. Positional param normalization avoids name-conflict panics,
+        // and every template splits into a known method.
         let matchers = route_class_matchers();
         assert!(!matchers.is_empty());
         assert!(matchers.contains_key(&axum::http::Method::GET));
@@ -60628,9 +60395,9 @@ mod tests {
     //
     // `dag_retry::is_compensation_dispatch` reads `ActivityScheduled.input`, a
     // payload-bearing field. On a codec-encrypting or payload-offloading
-    // deployment a raw history hands it an opaque envelope, the predicate
-    // returns `false`, and the compensator is read back as a forward node —
-    // the exact defect the exclusion exists to close.
+    // deployment, a raw history hands it an opaque envelope. The predicate then
+    // returns `false`, and the compensator reads back as a forward node. The
+    // exclusion exists to close exactly that defect.
 
     /// Build a codec registry whose default is the byte-reversal test codec, so
     /// `encode_event` produces the real `_harvest_codec_envelope` shape.
@@ -60714,15 +60481,14 @@ mod tests {
     /// An offload reference that survives the pass must FAIL the retry, not
     /// silently pass through as an opaque payload (issue #780).
     ///
-    /// The reachable shape is a *configuration removal*: a deployment that had a
-    /// `PayloadStore` registered offloaded an oversized compensation envelope,
-    /// and the store was later unregistered (or failed to construct at boot). On
-    /// the next read `offloader` is `None`, so the inflate pass is skipped
-    /// entirely and `decode_event` happily returns the reference verbatim — it
-    /// is not a codec envelope, so nothing else rejects it. The issue #780
-    /// signal-2 guard then looks for `dag_compensate` inside
-    /// `{"_harvest_offload_envelope": 1, ...}` and finds nothing, so a run that
-    /// fully rolled back reads as retryable.
+    /// The reachable shape is a *configuration removal*. A deployment with a
+    /// `PayloadStore` offloaded an oversized compensation envelope. The store
+    /// was then unregistered, or failed to construct at boot. On the next read
+    /// `offloader` is `None`, so the inflate pass is skipped. `decode_event`
+    /// returns the reference verbatim, and nothing else rejects it, because it
+    /// is not a codec envelope. The issue #780 signal-2 guard then looks for
+    /// `dag_compensate` inside `{"_harvest_offload_envelope": 1, ...}` and finds
+    /// nothing. So a run that fully rolled back reads as retryable.
     #[tokio::test]
     async fn a_residual_offload_reference_fails_closed_when_no_store_is_configured() {
         use autumn_harvest::WorkflowEvent;
@@ -61214,8 +60980,8 @@ mod tests {
         use autumn_harvest::build_routing::BuildCompatibilitySet;
 
         let compat = BuildCompatibilitySet::default();
-        // The pinned host is live and polls the queue but runs the wrong build:
-        // no OTHER worker may stand in for it, so the task is unclaimable.
+        // The pinned host is live and polls the queue but runs the wrong build.
+        // No OTHER worker may stand in for it, so the task is unclaimable.
         let workers = vec![
             eligibility_worker("w-host", &["gpu"], "build-1", serde_json::json!({})),
             eligibility_worker("w-peer", &["gpu"], "build-2", serde_json::json!({})),
@@ -61239,9 +61005,9 @@ mod tests {
         use autumn_harvest::build_routing::BuildCompatibilitySet;
 
         let compat = BuildCompatibilitySet::default();
-        // Sticky owner recorded but NOT a session member: the lease self-heals
+        // Sticky owner recorded but NOT a session member. The lease self-heals
         // at `sticky_until`, so any eligible poller counts and this is not a
-        // stall (see `task_has_eligible_worker`'s doc comment).
+        // stall (see the doc comment of `task_has_eligible_worker`).
         let peer_only = vec![eligibility_worker(
             "w-peer",
             &["default"],
@@ -61265,9 +61031,9 @@ mod tests {
         use autumn_harvest::build_routing::BuildCompatibilitySet;
 
         let compat = BuildCompatibilitySet::default();
-        // `Worker::run` leaves its poll loop BEFORE transitioning to
-        // `Draining`, so a draining worker claims no new task for the whole
-        // drain window even though queue coverage still counts it.
+        // `Worker::run` leaves its poll loop BEFORE it moves to `Draining`. So a
+        // draining worker claims no new task for the whole drain window, though
+        // queue coverage still counts it.
         let draining = vec![eligibility_worker_with_status(
             "w-draining",
             &["default"],
@@ -61335,7 +61101,7 @@ mod tests {
         use autumn_harvest::stall_diagnosis::BlockedOn;
 
         let codecs = reversing_codecs();
-        // The fan-out case Codex named: a retrying row loses precedence to a
+        // The fan-out case (issue #809): a retrying row loses precedence to a
         // paused-queue row, so its error never reaches the caller.
         let mut winner = BlockedOn::ActivityQueuePaused {
             queue: "payments".to_string(),
@@ -61558,9 +61324,9 @@ mod tests {
 
     #[test]
     fn pending_activity_input_field_is_omitted_when_none() {
-        // AC1's byte-identity guarantee for /stack hangs on this serde
-        // contract: `input: None` (flag off / non-admin) must not even emit
-        // the key, so pre-#608 responses are reproduced byte-for-byte.
+        // The AC1 byte-identity guarantee for /stack hangs on this serde
+        // contract. `input: None` (flag off or non-admin) must not emit the key,
+        // so pre-#608 responses stay byte-for-byte identical.
         let off = pending_with_checkpoint(None);
         assert!(off.input.is_none(), "fixture sanity: input starts None");
         let off_json = serde_json::to_string(&off).expect("serialize");
@@ -61609,9 +61375,9 @@ mod tests {
         let t1 = t0 + chrono::Duration::seconds(5);
         let t2 = t0 + chrono::Duration::seconds(9);
 
-        // Only `LocalActivityFailed` events feed the map now — regular activity
-        // failures are sourced from the task-row `error` column at the join
-        // site (a retryable regular failure appends no event).
+        // Only `LocalActivityFailed` events feed the map. Regular activity
+        // failures come from the task-row `error` column at the join site,
+        // because a retryable regular failure appends no event.
         let events = vec![
             (
                 10_i64,
@@ -61703,9 +61469,9 @@ mod tests {
         use autumn_harvest::types::ActivityExecId;
         let act = ActivityExecId::new();
         let t0 = chrono::Utc::now();
-        // A regular ActivityFailed event must NOT feed the local map: the
-        // regular path is task-row-sourced (a retryable regular failure appends
-        // no event at all, so an event-sourced map would miss it — the P1 bug).
+        // A regular ActivityFailed event must NOT feed the local map. The
+        // regular path reads the task row, because a retryable regular failure
+        // appends no event. An event-sourced map would miss that failure.
         let events = vec![(
             10_i64,
             WorkflowEvent::ActivityFailed {
@@ -61931,13 +61697,12 @@ mod tests {
         );
     }
 
-    /// issue #810: the registration request's optional `condition` field.
-    /// It rides the request as raw JSON (so a bad condition can never trip
-    /// axum's Json extractor into a 422 plain-text rejection) and is decoded
-    /// by the handler via `decode_trigger_condition`, which produces the
-    /// AC-mandated 400 for unknown operators, over-cap trees, and malformed
-    /// paths alike; a legacy body without the field still deserializes
-    /// (`None`).
+    /// Issue #810: the optional `condition` field of the registration request.
+    /// It rides the request as raw JSON, so a bad condition never trips the axum
+    /// Json extractor into a 422 plain-text rejection. The handler decodes it
+    /// with `decode_trigger_condition`. That gives the AC-mandated 400 for
+    /// unknown operators, over-cap trees and malformed paths alike. A legacy
+    /// body without the field still deserializes (`None`).
     #[test]
     fn create_completion_trigger_request_condition_serde() {
         // Legacy body (no condition key) → None, decoded to no guard.
@@ -61969,10 +61734,10 @@ mod tests {
             Some(TriggerCondition::GreaterThan { ref path, .. }) if path == "amount"
         ));
 
-        // Unknown operator: the REQUEST still deserializes (the raw-JSON
-        // field keeps the Json extractor out of the decision — a typed field
-        // here would surface as axum's 422 with a plain-text body), and the
-        // handler decode rejects it (→ 400, never silently dropped).
+        // Unknown operator: the REQUEST still deserializes, and the handler
+        // decode rejects it (400, never silently dropped). The raw-JSON field
+        // keeps the Json extractor out of the decision. A typed field here would
+        // surface as the axum 422 with a plain-text body.
         let bad: CreateCompletionTriggerRequest = serde_json::from_value(serde_json::json!({
             "source_workflow_name": "a",
             "target_workflow_name": "b",
@@ -62542,9 +62307,9 @@ mod tests {
 
     #[test]
     fn resolve_schedule_deadline_secs_returns_none_none_with_no_registry() {
-        // A schedule read while no runtime is installed (or the workflow is
-        // unknown to the registry) must resolve to (None, None), never panic
-        // or guess a stale value.
+        // A schedule read with no runtime installed, or with a workflow unknown
+        // to the registry, must resolve to (None, None). It must never panic or
+        // guess a stale value.
         assert_eq!(
             resolve_schedule_deadline_secs(None, "anything"),
             (None, None)
@@ -62612,13 +62377,12 @@ mod tests {
 
     #[test]
     fn resolve_schedule_deadline_secs_applies_fleet_wide_ceiling() {
-        // Codex review on issue #743 (PR #1141): the resolver previously
-        // reported the RAW declared execution_timeout/sla, disagreeing with
-        // what a real fire would actually set on deadline_at/sla_deadline_at
-        // once a fleet-wide `max_workflow_execution_timeout` ceiling is
-        // configured. Both the advertised timeout AND the sla (clamped
-        // against the CEILED timeout, not the raw one) must reflect the 1h
-        // ceiling, never the raw 10h/8h declarations.
+        // Issue #743 (PR #1141): the resolver used to report the RAW declared
+        // execution_timeout/sla. With a fleet-wide
+        // `max_workflow_execution_timeout` ceiling, that disagrees with what a
+        // real fire sets on deadline_at/sla_deadline_at. The advertised timeout
+        // AND the sla (clamped against the CEILED timeout, not the raw one) must
+        // show the 1h ceiling, never the raw 10h/8h declarations.
         let registry = HandlerRegistry::new(
             vec![deadline_info_fixture(
                 "ceiling_wf",
@@ -62658,16 +62422,16 @@ mod tests {
 
     #[test]
     fn schedule_entry_from_row_resolves_execution_timeout_and_sla_for_a_dag_schedule() {
-        // Closes the review gap left by the 5 tests above, which only exercise
-        // plain-workflow-named schedules. A `kind: "dag"` row's `name` resolves
-        // to `s.dag_name` (see the `(kind, name)` derivation in
-        // `schedule_entry_from_row`), and `HarvestBuilder::dags(...)`
-        // auto-registers a unified DAG's shadow `WorkflowInfo` under that SAME
-        // name in `registry.workflows` (`DagInfo::as_workflow_info()` ->
-        // `self.workflows.push(workflow_info)`), so `resolve_schedule_deadline_secs`
-        // must resolve identically for `kind: "dag"` schedules as it does for
-        // plain-workflow schedules -- the "ONE lookup covers both schedule
-        // kinds identically" claim documented on `resolve_schedule_deadline_secs`.
+        // Closes the gap left by the 5 tests above, which use only
+        // plain-workflow-named schedules. The `name` of a `kind: "dag"` row
+        // resolves to `s.dag_name` (see the `(kind, name)` derivation in
+        // `schedule_entry_from_row`). `HarvestBuilder::dags(...)` auto-registers
+        // the shadow `WorkflowInfo` of a unified DAG under that SAME name in
+        // `registry.workflows` (`DagInfo::as_workflow_info()` ->
+        // `self.workflows.push(workflow_info)`). So `resolve_schedule_deadline_secs`
+        // must resolve `kind: "dag"` schedules like plain-workflow ones. That is
+        // the "ONE lookup covers both schedule kinds identically" claim on
+        // `resolve_schedule_deadline_secs`.
         let registry = HandlerRegistry::new(
             vec![deadline_info_fixture(
                 "nightly_reconciliation",
@@ -62707,8 +62471,8 @@ mod tests {
     #[test]
     fn circuit_cooldown_until_degrades_on_unrepresentable_input() {
         // A missing `cooldown_until` is already the documented shape for a
-        // force-opened breaker, so degrading is never a lie — but it must never
-        // panic or wrap either.
+        // force-opened breaker, so degrading is never a lie. But it must never
+        // panic or wrap.
         let now = chrono::Utc::now();
         for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0, 1e30] {
             assert!(
@@ -62798,7 +62562,7 @@ mod tests {
     fn contributing_reasons_report_an_orphaned_claimed_row() {
         use autumn_harvest::stall_diagnosis::PendingActivityFacts;
         // The converse: a claimed row whose fleet is gone (issue #367) is an
-        // orphan, and worker liveness is not a claim-time gate — it holds for a
+        // orphan. Worker liveness is not a claim-time gate, so it holds for a
         // claimed row too.
         let facts = PendingActivityFacts {
             activity_name: Some("send_email".to_string()),
@@ -62829,12 +62593,11 @@ mod tests {
     #[test]
     fn contributing_reasons_use_claimant_liveness_for_a_held_row() {
         use autumn_harvest::stall_diagnosis::PendingActivityFacts;
-        // A row held by its own claimant, which has begun graceful shutdown
-        // (`Draining`, so it claims nothing new but IS finishing exactly this
-        // row). Queue-level claim eligibility is therefore false, but the
-        // claimant is alive and the classifier reports `healthy_in_progress` —
-        // so `no_live_worker` must NOT appear, or the reason codes would
-        // contradict the headline verdict.
+        // A row held by its own claimant, which has begun graceful shutdown. It
+        // is `Draining`, so it claims nothing new but IS finishing this row.
+        // Queue-level claim eligibility is false, but the claimant is alive and
+        // the classifier reports `healthy_in_progress`. So `no_live_worker` must
+        // NOT appear, or the reason codes would contradict the headline verdict.
         let facts = PendingActivityFacts {
             activity_name: Some("send_email".to_string()),
             queue: "email".to_string(),
@@ -63061,13 +62824,13 @@ mod tests {
         }
     }
 
-    /// The circuit registry is **in-process** (`circuit_breaker.rs`) and each
-    /// worker process builds its own (`HandlerRegistry::new`), so a local
-    /// snapshot only describes the local worker's breaker. It may be treated as
-    /// the answer for a task ONLY when the local worker is the sole worker that
-    /// could claim that task — otherwise a peer replica whose breaker is closed
-    /// can still dispatch it, and reporting a fleet-wide stall would be a false
-    /// positive on the flagship verdict.
+    /// The circuit registry is **in-process** (`circuit_breaker.rs`), and each
+    /// worker process builds its own (`HandlerRegistry::new`). So a local
+    /// snapshot describes only the local worker's breaker. It answers for a task
+    /// ONLY when the local worker is the sole worker that could claim it.
+    /// Otherwise a peer replica with a closed breaker can still dispatch it. A
+    /// fleet-wide stall report would then be a false positive on the flagship
+    /// verdict.
     #[test]
     fn local_circuit_snapshot_is_authoritative_only_for_a_sole_local_eligible_worker() {
         // Sole eligible worker, and it is us: our breaker IS the one that will
@@ -63131,8 +62894,8 @@ mod tests {
     #[test]
     fn unsnapshotted_row_with_registered_requirements_has_no_eligible_worker() {
         // The behavioural composition: an unsnapshotted row whose registered
-        // activity demands `gpu=true` is NOT claimable by a live poller that
-        // advertises `gpu=false`, so the endpoint must not read it as healthy.
+        // activity demands `gpu=true` is NOT claimable by a live poller with
+        // `gpu=false`. So the endpoint must not read it as healthy.
         let registered: std::collections::HashMap<String, serde_json::Value> =
             std::collections::HashMap::from([(
                 "gated".to_string(),
@@ -63189,9 +62952,9 @@ mod tests {
         // handler, so its `requires` is what `claim_task` will enforce.
         assert!(registry_fallback_binds("build-x", "build-x"));
 
-        // The default, no-build-routing deployment: every worker (and this
-        // process) advertises no build identity, so they are treated as one
-        // build and the fallback binds exactly as it did before.
+        // The default, no-build-routing deployment: no worker (nor this process)
+        // advertises a build identity. So they count as one build, and the
+        // fallback binds exactly as it did before.
         assert!(registry_fallback_binds("", ""));
 
         // Rolling deploy: the worker runs a DIFFERENT build, whose handler may
@@ -63216,9 +62979,9 @@ mod tests {
             "build-new",
         );
 
-        // A co-located worker that has not registered a row yet, and an
-        // API-only replica, both leave the local build unidentified -- which
-        // `registry_fallback_binds` reads as "no build identity configured".
+        // A co-located worker with no row yet, and an API-only replica, both
+        // leave the local build unidentified. `registry_fallback_binds` reads
+        // that as "no build identity configured".
         assert_eq!(local_build_id_from_workers(&workers, Some("w-missing")), "");
         assert_eq!(local_build_id_from_workers(&workers, None), "");
     }
@@ -63226,12 +62989,12 @@ mod tests {
     #[test]
     fn registry_fallback_does_not_gate_a_worker_on_a_different_build() {
         // Rolling deploy. THIS replica runs `build-new`, whose `gated` handler
-        // declares `requires = gpu=true`. The row was enqueued by `build-old`,
-        // whose handler declared nothing, so its snapshot is NULL -- and
-        // `claim_task` admits the old worker, because that worker builds its
-        // own `ineligible_activities` from its OWN registry, which has no
-        // requirement for `gated`. Diagnosis must not reject it on our
-        // requirement and report a false `activity_no_worker`.
+        // declares `requires = gpu=true`. `build-old` enqueued the row, and its
+        // handler declared nothing, so the snapshot is NULL. `claim_task` admits
+        // the old worker, which builds its `ineligible_activities` from its OWN
+        // registry. That registry has no requirement for `gated`. Diagnosis must
+        // not reject it on this replica's requirement and report a false
+        // `activity_no_worker`.
         let registered: std::collections::HashMap<String, serde_json::Value> =
             std::collections::HashMap::from([(
                 "gated".to_string(),
@@ -63293,9 +63056,9 @@ mod tests {
             "the fallback must still gate a worker running the build it came from"
         );
 
-        // Control 2 -- a requirement carried on the ROW's own snapshot is what
-        // `claim_task` enforces server-side, independent of any worker's build,
-        // so it gates every build.
+        // Control 2: `claim_task` enforces a requirement on the ROW's own
+        // snapshot server-side, whatever the worker's build. So it gates every
+        // build.
         let snapshot = serde_json::json!([{"Exact": {"key": "gpu", "value": "true"}}]);
         let snapshotted =
             resolve_required_capabilities(Some(&snapshot), Some("gated"), &registered);
@@ -63354,9 +63117,9 @@ mod tests {
             "build-new",
         ));
 
-        // The default, no-build-routing deployment: every worker (and this
-        // process) advertises no build identity, so it behaves exactly like a
-        // single-build fleet -- the AC3 regression pin.
+        // The default, no-build-routing deployment: no worker (nor this process)
+        // advertises a build identity. So it behaves exactly like a single-build
+        // fleet. This is the AC3 regression pin.
         let no_build_routing = vec![
             eligibility_worker("w-a", &["payments"], "", serde_json::json!({})),
             eligibility_worker("w-b", &["payments"], "", serde_json::json!({})),
@@ -63388,23 +63151,20 @@ mod tests {
         ));
     }
 
-    /// AC1: a task whose activity is breaker-tracked locally but whose only
-    /// eligible worker is on a different build must not have that local fact
-    /// applied to it -- the local tracked/untracked fact is unreliable
-    /// off-build, so the gate does not apply (and, per the endpoint's
-    /// direction-of-safety rule, is not reported as a rate-limit block
-    /// either).
+    /// AC1: a task whose activity is breaker-tracked locally, but whose only
+    /// eligible worker is on another build, must not get that local fact. The
+    /// local tracked/untracked fact is unreliable off-build, so the gate does
+    /// not apply. Per the endpoint's direction-of-safety rule, it is not reported
+    /// as a rate-limit block either.
     ///
-    /// Note the short-circuit: `rate_limit_gate_applies` returns `false` here
-    /// on `!locally_tracked` alone, without even evaluating build agreement --
-    /// there is no cross-process breaker registry to consult (issue #1190's
-    /// own "why it was not fixed on #1188" section), so a build mismatch on
-    /// this side of the disagreement cannot be turned into a positive
-    /// detection, only prevented from being masked by a build check that
-    /// would otherwise wrongly vouch for it. The bucket is therefore
-    /// consulted here no more (and no less) than it was before this fix; the
-    /// residual false-negative risk this scenario describes is accepted
-    /// exactly like the analogous fleet-wide breaker outage
+    /// Note the short-circuit: `rate_limit_gate_applies` returns `false` here on
+    /// `!locally_tracked` alone, without a check of build agreement. There is
+    /// no cross-process breaker registry to consult (see the "why it was not
+    /// fixed on #1188" section of issue #1190). So a build mismatch on this
+    /// side cannot become a positive detection. It can only be kept from being
+    /// masked by a build check that would wrongly vouch for it. The bucket is
+    /// consulted here no more and no less than before this fix. The residual
+    /// false-negative risk is accepted, like the fleet-wide breaker outage that
     /// `local_circuit_snapshot_is_authoritative` already declines to detect.
     #[test]
     fn rate_limit_gate_does_not_apply_when_tracked_locally_but_eligible_peer_differs_build() {
@@ -63422,13 +63182,12 @@ mod tests {
         ));
     }
 
-    /// AC2: a task whose activity is NOT breaker-tracked locally but whose
-    /// only eligible worker is on a different build must not have the bucket
-    /// consulted as the verdict either -- that peer's build may track the
-    /// breaker, in which case its real gate is dispatch-time, not this
-    /// bucket, and reporting `activity_rate_limited` /
-    /// `activity_rate_limit_bucket_missing` for it would be a false positive
-    /// on a `stalled` verdict, the worse direction.
+    /// AC2: take a task whose activity is NOT breaker-tracked locally, with its
+    /// only eligible worker on another build. The bucket must not be its
+    /// verdict either. The build of that peer may track the breaker. Its real
+    /// gate is then dispatch-time, not this bucket. A report of
+    /// `activity_rate_limited` / `activity_rate_limit_bucket_missing` would be a
+    /// false positive on a `stalled` verdict, the worse direction.
     #[test]
     fn rate_limit_gate_does_not_apply_when_untracked_locally_but_eligible_peer_differs_build() {
         let workers = vec![eligibility_worker(
@@ -63445,10 +63204,9 @@ mod tests {
         ));
     }
 
-    /// AC3: a single-build fleet (and any deployment with no build ids, where
-    /// every worker including this process advertises `""`) behaves exactly
-    /// as it did before this fix -- the gate applies iff the activity is not
-    /// locally tracked.
+    /// AC3: a single-build fleet behaves exactly as before this fix. So does a
+    /// deployment with no build ids, where each worker and this process
+    /// advertise `""`. The gate applies iff the activity is not locally tracked.
     #[test]
     fn rate_limit_gate_applies_exactly_as_before_on_a_single_build_fleet() {
         let workers = vec![
