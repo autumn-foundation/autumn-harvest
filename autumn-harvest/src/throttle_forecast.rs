@@ -10,7 +10,8 @@
 //! This module answers that question before deploy. [`forecast`] replays a
 //! list of arrival bursts through the bucket. [`forecast_schedules`] walks
 //! real schedules with [`SlotWalker`] and forecasts their slots.
-//! [`steady_state`] tells whether a periodic burst drains before the next one.
+//! [`steady_state`] tells whether a periodic burst drains before the next
+//! one. It covers a policy with no deadline.
 //!
 //! ## Model
 //!
@@ -133,6 +134,12 @@ pub enum ForecastError {
     /// The burst is not a finite number of 1 or more.
     #[error("throttle burst must be a finite number >= 1, got {0}")]
     InvalidBurst(f64),
+    /// The policy has a `schedule_to_start` deadline.
+    ///
+    /// A deadline drops starts, so a backlog cannot grow without a bound, and
+    /// a closed form does not apply. Call [`forecast`] with the periodic bursts.
+    #[error("steady_state models a policy with no schedule_to_start; use forecast")]
+    DeadlineDrops,
 }
 
 /// The bucket of one policy, in GCRA form.
@@ -182,7 +189,9 @@ impl Bucket {
                 if slack < 0.0 {
                     0
                 } else {
-                    let fits = (slack / self.interval).floor() + 1.0;
+                    // Float error can put an exact fit just under a whole
+                    // token. The epsilon keeps that start.
+                    let fits = (slack / self.interval + FIT_EPSILON).floor() + 1.0;
                     if fits >= arrival.count as f64 {
                         arrival.count
                     } else {
@@ -214,6 +223,9 @@ impl Bucket {
         }
     }
 }
+
+/// The float error, in tokens, that an exact fit can show.
+const FIT_EPSILON: f64 = 1e-9;
 
 /// Convert seconds to a duration, rounded to the nanosecond.
 ///
@@ -297,6 +309,8 @@ pub fn forecast_schedules(
 ///
 /// # Errors
 /// Returns [`ForecastError`] when the policy has no valid rate or burst.
+/// Returns [`ForecastError::DeadlineDrops`] when the policy has a
+/// `schedule_to_start` deadline.
 #[allow(
     clippy::cast_precision_loss,
     reason = "a fan-out stays far inside the exact range of f64"
@@ -307,6 +321,9 @@ pub fn steady_state(
     period: Duration,
 ) -> Result<SteadyState, ForecastError> {
     Bucket::new(policy)?;
+    if policy.schedule_to_start.is_some() {
+        return Err(ForecastError::DeadlineDrops);
+    }
     let drain = fan_out as f64 / policy.refill_per_sec;
     let period = period.as_secs_f64();
     if drain <= period {
@@ -470,6 +487,24 @@ mod tests {
             .unwrap();
         assert_eq!(f.batches, Vec::new());
         assert_eq!(f.drained_at(), None);
+    }
+
+    #[test]
+    fn a_start_that_fits_exactly_is_not_dropped() {
+        // A full bucket of 20 admits all 20 at once, even with a zero deadline.
+        let p = policy("20/s", None, Some(Duration::ZERO));
+        let f = forecast(&p, &[at(0, 20)]).unwrap();
+        assert_eq!(f.admitted(), 20);
+        assert_eq!(f.dropped(), 0);
+    }
+
+    #[test]
+    fn steady_state_refuses_a_policy_that_drops() {
+        let p = policy("1/s", Some(1.0), Some(secs(1)));
+        assert_eq!(
+            steady_state(&p, 10, secs(1)),
+            Err(ForecastError::DeadlineDrops)
+        );
     }
 
     #[test]
