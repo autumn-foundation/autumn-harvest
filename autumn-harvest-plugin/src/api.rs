@@ -49568,7 +49568,7 @@ fn project_herd_budgets(
 /// The lookback of a herd walk and the time at which the walk starts.
 ///
 /// A slot up to one jitter window before `from` can still start inside the
-/// window, so the walk looks back by the widest jitter of `candidates`.
+/// window. So the walk looks back by the widest jitter of `candidates`.
 fn herd_lookback(
     candidates: &[(&HarvestSchedule, Schedule)],
     from: chrono::DateTime<chrono::Utc>,
