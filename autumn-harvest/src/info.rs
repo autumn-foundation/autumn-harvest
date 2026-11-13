@@ -1238,12 +1238,11 @@ fn validate_node(
         && let Some(add_props) = schema_obj.get("additionalProperties")
     {
         // Known-property membership is checked directly against the schema's
-        // own `properties` map (already a `BTreeMap`) rather than collecting
-        // it into a fresh `HashSet<&str>` on every call: `Map::contains_key`
-        // is an allocation-free lookup against a map we've already fetched,
-        // whereas rebuilding and hashing a `HashSet` from scratch every
-        // validation is pure per-call waste for a value that never changes
-        // for a given schema.
+        // own `properties` map (already a `BTreeMap`). It is not collected
+        // into a fresh `HashSet<&str>` on every call. `Map::contains_key` is
+        // an allocation-free lookup against a map that is already fetched.
+        // Rebuilding and hashing a `HashSet` on every validation is pure
+        // per-call waste for a value that never changes for a given schema.
         let known_props = schema_obj.get("properties").and_then(|v| v.as_object());
         let is_known_prop = |key: &str| known_props.is_some_and(|props| props.contains_key(key));
         if add_props.as_bool() == Some(false) {

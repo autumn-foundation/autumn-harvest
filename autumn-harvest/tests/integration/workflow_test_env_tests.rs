@@ -117,7 +117,7 @@ fn cancellable_await_workflow<'a>(
     })
 }
 
-/// (Codex P2 round 5, issue #768 — FIX 1) Arm `idle` at 300s, then call
+/// Issue #768: arm `idle` at 300s, then call
 /// `start_timer("idle", 600)` again with NO cancel/reset between. The second call
 /// is a duration-preserving idempotent no-op: the returned handle MUST carry the
 /// ORIGINAL 300s, not 600, so the durable row / virtual clock stay consistent with
@@ -220,10 +220,9 @@ fn arm_timer_activity_cancel_then_await_workflow<'a>(
     })
 }
 
-/// (Codex P2 round 4, issue #768 — FIX A primary flow) Arm a cancellable timer,
-/// suspend on an activity, then `reset()` and `await_fire()` AFTER the activity
-/// completes. Under the round-4 model the armed timer's `harvest_timers` row is
-/// inserted only at `await_fire`, so it can NEVER fire while the workflow is
+/// Issue #768: arm a cancellable timer, suspend on an activity, then `reset()`
+/// and `await_fire()` AFTER the activity completes. The armed timer's
+/// `harvest_timers` row is inserted only at `await_fire`, so it can NEVER fire while the workflow is
 /// parked on the activity — no spurious `TimerFired` that would break the
 /// subsequent `reset()` (an unconsumed fire → non-determinism) or diverge replay.
 fn arm_timer_activity_reset_then_await_workflow<'a>(
@@ -242,7 +241,7 @@ fn arm_timer_activity_reset_then_await_workflow<'a>(
     })
 }
 
-/// (Codex P2 round 15, issue #768) Arm two cancellable timers with DIFFERENT
+/// Issue #768: arm two cancellable timers with DIFFERENT
 /// durations and `await_fire()` both concurrently via `tokio::join!`. Production
 /// reschedules the parked task to the MINIMUM `fires_at` and ingests due timers in
 /// deadline order, so the FAST timer (dur 1) must fire before the SLOW one (dur
@@ -254,7 +253,7 @@ fn concurrent_await_two_timers_workflow<'a>(
     Box::pin(async move {
         // Capture the virtual-clock start so the test can assert the elapsed after
         // both concurrent timers fire is the MAX deadline (10s), not the SUM (11s)
-        // — issue #768, Codex P2 round 16.
+        // (issue #768).
         let start = ctx.now();
         let slow = ctx.start_timer("slow", 10);
         let fast = ctx.start_timer("fast", 1);
@@ -268,7 +267,7 @@ fn concurrent_await_two_timers_workflow<'a>(
     })
 }
 
-/// (Codex P2 round 16, issue #768 — Finding 2) A sibling/handler-style
+/// Issue #768: a sibling/handler-style
 /// `cancel_timer("deadline")` targeting an id the main body uses as a CLASSIC
 /// `ctx.timer` must be a NO-OP: it must NOT emit a `CancelTimer` (whose
 /// worker-side `delete_pending_timer` would delete the classic timer's durable
@@ -292,7 +291,7 @@ fn cancel_timer_does_not_kill_a_classic_timer_workflow<'a>(
     })
 }
 
-/// (Codex P2 round 4, issue #768 — FIX B) Arm a cancellable timer, cancel it, and
+/// Issue #768: arm a cancellable timer, cancel it, and
 /// then start a CLASSIC `ctx.timer` with the SAME id in one task. The classic
 /// timer must arm cleanly and fire — the same-batch `CancelTimer` must not leave
 /// the classic timer rescheduled to a deleted row (no hang), and the run must
@@ -310,7 +309,7 @@ fn cancel_then_classic_timer_same_id_workflow<'a>(
     })
 }
 
-/// (Codex P2 round 8, issue #768 — FIX A) Arm `idle` at 300s via a handle, then
+/// Issue #768: arm `idle` at 300s via a handle, then
 /// reset it to 600s through `ctx.reset_timer` (NOT the handle), and await the
 /// original handle. `await_fire()` must use the CURRENT armed duration (600) —
 /// read from the logical state map — for the live deadline AND the virtual
@@ -704,7 +703,7 @@ async fn test_cancellable_timer_fires_when_not_cancelled() {
     );
 }
 
-/// (Codex P2 round 15, issue #768) Concurrent awaited cancellable timers fire in
+/// Issue #768: concurrent awaited cancellable timers fire in
 /// DEADLINE order (min `fires_at` first), matching production's min-deadline
 /// reschedule + deadline-ordered ingest — never in `join!` poll order.
 #[tokio::test]
@@ -729,7 +728,7 @@ async fn test_concurrent_awaited_timers_fire_in_deadline_order() {
          slow dur=10), never in join! poll order: {fired_order:?}"
     );
 
-    // Issue #768, Codex P2 round 16: the two timers are armed concurrently (one
+    // Issue #768: the two timers are armed concurrently (one
     // `await_fire` batch), so production starts both deadlines at the same instant
     // and the workflow-observed elapsed after both fire is the MAX deadline (10s),
     // NOT the sum (11s). The live `ctx.now()` read inside the workflow, and
@@ -755,7 +754,7 @@ async fn test_concurrent_awaited_timers_fire_in_deadline_order() {
     );
 }
 
-/// FIX 1 (Codex P2 round 5, issue #768): a duplicate active `start_timer` with a
+/// Issue #768: a duplicate active `start_timer` with a
 /// DIFFERENT duration preserves the RECORDED duration. The handle carries 300
 /// (not the second call's 600), exactly one `TimerStarted(idle, 300)` is
 /// recorded, the timer fires at the 300s deadline (the virtual clock advances by
@@ -870,7 +869,7 @@ async fn test_reset_then_fire() {
     );
 }
 
-/// (Codex P2 round 8, issue #768 — FIX A) A reset performed through
+/// Issue #768: a reset performed through
 /// `ctx.reset_timer` (or another handle) must be honoured by a subsequent
 /// `await_fire()` on the ORIGINAL handle: the live deadline and the virtual
 /// clock must use the CURRENT armed duration (600) from the logical state map,
@@ -932,7 +931,7 @@ async fn test_await_fire_uses_current_reset_duration_not_stale_handle() {
     );
 }
 
-/// (Codex P2 round 8, issue #768 — FIX B) The harness virtual clock
+/// Issue #768: the harness virtual clock
 /// (`final_now`/`elapsed`) must advance ONLY for timers that actually fired.
 /// A reset records `[TimerStarted(300), TimerCancelled, TimerStarted(300),
 /// TimerFired]`; only the second (fired) 300 counts — NOT the cancelled first
@@ -952,7 +951,7 @@ async fn test_final_now_counts_only_fired_arm_not_cancelled_reset_arm() {
     assert_eq!(outcome.final_now(), start + chrono::Duration::seconds(300));
 }
 
-/// (Codex P2 round 8, issue #768 — FIX B) A cancelled timer never fired, so the
+/// Issue #768: a cancelled timer never fired, so the
 /// harness virtual clock must not advance for its `TimerStarted` at all. Before
 /// the fix `final_now` counted the cancelled arm's 300.
 #[tokio::test]
@@ -1129,9 +1128,8 @@ async fn start_timer_then_activity_then_cancel_then_await_cancelled() {
 
 #[tokio::test]
 async fn start_timer_activity_reset_then_await_fires_without_spurious_fire() {
-    // FIX A primary flow (Codex P2 round 4, issue #768): arm → activity →
-    // reset → await. The armed timer must NOT fire while parked on the
-    // activity — under the round-4 model its durable row is inserted only at
+    // Issue #768: arm → activity → reset → await. The armed timer must NOT
+    // fire while parked on the activity. Its durable row is inserted only at
     // `await_fire`, so a `reset()` after the activity is never confronted with an
     // already-fired timer (which would leave an unconsumed TimerFired → non-
     // determinism), and the run replays deterministically to a final `Fired`.
@@ -1147,8 +1145,8 @@ async fn start_timer_activity_reset_then_await_fires_without_spurious_fire() {
     );
 
     let events = outcome.events();
-    // No TimerFired may precede ActivityCompleted (the arm-during-activity window
-    // is exactly what round 4 makes non-fire-eligible).
+    // No TimerFired may precede ActivityCompleted. The durable row is inserted
+    // only at `await_fire`, so the arm-during-activity window is not fire-eligible.
     let ac = events
         .iter()
         .position(|e| matches!(e, WorkflowEvent::ActivityCompleted { .. }))
@@ -1188,7 +1186,7 @@ async fn start_timer_activity_reset_then_await_fires_without_spurious_fire() {
 
 #[tokio::test]
 async fn cancel_then_classic_timer_same_id_arms_and_fires() {
-    // FIX B (Codex P2 round 4, issue #768): a same-task `start_timer("idle");
+    // Issue #768: a same-task `start_timer("idle");
     // cancel(); ctx.timer("idle", n)` must arm the CLASSIC timer cleanly and
     // fire — the same-batch cancel must not leave the classic timer wedged (no
     // hang), and the run must replay deterministically.
@@ -1228,7 +1226,7 @@ async fn cancel_then_classic_timer_same_id_arms_and_fires() {
 
 #[tokio::test]
 async fn cancel_timer_on_a_classic_id_does_not_kill_the_classic_timer() {
-    // Issue #768, Codex P2 round 16 — Finding 2. A `cancel_timer("deadline")`
+    // Issue #768: a `cancel_timer("deadline")`
     // targeting the classic timer's id must be a pure no-op: it must NOT record a
     // `TimerCancelled` (whose worker-side `delete_pending_timer` would delete the
     // classic timer's durable row), so the classic timer still fires — no hang —

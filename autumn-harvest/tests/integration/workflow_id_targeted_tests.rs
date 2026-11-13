@@ -577,7 +577,7 @@ async fn resolver_picks_most_recent_of_multiple_terminal_runs() {
     // pick against fabricated structs.
     //
     // Only ONE row per (workflow_name, workflow_id) may ever hold a state
-    // OUTSIDE {CONTINUED_AS_NEW, TERMINATED} -- that's the DB-level partial
+    // OUTSIDE {CONTINUED_AS_NEW, TERMINATED} -- that is the DB-level partial
     // unique index every OTHER helper in this file already relies on. So
     // "genuinely multiple terminal candidates" is modelled the way it
     // actually arises in production: a continue-as-new chain (each
@@ -1060,7 +1060,7 @@ async fn randomized_signal_by_id_continue_as_new_race_zero_misdeliveries() {
     );
     // The success metric names randomized interleavings, not a specific mix;
     // require the fixture actually exercised BOTH sides of the "who commits
-    // first" race so this isn't a vacuously-passing test.
+    // first" race so this is not a vacuously-passing test.
     assert!(
         delivered_to_pred > 0,
         "fixture must exercise resolve-wins-the-race at least once"
@@ -2124,7 +2124,7 @@ async fn worker_cross_shard_signal_external_workflow_by_id() {
     // `ExecutionId` is genuinely encoded with shard 0 or 1 (whichever is NOT
     // the target's rendezvous-hashed shard) — so the single worker must be
     // assigned both shards or it will never see a caller row encoded on the
-    // shard it isn't watching, and the request stays pending forever.
+    // shard it is not watching, and the request stays pending forever.
     runtime_config.shard_assignments = vec![ShardId::new(0), ShardId::new(1)];
     let worker =
         Arc::new(Worker::new(runtime_config, Arc::new(registry)).expect("worker should build"));
@@ -2327,7 +2327,7 @@ impl autumn_harvest::telemetry::MetricsRecorder for UnfinishedHandlerRecorder {
     }
 }
 
-// 7b. Issue #751 code review (round 2, P2): a cross-shard cancel's deferred
+// 7b. Issue #751: a cross-shard cancel's deferred
 //     unfinished-update-handler check must run against the connection that
 //     actually owns the checked execution id, not unconditionally against
 //     the caller's own shard connection -- otherwise the check silently sees
@@ -2498,8 +2498,8 @@ async fn cross_shard_cancel_reports_unfinished_handlers_on_the_target_shard() {
 /// A minimal [`MetricsRecorder`] that captures every terminal-observability
 /// call the cross-pool cancel-by-id follow-up path can make: the deferred
 /// unfinished-update-handler check, the cancel-terminal metric, and the
-/// (later, caller-side) "external cancel sent" metric. Used by the round-3
-/// review test below to prove the terminal-shard follow-ups are recorded
+/// (later, caller-side) "external cancel sent" metric. Used by test 7c
+/// below to prove the terminal-shard follow-ups are recorded
 /// immediately -- before the caller-side outer transaction has any chance
 /// to fail and discard them.
 #[derive(Default)]
@@ -2537,7 +2537,7 @@ impl autumn_harvest::telemetry::MetricsRecorder for CrossPoolFollowupRecorder {
     }
 }
 
-// 7c. Issue #751 code review (round 3, P2): a cross-shard cancel's target-side
+// 7c. Issue #751: a cross-shard cancel's target-side
 //     commit is real and irrevocable the instant `attempt_cancel_delivery`
 //     returns for the cross-pool branch -- it runs on a *fresh* connection
 //     with its own top-level `conn.transaction(...)` wrap, not a savepoint on
@@ -2754,7 +2754,7 @@ async fn cross_shard_cancel_target_followups_survive_a_failed_caller_side_commit
     );
 }
 
-// 7d. Issue #751 code review (round 5, P2): the deferred unfinished-handler
+// 7d. Issue #751: the deferred unfinished-handler
 //     check's same-pool decision must compare *resolved connection pools*,
 //     not raw `ShardId`s. A legacy/pre-sharding caller execution carries the
 //     `ShardId::UNENCODED` sentinel, which `exact_pool_for_execution`

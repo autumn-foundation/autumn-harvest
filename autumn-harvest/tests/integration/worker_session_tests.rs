@@ -339,7 +339,7 @@ mod db_tests {
 
     /// Sanity: an ordinary (non-session) sticky task DOES fail over after its
     /// lease expires -- confirms the test's premise and that the new gate
-    /// doesn't accidentally change existing sticky-routing behavior.
+    /// does not accidentally change existing sticky-routing behavior.
     #[tokio::test]
     async fn non_session_sticky_task_does_fail_over_after_lease_expires() {
         let (mut conn, _c) = setup().await;

@@ -199,8 +199,7 @@ pub enum TargetLocation {
         run: ResolvedRun,
         /// Shards that could not be inspected, if any. **Non-empty means this
         /// answer is a live run found over a partial view**, and the caller must
-        /// decide whether its operation may act on that (issue #1146, Codex
-        /// round 2).
+        /// decide whether its operation may act on that (issue #1146).
         ///
         /// A **signal** may. Delivering to a live run in hand is real delivery,
         /// and re-delivery is not idempotent without an idempotency key — so
@@ -215,7 +214,7 @@ pub enum TargetLocation {
         /// fan-out be what makes the assertion.
         uninspected: Vec<UninspectedShard>,
         /// Shards that hold a **further live run** of the same key, besides the
-        /// one on `shard` (issue #1146, Codex round 3).
+        /// one on `shard` (issue #1146).
         ///
         /// Empty in every healthy deployment. Non-empty is the state
         /// [`merge_locations`] warns about: `(workflow_name, workflow_id)`
@@ -300,7 +299,7 @@ impl TargetLocation {
     /// in hand is idempotent progress either way. It governs only what may be
     /// recorded.
     ///
-    /// # What `true` does not mean (issue #1146, Codex round 4)
+    /// # What `true` does not mean (issue #1146)
     ///
     /// It is authoritative over **the observations this fan-out made**, not over
     /// an instant in time. The shards are read sequentially, on separate
@@ -494,7 +493,7 @@ pub fn merge_locations(
 }
 
 /// How long a fan-out will wait for a **peer** shard's connection before giving
-/// up on that shard for this attempt (issue #1146, Codex round 1 P1).
+/// up on that shard for this attempt (issue #1146).
 ///
 /// Deliberately far shorter than [`crate::audit_export::SHARD_ACQUIRE_BOUND`],
 /// and for a different reason. That bound exists to stop an *indefinite* park
@@ -510,7 +509,7 @@ pub fn merge_locations(
 /// stall for it on every tick, delaying every other resident of that pass.
 ///
 /// **What this bound guarantees is bounded return, not progress**, and the
-/// distinction matters (Codex round 4). A one-connection pool has nothing to
+/// distinction matters. A one-connection pool has nothing to
 /// spare while its own scanner is mid-pass, so a peer read succeeds only if it
 /// lands during that scanner's sleep window. That is likely — passes are short
 /// relative to `poll_interval`, and two independent tasks doing different work
@@ -533,7 +532,7 @@ pub fn merge_locations(
 pub const FANOUT_ACQUIRE_BOUND: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// Total budget for one **peer** shard probe — acquisition *and* query
-/// (issue #1146, Codex round 2 P1).
+/// (issue #1146).
 ///
 /// [`FANOUT_ACQUIRE_BOUND`] bounds only the checkout. A connection that is
 /// handed over and then never answers is just as fatal: the peer database
@@ -765,11 +764,11 @@ async fn fan_out_candidates(
     // and the shape `ShardedDbPool::from_map` produces whenever the same
     // `DbPool` is inserted under more than one id.
     //
-    // Probing such an alias again is not merely wasteful, it is the bug Codex
-    // round 5 found: the resolver filters on `(workflow_name, workflow_id)` with
-    // no shard predicate, so an alias returns the rows its sibling already
-    // returned — while the acquisition it needs comes from the very pool that
-    // supplied `held`. On a one-connection pool that acquisition cannot succeed
+    // Probing such an alias again is not merely wasteful. It is a bug. The
+    // resolver filters on `(workflow_name, workflow_id)` with no shard
+    // predicate, so an alias returns the rows its sibling already returned.
+    // But the acquisition it needs comes from the very pool that supplied
+    // `held`. On a one-connection pool that acquisition cannot succeed
     // until this function returns, so the alias was reported uninspected on
     // every sweep and a by-id cancel could never reach an authoritative answer:
     // it cancelled the live run and then withheld its terminal forever.
@@ -784,8 +783,7 @@ async fn fan_out_candidates(
     // holding shard 1 of an aliased {0, 1} pair would try to acquire "shard 0" —
     // the pool it is itself holding — and, on a one-connection pool, time out and
     // mark it uninspected on every sweep, permanently withholding a by-id
-    // cancel's terminal. Order must not decide correctness here (issue #1146,
-    // Codex round 6, on the round-5 fix).
+    // cancel's terminal. Order must not decide correctness here (issue #1146).
     if let Some((held_shard, _)) = held.as_ref()
         && let Some(held_pool) = pool.exact_pool_for(*held_shard)
     {
@@ -1081,7 +1079,7 @@ enum ProbeOutcome {
 /// caller cannot forget to memoize one of them, which is exactly the bug this
 /// shape replaced: only the acquisition failures were recorded, so a peer whose
 /// *query* failed slowly was re-probed once per pending row instead of once per
-/// sweep (issue #1146, Codex round 3 P2).
+/// sweep (issue #1146).
 ///
 /// A query that returns an error is `Err` and never `Ok(None)`: a shard that
 /// answered with a failure has not told us the key is absent.
@@ -1196,7 +1194,7 @@ pub(crate) fn peer_acquire_bound(pool: &DbPool) -> std::time::Duration {
 /// previous shape had four of them written out separately and one — a failed
 /// resolution query — silently skipped the memo, so a peer failing slowly just
 /// under the probe bound was re-probed once per pending row instead of once per
-/// sweep (issue #1146, Codex round 3 P2). Routing them all through one place
+/// sweep (issue #1146). Routing them all through one place
 /// removes the class rather than the instance.
 fn mark_uninspected(
     uninspected: &mut Vec<UninspectedShard>,
@@ -1452,7 +1450,7 @@ mod tests {
 
     #[test]
     fn two_live_runs_on_different_shards_are_not_authoritative_even_when_complete() {
-        // Codex round 3. Pinning a key to one shard (#697) while an unpinned
+        // Pinning a key to one shard (#697) while an unpinned
         // start of the same key hashes to another produces two live runs that no
         // shard-local unique index can see. The fan-out DOES see both, and the
         // ranking still picks the most recently started as the current run — the

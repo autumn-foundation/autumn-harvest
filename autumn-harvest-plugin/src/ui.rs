@@ -750,8 +750,8 @@ const fn determine_banner_state(stats: &WorkerFleetStats) -> Option<BannerState>
     if stats.total == 0 && !stats.any_shard_errored {
         return None;
     }
-    // Shard errors mean partial visibility — we can't rule out active workers
-    // on the unreachable shard, so cap severity at Degraded.
+    // Shard errors mean partial visibility. Active workers can exist on the
+    // unreachable shard, so cap severity at Degraded.
     if stats.any_shard_errored {
         return Some(BannerState::Degraded);
     }
@@ -977,7 +977,7 @@ async fn dag_detail_ui(
     // 404 (issue #957 AC7: "unknown run ids render the 404 message"), NOT a
     // silent fallback to a different run. An omitted `?run=` defaults to the
     // latest run. The DB existence check only runs for a parseable run id that
-    // isn't already in the displayed page.
+    // is not already in the displayed page.
     // A parseable run id counts as valid only when it names a run of *this* DAG
     // (in the displayed page, or on the owning shard). An unparseable or unknown
     // run id leaves this `None` — the resolution below maps a present-but-unknown
@@ -2351,7 +2351,7 @@ async fn render_workflow_detail_page(
 }
 
 /// Decode only the workflow-detail fields the renderer actually displays
-/// (PR #936 review, round 5): the execution row's payload fields (the
+/// (PR #936): the execution row's payload fields (the
 /// Input/Output/Memo/Search-attributes cards + the error banner), the
 /// timeline page's event payloads (rendered in full under "view payload"),
 /// and the blocked-on panel's heartbeat checkpoints. Hidden fields are
@@ -2659,8 +2659,8 @@ async fn terminate_workflow_ui(
 }
 
 /// Flash text for the pause action: an idempotent repeat (`newly_paused:
-/// false`) is called out so the operator isn't misled into thinking their
-/// click performed the transition (issue #609 post-review hardening).
+/// false`) is called out so the operator is not misled into thinking their
+/// click performed the transition (issue #609).
 const fn pause_flash_message(newly_paused: bool) -> &'static str {
     if newly_paused {
         "Workflow paused"
@@ -5971,7 +5971,7 @@ fn build_query_string(
     // Carries the raw text through, valid or not — a bound the operator is
     // still correcting (an invalid value with its inline error, see
     // `parse_started_bound`) must not silently vanish from a Next/Previous
-    // link before they've resolved it.
+    // link before they have resolved it.
     if !started_after_raw.is_empty() {
         let _ = write!(out, "&started_after={}", url_encode(started_after_raw));
     }
@@ -6022,7 +6022,7 @@ const ACTIVITY_PANEL_EVENT_TYPES: &[&str] = &[
 /// Extract a string field from the inner `data` object of an adjacently-tagged event payload.
 ///
 /// Events are stored as `{"type": "...", "data": {...}}`. This helper reaches through the outer
-/// wrapper so callers don't have to repeat the two-step lookup everywhere.
+/// wrapper so callers do not have to repeat the two-step lookup everywhere.
 fn event_data_field<'a>(event_data: &'a Value, field: &str) -> Option<&'a str> {
     event_data.get("data")?.get(field)?.as_str()
 }
@@ -6781,7 +6781,7 @@ enum CheckpointCellState {
 /// mirroring the stack API (#503 review): each checkpoint is judged against its
 /// activity's effective cap (per-activity `max_result_bytes` raised against the
 /// global ceiling), then a cumulative per-page budget — the global cap — bounds
-/// the total rendered bytes so a large fan-out can't generate a huge HTML page.
+/// the total rendered bytes so a large fan-out cannot generate a huge HTML page.
 /// The first payload-bearing checkpoint is always shown. The byte size is
 /// measured once here via the shared non-allocating counter; the renderer reads
 /// the resulting state without re-serializing.
@@ -7529,7 +7529,7 @@ const fn dag_node_status_label(status: DagNodeStatus) -> &'static str {
 
 /// Whether a "Retry from this node" action should be offered: the run must be
 /// terminally retryable (matching #366's accepted source states) and the node
-/// must be an attempted-but-not-succeeded node (so the #366 resolver won't
+/// must be an attempted-but-not-succeeded node (so the #366 resolver will not
 /// reject it as never-attempted / already-succeeded).
 fn node_retry_offered(run_state: &str, status: DagNodeStatus) -> bool {
     matches!(run_state, "FAILED" | "CANCELLED" | "TIMED_OUT")
@@ -13808,7 +13808,7 @@ mod tests {
             .expect("lazy pool builds without connecting")
     }
 
-    /// Issue #619 review (round 11): mid a shard-add rollout the router
+    /// Issue #619: mid a shard-add rollout the router
     /// advertises a shard this process has no pool for. Fanning out over the
     /// pools alone would give that shard no future at all, so it could never
     /// reach `unreadable_shards` — and if it is the only shard holding a queue,
@@ -15900,7 +15900,7 @@ mod tests {
         }
     }
 
-    // ── Issue #608 / PR #936 round 5: decode only rendered detail fields ─────
+    // ── Issue #608 / PR #936: decode only rendered detail fields ─────
 
     /// Reversing test codec so an envelope is distinguishable from plaintext.
     #[derive(Debug)]
@@ -15964,7 +15964,7 @@ mod tests {
         }
     }
 
-    /// PR #936 round 5: the pending-activity `input` and pending-signal
+    /// PR #936: the pending-activity `input` and pending-signal
     /// payloads are never rendered by the detail page, so they must not be
     /// decoded and must not count toward the `payload.decode_read` audit
     /// outcome — envelopes there stay untouched and the outcome stays empty
@@ -20260,7 +20260,7 @@ mod tests {
         );
     }
 
-    // -- Codex round 1 regressions --
+    // -- Backfill window and auto-pause regressions --
 
     /// Codex #1: a submitted window with sub-second precision must reach the API
     /// unchanged. `SecondsFormat::Secs` truncated both bounds, and an `interval:`
@@ -20356,7 +20356,7 @@ mod tests {
         assert!(!html.contains(&format!("schedules/{active_id}/resume")));
     }
 
-    // -- Codex round 2 regressions --
+    // -- Unlimited run cap and exhaustion regressions --
 
     /// Codex #1: `max_runs = 0` is the engine's "unlimited" (every bound check
     /// guards on `max > 0`, pinned by `backfill_max_runs_zero_is_treated_as_unlimited`),
@@ -20462,7 +20462,7 @@ mod tests {
         );
     }
 
-    // -- Codex round 3 regressions --
+    // -- Pending-slot bound and auto-pause preview regressions --
 
     /// Codex r3 #1: the `end_at` bound is about the pending slot, not the wall
     /// clock. `schedule_overdue` tests `next_run_at >= end_at`; comparing `now`
@@ -20520,9 +20520,9 @@ mod tests {
         assert!(!schedule_is_bounded_out(&no_slot_before_cutoff, now));
     }
 
-    /// Codex r3 #2: `max_runs = 0` is unlimited, so the *preview* must not report
-    /// a spent budget either. The list cell was corrected in round 2 while the
-    /// shared computation still mapped the raw cap.
+    /// `max_runs = 0` is unlimited, so the *preview* must not report a spent
+    /// budget either. The list cell and the shared computation must both map
+    /// the raw cap to unlimited.
     #[test]
     fn a_zero_run_cap_is_unlimited_in_the_shared_budget_helper() {
         assert_eq!(

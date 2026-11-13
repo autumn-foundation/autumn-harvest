@@ -490,8 +490,8 @@ mod tests {
     fn test_saga_context_accessor() {
         let ctx = WorkflowContext::new_test();
         let saga = Saga::new(&ctx);
-        // We can't easily assert on the context itself without PartialEq,
-        // but we can verify the method exists and returns a reference.
+        // Without PartialEq the context itself is hard to assert on. The test
+        // verifies that the method exists and returns a reference.
         let _ = saga.context();
     }
 

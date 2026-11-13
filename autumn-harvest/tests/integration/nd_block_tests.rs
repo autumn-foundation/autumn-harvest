@@ -747,7 +747,7 @@ async fn blocked_execution_resumes_after_rollback() {
     let _ = handle2.await;
 
     // "Rollback": v1 is deployed again. Backdate the backoff so the test
-    // doesn't sleep through it.
+    // does not sleep through it.
     make_task_claimable_now(&mut conn, exec_id).await;
     let (worker3, handle3) = spawn_worker(
         make_worker(

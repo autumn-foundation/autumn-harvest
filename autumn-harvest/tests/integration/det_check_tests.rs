@@ -1459,7 +1459,7 @@ fn det011_does_not_flag_macros_whose_name_merely_ends_in_select() {
     // must NOT be flagged — the backward path walk absorbs the leading ident
     // bytes into a non-matching path (`sql_select` / `my_select`), keeping
     // det_check in agreement with the compile-time HVG010 guardrail (which
-    // matches macro paths exactly and accepts these) (#980 Codex P2 review).
+    // matches macro paths exactly and accepts these) (#980).
     for call in [
         "sql_select! { columns }",
         "let _ = my_select!();",
@@ -1595,7 +1595,7 @@ fn det011_does_not_flag_qualified_non_futures_combinator_paths() {
     // and matches it exactly against the same set as the macro lint's
     // `is_select_combinator_path`, so a same-tail-name helper under a different
     // root is rejected exactly as the compile-time HVG010 guardrail rejects it
-    // (#980 Codex P2 review).
+    // (#980).
     for call in [
         "let _ = crate::future::select(a, b).await;",
         "let _ = my_dsl::select_all(v);",
@@ -1760,7 +1760,7 @@ fn det011_does_not_flag_absolute_non_futures_combinator_paths() {
 fn det011_does_not_flag_method_call_forms_of_combinators() {
     // Method calls (`.select_all()`, `.try_select(..)`) are NOT the futures
     // free-function combinators — they must not be flagged, mirroring the AST
-    // visitor's structural exclusion of method-call receivers (#799 P2 review).
+    // visitor's structural exclusion of method-call receivers (#799).
     for call in [
         "let _ = x.select_all();",
         "let _ = q.try_select(a, b);",
@@ -1989,12 +1989,13 @@ fn pure_helper(x: i64) -> i64 {
 
 #[test]
 fn transitive_cross_file_via_check_dir_is_not_resolved_same_module_only() {
-    // BOUNDARY (issue #778, Codex r4/r5): the workflow lives in file A and calls
-    // a first-party helper defined in file B. Reaching it requires a `use` import
-    // the line-based scanner cannot see, so under same-module-only resolution the
-    // cross-file helper is deliberately NOT resolved — a documented safe
-    // false-negative (never resolving cross-module is what ends the round-4/round-5
-    // false-positive family for a CI gate). #386 is body-only and also misses these
+    // BOUNDARY (issue #778): the workflow lives in file A and calls a
+    // first-party helper defined in file B. Reaching it requires a `use` import
+    // the line-based scanner cannot see. Under same-module-only resolution the
+    // cross-file helper is deliberately NOT resolved. That is a documented safe
+    // false-negative. Cross-module name resolution flagged innocent code under a
+    // same-named helper, and never resolving cross-module ends that family of
+    // false positives for a CI gate. #386 is body-only and also misses these
     // transitive skips; the backstop is runtime replay (`WorkflowReplayer` / live
     // `HistoryMatcher`) plus manual review, not #386.
     let dir = tempfile::tempdir().expect("tempdir");
@@ -2231,7 +2232,7 @@ fn bad_time_helper() -> i64 {
 /// clean (the line-based lexer does not track cross-line string literals).
 const WF_UTC: &str = "#[workflow]\nasync fn wf(ctx: &WorkflowContext) -> Result<(), String> {\n    let _ = chrono::Utc::now();\n    Ok(())\n}\n";
 
-// P1 FIX #1 (AC8): a bare repo-root scan must exclude the deliberately-broken
+// AC8: a bare repo-root scan must exclude the deliberately-broken
 // `compile_fail/` trybuild fixtures (they are not real workflow source and
 // carry committed `.stderr` snapshots that must not be edited).
 #[test]
@@ -2266,7 +2267,7 @@ fn check_dir_excludes_compile_fail_fixtures() {
     );
 }
 
-// P2 FIX #4: `check_dir` must also skip `target/` and hidden (`.`) directories.
+// `check_dir` must also skip `target/` and hidden (`.`) directories.
 #[test]
 fn check_dir_skips_target_and_hidden_dirs() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -2293,7 +2294,7 @@ fn check_dir_skips_target_and_hidden_dirs() {
     assert!(det001[0].location.as_ref().unwrap().file.contains("real"));
 }
 
-// P1 FIX #2 (zero-FP): a call bound to a fn-pointer PARAMETER of the same name
+// Zero false positives: a call bound to a fn-pointer PARAMETER of the same name
 // must NOT resolve to a same-named first-party free helper (#386 excludes
 // function pointers). Reproducer A.
 #[test]
@@ -2316,7 +2317,7 @@ fn transform(n: i64) -> i64 {
     );
 }
 
-// P1 FIX #2 (zero-FP): a call bound to a LOCAL closure of the same name must
+// Zero false positives: a call bound to a LOCAL closure of the same name must
 // NOT resolve to a same-named first-party free helper (#386 excludes
 // closures). Reproducer B.
 #[test]
@@ -2513,16 +2514,17 @@ fn bad() -> i64 {
     assert_eq!(finding.via_helper.as_deref(), Some("bad"));
 }
 
-// ── P2 FIX #3: check_paths — cross-path index, dedup, symlinks, non-UTF8 ────
+// ── check_paths — cross-path index, dedup, symlinks, non-UTF8 ───────────────
 
-// BOUNDARY (issue #778, Codex r4/r5): the changed-files CI pattern `det-check
+// BOUNDARY (issue #778): the changed-files CI pattern `det-check
 // f1.rs f2.rs` passes each file as a SEPARATE argument. `check_paths` still
 // collects them into a single shared index (dedup / symlink / non-UTF-8
 // robustness stand — see the tests below), but bare helper calls resolve
 // same-module ONLY, so a cross-file transitive helper is deliberately NOT
-// resolved (a documented safe false-negative). Never resolving cross-module is
-// what ends the round-4/round-5 false-positive family; for a CI gate a false
-// positive on innocent code is the worse outcome.
+// resolved (a documented safe false-negative). Cross-module name resolution
+// flagged innocent code under a same-named helper. Never resolving cross-module
+// ends that family of false positives. For a CI gate a false positive on
+// innocent code is the worse outcome.
 #[test]
 fn check_paths_cross_file_helper_is_not_resolved_same_module_only() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -2710,7 +2712,7 @@ fn check_paths_errors_on_a_missing_top_level_path() {
     );
 }
 
-// ── P2 FIX #4: additional coverage — transitive structural rule, exacts ─────
+// ── Additional coverage — transitive structural rule, exacts ────────────────
 
 // A STRUCTURAL rule (DET010) reached through a first-party helper must be
 // attributed with `via_helper` — proving the full rule set (not just the
@@ -3670,10 +3672,10 @@ mod m {
     assert_eq!(finding.workflow_name.as_deref(), Some("wf"));
 }
 
-// ── FIX F (issue #778, Codex r6): recognize raw identifiers in the CALL tokenizer.
-// Round 4 indexed a `fn r#gen` def under the key `r#gen`, but the call tokenizer
-// split `r#gen()` into `r`/`gen`, so the call never matched the def → a reachable
-// hard blocker in a raw-ident helper was silently missed (false negative).
+// ── Issue #778: recognize raw identifiers in the CALL tokenizer.
+// The def index stores a `fn r#gen` def under the key `r#gen`. A call tokenizer
+// that splits `r#gen()` into `r`/`gen` never matches the def. A reachable hard
+// blocker in a raw-ident helper is then silently missed (false negative).
 
 #[test]
 fn raw_ident_helper_call_is_resolved_and_flagged() {

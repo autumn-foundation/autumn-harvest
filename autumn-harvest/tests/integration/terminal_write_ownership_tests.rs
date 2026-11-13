@@ -805,7 +805,7 @@ async fn a_dispatcher_that_still_owns_the_claim_is_released_when_skip_locked_is_
 }
 
 // ---------------------------------------------------------------------------
-// fail_execution_on_error -- Codex review round 1, P1: this shared
+// fail_execution_on_error -- this shared
 // error-handling glue passed `SuspendedClaimAmbiguous` through un-failed but
 // not `TerminalWriteClaimAmbiguous`, so a #1184-guarded write's ambiguity
 // (e.g. from `persist_workflow_continue_as_new`'s seal transaction) fell
@@ -863,7 +863,7 @@ async fn fail_execution_on_error_passes_terminal_write_claim_ambiguous_through_u
 }
 
 // ---------------------------------------------------------------------------
-// move_workflow_to_dlq_for_history_cap -- Codex review round 3, P1: the
+// move_workflow_to_dlq_for_history_cap -- the
 // hard-cap terminal-failure/DLQ path had no ownership check at all. A stale
 // dispatcher whose claim had already moved could still DLQ and terminally
 // fail a run its new owner was actively driving.

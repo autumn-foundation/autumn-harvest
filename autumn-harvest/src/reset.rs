@@ -1591,7 +1591,7 @@ pub(crate) async fn insert_fork_row(
     // RUNNING execution (the documented escalation path for a stuck block),
     // whose search_attrs still carries the diagnostic — the fresh fork itself
     // has never diverged, so it must not display a phantom "blocked" reason.
-    // Guarded on `Some` so a source with no search_attrs at all doesn't gain
+    // Guarded on `Some` so a source with no search_attrs at all does not gain
     // a stray `{}` object (`apply_raw_search_attrs_patch_in_memory` always
     // returns `Some`, mirroring `store::update_search_attrs`'s DB semantics).
     let fork_search_attrs = source.search_attrs.as_ref().map(|_| {
@@ -1628,9 +1628,10 @@ pub(crate) async fn insert_fork_row(
         runbook_url: source.runbook_url.as_deref(),
         severity: source.severity.as_deref(),
         context_headers: source.context_headers.clone(),
-        // Reset forks are operator interventions, not scheduled fires: leaving
-        // schedule_id NULL keeps their (re-)completion out of scheduled carryover so a
-        // reset of an old slot can't roll a later run's incremental cursor backward (#488).
+        // Reset forks are operator interventions, not scheduled fires. A NULL
+        // schedule_id keeps their (re-)completion out of scheduled carryover. So a
+        // reset of an old slot cannot roll a later run's incremental cursor backward
+        // (#488).
         schedule_id: None,
         scheduled_for: None,
         workflow_attempt: 1,

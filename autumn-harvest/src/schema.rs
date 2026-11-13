@@ -124,7 +124,7 @@ diesel::table! {
         /// `NULL` when `sla_breached = false`.
         sla_breached_at -> Nullable<Timestamptz>,
         /// The logical schedule slot this run fires for (issue #488). Carryover is
-        /// ordered by this rather than `completed_at` so out-of-order completions can't
+        /// ordered by this and not by `completed_at`, so out-of-order completions cannot
         /// roll an incremental cursor backward. NULL for non-scheduled executions.
         scheduled_for -> Nullable<Timestamptz>,
         /// Attempt number of this execution in its retry chain (issue #523). 1 = first attempt.
@@ -399,10 +399,10 @@ diesel::table! {
         /// be silently dropped. Read-and-cleared by `park_workflow_task` so a park
         /// racing a same-cycle wake immediately re-pends instead of parking.
         wake_requested -> Bool,
-        /// Issue #804 (round 46): WHICH handler the two counters above are
-        /// about, as `{kind}:{name}`. The counters describe one frontier, and
-        /// a frontier is identified by the single handler that would move it;
-        /// a mismatch means the evidence belongs to a frontier now behind us.
+        /// Issue #804: WHICH handler the two counters above are about, as
+        /// `{kind}:{name}`. The counters describe one frontier. The single
+        /// handler that would move a frontier identifies it. A mismatch means
+        /// that the evidence belongs to an earlier frontier.
         /// `NULL` = none recorded yet, which reads as a mismatch.
         capability_miss_handler -> Nullable<Text>,
         timed_out_claims -> Nullable<Array<Nullable<Text>>>,

@@ -276,7 +276,7 @@ async fn two_scheduled_runs_carry_cursor_forward() {
     let run1_ids = wait_for_state(&url, wf_name, "COMPLETED", 1).await;
     assert_eq!(run1_ids.len(), 1, "run 1 must complete");
 
-    // Load run 1's output and assert it's {value:1}.
+    // Load run 1's output and assert it is {value:1}.
     let mut check = AsyncPgConnection::establish(&url).await.unwrap();
     let run1_output: Option<serde_json::Value> = harvest_workflow_executions::table
         .filter(harvest_workflow_executions::dsl::id.eq(run1_ids[0]))
@@ -599,7 +599,7 @@ async fn last_error_reflects_prior_failure_and_clears_after_recovery() {
 /// any stale or reset value.
 #[tokio::test]
 async fn skip_policy_does_not_advance_carryover() {
-    // This tests that OverlapPolicy::Skip dropping a fire doesn't corrupt carryover.
+    // This tests that OverlapPolicy::Skip dropping a fire does not corrupt carryover.
     // Effectively: run 1 completes {value:1}, one slot is skipped (max_active_runs=1
     // with run 1 still running), run 2 fires next tick and sees {value:1}.
     // We can verify skip indirectly: two ticks with max_active_runs=1 while run 1
@@ -608,7 +608,7 @@ async fn skip_policy_does_not_advance_carryover() {
     //
     // Full overlap-skip scenario is exercised by a simpler assertion: the
     // carryover integration test above already confirms the scheduler-side path.
-    // This test focuses on the "skipped slot count doesn't advance cursor"
+    // This test focuses on the "skipped slot count does not advance cursor"
     // invariant via the recovery_aware_handler.
     let (mut conn, url, _c) = setup_db().await;
     let wf_name = "carryover_skip_wf";

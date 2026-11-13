@@ -1,7 +1,7 @@
 //! Workflow simulator for local, determinism-safe testing.
 //!
-//! Provides a fast, in-memory execution environment for workflows that doesn't
-//! require Postgres or worker pools. This allows testing workflow logic,
+//! Provides a fast, in-memory execution environment for workflows that does
+//! not require Postgres or worker pools. This allows testing workflow logic,
 //! branching, and state manipulation instantly.
 
 use std::collections::{HashMap, HashSet};
@@ -1519,8 +1519,7 @@ mod tests {
         assert_eq!(non_retryable, Some(false));
     }
 
-    // ── Cancellable/renewable timer bookkeeping in the simulator (issue #768,
-    //    Codex P2 round 14) ─────────────────────────────────────────────────
+    // ── Cancellable/renewable timer bookkeeping in the simulator (issue #768) ──
 
     /// Arm a cancellable timer and await its fire — the workflow must make
     /// progress (no simulator deadlock) and record the timer lifecycle.

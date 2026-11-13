@@ -4105,26 +4105,25 @@ async fn delete_candidate_execution(
         .map_err(database_error)?;
 
         // `harvest_completion_deliveries.workflow_exec_id` has no `ON
-        // DELETE CASCADE` (issue #605 code review). Only `DELIVERED`
-        // rows are deleted here — a fully successful delivery has
-        // nothing left to do, so it is safe cleanup exactly like
-        // `harvest_dead_letters` above. A `PENDING`/`INFLIGHT`/`FAILED`
-        // row is deliberately left alone (PR #921 review, Codex): its
-        // `payload` is frozen precisely so delivery does not depend on
-        // the execution row surviving, and this execution reaching its
-        // retention age has no bearing on whether its callback still
-        // needs to be retried or is awaiting an operator's redrive.
-        // Known limitation: once its owning execution is collected, a
+        // DELETE CASCADE` (issue #605). Only `DELIVERED` rows are
+        // deleted here. A fully successful delivery has nothing left to
+        // do, so it is safe cleanup exactly like `harvest_dead_letters`
+        // above. A `PENDING`/`INFLIGHT`/`FAILED` row is deliberately
+        // left alone (PR #921). Its `payload` is frozen so that delivery
+        // does not depend on the execution row surviving. The retention
+        // age of this execution has no bearing on whether its callback
+        // still needs a retry or awaits an operator's redrive.
+        //
+        // Known limitation: after its owning execution is collected, a
         // surviving non-`DELIVERED` row references a `workflow_exec_id`
-        // that no longer exists (there is no FK to violate, so this is
-        // safe) and this retention pass will never revisit that exact
-        // execution again — so even if the delivery later resolves to
-        // `DELIVERED`, nothing currently deletes it. A future dedicated
-        // delivery-retention policy, scoped to this table's own age/
-        // state rather than its owning execution's, would be needed to
-        // reclaim those rows; out of scope here, where the goal is only
-        // to stop retention from destroying a delivery that hasn't
-        // finished yet.
+        // that no longer exists. There is no FK to violate, so this is
+        // safe. This retention pass never revisits that execution. So
+        // if the delivery later resolves to `DELIVERED`, nothing
+        // currently deletes it. Reclaiming those rows needs a dedicated
+        // delivery-retention policy, scoped to this table's own
+        // age/state and not its owning execution's. That is out of scope
+        // here. The goal here is only to stop retention from destroying
+        // a delivery that has not finished yet.
         diesel::delete(
             harvest_completion_deliveries::table
                 .filter(harvest_completion_deliveries::workflow_exec_id.eq(candidate_id))

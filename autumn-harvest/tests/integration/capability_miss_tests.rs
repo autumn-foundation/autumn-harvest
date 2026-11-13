@@ -130,11 +130,11 @@ struct CapabilityMetrics {
     /// Poison-pill quarantine emissions — must stay empty (AC4).
     quarantined: Mutex<Vec<(String, String)>>,
     /// `harvest.workflow.started` emissions as `(workflow, queue)`. A release
-    /// must never let this fire twice for one execution (Codex round-17 P2).
+    /// must never let this fire twice for one execution.
     started: Mutex<Vec<(String, String)>>,
     /// `harvest.workflow.task_timeout` emissions as `(workflow, queue)` — the
     /// issue #494 signal, kept separate from `misses` so the two paths can be
-    /// told apart (Codex round-25 P1).
+    /// told apart.
     task_timeouts: Mutex<Vec<(String, String)>>,
 }
 
@@ -256,7 +256,7 @@ fn build_worker(
 
 /// `build_worker` with the two issue #494 knobs exposed.
 ///
-/// Only the round-25 P1 regression guard needs them: it has to make the
+/// Only the issue #494 timeout-budget regression guard needs them: it has to make the
 /// workflow decision cycle overrun a *short* budget and quarantine on the
 /// *first* strike, so the timeout path is reached deterministically rather
 /// than after 90 seconds and three redeliveries.
@@ -433,7 +433,7 @@ async fn load_execution(url: &str, exec_id: ExecutionId) -> WorkflowExecution {
 /// is up to 1,200 TCP+auth handshakes against the database for a single wait,
 /// and this suite runs against a *shared* Postgres. That storm competes for
 /// connection slots with the very worker the wait is waiting on — including its
-/// startup fleet registration, which gates task claiming (issue #804, round 54)
+/// startup fleet registration, which gates task claiming (issue #804)
 /// — so the polling can starve the progress it is polling for.
 async fn load_execution_on(
     conn: &mut AsyncPgConnection,
@@ -497,7 +497,7 @@ async fn dead_letter_errors(url: &str, exec_id: ExecutionId) -> Vec<String> {
 }
 
 /// Seed a task row's distinct-miss set as if `workers` had each already claimed
-/// and released it (issue #804 round 6).
+/// and released it (issue #804).
 ///
 /// The redelivery budget is consumed per DISTINCT worker, so an all-incapable
 /// *fleet* is what exhausts it — a single worker bouncing never can. Seeding the
@@ -509,15 +509,15 @@ async fn dead_letter_errors(url: &str, exec_id: ExecutionId) -> Vec<String> {
 /// These tests exercise clauses that are not about the frontier (cardinality,
 /// the error column, crash strikes, the claim guard), so they all use one key
 /// and seed it where the row's counters have to survive the release -- the
-/// SAME-frontier arm (issue #804, Codex round-46 P1).
+/// SAME-frontier arm (issue #804).
 const TEST_FRONTIER: &str = "workflow:noop_wf";
 
 async fn seed_prior_missing_workers(
     url: &str,
     exec_id: ExecutionId,
     workers: &[&str],
-    // The workflow these misses were recorded against (issue #804, Codex
-    // round-46 P1). Evidence is keyed by frontier, so seeding it without the
+    // The workflow these misses were recorded against (issue #804).
+    // Evidence is keyed by frontier, so seeding it without the
     // handler it is about would read as a mismatch -- a fresh budget -- and
     // every escalation these tests assert would silently become a release.
     missing_workflow: &str,
@@ -642,7 +642,7 @@ async fn wait_for_task_owner(
     // (same rationale as `wait_for_terminal`): a row still `PENDING` with a
     // future `scheduled_at` is a backoff, a row owned by someone else is a lost
     // race, and an EMPTY worker registry is a registration that never committed
-    // — which gates claiming outright (issue #804, round 54) and is invisible
+    // — which gates claiming outright (issue #804) and is invisible
     // from the task row alone.
     let mut diag = connect(url).await;
     let tasks = load_tasks_on(&mut diag, exec_id).await;
@@ -772,7 +772,7 @@ async fn wait_for_terminal(
 /// failed.
 ///
 /// `attempt` is deliberately **not** asserted here, because it is the one
-/// clause that legitimately differs by phase (Codex round-17 P2): a
+/// clause that legitimately differs by phase: a
 /// pre-handler release restores it, a post-handler release must not. Use
 /// [`assert_released_before_the_handler`] for the pre-handler case, which is
 /// where restoring it is the AC4 retry-budget guarantee.
@@ -932,7 +932,7 @@ fn decoy_workflow(_ctx: &WorkflowContext, _input: serde_json::Value) -> BoxFut<'
 }
 
 /// Where `workflow_invalidates_peer_then_misses` reaches the database, and the
-/// peer whose evidence it clears (issue #804 round 27).
+/// peer whose evidence it clears (issue #804).
 ///
 /// A **pool**, not a URL, for the exact reason [`CLAIM_THEFT_INJECTION`]
 /// documents. The whole body has a bounded window to reach a
@@ -978,7 +978,7 @@ async fn prewarm_race_injection() {
         .expect("race pre-warm round-trips");
 }
 
-/// The deterministic injection point for the round-27 race: a workflow body
+/// The deterministic injection point for the invalidate-then-miss race: a workflow body
 /// that clears a peer's capability-miss evidence **while its own dispatch holds
 /// the claim**, then misses on an activity this worker does not register.
 ///
@@ -1012,7 +1012,7 @@ fn workflow_invalidates_peer_then_misses(
 }
 
 /// Where `workflow_steals_own_claim_then_misses` reaches the database (issue
-/// #804 round 28). Same `OnceLock` rationale as [`RACE_INJECTION`].
+/// #804). Same `OnceLock` rationale as [`RACE_INJECTION`].
 /// A **pool**, not a URL, deliberately. The theft has to land in the narrow
 /// window between the claim committing and the miss being decided, and it is
 /// the only thing standing between the stolen row and a terminal failure. A
@@ -1052,7 +1052,7 @@ async fn prewarm_claim_theft_injection() {
         .expect("claim-theft pre-warm round-trips");
 }
 
-/// The deterministic injection point for the round-28 lost-claim P1: a workflow
+/// The deterministic injection point for the lost-claim hazard: a workflow
 /// body that hands its own task row to another worker **while its dispatch is
 /// still running**, then misses.
 ///
@@ -1102,7 +1102,7 @@ fn workflow_calls_peer_activity(ctx: &WorkflowContext, input: serde_json::Value)
 }
 
 /// Sibling of [`workflow_calls_peer_activity`] on its own dedicated activity
-/// queue, so the round-17 start-metric test cannot claim (or be blocked by) an
+/// queue, so the started-once metric test cannot claim (or be blocked by) an
 /// adjacent test's activity row in the shared database.
 fn workflow_calls_started_once_activity(
     ctx: &WorkflowContext,
@@ -1429,7 +1429,7 @@ async fn activity_capability_miss_is_released_for_a_capable_peer() {
 /// rolls back — so nothing lands in history either. If the release also rolled
 /// `attempt` back to `0`, the next capable claim would see `attempt == 1` with
 /// no scheduling events and emit the counter a **second** time, inflating
-/// workflow-start counts and every SLO derived from them (Codex round-17 P2).
+/// workflow-start counts and every SLO derived from them.
 ///
 /// The fix is phase-gated: only a `BeforeHandler` release restores `attempt`
 /// (nothing ran, and the metric was never emitted, so the next dispatch *must*
@@ -1557,7 +1557,7 @@ async fn a_post_handler_release_does_not_re_emit_workflow_started() {
 }
 
 // ---------------------------------------------------------------------------
-// Codex round-19 P2 — a local-activity miss releases BEFORE its batch's
+// A local-activity miss releases BEFORE its batch's
 // sibling commands are committed.
 // ---------------------------------------------------------------------------
 
@@ -1692,7 +1692,7 @@ async fn a_local_activity_miss_releases_before_committing_its_batch() {
 }
 
 // ---------------------------------------------------------------------------
-// Frontier-scoped miss accounting (issue #804, Codex round-20 P1).
+// Frontier-scoped miss accounting (issue #804).
 // ---------------------------------------------------------------------------
 
 const Q_TWO_FRONTIER: &str = "q804-two-frontier";
@@ -1925,8 +1925,7 @@ async fn durable_inline_progress_starts_the_next_frontier_with_a_clean_budget() 
 /// Retry **exhaustion** retires a frontier as decisively as success does — the
 /// local activity will never be attempted again, so the run's stuck position has
 /// moved. Both outcomes therefore reset the accounting, and both do it in the
-/// same transaction as the append that makes the progress durable (issue #804,
-/// Codex round-21 P1).
+/// same transaction as the append that makes the progress durable (issue #804).
 ///
 /// Same non-nested fleet as the success case above, but frontier 1 is a local
 /// activity that always fails and a workflow that catches the exhaustion and
@@ -2029,7 +2028,7 @@ async fn exhausting_a_local_activity_also_starts_the_next_frontier_clean() {
 /// escalates through the ordinary terminal-failure path, tagged with the
 /// greppable `no_capable_worker:` prefix.
 ///
-/// The budget is consumed per distinct worker (issue #804 round 6), so it is an
+/// The budget is consumed per distinct worker (issue #804), so it is an
 /// all-incapable *fleet* that exhausts it. Three prior workers are seeded onto
 /// the row and this test's worker is the fourth — one past a budget of 3.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2086,8 +2085,8 @@ async fn capability_miss_escalates_after_the_budget_with_no_capable_worker() {
         "the reason must state the exact number of releases that completed \
          (a single-char check cannot catch an off-by-one), got {error:?}"
     );
-    // The knob is reported separately from the release count (Codex round-23
-    // P1). They coincide here -- a distinct sweep where each worker missed once
+    // The knob is reported separately from the release count. They coincide
+    // here -- a distinct sweep where each worker missed once
     // -- but the string must name the knob in its own labelled position, so an
     // operator can tell a real 3-release sweep from a budget that happens to be
     // 3.
@@ -2141,7 +2140,7 @@ async fn capability_miss_escalates_after_the_budget_with_no_capable_worker() {
     );
 }
 
-/// **Issue #804 round-6 P1.** One incapable worker repeatedly winning the claim
+/// **Issue #804.** One incapable worker repeatedly winning the claim
 /// race must never exhaust the redelivery budget.
 ///
 /// The release backoff makes the task eligible to *every* worker again — the
@@ -2158,11 +2157,12 @@ async fn capability_miss_escalates_after_the_budget_with_no_capable_worker() {
 ///
 /// A live peer that never claims is seeded so the fleet evidence stays
 /// `CapablePeerMayExist` — which is exactly the state this property is about.
-/// The concern round 6 fixed is "a capable peer may be live and merely losing
-/// the claim race", so the test has to be run in a fleet where that is true.
+/// The concern that the distinct-worker budget fixes is "a capable peer may be
+/// live and merely losing the claim race". So the test has to run in a fleet
+/// where that is true.
 /// With the registry instead CONFIRMING that the lone worker is the whole live
 /// fleet there is provably no peer to protect, and the configured budget bounds
-/// total releases too (round 15) — see
+/// total releases too — see
 /// `single_worker_fleet_escalates_at_the_configured_budget` below and the pure
 /// `configured_total_bound_requires_confirmed_fleet_coverage`.
 ///
@@ -2194,7 +2194,7 @@ async fn one_incapable_worker_cannot_exhaust_the_shared_redelivery_budget() {
 
     // A live worker on this queue that never claims, so the registry can never
     // conclude the fleet has been swept. Without it the lone incapable pod IS
-    // the confirmed fleet, and the round-15 total bound would (correctly)
+    // the confirmed fleet, and the total-release bound would (correctly)
     // escalate at BUDGET + 1 -- a different property, covered separately.
     seed_live_worker(&url, "pod-peer-live-never-claims", Q_ESCALATE).await;
 
@@ -2262,19 +2262,20 @@ async fn one_incapable_worker_cannot_exhaust_the_shared_redelivery_budget() {
 /// `CapablePeerMayExist`, which is the state this test is the contrast for.
 const Q_SOLO_FLEET: &str = "q804-solo-fleet";
 
-/// **Issue #804 round-15 P1.** `capability_miss_max_redeliveries` must remain a
+/// **Issue #804.** `capability_miss_max_redeliveries` must remain a
 /// *maximum* in a fleet smaller than the budget.
 ///
-/// The budget's unit of account is DISTINCT workers (round 6), so a fleet of
-/// one can never satisfy `distinct_after > budget` however many times it
-/// bounces the task. Before round 15 the only remaining bound was the absolute
-/// `10x` release ceiling: with the default budget of 5 that is 51 claims and,
+/// The budget's unit of account is DISTINCT workers, so a fleet of one can
+/// never satisfy `distinct_after > budget` however many times it bounces the
+/// task. Without the total-release bound, the only remaining bound is the
+/// absolute `10x` release ceiling: with the default budget of 5 that is 51 claims and,
 /// under the capped backoff, roughly 23 minutes before anyone is paged — for a
 /// knob documented as five releases and ~31 seconds.
 ///
-/// Round 15 applies the configured budget to *total* releases as well, but only
-/// once the worker registry CONFIRMS every live worker on the queue has missed
-/// the task (`AllLiveWorkersMissed`). That gate is what keeps round 6 intact:
+/// The total-release bound applies the configured budget to *total* releases as
+/// well, but only once the worker registry CONFIRMS every live worker on the
+/// queue has missed the task (`AllLiveWorkersMissed`). That gate is what keeps
+/// the distinct-worker budget intact:
 /// on unconfirmed evidence the same total could have been run up by one pod
 /// while a capable peer merely kept losing the claim race.
 ///
@@ -2284,7 +2285,7 @@ const Q_SOLO_FLEET: &str = "q804-solo-fleet";
 /// there a live peer is seeded so the fleet is never confirmed swept, and here
 /// the lone pod IS the confirmed fleet, so the budget is free to bound it.
 ///
-/// Falsifiable — verified by reverting the round-15 branch in
+/// Falsifiable — verified by reverting the total-release branch in
 /// `capability_miss_decision`: the run stays `RUNNING` past the budget and
 /// `wait_for_state(.., "FAILED", ..)` times out.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2341,8 +2342,8 @@ async fn single_worker_fleet_escalates_at_the_configured_budget() {
     // A single-pod fleet exhausts on TOTAL releases, so the distinct count stays
     // at 1 while the release count reaches the budget. Reporting them separately
     // is what lets an operator tell this sub-case apart from a real N-worker
-    // sweep at a glance (Codex round-23 P1) -- with only one number printed the
-    // two are indistinguishable.
+    // sweep at a glance. With only one number printed the two are
+    // indistinguishable.
     assert!(
         error.contains("across 1 distinct worker(s)"),
         "a one-pod fleet must report its real distinct count, not the budget, \
@@ -2398,13 +2399,13 @@ async fn single_worker_fleet_escalates_at_the_configured_budget() {
 }
 
 // ---------------------------------------------------------------------------
-// Same-id restart onto a capable build (issue #804, Codex round-26 P1)
+// Same-id restart onto a capable build (issue #804)
 // ---------------------------------------------------------------------------
 
 const Q_RESTART: &str = "q804-restart";
 const Q_CLAIM_RACE: &str = "q804-claim-race";
 
-/// Dedicated queue for the round-28 lost-claim test, so stealing every RUNNING
+/// Dedicated queue for the lost-claim test, so stealing every RUNNING
 /// row on it cannot disturb an adjacent test sharing the database.
 const Q_LOST_CLAIM: &str = "q804-lost-claim";
 
@@ -2490,7 +2491,7 @@ async fn stale_miss_evidence_from_a_worker_that_never_restarted_still_escalates(
     );
 }
 
-/// **Issue #804, Codex round-26 P1.** A worker that restarts onto a build which
+/// **Issue #804.** A worker that restarts onto a build which
 /// registers the missing handler must not still be counted as incapable.
 ///
 /// `workers::register_worker` upserts on `worker_id` and refreshes that row's
@@ -2645,17 +2646,17 @@ async fn restart_onto_a_capable_build_clears_its_stale_miss_evidence() {
     assert_eq!(metrics.quarantine_count(), 0);
 }
 
-/// **Issue #804, Codex round-27 P1.** The release-vs-escalate decision must not
+/// **Issue #804.** The release-vs-escalate decision must not
 /// be made on a claim-time snapshot that a peer's re-registration has since
 /// invalidated.
 ///
-/// Round 26's invalidation is deliberately **not** ownership-guarded — it has to
+/// The same-id restart invalidation is deliberately **not** ownership-guarded — it has to
 /// reach a row another worker is mid-dispatch on, because that is precisely the
 /// row whose decision stale evidence poisons. That made it the one writer that
 /// can change these columns between a claim and its miss, breaking the invariant
 /// `frontier_miss_state` had documented and relied on.
 ///
-/// The consequence is that round 26 fixes nothing in its own headline scenario
+/// The consequence is that the invalidation fixes nothing in its own headline scenario
 /// whenever the restart lands mid-dispatch: `pod-b` claimed while the row still
 /// named `pod-a`, `pod-a` restarts onto a capable build and clears its entry,
 /// and `pod-b` — still deciding on its snapshot — reads `pod-a` as incapable
@@ -2762,11 +2763,11 @@ async fn peer_reregistering_mid_dispatch_is_seen_by_the_decision() {
 }
 
 // ---------------------------------------------------------------------------
-// Codex round-28 P1s: a lost claim makes no decision; registration is atomic.
+// A lost claim makes no decision; registration is atomic.
 // ---------------------------------------------------------------------------
 
 /// A dispatcher that lost its claim mid-dispatch must make **no terminal
-/// decision** about the task (issue #804, Codex round-28 P1).
+/// decision** about the task (issue #804).
 ///
 /// The release path is ownership-guarded (`worker_id = $2`), but the escalation
 /// path is not: `queue::fail_task` accepts any `PENDING`/`RUNNING` row
@@ -2890,7 +2891,7 @@ async fn a_claim_lost_mid_dispatch_makes_no_terminal_decision() {
 /// with no ownership check at all, so a stale dispatcher whose claim had
 /// already moved to another worker would terminally fail the run regardless.
 ///
-/// Codex review round 2: the function now surfaces this as
+/// The function now surfaces this as
 /// `Err(HarvestError::SuspendedClaimAmbiguous)` rather than performing a
 /// release and returning `Ok(())` itself -- it must never touch the row a
 /// genuine transfer already handed to a new owner, and propagating instead
@@ -2992,18 +2993,18 @@ async fn a_stale_dispatcher_with_zero_emitted_commands_makes_no_terminal_decisio
 /// which must succeed once the contending lock is released, since ownership
 /// never actually moved.
 ///
-/// Codex review round 2 split the fix into two calls:
+/// The fix is split into two calls:
 /// [`fail_suspended_workflow_if_still_claimed`] itself must return
 /// **immediately**, without blocking on anything -- it only probes via
 /// `SKIP LOCKED`, so it can never be the thing waiting inside a transaction
 /// that also holds another lock -- and the blocking, ownership-guarded
 /// release is a **separate**, standalone call
-/// ([`queue::release_suspended_workflow_claim`]) made only afterward. Codex
-/// review round 3 relocated that standalone call from `process_workflow_
-/// task`'s own post-transaction `match` arm out to `process_task` -- one
-/// layer further out, after the issue #494 `workflow_task_timeout` budget
-/// has already been unwound -- but the two-call shape this test drives is
-/// unchanged by that move. This test drives both calls in that order and
+/// ([`queue::release_suspended_workflow_claim`]) made only afterward. That
+/// standalone call later moved from `process_workflow_task`'s own
+/// post-transaction `match` arm out to `process_task`. That is one layer
+/// further out, after the issue #494 `workflow_task_timeout` budget has
+/// already been unwound. The two-call shape this test drives is unchanged by
+/// that move. This test drives both calls in that order and
 /// asserts the fast
 /// return is genuinely fast (bounded well under the lock-hold window) before
 /// asserting the release itself blocks and then succeeds.
@@ -3058,8 +3059,8 @@ async fn a_dispatcher_that_still_owns_the_claim_is_released_when_skip_locked_is_
 
             // The standalone release, exactly as `process_task` performs it
             // after `process_workflow_task`'s own transaction has already
-            // ended (Codex review round 3 moved it one layer further out,
-            // past the issue #494 timeout budget too -- see
+            // ended (it sits one layer further out, past the issue #494
+            // timeout budget too -- see
             // `run_under_workflow_body_budget`'s doc comment) -- this is the
             // call that actually blocks on `conn_lock`'s held lock, never
             // the probe above.
@@ -3135,8 +3136,7 @@ async fn a_dispatcher_that_still_owns_the_claim_is_released_when_skip_locked_is_
 }
 
 /// A rolled-back ambiguous-claim decision discards **every** write made
-/// earlier in the same enclosing transaction, not just its own (issue #1182,
-/// Codex review round 2, "Finding 2").
+/// earlier in the same enclosing transaction, not just its own (issue #1182).
 ///
 /// `process_workflow_task` wraps its whole persistence flow -- including
 /// bookkeeping unrelated to this dispatch's own outcome, e.g. `clear_nd_block`
@@ -3243,8 +3243,7 @@ async fn an_ambiguous_claim_rolls_back_every_earlier_write_in_the_same_transacti
 /// [`crate::poison_pill::quarantine_orphan`], which locks the task row and
 /// then goes on to touch the execution row) never deadlocks against this
 /// dispatch's claim-release path, because this dispatch never holds the
-/// execution row while it waits on the task row (issue #1182, Codex review
-/// round 2, "Finding 1").
+/// execution row while it waits on the task row (issue #1182).
 ///
 /// The doc comments on [`fail_suspended_workflow_if_still_claimed`] and
 /// [`queue::release_suspended_workflow_claim`] both describe the cycle a
@@ -3397,8 +3396,7 @@ async fn a_task_row_first_peer_touching_the_execution_row_never_deadlocks_the_re
     );
 }
 
-/// Registration and capability-miss cleanup are one commit (issue #804, Codex
-/// round-28 P1).
+/// Registration and capability-miss cleanup are one commit (issue #804).
 ///
 /// Publishing a worker as live while its stale evidence survives makes it
 /// affirmative fleet evidence *against itself*: another claimant reads the whole
@@ -3479,7 +3477,7 @@ async fn a_failed_evidence_cleanup_rolls_back_the_registration() {
     );
 }
 
-/// Dedicated queue for the round-49 reused-`worker_id` test, so seeding a row
+/// Dedicated queue for the reused-`worker_id` test, so seeding a row
 /// that advertises it cannot perturb an adjacent test's fleet evidence.
 const Q_REUSED_ID: &str = "q804-reused-id";
 /// The pod name reused across the two instances — a *configured stable* id,
@@ -3519,8 +3517,7 @@ async fn evidence_names_worker(url: &str, exec_id: ExecutionId, worker_id: &str)
 }
 
 /// A failed startup registration is retried on the next heartbeat even when a
-/// PREVIOUS row for the same `worker_id` survived (issue #804, Codex round-49
-/// P1).
+/// PREVIOUS row for the same `worker_id` survived (issue #804).
 ///
 /// [`autumn_harvest::workers::do_heartbeat_tick`] already heals an **absent**
 /// row through its `Ok(0)` re-registration arm. But a reused `worker_id` — a
@@ -3640,14 +3637,14 @@ async fn a_surviving_old_row_still_retries_the_failed_startup_registration() {
 /// what produces `AllLiveWorkersMissed` and a terminal failure of a task this
 /// worker can run.
 ///
-/// Not heartbeating is necessary but not sufficient (round 51): the
+/// Not heartbeating is necessary but not sufficient: the
 /// capability-miss fleet window is floored at 120 s, so for that whole window
 /// the surviving row is still read as a live worker that has already missed.
 /// The tick therefore *withdraws* the row outright, which is the truthful
 /// state while the registration is unverified — an absent worker is simply not
 /// part of the fleet read.
 ///
-/// The failure is injected the same way round 28's atomicity test does —
+/// The failure is injected the same way the registration atomicity test does —
 /// renaming `harvest_task_queue` out from under the invalidation on a separate
 /// connection, deterministic and reversible within the test. The DB suite runs
 /// `--test-threads=1`, so no sibling can observe it.
@@ -4085,7 +4082,7 @@ async fn a_timed_out_workflow_task_reset_preserves_the_capability_miss_budget() 
 }
 
 /// A stale dispatcher must not release a claim that is no longer its own
-/// (issue #804, Codex round-37 P1).
+/// (issue #804).
 ///
 /// `poison_pill::requeue_orphan` hands an orphaned row back as `PENDING` /
 /// `worker_id = NULL` with `crash_strikes + 1`, and nothing stops the SAME
@@ -4165,7 +4162,7 @@ async fn a_same_worker_reclaim_after_a_requeue_is_not_released_by_the_stale_disp
 }
 
 /// The number the release logs must be the one its own `UPDATE` wrote
-/// (issue #804, Codex round-36 P2).
+/// (issue #804).
 ///
 /// `observe_miss_and_fleet` snapshots `capability_miss_workers` and derives
 /// `distinct_after` from it. A peer restarting onto a capable build then runs
@@ -4224,7 +4221,7 @@ async fn the_release_reports_the_cardinality_it_actually_committed() {
         &queue::TaskClaim::new(task_id, "incapable", load_task(&url, task_id).await.attempt),
         Duration::from_secs(1),
         CapabilityMissPhase::BeforeHandler,
-        // The claim epoch this seeded row was claimed at (Codex round-37 P1).
+        // The claim epoch this seeded row was claimed at.
         0,
         TEST_FRONTIER,
     )
@@ -4282,10 +4279,9 @@ async fn release_never_writes_the_error_column() {
         &queue::TaskClaim::new(task_id, "incapable", load_task(&url, task_id).await.attempt),
         Duration::from_secs(1),
         // A workflow-type lookup miss is `BeforeHandler`: the crash-strike
-        // counter is preserved (Codex round-12 P1) and `attempt` is restored
-        // (Codex round-17 P2).
+        // counter is preserved and `attempt` is restored.
         CapabilityMissPhase::BeforeHandler,
-        // The claim epoch this seeded row was claimed at (Codex round-37 P1).
+        // The claim epoch this seeded row was claimed at.
         0,
         TEST_FRONTIER,
     )
@@ -4326,10 +4322,9 @@ async fn release_never_writes_the_error_column() {
         &queue::TaskClaim::new(task2, "incapable", load_task(&url, task2).await.attempt),
         Duration::from_secs(1),
         // A workflow-type lookup miss is `BeforeHandler`: the crash-strike
-        // counter is preserved (Codex round-12 P1) and `attempt` is restored
-        // (Codex round-17 P2).
+        // counter is preserved and `attempt` is restored.
         CapabilityMissPhase::BeforeHandler,
-        // The claim epoch this seeded row was claimed at (Codex round-37 P1).
+        // The claim epoch this seeded row was claimed at.
         0,
         TEST_FRONTIER,
     )
@@ -4381,7 +4376,7 @@ async fn release_is_a_noop_when_the_claim_was_already_taken() {
         ),
         Duration::from_secs(1),
         CapabilityMissPhase::BeforeHandler,
-        // The claim epoch this seeded row was claimed at (Codex round-37 P1).
+        // The claim epoch this seeded row was claimed at.
         0,
         TEST_FRONTIER,
     )
@@ -4429,13 +4424,13 @@ async fn seed_live_worker(url: &str, worker_id: &str, queue: &str) {
     .expect("seed live worker row");
 }
 
-/// Poll until `worker_id` has a row in `harvest_workers` (issue #804 round 26).
+/// Poll until `worker_id` has a row in `harvest_workers` (issue #804).
 ///
 /// `Worker::run` registers before entering its poll loop, so this is the
 /// observable edge for "this worker has come up" — and therefore for "its stale
 /// capability-miss evidence has been invalidated", which happens in the same
 /// registration step.
-/// How many rows `harvest_workers` holds for `worker_id` (issue #804 round 28).
+/// How many rows `harvest_workers` holds for `worker_id` (issue #804).
 async fn live_worker_count(url: &str, worker_id: &str) -> i64 {
     let mut conn = connect(url).await;
     harvest_workers::table
@@ -4466,7 +4461,7 @@ async fn wait_for_live_worker(url: &str, worker_id: &str, timeout: Duration) {
     .unwrap_or_else(|_| panic!("worker {worker_id} never registered within {timeout:?}"));
 }
 
-/// Codex round-8 P1 / the success metric's load-bearing half: **zero spurious
+/// The success metric's load-bearing half: **zero spurious
 /// FAILED executions as long as >= 1 capable worker is live.**
 ///
 /// A fixed redelivery budget has no relationship to the live fleet, so a
@@ -4535,7 +4530,7 @@ async fn budget_never_escalates_while_a_capable_worker_is_live() {
 }
 
 // ---------------------------------------------------------------------------
-// Rate-limit token refund on release (#804 x #332, Codex round-11 P2)
+// Rate-limit token refund on release (#804 x #332)
 // ---------------------------------------------------------------------------
 
 const Q_RATE: &str = "q804-rate";
@@ -4558,7 +4553,7 @@ async fn stored_tokens(url: &str, key: &str) -> f64 {
 }
 
 /// Releasing a rate-limited activity for a capable peer must give its token
-/// back (issue #804, Codex round-11 P2).
+/// back (issue #804).
 ///
 /// `claim_task` debits a token for any rate-limited activity that is not
 /// circuit-breaker-tracked, and an incapable worker's claim is no exception —
@@ -4640,7 +4635,7 @@ async fn releasing_a_rate_limited_activity_refunds_its_token() {
 }
 
 /// A stale dispatcher's refund leaves exactly ONE outstanding debit for the
-/// one live claim (issue #804, Codex round-42 P2).
+/// one live claim (issue #804).
 ///
 /// The finding read the unconditional refund in `handle_capability_miss` as an
 /// over-credit: a dispatcher that resumes after `reclaim_orphaned_tasks` has
@@ -4748,8 +4743,7 @@ async fn stale_dispatcher_refund_leaves_one_debit_for_the_live_claim() {
 // A release must not launder a poison task's crash history (issue #804 x #367).
 // ---------------------------------------------------------------------------
 
-/// A pre-handler capability miss must **preserve** `crash_strikes` (Codex
-/// round-12 P1).
+/// A pre-handler capability miss must **preserve** `crash_strikes`.
 ///
 /// `crash_strikes` is issue #367's evidence that a task keeps killing the worker
 /// process that runs it: `reclaim_orphaned_tasks` increments it each time the
@@ -4793,7 +4787,7 @@ async fn releasing_a_pre_handler_miss_preserves_the_poison_pill_crash_strikes() 
         &queue::TaskClaim::new(task_id, "incapable", load_task(&url, task_id).await.attempt),
         Duration::from_secs(1),
         CapabilityMissPhase::BeforeHandler,
-        // The claim epoch this seeded row was claimed at (Codex round-37 P1).
+        // The claim epoch this seeded row was claimed at.
         2,
         TEST_FRONTIER,
     )
@@ -4841,7 +4835,7 @@ async fn releasing_a_pre_handler_miss_preserves_the_poison_pill_crash_strikes() 
         &queue::TaskClaim::new(task2, "incapable", load_task(&url, task2).await.attempt),
         Duration::from_secs(1),
         CapabilityMissPhase::AfterHandler,
-        // The claim epoch this seeded row was claimed at (Codex round-37 P1).
+        // The claim epoch this seeded row was claimed at.
         2,
         TEST_FRONTIER,
     )
@@ -4866,8 +4860,7 @@ async fn releasing_a_pre_handler_miss_preserves_the_poison_pill_crash_strikes() 
 }
 
 // ---------------------------------------------------------------------------
-// Codex round-25 P1 — the issue #494 budget bounds the decision cycle, and
-// nothing after it.
+// The issue #494 budget bounds the decision cycle, and nothing after it.
 // ---------------------------------------------------------------------------
 
 /// A workflow with nothing to do: the decision cycle is the DB work around it
@@ -4886,8 +4879,8 @@ fn trivial_workflow(_ctx: &WorkflowContext, _input: serde_json::Value) -> BoxFut
 /// release/escalation that runs *after* the decision cycle — so a workflow that
 /// returned near its deadline and only then tripped the post-handler preflight
 /// could have that blameless cleanup cancelled, bank a timeout strike it never
-/// earned, and at `poison_pill_threshold` be terminally failed (Codex round-25
-/// P1). It now wraps the decision cycle alone, inside `process_task`.
+/// earned, and at `poison_pill_threshold` be terminally failed. It now wraps
+/// the decision cycle alone, inside `process_task`.
 ///
 /// The scoping rule itself is pinned without a database by
 /// `worker::tests::cleanup_sequenced_after_the_budget_is_not_cancelled_by_it`,
@@ -4965,9 +4958,9 @@ async fn an_overrunning_decision_cycle_is_still_cut_by_the_workflow_task_budget(
 }
 
 // ---------------------------------------------------------------------------
-// Codex round-31 P1: the ownership check is ATOMIC with the terminal failure.
+// The ownership check is ATOMIC with the terminal failure.
 //
-// Every earlier round narrowed the window between an escalation's last
+// Every earlier fix narrowed the window between an escalation's last
 // ownership check and its terminal write; none closed it, because the check and
 // the write stayed separate database operations and `queue::fail_task` accepts
 // any `PENDING`/`RUNNING` row regardless of `worker_id`. These two tests drive
@@ -5085,7 +5078,7 @@ async fn a_claim_transferred_before_the_terminal_write_is_not_failed_by_the_stal
     );
 }
 
-/// The guard must never *wait* on the task row (round-32 F1).
+/// The guard must never *wait* on the task row.
 ///
 /// `poison_pill::quarantine_orphan` locks the task row first and the execution
 /// row second (via the dead-letter FK and `fail_owning_workflow`), the exact
@@ -5180,7 +5173,7 @@ async fn a_task_row_locked_by_a_concurrent_transaction_withdraws_without_waiting
 }
 
 /// A poison-pill requeue hands the row back to the pool with the SAME worker
-/// still eligible to re-claim it (round-32 F3).
+/// still eligible to re-claim it.
 ///
 /// `poison_pill::requeue_orphan` sets `PENDING` / `worker_id = NULL` and bumps
 /// `crash_strikes`; nothing stops the original worker from winning the row
@@ -5325,13 +5318,12 @@ async fn a_claim_still_held_through_the_terminal_write_still_fails_the_task() {
     );
 }
 
-/// Codex round-31 P1 (second finding): the preloaded `next_event_id` is stale by
-/// the time the terminal write runs, so it must be re-derived under the
-/// execution row's lock.
+/// The preloaded `next_event_id` is stale by the time the terminal write runs,
+/// so it must be re-derived under the execution row's lock.
 ///
-/// Round 29 deliberately hoisted the history load OUT of the window between the
-/// escalation's last evidence check and its terminal write. That made the id it
-/// produced older, not fresher: a parallel activity completing in the widened
+/// The escalation deliberately hoists the history load OUT of the window
+/// between its last evidence check and its terminal write. That makes the id it
+/// produces older, not fresher: a parallel activity completing in the widened
 /// window consumes the cached id, and appending `WorkflowFailed` at a consumed
 /// id aborts the whole terminal transaction on
 /// `UNIQUE(workflow_exec_id, event_id)`. The row is then left `RUNNING` under a
@@ -5348,7 +5340,7 @@ async fn a_terminal_write_appends_at_the_event_id_current_under_the_lock() {
     let (exec_id, task) = seed_claimed_task(&url, "q804-round32", "worker-a").await;
 
     let mut conn = connect(&url).await;
-    // What the escalation does first (round 29): pay the history read up front.
+    // What the escalation does first: pay the history read up front.
     let preloaded = preload_failure_history(&mut conn, &task).await;
 
     // Exactly the interleaving the finding names: a parallel activity completes
@@ -5412,10 +5404,10 @@ async fn a_terminal_write_appends_at_the_event_id_current_under_the_lock() {
 }
 
 // ---------------------------------------------------------------------------
-// Codex round-33 P1: the evidence re-decision must happen UNDER the task lock.
+// The evidence re-decision must happen UNDER the task lock.
 //
 // A peer that re-registers clears itself from `capability_miss_workers` without
-// touching `worker_id` or `crash_strikes`, so the round-31/32 claim guard is
+// touching `worker_id` or `crash_strikes`, so the atomic claim guard is
 // blind to it: ownership is unchanged, the guard passes, and the escalation
 // commits -- terminally failing a run the newly-capable peer could serve. These
 // two drive the guard with an evidence recheck attached and stage the clear on
@@ -5467,7 +5459,7 @@ async fn a_peer_that_re_registers_before_the_lock_withdraws_the_escalation() {
                 },
                 frontier_reset_committed: false,
                 // The frontier the seeded evidence is recorded against
-                // (Codex round-46 P1): a mismatch would read as a fresh
+                // (issue #804): a mismatch would read as a fresh
                 // budget and the escalation these tests are about would
                 // never be reached.
                 frontier: "workflow:round31_wf",
@@ -5544,7 +5536,7 @@ async fn evidence_that_still_supports_escalation_under_the_lock_still_commits() 
                 },
                 frontier_reset_committed: false,
                 // The frontier the seeded evidence is recorded against
-                // (Codex round-46 P1): a mismatch would read as a fresh
+                // (issue #804): a mismatch would read as a fresh
                 // budget and the escalation these tests are about would
                 // never be reached.
                 frontier: "workflow:round31_wf",
@@ -5584,7 +5576,7 @@ async fn evidence_that_still_supports_escalation_under_the_lock_still_commits() 
     );
 }
 
-/// Codex round-34 P2: the terminal reason must come from the resolution the
+/// The terminal reason must come from the resolution the
 /// boundary decided on, not the one from a moment earlier.
 ///
 /// An escalation can still *stand* under the lock but stand for a different
@@ -5632,7 +5624,7 @@ async fn the_persisted_reason_comes_from_the_in_transaction_resolution() {
                 },
                 frontier_reset_committed: false,
                 // The frontier the seeded evidence is recorded against
-                // (Codex round-46 P1): a mismatch would read as a fresh
+                // (issue #804): a mismatch would read as a fresh
                 // budget and the escalation these tests are about would
                 // never be reached.
                 frontier: "workflow:round31_wf",
@@ -5736,7 +5728,7 @@ async fn explain_plan(conn: &mut AsyncPgConnection, statement: &str) -> String {
 }
 
 /// The startup invalidation must be servable by an index, not a full scan of
-/// the queue backlog (issue #804, Codex round-39 P2).
+/// the queue backlog (issue #804).
 ///
 /// `invalidate_capability_miss_evidence_for_worker` runs inside
 /// `register_worker`'s transaction, so the worker is **not published to the
@@ -5805,7 +5797,7 @@ async fn the_startup_invalidation_is_index_servable_not_a_backlog_scan() {
 }
 
 /// The empty-array guard in the invalidation's `WHERE` clause is
-/// **load-bearing**, not redundant (issue #804, Codex round-39 P2).
+/// **load-bearing**, not redundant (issue #804).
 ///
 /// The partial index is gated on that predicate, and Postgres's implication
 /// prover cannot derive it from the array-membership test alone: dropping the
@@ -5855,7 +5847,7 @@ async fn dropping_the_empty_array_guard_returns_the_invalidation_to_a_full_scan(
 }
 
 // ---------------------------------------------------------------------------
-// Codex round-45 P1 — a cross-type continue-as-new (issue #803) whose TARGET
+// A cross-type continue-as-new (issue #803) whose TARGET
 // type this worker does not register is a capability miss, not a terminal
 // failure.
 // ---------------------------------------------------------------------------
@@ -5998,12 +5990,12 @@ async fn cross_type_continue_as_new_missing_target_is_released_for_a_capable_pee
     );
 }
 
-// -- Codex round-46 P1: evidence is keyed to the handler it is about ---------
+// -- Evidence is keyed to the handler it is about ----------------------------
 
 const Q_FRONTIER_KEY: &str = "q804-frontier-key";
 
 /// A frontier the fleet has never been offered must not inherit a *different*
-/// frontier's spent budget (issue #804, Codex round-46 P1).
+/// frontier's spent budget (issue #804).
 ///
 /// The counters describe ONE frontier — "the position the workflow is stuck
 /// at, and therefore the single handler a claiming worker must register to move
@@ -6132,21 +6124,21 @@ async fn evidence_recorded_against_another_handler_does_not_spend_this_frontiers
     assert_eq!(load_task(&url, task_id).await.crash_strikes, 0);
 }
 
-/// Dedicated queue for the round-55 runtime re-registration test, so blocking
+/// Dedicated queue for the runtime re-registration test, so blocking
 /// its task row cannot stall an adjacent test.
 const Q_RUNTIME_REREG: &str = "q804-runtime-rereg";
 /// The worker whose fleet row vanishes at runtime.
 const RUNTIME_REREG_WORKER_ID: &str = "pod-runtime-rereg";
 
 /// A **runtime** re-registration failure arms the claim gate, not just a startup
-/// one (issue #804, Codex round-55 P1).
+/// one (issue #804).
 ///
-/// Round 54 gated claiming on `may_claim_tasks`, but seeded the flag only from
-/// the *startup* `register_in_fleet` result. [`do_heartbeat_tick`]'s `Ok(0)`
+/// The startup claim gate keys claiming on `may_claim_tasks`. It first seeded
+/// the flag only from the *startup* `register_in_fleet` result. [`do_heartbeat_tick`]'s `Ok(0)`
 /// arm heals a fleet row that vanishes later — an operator cleanup, a retention
 /// sweep, a truncated table — and when that heal fails it logged a warning and
 /// left the flag clear. The worker then kept claiming while absent from
-/// `harvest_workers`, which is the exact state round 54 exists to prevent, and
+/// `harvest_workers`, which is the exact state the claim gate exists to prevent, and
 /// it is harmful twice over: the worker is invisible to a peer's fleet
 /// evidence (so an incapable claimant can derive `AllLiveWorkersMissed` and
 /// terminally fail work this worker can run), and its own claims match

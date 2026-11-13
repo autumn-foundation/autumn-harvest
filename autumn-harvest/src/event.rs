@@ -473,7 +473,7 @@ pub enum WorkflowEvent {
         /// JSON input for the activity.
         #[cfg_attr(feature = "fuzzing", arbitrary(with = crate::fuzzing::value))]
         input: serde_json::Value,
-        /// Target worker queue (informational; external activities don't occupy a slot).
+        /// Target worker queue (informational; external activities do not occupy a slot).
         queue: String,
         /// Maximum seconds the external system has to deliver a result.
         schedule_to_close_secs: u64,

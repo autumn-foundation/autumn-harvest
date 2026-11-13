@@ -305,12 +305,11 @@ mod controller {
     /// never-armed sentinel (see [`ARMED_GEN`]).
     static NEXT_GEN: AtomicU64 = AtomicU64::new(1);
     /// The generation of the currently-armed plan, or `0` when disarmed. This
-    /// is the *sole* armed/disarmed signal — see [`entry_snapshot`] for why an
+    /// is the *sole* armed/disarmed signal. See [`entry_snapshot`] for why an
     /// earlier revision's separate `ARMED: AtomicBool` was removed. A resolved
     /// action only fires when the state it was resolved from still carries
-    /// this generation — so a fault resolved by a spawned task that outlived
-    /// its plan can never leak into a later test (issue #940, Codex review
-    /// round 1).
+    /// this generation. So a fault resolved by a spawned task that outlived
+    /// its plan can never leak into a later test (issue #940).
     static ARMED_GEN: AtomicU64 = AtomicU64::new(0);
 
     /// An injected fault error. Surfaces at a [`chaos_fallible!`] site as
@@ -949,14 +948,13 @@ mod controller {
     /// including a real `--features chaos` binary, so it costs nothing
     /// outside `cargo test`. `entry_snapshot_rejects_a_straddled_read_of_the_real_production_path`
     /// uses it to pause THIS function on a real OS thread and drive a
-    /// genuine concurrent disarm+rearm across the pause, proving this exact
-    /// function -- not a hand-reconstructed stand-in -- rejects a straddled
-    /// read (Codex review round 3, issue #1202: the sibling
+    /// genuine concurrent disarm+rearm across the pause. That proves this exact
+    /// function, not a hand-reconstructed stand-in, rejects a straddled read
+    /// (issue #1202). The sibling
     /// `entry_snapshot_transitions_cleanly_where_the_removed_two_read_shape_straddled`
     /// test below only replays the REMOVED shape's bug against a clone,
-    /// `vulnerable_two_read_shape`, and so cannot detect a regression that
-    /// reintroduces an equivalent stale-decision defect into this real
-    /// function).
+    /// `vulnerable_two_read_shape`. So it cannot detect a regression that puts
+    /// an equivalent stale-decision defect back into this real function.
     fn entry_snapshot() -> Option<Arc<ChaosState>> {
         let entry_gen = ARMED_GEN.load(Ordering::SeqCst);
         if entry_gen == 0 {
@@ -1203,8 +1201,8 @@ mod controller {
     /// simulates a task crash and must be triggered inside a spawned task.
     pub async fn hit(point: ChaosPoint) {
         // One consistent (state, generation) snapshot — see `entry_snapshot`:
-        // rejects a task that straddled a disarm+rearm so it can't fire a
-        // newer plan's directive.
+        // rejects a task that straddled a disarm+rearm, so that it cannot fire
+        // a newer plan's directive.
         let Some(state) = entry_snapshot() else {
             return;
         };
@@ -1602,10 +1600,10 @@ mod controller {
             assert_eq!(state.actions_fired.load(Ordering::Relaxed), 0);
         }
 
-        /// The P2 fix (`mark_fired` is bumped by the entry point only when it can
-        /// honor the resolved action) locked in at the real entry points: a
-        /// honored directive bumps the anti-vacuity counter, a resolve that does
-        /// not fire (wrong ordinal) does not, and each honoring site increments
+        /// The entry point bumps `mark_fired` only when it can honor the resolved
+        /// action. This test locks that rule in at the real entry points. A
+        /// honored directive bumps the anti-vacuity counter. A resolve that does
+        /// not fire (wrong ordinal) does not. Each honoring site increments
         /// exactly once per honored hit.
         #[tokio::test]
         async fn honored_entry_points_bump_actions_fired_but_resolve_alone_does_not() {
@@ -1642,7 +1640,7 @@ mod controller {
             }
         }
 
-        // ---- Fix 2 (Codex review round 1): scripted directives are validated
+        // ---- Fix 2: scripted directives are validated
         //      against the point's declared caps at plan-build time -----------
 
         #[test]
@@ -1684,7 +1682,7 @@ mod controller {
             let _ = ChaosPlan::scripted().hold_at(QUEUE_PARK_BEFORE_UPDATE);
         }
 
-        // ---- Fix 1 (Codex review round 1): a resolved action is fenced by the
+        // ---- Fix 1: a resolved action is fenced by the
         //      armed generation, so a stale state cannot fire into a later plan -
 
         #[tokio::test]
@@ -1722,15 +1720,15 @@ mod controller {
             drop(newer);
         }
 
-        // ---- Fix 3 (Codex review round 2): the entry snapshot rejects a state
-        //      whose generation != the armed generation, so a task that
-        //      straddled a disarm+rearm between the `ARMED_GEN` read and the
-        //      `STATE` read cannot adopt a *newer* plan's directive. Unlike
-        //      Fix 1 (a *captured* Arc fenced at fire time), this rejects the
-        //      torn read at the entry point, before `resolve` even bumps the
-        //      hit counter. (Fix 4, below, later removed a separate `ARMED`
-        //      bool this window used to sit behind; this generation-mismatch
-        //      fence is unchanged and still the mechanism this test exercises.) --
+        // ---- Fix 3: the entry snapshot rejects a state whose generation !=
+        //      the armed generation. So a task that straddled a disarm+rearm
+        //      between the `ARMED_GEN` read and the `STATE` read cannot adopt
+        //      a *newer* plan's directive. Unlike Fix 1 (a *captured* Arc
+        //      fenced at fire time), this rejects the torn read at the entry
+        //      point, before `resolve` even bumps the hit counter. Fix 4,
+        //      below, later removed a separate `ARMED` bool that guarded this
+        //      window. This generation-mismatch fence is unchanged, and this
+        //      test still exercises it. --
 
         #[tokio::test]
         async fn entry_snapshot_rejects_a_torn_state_from_a_different_generation() {
@@ -1764,16 +1762,16 @@ mod controller {
             // `_guard` drop restores STATE=None / disarmed for the next test.
         }
 
-        // ---- Fix 4 (Codex review round 4, issue #1202 / #940 follow-up): the
-        //      entry point used to read `ARMED` (a bare bool) and `ARMED_GEN`
-        //      (the generation) as two SEPARATE atomics. A task preempted
-        //      between those two reads could observe `ARMED == true` under an
-        //      outgoing plan, resume after a *full* disarm + re-arm to a
-        //      different plan, and then read the *incoming* plan's
-        //      `ARMED_GEN`/`STATE` pair -- which is trivially self-consistent
-        //      (both belong to the same, newer generation) -- so the mismatch
-        //      fence (Fix 3, above) never fires and the straggling task
-        //      wrongly adopts the newer plan's directive.
+        // ---- Fix 4 (issue #1202 / #940 follow-up): the entry point used to
+        //      read `ARMED` (a bare bool) and `ARMED_GEN` (the generation) as
+        //      two SEPARATE atomics. A task preempted between those two reads
+        //      could observe `ARMED == true` under an outgoing plan. It could
+        //      then resume after a *full* disarm + re-arm to a different plan,
+        //      and read the *incoming* plan's `ARMED_GEN`/`STATE` pair. That
+        //      pair is trivially self-consistent: both belong to the same,
+        //      newer generation. So the mismatch fence (Fix 3, above) never
+        //      fires, and the straggling task wrongly adopts the newer plan's
+        //      directive.
         //
         //      `vulnerable_two_read_shape` below is a byte-for-byte copy of
         //      the *removed* algorithm (what `entry_snapshot` used to be),
@@ -1878,17 +1876,17 @@ mod controller {
             drop(guard);
         }
 
-        // ---- Codex review round 3 (issue #1202): the test above only proves
-        //      the REMOVED two-read shape was buggy by calling a
-        //      hand-reconstructed clone (`vulnerable_two_read_shape`) -- it
-        //      never exercises the REAL `entry_snapshot` under an actual
-        //      straddle, so it would not catch a regression that
-        //      reintroduces an equivalent stale-decision defect (a separate
-        //      flag or otherwise) into the real function. This test closes
-        //      that gap: it pauses the REAL `entry_snapshot` (via the
-        //      `#[cfg(test)]`-only rendezvous installed next to it) on a
-        //      genuine OS thread, between its own two reads, and drives a
-        //      real concurrent disarm+rearm across the pause. ----
+        // ---- Issue #1202: the test above only proves that the REMOVED
+        //      two-read shape was buggy. It calls a hand-reconstructed clone
+        //      (`vulnerable_two_read_shape`). It never exercises the REAL
+        //      `entry_snapshot` under an actual straddle. So it would not
+        //      catch a regression that puts an equivalent stale-decision
+        //      defect (a separate flag or otherwise) back into the real
+        //      function. This test closes that gap. It pauses the REAL
+        //      `entry_snapshot` (via the `#[cfg(test)]`-only rendezvous
+        //      installed next to it) on a genuine OS thread, between its own
+        //      two reads. It then drives a real concurrent disarm+rearm across
+        //      the pause. ----
 
         #[tokio::test]
         async fn entry_snapshot_rejects_a_straddled_read_of_the_real_production_path() {

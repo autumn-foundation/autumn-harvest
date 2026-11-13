@@ -464,12 +464,13 @@ pub fn check_dir(dir: &Path) -> std::io::Result<DetCheckReport> {
 /// All paths are collected into a **single shared index** before scanning, so
 /// every file is de-duplicated across arguments (the changed-files CI pattern
 /// `det-check $(git diff --name-only '*.rs')`) and no file is scanned twice.
-/// One-hop first-party helper reachability (issue #778) is nevertheless resolved
-/// **same-module only** (same file + module path; see [`resolve_helper`]): a
+/// One-hop first-party helper reachability (issue #778) is still resolved
+/// **same-module only** (same file + module path; see [`resolve_helper`]). A
 /// cross-file transitive helper is deliberately NOT resolved (a safe
-/// false-negative), because the line-based scanner cannot see the `use` import
-/// that would make such a bare call reach across files — resolving it risks the
-/// Codex round-4/round-5 false-positive family, which for a CI gate is the worse
+/// false-negative). The line-based scanner cannot see the `use` import that
+/// makes such a bare call reach across files. Resolving it risks false
+/// positives on same-file-different-module, aliased-import and
+/// globally-unique helpers. For a CI gate a false positive is the worse
 /// outcome.
 ///
 /// A file argument is scanned directly; a directory argument is walked
@@ -1036,16 +1037,17 @@ fn scan_functions(fns: &[FnDef]) -> DetCheckReport {
 ///   caller's own module) is treated as ambiguous and NOT resolved — a safe
 ///   false-negative, never a false-positive.
 ///
-/// This is a deliberate scope decision: the line-based front-door cannot resolve
-/// `use` imports/aliases, so ANY cross-module resolution keeps producing the
-/// Codex round-4 (same-file-different-module) and round-5 (aliased-import,
-/// globally-unique) false-positive family. For a CI GATE a false positive
+/// This is a deliberate scope decision. The line-based front-door cannot
+/// resolve `use` imports/aliases. So ANY cross-module resolution keeps
+/// producing false positives: same-file-different-module calls, and
+/// aliased-import or globally-unique helpers. For a CI GATE a false positive
 /// (failing CI on innocent code) is the worst outcome and outranks marginal
-/// recall, so the earlier globally-unique (`[only]`) and same-file-different-module
-/// fallbacks are removed. What is skipped here is a false-negative that the
-/// body-only compile-time `#[workflow]` guardrail (#386) also misses; the backstop
-/// for it is runtime determinism detection (`WorkflowReplayer` and the live
-/// `HistoryMatcher`) plus manual review, not #386.
+/// recall. So the earlier globally-unique (`[only]`) and
+/// same-file-different-module fallbacks are removed. What is skipped here is a
+/// false-negative that the body-only compile-time `#[workflow]` guardrail
+/// (#386) also misses. The backstop for it is runtime determinism detection
+/// (`WorkflowReplayer` and the live `HistoryMatcher`) plus manual review, not
+/// #386.
 fn resolve_helper(candidates: &[usize], fns: &[FnDef], caller: &FnDef) -> Option<usize> {
     // Same module only (same file + same module path). Exactly one such candidate
     // resolves; two same-named helpers in one module is not valid Rust, and none
@@ -1490,7 +1492,7 @@ fn parse_use_bindings(use_body: &str) -> (Vec<String>, bool) {
             }
             match parse_use_single(item) {
                 Some(name) => names.push(name),
-                None => glob = true, // couldn't name it → conservative
+                None => glob = true, // could not name it → conservative
             }
         }
         return (names, glob);
@@ -1966,15 +1968,14 @@ const fn is_ident_byte(b: u8) -> bool {
 }
 
 /// DET011 candidate patterns for the futures combinator FUNCTIONS. Each is the
-/// bare combinator NAME (no trailing `(`) — a cheap substring locator; the
-/// accept/reject decision is made by the path-precise
-/// [`matches_futures_combinator_pattern`], which confirms the name is a complete
-/// token, requires a call `(` (skipping an optional turbofish and whitespace),
-/// and extracts the full qualified path ending at the call to match it exactly
-/// against the allowed set. This keeps `det_check` in lock-step with the
-/// compile-time HVG010 guardrail's `is_select_combinator_path`, which matches
-/// whole paths exactly after `syn` has already stripped any turbofish
-/// (#980 Codex P2 review).
+/// bare combinator NAME (no trailing `(`), a cheap substring locator. The
+/// path-precise [`matches_futures_combinator_pattern`] makes the accept/reject
+/// decision. It confirms that the name is a complete token. It requires a call
+/// `(`, after an optional turbofish and whitespace. It extracts the full
+/// qualified path that ends at the call, and matches it exactly against the
+/// allowed set. This keeps `det_check` in lock-step with the compile-time
+/// HVG010 guardrail's `is_select_combinator_path` (#980). That function
+/// matches whole paths exactly after `syn` has stripped any turbofish.
 const DET011_COMBINATOR_FN_PATTERNS: &[&str] =
     &["future::select", "select_all", "select_ok", "try_select"];
 

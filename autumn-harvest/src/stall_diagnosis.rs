@@ -34,8 +34,8 @@
 //! 1. terminal execution — nothing to diagnose
 //! 2. [`BlockedOn::Paused`] — an operator deliberately parked this run
 //! 3. the **worst** verdict across every pending activity (see
-//!    [`activity_precedence`]) — with one narrow exception (issue #1193
-//!    Codex round-3 P1): a [`Degraded`](ExecutionHealth::Degraded) activity
+//!    [`activity_precedence`]) — with one narrow exception (issue #1193):
+//!    a [`Degraded`](ExecutionHealth::Degraded) activity
 //!    verdict yields to the run's OWN workflow task if THAT is hard-blocked
 //!    (an operator-paused queue or no live poller), because a frozen
 //!    decision cycle is worse than one activity self-resolving into
@@ -57,8 +57,8 @@
 //!
 //! The three circuit-open shapes are deliberately ranked by health severity
 //! rather than sharing one tier (issue #1193): a forced-open breaker
-//! outranks an organically-tripped one (Codex round-1 P1), which in turn
-//! outranks a half-open one (Codex round-2 P1). Each pair used to share a
+//! outranks an organically-tripped one, which in turn
+//! outranks a half-open one. Each pair used to share a
 //! tier while also sharing a health value, so a tie was inconsequential —
 //! but once `Degraded` split `Stalled` from `Healthy` down the middle, a
 //! same-rank tie between two now-differently-healthed shapes could let the
@@ -248,7 +248,7 @@ pub enum BlockedOn {
         /// `half_open` (a forced-open breaker's phase never leaves `Open` until
         /// an explicit `force_close`, so the two never coexist).
         ///
-        /// Issue #1193 Codex round-1 P2: `cooldown_until` alone is NOT a safe
+        /// Issue #1193: `cooldown_until` alone is NOT a safe
         /// discriminator. `CircuitBreakerPolicy::new` accepts any
         /// `std::time::Duration` for its cooldown, and an organically-tripped
         /// breaker configured with one outside `chrono`'s representable range
@@ -486,7 +486,7 @@ impl BlockedOn {
             // the one case that clears with no fast-fail at all).
             //
             // Keyed on `forced_open`, NOT on `cooldown_until.is_some()`
-            // (Codex round-1 P2 on PR #1365): `CircuitBreakerPolicy::new`
+            // (PR #1365): `CircuitBreakerPolicy::new`
             // accepts any `std::time::Duration`, and an organically-tripped
             // breaker configured with a cooldown outside `chrono`'s
             // representable range ALSO reports `cooldown_until: None` --
@@ -596,7 +596,7 @@ pub struct PendingActivityFacts {
     /// otherwise. Must NOT be inferred from `circuit_cooldown_until.is_none()`
     /// -- an organically-tripped breaker with an unrepresentable cooldown ALSO
     /// reports no `circuit_cooldown_until`, which is indistinguishable from a
-    /// forced-open one by that field alone (issue #1193 Codex round-1 P2).
+    /// forced-open one by that field alone (issue #1193).
     pub circuit_forced_open: bool,
     /// `true` when the rate-limit bucket has fewer than one token.
     ///
@@ -842,12 +842,12 @@ pub const fn activity_precedence(blocked: &BlockedOn) -> u8 {
         // keep-the-first-max fold silently pick the milder one purely by row
         // order, masking a genuinely worse condition elsewhere in the fan-out.
         //
-        // - FORCED-open (`Stalled`): a Codex round-1 P1 finding. It used to
+        // - FORCED-open (`Stalled`). It used to
         //   share a tier with organic-open (both were `Stalled`), so the tie
         //   was inconsequential; once they diverged (`Stalled` vs
         //   `Degraded`) a tie could mask the genuine stall behind the
         //   self-healing one.
-        // - ORGANIC-open (`Degraded`): a Codex round-2 P1 finding. It used to
+        // - ORGANIC-open (`Degraded`). It used to
         //   share a tier with `HalfOpen` (both were, at the time, considered
         //   together), and once `HalfOpen` stayed `Healthy` while organic-open
         //   became `Degraded`, the same masking risk applied in the opposite
@@ -930,11 +930,10 @@ fn activity_precedence_for_facts(facts: &PendingActivityFacts, now: DateTime<Utc
     // circuit-open verdict. It falls through to the not-due-yet ranks below.
     if activity_circuit_currently_blocks(facts, now) && facts.activity_name.is_some() {
         // Issue #1193: the three circuit shapes are ranked by health severity
-        // (forced > organic > half-open), mirroring `activity_precedence`, so
+        // (forced > organic > half-open), mirroring `activity_precedence`. So
         // a same-rank tie between two DIFFERENTLY-healthed shapes can never
         // let the fold pick the milder one over a worse condition elsewhere
-        // in the fan-out (round-1 P1: forced vs organic; round-2 P1: organic
-        // vs half-open).
+        // in the fan-out.
         return if facts.circuit_phase == Some(BlockingCircuitPhase::Open) {
             if facts.circuit_forced_open {
                 7 // ActivityCircuitOpen (forced)
@@ -1531,7 +1530,7 @@ pub fn classify_execution(inputs: &DiagnosisInputs, now: DateTime<Utc>) -> Optio
     );
     if let Some((idx, _)) = worst_activity_index {
         let verdict = classify_pending_activity(&inputs.activities[idx], now);
-        // Issue #1193 Codex round-3 P1: a `Degraded` activity verdict
+        // Issue #1193: a `Degraded` activity verdict
         // promises "no human needed, this clears on its own (even if only
         // into a terminal failure)". But if the run's OWN workflow task
         // cannot be claimed AT ALL -- an operator-paused queue or no live
@@ -1793,7 +1792,7 @@ fn summarize_activity_cause(blocked: &BlockedOn) -> Option<String> {
         // flag -- NOT by whether `cooldown_until` could be computed. An
         // organically-tripped breaker configured with a cooldown outside
         // `chrono`'s representable range also reports no `cooldown_until`
-        // (issue #1193 Codex round-1 P2), so that field alone cannot tell the
+        // (issue #1193), so that field alone cannot tell the
         // two apart; the messages below still land on the right one.
         BlockedOn::ActivityCircuitOpen {
             activity_name,
@@ -2211,7 +2210,7 @@ mod tests {
     /// fast-fails non-retryably (issue #369's `ActivityFailure::circuit_open`),
     /// so it is neither a clean `healthy` nor a human-needed `stalled` --
     /// `degraded`. The split is keyed on `forced_open`, NOT `cooldown_until`
-    /// (Codex round-1 P2 on PR #1365): an organic trip with an unrepresentable
+    /// (PR #1365): an organic trip with an unrepresentable
     /// cooldown also has `cooldown_until: None`, so that field alone cannot
     /// discriminate.
     #[test]
@@ -2248,7 +2247,7 @@ mod tests {
         };
         assert_eq!(organic_open.health(), ExecutionHealth::Degraded);
 
-        // AC (issue #1193 Codex round-1 P2): an organic trip whose cooldown
+        // AC (issue #1193): an organic trip whose cooldown
         // could not be represented (see `circuit_cooldown_until` in `api.rs`)
         // is STILL `degraded`, not `stalled` -- `forced_open` is what decides
         // it, and it stays `false` regardless of whether the display
@@ -2271,7 +2270,7 @@ mod tests {
     /// AC (issue #1193): pin the timed-vs-forced split across all three
     /// observable circuit phases in one place, as the definitive reference.
     ///
-    /// Includes the Codex round-1 P2 regression case: an organic trip whose
+    /// Includes the unrepresentable-cooldown regression case: an organic trip whose
     /// cooldown could not be represented as a `DateTime` (`cooldown_until:
     /// None`) must still resolve to `Degraded`, distinguishing it from the
     /// truly forced-open case that shares the same `cooldown_until: None`
@@ -2439,7 +2438,7 @@ mod tests {
         assert_eq!(verdict.health(), ExecutionHealth::Degraded);
     }
 
-    /// AC (issue #1193 Codex round-4 P2): an organic trip whose cooldown will
+    /// AC (issue #1193): an organic trip whose cooldown will
     /// have already elapsed by the time this row is even due is not "heading
     /// for a terminal failure" -- `CircuitBreakerRegistry::on_dispatch`
     /// checks the elapsed cooldown at the ACTUAL dispatch instant, so this
@@ -2499,7 +2498,7 @@ mod tests {
         );
     }
 
-    /// The converse of the round-4 P2 fix: when the row is due WHILE the
+    /// The converse of the cooldown-clears-before-due rule: when the row is due WHILE the
     /// breaker is still certainly open (cooldown ahead of `scheduled_at`),
     /// the fast-fail is real and `degraded` is the correct, unchanged verdict.
     #[test]
@@ -2514,8 +2513,8 @@ mod tests {
         assert_eq!(verdict.health(), ExecutionHealth::Degraded);
     }
 
-    /// Forced-open has no cooldown to compare against at all, so the round-4
-    /// P2 exception can never apply to it: it stays `stalled` however far in
+    /// Forced-open has no cooldown to compare against at all, so the
+    /// cooldown-clears-before-due exception can never apply to it: it stays `stalled` however far in
     /// the future `scheduled_at` is.
     #[test]
     fn forced_open_circuit_wins_regardless_of_how_far_in_the_future_the_task_is() {
@@ -2529,13 +2528,13 @@ mod tests {
         assert_eq!(verdict.health(), ExecutionHealth::Stalled);
     }
 
-    /// AC (issue #1193 Codex round-5 P2): the round-4 fix compared only
-    /// `scheduled_at` against `cooldown_until`, so it never applied to a row
-    /// that is ALREADY due. But a read-only breaker snapshot deliberately
-    /// keeps reporting `open` with a *past* `cooldown_until` until some
-    /// dispatch actually admits the probe -- so an already-due row whose
-    /// cooldown has already elapsed is exactly as "probe-ready" as a
-    /// not-yet-due one whose cooldown will clear before it's due. The
+    /// AC (issue #1193): comparing only `scheduled_at` against `cooldown_until`
+    /// never applies the cooldown-clears-before-due rule to a row that is
+    /// ALREADY due. A read-only breaker snapshot deliberately keeps reporting
+    /// `open` with a *past* `cooldown_until` until some dispatch actually admits
+    /// the probe. So an already-due row whose cooldown has already elapsed is
+    /// exactly as "probe-ready" as a not-yet-due one whose cooldown will clear
+    /// before it is due. The
     /// comparison must use the effective dispatch instant
     /// (`max(now, scheduled_at)`), which for an already-due row is `now`.
     #[test]
@@ -2677,7 +2676,7 @@ mod tests {
         assert_eq!(verdict.health(), ExecutionHealth::Stalled);
     }
 
-    /// AC (issue #1193 Codex round-1 P2): an ORGANIC trip whose cooldown could
+    /// AC (issue #1193): an ORGANIC trip whose cooldown could
     /// not be represented (e.g. a policy cooldown outside `chrono`'s range)
     /// looks identical to a forced-open breaker by `cooldown_until` alone --
     /// both are `None`. `circuit_forced_open: false` is what keeps it
@@ -3149,7 +3148,7 @@ mod tests {
         assert_eq!(verdict.health(), ExecutionHealth::Stalled);
     }
 
-    // ── A nondeterminism block is an engine-declared stall (PR #1188 round 6) ──
+    // ── A nondeterminism block is an engine-declared stall (PR #1188) ──
     // Issue #603 keeps an nd-blocked execution `RUNNING` and re-pends its
     // workflow task `PENDING` at a backoff `scheduled_at`, indefinitely, until a
     // compatible build is deployed. That is indistinguishable from an ordinary
@@ -3248,7 +3247,8 @@ mod tests {
 
     #[test]
     fn no_nd_block_leaves_the_ladder_untouched() {
-        // The default (`None`) must be byte-identical to the pre-round-6 ladder.
+        // The default (`None`) must give the same verdict as a ladder with no
+        // nondeterminism-block rung.
         let inputs = DiagnosisInputs {
             activities: vec![healthy_activity()],
             ..Default::default()
@@ -3259,7 +3259,7 @@ mod tests {
     }
 
     // ── A timer cannot fire if its own workflow task can never be claimed ──
-    // (PR #1188 review round 5). A durable timer fires only when a worker
+    // (PR #1188). A durable timer fires only when a worker
     // claims the owning workflow task, so a hard impediment on THAT task —
     // an operator queue pause (#619) or no live poller — outranks every timer
     // verdict below. Its *ordinary* healthy-dispatch result must NOT be hoisted
@@ -3408,7 +3408,7 @@ mod tests {
         assert_eq!(verdict.kind(), "activity_no_worker", "{verdict:?}");
     }
 
-    /// AC (issue #1193 Codex round-3 P1): the one exception to
+    /// AC (issue #1193): the one exception to
     /// `wedged_activity_still_outranks_a_workflow_queue_impediment` above.
     /// A `Degraded` activity verdict promises "no human needed", but if the
     /// run's own workflow task can never be claimed at all, the decision
@@ -3555,7 +3555,7 @@ mod tests {
         assert!(workflow_task_hard_impediment(&wf_task()).is_none());
     }
 
-    // ── Overdue timers must own the workflow wake (PR #1188 review round 4) ──
+    // ── Overdue timers must own the workflow wake (PR #1188) ──
 
     /// Codex's exact counterexample. `persist_scheduled_external_activity`
     /// parks the workflow task and discards the armed deadline, so a
@@ -4208,7 +4208,7 @@ mod tests {
 
     #[test]
     fn workflow_wake_was_missed_truth_table() {
-        // No evidence supplied: preserve the pre-round-4 unconditional verdict.
+        // No evidence supplied: keep the unconditional missed-wake verdict.
         assert!(workflow_wake_was_missed(None, t(0)));
         // Claimed right now.
         assert!(!workflow_wake_was_missed(
@@ -4351,9 +4351,8 @@ mod tests {
                 activity_name: None,
             },
             // Issue #1193: the three circuit-open shapes are ranked by health
-            // severity (Codex round-1 P1: forced > organic; round-2 P1:
-            // organic > half-open), so no two differently-healthed shapes
-            // ever share a tier.
+            // severity (forced > organic > half-open), so no two
+            // differently-healthed shapes ever share a tier.
             BlockedOn::ActivityCircuitOpen {
                 activity_name: "a".into(),
                 cooldown_until: None,
@@ -4623,7 +4622,7 @@ mod tests {
         );
     }
 
-    /// AC (issue #1193 Codex round-1 P1): a forced-open breaker elsewhere in
+    /// AC (issue #1193): a forced-open breaker elsewhere in
     /// the same fan-out must never be masked by an organically-tripped one.
     /// Before the precedence split both mapped to the SAME health (`Stalled`),
     /// so a tie here was inconsequential; once they diverge (`Stalled` vs
@@ -4676,7 +4675,7 @@ mod tests {
         assert_eq!(forced_first.health(), ExecutionHealth::Stalled);
     }
 
-    /// AC (issue #1193 Codex round-2 P1): the same masking risk, one tier
+    /// AC (issue #1193): the same masking risk, one tier
     /// down. An organically-tripped breaker elsewhere in the same fan-out
     /// must never be masked by a half-open one. Before this fix both shared
     /// precedence 5, so a half-open row ordered first would win the fold and
@@ -4927,7 +4926,7 @@ mod tests {
              clean wait: {summary}"
         );
 
-        // AC (issue #1193 Codex round-1 P2): organic + unrepresentable
+        // AC (issue #1193): organic + unrepresentable
         // cooldown must still read like the organic case above (deadline
         // language, no force-close), not like the forced case below.
         let organic_unrepresentable = BlockedOn::ActivityCircuitOpen {
@@ -5776,7 +5775,7 @@ mod tests {
 
         /// `None` (unrepresentable/forced); a deadline already in the past
         /// relative to `now` (`t(0)`), covering an already-due row whose
-        /// cooldown has already cleared (round-5 P2); one BEFORE the
+        /// cooldown has already cleared; one BEFORE the
         /// "due later" `scheduled_at` (`t(10)`); or one AFTER it -- so the
         /// `organic_cooldown_clears_by_dispatch` guard's boundary is actually
         /// exercised by the sweep in every case, not left at a single
@@ -5815,8 +5814,8 @@ mod tests {
                 opt_string(),  // concurrency_key
                 any::<bool>(), // rate_limit_saturated
             );
-            // Varied independently of `circuit_phase` on purpose (issue #1193
-            // Codex round-1 P1): the "flag set but its companion field says
+            // Varied independently of `circuit_phase` on purpose (issue #1193).
+            // The "flag set but its companion field says
             // HalfOpen/absent" shape must be swept too, since `forced_open`
             // is meaningful only when `circuit_phase == Some(Open)` and the
             // guard in both `activity_precedence_for_facts` and

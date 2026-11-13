@@ -6,7 +6,7 @@
 //! - **B2** a benign `SetCurrentDetails` does not wedge an in-subset workflow.
 //! - **B3** retry-exhaustion / terminal-failure paths.
 //! - **B4** an unsupported command mid-batch rolls the whole cycle back.
-//! - **timer-id reuse** (Codex round-5): a re-armed timer id fires again.
+//! - **timer-id reuse**: a re-armed timer id fires again.
 //! - **m7** multi-execution `run_until_idle`.
 
 // The `#[workflow]` macro references the workflow's input parameter, so a
@@ -302,7 +302,7 @@ async fn unsupported_command_rolls_the_whole_cycle_back() {
     assert!(matches!(history[1], WorkflowEvent::WorkflowFailed { .. }));
 }
 
-// ── Timer-id reuse: a re-armed timer id fires again (Codex round-5) ────────────
+// ── Timer-id reuse: a re-armed timer id fires again ────────────────────────────
 
 /// Arms the SAME timer id twice in sequence (the poll-loop idiom). The core
 /// supports this via cursor-based per-id FIFO pairing; the backend must create a

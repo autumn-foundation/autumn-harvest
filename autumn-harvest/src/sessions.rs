@@ -245,10 +245,10 @@ pub fn new_session_slot_registry() -> SessionSlotRegistry {
 
 /// Attempt to claim `session_id`'s slot, bounded by `max_concurrent_sessions`.
 ///
-/// Returns `true` on success (either newly inserted, or already held by
-/// this worker -- idempotent, so a retried acquire dispatch that already
-/// won locally on an earlier attempt this process doesn't need to re-claim
-/// a slot) -- the caller now holds the slot and must eventually call
+/// Returns `true` on success: the slot is newly inserted, or this worker
+/// already holds it. The call is idempotent, so a retried acquire dispatch
+/// that already won locally on an earlier attempt does not need to re-claim
+/// a slot. The caller now holds the slot and must eventually call
 /// [`release_session_slot`]. Returns `false` without side effects when
 /// `max <= 0` (sessions disabled) or the registry is already at `max` and
 /// does not already contain `session_id`.
@@ -279,7 +279,7 @@ pub fn try_acquire_session_slot(
 
 /// Release a previously claimed session slot.
 ///
-/// Idempotent: releasing a `session_id` this registry doesn't (or no
+/// Idempotent: releasing a `session_id` this registry does not (or no
 /// longer) hold is a no-op, so a defensive double-release (e.g. a
 /// reconcile sweep racing an in-flight `Session::complete()`) is safe.
 pub fn release_session_slot(registry: &SessionSlotRegistry, session_id: crate::types::SessionId) {
@@ -587,7 +587,7 @@ pub async fn record_session_completed(
 /// Push a session's lease (`expires_at`) forward from now (issue #606).
 ///
 /// Called after each member-activity completion so a long-running, still
-/// legitimately active pipeline isn't reclaimed by the broken-session
+/// legitimately active pipeline is not reclaimed by the broken-session
 /// scanner's `expires_at < NOW()` check purely because its member activities
 /// individually take longer than one [`SESSION_MEMBER_STICKY_TIMEOUT`]
 /// window to finish. Idempotent-shaped: only an `ACTIVE` row is refreshed —

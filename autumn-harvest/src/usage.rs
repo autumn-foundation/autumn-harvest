@@ -118,14 +118,13 @@ pub const fn default_usage_window_ceiling() -> std::time::Duration {
 ///
 /// Unlike `GET /workflows/count`'s top-N + `other` rollup, a chargeback
 /// report must never silently drop a low-volume tenant's data — so
-/// exceeding this cap is a hard error naming the ceiling rather than a
-/// silent rollup. The cap is enforced at two layers: [`usage_sql`] binds it
-/// (plus one) as a `LIMIT` so a single high-cardinality shard can't
-/// materialize an unbounded result set, and the plugin's
-/// `build_usage_response` checks the merged cross-shard count before
-/// constructing the response — the DB-side `LIMIT` bounds the expensive
-/// part (the query and its memory), the merge-side check produces the
-/// accurate 413.
+/// exceeding this cap is a hard error that names the ceiling, not a silent
+/// rollup. Two layers enforce the cap. [`usage_sql`] binds it (plus one) as a
+/// `LIMIT`, so a single high-cardinality shard cannot materialize an
+/// unbounded result set. The plugin's `build_usage_response` checks the
+/// merged cross-shard count before it constructs the response. The DB-side
+/// `LIMIT` bounds the expensive part (the query and its memory). The
+/// merge-side check produces the accurate 413.
 #[must_use]
 pub const fn default_usage_max_groups() -> usize {
     10_000

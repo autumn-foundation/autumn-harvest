@@ -278,12 +278,12 @@ fn three_worker_scenario_only_owning_worker_gets_cache_hits() {
 
     let exec_id = uuid::Uuid::new_v4();
 
-    // --- Round 1: task lands on worker-0 (cold path) ---
+    // --- Cycle 1: task lands on worker-0 (cold path) ---
     simulate_task_cycle(&mut cache_w0, &metrics_w0, exec_id, true, vec![], 2);
     assert_eq!(metrics_w0.miss_count(), 1);
     assert_eq!(metrics_w0.hit_count(), 0);
 
-    // --- Round 2: follow-up task lands on worker-0 (warm path) ---
+    // --- Cycle 2: follow-up task lands on worker-0 (warm path) ---
     simulate_task_cycle(&mut cache_w0, &metrics_w0, exec_id, true, vec![], 4);
     assert_eq!(metrics_w0.miss_count(), 1, "owner: still only 1 miss");
     assert_eq!(metrics_w0.hit_count(), 1, "owner: first hit");

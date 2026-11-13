@@ -270,7 +270,7 @@ async fn reset_reverts_running_task_to_pending() {
         "PENDING",
         "reset should move RUNNING → PENDING"
     );
-    // Execution stays RUNNING (timeout below threshold doesn't fail it).
+    // Execution stays RUNNING (timeout below threshold does not fail it).
     assert_eq!(execution_state(&mut conn, exec_id).await, "RUNNING");
 }
 

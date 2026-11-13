@@ -78,9 +78,9 @@ fn only_activity_failed(rt: &SqliteRuntime, exec: ExecutionId) -> WorkflowEvent 
 
 // ── FIX 1: typed activity-failure envelope is decoded into the terminal event ──
 
-// Registered body only — scheduled via the raw path (no policy). `max_attempts`
-// therefore comes from the `ActivitySpec` (1), so the very first typed failure is
-// terminal and the decode is what's under test (independent of the retry gate).
+// Registered body only, scheduled via the raw path (no policy). So `max_attempts`
+// comes from the `ActivitySpec` (1), and the very first typed failure is terminal.
+// The test checks the decode, independent of the retry gate.
 #[workflow]
 async fn typed_fail_wf(ctx: &WorkflowContext, n: i64) -> Result<i64, String> {
     let out = ctx

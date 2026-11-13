@@ -56,7 +56,7 @@
     clippy::missing_panics_doc,
     clippy::missing_errors_doc,
     // Diesel `#[derive(QueryableByName)] struct XxxRow { .. }` helpers are
-    // conventionally defined right where they're used, mid-function, across
+    // conventionally defined right where they are used, mid-function, across
     // every integration-test file in this repo that reads a raw column via
     // `sql_query` (see e.g. `child_policy_tests.rs`, `pause_tests.rs`).
     clippy::items_after_statements
@@ -1283,7 +1283,7 @@ async fn continue_as_new_cross_type_to_no_quota_workflow_clears_quota_key() {
 }
 
 // ---------------------------------------------------------------------------
-// Issue #946, Codex round-3 review — a `SpawnDetachedChildWorkflow` command
+// Issue #946 — a `SpawnDetachedChildWorkflow` command
 // (issue #347) resolves and enforces the TARGET workflow type's own declared
 // quota exactly like a fresh admission, worker-driven end to end.
 // `ParentClosePolicy` governs the detached child's *lifecycle*; the target
@@ -1328,8 +1328,7 @@ pub fn detached_quota_child<'a>(
 /// identical decision cycle; once the blocking execution frees its slot,
 /// the retry succeeds and the detached child is created with the resolved
 /// `quota_key` stamped on its own row -- the exact
-/// `create_detached_child_executions` code path (issue #946, Codex round-3
-/// review).
+/// `create_detached_child_executions` code path (issue #946).
 #[tokio::test]
 async fn detached_child_spawn_honors_target_quota_parks_parent_then_succeeds() {
     let _serial = serial().await;
@@ -1480,7 +1479,7 @@ fn detached_quota_mixed_parent<'a>(
         // sibling test above exercises. A `QuotaExceeded` surfacing from
         // THAT call is caught by `recover_from_child_quota_exceeded`'s OTHER
         // call site -- `handle_suspended_workflow`'s dispatch tail (issue
-        // #946, Codex round-3 review).
+        // #946).
         ctx.timer("mixed-batch-tick", 1)
             .await
             .map_err(|e| e.to_string())?;
@@ -1497,7 +1496,7 @@ fn detached_quota_mixed_parent<'a>(
 /// [`detached_child_spawn_honors_target_quota_parks_parent_then_succeeds`]
 /// exercises above. When the detached child's target quota is at cap, this
 /// path must ALSO park + wake the parent rather than terminally failing it
-/// (issue #946, Codex round-3 review).
+/// (issue #946).
 #[tokio::test]
 async fn detached_child_spawn_in_mixed_batch_honors_target_quota_parks_parent_then_succeeds() {
     let _serial = serial().await;
@@ -1581,7 +1580,7 @@ async fn detached_child_spawn_in_mixed_batch_honors_target_quota_parks_parent_th
 }
 
 // ---------------------------------------------------------------------------
-// Issue #946, Codex round-4 review — `enforce_quota_admission`'s documented
+// Issue #946 — `enforce_quota_admission`'s documented
 // "the just-inserted row has appended no events yet" contract was violated
 // at all three child-spawn call sites: each appended the child's own
 // `WorkflowStarted`/`ChildWorkflowStarted` event BEFORE calling
@@ -1792,7 +1791,7 @@ async fn detached_child_multi_spawn_batch_locks_every_distinct_key_and_admits_al
 }
 
 // ---------------------------------------------------------------------------
-// Issue #946, Codex round-3 review — an AWAITED child spawn (`ctx.
+// Issue #946 — an AWAITED child spawn (`ctx.
 // spawn_child_workflow_raw`, whether a lone spawn or one of a genuine
 // fan-out, both dispatch through the same `persist_all_started_child_workflows`
 // suspension-batch handler) resolves and enforces the TARGET workflow type's
@@ -1967,7 +1966,7 @@ async fn awaited_child_spawn_honors_target_quota_parks_parent_then_succeeds() {
 /// An awaited child spawn (`persist_all_started_child_workflows`) must not
 /// be wrongly rejected by its OWN just-appended `WorkflowStarted` event
 /// counting toward the `history_bytes` admission it is itself part of
-/// (issue #946, Codex round-4 review — see the section comment above
+/// (issue #946 — see the section comment above
 /// [`detached_child_spawn_quota_check_excludes_its_own_just_appended_history_bytes`]
 /// for the full rationale).
 #[tokio::test]
@@ -2204,7 +2203,7 @@ async fn mixed_fan_out_rolls_back_the_whole_decision_when_the_sequential_group_e
 }
 
 // ---------------------------------------------------------------------------
-// Issue #946, Codex round-3 review — the child-timeout-race primitive
+// Issue #946 — the child-timeout-race primitive
 // (`ctx.spawn_child_workflow_timeout`, issue #779) dispatches through
 // `persist_child_timeout_race` -> `insert_awaited_child_execution`, a THIRD
 // distinct child-spawn code path from the two above (fan-out and detached).
@@ -2376,8 +2375,8 @@ async fn child_timeout_race_spawn_honors_target_quota_parks_parent_then_succeeds
 /// A child-timeout-race child spawn (`persist_child_timeout_race` ->
 /// `insert_awaited_child_execution`) must not be wrongly rejected by its OWN
 /// just-appended `ChildWorkflowStarted`/`WorkflowStarted` events counting
-/// toward the `history_bytes` admission it is itself part of (issue #946,
-/// Codex round-4 review — see the section comment above
+/// toward the `history_bytes` admission it is itself part of (issue #946 —
+/// see the section comment above
 /// [`detached_child_spawn_quota_check_excludes_its_own_just_appended_history_bytes`]
 /// for the full rationale).
 #[tokio::test]
@@ -2931,7 +2930,7 @@ async fn replace_execution_allow_duplicate_failed_only_enforces_quota_on_resurre
     start_ok(&mut conn, wf, serde_json::json!({"tenant_id": "t1"})).await;
     assert_eq!(active_count(&mut conn, wf, "t1").await, 1);
 
-    // 3. Before the P1 fix, `replace_execution` (reached here via
+    // 3. Before the quota fix, `replace_execution` (reached here via
     //    `AllowDuplicateFailedOnly` over a FAILED prior) never called
     //    `enforce_quota_admission` at all -- this would have silently
     //    resurrected the failed row into a fresh ACTIVE execution.
@@ -2988,7 +2987,7 @@ async fn replace_execution_terminate_if_running_enforces_quota_over_a_terminal_p
     start_ok(&mut conn, wf, serde_json::json!({"tenant_id": "t1"})).await;
     assert_eq!(active_count(&mut conn, wf, "t1").await, 1);
 
-    // Before the P1 fix, `replace_execution` (reached here via
+    // Before the quota fix, `replace_execution` (reached here via
     // `TerminateIfRunning` over a terminal COMPLETED prior) never called
     // `enforce_quota_admission`.
     let exec_id2 = ExecutionId::new();
@@ -3059,7 +3058,7 @@ async fn replace_execution_terminate_if_running_enforces_the_new_requests_resolv
 
     // Now re-target E's SAME `workflow_id` with `TerminateIfRunning`, but
     // this request body resolves to "victim-tenant" -- the
-    // ALREADY-SATURATED key. Before the P1 fix, `replace_execution`
+    // ALREADY-SATURATED key. Before the quota fix, `replace_execution`
     // (`ActiveConflictBehavior::Terminate`) never called
     // `enforce_quota_admission`, so E would have been silently sealed and
     // replaced by a fresh execution counted against "victim-tenant",
@@ -3155,11 +3154,11 @@ async fn replace_execution_paths_still_succeed_when_not_over_cap() {
     assert_eq!(active_count(&mut conn, wf, "roomy").await, 2);
 }
 
-/// Codex P2 (issue #946, round 1): `history_bytes`, not just
+/// Issue #946: `history_bytes`, not just
 /// `active_executions`, must be exempted for the row a `TerminateIfRunning`
 /// replace is about to seal -- and specifically on Site 1 (the
 /// `ActiveConflictBehavior::Terminate` path over a RUNNING/PAUSED existing,
-/// reached via the pre-check-cancel shortcut before the P1/P2 fix and via
+/// reached via the pre-check-cancel shortcut before the fix and via
 /// the atomic `inline_cancel` + `replace_execution` fallthrough after it).
 ///
 /// Before the fix, `enforce_quota_before_terminate_pre_check` only ever
@@ -3224,7 +3223,7 @@ async fn replace_execution_terminate_if_running_exempts_the_replaced_runs_own_hi
     );
 
     // Now replace the SAME row via `TerminateIfRunning` (Site 1 -- the
-    // existing row is still RUNNING at this point). Before the P1/P2 fix,
+    // existing row is still RUNNING at this point). Before the fix,
     // this would ALSO have been wrongly rejected on `history_bytes`, since
     // the pre-check helper only exempted `active_executions`. After the
     // fix, the existing row is sealed to CANCELLED before the quota check
@@ -3258,8 +3257,8 @@ async fn replace_execution_terminate_if_running_exempts_the_replaced_runs_own_hi
 }
 
 /// A workflow-level retry (issue #523) continuation must NOT be silently
-/// dropped by a per-tenant quota that has since filled up (issue #946, Codex
-/// round-2 review). `start_or_load_workflow_execution_collect` already
+/// dropped by a per-tenant quota that has since filled up (issue #946).
+/// `start_or_load_workflow_execution_collect` already
 /// exempts a retry continuation from the admission gate (`gate: None`) and
 /// from concurrency-supersede (`concurrency_on_conflict: Defer`) with an
 /// explicit "in-flight continuation, not a fresh admission" rationale --
@@ -3345,8 +3344,8 @@ async fn active_executions_cap_does_not_block_a_workflow_level_retry_continuatio
 }
 
 // ---------------------------------------------------------------------------
-// Resolved quota-key length bound (issue #946, Codex round-2 review:
-// "bound resolved quota keys before indexing them")
+// Resolved quota-key length bound (issue #946: "bound resolved quota keys
+// before indexing them")
 // ---------------------------------------------------------------------------
 //
 // `key_expr` is an author-declared, trusted dot-path, but the VALUE it
@@ -3439,7 +3438,7 @@ async fn quota_key_exactly_at_the_length_bound_is_admitted() {
 }
 
 // ---------------------------------------------------------------------------
-// Issue #946, Codex round-3 review (P2) — "Validate cross-type continuation
+// Issue #946 — "Validate cross-type continuation
 // quota keys before insertion". Mirrors
 // `oversized_resolved_quota_key_is_rejected_before_any_db_write` above, but
 // for the CROSS-TYPE `continue_as_new_as_type` path
@@ -3696,7 +3695,7 @@ async fn continue_as_new_cross_type_oversized_quota_key_still_records_its_abando
 }
 
 // ---------------------------------------------------------------------------
-// Issue #946, Codex round-3 review — a SAME-SHARD completion trigger whose
+// Issue #946 — a SAME-SHARD completion trigger whose
 // TARGET's per-tenant quota is exhausted at fire time must defer the start
 // to the durable outbox for retry, NOT propagate `Err` out of
 // `evaluate_triggers_for_execution` and roll back the SOURCE execution's own

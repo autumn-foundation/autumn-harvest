@@ -1068,7 +1068,7 @@ pub fn mean_inflight(samples: &[usize]) -> Option<f64> {
 /// Reasons a closed-loop throughput figure is feeder-bound on **any** shard.
 ///
 /// The per-shard form of [`inflight_soundness`], and the same lesson the
-/// pacing gate learned one review round earlier (Codex, PR #1282): a mean over
+/// pacing gate learned earlier in PR #1282: a mean over
 /// every shard's samples lets well-fed shards hide a starved one. Four shards
 /// at 32, 32, 32 and 28 average 31 against a floor of 28.8 and pass — while the
 /// shard that missed its target is the one bounding the aggregate rate the cell
@@ -2637,7 +2637,7 @@ mod tests {
 
     #[test]
     fn a_single_feeder_bound_shard_cannot_hide_behind_its_peers() {
-        // The regression this exists to catch (Codex review round 3, PR #1282):
+        // The regression this exists to catch (PR #1282):
         // 32/32/32/28 averages 31 against a floor of 28.8, so a flattened mean
         // passes while the starved shard is the one bounding the aggregate rate
         // the cell publishes.
@@ -4568,8 +4568,8 @@ pub mod db {
     /// Abort the accept loop when a `SignalServer` is dropped without
     /// [`SignalServer::stop`].
     ///
-    /// The panic path, one layer further out than `Fleet`'s (Codex review
-    /// round 4, PR #1282): if `run_signal_roundtrip` panics after the server is
+    /// The panic path, one layer further out than `Fleet`'s (PR #1282): if
+    /// `run_signal_roundtrip` panics after the server is
     /// spawned, unwinding merely *drops* this handle, and dropping a
     /// `JoinHandle` detaches its task. The accept loop would keep running --
     /// holding its `ShardedDbPool` clone and its idle connections -- through
@@ -4738,13 +4738,13 @@ pub mod db {
     /// Recorded during provisioning rather than probed from an environment
     /// variable, because on the testcontainer path there is no such variable:
     /// the probe returned `None` and the published environment block simply
-    /// omitted the Postgres version for an otherwise perfectly good run (Codex
-    /// review round 3, PR #1282). `postgres:16` is a moving tag, and the doc
+    /// omitted the Postgres version for an otherwise perfectly good run (PR
+    /// #1282). `postgres:16` is a moving tag, and the doc
     /// treats the exact version as reproduction metadata, so "unknown" is not
     /// an acceptable answer for a run that had a server in front of it.
     /// Every DISTINCT server version this run provisioned against.
     ///
-    /// A set rather than a single value (Codex review round 4, PR #1282): in
+    /// A set rather than a single value (PR #1282): in
     /// `HARVEST_BENCH_SHARD_URLS` mode the shards are independent servers and
     /// nothing makes them the same build. Recording only the first would print
     /// shard 0's version as though it described the whole sweep -- inaccurate
@@ -5116,7 +5116,7 @@ pub mod db {
         // `expect` below unwinds and dropping loose handles would DETACH the
         // siblings, leaving them inserting rows and holding connections until
         // the 900s deadline while later cells of the sweep are being measured
-        // (Codex review round 3, PR #1282). Dropping a `JoinSet` aborts what it
+        // (PR #1282). Dropping a `JoinSet` aborts what it
         // owns, so the containment in `benches/e2e_bench.rs` actually contains.
         //
         // Each task also holds a `census` guard. Dropping the `JoinSet` on a

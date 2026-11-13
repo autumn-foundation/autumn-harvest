@@ -1226,9 +1226,9 @@ async fn registration_order_is_outermost_first_end_to_end() {
     let exec_id = seed_workflow(&mut conn, "wf_order", serde_json::json!({"v": 7}), queue).await;
 
     let log = Arc::new(Mutex::new(Vec::new()));
-    // The handler just echoes (the module-level `echo_activity`). We can't inject
-    // a "handler" marker through the fn pointer easily, so the ordering is
-    // asserted purely on the interceptors' before/after markers, which is
+    // The handler just echoes (the module-level `echo_activity`). A "handler"
+    // marker is hard to inject through the fn pointer. So the ordering is
+    // asserted purely on the before/after markers of the interceptors. That is
     // sufficient to prove i1 is OUTERMOST (its before is first, after is last).
     let registry = build_registry(
         vec![wf_info("wf_order", wf_one_activity)],

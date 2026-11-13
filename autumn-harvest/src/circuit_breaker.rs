@@ -452,8 +452,8 @@ impl CircuitBreakerRegistry {
                 if st.probe_in_flight {
                     // A probe is already running; no further dispatch is admitted
                     // until it completes and transitions the breaker. Advertise
-                    // no retry-after so callers don't busy-loop on a `0s` hint —
-                    // the outcome is gated on the probe, not a timer.
+                    // no retry-after, so that callers do not busy-loop on a `0s`
+                    // hint. The probe gates the outcome, not a timer.
                     DispatchDecision::ShortCircuit {
                         opened_at: st.opened_at_wall,
                         retry_after: None,
@@ -1016,8 +1016,8 @@ fn apply_result(
         },
         CircuitPhase::HalfOpen => {
             // Only the admitted probe decides the half-open outcome. A
-            // same-generation non-probe (shouldn't normally happen, but be
-            // defensive) must not close the breaker early or restart cooldown.
+            // same-generation non-probe must not close the breaker early or
+            // restart cooldown. That case should not happen; this is defensive.
             if !token.is_probe {
                 return None;
             }
@@ -2028,7 +2028,7 @@ mod tests {
     }
 
     // A half-open probe that returns a non-retryable (bad-input) error must NOT
-    // close the breaker: a per-request error doesn't prove the downstream
+    // close the breaker: a per-request error does not prove the downstream
     // recovered. It is inconclusive — the breaker re-arms its cooldown and waits
     // for another probe, emitting no transition.
     #[test]

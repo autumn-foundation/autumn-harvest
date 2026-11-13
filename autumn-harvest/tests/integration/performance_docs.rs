@@ -101,21 +101,20 @@ fn read_performance_doc() -> String {
 /// Guards that require a *phrase* to be present must survive the Markdown being
 /// re-wrapped: a hard wrap inserted between two words of the phrase makes a
 /// plain `contains` miss, and the failure reads as "the correction is absent"
-/// when the correction is right there. Round 35 hit exactly that on its own
-/// fix, so the normalisation lives here rather than being a per-guard quirk.
+/// when the correction is right there. A guard has already tripped on its own
+/// fix this way. So the normalisation lives here, not as a per-guard quirk.
 fn collapse_ws(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Does `haystack` state `phrase` in its own voice, rather than quoting it?
 ///
-/// Several guards in this module ban a specific superseded phrasing. Every one
-/// of them, written naively as `haystack.contains(phrase)`, failed on the very
-/// text that *fixed* the thing it guards — because a retraction has to
-/// reproduce the claim it retracts in order to name it. That has now happened
-/// three times (the round-23 keyword ban, the round-26 changelog guard, and the
-/// round-28 `all_gates` guard), so the distinction lives here rather than being
-/// re-derived inline a fourth time.
+/// Several guards in this module ban a specific superseded phrasing. Each one,
+/// written naively as `haystack.contains(phrase)`, failed on the very text
+/// that *fixed* the thing it guards. A retraction has to reproduce the claim it
+/// retracts in order to name it. That has happened three times: the keyword
+/// ban, the changelog guard and the `all_gates` guard. So the distinction lives
+/// here, not re-derived inline a fourth time.
 ///
 /// The signal is the character immediately preceding the phrase: a retraction
 /// reads `... does not support a "predicates are a rounding error" reading`,
@@ -984,12 +983,12 @@ fn ci_yaml_plain_scalars_do_not_contain_a_mapping_colon() {
 /// The benchmark's *generated report* must not republish the retracted
 /// attribution either.
 ///
-/// Round 24 narrowed the claim in `docs/performance.md`; round 26 found the
-/// changelog's leading entry still carried it; this covers the third surface —
-/// the note `benches/claim_bench.rs` prints under its per-gate table. That note
-/// is arguably the worst place for it to survive: the doc is read once, but the
-/// bench output is what someone pastes into a PR when they regenerate the
-/// numbers, so a stale interpretation there propagates into new writing.
+/// One fix narrowed the claim in `docs/performance.md`. A later one found that
+/// the changelog's leading entry still carried it. This test covers the third
+/// surface: the note `benches/claim_bench.rs` prints under its per-gate table.
+/// That note is arguably the worst place for it to survive. The doc is read
+/// once, but someone pastes the bench output into a PR when they regenerate
+/// the numbers. So a stale interpretation there propagates into new writing.
 ///
 /// Scoped to `println!` string content rather than the whole file: the source
 /// may freely *discuss* the retraction in comments (this fix does), and a guard
@@ -1096,17 +1095,17 @@ fn every_bench_database_await_is_bounded() {
 /// `all_gates` seeds the same PAUSED ballast `paused_rows` does, so it scans
 /// 20 000 rows but sorts only 10 000, while its would-be `double_backlog`
 /// comparand sorts 20 000. Comparing them charges the row for every predicate
-/// while crediting it with half the sort — the same confound round 24 retracted
-/// for `paused_rows`. Round 35: not a *floor* either. A floor is a lower bound,
-/// and adding the sort saving back to derive one assumes the difference
-/// decomposes into predicate cost plus sort cost; the scenarios also filter to
-/// different post-filter populations and can reach different plans, so it does
-/// not. The comparison bounds nothing in either direction.
+/// while crediting it with half the sort. That is the same confound already
+/// retracted for `paused_rows`. It is not a *floor* either. A floor is a lower
+/// bound. Adding the sort saving back to derive one assumes that the difference
+/// decomposes into predicate cost plus sort cost. It does not: the scenarios
+/// also filter to different post-filter populations and can reach different
+/// plans. The comparison bounds nothing in either direction.
 ///
 /// This is a separate guard from
 /// [`the_paused_rows_delta_is_not_attributed_to_the_predicate`] because the two
-/// claims failed independently: the `paused_rows` attribution was retracted a
-/// full round before anyone noticed `all_gates` rested on the identical
+/// claims failed independently. The `paused_rows` attribution was retracted
+/// well before anyone noticed that `all_gates` rested on the identical
 /// comparison.
 #[test]
 fn the_all_gates_delta_is_not_published_as_a_predicate_bound() {
@@ -1133,9 +1132,9 @@ fn the_all_gates_delta_is_not_published_as_a_predicate_bound() {
     // And the correction must be present, so the claim cannot simply be deleted
     // and leave the reader to draw the retracted conclusion from the table.
     //
-    // Round 35: this used to require the phrase "floor, not a bound". That was
-    // itself the retracted claim — a floor *is* a lower bound — so the guard
-    // was mandating the error it existed to prevent. Requiring the *direction-
+    // This used to require the phrase "floor, not a bound". That was itself
+    // the retracted claim, because a floor *is* a lower bound. So the guard
+    // mandated the error it existed to prevent. Requiring the *direction-
     // free* conclusion instead is what [`the_all_gates_figure_is_not_published_
     // as_a_directional_bound`] then enforces the other half of.
     assert!(
@@ -1155,11 +1154,11 @@ fn the_all_gates_delta_is_not_published_as_a_predicate_bound() {
 /// on every claim but sit on their cheapest null/empty path in every scenario
 /// here, so they are exercised rather than measured.
 ///
-/// This is the same overclaim round 28 retracted in `docs/performance.md`, one
-/// level out. It matters more here than on the page: an overview is what a
-/// reader sees *before* deciding whether to open the page, so "each predicate"
-/// invites precisely the "predicates are a rounding error" conclusion — and it
-/// does so one step further from the caveats that would have stopped them.
+/// This is the same overclaim already retracted in `docs/performance.md`, one
+/// level out. It matters more here than on the page. A reader sees an overview
+/// *before* deciding whether to open the page. So "each predicate" invites
+/// precisely the "predicates are a rounding error" conclusion. It does so one
+/// step further from the caveats that would have stopped them.
 ///
 /// It also covers the bench source, because the first pass at this fix
 /// corrected only the two files the review named and left the identical wording
@@ -1206,20 +1205,19 @@ fn overview_docs_do_not_claim_complete_predicate_coverage() {
 /// The released entry's *current-behavior* description must not promise a
 /// pid-liveness guarantee the sweep no longer offers.
 ///
-/// Round 5 removed the pid veto from `sweep_step` outright, making the
-/// server-visible lease the sole liveness authority — precisely because a
-/// containerised run records pid 1, pid 1 is alive everywhere, and the veto
-/// therefore skipped every stale database a previous container run had left
-/// behind. The opening description still told operators the sweep skips a
+/// A fix removed the pid veto from `sweep_step` outright. The server-visible
+/// lease became the sole liveness authority. A containerised run records
+/// pid 1, and pid 1 is alive everywhere. So the veto skipped every stale
+/// database that a previous container run had left behind. The opening description still told operators the sweep skips a
 /// database "whose owning pid is still alive", which is both untrue and
 /// reassuring in the wrong direction: an operator reading it would expect a
 /// live-but-leaseless run to be protected from reclamation.
 ///
 /// Scoped to the text *before* the first `Post-review hardening` section, and
 /// that scoping is the substance of the test. The released entry embeds a
-/// round-by-round narrative in which "the local pid check is kept" is a true
-/// statement about round 2, later superseded; banning the phrase everywhere
-/// would forbid the entry from recording its own history. The prefix is the
+/// step-by-step narrative. In it, "the local pid check is kept" is a true
+/// statement about an early step, later superseded. Banning the phrase
+/// everywhere would forbid the entry from recording its own history. The prefix is the
 /// part that speaks in the present tense about shipped behaviour.
 ///
 /// The sibling guard below catches a *retracted conclusion*; this one catches a
@@ -1278,10 +1276,9 @@ fn the_released_entry_does_not_promise_pid_liveness_protection() {
 /// then corrected, and a guard that forbade the superseded wording anywhere
 /// would forbid the diary from recording the correction at all.
 ///
-/// This is the second time this exact drift has occurred (round 26 was the
-/// first) and the existing `changelog_fragment_quotes_the_published_figures`
-/// did not catch it, because that guard checks the *figures* the entry quotes
-/// against the published tables. Here the figure was right and the *conclusion*
+/// This exact drift has now occurred twice. The existing
+/// `changelog_fragment_quotes_the_published_figures` did not catch it. That
+/// guard checks the *figures* the entry quotes against the published tables. Here the figure was right and the *conclusion*
 /// drawn from it was withdrawn — a class the figure check cannot see.
 #[test]
 fn the_changelog_leading_entry_does_not_publish_the_retracted_bound() {
@@ -1317,11 +1314,11 @@ fn the_changelog_leading_entry_does_not_publish_the_retracted_bound() {
 
 /// `+28%` must not be published as a bound in *either* direction.
 ///
-/// Round 28 retracted "the surviving bound on combined predicate cost" and
-/// round 29 replaced it with "a floor, not a bound" — but a floor **is** a
-/// lower bound, so that wording restated the retracted claim in the one
-/// direction it was still tempting to keep, and contradicted the "cannot bound
-/// in either direction" conclusion sitting a few lines below it.
+/// One fix retracted "the surviving bound on combined predicate cost". The
+/// next one replaced it with "a floor, not a bound". But a floor **is** a lower
+/// bound. So that wording restated the retracted claim in the one direction it
+/// was still tempting to keep. It also contradicted the "cannot bound in
+/// either direction" conclusion a few lines below it.
 ///
 /// The reasoning that produced it does not hold either: adding the unmeasured
 /// sort saving back to the difference assumes the difference decomposes into
@@ -1412,12 +1409,12 @@ fn the_all_gates_figure_is_not_published_as_a_directional_bound() {
 /// the published table currently carries.
 ///
 /// The existing `changelog_fragment_quotes_the_published_figures` pins exactly
-/// one number — the control's multiplier — because that was the figure the
-/// round-26 drift turned on. It therefore did not notice that the leading
-/// entry's "per-gate attribution (AC2)" list had gone stale in *all five* of its
-/// figures when round 22 regenerated the tables from a fresh run: the diary
-/// recorded the regeneration, the page carried the new numbers, and the entry
-/// that becomes the release note kept the old ones. Two of them had even swapped
+/// one number, the control's multiplier. An earlier drift turned on that
+/// figure. So the guard did not notice a later regeneration of the tables from
+/// a fresh run. It left the leading entry's "per-gate attribution (AC2)" list
+/// stale in *all five* of its figures. The diary recorded the regeneration and
+/// the page carried the new numbers. The entry that becomes the release note
+/// kept the old ones. Two of them had even swapped
 /// rank with each other, so the release note published an ordering the page
 /// explicitly says does not reproduce.
 ///
@@ -1475,12 +1472,12 @@ fn changelog_leading_entry_per_gate_figures_match_the_published_table() {
 /// Every millisecond figure the changelog's headline findings quote must still
 /// appear somewhere on the published page.
 ///
-/// The per-gate guard above covers the AC2 list. Auditing that fix turned up
-/// that the *same* round-22 regeneration had also left findings (1) and (4)
-/// behind — the release note claimed 1k→10k cost ~24x (9.92 ms → 234.22 ms) and
-/// that 100k drains at ~2 claims/s against ~3 650 enqueues/s, while the page's
-/// own sweep table published 10.44 ms → 200.03 ms → 2 919.99 ms, ~3 claims/s and
-/// ~4 600 enqueues/s. So the drift was never specific to the gate list; it was
+/// The per-gate guard above covers the AC2 list. An audit of that fix found
+/// that the *same* regeneration had also left findings (1) and (4) behind. The
+/// release note claimed 1k→10k cost ~24x (9.92 ms → 234.22 ms). It also claimed
+/// that 100k drains at ~2 claims/s against ~3 650 enqueues/s. The page's own
+/// sweep table published 10.44 ms → 200.03 ms → 2 919.99 ms, ~3 claims/s and
+/// ~4 600 enqueues/s. So the drift was never specific to the gate list. It was
 /// the whole headline.
 ///
 /// A containment check rather than a table parse, deliberately: the headline is
@@ -1516,9 +1513,9 @@ fn changelog_headline_millisecond_figures_still_appear_on_the_page() {
 
     // The budget sentence quotes the reference p50 the gate is derived from, so
     // it goes stale on exactly the same regeneration. It sat outside the
-    // headline block and drifted independently: round 5 widened the reference
-    // to a 200-234 ms range and the entry kept quoting a flat "234 ms", which
-    // by then also contradicted the entry's own corrected headline.
+    // headline block and drifted independently. A fix widened the reference to
+    // a 200-234 ms range, and the entry kept quoting a flat "234 ms". By then
+    // that also contradicted the entry's own corrected headline.
     let budget_start = leading
         .find("fails the build when")
         .expect("the leading entry must state the gate's budget");
@@ -1586,8 +1583,8 @@ fn changelog_headline_millisecond_figures_still_appear_on_the_page() {
 /// The enum docs are a second surface for that claim, and a worse one:
 /// `comparand()` is what the report generator pairs rows by, so a maintainer
 /// republishing a run reads the attribution from here, not from the page.
-/// Round 35 was this same shape — a retraction that landed in the docs and
-/// left a stale assertion somewhere else.
+/// The "floor, not a bound" correction had this same shape: a retraction that
+/// landed in the docs and left a stale assertion somewhere else.
 #[test]
 fn claim_gate_docs_do_not_claim_the_delta_isolates_the_anti_join() {
     let harness = read_normalized(

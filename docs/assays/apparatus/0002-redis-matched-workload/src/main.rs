@@ -197,7 +197,7 @@ struct CellReport {
     claims_per_sec: f64,
     truncated: bool,
     /// `None` (rendered `n/a`) when `n == 0` -- a zero-sample percentile is
-    /// not "0ms", it's "nothing was measured". Mirrors
+    /// not "0ms", it is "nothing was measured". Mirrors
     /// `claim_bench_support.rs`'s own `n/a` rendering for a zero-sample
     /// consumer (`claim_bench.rs:133-136`) rather than printing a
     /// misleadingly instantaneous-looking `0.000`.
@@ -248,12 +248,12 @@ async fn run_cell(backlog: usize, redis_url: &str, scenario_budget: Duration) ->
             // Redis would otherwise hang `run_cell` past
             // `BENCH_SCENARIO_SECS` with no truncated report to show for it.
             //
-            // Post-review correction, round 3: a timed-out or failed connect
-            // no longer panics the whole scenario. It still clears the start
-            // gate (so the other CLAIMERS-1 successful claimers aren't stuck
-            // waiting on a Barrier that can never reach its count) and
-            // reports back an explicitly truncated, sample-free outcome —
-            // mirroring `claim_bench_support.rs`'s own checkout-timeout path
+            // A timed-out or failed connect does not panic the whole
+            // scenario. It still clears the start gate, so the other
+            // CLAIMERS-1 successful claimers are not stuck waiting on a
+            // Barrier that can never reach its count. It reports back an
+            // explicitly truncated, sample-free outcome. That mirrors the
+            // checkout-timeout path of `claim_bench_support.rs`
             // (`ClaimerOutcome::from_observed(Vec::new(), true)`), which
             // makes a stalled connection an explicitly unsound report rather
             // than an aborted process.

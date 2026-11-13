@@ -532,19 +532,19 @@ pub const fn is_activity_paused_query() -> &'static str {
 /// to prevent. Running this inside the enforcement transaction closes all but a
 /// bounded residual, described below.
 ///
-/// # Called TWICE per enforcement, and why (round-17 review)
+/// # Called TWICE per enforcement, and why
 ///
 /// `enforce_activity_timeout` calls this once near the top of its transaction
 /// and again **after** it has taken the execution and task row locks. The first
-/// call is an advisory fast path — it lets a held task bail before paying for
+/// call is an advisory fast path. It lets a held task bail before it pays for
 /// the row locks and the history load. It is emphatically **not** the
-/// guarantee, because the statement immediately after it,
-/// `lock_workflow_execution_row_and_load_history`, is a `FOR UPDATE` that can
+/// guarantee. The statement immediately after it,
+/// `lock_workflow_execution_row_and_load_history`, is a `FOR UPDATE`. It can
 /// block for an **unbounded** period behind any other holder of that row.
-/// `pause_activity` shares no row with that transaction, so an operator pause
-/// commits freely during that wait and returns success — and with only the
-/// first call, the enforcer went on to fail the task anyway. The second call,
-/// after the last blocking acquisition, is the authoritative one.
+/// `pause_activity` shares no row with that transaction. So an operator pause
+/// commits freely during that wait and returns success. With only the first
+/// call, the enforcer then failed the task anyway. The second call, after the
+/// last blocking acquisition, is the authoritative one.
 ///
 /// # Residual window (deliberate)
 ///

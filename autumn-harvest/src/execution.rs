@@ -165,7 +165,7 @@ pub struct StartWorkflowParams<'a> {
     pub schedule_id: Option<uuid::Uuid>,
     /// The logical schedule slot this run fires for (issue #488). Carryover selects the
     /// previous fire by this slot (not completion time), so out-of-order completions
-    /// (overlap / catch-up / backfill) can't roll an incremental cursor backward.
+    /// (overlap / catch-up / backfill) cannot roll an incremental cursor backward.
     /// `None` for manual starts and any non-scheduled call site.
     pub scheduled_for: Option<chrono::DateTime<chrono::Utc>>,
     /// Attempt number for this execution in the retry chain (issue #523). 1 = first attempt.
@@ -1095,10 +1095,10 @@ fn record_quota_rejected_metric(
 /// [`crate::worker::insert_awaited_child_execution`]) can call the SAME
 /// enforcement after inserting a child's row, rather than duplicating the
 /// "subtract 1 for the row this call just inserted" contract documented
-/// below (issue #946, Codex round-3 review — a spawned child accumulates its
-/// own history/DLQ/active-execution footprint against its own declared
-/// quota exactly like any other registry-aware start, so it must not be
-/// invisible to enforcement).
+/// below (issue #946). A spawned child accumulates its own
+/// history/DLQ/active-execution footprint against its own declared quota,
+/// exactly like any other registry-aware start. So it must not be invisible
+/// to enforcement.
 ///
 /// `has_any_cap()` false (a declared `QuotaPolicy` with no `with_max_*`
 /// calls) and an unresolvable key (missing/null/non-object input field,
@@ -1172,7 +1172,7 @@ pub(crate) async fn enforce_quota_admission(
 
     // Serialize check-then-admit for this key under a transaction-scoped
     // advisory lock (auto-released at commit or rollback) so concurrent
-    // starts for the same key can't all observe stale pre-admission usage
+    // starts for the same key cannot all observe stale pre-admission usage
     // and jointly overshoot the cap -- the same race `lock_concurrency_key`
     // closes for issue #247, under a namespace-disjoint key so the two
     // primitives' advisory locks can never collide.
@@ -1467,7 +1467,7 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
     // `ConcurrencyPolicy`/`ThrottlePolicy` use (AC1) -- no second resolver.
     //
     // Resolved HERE, before the TerminateIfRunning pre-check below (issue
-    // #946 P1/P2 review), so `quota_key` is known in time to decide whether
+    // #946), so `quota_key` is known in time to decide whether
     // that pre-check even runs -- a quota-governed key skips it entirely and
     // falls through to the atomic replace path instead; see the pre-check
     // block's own comment for the full rationale.
@@ -1535,7 +1535,7 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
         });
     }
     // A workflow-level retry (#523) continuation must never be blocked by a
-    // quota that has since filled up (issue #946 Codex round-2 review): it
+    // quota that has since filled up (issue #946): it
     // is in-flight continuation of an already-admitted logical run, not a
     // fresh admission, exactly like the `gate: None` and
     // `concurrency_on_conflict: Defer` exemptions this same function already
@@ -1613,7 +1613,7 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
     }
 
     // Route a quota-governed key through the fully atomic `inline_cancel` +
-    // `replace_execution` path instead (issue #946 P1/P2 review), by simply
+    // `replace_execution` path instead (issue #946), by simply
     // never entering this pre-check block when `quota_key.is_some()`: with
     // the prior row left un-cancelled, the INSERT below is a no-op, which
     // falls through to the FOR-UPDATE-locked `ActiveConflictBehavior::Terminate`
@@ -1657,8 +1657,8 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
         // The pre-check cancel is durable. Skip it when this start cannot
         // write a replacement; the locked branch below then refuses first.
         && encode_failure.is_none()
-        // Skip the pre-check cancellation when we're going to reject this fresh
-        // start for a debounced workflow — otherwise we'd cancel the prior run
+        // Skip the pre-check cancellation when this fresh start for a debounced
+        // workflow is rejected. Otherwise it would cancel the prior run
         // (Transaction 1) and then reject, leaving it cancelled with no successor.
         && !reject_fresh_if_debounced
         && let Some(existing) =
@@ -2412,8 +2412,8 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
                     )
                     .await?;
                     deferred.append(&mut extra_deferred);
-                    // A replacement is a fresh admission too (issue #811, Codex
-                    // round 2): shed other runs on the key, not just our own prior.
+                    // A replacement is a fresh admission too (issue #811): shed
+                    // other runs on the key, not just our own prior.
                     let (mut sup_metrics, mut sup_deferred) = run_latest_wins_supersede(
                         conn,
                         &request,
@@ -2482,8 +2482,7 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
                             )
                             .await?;
                             // Replacing our own terminal prior still admits a new
-                            // run into the key's population (issue #811, Codex
-                            // round 2).
+                            // run into the key's population (issue #811).
                             let (sup_metrics, mut sup_deferred) = run_latest_wins_supersede(
                                 conn,
                                 &request,
@@ -2540,7 +2539,7 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
                     )
                     .await?;
                     // Same as the two arms above: a replacement admits a new run
-                    // (issue #811, Codex round 2).
+                    // (issue #811).
                     let (sup_metrics, mut sup_deferred) = run_latest_wins_supersede(
                         conn,
                         &request,
@@ -3461,7 +3460,7 @@ mod resolve_by_workflow_id_tests {
 /// arms (`ActiveConflictBehavior::Terminate`, `AllowDuplicateFailedOnly` over a
 /// FAILED/CANCELLED prior, and `TerminateIfRunning` over a terminal prior).
 ///
-/// A replacement is a fresh admission too (Codex round 2): it seals THIS
+/// A replacement is a fresh admission too (issue #811): it seals THIS
 /// `workflow_id`'s own prior, which says nothing about a *different*
 /// `workflow_id` holding the same concurrency key. Skipping the pass there let a
 /// `limit = 1` group retain both runs despite `cancel_running`.
@@ -4019,7 +4018,7 @@ async fn notify_awaited_parent_of_child_terminal(
             // locked FOR UPDATE above; `materialize_due_child_timeout_deadlines`
             // re-locks it (a same-transaction no-op) *before* it takes the due
             // timers FOR UPDATE — the unified execution-row → timer lock order
-            // (see its convention comment, issue #779 Codex round-11) — so this
+            // (see its convention comment, issue #779) — so this
             // operator path and the worker-wake/child-timeout paths cannot ABBA
             // against each other on the same overdue parent. It then appends
             // `TimerFired` under the same parent-row MAX(event_id) discipline as
@@ -4060,7 +4059,7 @@ pub async fn cancel_workflow_execution_collect(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
     reason: &str,
-    // issue #1197, item 2 (Codex round 3, P2): threaded into this cancellation's
+    // issue #1197, item 2: threaded into this cancellation's
     // own completion-trigger evaluation below so a nested self-referential
     // admission recursing off of THIS cancel sees the real caller-supplied
     // recorder instead of unconditionally falling back to the process-global
@@ -4347,7 +4346,7 @@ async fn cancel_workflow_execution_collect_mode(
             // caller's perspective in the common case, so nothing here could
             // safely emit post-commit anyway) -- but `metrics`, when the
             // caller has one, is now passed through rather than hardcoded to
-            // `None` (issue #1197, item 2, Codex round 3 P2), so a nested
+            // `None` (issue #1197, item 2), so a nested
             // self-referential admission this cancellation's own trigger
             // evaluation recurses into sees the real recorder instead of
             // unconditionally falling back to the process-global one.
@@ -5952,7 +5951,7 @@ pub async fn resume_workflow_execution(
     .await?;
 
     // A no-op resume never actually resumed anything: skip the duration
-    // histogram so zero-length phantom samples don't skew percentiles
+    // histogram so zero-length phantom samples do not skew percentiles
     // (mirrors pause gating `record_workflow_paused` on `newly_paused`).
     if result.newly_resumed {
         metrics.record_workflow_pause_duration(
@@ -6512,7 +6511,7 @@ async fn cascade_cancel_detached_child(
             harvest_workflow_executions::error.eq(Some(reason.to_string())),
             harvest_workflow_executions::completed_at.eq(Some(Utc::now())),
             // Clear active-pause metadata when a paused child is made terminal so
-            // it doesn't appear "terminal and still paused" in APIs/UI (#383).
+            // it does not appear "terminal and still paused" in APIs/UI (#383).
             harvest_workflow_executions::paused_at.eq(None::<chrono::DateTime<Utc>>),
             harvest_workflow_executions::pause_reason.eq(None::<String>),
             harvest_workflow_executions::pause_actor.eq(None::<String>),
@@ -6576,7 +6575,7 @@ async fn cascade_terminate_detached_child(
             harvest_workflow_executions::error.eq(Some(reason.to_string())),
             harvest_workflow_executions::completed_at.eq(Some(Utc::now())),
             // Clear active-pause metadata when a paused child is made terminal so
-            // it doesn't appear "terminal and still paused" in APIs/UI (#383).
+            // it does not appear "terminal and still paused" in APIs/UI (#383).
             harvest_workflow_executions::paused_at.eq(None::<chrono::DateTime<Utc>>),
             harvest_workflow_executions::pause_reason.eq(None::<String>),
             harvest_workflow_executions::pause_actor.eq(None::<String>),
@@ -6631,7 +6630,7 @@ async fn cascade_terminate_detached_child(
 /// it seals a live run (`RUNNING`/`SUSPENDED`/`PAUSED`) in the
 /// `TERMINATED` state unilaterally, surfacing to result-awaiting callers as
 /// [`HarvestError::Terminated`] (distinct from a cooperative `CANCELLED`
-/// and from a `FAILED`). Open task rows are still failed so workers don't
+/// and from a `FAILED`). Open task rows are still failed so workers do not
 /// keep chewing on a torn-down execution.
 ///
 /// This emits a [`WorkflowEvent::WorkflowCancelled`] (no new event variant —
@@ -6748,7 +6747,7 @@ pub async fn terminate_workflow_execution_collect(
                         harvest_workflow_executions_ext::sla_deadline_at.eq(new_sla_deadline_at),
                     ),
                     // Clear active-pause metadata when terminating a paused
-                    // run so it doesn't appear terminal-and-paused (#383).
+                    // run so it does not appear terminal-and-paused (#383).
                     harvest_workflow_executions::paused_at.eq(None::<chrono::DateTime<Utc>>),
                     harvest_workflow_executions::pause_reason.eq(None::<String>),
                     harvest_workflow_executions::pause_actor.eq(None::<String>),
@@ -6852,7 +6851,7 @@ pub async fn terminate_workflow_execution_collect(
 /// it seals a live run (`RUNNING`/`SUSPENDED`/`PAUSED`) in the
 /// `TERMINATED` state unilaterally, surfacing to result-awaiting callers as
 /// [`HarvestError::Terminated`] (distinct from a cooperative `CANCELLED`
-/// and from a `FAILED`). Open task rows are still failed so workers don't
+/// and from a `FAILED`). Open task rows are still failed so workers do not
 /// keep chewing on a torn-down execution.
 ///
 /// This emits a [`WorkflowEvent::WorkflowCancelled`] (no new event variant —
@@ -7837,7 +7836,7 @@ fn check_sws_payload_cap(
 /// start (see the two call sites in
 /// [`signal_with_start_workflow_execution_with_metrics`]) — an attach never
 /// writes `start_input`, so validating it there would reject a call that
-/// will never actually use the value it's rejecting (issue #918 review).
+/// will never actually use the value it rejects (issue #918 review).
 fn check_sws_input_schema(
     input: &serde_json::Value,
     workflow_info: Option<&WorkflowInfo>,
@@ -7935,7 +7934,7 @@ pub async fn signal_with_start_workflow_execution_with_metrics_and_codecs(
             .map(str::to_owned);
 
             // Cross-execution dedupe: scope by (workflow_name, workflow_id, key)
-            // so escalation/reset paths on a new exec_id don't re-queue the signal.
+            // so escalation/reset paths on a new exec_id do not re-queue the signal.
             // A promise belongs to one run, so its key dedupes per execution
             // only, at the insert below (issue #1985).
             let promise_signal = request
@@ -9559,7 +9558,7 @@ async fn resolve_carryover(
     use diesel::prelude::*;
     use diesel_async::RunQueryDsl;
 
-    // No slot on the current run → can't bound to earlier slots; resolve nothing.
+    // No slot on the current run → cannot bound to earlier slots; resolve nothing.
     let Some(current_slot) = current_scheduled_for else {
         return Ok((None, None));
     };
@@ -10896,7 +10895,7 @@ mod pause_helper_tests {
 
     #[test]
     fn external_resume_shift_query_never_waits_on_a_locked_task_row() {
-        // Third bot-review round (issue #609 post-review hardening): the
+        // Issue #609 post-review hardening: the
         // harvest_external_tasks lock convention is task row → execution row
         // (completion paths, timeout scanner), but this shift runs with the
         // execution row lock already held — the inverted order. It must

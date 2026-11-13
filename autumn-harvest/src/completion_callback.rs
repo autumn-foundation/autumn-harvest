@@ -685,9 +685,9 @@ mod ssrf_tests {
     // RFC-special-range coverage (PR #1004 review notes / issue #605 hardening)
     //
     // `is_ipv4_non_routable` must block every non-routable IPv4 range, not
-    // just the single representative address per range. These tests both
-    // audit the ranges documented as already covered (VERIFY, don't assume)
-    // and pin the two newly closed gaps: 0.0.0.0/8 and 198.18.0.0/15.
+    // just the single representative address per range. These tests audit
+    // the ranges documented as already covered (VERIFY, do not assume). They
+    // also pin the two newly closed gaps: 0.0.0.0/8 and 198.18.0.0/15.
     // ---------------------------------------------------------------------
 
     /// A policy that allows IP literals (so the classifier — not the
@@ -884,9 +884,10 @@ pub fn build_envelope(
 /// receiver's signature check is over exactly what it received.
 ///
 /// # Errors
-/// Returns `Err` only if the envelope somehow fails to serialize (it cannot,
-/// in practice, given `CompletionEnvelope`'s field types — kept fallible so
-/// serialization changes can't silently panic in the delivery path).
+/// Returns `Err` only if the envelope fails to serialize. With
+/// `CompletionEnvelope`'s field types it cannot, in practice. It stays
+/// fallible so that serialization changes cannot silently panic in the
+/// delivery path.
 pub fn serialize_body(envelope: &CompletionEnvelope) -> Result<Vec<u8>, serde_json::Error> {
     serde_json::to_vec(envelope)
 }
@@ -2706,7 +2707,7 @@ const COMPLETION_DELIVERY_FIRE_BATCH_SIZE: i64 = 100;
 
 /// How long a claimed row stays `INFLIGHT` before it becomes reclaimable
 /// again. Protects against a scanner crashing between claim and
-/// record-outcome: the row is not stuck forever, but also isn't
+/// record-outcome: the row is not stuck forever, but it is also not
 /// immediately double-claimed by a concurrent scanner tick.
 #[cfg(feature = "db")]
 const INFLIGHT_LEASE_SECS: i64 = 30;
@@ -3258,16 +3259,16 @@ async fn fire_due_on_conn(
         dispatchable.push((row, Some((body, headers))));
     }
 
-    // Dispatch every claimed delivery's HTTP POST concurrently rather than
-    // one at a time: a sequential loop would hold this shard's single
-    // connection (checked out from a bounded pool shared with other work)
-    // for the sum of every attempt's latency — with a full batch and a few
-    // slow/unreachable targets, that's tens of minutes worst case. Dispatching
-    // concurrently bounds the wall-clock cost of one tick to the *slowest*
-    // single delivery instead of the sum of all of them. Only the network
-    // call is concurrent; outcome recording below still runs sequentially
-    // against the single connection this function was handed (mirroring
-    // every other scanner in this codebase).
+    // Dispatch every claimed delivery's HTTP POST concurrently, not one at a
+    // time. A sequential loop holds this shard's single connection for the
+    // sum of every attempt's latency. That connection comes from a bounded
+    // pool shared with other work. With a full batch and a few
+    // slow/unreachable targets, that is tens of minutes worst case.
+    // Concurrent dispatch bounds the wall-clock cost of one tick to the
+    // *slowest* single delivery, not the sum of all of them. Only the network
+    // call is concurrent. Outcome recording below still runs sequentially
+    // against the single connection this function was handed, like every
+    // other scanner in this codebase.
     let delivery_futures = dispatchable.iter().map(|(row, prepared)| async move {
         match prepared {
             Some((body, headers)) => {

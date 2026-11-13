@@ -180,7 +180,7 @@ async fn scrub(conn: &mut AsyncPgConnection) {
         "DELETE FROM harvest_events",
         "DELETE FROM harvest_workflow_executions",
     ] {
-        // Ignore "table doesn't exist" only if the migration set omitted it;
+        // Ignore "table does not exist" only if the migration set omitted it;
         // all listed tables are in the full migration bundle, so a real error
         // should surface.
         diesel::sql_query(stmt).execute(conn).await.expect(stmt);
@@ -1843,7 +1843,7 @@ async fn boot_load_of_persisted_gate_blocks_completion_trigger() {
     .expect("evaluate must not error (block is a clean skip)");
 
     set_global_admission_gate_cache(None);
-    // Remove the persisted gate so it can't leak into a sibling test even if an
+    // Remove the persisted gate so it cannot leak into a sibling test even if an
     // assertion below panics (the next test's `scrub` also clears it).
     diesel::sql_query("DELETE FROM harvest_admission_gates")
         .execute(&mut conn)
@@ -1984,7 +1984,7 @@ async fn cross_shard_gate_check_resolves_target_queue_on_target_shard() {
     )
     .await;
 
-    // FALLBACK path (F2 re-review round 2): the target-shard (0) pool is
+    // FALLBACK path (F2): the target-shard (0) pool is
     // UNAVAILABLE. Seed shard 1 (source) with a WRONG queue for ag_target_wf and
     // install a sharded pool that maps ONLY shard 1 — so `exact_pool_for(0)` is
     // None and the resolver takes the fallback. It must return the shard-
@@ -2038,7 +2038,7 @@ async fn cross_shard_gate_check_resolves_target_queue_on_target_shard() {
         "the pre-fix source-connection resolution must NOT find the target queue \
          (it queries the source shard's schedules, missing the gate)"
     );
-    // F2 re-review round 2: with the target-shard pool unavailable, the fallback
+    // F2: with the target-shard pool unavailable, the fallback
     // must NOT read the source shard's schedules — so it returns neither the
     // source's wrong queue nor the (unreachable) target's queue.
     assert_ne!(
@@ -2058,10 +2058,9 @@ async fn cross_shard_gate_check_resolves_target_queue_on_target_shard() {
 
 /// Finding (F-round6): the IMMEDIATE cross-shard completion-trigger relay via
 /// `DeferredTriggerStart::spawn()` — the common successful path — must count the
-/// `completion_trigger_outbox` bypass, not just the later scanner. Round-1 added
-/// the counter only in `enforce_completion_triggers_outbox`, so a gate raised
-/// after the source commit but before the immediate relay left the exempt start
-/// UNCOUNTED. The count is emitted via the process-global recorder (spawn has no
+/// `completion_trigger_outbox` bypass, not just the later scanner. A counter only
+/// in `enforce_completion_triggers_outbox` leaves the exempt start UNCOUNTED when
+/// a gate is raised after the source commit but before the immediate relay. The count is emitted via the process-global recorder (spawn has no
 /// metrics param), gated on the outbox-row delete actually removing the row, so
 /// the scanner can never re-process and re-count the same relay (exactly-once).
 ///
@@ -3071,13 +3070,12 @@ async fn run_stale_sealed_delivered_case(
 /// F-round15: a stale cross-shard outbox row is a ONE-SHOT delivery marker. If its
 /// deterministic target already ran and has since SEALED
 /// (`TERMINATED`/`CONTINUED_AS_NEW`), the fire was already DELIVERED — the scanner
-/// must treat it as delivered, NOT as a fresh (gated) admission. The round-13 fix
-/// routed the relay through `gate_checked_start_or_load`, whose existence lock is
-/// active-only, so a sealed target was invisible to it: under a matching gate it
-/// BLOCKED (marking the fires row `admission_blocked`) and with no gate a sealed
-/// target let `start_or_load` create a SECOND target run — both re-doing an
-/// already-delivered fire. The any-state existence check in
-/// `relay_gate_checked_start` closes this.
+/// must treat it as delivered, NOT as a fresh (gated) admission. A relay routed
+/// only through `gate_checked_start_or_load` cannot see a sealed target, because
+/// that existence lock is active-only. Under a matching gate it BLOCKS (marking
+/// the fires row `admission_blocked`). With no gate, `start_or_load` creates a
+/// SECOND target run. Both re-do an already-delivered fire. The any-state
+/// existence check in `relay_gate_checked_start` closes this.
 ///
 /// Two-DB multi-shard, three cases: `TERMINATED` + active gate, `TERMINATED` + no
 /// gate, `CONTINUED_AS_NEW` + active gate. Confirmed red first: against the
@@ -3293,7 +3291,7 @@ async fn running_webhook_delivery_count(conn: &mut AsyncPgConnection) -> i64 {
     .n
 }
 
-/// The idempotent-retry (non-racy) case round 9 handles: a LIVE existing run under
+/// The idempotent-retry (non-racy) case: a LIVE existing run under
 /// an active gate is ATTACHED (idempotent load), the gate is SKIPPED, and no fresh
 /// run is created — `gate_checked_start_or_load` must not block a non-admission.
 #[tokio::test]
@@ -3340,7 +3338,7 @@ async fn gate_checked_start_attaches_to_a_live_run_and_skips_the_gate() {
     assert_eq!(running_webhook_delivery_count(&mut conn).await, 1);
 }
 
-/// The TOCTOU the round-9 unlocked check left open, now closed: a run that is LIVE
+/// The TOCTOU an unlocked existence check leaves open: a run that is LIVE
 /// when the delegate is invoked but SEALS (TERMINATED) before the start decision
 /// commits. `gate_checked_start_or_load` locks the run through the decision, so it
 /// observes the SEALED state and BLOCKS the fresh replacement under the active gate
@@ -3438,7 +3436,7 @@ async fn gate_checked_start_blocks_a_run_that_seals_under_the_lock() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// F-round18: gate REPLACEMENT starts, don't treat them as idempotent attaches.
+// F-round18: gate REPLACEMENT starts, do not treat them as idempotent attaches.
 // `gate_checked_start_or_load` must apply the gate whenever `start_or_load` will
 // CREATE a new execution (a fresh admission) — including a REPLACEMENT over a
 // non-sealed prior (AllowDuplicateFailedOnly over FAILED/CANCELLED; any

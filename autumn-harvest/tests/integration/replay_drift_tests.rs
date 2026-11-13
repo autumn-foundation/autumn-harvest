@@ -767,7 +767,7 @@ async fn require_complete_coverage_fails_closed_without_a_manifest() {
 
 /// Same fail-closed rule when the manifest exists but cannot be parsed.
 ///
-/// The rung moved from `4` to `2` in Codex round 21, and the move is the point:
+/// The rung moved from `4` to `2`, and the move is the point:
 /// a corrupt manifest disables the rung-`2` and rung-`3` guards for *every*
 /// caller, so blocking only under the opt-in `require_complete_coverage` left the
 /// default gate green on a damaged bundle. Rung `2` ("the gate could not fully
@@ -1198,7 +1198,7 @@ fn workflow_id_snapshot_json(workflow_name: &str) -> String {
 }
 
 /// `WorkflowReplayer::replay_bundle` delegates to `ReplayVerifier`; every
-/// configured replay-context fallback must survive that hop (Codex round-10 P2).
+/// configured replay-context fallback must survive that hop.
 ///
 /// Issue #614 already proved this for `history_policy`. The four
 /// `HistorySnapshot`-metadata fallbacks — `context_headers`,
@@ -1247,7 +1247,7 @@ async fn the_workflow_id_fallback_genuinely_changes_the_outcome() {
 }
 
 // ===========================================================================
-// The execution's queue must survive the fixture round trip (Codex round-12 P1)
+// The execution's queue must survive the fixture round trip
 // ===========================================================================
 
 /// A workflow that embeds its own execution queue in an activity input.
@@ -1343,7 +1343,7 @@ async fn a_snapshot_without_the_queue_genuinely_diverges() {
 }
 
 /// `replay_bundle` delegates to `ReplayVerifier`; the replayer's own configured
-/// queue fallback must survive that hop, exactly like `workflow_id` (round-10 P2).
+/// queue fallback must survive that hop, exactly like `workflow_id`.
 #[tokio::test]
 async fn workflow_replayer_bundle_delegation_carries_the_queue_fallback() {
     let dir = tempfile::tempdir().unwrap();
@@ -1741,7 +1741,7 @@ fn codec_snapshot_json(workflow_name: &str) -> String {
     snapshot_json(workflow_name, ExecutionId::new(), events)
 }
 
-/// The money test for the codec guard (Codex round-10 P1).
+/// The money test for the codec guard.
 ///
 /// The export loads history with `load_history_undecoded`, and
 /// `read_path_decoder` returns `None` whenever `decode_payloads_on_read` is
@@ -1794,7 +1794,7 @@ async fn a_codec_encrypted_fixture_blocks_the_gate_instead_of_reporting_drift() 
     );
 }
 
-/// The money test for the contradicted-emptiness rule (Codex round-18 P1).
+/// The money test for the contradicted-emptiness rule.
 ///
 /// `allow_empty_bundle(true)` is the right setting for a fleet that may
 /// legitimately be idle. But an **export outage** produces an empty bundle too:
@@ -1985,7 +1985,7 @@ fn erased_snapshot_json(workflow_name: &str) -> String {
     snapshot_json(workflow_name, ExecutionId::new(), events)
 }
 
-/// The money test for the erasure guard (Codex round-16 P2).
+/// The money test for the erasure guard.
 ///
 /// A bundle acquires an erased fixture two ways, and the second needs no race:
 /// the sample export selects an execution in flight and it completes and is
@@ -2187,7 +2187,7 @@ fn mentions_workflow<'a>(
 }
 
 // ===========================================================================
-// The candidate build id must reach every fixture context (Codex round-13 P1)
+// The candidate build id must reach every fixture context
 // ===========================================================================
 //
 // `ctx.build_id()` differs in kind from every other value this gate threads.
@@ -2399,7 +2399,7 @@ async fn replay_verifier_carries_the_candidate_build_id() {
 }
 
 // ---------------------------------------------------------------------------
-// Candidate payload caps (Codex round 20)
+// Candidate payload caps
 // ---------------------------------------------------------------------------
 
 /// Comfortably under the library default activity-input cap (2 MiB) and
@@ -2529,7 +2529,7 @@ async fn replay_verifier_carries_the_candidate_payload_caps() {
 }
 
 // ---------------------------------------------------------------------------
-// Codex round 21 — a present-but-unreadable manifest must block the gate
+// A present-but-unreadable manifest must block the gate
 // ---------------------------------------------------------------------------
 
 /// A manifest that is **present but unreadable** must block the *default* gate.
@@ -2640,7 +2640,7 @@ async fn readable_manifest_is_not_reported_as_unreadable() {
 }
 
 // ---------------------------------------------------------------------------
-// Codex round 21 — replay must register the candidate's declarative handlers
+// Replay must register the candidate's declarative handlers
 // ---------------------------------------------------------------------------
 
 /// A workflow that branches on whether a declarative query handler is
@@ -2651,7 +2651,7 @@ async fn readable_manifest_is_not_reported_as_unreadable() {
 /// declarative handlers before any workflow code runs"), and
 /// `ctx.list_query_names()` merges the declarative map into its result. So this
 /// branch is genuinely observable from workflow code — the same class as the
-/// payload caps fixed in round 20: **candidate configuration that lives in no
+/// candidate payload caps tested above: **candidate configuration that lives in no
 /// `WorkflowEvent`**, which replay must mirror or it is not replaying the
 /// candidate at all.
 fn query_branching_workflow<'a>(
@@ -2769,7 +2769,7 @@ async fn removing_a_declarative_handler_is_still_reported_as_drift() {
 }
 
 // ---------------------------------------------------------------------------
-// Codex round 22 — per-workflow candidate config must not be applied bundle-wide
+// Per-workflow candidate config must not be applied bundle-wide
 //
 // One family, two members: configuration the live worker resolves *by workflow
 // type* but which replay previously applied to every fixture uniformly.
@@ -2999,7 +2999,7 @@ async fn without_an_override_the_global_input_cap_still_binds() {
 }
 
 // ---------------------------------------------------------------------------
-// Bundle ↔ manifest inventory reconciliation (round-23 P1)
+// Bundle ↔ manifest inventory reconciliation
 // ---------------------------------------------------------------------------
 
 /// An in-flight history for `workflow_name` under a caller-chosen execution id.
@@ -3295,7 +3295,7 @@ async fn per_type_counts_bind_even_without_declared_identities() {
 }
 
 // ===========================================================================
-// Round 24 — an incomplete in-progress branch is in-flight, not drift
+// An incomplete in-progress branch is in-flight, not drift
 // ===========================================================================
 //
 // `check_strict_replay_no_match` already grants canary replay a frontier
@@ -3514,7 +3514,7 @@ async fn strict_replay_still_rejects_both_incomplete_shapes() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Built-in side effects at the in-flight frontier (issue #798, Codex round 25).
+// Built-in side effects at the in-flight frontier (issue #798).
 //
 // `ctx.system_now()` / `system_time_now()` / `new_uuid()` / `random_u64()` /
 // `random_f64()` all funnel through `capture_builtin_validated`; `random_range`
@@ -3678,7 +3678,7 @@ async fn a_random_range_at_the_in_flight_frontier_is_not_drift() {
 // `run_workflow_canary` has two terminal arms that both reach the frontier
 // with recorded history fully consumed: the `Err(_elapsed)` (suspended) arm
 // and the `Ok(Ok(output))` (completing) arm. The suspended arm tolerates a
-// command emitted at the frontier (that's `workflow_system_now_then_park`
+// command emitted at the frontier (that is `workflow_system_now_then_park`
 // above: the tests pass because the workflow *parks* on `step_two` after
 // reading the clock). The completing arm did not: a workflow that reads the
 // clock at the frontier and then returns `Ok` — rather than parking on

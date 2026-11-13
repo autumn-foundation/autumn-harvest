@@ -744,13 +744,13 @@ fn cancellable_timer_then_side_effect_workflow<'a>(
     })
 }
 
-/// Duplicate ACTIVE arm with a DIFFERENT duration (Codex P2 round 5, issue
-/// #768): `start_timer("idle", 300)` then `start_timer("idle", 600)` with no
+/// Duplicate ACTIVE arm with a DIFFERENT duration (issue #768):
+/// `start_timer("idle", 300)` then `start_timer("idle", 600)` with no
 /// cancel/reset between. The second call is a duration-preserving idempotent
-/// no-op — the returned handle MUST carry the ORIGINAL recorded 300s, not 600,
-/// so the durable row / virtual clock stay consistent with the single recorded
-/// `TimerStarted(idle, 300)`. Emits the armed duration in its result so the test
-/// can assert 300 (before the fix the handle carried 600).
+/// no-op. The returned handle MUST carry the ORIGINAL recorded 300s, not 600.
+/// So the durable row and the virtual clock stay consistent with the single
+/// recorded `TimerStarted(idle, 300)`. The result holds the armed duration, so
+/// the test can assert 300 (before the fix the handle carried 600).
 fn duplicate_active_start_timer_diff_duration_workflow<'a>(
     ctx: &'a WorkflowContext,
     _input: Value,
@@ -765,13 +765,13 @@ fn duplicate_active_start_timer_diff_duration_workflow<'a>(
     })
 }
 
-/// SOUNDNESS gate (Codex P2 round 5, issue #768): the REORDERED code awaits the
-/// timer BEFORE the activity. Replayed against a history where the activity was
-/// recorded FIRST (`[…, TimerStarted, ActivityScheduled, ActivityCompleted,
-/// TimerFired]`), the `await_fire` outcome scan must STOP at the unconsumed
-/// `ActivityScheduled` (returning `NoMatch`) so strict replay reports a
-/// non-determinism divergence — instead of skipping across the activity to claim
-/// the trailing `TimerFired` and passing (the false-negative the fix closes).
+/// SOUNDNESS gate (issue #768): the REORDERED code awaits the timer BEFORE the
+/// activity. The history recorded the activity FIRST (`[…, TimerStarted,
+/// ActivityScheduled, ActivityCompleted, TimerFired]`). On replay, the
+/// `await_fire` outcome scan must STOP at the unconsumed `ActivityScheduled`
+/// (returning `NoMatch`). So strict replay reports a non-determinism divergence.
+/// The scan must not skip across the activity to claim the trailing
+/// `TimerFired` and pass. That false negative is what the stop prevents.
 fn timer_await_before_activity_workflow<'a>(
     ctx: &'a WorkflowContext,
     _input: Value,
@@ -787,7 +787,7 @@ fn timer_await_before_activity_workflow<'a>(
     })
 }
 
-/// LEGIT flow (Codex P2 round 5, issue #768): arm the timer, run the activity,
+/// LEGIT flow (issue #768): arm the timer, run the activity,
 /// THEN await the timer — the order recorded in history. When `await_fire` runs,
 /// the activity events are already CONSUMED, so the outcome scan crosses them via
 /// `is_consumed` and reaches the `TimerFired`. Proves the soundness stop does NOT
@@ -807,15 +807,14 @@ fn activity_then_timer_await_workflow<'a>(
     })
 }
 
-/// FIX 1 SOUNDNESS GATE (Codex P2 round 6, issue #768): the REORDERED code
-/// CANCELS the timer BEFORE running the activity. Replayed against a history that
-/// recorded the activity FIRST (`[…, TimerStarted, ActivityScheduled,
-/// ActivityCompleted, TimerCancelled, WorkflowCompleted]`), `match_timer_cancel`'s
-/// scan must STOP at the unconsumed `ActivityScheduled` (returning `NoMatch`) so
-/// strict replay reports a non-determinism divergence — instead of skipping across
-/// the activity to claim the trailing `TimerCancelled` and passing (the
-/// false-negative this fix closes; sibling of the round-5 `match_timer_or_cancel`
-/// fix).
+/// Cancel SOUNDNESS GATE (issue #768): the REORDERED code CANCELS the timer
+/// BEFORE running the activity. The history recorded the activity FIRST (`[…,
+/// TimerStarted, ActivityScheduled, ActivityCompleted, TimerCancelled,
+/// WorkflowCompleted]`). On replay, the `match_timer_cancel` scan must STOP at
+/// the unconsumed `ActivityScheduled` (returning `NoMatch`). So strict replay
+/// reports a non-determinism divergence. The scan must not skip across the
+/// activity to claim the trailing `TimerCancelled` and pass. This is the cancel
+/// sibling of the same stop in `match_timer_or_cancel`.
 fn cancel_timer_before_activity_workflow<'a>(
     ctx: &'a WorkflowContext,
     _input: Value,
@@ -831,7 +830,7 @@ fn cancel_timer_before_activity_workflow<'a>(
     })
 }
 
-/// FIX 1 LEGIT control (Codex P2 round 6, issue #768): arm the timer, run the
+/// Cancel LEGIT control (issue #768): arm the timer, run the
 /// activity, THEN cancel — the order recorded in history. When `cancel()` runs,
 /// the activity events are already CONSUMED, so `match_timer_cancel`'s scan crosses
 /// them via `is_consumed` and reaches the `TimerCancelled` at the cursor. Proves
@@ -851,13 +850,13 @@ fn activity_then_cancel_timer_workflow<'a>(
     })
 }
 
-/// FIX 2 (Codex P2 round 6, issue #768): the core sliding-window / idle-session
-/// LOOP that reuses the SAME timer id — arm; await→Fired; arm again — N times,
-/// with a fresh duration each iteration. Consuming a fire must CLEAR the Armed
-/// logical state so each iteration's `start_timer` records a FRESH `TimerStarted`
+/// Timer-reuse LOOP (issue #768): the core sliding-window / idle-session loop
+/// that reuses the SAME timer id (arm; await→Fired; arm again) N times, with a
+/// fresh duration each iteration. Consuming a fire must CLEAR the Armed logical
+/// state. Then each iteration's `start_timer` records a FRESH `TimerStarted`
 /// (N `TimerStarted` + N `TimerFired`, balanced). Before the fix the stale Armed
-/// state made the second+ `start_timer` a duplicate no-op, leaving the recorded
-/// `TimerStarted`s unconsumed → an early-completion divergence.
+/// state made the second+ `start_timer` a duplicate no-op. The recorded
+/// `TimerStarted`s stayed unconsumed → an early-completion divergence.
 fn cancellable_timer_loop_reuse_workflow<'a>(
     ctx: &'a WorkflowContext,
     input: Value,
@@ -874,7 +873,7 @@ fn cancellable_timer_loop_reuse_workflow<'a>(
     })
 }
 
-/// Codex P2 round 10 (issue #768) — CANONICAL ORDER: arm the timer, THEN cancel
+/// Issue #768, CANONICAL ORDER: arm the timer, THEN cancel
 /// it (no intervening activity), matching the recorded history
 /// `[TimerStarted(idle), TimerCancelled(idle)]`. Must replay cleanly: `start_timer`
 /// consumes the `TimerStarted` at the cursor, then `match_timer_cancel` claims the
@@ -890,13 +889,13 @@ fn start_then_cancel_no_activity_workflow<'a>(
     })
 }
 
-/// Codex P2 round 10 (issue #768) — REORDERED: cancel the timer BEFORE arming it,
-/// replayed against the canonical `[TimerStarted(idle), TimerCancelled(idle)]`
-/// history. `match_timer_cancel("idle")`'s scan must STOP at the unconsumed
-/// SAME-id `TimerStarted` (this id's own command-ordering anchor) rather than
-/// crossing it to claim the trailing `TimerCancelled` — so strict replay reports
-/// `NonDeterminismDetected`. Before the round-10 fix the shared helper crossed a
-/// same-id `TimerStarted` transparently, wrongly passing the reorder.
+/// Issue #768, REORDERED: cancel the timer BEFORE arming it, replayed against
+/// the canonical `[TimerStarted(idle), TimerCancelled(idle)]` history. The
+/// `match_timer_cancel("idle")` scan must STOP at the unconsumed SAME-id
+/// `TimerStarted`, which is this id's own command-ordering anchor. It must not
+/// cross it to claim the trailing `TimerCancelled`. So strict replay reports
+/// `NonDeterminismDetected`. Before the fix the shared helper crossed a same-id
+/// `TimerStarted` transparently and wrongly passed the reorder.
 fn cancel_then_start_no_activity_workflow<'a>(
     ctx: &'a WorkflowContext,
     _input: Value,
@@ -3415,13 +3414,14 @@ async fn duplicate_active_start_timer_replays_succeeded() {
     );
 }
 
-/// FIX 1 (Codex P2 round 5, issue #768) — a duplicate active `start_timer` with a
-/// DIFFERENT duration preserves the RECORDED duration. History records exactly one
-/// `TimerStarted(idle, 300)` (the second `start_timer(idle, 600)` is a no-op), and
-/// on replay the handle must carry 300 — so the timer fires at the 300s deadline
-/// (the virtual clock advances by 300, not 600) and the run resolves `Fired`. The
-/// fixture emits the armed duration in its result; before the fix the handle
-/// carried 600 (the durable row / clock would use 600 while history recorded 300).
+/// Issue #768: a duplicate active `start_timer` with a DIFFERENT duration
+/// preserves the RECORDED duration. History records exactly one
+/// `TimerStarted(idle, 300)`, because the second `start_timer(idle, 600)` is a
+/// no-op. On replay the handle must carry 300. So the timer fires at the 300s
+/// deadline (the virtual clock advances by 300, not 600) and the run resolves
+/// `Fired`. The fixture emits the armed duration in its result. Before the fix
+/// the handle carried 600, so the durable row and clock used 600 while history
+/// recorded 300.
 #[tokio::test]
 async fn duplicate_active_start_timer_diff_duration_preserves_recorded_duration() {
     let events = vec![wf_started(), cancellable_ts(), cancellable_tf()];
@@ -3451,7 +3451,7 @@ async fn duplicate_active_start_timer_diff_duration_preserves_recorded_duration(
     );
 }
 
-/// FIX 2 SOUNDNESS GATE (Codex P2 round 5, issue #768): the reordered code awaits
+/// Await SOUNDNESS GATE (issue #768): the reordered code awaits
 /// the timer BEFORE the activity, replayed against a history recording the
 /// activity FIRST. The `await_fire` outcome scan must STOP at the unconsumed
 /// `ActivityScheduled` so strict replay reports `NonDeterminismDetected` — NOT
@@ -3493,9 +3493,9 @@ async fn await_timer_before_activity_detects_command_reorder() {
     );
 }
 
-/// FIX 2 (Codex P2 round 5, issue #768): the LEGIT `arm→activity→await_fire` flow
-/// still replays cleanly against the SAME history — the activity events are
-/// consumed before `await_fire` runs, so the outcome scan crosses them via
+/// Issue #768: the LEGIT `arm→activity→await_fire` flow still replays cleanly
+/// against the SAME history. The activity events are consumed before
+/// `await_fire` runs, so the outcome scan crosses them via
 /// `is_consumed` and reaches the `TimerFired`. Proves the soundness stop does not
 /// break the legitimate ordering.
 #[tokio::test]
@@ -3532,7 +3532,7 @@ async fn activity_then_await_timer_replays_succeeded() {
     );
 }
 
-/// FIX 1 SOUNDNESS GATE (Codex P2 round 6, issue #768): the reordered code cancels
+/// Cancel SOUNDNESS GATE (issue #768): the reordered code cancels
 /// the timer BEFORE the activity, replayed against a history recording the activity
 /// FIRST. `match_timer_cancel`'s scan must STOP at the unconsumed
 /// `ActivityScheduled` so strict replay reports `NonDeterminismDetected` — NOT
@@ -3574,9 +3574,9 @@ async fn cancel_timer_before_activity_detects_command_reorder() {
     );
 }
 
-/// FIX 1 LEGIT control (Codex P2 round 6, issue #768): the `arm→activity→cancel`
-/// flow still replays cleanly against the SAME history — the activity events are
-/// consumed before `cancel()` runs, so `match_timer_cancel`'s scan crosses them via
+/// Cancel LEGIT control (issue #768): the `arm→activity→cancel` flow still
+/// replays cleanly against the SAME history. The activity events are consumed
+/// before `cancel()` runs, so `match_timer_cancel`'s scan crosses them via
 /// `is_consumed` and reaches the `TimerCancelled`. Proves the soundness stop does
 /// not break the legitimate ordering.
 #[tokio::test]
@@ -3613,7 +3613,7 @@ async fn activity_then_cancel_timer_replays_succeeded() {
     );
 }
 
-/// Codex P2 round 10 SOUNDNESS GATE (issue #768): the reordered code cancels the
+/// Same-id SOUNDNESS GATE (issue #768): the reordered code cancels the
 /// timer BEFORE arming it, replayed against the canonical
 /// `[TimerStarted(idle), TimerCancelled(idle)]` history. `match_timer_cancel`'s
 /// scan must STOP at the unconsumed SAME-id `TimerStarted` (its ordering anchor)
@@ -3645,8 +3645,8 @@ async fn cancel_then_start_no_activity_detects_command_reorder() {
     );
 }
 
-/// Codex P2 round 10 LEGIT control (issue #768): the canonical `arm→cancel` order
-/// (no intervening activity) must still replay cleanly against the same history —
+/// Same-id LEGIT control (issue #768): the canonical `arm→cancel` order (no
+/// intervening activity) must still replay cleanly against the same history.
 /// `start_timer` consumes the `TimerStarted` at the cursor, then
 /// `match_timer_cancel` claims the `TimerCancelled` directly. Proves the same-id
 /// anchor stop does not break the legitimate ordering.
@@ -3674,13 +3674,13 @@ async fn start_then_cancel_no_activity_replays_succeeded() {
     );
 }
 
-/// FIX 2 (Codex P2 round 6, issue #768): the sliding-window / idle-session LOOP
-/// that reuses the SAME timer id (arm; await→Fired; arm again — with a DIFFERENT
-/// duration each iteration) must replay cleanly. Consuming a fire clears the Armed
-/// logical state so each iteration records a FRESH `TimerStarted` (N `TimerStarted`
-/// + N `TimerFired`, balanced). Before the fix the stale Armed state made the
-/// second+ `start_timer` a duplicate no-op, leaving the recorded `TimerStarted`s
-/// unconsumed → an early-completion divergence.
+/// Timer-reuse LOOP (issue #768): the sliding-window / idle-session loop that
+/// reuses the SAME timer id must replay cleanly (arm; await→Fired; arm again,
+/// with a DIFFERENT duration each iteration). Consuming a fire clears the Armed
+/// logical state. So each iteration records a FRESH `TimerStarted`
+/// (N `TimerStarted` + N `TimerFired`, balanced). Before the fix the stale Armed
+/// state made the second+ `start_timer` a duplicate no-op. The recorded
+/// `TimerStarted`s stayed unconsumed → an early-completion divergence.
 #[tokio::test]
 async fn cancellable_timer_loop_reuse_replays_succeeded() {
     let iterations = 3u64;
@@ -4610,7 +4610,7 @@ async fn non_determinism_report_includes_expected_actual() {
 // Activity input mismatch is detected (strict replay mode)
 // ---------------------------------------------------------------------------
 
-/// Workflow that calls `step_one` with a NON-NULL input that won't match history.
+/// Workflow that calls `step_one` with a NON-NULL input that does not match history.
 fn changed_input_workflow<'a>(
     ctx: &'a WorkflowContext,
     _input: Value,
@@ -5778,7 +5778,7 @@ async fn a_pre_fix_history_with_dropped_dispatches_replays_without_reinterpretat
 }
 
 /// A `patched()` gate ADDED by the candidate build lands inside the transparent
-/// tail and takes the `NewlyPatched` branch (issue #952 review round 1): the
+/// tail and takes the `NewlyPatched` branch (issue #952): the
 /// live-frontier `debug_assert` there must read the cursor-only frontier, not
 /// `is_replaying()`, which now reports `true` for a sealed-failed run. Without
 /// the fix this test panics in a debug build.
@@ -7693,15 +7693,15 @@ async fn child_timeout_in_flight_canary_replays_succeeded() {
     );
 }
 
-/// Codex P2 round 10 (issue #779): an in-flight child-timeout workflow that was
-/// woken by an update (`UpdateAdmitted`/`UpdateCompleted` appended AFTER the
-/// armed race, at the recorded-history frontier). Update events are transparent
-/// to the global unconsumed-history check (`has_non_lifecycle_unconsumed`), but
-/// `match_child_or_timer`'s `InProgress` scan skips them via `scan_cursor += 1`
-/// WITHOUT consuming them, so the matcher cursor is left positioned BEFORE the
-/// trailing updates. A raw `position() >= len()` frontier check therefore reads
-/// `false` (cursor < len), defeating the canary-at-frontier suppression and
-/// producing a FALSE non-determinism for a perfectly healthy suspend. The
+/// Issue #779: an in-flight child-timeout workflow that an update woke
+/// (`UpdateAdmitted`/`UpdateCompleted` appended AFTER the armed race, at the
+/// recorded-history frontier). Update events are transparent to the global
+/// unconsumed-history check (`has_non_lifecycle_unconsumed`). But the
+/// `InProgress` scan of `match_child_or_timer` skips them via
+/// `scan_cursor += 1` WITHOUT consuming them. So the matcher cursor stays
+/// BEFORE the trailing updates. A raw `position() >= len()` frontier check then
+/// reads `false` (cursor < len). That defeats the canary-at-frontier
+/// suppression and reports a FALSE non-determinism for a healthy suspend. The
 /// frontier check must treat trailing transparent update events the same way the
 /// global unconsumed check does.
 fn child_in_flight_woken_by_update_fixture() -> Vec<WorkflowEvent> {
@@ -8082,12 +8082,12 @@ async fn child_timeout_oversized_input_propagated_replays_deterministically() {
     );
 }
 
-/// #779 (Codex round-12 P2): a workflow that CATCHES an oversized child-timeout
+/// Issue #779: a workflow that CATCHES an oversized child-timeout
 /// `PayloadTooLarge` (records NOTHING) and then IMMEDIATELY dispatches a SECOND
-/// child-timeout (recorded). The first (caught, seq 1) call's fresh-dispatch peek
-/// must be fingerprinted by its OWN timer id (`__child_timeout:1:oversized_child`)
-/// so it is never miscredited the SECOND (seq 2) call's `ChildWorkflowStarted` at
-/// the cursor.
+/// child-timeout (recorded). The fresh-dispatch peek of the first call (caught,
+/// seq 1) must be fingerprinted by its OWN timer id
+/// (`__child_timeout:1:oversized_child`). So it never takes credit for the
+/// `ChildWorkflowStarted` of the SECOND (seq 2) call at the cursor.
 ///
 /// RED (pre-fix, unfingerprinted `peek_child_start_at_cursor`): the first call's
 /// peek matched the second call's `ChildWorkflowStarted`, concluded it was already
@@ -9846,11 +9846,11 @@ async fn interleaved_sibling_multi_timer_reversed_fire_order_replays_succeeded()
 // (timer positional-anchor mismatch), which likewise stays green.
 // ---------------------------------------------------------------------------
 
-/// Signal-site park-forever guard (issue #768 round 13, preserved by #1071):
+/// Signal-site park-forever guard (issue #768, preserved by #1071):
 /// a plain `wait_for_signal("go")` whose history ends in a STRAY unconsumed
 /// `TimerStarted` with NO matching `TimerFired` and NO signal must still be a
-/// divergence — pushing a `WaitForSignal` command here would park the run
-/// forever on a signal that will never arrive. The #1071 TimerFired-tolerance
+/// divergence. A `WaitForSignal` command here would park the run forever on a
+/// signal that will never arrive. The #1071 TimerFired-tolerance
 /// fix must not suppress this (there is no `TimerFired` to cross here).
 #[tokio::test]
 async fn interleaved_sibling_signal_stray_timer_started_still_diverges() {
@@ -11835,12 +11835,11 @@ fn mixed_join_signal_and_child<'a>(
     })
 }
 
-/// Codex round 1, P1: a plain `join!(wait_for_signal, execute_activity)` must
-/// replay to completion. The sibling's `ActivityScheduled` (and its terminal)
-/// sit between the cursor and the eventual `SignalReceived`, and `match_signal`
-/// previously treated an interleaved activity/child event as a **divergence** —
-/// the composition this PR advertises would have nd-blocked on its first wake
-/// instead of completing.
+/// A plain `join!(wait_for_signal, execute_activity)` must replay to
+/// completion. The sibling's `ActivityScheduled` (and its terminal) sit between
+/// the cursor and the eventual `SignalReceived`. `match_signal` previously
+/// treated an interleaved activity/child event as a **divergence**. So the
+/// advertised composition nd-blocked on its first wake instead of completing.
 #[tokio::test]
 async fn mixed_join_signal_and_activity_replays_when_the_signal_arrives_last() {
     let activity_id = ActivityExecId::new();
@@ -11955,11 +11954,11 @@ async fn mixed_join_signal_and_child_replays() {
 /// arrived. This is a healthy **suspend** — the workflow re-parks on the signal
 /// — not a divergence.
 ///
-/// A TIMER sibling in the same position must park too (Codex round 3; see
+/// A TIMER sibling in the same position must park too (see
 /// `mixed_join_signal_timer_and_activity_parks_after_the_activity_resolves`).
-/// What round 13 (issue #768) still requires is that a stray command NOTHING in
-/// the decision claims nd-blocks — which is now decided at the end of the cycle
-/// rather than inside the scan.
+/// The stray-command guard (issue #768) still requires that a stray command
+/// NOTHING in the decision claims nd-blocks. The end of the cycle now decides
+/// that, not the scan.
 #[tokio::test]
 async fn mixed_join_signal_and_activity_parks_when_the_signal_has_not_arrived() {
     let activity_id = ActivityExecId::new();
@@ -12011,15 +12010,15 @@ fn mixed_join_signal_timer_and_activity<'a>(
     })
 }
 
-/// Codex round 3, P1: the FIRST wake of a mixed batch that contains a durable
-/// timer beside a signal wait must be a healthy suspend, not a divergence.
+/// The FIRST wake of a mixed batch that contains a durable timer beside a
+/// signal wait must be a healthy suspend, not a divergence.
 ///
 /// `join!(ctx.wait_for_signal("go"), ctx.timer("t", 5))` persists `TimerStarted`
 /// and nothing for the signal wait. On the next drive the signal is polled
-/// first, its scan crosses that `TimerStarted`, and before this fix the crossed
-/// timer set `stray_timer_command` — so the end-of-scan round-13 guard (#768)
-/// returned `Diverged` and nd-blocked an advertised AC1 composition on its very
-/// first wake, immediately after #950 made the batch persistable.
+/// first, and its scan crosses that `TimerStarted`. Before this fix the crossed
+/// timer set `stray_timer_command`. So the end-of-scan stray-command guard
+/// (#768) returned `Diverged`. It nd-blocked an advertised AC1 composition on
+/// its very first wake, immediately after #950 made the batch persistable.
 ///
 /// The timer here belongs to THIS decision (the sibling branch emits
 /// `StartTimer("t")` in the same cycle and `match_timer_strict` claims the
@@ -12142,7 +12141,7 @@ fn solo_wait_for_signal<'a>(
     })
 }
 
-/// Codex round 2, P1-B: a deploy that REPLACES a recorded activity with a lone
+/// A deploy that REPLACES a recorded activity with a lone
 /// `wait_for_signal` must still be caught, not silently parked forever.
 ///
 /// The history was recorded by code that ran an activity; the new code runs only

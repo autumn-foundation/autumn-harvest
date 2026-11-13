@@ -1427,8 +1427,7 @@ pub(crate) async fn lock_workflow_execution_and_load_history(
 /// locked execution row itself — the `SELECT ... FOR UPDATE` loads the full
 /// row anyway, so a caller that needs row-current execution metadata under
 /// the lock (e.g. [`enforce_activity_timeout`]'s PAUSED re-check, issue #609
-/// post-review hardening, second bot-review round) gets it without a second
-/// query. Mirrors `worker.rs`'s sibling of the same name.
+/// post-review hardening) gets it without a second query. Mirrors `worker.rs`'s sibling of the same name.
 async fn lock_workflow_execution_row_and_load_history(
     conn: &mut AsyncPgConnection,
     exec_id: crate::types::ExecutionId,
@@ -1600,7 +1599,7 @@ struct ActivityTimeoutOutcome {
 /// at transaction start — i.e. before this transaction waited on the queue
 /// advisory lock — which would judge the deadline against a stale instant.
 ///
-/// **Lock ordering (issue #619 round-22 review):** this locks a `harvest_task_queue`
+/// **Lock ordering (issue #619):** this locks a `harvest_task_queue`
 /// row, so it may only run *after* the execution row is locked — see
 /// [`schedule_to_start_still_expired_unlocked_query`] for the fast path that
 /// runs before it and why the split exists.
@@ -1618,16 +1617,16 @@ const fn schedule_to_start_still_expired_query() -> &'static str {
 /// Byte-identical to [`schedule_to_start_still_expired_query`] minus the
 /// `FOR UPDATE`, so the two can never disagree about the deadline predicate.
 ///
-/// # Why the split exists (issue #619 round-22 review)
+/// # Why the split exists (issue #619)
 ///
 /// The documented `harvest_task_queue` lock order is **execution row → task
 /// row**, and `resume_workflow_execution` follows it: it holds the execution
 /// row `FOR UPDATE` and then shifts this execution's task rows with a plain,
 /// *waiting* `UPDATE` (unlike its external-task sibling, that shift has no
-/// `SKIP LOCKED` escape). Round 18 placed the locked re-read *before* the
-/// execution lock, inverting the order for `ScheduleToStart` — enforcement
-/// holding a task row and waiting on the execution row while a resume holds the
-/// execution row and waits on that task row. Postgres would abort one of them,
+/// `SKIP LOCKED` escape). An earlier version placed the locked re-read *before*
+/// the execution lock. That inverted the order for `ScheduleToStart`:
+/// enforcement held a task row and waited on the execution row, while a resume
+/// held the execution row and waited on that task row. Postgres would abort one of them,
 /// failing either the timeout sweep or the operator's resume.
 ///
 /// So the authoritative locked re-read moved *after* the execution lock, and
@@ -1646,7 +1645,7 @@ const fn schedule_to_start_still_expired_unlocked_query() -> &'static str {
 }
 
 /// Locked re-read of a task's *row-current* schedule-to-start deadline (issue
-/// #619 round-18 review).
+/// #619).
 ///
 /// [`find_timed_out_tasks`] produces a snapshot, and a whole pause/resume cycle
 /// can complete before a given row in a large batch is reached. Resume credits
@@ -1739,8 +1738,8 @@ const fn expected_task_states_for_timeout(reason: &TimeoutReason) -> &'static [&
 }
 
 /// Pure decision rule for the PAUSED re-check the timeout enforcers perform
-/// under the execution row lock (issue #609 post-review hardening, second
-/// bot-review round). `true` means "skip enforcement for this task without
+/// under the execution row lock (issue #609 post-review hardening). `true`
+/// means "skip enforcement for this task without
 /// mutating anything" — the row stays `PENDING`/`RUNNING`, no
 /// `ActivityTimedOut` is appended, and the pause machinery (claim-gate
 /// freeze + resume-time deadline shift) covers it instead.
@@ -1790,7 +1789,7 @@ fn pause_suppresses_timeout_enforcement(
 
 /// Pure verdict for the locked re-read of an external-task row inside
 /// [`enforce_external_task_timeouts`]'s per-task transaction (issue #609
-/// post-review hardening, third bot-review round). `true` means "the row is
+/// post-review hardening). `true` means "the row is
 /// still an enforceable schedule-to-close timeout": it is still open
 /// (`PENDING`) and its deadline is still elapsed. `false` means a concurrent
 /// writer won the race after the scan snapshot — a completion/failure flipped
@@ -2077,8 +2076,8 @@ async fn enforce_activity_timeout(
     // Did the task time out (vs. a no-op because the task already moved on)?
     // Only a real enforcement can count toward the breaker.
     //
-    // Pinned `READ COMMITTED`, not the session default (issue #619 round-24
-    // review). The queue advisory lock taken below is a `SELECT`, so it fixes
+    // Pinned `READ COMMITTED`, not the session default (issue #619). The
+    // queue advisory lock taken below is a `SELECT`, so it fixes
     // this transaction's snapshot and *then* blocks waiting for an in-flight
     // pause. Under `REPEATABLE READ` that snapshot is the transaction's only
     // one, so after the pause commits and releases the lock, `is_queue_paused`
@@ -2155,7 +2154,7 @@ async fn enforce_activity_timeout(
             // never on the far more common in-flight timeout paths. Bailing here
             // also skips the row locks and history load entirely for a held task.
             //
-            // SHARED mode (round-21 review): exclusive would block every claim's
+            // SHARED mode: exclusive would block every claim's
             // `try_lock_queue_for_claim` for this whole transaction, stalling
             // dispatch on a queue that is not paused at all. Shared still mutually
             // excludes the exclusive pause/resume, which is the only ordering this
@@ -2181,7 +2180,7 @@ async fn enforce_activity_timeout(
                 // `lock_workflow_execution_row_and_load_history`, can block for an
                 // UNBOUNDED period behind any other holder of that row, and
                 // `pause_activity` shares no row with this transaction so it commits
-                // freely during that wait (round-17 review, P1). The authoritative
+                // freely during that wait (issue #807). The authoritative
                 // re-check therefore runs AFTER the row locks; see it below.
                 // Placed after the queue re-check so the two read coarse-to-fine,
                 // and before `schedule_to_start_still_expired_unlocked` so a held
@@ -2212,7 +2211,7 @@ async fn enforce_activity_timeout(
                 // instant its deadline was extended. Covers both the queue (#619)
                 // and activity (#807) resume paths, which shift the same column.
                 //
-                // Unlocked here (round-22 review): locking the task row before the
+                // Unlocked here (issue #619): locking the task row before the
                 // execution row below would invert the documented
                 // execution-row -> task-row order and deadlock against
                 // `resume_workflow_execution`. This is a fast path that skips the
@@ -2254,7 +2253,7 @@ async fn enforce_activity_timeout(
                 return Ok(None);
             }
             // Authoritative ACTIVITY-pause re-check, AFTER the blocking row
-            // acquisitions above (issue #807, round-17 review, P1).
+            // acquisitions above (issue #807).
             //
             // The copy near the top of this transaction is a fast path only. Between
             // it and here sits `lock_workflow_execution_row_and_load_history`, a
@@ -2290,8 +2289,7 @@ async fn enforce_activity_timeout(
                 return Ok(None);
             }
             // Authoritative PAUSED re-check under the execution row lock
-            // (issue #609 post-review hardening, second bot-review round):
-            // the scan snapshot's PAUSED exclusions are non-locking, so a
+            // (issue #609 post-review hardening): the scan snapshot's PAUSED exclusions are non-locking, so a
             // pause committing after the scan — or while this transaction
             // waited on the lock `pause_workflow_execution` itself holds —
             // must be honoured here or the timeout lands mid-pause. See
@@ -2979,8 +2977,7 @@ async fn enforce_workflow_timeout(
     codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<()> {
     // Pinned `READ COMMITTED` for the same fresh-snapshot reason as
-    // `enforce_activity_timeout` — see the note there (issue #619 round-24
-    // review). Without it, a `repeatable read` session default lets this
+    // `enforce_activity_timeout` — see the note there (issue #619). Without it, a `repeatable read` session default lets this
     // enforcer time out the whole execution after a pause was acknowledged.
     let mut tx = conn.build_transaction().read_committed();
     // `wake_parent_for_child_timeout` below raises a dispatch hint (issue
@@ -3035,14 +3032,14 @@ async fn enforce_workflow_timeout(
                 // already credited forward destroys the run the hold was protecting.
                 //
                 // Unlocked fast path, for the same lock-ordering reason as the
-                // activity path (round-22 review); the authoritative locked re-read
+                // activity path (issue #619); the authoritative locked re-read
                 // runs below, once the execution row is held.
                 if !schedule_to_start_still_expired_unlocked(conn, task.id).await? {
                     return Ok(None);
                 }
             }
 
-            // Lock the execution row BEFORE any task row (round-22 review). This
+            // Lock the execution row BEFORE any task row (issue #619). This
             // path used to read the execution unlocked and only take the row lock
             // implicitly, inside `store::append_events` below — which left the
             // locked `schedule_to_start` re-read above it, inverting the documented
@@ -3205,7 +3202,7 @@ async fn enforce_workflow_timeout(
 /// The scan filter above is a non-locking snapshot only — it does not
 /// serialize with `pause_workflow_execution` (which locks only the execution
 /// row), so a pause committing after the scan must not be enforced anyway
-/// (issue #609 post-review hardening, second bot-review round). The guarantee
+/// (issue #609 post-review hardening). The guarantee
 /// is the per-task transaction below: it locks the external-task row, then
 /// the execution row `FOR UPDATE`, re-checks `PAUSED` under that execution
 /// lock, and skips the task entirely (left `PENDING`, no event) when the
@@ -3213,7 +3210,7 @@ async fn enforce_workflow_timeout(
 /// under the same lock the pause path holds. The lock *order* (task row
 /// first, execution row second) matches the external-task completion paths —
 /// see the lock-ordering convention comment inside the transaction (issue
-/// #609 post-review hardening, third bot-review round).
+/// #609 post-review hardening).
 ///
 /// # Errors
 ///
@@ -3260,7 +3257,7 @@ pub async fn enforce_external_task_timeouts(conn: &mut AsyncPgConnection) -> Har
         let result = crate::dispatch::buffered_settled_in_background(Box::pin(
             conn.transaction::<bool, HarvestError, _>(async |conn| {
                 // Per-table lock-ordering convention (issue #609
-                // post-review hardening, third bot-review round):
+                // post-review hardening):
                 //
                 //   harvest_external_tasks: task row → execution row
                 //   harvest_task_queue:     execution row → task row
@@ -3322,8 +3319,8 @@ pub async fn enforce_external_task_timeouts(conn: &mut AsyncPgConnection) -> Har
                 // `pause_workflow_execution`/`resume_workflow_execution`
                 // hold — so the PAUSED re-check, the external-task state
                 // flip, and the event append below all serialize with the
-                // pause path (issue #609 post-review hardening, second
-                // bot-review round): the pause-suppression guarantee is
+                // pause path (issue #609 post-review hardening): the
+                // pause-suppression guarantee is
                 // unchanged by the task-first reordering. A vanished
                 // execution row (None) proceeds and surfaces as
                 // `append_single_event`'s NotFound, matching the
@@ -3696,7 +3693,7 @@ enum DeliveryRoute {
         /// The shard whose database holds the resolved run.
         shard: crate::types::ShardId,
         /// The cross-shard resolution found a **live** run on `shard`
-        /// (issue #1146, Codex round 1 P2).
+        /// (issue #1146).
         ///
         /// The delivery attempt re-resolves shard-locally on `shard` — which it
         /// must, to catch a continue-as-new that lands between resolution and
@@ -4113,7 +4110,7 @@ async fn resolve_delivery_route(
 }
 
 /// What to do with a shard-local by-id delivery outcome, once the cross-shard
-/// resolution's view is taken into account (issue #1146, Codex round 1 P2).
+/// resolution's view is taken into account (issue #1146).
 ///
 /// Split out as a pure function for the same reason
 /// `worker::classify_cross_shard_continue_as_new` and `classify_successor_slot`
@@ -4291,7 +4288,7 @@ async fn attempt_signal_delivery(
             // grace window (issue #751 AC4).
             //
             // UNLESS the cross-shard resolution just saw a LIVE run here
-            // (issue #1146, Codex round 1 P2): the two views disagree, which
+            // (issue #1146): the two views disagree, which
             // means the key moved shards between the two reads, and this
             // shard-local read cannot see where it went. Leave the row pending
             // so the next sweep re-resolves globally rather than durably
@@ -4518,7 +4515,7 @@ pub async fn enforce_external_signals_outbox(
                     // path: a live run found over a partial view is still real
                     // delivery, and re-delivery is not idempotent without an
                     // idempotency key, so staying pending would duplicate the
-                    // signal (issue #1146, Codex round 2).
+                    // signal (issue #1146).
                     // `reverify_after_cancel` is likewise unused (issue
                     // #1313). A signal reports a delivery to one run, never a
                     // claim about the whole key. A run that starts during the
@@ -4561,7 +4558,7 @@ pub async fn enforce_external_signals_outbox(
                         };
 
                         // Bounded for the same reason the fan-out is (issue
-                        // #1146, Codex round 1 P1): this is a peer pool reached
+                        // #1146): this is a peer pool reached
                         // while holding a connection from another pool in the
                         // same process, and one timeout checker runs per
                         // assigned shard. An unbounded wait here lets two
@@ -4733,7 +4730,7 @@ struct CancelDeliveryAccumulators {
 /// on the next sweep") rather than propagated — matching
 /// `attempt_signal_delivery`'s "one row's transient failure must not abort
 /// the scan" contract.
-// issue #1197, item 2 (Codex round 3, P2): `metrics` is threaded through to
+// issue #1197, item 2: `metrics` is threaded through to
 // `cancel_workflow_execution_collect` so a nested self-referential admission
 // this delivery's own trigger evaluation recurses into sees the real
 // recorder. That pushes this function's argument count one over clippy's
@@ -4814,7 +4811,7 @@ async fn attempt_cancel_delivery(
                 }
                 // Already terminal = no-op success (goal already met) —
                 // UNLESS the cross-shard resolution just saw a LIVE run on this
-                // shard (issue #1146, Codex round 1 P2). The two views disagree,
+                // shard (issue #1146). The two views disagree,
                 // so the key moved shards between the reads and this
                 // shard-local read cannot see where. Reporting success here
                 // would durably record a cancellation that never reached the
@@ -4874,7 +4871,7 @@ async fn attempt_cancel_delivery(
 /// workflows never start for a cancellation that later rolls back (issue
 /// #492). The trailing shard lets the post-commit loop route each deferred
 /// handler check to the connection that actually owns its execution id
-/// (issue #751 review, round 2): for a cross-shard cancellation the target
+/// (issue #751 review): for a cross-shard cancellation the target
 /// (and any cascade-closed children) live on the TARGET shard, never on
 /// `conn`, so routing every check through `conn` unconditionally would
 /// silently see zero events and never report a genuinely unfinished update
@@ -4914,7 +4911,7 @@ pub async fn enforce_external_cancels_outbox(
 
     // Resolved once, up front, for routing deferred unfinished-handler
     // checks to the correct shard's connection after each step commits
-    // (issue #751 review, round 2). Mirrors the identical resolution
+    // (issue #751 review). Mirrors the identical resolution
     // performed per-attempt inside the step transaction below.
     let outer_sharded_pool = sharded_pool.clone().or_else(|| {
         crate::shard::GLOBAL_SHARDED_POOL
@@ -5131,7 +5128,7 @@ pub async fn enforce_external_cancels_outbox(
                     };
 
                     // Bounded for the same reason as the signal outbox above
-                    // (issue #1146, Codex round 1 P1).
+                    // (issue #1146).
                     let mut target_conn = match crate::replication::fenced_get_within(
                         pool,
                         crate::external_target_location::peer_acquire_bound(pool),
@@ -5172,7 +5169,7 @@ pub async fn enforce_external_cancels_outbox(
                     // transaction can roll it back. Its follow-ups are
                     // therefore handled immediately below, using this same
                     // connection, rather than deferred past `conn`'s commit
-                    // (issue #751 review, round 3).
+                    // (issue #751 review).
                     target_conn_opt = Some(target_conn);
                     terminal
                     }
@@ -5268,7 +5265,7 @@ pub async fn enforce_external_cancels_outbox(
                 // contributes no new checks/metrics of its own. Acting on
                 // them right here -- while `target_conn` is still open --
                 // means they can never be dropped this way (issue #751
-                // review, round 3).
+                // review).
                 let (deferred_starts, deferred_checks, cancel_metrics) =
                     if let Some(mut target_conn) = target_conn_opt {
                         for start in deferred_starts {
@@ -5347,7 +5344,7 @@ pub async fn enforce_external_cancels_outbox(
                 }
                 // Route each deferred unfinished-handler check to whichever
                 // connection actually owns its execution id (issue #751
-                // review, round 2). A same-shard check reuses the
+                // review). A same-shard check reuses the
                 // already-committed `conn` directly (and must — re-acquiring
                 // a second connection from that same pool while `conn` is
                 // still held would self-deadlock a pool of size 1, matching
@@ -5358,7 +5355,7 @@ pub async fn enforce_external_cancels_outbox(
                 //
                 // "Same shard" here means "resolves to the same *physical
                 // pool*", not a raw `ShardId` equality check (issue #751
-                // review, round 5): a legacy/pre-sharding caller execution
+                // review): a legacy/pre-sharding caller execution
                 // carries `ShardId::UNENCODED`, which `exact_pool_for_execution`
                 // correctly resolves to the default shard's pool via its own
                 // fallback -- but a raw `exec_id.shard() == caller_shard`
@@ -8136,7 +8133,7 @@ mod tests {
         );
     }
 
-    /// Round-18 P2: the stale-scan guard must re-read the row under a lock and
+    /// Issue #619: the stale-scan guard must re-read the row under a lock and
     /// judge it against *real* current time.
     ///
     /// `FOR UPDATE` is what serializes this read against `resume_queue`'s
@@ -8174,16 +8171,16 @@ mod tests {
         );
     }
 
-    /// Round-22 P2: the locked deadline re-read must never precede the
+    /// Issue #619: the locked deadline re-read must never precede the
     /// execution-row lock.
     ///
     /// The documented `harvest_task_queue` order is execution row -> task row,
     /// and `resume_workflow_execution` follows it (execution `FOR UPDATE`, then
     /// a plain *waiting* `UPDATE` of this execution's task rows — that shift has
-    /// no `SKIP LOCKED` escape, unlike its external-task sibling). Round 18 put
-    /// the locked re-read before the execution lock and inverted it, so a resume
-    /// racing a `schedule_to_start` sweep could deadlock and Postgres would abort
-    /// one of them.
+    /// no `SKIP LOCKED` escape, unlike its external-task sibling). An earlier
+    /// version put the locked re-read before the execution lock and inverted it.
+    /// A resume racing a `schedule_to_start` sweep could then deadlock, and
+    /// Postgres would abort one of them.
     ///
     /// Source-level because the hazard is *statement order*, which no SQL-shape
     /// assertion can see. Checked per enforcement function so a later edit that
@@ -8486,7 +8483,7 @@ mod tests {
         );
     }
 
-    // ── locked PAUSED re-check (issue #609, second bot-review round) ────────
+    // ── locked PAUSED re-check (issue #609) ─────────────────────────────────
 
     #[test]
     fn pause_recheck_never_suppresses_a_running_execution() {

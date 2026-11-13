@@ -444,13 +444,13 @@ pub struct BuiltHarvest {
     /// loudly with `413` (issue #596). Defaults to 10,000.
     pub usage_max_groups: usize,
     /// Resolved builder-wide completion-callback configuration (issue #605).
-    /// `deliverer` is still `None` here when the embedder didn't supply a
+    /// `deliverer` is still `None` here when the embedder did not supply a
     /// custom one — the plugin substitutes its default `reqwest`-based
     /// implementation at runtime startup.
     completion_callback_config: crate::completion_callback::CompletionCallbackBuilderConfig,
     audit_export_config: crate::audit_export::AuditExportBuilderConfig,
     /// When set, `into_worker_parts*` does **not** install the process-global
-    /// audit-export config (issue #953, Codex review round 5 P1).
+    /// audit-export config (issue #953).
     ///
     /// The plugin runner publishes it itself, once its whole build has
     /// succeeded. Without this, the conversion installs the config partway
@@ -1325,7 +1325,7 @@ impl BuiltHarvest {
 
     /// Suppress the process-global audit-export install that
     /// [`Self::into_worker_parts`] and [`Self::into_worker_parts_with_extra_state`]
-    /// otherwise perform (issue #953, Codex review round 5 P1).
+    /// otherwise perform (issue #953).
     ///
     /// For a caller that publishes the config itself **after** its whole build
     /// has succeeded — the plugin runner does exactly this. The conversion
@@ -2194,7 +2194,7 @@ impl HarvestBuilder {
     /// The target is validated against the configured SSRF host allowlist
     /// at [`try_build`](Self::try_build) time — call
     /// [`completion_callback_allowlist`](Self::completion_callback_allowlist)
-    /// first if the target's host isn't already allowlisted, or `try_build`
+    /// first if the target's host is not already allowlisted, or `try_build`
     /// returns [`HarvestBuilderError::CallbackTargetRejected`].
     #[must_use]
     pub fn completion_callback_default(
@@ -2833,7 +2833,7 @@ impl HarvestBuilder {
                 "worker_heartbeat_interval must be greater than zero".to_string(),
             ));
         }
-        // Issue #804 (Codex round-19 P1): surface a cadence the fleet-wide
+        // Issue #804: surface a cadence the fleet-wide
         // capability-miss liveness window cannot vouch for. Never rejects — an
         // already-deployed slow fleet must keep booting.
         #[cfg(feature = "db")]
@@ -3210,7 +3210,7 @@ fn validate_completion_triggers(
 }
 
 /// Warn when this worker heartbeats more slowly than the fleet-wide liveness
-/// window its peers judge it by (issue #804, Codex round-19 P1).
+/// window its peers judge it by (issue #804).
 ///
 /// Nothing in `harvest_workers` records a worker's cadence, so a peer running
 /// the capability-miss fleet lookup cannot ask "is this row fresh *for the
@@ -3522,7 +3522,7 @@ pub(crate) const RESERVED_RATE_LIMIT_KEY_PREFIXES: [&str; 2] = ["dyn-rate:", "st
 /// path), so a worker constructed without going through the builder still
 /// fails loud, once, before its poll loop and first enqueue — rather than
 /// slipping an invalid config past the piecemeal schedule-time guards in
-/// `persist_scheduled_activities` (issue #699 review, Codex round-5 P2).
+/// `persist_scheduled_activities` (issue #699 review).
 ///
 /// Checks, per activity:
 /// - a dynamic `rate_limit(key = …)` on a **local** activity — local activities
@@ -3575,7 +3575,7 @@ pub(crate) fn validate_activity_rate_limits<'a>(
             // path where per-key rate limiting lives. The `#[activity]` macro
             // rejects this at parse time, but a hand-built `ActivityInfo`
             // (direct `HandlerRegistry`) bypasses the macro. Fail loud
-            // (issue #699 review, Codex round-5 P2). (Scope: this rejects the
+            // (issue #699 review). (Scope: this rejects the
             // DYNAMIC form only; the pre-existing static-rate-on-local #332
             // asymmetry is a documented follow-up, not expanded here.)
             if activity.is_local {
@@ -3654,7 +3654,7 @@ pub(crate) fn validate_activity_rate_limits<'a>(
         // rate/burst.
         //
         // Checked on the EFFECTIVE key, not on `rate_limit_key` alone (issue
-        // #1127, Codex review round 1 P2): the static bucket a worker registers
+        // #1127): the static bucket a worker registers
         // falls back to the activity NAME when no key is given, so a hand-built
         // `ActivityInfo` named `start-throttle:reports` would otherwise pass
         // validation and register a squatting bucket. (The `#[activity]` macro
@@ -6842,7 +6842,7 @@ mod tests {
             crate::start_idempotency::purge_window_secs(),
         );
 
-        // Restore the default so ordering-independent test runs don't leak state.
+        // Restore the default so ordering-independent test runs do not leak state.
         crate::start_idempotency::set_purge_window_secs(
             crate::start_idempotency::DEFAULT_START_IDEMPOTENCY_WINDOW,
         );
@@ -8290,7 +8290,7 @@ mod tests {
 
     /// The reserved-prefix check runs on the EFFECTIVE static key, which falls
     /// back to the activity NAME when no `rate_limit_key` is given (issue
-    /// #1127, Codex review round 1 P2). A hand-built `ActivityInfo` named like
+    /// #1127). A hand-built `ActivityInfo` named like
     /// a generated bucket would otherwise register a squatting static bucket
     /// that the idle-bucket GC then collects, stranding its tasks until a
     /// worker restart.
@@ -8960,7 +8960,7 @@ mod tests {
             .try_build();
         // The URL is carried REDACTED to its origin: a SIEM ingest endpoint's
         // path can be its credential, and this error's Display goes to the
-        // startup log (issue #953, Codex review round 24 P1). The host still
+        // startup log (issue #953). The host still
         // identifies what was rejected, which is all the rejection is about.
         assert!(
             matches!(
@@ -9120,8 +9120,7 @@ mod tests {
     }
 
     /// A rejected sink URL must not carry its credential into the error, which
-    /// a startup failure writes straight to the logs (issue #953, Codex review
-    /// round 24 P1).
+    /// a startup failure writes straight to the logs (issue #953).
     #[test]
     fn a_rejected_sink_url_is_redacted_in_the_build_error() {
         let err = HarvestBuilder::new()
@@ -9178,7 +9177,7 @@ mod tests {
 
     /// The plugin runner publishes the global itself after its build succeeds,
     /// so the conversion must not write it at all — not write it and have it
-    /// repaired later (issue #953, Codex review round 5 P1). A live runtime's
+    /// repaired later (issue #953). A live runtime's
     /// scanner ticking mid-build would otherwise export records to a sink that
     /// never came into service, and no restore un-sends those.
     ///

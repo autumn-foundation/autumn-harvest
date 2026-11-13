@@ -487,9 +487,9 @@ pub enum QueryReplayOutcome {
 ///   every replay (the guard reconstructs from the recorded `MutexGranted`
 ///   anchor), so a mutex-holding workflow that completes/continues with the
 ///   guard dropped must NOT be flagged as "new commands emitted beyond recorded
-///   history" on the strict replay path. (Issue #1175: canary replay's
-///   completing path doesn't call this function at all any more, so the
-///   question doesn't arise there — every command past the frontier is
+///   history" on the strict replay path. (Issue #1175: the completing path of
+///   canary replay does not call this function at all any more, so the
+///   question does not arise there. Every command past the frontier is
 ///   tolerated, bookkeeping or not.)
 /// - A drop release (issue #2193): the `ScheduleActivity` that a dropped
 ///   `Session` issues. A run that ends first never records it, so a replay of
@@ -1269,12 +1269,12 @@ pub async fn run_workflow_strict(
     // byte-faithful to the live worker rather than silently using the default
     // policy. `WorkflowHistoryPolicy::default()` preserves prior behavior.
     history_policy: WorkflowHistoryPolicy,
-    // Issue #798 (Codex round 20): the **candidate** worker's payload limits.
+    // Issue #798: the **candidate** worker's payload limits.
     // They live in no `WorkflowEvent`, so a pure-history replay cannot recover
     // them; leaving them at the library defaults makes the gate answer the wrong
     // question when the candidate build changes a cap or an offload threshold.
     payload_limits: ReplayPayloadLimits,
-    // Issue #798 (Codex round 21): the candidate's declarative `#[query]` /
+    // Issue #798: the candidate's declarative `#[query]` /
     // `#[update]` handlers. The live worker registers these before any workflow
     // code runs and `ctx.list_query_names()` surfaces them, so a workflow that
     // branches on their presence replays down the wrong path without them.
@@ -1340,12 +1340,12 @@ pub(crate) async fn run_workflow_strict_advancing_clock(
     // Issue #614: the runtime registry's history policy (see [`run_workflow_strict`]).
     // `WorkflowHistoryPolicy::default()` preserves prior behavior.
     history_policy: WorkflowHistoryPolicy,
-    // Issue #798 (Codex round 20): the **candidate** worker's payload limits.
+    // Issue #798: the **candidate** worker's payload limits.
     // They live in no `WorkflowEvent`, so a pure-history replay cannot recover
     // them; leaving them at the library defaults makes the gate answer the wrong
     // question when the candidate build changes a cap or an offload threshold.
     payload_limits: ReplayPayloadLimits,
-    // Issue #798 (Codex round 21): the candidate's declarative `#[query]` /
+    // Issue #798: the candidate's declarative `#[query]` /
     // `#[update]` handlers. The live worker registers these before any workflow
     // code runs and `ctx.list_query_names()` surfaces them, so a workflow that
     // branches on their presence replays down the wrong path without them.
@@ -1663,12 +1663,12 @@ pub(crate) async fn run_workflow_canary(
     // byte-faithful to the live worker rather than silently using the default
     // policy. `WorkflowHistoryPolicy::default()` preserves prior behavior.
     history_policy: WorkflowHistoryPolicy,
-    // Issue #798 (Codex round 20): the **candidate** worker's payload limits.
+    // Issue #798: the **candidate** worker's payload limits.
     // They live in no `WorkflowEvent`, so a pure-history replay cannot recover
     // them; leaving them at the library defaults makes the gate answer the wrong
     // question when the candidate build changes a cap or an offload threshold.
     payload_limits: ReplayPayloadLimits,
-    // Issue #798 (Codex round 21): the candidate's declarative `#[query]` /
+    // Issue #798: the candidate's declarative `#[query]` /
     // `#[update]` handlers. The live worker registers these before any workflow
     // code runs and `ctx.list_query_names()` surfaces them, so a workflow that
     // branches on their presence replays down the wrong path without them.
@@ -1832,7 +1832,7 @@ pub(crate) async fn run_workflow_canary(
                     };
                 }
 
-                // If history still has unconsumed events when we suspend, that's non-deterministic
+                // Unconsumed history events at suspension are non-deterministic.
                 if ctx.history_has_unconsumed_events() {
                     let nd = ctx.take_nd_details().or_else(|| {
                         Some(crate::error::NonDeterministicDetails {
@@ -2404,7 +2404,7 @@ fn execute_span(
     // ADR-0001 §2.1: emit harvest.workflow.execute for every executor cycle.
     // harvest.replay defaults to false at span creation so subscribers that only
     // observe on_new_span (e.g. tests) see the correct value for callers that
-    // don't supply span_meta. The worker passes span_meta to override it and to
+    // do not supply span_meta. The worker passes span_meta to override it and to
     // populate the Empty fields (workflow.id, shard.id, queue) that only the
     // worker context knows.
     let span = tracing::info_span!(

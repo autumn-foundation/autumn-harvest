@@ -63,15 +63,16 @@ use crate::failure::ActivityFailure;
 pub const DEFAULT_MEMORY_BYTES: usize = 16 * 1024 * 1024;
 
 /// Maximum size, in bytes, of a guest's returned output buffer
-/// (issue #965 review round 8).
+/// (issue #965).
 ///
-/// The guest's `run` returns a packed `(out_ptr, out_len)`; the host reads
+/// The guest's `run` returns a packed `(out_ptr, out_len)`. The host reads
 /// `out_len` bytes and deserializes them as JSON. `out_len` is already
-/// bounds-checked against live guest memory (≤ the linear-memory ceiling), but
-/// a guest returning a large *in-bounds* buffer — e.g. a 16 MiB JSON array of
-/// tiny values — would otherwise make the host spend CPU (outside the guest's
-/// wasmtime fuel/epoch budget) and balloon host memory parsing it into a
-/// `serde_json::Value`. This caps `out_len` *before* deserialization: an
+/// bounds-checked against live guest memory (≤ the linear-memory ceiling).
+/// But a guest can return a large *in-bounds* buffer, e.g. a 16 MiB JSON
+/// array of tiny values. The host then spends CPU outside the guest's
+/// wasmtime fuel/epoch budget. It also balloons host memory while it parses
+/// the buffer into a `serde_json::Value`. This caps `out_len` *before*
+/// deserialization: an
 /// oversized output is rejected as a non-retryable
 /// [`ActivityFailure::wasm_output_too_large`] rather than parsed. Set well
 /// below the 16 MiB memory ceiling; a spike default, not a per-activity knob.
@@ -95,7 +96,7 @@ pub const WASM_MAX_TABLE_ELEMENTS: usize = 100_000;
 pub const WASM_MAX_TABLES: usize = 16;
 
 /// Maximum number of linear memories a single guest may instantiate
-/// (issue #965 review round 3).
+/// (issue #965).
 ///
 /// The JSON-over-linear-memory ABI uses exactly one exported `memory`. The
 /// `memory_size` limit caps each memory's *bytes*, but wasmtime otherwise
@@ -106,12 +107,12 @@ pub const WASM_MAX_TABLES: usize = 16;
 pub const WASM_MAX_MEMORIES: usize = 1;
 
 /// Maximum number of module instances a single guest invocation may create
-/// (issue #965 review round 3).
+/// (issue #965).
 ///
 /// One instance per invocation — the runtime instantiates exactly one module.
 pub const WASM_MAX_INSTANCES: usize = 1;
 
-/// Guest call-stack ceiling in bytes (issue #965 review round 3).
+/// Guest call-stack ceiling in bytes (issue #965).
 ///
 /// Matches wasmtime's own default (512 KiB); set explicitly so deeply-recursive
 /// guest code always traps (a retryable `WasmTrap`) rather than overflowing the
@@ -128,9 +129,8 @@ pub const WASM_MAX_STACK_BYTES: usize = 512 * 1024;
 /// guarantees termination.
 ///
 /// This constant is the **default** that ceiling takes. An embedder may raise or
-/// lower `WasmLimits::max_wall_clock` for an activity, so this value is not
-/// itself an upper bound on every invocation in the process (issue #965 review
-/// round 10 — the doc previously overstated it as one).
+/// lower `WasmLimits::max_wall_clock` for an activity. So this value is not
+/// itself an upper bound on every invocation in the process (issue #965).
 pub const DEFAULT_MAX_WALL_CLOCK: Duration = Duration::from_secs(300);
 
 /// How often the shared epoch ticker advances the engine's epoch counter.
@@ -220,11 +220,11 @@ pub(crate) struct HostState {
 /// Advanced by a golden-ratio increment per invocation so successive stores get
 /// distinct (non-cryptographic) seeds without depending on the wall clock.
 ///
-/// Initialised **lazily from OS entropy** on first use (issue #965 review round
-/// 10). A fixed start value made the whole stream reproducible across process
-/// restarts — invocation *N* in any process drew the identical sequence — which
-/// is a stronger and more surprising property than the documented
-/// "non-cryptographic" caveat implies. Seeding from entropy keeps draws
+/// Initialised **lazily from OS entropy** on first use (issue #965). A fixed
+/// start value made the whole stream reproducible across process restarts.
+/// Invocation *N* in any process drew the identical sequence. That property is
+/// stronger and more surprising than the documented "non-cryptographic" caveat
+/// implies. Seeding from entropy keeps draws
 /// unpredictable across restarts; the stream is still **not** cryptographically
 /// secure (xorshift64), so guests must not use it for tokens or nonces.
 static RNG_SEED_COUNTER: OnceLock<AtomicU64> = OnceLock::new();
@@ -317,11 +317,11 @@ impl WasmModuleStore {
         // than overflowing the host worker thread. Matches wasmtime's default;
         // set explicitly so a future default change cannot silently unbound it.
         config.max_wasm_stack(WASM_MAX_STACK_BYTES);
-        // Minimal-proposal core-WASM engine (issue #965 review round 3): disable
-        // every post-MVP proposal the JSON-over-linear-memory `alloc`/`run` ABI
-        // does not use, so an untrusted guest cannot reach a resource dimension
+        // Minimal-proposal core-WASM engine (issue #965): disable every post-MVP
+        // proposal that the JSON-over-linear-memory `alloc`/`run` ABI does not
+        // use. Then an untrusted guest cannot reach a resource dimension
         // *outside* the store limiter (extra linear memories, a GC heap, shared
-        // memory, fibers, ...) and the module-validation surface stays minimal.
+        // memory, fibers, ...). The module-validation surface also stays minimal.
         // Each setter below is only reached because the corresponding wasmtime
         // crate feature (`gc`/`threads`/`component-model`) is enabled by our
         // default-features dependency.
@@ -348,9 +348,9 @@ impl WasmModuleStore {
         // `reference_types` prerequisite), `multi_value`, `simd` (`v128` is a
         // bounded value type), `backtrace` (trap diagnostics).
         //
-        // Caveat on `bulk_memory` and FUEL specifically (issue #965 review round
-        // 10): fuel is charged per *instruction*, not per byte, so `memory.fill`
-        // / `memory.copy` / `memory.init` each cost ONE unit no matter how many
+        // Caveat on `bulk_memory` and FUEL specifically (issue #965): fuel is
+        // charged per *instruction*, not per byte. So `memory.fill` /
+        // `memory.copy` / `memory.init` each cost ONE unit, no matter how many
         // bytes they move. Fuel therefore does NOT bound the work a bulk-memory
         // guest performs, and must not be relied on to. What bounds it is the
         // mandatory wall-clock ceiling (armed against a real `Instant`, see
@@ -622,16 +622,16 @@ fn link_host_functions(
                     else {
                         return -1;
                     };
-                    // SECURITY (issue #965 review, Finding 26): reject an
-                    // over-long key BEFORE slicing/`from_utf8`-ing the guest
-                    // bytes. `from_utf8` over a guest-controlled multi-MiB slice
-                    // is host CPU that is NOT charged to wasmtime fuel, so a loop
-                    // of `env_get` calls with a huge in-bounds `key_len` could
-                    // burn host CPU to the wall-clock deadline. A key longer than
-                    // any allowlisted entry can never match, so bail with the
-                    // in-band miss (-1) without touching the slice. Round 1 only
-                    // avoided the `vec![0u8; key_len]` allocation; this also
-                    // bounds the validation scan.
+                    // SECURITY (issue #965): reject an over-long key BEFORE
+                    // slicing/`from_utf8`-ing the guest bytes. `from_utf8` over
+                    // a guest-controlled multi-MiB slice is host CPU that is NOT
+                    // charged to wasmtime fuel. So a loop of `env_get` calls
+                    // with a huge in-bounds `key_len` could burn host CPU to the
+                    // wall-clock deadline. A key longer than any allowlisted
+                    // entry can never match. So bail with the in-band miss (-1)
+                    // without touching the slice. Skipping the
+                    // `vec![0u8; key_len]` allocation alone is not enough. This
+                    // check also bounds the validation scan.
                     if key_len > max_allowed_key_len {
                         return -1;
                     }
@@ -756,9 +756,9 @@ pub fn invoke_wasm_activity(
 /// serialization and store setup — and charges that whole pre-guest interval
 /// against `deadline`. If the budget is already spent (`elapsed >= deadline`)
 /// the attempt fails fast as a retryable
-/// [`ActivityFailure::resource_exhausted`] **without invoking the guest**,
-/// closing the window where a fast guest handed a zero→one-tick deadline could
-/// race to completion past its own start-to-close (issue #965 review round 9).
+/// [`ActivityFailure::resource_exhausted`] **without invoking the guest**.
+/// That closes a window: a fast guest with a zero→one-tick deadline could
+/// race to completion past its own start-to-close (issue #965).
 /// `dispatch_start = None` charges nothing and uses `deadline` verbatim as the
 /// guest budget (the convenience/test call shape).
 ///
@@ -922,7 +922,7 @@ fn invoke_wasm_activity_inner(
         limits: StoreLimitsBuilder::new()
             .memory_size(limits.memory_bytes)
             // Cap every store resource dimension, not just linear-memory bytes
-            // (issue #965 review round 3): a table lives in host storage outside
+            // (issue #965): a table lives in host storage outside
             // the byte ceiling, and multiple memories/instances would each be
             // individually sub-cap yet collectively exceed the sandbox.
             .memories(WASM_MAX_MEMORIES)
@@ -958,7 +958,7 @@ fn invoke_wasm_activity_inner(
                 "wasm activity start-to-close budget exhausted before guest start",
             ));
         }
-        // Cap the remaining budget at the mandatory ceiling (issue #965 round 3).
+        // Cap the remaining budget at the mandatory ceiling (issue #965).
         crate::wasm_store::InvokeBudget::Remaining(remaining) => {
             remaining.min(limits.max_wall_clock)
         }
@@ -966,7 +966,7 @@ fn invoke_wasm_activity_inner(
     };
 
     // Wall-clock bound + cooperative cancellation via a per-invocation
-    // epoch-deadline callback (issue #965 review). Arm the first deadline one
+    // epoch-deadline callback (issue #965). Arm the first deadline one
     // tick out; on each callback poll the cancellation token and compare the
     // *real clock* against an absolute deadline, trapping (as an epoch interrupt
     // → retryable `ResourceExhausted`) when either the token fires or the
@@ -977,7 +977,7 @@ fn invoke_wasm_activity_inner(
     // callback, so the fast path pays nothing.
     //
     // The bound is an absolute `Instant`, NOT a countdown of callback
-    // invocations (issue #965 review round 10). wasmtime emits epoch checks only
+    // invocations (issue #965). wasmtime emits epoch checks only
     // at function entry, loop headers, and host libcalls, so a guest controls how
     // much work sits between two consecutive callbacks. Counting invocations
     // therefore measures "check points crossed", not time: a guest that does more
@@ -1024,10 +1024,10 @@ fn invoke_wasm_activity_inner(
     // and — for `instantiate` — an unsatisfied import → `SandboxDenied`).
     let classify = |e: &wasmtime::Error, phase: WasmErrPhase| -> ActivityFailure {
         // A permanent capability denial outranks a concurrent cancellation
-        // (issue #965 review round 10). An ungranted import is a deterministic
-        // misconfiguration: reporting it as a retryable "cancelled" just because
-        // the token happened to fire during `instantiate` would spend the whole
-        // retry budget rediscovering the same denial. Classify first and keep a
+        // (issue #965). An ungranted import is a deterministic
+        // misconfiguration. The token can fire during `instantiate`. A
+        // retryable "cancelled" report then spends the whole retry budget
+        // rediscovering the same denial. Classify first and keep a
         // `SandboxDenied` verdict; otherwise fall back to the run-state reasons.
         let classified = classify_wasmtime_err_phase(e, phase);
         if classified.error_type == crate::failure::ERROR_TYPE_SANDBOX_DENIED {
@@ -1097,11 +1097,11 @@ fn invoke_wasm_activity_inner(
     let out_len = usize::try_from(bits & 0xFFFF_FFFF)
         .map_err(|_| ActivityFailure::wasm_trap("wasm output length out of range"))?;
 
-    // Cap the output size BEFORE bounds-checking or parsing (issue #965 review
-    // round 8): `out_len` is guest-controlled and, while bounded by live guest
-    // memory (≤ the 16 MiB ceiling), a large in-bounds buffer would otherwise
-    // make the host spend CPU (outside the guest's fuel/epoch budget) and
-    // balloon host memory in `serde_json::from_slice`. An oversized output is a
+    // Cap the output size BEFORE bounds-checking or parsing (issue #965).
+    // `out_len` is guest-controlled. Live guest memory bounds it (≤ the 16 MiB
+    // ceiling). But a large in-bounds buffer still makes the host spend CPU
+    // outside the guest's fuel/epoch budget. It also balloons host memory in
+    // `serde_json::from_slice`. An oversized output is a
     // deterministic guest bug, so reject it non-retryably rather than parsing.
     if out_len > WASM_MAX_OUTPUT_BYTES {
         return Err(ActivityFailure::wasm_output_too_large(format!(
@@ -1511,16 +1511,16 @@ mod tests {
         );
     }
 
-    /// SECURITY regression (issue #965 review, Finding 26): a guest that calls
-    /// the granted `env_get` with a huge but fully **in-bounds** `key_len`
-    /// (~16 MiB, pointing at valid guest memory) must be rejected by the
-    /// longest-allowlisted-key cap BEFORE the host reads/`from_utf8`-validates
-    /// the slice. This is the case the round-1 no-alloc fix left open: the
-    /// `i32::MAX` sibling test is *out of range* (the slice read yields `None`),
-    /// so it never reached `from_utf8` even pre-fix; here the slice IS in range,
-    /// so pre-cap the host would `from_utf8`-scan the whole ~16 MiB (host CPU
-    /// uncharged to fuel — a `DoS` in a tight loop). Post-fix the length cap makes
-    /// it an in-band miss (-1) with no scan, no OOM, and no panic.
+    /// SECURITY regression (issue #965): a guest calls the granted `env_get`
+    /// with a huge but fully **in-bounds** `key_len` (~16 MiB, pointing at
+    /// valid guest memory). The longest-allowlisted-key cap must reject it
+    /// BEFORE the host reads/`from_utf8`-validates the slice. A no-alloc guard
+    /// alone leaves this case open. The `i32::MAX` sibling test is *out of
+    /// range* (the slice read yields `None`), so it never reaches `from_utf8`.
+    /// Here the slice IS in range. Without the cap the host `from_utf8`-scans
+    /// the whole ~16 MiB, host CPU that fuel does not charge (a `DoS` in a
+    /// tight loop). The length cap makes it an in-band miss (-1) with no scan,
+    /// no OOM, and no panic.
     const ENV_HUGE_INBOUNDS_KEYLEN_WAT: &str = r#"
         (module
           (import "env" "env_get" (func $e (param i32 i32 i32 i32) (result i32)))
@@ -2195,12 +2195,13 @@ mod tests {
 
     #[test]
     fn rng_seed_stream_is_not_a_fixed_process_constant() {
-        // Issue #965 review round 10: the seed counter used to start from a fixed
-        // constant, so invocation N in ANY process drew an identical stream. It is
-        // now initialised from OS entropy. We cannot observe a "restart" in-process,
-        // so assert the property that made the old behaviour reproducible: the very
-        // first seed is not the hard-coded golden-ratio start value, and successive
-        // seeds advance (and stay nonzero, which xorshift64 requires).
+        // Issue #965: the seed counter used to start from a fixed constant, so
+        // invocation N in ANY process drew an identical stream. It is now
+        // initialised from OS entropy. A test cannot observe a "restart"
+        // in-process. So assert the property that made the old behaviour
+        // reproducible. The very first seed is not the hard-coded golden-ratio
+        // start value. Successive seeds advance and stay nonzero, which
+        // xorshift64 requires.
         const OLD_FIXED_START: u64 = 0x9E37_79B9_7F4A_7C15;
         let first = next_rng_seed();
         let second = next_rng_seed();
@@ -2219,11 +2220,11 @@ mod tests {
 
     #[test]
     fn sandbox_denial_outranks_a_concurrent_cancellation() {
-        // Issue #965 review round 10: an ungranted import is a permanent
-        // misconfiguration. If the cancellation token fires while `instantiate`
-        // is failing on that import, the failure must still be reported as the
-        // NON-retryable `SandboxDenied` — reporting a retryable "cancelled"
-        // would spend the whole retry budget rediscovering the same denial.
+        // Issue #965: an ungranted import is a permanent misconfiguration. The
+        // cancellation token can fire while `instantiate` fails on that import.
+        // The failure must still be reported as the NON-retryable
+        // `SandboxDenied`. A retryable "cancelled" report would spend the whole
+        // retry budget rediscovering the same denial.
         let store = WasmModuleStore::new();
         let module = compile(&store, &deny_guest_importing("now_millis"));
         let cancel = CancellationToken::new();
@@ -2423,13 +2424,13 @@ mod tests {
 
     #[test]
     fn dispatch_start_overhead_fails_fast_before_the_guest() {
-        // Finding 21 (issue #965 review round 9): the invoke path charges ALL
-        // pre-guest overhead — resolution + fetch + compile + input
-        // serialization + store setup — against the start-to-close deadline,
-        // measured at the last host-only moment before the guest's epoch is
-        // armed. A `dispatch_start` already past the deadline must fail fast as a
-        // retryable ResourceExhausted WITHOUT invoking the guest, proven with an
-        // ECHO module that would otherwise return Ok(input) within a single tick.
+        // Issue #965: the invoke path charges ALL pre-guest overhead against
+        // the start-to-close deadline. That is resolution + fetch + compile +
+        // input serialization + store setup. It is measured at the last
+        // host-only moment before the guest's epoch is armed. A `dispatch_start`
+        // already past the deadline must fail fast as a retryable
+        // ResourceExhausted WITHOUT invoking the guest. The test proves it with
+        // an ECHO module that would otherwise return Ok(input) within one tick.
         let store = WasmModuleStore::new();
         let module = compile(&store, ECHO_WAT);
         let input = serde_json::json!({ "sentinel": "must-not-echo" });
@@ -2461,7 +2462,8 @@ mod tests {
     fn dispatch_start_within_budget_runs_the_guest() {
         // The complement: negligible pre-guest overhead leaves the guest
         // essentially its full budget, so the ECHO module runs and returns
-        // Ok(input) (round-7 in-budget behaviour preserved through the move).
+        // Ok(input). The in-budget behaviour survives the move to pre-guest
+        // accounting.
         let store = WasmModuleStore::new();
         let module = compile(&store, ECHO_WAT);
         let input = serde_json::json!({ "echo": "me" });

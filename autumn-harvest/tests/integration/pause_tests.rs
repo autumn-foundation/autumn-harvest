@@ -920,8 +920,7 @@ async fn resume_shifts_scheduled_at_for_frozen_rows_only() {
     );
 }
 
-// ── Second bot-review round (issue #609 post-review hardening): scan-vs- ────
-// ── enforce races in the timeout scanners ───────────────────────────────────
+// ── Issue #609 hardening: scan-vs-enforce races in the timeout scanners ─────
 
 /// Inserts a PENDING activity task with a caller-chosen `activity_id` so a
 /// matching non-terminal `ActivityScheduled` event can be appended to history
@@ -971,18 +970,18 @@ async fn hold_execution_row_lock(conn: &mut AsyncPgConnection, exec_id: Executio
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn activity_schedule_to_close_enforcement_yields_to_a_pause_committed_after_the_scan() {
-    // Second bot-review round, finding A (issue #609 post-review hardening,
-    // P2): the ScheduleToClose scanner's PAUSED exclusion protects only the
-    // `find_timed_out_tasks` SELECT snapshot. `enforce_activity_timeout`
-    // then locks the execution row — but previously never re-checked whether
-    // the locked row was now PAUSED, so a pause committing after the scan
-    // (or while enforcement waited on the lock) still appended
-    // `ActivityTimedOut { ScheduleToClose }` and failed the task mid-pause.
+    // Issue #609 hardening, finding A: the PAUSED exclusion of the
+    // ScheduleToClose scanner protects only the `find_timed_out_tasks`
+    // SELECT snapshot. `enforce_activity_timeout` then locks the execution
+    // row. It previously never re-checked whether the locked row was now
+    // PAUSED. So a pause that committed after the scan (or while enforcement
+    // waited on the lock) still appended `ActivityTimedOut { ScheduleToClose }`
+    // and failed the task mid-pause.
     // Choreography: hold the execution row lock on one connection, queue the
-    // real pause behind it, then start the scanner — its scan snapshot (a
+    // real pause behind it, then start the scanner. Its scan snapshot (a
     // non-locking read) sees the still-RUNNING execution and picks up the
-    // expired task, and its enforcement transaction queues on the row lock
-    // BEHIND the pause. Releasing the lock lets the pause commit first; the
+    // expired task. Its enforcement transaction queues on the row lock
+    // BEHIND the pause. Releasing the lock lets the pause commit first. The
     // authoritative locked re-check must then skip enforcement entirely.
     use autumn_harvest::timeout::enforce_timeouts_once;
 
@@ -1099,19 +1098,18 @@ async fn activity_schedule_to_close_enforcement_yields_to_a_pause_committed_afte
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn external_task_enforcement_yields_to_a_pause_committed_after_the_scan() {
-    // Second bot-review round, finding B (issue #609 post-review hardening,
-    // P2): the external-task scan's PAUSED check was a non-locking NOT EXISTS
-    // subquery inside the claiming UPDATE — it never serialized with
-    // `pause_workflow_execution` (which locks only the execution row), so a
-    // pause committing between the UPDATE's snapshot and the event append
-    // still flipped the external task to TIMED_OUT and appended
-    // `ActivityTimedOut` mid-pause. The per-task transaction now locks the
-    // external-task row first (third bot-review round: task-row-first is the
-    // harvest_external_tasks convention set by the completion paths — taking
-    // the execution lock first was an ABBA inversion against
-    // `complete_externally`/`fail_externally`/`extend_deadline`), THEN the
-    // execution row, and re-checks PAUSED under the execution lock — so the
-    // state flip and the event append still serialize with the pause path.
+    // Issue #609 hardening, finding B: the PAUSED check of the external-task
+    // scan was a non-locking NOT EXISTS subquery inside the claiming UPDATE.
+    // It never serialized with `pause_workflow_execution`, which locks only
+    // the execution row. So a pause that committed between the UPDATE
+    // snapshot and the event append still flipped the external task to
+    // TIMED_OUT and appended `ActivityTimedOut` mid-pause. The per-task
+    // transaction now locks the external-task row first, THEN the execution
+    // row. It re-checks PAUSED under the execution lock, so the state flip
+    // and the event append still serialize with the pause path.
+    // Task-row-first is the harvest_external_tasks convention set by the
+    // completion paths. Taking the execution lock first was an ABBA inversion
+    // against `complete_externally`/`fail_externally`/`extend_deadline`.
     // Same choreography as the sibling task-queue test above.
     use autumn_harvest::timeout::enforce_external_task_timeouts;
 
@@ -1400,19 +1398,19 @@ async fn retry_path_requeues_when_a_concurrent_resume_shifted_the_deadline() {
     );
 }
 
-// ── Round 2 (issue #609 post-review hardening): pause after the gate ────────
+// ── Issue #609 hardening: pause after the gate ──────────────────────────────
 
 /// Activity handler that reproduces an operator pause committing in the gap
 /// between the retry path's non-locking `owning_execution_is_paused` gate and
 /// `record_schedule_to_close_activity_timeout`'s transaction taking the
-/// execution row lock. Mirroring the round-3 lock-holding precedent
-/// (`wake_workflow_task_retries_after_losing_the_park_row_lock_race`): a hold
-/// connection takes the execution row's `FOR UPDATE` lock in an explicit
-/// open `BEGIN`, a second connection queues the *real*
-/// `pause_workflow_execution` behind it, and the hold is released only after
-/// this attempt's retryable failure has passed the gate (reading the still
-/// committed-RUNNING snapshot) and blocked on the row lock — so the pause
-/// commits first in the lock queue and the timeout transaction observes a
+/// execution row lock. It mirrors the lock-holding precedent of
+/// `wake_workflow_task_retries_after_losing_the_park_row_lock_race`. A hold
+/// connection takes the `FOR UPDATE` lock of the execution row in an explicit
+/// open `BEGIN`. A second connection queues the *real*
+/// `pause_workflow_execution` behind it. The hold is released only after the
+/// retryable failure of this attempt has passed the gate (reading the still
+/// committed-RUNNING snapshot) and blocked on the row lock. So the pause
+/// commits first in the lock queue. The timeout transaction then observes a
 /// now-PAUSED execution whose row deadline IS exceeded. Only the
 /// in-transaction PAUSED re-check can save the task from being
 /// deadline-failed mid-pause.
@@ -1491,20 +1489,20 @@ fn self_pausing_activity<'a>(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(clippy::too_many_lines)]
 async fn retry_path_requeues_when_a_concurrent_pause_committed_after_the_gate() {
-    // Round 2 (issue #609 post-review hardening, P2): the retry path's
-    // `owning_execution_is_paused` gate is a non-locking read taken BEFORE
+    // Issue #609 hardening: the `owning_execution_is_paused` gate of the
+    // retry path is a non-locking read taken BEFORE
     // `record_schedule_to_close_activity_timeout` opens its transaction and
     // takes the execution row lock. A pause committing in that gap used to
     // be deadline-failed anyway (the transaction only re-checked task state
-    // and the row-current deadline), violating the
+    // and the row-current deadline). That violated the
     // pause-suspends-schedule_to_close contract for the race window. The
     // authoritative PAUSED re-check under the execution row lock is the
-    // guarantee; this test constructs the race window by letting the activity
-    // itself queue a real pause of its own execution behind a held row lock
+    // guarantee. This test constructs the race window: the activity itself
+    // queues a real pause of its own execution behind a held row lock
     // mid-attempt (released only after the failure reaches the retry path).
     // Both the claim-time snapshot deadline AND the row-current deadline are
-    // exceeded, so neither the snapshot gate nor the resume-shift staleness
-    // re-check can save the task — only the new PAUSED re-check.
+    // exceeded. So neither the snapshot gate nor the resume-shift staleness
+    // re-check can save the task, only the new PAUSED re-check.
     use autumn_harvest::info::ActivityInfo;
     use autumn_harvest::queue::{EnqueueParams, TaskType};
     use autumn_harvest::types::ActivityExecId;

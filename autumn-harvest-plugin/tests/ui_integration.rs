@@ -4282,7 +4282,7 @@ async fn ui_schedules_pause_redirect_resolves_to_the_list() {
     );
 }
 
-/// Codex round 1 #3: an auto-paused schedule (#360 sets `auto_paused_at`
+/// An auto-paused schedule (#360 sets `auto_paused_at`
 /// **without** `is_paused`) must be resumable from Vantage — per row and in
 /// bulk — and the resume must clear the auto-pause state the way the API's does,
 /// or the next tick immediately re-pauses it.
@@ -4391,7 +4391,7 @@ async fn ui_schedules_bulk_resume_reaches_auto_paused_rows() {
     );
 }
 
-/// Codex round 1 #2: the preview drill-down must render for a schedule on a
+/// The preview drill-down must render for a schedule on a
 /// healthy shard even when an earlier shard is unreachable — the resilient
 /// resolver found the row, so a second fragile lookup must not undo that.
 #[tokio::test]
@@ -4448,10 +4448,9 @@ async fn ui_schedules_preview_survives_an_unreachable_earlier_shard() {
     );
 }
 
-/// Codex round 2 #2: the backfill launcher must work for a schedule on a
-/// healthy shard while an earlier shard is unreachable. Round 1 fixed the
-/// preview instance; the shared lookup underneath is now resilient, so the
-/// backfill path is covered by the same rule.
+/// The backfill launcher must work for a schedule on a healthy shard while an
+/// earlier shard is unreachable. The preview and the backfill path share one
+/// resilient lookup, so the same rule covers both.
 #[tokio::test]
 async fn ui_schedules_backfill_survives_an_unreachable_earlier_shard() {
     let (good_url, _container) = setup_test_database_url().await;
@@ -4517,7 +4516,7 @@ async fn ui_schedules_backfill_survives_an_unreachable_earlier_shard() {
     );
 }
 
-/// Codex round 2 #3: a schedule that is terminal on its live bounds but whose
+/// A schedule that is terminal on its live bounds but whose
 /// tick never stamped `exhausted_at` must still read as unhealthy on the list.
 #[tokio::test]
 async fn ui_schedules_list_flags_a_row_bounded_out_before_its_tick_stamped_it() {
@@ -4577,7 +4576,7 @@ async fn ui_schedules_list_flags_a_row_bounded_out_before_its_tick_stamped_it() 
     );
 }
 
-/// Codex round 2 #1: a legacy `max_runs = 0` row is unlimited, and must not be
+/// A legacy `max_runs = 0` row is unlimited, and must not be
 /// rendered as a spent budget or flagged unhealthy.
 #[tokio::test]
 async fn ui_schedules_zero_run_cap_renders_as_unlimited() {
@@ -6519,13 +6518,13 @@ async fn workflow_detail_ui_renders_decoded_input() {
     // payload is an envelope. The panel renders the checkpoint and the
     // timeline renders each event's data; the blocked-on activity *input*
     // and signal *payload* are never rendered, so they are deliberately NOT
-    // decoded (PR #936 review, round 5) — their plaintext must not appear
+    // decoded (PR #936) — their plaintext must not appear
     // anywhere in the page.
     {
         // `load_history_undecoded`: the seeded `WorkflowStarted` input is a
         // "reverse"-codec envelope, and the strict `load_history` (identity-only
         // registry) hard-errors `UnknownPayloadCodec` on it — the exact
-        // strict-loader behavior PR #936 round 2 documented. The raw loader is
+        // strict-loader behavior PR #936 documented. The raw loader is
         // the correct fixture tool for reading `next_event_id` here.
         let history = autumn_harvest::store::load_history_undecoded(&mut conn, exec_id)
             .await
@@ -6616,7 +6615,7 @@ async fn workflow_detail_ui_renders_decoded_input() {
         !html.contains("_harvest_codec_envelope"),
         "workflow detail must not render the raw envelope: {html}"
     );
-    // Hidden fields are not decoded (PR #936 round 5): their plaintext never
+    // Hidden fields are not decoded (PR #936): their plaintext never
     // reaches the page.
     assert!(
         !html.contains("pii-detail-task-input"),
@@ -6744,7 +6743,7 @@ async fn rejected_signal_render_attributes_decode_audit_to_the_post_route() {
     );
 }
 
-/// Issue #608 / PR #936 round 5: a detail render whose *only* envelopes live
+/// Issue #608 / PR #936: a detail render whose *only* envelopes live
 /// in fields the page never displays — the pending-activity `input`, the
 /// pending-signal payload, and the attempts/signals panel event copies
 /// (isolated from the timeline via `?event_page=1`) — must do zero decode

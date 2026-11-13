@@ -1,4 +1,4 @@
-//! Regression tests for the two Codex #1069 P2 review findings on commit `48d54b2`.
+//! Regression tests for the two #1069 review findings on commit `48d54b2`.
 //!
 //! - **FINDING 1** (`queue.rs`) — a deterministic `arm_seq` tie-breaker so several
 //!   timers armed with the same `fire_at` (e.g. `tokio::join!(ctx.timer("a", 1),

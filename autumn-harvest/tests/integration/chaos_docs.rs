@@ -45,7 +45,7 @@ fn read_chaos_doc() -> String {
 }
 
 /// Return the body of the first ` ```bash ` fenced block containing `needle`,
-/// scanning subsequent blocks if an earlier one doesn't match. Panics with a
+/// scanning subsequent blocks if an earlier one does not match. Panics with a
 /// message naming what was searched for if no such block exists.
 fn bash_block_containing<'a>(doc: &'a str, needle: &str) -> &'a str {
     let mut search_from = 0;

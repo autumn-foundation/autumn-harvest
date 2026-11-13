@@ -1975,7 +1975,7 @@ pub(crate) fn checkpoint_budget_decisions(sizes: &[Option<u64>], budget: u64) ->
 }
 
 /// Apply [`checkpoint_budget_decisions`] to a stack response so a fan-out
-/// workflow with many heartbeating activities can't return roughly
+/// workflow with many heartbeating activities cannot return roughly
 /// `count × cap` bytes (#503 review). Withheld checkpoints get
 /// `heartbeat_details = None` + `heartbeat_details_omitted_for_budget = true`,
 /// while their `heartbeat_details_bytes` size is still reported. Returns `true`
@@ -2010,7 +2010,7 @@ pub(crate) fn apply_checkpoint_response_budget(
 
 /// Apply [`checkpoint_budget_decisions`] to the decoded pending-activity
 /// inputs of a stack response, mirroring [`apply_checkpoint_response_budget`]
-/// so a fan-out workflow with many pending activities can't return roughly
+/// so a fan-out workflow with many pending activities cannot return roughly
 /// `count × cap` bytes of decoded inputs (issue #608, PR #936 review).
 /// Withheld inputs get `input = None` + `input_omitted_for_budget =
 /// Some(true)`, while their `input_bytes` size is still reported. Returns
@@ -4004,7 +4004,7 @@ impl HistoryBatchExportWork {
 
     /// Record a candidate that discovery already **selected** but the export
     /// could not produce a document for because its shard became unreachable
-    /// in between (Codex round-11 P1).
+    /// in between.
     ///
     /// Deliberately records *both* signals, because they answer different
     /// questions and only one of them is load-bearing for the replay gate:
@@ -4178,8 +4178,8 @@ async fn list_gates_handler(
 /// fail-closed. Returns the reloaded active-gate count so the caller can emit the
 /// `admission_gates_active` metric.
 ///
-/// On a reload FAILURE, arm fail-closed (issue #618, F-round22, superseding the
-/// F-round16 "do NOT arm fail-closed" decision) and return `None`. While the gate
+/// On a reload FAILURE, arm fail-closed (issue #618) and return `None`. An earlier
+/// design did NOT arm fail-closed here; this one supersedes it. While the gate
 /// table is momentarily unreadable, `check()` — the API / fresh-admission path,
 /// which CAN retry — must return the synthetic block until a successful refresh
 /// reconciles ALL active gates, rather than serving fresh admissions from a
@@ -4191,12 +4191,12 @@ async fn list_gates_handler(
 /// conservative behaviour for a safety control during a gate-table outage
 /// (over-block briefly rather than leak), bounded by the <=1s background refresh.
 ///
-/// The already-applied write-through delta is retained and load-bearing:
-/// `check_cached` — the completion-trigger / in-flight-continuation path, which
-/// CANNOT retry — ignores the fail-closed flag (round 3) and reads the snapshot,
-/// so the just-created gate is still matched (and the just-lifted gate no longer
-/// matched) there, and no in-flight work is permanently dropped. Fail-closed is
-/// therefore transient: the next successful reload re-arms `initialized = true`.
+/// The already-applied write-through delta is retained and load-bearing.
+/// `check_cached` is the completion-trigger / in-flight-continuation path, which
+/// CANNOT retry. It ignores the fail-closed flag and reads the snapshot. So the
+/// just-created gate is still matched there, and the just-lifted gate no longer
+/// matches. No in-flight work is permanently dropped. Fail-closed is therefore
+/// transient: the next successful reload re-arms `initialized = true`.
 fn reconcile_gate_cache_after_mutation<E: std::fmt::Display>(
     cache: &autumn_harvest::AdmissionGateCache,
     op: &'static str,
@@ -4275,7 +4275,7 @@ async fn create_gate_handler(
     match result {
         Ok(gate) => {
             // Write-through the just-persisted gate into the in-memory snapshot
-            // (issue #618, F-round16) BEFORE the full refresh, so this replica
+            // (issue #618) BEFORE the full refresh, so this replica
             // honours the new gate even if the follow-up load fails. The gate was
             // persisted to the DB first (create_gate above), so the snapshot is now
             // accurate for this change regardless of the refresh outcome. This
@@ -4283,13 +4283,13 @@ async fn create_gate_handler(
             // does NOT retry after a synthetic fail-closed block — a stale-open
             // snapshot here would durably MISS the new gate.
             api_state.gate_cache().apply_created(gate.clone());
-            // Reconcile any OTHER concurrent changes with a full refresh; on a
-            // reload failure arm fail-closed so check() blocks fresh admissions
-            // until the gate table is readable (issue #618, F-round22 — see
+            // Reconcile any OTHER concurrent changes with a full refresh. On a
+            // reload failure, arm fail-closed so check() blocks fresh admissions
+            // until the gate table is readable (issue #618; see
             // reconcile_gate_cache_after_mutation for the full rationale). The
-            // round-16 write-through above is retained: check_cached ignores the
-            // fail-closed flag (round 3) and keeps honouring the just-created gate,
-            // so completion triggers / in-flight continuation are unaffected.
+            // write-through above is retained: check_cached ignores the
+            // fail-closed flag and keeps honouring the just-created gate, so
+            // completion triggers / in-flight continuation are unaffected.
             if let Some(count) = reconcile_gate_cache_after_mutation(
                 api_state.gate_cache().as_ref(),
                 "create",
@@ -4372,25 +4372,25 @@ async fn lift_gate_handler(
     let id_str = id.to_string();
     match admission_gate_db::lift_gate(&mut conn, id, &actor).await {
         Ok(Some(_gate)) => {
-            // Write-through the lift into the in-memory snapshot (issue #618,
-            // F-round16) BEFORE the full refresh, so the just-lifted gate stops
+            // Write-through the lift into the in-memory snapshot (issue #618)
+            // BEFORE the full refresh, so the just-lifted gate stops
             // matching on this replica even if the follow-up load fails. The lift
             // was persisted to the DB first (lift_gate above). This is what makes a
             // lift durable for the completion-trigger path (check_cached): a
             // stale-open snapshot here would keep dropping targets as
             // admission_blocked against a gate the operator already lifted.
             api_state.gate_cache().apply_lifted(id);
-            // Reconcile any OTHER concurrent changes with a full refresh; on a
-            // reload failure arm fail-closed so check() blocks fresh admissions
-            // until the gate table is readable (issue #618, F-round22 — see
+            // Reconcile any OTHER concurrent changes with a full refresh. On a
+            // reload failure, arm fail-closed so check() blocks fresh admissions
+            // until the gate table is readable (issue #618; see
             // reconcile_gate_cache_after_mutation for the full rationale). This
-            // briefly OVER-BLOCKS — including re-blocking the just-lifted work —
-            // which is the correct conservative behaviour for a safety control
-            // during a gate-table outage (over-block briefly rather than risk
-            // leaking a start past another replica's still-active gate), bounded by
-            // the <=1s refresh. The round-16 write-through above is retained:
-            // check_cached ignores the fail-closed flag (round 3) and the lifted
-            // gate no longer matches there, so in-flight continuation is unaffected.
+            // briefly OVER-BLOCKS, including the just-lifted work. That is the
+            // correct conservative behaviour for a safety control during a
+            // gate-table outage. It is better to over-block briefly than to leak a
+            // start past the still-active gate of another replica. The <=1s
+            // refresh bounds the over-block. The write-through above is retained:
+            // check_cached ignores the fail-closed flag and the lifted gate no
+            // longer matches there, so in-flight continuation is unaffected.
             if let Some(count) = reconcile_gate_cache_after_mutation(
                 api_state.gate_cache().as_ref(),
                 "lift",
@@ -10661,8 +10661,8 @@ async fn submit_batch_operation(
         // `observe_shards`/`workflow_count`).
         let pools = crate::shard_fanout::pools_by_shard(&api_state);
         let expected = crate::shard_fanout::expected_shards(&api_state, &pools);
-        // Track how many sample rows we've already pulled so we can SKIP the
-        // sample query on a shard once the global cap is filled (count-only
+        // Track how many sample rows are already pulled, to SKIP the sample
+        // query on a shard once the global cap is filled (count-only
         // continuation). An unreachable shard degrades this preview to
         // `status = "partial"` instead of failing the whole request with a 500
         // (mirrors `POST /workflows/batch_reset`).
@@ -11747,7 +11747,7 @@ pub(crate) fn parse_search_attr_filter(raw: &str) -> Result<SearchAttrPredicate,
     };
 
     match op {
-        // Trim the value before coercion so whitespace can't silently flip the
+        // Trim the value before coercion so whitespace cannot silently flip the
         // inferred type (matches the `in`/comparison ops, issue #506 review).
         "eq" => Ok(SearchAttrPredicate::Eq {
             key: key.to_string(),
@@ -12703,7 +12703,7 @@ async fn get_workflow_history(
 
     let (mut conn, exec_shard) = db_conn_for_execution_with_shard(&api_state, exec_id).await?;
 
-    // 404 when the execution doesn't exist — cheaper than a full-row load.
+    // 404 when the execution does not exist — cheaper than a full-row load.
     if !autumn_harvest::store::check_execution_exists(&mut conn, exec_id)
         .await
         .map_err(map_error)?
@@ -13027,7 +13027,7 @@ pub(crate) async fn resolve_terminal_workflow_execution(
 ) -> Result<WorkflowExecution, AutumnError> {
     let mut current_id = exec_id;
     let mut last_continued_as_new: Option<WorkflowExecution> = None;
-    // Bound the chain walk so a pathological cycle can't loop forever.
+    // Bound the chain walk so a pathological cycle cannot loop forever.
     for _ in 0..128 {
         let execution = match load_execution_following_retries(api_state, current_id).await {
             Ok(e) => e,
@@ -15386,9 +15386,9 @@ fn worker_can_claim_now(worker: &WorkerRow, queue_name: &str, shard_id: i32) -> 
 /// `activity_name`, and that list is computed **on each worker** from **that
 /// worker's own** registry (`Worker::new`). Reading an absent snapshot as "no
 /// requirements" would report `healthy_in_progress` for a task no live worker
-/// can claim (issue #809, round 11) -- but the local registry describes only
-/// *this* process's build, so the fallback is per-worker evidence and callers
-/// must consult [`registry_fallback_binds`] before rejecting anyone on it.
+/// can claim (issue #809). But the local registry describes only the build of
+/// *this* process. So the fallback is per-worker evidence, and callers must
+/// consult [`registry_fallback_binds`] before rejecting anyone on it.
 ///
 /// Mirrors `queue::apply_activity_requirements` (the shard-health coverage
 /// backfill) and the eligibility explainer's own resolution (issue #611), so
@@ -15610,12 +15610,12 @@ fn local_circuit_snapshot_is_authoritative(
 ///
 /// `worker_build_ids` maps worker id -> advertised build id, built ONCE by
 /// the caller from the same `workers` slice [`eligible_worker_ids`] already
-/// scanned to produce `eligible_ids` (issue #1190 review round 1). Looking a
+/// scanned to produce `eligible_ids` (issue #1190). Looking a
 /// worker's build up here is therefore an O(1) map hit rather than a second
 /// O(workers) linear scan per eligible id, which would otherwise make a wide
 /// fan-out with many eligible workers quadratic in fleet size.
 ///
-/// Vacuously `true` for an empty `eligible_ids` (issue #1190 review round 2):
+/// Vacuously `true` for an empty `eligible_ids` (issue #1190):
 /// with no candidate worker there is no OTHER build the local fact could
 /// disagree with, so the "every worker agrees" claim holds trivially, same as
 /// the standard reading of a universally-quantified statement over an empty
@@ -15999,7 +15999,7 @@ pub(crate) async fn build_diagnosis_report(
     // (issue #1190) short-circuits to `false` on `locally_tracked` alone,
     // with no build check at all, so a locally-tracked activity's key can
     // never surface regardless of what its eligible workers' builds are.
-    // Filtering it out here (issue #1190 review round 1) therefore loses no
+    // Filtering it out here (issue #1190) therefore loses no
     // coverage and avoids sending a large, unfiltered fan-out of dynamic
     // bucket keys to Postgres for lookups the per-task gate would discard
     // unconditionally anyway. Only the OTHER direction -- untracked here but
@@ -16098,7 +16098,7 @@ pub(crate) async fn build_diagnosis_report(
     // [`registry_fallback_binds`]). `None` for an API-only replica.
     let local_build_id = local_build_id_from_workers(&live_workers, local_worker_id.as_deref());
     // Worker id -> advertised build id, built ONCE for every task's
-    // `rate_limit_gate_applies` call (issue #1190 review round 1) rather than
+    // `rate_limit_gate_applies` call (issue #1190) rather than
     // re-scanning `live_workers` per eligible id per task -- see
     // `every_eligible_worker_is_on_the_local_build`.
     let worker_build_ids: std::collections::HashMap<&str, &str> = live_workers
@@ -16179,7 +16179,7 @@ pub(crate) async fn build_diagnosis_report(
             };
             // Authoritative, straight from the registry's own flag -- NEVER
             // inferred from whether `circuit_cooldown_until` could be
-            // computed (issue #1193 Codex round-1 P2): a policy cooldown
+            // computed (issue #1193): a policy cooldown
             // outside `chrono`'s representable range ALSO makes
             // `circuit_cooldown_until` return `None` for a breaker that was
             // tripped organically, which would otherwise be indistinguishable
@@ -17292,7 +17292,7 @@ async fn get_workflow_stack(
             // cap projection. Both operate on the response copy only. The
             // decoded input is projected against the activity's effective
             // input cap further below (PR #936 review), mirroring the
-            // checkpoint projection, so a large fan-out can't bloat the
+            // checkpoint projection, so a large fan-out cannot bloat the
             // response.
             let mut heartbeat_details = t.heartbeat_details;
             let decoded_input = if let Some(codecs) = decoder.as_ref() {
@@ -17335,7 +17335,7 @@ async fn get_workflow_stack(
 
             // Judge the checkpoint against this activity's effective result cap
             // (per-activity override raised against the global ceiling), matching
-            // the worker, so configured large-payload activities aren't wrongly
+            // the worker, so configured large-payload activities are not wrongly
             // truncated (#503 review).
             let heartbeat_cap = stack_runtime
                 .as_ref()
@@ -17464,7 +17464,7 @@ async fn get_workflow_stack(
     let mut pending_activities = pending_activities;
     pending_activities.extend(external_pending);
     // Bound the total checkpoint bytes returned across all pending activities so
-    // a large fan-out can't return roughly `count × cap` bytes (#503 review).
+    // a large fan-out cannot return roughly `count × cap` bytes (#503 review).
     // The per-response budget reuses the global activity-result cap.
     let checkpoints_truncated_for_budget =
         apply_checkpoint_response_budget(&mut pending_activities, default_heartbeat_cap);
@@ -18883,7 +18883,7 @@ pub(crate) async fn start_workflow(
 
     // A debounced start's execution lands on the debounce-key's shard, not this
     // workflow-id-derived `shard`. Skip the workflow-id-shard gate for debounced
-    // starts so a gate on that shard can't reject a request whose work would be
+    // starts so a gate on that shard cannot reject a request whose work would be
     // created elsewhere; the debounce block below enforces the gate on the
     // correct (debounce-key) shard transactionally. This is safe: a debounced
     // request only creates NEW work on the debounce shard — the fall-through to
@@ -19457,7 +19457,7 @@ pub(crate) async fn start_workflow(
             // Validate a supplied execution_timeout_secs at admission: it is stored
             // as a raw i64 and the fire path converts it with `try_seconds`, which
             // silently yields `None` for an out-of-range value — dropping both the
-            // requested timeout and the workflow default (and the ceiling can't clamp
+            // requested timeout and the workflow default (and the ceiling cannot clamp
             // `None`). Reject the bad value here instead (issue #499). Negative is
             // also rejected; a non-positive deadline is never a meaningful timeout.
             if let Some(secs) = request.execution_timeout_secs
@@ -19541,7 +19541,7 @@ pub(crate) async fn start_workflow(
                     .map(|d| d.num_seconds())
             });
 
-            // Effective server-side ceiling captured so the fire path can't bypass it.
+            // Effective server-side ceiling captured so the fire path cannot bypass it.
             let effective_ceiling_secs = api_state
                 .max_workflow_execution_timeout()
                 .and_then(|d| chrono::Duration::from_std(d).ok())
@@ -20163,7 +20163,7 @@ pub(crate) async fn start_workflow(
     // `try_seconds` avoids a panic on an out-of-range untrusted `i64`, and the
     // non-negative filter rejects negative inputs (which would breach immediately).
     // The resolved SLA is clamped against the workflow's declared
-    // `execution_timeout` default so an API-started run can't get a softer SLA
+    // `execution_timeout` default so an API-started run cannot get a softer SLA
     // deadline than its declared hard timeout (the core also clamps against any
     // request-supplied execution_timeout).
     let effective_sla = request
@@ -21216,7 +21216,7 @@ async fn batch_start_workflows(
             )
         {
             // A debounced item with no explicit workflow_id is *definitely* a fresh
-            // start (a generated id can't collide), which batch cannot debounce-admit.
+            // start (a generated id cannot collide), which batch cannot debounce-admit.
             // Reject it in pre-validation so an atomic batch aborts before any earlier
             // item is started + committed (Codex 6929). A debounced item *with* a
             // workflow_id may attach to an existing run, so it is resolved per-item
@@ -21243,7 +21243,7 @@ async fn batch_start_workflows(
             // workflow_id), determining whether a throttled item would attach to an
             // already-active execution (bypassing the bucket, same as a plain start)
             // versus admit fresh requires a DB lookup this in-memory pre-validation
-            // pass deliberately doesn't perform (issue #357) -- so every atomic item
+            // pass deliberately does not perform (issue #357) -- so every atomic item
             // for a throttled workflow is rejected unconditionally, the conservative
             // choice that closes the bypass without a false admit. Reject here (not
             // silently skip the throttle check as before) so an atomic batch can
@@ -23242,10 +23242,10 @@ pub(crate) async fn signal_with_start_workflow(
     // check closed a TOCTOU window (an unlocked pre-scan could observe a live
     // execution that completes before the core resolver's lock, escalating to
     // a fresh start) at the cost of a real bug: it rejected a signal to an
-    // already-running execution whenever the signal payload didn't match the
+    // already-running execution whenever the signal payload did not match the
     // workflow's *start*-input schema, even though start_input is never
     // written on an attach (issue #918 review). Passing `workflow_info` below
-    // lets the core primitive validate at the only point that's both race-
+    // lets the core primitive validate at the only point that is both race-
     // free and semantically correct -- inside the lock, only when `created`.
 
     let trace_ctx = tracing::info_span!(
@@ -27697,7 +27697,7 @@ pub(crate) async fn signal_workflow(
         }
     }
 
-    // Fail closed if the runtime isn't installed yet, rather than silently
+    // Fail closed if the runtime is not installed yet, rather than silently
     // skipping the schema/cap checks below. `install_storage_pool` runs before
     // `install(runtime)` during plugin startup (with a genuine `.await` -- the
     // boot-time admission-gate load -- in between), so a request can reach this
@@ -29109,7 +29109,7 @@ pub(crate) async fn resolve_schedule_with_shard(
 
     let mut any_shard_unreachable = false;
     for shard_id in &expected {
-        // Router-known but poolless (mid shard-add): can't check it, so treat
+        // Router-known but poolless (mid shard-add): cannot check it, so treat
         // it as unreachable — a not-found result becomes 503-indeterminate
         // rather than an authoritative 404.
         let Some(shard_pool) = pools.get(shard_id) else {
@@ -29163,7 +29163,7 @@ enum ScheduleExistenceOutcome {
     /// Every expected shard was queried successfully and none had the row — the
     /// id is genuinely unknown, so an authoritative `404`.
     NotFound,
-    /// The row wasn't found but at least one expected shard could not be checked
+    /// The row was not found but at least one expected shard could not be checked
     /// (no configured pool, unreachable connection, or a per-shard lookup
     /// error) — existence is indeterminate, so `503` rather than a lying `404`.
     Indeterminate,
@@ -29300,7 +29300,7 @@ pub(crate) async fn load_schedule_runs(
     validate_run_filters(&params)?;
 
     // Existence + next_run_at resolution consults the full expected shard set
-    // (router ∪ pools), so it 503s rather than 404s when a shard couldn't be
+    // (router ∪ pools), so it 503s rather than 404s when a shard could not be
     // checked; the runs fan-out below uses the *same* expected shard set so its
     // partial/complete status can never read `complete` while a router-known
     // shard was never queried (issue #762 review).
@@ -29571,7 +29571,7 @@ async fn upsert_workflow_schedule_and_read_back(
     // Reuse the single-source `scheduler::schedule_running_basis` (shard-local
     // `RUNNING`/`PAUSED` count, cross-type #1160 successors of this schedule_id
     // included, + #607 pending-throttle backlog) that list/get use; a count
-    // failure falls back to `false` (don't suppress the wedge signal).
+    // failure falls back to `false` (do not suppress the wedge signal).
     let name = row
         .dag_name
         .as_deref()
@@ -31783,7 +31783,7 @@ async fn trigger_schedule_now(
     // needed. A deferred trigger still counts as a spent run-budget slot
     // (mirrors the scheduler-tick/backfill precedent: the pre-incremented
     // `runs_started` above is NOT rolled back), so a repeatedly-triggered
-    // throttled schedule can't also bypass its own `max_runs` budget by
+    // throttled schedule cannot also bypass its own `max_runs` budget by
     // piling up pending rows.
     let mut trigger_throttle_bucket: Option<String> = None;
     if let Some((throttle_policy, resolved_throttle_key)) =
@@ -32645,7 +32645,7 @@ pub(crate) async fn schedule_backfill_inner(
 
     // Reject exhausted schedules — bounds have been reached and no more runs
     // should start via any path (issue #478). Also check live bounds in case
-    // the scheduler hasn't yet processed an already-violated row.
+    // the scheduler has not yet processed an already-violated row.
     {
         let now = chrono::Utc::now();
         let live_end_at_exceeded = schedule.end_at.is_some_and(|end| now >= end);
@@ -32877,7 +32877,7 @@ pub(crate) async fn schedule_backfill_inner(
         });
 
     // Count running executions once before the loop; track dispatched_this_call separately
-    // so we don't re-query on every timestamp. This value gates max_active_runs,
+    // so we do not re-query on every timestamp. This value gates max_active_runs,
     // so non-dry-run dispatch must not treat count failures as zero.
     let running_at_start = if uncapped {
         0
@@ -33024,7 +33024,7 @@ pub(crate) async fn schedule_backfill_inner(
     // exec `conn` — all budget statements are sequential, never two concurrent
     // connections. Only for a GENUINELY different pool (multi-shard) do we hold a
     // separate schedule connection across the loop, where concurrent holds across
-    // distinct pools don't contend. Assumption: distinct ShardIds map to distinct
+    // distinct pools do not contend. Assumption: distinct ShardIds map to distinct
     // pools in standard single/multi-shard topologies (single-shard always has
     // schedule_shard == exec_shard).
 
@@ -33097,7 +33097,7 @@ pub(crate) async fn schedule_backfill_inner(
                         .or_insert(0) += 1;
                     continue;
                 }
-                // Respect max_active_runs: skip if we've already saturated the limit.
+                // Respect max_active_runs: skip once the limit is saturated.
                 if running_at_start + dispatched_this_call >= max_active {
                     skipped += 1;
                     *skipped_reasons
@@ -33452,7 +33452,7 @@ pub(crate) async fn schedule_backfill_inner(
                                 // shortcut), not a new admission. Report it as
                                 // already-consumed rather than a fresh
                                 // dispatch, so a repeated identical backfill
-                                // request can't double-count the slot as
+                                // request cannot double-count the slot as
                                 // dispatched or double-spend max_runs budget
                                 // for it (code review, issue #607).
                                 let budget_conn = sched_conn_opt.as_mut().unwrap_or(&mut conn);
@@ -33702,7 +33702,7 @@ pub(crate) async fn schedule_backfill_inner(
 
                 // Pre-check across ALL states including CONTINUED_AS_NEW / TERMINATED.
                 // start_or_load_workflow_execution uses a partial unique index that
-                // excludes sealed rows, so a sealed prior run wouldn't conflict and
+                // excludes sealed rows, so a sealed prior run would not conflict and
                 // a duplicate would be created for the same scheduled slot.
                 let prior_check = harvest_workflow_executions::table
                     .filter(harvest_workflow_executions::workflow_name.eq(&dag_name))
@@ -34063,7 +34063,7 @@ async fn query_running_count_best_effort(
 /// (issue #607) for workflow `name`, mirroring `query_running_count`'s shape
 /// and shard scope. Used to fold a workflow schedule's already-deferred
 /// backfill slots into `running_at_start` so a subsequent, separate backfill
-/// request can't dispatch (and defer) past `max_active_runs` while an earlier
+/// request cannot dispatch (and defer) past `max_active_runs` while an earlier
 /// request's deferred slots are still sitting in the throttle queue, never
 /// having become a real execution `query_running_count` alone would see.
 async fn query_pending_throttle_count(
@@ -34537,7 +34537,7 @@ async fn replay_dead_letter(
     let replay_result = replay_dead_letter_from_shards(&api_state, dead_letter_id).await;
 
     // For the single-replay path we insert the audit record on the default pool
-    // since the DLQ entry may live on any shard and we don't track which one.
+    // since the DLQ entry may live on any shard and we do not track which one.
     let pool = api_state.storage_pool().map_err(map_error)?;
     let mut audit_conn = acquire_conn(pool.default_pool()).await?;
 
@@ -34894,7 +34894,7 @@ fn parse_bulk_dlq_form(body: &[u8]) -> Result<ParsedBulkDlqRequest, AutumnError>
         let field = key.trim();
         let value = value.trim();
         // Cause filters (issue #613) must be rejected — not silently skipped —
-        // when empty, so an accidental empty form value can't widen the cohort
+        // when empty, so an accidental empty form value cannot widen the cohort
         // (the generic empty-value skip below would otherwise drop them).
         if matches!(field, "error_class" | "dlq_reason" | "failure_signature") {
             let normalized = normalize_cause_filter(Some(value.to_string()))?;
@@ -37007,7 +37007,7 @@ async fn get_start_throttle_pacing_override(
         (axum::http::StatusCode::OK, axum::Json(response)).into_response()
     } else {
         // Surface the full per-shard breakdown whenever the flattened
-        // top-level view can't be fully trusted -- either an unreachable
+        // top-level view cannot be fully trusted -- either an unreachable
         // shard (pre-existing) or a genuine cross-shard override
         // disagreement (issue #945 review, P2). `shard_disagreement`
         // distinguishes the two causes; `shards` lets an operator see
@@ -41879,7 +41879,7 @@ async fn audit_export_reactivate_handler(
 //
 // The queue-pause sibling (#619) is the direct prior art for every helper in
 // this block and the shapes are deliberately identical, one granularity down:
-// same fleet-wide fan-out, same collect-don't-abort per-shard loop, same 207
+// same fleet-wide fan-out, same collect-do not-abort per-shard loop, same 207
 // partial-application contract, same earliest-hold / longest-hold provenance
 // rules, same audited-rejection path. Where a helper is genuinely
 // feature-neutral it is REUSED rather than copied (see
@@ -44075,7 +44075,7 @@ async fn db_conn_for_dag(
 /// unusually large -- is exactly the case where `COUNT(*)` is most expensive:
 /// Postgres cannot know the threshold is already satisfied until it has
 /// counted every single matching row, so a workflow with 500,000 recorded
-/// events pays to have all 500,000 counted merely to answer "yes, that's
+/// events pays to have all 500,000 counted merely to answer "yes, that is
 /// `>= 10,000`". The profile uses a 5.3M-row `harvest_events` fixture. It
 /// holds 5,000 ordinary executions plus 15 long-running ones with 50k-450k
 /// events each. `cargo xtask perf history-bloat` builds it, and the
@@ -44113,7 +44113,7 @@ async fn db_conn_for_dag(
 /// `VACUUM`, however, the identical no-`ORDER BY` query fell back to a plain
 /// Seq Scan reading 2,956,744 non-matching rows first -- 88,618 buffers,
 /// 228x worse than the `ORDER BY`'d form -- because an un-set visibility map
-/// doesn't just inflate `Heap Fetches` within a fixed plan, it can also make
+/// does not just inflate `Heap Fetches` within a fixed plan, it can also make
 /// the planner's *cost estimate* for an Index Only Scan look bad enough that
 /// the planner rejects that access path shape entirely. `ORDER BY event_id`
 /// gives the planner a sort target that makes the intended composite index --
@@ -47279,7 +47279,7 @@ async fn stream_execution_events(
         // this call never sent, when `try_send` fails partway through.
         // That would hand a reconnecting client a cursor past events it
         // never received.
-        // Using a macro-style closure here because closures can't easily `break 'notify`.
+        // Using a macro-style closure here because closures cannot easily `break 'notify`.
         // We use a boolean return: (last_id, last_event_id, terminal_state, should_break).
         let send_rows =
             |rows: &[autumn_harvest::models::HarvestEvent],
@@ -47684,7 +47684,7 @@ async fn stream_execution_events(
     }));
 
     // Return the SSE response. axum's KeepAlive wrapper sends `: ping\n\n`
-    // comments every keepalive_interval so proxies don't idle the connection.
+    // comments every keepalive_interval so proxies do not idle the connection.
     Sse::new(rx)
         .keep_alive(KeepAlive::new().interval(keepalive_interval).text("ping"))
         .into_response()
@@ -48224,7 +48224,7 @@ async fn stream_workflow_progress(
                         // published chunk may have arrived on the listener
                         // socket but not yet been forwarded by the driver
                         // task when this idle tick fired. Drain (non-blocking)
-                        // with a short grace so the primary "here's your
+                        // with a short grace so the primary "here is your
                         // answer" frame is not dropped on close. A non-Chunk
                         // outcome (no more chunks in flight, timeout, or the
                         // listener dropped) exits the drain and proceeds to
@@ -49392,7 +49392,7 @@ pub(crate) async fn compute_schedule_preview_for(
     // are permanently terminal: they will never fire again, so the preview must
     // report zero entries rather than projecting fire times the live scheduler
     // will never actually dispatch. A budget that has already reached zero is
-    // handled the same way even if the row hasn't transitioned to `exhausted_at`
+    // handled the same way even if the row has not transitioned to `exhausted_at`
     // yet (the live scheduler sets it eagerly, but this check is an inexpensive,
     // harmless belt-and-suspenders match — `truncate_preview_entries_by_bounds`
     // would produce an empty list for `Some(0)` regardless, so this only skips
@@ -50600,7 +50600,7 @@ async fn drain_preview_handler(
 
     // Load worker rows per shard WITHOUT snapshot-dependent filters and dedup by
     // freshest snapshot, exactly as /workers does, so a stale Active copy on one
-    // shard can't be retained while the fresher Draining/Stopped row on another
+    // shard cannot be retained while the fresher Draining/Stopped row on another
     // shard is filtered out before dedup (issue #522 review). The preview's own
     // filters (default-Active status plus any requested status/health/build/
     // deployment) and the limit are applied globally against the freshest row.
@@ -50744,7 +50744,7 @@ pub(crate) async fn admit_update(
         Err(e) => return e.into_response(),
     };
 
-    // Fail closed if the runtime isn't installed yet, rather than silently
+    // Fail closed if the runtime is not installed yet, rather than silently
     // skipping the validator check below. `install_storage_pool` runs before
     // `install(runtime)` during plugin startup (with a genuine `.await` --
     // the boot-time admission-gate load -- in between), so a request can
@@ -51943,7 +51943,7 @@ async fn clear_build_ramp_handler(
     }
 
     // If any shard failed and no reachable shard had a policy to clear, we
-    // can't tell whether the queue truly has no ramp or the ramp lives on an
+    // cannot tell whether the queue truly has no ramp or the ramp lives on an
     // unreachable shard — surface 503 rather than a misleading 404.
     if !shard_errors.is_empty() && last_policy.is_none() {
         return (
@@ -55413,7 +55413,7 @@ mod tests {
 
     /// The bulk DLQ `min_attempts` guard (issue #613): `>= 1` is accepted, but
     /// `0` and negatives — which match every 1-based-attempt row — are rejected
-    /// so a malformed request can't slip past the empty-filter safety guard.
+    /// so a malformed request cannot slip past the empty-filter safety guard.
     #[test]
     fn validate_bulk_min_attempts_rejects_non_positive() {
         assert_eq!(validate_bulk_min_attempts(1).unwrap(), 1);
@@ -56075,7 +56075,7 @@ mod tests {
     #[test]
     fn input_budget_skips_absent_inputs() {
         // Entries with no included input (external handoffs, per-field
-        // truncations) don't consume budget.
+        // truncations) do not consume budget.
         let mut items = vec![
             pending_with_input(None),
             pending_with_input(Some(100)),
@@ -56141,7 +56141,7 @@ mod tests {
 
     #[test]
     fn checkpoint_budget_skips_absent_payloads() {
-        // Entries with no included payload don't consume budget.
+        // Entries with no included payload do not consume budget.
         let mut items = vec![
             pending_with_checkpoint(None),
             pending_with_checkpoint(Some(100)),
@@ -60158,7 +60158,7 @@ mod tests {
 
     #[test]
     fn parse_workflow_filters_cursor_sets_paginated() {
-        // We don't test the cursor body here (the round-trip test does that),
+        // We do not test the cursor body here (the round-trip test does that),
         // just that a `cursor` param flips the paginated flag.
         let encoded = encode_workflow_list_cursor_raw(
             &chrono::DateTime::parse_from_rfc3339("2026-06-18T10:00:00Z")
@@ -61831,9 +61831,9 @@ mod tests {
             !on_json.contains("failed_at"),
             "last_failure with failed_at=None must omit the failed_at key: {on_json}"
         );
-        // Quote-anchor the key so this doesn't spuriously match the unrelated
-        // `heartbeat_details` field on PendingActivity — we're asserting the
-        // `last_failure` object itself carries no `"details"` key.
+        // Quote-anchor the key so this does not spuriously match the unrelated
+        // `heartbeat_details` field on PendingActivity. The assertion is that
+        // the `last_failure` object itself carries no `"details"` key.
         assert!(
             !on_json.contains("\"details\""),
             "last_failure with details=None must omit the details key: {on_json}"
@@ -63441,7 +63441,7 @@ mod tests {
             "build-new",
         ));
 
-        // An eligible id absent from the map (structurally shouldn't happen,
+        // An eligible id absent from the map (structurally should not happen,
         // since eligible_ids is always derived from the same worker slice the
         // map is built from, but the lookup must default safely) is treated
         // as build-unknown, not build-matching.

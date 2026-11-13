@@ -26,7 +26,7 @@
 //!
 //! ## Consuming the stream (the other half of AC8)
 //!
-//! An example binary can't cleanly host a live HTTP server, so here is exactly
+//! An example binary cannot cleanly host a live HTTP server. So here is exactly
 //! how a client subscribes with `curl`. Start your Autumn app (which mounts the
 //! Harvest management API), trigger this workflow to get an `{exec_id}`, then:
 //!

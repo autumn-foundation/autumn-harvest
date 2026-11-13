@@ -33,15 +33,15 @@
 //!   discovery) and `history_bloat_min_events` are mutually-exclusive
 //!   discovery paths and must be rejected with `400` when combined, rather
 //!   than letting one silently win;
-//! - finding B (second review round): `min_history_events` (issue #493) must
+//! - finding B: `min_history_events` (issue #493) must
 //!   still compose with `history_bloat_min_events` when both are supplied at
 //!   once -- `AND`ing the two `>=` thresholds together (equivalent to the
 //!   stricter/maximum of the two), not silently dropping one;
-//! - finding C (second review round): the per-shard candidate query is
+//! - finding C: the per-shard candidate query is
 //!   bounded to `filters.limit`, ordered by history size descending, *before*
 //!   any full execution row is loaded -- proven correct even when a single
 //!   shard alone has more matching candidates than the global limit;
-//! - finding b (third review round): `history_event_count` must stay ABSENT
+//! - finding b: `history_event_count` must stay ABSENT
 //!   on the legacy `no_progress_minutes` (stalled-workflow) discovery path
 //!   even when the composed `min_history_events` filter is ALSO satisfied --
 //!   the field is exclusive to the dedicated `history_bloat_min_events` path.
@@ -270,8 +270,7 @@ async fn seed_workflow_with_history_size(
 /// step, factored out here so it composes with `seed_workflow_with_history_size`
 /// (which seeds a specific *event count*, not a specific *staleness*).  Used
 /// to prove a row can satisfy BOTH `no_progress_minutes` (staleness) and
-/// `min_history_events` (count) at once -- PR #1139 review, round 3, finding
-/// b.
+/// `min_history_events` (count) at once (PR #1139, finding b).
 async fn backdate_all_events(database_url: &str, exec_id: ExecutionId, hours_ago: i64) {
     let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
         .await
@@ -484,7 +483,7 @@ async fn history_bloat_min_events_non_numeric_value_returns_400() {
 }
 
 /// AC7: a negative `history_bloat_min_events` value returns `400`, not a
-/// silently accepted (and meaningless, since counts can't be negative)
+/// silently accepted (and meaningless, since counts cannot be negative)
 /// filter.
 #[tokio::test]
 async fn history_bloat_min_events_negative_value_returns_400() {
@@ -548,7 +547,7 @@ async fn history_bloat_min_events_merges_and_sorts_globally_across_shards() {
         seed_workflow_with_history_size(&shard0_url, ShardId::new(0), "hb-shard0-small", 1).await; // total 2
 
     // Shard 1: one above-threshold row that is *larger* than shard 0's, so a
-    // correct global sort must place it first -- proving the merge isn't
+    // correct global sort must place it first -- proving the merge is not
     // just "shard 0's page, then shard 1's page".
     let _shard1_larger = seed_workflow_with_history_size(
         &shard1_url,
@@ -598,7 +597,7 @@ async fn history_bloat_min_events_merges_and_sorts_globally_across_shards() {
 
     // Global descending sort: shard 1's larger row (12) must precede shard
     // 0's row (6) -- a per-shard-then-concatenate merge would get this
-    // backwards (shard 0 first, since it's the default shard queried first).
+    // backwards (shard 0 first, since it is the default shard queried first).
     let shard1_pos = ids.iter().position(|id| id == "hb-shard1-larger").unwrap();
     let shard0_pos = ids.iter().position(|id| id == "hb-shard0-large").unwrap();
     assert!(
@@ -634,10 +633,10 @@ async fn history_bloat_min_events_merges_and_sorts_globally_across_shards() {
 
 /// `min_history_events` (issue #493) has no "live-only" restriction and
 /// composes with an explicit `state=` filter -- including a *terminal*
-/// state, which `history_bloat_min_events` above always excludes. Before the
-/// P1 fix, `min_history_events` itself triggered the dedicated (terminal-
-/// excluding) discovery path, so this exact query would have silently
-/// returned an empty array instead of the completed row below.
+/// state, which `history_bloat_min_events` above always excludes. If
+/// `min_history_events` itself triggers the dedicated (terminal-excluding)
+/// discovery path, this exact query silently returns an empty array instead
+/// of the completed row below.
 #[tokio::test]
 async fn min_history_events_composes_with_state_including_terminal() {
     let (database_url, _container) = setup_database().await;
@@ -887,7 +886,7 @@ async fn history_bloat_min_events_combined_with_no_progress_minutes_returns_400(
     );
 }
 
-// ─── PR #1139 review (round 3, finding b): no_progress_minutes must never ──
+// ─── PR #1139 (finding b): no_progress_minutes must never ──
 // leak `history_event_count`, even when the pre-existing, general-purpose
 // `min_history_events` filter (issue #493) is ALSO supplied and satisfied.
 //

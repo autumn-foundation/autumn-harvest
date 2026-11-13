@@ -311,10 +311,9 @@ async fn runs_started_for_schedule(
 }
 
 /// Like `insert_workflow_schedule`, but with a caller-specified
-/// `max_active_runs` (issue #607 round 5: `schedule_backfill`'s own
-/// `max_active_runs` overlap gate must count pending throttled slots left
-/// over from an earlier, separate backfill call, not just RUNNING/PAUSED
-/// executions).
+/// `max_active_runs` (issue #607). The `max_active_runs` overlap gate of
+/// `schedule_backfill` must count pending throttled slots left over from an
+/// earlier, separate backfill call, not just RUNNING/PAUSED executions.
 async fn insert_workflow_schedule_with_max_active(
     conn: &mut diesel_async::AsyncPgConnection,
     wf_name: &str,
@@ -389,15 +388,15 @@ async fn seed_execution(
     .expect("seed prior execution");
 }
 
-/// Issue #607 round 4: `schedule_backfill`'s workflow branch previously
-/// admitted every backfilled slot immediately, bypassing throttle pacing
-/// entirely -- an operator backfilling hundreds of slots for a throttled
-/// workflow got them all admitted at once. Verifies the fix: burst = 2
-/// against 5 planned hourly slots admits exactly 2 executions immediately
-/// and durably defers the remaining 3 as pending throttle rows (each
-/// counted in `skipped_reasons["throttled"]`, per the scheduler-tick
-/// precedent where a deferred fire still counts as "dispatched" -- the
-/// slot was consumed, just not admitted yet).
+/// Issue #607: the workflow branch of `schedule_backfill` previously admitted
+/// every backfilled slot immediately and bypassed throttle pacing entirely.
+/// An operator backfilling hundreds of slots for a throttled workflow got
+/// them all admitted at once. Verifies the fix: burst = 2 against 5 planned
+/// hourly slots admits exactly 2 executions immediately. It durably defers
+/// the remaining 3 as pending throttle rows. Each one counts in
+/// `skipped_reasons["throttled"]`. The scheduler tick sets the precedent: a
+/// deferred fire still counts as "dispatched", because the slot was consumed,
+/// just not admitted yet.
 #[tokio::test]
 async fn schedule_backfill_paces_admissions_and_defers_the_excess() {
     let (url, _container) = setup_database().await;
@@ -442,7 +441,7 @@ async fn schedule_backfill_paces_admissions_and_defers_the_excess() {
     );
 }
 
-/// Issue #607 round 4: an oversized backfilled slot must be skipped (not
+/// Issue #607: an oversized backfilled slot must be skipped (not
 /// durably deferred into a pending row that could never successfully fire)
 /// -- mirroring the fix already applied to the single-start, batch, and
 /// scheduler-tick call sites.
@@ -499,18 +498,17 @@ async fn schedule_backfill_skips_oversized_input_before_deferring() {
     );
 }
 
-/// Code-review fix (issue #607 round 5): a throttled scheduled fire durably
-/// defers before any `harvest_workflow_executions` row exists, so a *second,
-/// separate* `schedule_backfill` request recomputing `running_at_start` from
-/// `query_running_count` alone would not see an earlier request's still-
-/// pending deferred slot and could dispatch (and again defer) past
-/// `max_active_runs` -- the throttle scanner would later fire both pending
-/// rows without ever re-checking the schedule's overlap gate. Verifies the
-/// fix: with `max_active_runs = 1` and an already-empty bucket, a first
-/// backfill call defers its one slot into a pending throttle row (no
-/// execution), and a *second* backfill call for a different slot is skipped
-/// with `skipped_reasons["max_active_runs"]` instead of writing a second
-/// pending row.
+/// Issue #607: a throttled scheduled fire durably defers before any
+/// `harvest_workflow_executions` row exists. A *second, separate*
+/// `schedule_backfill` request can recompute `running_at_start` from
+/// `query_running_count` alone. It then misses an earlier request's
+/// still-pending deferred slot. It can dispatch (and again defer) past
+/// `max_active_runs`. The throttle scanner later fires both pending rows
+/// without re-checking the schedule's overlap gate. Verifies the fix: take
+/// `max_active_runs = 1` and an already-empty bucket. A first backfill call
+/// defers its one slot into a pending throttle row (no execution). A *second*
+/// backfill call for a different slot is skipped with
+/// `skipped_reasons["max_active_runs"]` and writes no second pending row.
 #[tokio::test]
 async fn schedule_backfill_counts_pending_throttled_slots_against_max_active_runs() {
     let (url, _container) = setup_database().await;
@@ -559,11 +557,11 @@ async fn schedule_backfill_counts_pending_throttled_slots_against_max_active_run
         "exactly one pending throttle row after the first call"
     );
 
-    // A second, separate backfill call for a *different* slot (a different
-    // hour, so it plans to a distinct workflow_id and isn't rejected as an
-    // already-existing run) must see the first call's still-pending deferred
-    // slot counted against max_active_runs=1, and skip rather than defer a
-    // second row.
+    // A second, separate backfill call for a *different* slot must see the
+    // first call's still-pending deferred slot counted against
+    // max_active_runs=1. It must skip, not defer a second row. The slot uses a
+    // different hour. So it plans to a distinct workflow_id and is not
+    // rejected as an already-existing run.
     let next_hour = now + chrono::Duration::hours(1);
     let (status2, body2) = post_json(
         &app,
@@ -604,14 +602,14 @@ async fn schedule_backfill_counts_pending_throttled_slots_against_max_active_run
     );
 }
 
-/// Code-review fix (issue #607 round 7): `schedule_backfill`'s throttle
-/// branch treated every `Deferred` outcome as a fresh dispatch, even when
-/// `reserve_or_defer` actually resolved to an *already-existing* pending row
-/// for the same `workflow_id` (its own idempotency shortcut) -- e.g. an
-/// operator repeating the exact same backfill window while the first call's
+/// Issue #607: the throttle branch of `schedule_backfill` treated every
+/// `Deferred` outcome as a fresh dispatch. It did so even when
+/// `reserve_or_defer` resolved to an *already-existing* pending row for the
+/// same `workflow_id` (its own idempotency shortcut). An example is an
+/// operator who repeats the exact same backfill window while the first call's
 /// throttled slot is still durably pending. That double-counted the slot in
-/// `dispatched`/`dispatched_this_call`, which then double-spent the
-/// schedule's `max_runs` budget for a call that created nothing new.
+/// `dispatched`/`dispatched_this_call`. The schedule's `max_runs` budget was
+/// then double-spent for a call that created nothing new.
 /// Verifies a repeated identical backfill window reports the already-
 /// pending slot as skipped (`already_exists`), not dispatched, and does not
 /// advance `runs_started` a second time.
@@ -693,10 +691,10 @@ async fn repeated_backfill_call_does_not_double_count_an_already_pending_throttl
     );
 }
 
-/// Code-review fix (issue #607 round 6): `POST /admin/schedules/{id}/trigger`
-/// (manual trigger-now) previously called the start primitive directly with
-/// no throttle check at all -- unlike scheduled and backfilled fires, which
-/// both already pace through `reserve_or_defer`. An operator repeatedly
+/// Issue #607: `POST /admin/schedules/{id}/trigger` (manual trigger-now)
+/// previously called the start primitive directly with no throttle check at
+/// all. Scheduled and backfilled fires both already pace through
+/// `reserve_or_defer`. An operator repeatedly
 /// hitting this route for a throttled workflow schedule could bypass its
 /// declared rate/burst entirely. Verifies a manual trigger against an
 /// already-empty bucket is durably deferred (`outcome: "deferred"`, no
@@ -775,18 +773,17 @@ async fn manual_trigger_starts_immediately_when_token_available() {
     );
 }
 
-/// Code-review fix (issue #607 round 9): when a manual trigger for a
-/// throttled workflow reserves a token and the subsequent start call then
-/// fails, the old code rolled back the `runs_started` budget pre-increment
-/// but never refunded the reserved throttle token -- draining one bucket
-/// token per failed trigger even though nothing was ever admitted, so
+/// Issue #607: a manual trigger for a throttled workflow can reserve a token
+/// and then fail its start call. The old code rolled back the `runs_started`
+/// budget pre-increment but never refunded the reserved throttle token. Each
+/// failed trigger drained one bucket token, though nothing was admitted. So
 /// repeated transient/configuration failures could defer later manual or
 /// scheduled fires behind an artificially empty bucket. Verifies the token
-/// IS refunded: a Postgres trigger deterministically forces the first
-/// manual trigger's start to fail after a token was reserved (burst = 1);
-/// once the forcing trigger is removed, a second manual trigger for the
-/// SAME throttle key still fires immediately rather than deferring --
-/// proof the first call's token made it back into the bucket.
+/// IS refunded. A Postgres trigger deterministically forces the first manual
+/// trigger's start to fail after a token was reserved (burst = 1). The test
+/// then removes the forcing trigger. A second manual trigger for the SAME
+/// throttle key still fires immediately and does not defer. That proves the
+/// first call's token went back into the bucket.
 #[tokio::test]
 async fn manual_trigger_refunds_its_token_when_the_start_fails() {
     let (url, _container) = setup_database().await;
@@ -923,14 +920,13 @@ async fn under_limit_starts_then_defers_excess_and_backlog_is_visible() {
     assert_eq!(acme["workflow_name"], json!("sync_tenant"));
 }
 
-/// Code-review fix (issue #607 round 7): the admission gate's (#377)
-/// idempotent-retry bypass only checked for an existing non-terminal
-/// *execution*, not an existing *pending throttle row* -- so a retry for an
-/// explicit `workflow_id` that is already durably deferred in
-/// `harvest_start_throttle` was wrongly blocked with a `503` once a gate
-/// activated, even though `reserve_or_defer`'s own idempotency shortcut
-/// resolves the retry to the exact same pending row without creating any
-/// new admission. Verifies the gate bypass now also recognizes a pending
+/// Issue #607: the idempotent-retry bypass of the admission gate (#377) only
+/// checked for an existing non-terminal *execution*, not an existing
+/// *pending throttle row*. A retry for an explicit `workflow_id` that is
+/// already durably deferred in `harvest_start_throttle` was then wrongly
+/// blocked with a `503` once a gate activated. Yet the idempotency shortcut
+/// of `reserve_or_defer` resolves the retry to the exact same pending row
+/// and creates no new admission. Verifies the gate bypass now also recognizes a pending
 /// throttle row, while a genuinely fresh `workflow_id` is still blocked.
 #[tokio::test]
 async fn retry_with_a_pending_throttle_row_bypasses_the_admission_gate() {
@@ -1184,14 +1180,14 @@ async fn batch_start_rejects_item_with_conflicting_throttle_and_debounce_policie
     );
 }
 
-/// Code-review fix (issue #607 round 9): `batch_start_workflows`'s Phase 1
-/// admission-gate check's idempotent-retry bypass only checked whether an
-/// explicit `workflow_id` already had an active *execution* -- not an
-/// already-pending *throttle* row -- mirroring the same gap the single-start
-/// route had (round 7). A batch retry for a `workflow_id` durably deferred in
-/// `harvest_start_throttle` was wrongly rejected once a gate activated, even
-/// though `reserve_or_defer`'s own idempotency shortcut in Phase 2 would
-/// resolve it to the same pending row without creating any new admission.
+/// Issue #607: in `batch_start_workflows`, the idempotent-retry bypass of the
+/// Phase 1 admission-gate check only asked whether an explicit `workflow_id`
+/// already had an active *execution*. It did not look for an already-pending
+/// *throttle* row. The single-start route had the same gap. A batch retry for
+/// a `workflow_id` durably deferred in `harvest_start_throttle` was wrongly
+/// rejected once a gate activated. Yet the idempotency shortcut of
+/// `reserve_or_defer` in Phase 2 resolves it to the same pending row and
+/// creates no new admission.
 /// Verifies the gate bypass now also recognizes a pending throttle row for
 /// batch items, while a genuinely fresh `workflow_id` in the same batch call
 /// is still blocked.
@@ -1471,7 +1467,7 @@ async fn batch_gate_bypasses_an_attaching_item_but_blocks_a_would_be_fresh_creat
     );
 }
 
-/// Code-review fix (issue #607 round 5): an atomic batch is an all-or-nothing
+/// Issue #607: an atomic batch is an all-or-nothing
 /// synchronous insert with no way to represent a `Deferred` outcome. Before
 /// this fix, `atomic=true` items skipped the throttle admission check
 /// entirely, letting a client bypass a workflow's rate policy simply by

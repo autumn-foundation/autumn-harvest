@@ -26239,7 +26239,7 @@ async fn suspended_command_event_count(
     //
     // New-vs-existing is resolved against the DB here, exactly as the
     // homogeneous timer and child arms above do — NOT by taking the vector
-    // lengths (Codex round 2, P1). `persist_mixed_suspension_batch` emits those
+    // lengths. `persist_mixed_suspension_batch` emits those
     // events only for genuinely new rows, so on a RE-PARK (one branch woke the
     // parent; the siblings are re-emitted and already exist) a length-based
     // count claims events this decision will not append, and it does so on every
@@ -26347,7 +26347,7 @@ async fn dead_letter_for_history_cap(
             crate::notify::coalesced(conn, async |conn| {
                 use crate::schema::harvest_workflow_executions::dsl as exec_dsl;
                 let reason = reason.clone();
-                // Issue #1184 (Codex review round 3, P1): this transaction had no
+                // Issue #1184: this transaction had no
                 // ownership recheck at all -- a stale dispatcher whose claim had
                 // already moved could still DLQ and terminally fail a run its new
                 // owner was actively driving. Lock the execution row FIRST (the
@@ -26543,8 +26543,8 @@ async fn count_history_events_with_retries(
 ///
 /// The threshold is the smallest integer event count satisfying
 /// `count >= cap * fraction` -- i.e. `(cap as f64 * fraction).ceil()`, NOT a
-/// truncating cast (PR #1139 review, third round). `cap * fraction` is
-/// non-integral whenever `cap` isn't evenly divisible by the fraction's
+/// truncating cast (PR #1139). `cap * fraction` is
+/// non-integral whenever `cap` is not evenly divisible by the fraction's
 /// denominator (e.g. cap=10, fraction=0.75 -> 7.5), and a truncating cast
 /// would round DOWN to 7, firing at the 7th event (70% of the cap) instead
 /// of the first integer count that actually reaches 75% (the 8th event,
@@ -26558,9 +26558,9 @@ async fn count_history_events_with_retries(
 /// `process_workflow_task`, gated there by callers combining this with
 /// `matches!(&outcome, WorkflowOutcome::Suspended { .. })` and `!is_canary`;
 /// and (2) `fail_workflow_for_history_cap`'s hard-cap terminal-fail path
-/// (PR #1139 review), evaluated there against the DURABLE post-failure
-/// event count -- never a prospective, not-yet-persisted one (PR #1139
-/// review, second round) -- since a single decision can grow durably
+/// (PR #1139), evaluated there against the DURABLE post-failure
+/// event count -- never a prospective, not-yet-persisted one -- since a
+/// single decision can grow durably
 /// recorded history from below the soft threshold straight past the hard
 /// cap in one inline append batch, bypassing (1) entirely; the crossing
 /// still happened in the same decision, so it is evaluated there too
@@ -26775,7 +26775,7 @@ async fn fail_workflow_for_history_cap(
                 )
             });
 
-    // Issue #1184 (Codex review round 5): captured here, before the DLQ
+    // Issue #1184: captured here, before the DLQ
     // transaction below, not after it returns. `record_workflow_completed`
     // defines this value as handler runtime; reading `started_at.elapsed()`
     // after `move_workflow_to_dlq_for_history_cap` returns would fold in
@@ -26810,17 +26810,15 @@ async fn fail_workflow_for_history_cap(
     // counts this workflow task as a failure, not as a success.
     cycle_failure.failed_terminally();
 
-    // Issue #1184 (Codex review round 3, self-applied): emitted only now
-    // that `move_workflow_to_dlq_for_history_cap`'s transaction has actually
-    // committed -- that transaction gained an ownership guard in this same
-    // change (Codex round 3, P1) and can now roll back for a blameless
-    // claim-ambiguity reason, not just a genuine DB error. Emitting these
-    // before the call (the previous ordering) meant a rolled-back attempt
-    // still counted a decision that was never durably persisted, and the
-    // eventual real attempt counts it again -- the identical class of bug
-    // fixed for the ordinary terminal-outcome path in
-    // `emit_pending_workflow_metrics` (round 2, P2); same fix, applied here
-    // for consistency since this path has the same new failure mode.
+    // Issue #1184: emitted only now that
+    // `move_workflow_to_dlq_for_history_cap`'s transaction has actually
+    // committed. That transaction has an ownership guard, so it can roll back
+    // for a blameless claim-ambiguity reason, not just a genuine DB error.
+    // Emitting these before the call meant a rolled-back attempt still
+    // counted a decision that was never durably persisted. The eventual real
+    // attempt then counts it again. `emit_pending_workflow_metrics` fixes the
+    // identical class of bug for the ordinary terminal-outcome path. This
+    // path has the same failure mode, so it gets the same fix.
     //
     // issue #1197, item 1: the same discipline now also covers the
     // completion-trigger latest-wins supersede counters this call's inline
@@ -27002,7 +27000,7 @@ async fn process_workflow_task(
     // (issue #494), forwarded to inline local activities so their reported
     // deadline cannot out-live the cycle. `None` when that timeout is disabled.
     workflow_task_deadline: Option<chrono::DateTime<chrono::Utc>>,
-    // Issue #804 (Codex round-22 P2): set by this dispatch when a frontier
+    // Issue #804: set by this dispatch when a frontier
     // reset commits, so a later capability miss can decide on the counters the
     // row actually holds without re-reading them. See `frontier_miss_state`.
     frontier_reset_committed: &std::sync::atomic::AtomicBool,
@@ -27070,7 +27068,7 @@ async fn process_workflow_task(
     // redelivery budget is exhausted. Which is exactly right — "this worker
     // cannot run this build" is a property of the worker, not of the execution.
     //
-    // The resolved `Arc` is KEPT (Codex review round 1), not merely tested for
+    // The resolved `Arc` is KEPT, not merely tested for
     // presence, and handed to the handler as `ModuleHost::pinned_module`. A
     // second lookup inside the trampoline could miss where this one hit — an
     // `unload_build` landing between the two — and a miss *there* is an
@@ -27506,7 +27504,7 @@ async fn process_workflow_task(
         // switch, capability grant, decide budget — and stamp the per-execution
         // facts onto the clone. Constructing a fresh `ModuleHost::new` here
         // instead would silently run every production guest under the *default*
-        // (unrestricted) policy (Codex review round 1).
+        // (unrestricted) policy.
         #[cfg(feature = "hot-code-swap")]
         let drive = match registry.module_host() {
             Some(policy) => {
@@ -27640,7 +27638,7 @@ async fn process_workflow_task(
                     )
                     .await;
                 }
-                // Issue #804 (Codex round-19 P2): bail out for a capable peer
+                // Issue #804: bail out for a capable peer
                 // BEFORE the five commits below. `run_local_activity_inline`
                 // resolves the handler at its top, so raising here is
                 // behaviourally identical — same typed error, same
@@ -27678,7 +27676,7 @@ async fn process_workflow_task(
                 notify_progress_from_commands(conn, prepared.exec_id, &commands).await;
                 // Issue #691 (FIX-B): resolve any ReleaseMutex bookkeeping (an
                 // early drop(guard)) BEFORE the inline local-activity re-drive so
-                // the release isn't deferred across the re-drive and a contender
+                // the release is not deferred across the re-drive and a contender
                 // is granted the freed key while the local activity runs. No-op
                 // when the batch carries no ReleaseMutex.
                 process_mutex_releases_from_commands(
@@ -27890,8 +27888,7 @@ async fn process_workflow_task(
                         return Ok(());
                     }
                     Err(e) => {
-                        // Issue #946, Codex round-3/round-4 review:
-                        // `run_local_activity_inline` calls
+                        // Issue #946: `run_local_activity_inline` calls
                         // `DetachedSpawnPersistence::persist` ->
                         // `create_detached_child_executions`, which can
                         // reject with `QuotaExceeded` when the detached
@@ -27947,7 +27944,7 @@ async fn process_workflow_task(
                         return Ok(());
                     }
                 };
-                // Issue #804 (Codex round-20 P1): the local activity resolved
+                // Issue #804: the local activity resolved
                 // and its events are durably appended, so the workflow's
                 // frontier has moved permanently past it. Every capability miss
                 // recorded before now was recorded against a handler this run no
@@ -27962,7 +27959,7 @@ async fn process_workflow_task(
                 //
                 // The reset itself lives inside `run_local_activity_inline`,
                 // committed in the SAME transaction as the frontier-resolving
-                // append (Codex round-21 P1) — writing it here would be an
+                // append. Writing it here would be an
                 // independent failure point after the progress became durable,
                 // and a failure would strand this still-claimed row.
                 history_events.extend(new_events);
@@ -28828,7 +28825,7 @@ async fn process_workflow_task(
         clear_panic_strike(workflow_panic_strikes, prepared.exec_id.as_uuid());
     }
 
-    // Issue #804 (Codex round-6 P2): detect a capability miss on this cycle's
+    // Issue #804: detect a capability miss on this cycle's
     // commands BEFORE any terminal telemetry is emitted.
     //
     // The authoritative all-or-nothing checks live inside the persistence
@@ -28849,7 +28846,7 @@ async fn process_workflow_task(
     // Commands first, so the reported name stays deterministic in command order
     // for every batch that carries one; then the outcome's cross-type
     // continue-as-new target, which `drive_workflow` moved OUT of the command
-    // list and so cannot be seen by the scan above (issue #804, Codex round-45).
+    // list and so cannot be seen by the scan above (issue #804).
     if let Some((kind, name)) = first_persist_capability_miss(
         registry,
         update_result_command_source(&outcome, &pending_cmds),
@@ -28975,7 +28972,7 @@ async fn process_workflow_task(
             // Issue #952: the abandoned-dispatch records this failing cycle is
             // about to append — resolved against the same dedup persistence
             // applies, so a re-park of already-started children cannot trip the
-            // cap on events that will never be written (Codex P2 round 3).
+            // cap on events that will never be written.
             let abandoned = match abandoned_dispatch_event_count_resolved(
                 conn,
                 &pending_cmds,
@@ -29099,7 +29096,7 @@ async fn process_workflow_task(
             unreachable!("a TaskFailed outcome returns at the issue #1797 gate")
         }
     };
-    // Issue #1184 (Codex review round 2, P2): these used to be EMITTED right
+    // Issue #1184: these used to be EMITTED right
     // here, before the persist transaction below. A claim-ambiguity rollback
     // (this issue's own guards, or #1182's SuspendedClaimAmbiguous) or an
     // operator pause caught by `check_paused_and_park` inside that
@@ -29140,7 +29137,7 @@ async fn process_workflow_task(
             unreachable!("a TaskFailed outcome returns at the issue #1797 gate")
         }
     };
-    // Issue #1184 (Codex review round 4, P2): stop these clocks HERE, at the
+    // Issue #1184: stop these clocks HERE, at the
     // moment the decision cycle itself finished -- not at emission time in
     // the `Persisted` arm below, which runs only after the persist
     // transaction plus its own post-commit housekeeping (deferred schedule
@@ -29180,10 +29177,10 @@ async fn process_workflow_task(
     // clear the DB row. Mirror that clear into the in-memory snapshot *before*
     // `execution_ref` is captured (same pattern as the pending_cmds patch
     // just below), so a same-cycle `ContinuedAsNew` successor built from
-    // `execution_ref.search_attrs` doesn't silently reintroduce the six
+    // `execution_ref.search_attrs` does not silently reintroduce the six
     // diagnostic keys the transaction is about to delete from the DB.
     // `was_nd_blocked` is captured before mutating so the transaction's own
-    // guard (which decides whether to call `clear_nd_block` at all) doesn't
+    // guard (which decides whether to call `clear_nd_block` at all) does not
     // read back the now-already-cleared in-memory value and skip the call.
     let was_nd_blocked = prepared.execution.nd_blocked_at.is_some();
     if was_nd_blocked {
@@ -29772,14 +29769,14 @@ async fn process_workflow_task(
             // The crossing decision itself is computed here, against the
             // *true* durably-persisted event count (a fresh, lock-free
             // `COUNT(*)`), rather than the pre-transaction prospective
-            // estimate -- closing a Codex-review finding where a decision
-            // cycle that merely enqueued (never granted) a contended
-            // `AcquireMutex` could over-count by one and cross the threshold
-            // a cycle early. A bounded retry (issue #704, PR #1139 review --
-            // see `count_history_events_with_retries`'s doc comment) narrows
+            // estimate. With the estimate, a decision cycle that merely
+            // enqueued (never granted) a contended `AcquireMutex` could
+            // over-count by one and cross the threshold a cycle early. A
+            // bounded retry (issue #704 -- see
+            // `count_history_events_with_retries`'s doc comment) narrows
             // the window where a transient read failure silently and
             // permanently drops this execution's one-shot warning chance; a
-            // still-persistent failure degrades to "don't warn this cycle"
+            // still-persistent failure degrades to "do not warn this cycle"
             // rather than risking a false mark or panicking a best-effort
             // telemetry path.
             let should_warn_history_bloat = if may_warn_history_bloat {
@@ -29818,9 +29815,8 @@ async fn process_workflow_task(
             .await;
         }
         Err(error) => {
-            // Issue #1182 (Codex review round 3): an ambiguous suspended-
-            // dispatch claim is deliberately NOT intercepted here, unlike
-            // round 2's first cut. `?` inside the transaction closure has
+            // Issue #1182: an ambiguous suspended-dispatch claim is
+            // deliberately NOT intercepted here. `?` inside the transaction closure has
             // already rolled the *whole* persistence transaction back --
             // releasing the execution row's lock and discarding any
             // bookkeeping write made earlier in this cycle (see
@@ -29834,8 +29830,8 @@ async fn process_workflow_task(
             // consuming the remaining budget and being cancelled mid-flight
             // -- reporting `BodyTimedOut` and banking a timeout strike
             // against a workflow whose handler had in fact completed fine;
-            // only the *cleanup* waited on unrelated row contention (Codex
-            // review round 3). So this error, like a capability miss, is
+            // only the *cleanup* waited on unrelated row contention. So this
+            // error, like a capability miss, is
             // simply propagated here: the caller (`process_task`) performs
             // the release *after* the budgeted cycle has already returned,
             // exactly mirroring how it already handles
@@ -29860,8 +29856,7 @@ async fn process_workflow_task(
                 );
                 return Err(error);
             }
-            // Issue #946, Codex round-3/round-4 review: `persist_terminal_
-            // outcome_commands` calls `create_detached_child_executions`
+            // Issue #946: `persist_terminal_outcome_commands` calls `create_detached_child_executions`
             // directly, so a `QuotaExceeded` from a detached child's target
             // quota can surface here for the `is_terminal_with_commands`
             // path. Defer with a bounded backoff rather than terminally
@@ -30030,7 +30025,7 @@ enum TaskDispatchOutcome {
     /// `harvest.workflow.task_timeout` metric, and the requeue-or-quarantine
     /// decision. It exists at all because the budget now lives *inside*
     /// `process_task`, wrapped around the decision cycle alone — see
-    /// [`run_under_workflow_body_budget`] (issue #804, Codex round-25 P1).
+    /// [`run_under_workflow_body_budget`] (issue #804).
     BodyTimedOut,
     /// The cycle failed the workflow task and re-pended it, after a deadlock
     /// or a contained handler panic (issue #1815). The run stays `RUNNING`.
@@ -30138,7 +30133,7 @@ impl DeferredActivityFailure {
 /// timeout strike, emitting the wrong metric, and, once
 /// `poison_pill_threshold` strikes accumulated, terminally failing an
 /// execution whose body had in fact completed and whose correct outcome was a
-/// blameless release (Codex round-25 P1).
+/// blameless release.
 ///
 /// `None` means no budget: the activity path was never wrapped in one, and the
 /// workflow path opts out when `workflow_task_timeout` is zero.
@@ -30155,7 +30150,7 @@ async fn run_under_workflow_body_budget<F: std::future::Future>(
     }
 }
 
-/// Issue #1182 (Codex review round 3): performs the release for an ambiguous
+/// Issue #1182: performs the release for an ambiguous
 /// suspended-dispatch claim -- if `error` names one -- and returns `None`
 /// (a no-op) for every other error, so the caller falls through to the
 /// capability-miss check unchanged.
@@ -30285,7 +30280,7 @@ async fn process_task(
     // Issue #804: the redelivery budget and the fleet-liveness window that
     // gates it.
     capability_miss_policy: CapabilityMissPolicy,
-    // Issue #804 (Codex round-25 P1): the issue #494 wall-clock budget, applied
+    // Issue #804: the issue #494 wall-clock budget, applied
     // HERE around the workflow decision cycle alone rather than by the dispatch
     // site around this whole function — so it can never cancel the
     // capability-miss cleanup below. `None` on the activity path (never bounded
@@ -30303,7 +30298,7 @@ async fn process_task(
     // the owner tenure, because it names the database of the owner row.
     owner_shard: crate::types::ShardId,
 ) -> HarvestResult<TaskDispatchOutcome> {
-    // Issue #804 (Codex round-22 P2): the workflow path sets this when a
+    // Issue #804: the workflow path sets this when a
     // frontier reset commits, so the capability-miss interception below knows
     // the persisted counters without re-reading them. Activity tasks never
     // resolve a frontier inline, so it stays clear on that path and their
@@ -30387,9 +30382,9 @@ async fn process_task(
                 drain_cancel,
             )
             .await;
-            // Acquire only if we actually need to act on a capability miss or
-            // an ambiguous terminal-write claim (issue #1184, Codex review
-            // round 1, P2): this shared activity dispatch path can reach
+            // Acquire only when the dispatch must act on a capability miss or
+            // an ambiguous terminal-write claim (issue #1184): this shared
+            // activity dispatch path can reach
             // `fail_task_and_execution_with_history`'s #1184 guard too (e.g.
             // via a session-acquire/session-release failure, or
             // `finalize_activity_failure`), and without this check its
@@ -30426,7 +30421,7 @@ async fn process_task(
         return unload_fenced_partition(&mut conn, &registry, &workflow_cache, &task, key, pinned)
             .await;
     }
-    // Issue #1182 (Codex review round 3): an ambiguous suspended-dispatch
+    // Issue #1182: an ambiguous suspended-dispatch
     // claim is intercepted HERE -- after `run_under_workflow_body_budget`
     // has already returned -- rather than inside `process_workflow_task`.
     // See `handle_ambiguous_suspended_claim`'s doc comment for why.
@@ -30469,7 +30464,7 @@ async fn process_task(
     )
     .await;
     // An escalation terminally failed the execution, so its #782 strike entry
-    // has nothing left to measure and must not outlive it (Codex round-16 P2).
+    // has nothing left to measure and must not outlive it.
     // A release leaves the execution running and keeps the entry — see
     // `clear_panic_strike_on_capability_miss_escalation` for why the re-raised
     // typed error is the exact discriminator.
@@ -30806,8 +30801,7 @@ impl MissingHandler<'_> {
         format!("no {} handler registered for '{}'", self.kind, self.name)
     }
 
-    /// The durable identity of the frontier this miss is about (issue #804,
-    /// Codex round-46 P1).
+    /// The durable identity of the frontier this miss is about (issue #804).
     ///
     /// `capability_misses` / `capability_miss_workers` describe **one**
     /// frontier — the position the workflow is stuck at, and therefore the
@@ -30839,12 +30833,12 @@ pub struct CapabilityMissPolicy {
     /// Build it with [`capability_miss_fleet_stale_secs`], not
     /// [`worker_stale_secs`]: this window is applied to *peers*, so it must
     /// carry the fleet-wide floor that keeps a slower-but-healthy peer visible
-    /// to a fast-heartbeating claimant (Codex round-19 P1).
+    /// to a fast-heartbeating claimant.
     pub worker_stale_secs: i64,
 }
 
 /// One coherent observation of the miss evidence and the live fleet
-/// (issue #804, Codex rounds 28 and 30).
+/// (issue #804).
 ///
 /// The fleet read and the miss read are separate statements, so under `READ
 /// COMMITTED` a registration can commit between them — and **both** orderings
@@ -30852,9 +30846,9 @@ pub struct CapabilityMissPolicy {
 /// both sides of the fleet read and the two must agree before any
 /// evidence-derived bound may fire.
 ///
-/// This exists as a shared constructor because round 29 re-derived the same
-/// sequence by hand at the commit boundary and silently dropped the bracket,
-/// reintroducing exactly the race round 28 had closed. Both the decision and
+/// This exists as a shared constructor because a hand-written copy of the
+/// sequence at the commit boundary once dropped the bracket. That reintroduced
+/// the registration race the bracket closes. Both the decision and
 /// its revalidation now take their `(fleet, confidence)` pair from here, so the
 /// two cannot drift apart again.
 struct BracketedMissObservation {
@@ -30875,8 +30869,8 @@ async fn observe_miss_and_fleet(
     let before =
         current_frontier_miss_state(conn, task, worker_id, frontier_reset_committed, frontier)
             .await;
-    // Fleet evidence for the distinct-worker bound (issue #804, Codex round-8
-    // P1). See `read_live_fleet_or_degrade` for why a failure here degrades to
+    // Fleet evidence for the distinct-worker bound (issue #804). See
+    // `read_live_fleet_or_degrade` for why a failure here degrades to
     // an empty set instead of propagating.
     let live_workers = read_live_fleet_or_degrade(conn, task, policy.worker_stale_secs).await;
     let after =
@@ -30936,16 +30930,16 @@ async fn read_live_fleet_or_degrade(
         }
     };
 
-    // Narrow to workers that could actually claim THIS task (issue #804,
-    // round-10 P2). A build-incompatible or label-ineligible worker never wins
+    // Narrow to workers that could actually claim THIS task (issue #804).
+    // A build-incompatible or label-ineligible worker never wins
     // the claim, so it never joins `capability_miss_workers` and would
     // otherwise hold the evidence at `CapablePeerMayExist` forever.
     //
     // A compat-set read FAILURE is not evidence of incompatibility: degrading
     // it to an empty set would assert that every cross-build peer is
     // ineligible, fabricate `AllLiveWorkersMissed`, and terminally fail the
-    // execution at `budget + 1` while a declared, capable peer was live
-    // (Codex round-18 P1). `narrow_live_fleet` therefore suppresses the build
+    // execution at `budget + 1` while a declared, capable peer was live.
+    // `narrow_live_fleet` therefore suppresses the build
     // axis on failure and keeps the still-readable label axis.
     let compat = match crate::build_routing::load_compat_set(conn).await {
         Ok(compat) => Some(compat),
@@ -30970,7 +30964,7 @@ async fn read_live_fleet_or_degrade(
 }
 
 /// Give back the per-activity rate-limit token this claim spent, when it spent
-/// one (issue #804 x #332, Codex round-11 P2).
+/// one (issue #804 x #332).
 ///
 /// `claim_task` debits a token in its `rate_limit_debit` CTE for any task
 /// carrying a `rate_limit_key` whose activity is **not** circuit-breaker
@@ -30995,7 +30989,7 @@ async fn read_live_fleet_or_degrade(
 ///
 /// # Why this is deliberately NOT gated on still owning the claim
 ///
-/// Codex round 42 read the unconditional refund as an over-credit: a stale
+/// The unconditional refund can look like an over-credit: a stale
 /// dispatcher resuming after `poison_pill::reclaim_orphaned_tasks` re-pended
 /// its task would "refund the replacement claim's token", letting an extra
 /// activity through. Tokens are fungible, so the only meaningful question is
@@ -31082,21 +31076,21 @@ async fn handle_capability_miss(
     metrics: &dyn crate::telemetry::MetricsRecorder,
     missing: MissingHandler<'_>,
     policy: CapabilityMissPolicy,
-    // Issue #804 (Codex round-22 P2): did this dispatch commit a frontier
+    // Issue #804: did this dispatch commit a frontier
     // reset? See `frontier_miss_state` for why this replaces a DB re-read.
     frontier_reset_committed: bool,
     // Issue #1243: configured codecs, so this write encodes under the
     // same registry replay decodes with.
     codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<TaskDispatchOutcome> {
-    // Give back the rate-limit token this claim spent (issue #804, Codex
-    // round-11 P2). Unconditional here, before the release-vs-escalate branch,
+    // Give back the rate-limit token this claim spent (issue #804).
+    // Unconditional here, before the release-vs-escalate branch,
     // because the activity did not run in EITHER case — the capacity was
     // charged to a dispatch that did nothing.
     refund_capability_miss_rate_limit_token(conn, task).await;
 
     // The handler this dispatch is stuck on, which is what the row's counters
-    // are evidence ABOUT (issue #804, Codex round-46 P1). Newly ingested
+    // are evidence ABOUT (issue #804). Newly ingested
     // history — a pending signal, a due timer, an external delta — can move the
     // replay onto a different branch between two dispatches of the same task
     // without any park or inline progress in between, so the counters can carry
@@ -31129,7 +31123,7 @@ async fn handle_capability_miss(
 
     // A lost claim is not a decision to make. The escalation write is not
     // ownership-guarded, so deciding here would let a stale dispatcher
-    // terminally fail a task another worker now owns (Codex round-28 P1).
+    // terminally fail a task another worker now owns.
     // Either read observing the loss is enough — the claim does not come back.
     let (Some((misses_before, distinct_before)), Some(_)) = (
         before_fleet.decidable_counters(),
@@ -31214,7 +31208,7 @@ struct CapabilityMissCtx<'a> {
 /// Return an incapable claim to the queue for a peer (issue #804, AC1/AC2).
 ///
 /// Shared by the ordinary release arm and by an escalation withdrawn at the
-/// commit boundary (Codex round-29 P1), so the two can never drift on the
+/// commit boundary, so the two can never drift on the
 /// backoff, the phase-gated counter handling, or the metric.
 async fn release_capability_miss(
     conn: &mut AsyncPgConnection,
@@ -31236,22 +31230,22 @@ async fn release_capability_miss(
             // the same incapable worker re-claiming its own released row.
             // The backoff is applied against the DB clock inside the release
             // statement, so host/Postgres skew cannot swallow it.
-            // Scaled off the CURRENT frontier's miss count (issue #804, Codex
-            // round-20 P1), not the claim-time snapshot: a frontier the fleet
+            // Scaled off the CURRENT frontier's miss count (issue #804),
+            // not the claim-time snapshot: a frontier the fleet
             // has not been asked about yet must start at the base delay rather
             // than inherit a prior frontier's backoff.
             let delay = capability_miss_backoff(misses_before);
             // The phase governs both conditional clauses of the release:
             // issue #367's `crash_strikes` may only be cleared by a dispatch
-            // that ran the handler to a conclusion (Codex round-12 P1), and
+            // that ran the handler to a conclusion, and
             // `attempt` may only be restored by one that never reached the
-            // handler at all (Codex round-17 P2). See
+            // handler at all. See
             // `CapabilityMissPhase::clears_crash_strikes` /
             // `::restores_dispatch_attempt`.
             // The returned cardinality is the one this `UPDATE` committed, not
             // the one `observe_miss_and_fleet` snapshotted -- a peer's
-            // re-registration can invalidate an entry in between (Codex
-            // round-36 P2). See `release_task_for_capability_miss`.
+            // re-registration can invalidate an entry in between. See
+            // `release_task_for_capability_miss`.
             let released = queue::release_task_for_capability_miss(
                 conn,
                 // A stuck-running requeue keeps `crash_strikes`, so only
@@ -31261,11 +31255,9 @@ async fn release_capability_miss(
                 missing.phase,
                 // The claim epoch this dispatch holds. A poison-pill requeue
                 // bumps it and lets the SAME worker re-claim, so `worker_id`
-                // alone would also match that replacement claim (Codex
-                // round-37 P1).
+                // alone would also match that replacement claim.
                 task.crash_strikes,
-                // The frontier these counters are evidence about (Codex
-                // round-46 P1): a release that lands on a DIFFERENT handler
+                // The frontier these counters are evidence about: a release that lands on a DIFFERENT handler
                 // than the row records restarts the count at 1 rather than
                 // inheriting the prior frontier's missers.
                 &missing.frontier_key(),
@@ -31314,7 +31306,7 @@ async fn release_capability_miss(
 }
 
 /// Whether an escalation decided a moment ago still stands at the commit
-/// boundary (issue #804, Codex round-29 P1).
+/// boundary (issue #804).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EscalationRevalidation {
     /// Commit the terminal failure, reporting the carried **fresh** resolution.
@@ -31324,9 +31316,9 @@ pub enum EscalationRevalidation {
     /// as `BudgetExhausted` while every live worker has missed it, and as
     /// `ReleaseCeilingExhausted` the moment a never-tried capable peer appears.
     /// Reporting the obsolete cause would tell an operator no live worker
-    /// registers the handler when one demonstrably does (issue #804, Codex
-    /// round-31 P2), so the fresh resolution travels with the verdict and is
-    /// what derives the reason string, the metric label, and the log line.
+    /// registers the handler when one demonstrably does (issue #804). So the
+    /// fresh resolution travels with the verdict. It derives the reason string,
+    /// the metric label, and the log line.
     Stands(CapabilityMissResolution),
     /// Abandon it — the reason is `&'static str` so the log line and the test
     /// assert on the same value.
@@ -31353,7 +31345,7 @@ const fn revalidate_escalation(
         // A row that changed hands must not be failed by the dispatcher that
         // lost it. This is the cheap, early half of that guard: the terminal
         // write itself re-checks ownership under the row's `FOR UPDATE` lock
-        // (round-31 P1), because an unlocked re-read only narrows the window.
+        // because an unlocked re-read only narrows the window.
         CurrentMissState::ClaimLost => EscalationRevalidation::Withdrawn("claim_lost"),
         _ => match fresh {
             Some(fresh) => match fresh.action {
@@ -31373,13 +31365,12 @@ const fn revalidate_escalation(
     }
 }
 
-/// Pay the escalation's expensive read, then re-validate it (issue #804, Codex
-/// round-29 P1).
+/// Pay the escalation's expensive read, then re-validate it (issue #804).
 ///
 /// `fail_task_and_execution` used to load the workflow's history *after* the
-/// last evidence check, so the window in which a capable peer could go live
-/// unnoticed contained an awaited read whose cost grows with the history — not
-/// the "few microseconds of in-memory work" the round-27 note claimed. The read
+/// last evidence check. So the window in which a capable peer could go live
+/// unnoticed held an awaited read whose cost grows with the history. It was
+/// not "a few microseconds of in-memory work". The read
 /// is paid here first, and the returned [`PreloadedFailureHistory`] is
 /// *consumed* by the committing call, so the ordering is a compile-time
 /// property rather than a comment that can drift.
@@ -31423,8 +31414,7 @@ async fn prepare_escalation_commit(
 /// emission point) or the missing-handler *detail* — the human-facing rendering
 /// is what was already decided from. It does carry the frontier KEY, because
 /// that is not a rendering: it is the identity the counters are evidence about,
-/// and without it the re-read cannot tell whose missers it is looking at
-/// (Codex round-46 P1).
+/// and without it the re-read cannot tell whose missers it is looking at.
 #[doc(hidden)]
 #[derive(Clone, Copy)]
 pub struct EscalationEvidenceRecheck<'a> {
@@ -31438,7 +31428,7 @@ pub struct EscalationEvidenceRecheck<'a> {
     pub frontier_reset_committed: bool,
     /// The frontier this miss is about (`{kind}:{name}`), so the re-read
     /// applies the row's counters only if they are evidence about THIS handler
-    /// (issue #804, Codex round-46 P1).
+    /// (issue #804).
     pub frontier: &'a str,
 }
 
@@ -31446,9 +31436,8 @@ pub struct EscalationEvidenceRecheck<'a> {
 /// report the decision it lands on.
 ///
 /// The two travel together on purpose. A re-decision that cannot change the
-/// reported reason is the round-34 P2 bug (the boundary escalates for a fresh
-/// cause while paging with the stale one), so the boundary never accepts one
-/// without the other.
+/// reported reason lets the boundary escalate for a fresh cause while paging
+/// with the stale one. So the boundary never accepts one without the other.
 #[doc(hidden)]
 #[derive(Clone, Copy)]
 pub struct EscalationCommit<'a> {
@@ -31477,11 +31466,10 @@ async fn revalidate_escalation_evidence(
         frontier,
     } = recheck;
     // The revalidation uses the SAME bracketed observation the decision does
-    // (issue #804, Codex round-30 P1). Round 29 re-derived a single miss read
-    // here and so reintroduced the round-28 race: a peer re-registering between
-    // that read and the fleet read is still named in the miss array while
-    // already appearing live, which derives `AllLiveWorkersMissed` and fails a
-    // run a capable worker could serve.
+    // (issue #804). A single miss read here reintroduces the registration
+    // race. A peer re-registering between that read and the fleet read is
+    // still named in the miss array while already appearing live. That derives
+    // `AllLiveWorkersMissed` and fails a run a capable worker could serve.
     let BracketedMissObservation {
         before,
         after,
@@ -31497,11 +31485,11 @@ async fn revalidate_escalation_evidence(
     )
     .await;
     // Either read observing a lost claim is enough — the claim does not come
-    // back — so `before` decides and `after` only has to agree it is still ours.
+    // back — so `before` decides and `after` only has to agree the claim is held.
     // Re-decide from the fresh reads and carry the WHOLE resolution, not just
     // its verdict: an escalation that still stands may now stand for a
     // different reason, and the reason is what an operator is paged with
-    // (issue #804, Codex round-31 P2).
+    // (issue #804).
     let fresh = match (before.decidable_counters(), after.decidable_counters()) {
         (Some((misses, distinct)), Some(_)) => Some(resolve_capability_miss_with_confidence(
             distinct,
@@ -31525,12 +31513,12 @@ async fn revalidate_escalation_evidence(
 }
 
 /// Which distinct-worker count a capability-miss log line may report
-/// (issue #804, Codex round-35 P2).
+/// (issue #804).
 ///
-/// The two branches have **opposite** correct answers, and getting it backwards
-/// is exactly what round 34 did: the release log was flipped to the pre-claim
-/// count it must not use, while the escalation log kept the post-claim count it
-/// must not use. Both now go through here so they cannot drift again.
+/// The two branches have **opposite** correct answers, and it is easy to swap
+/// them. A swapped release log reports the pre-claim count it must not use. A
+/// swapped escalation log reports the post-claim count it must not use. Both go
+/// through here so they cannot drift.
 ///
 /// - `Some(durable)` — the release branch. The value is what the release
 ///   `UPDATE` itself returned, so it *is* the durable set, matching
@@ -31538,11 +31526,11 @@ async fn revalidate_escalation_evidence(
 ///   deliberately **not** `resolution.distinct_after`: that is derived from the
 ///   snapshot `observe_miss_and_fleet` read, and a peer restarting onto a
 ///   capable build can `array_remove` an entry between that read and the write,
-///   leaving the snapshot one higher than the row (Codex round-36 P2).
+///   leaving the snapshot one higher than the row.
 /// - `None` — the escalation branch never runs that `UPDATE`, so the claimant
 ///   was never appended and there is no post-update count to report. The
 ///   persisted set is the pre-claim count, matching `completed_releases` and the
-///   reason string on the same line (Codex round-8 P2).
+///   reason string on the same line.
 ///
 /// The two sources also have different Rust types (`i32` vs `usize`), which is
 /// part of why swapping them compiled silently — `tracing` accepts either. The
@@ -31572,13 +31560,13 @@ fn log_terminal_withdrawal(task: &TaskQueueItem, write: &TerminalWriteOutcome) {
 
 /// Renders an escalation's cause, reason string and metric label from one
 /// resolution, so the three can never tell an operator different stories about
-/// the same escalation (issue #804, Codex round-34 P2).
+/// the same escalation (issue #804).
 ///
 /// The *reported* counts are the persisted ones. The decision was made on the
 /// post-increment distinct count (this claim is evidence), but the escalation
 /// branch never runs the release `UPDATE`, so no redelivery and no
-/// distinct-worker append actually happened for this claim (Codex round-8 P2,
-/// extended to the log field in round 34).
+/// distinct-worker append actually happened for this claim. The same rule
+/// covers the log field.
 struct EscalationReporter {
     detail: String,
     max_redeliveries: u32,
@@ -31652,30 +31640,29 @@ const fn escalation_log_message(cause: EscalationCause) -> &'static str {
     }
 }
 
-/// Whether the ownership-guarded terminal write actually committed (issue #804,
-/// Codex round-31 P1).
+/// Whether the ownership-guarded terminal write actually committed (issue #804).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[doc(hidden)]
 pub enum TerminalWriteOutcome {
-    /// The claim was still ours under the row lock; the failure is durable.
+    /// The claim was still held under the row lock; the failure is durable.
     ///
     /// Carries the resolution the boundary actually decided from when an
     /// evidence re-check was attached, so the caller's log reports the same
-    /// story the persisted reason string tells (issue #804, Codex round-34 P2).
+    /// story the persisted reason string tells (issue #804).
     Committed(Option<CapabilityMissResolution>),
     /// The row changed hands. Nothing was written.
     ClaimLost,
-    /// The claim was still ours, but the capability-miss evidence moved under
+    /// The claim was still held, but the capability-miss evidence moved under
     /// the lock — a peer re-registered and is no longer named as incapable, so
     /// the run this was about to fail terminally now has a worker that can
-    /// serve it. Nothing was written (issue #804, Codex round-33 P1).
+    /// serve it. Nothing was written (issue #804).
     EvidenceChanged(&'static str),
 }
 
 /// Fail the task and its execution **only if this worker still holds the
-/// claim**, atomically (issue #804, Codex round-31 P1).
+/// claim**, atomically (issue #804).
 ///
-/// Every earlier round narrowed the window between an escalation's last
+/// Three earlier guards narrow the window between an escalation's last
 /// ownership check and its terminal write — by re-reading the row
 /// ([`current_frontier_miss_state`]), by hoisting the history load out of the
 /// way ([`preload_failure_history`]), by re-validating the decision
@@ -31707,8 +31694,8 @@ pub enum TerminalWriteOutcome {
 /// opened and a parallel activity completion may have consumed it. Appending at
 /// a consumed id aborts the terminal transaction on
 /// `UNIQUE(workflow_exec_id, event_id)` and strands the row `RUNNING` under a
-/// live worker (Codex round-31 P1). Round 29's hoist is preserved: the *full*
-/// history load stays outside; only the indexed `MAX(event_id)` runs here.
+/// live worker. The history hoist is preserved: the *full* history load stays
+/// outside; only the indexed `MAX(event_id)` runs here.
 ///
 /// **Lock order.** The execution row is locked first, then the task row —
 /// `harvest_task_queue`'s documented order (`enforce_activity_timeout`,
@@ -31720,7 +31707,7 @@ pub enum TerminalWriteOutcome {
 /// the task's `capability_miss_workers` without touching `worker_id` or
 /// `crash_strikes`, so the claim guard above is blind to it: the escalation
 /// would still commit and terminally fail a run the newly-capable peer could
-/// serve (Codex round-33 P1). When `recheck` is `Some`, the escalation is
+/// serve. When `recheck` is `Some`, the escalation is
 /// therefore re-decided from evidence read *under the task lock* — the
 /// authoritative decision. The pre-transaction check in
 /// [`prepare_escalation_commit`] is kept as a cheap early exit, not as the
@@ -31777,11 +31764,10 @@ where
             // at a consumed id aborts the whole terminal transaction on
             // `UNIQUE(workflow_exec_id, event_id)` and leaves the row `RUNNING`
             // under a LIVE incapable worker -- unclaimable, and invisible to
-            // orphan reclamation, which requires a dead heartbeat (issue #804,
-            // Codex round-31 P1).
+            // orphan reclamation, which requires a dead heartbeat (issue #804).
             //
-            // This does not undo round 29. What round 29 hoisted out of the
-            // window was the *full* `store::load_history`, whose cost grows with
+            // This does not undo the history hoist. What the hoist moved out of
+            // the window was the *full* `store::load_history`, whose cost grows with
             // the history; `next_event_id_for` is an indexed `MAX(event_id)`
             // whose cost does not, and it takes the same execution-row lock, so
             // it replaces the explicit lock rather than adding a read.
@@ -31832,7 +31818,7 @@ where
             // than the pre-transaction decision found, and the cause is what the
             // operator is paged with. Derive the reason from the evidence this
             // boundary actually decided on, never from the older one
-            // (issue #804, Codex round-34 P2).
+            // (issue #804).
             let error = match (fresh.as_ref(), escalation.as_ref()) {
                 (Some(fresh), Some(escalation)) => (escalation.derive_reason)(fresh),
                 _ => error.clone(),
@@ -31871,7 +31857,7 @@ async fn escalate_capability_miss(
         missing,
     } = ctx;
     let max_redeliveries = policy.max_redeliveries;
-    // The identity the row's counters are evidence about (Codex round-46 P1).
+    // The identity the row's counters are evidence about.
     let frontier = missing.frontier_key();
 
     let (preloaded, revalidation) =
@@ -31879,7 +31865,7 @@ async fn escalate_capability_miss(
     // The re-decided resolution, not the one from a moment ago: an escalation
     // that still stands may stand for a *different* cause now, and the cause is
     // what the reason string, the metric label, and the log line report
-    // (issue #804, Codex round-31 P2).
+    // (issue #804).
     let EscalationRevalidation::Stands(resolution) = revalidation else {
         let EscalationRevalidation::Withdrawn(why) = revalidation else {
             unreachable!("EscalationRevalidation has exactly two variants")
@@ -31900,7 +31886,7 @@ async fn escalate_capability_miss(
     // The decision was made on the POST-increment distinct count (this claim is
     // evidence), but the *reported* counts are the persisted ones: this branch
     // never runs the release UPDATE, so no redelivery and no distinct-worker
-    // append actually happened for this claim (Codex round-8 P2). Reporting the
+    // append actually happened for this claim. Reporting the
     // post-increment total here would tell an operator that N+1 redeliveries
     // occurred when only N did.
     let escalation = escalation_from_persisted(
@@ -31949,7 +31935,7 @@ async fn escalate_capability_miss(
         preloaded,
         // The authoritative evidence re-decision: read under the task lock,
         // so a peer that re-registered after the pre-transaction check
-        // cannot be missed (issue #804, Codex round-33 P1).
+        // cannot be missed (issue #804).
         Some(EscalationCommit {
             recheck: EscalationEvidenceRecheck {
                 task,
@@ -32190,7 +32176,7 @@ fn spawn_concurrency_sampler(
             let mut deferred_by_key: std::collections::HashMap<String, u64> =
                 std::collections::HashMap::new();
             // Skip the whole tick on any shard read failure so a partial aggregate
-            // doesn't under-report concurrency during a storage outage (#522).
+            // does not under-report concurrency during a storage outage (#522).
             let mut read_failed = false;
             for pool in &pools {
                 // Selected against `cancel` (issue #1426), mirroring
@@ -32221,7 +32207,7 @@ fn spawn_concurrency_sampler(
                     Ok(stats) => {
                         for stat in &stats {
                             // Grouped by (key, task_type) so workflow and activity
-                            // budgets for the same key don't collide on the label.
+                            // budgets for the same key do not collide on the label.
                             let metric_key = format!("{}:{}", stat.key, stat.task_type);
                             *in_flight_by_key.entry(metric_key.clone()).or_insert(0) +=
                                 u64::try_from(stat.in_flight).unwrap_or(0);
@@ -32313,7 +32299,7 @@ fn spawn_rate_limit_sampler(
             let mut refill_by_key: std::collections::HashMap<String, f64> =
                 std::collections::HashMap::new();
             // Skip the whole tick on any shard read failure so a partial aggregate
-            // doesn't under-report available tokens during a storage outage (#522).
+            // does not under-report available tokens during a storage outage (#522).
             let mut read_failed = false;
             for pool in &pools {
                 // Selected against `cancel` (issue #1426), mirroring
@@ -32626,11 +32612,11 @@ fn spawn_schedule_overdue_sampler(
         }
         // Labels emitted on the previous pass, so a series that disappears from a
         // COMPLETE pass (schedule deleted/renamed) can be zeroed instead of
-        // sticking at its last value (Codex round 5 F2).
+        // sticking at its last value.
         let mut previous_emitted: std::collections::HashSet<ScheduleGaugeKey> =
             std::collections::HashSet::new();
         loop {
-            // Sample FIRST, then sleep (Codex round 5 F1): an eager pass on
+            // Sample FIRST, then sleep: an eager pass on
             // startup emits the gauge and learns the adaptive cadence
             // immediately, so a worker that starts while a fast schedule is
             // already wedged detects it within one cadence grace window rather
@@ -33858,7 +33844,7 @@ fn spawn_stranded_work_sampler(
                     }
                 };
 
-                // Back-fill effective requirements for activity rows that didn't
+                // Back-fill effective requirements for activity rows that did not
                 // snapshot required_capabilities (legacy/manual enqueues), so the
                 // coverage check below applies the same activity eligibility
                 // claim_task's $6 gate enforces.
@@ -34418,7 +34404,7 @@ fn spawn_history_oversized_sampler(
             let mut count_by_workflow: std::collections::HashMap<String, u64> =
                 std::collections::HashMap::new();
             // Skip the whole tick on any shard read failure so a partial aggregate
-            // (or the zero-fill below) doesn't clear the gauge during an outage
+            // (or the zero-fill below) does not clear the gauge during an outage
             // (#522).
             let mut read_failed = false;
             for pool in &pools {
@@ -36805,7 +36791,7 @@ impl Worker {
             }
         }
 
-        // Comprehensive rate-limit validation (issue #699, Codex round-5 P2).
+        // Comprehensive rate-limit validation (issue #699).
         // A `HandlerRegistry` built directly (not via `HarvestBuilder::try_build`)
         // bypasses ALL builder validation, so an invalid rate-limit config
         // (a dynamic `rate_limit(key = …)` on a local activity, a dynamic key
@@ -37763,14 +37749,14 @@ impl Worker {
 
         // Register + rate-limit buckets on every shard pool. Each shard keeps
         // its OWN pending flag: a shard whose registration failed must retry
-        // even when a sibling shard succeeded (issue #804, Codex round-50 P1).
+        // even when a sibling shard succeeded (issue #804).
         // Each flag is SHARED (not copied) between that shard's heartbeat task
         // and that shard's slot in the poll loop: the heartbeat retries and
         // eventually clears it, and the poll loop must observe the clearing to
         // resume claiming on that shard. See `may_claim_tasks`.
         //
-        // Every per-shard acquisition here is bounded (issue #961 review,
-        // Codex P1): this loop is sequential, so an unreachable or exhausted
+        // Every per-shard acquisition here is bounded (issue #961):
+        // this loop is sequential, so an unreachable or exhausted
         // pool on ONE shard would otherwise park it forever and the poll loop
         // below would never start at all — stranding every healthy shard. A
         // bounded failure instead arms that shard's pending flag, which its own
@@ -38017,7 +38003,7 @@ impl Worker {
                 // Skip a shard whose own registration is still unverified: on
                 // that shard this worker is not a fleet member, so it must not
                 // claim (see `may_claim_tasks`). Sibling shards are unaffected,
-                // which is why the flag is per shard (round-50 P1).
+                // which is why the flag is per shard.
                 // Fully qualified: diesel's blanket `RunQueryDsl::load` is in
                 // scope here and shadows the inherent `AtomicBool::load` through
                 // the `Arc` deref.
@@ -39125,7 +39111,7 @@ impl Worker {
             .collect();
         // Worker-session local-registry reconciler (issue #606): a session's
         // `harvest_sessions` row may live on any shard this worker touches
-        // (session identity doesn't self-encode a shard the way ExecutionId
+        // (session identity does not self-encode a shard the way ExecutionId
         // does), so — mirroring the poison-pill reclaimer above — one
         // reconciler per assigned shard pool checks this worker's *entire*
         // local registry against that shard's rows; a session hosted on a
@@ -39552,7 +39538,7 @@ impl Worker {
         // worker (not the scheduler tick) and no-ops internally when metrics are
         // disabled. Uses `sampler_pools` so single-shard and multi-shard
         // deployments both aggregate the full schedule set. The interval is
-        // adaptive (Codex round 4): a coarse 30s ceiling for a slow/Manual fleet,
+        // adaptive: a coarse 30s ceiling for a slow/Manual fleet,
         // adapting down toward the fastest active cadence (never below
         // `poll_interval`) so a sub-30s schedule is still detected within its
         // grace window.
@@ -39606,7 +39592,7 @@ impl Worker {
     /// `register_in_fleet` for this same pool. It is deliberately not a field
     /// on `Worker`: `run_multi_shard` spawns one heartbeat per shard, and a
     /// shared flag would let a shard whose registration succeeded clear the
-    /// retry a *failed* shard still needs (issue #804, Codex round-50 P1).
+    /// retry a *failed* shard still needs (issue #804).
     #[allow(clippy::too_many_arguments)]
     fn spawn_heartbeat_task(
         &self,
@@ -41135,10 +41121,10 @@ impl Worker {
         // the restarted -- possibly now capable -- instance would otherwise be
         // indistinguishable from the old incapable one, and another claimant
         // would derive `AllLiveWorkersMissed` and terminally fail a run at
-        // exactly the moment the fix arrived (issue #804, Codex round-26 P1).
+        // exactly the moment the fix arrived (issue #804).
         //
         // Publishing the worker while that cleanup fails is strictly worse than
-        // not publishing it, so the two are ATOMIC (Codex round-28 P1): a failed
+        // not publishing it, so the two are ATOMIC: a failed
         // invalidation rolls the registration back, and the heartbeat's
         // `Ok(0)` self-heal retries the pair within one interval. See
         // `register_worker_and_clear_stale_miss_evidence`.
@@ -41180,7 +41166,7 @@ impl Worker {
                         // when the row is ABSENT: a reused `worker_id` leaves
                         // the previous row alive, the heartbeat updates it, and
                         // without this the atomic pair would never be retried
-                        // (issue #804, Codex round-49 P1).
+                        // (issue #804).
                         tracing::warn!(
                             worker_id = %self.config.worker_id,
                             error = %error,
@@ -41193,7 +41179,7 @@ impl Worker {
                 }
             }
             Err(error) => {
-                // Also arms the retry (issue #804, Codex round-50 P1). Nothing
+                // Also arms the retry (issue #804). Nothing
                 // was even attempted, so a surviving row from a previous
                 // instance under a reused `worker_id` still advertises the old
                 // build and still carries this id's stale capability-miss
@@ -42697,7 +42683,7 @@ impl Worker {
         //
         // Deliberately `capability_miss_fleet_stale_secs`, NOT the bare
         // `worker_stale_secs` the poison-pill reclaimer and broken-session
-        // scanner use (Codex round-19 P1): those judge rows with a window they
+        // scanner use: those judge rows with a window they
         // chose, whereas this judges *peers* by a cadence they did not. Without
         // the floor a fast-heartbeating claimant drops a live peer on the
         // default cadence and terminally fails an execution it could have run.
@@ -42808,7 +42794,7 @@ impl Worker {
                 let workflow_task_deadline = chrono::Duration::from_std(workflow_task_timeout)
                     .ok()
                     .and_then(|budget| chrono::Utc::now().checked_add_signed(budget));
-                // Issue #804 (Codex round-25 P1): the budget is handed to
+                // Issue #804: the budget is handed to
                 // `process_task`, which scopes it to the decision cycle, rather
                 // than wrapped around the call. Wrapping it here also bounded
                 // the capability-miss release/escalation that follows the
@@ -42860,7 +42846,7 @@ impl Worker {
                 match outcome {
                     Ok(TaskDispatchOutcome::Completed) => {
                         // Success: clear the consecutive-timeout counter for
-                        // this execution so a later transient timeout doesn't
+                        // this execution so a later transient timeout does not
                         // inherit previous strikes.
                         if let Some(exec_id) = exec_id_for_timeout {
                             timeout_strikes
@@ -43049,7 +43035,7 @@ impl Worker {
                             crate::poison_pill::ReclaimAction::Quarantine => {
                                 // Clear the in-process counter before the
                                 // async DB call so a concurrent reclaim
-                                // doesn't double-quarantine.
+                                // does not double-quarantine.
                                 if let Some(exec_id) = exec_id_for_timeout {
                                     begin_quarantine_strikes(
                                         &mut timeout_strikes
@@ -44896,7 +44882,7 @@ pub(crate) struct PoolShortfall {
 /// exactly the aliasing factor: shards 0 and 1 sharing a pool at `max_size = 2`
 /// look fine twice over, while between them they can hold both connections and
 /// leave a third shard's checker unable to probe that database at all (issue
-/// #1146, Codex round 9 P1).
+/// #1146).
 ///
 /// The requirement for one physical pool is therefore `local scanners + 1`, not
 /// a flat 2. Identity comes from `same_underlying_pool`, the same test the
@@ -45509,9 +45495,9 @@ mod tests {
     }
 
     /// The release and escalation branches must report OPPOSITE distinct-worker
-    /// bases, and round 34 got it backwards on both (issue #804, round-35 P2).
+    /// bases, and it is easy to swap both (issue #804).
     ///
-    /// This is the pin that would have caught it: a tracing field is invisible
+    /// This is the pin that catches a swap: a tracing field is invisible
     /// to every other test in the suite, so the choice is routed through one
     /// helper and asserted here.
     #[test]
@@ -45527,8 +45513,8 @@ mod tests {
         };
         // The release branch reports what its own UPDATE returned. The durable
         // value (2) is deliberately lower than BOTH the snapshot's
-        // `distinct_after` (4) and its `distinct_before` (3) -- the round-36
-        // case, with two peers re-registering and having their evidence
+        // `distinct_after` (4) and its `distinct_before` (3) -- the case
+        // with two peers re-registering and having their evidence
         // invalidated between the read and the write. Two rather than one so
         // the durable count cannot coincide with either snapshot field, which
         // is what makes the assertions below discriminating.
@@ -45826,7 +45812,7 @@ mod tests {
         assert_eq!(ActiveWorkflowState::Paused.as_str(), "paused");
     }
 
-    /// Issue #619 review (round 12): a hold observed on a **readable** shard must
+    /// Issue #619: a hold observed on a **readable** shard must
     /// reach the gauge even when an unrelated shard's read failed. Suppressing it
     /// leaves `harvest.queue.paused` unset, so the dashboard shows nothing and
     /// `harvest_queue_paused_too_long` cannot fire — for the whole duration of an
@@ -45879,7 +45865,7 @@ mod tests {
         );
     }
 
-    /// A complete scan keeps the round-10 behaviour: emit every hold, zero-fill
+    /// A complete scan keeps the full-pass behaviour: emit every hold, zero-fill
     /// exactly the queues that dropped out, and replace the previous set.
     #[test]
     fn queue_pause_emissions_zero_fill_once_on_a_complete_scan() {
@@ -46038,7 +46024,7 @@ mod tests {
         assert_eq!(wasm_effective_deadline(None, None), None);
     }
 
-    // ── Adaptive overdue sampler interval (issue #696, Codex round 4) ─────────
+    // ── Adaptive overdue sampler interval (issue #696) ─────────
 
     #[test]
     fn overdue_interval_no_active_cadence_uses_ceiling() {
@@ -46099,7 +46085,7 @@ mod tests {
         );
     }
 
-    // ── Disappeared gauge-label cleanup (issue #696, Codex round 5 F2) ─────────
+    // ── Disappeared gauge-label cleanup (issue #696) ─────────
 
     fn key(kind: &str, name: &str) -> ScheduleGaugeKey {
         (kind.to_string(), name.to_string())
@@ -46481,7 +46467,7 @@ mod tests {
     /// The aliased case the per-logical-shard check could not see. Two logical
     /// shards on one physical pool at `max_size = 2` passed a `max_size < 2`
     /// test twice, while between them holding both connections and starving a
-    /// third shard's cross-shard read (issue #1146, Codex round 9 P1).
+    /// third shard's cross-shard read (issue #1146).
     #[test]
     fn two_shards_aliased_onto_one_pool_need_a_third_connection() {
         use crate::types::ShardId;
@@ -47208,7 +47194,7 @@ mod tests {
         assert_eq!(out, Some(7));
     }
 
-    /// The round-25 P1 itself: work sequenced **after** the budgeted cycle must
+    /// The scoping rule itself: work sequenced **after** the budgeted cycle must
     /// survive, even when it outlives every millisecond the budget had left.
     ///
     /// That "after" work is the issue #804 capability-miss release/escalation —
@@ -48201,7 +48187,7 @@ mod tests {
     }
 
     /// A registration that cannot even acquire a connection must arm the
-    /// heartbeat retry (issue #804, Codex round-50 P1).
+    /// heartbeat retry (issue #804).
     ///
     /// Nothing is attempted in that arm, so with a reused `worker_id` a
     /// surviving row still advertises the old build and still carries this
@@ -49094,8 +49080,7 @@ mod tests {
         heartbeats_stop_after_run_is_cancelled(&worker, worker.run(&pool), 2).await;
     }
 
-    /// The pending flag is per pool, not per worker (issue #804, Codex
-    /// round-50 P1).
+    /// The pending flag is per pool, not per worker (issue #804).
     ///
     /// `run_multi_shard` registers against every shard. A single worker-wide
     /// flag would let a shard whose registration succeeded clear the retry a
@@ -49738,7 +49723,7 @@ mod tests {
 
     // ── cancellable-timer event interleaving (issue #768, FINDING 1) ────────
 
-    /// Codex P2 round 4 (issue #768): a fresh `ArmTimer { for_await: false }`
+    /// Issue #768: a fresh `ArmTimer { for_await: false }`
     /// (from `start_timer`/`reset`) emits a `TimerStarted` event for positional
     /// replay but the pure `arm_timer_events` never signals a `harvest_timers`
     /// row insert — a cancellable timer becomes fire-eligible only when it is
@@ -49781,7 +49766,7 @@ mod tests {
         );
     }
 
-    /// Issue #768 round 7: an `await_fire` re-arm (`for_await: true`) followed by a
+    /// Issue #768: an `await_fire` re-arm (`for_await: true`) followed by a
     /// same-task sibling branch's `cancel_timer` in the SAME batch must NOT
     /// contribute a deadline to `min_fires_at` (`armed_indices` empty → the caller's
     /// `armed_fires_at` is `None` → the parked task wakes NOW instead of being
@@ -49835,13 +49820,13 @@ mod tests {
         );
     }
 
-    /// Round 9 FINDING: a reset-then-await in ONE task —
+    /// Issue #768: a reset-then-await in ONE task —
     /// `[CancelTimer(X), ArmTimer(X, for_await: false), ArmTimer(X, for_await: true)]`
     /// — must arm the durable row and contribute its deadline in THIS transaction.
     /// The fresh arm (`for_await: false`, from `reset`) re-establishes X *after* the
     /// cancel, so X is live at end-of-batch and the `await_fire` re-arm at index 2
-    /// contributes. Before the round-9 fix the order-independent "cancel anywhere
-    /// cancels the arm" rule dropped it, shifting the deadline to the next claim.
+    /// contributes. An order-independent "cancel anywhere cancels the arm" rule
+    /// drops it, which shifts the deadline to the next claim.
     #[test]
     fn plan_timer_lifecycle_pure_arms_a_reset_then_await_in_one_batch() {
         let commands = vec![
@@ -49881,7 +49866,7 @@ mod tests {
         );
     }
 
-    /// Round 11 FINDING: an await arm CANCELLED by a *later* same-batch reset must
+    /// Issue #768: an await arm CANCELLED by a *later* same-batch reset must
     /// NOT contribute a firing row. Batch `[ArmTimer(X, for_await: true, old),
     /// CancelTimer(X), ArmTimer(X, for_await: false, new)]` (an `await_fire()`
     /// polled before a sibling `reset` in the same task): the await arm at index 0
@@ -49890,9 +49875,9 @@ mod tests {
     /// never contributes a firing row. `armed_indices` is therefore EMPTY → the
     /// parked task wakes NOW → live and replay both resolve `Cancelled` (replay
     /// sees the recorded `TimerCancelled` before the fresh arm's `TimerStarted`).
-    /// The round-10 end-of-batch-liveness rule kept the await arm (X is live at
-    /// end-of-batch because the fresh arm re-established it) and armed a firing row
-    /// off the stale await duration → a live-vs-replay divergence.
+    /// An end-of-batch-liveness rule keeps the await arm, because the fresh arm
+    /// re-establishes X by the end of the batch. It then arms a firing row off the
+    /// stale await duration, which is a live-vs-replay divergence.
     #[test]
     fn plan_timer_lifecycle_pure_excludes_an_await_arm_cancelled_by_a_later_reset() {
         let commands = vec![
@@ -50010,7 +49995,7 @@ mod tests {
     }
 
     /// A LIVE cancellable arm colliding with a same-batch classic `StartTimer`
-    /// for the same id is a hard invariant violation (issue #768, round 15): the
+    /// for the same id is a hard invariant violation (issue #768): the
     /// arm's `TimerStarted` would be silently dropped, corrupting history. The
     /// persist guard must flag it.
     #[test]
@@ -50034,7 +50019,7 @@ mod tests {
         );
     }
 
-    /// Order-independence (issue #768, Codex P2 round 16): a classic `StartTimer(x)`
+    /// Order-independence (issue #768): a classic `StartTimer(x)`
     /// placed BEFORE a same-id cancellable `ArmTimer(x)` in the batch is the reverse
     /// order of the prefix-only check, and must still be flagged.
     #[test]
@@ -51024,8 +51009,8 @@ mod tests {
         // buckets on top of `pre_suspension_event_count`'s bookkeeping — but it
         // resolves the timer and child buckets against the DB first, since
         // `persist_mixed_suspension_batch` emits their events only for genuinely
-        // NEW rows (Codex round 2, P1: taking the vector lengths inflated the
-        // prospective count on every re-park). This assertion is therefore the
+        // NEW rows. Taking the vector lengths would inflate the prospective
+        // count on every re-park. This assertion is therefore the
         // UPPER bound, with every branch fresh.
         let branch_events =
             batch.scheduled_activities.len() + batch.timers.len() + batch.children.len();
@@ -51148,7 +51133,7 @@ mod tests {
         );
     }
 
-    /// Codex round 4, P2: `TimerHandle::await_fire()` is a durable await that
+    /// `TimerHandle::await_fire()` is a durable await that
     /// emits `ArmTimer { for_await: true }` — the ONE path that inserts the
     /// `harvest_timers` row and makes a cancellable timer fire-eligible — and
     /// then parks. Joined with a local activity it must be rejected like every
@@ -51897,13 +51882,13 @@ mod tests {
 
     #[test]
     fn single_worker_fleet_honors_the_configured_redelivery_maximum() {
-        // Codex round-15 P1. In a fleet SMALLER than the budget the distinct
-        // bound is unreachable by construction: one incapable worker pins
-        // `distinct_after` at 1 forever, and `1 > 5` never holds. Before the
-        // fix the only remaining bound was the 10x ceiling, so a budget of 5
-        // permitted 50 releases and escalated on the 51st claim -- roughly 23
-        // minutes at the backoff cap -- and `capability_miss_max_redeliveries`
-        // stopped being a maximum for the common small deployment.
+        // The configured TOTAL bound. In a fleet SMALLER than the budget the
+        // distinct bound is unreachable by construction: one incapable worker
+        // pins `distinct_after` at 1 forever, and `1 > 5` never holds. Without
+        // the total bound the only remaining bound is the 10x ceiling. A budget
+        // of 5 then permits 50 releases and escalates on the 51st claim, roughly
+        // 23 minutes at the backoff cap. `capability_miss_max_redeliveries` then
+        // is not a maximum for the common small deployment.
         let budget = WorkerConfig::default().capability_miss_max_redeliveries;
         assert_eq!(budget, 5, "the shipped default this bound is derived from");
 
@@ -51939,7 +51924,7 @@ mod tests {
         let budget = 5_u32;
         // `Unavailable`: the registry gave no usable answer, so `budget` total
         // releases may all have been won by the SAME worker -- exactly the
-        // round-6 P1 the distinct bound exists to prevent. The tight bound must
+        // hazard the distinct bound exists to prevent. The tight bound must
         // NOT fire; the ceiling remains the only backstop.
         assert_eq!(
             capability_miss_decision(1, 6, budget, FleetCapabilityEvidence::Unavailable),
@@ -51953,7 +51938,8 @@ mod tests {
             CapabilityMissAction::Escalate
         );
         // `CapablePeerMayExist`: a live worker has never missed it, so it may be
-        // capable. Same conclusion, for the round-8 reason.
+        // capable. Same conclusion: a terminal failure would assert the opposite
+        // of the truth while that worker may be live and polling.
         assert_eq!(
             capability_miss_decision(1, 6, budget, FleetCapabilityEvidence::CapablePeerMayExist),
             CapabilityMissAction::Release
@@ -52303,12 +52289,12 @@ mod tests {
 
     /// The absolute release ceiling must NOT claim the fleet-wide conclusion.
     ///
-    /// Review round 6 added a secondary bound —
+    /// A secondary bound exists —
     /// `CAPABILITY_MISS_TOTAL_BUDGET_MULTIPLIER x budget` total releases — so a
     /// fleet SMALLER than the budget still terminates (with one incapable
     /// worker the distinct set can never exceed a budget of 5, so the primary
-    /// bound alone would bounce forever and AC3 would not hold). But it left
-    /// that new branch resolving to `BudgetExhausted`, which reports "escalated
+    /// bound alone would bounce forever and AC3 would not hold). If that branch
+    /// resolved to `BudgetExhausted`, it would report "escalated
     /// after {budget} capability-miss redeliveries; no live worker on this queue
     /// has the handler" — two false statements at once: the real release count
     /// is `10 x` higher, and the task may have been missed by a single worker
@@ -52318,11 +52304,11 @@ mod tests {
     /// introduced to prevent, so the ceiling gets its own variant that states
     /// the counts it actually observed.
     ///
-    /// (The quoted wording above is the round-6 state, kept because it is what
-    /// this test was written against. `BudgetExhausted` reports its real
-    /// persisted counts too since round 23 — but the variants stay separate,
-    /// because the split is about the *conclusion* and the `outcome_label()`,
-    /// not only about which numbers get printed.)
+    /// (The quoted wording above is the older `BudgetExhausted` text, kept
+    /// because this test was written against it. `BudgetExhausted` now reports
+    /// its real persisted counts too. The variants stay separate, because the
+    /// split is about the *conclusion* and the `outcome_label()`, not only about
+    /// which numbers get printed.)
     #[test]
     fn release_ceiling_escalation_reports_its_real_counts_not_a_fleet_conclusion() {
         use crate::telemetry::CAPABILITY_MISS_OUTCOME_ESCALATED;
@@ -52331,7 +52317,7 @@ mod tests {
         // The shape only this bound can produce: releases past the ceiling,
         // distinct workers still comfortably within budget.
         //
-        // `Unavailable` is load-bearing since round 15. With confirmed coverage
+        // `Unavailable` is load-bearing. With confirmed coverage
         // the configured budget now bounds TOTAL releases as well, so a
         // one-worker fleet escalates at 6 and can never accumulate 51 -- the
         // ceiling is reachable only when coverage could not be established. The
@@ -52421,8 +52407,7 @@ mod tests {
     }
 
     /// The ceiling wording must print the ceiling that actually tripped, not the
-    /// multiplier applied to a number it then fails to multiply (Codex round-23
-    /// P2).
+    /// multiplier applied to a number it then fails to multiply.
     ///
     /// `{MULTIPLIER}x capability_miss_max_redeliveries = {max_redeliveries}`
     /// reads as an equation and is false as one: with the default budget it
@@ -52478,7 +52463,7 @@ mod tests {
     }
 
     /// Distinct-bound exhaustion must report the releases that actually
-    /// happened, not the budget (Codex round-23 P1).
+    /// happened, not the budget.
     ///
     /// The two are equal only in the canonical shape where every worker misses
     /// exactly once. Under `Unavailable` evidence a repeat miss grows
@@ -52549,7 +52534,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Fleet-gated redelivery budget (issue #804, Codex round-8 P1)
+    // Fleet-gated redelivery budget (issue #804)
     // -----------------------------------------------------------------------
 
     fn ids(names: &[&str]) -> Vec<String> {
@@ -52557,8 +52542,7 @@ mod tests {
     }
 
     /// A worker that advertises the queue but cannot pass the task's *own*
-    /// claim gates must not count as a possible capable peer (issue #804,
-    /// Codex round-10 P2).
+    /// claim gates must not count as a possible capable peer (issue #804).
     ///
     /// `claim_task` rejects a worker whose build is not compatible with the
     /// task's `required_build_id` (#171) or whose labels do not satisfy its
@@ -52629,7 +52613,7 @@ mod tests {
     }
 
     /// An **unreadable** compatibility table is not evidence of
-    /// incompatibility (issue #804, Codex round-18 P1).
+    /// incompatibility (issue #804).
     ///
     /// `BuildCompatibilitySet::is_eligible` answers `false` for a worker whose
     /// build differs from the requirement unless a declaration says otherwise,
@@ -52638,7 +52622,7 @@ mod tests {
     /// cross-build peer `claim_task` would still let claim through
     /// `harvest_build_compat`. The narrowed fleet then contains only the
     /// incapable claimer, `fleet_capability_evidence` fabricates
-    /// `AllLiveWorkersMissed`, and the round-15 configured-total bound fires at
+    /// `AllLiveWorkersMissed`, and the configured-total bound fires at
     /// `budget + 1` — terminally failing an execution a live capable peer was
     /// eligible to run, on the strength of one transient `SELECT` failure.
     ///
@@ -52739,7 +52723,7 @@ mod tests {
     }
 
     /// An untried live peer withholds the distinct bound even when the registry
-    /// cannot see the claimant (issue #804, Codex round-38 P1).
+    /// cannot see the claimant (issue #804).
     ///
     /// `Unavailable` is detected self-referentially — the claimant is missing
     /// from the live set — but that says nothing about whether the *rest* of the
@@ -52748,16 +52732,16 @@ mod tests {
     /// that is otherwise perfectly readable and may be listing a live peer that
     /// has never missed this task.
     ///
-    /// Round 15 lets the distinct bound fire on `Unavailable` because `budget +
-    /// 1` distinct missers is strong evidence *on its own*, independent of the
-    /// registry. That reasoning holds when the registry tells us nothing — and
-    /// breaks here, where it is actively naming an untried peer. Escalating
-    /// would terminally fail a task while a worker that may well hold the
-    /// handler is live and polling: the round-8 P1 failure mode, reached
-    /// through the `Unavailable` door.
+    /// The distinct bound may fire on `Unavailable` because `budget + 1`
+    /// distinct missers is strong evidence *on its own*, independent of the
+    /// registry. That reasoning holds when the registry says nothing. It breaks
+    /// here, where the registry names an untried peer. Escalating would
+    /// terminally fail a task while a worker that may well hold the handler is
+    /// live and polling. That is the rollout failure mode of the distinct
+    /// bound, reached through the `Unavailable` door.
     ///
     /// So an untried peer wins over the claimant-absent check. A registry that
-    /// names nobody untried still resolves `Unavailable` and keeps round 15's
+    /// names nobody untried still resolves `Unavailable` and keeps the distinct
     /// bound.
     #[test]
     fn an_untried_live_peer_withholds_the_bound_even_if_the_claimant_is_missing() {
@@ -52786,7 +52770,7 @@ mod tests {
              naming a live worker that has never missed this task"
         );
 
-        // The control that keeps round 15 honest: a registry naming NOBODY
+        // The control that keeps the `Unavailable` rule honest: a registry naming NOBODY
         // untried still resolves `Unavailable`, and the distinct bound still
         // fires. Without this, always-withholding would satisfy the assertion
         // above while silently unbounding the small-fleet case.
@@ -52938,7 +52922,7 @@ mod tests {
         );
     }
 
-    /// Codex round-8 P2: the escalation branch never runs the release UPDATE,
+    /// Issue #804: the escalation branch never runs the release UPDATE,
     /// so the durable record has one fewer redelivery than the decision saw.
     /// The reason string is what an operator reconstructs the incident from, so
     /// it must report completed redeliveries only.
@@ -52953,7 +52937,7 @@ mod tests {
                 distinct_after: 1,
                 completed_releases: 50,
                 released_workers: 1,
-                // `Unavailable`, not confirmed coverage: since round 15 the
+                // `Unavailable`, not confirmed coverage: the
                 // configured budget also bounds TOTAL releases once coverage is
                 // confirmed, so a one-worker fleet could never reach 50
                 // releases under `AllLiveWorkersMissed`. The ceiling wording
@@ -52971,7 +52955,7 @@ mod tests {
         );
     }
 
-    /// The call-site half of Codex round-8 P2: the reported counts must come
+    /// The call-site half of the same rule: the reported counts must come
     /// from the PERSISTED row, never from the resolution's post-increment
     /// decision inputs. Constructed so the two differ by exactly one, which is
     /// the whole bug.
@@ -53667,7 +53651,7 @@ mod tests {
     #[test]
     fn capability_miss_fleet_window_never_shrinks_the_liveness_window() {
         // The whole safety argument for the floor is that it can only ever
-        // RETAIN more peers than the pre-round-19 window did, so no fleet that
+        // RETAIN more peers than the window without the floor, so no fleet that
         // escalated correctly before can start escalating spuriously now.
         for secs in [0, 1, 2, 5, 10, 30, 59, 60, 61, 120, 600, 86_400] {
             let interval = Duration::from_secs(secs);
@@ -53681,7 +53665,7 @@ mod tests {
 
     #[test]
     fn capability_miss_fleet_window_covers_a_peer_on_the_default_cadence() {
-        // The round-19 P1 itself: a claimant configured to heartbeat every
+        // The hazard itself: a claimant configured to heartbeat every
         // second must not conclude a peer running the DEFAULT 5s cadence is
         // dead. This is a default-configuration hazard, not an exotic one.
         let fast_claimant = Duration::from_secs(1);
@@ -53729,7 +53713,7 @@ mod tests {
 
     #[test]
     fn an_unregistered_worker_may_not_claim_tasks() {
-        // Issue #804, Codex round-54 P1. A worker whose atomic register+
+        // Issue #804. A worker whose atomic register+
         // invalidate pair has not committed is not a fleet member: it is
         // invisible to peers' capability evidence, AND every task it claims
         // matches the orphan-reclaim predicate (RUNNING with a worker_id that
@@ -53885,7 +53869,7 @@ mod tests {
 
     #[test]
     fn missing_local_activity_handler_names_the_activity_that_cannot_run() {
-        // Issue #804 (Codex round-19 P2): the inline local-activity arm commits
+        // Issue #804: the inline local-activity arm commits
         // durable logs (#790), progress notifications (#791), search-attribute
         // and current-details patches, and mutex releases (#691) BEFORE
         // `run_local_activity_inline` consults the registry. Once a miss became
@@ -53937,7 +53921,7 @@ mod tests {
 
     #[test]
     fn persist_capability_miss_finds_each_handler_bearing_command() {
-        // Issue #804 (Codex round-6 P2): the three commands whose PERSISTENCE
+        // Issue #804: the three commands whose PERSISTENCE
         // resolves a handler must all be caught by the pre-pass that runs
         // *ahead* of the terminal telemetry, mirroring the in-transaction
         // checks in persist_scheduled_activities /
@@ -53977,7 +53961,7 @@ mod tests {
 
     #[test]
     fn continue_as_new_to_an_unregistered_type_is_a_capability_miss() {
-        // Issue #804 (Codex round-45 P1). A cross-type continue-as-new (issue
+        // Issue #804. A cross-type continue-as-new (issue
         // #803) resolves the TARGET type's handler, so during a rolling deploy
         // an old pod that runs the source type but not the new target is in
         // exactly the state #804 exists for: blameless, transient, and fixable
@@ -54134,8 +54118,8 @@ mod tests {
     /// reads; every other field is irrelevant to it.
     ///
     /// The recorded frontier is [`SAME_FRONTIER`], so a test asserting the
-    /// snapshot is *preserved* must pass that key — passing anything else is
-    /// the round-46 mismatch, which zeroes.
+    /// snapshot is *preserved* must pass that key. Any other key is a frontier
+    /// mismatch, which zeroes.
     fn frontier_task(misses: i32, workers: &[&str]) -> TaskQueueItem {
         TaskQueueItem {
             capability_misses: misses,
@@ -54175,7 +54159,7 @@ mod tests {
 
     #[test]
     fn no_frontier_reset_preserves_the_storage_ceiling_guard() {
-        // Issue #804, Codex round-22 P2. The predecessor of this rule
+        // Issue #804. The predecessor of this rule
         // fabricated a clean frontier whenever a re-read failed, which bypassed
         // the `i32::MAX` guard: the resolver said Release, and the release
         // statement's `capability_misses + 1` against the REAL row then raised
@@ -54206,7 +54190,7 @@ mod tests {
     }
 
     /// Counters recorded against a DIFFERENT handler are not evidence about
-    /// this one (issue #804, Codex round-46 P1).
+    /// this one (issue #804).
     ///
     /// The reset flag only covers the two ways a dispatch can *itself* retire a
     /// frontier: a park, or inline local-activity progress. Newly ingested
@@ -54248,7 +54232,7 @@ mod tests {
 
     /// A row with no frontier recorded yet reads as a mismatch, which is the
     /// safe direction: a full budget releases, where a fabricated match could
-    /// charge a spend nobody made (issue #804, Codex round-46 P1).
+    /// charge a spend nobody made (issue #804).
     #[test]
     fn an_unrecorded_frontier_reads_as_a_fresh_budget() {
         let task = TaskQueueItem {
@@ -54300,14 +54284,14 @@ mod tests {
         );
     }
 
-    // -- Codex round-28 P1s: ownership, staleness, and read coherence --------
+    // -- Issue #804: ownership, staleness, and read coherence --------
 
     /// A re-read that matches no owned row is POSITIVE evidence that the claim
     /// is gone, not merely an absence of fresh data. It must not fall back to
     /// the snapshot and let the decision proceed: the escalation write is not
     /// ownership-guarded (`queue::fail_task` accepts any PENDING/RUNNING row
     /// regardless of `worker_id`), so a stale dispatcher deciding `Escalate`
-    /// terminally fails a task another worker now owns (Codex round-28 P1).
+    /// terminally fails a task another worker now owns.
     #[test]
     fn a_lost_claim_is_distinguished_from_an_unreadable_row() {
         let task = frontier_task(3, &["worker-a"]);
@@ -54513,7 +54497,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Codex round-29 P1: an escalation is revalidated at the commit boundary.
+    // Issue #804: an escalation is revalidated at the commit boundary.
     // -----------------------------------------------------------------------
 
     /// A resolution carrying `action`, with the counts/evidence a fully
@@ -54599,10 +54583,10 @@ mod tests {
 
     #[test]
     fn a_peer_reregistering_inside_the_commit_bracket_withdraws_the_escalation() {
-        // Codex round-30 P1. Round 29 re-derived a SINGLE miss read at the
-        // commit boundary, so a peer whose entry is invalidated between that
-        // read and the fleet read still counted as a misser while already
-        // appearing live -- `AllLiveWorkersMissed`, and a terminal write.
+        // Issue #804. A SINGLE miss read at the commit boundary is unsafe. A
+        // peer whose entry is invalidated between that read and the fleet read
+        // still counts as a misser while already appearing live. That derives
+        // `AllLiveWorkersMissed`, and a terminal write.
         //
         // This composes exactly what `prepare_escalation_commit` now does with
         // the shared bracket: the two reads disagree, so the confidence is
@@ -54648,7 +54632,7 @@ mod tests {
 
     #[test]
     fn the_reported_cause_is_the_revalidated_one_not_the_obsolete_one() {
-        // Codex round-31 P2. The initial decision and the commit-boundary
+        // Issue #804. The initial decision and the commit-boundary
         // revalidation can BOTH say escalate for different reasons: a task past
         // the absolute release ceiling escalates as `BudgetExhausted` while
         // every live worker has missed it, and as `ReleaseCeilingExhausted` the
@@ -54798,7 +54782,7 @@ mod tests {
 
     #[test]
     fn capability_miss_budget_is_not_consumed_twice_by_the_same_worker() {
-        // Issue #804 (Codex round-6 P1): the backoff makes a released task
+        // Issue #804: the backoff makes a released task
         // eligible to EVERY worker again, including the one that just released
         // it, and the claim query has no capability filter. Under plain
         // total-miss accounting, six consecutive claim-race wins by ONE
@@ -54830,9 +54814,9 @@ mod tests {
         // so AC3's "bounded release" needs an absolute ceiling as well.
         //
         // The empty `live_workers` here is load-bearing: it makes the evidence
-        // `Unavailable`, which is exactly the state the round-15 configured
-        // total bound withholds itself from (it would otherwise let one worker's
-        // repeat misses exhaust the budget -- the round-6 defect). So this is
+        // `Unavailable`, which is exactly the state the configured total bound
+        // withholds itself from. Otherwise one worker's repeat misses could
+        // exhaust the budget. So this is
         // the case the ceiling still exists for, and it is a generous multiple
         // of the budget: reaching it while a capable peer is live requires that
         // peer to lose the claim race that many times in a row, which is
@@ -54920,13 +54904,13 @@ mod tests {
     /// ~2000 years — but the column is writable by an operator, a backfill, or
     /// a test seed).
     /// The phase a raise site stamps must reach the dispatch site's strike
-    /// decision unchanged (issue #804, round 10).
+    /// decision unchanged (issue #804).
     ///
     /// Pins the wiring, not the rule: `CapabilityMissPhase`'s own truth table
     /// lives in `error.rs`. What can silently break *here* is the derivation in
-    /// `handle_capability_miss` — an inverted boolean, or a hard-coded `false`
-    /// reintroducing the pre-round-10 "never clear" behaviour that let a
-    /// healthy workflow bank issue #494 strikes it did not earn.
+    /// `handle_capability_miss` — an inverted boolean, or a hard-coded `false`.
+    /// A hard-coded `false` means "never clear", which lets a healthy workflow
+    /// bank issue #494 strikes it did not earn.
     #[test]
     fn missing_handler_phase_reaches_the_timeout_strike_decision() {
         for (phase, expected) in [
@@ -55180,10 +55164,10 @@ mod tests {
         assert!(strikes.lock().unwrap().is_empty());
     }
 
-    /// **Issue #804 round-16 P2.** An *escalated* capability miss must clear the
+    /// **Issue #804.** An *escalated* capability miss must clear the
     /// #782 panic strike, because escalation terminally fails the execution.
     ///
-    /// Round 13 stopped a pre-/mid-handler miss from clearing the strike, which
+    /// A pre-/mid-handler miss does not clear the strike, which
     /// is right for the **release** path — the execution stays `RUNNING` and the
     /// streak must survive. Escalation is the opposite: it routes through
     /// `fail_task_and_execution`, so there is no later cycle for that execution
@@ -55223,7 +55207,7 @@ mod tests {
             );
         }
 
-        // A release is non-terminal: round 13's protection stands.
+        // A release is non-terminal: the strike preservation stands.
         let strikes = seed();
         let released: HarvestResult<TaskDispatchOutcome> = Ok(TaskDispatchOutcome::Released {
             clears_timeout_strike: false,
@@ -55237,7 +55221,7 @@ mod tests {
         );
 
         // The terminal write failed, so the row is stranded `RUNNING` and will
-        // be re-driven. Preserving the streak is the whole point of round 13.
+        // be re-driven. Preserving the streak is the whole point of the release rule.
         let strikes = seed();
         let write_failed: HarvestResult<TaskDispatchOutcome> =
             Err(HarvestError::NotFound("terminal write lost the row".into()));
@@ -55580,7 +55564,7 @@ mod tests {
         assert!(!deadline_would_be_exceeded(shifted_fresh, now, delay));
     }
 
-    // ── schedule_to_close in-transaction re-check (issue #609, round 2) ─────
+    // ── schedule_to_close in-transaction re-check (issue #609) ─────
 
     #[test]
     fn recheck_missing_task_row_is_handled() {
@@ -56809,7 +56793,7 @@ mod tests {
     /// any other type, so without an explicit check it would be accepted and
     /// the successor would run the DAG's level-walker with the `max_active_runs`
     /// / paused-schedule admission gates bypassed. DAG continue-as-new is out
-    /// of scope for issue #803: reject it, don't half-support it.
+    /// of scope for issue #803: reject it, do not half-support it.
     #[test]
     fn can803_rejects_a_unified_dag_target() {
         let registry = HandlerRegistry::new(
@@ -58061,7 +58045,7 @@ mod tests {
     }
 
     /// The history hard-cap preflight counts what will actually be APPENDED, not
-    /// the whole batch (Codex P2 round 3). Over-counting is not the safe
+    /// the whole batch. Over-counting is not the safe
     /// direction here: breaching the cap dead-letters the execution and replaces
     /// its real failure with a history-cap error, so a re-park of already-started
     /// children must not be counted.

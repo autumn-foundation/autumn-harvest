@@ -9,12 +9,12 @@
 ///
 /// Downstream crates (such as `autumn-harvest-plugin`) should consume this
 /// const instead of invoking `diesel_migrations::embed_migrations!()` against
-/// this crate's path. Proc-macro path arguments are resolved at the *consumer's*
-/// compile-time location, which doesn't survive `cargo publish` because the
-/// upstream crate's directory layout isn't available in the downstream's
-/// packaged tarball. Centralising the macro invocation here keeps the path
-/// resolution local to this crate, where the `migrations/` directory always
-/// ships alongside.
+/// this crate's path. Proc-macro path arguments resolve at the *consumer's*
+/// compile-time location. That does not survive `cargo publish`, because the
+/// downstream's packaged tarball does not have the upstream crate's directory
+/// layout. Centralising the macro invocation here keeps the path resolution
+/// local to this crate, where the `migrations/` directory always ships
+/// alongside.
 #[cfg(feature = "db")]
 #[macro_export]
 macro_rules! cfg_db {

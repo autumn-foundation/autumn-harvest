@@ -507,7 +507,7 @@ async fn worker_resolves_dynamic_key_from_workflow_input_not_activity_input() {
     // Two executions of the same workflow/activity, differing ONLY in workflow
     // input. The activity input is identical (`{"item":"x"}`) for both — so if
     // the activity input were the source, both would resolve to the same
-    // fallback key. They don't: acme -> ...:acme, {} -> ...: (empty fallback).
+    // fallback key. They do not: acme -> ...:acme, {} -> ...: (empty fallback).
     let exec_acme = ExecutionId::new();
     let exec_empty = ExecutionId::new();
     start_or_load_workflow_execution(
@@ -560,8 +560,8 @@ async fn worker_resolves_dynamic_key_from_workflow_input_not_activity_input() {
         "acme's key must resolve from the WORKFLOW input"
     );
     // Absent-field fallback: workflow input `{}` -> the UNRESOLVED (`None`)
-    // shared fallback bucket, encoded with the distinct `U` marker (issue #699
-    // review, Codex round-5 P2). Distinct from a legitimately-resolved
+    // shared fallback bucket, encoded with the distinct `U` marker (issue
+    // #699). Distinct from a legitimately-resolved
     // empty-string tenant `Some("")`, which would bucket under `L0:`.
     assert_eq!(
         rate_limit_key_for_exec(&mut conn, exec_empty).await,
@@ -737,7 +737,7 @@ async fn success_metric_cross_key_burst_fairness() {
     }
 }
 
-// ── Issue #699 review (Codex round-5 P2): comprehensive worker-startup gate ───
+// ── Issue #699: comprehensive worker-startup gate ─────────────────────────────
 //
 // The public `HandlerRegistry` path bypasses ALL `HarvestBuilder::try_build`
 // rate-limit validation, so an invalid config used to slip through and only be
@@ -755,7 +755,7 @@ async fn success_metric_cross_key_burst_fairness() {
 /// task-dispatch/enqueue path where per-key rate limiting lives. The
 /// `#[activity]` macro rejects this at parse time, but a hand-built
 /// `ActivityInfo` (direct `HandlerRegistry`) bypasses the macro. The
-/// worker-startup gate must reject it (Codex round-5 P2, worker.rs:4693).
+/// worker-startup gate must reject it (see `worker.rs`).
 #[test]
 fn worker_startup_rejects_dynamic_rate_limit_on_local_activity() {
     // `charge_info()` is a valid dynamic-key activity (key = input.tenant_id,
@@ -796,7 +796,7 @@ fn worker_startup_rejects_dynamic_rate_limit_on_local_activity() {
 /// DIFFERENT `rps` must be rejected: both register the same composite bucket
 /// `ON CONFLICT DO NOTHING`, so the bucket's rate/burst would become
 /// insertion-order dependent. The builder path (`try_build`) already rejects
-/// this; the worker-startup gate must too (Codex round-5 P2, worker.rs:4826).
+/// this; the worker-startup gate must too (see `worker.rs`).
 #[test]
 fn worker_startup_rejects_conflicting_rps_for_same_key_expr() {
     // Two dynamic-key activities on the SAME normalized expression
@@ -849,8 +849,8 @@ fn worker_startup_accepts_valid_direct_registry() {
 
 /// A dynamic `rate_limit(key = ...)` WITHOUT an `rps` reaching the worker via a
 /// direct `HandlerRegistry` must fail loud at the startup gate rather than run
-/// unrated (the primary gate as of Codex round-5 P2; the schedule-time guard in
-/// `persist_scheduled_activities` stays as defense-in-depth behind it).
+/// unrated. This gate is the primary one (issue #699). The schedule-time guard
+/// in `persist_scheduled_activities` stays as defense-in-depth behind it.
 #[test]
 fn worker_startup_rejects_dynamic_key_without_rps() {
     let mut bad_charge = charge_info();
@@ -882,9 +882,9 @@ fn worker_startup_rejects_dynamic_key_without_rps() {
 /// A STATIC `rate_limit_key` beginning with the reserved `dyn-rate:` prefix
 /// reaching the worker via a direct `HandlerRegistry` must fail loud at the
 /// startup gate rather than register a bucket colliding with the generated
-/// dynamic per-key namespace (the primary gate as of Codex round-5 P2; the
+/// dynamic per-key namespace. This gate is the primary one (issue #699). The
 /// schedule-time guard in `persist_scheduled_activities` stays as
-/// defense-in-depth behind it).
+/// defense-in-depth behind it.
 #[test]
 fn worker_startup_rejects_reserved_static_prefix() {
     let mut bad_charge = charge_info();

@@ -2,7 +2,7 @@
 //!
 //! All writes go through [`append_events()`] which inserts atomically.
 //! The `UNIQUE(workflow_exec_id, event_id)` constraint guarantees
-//! that two workers can't append conflicting events to the same workflow.
+//! that two workers cannot append conflicting events to the same workflow.
 
 use crate::cached_stmt::CachePreparedDsl as _;
 use crate::schema::harvest_workflow_executions_ext;
@@ -1394,7 +1394,7 @@ pub(crate) async fn lock_and_load_history_undecoded(
 /// # Errors
 ///
 /// Returns [`crate::error::HarvestError::Database`] on connection or query errors, or
-/// [`crate::error::HarvestError::Serialization`] if a stored JSON value can't be deserialized
+/// [`crate::error::HarvestError::Serialization`] if a stored JSON value cannot be deserialized
 /// into `WorkflowEvent`.
 pub async fn load_history(
     conn: &mut AsyncPgConnection,
@@ -1467,7 +1467,7 @@ pub async fn load_history_with_codecs(
 ///
 /// Returns [`crate::error::HarvestError::Database`] on connection or query
 /// errors, or [`crate::error::HarvestError::Serialization`] if a stored JSON
-/// value can't be deserialized into [`WorkflowEvent`].
+/// value cannot be deserialized into [`WorkflowEvent`].
 pub async fn load_history_undecoded(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
@@ -1667,7 +1667,7 @@ pub async fn load_histories_undecoded_batch(
 ///
 /// Returns [`crate::error::HarvestError::Database`] on connection or query
 /// errors, or [`crate::error::HarvestError::Serialization`] if a stored JSON
-/// value can't be deserialized into [`WorkflowEvent`].
+/// value cannot be deserialized into [`WorkflowEvent`].
 #[cfg(feature = "db")]
 pub async fn load_timestamped_history(
     conn: &mut AsyncPgConnection,
@@ -1720,7 +1720,7 @@ pub async fn load_timestamped_history(
 ///
 /// Returns [`crate::error::HarvestError::Database`] on connection or query
 /// errors, or [`crate::error::HarvestError::Serialization`] if a stored JSON
-/// value can't be deserialized into [`WorkflowEvent`].
+/// value cannot be deserialized into [`WorkflowEvent`].
 pub async fn load_history_with_timestamps(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
@@ -2084,7 +2084,7 @@ pub async fn check_execution_exists(
 ///   this list.  Unknown type names yield an empty page (not an error).
 /// - `include_totals`: when `true`, runs an extra `COUNT`/`MAX` aggregate
 ///   query to populate `HistoryPage::total_events` and `HistoryPage::last_event_id`.
-///   Pass `false` when the caller doesn't need these fields to save a DB round-trip.
+///   Pass `false` when the caller does not need these fields to save a DB round-trip.
 ///
 /// # Errors
 ///
@@ -2102,7 +2102,7 @@ pub async fn load_history_page(
     use diesel::dsl::{count_star, max};
 
     // ── 1. Aggregate query: total events + last id (unfiltered) ──────────────
-    // Skipped when the caller doesn't need totals (e.g. get_workflow bounded view).
+    // Skipped when the caller does not need totals (e.g. get_workflow bounded view).
     let (total_events, last_event_id) = if include_totals {
         let (total, last): (i64, Option<i64>) = harvest_events::table
             .filter(harvest_events::workflow_exec_id.eq(exec_id.as_uuid()))
@@ -2311,7 +2311,7 @@ fn workflow_child_row_from_parts(
 /// `load_workflow_children_batch`, which this mirrors exactly except for
 /// returning `WorkflowChildRow` (this endpoint's flat, non-parent-tagged
 /// projection) instead of `LineageChildRow` (the nested `/tree` endpoint's
-/// parent-tagged one) — the caller here doesn't need to know *which* parent
+/// parent-tagged one) — the caller here does not need to know *which* parent
 /// in the frontier produced a given child, only the whole next frontier and
 /// the whole set of matching rows.
 ///
@@ -2852,9 +2852,9 @@ pub async fn append_workflow_logs(
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let admit = (remaining as usize).min(lines.len());
 
-    // Keep the affected-row count (issue #790 review round 2): on the re-drive
-    // path the conflict clause collapses rows that are already stored, so
-    // `admit` counts what we OFFERED, not what landed.
+    // Keep the affected-row count (issue #790). On the re-drive path the
+    // conflict clause collapses rows that are already stored, so `admit`
+    // counts what was OFFERED, not what landed.
     let inserted = if admit > 0 {
         let rows: Vec<crate::models::NewHarvestWorkflowLog> = lines[..admit]
             .iter()
