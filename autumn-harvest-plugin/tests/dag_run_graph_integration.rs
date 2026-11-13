@@ -790,10 +790,10 @@ async fn dag_run_graph_skip_marker_with_opaque_codec_details_is_still_skipped() 
 #[tokio::test]
 async fn dag_run_graph_excludes_a_codec_encoded_compensation_dispatch() {
     // Issue #780: the run-graph readers load RAW history
-    // (`load_history_with_timestamps` leaves payload fields undecoded), so on a
+    // (`load_history_with_timestamps` leaves payload fields undecoded). So on a
     // codec-encrypting or payload-offloading deployment the compensation-dispatch
-    // exclusion silently stopped working — `is_compensation_dispatch` saw an
-    // opaque envelope, returned false, and a never-executed forward node was
+    // exclusion silently stopped working. `is_compensation_dispatch` saw an
+    // opaque envelope and returned false. A never-executed forward node was then
     // reported with the old compensation's status/timings/attempts.
     //
     // Cross-version drift: history was produced by an older definition whose

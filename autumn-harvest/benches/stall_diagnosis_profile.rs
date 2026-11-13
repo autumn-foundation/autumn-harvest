@@ -191,12 +191,12 @@ fn build_inputs(n: usize, now: DateTime<Utc>) -> DiagnosisInputs {
 /// Reads `key` as a `usize`, using `default` only when the variable is
 /// genuinely *absent*. A *present but malformed* value (a typo, e.g.
 /// `STALL_DIAGNOSIS_PROFILE_N=50O`, or non-Unicode content) is a
-/// configuration error, not silently substituted for the default -- a
-/// harness whose whole point is producing a specific, documented,
-/// reproducible number must not silently profile a *different*
-/// configuration than the one actually requested and report success as if
-/// nothing were wrong (the fixture's own sanity check would still pass,
-/// since it is computed from the same substituted value).
+/// configuration error. It is not silently substituted for the default. This
+/// harness exists to produce a specific, documented, reproducible number. It
+/// must not silently profile a *different* configuration than the one
+/// requested and report success as if nothing were wrong. The fixture's own
+/// sanity check would still pass, since it is computed from the same
+/// substituted value.
 fn env_usize(key: &str, default: usize) -> usize {
     match std::env::var(key) {
         Ok(raw) => raw
@@ -211,8 +211,8 @@ fn env_usize(key: &str, default: usize) -> usize {
 
 /// Rejects a workload size that would silently stop exercising the
 /// documented "wide fan-out with a genuine root cause away from either end"
-/// shape this harness exists to measure -- so shortening a Valgrind run
-/// cannot quietly produce measurements for a degenerate workload instead.
+/// shape. This harness exists to measure that shape. So shortening a Valgrind
+/// run cannot quietly produce measurements for a degenerate workload instead.
 fn validate_workload_params(n: usize, reps: usize) {
     // reps=0 skips the measured loop entirely -- the harness would exit 0
     // and print a plausible-looking summary line without ever profiling the
@@ -283,9 +283,9 @@ fn main() {
         *kind_tally.entry(blocked_on.kind()).or_insert(0) += 1;
     }
 
-    // Printed so the binary cannot be trivially dead-code-eliminated and so a
-    // regression that changes which verdict wins is loudly visible rather
-    // than silently under- or over-measuring the fold.
+    // Printed so the binary cannot be trivially dead-code-eliminated. The
+    // print also makes a regression that changes which verdict wins loudly
+    // visible, rather than silently under- or over-measuring the fold.
     let mut kinds: Vec<(&str, u64)> = kind_tally.into_iter().collect();
     kinds.sort_unstable();
     println!(

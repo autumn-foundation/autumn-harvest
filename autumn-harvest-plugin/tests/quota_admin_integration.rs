@@ -679,13 +679,13 @@ async fn plain_start_writes_a_failed_audit_row_when_quota_exceeded() {
         .expect("a quota-rejected start must be audited");
     assert_eq!(row.status, "failed");
     assert_eq!(row.error_summary, "quota exceeded");
-    // Regression guard for issue #946: routing
-    // has already resolved the target shard by the time the quota check
-    // rejects the start, so the audit row must record it (matching every
-    // other failure arm on this route, and the signal-with-start /
-    // update-with-start quota arms below) -- a quota-rejection audit row
-    // with a NULL shard is otherwise indistinguishable by shard in the
-    // audit trail precisely where enforcement is shard-local.
+    // Regression guard for issue #946: routing has already resolved the
+    // target shard by the time the quota check rejects the start. So the audit
+    // row must record it. That matches every other failure arm on this route,
+    // and the signal-with-start / update-with-start quota arms below. A
+    // quota-rejection audit row with a NULL shard is otherwise
+    // indistinguishable by shard in the audit trail. That is precisely where
+    // enforcement is shard-local.
     assert_eq!(
         row.shard_id,
         Some(0),

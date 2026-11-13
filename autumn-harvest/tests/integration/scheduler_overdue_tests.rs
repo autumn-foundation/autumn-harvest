@@ -544,9 +544,9 @@ async fn non_deferring_policy_at_capacity_is_overdue() {
     );
 }
 
-/// A calendar `run_next_business_day` schedule whose slot fell on
-/// an excluded (weekend) day is deliberately deferred by the tick to the next
-/// business day; while that adjusted fire is still in the FUTURE the tick keeps
+/// A calendar `run_next_business_day` schedule whose slot fell on an excluded
+/// (weekend) day is deliberately deferred by the tick to the next business day.
+/// While that adjusted fire is still in the FUTURE, the tick keeps
 /// `next_run_at` pinned to the (past) original slot. The sampler must NOT flag it
 /// overdue — reusing the tick's own calendar rebasing. A control run WITHOUT the
 /// calendar (same past slot) IS overdue, proving the calendar resolution is what
@@ -623,9 +623,9 @@ async fn calendar_schedule_wedged_past_adjusted_fire_is_overdue_via_sampler() {
 }
 
 /// Run ONE overdue sampling pass for a single shard connection and emit into
-/// `metrics`, mirroring the worker sampler loop's per-pass reconciliation:
-/// run [`overdue_schedule_pass`], emit each verdict, then zero
-/// any label from `previous_emitted` that disappeared from this COMPLETE pass via
+/// `metrics`. This mirrors the worker sampler loop's per-pass reconciliation.
+/// Run [`overdue_schedule_pass`] and emit each verdict. Then zero any label from
+/// `previous_emitted` that disappeared from this COMPLETE pass, via
 /// [`autumn_harvest::worker::labels_to_clear`]. Returns `(current keys,
 /// pass_complete)`. Single-shard, so a pass is complete iff the read succeeded.
 async fn run_and_emit_overdue_pass(
@@ -656,9 +656,9 @@ async fn run_and_emit_overdue_pass(
     (current, complete)
 }
 
-/// A schedule that was overdue and is then deleted has its
-/// gauge series zeroed on the next COMPLETE pass, so `harvest.schedule.overdue`
-/// cannot stick at `1` for a schedule that no longer exists. Drives the real
+/// A schedule that was overdue and is then deleted has its gauge series zeroed
+/// on the next COMPLETE pass. So `harvest.schedule.overdue` cannot stick at `1`
+/// for a schedule that no longer exists. Drives the real
 /// `overdue_schedule_pass` + `worker::labels_to_clear` reconciliation the sampler
 /// loop performs, against a real DB, across a delete. (F1's eager-first-pass is a
 /// structural loop change — sample-before-sleep — with no non-brittle unit seam;

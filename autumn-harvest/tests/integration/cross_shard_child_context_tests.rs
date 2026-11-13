@@ -583,8 +583,8 @@ async fn sequential_placed_spawns_do_not_all_collide_on_one_shard() {
 
     // Assert the DETERMINISTIC property, not a distribution one: child N must
     // hash as the Nth invocation. "they did not all land on one shard" would be a
-    // flaky assertion — three keys over four shards legitimately collide about 6
-    // times in 100 — and it would also pass by luck under the very bug this test
+    // flaky assertion. Three keys over four shards legitimately collide about 6
+    // times in 100. It would also pass by luck under the very bug this test
     // exists to catch.
     let router = four_shard_router();
     let expected: Vec<i32> = (1..=3)

@@ -222,9 +222,10 @@ fn arm_timer_activity_cancel_then_await_workflow<'a>(
 
 /// Issue #768: arm a cancellable timer, suspend on an activity, then `reset()`
 /// and `await_fire()` AFTER the activity completes. The armed timer's
-/// `harvest_timers` row is inserted only at `await_fire`, so it can NEVER fire while the workflow is
-/// parked on the activity — no spurious `TimerFired` that would break the
-/// subsequent `reset()` (an unconsumed fire → non-determinism) or diverge replay.
+/// `harvest_timers` row is inserted only at `await_fire`. So it can NEVER fire
+/// while the workflow is parked on the activity. No spurious `TimerFired` can
+/// break the subsequent `reset()` (an unconsumed fire → non-determinism) or
+/// diverge replay.
 fn arm_timer_activity_reset_then_await_workflow<'a>(
     ctx: &'a WorkflowContext,
     _input: Value,
@@ -251,9 +252,9 @@ fn concurrent_await_two_timers_workflow<'a>(
     _input: Value,
 ) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
     Box::pin(async move {
-        // Capture the virtual-clock start so the test can assert the elapsed after
-        // both concurrent timers fire is the MAX deadline (10s), not the SUM (11s)
-        // (issue #768).
+        // Capture the virtual-clock start (issue #768). The test then asserts
+        // that the elapsed time after both concurrent timers fire is the MAX
+        // deadline (10s), not the SUM (11s).
         let start = ctx.now();
         let slow = ctx.start_timer("slow", 10);
         let fast = ctx.start_timer("fast", 1);
@@ -267,11 +268,11 @@ fn concurrent_await_two_timers_workflow<'a>(
     })
 }
 
-/// Issue #768: a sibling/handler-style
-/// `cancel_timer("deadline")` targeting an id the main body uses as a CLASSIC
-/// `ctx.timer` must be a NO-OP: it must NOT emit a `CancelTimer` (whose
-/// worker-side `delete_pending_timer` would delete the classic timer's durable
-/// row and hang its waiter). The classic timer therefore still fires and the run
+/// Issue #768: a sibling/handler-style `cancel_timer("deadline")` can target an
+/// id that the main body uses as a CLASSIC `ctx.timer`. It must be a NO-OP and
+/// must NOT emit a `CancelTimer`. That command's worker-side
+/// `delete_pending_timer` would delete the classic timer's durable row and
+/// hang its waiter. The classic timer therefore still fires and the run
 /// replays deterministically.
 fn cancel_timer_does_not_kill_a_classic_timer_workflow<'a>(
     ctx: &'a WorkflowContext,
@@ -703,9 +704,9 @@ async fn test_cancellable_timer_fires_when_not_cancelled() {
     );
 }
 
-/// Issue #768: concurrent awaited cancellable timers fire in
-/// DEADLINE order (min `fires_at` first), matching production's min-deadline
-/// reschedule + deadline-ordered ingest — never in `join!` poll order.
+/// Issue #768: concurrent awaited cancellable timers fire in DEADLINE order
+/// (min `fires_at` first), never in `join!` poll order. That matches
+/// production's min-deadline reschedule + deadline-ordered ingest.
 #[tokio::test]
 async fn test_concurrent_awaited_timers_fire_in_deadline_order() {
     let outcome = WorkflowTestEnv::new()
@@ -728,10 +729,10 @@ async fn test_concurrent_awaited_timers_fire_in_deadline_order() {
          slow dur=10), never in join! poll order: {fired_order:?}"
     );
 
-    // Issue #768: the two timers are armed concurrently (one
-    // `await_fire` batch), so production starts both deadlines at the same instant
-    // and the workflow-observed elapsed after both fire is the MAX deadline (10s),
-    // NOT the sum (11s). The live `ctx.now()` read inside the workflow, and
+    // Issue #768: the two timers are armed concurrently (one `await_fire`
+    // batch), so production starts both deadlines at the same instant. The
+    // workflow-observed elapsed after both fire is the MAX deadline (10s), NOT
+    // the sum (11s). The live `ctx.now()` read inside the workflow, and
     // `final_now()`/`elapsed()` reconstructed from history, must all agree at 10.
     let result = outcome.result.as_ref().expect("run ok");
     assert_eq!(
@@ -869,11 +870,11 @@ async fn test_reset_then_fire() {
     );
 }
 
-/// Issue #768: a reset performed through
-/// `ctx.reset_timer` (or another handle) must be honoured by a subsequent
-/// `await_fire()` on the ORIGINAL handle: the live deadline and the virtual
-/// clock must use the CURRENT armed duration (600) from the logical state map,
-/// not the awaiting handle's stale cached 300. Before the fix the clock
+/// Issue #768: a reset performed through `ctx.reset_timer` (or another handle)
+/// must be honoured by a subsequent `await_fire()` on the ORIGINAL handle. The
+/// live deadline and the virtual clock must use the CURRENT armed duration
+/// (600) from the logical state map. They must not use the awaiting handle's
+/// stale cached 300. Before the fix the clock
 /// advanced by 300 and disagreed with the recorded `TimerStarted(idle, 600)`.
 #[tokio::test]
 async fn test_await_fire_uses_current_reset_duration_not_stale_handle() {
@@ -1130,9 +1131,9 @@ async fn start_timer_then_activity_then_cancel_then_await_cancelled() {
 async fn start_timer_activity_reset_then_await_fires_without_spurious_fire() {
     // Issue #768: arm → activity → reset → await. The armed timer must NOT
     // fire while parked on the activity. Its durable row is inserted only at
-    // `await_fire`, so a `reset()` after the activity is never confronted with an
-    // already-fired timer (which would leave an unconsumed TimerFired → non-
-    // determinism), and the run replays deterministically to a final `Fired`.
+    // `await_fire`. So a `reset()` after the activity never meets an
+    // already-fired timer, which would leave an unconsumed TimerFired →
+    // non-determinism. The run replays deterministically to a final `Fired`.
     let outcome = WorkflowTestEnv::new()
         .mock_activity("work", |_| Ok(json!("done")))
         .run(arm_timer_activity_reset_then_await_workflow, json!(null))
@@ -1186,10 +1187,10 @@ async fn start_timer_activity_reset_then_await_fires_without_spurious_fire() {
 
 #[tokio::test]
 async fn cancel_then_classic_timer_same_id_arms_and_fires() {
-    // Issue #768: a same-task `start_timer("idle");
-    // cancel(); ctx.timer("idle", n)` must arm the CLASSIC timer cleanly and
-    // fire — the same-batch cancel must not leave the classic timer wedged (no
-    // hang), and the run must replay deterministically.
+    // Issue #768: a same-task `start_timer("idle"); cancel(); ctx.timer("idle", n)`
+    // must arm the CLASSIC timer cleanly and fire. The same-batch cancel must
+    // not leave the classic timer wedged (no hang). The run must replay
+    // deterministically.
     let outcome = WorkflowTestEnv::new()
         .run(cancel_then_classic_timer_same_id_workflow, json!(null))
         .await;
@@ -1226,11 +1227,11 @@ async fn cancel_then_classic_timer_same_id_arms_and_fires() {
 
 #[tokio::test]
 async fn cancel_timer_on_a_classic_id_does_not_kill_the_classic_timer() {
-    // Issue #768: a `cancel_timer("deadline")`
-    // targeting the classic timer's id must be a pure no-op: it must NOT record a
-    // `TimerCancelled` (whose worker-side `delete_pending_timer` would delete the
-    // classic timer's durable row), so the classic timer still fires — no hang —
-    // and the run replays deterministically.
+    // Issue #768: a `cancel_timer("deadline")` targeting the classic timer's id
+    // must be a pure no-op. It must NOT record a `TimerCancelled`, whose
+    // worker-side `delete_pending_timer` would delete the classic timer's
+    // durable row. So the classic timer still fires with no hang, and the run
+    // replays deterministically.
     let outcome = WorkflowTestEnv::new()
         .run(
             cancel_timer_does_not_kill_a_classic_timer_workflow,

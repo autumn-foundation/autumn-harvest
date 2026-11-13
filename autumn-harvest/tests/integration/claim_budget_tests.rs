@@ -1956,11 +1956,10 @@ async fn zz_capture_queue_pause_claim_evidence() {
     // committed snapshot reflects exactly the code path a live worker takes.
     // Fresh connection + fresh seed at the published headline scale.
     let mut stats_conn = db::connect(&bench.url).await;
-    // A failure here is caught downstream: if the extension genuinely
-    // could not be created, the SELECT against `pg_stat_statements` below
-    // (guarded by its own `.expect(...)`) fails with "relation does not
-    // exist" -- so discarding this particular result does not let a broken
-    // capture pass.
+    // A failure here is caught downstream. If the extension genuinely could
+    // not be created, the SELECT against `pg_stat_statements` below (guarded
+    // by its own `.expect(...)`) fails with "relation does not exist". So
+    // discarding this particular result does not let a broken capture pass.
     let _ = diesel::sql_query("CREATE EXTENSION IF NOT EXISTS pg_stat_statements")
         .execute(&mut stats_conn)
         .await;
@@ -2081,13 +2080,13 @@ async fn zz_capture_queue_pause_claim_evidence() {
     // the way it might be for an ad-hoc query -- the `claimed + 1` real
     // claim_task() calls immediately above are guaranteed to have executed
     // the production claim_task_query() text, which always matches
-    // `%harvest_task_queue%`. Unlike a missing preload (already guarded by
-    // the `.expect()` on the query above), a zero-row result here means the
-    // extension is loaded but not tracking (e.g.
-    // `pg_stat_statements.track = none`, which does not error, it just
-    // silently returns nothing) or some other scoping problem -- either way
-    // this must abort the capture, not fall back to a placeholder the shell
-    // harness's marker-only success check would accept.
+    // `%harvest_task_queue%`. The `.expect()` on the query above already
+    // guards a missing preload. A zero-row result here means the extension is
+    // loaded but not tracking, or some other scoping problem. One example is
+    // `pg_stat_statements.track = none`, which does not error but silently
+    // returns nothing. Either way this must abort the capture. It must not
+    // fall back to a placeholder that the shell harness's marker-only success
+    // check would accept.
     assert!(
         !stats_rows.is_empty(),
         "pg_stat_statements returned zero rows matching '%harvest_task_queue%' \

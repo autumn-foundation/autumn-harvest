@@ -1735,7 +1735,7 @@ mod pure_tests {
 
     #[test]
     fn claims_never_exceed_a_fifth_of_the_backlog() {
-        // Guards the "do not drain the queue" invariant: measuring must leave the
+        // Guards the "do not drain the queue" invariant. Measuring must leave the
         // backlog at >= 80% of its seeded depth, or the bench measures an empty queue.
         for backlog in BACKLOG_SWEEP {
             let claims = measured_claims_for(backlog);
@@ -2445,13 +2445,15 @@ mod pure_tests {
         );
     }
 
-    /// A `dbname` query parameter silently outranks the path we just rewrote.
+    /// A `dbname` query parameter silently outranks the path `with_db_name` just
+    /// rewrote.
     ///
     /// `tokio-postgres`'s `UrlParser::parse` runs `parse_path` (`config.rs:997`)
     /// and *then* `parse_params` (`:998`), and both assign the same
     /// `Config::dbname` field — so the query wins. Carrying the query over
-    /// verbatim keeps `sslmode` alive, but it also points the sweep lock, the
-    /// lease and the migration connection back at the operator's admin database. The harness runs `TRUNCATE` there.
+    /// verbatim keeps `sslmode` alive. But it also points the sweep lock, the
+    /// lease and the migration connection back at the operator's admin
+    /// database. The harness runs `TRUNCATE` there.
     #[test]
     fn with_db_name_removes_an_overriding_dbname_query_parameter() {
         assert_eq!(

@@ -250,13 +250,13 @@ fn prometheus_examples_use_stable_bounded_harvest_metrics() {
 
 #[test]
 fn saga_spike_alert_absolute_floor_fires_without_a_baseline() {
-    // Issue #801: a NEW or long-dormant
-    // workflow has no samples in the `offset 1h` baseline window, so a bare
-    // `> 4 * rate(... offset 1h)` comparison yields no series and the
-    // absolute 1/min floor never fires for the FIRST rollback wave — the
-    // exact case the alert exists for. The `or <current> * 0` arm defaults
-    // the baseline to a zero-valued series with matching labels; pin that
-    // fallback textually so it cannot be silently simplified away.
+    // Issue #801: a NEW or long-dormant workflow has no samples in the
+    // `offset 1h` baseline window. So a bare `> 4 * rate(... offset 1h)`
+    // comparison yields no series. The absolute 1/min floor then never fires
+    // for the FIRST rollback wave, which is the exact case the alert exists
+    // for. The `or <current> * 0` arm defaults the baseline to a zero-valued
+    // series with matching labels. Pin that fallback textually so it cannot be
+    // silently simplified away.
     let pack = read_pack();
     let rules = pack["rules"].as_array().expect("rules must be an array");
     let spike = rules
@@ -274,8 +274,9 @@ fn saga_spike_alert_absolute_floor_fires_without_a_baseline() {
 }
 
 /// Issue #619: the queue-pause alert's description must not say, unqualified,
-/// that a pause is safe because "nothing fails, retries, or dead-letters". That is true of the *relative* `schedule_to_start` timer,
-/// which a pause suspends and credits back on resume, but **not** of the
+/// that a pause is safe because "nothing fails, retries, or dead-letters".
+/// That is true of the *relative* `schedule_to_start` timer, which a pause
+/// suspends and credits back on resume, but **not** of the
 /// *absolute* `schedule_to_close` deadline (issue #378), which keeps running for
 /// the whole hold. This is the one alert an operator consults after the 1h/4h
 /// threshold, so an unqualified "nothing fails" there invites leaving a hold in
@@ -823,11 +824,11 @@ fn capability_miss_released_outcome_never_pages() {
 ///
 /// The rule's prose is what on-call reads first, so it must not send them to a
 /// fleet-exhaustion investigation for an escalation that does not support one.
-/// This pins the cause-neutral phrasing rather than the wording: the reason
-/// string must be named as the discriminator, the ceiling's weaker conclusion
-/// must be stated, and the stale "a fleet smaller than the budget"
-/// claim must not reappear — a *registered* small fleet escalates at `N` via
-/// the configured-total bound, not via the ceiling.
+/// This pins the cause-neutral phrasing rather than the wording. The reason
+/// string must be named as the discriminator. The ceiling's weaker conclusion
+/// must be stated. The stale "a fleet smaller than the budget" claim must not
+/// reappear. A *registered* small fleet escalates at `N` via the
+/// configured-total bound, not via the ceiling.
 #[test]
 fn capability_miss_paging_rule_prose_is_cause_neutral() {
     let pack = read_pack();
@@ -1057,7 +1058,7 @@ fn capability_miss_escalation_is_never_documented_as_dead_lettering() {
 ///
 /// `capability_miss_fleet_stale_secs` is
 /// `max(2 × worker_heartbeat_interval, CAPABILITY_MISS_MIN_FLEET_STALE_SECS)`,
-/// and the floor is 120 s — so at the default 5 s cadence the capability window
+/// and the floor is 120 s. So at the default 5 s cadence the capability window
 /// is 120 s where the poison-pill reclaimer's is 10 s. The 12× divergence is
 /// deliberate: judging *peers* whose cadence a worker cannot read needs a
 /// fleet-wide bound, not its own. An operator who reads

@@ -119,15 +119,15 @@ async fn place_order_after(
     // Past this point the transaction has committed: the `orders` row and the
     // `WorkflowStarted` event both landed together, and a worker can now claim
     // the run's first task. `finish()` is an optional latency optimization
-    // (eagerly dispatches any deferred completion-trigger follow-ups) — never
-    // a correctness requirement, since a periodic scanner delivers the same
-    // follow-ups if it is skipped.
+    // that eagerly dispatches any deferred completion-trigger follow-ups. It is
+    // never a correctness requirement, since a periodic scanner delivers the
+    // same follow-ups if it is skipped.
     let exec_id = outcome.exec_id;
     outcome.finish().await;
     Ok(exec_id)
 }
 
-/// A validation failure AFTER the domain insert rolls back BOTH writes — the
+/// A validation failure AFTER the domain insert rolls back BOTH writes. The
 /// workflow start never happened, and the `orders` row it would have referenced
 /// does not exist either. There is no half-written state to clean up.
 async fn place_order_rejected(

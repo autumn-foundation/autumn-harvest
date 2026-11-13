@@ -180,8 +180,8 @@ async fn scrub(conn: &mut AsyncPgConnection) {
         "DELETE FROM harvest_events",
         "DELETE FROM harvest_workflow_executions",
     ] {
-        // Ignore "table does not exist" only if the migration set omitted it;
-        // all listed tables are in the full migration bundle, so a real error
+        // Ignore "table does not exist" only if the migration set omitted it.
+        // All listed tables are in the full migration bundle, so a real error
         // should surface.
         diesel::sql_query(stmt).execute(conn).await.expect(stmt);
     }
@@ -2038,9 +2038,9 @@ async fn cross_shard_gate_check_resolves_target_queue_on_target_shard() {
         "the pre-fix source-connection resolution must NOT find the target queue \
          (it queries the source shard's schedules, missing the gate)"
     );
-    // F2: with the target-shard pool unavailable, the fallback
-    // must NOT read the source shard's schedules — so it returns neither the
-    // source's wrong queue nor the (unreachable) target's queue.
+    // F2: with the target-shard pool unavailable, the fallback must NOT read
+    // the source shard's schedules. So it returns neither the source's wrong
+    // queue nor the (unreachable) target's queue.
     assert_ne!(
         fallback, "ag_source_wrong_q",
         "the target-shard-unavailable fallback must NOT resolve against the source \
@@ -2060,7 +2060,8 @@ async fn cross_shard_gate_check_resolves_target_queue_on_target_shard() {
 /// `DeferredTriggerStart::spawn()` — the common successful path — must count the
 /// `completion_trigger_outbox` bypass, not just the later scanner. A counter only
 /// in `enforce_completion_triggers_outbox` leaves the exempt start UNCOUNTED when
-/// a gate is raised after the source commit but before the immediate relay. The count is emitted via the process-global recorder (spawn has no
+/// a gate is raised after the source commit but before the immediate relay.
+/// The count is emitted via the process-global recorder (spawn has no
 /// metrics param), gated on the outbox-row delete actually removing the row, so
 /// the scanner can never re-process and re-count the same relay (exactly-once).
 ///
@@ -3291,9 +3292,9 @@ async fn running_webhook_delivery_count(conn: &mut AsyncPgConnection) -> i64 {
     .n
 }
 
-/// The idempotent-retry (non-racy) case: a LIVE existing run under
-/// an active gate is ATTACHED (idempotent load), the gate is SKIPPED, and no fresh
-/// run is created — `gate_checked_start_or_load` must not block a non-admission.
+/// The idempotent-retry (non-racy) case: a LIVE existing run under an active
+/// gate is ATTACHED (idempotent load). The gate is SKIPPED, and no fresh run is
+/// created. `gate_checked_start_or_load` must not block a non-admission.
 #[tokio::test]
 async fn gate_checked_start_attaches_to_a_live_run_and_skips_the_gate() {
     let _guard = TEST_SERIAL
@@ -3338,8 +3339,8 @@ async fn gate_checked_start_attaches_to_a_live_run_and_skips_the_gate() {
     assert_eq!(running_webhook_delivery_count(&mut conn).await, 1);
 }
 
-/// The TOCTOU an unlocked existence check leaves open: a run that is LIVE
-/// when the delegate is invoked but SEALS (TERMINATED) before the start decision
+/// The TOCTOU an unlocked existence check leaves open. A run is LIVE when the
+/// delegate is invoked but SEALS (TERMINATED) before the start decision
 /// commits. `gate_checked_start_or_load` locks the run through the decision, so it
 /// observes the SEALED state and BLOCKS the fresh replacement under the active gate
 /// — never a silent uncounted admission.

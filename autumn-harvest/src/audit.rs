@@ -1995,10 +1995,10 @@ pub async fn list_audit(
 ///   another, still mid-bootstrap on the same sweep.
 ///
 /// Deliberately **not** time-based. An earlier revision expired the guard 24h
-/// after the exporter's last heartbeat, so a long worker outage lifted it; a
+/// after the exporter's last heartbeat, so a long worker outage lifted it. A
 /// timeout cannot distinguish "export was intentionally removed" from "the
-/// worker has been down since Friday", and it resolves that ambiguity by
-/// deleting audit records during exactly the outage where they matter most
+/// worker has been down since Friday". It resolves that ambiguity by deleting
+/// audit records during exactly the outage where they matter most
 /// (issue #953).
 ///
 /// Retiring export is therefore an explicit operator action —
@@ -2800,9 +2800,9 @@ mod tests {
     #[test]
     fn queue_coverage_route_is_classified_read_only() {
         // The fleet-wide task-queue coverage read model (issue #774) is a
-        // read-only fan-out projection, no different from the other cross-shard
-        // read models it is modeled after (workflow_reachability, workflow_count,
-        // shard_health). This pinned test — not just the general exhaustiveness
+        // read-only fan-out projection. It is no different from the other
+        // cross-shard read models it is modeled after (workflow_reachability,
+        // workflow_count, shard_health). This pinned test — not just the general exhaustiveness
         // guards below, which only cross-check CLASSIFIED_ROUTES and
         // ALL_MUTATION_ROUTES against each other rather than against the live
         // router — is what actually catches the route being dropped from BOTH

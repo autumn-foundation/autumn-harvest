@@ -1579,9 +1579,9 @@ async fn rerun_clones_start_params_verbatim() {
     let pool = build_pool(&url);
     let wf = "rr_clone_wf";
     // Issue #605 review (R-64): the re-run route now re-validates a cloned
-    // `completion_callbacks` against the live SSRF policy, so this app must
-    // allowlist the seeded target — `build_app`'s default empty allowlist
-    // would otherwise reject it and this test would exercise R-64's
+    // `completion_callbacks` against the live SSRF policy. So this app must
+    // allowlist the seeded target. `build_app`'s default empty allowlist
+    // would otherwise reject it. This test would then exercise R-64's
     // rejection path instead of the verbatim-clone path it is named for.
     let app = build_app_allowing_hook_example(&pool, vec![plain_info(wf)]);
     let mut conn = pool.get().await.unwrap();

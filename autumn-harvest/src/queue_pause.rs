@@ -410,7 +410,7 @@ pub const fn try_lock_queue_for_claim_query() -> &'static str {
 /// inverse of `resume_queue`, which holds this lock and then row-locks every
 /// `PENDING` task on the queue for its `scheduled_at` shift. A *blocking*
 /// acquire would therefore create an ABBA deadlock between a claim and a
-/// resume, and Postgres would abort either the claim or the operator's resume.
+/// resume. Postgres would then abort either the claim or the operator's resume.
 /// `pg_try_advisory_xact_lock_shared` never waits, so it cannot participate in
 /// a wait cycle at all.
 ///
@@ -578,11 +578,12 @@ pub async fn lock_queue_for_pause(
 /// The enforcer must not reuse [`lock_queue_for_pause`]. Exclusive mode blocks
 /// shared, and [`try_lock_queue_for_claim`] takes the shared mode of this key on
 /// every claim. So an exclusive enforcement transaction stalls *all* dispatch on
-/// its queue for its full duration, on a queue with **no pause at all**. The workflow sibling holds the lock across
-/// `append_events`, the parent-close cascade and trigger evaluation, so a
-/// backlog of expired tasks could repeatedly halt unrelated work. Claims fail
-/// their `try` silently and simply yield no task, which is the same
-/// "silently stops dispatching" failure the class-id separation documented on
+/// its queue for its full duration, on a queue with **no pause at all**. The
+/// workflow sibling holds the lock across `append_events`, the parent-close
+/// cascade and trigger evaluation, so a backlog of expired tasks could
+/// repeatedly halt unrelated work. Claims fail their `try` silently and simply
+/// yield no task, which is the same "silently stops dispatching" failure the
+/// class-id separation documented on
 /// [`lock_queue_for_pause`] exists to prevent — reached from a different side.
 ///
 /// Shared mode is sufficient because this lock's only job is to order the
@@ -820,7 +821,7 @@ pub const fn queue_pause_suppresses_timeout(
 /// after this statement's snapshot is invisible here and was rejected there —
 /// thawing with its entire held wait uncredited, and so immediately
 /// `schedule_to_start`-failable. The `paused_at` partition removes the
-/// dependence on visibility for *which side a row belongs to*; it cannot
+/// dependence on visibility for *which side a row belongs to*. It cannot
 /// remove the dependence on visibility for *whether a pass sees the row at all*.
 ///
 /// The fix is to stop deriving pass 2's exclusion from a predicate and derive
@@ -1829,9 +1830,9 @@ mod tests {
     #[test]
     fn resume_shift_never_uses_the_frozen_transaction_clock() {
         let sql = resume_shift_scheduled_at_query();
-        // The partition compares against the bound `paused_at`, so NO frozen
-        // clock belongs anywhere in this query: not in the credit arithmetic,
-        // not in the due predicate, and not in the partition. A frozen clock in
+        // The partition compares against the bound `paused_at`. So NO frozen
+        // clock belongs anywhere in this query. That covers the credit
+        // arithmetic, the due predicate and the partition. A frozen clock in
         // the WHERE half hides the commit-visibility bug, so the ban covers the
         // whole string.
         for frozen in ["NOW()", "transaction_timestamp()", "statement_timestamp()"] {
@@ -1945,12 +1946,12 @@ mod tests {
     /// A scan-first order lands the stamp as close to `COMMIT` as possible. It
     /// assumes that claimers share neither [`lock_queue_for_pause`]'s advisory
     /// lock nor visibility of the uncommitted pause row, and so keep dispatching
-    /// until `COMMIT`. That premise is false: [`try_lock_queue_for_claim`] takes the
-    /// **shared** mode of the very key the pause takes exclusively, so the queue
-    /// is effectively held from the instant the lock is granted. Stamping after
-    /// an unbounded `COUNT(*)` therefore credits none of that genuinely-held
-    /// interval back on resume, and a task with a short `schedule_to_start` can
-    /// be timed out immediately after the thaw for time the pause transaction
+    /// until `COMMIT`. That premise is false. [`try_lock_queue_for_claim`] takes
+    /// the **shared** mode of the very key the pause takes exclusively. So the
+    /// queue is effectively held from the instant the lock is granted. Stamping
+    /// after an unbounded `COUNT(*)` therefore credits none of that held
+    /// interval back on resume. A task with a short `schedule_to_start` can then
+    /// time out immediately after the thaw, for time that the pause transaction
     /// itself blocked it.
     ///
     /// Three things are pinned, because breaking any one of them silently
@@ -2034,13 +2035,13 @@ mod tests {
     /// The two passes must be made disjoint by the **ids the first pass
     /// actually shifted**, never by re-testing `created_at`.
     ///
-    /// A `created_at` predicate on pass 2 leaves a coverage hole: a row
-    /// on pass 1's side that pass 1's snapshot could not see (its enqueue
-    /// committed late) was excluded from pass 2 by that very predicate and so
-    /// credited by neither pass. Excluding by id instead makes coverage total
-    /// for any commit order, while still guaranteeing no row is shifted twice —
-    /// pass 1's `+=` credit is *relative*, so a second application would erase
-    /// the pre-pause wait it exists to preserve and double-count
+    /// A `created_at` predicate on pass 2 leaves a coverage hole. Take a row on
+    /// pass 1's side that pass 1's snapshot could not see, because its enqueue
+    /// committed late. That very predicate excludes it from pass 2, so neither
+    /// pass credits it. Excluding by id instead makes coverage total for any
+    /// commit order. It still guarantees that no row is shifted twice. Pass 1's
+    /// `+=` credit is *relative*, so a second application would erase the
+    /// pre-pause wait it exists to preserve and double-count
     /// `released_task_count`.
     #[test]
     fn the_second_resume_pass_excludes_by_shifted_id_not_created_at() {
@@ -2170,9 +2171,9 @@ mod tests {
         );
     }
 
-    /// Pass 2 applies the SAME per-side formula the partition
-    /// defines, so a row it has to cover on pass 1's behalf is credited exactly
-    /// as pass 1 would have credited it.
+    /// Pass 2 applies the SAME per-side formula the partition defines. So a row
+    /// that it covers on pass 1's behalf gets exactly the credit pass 1 would
+    /// give it.
     ///
     /// Both arms are load-bearing and independently falsifiable. Collapsing to
     /// the absolute arm alone hands a pre-pause row a full fresh
@@ -2330,9 +2331,9 @@ mod tests {
         );
     }
 
-    /// Both claim releases share one prefix, so the guard and the
-    /// attempt restoration cannot drift apart — and only the paused variant
-    /// consults the pause table.
+    /// Both claim releases share one prefix, so the guard and the attempt
+    /// restoration cannot drift apart. Only the paused variant consults the
+    /// pause table.
     #[test]
     fn both_claim_releases_share_the_guard_and_restore_the_attempt() {
         let unconditional = release_claim_query();

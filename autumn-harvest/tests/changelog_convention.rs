@@ -8,8 +8,8 @@ use std::path::PathBuf;
 #[test]
 fn changelog_fragments_readme_exists() {
     // Walk up from this crate's manifest dir to the workspace root so the test
-    // is robust to crate nesting depth. Only assert when the test is clearly inside a
-    // git checkout: a packaged crates.io distribution ships the crate without the
+    // is robust to crate nesting depth. Only assert inside a git checkout. A
+    // packaged crates.io distribution ships the crate without the
     // workspace-level `docs/` dir and must not fail the build there.
     let mut dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let mut in_git_repo = false;
