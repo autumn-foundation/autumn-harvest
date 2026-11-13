@@ -83,6 +83,15 @@ pub const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(25);
 /// [`WorkerConfig::with_max_concurrent_claims`].
 pub const DEFAULT_MAX_CONCURRENT_CLAIMS: usize = 2;
 
+/// Default interval of the two population samplers: 15 s (issue #2668).
+///
+/// The samplers feed `harvest.workflow.history_oversized` and
+/// `harvest.workflow.active`. Each sample counts the whole active population
+/// of each shard. Prometheus scrapes a gauge each 15 to 60 s, so no scrape
+/// reads most samples at the poll interval. See
+/// [`WorkerConfig::population_sample_interval`].
+pub const DEFAULT_POPULATION_SAMPLE_INTERVAL: Duration = Duration::from_secs(15);
+
 /// The largest valid [`WorkerConfig::claim_slots_per_shard`]: 1024.
 ///
 /// A claim that misses tries each slot once in one statement. This bound
@@ -4188,7 +4197,7 @@ pub struct WorkerConfig {
     /// A lower value gives a fresher gauge at a higher database cost. The
     /// first sample comes one interval after the worker starts. Every other
     /// sampler keeps the poll interval. The value must not be zero. Default: 15
-    /// seconds ([`crate::worker::DEFAULT_POPULATION_SAMPLE_INTERVAL`]).
+    /// seconds ([`DEFAULT_POPULATION_SAMPLE_INTERVAL`]).
     pub population_sample_interval: Duration,
     /// Slot-name prefix identifying this shard's DR replication (issue #954).
     ///
@@ -4613,7 +4622,7 @@ impl Default for WorkerConfig {
             dr_fencing: crate::replication::DrFencing::Auto,
             replication_sample_interval: Duration::from_secs(15),
             replication_watermark_retain: Duration::from_secs(3600),
-            population_sample_interval: crate::worker::DEFAULT_POPULATION_SAMPLE_INTERVAL,
+            population_sample_interval: DEFAULT_POPULATION_SAMPLE_INTERVAL,
             replication_slot_prefix: crate::replication::DEFAULT_DR_SLOT_PREFIX.to_string(),
             max_workflow_start_delay: DEFAULT_MAX_WORKFLOW_START_DELAY,
             unknown_target_grace_window: Duration::from_secs(5),
@@ -5843,10 +5852,7 @@ mod tests {
             WorkerConfig::default().population_sample_interval,
             Duration::from_secs(15)
         );
-        assert_eq!(
-            crate::worker::DEFAULT_POPULATION_SAMPLE_INTERVAL,
-            Duration::from_secs(15)
-        );
+        assert_eq!(DEFAULT_POPULATION_SAMPLE_INTERVAL, Duration::from_secs(15));
     }
 
     #[test]

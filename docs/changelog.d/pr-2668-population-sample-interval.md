@@ -6,7 +6,7 @@ on `poll_interval`, 500 ms by default, on every worker. At 1M executions they
 used 77% of the buffers of the workload.
 
 - New knob `WorkerConfig::population_sample_interval`, default 15 s
-  (`worker::DEFAULT_POPULATION_SAMPLE_INTERVAL`). Set it with
+  (`builder::DEFAULT_POPULATION_SAMPLE_INTERVAL`). Set it with
   `with_population_sample_interval`. At the default poll interval the two
   samplers now make 30 times fewer calls.
 - Every other sampler keeps `poll_interval`.
@@ -21,7 +21,7 @@ used 77% of the buffers of the workload.
 
 **Upgrade note.** `WorkerConfig` and `WorkerRuntimeConfig` have the new
 public field `population_sample_interval`. A struct literal must set it. Use
-`worker::DEFAULT_POPULATION_SAMPLE_INTERVAL` to keep the default.
+`builder::DEFAULT_POPULATION_SAMPLE_INTERVAL` to keep the default.
 
 No migration. No new `WorkflowEvent` variant. Design record:
 `docs/design/DESIGN-2668.md`.

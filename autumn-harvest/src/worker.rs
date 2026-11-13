@@ -86,16 +86,7 @@ pub type DbPool = deadpool::managed::Pool<
 /// `GLOBAL_DEFAULT_WORKFLOW_QUEUE` and so must not run on a read-only path.
 pub const DEFAULT_WORKER_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
-pub use crate::builder::DEFAULT_MAX_CONCURRENT_CLAIMS;
-
-/// Default interval of the two population samplers (issue #2668).
-///
-/// The samplers feed `harvest.workflow.history_oversized` and
-/// `harvest.workflow.active`. Each sample counts the whole active population
-/// of each shard. Prometheus scrapes a gauge each 15 to 60 s, so no scrape
-/// reads most samples at `poll_interval`. See
-/// [`crate::builder::WorkerConfig::population_sample_interval`].
-pub const DEFAULT_POPULATION_SAMPLE_INTERVAL: Duration = Duration::from_secs(15);
+pub use crate::builder::{DEFAULT_MAX_CONCURRENT_CLAIMS, DEFAULT_POPULATION_SAMPLE_INTERVAL};
 
 /// Ceiling for the overdue-schedule gauge's adaptive sampling interval (issue
 /// #696).
