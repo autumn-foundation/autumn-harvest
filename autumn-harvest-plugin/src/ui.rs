@@ -7,6 +7,7 @@
 #![allow(clippy::literal_string_with_formatting_args)]
 
 use std::fmt::Write as _;
+#[cfg(test)]
 use std::sync::Arc;
 
 use std::collections::{HashMap, HashSet};
@@ -2550,11 +2551,7 @@ async fn cancel_workflow_ui(
     let exec_id_str = exec_id.as_uuid().to_string();
     let reason = form.reason.as_deref().unwrap_or("").trim().to_string();
 
-    let metrics_ref: Arc<dyn autumn_harvest::telemetry::MetricsRecorder> =
-        api_state.runtime().map_or_else(
-            |_| Arc::new(autumn_harvest::telemetry::NoOpMetrics) as _,
-            |rt| Arc::clone(&rt.registry().telemetry().metrics),
-        );
+    let metrics_ref = crate::api::metrics_recorder_or_noop(&api_state);
     let cancel_result =
         cancel_workflow_execution(&mut conn, exec_id, &reason, metrics_ref.as_ref()).await;
     let (status, error_summary, flash) = match &cancel_result {
@@ -2613,11 +2610,7 @@ async fn terminate_workflow_ui(
     let exec_id_str = exec_id.as_uuid().to_string();
     let reason = form.reason.as_deref().unwrap_or("").trim().to_string();
 
-    let metrics_ref: Arc<dyn autumn_harvest::telemetry::MetricsRecorder> =
-        api_state.runtime().map_or_else(
-            |_| Arc::new(autumn_harvest::telemetry::NoOpMetrics) as _,
-            |rt| Arc::clone(&rt.registry().telemetry().metrics),
-        );
+    let metrics_ref = crate::api::metrics_recorder_or_noop(&api_state);
     let terminate_result =
         terminate_workflow_execution(&mut conn, exec_id, &reason, metrics_ref.as_ref()).await;
     let (status, error_summary, flash) = match &terminate_result {
@@ -2703,11 +2696,7 @@ async fn pause_workflow_ui(
         .map(str::trim)
         .filter(|r| !r.is_empty());
 
-    let metrics_ref: Arc<dyn autumn_harvest::telemetry::MetricsRecorder> =
-        api_state.runtime().map_or_else(
-            |_| Arc::new(autumn_harvest::telemetry::NoOpMetrics) as _,
-            |rt| Arc::clone(&rt.registry().telemetry().metrics),
-        );
+    let metrics_ref = crate::api::metrics_recorder_or_noop(&api_state);
     let result =
         pause_workflow_execution(&mut conn, exec_id, reason, &actor, metrics_ref.as_ref()).await;
     let (status, error_summary, flash) = match &result {
@@ -2757,11 +2746,7 @@ async fn resume_workflow_ui(
     let actor = api_state.extract_actor(&headers);
     let exec_id_str = exec_id.as_uuid().to_string();
 
-    let metrics_ref: Arc<dyn autumn_harvest::telemetry::MetricsRecorder> =
-        api_state.runtime().map_or_else(
-            |_| Arc::new(autumn_harvest::telemetry::NoOpMetrics) as _,
-            |rt| Arc::clone(&rt.registry().telemetry().metrics),
-        );
+    let metrics_ref = crate::api::metrics_recorder_or_noop(&api_state);
     let result = resume_workflow_execution(&mut conn, exec_id, &actor, metrics_ref.as_ref()).await;
     let (status, error_summary, flash) = match &result {
         Ok(resumed) => (

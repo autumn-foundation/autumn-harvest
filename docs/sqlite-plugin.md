@@ -228,11 +228,17 @@ API behind `api_with_auth` outside `dev`.
 - A direct `DatabaseFleet::restore` to a point in time restores the
   Harvest file at its latest state. Use `HarvestFleet::restore` for one
   target on both files.
+- An open of a tenant refuses in the short time between the publish of
+  its `HarvestFleet::restore` and the return. Open it again.
+- Do not run a direct restore of a tenant while a `HarvestFleet::restore`
+  of it runs. A direct restore that publishes just before the
+  `HarvestFleet::restore` returns can take its target.
 - On Unix the database identity is the device and inode. Elsewhere it is
   the creation time, which Windows can keep across a rename. A direct
-  `DatabaseFleet::restore` on Windows can then keep the old Harvest file.
-  Use `HarvestFleet::restore` there: a finished restore commits its target,
-  and the next open applies it whatever the identity says.
+  `DatabaseFleet::restore` on Windows can then keep the old Harvest file,
+  or the target of an earlier `HarvestFleet::restore`. Use
+  `HarvestFleet::restore` there: a finished restore binds its target to
+  the restored file, so the next open applies it.
 - An import or a re-create gives the tenant a new database file. A Harvest
   file with no replica then goes aside, as `<file>.aside-<n>`.
 - `DatabaseFleet::release_ownership` does not wait for a Harvest backlog.
@@ -289,6 +295,11 @@ sequenceDiagram
   restores the database. It keeps the target on disk, and the next open
   restores the Harvest file to the same point. When the Harvest replica no
   longer reaches the target, each open refuses until a new restore.
+- **A later restore supersedes the target.** The target names the
+  database file that its restore published. A direct
+  `DatabaseFleet::restore` before the next open replaces that file, so the
+  Harvest file goes to its latest state. A direct restore that fails keeps
+  the target. `formal/verus/src/restore_target.rs` proves the rule.
 - **One checkpointer.** A shipped file opens with
   `wal_autocheckpoint = 0`. The replicator checkpoints only what it has
   shipped.
@@ -426,7 +437,10 @@ task declares. The agent keys its memory and its workspace by agent id,
 with no tenant. So the build refuses `agent` with `sqlite_per_tenant()`.
 
 The agent reads its profile overlays through the store of the harness,
-such as `SqliteOverlayStore` in a file of its own. The
+such as `SqliteOverlayStore` in a file of its own. In a fleet database that
+a replicator checkpoints, open it with `SqliteOverlayStore::with_connector`.
+Each call then opens its own connection with the pragmas of the fleet. See
+the profile overlay section of `docs/agent-adapter.md`. The
 `/agents/{kind}/profile` routes still need Postgres, so the build refuses
 `agent_overlay_store`.
 
