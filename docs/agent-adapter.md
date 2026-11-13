@@ -2453,6 +2453,48 @@ fn with_overlays(db: &Path, base: AgentHarness) -> Result<AgentHarness, Box<dyn 
   read. On a worker with no store, the op read fails and retries. See
   `docs/design/DESIGN-2372.md`.
 
+#### The store in a replicated fleet database
+
+`SqliteOverlayStore::open` keeps one connection with the default
+`wal_autocheckpoint`. A fleet database that ships its WAL to a replica
+needs two rules: only the replicator checkpoints, and the replicator
+connection closes last. So open the store on a connection factory:
+
+```rust
+use std::path::PathBuf;
+use std::sync::Arc;
+use autumn_harvest_agent::{AgentHarness, SqliteConnector, SqliteOverlayStore};
+
+fn with_fleet_overlays(db: PathBuf, base: AgentHarness) -> Result<AgentHarness, Box<dyn std::error::Error>> {
+    let connect: SqliteConnector = Arc::new(move || {
+        let conn = rusqlite::Connection::open(&db)?;
+        conn.execute_batch("PRAGMA busy_timeout = 5000; PRAGMA wal_autocheckpoint = 0;")?;
+        Ok(conn)
+    });
+    let store = Arc::new(SqliteOverlayStore::with_connector(connect, Arc::new(base.clone()))?);
+    Ok(base.overlay_store(store))
+}
+```
+
+- The store applies its schema through the factory.
+- Each call opens one connection and drops it after the call. The store
+  keeps no connection between calls, and runs one call at a time.
+- The store sets `foreign_keys = ON` and no other pragma. Set the pragmas
+  of the fleet in the factory.
+- A store connection does not checkpoint when it closes, also when it
+  closes last.
+- Open a connection only while another connection of the app stays open,
+  such as the replicator connection. Then a store connection never closes
+  last.
+- Set `busy_timeout` in the factory. With none, a call fails at once on a
+  busy file.
+- Use the `rusqlite` version of `autumn-harvest-sqlite`, so the
+  `Connection` types match.
+- Each call must open the same database. A new in-memory database on each
+  call has no tables.
+- The guards of the tables do not change. See
+  `docs/design/DESIGN-2656.md`.
+
 ### Tool guidance and skills (issue #2373)
 
 A profile and a task can carry two text parts. A profile overlay can set

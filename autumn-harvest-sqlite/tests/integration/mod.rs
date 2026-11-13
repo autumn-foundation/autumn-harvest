@@ -29,6 +29,7 @@ mod llm_ledger;
 mod local_activities;
 mod operator_reads;
 mod overlay_log;
+mod overlay_log_connector;
 mod payload_caps;
 mod payload_depth;
 mod portable_activity;
