@@ -2814,6 +2814,10 @@ standalone note rather than part of the claim-path attribution table above:
   — four worker samplers issuing SQL with no `metrics.is_enabled()` guard
   (issue #1428), eliminated entirely rather than reduced (pool-touch count
   and corroborating `strace` `connect` calls both N → 0).
+* [`docs/performance-population-sampler-cadence.md`](performance-population-sampler-cadence.md)
+  — two population samplers ran on the 500 ms poll interval and used 77% of
+  the buffers at 1M executions (issue #2668). A 15 s interval cuts the calls
+  by 30 times.
 * [`docs/performance-completion-trigger-outbox-queue.md`](performance-completion-trigger-outbox-queue.md)
   — the per-row `harvest_schedules` lookup in
   `completion_trigger::enforce_completion_triggers_outbox`'s cross-shard

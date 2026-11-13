@@ -86,7 +86,7 @@ pub type DbPool = deadpool::managed::Pool<
 /// `GLOBAL_DEFAULT_WORKFLOW_QUEUE` and so must not run on a read-only path.
 pub const DEFAULT_WORKER_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
-pub use crate::builder::DEFAULT_MAX_CONCURRENT_CLAIMS;
+pub use crate::builder::{DEFAULT_MAX_CONCURRENT_CLAIMS, DEFAULT_POPULATION_SAMPLE_INTERVAL};
 
 /// Ceiling for the overdue-schedule gauge's adaptive sampling interval (issue
 /// #696).
@@ -195,6 +195,9 @@ pub struct WorkerRuntimeConfig {
     pub claim_slots_per_shard: Option<std::num::NonZeroU16>,
     /// Interval between queue poll attempts when idle.
     pub poll_interval: Duration,
+    /// Interval of the two population samplers (issue #2668). The value
+    /// must not be zero. See [`crate::builder::WorkerConfig::population_sample_interval`].
+    pub population_sample_interval: Duration,
     /// Maximum time to wait for in-flight tasks during shutdown.
     pub shutdown_timeout: Duration,
     /// Grace period for an activity handler to unwind cooperatively after
@@ -372,6 +375,11 @@ impl WorkerRuntimeConfig {
                 crate::builder::MAX_CLAIM_SLOTS_PER_SHARD
             )));
         }
+        if self.population_sample_interval.is_zero() {
+            return Err(HarvestError::Config(
+                "population_sample_interval is 0; the population samplers would spin".into(),
+            ));
+        }
         if self.cancellation_grace_period > MAX_CANCELLATION_GRACE_PERIOD {
             return Err(HarvestError::Config(format!(
                 "cancellation_grace_period of {}s exceeds the maximum of {}s",
@@ -505,6 +513,7 @@ impl From<WorkerConfig> for WorkerRuntimeConfig {
             max_concurrent_claims: cfg.max_concurrent_claims,
             claim_slots_per_shard: cfg.claim_slots_per_shard,
             poll_interval: DEFAULT_WORKER_POLL_INTERVAL,
+            population_sample_interval: cfg.population_sample_interval,
             shutdown_timeout: cfg.shutdown_timeout,
             cancellation_grace_period: cfg.cancellation_grace_period,
             sticky_timeout: cfg.sticky_timeout,
@@ -34458,6 +34467,35 @@ fn spawn_pause_auto_resumer(
     })
 }
 
+/// Spawn the two population samplers on `population_sample_interval`
+/// (issue #2668).
+///
+/// The history-oversized sampler (#493) and the active-workflow sampler
+/// (#770) each count the whole active population of each shard. On
+/// `poll_interval` they used 77% of the buffers at 1M executions. So they
+/// use their own interval, and no other sampler does. Returns the history
+/// sampler first, then the active sampler.
+fn spawn_population_samplers(
+    config: &WorkerRuntimeConfig,
+    pools: Vec<DbPool>,
+    cancel: &CancellationToken,
+    telemetry: &Arc<crate::telemetry::TelemetryConfig>,
+    soft_threshold: u64,
+) -> [tokio::task::JoinHandle<()>; 2] {
+    let interval = config.population_sample_interval;
+    // Each sampler returns at once when no metrics recorder is set.
+    [
+        spawn_history_oversized_sampler(
+            pools.clone(),
+            cancel.clone(),
+            telemetry.clone(),
+            soft_threshold,
+            interval,
+        ),
+        spawn_workflow_active_sampler(pools, cancel.clone(), telemetry.clone(), interval),
+    ]
+}
+
 /// Periodically sample the count of in-flight (RUNNING) executions per
 /// workflow type whose history size exceeds the soft `continue_as_new`
 /// threshold and emit it as a gauge metric (issue #493, AC2).
@@ -34568,6 +34606,9 @@ fn spawn_history_oversized_sampler(
 /// Query the count of RUNNING executions per workflow type that have
 /// accumulated more than `soft_threshold` events.
 ///
+/// `SUSPENDED` is not a stored state (see `replay_sample.rs`), so the
+/// predicate names `RUNNING` only (issue #2668).
+///
 /// Returns `(workflow_name, count)` pairs; omits workflow types with zero
 /// oversized executions.
 async fn sample_history_oversized_counts(
@@ -34585,7 +34626,7 @@ async fn sample_history_oversized_counts(
     let rows: Vec<Row> = diesel::sql_query(
         "SELECT wf.workflow_name, COUNT(*)::bigint AS oversized_count \
          FROM harvest_workflow_executions wf \
-         WHERE wf.state IN ('RUNNING', 'SUSPENDED') \
+         WHERE wf.state = 'RUNNING' \
          AND (SELECT COUNT(*) FROM harvest_events he WHERE he.workflow_exec_id = wf.id) > $1 \
          GROUP BY wf.workflow_name",
     )
@@ -39377,20 +39418,12 @@ impl Worker {
                 ))
             })
             .collect();
-        let history_oversized_sampler = spawn_history_oversized_sampler(
+        let [history_oversized_sampler, workflow_active_sampler] = spawn_population_samplers(
+            &self.config,
             sampler_pools.clone(),
-            self.shutdown.clone(),
-            self.registry.telemetry().clone(),
+            &self.shutdown,
+            self.registry.telemetry(),
             self.registry.history_policy().continue_as_new_threshold(),
-            self.config.poll_interval,
-        );
-        // Active-workflow population gauge (issue #770): the live in-progress
-        // count per (workflow, state). Self-no-ops when metrics are disabled.
-        let workflow_active_sampler = spawn_workflow_active_sampler(
-            sampler_pools.clone(),
-            self.shutdown.clone(),
-            self.registry.telemetry().clone(),
-            self.config.poll_interval,
         );
         // Adaptive slot-tuner control loop (issue #548): only spawned when
         // `WorkerConfig::with_slot_tuner` was configured. Unlike the sampler
@@ -46522,6 +46555,117 @@ mod tests {
         );
     }
 
+    // ── Issue #2668: the population samplers use their own interval ──────
+    //
+    // Each population sampler counts the whole active population of a
+    // shard. On `poll_interval` they used 77% of the buffers at 1M runs.
+    // These tests count real connections, as the #1428 tests above do.
+
+    /// A recorder that reads as enabled and records nothing.
+    struct EnabledMetrics;
+
+    impl crate::telemetry::MetricsRecorder for EnabledMetrics {}
+
+    fn enabled_telemetry() -> Arc<crate::telemetry::TelemetryConfig> {
+        let telemetry = crate::telemetry::TelemetryConfig {
+            metrics: Arc::new(EnabledMetrics),
+            ..crate::telemetry::TelemetryConfig::default()
+        };
+        assert!(telemetry.metrics.is_enabled());
+        Arc::new(telemetry)
+    }
+
+    /// A runtime config with a 50 ms poll interval and a 3 s population
+    /// interval. No other setting uses 3 s, so a test proves that the
+    /// samplers read this field and not a constant.
+    fn population_cadence_config() -> WorkerRuntimeConfig {
+        let mut cfg = default_runtime_config();
+        cfg.poll_interval = Duration::from_millis(50);
+        cfg.population_sample_interval = Duration::from_secs(3);
+        cfg
+    }
+
+    /// Issue #2668: with metrics on, the population samplers wait for the
+    /// population interval. They open no connection on a poll tick. They
+    /// open one within three poll ticks after the interval ends.
+    #[tokio::test(start_paused = true)]
+    async fn population_samplers_wait_for_the_population_interval_not_the_poll_interval() {
+        let cfg = population_cadence_config();
+        let listener = accept_counting_pool().await;
+        let cancel = CancellationToken::new();
+        let handles = spawn_population_samplers(
+            &cfg,
+            vec![listener.pool.clone()],
+            &cancel,
+            &enabled_telemetry(),
+            100,
+        );
+
+        // The samplers start their sleep in the first tick. So this stops
+        // two poll ticks before the first sample.
+        let ticks_in_interval = usize::try_from(
+            cfg.population_sample_interval.as_millis() / cfg.poll_interval.as_millis(),
+        )
+        .expect("tick count fits usize");
+        advance_sampler_ticks(cfg.poll_interval, ticks_in_interval - 1).await;
+        let touches_before = listener.touch_count();
+
+        // Move past the first sample, then stop the clock. A longer
+        // interval than the configured one then opens no connection.
+        advance_sampler_ticks(cfg.poll_interval, 3).await;
+        // The accept is real loopback I/O. A yield polls I/O and does not
+        // advance the paused clock. Wait under a deadline in real time.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while listener.touch_count() == 0 && std::time::Instant::now() < deadline {
+            tokio::task::yield_now().await;
+        }
+        let touches_after = listener.touch_count();
+        cancel.cancel();
+        for handle in handles {
+            let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+        }
+        listener.stop();
+
+        assert_eq!(
+            touches_before, 0,
+            "the population samplers must not query on a poll_interval tick"
+        );
+        assert!(
+            touches_after > 0,
+            "the population samplers must query once the population interval ends"
+        );
+    }
+
+    /// Issue #2668: a cancel during the long sleep ends both samplers at
+    /// once. A shutdown never waits for the population interval.
+    #[tokio::test(start_paused = true)]
+    async fn population_samplers_stop_on_cancel_during_the_sleep() {
+        let cfg = population_cadence_config();
+        let listener = accept_counting_pool().await;
+        let cancel = CancellationToken::new();
+        let handles = spawn_population_samplers(
+            &cfg,
+            vec![listener.pool.clone()],
+            &cancel,
+            &enabled_telemetry(),
+            100,
+        );
+        advance_sampler_ticks(cfg.poll_interval, 1).await;
+
+        cancel.cancel();
+        for handle in handles {
+            // A failed cancel leaves the sampler in its sleep. The idle
+            // runtime then moves the paused clock to the 1 ms deadline
+            // first, so the timeout fails the test.
+            let joined = tokio::time::timeout(Duration::from_millis(1), handle).await;
+            assert!(
+                joined.is_ok(),
+                "a sampler must end on cancel without waiting for its sleep"
+            );
+        }
+        listener.stop();
+    }
+
     #[test]
     fn a_two_connection_pool_serving_one_shard_is_sufficient() {
         use crate::types::ShardId;
@@ -46644,6 +46788,7 @@ mod tests {
             codec_rotation_batch_size: crate::codec_rotation::CODEC_ROTATION_DEFAULT_BATCH,
             scanner: crate::scanner_lease::ScannerConfig::default(),
             fairness_keys: false,
+            population_sample_interval: DEFAULT_POPULATION_SAMPLE_INTERVAL,
         }
     }
 
@@ -46675,6 +46820,33 @@ mod tests {
             vec![crate::types::ShardId::new(0), crate::types::ShardId::new(1)],
             "a duplicate shard must not reach the per-shard monitor fan-out, \
              which spawns one control-loop set per assignment entry",
+        );
+    }
+
+    /// Issue #2668: the conversion copies the population interval and
+    /// keeps it apart from the poll interval.
+    #[test]
+    fn runtime_config_carries_the_population_sample_interval() {
+        let worker_config = crate::builder::WorkerConfig::default()
+            .with_population_sample_interval(Duration::from_secs(42));
+        let runtime_config = WorkerRuntimeConfig::from(worker_config);
+        assert_eq!(
+            runtime_config.population_sample_interval,
+            Duration::from_secs(42)
+        );
+        assert_eq!(runtime_config.poll_interval, DEFAULT_WORKER_POLL_INTERVAL);
+    }
+
+    /// Issue #2668: a runtime config that skips the builder can still hold
+    /// a zero interval. `validate` rejects it, so `Worker::new` fails.
+    #[test]
+    fn validate_rejects_a_zero_population_sample_interval() {
+        let mut cfg = default_runtime_config();
+        cfg.population_sample_interval = Duration::ZERO;
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("population_sample_interval"),
+            "the error must name the knob: {err}"
         );
     }
 
@@ -47581,6 +47753,7 @@ mod tests {
             replication_slot_prefix: crate::replication::DEFAULT_DR_SLOT_PREFIX.to_string(),
             replication_sample_interval: Duration::from_secs(15),
             replication_watermark_retain: Duration::from_secs(3600),
+            population_sample_interval: Duration::from_secs(20),
             queues: vec!["email".to_string(), "billing".to_string()],
             notification_database_url: Some("postgres://localhost/test".to_string()),
             shard_notification_database_urls: Vec::new(),
@@ -47642,6 +47815,10 @@ mod tests {
         assert_eq!(runtime_cfg.max_concurrent_claims, 3);
         assert_eq!(runtime_cfg.shutdown_timeout, Duration::from_secs(60));
         assert_eq!(runtime_cfg.poll_interval, Duration::from_millis(500));
+        assert_eq!(
+            runtime_cfg.population_sample_interval,
+            Duration::from_secs(20)
+        );
         assert_eq!(
             runtime_cfg.cancellation_grace_period,
             Duration::from_secs(10)

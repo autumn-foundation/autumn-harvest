@@ -154,6 +154,8 @@ pub struct WorkerConfigView {
     pub claim_slots_per_shard: Option<u16>,
     /// Worker poll interval, milliseconds.
     pub poll_interval_ms: u64,
+    /// Population sampler interval, milliseconds (issue #2668).
+    pub population_sample_interval_ms: u64,
     /// Graceful shutdown timeout, milliseconds.
     pub shutdown_timeout_ms: u64,
     /// In-memory workflow LRU cache size (entries).
@@ -456,6 +458,7 @@ impl WorkerConfigView {
             dr_fencing,
             replication_sample_interval,
             replication_watermark_retain,
+            population_sample_interval,
             replication_slot_prefix,
             max_workflow_start_delay,
             unknown_target_grace_window,
@@ -495,6 +498,7 @@ impl WorkerConfigView {
             max_concurrent_claims: *max_concurrent_claims,
             claim_slots_per_shard: claim_slots_per_shard.map(std::num::NonZeroU16::get),
             poll_interval_ms: dur_ms(poll_interval),
+            population_sample_interval_ms: dur_ms(*population_sample_interval),
             shutdown_timeout_ms: dur_ms(*shutdown_timeout),
             workflow_cache_size: *workflow_cache_size,
             resident_workflows: *resident_workflows && !sticky_timeout.is_zero(),
@@ -1010,6 +1014,22 @@ mod tests {
         let configured = WorkerConfig::default().with_retry_after_ceiling(Duration::from_secs(90));
         let view = WorkerConfigView::from_worker_config(&configured, Duration::from_millis(500));
         assert_eq!(view.retry_after_ceiling_ms, 90_000);
+    }
+
+    /// Issue #2668: the snapshot reports the population sampler cadence.
+    #[test]
+    fn population_sample_interval_ms_surfaces_the_default_and_an_override() {
+        let default_view = WorkerConfigView::from_worker_config(
+            &WorkerConfig::default(),
+            Duration::from_millis(500),
+        );
+        assert_eq!(default_view.population_sample_interval_ms, 15_000);
+
+        let configured =
+            WorkerConfig::default().with_population_sample_interval(Duration::from_secs(45));
+        let view = WorkerConfigView::from_worker_config(&configured, Duration::from_millis(500));
+        let json = serde_json::to_value(&view).expect("serialize");
+        assert_eq!(json["population_sample_interval_ms"], 45_000);
     }
 
     #[cfg(feature = "db")]
