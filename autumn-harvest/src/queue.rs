@@ -1279,6 +1279,30 @@ macro_rules! claim_order_by_sql {
 /// `$counts` names the running-count CTE that the concurrency gate reads.
 /// Each candidate scan and `seek_held` use this text, so every gate is the
 /// same in each.
+///
+/// Clone-class note: this macro expands the `required_build_id` and
+/// `required_capabilities` eligibility checks. jscpd (min-tokens 50,
+/// min-lines 5) finds two matches against
+/// [`claim_task_batched_candidates_query`]: 97 and 211 tokens, about 50
+/// lines total. Both copies use the same `$3` bind. Both read
+/// `worker_info.labels` and `harvest_task_queue.`.
+///
+/// [`build_and_capability_eligibility_predicate`] already names and shares
+/// this exact rule across three other sites, from issue #1340's bug 13
+/// chain. This pair cannot call that function as written. That function
+/// takes a runtime `String` for a `$10`-bound query. This macro, and
+/// [`claim_task_batched_candidates_query`]'s own body, must stay the
+/// compile-time `concat!` text that [`claim_task_query`]'s `const fn`
+/// return relies on.
+///
+/// A merge needs either a second `concat!`-only macro carrying the `$3`
+/// bind, or giving up `claim_task_query`'s const-ness. That is a tradeoff
+/// on the hottest claim path (#2651, #2652), not a drop-in change. No
+/// direct co-change or missed-fix ties these two copies to each other.
+/// Both trace to one shared origin, commit 7bf37898 (#1971, #2052). The
+/// duplication stays. A merge here needs sign-off from someone who can
+/// re-run the Ledger profile and the claim perf repro. See the issue
+/// #1340 scope note on [`claim_task_batched_candidates_query`].
 macro_rules! claim_candidate_gates_sql {
     ($counts:literal) => {
         concat!(
@@ -11027,6 +11051,14 @@ pub async fn pending_queue_demand_by_queue_name(
 /// redesigns, out of scope
 /// here. Named explicitly, alongside the gaps above, as what a reviewer
 /// needs before this becomes the default claim path.
+///
+/// Clone-class note: this function's own `required_build_id` and
+/// `required_capabilities` checks repeat verbatim in the
+/// `claim_candidate_gates_sql!` macro above. See the note on that macro
+/// for the token counts and the shared origin commit. It also explains
+/// why the two copies cannot fold into
+/// [`build_and_capability_eligibility_predicate`] as that function stands
+/// today.
 // The body is one SQL string literal; the line count is the query's, not
 // control flow's -- the same allow `claim_task_query` carries.
 #[allow(clippy::too_many_lines)]
