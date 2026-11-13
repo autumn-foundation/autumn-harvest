@@ -468,9 +468,8 @@ async fn dangling_claim_is_reclaimed() {
         .await
         .expect("delete exec");
 
-    // Directly exercise the reserve reclaim path: within the window, a dangling
-    // pointer must reclaim (Reserved) rather than return a Duplicate for a run
-    // that no longer exists.
+    // Within the window, a dangling pointer must reclaim (`Reserved`). It must not
+    // return a `Duplicate` for a run that no longer exists.
     let e2 = ExecutionId::new_for_shard(ShardId::new(0));
     let reservation = reserve_start_idempotency(&mut conn, wf, key, e2, 0, window_secs())
         .await
@@ -502,11 +501,10 @@ async fn dangling_claim_is_reclaimed() {
     assert_eq!(pointed, e2.as_uuid());
 }
 
-/// FIX 2 (issue #808 review): a fresh key whose `workflow_id` collides with a
-/// pre-existing run under `AllowDuplicate` returns the EXISTING execution
-/// (started_fresh:false, deduplicated:false), and the claim is REPOINTED at the
-/// real run so a subsequent same-key request deduplicates cleanly — no claim
-/// churn, no re-running the start.
+/// Issue #808: a fresh key whose `workflow_id` collides with an existing run under
+/// `AllowDuplicate` returns the EXISTING execution (`started_fresh:false`,
+/// `deduplicated:false`). The claim is REPOINTED at the real run. A later
+/// same-key request then deduplicates cleanly, with no claim churn and no rerun.
 #[tokio::test]
 async fn fresh_key_attaching_to_existing_run_repoints_claim() {
     let (mut conn, _c) = setup_db().await;
@@ -616,9 +614,9 @@ async fn fresh_key_attaching_to_existing_run_repoints_claim() {
     );
 }
 
-/// FIX 7 (issue #808 review): a same-key HIT short-circuits the reuse-policy
-/// matrix entirely — a second start carrying the same key with `RejectDuplicate`
-/// returns the cached run as a dedup no-op, NOT an `AlreadyExists` conflict.
+/// Issue #808: a same-key HIT skips the reuse-policy matrix. A second start with
+/// the same key and `RejectDuplicate` returns the cached run as a dedup no-op,
+/// NOT an `AlreadyExists` conflict.
 #[tokio::test]
 async fn dedup_hit_short_circuits_reject_duplicate() {
     let (mut conn, _c) = setup_db().await;
@@ -666,8 +664,8 @@ async fn dedup_hit_short_circuits_reject_duplicate() {
     assert_eq!(exec_count(&mut conn, wf).await, 1);
 }
 
-/// FIX 5 (issue #808 review): the expiry sweep deletes ONLY rows older than the
-/// retention window — a fresh claim survives.
+/// Issue #808: the expiry sweep deletes ONLY rows older than the retention
+/// window. A fresh claim survives.
 #[tokio::test]
 async fn purge_deletes_only_expired_rows() {
     let (mut conn, _c) = setup_db().await;

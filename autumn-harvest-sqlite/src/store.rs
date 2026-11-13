@@ -3,10 +3,10 @@
 //! This reimplements the *behavior* of the Postgres `store` module (append event
 //! JSON ordered by a per-execution sequence; load ordered by that sequence) on
 //! `rusqlite`. The `harvest_events` table is the append-only
-//! [`WorkflowEvent`] log and is the *canonical, replayable* history: every row is
+//! [`WorkflowEvent`] log and the *canonical, replayable* history. Every row is
 //! `serde_json::to_string` of a `WorkflowEvent` in the shared adjacently-tagged
-//! (`#[serde(tag = "type", content = "data")]`) form, so a history produced here
-//! is byte-identical, per event, to one the Postgres backend would write.
+//! form (`#[serde(tag = "type", content = "data")]`). So each event is
+//! byte-identical to the one the Postgres backend would write.
 //!
 //! Every helper takes `conn: &Connection`. A `rusqlite::Transaction` derefs to
 //! `Connection`, so callers that need decision-cycle atomicity pass `&tx` (the
@@ -310,10 +310,11 @@ pub fn workflow_name_of(conn: &Connection, exec_id: ExecutionId) -> SqliteResult
     )?)
 }
 
-/// The run-scoped business `workflow_id` recorded at start (issue #698). Re-read on
-/// every drive cycle and threaded into the [`WorkflowContext`] so
-/// `ctx.info().workflow_id` is stable across replays and never empty (defaults to
-/// the `exec_id` string form when the caller supplied no business id).
+/// The run-scoped business `workflow_id` recorded at start (issue #698).
+///
+/// Each drive cycle reads it again and passes it into the [`WorkflowContext`]. So
+/// `ctx.info().workflow_id` is stable across replays and never empty. Without a
+/// business id from the caller, it is the `exec_id` string form.
 pub fn workflow_id_of(conn: &Connection, exec_id: ExecutionId) -> SqliteResult<String> {
     Ok(conn.query_row(
         "SELECT workflow_id FROM harvest_executions WHERE exec_id = ?1",
@@ -340,24 +341,21 @@ pub fn running_executions(conn: &Connection) -> SqliteResult<Vec<ExecutionId>> {
 /// (issue #1068). Returns `(exec_id, state)` where `state` is `RUNNING`,
 /// `COMPLETED`, or `FAILED`.
 ///
-/// A prior in a SEALED state (`CONTINUED_AS_NEW`/`TERMINATED`) is EXCLUDED, so it
-/// is invisible to the reuse decision — a replaced/superseded run leaves the
-/// active set and the key becomes available to a new start, mirroring the Postgres
-/// core's uniqueness index (which excludes those sealed states). The single-writer
-/// contract guarantees at most one active row per key once this feature has
-/// landed; `ORDER BY rowid DESC LIMIT 1` is a defensive tie-break preferring the
-/// newest active row if a database created by the pre-#1068 always-fresh behavior
-/// already holds duplicate active rows for a reused id.
+/// A prior in a SEALED state (`CONTINUED_AS_NEW`/`TERMINATED`) is EXCLUDED from
+/// the reuse decision. A replaced run leaves the active set, and a new start can
+/// take the key. This mirrors the Postgres core's uniqueness index, which excludes
+/// those sealed states. The single-writer contract guarantees at most one active row
+/// per key. `ORDER BY rowid DESC LIMIT 1` is a defensive tie-break for older data.
+/// It prefers the newest active row when a pre-#1068 database holds duplicates.
 ///
-/// **Legacy-duplicate reconciliation (pre-#1068 data only).** Once the reuse
-/// matrix has landed, at most one active row per key is ever created, so the
-/// newest-only lookup is exact for every start. It matters only for a database
-/// created by the pre-#1068 always-fresh behavior, which could already hold
-/// MULTIPLE active rows for a reused id — and the four policies reconcile that
+/// **Legacy-duplicate reconciliation (pre-#1068 data only).** Since the reuse
+/// matrix, at most one active row per key is ever created. So the newest-only
+/// lookup is exact for every start. The pre-#1068 always-fresh behavior could
+/// leave MULTIPLE active rows for a reused id. The four policies reconcile that
 /// legacy state differently:
-/// - **`TerminateIfRunning`** is the ONLY policy that fully reconciles it: it seals
-///   EVERY active row for the key (via [`find_active_executions_by_key`]), so no
-///   legacy duplicate survives (Codex #1080 P2). It does NOT use this
+/// - **`TerminateIfRunning`** is the ONLY policy that fully reconciles it. It
+///   seals EVERY active row for the key through [`find_active_executions_by_key`],
+///   so no legacy duplicate survives (issue #1080). It does NOT use this
 ///   newest-only accessor.
 /// - **`AllowDuplicateFailedOnly`** deliberately does not disturb a running run, so
 ///   a legacy RUNNING duplicate persists under it. That fits its "replace a
@@ -415,20 +413,19 @@ pub fn newest_execution_by_key(
 }
 
 /// EVERY ACTIVE (non-sealed) execution for a `(workflow_name, workflow_id)` key,
-/// newest-first — the `TerminateIfRunning` reconciliation lookup (Codex #1080 P2).
+/// newest-first: the `TerminateIfRunning` reconciliation lookup (issue #1080).
 ///
 /// The single-row [`find_active_execution_by_key`] returns only the NEWEST active
-/// row, which is exact for every start once the reuse matrix has landed (at most
-/// one active row per key is ever created). But a database written by the pre-#1068
-/// always-fresh `start_workflow_with_id` can already hold MULTIPLE `RUNNING` rows
-/// for one key; `TerminateIfRunning` must seal/cancel EVERY one, or an older
-/// duplicate survives `RUNNING` and keeps being driven by `run_until_idle` after the
-/// key was "terminated and restarted" — defeating the guarantee for upgraded
-/// databases. This returns the full active set (same sealed-state exclusion as the
-/// single-row accessor) so the `TerminateIfRunning` arm can iterate it.
+/// row. That is exact for every start since the reuse matrix, which creates at
+/// most one active row per key. A database written by the pre-#1068 always-fresh
+/// `start_workflow_with_id` can hold MULTIPLE `RUNNING` rows for one key.
+/// `TerminateIfRunning` must seal or cancel EVERY one. Otherwise an older
+/// duplicate stays `RUNNING`, and `run_until_idle` keeps driving it after the
+/// restart. That defeats the guarantee for upgraded databases. This returns the
+/// full active set, with the same sealed-state exclusion, for that arm to iterate.
 ///
-/// `ORDER BY rowid DESC` (newest-first) is a stable, deterministic order; the
-/// caller seals every returned row regardless, so the order is not load-bearing.
+/// `ORDER BY rowid DESC` gives a stable order. The caller seals every row
+/// regardless, so the order is not load-bearing.
 pub fn find_active_executions_by_key(
     conn: &Connection,
     workflow_name: &str,
@@ -461,15 +458,15 @@ pub fn find_active_executions_by_key(
 /// `(workflow_name, workflow_id)` slot. `sealed_state` is `CONTINUED_AS_NEW` (mirroring core's `replace_execution`,
 /// which seals to `CONTINUED_AS_NEW`).
 ///
-/// Sealing a *terminal* prior (e.g. a `COMPLETED` run replaced by
-/// `TerminateIfRunning`) moves it into a SEALED state that `erase::is_terminal_state`
-/// treats as terminal, so the prior's `exec_id` is no longer resumable via
-/// [`run_until_blocked`](crate::SqliteRuntime::run_until_blocked) (it short-circuits
-/// to a non-resumable terminal outcome) — consistent with core's `replace_execution`,
-/// which likewise seals the superseded run out of the active/resumable set. The pure
-/// [`outcome`](crate::SqliteRuntime::outcome) accessor likewise reports a sealed run
-/// terminally, as [`ExecutionOutcome::Terminated`](crate::ExecutionOutcome::Terminated)
-/// (Codex #1080 P2) — never `Running` — so a client polling a superseded prior sees it
+/// Sealing a *terminal* prior, such as a `COMPLETED` run replaced by
+/// `TerminateIfRunning`, moves it into a SEALED state. `erase::is_terminal_state`
+/// treats that state as terminal. So
+/// [`run_until_blocked`](crate::SqliteRuntime::run_until_blocked) no longer resumes
+/// the prior's `exec_id`. It short-circuits to a non-resumable terminal outcome.
+/// Core's `replace_execution` also seals the superseded run out of the resumable
+/// set. The pure [`outcome`](crate::SqliteRuntime::outcome) accessor reports a
+/// sealed run as [`ExecutionOutcome::Terminated`](crate::ExecutionOutcome::Terminated),
+/// never `Running` (issue #1080). So a client polling a superseded prior sees it
 /// end rather than spin forever.
 pub fn seal_execution(
     conn: &Connection,
@@ -782,7 +779,6 @@ pub fn retry_of(conn: &Connection, exec_id: ExecutionId) -> SqliteResult<Option<
     })
 }
 
-/// The last event of `exec_id`, if any.
 fn last_event(conn: &Connection, exec_id: ExecutionId) -> SqliteResult<Option<WorkflowEvent>> {
     let last: Option<String> = conn
         .query_row(
@@ -794,9 +790,10 @@ fn last_event(conn: &Connection, exec_id: ExecutionId) -> SqliteResult<Option<Wo
     Ok(last.map(|json| serde_json::from_str(&json)).transpose()?)
 }
 
-/// True if history already holds an `ActivityScheduled` for `activity_id` (keeps
-/// command application idempotent — a fresh `ScheduleActivity` mints a new id, so
-/// this only matches on a defensive re-application of the same cycle).
+/// True if history already holds an `ActivityScheduled` for `activity_id`.
+///
+/// It keeps command application idempotent. A fresh `ScheduleActivity` mints a new
+/// id, so this matches only on a defensive re-application of the same cycle.
 pub fn history_has_activity_scheduled(events: &[WorkflowEvent], activity_id: &str) -> bool {
     events.iter().any(|e| {
         matches!(e, WorkflowEvent::ActivityScheduled { activity_id: id, .. }
@@ -808,14 +805,13 @@ pub fn history_has_activity_scheduled(events: &[WorkflowEvent], activity_id: &st
 /// `TimerStarted(timer_id)` events not yet ended by a `TimerFired` or a
 /// `TimerCancelled`.
 ///
-/// A timer id may be RE-ARMED under the same name (the poll-loop idiom
-/// `loop { ctx.timer("tick", 1).await?; … }`), which the core supports via
-/// cursor-based per-id FIFO pairing. Arm idempotency must therefore key on
-/// OCCURRENCE, not the bare id: a plain "history already has a `TimerStarted`
-/// for this id?" guard would wrongly match a PRIOR *fired* arm and skip a genuine
-/// re-arm, wedging the run. `> 0` means an arm is already recorded and unfired
-/// (a replay-cycle re-emit — skip it); `== 0` means every prior arm has fired, so
-/// a `StartTimer` for this id is a genuinely new arm that must be persisted.
+/// A timer id may be RE-ARMED under the same name, as in the poll-loop idiom
+/// `loop { ctx.timer("tick", 1).await?; … }`. The core pairs arms per id in FIFO
+/// order with a cursor. So arm idempotency must key on OCCURRENCE, not the bare id.
+/// A plain "history has a `TimerStarted` for this id" guard matches a PRIOR *fired*
+/// arm. It then skips a real re-arm and wedges the run. `> 0` means an unfired arm
+/// is already recorded: a replay-cycle re-emit to skip. `== 0` means every prior
+/// arm has fired. A `StartTimer` for this id is then a new arm to persist.
 ///
 /// A `TimerCancelled` ends an arm too (issue #2029). A cancellable timer can
 /// then release its id to `ctx.timer`. The walk follows history order, and an

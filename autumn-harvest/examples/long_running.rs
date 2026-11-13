@@ -21,11 +21,11 @@ use serde_json::{Value, json};
 //
 //   * `chain_execution_timeout = "7d"` bounds the WHOLE continue-as-new chain. It
 //     is anchored at the first run's start and carried verbatim across every
-//     `continue_as_new`, so the deadline is the same absolute instant for run #1
-//     and run #500. This is the runaway-loop protection a per-run cap cannot give:
-//     a bug that keeps continuing-as-new without making progress is force-timed-out
-//     (`TIMED_OUT`) once the chain outlives 7 days, and the metric
-//     `harvest.workflow.chain_timeout` distinguishes it from a per-run timeout.
+//     `continue_as_new`. So the deadline is the same instant for run #1 and run
+//     #500. A per-run cap cannot give this runaway-loop protection. A bug that
+//     keeps continuing-as-new without progress is force-timed-out (`TIMED_OUT`)
+//     once the chain outlives 7 days. The metric `harvest.workflow.chain_timeout`
+//     distinguishes it from a per-run timeout.
 //
 // Fleet-wide alternative: `HarvestBuilder::max_workflow_chain_timeout(d)` caps AND
 // defaults every chain, so you can bound total lifetime fleet-wide even for

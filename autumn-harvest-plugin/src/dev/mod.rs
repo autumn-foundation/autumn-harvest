@@ -1,8 +1,8 @@
 //! Zero-setup local dev runtime (issue #525).
 //!
-//! One command brings up a **fully working** local Harvest: an ephemeral
-//! Postgres started for you, the ordinary embedded migrations applied, a worker
-//! polling, and the management API + Vantage UI served — with no Docker, no
+//! One command brings up a **fully working** local Harvest. It starts an
+//! ephemeral Postgres, applies the ordinary embedded migrations, polls with a
+//! worker, and serves the management API + Vantage UI. There is no Docker, no
 //! hand-authored `compose.yaml`, no `DATABASE_URL` to set and no
 //! `diesel migration run` to remember.
 //!
@@ -13,16 +13,16 @@
 //! # What this is not
 //!
 //! It is **not** a second storage backend. The cluster it starts is real
-//! `PostgreSQL` running the engine's real schema and real migrations, so a
+//! `PostgreSQL` with the engine's real schema and real migrations. So a
 //! workflow that runs here is byte-for-byte the workflow it will be in
-//! production. What is automated is the Postgres *lifecycle* — nothing about
-//! the engine, the event contract or replay changes. There is no "dev mode lies
-//! to you" gap, which is exactly why a SQLite or in-memory backend was rejected.
+//! production. Only the Postgres *lifecycle* is automated. The engine, the
+//! event contract and replay do not change. There is no "dev mode lies to you"
+//! gap, which is exactly why a SQLite or in-memory backend was rejected.
 //!
-//! It is also **not** for production, and says so on every start. It refuses to
-//! talk to anything it cannot show to be a local development database
-//! ([`classify_database_url`]), and everything it creates is reclaimed on exit
-//! — including after a `SIGKILL`, via [`reap_stale_sessions`].
+//! It is also **not** for production, and says so on every start. It refuses
+//! anything it cannot show to be a local development database
+//! ([`classify_database_url`]). Everything it creates is reclaimed on exit,
+//! also after a `SIGKILL`, via [`reap_stale_sessions`].
 //!
 //! # Layout
 //!
@@ -340,9 +340,9 @@ pub struct DevRuntimeConfig {
     pub database_url: Option<String>,
     /// Accept a loopback database whose *name* looks production-shaped.
     ///
-    /// Note there is deliberately no equivalent for a remote host: "my local
-    /// database is called `myapp_production`" is ordinary, "my dev runtime is
-    /// pointed at `db.prod.internal`" never is.
+    /// There is deliberately no equivalent for a remote host. A local database
+    /// called `myapp_production` is ordinary. A dev runtime pointed at
+    /// `db.prod.internal` never is.
     pub allow_suspicious_database_name: bool,
     /// HTTP port. `0` asks the kernel for a free one.
     pub http_port: u16,
@@ -402,9 +402,9 @@ pub struct DevRuntime {
     api_url: String,
     ui_url: String,
     banner: String,
-    /// `None` once teardown has taken it, so a double shutdown is a no-op and
-    /// the two teardown paths (this one and Autumn's `on_shutdown` hook) can
-    /// race harmlessly — exactly one of them wins.
+    /// `None` once teardown has taken it, so a double shutdown is a no-op. The
+    /// two teardown paths, this one and Autumn's `on_shutdown` hook, can race
+    /// harmlessly. Exactly one of them wins.
     postgres: Arc<Mutex<Option<EphemeralPostgres>>>,
     server: ServerThread,
 }
@@ -425,13 +425,14 @@ impl DevRuntime {
         refuse_unsupported_harvest_mode(&OsEnv)?;
 
         // Before anything binds: `http_host` is a public field documented as
-        // loopback-only, and until now nothing enforced it.
+        // loopback-only, so enforce it here.
         require_loopback_http_host(&config.http_host)?;
 
-        // The port is settled FIRST, before any cluster exists. autumn-web
-        // `process::exit(1)`s on a bind failure, which skips every destructor
-        // and both teardown paths — so a busy port used to leak a postmaster
-        // and its data directory outright. Failing here costs nothing.
+        // The port is settled FIRST, before any cluster exists. On a bind
+        // failure autumn-web calls `process::exit(1)`. That skips every
+        // destructor and both teardown paths. So a busy port would leak a
+        // postmaster and its data directory outright. A failure here costs
+        // nothing.
         let http_port = reserve_http_port(&config.http_host, config.http_port)?;
 
         let (database_url, storage, postgres) = provision_storage(&config).await?;
@@ -439,24 +440,23 @@ impl DevRuntime {
 
         // The mode check above could not be PROVEN to still hold across
         // provisioning. `autumn.toml` is a file this dev runtime does not
-        // own, and provisioning is the long step (Codex review, issue
-        // #1291). Re-check now, while teardown is still ours to run. The
-        // window narrows from the whole provisioning duration down to the
-        // microseconds before the server starts. This mirrors the port
-        // reservation below, re-proven rather than trusted from before
-        // provisioning.
+        // own, and provisioning is the long step (issue #1291). Re-check
+        // now, while this code can still run teardown. The window narrows
+        // from the whole provisioning duration down to the microseconds
+        // before the server starts. This mirrors the port reservation below,
+        // re-proven rather than trusted from before provisioning.
         if let Err(error) = refuse_unsupported_harvest_mode(&OsEnv) {
             return Err(abandon_cluster(&postgres, error).await);
         }
 
-        // The reservation above could not be *held* across provisioning —
-        // autumn-web binds this same port itself — and provisioning is the long
-        // step. Two `cargo dev` runs that both found 3000 free will therefore
-        // both arrive here, and the loser would reach autumn-web's bind-failure
-        // `process::exit(1)`, which skips every destructor and strands the
-        // cluster it just built. Re-prove the port now, while teardown is still
-        // ours to run: the window narrows from seconds of provisioning to the
-        // microseconds before the server binds.
+        // The reservation above could not be *held* across provisioning,
+        // because autumn-web binds this same port itself. Provisioning is the
+        // long step. Two `cargo dev` runs that both found 3000 free both arrive
+        // here. The loser reaches autumn-web's bind-failure `process::exit(1)`.
+        // That skips every destructor and strands the cluster it just built.
+        // Re-prove the port now, while this code can still run teardown. The
+        // window narrows from seconds of provisioning to the microseconds
+        // before the server binds.
         if let Err(error) = reserve_http_port(&config.http_host, http_port) {
             return Err(abandon_cluster(&postgres, error).await);
         }
@@ -486,8 +486,8 @@ impl DevRuntime {
         };
         if let Err(error) = runtime.wait_until_ready().await {
             // Same rule: a runtime that never became usable must still take its
-            // cluster with it — and if it could not, say so rather than
-            // reporting only the readiness failure.
+            // cluster with it. If that fails, report it too, not only the
+            // readiness failure.
             if let Err(teardown) = runtime.shutdown().await {
                 report_leaked_teardown(&teardown);
             }
@@ -545,8 +545,8 @@ impl DevRuntime {
     /// # Errors
     ///
     /// [`DevError`] if the cluster could not be stopped or its directory could
-    /// not be removed — the two failures that would actually leave state
-    /// behind, so they are reported rather than swallowed.
+    /// not be removed. Those two failures leave state behind, so they are
+    /// reported, not swallowed.
     pub async fn shutdown(mut self) -> Result<(), DevError> {
         self.server.stop().await;
         let taken = self.postgres.lock().await.take();
@@ -604,16 +604,16 @@ impl Drop for DevRuntime {
     /// Backstop for a `DevRuntime` dropped without `shutdown()` — a panicking
     /// test, an early `?`.
     ///
-    /// Without this, dropping detaches the server thread and the last `Arc` to
-    /// the cluster lives inside that thread's task, so `EphemeralPostgres`'s own
+    /// Without this, a drop detaches the server thread. The last `Arc` to the
+    /// cluster lives inside that thread's task. So `EphemeralPostgres`'s own
     /// `Drop` may never run before the process exits. Every failing run of the
     /// end-to-end test leaked a postmaster.
     fn drop(&mut self) {
         if let Some(stop) = self.server.stop.take() {
             let _ = stop.send(());
         }
-        // `try_lock`: nothing else can hold this by the time we are dropped, and
-        // blocking here would be worse than skipping the teardown.
+        // `try_lock`: nothing else can hold this during the drop, and a block
+        // here would be worse than a skipped teardown.
         if let Ok(mut guard) = self.postgres.try_lock()
             && let Some(postgres) = guard.take()
         {
@@ -628,12 +628,12 @@ impl Drop for DevRuntime {
 
 /// The OS thread the Autumn app runs on, plus the channel that stops it.
 ///
-/// A dedicated thread with its own Tokio runtime, rather than a `tokio::spawn`:
-/// `AppBuilder::run`'s future is not provably `Send` — rustc cannot infer the
-/// higher-ranked lifetime through one of autumn-web's internal closures and
-/// rejects the spawn outright — and `Runtime::block_on` carries no such bound.
-/// It also isolates the dev server's runtime from the caller's, which is what
-/// lets a test start and stop one from inside its own `#[tokio::test]` runtime.
+/// A dedicated thread with its own Tokio runtime, not a `tokio::spawn`.
+/// `AppBuilder::run`'s future is not provably `Send`. rustc cannot infer the
+/// higher-ranked lifetime through one of autumn-web's internal closures, so it
+/// rejects the spawn outright. `Runtime::block_on` carries no such bound. The
+/// thread also isolates the dev server's runtime from the caller's. So a test
+/// can start and stop one from inside its own `#[tokio::test]` runtime.
 struct ServerThread {
     stop: Option<tokio::sync::oneshot::Sender<()>>,
     handle: Option<std::thread::JoinHandle<()>>,
@@ -659,8 +659,8 @@ impl ServerThread {
 
     /// Ask the server to stop, then wait for its thread.
     ///
-    /// Best-effort by design: a server thread that will not come back must not
-    /// stop us from reclaiming the database, which is the part that actually
+    /// Best-effort by design. A server thread that never returns must not
+    /// block the reclaim of the database, which is the part that actually
     /// leaks.
     async fn stop(&mut self) {
         if let Some(stop) = self.stop.take() {
@@ -688,9 +688,9 @@ async fn provision_storage(
                     return Err(DevError::SuspiciousDatabase { reason });
                 }
                 // `eprintln!` as well as `tracing`: at this point in boot no
-                // subscriber has been installed (autumn-web installs its own
-                // later, on the server thread), so a tracing-only warning is
-                // silently dropped — and AC4 calls for a loud, unmissable one.
+                // subscriber is installed. autumn-web installs its own later,
+                // on the server thread. So a tracing-only warning is silently
+                // dropped, and AC4 calls for a loud, unmissable one.
                 eprintln!(
                     "harvest-dev: WARNING — proceeding against a production-shaped database \
                      name: {reason}"
@@ -713,11 +713,11 @@ async fn provision_storage(
         ));
     }
 
-    // Before the reaper, not after. A stale session record names a `bin_dir`
-    // whose `pg_ctl` `stop_orphan` executes, and as `root` this process would
-    // happily read one out of a `harvest-dev-0` some unprivileged local user
-    // pre-created. Provisioning as `root` cannot work regardless, so refuse it
-    // here — while the only thing we have done is decide to.
+    // Before the reaper, not after. A stale session record names a `bin_dir`,
+    // and `stop_orphan` executes its `pg_ctl`. As `root`, this process would
+    // read one out of a `harvest-dev-0` that an unprivileged local user
+    // pre-created. Provisioning as `root` cannot work anyway. So refuse it
+    // here, before this process has done anything.
     refuse_to_run_as_root()?;
 
     // Reclaim anything a killed predecessor left behind before adding to it.
@@ -766,10 +766,10 @@ async fn resolve_binaries() -> Result<PostgresBinaries, DevError> {
 /// Give up on a start that has already provisioned a cluster, taking the
 /// cluster with it.
 ///
-/// The cluster is up; never leak it behind a failure that happened afterwards.
-/// `take()` into a local first: holding the guard across the awaited shutdown is
-/// the classic deadlock shape, and the `on_shutdown` hook contends for this very
-/// lock. The error is passed through so callers read as `return Err(...)`.
+/// The cluster is up, so never leak it behind a later failure. `take()` into a
+/// local first. A guard held across the awaited shutdown is the classic
+/// deadlock shape, and the `on_shutdown` hook contends for this very lock. The
+/// error passes through, so callers read as `return Err(...)`.
 ///
 /// The start error stays the one returned — it is the cause. But a teardown
 /// failure on top of it must not be silent (issue #1299). The caller sees
@@ -823,16 +823,16 @@ fn refuse_unsupported_harvest_mode(env: &dyn Env) -> Result<(), DevError> {
 
 /// Refuse to serve anywhere but loopback.
 ///
-/// `DevRuntimeConfig::http_host` is public and documented as loopback-only, but
-/// a doc comment is not an enforcement: a library caller could set `0.0.0.0`,
-/// `::` or a LAN interface. That matters more here than in most servers because
-/// `run_app` mounts the management router with `.api(...)`, **not**
-/// `api_with_auth` — the dev runtime is unauthenticated precisely because it is
-/// unreachable, so the two facts have to be kept true together.
+/// `DevRuntimeConfig::http_host` is public and documented as loopback-only.
+/// But a doc comment is not an enforcement. A library caller could set
+/// `0.0.0.0`, `::` or a LAN interface. That matters more here than in most
+/// servers. `run_app` mounts the management router with `.api(...)`, **not**
+/// `api_with_auth`. The dev runtime is unauthenticated precisely because it is
+/// unreachable, so the two facts must stay true together.
 ///
-/// Every address the host resolves to must be loopback, and a host that cannot
-/// be resolved is refused rather than assumed: proving loopback is the point,
-/// and an unprovable host is not a proof.
+/// Every address the host resolves to must be loopback. A host that cannot be
+/// resolved is refused, not assumed. Proof of loopback is the point, and an
+/// unprovable host is not a proof.
 fn require_loopback_http_host(host: &str) -> Result<(), DevError> {
     use std::net::ToSocketAddrs as _;
 
@@ -855,11 +855,10 @@ fn require_loopback_http_host(host: &str) -> Result<(), DevError> {
 
 /// The `host:port` authority for a URL, bracketing an IPv6 literal.
 ///
-/// `::1` is a perfectly valid loopback host, and
-/// `format!("http://{host}:{port}")` turns it into `http://::1:3000`, which no
-/// URL parser accepts — so the readiness poll could never succeed and the
-/// runtime would report `ServerNotReady` after its full budget, with the real
-/// cause nowhere in the message.
+/// `::1` is a perfectly valid loopback host. `format!("http://{host}:{port}")`
+/// turns it into `http://::1:3000`, which no URL parser accepts. The readiness
+/// poll then never succeeds. The runtime reports `ServerNotReady` after its
+/// full budget, and the message omits the real cause.
 #[must_use]
 pub fn http_authority(host: &str, port: u16) -> String {
     // A name or an IPv4 literal needs no brackets; only an IPv6 literal does,
@@ -872,13 +871,13 @@ pub fn http_authority(host: &str, port: u16) -> String {
 
 /// Settle the HTTP port, proving it is bindable.
 ///
-/// `0` asks the kernel to choose. A concrete port is bound and released, which
-/// turns "something else is already on 3000" into a legible error here instead
-/// of a `process::exit(1)` deep inside autumn-web's boot — which skips every
-/// destructor and would strand the cluster we are about to create.
+/// `0` asks the kernel to choose. A concrete port is bound and released. So
+/// "something else is already on 3000" becomes a legible error here. Otherwise
+/// it is a `process::exit(1)` deep inside autumn-web's boot. That skips every
+/// destructor and strands the cluster that the caller is about to create.
 fn reserve_http_port(host: &str, requested: u16) -> Result<u16, DevError> {
-    // Bind the host we will actually serve on, not a hard-coded `127.0.0.1`:
-    // otherwise `--http-host ::1` proves a port free on the wrong interface.
+    // Bind the host that the server uses, not a hard-coded `127.0.0.1`.
+    // Otherwise `--http-host ::1` proves a port free on the wrong interface.
     let listener = std::net::TcpListener::bind((host, requested)).map_err(|source| {
         DevError::HttpPortUnavailable {
             port: requested,
@@ -895,10 +894,9 @@ fn reserve_http_port(host: &str, requested: u16) -> Result<u16, DevError> {
 
 /// Build and run the Autumn app carrying `HarvestPlugin` and the sample.
 ///
-/// Configuration is injected through Autumn's own [`ConfigLoader`] seam rather
-/// than by mutating the process environment: `std::env::set_var` is `unsafe` and
-/// unsound once other threads exist, and this runs inside a Tokio runtime that
-/// already has them.
+/// Configuration goes in through Autumn's own [`ConfigLoader`] seam, not through
+/// the process environment. `std::env::set_var` is `unsafe` and unsound once
+/// other threads exist. This runs inside a Tokio runtime that already has them.
 ///
 /// [`ConfigLoader`]: autumn_web::config::ConfigLoader
 fn spawn_server(
@@ -923,8 +921,8 @@ fn spawn_server(
         .name("harvest-dev-server".to_owned())
         .spawn(move || {
             // A guard, not a trailing store: a panicking server thread must
-            // still mark itself finished, or `wait_until_ready` burns its whole
-            // 180-second budget waiting for a thread that is already dead.
+            // still mark itself finished. Otherwise `wait_until_ready` burns its
+            // whole 180-second budget on a thread that is already dead.
             let _exit_guard = ExitedOnDrop(exited_in_thread);
             let runtime = match tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
@@ -1028,11 +1026,11 @@ async fn run_app(
             .run(),
     )
     .await;
-    // Deliberately NO `on_shutdown` teardown hook. It looked like belt and
-    // braces and was actually a race: on Ctrl-C both this thread's hook and
-    // `DevRuntime::shutdown` reach for the same `Option`, and whichever loses
-    // reports success for work the winner may have had truncated — the server
-    // thread is cancelled and its runtime given a 5 s budget, while
+    // Deliberately NO `on_shutdown` teardown hook. It looks like belt and
+    // braces, but it is a race. On Ctrl-C, this thread's hook and
+    // `DevRuntime::shutdown` both reach for the same `Option`. The loser
+    // reports success for work that the winner may have truncated. The server
+    // thread is cancelled and its runtime gets a 5 s budget, but
     // `pg_ctl stop --wait` is allowed 90. Teardown has exactly one owner:
     // `DevRuntime::shutdown`, plus `Drop` as the panic-path backstop.
     let _ = postgres;
@@ -1064,9 +1062,9 @@ impl autumn_web::config::ConfigLoader for DevConfigLoader {
         Output = Result<autumn_web::config::AutumnConfig, autumn_web::config::ConfigError>,
     > + Send {
         let mut config = autumn_web::config::AutumnConfig {
-            // `dev` is what makes Autumn *apply* pending migrations rather than
-            // merely report them — the same switch the Docker quickstart sets
-            // by hand, and the reason no `diesel migration run` is needed.
+            // `dev` makes Autumn *apply* pending migrations, not only report
+            // them. The Docker quickstart sets the same switch by hand. It is
+            // the reason no `diesel migration run` is needed.
             profile: Some("dev".to_owned()),
             ..autumn_web::config::AutumnConfig::default()
         };
@@ -1155,11 +1153,11 @@ mod harvest_mode_gate_tests {
 #[cfg(test)]
 mod server_panic_tests {
     //! A panicking server thread must surface its cause, not just
-    //! `ServerNotReady` (Codex review, issue #1291).
+    //! `ServerNotReady` (issue #1291).
     //!
     //! `register_plugin_migrations`'s backstop assertion panics on this
     //! thread. This happens if ambient Harvest configuration changes in the
-    //! narrow window this PR's other checks cannot close.
+    //! narrow window that the other checks cannot close.
 
     use super::{panic_payload_message, run_catching_panic};
 

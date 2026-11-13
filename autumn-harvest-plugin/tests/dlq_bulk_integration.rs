@@ -543,9 +543,9 @@ async fn post_form(app: &HarvestApiApp, uri: &str, body: &str) -> (StatusCode, V
     (status, json)
 }
 
-/// The AC5 round-trip money test: the bulk dry-run `matched` count for a cause
-/// cohort equals the same cohort's count from the aggregate facet, proving both
-/// surfaces share the classifier (lossless by construction).
+/// The AC5 round-trip money test. The bulk dry-run `matched` count for a cause
+/// cohort equals that cohort's aggregate facet count. That proves both
+/// surfaces share the classifier, so the round trip is lossless by construction.
 #[tokio::test]
 async fn bulk_cause_dry_run_count_equals_aggregate_facet() {
     let (database_url, _container) = setup_test_database_url().await;
@@ -791,11 +791,10 @@ async fn count_dlq_rows_by_queue(database_url: &str, queue_name: &str) -> i64 {
         .expect("failed to count dead letters by queue")
 }
 
-/// The AC5 over-action superset money test (issue #613, P2-1): a cause facet
-/// read scoped to one queue must re-select EXACTLY that queue's rows in a bulk
-/// operation — never every queue's. Before the bulk filter learned
-/// `queue_name`, an operator feeding a `?queue_name=qa` facet into a discard
-/// would silently act across ALL queues.
+/// The AC5 over-action superset money test (issue #613). A cause facet read
+/// scoped to one queue must re-select EXACTLY that queue's rows in a bulk
+/// operation. Before the bulk filter learned `queue_name`, a discard fed from a
+/// `?queue_name=qa` facet silently acted across ALL queues.
 #[tokio::test]
 async fn bulk_cause_plus_queue_round_trips_exactly() {
     let (database_url, _container) = setup_test_database_url().await;
@@ -891,11 +890,10 @@ async fn bulk_min_attempts_filter_narrows() {
     );
 }
 
-/// A non-positive `min_attempts` matches EVERY DLQ row (`attempts >= 0` is
-/// universally true, attempt counts being 1-based), so on the DESTRUCTIVE bulk
-/// path it must be rejected with `400` at the request boundary rather than
-/// slipping past the empty-filter safety guard (AC8, issue #613). Covers both
-/// the reported negative case and `0`; asserts nothing is acted on.
+/// A non-positive `min_attempts` matches EVERY DLQ row, because attempt counts
+/// are 1-based. On the DESTRUCTIVE bulk path it must get `400` at the request
+/// boundary, so it cannot slip past the empty-filter guard (AC8, issue #613).
+/// Covers the reported negative case and `0`, and asserts nothing is acted on.
 #[tokio::test]
 async fn bulk_negative_min_attempts_is_rejected_400() {
     let (database_url, _container) = setup_test_database_url().await;

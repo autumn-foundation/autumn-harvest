@@ -4,26 +4,26 @@
 //!
 //! The [`crate::payload_codec`] boundary lets an embedder encrypt every
 //! payload-bearing field before it touches `harvest_events`. Without rotation
-//! that is compliance theater: `harvest_events` is append-only, so after a key
-//! compromise every byte of stored history stays encrypted under the
-//! compromised key forever. This module closes that: envelopes carry a key id,
-//! the registry holds many keyed codecs with exactly one active, and a
-//! shard-local background sweep lazily re-encrypts stored rows onto the active
-//! key until the old key can be retired with proof that nothing depends on it.
+//! that is compliance theater. `harvest_events` is append-only, so after a key
+//! compromise all stored history stays under the compromised key forever.
+//! This module closes that gap. Envelopes carry a key id. The registry holds
+//! many keyed codecs with exactly one active. A shard-local background sweep
+//! lazily re-encrypts stored rows onto the active key. The old key can then
+//! be retired with proof that nothing depends on it.
 //!
 //! ## ⚠️ Sanctioned in-place mutation exception #3
 //!
 //! Re-encryption **mutates stored `harvest_events.event_data` bytes in place**.
 //! Exactly two code paths write `event_data` after insert: PII erasure
 //! ([`crate::erase`], issue #495, historically "exception #2") and this
-//! ("#3"). See the "Engine Invariants" section of `CLAUDE.md`, including why
-//! the heartbeat checkpoint issue #948 named as the first exception is not one
-//! (it mutates `harvest_task_queue`, not the event log).
+//! ("#3"). See the "Engine Invariants" section of `CLAUDE.md`. It also says
+//! why the heartbeat checkpoint that issue #948 named as the first exception
+//! is not one: it mutates `harvest_task_queue`, not the event log.
 //!
 //! The scope guarantee that makes it safe: **only the ciphertext bytes inside
 //! payload fields change.** The decoded plaintext is byte-identical before and
-//! after, and the event `type`, variant structure, event ids, ordering, and
-//! timestamps are never touched — so replay determinism is unaffected *by
+//! after. The event `type`, variant structure, event ids, ordering, and
+//! timestamps are never touched. So replay determinism is unaffected *by
 //! construction*, not by convention. `replay_fidelity` in
 //! `tests/integration/codec_rotation_db_tests.rs` proves it end to end.
 //!
@@ -405,11 +405,11 @@ fn reencrypt_field_under(
     if crate::erase::is_erasure_tombstone(field) {
         return Ok(FieldStep::Erased);
     }
-    // Discriminator-only, NOT the strict `extract_offload_ref` parser: a
-    // field bearing the offload marker is passed through whether or not its
-    // reference parses, because there is no ciphertext here to rotate and
-    // rewriting it would orphan the blob either way. A reference that does
-    // not parse can only be a row written before issue #1758.
+    // Discriminator-only, NOT the strict `extract_offload_ref` parser. A
+    // field with the offload marker passes through whether or not its
+    // reference parses. It holds no ciphertext to rotate, and a rewrite would
+    // orphan the blob either way. A reference that does not parse can only be
+    // a row written before issue #1758.
     if is_offload_envelope(field) {
         return Ok(FieldStep::Offloaded);
     }
@@ -526,11 +526,10 @@ pub fn reencrypt_column_cell_under(
 /// encryption.
 ///
 /// Registering [`crate::payload_codec::IdentityCodec`] under a key id and
-/// activating it is a request to store payloads in the clear. Honouring that on
-/// the *write* path is the embedder's business; honouring it on the sweep would
-/// mean walking stored history and replacing ciphertext with plaintext, which
-/// is a crypto-shredding-in-reverse operation nobody asked for. The sweep
-/// refuses to do it and reports zero work instead.
+/// activating it is a request to store payloads in the clear. On the *write*
+/// path that is the embedder's business. On the sweep it would replace stored
+/// ciphertext with plaintext: crypto-shredding in reverse, which nobody asked
+/// for. The sweep refuses and reports zero work instead.
 ///
 /// Only the sweep consults this, and the sweep only exists under `db`.
 #[cfg(feature = "db")]
@@ -538,35 +537,32 @@ fn active_key_would_decrypt(codecs: &PayloadCodecs) -> bool {
     codecs.active_codec_id().is_none_or(|id| id == "identity")
 }
 
-/// A bounded category for a per-row sweep failure, safe to put in a log line.
-///
-/// The failure text itself is NOT loggable. A decode error here originates in
-/// an **embedder-supplied** `PayloadCodec`, so its `CodecError` message is
-/// arbitrary text this crate does not control and cannot bound — it may carry
-/// key material or plaintext diagnostics the codec author included for local
-/// debugging and never expected in a production log.
-///
-/// The lossy read path already made this decision: every failure it can hit
-/// becomes one of the fixed `UNDECODABLE_REASON_*` strings rather than the
-/// codec's own message. The sweep runs over the same rows with the same codecs
-/// and has no reason to be laxer. What makes the line actionable is the row id
-/// and the key ids, both of which are bounded and stay.
 /// How often a shard whose pass is already complete re-confirms that against the
 /// census.
 ///
-/// The census is a full scan, and a converged shard reaches the end of its scan
-/// on every scanner tick, so confirming completion per tick would
-/// sequential-scan `harvest_events` several times a second per shard. But it
-/// cannot be dropped entirely: a row that commits below the cursor (its
-/// `BIGSERIAL` id allocated before the scan passed it, its transaction
-/// committing after) is found no other way, and leaving it stranded deadlocks
-/// retirement.
+/// The census is a full scan. A converged shard reaches the end of its scan on
+/// every scanner tick. A per-tick check would scan `harvest_events` several
+/// times a second per shard. The check cannot be dropped, though. A row can
+/// commit below the cursor: its `BIGSERIAL` id was allocated before the scan
+/// passed it, and its transaction committed after. Nothing else finds that
+/// row, and a stranded row deadlocks retirement.
 ///
 /// Five minutes bounds the scan load to something negligible while keeping the
 /// recovery window far shorter than any rotation an operator is watching.
 #[cfg(feature = "db")]
 const COMPLETED_CURSOR_REVALIDATION_SECS: f64 = 300.0;
 
+/// A bounded category for a per-row sweep failure, safe to put in a log line.
+///
+/// The failure text itself is NOT loggable. A decode error here comes from an
+/// **embedder-supplied** `PayloadCodec`. Its `CodecError` message is arbitrary
+/// text that this crate cannot bound. It may carry key material or plaintext
+/// diagnostics that the codec author never expected in a production log.
+///
+/// The lossy read path made the same decision. Every failure it can hit
+/// becomes a fixed `UNDECODABLE_REASON_*` string, not the codec's own message.
+/// The sweep reads the same rows with the same codecs, so it is no laxer. The
+/// row id and the key ids make the line actionable, and both are bounded.
 #[cfg(feature = "db")]
 pub(crate) const fn sweep_error_kind(error: &HarvestError) -> &'static str {
     match error {
@@ -584,16 +580,15 @@ pub(crate) const fn sweep_error_kind(error: &HarvestError) -> &'static str {
 ///
 /// `event_value` must be the adjacently-tagged form stored in
 /// `harvest_events.event_data`: `{"type": "...", "data": {...}}`. Only values
-/// under [`PAYLOAD_FIELD_KEYS`] inside `data` are considered — the same
-/// allowlist the codec, erasure and export paths already share — so the event
-/// `type`, event ids, ordering and timestamps are structurally out of reach.
+/// under [`PAYLOAD_FIELD_KEYS`] inside `data` are considered. The codec,
+/// erasure and export paths share that allowlist. So the event `type`, event
+/// ids, ordering and timestamps are structurally out of reach.
 ///
 /// **All-or-nothing.** Every field is decoded and re-encoded into a staging
 /// buffer first; `event_value` is mutated only once every field has succeeded.
 /// A field that cannot be decoded (an unregistered key id, corrupt ciphertext)
-/// returns `Err` with `event_value` **completely unmodified**, so the caller can
-/// never persist a half-rotated row and never persists plaintext where
-/// ciphertext used to be.
+/// returns `Err` with `event_value` **completely unmodified**. So the caller
+/// never persists a half-rotated row, or plaintext where ciphertext was.
 ///
 /// Returns a zero outcome — touching nothing — when no keyed codec is
 /// registered, which is every deployment that has not adopted rotation.
@@ -612,10 +607,10 @@ pub fn reencrypt_event_payload_fields(
 
 /// [`reencrypt_event_payload_fields`], pinned to an explicit target key id.
 ///
-/// [`sweep_codec_reencryption_once`] resolves the active key once per batch and
-/// calls THIS function (not the wrapper) for every row, so a concurrent
-/// `set_active_key` cannot straddle a single row and leave half its
-/// fields on the old key and half on the new one. It also cannot cause a
+/// [`sweep_codec_reencryption_once`] resolves the active key once per batch.
+/// It calls THIS function, not the wrapper, for every row. So a concurrent
+/// `set_active_key` cannot leave half of one row's fields on the old key and
+/// half on the new one. It also cannot cause a
 /// plaintext write: [`PayloadCodecs::encode_payload_under`] refuses an identity
 /// codec at the point of use rather than relying on a check made earlier.
 ///
@@ -654,9 +649,9 @@ pub fn reencrypt_event_payload_fields_under(
     if staged.is_empty() {
         return Ok(outcome);
     }
-    // The immutable borrow above established that `data` is an object, so this
-    // cannot fail; treating it as an error rather than an `if let` keeps a
-    // future refactor from silently discarding `staged` and reporting no work.
+    // The immutable borrow above proved that `data` is an object, so this
+    // cannot fail. An error, not an `if let`, stops a future refactor from
+    // silently discarding `staged` and reporting no work.
     let data_mut = event_value
         .get_mut("data")
         .and_then(Value::as_object_mut)
@@ -673,9 +668,8 @@ pub fn reencrypt_event_payload_fields_under(
     Ok(outcome)
 }
 
-/// Whether any payload-bearing field of a serialized event carries a codec key
-/// id other than `active` — i.e. whether this row has anything for the sweep to
-/// do at all.
+/// Whether any payload field of a serialized event has a key id other than
+/// `active`, that is, whether the sweep has work on this row.
 ///
 /// A few map lookups and no allocation, so the sweep can skip the deep clone of
 /// an event that is already fully converted. That is the steady state on a
@@ -702,9 +696,9 @@ pub fn has_non_active_key(event_value: &Value, active: &str) -> bool {
 ///
 /// A kid-less envelope resolves to
 /// [`CODEC_LEGACY_KEY_ID`](crate::payload_codec::CODEC_LEGACY_KEY_ID). Fields
-/// that carry no ciphertext at all — plaintext, offload reference envelopes,
-/// erasure tombstones — contribute nothing, which is exactly what makes the
-/// retirement gate's census agree with what the sweep is able to convert.
+/// with no ciphertext contribute nothing: plaintext, offload reference
+/// envelopes and erasure tombstones. That makes the retirement gate's census
+/// agree with what the sweep can convert.
 #[must_use]
 pub fn event_key_ids(event_value: &Value) -> std::collections::BTreeSet<String> {
     let mut ids = std::collections::BTreeSet::new();
@@ -726,10 +720,10 @@ pub fn event_key_ids(event_value: &Value) -> std::collections::BTreeSet<String> 
 /// Rows examined per shard per scanner tick when the caller does not override
 /// it.
 ///
-/// The sweep's rate limiter: raising it converts history faster and holds the
-/// scanner connection longer; lowering it (or passing `0`) throttles or stops
-/// the sweep without a deploy. Unconditional (not `db`-gated) so a no-`db`
-/// build can still name the default in a `WorkerConfig`.
+/// The sweep's rate limiter. A higher value converts history faster and holds
+/// the scanner connection longer. A lower value, or `0`, throttles or stops
+/// the sweep without a deploy. Not `db`-gated, so a no-`db` build can still
+/// name the default in a `WorkerConfig`.
 pub const CODEC_ROTATION_DEFAULT_BATCH: i64 = 200;
 
 #[cfg(feature = "db")]
@@ -770,10 +764,10 @@ mod db {
     /// before it. The flat shapes are kept read-only, for history written
     /// before issue #1253.
     ///
-    /// Kept byte-for-byte in step with the Rust shape check so the census can
-    /// never count a row the sweep is unable to convert (which would make the
-    /// retirement gate block forever) nor miss one it can (which would let the
-    /// gate open early). `a_near_envelope_is_neither_counted_nor_swept` in
+    /// Kept byte-for-byte in step with the Rust shape check. The census must
+    /// never count a row that the sweep cannot convert: the retirement gate
+    /// would block forever. It must never miss one that the sweep can convert:
+    /// the gate would open early. `a_near_envelope_is_neither_counted_nor_swept` in
     /// `tests/integration/codec_rotation_db_tests.rs` pins the two together.
     const ENVELOPE_PREDICATE: &str = "
               jsonb_typeof(f.value) = 'object'
@@ -932,9 +926,9 @@ mod db {
         /// of a completion stamp, so a transient failure always gets another
         /// chance.
         pub unresolved_rows: i64,
-        /// Set only when a pass reached the end of the shard having converted
-        /// everything it saw — "this key is safe to gate on", not merely "the
-        /// scan ran off the end".
+        /// Set only when a pass reached the end of the shard and converted
+        /// everything it saw. It means "this key is safe to gate on", not
+        /// merely "the scan ran off the end".
         pub completed_at: Option<DateTime<Utc>>,
         /// Last time this row was written (issue #1258). Cursor liveness, for
         /// an operator to read — NOT the revalidation deadline. An ordinary
@@ -1001,10 +995,9 @@ mod db {
     /// tombstone (#495). That keeps this census in step with what the sweep
     /// can convert.
     ///
-    /// This is a sequential scan of the largest tables in the schema. It backs an
-    /// admin-gated, operator-invoked read and the retirement gate — both
-    /// rotation-scoped, run a handful of times per rotation — not anything on a
-    /// request or dispatch path.
+    /// This is a sequential scan of the largest tables in the schema. It backs
+    /// an admin-gated operator read and the retirement gate. Both run a few
+    /// times per rotation, never on a request or dispatch path.
     ///
     /// # Errors
     ///
@@ -1012,9 +1005,8 @@ mod db {
     pub async fn count_rows_by_key_id(
         conn: &mut AsyncPgConnection,
     ) -> HarvestResult<BTreeMap<String, i64>> {
-        // Targeted `->` lookups over the compile-time-constant field list,
-        // rather than `jsonb_each` materialising a tuple for every key of
-        // `data` (timestamps, ids, everything) only to discard most of them.
+        // Targeted `->` lookups over the constant field list. `jsonb_each`
+        // would build a tuple for every key of `data` and discard most.
         let key_id = key_id_expr("$2");
         let mut sources = vec![format!(
             "SELECT key_id, COUNT(*)::BIGINT AS row_count \
@@ -1087,22 +1079,21 @@ mod db {
     /// [`load_shard_rotation_progress`], classifying against a **caller-pinned**
     /// active key rather than whatever the registry holds right now.
     ///
-    /// A multi-shard report reads each shard on its own connection, so reading
-    /// the active key per shard lets a concurrent
-    /// [`PayloadCodecs::set_active_key`] straddle the fan-out: shards observed
-    /// before the flip classify their rows against the outgoing key and count
-    /// them as converted, shards observed after classify the same key's rows as
-    /// remaining, and the aggregate advertises whichever key was active when it
-    /// was assembled. The dangerous reading is `rows_remaining_total: 0` beside
-    /// the *new* `active_key_id` while rows under the old key are still out
-    /// there -- precisely what the runbook tells an operator means "safe to
-    /// retire".
+    /// A multi-shard report reads each shard on its own connection. A per-shard
+    /// read of the active key lets a concurrent
+    /// [`PayloadCodecs::set_active_key`] straddle the fan-out. Shards read
+    /// before the flip count the outgoing key's rows as converted. Shards read
+    /// after count the same rows as remaining. The aggregate shows whichever
+    /// key was active when it was assembled. The dangerous reading is
+    /// `rows_remaining_total: 0` beside the *new* `active_key_id` while rows
+    /// under the old key remain. The runbook tells an operator that this
+    /// reading means "safe to retire".
     ///
-    /// Pinning does not make the census transactional across shards -- rows can
-    /// still be written while the fan-out runs -- but it removes the one
-    /// inconsistency that turns a partial observation into a *wrong* one rather
-    /// than merely a stale one. The retirement gate does its own census and
-    /// does not rely on this report.
+    /// Pinning does not make the census transactional across shards. Rows can
+    /// still be written while the fan-out runs. But it removes the one
+    /// inconsistency that makes a partial observation *wrong*, not merely
+    /// stale. The retirement gate does its own census and does not rely on
+    /// this report.
     ///
     /// # Errors
     ///
@@ -1114,11 +1105,11 @@ mod db {
         codecs: &PayloadCodecs,
         active_key_id: &str,
     ) -> HarvestResult<ShardRotationProgress> {
-        // With no keyed codec registered -- every deployment that has not
-        // adopted rotation -- the answer is trivially "nothing to rotate", and
-        // running a sequential scan of the largest table to say so would let an
-        // unauthenticated-to-the-DB dashboard poll turn an admin GET into
-        // repeated full-table reads on every shard.
+        // With no keyed codec registered, the answer is "nothing to rotate".
+        // That is every deployment that has not adopted rotation. A scan of
+        // the largest table to say so is costly. A dashboard poll needs no DB
+        // credentials, and it would turn an admin GET into repeated full-table
+        // reads on every shard.
         if !codecs.has_keyed_codecs() {
             return Ok(ShardRotationProgress {
                 active_key_id: active_key_id.to_string(),
@@ -1127,14 +1118,13 @@ mod db {
             });
         }
         let rows_by_key_id = count_rows_by_key_id(conn).await?;
-        // Scope the cursor to the key being reported, exactly as the sweep
-        // scopes the cursor it resumes from. `ShardRotationProgress::cursor` is
-        // documented as the resume cursor for the *active key's* pass, and
-        // between a flip and that shard's next tick the stored row still
-        // belongs to the previous key. Reporting it here would put a completed
-        // cursor beside the new `active_key_id`, which reads as a finished
-        // rotation that has not started -- to a dashboard, and to the operator
-        // the runbook sends to this endpoint.
+        // Scope the cursor to the reported key, as the sweep scopes the cursor
+        // it resumes from. `ShardRotationProgress::cursor` is the resume cursor
+        // of the *active key's* pass. Between a flip and the shard's next tick,
+        // the stored row still belongs to the previous key. Reporting it would
+        // put a completed cursor beside the new `active_key_id`. That reads as
+        // a finished rotation that has not started. Dashboards and the
+        // operator that the runbook sends here both read it that way.
         let cursor = if cursor_table_present(conn).await? {
             load_cursor(conn, shard_id)
                 .await?
@@ -1196,16 +1186,16 @@ mod db {
     ///
     /// The write is a **compare-and-swap**:
     /// `UPDATE harvest_events SET event_data = $new WHERE id = $1 AND event_data = $old`.
-    /// If anything changed the row between the read and the write — PII erasure
-    /// (#495) tombstoning it, or a second sweeper — the update matches zero
-    /// rows and this sweep counts it unresolved and skips it. The sweep always
-    /// loses such a race, which is the only safe direction: re-writing
-    /// ciphertext over a tombstone would resurrect payload data an erasure had
-    /// just destroyed.
+    /// Something can change the row between the read and the write: a PII
+    /// erasure (#495) tombstone, or a second sweeper. The update then matches
+    /// zero rows, and this sweep counts the row unresolved and skips it. The
+    /// sweep always loses such a race. That is the only safe direction.
+    /// Ciphertext written over a tombstone would resurrect payload data that
+    /// an erasure had just destroyed.
     ///
-    /// A row that cannot be decoded is logged (by id only, never content) and
-    /// left byte-identical, so one unreadable row cannot wedge the whole pass —
-    /// and it keeps the retirement gate correctly blocked.
+    /// A row that cannot be decoded is logged by id only, never content. It is
+    /// left byte-identical, so one unreadable row cannot wedge the whole pass.
+    /// It also keeps the retirement gate correctly blocked.
     ///
     /// ## Racing retirement (issue #1251)
     ///
@@ -1223,9 +1213,8 @@ mod db {
     ///
     /// Propagates database failures. A per-row codec failure is not an error.
     // The batch loop, the unresolved-vs-complete decision and the
-    // cursor-churn guard are one transaction's worth of reasoning; splitting
-    // them would hide the fact that the cursor written at the end depends on
-    // what every branch above decided.
+    // cursor-churn guard form one argument. A split would hide that the final
+    // cursor write depends on what every branch decided.
     #[allow(clippy::too_many_lines)]
     pub async fn sweep_codec_reencryption_once(
         conn: &mut AsyncPgConnection,
@@ -1242,9 +1231,9 @@ mod db {
         }
         let shard = crate::types::ShardId::new(shard_id);
         // Resolve the target key ONCE for the whole batch. Every row is
-        // re-encoded under this exact key id, so a concurrent `set_active_key`
-        // cannot straddle a row, and the progress we file below is attributed to
-        // the key we actually converted onto.
+        // re-encoded under this exact key id. So a concurrent `set_active_key`
+        // cannot straddle a row, and the recorded progress names the key that
+        // the rows were converted onto.
         let active_key_id = codecs.active_key_id();
         // Pin the target for the whole batch (issue #1251). Without this, a
         // second rotation can move `active_key_id` off this batch's target
@@ -1258,10 +1247,9 @@ mod db {
         let previous = load_cursor(conn, shard_id).await?;
         // A cursor recorded against a DIFFERENT key is stale: rotating, rotating
         // again, and ROLLING BACK all mean "rescan this shard from the start".
-        // Rollback is the case that makes this load-bearing — the key being
-        // rolled back to may have completed a pass of its own long ago, and
-        // resuming that pass would skip every row written under the key being
-        // rolled back from.
+        // Rollback makes this load-bearing. The rollback target may have
+        // completed a pass of its own long ago. Resuming that pass would skip
+        // every row written under the key being rolled back from.
         let resumed = previous
             .as_ref()
             .filter(|cursor| cursor.active_key_id == active_key_id);
@@ -1284,10 +1272,9 @@ mod db {
         let mut rewritten = 0usize;
         let mut unresolved = 0i64;
         for row in rows {
-            // Cheap pre-check before the deep clone: the steady state is a
-            // fully-converted shard where every fetched row is already on the
-            // active key, and cloning a multi-kilobyte event JSON to discover
-            // that is pure waste.
+            // Cheap pre-check before the deep clone. In the steady state every
+            // fetched row is already on the active key. Cloning multi-kilobyte
+            // event JSON to discover that is pure waste.
             if !has_non_active_key(&row.event_data, &active_key_id) {
                 continue;
             }
@@ -1298,8 +1285,8 @@ mod db {
                     if compare_and_swap_event(conn, shard, row.id, &original, &candidate).await? {
                         rewritten += 1;
                     } else {
-                        // The row changed under us — a PII erasure, or another
-                        // sweeper. We lose, by design. Count it so the pass does
+                        // A PII erasure or another sweeper changed the row.
+                        // The sweep loses, by design. Count it so the pass does
                         // not report itself complete over a row it never
                         // converted.
                         unresolved += 1;
@@ -1315,13 +1302,12 @@ mod db {
                     unresolved += 1;
                     // Bounded and content-free: the row id, the operator-chosen
                     // key ids the row references, and a fixed category for the
-                    // failure. Never a payload, never ciphertext — and never
-                    // the error's own text, which for a decode failure comes
+                    // failure. Never a payload, never ciphertext. Never the
+                    // error's own text either: for a decode failure it comes
                     // from an embedder-supplied codec and is unbounded (see
-                    // `sweep_error_kind`). Naming the key ids is what makes the
-                    // log actionable — the usual cause is a key dropped from
-                    // the registry before its rows were converted, and this
-                    // says which one to put back.
+                    // `sweep_error_kind`). The key ids make the log actionable.
+                    // The usual cause is a key dropped from the registry before
+                    // its rows were converted. The log says which to put back.
                     tracing::warn!(
                         event_row_id = row.id,
                         shard_id,
@@ -1339,36 +1325,34 @@ mod db {
         let events_unresolved_total = carried.1.saturating_add(unresolved);
         let mut unresolved_total = events_unresolved_total;
 
-        // A pass that ran off the end of the shard having left something
-        // unconverted must NOT be marked complete and must NOT leave those rows
-        // behind the cursor forever: reset to 0 so they get another attempt.
-        // That is what makes a transient failure — a key registered late, a race
-        // lost to an erasure — eventually consistent rather than permanent.
+        // A pass that reached the end of the shard with rows unconverted must
+        // NOT be marked complete. It must NOT leave those rows behind the
+        // cursor forever either: reset to 0 so they get another attempt. So a
+        // transient failure is eventually consistent, not permanent. Examples
+        // are a key registered late, or a race lost to an erasure.
         //
         // `unresolved_total` only counts rows this pass SAW and could not
-        // convert. It cannot speak for a row the pass never saw, and there is a
-        // way for one to exist: `harvest_events.id` is a `BIGSERIAL`, so an
-        // INSERT allocates its id before it commits. A scan can pass an id that
-        // is not yet visible and leave that row below the cursor once it
-        // commits, where `WHERE id > $1` will never look again. Nothing counted
-        // it, so the pass would look clean and record `completed_at` — and the
-        // census would report the outgoing key forever while `retire_codec_key`
-        // refused forever. A deadlock of the whole procedure, needing a manual
-        // cursor reset to escape.
+        // convert. It cannot speak for a row the pass never saw, and one can
+        // exist. `harvest_events.id` is a `BIGSERIAL`, so an INSERT allocates
+        // its id before it commits. A scan can pass an id that is not yet
+        // visible. Once that row commits, it sits below the cursor, where
+        // `WHERE id > $1` never looks again. Nothing counted it, so the pass
+        // would look clean and record `completed_at`. The census would then
+        // report the outgoing key forever, and `retire_codec_key` would refuse
+        // forever. That deadlocks the whole procedure until a manual cursor
+        // reset.
         //
-        // So completion is confirmed against the census rather than inferred
-        // from having reached the end. The census is the same count the
-        // retirement gate trusts, which is the point: "complete" now means the
-        // thing the runbook tells an operator it means. It costs one aggregate
-        // per *completing* pass, not per batch, and only on a shard that would
-        // otherwise have declared itself done.
-        // On a shard that has already converged, EVERY tick reaches the end
-        // with nothing unresolved -- the batch is empty because there is
-        // nothing past the cursor. Censusing on that condition alone would run
-        // a full scan of `harvest_events` per shard per tick, forever, at the
-        // scanner's interval (500 ms by default). So an already-complete cursor
-        // re-confirms itself on a slow clock instead: `next_revalidation_at`
-        // (issue #1258).
+        // So completion is confirmed against the census, not inferred from
+        // reaching the end. The retirement gate trusts the same count. So
+        // "complete" means what the runbook tells an operator it means. It
+        // costs one aggregate per *completing* pass, not per batch. It runs
+        // only on a shard that would otherwise declare itself done.
+        // On a converged shard, EVERY tick reaches the end with nothing
+        // unresolved: the batch is empty because nothing is past the cursor.
+        // A census on that condition alone would scan all of `harvest_events`
+        // per shard per tick, forever, at the scanner's interval (500 ms by
+        // default). So a complete cursor re-confirms itself on a slow clock
+        // instead: `next_revalidation_at` (issue #1258).
         //
         // That column is its own timer, separate from `updated_at`. An
         // ordinary advancing write on a busy converged shard bumps
@@ -1376,14 +1360,14 @@ mod db {
         // deadline out every tick, or a shard that never idles never
         // revalidates.
         //
-        // The clock has to be the stored one, not an in-process one: several
-        // workers sweep the same shard, and a DB-side timestamp makes the
-        // revalidation fleet-wide rather than once per worker.
+        // The clock is the stored one, not an in-process one. Several workers
+        // sweep the same shard. A DB-side timestamp makes the revalidation
+        // fleet-wide, not once per worker.
         let already_complete = resumed.is_some_and(|cursor| cursor.completed_at.is_some());
         // Census when a pass is newly completing, and on a converged shard only
-        // when this worker wins the interval's claim. Skipping it in the steady
-        // state is the whole point; skipping it forever is not, because a row
-        // that commits below the cursor is only ever found this way.
+        // when this worker wins the interval's claim. The census is skipped in
+        // the steady state, but never forever. A row that commits below the
+        // cursor is only ever found this way.
         let revalidate = if reached_end && unresolved_total == 0 && already_complete {
             claim_completed_cursor_revalidation(conn, shard).await?
         } else {
@@ -1439,18 +1423,17 @@ mod db {
                 (0, 0, None)
             } else if !census_needed {
                 // Converged, and the revalidation clock has not come round. Keep
-                // the completion stamp -- this branch must not be mistaken for
-                // "the census said no", which would reset a perfectly good
-                // completion on every tick.
+                // the completion stamp. This branch is not "the census said
+                // no", which would reset a good completion on every tick.
                 //
                 // But DO advance over what this tick examined. `highest_id` is
                 // correct in both cases by construction: the max id read, falling
-                // back to the resume point when the batch was empty. Carrying the
-                // stored `last_event_id` instead would stand still over an
-                // underfilled batch, so a converged shard receiving traffic would
-                // re-read and re-deserialize the same rows every tick until the
-                // batch filled or the five-minute clock moved it -- read
-                // amplification bounded only by `batch_limit`.
+                // back to the resume point when the batch was empty. The stored
+                // `last_event_id` would stand still over an underfilled batch.
+                // A converged shard with traffic would then re-read the same
+                // rows every tick, until the batch filled or the five-minute
+                // clock moved it. Only `batch_limit` would bound that read
+                // amplification.
                 (
                     highest_id,
                     0,
@@ -1471,11 +1454,9 @@ mod db {
 
         // Steady state on a converted shard: the pass is already complete and
         // this tick fetched nothing new. Re-upserting the identical row would
-        // refresh `updated_at` on every scanner tick, forever, generating WAL
-        // and dead tuples per shard for a deployment that simply keeps a keyed
-        // codec configured -- and making the cursor read as freshly active
-        // while doing no work, which is exactly backwards for an operator
-        // watching it.
+        // refresh `updated_at` on every scanner tick, forever. That writes WAL
+        // and dead tuples per shard for any deployment with a keyed codec. It
+        // also makes an idle cursor look freshly active to an operator.
         //
         // A revalidation tick needs no exception here. The claim statement
         // has already bumped `next_revalidation_at`, so a clean re-census
@@ -1784,21 +1765,21 @@ mod db {
     /// `original`. Returns whether the swap took effect.
     ///
     /// This is the single guard that keeps sanctioned exception #3 from
-    /// undoing exception #2: if anything changed the row between the sweep's
-    /// read and this write — a PII erasure (#495) tombstoning it, or a second
-    /// sweeper — the `WHERE` clause matches nothing and the sweep loses. That
-    /// is the only safe direction, and the caller counts the loss so the pass
-    /// re-runs rather than reporting itself complete over that row.
+    /// undoing exception #2. Something can change the row between the sweep's
+    /// read and this write: a PII erasure (#495) tombstone, or a second
+    /// sweeper. The `WHERE` clause then matches nothing and the sweep loses.
+    /// That is the only safe direction. The caller counts the loss, so the
+    /// pass re-runs and does not report itself complete over that row.
     ///
     /// It is also fenced against the shard generation (#954). This is the only
-    /// path that UPDATEs `harvest_events` in place, so `store.rs`'s fence on
-    /// every INSERT does not cover it, and the failure an unfenced sweep allows
-    /// is the worst one this feature has: a worker still pinned to the old
-    /// generation, reconnected to the promoted primary, would have its appends
-    /// refused but its **re-encryption accepted** — rewriting rows the new
-    /// region owns under an active key that region may already have retired.
-    /// Silent, permanent, and destroys payloads rather than merely forking
-    /// history. The assertion and the swap share one transaction so the
+    /// path that UPDATEs `harvest_events` in place. So `store.rs`'s fence on
+    /// every INSERT does not cover it. An unfenced sweep allows the worst
+    /// failure of this feature. Take a worker still pinned to the old
+    /// generation and reconnected to the promoted primary. Its appends are
+    /// refused, but its **re-encryption is accepted**. It rewrites rows the new
+    /// region owns, under an active key that region may have retired already.
+    /// That is silent and permanent, and it destroys payloads, not merely
+    /// forks history. The assertion and the swap share one transaction. So the
     /// assertion's `FOR SHARE` stays a commit-order barrier against a
     /// concurrent promotion.
     ///
@@ -1812,10 +1793,9 @@ mod db {
     ///
     /// [`EventRewrite::CodecRotation`]: crate::append_only::EventRewrite::CodecRotation
     ///
-    /// `#[doc(hidden)] pub` purely so that race semantics can be exercised
-    /// directly by an integration test (a stale `original` must not win), which
-    /// is not reachable through the batch-oriented public sweep entry point.
-    /// Not part of the engine's semver-stable surface.
+    /// `#[doc(hidden)] pub` only so an integration test can drive the race
+    /// directly: a stale `original` must not win. The batch-oriented public
+    /// sweep cannot reach that case. Not part of the semver-stable surface.
     ///
     /// # Errors
     ///
@@ -2150,12 +2130,12 @@ mod db {
     /// timeout enforcement, broken-session reclaim, mutex-lease reclaim, and the
     /// scanner-liveness heartbeat.
     ///
-    /// Shard-local costs nothing in coverage: a multi-shard worker spawns one
-    /// timeout checker per assigned shard (`monitor_shard_scope` narrows each to
-    /// its own), so every shard is swept by its own checker on its own
-    /// connection. Unlike the throttle / debounce / start-idempotency residents,
-    /// this sweep has no cross-shard work to route — a row is rewritten on the
-    /// shard that stores it.
+    /// Shard-local costs nothing in coverage. A multi-shard worker spawns one
+    /// timeout checker per assigned shard, and `monitor_shard_scope` narrows
+    /// each to its own. So each shard is swept by its own checker on its own
+    /// connection. Unlike the throttle, debounce and start-idempotency
+    /// residents, this sweep has no cross-shard work to route. A row is
+    /// rewritten on the shard that stores it.
     ///
     /// `shard_assignments` is used only to attribute progress to the right shard
     /// id; the connection decides which rows are actually swept.
@@ -2715,9 +2695,9 @@ mod db {
     ///
     /// See [`FleetWriteFence`] for the two ways to supply the fence.
     ///
-    /// On success the key is dropped from this process's in-memory registry via
-    /// [`PayloadCodecs::retire_key_local`]; disposing of the key *material* is
-    /// the embedder's business (this crate never holds it). Read
+    /// On success, [`PayloadCodecs::retire_key_local`] drops the key from this
+    /// process's in-memory registry. The key *material* is the embedder's to
+    /// dispose of: this crate never holds it. Read
     /// `docs/operations/codec-key-rotation.md` before you do: an `Ok` here is
     /// scoped to `harvest_events`, not to every place a codec envelope can sit.
     ///
@@ -2740,11 +2720,10 @@ mod db {
     ) -> HarvestResult<()> {
         validate_retirement_request(expected_shards, codecs, key_id)?;
 
-        // Fail closed on an INCOMPLETE list, not just an unreachable shard. A
-        // caller that passes a stale or process-local subset would otherwise get
-        // a vacuous `Ok` while whole shards were never censused -- and the
-        // runbook tells the operator that `Ok` is when key material may be
-        // destroyed.
+        // Fail closed on an INCOMPLETE list, not just an unreachable shard.
+        // Otherwise a stale or process-local subset gets a vacuous `Ok` while
+        // whole shards were never censused. The runbook tells the operator
+        // that `Ok` means the key material may be destroyed.
         let missing: Vec<CodecKeyShardRemainder> = sharded_pool
             .iter_shards()
             .map(|(shard, _)| shard)
@@ -3600,10 +3579,10 @@ mod tests {
     #[test]
     fn a_field_that_decodes_to_non_json_bytes_is_left_completely_untouched() {
         // Regression test (PR #1275 review): decode_payload_bytes must still
-        // validate the decoded bytes as JSON. A codec that "successfully"
-        // decodes corrupt or mismatched ciphertext into non-JSON garbage must
-        // fail the row, not be silently re-encrypted and written back out as
-        // new ciphertext wrapping the garbage.
+        // validate the decoded bytes as JSON. A codec can "successfully"
+        // decode corrupt or mismatched ciphertext into non-JSON garbage. That
+        // must fail the row. It must not be re-encrypted and written back as
+        // new ciphertext around the garbage.
         let codecs = PayloadCodecs::default();
         codecs
             .register_key("k-garbage", Arc::new(GarbageDecodeCodec))
@@ -3686,19 +3665,19 @@ mod tests {
     ///
     /// `store::load_history` delegates to `load_history_with_codecs` with the
     /// identity registry, so it hard-errors `UnknownCodecKey` on the first
-    /// keyed envelope. Once the engine's writes encode through the configured
-    /// registry, any engine read still on that loader is a live defect, not a
-    /// latent one: the activity-start path reloads history under the execution
-    /// row lock, so an identity read there means **no activity can start** on a
-    /// deployment with a keyed codec configured.
+    /// keyed envelope. The engine's writes encode through the configured
+    /// registry. So any engine read still on that loader is a live defect, not
+    /// a latent one. The activity-start path reloads history under the
+    /// execution row lock. An identity read there means **no activity can
+    /// start** on a deployment with a keyed codec.
     ///
     /// Every engine read must therefore be one of two things:
     ///
     /// - `load_history_with_codecs` / `load_history_inflated`, when it looks at
     ///   payload fields; or
     /// - `load_history_undecoded`, when it only does id arithmetic
-    ///   (`next_event_id`) or matches on event variants — decoding buys such a
-    ///   caller nothing and costs it a registry it may not have.
+    ///   (`next_event_id`) or matches on event variants. Decoding buys such a
+    ///   caller nothing and needs a registry it may not have.
     ///
     /// Source-level because the property is "which function was called", which
     /// no runtime assertion can observe without a keyed deployment of every
@@ -3708,17 +3687,17 @@ mod tests {
     /// # Why the counting is written this way
     ///
     /// An earlier version of this guard matched the literal `store::load_history(`
-    /// and missed three real defects: a bare `load_history(` in a module that
-    /// imports it, and the `lock_and_load_history` **wrapper**, whose one caller
-    /// (`ActivityContext::run_transactional`) would have rolled back every
-    /// transactional activity commit under a keyed codec. Matching a call
-    /// spelling is a guess about how callers write; neutralising every *safe*
-    /// spelling and counting the remainder is not.
+    /// and missed three real defects. One was a bare `load_history(` in a module
+    /// that imports it. Another was the `lock_and_load_history` **wrapper**.
+    /// Its one caller, `ActivityContext::run_transactional`, would have rolled
+    /// back every transactional activity commit under a keyed codec. Matching a
+    /// call spelling guesses how callers write. Neutralising every *safe*
+    /// spelling and counting the remainder does not.
     #[test]
     fn no_engine_path_reads_history_through_the_identity_loader() {
         /// Every loader that is safe by construction. `lock_and_load_history_undecoded`
-        /// is here because its name states the contract; a wrapper that hides an
-        /// identity read behind a neutral name is exactly what this guard missed once.
+        /// is here because its name states the contract. This guard once missed
+        /// a wrapper that hid an identity read behind a neutral name.
         const SAFE_LOADERS: &[&str] = &[
             "load_history_with_codecs(",
             "load_history_undecoded(",
@@ -3799,20 +3778,19 @@ mod tests {
     ///
     /// `store::append_events` encodes with the identity registry, so a
     /// payload-bearing event written through it lands in `harvest_events` as
-    /// **cleartext** — and stays that way. Unlike an identity *read*, which
-    /// fails loudly with `UnknownCodecKey`, an identity write succeeds
-    /// silently, and the sweep never repairs it: converting plaintext to
-    /// ciphertext is not something the sweep does, by design (it re-encodes
-    /// rows that already carry a non-active key id, and plaintext carries
-    /// none). So the leak is permanent and invisible.
+    /// **cleartext**, and stays that way. An identity *read* fails loudly with
+    /// `UnknownCodecKey`. An identity write succeeds silently, and the sweep
+    /// never repairs it. By design, the sweep never turns plaintext into
+    /// ciphertext. It re-encodes rows that carry a non-active key id, and
+    /// plaintext carries none. So the leak is permanent and invisible.
     ///
-    /// That asymmetry is exactly why this guard exists separately: the read
-    /// guard catches its class the first time a keyed deployment runs, and this
-    /// one has to catch its class before that, because nothing downstream will.
+    /// That asymmetry is why this guard exists separately. The read guard
+    /// catches its class the first time a keyed deployment runs. This one must
+    /// catch its class before that, because nothing downstream will.
     ///
-    /// The allowlist is not aspirational — every entry is a real remaining gap
-    /// tracked in issue #1243, with the count pinned so the number can only go
-    /// down. `store.rs` is excluded: it *defines* both helpers, and its own
+    /// The allowlist is not aspirational. Each entry is a real remaining gap,
+    /// tracked in issue #1243, with a pinned count that can only go down.
+    /// `store.rs` is excluded: it *defines* both helpers, and its own
     /// delegation between them is the thing every other file must not do.
     #[test]
     fn no_engine_path_appends_history_through_the_identity_encoder() {

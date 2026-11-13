@@ -1,9 +1,8 @@
 //! Kafka [`EventSource`] adapter (issue #944), behind the `kafka` feature.
 //!
-//! The adapter is deliberately thin: it does no mapping, no idempotency, no
-//! poison accounting and no backpressure — all of that is broker-agnostic and
-//! lives in [`super::runtime`]. Its whole job is `receive` / `ack` / `abandon`
-//! / `lag` over `rdkafka`.
+//! The adapter is thin. Mapping, idempotency, poison accounting and
+//! backpressure are broker-agnostic and live in [`super::runtime`]. Its whole
+//! job is `receive` / `ack` / `abandon` / `lag` over `rdkafka`.
 //!
 //! # Manual commit, and why the runtime gates it
 //!
@@ -11,11 +10,10 @@
 //! commit is a **high-water mark**: committing offset N asserts that
 //! everything below N is done. Because the runtime dispatches up to
 //! `max_in_flight` messages concurrently, acking offset 5 while 4 is still in
-//! flight would silently skip 4 after a crash. The runtime therefore routes
-//! every ack through [`super::disposition::OffsetTracker`] and only calls
-//! [`EventSource::ack`] once the completed prefix is contiguous — so by the
-//! time this adapter commits `position + 1`, every lower offset really is
-//! settled.
+//! flight would silently skip 4 after a crash. So the runtime routes every ack
+//! through [`super::disposition::OffsetTracker`]. It calls
+//! [`EventSource::ack`] only once the completed prefix is contiguous. When
+//! this adapter commits `position + 1`, every lower offset is settled.
 //!
 //! # Build note
 //!
@@ -47,7 +45,7 @@ pub enum OffsetReset {
     /// Start at the high watermark. An uncommitted partition this source has
     /// never read from owes nothing, because a resume would land at the tail.
     /// Once it HAS read from one, [`PartitionAnchors`] pins where that
-    /// resolution actually landed and the policy no longer applies — otherwise
+    /// resolution landed, and the policy no longer applies. Without the pin,
     /// the baseline would chase the moving tail and report zero forever.
     Latest,
     /// Do not start at all: librdkafka reports an offset-reset error instead of
@@ -55,11 +53,11 @@ pub enum OffsetReset {
     /// misspelling it survives client-create validation and reaches a running
     /// consumer.
     ///
-    /// An uncommitted partition therefore has no resumable position, and no
-    /// honest lag: the retained log is not backlog the consumer can work
-    /// through, and zero would read as caught-up. [`partition_lag`] declines to
-    /// answer instead. A partition with a commit or an [anchor][PartitionAnchors]
-    /// is unaffected — the position is known and this policy never applies.
+    /// So an uncommitted partition has no resumable position and no honest
+    /// lag. The retained log is not backlog the consumer can work through,
+    /// and zero would read as caught-up. [`partition_lag`] declines to answer
+    /// instead. A partition with a commit or an [anchor][PartitionAnchors] is
+    /// unaffected: the position is known and this policy never applies.
     Error,
 }
 
@@ -73,8 +71,8 @@ pub struct KafkaSourceConfig {
     pub group_id: String,
     /// The topic to consume.
     pub topic: String,
-    /// Extra `librdkafka` properties (SASL, TLS, fetch tuning, …), applied
-    /// after the defaults so they can override them — except
+    /// Extra `librdkafka` properties (SASL, TLS, fetch tuning, …). They apply
+    /// after the defaults, so they can override them. The exception is
     /// `enable.auto.commit`, which is forced off (see the module docs).
     pub extra: Vec<(String, String)>,
 }
@@ -104,28 +102,25 @@ impl KafkaSourceConfig {
 
     /// The `auto.offset.reset` librdkafka will actually apply.
     ///
-    /// Mirrors [`Self::to_client_config`]'s precedence exactly — the `earliest`
-    /// default, then `extra` overriding it, last write winning — so the lag
-    /// gauge cannot disagree with the running consumer about where an
+    /// Mirrors the precedence of [`Self::to_client_config`] exactly: the
+    /// `earliest` default, then `extra` overriding it, last write winning. So
+    /// the lag gauge cannot disagree with the running consumer about where an
     /// uncommitted partition resumes.
     ///
-    /// Deliberately NOT forced the way `enable.auto.commit` is: auto-commit
-    /// would break the ack-after-commit contract unconditionally, whereas an
-    /// offset-reset policy is a legitimate caller choice (a new binding on a
-    /// huge existing topic may well want only new messages). `latest` DOES
-    /// threaten at-least-once while the group has no committed offset — a
-    /// rebuild would re-resolve it against a tail the blocked record has
-    /// already advanced past — but that is closed by anchoring rather than by
-    /// forbidding the policy; see [`PartitionAnchors`].
+    /// This is NOT forced the way `enable.auto.commit` is. Auto-commit always
+    /// breaks the ack-after-commit contract. An offset-reset policy is a
+    /// legitimate caller choice: a new binding on a huge existing topic may
+    /// want only new messages. `latest` DOES threaten at-least-once while the
+    /// group has no committed offset. A rebuild would re-resolve it against a
+    /// tail the blocked record has already advanced past. Anchoring closes
+    /// that hole without forbidding the policy; see [`PartitionAnchors`].
     ///
     /// librdkafka has exactly three policies, and all three are modelled:
     /// `earliest`/`smallest`/`beginning`, `latest`/`end`/`largest`, and
-    /// `error`. Only a genuinely unrecognised value maps to `Earliest`, and
-    /// that fallback is unreachable in practice — librdkafka rejects such a
-    /// string at client-create time, so it never reaches a running consumer.
-    /// `error` emphatically does not fall in that bucket: it is accepted, it
-    /// runs, and it means "resolve nothing", so it gets its own variant rather
-    /// than being folded into the default.
+    /// `error`. Only an unrecognised value maps to `Earliest`. That fallback
+    /// is unreachable in practice: librdkafka rejects such a string at
+    /// client-create time. `error` is not in that bucket. It is accepted, it
+    /// runs, and it means "resolve nothing", so it gets its own variant.
     #[must_use]
     pub fn effective_offset_reset(&self) -> OffsetReset {
         self.extra
@@ -168,31 +163,29 @@ impl KafkaSourceConfig {
 ///
 /// # Why this exists
 ///
-/// `auto.offset.reset` is only consulted when a partition has **no committed
-/// offset** — and for a `latest` group that window is unbounded: nothing
-/// commits until the first message settles, and if that first message keeps
-/// failing, nothing ever does. In that window the reset policy is not a fixed
-/// position but a *moving* one, because `latest` re-resolves against whatever
-/// the high watermark happens to be at the moment it is asked. Two things
-/// silently follow that moving tail:
+/// `auto.offset.reset` applies only when a partition has **no committed
+/// offset**. For a `latest` group that window is unbounded. Nothing commits
+/// until the first message settles, and if that message keeps failing,
+/// nothing ever does. In that window the reset policy is a *moving* position.
+/// `latest` re-resolves against the high watermark at the moment it is asked.
+/// Two things silently follow that moving tail:
 ///
 /// * **Recovery.** [`EventSource::recover`] rebuilds the consumer to re-read the
-///   blocked record. With no commit to resume from, the rebuild re-resolves
-///   `latest` against the *current* tail — which the blocked record itself has
-///   already advanced past — so it skips that record permanently while the
-///   runtime reports a successful retry. That is message loss, not a delayed
-///   delivery.
+///   blocked record. With no commit, the rebuild re-resolves `latest` against
+///   the *current* tail. The blocked record has already advanced that tail.
+///   So the rebuild skips the record permanently, while the runtime reports a
+///   successful retry. That is message loss, not a delayed delivery.
 /// * **The lag gauge.** Baselining an uncommitted partition at the live high
-///   watermark makes every sample `high - high = 0`. A group that started at
-///   100 and is stuck while producers push the topic to 1000 reports an
-///   all-clear for the 900 records it owes — masking exactly the
+///   watermark makes every sample `high - high = 0`. Take a group that started
+///   at 100 and is stuck while producers push the topic to 1000. It reports
+///   an all-clear for the 900 records it owes. That masks the
 ///   pre-first-commit outage the gauge exists to expose.
 ///
-/// The fix for both is one fact: **the first offset this source ever read from
-/// a partition is where `latest` resolved**, and that is a fixed anchor. It is
-/// recorded on receive, raised by every commit, re-asserted synchronously
-/// before a rebuild (which also makes any in-flight async commit durable), and
-/// used as the lag baseline.
+/// One fact fixes both: **the first offset this source ever read from a
+/// partition is where `latest` resolved**. That is a fixed anchor. Receive
+/// records it, and every commit raises it. A rebuild re-asserts it
+/// synchronously first, which also makes any in-flight async commit durable.
+/// The lag gauge uses it as the baseline.
 ///
 /// Committing that anchor is not a loss: for a `latest` group, "everything
 /// below where I started is not mine" is precisely what the policy *means*.
@@ -201,46 +194,46 @@ impl KafkaSourceConfig {
 ///
 /// # Durability: the map is in-process, so a crash does not run `recover`
 ///
-/// A rebuild is an *in-process* re-assert, which covers a wedged prefix but not
-/// a crash or `SIGKILL` — those never run [`EventSource::recover`] at all. A
-/// replacement process would have neither a committed offset nor this map, and
-/// would re-resolve `latest` against a tail the in-flight record has already
-/// advanced past: the same permanent skip, for a record the connector had
-/// already *accepted*.
+/// A rebuild is an *in-process* re-assert. It covers a wedged prefix but not a
+/// crash or `SIGKILL`, which never run [`EventSource::recover`]. A
+/// replacement process has neither a committed offset nor this map. It
+/// re-resolves `latest` against a tail the in-flight record has already
+/// advanced past. That is the same permanent skip, for a record the connector
+/// had already *accepted*.
 ///
-/// So under `latest` the floor is committed **eagerly**, before the batch is
-/// dispatched, by [`anchors_needing_durability`] — once per partition per
-/// process, since a landed commit retires it. `earliest` owes nothing: its
-/// baseline is the low watermark, which does not move backwards, so a restart
-/// re-reads rather than skips.
+/// So under `latest`, [`anchors_needing_durability`] commits the floor
+/// **eagerly**, before the batch is dispatched. This happens once per
+/// partition per process, since a landed commit retires it. `earliest` owes
+/// nothing. Its baseline is the low watermark, which does not move backwards,
+/// so a restart re-reads rather than skips.
 ///
 /// # Scope: a local fact, not a group one
 ///
 /// An anchor records what **this source instance** read. Nothing evicts one
-/// when a rebalance moves the partition elsewhere, so a long-lived source
+/// when a rebalance moves the partition elsewhere. So a long-lived source
 /// accumulates floors for partitions another replica now owns. That matters
 /// asymmetrically, and the two uses are guarded differently:
 ///
-/// * **Committing** speaks for the whole group, so it is filtered by
-///   [`committable_anchors`] down to partitions this consumer still owns and to
-///   floors that strictly raise what the group has committed. Unfiltered, a
-///   stale floor rewinds another replica's partition and replays records whose
-///   idempotency claims have long expired — duplicate executions, not
-///   deduplicated retries.
+/// * **Committing** speaks for the whole group. [`committable_anchors`]
+///   filters it down to partitions this consumer still owns. It also keeps
+///   only floors that strictly raise what the group has committed. Without
+///   the filter, a stale floor rewinds another replica's partition. That
+///   replays records whose idempotency claims have long expired: duplicate
+///   executions, not deduplicated retries.
 /// * **The lag baseline** is read-only and per-replica, so a stale anchor there
-///   can only skew one gauge sample. It is deliberately *not* filtered by the
-///   assignment: mid-rebalance `assignment()` is briefly empty, and dropping
-///   anchors then would re-open the `latest` under-report above — a false
-///   all-clear on the gauge, which is the failure direction that hurts. A
+///   can only skew one gauge sample. The assignment deliberately does *not*
+///   filter it. Mid-rebalance, `assignment()` is briefly empty. Dropping
+///   anchors then would re-open the `latest` under-report above. A false
+///   all-clear on the gauge is the failure direction that hurts. A
 ///   best-effort local baseline is the better trade there.
 ///
 /// # Residual
 ///
 /// A partition this replica has **never read** has no anchor and falls back to
-/// the reset policy. That is the honest answer, and for `latest` it is also the
-/// correct one: records that arrived before this source existed genuinely are
-/// not its work. Closing it further would need cross-replica state this adapter
-/// deliberately does not keep.
+/// the reset policy. That is the honest answer, and for `latest` it is also
+/// correct. Records that arrived before this source existed are not its work.
+/// Closing it further needs cross-replica state this adapter deliberately does
+/// not keep.
 ///
 /// The narrower residual is a partition read since the last successful eager
 /// commit — one whose commit failed and is queued for retry. A crash inside that
@@ -306,26 +299,27 @@ impl PartitionAnchors {
 ///
 /// A retained anchor is a fact about **this source's read history**, not about
 /// the group. Nothing evicts one when a rebalance moves the partition
-/// elsewhere, so the two diverge the moment ownership changes — and a commit
-/// speaks for the whole group. Two conditions, each closing a hole the other
+/// elsewhere. So the two diverge the moment ownership changes, and a commit
+/// speaks for the whole group. Two conditions each close a hole the other
 /// leaves open:
 ///
 /// * **Assigned.** Only a partition this consumer currently owns. A stale
-///   anchor for a partition another replica is advancing would assert a resume
-///   point for work this replica is not doing: rewind it, and that replica's
-///   successor replays everything from the stale floor — long after the
-///   connector's idempotency claims for those records expired, so the replay
-///   lands as duplicate executions rather than deduplicated retries.
+///   anchor for a partition another replica is advancing asserts a resume
+///   point for work this replica is not doing. If it rewinds that partition,
+///   the successor replays everything from the stale floor. The connector's
+///   idempotency claims for those records expired long ago. So the replay
+///   lands as duplicate executions, not deduplicated retries.
 /// * **Raises.** Only where the anchor is strictly ahead of what the group has
 ///   committed. Ownership alone is not enough, because [`record_read`] is
-///   first-read-wins: correct within one continuous ownership span, stale
-///   across a revoke-and-return. A partition read at 100, revoked, advanced to
-///   5000 by another replica and then handed back still carries a floor of 100.
+///   first-read-wins. That is correct within one continuous ownership span,
+///   and stale across a revoke-and-return. Take a partition read at 100,
+///   revoked, advanced to 5000 by another replica, then handed back. It
+///   still carries a floor of 100.
 ///
 /// Together they make an anchor commit **monotonic and local**: it can only
-/// raise a partition this replica owns. The case the anchor exists for — a
-/// `latest` group that has never committed anywhere — passes both trivially,
-/// since the partition was just read from and any floor raises "no floor".
+/// raise a partition this replica owns. The anchor exists for a `latest`
+/// group that has never committed anywhere. That case passes both trivially:
+/// the partition was just read from, and any floor raises "no floor".
 ///
 /// `committed` returns the group's durable next-offset for a partition, or
 /// `None` when it has never committed one.
@@ -351,18 +345,19 @@ fn committable_anchors(
 /// things for durability:
 ///
 /// * **Not assigned** — nothing spoke for the partition. Retiring it would be a
-///   silent lie with a long fuse: `durable` is permanent process state, so if a
-///   rebalance hands that partition back later the eager commit is suppressed
-///   *forever*, and a crash under an otherwise-uncommitted `latest` group
-///   re-resolves at the tail and skips accepted records.
+///   silent lie with a long fuse. `durable` is permanent process state. If a
+///   rebalance hands that partition back later, the eager commit stays
+///   suppressed *forever*. A crash under an otherwise-uncommitted `latest`
+///   group then re-resolves at the tail and skips accepted records.
 /// * **Assigned but does not raise** — the group is already committed at or
 ///   above the floor, so a crash resumes covered. Genuinely durable, even
 ///   though this pass committed nothing for it.
 ///
-/// So ownership, not the commit list, is what makes a partition retirable. The
-/// cost of *not* retiring an unassigned one is a `committed_offsets` call on the
-/// next receive while the stale anchor lingers — a rare failure-path cost
-/// (read, commit failed, then revoked), not a steady-state one.
+/// So ownership, not the commit list, makes a partition retirable. An
+/// unassigned partition that is *not* retired costs a `committed_offsets`
+/// call on each next receive while the stale anchor lingers. That is a rare
+/// failure-path cost (read, commit failed, then revoked), not a steady-state
+/// one.
 fn covered_anchor_partitions(owed: &[(i32, i64)], assigned: &[i32]) -> Vec<i32> {
     owed.iter()
         .map(|(partition, _)| *partition)
@@ -373,40 +368,40 @@ fn covered_anchor_partitions(owed: &[(i32, i64)], assigned: &[i32]) -> Vec<i32> 
 /// Whether this replica may commit a settled offset for `partition`.
 ///
 /// The **assigned** half of [`committable_anchors`], on the path that runs far
-/// more often. A commit speaks for the whole group, and a dispatch routinely
-/// outlives the rebalance that revoked its partition: it settles afterwards,
+/// more often. A commit speaks for the whole group. A dispatch routinely
+/// outlives the rebalance that revoked its partition. It settles afterwards,
 /// commits an offset the new owner has long since advanced past, and rewinds
-/// the group. Those records then replay well after the connector's idempotency
-/// claims for them expired, so they land as **duplicate executions** rather
-/// than deduplicated retries — the hazard `committable_anchors` was written
-/// for, reached through `ack`/`commit_position` instead of through an anchor.
+/// the group. Those records then replay after their idempotency claims
+/// expired. They land as **duplicate executions**, not deduplicated retries.
+/// That is the `committable_anchors` hazard, reached through
+/// `ack`/`commit_position` instead of through an anchor.
 ///
-/// Kafka will not stop this for us. A consumer that is still a live member of
-/// the group at the current generation may commit an offset for a partition it
-/// does not own; the classic rebalance protocol validates the generation, not
-/// the assignment. Ownership has to be checked here.
+/// Kafka does not stop this. A live group member at the current generation
+/// may commit an offset for a partition it does not own. The classic
+/// rebalance protocol validates the generation, not the assignment. So
+/// ownership must be checked here.
 ///
-/// Suppressing is always the safe direction: nothing is committed, so the
-/// records are simply re-read and deduped on their idempotency key — the same
-/// outcome the runtime already documents for a failed ack. That is also why
-/// a briefly-empty mid-rebalance assignment needs no special case.
+/// Suppressing is always the safe direction. Nothing is committed, so the
+/// records are re-read and deduped on their idempotency key. The runtime
+/// documents the same outcome for a failed ack. So a briefly-empty
+/// mid-rebalance assignment needs no special case.
 ///
 /// # Residual: revoked, advanced elsewhere, and handed back
 ///
-/// Ownership alone is not the whole guard, and [`committable_anchors`] pairs it
-/// with a **raises** check for exactly that reason. A partition revoked,
-/// advanced to 5000 by another replica, and then reassigned here is owned
-/// again, so a dispatch from before the gap still commits its stale offset.
-/// Closing it needs the group's committed offset — a `committed_offsets`
-/// broker round-trip, which the anchor path can afford because it runs rarely
-/// and this path cannot because it runs per settlement.
+/// Ownership alone is not the whole guard, so [`committable_anchors`] pairs it
+/// with a **raises** check. Take a partition revoked, advanced to 5000 by
+/// another replica, then reassigned here. It is owned again, so a dispatch
+/// from before the gap still commits its stale offset. Closing that needs the
+/// group's committed offset, a `committed_offsets` broker round-trip. The
+/// anchor path can afford it because it runs rarely. This path cannot,
+/// because it runs per settlement.
 ///
-/// The generation fencing that *would* close it cheaply has nowhere to live:
-/// it needs the assignment generation the message was read at, carried on the
-/// handle to its commit — and a positional commit deliberately arrives without
-/// the reading message's handle at all, because the mark it commits belongs to
-/// no single message. So the residual is narrowed to "outlived two rebalances"
-/// rather than "outlived one", and left documented.
+/// Generation fencing would close it cheaply, but it has nowhere to live. It
+/// needs the assignment generation at read time, carried on the handle to its
+/// commit. A positional commit arrives without the reading message's handle.
+/// The mark it commits belongs to no single message. So the residual narrows
+/// to "outlived two rebalances" instead of "outlived one", and stays
+/// documented.
 fn may_commit_settled(partition: i32, assigned: &[i32]) -> bool {
     assigned.contains(&partition)
 }
@@ -414,16 +409,17 @@ fn may_commit_settled(partition: i32, assigned: &[i32]) -> bool {
 /// The anchors that must be made durable *before* their records are dispatched.
 ///
 /// [`PartitionAnchors`] is in-process state, and only [`EventSource::recover`]
-/// commits it — an in-process rebuild a crash or SIGKILL never runs. Under
-/// `latest` that leaves a real at-least-once hole: a replacement process has
-/// neither a committed offset nor the map, re-resolves `latest` against a tail
-/// the in-flight record has already advanced past, and skips it permanently.
-/// The record was *accepted* and awaiting settlement, so that is loss, not the
-/// "records that arrived before I existed are not mine" the policy promises.
+/// commits it. A crash or SIGKILL never runs that in-process rebuild. Under
+/// `latest` that leaves a real at-least-once hole. A replacement process has
+/// neither a committed offset nor the map. It re-resolves `latest` against a
+/// tail the in-flight record has already advanced past, and skips the record
+/// permanently. The record was *accepted* and awaiting settlement, so that is
+/// loss. It is not the "records that arrived before I existed are not mine"
+/// the policy promises.
 ///
-/// Committing the first-read offset (not `offset + 1`) is what makes this safe
-/// to do eagerly: it asserts only that records *below* it are not ours — exactly
-/// what `latest` means — and leaves the record itself to be re-read.
+/// The commit uses the first-read offset, not `offset + 1`, so it is safe to
+/// do eagerly. It asserts only that records *below* it are not ours, which is
+/// what `latest` means. The record itself is re-read.
 ///
 /// `latest` is the ONLY policy that owes this, and the guard says so positively
 /// rather than excluding the others one by one:
@@ -437,11 +433,11 @@ fn may_commit_settled(partition: i32, assigned: &[i32]) -> bool {
 ///   loudly instead.
 ///
 /// Keying on `Latest` also stops a future fourth policy from inheriting the
-/// commit by default: a new variant owes nothing until someone shows it can
+/// commit by default. A new variant owes nothing until someone shows it can
 /// resolve forward past an accepted record.
 ///
-/// Only partitions not yet in `durable` are returned, so a landed commit is
-/// retired and a failed one stays queued for the next receive to retry.
+/// Only partitions not yet in `durable` are returned. A landed commit is
+/// retired, and a failed one stays queued for the next receive to retry.
 fn anchors_needing_durability(reset: OffsetReset, anchors: &PartitionAnchors) -> Vec<(i32, i64)> {
     if !matches!(reset, OffsetReset::Latest) {
         return Vec::new();
@@ -456,9 +452,9 @@ fn anchors_needing_durability(reset: OffsetReset, anchors: &PartitionAnchors) ->
 /// A Kafka-backed [`EventSource`].
 pub struct KafkaSource {
     /// Swappable so [`EventSource::recover`] can rebuild it in place when the
-    /// commit prefix wedges. Guarded by a `std::sync::Mutex` that is only ever
-    /// held long enough to clone the `Arc` out — never across an `.await`, so
-    /// it cannot block the runtime or deadlock with a concurrent rebuild.
+    /// commit prefix wedges. The `std::sync::Mutex` is held only to clone the
+    /// `Arc` out, never across an `.await`. So it cannot block the runtime or
+    /// deadlock with a concurrent rebuild.
     consumer: std::sync::Mutex<Arc<StreamConsumer>>,
     topic: String,
     /// Retained so a rebuild produces an identically-configured consumer.
@@ -494,7 +490,6 @@ impl KafkaSource {
         })
     }
 
-    /// Create a consumer subscribed to `config.topic`.
     fn build_consumer(config: &KafkaSourceConfig) -> Result<Arc<StreamConsumer>, ConnectorError> {
         let consumer: StreamConsumer = config
             .to_client_config()
@@ -535,26 +530,26 @@ impl KafkaSource {
     /// once per partition per process: a landed commit marks the partition
     /// durable and it is never revisited.
     ///
-    /// Guarded by the same [`committable_anchors`] filter [`EventSource::recover`]
-    /// uses, so an eager commit is still monotonic and local — it can only raise
-    /// a partition this replica currently owns. Only the partitions the pass
-    /// actually spoke for are retired; see [`covered_anchor_partitions`] for why
+    /// The same [`committable_anchors`] filter as [`EventSource::recover`]
+    /// guards it. So an eager commit is still monotonic and local: it can only
+    /// raise a partition this replica currently owns. Only the partitions the
+    /// pass spoke for are retired. See [`covered_anchor_partitions`] for why
     /// "assigned" and not "committed" is the right line.
     ///
     /// **Best-effort.** A failed commit warns and leaves the partition owed, so
-    /// the next receive retries — *every* next receive, drained or idle, which
-    /// is what bounds the crash window to a poll interval rather than to the
-    /// topic's next burst of traffic (see [`retry_owed_anchors`]).
+    /// the next receive retries. *Every* next receive retries, drained or idle.
+    /// That bounds the crash window to a poll interval, not to the topic's next
+    /// burst of traffic (see [`retry_owed_anchors`]).
     ///
-    /// Failing the receive instead would discard the drained records, whose
-    /// local consumer position has already advanced past them — the
-    /// permanent-loss hazard [`defer_recv_error`] exists to avoid, and here it
-    /// would fire on *every* commit failure rather than only on a crash. The
-    /// only correct form of "withhold the batch" would first `seek()` the
-    /// consumer back to each owed floor so the records are genuinely un-read;
-    /// that is a blocking librdkafka call on a broker already unhealthy enough
-    /// to have failed a commit, and its own failure mode is the loss it set out
-    /// to prevent. Retrying promptly is the cheaper bound on the same window.
+    /// Failing the receive instead would discard the drained records. Their
+    /// local consumer position has already advanced past them. That is the
+    /// permanent-loss hazard [`defer_recv_error`] exists to avoid. Here it would
+    /// fire on *every* commit failure, not only on a crash. The only correct
+    /// way to "withhold the batch" first seeks the consumer back to each owed
+    /// floor, so the records are un-read. `seek()` is a blocking librdkafka
+    /// call on a broker unhealthy enough to fail a commit. Its own failure
+    /// mode is the loss it sets out to prevent. Retrying promptly is the
+    /// cheaper bound on the same window.
     async fn make_anchors_durable(&self, consumer: &Arc<StreamConsumer>) {
         let reset = self.config.effective_offset_reset();
         let owed = self.with_anchors(|a| anchors_needing_durability(reset, a));
@@ -653,8 +648,6 @@ impl KafkaSource {
         timeout: std::time::Duration,
     ) -> Result<Vec<InboundMessage>, ConnectorError> {
         let mut batch = Vec::new();
-        // Wait `timeout` for the first message, then drain whatever else is
-        // already buffered without blocking again.
         let mut budget = timeout;
         while batch.len() < max {
             let next = tokio::time::timeout(budget, consumer.recv()).await;
@@ -712,18 +705,18 @@ impl KafkaSource {
     ///
     /// Guarded by [`may_commit_settled`]: a settlement that arrives after a
     /// rebalance took its partition away must not speak for the group. The
-    /// assignment read is a local librdkafka call, not a broker round-trip, so
-    /// it costs a list walk per settled prefix advance rather than a request.
+    /// assignment read is a local librdkafka call, not a broker round-trip.
+    /// So it costs a list walk per settled prefix advance, not a request.
     ///
     /// # Residual: the check is a snapshot, and the commit is asynchronous
     ///
     /// The guard narrows the window; it does not close it. A rebalance can
-    /// revoke the partition after the assignment is read and before
-    /// librdkafka's background thread actually builds the `OffsetCommit`
-    /// request, and that request carries whatever generation is current when
-    /// it is built — the classic protocol validates a committing member's
-    /// generation, not its assignment, so the stale offset can be accepted
-    /// under the *new* generation and rewind the group.
+    /// revoke the partition after the assignment is read. That can happen
+    /// before librdkafka's background thread builds the `OffsetCommit`
+    /// request. The request carries the generation current when it is built.
+    /// The classic protocol validates a committing member's generation, not
+    /// its assignment. So the stale offset can be accepted under the *new*
+    /// generation and rewind the group.
     ///
     /// It is left as a residual rather than fenced, for three reasons.
     ///
@@ -737,24 +730,23 @@ impl KafkaSource {
     ///    thread, outside anything this side holds. Closing it properly means
     ///    `CommitMode::Sync` — a broker round-trip per settlement, on the
     ///    dispatch hot path.
-    /// 3. **The blast radius is small and self-limiting.** The records a
-    ///    rewind replays are ones this replica settled moments earlier, so
-    ///    their idempotency claims are seconds old and well inside any window
-    ///    — they dedupe. And the rewind is only durable if the stale commit
-    ///    lands after the new owner's *final* commit for the partition;
-    ///    otherwise its next commit re-advances past it immediately. That is
-    ///    materially narrower than the unguarded case this guard replaced,
-    ///    where a dispatch routinely outlived its rebalance and the new owner
-    ///    had long since advanced.
+    /// 3. **The blast radius is small and self-limiting.** A rewind replays
+    ///    records this replica settled moments earlier. Their idempotency
+    ///    claims are seconds old and well inside any window, so they dedupe.
+    ///    The rewind is durable only if the stale commit lands after the new
+    ///    owner's *final* commit for the partition. Otherwise the next commit
+    ///    re-advances past it immediately. Without this guard, a dispatch
+    ///    routinely outlived its rebalance, and the new owner had long since
+    ///    advanced. The residual is materially narrower than that.
     ///
-    /// What is controllable is done: the commit payload is built *before* the
-    /// ownership check, so no fallible FFI work sits between the check and the
-    /// commit.
+    /// The controllable part is done. The commit payload is built *before*
+    /// the ownership check, so no fallible FFI work sits between the check and
+    /// the commit.
     fn commit_settled_offset(&self, partition: i32, offset: i64) -> Result<(), ConnectorError> {
         let consumer = self.consumer();
-        // Built first, deliberately: this is the only fallible/allocating work
-        // in the function, and leaving it between the ownership check and the
-        // commit would widen the window described above for no reason.
+        // Built first, deliberately: this is the only fallible or allocating
+        // work here. Placed between the ownership check and the commit, it
+        // would widen the window described above for no gain.
         let mut tpl = TopicPartitionList::new();
         // Kafka's committed offset is the NEXT offset to read, so commit
         // `offset + 1`. The runtime has already established that every lower
@@ -770,11 +762,10 @@ impl KafkaSource {
             .map(rdkafka::topic_partition_list::TopicPartitionListElem::partition)
             .collect();
         if !may_commit_settled(partition, &assigned) {
-            // Not an error: the settlement was real, this replica simply no
-            // longer speaks for the partition. Returning `Ok` keeps the
-            // runtime's "ack failed" warning for actual failures; the records
-            // are re-read by whoever owns the partition now and dedupe on
-            // their idempotency key.
+            // Not an error: the settlement was real, but this replica no
+            // longer speaks for the partition. `Ok` keeps the runtime's "ack
+            // failed" warning for actual failures. The current owner re-reads
+            // the records, and they dedupe on their idempotency key.
             tracing::warn!(
                 topic = %self.topic,
                 partition,
@@ -793,8 +784,8 @@ impl KafkaSource {
             .commit(&tpl, CommitMode::Async)
             .map_err(|e| ConnectorError::Broker(format!("kafka commit: {e}")))?;
         // Raise the resume floor. The commit above is ASYNC, so it may not be
-        // durable yet; recording it here lets `recover` re-assert it
-        // synchronously before a rebuild rather than racing it.
+        // durable yet. Recording it here lets `recover` re-assert it
+        // synchronously before a rebuild instead of racing it.
         self.with_anchors(|a| a.record_commit(partition, offset + 1));
         Ok(())
     }
@@ -821,9 +812,9 @@ fn to_inbound(
     InboundMessage {
         coordinates,
         payload,
-        // The record key is what Kafka partitions by, so surfacing it is what
-        // makes the documented per-key ordering remedy actually reachable
-        // from a mapping function (`ctx.key_str()`).
+        // Kafka partitions by the record key. Surfacing it lets a mapping
+        // function reach the documented per-key ordering remedy
+        // (`ctx.key_str()`).
         key,
         headers,
         handle,
@@ -835,12 +826,12 @@ fn to_inbound(
 ///
 /// **This is a message-loss guard, not a nicety.** Every record handed back by
 /// `recv()` has advanced librdkafka's *local* consumer position, whether or
-/// not it ever reaches the runtime. If a mid-batch error discarded them, the
-/// next poll would start at a higher offset, that offset would establish the
-/// [`OffsetTracker`][t]'s floor for the partition, and committing it would
-/// assert every lower offset is done — silently skipping records that were
-/// never dispatched. Returning the partial batch keeps them on the normal
-/// dispatch-then-commit path; the error resurfaces on the next poll, which by
+/// not it ever reaches the runtime. Suppose a mid-batch error discarded them.
+/// The next poll would start at a higher offset. That offset would set the
+/// [`OffsetTracker`][t] floor for the partition. Committing it would assert
+/// that every lower offset is done, silently skipping records never
+/// dispatched. Returning the partial batch keeps them on the normal
+/// dispatch-then-commit path. The error resurfaces on the next poll, which
 /// then has nothing drained to lose.
 ///
 /// [t]: crate::connector::OffsetTracker
@@ -850,18 +841,18 @@ const fn defer_recv_error(drained: usize) -> bool {
 
 /// Whether a receive pass should attempt the anchor commits it still owes.
 ///
-/// **Always** — and the unused `drained` is the point. The obvious reading of
+/// **Always**, and the unused `drained` is the point. The obvious reading of
 /// "make the floor durable before these records are dispatched" gates the
-/// attempt on `drained > 0`, which is right for the *first* attempt and wrong
+/// attempt on `drained > 0`. That is right for the *first* attempt and wrong
 /// for every retry after a failure. [`anchors_needing_durability`] keeps a
-/// failed partition owed precisely so the next receive retries it, but a topic
-/// that goes quiet right after the failure never drains again: the owed anchor
-/// is never retried, and the crash window
+/// failed partition owed so the next receive retries it. A topic that goes
+/// quiet right after the failure never drains again. The owed anchor is then
+/// never retried. The crash window that
 /// [`KafkaSource::make_anchors_durable`] describes as "until the next attempt"
-/// becomes unbounded in wall-clock time rather than one poll interval.
+/// becomes unbounded in wall-clock time, not one poll interval.
 ///
-/// Nothing owed is a no-op, so the quiet steady state costs one walk of the
-/// anchor map and no broker call at all — the `latest`-only cost of never
+/// Nothing owed is a no-op. So the quiet steady state costs one walk of the
+/// anchor map and no broker call. That is the `latest`-only cost of never
 /// leaving an owed floor stranded behind an idle topic.
 const fn retry_owed_anchors(_drained: usize) -> bool {
     true
@@ -886,11 +877,11 @@ impl EventSource for KafkaSource {
         // batch across two generations.
         let consumer = self.consumer();
         // ONE exit for a produced batch, deliberately. The drain has two ways to
-        // stop early (the `max`/budget break and the deferred-error path), and
-        // when the anchor step lived at the end of that loop the deferred path
-        // returned around it -- shipping records for dispatch with no durable
-        // floor. Keeping the drain in its own function makes the bypass
-        // impossible to reintroduce rather than merely fixed.
+        // stop early: the `max`/budget break and the deferred-error path. With
+        // the anchor step at the end of that loop, the deferred path returned
+        // around it. That shipped records for dispatch with no durable floor.
+        // The separate drain function makes that bypass impossible to
+        // reintroduce.
         let batch = self.drain_batch(&consumer, max, timeout).await?;
         // Before these records leave this function and become someone's
         // in-flight work, make the `latest` resume floor durable to the group.
@@ -919,10 +910,10 @@ impl EventSource for KafkaSource {
         Ok(())
     }
     fn abandon_redelivers(&self) -> bool {
-        // Not committing is the whole mechanism, so `abandon` above is a no-op
-        // and `recv()` has already advanced the local position past the
-        // message: nothing hands it back while this consumer lives. The
-        // runtime must treat a retry here as a wedge and rebuild the consumer
+        // Not committing is the whole mechanism, so `abandon` above is a no-op.
+        // `recv()` has already advanced the local position past the message,
+        // so nothing hands it back while this consumer lives. The runtime
+        // treats a retry here as a wedge and rebuilds the consumer
         // (`recover`), which re-reads from the last commit.
         false
     }
@@ -931,19 +922,19 @@ impl EventSource for KafkaSource {
     ///
     /// This is the retry a stalled prefix calls for. `recv()` has already
     /// advanced librdkafka's *local* position past the blocked message, so
-    /// nothing hands it back while this consumer lives — but a fresh consumer
-    /// rejoins the group and starts from the last **committed** offset, which
-    /// is precisely the message the runtime is waiting on.
+    /// nothing hands it back while this consumer lives. A fresh consumer
+    /// rejoins the group and starts from the last **committed** offset. That
+    /// is the message the runtime is waiting on.
     ///
     /// # Anchoring first, and why it is not optional
     ///
-    /// "The last committed offset" is only a resume point if one exists. A
-    /// group that has never committed — the unbounded window for a `latest`
-    /// binding whose very first message keeps failing — resolves
-    /// `auto.offset.reset` again on the rebuild, and `latest` resolves against
-    /// the *current* tail, which the blocked record has itself advanced past.
-    /// The rebuild would skip that record permanently while the runtime
-    /// reported a successful retry: message loss dressed as a retry.
+    /// "The last committed offset" is only a resume point if one exists. Take
+    /// a group that has never committed: a `latest` binding whose first
+    /// message keeps failing, in an unbounded window. The rebuild resolves
+    /// `auto.offset.reset` again. `latest` resolves against the *current*
+    /// tail, which the blocked record has itself advanced past. The rebuild
+    /// would skip that record permanently while the runtime reported a
+    /// successful retry: message loss dressed as a retry.
     ///
     /// So every resume floor this replica may speak for is committed
     /// **synchronously on the old consumer, before the new one is built** (see
@@ -954,14 +945,14 @@ impl EventSource for KafkaSource {
     /// "May speak for" is [`committable_anchors`]: a partition this consumer
     /// still owns, and a floor that strictly raises the group's committed
     /// offset. An anchor is a local read-history fact, and a commit is a
-    /// group-wide statement; the filter is what keeps a retained floor from
-    /// rewinding a partition that has since moved to another replica.
+    /// group-wide statement. The filter keeps a retained floor from rewinding
+    /// a partition that has since moved to another replica.
     ///
-    /// A failed anchor commit fails the whole recovery rather than rebuilding
+    /// A failed anchor commit fails the whole recovery instead of rebuilding
     /// anyway. Rebuilding on an unanchored group is exactly the skip this
-    /// guards against, and the runtime's response to a failed `recover` is to
-    /// back off and retry — which is the correct answer for a transient commit
-    /// error, and infinitely better than a silent loss.
+    /// guards against. The runtime answers a failed `recover` with back-off
+    /// and retry. That is correct for a transient commit error, and far
+    /// better than a silent loss.
     ///
     /// The old consumer is dropped once the last in-flight `Arc` to it goes,
     /// which closes its group membership and triggers a rebalance.
@@ -972,13 +963,13 @@ impl EventSource for KafkaSource {
         let previous = self.consumer();
         // Committing and creating a consumer are blocking librdkafka calls.
         let rebuilt = tokio::task::spawn_blocking(move || {
-            // Skipped when nothing has been read: an EMPTY offset list is not a
-            // no-op to librdkafka (it commits the current assignment), and
-            // there is no floor to assert anyway.
+            // Skipped when nothing has been read. To librdkafka an EMPTY offset
+            // list is not a no-op: it commits the current assignment. There is
+            // also no floor to assert.
             if !anchors.is_empty() {
                 // Partitions this consumer still owns. A retained anchor is a
-                // fact about local read history, not about the group, and the
-                // two diverge once a rebalance moves a partition away -- see
+                // fact about local read history, not about the group. The two
+                // diverge once a rebalance moves a partition away; see
                 // `committable_anchors`.
                 let assigned: Vec<i32> = previous
                     .assignment()
@@ -1070,17 +1061,16 @@ impl EventSource for KafkaSource {
             let timeout = budget()?;
 
             // Every partition of the topic, from metadata — deliberately NOT
-            // `consumer.assignment()`. Consumer lag is a property of the GROUP,
-            // but an assignment-scoped sum is a property of one replica: scale
-            // the connector to four replicas and each reports roughly a quarter
-            // of the backlog. The dashboard aggregates with `max by (source)`
-            // (correct for SQS, where every replica reads the same whole-queue
-            // depth), so an assignment-scoped Kafka sample would show the
-            // largest replica's subtotal and hide a partition stalled on any of
-            // the others — the exact failure the gauge exists to catch. Making
-            // the sample group-wide means one aggregation is right for both
-            // adapters and the gauge means the same thing regardless of which
-            // broker is behind it.
+            // `consumer.assignment()`. Consumer lag is a property of the GROUP.
+            // An assignment-scoped sum is a property of one replica. With four
+            // replicas, each reports roughly a quarter of the backlog. The
+            // dashboard aggregates with `max by (source)`. That is correct for
+            // SQS, where every replica reads the same whole-queue depth. An
+            // assignment-scoped Kafka sample would show the largest replica's
+            // subtotal. It would hide a partition stalled on any other replica,
+            // the exact failure the gauge exists to catch. A group-wide sample
+            // makes one aggregation right for both adapters. The gauge then
+            // means the same thing whichever broker is behind it.
             //
             // The cost is that each replica asks about every partition rather
             // than its own share, so broker calls per sample scale with replica
@@ -1102,13 +1092,12 @@ impl EventSource for KafkaSource {
             }
 
             // The DURABLE group offset, not `position()`. `position()` is the
-            // local next-fetch cursor: it advances the moment a record is
-            // fetched, regardless of whether that record has been dispatched,
-            // is being retried, or is stuck behind a blocked commit prefix. So
-            // a consumer wedged with a large uncommitted backlog — precisely
-            // the condition this gauge exists to expose — would report its lag
-            // falling to zero, while a restart replayed everything from the
-            // last commit.
+            // local next-fetch cursor. It advances the moment a record is
+            // fetched, whether that record is dispatched, retried, or stuck
+            // behind a blocked commit prefix. Take a consumer wedged with a
+            // large uncommitted backlog, the condition this gauge exists to
+            // expose. It would report its lag falling to zero, while a restart
+            // replayed everything from the last commit.
             //
             // `committed_offsets` takes an explicit partition list, unlike
             // `committed`, which is scoped to the local assignment.
@@ -1138,12 +1127,12 @@ impl EventSource for KafkaSource {
 
 /// The physical-subscription identity for a consumer group on a topic.
 ///
-/// The group is load-bearing and cannot be dropped: two consumers on one topic
-/// under **distinct** group ids each receive the whole stream, which is the
+/// The group is load-bearing and cannot be dropped. Two consumers on one topic
+/// under **distinct** group ids each receive the whole stream. That is the
 /// sanctioned way to fan one topic out to two targets. Identifying a
 /// subscription by topic alone would reject exactly that. Two consumers in the
-/// *same* group split the partitions between them, so each binding would see
-/// only a subset — the clash this identity exists to catch.
+/// *same* group split the partitions between them. Each binding then sees
+/// only a subset, the clash this identity exists to catch.
 ///
 /// The separator is `\u{1}`, a byte no Kafka group id or topic name may
 /// contain, so `("a", "b/c")` and `("a/b", "c")` cannot alias each other.
@@ -1152,17 +1141,17 @@ fn subscription_identity_for(config: &KafkaSourceConfig) -> String {
     // Read the values back out of the built config rather than off the struct
     // fields, so the identity is whatever librdkafka will ACTUALLY join.
     // `to_client_config` applies `extra` after the declared fields, so a
-    // `.property("group.id", ...)` override wins — and reading `config.group_id`
-    // here would accept two configs that land in one group, which then splits
-    // the partitions between them and silently starves both targets. Deriving
-    // from the built config makes the precedence single-sourced: there is no
-    // second copy of the ordering rule to drift.
+    // `.property("group.id", ...)` override wins. Reading `config.group_id`
+    // here would accept two configs that land in one group. That group splits
+    // the partitions between them and silently starves both targets. The
+    // built config keeps the precedence single-sourced, with no second copy
+    // of the ordering rule to drift.
     let built = config.to_client_config();
     let brokers = built.get("bootstrap.servers").unwrap_or(&config.brokers);
     let group = built.get("group.id").unwrap_or(&config.group_id);
-    // Brokers are load-bearing in the other direction: two independent
-    // clusters exposing the same topic under the same group id are two
-    // subscriptions, not one, and omitting them would reject that fan-in.
+    // Brokers are load-bearing in the other direction. Two independent
+    // clusters with the same topic and group id are two subscriptions, not
+    // one. Omitting the brokers would reject that fan-in.
     // `\u{1}` cannot appear in a broker list, group id or topic, so no triple
     // can alias another.
     format!(
@@ -1177,23 +1166,23 @@ fn subscription_identity_for(config: &KafkaSourceConfig) -> String {
 ///
 /// The value is a **seed** list, not an address: librdkafka contacts one entry
 /// and learns the real membership from its metadata. So order, whitespace,
-/// host case and repeats carry no meaning to Kafka — but they do change the
-/// raw string, which would make one cluster look like several and let the
-/// duplicate-subscription guard admit two runtimes into the same group. Kafka
-/// then splits the partitions between them and each target silently receives a
-/// fraction of the stream.
+/// host case and repeats carry no meaning to Kafka. They do change the raw
+/// string. One cluster would then look like several, and the
+/// duplicate-subscription guard would admit two runtimes into the same group.
+/// Kafka then splits the partitions between them, and each target silently
+/// receives a fraction of the stream.
 ///
 /// # Residual, deliberately not closed here
 ///
-/// Two *disjoint* seed lists naming the same cluster (`a:9092` and `b:9092`,
-/// both members of it; a DNS alias against a resolved name) still compare as
-/// different. Only the broker can settle that — via its cluster id — and
-/// fetching it means a live metadata round-trip during plugin **build**, where
-/// this identity is computed and no consumer exists yet. That would make
-/// startup fail when the broker is briefly unreachable: trading a rare
+/// Two *disjoint* seed lists for the same cluster still compare as different.
+/// Examples are `a:9092` and `b:9092` as two members, or a DNS alias against
+/// a resolved name. Only the broker can settle that, via its cluster id.
+/// Fetching it needs a live metadata round-trip during plugin **build**. This
+/// identity is computed there, and no consumer exists yet. Startup would then
+/// fail when the broker is briefly unreachable. That trades a rare
 /// config-typo detection for a common availability failure. The narrower
-/// canonical form covers every spelling of one *written* seed list, which is
-/// the shape a copy-pasted duplicate binding actually takes.
+/// canonical form covers every spelling of one *written* seed list. That is
+/// the shape a copy-pasted duplicate binding takes.
 fn canonical_broker_list(brokers: &str) -> String {
     let mut seeds: Vec<String> = brokers
         .split(',')
@@ -1208,29 +1197,29 @@ fn canonical_broker_list(brokers: &str) -> String {
 /// Bound on the metadata round-trip that reads the group's committed offsets
 /// before an anchor commit.
 ///
-/// One call on the recovery path, which is already slow and rare, so this only
-/// needs to stop a wedged broker turning a recovery into an indefinite hang:
-/// the runtime's answer to a failed `recover` is to back off and retry.
+/// One call on the recovery path, which is already slow and rare. So this only
+/// stops a wedged broker from turning a recovery into an indefinite hang. The
+/// runtime answers a failed `recover` with back-off and retry.
 const ANCHOR_COMMIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Overall wall-clock budget for one lag sample.
 ///
-/// The sample walks **every partition of the topic** (deliberately — see
-/// [`EventSource::lag`]), so its cost scales with partition count, and each
+/// The sample walks **every partition of the topic** (deliberately; see
+/// [`EventSource::lag`]). So its cost scales with partition count. Each
 /// `fetch_watermarks` is a live broker round-trip that can itself be slow. Left
 /// unbounded, a large topic against a degraded broker keeps a blocking thread
 /// occupied for minutes and keeps hammering the very broker that is struggling.
 ///
-/// The runtime independently budgets the call, which is what protects the
-/// message path; this bound is what makes an abandoned sample actually STOP.
-/// Without it the runtime's timeout only drops the `JoinHandle` — the blocking
-/// walk runs on to completion regardless, so abandoned walks pile up one per
-/// sample interval and the broker load grows rather than shrinks.
+/// The runtime independently budgets the call, which protects the message
+/// path. This bound makes an abandoned sample actually STOP. Without it, the
+/// runtime's timeout only drops the `JoinHandle`. The blocking walk runs on
+/// to completion regardless. Abandoned walks then pile up one per sample
+/// interval, and the broker load grows.
 ///
-/// Defined AS the runtime's [`ADAPTER_LAG_SAMPLE_CEILING`] rather than merely
-/// equal to it, so the two cannot drift: the runtime floors its own budget at
-/// that value precisely so it never gives up before this bound does. A local
-/// constant would let a future edit here silently reintroduce the overlap.
+/// Defined AS the runtime's [`ADAPTER_LAG_SAMPLE_CEILING`], not merely equal
+/// to it, so the two cannot drift. The runtime floors its own budget at that
+/// value so it never gives up before this bound does. A local constant would
+/// let a future edit here silently reintroduce the overlap.
 const LAG_SAMPLE_BUDGET: std::time::Duration =
     crate::connector::runtime::ADAPTER_LAG_SAMPLE_CEILING;
 
@@ -1239,9 +1228,9 @@ const LAG_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Time left in a sample's budget, or `None` once it is spent.
 ///
-/// `None` aborts the walk, which surfaces as an unavailable watermark and so
-/// as no sample at all — the same honest failure mode [`group_lag`] already
-/// uses for a partial answer.
+/// `None` aborts the walk. That surfaces as an unavailable watermark, and so
+/// as no sample at all. [`group_lag`] uses the same honest failure mode for a
+/// partial answer.
 fn remaining_lag_budget(
     deadline: std::time::Instant,
     now: std::time::Instant,
@@ -1253,15 +1242,15 @@ fn remaining_lag_budget(
 /// The group's outstanding records across `partitions`.
 ///
 /// `partitions` is the topic's full partition set from metadata, so the total
-/// is the GROUP's backlog rather than the calling replica's share of it. A
-/// partition with no entry in `committed` — one the group has never committed,
-/// which is the common shape for a partition owned by another replica — is
-/// baselined by `reset`, per [`partition_lag`].
+/// is the GROUP's backlog, not the calling replica's share of it. A partition
+/// with no entry in `committed` is baselined by `reset`, per
+/// [`partition_lag`]. The group has never committed it, which is common for a
+/// partition owned by another replica.
 ///
 /// Returns `None` if any watermark is unavailable, or if any partition has no
-/// resolvable position at all (see [`partition_lag`]). A partial sum is
-/// indistinguishable from a real drop in backlog, and reporting one would turn
-/// a broker hiccup into a false all-clear on the gauge operators page on.
+/// resolvable position at all (see [`partition_lag`]). A partial sum looks
+/// the same as a real drop in backlog. Reporting one would turn a broker
+/// hiccup into a false all-clear on the gauge operators page on.
 fn group_lag(
     topic: &str,
     partitions: &[i32],
@@ -1298,12 +1287,12 @@ fn group_lag(
 ///    read from the partition, so the first offset it read is where the group
 ///    resolved. Fixed, unlike the reset policy.
 /// 3. **The reset policy** — nothing committed and never read here (a partition
-///    owned by another replica), so the honest answer is where a resume would
+///    owned by another replica). The honest answer is where a resume would
 ///    land: `low` for `earliest`, `high` for `latest`. Under `error` a resume
-///    lands nowhere — librdkafka fails the consumer instead of picking a
-///    position — so there is no answer to give and this returns `None`.
+///    lands nowhere, because librdkafka fails the consumer instead. There is
+///    no answer to give, so this returns `None`.
 ///
-/// Baselines 1 and 2 are floored at the low watermark: retention can advance
+/// Baselines 1 and 2 are floored at the low watermark. Retention can advance
 /// `low` past a stale position, and records gone from the log are not backlog.
 ///
 /// `None` means "no honest number", never "zero": a caller must propagate it
@@ -1317,17 +1306,17 @@ fn partition_lag(
 ) -> Option<i64> {
     let current = match committed {
         // Retention can advance `low` past an old commit. Those records are
-        // gone from the log, so subtracting from the stale commit would report
-        // a backlog the consumer can never read -- a permanent false alarm on
-        // exactly the gauge operators page on.
+        // gone from the log. Subtracting from the stale commit would report a
+        // backlog the consumer can never read. That is a permanent false alarm
+        // on the gauge operators page on.
         Offset::Offset(o) => o.max(low),
         // Nothing committed. If this source has read from the partition, the
-        // first offset it read is where the group RESOLVED to, and that is a
-        // fixed baseline. Falling back to `reset` here would re-resolve
-        // `Latest` against the live high watermark on every sample, making the
-        // answer `high - high = 0` no matter how far the topic has run ahead --
-        // an all-clear for precisely the pre-first-commit outage this gauge
-        // exists to expose (see [`PartitionAnchors`]).
+        // first offset it read is where the group RESOLVED to. That is a fixed
+        // baseline. A fallback to `reset` here would re-resolve `Latest`
+        // against the live high watermark on every sample. The answer would be
+        // `high - high = 0`, however far the topic has run ahead. That is an
+        // all-clear for the pre-first-commit outage this gauge exists to
+        // expose (see [`PartitionAnchors`]).
         _ => match anchor {
             // Same retention guard as a stale commit: records below the low
             // watermark are gone from the log, not backlog.
@@ -1353,14 +1342,13 @@ mod tests {
     /// A group configured to start at the tail owes nothing for a partition it
     /// has never committed.
     ///
-    /// `to_client_config` applies `extra` AFTER its `earliest` default, so a
-    /// caller's `.property("auto.offset.reset", "latest")` is what librdkafka
-    /// actually uses — unlike `enable.auto.commit`, which is forced last
-    /// because auto-commit would break the ack-after-commit contract. An
-    /// offset-reset policy breaks no invariant, so it stays the caller's
-    /// choice, and the gauge has to honour it: baselining an uncommitted
-    /// partition at the LOW watermark would report the topic's whole retained
-    /// history as backlog for a brand-new latest-starting group, and on a quiet
+    /// `to_client_config` applies `extra` AFTER its `earliest` default. So
+    /// librdkafka uses a caller's `.property("auto.offset.reset", "latest")`.
+    /// `enable.auto.commit` is different: it is forced last, because
+    /// auto-commit would break the ack-after-commit contract. An offset-reset
+    /// policy breaks no invariant, so it stays the caller's choice, and the
+    /// gauge must honour it. A LOW-watermark baseline would report the whole
+    /// retained history as backlog for a new latest-starting group. On a quiet
     /// topic nothing ever commits, so that false backlog would never drain.
     #[test]
     fn a_latest_group_owes_nothing_for_an_uncommitted_partition() {
@@ -1390,11 +1378,11 @@ mod tests {
     /// accrued since it started -- not zero.
     ///
     /// This is the pre-first-commit outage the gauge exists to expose. Without
-    /// an anchor the uncommitted branch baselines at the LIVE high watermark,
-    /// so the sample is `high - high = 0` on every pass: the group starts at
-    /// 100, producers push the topic to 1000 while dispatch is failing, and the
-    /// gauge reports an all-clear for the 900 records now owed. Baselining at
-    /// the position the group actually resolved to makes the backlog visible.
+    /// an anchor, the uncommitted branch baselines at the LIVE high watermark.
+    /// The sample is then `high - high = 0` on every pass. The group starts at
+    /// 100, and producers push the topic to 1000 while dispatch fails. The
+    /// gauge reports an all-clear for the 900 records now owed. A baseline at
+    /// the position the group resolved to makes the backlog visible.
     #[test]
     fn an_uncommitted_latest_group_owes_what_accrued_since_it_started() {
         assert_eq!(
@@ -1427,12 +1415,12 @@ mod tests {
 
     /// The rebuild's resume floor, per partition.
     ///
-    /// A `latest` group with no committed offset has no durable anchor, so a
-    /// rebuild re-resolves `latest` against the *current* tail and skips the
-    /// very record the runtime is blocked on -- silent message loss reported as
-    /// a successful retry. The floor a rebuild must resume from is the first
-    /// offset this source ever read from the partition (which is where `latest`
-    /// resolved to), raised by anything already committed.
+    /// A `latest` group with no committed offset has no durable anchor. A
+    /// rebuild re-resolves `latest` against the *current* tail. It skips the
+    /// very record the runtime is blocked on: silent message loss reported as
+    /// a successful retry. A rebuild must resume from the first offset this
+    /// source ever read from the partition, where `latest` resolved. Anything
+    /// already committed raises that floor.
     #[test]
     fn partition_anchors_track_the_floor_a_rebuild_must_resume_from() {
         let mut anchors = PartitionAnchors::default();
@@ -1501,9 +1489,9 @@ mod tests {
     ///
     /// Ownership alone is not enough: `record_read` is first-read-wins, which is
     /// right within one continuous ownership span but stale across a
-    /// revoke-and-return. A partition we read at 100, lost, and got back after
-    /// another replica advanced it to 5000 still carries a floor of 100 —
-    /// writing that back rewinds the group and replays settled records.
+    /// revoke-and-return. Take a partition read at 100, lost, then returned
+    /// after another replica advanced it to 5000. It still carries a floor of
+    /// 100. Writing that back rewinds the group and replays settled records.
     #[test]
     fn an_anchor_never_rewinds_a_partition_the_group_has_moved_past() {
         let anchors = vec![(0, 100)];
@@ -1526,10 +1514,10 @@ mod tests {
     /// A `latest` group makes its resume floor durable before dispatching.
     ///
     /// `recover()` is an *in-process* rebuild, so a crash or SIGKILL never runs
-    /// it. A replacement process has neither a committed offset nor this map,
-    /// re-resolves `latest` against a tail the in-flight record has already
-    /// advanced past, and skips it permanently — at-least-once broken for a
-    /// record the connector had already accepted.
+    /// it. A replacement process has neither a committed offset nor this map.
+    /// It re-resolves `latest` against a tail the in-flight record has already
+    /// advanced past, and skips the record permanently. That breaks
+    /// at-least-once for a record the connector had already accepted.
     #[test]
     fn a_latest_group_makes_its_resume_floor_durable_before_dispatch() {
         let mut anchors = PartitionAnchors::default();
@@ -1559,10 +1547,10 @@ mod tests {
 
     /// Only a partition the commit pass actually spoke for is retired.
     ///
-    /// `durable` is permanent process state, so retiring a partition no commit
-    /// covered is not a harmless optimism: if a rebalance hands that partition
-    /// back later, the eager commit is suppressed forever and a crash under an
-    /// otherwise-uncommitted `latest` group re-resolves at the tail.
+    /// `durable` is permanent process state. So retiring a partition no commit
+    /// covered is not a harmless optimism. If a rebalance hands that partition
+    /// back later, the eager commit stays suppressed forever. A crash under an
+    /// otherwise-uncommitted `latest` group then re-resolves at the tail.
     #[test]
     fn only_partitions_the_commit_pass_covered_are_retired() {
         let owed = vec![(0, 100), (1, 7), (2, 42)];
@@ -1575,9 +1563,9 @@ mod tests {
             "an unassigned partition is not covered, however the commit ended",
         );
 
-        // An assigned partition filtered out by the RAISES guard IS covered:
-        // the group is already committed at or above the floor, so a crash
-        // resumes covered even though this pass committed nothing for it.
+        // An assigned partition filtered out by the RAISES guard IS covered.
+        // The group is already committed at or above the floor. So a crash
+        // resumes covered, though this pass committed nothing for it.
         assert_eq!(
             covered_anchor_partitions(&owed, &[0, 1, 2]),
             vec![0, 1, 2],
@@ -1593,12 +1581,12 @@ mod tests {
     /// A settled-offset commit speaks for the group, so it needs the same
     /// ownership guard the anchor commit has.
     ///
-    /// A dispatch outlives the rebalance that revoked its partition: it settles
-    /// afterwards and commits an offset for a partition another replica has
-    /// since advanced, rewinding the group. Those records replay long after
-    /// their idempotency claims expired, so they land as duplicate executions
-    /// rather than deduplicated retries — the exact hazard `committable_anchors`
-    /// documents, on the path that runs far more often than the anchor commit.
+    /// A dispatch outlives the rebalance that revoked its partition. It settles
+    /// afterwards and commits an offset another replica has since advanced
+    /// past, rewinding the group. Those records replay long after their
+    /// idempotency claims expired. They land as duplicate executions, not
+    /// deduplicated retries. That is the hazard `committable_anchors`
+    /// documents, on a path that runs far more often than the anchor commit.
     #[test]
     fn a_settled_commit_is_suppressed_for_a_partition_this_replica_lost() {
         assert!(
@@ -1613,9 +1601,9 @@ mod tests {
         assert!(may_commit_settled(2, &[0, 2]));
 
         // Mid-rebalance `assignment()` is briefly empty. Suppressing is the
-        // safe direction and matches the anchor path: with no assignment there
-        // is no partition this replica may speak for, and the message is simply
-        // redelivered and deduped.
+        // safe direction and matches the anchor path. With no assignment, this
+        // replica may speak for no partition. The message is redelivered and
+        // deduped.
         assert!(
             !may_commit_settled(0, &[]),
             "with no assignment there is nothing this replica may commit for",
@@ -1641,12 +1629,12 @@ mod tests {
 
     /// Only `latest` owes an eager commit, and the guard says so positively.
     ///
-    /// The eager commit is a cost paid to close one specific hazard: `latest`
+    /// The eager commit is a cost paid to close one specific hazard. `latest`
     /// is the only policy that re-resolves an uncommitted partition *forward*,
     /// past records this source already accepted. `earliest` resolves
-    /// backwards, and `error` does not resolve at all -- it fails the consumer
-    /// loudly instead, which cannot silently skip anything. Keying on `Latest`
-    /// rather than excluding `Earliest` also stops a future fourth policy from
+    /// backwards. `error` does not resolve at all: it fails the consumer
+    /// loudly, which cannot silently skip anything. Keying on `Latest` instead
+    /// of excluding `Earliest` also stops a future fourth policy from
     /// inheriting the commit by default.
     #[test]
     fn only_a_latest_group_owes_an_eager_anchor_commit() {
@@ -1667,9 +1655,9 @@ mod tests {
     /// The case the anchor exists for still commits.
     ///
     /// A `latest` binding whose first message keeps failing has nothing
-    /// committed anywhere, so both guards pass trivially: the partition is
-    /// assigned (it was just read from) and any floor raises "no floor at all".
-    /// Guarding the commit must not cost the loss fix it was added for.
+    /// committed anywhere. So both guards pass trivially. The partition is
+    /// assigned (it was just read from), and any floor raises "no floor at
+    /// all". Guarding the commit must not cost the loss fix it was added for.
     #[test]
     fn an_uncommitted_owned_partition_still_commits_its_anchor() {
         assert_eq!(
@@ -1679,8 +1667,8 @@ mod tests {
         );
     }
 
-    /// The walk stops once its budget is spent, and each call is clamped to
-    /// what is left so a single one cannot overrun the whole sample.
+    /// The walk stops once its budget is spent. Each call is clamped to what
+    /// is left, so a single one cannot overrun the whole sample.
     #[test]
     fn a_lag_sample_walk_stops_once_its_budget_is_spent() {
         let start = std::time::Instant::now();
@@ -1711,9 +1699,9 @@ mod tests {
         );
     }
 
-    /// A walk that runs out of budget partway reports NO sample rather than a
-    /// partial total — a partial sum is indistinguishable from a genuine drop
-    /// in backlog, which is the wrong thing to page on.
+    /// A walk that runs out of budget partway reports NO sample, not a partial
+    /// total. A partial sum looks the same as a genuine drop in backlog, which
+    /// is the wrong thing to page on.
     #[test]
     fn a_budget_exhausted_walk_reports_no_sample_not_a_partial_one() {
         let committed = TopicPartitionList::new();
@@ -1765,14 +1753,14 @@ mod tests {
 
     /// `error` is a THIRD valid `auto.offset.reset`, not a typo.
     ///
-    /// librdkafka accepts it and, for an uncommitted partition, declines to
-    /// pick a starting position at all -- it surfaces an offset-reset error to
-    /// the consumer instead. So it passes client-create validation and DOES
-    /// reach a running consumer, which is exactly the case the `_ => Earliest`
-    /// fallback's "librdkafka rejects a genuinely invalid value" argument does
-    /// not cover. Folding it into `Earliest` would baseline an uncommitted
-    /// partition at the low watermark and report the whole retained log as
-    /// consumable backlog for a consumer that cannot resume at all.
+    /// librdkafka accepts it. For an uncommitted partition it picks no starting
+    /// position and surfaces an offset-reset error to the consumer instead. So
+    /// it passes client-create validation and DOES reach a running consumer.
+    /// The `_ => Earliest` fallback argues that "librdkafka rejects a genuinely
+    /// invalid value". That argument does not cover this case. Folding it into
+    /// `Earliest` would baseline an uncommitted partition at the low watermark.
+    /// The whole retained log would then count as consumable backlog for a
+    /// consumer that cannot resume at all.
     #[test]
     fn the_error_reset_policy_is_modelled_not_folded_into_earliest() {
         for spelling in ["error", "ERROR", " error "] {
@@ -1794,13 +1782,12 @@ mod tests {
 
     /// Under `error`, a partition with no position yet has no honest lag.
     ///
-    /// Baselines 1 (a committed offset) and 2 (an anchor) still resolve -- the
-    /// position IS known in both -- so only the fall-through to the reset
-    /// policy is unanswerable. Reporting the retained log there would page an
-    /// operator with a backlog the consumer is not even able to start reading;
-    /// reporting zero would be an all-clear for a wedged group. Neither is
-    /// true, so the total is suppressed, exactly as it is for a missing
-    /// watermark.
+    /// Baselines 1 (a committed offset) and 2 (an anchor) still resolve: the
+    /// position IS known in both. Only the fall-through to the reset policy is
+    /// unanswerable. The retained log there would page an operator with a
+    /// backlog the consumer cannot even start reading. Zero would be an
+    /// all-clear for a wedged group. Neither is true, so the total is
+    /// suppressed, as it is for a missing watermark.
     #[test]
     fn an_unresolvable_position_suppresses_the_lag_rather_than_inventing_one() {
         assert_eq!(
@@ -1840,13 +1827,12 @@ mod tests {
     /// A partition the local replica has never committed still contributes its
     /// full retained backlog.
     ///
-    /// This is the case that only appears once the gauge goes group-wide: with
-    /// several replicas in one group, most partitions in the metadata list are
-    /// owned by *some other* replica, and `committed_offsets` returns
-    /// `Offset::Invalid` for a partition the group has not committed at all.
-    /// Scoring those as zero would silently re-create the very under-report the
-    /// group-wide change exists to fix -- the partitions we just started
-    /// counting would all count as nothing.
+    /// This case appears only once the gauge goes group-wide. With several
+    /// replicas in one group, *some other* replica owns most partitions in the
+    /// metadata list. `committed_offsets` returns `Offset::Invalid` for a
+    /// partition the group has not committed at all. Scoring those as zero
+    /// would silently re-create the under-report the group-wide change fixes.
+    /// The newly counted partitions would all count as nothing.
     #[test]
     fn group_lag_counts_an_uncommitted_partition_as_its_whole_backlog() {
         let mut committed = TopicPartitionList::new();
@@ -1876,9 +1862,9 @@ mod tests {
         assert_eq!(total, 60 + 7 + 15);
     }
 
-    /// The sum spans every partition it is handed, so a caller passing the
-    /// topic's full metadata partition set gets the GROUP's backlog rather than
-    /// one replica's subtotal.
+    /// The sum spans every partition it is handed. A caller that passes the
+    /// topic's full metadata partition set gets the GROUP's backlog, not one
+    /// replica's subtotal.
     #[test]
     fn group_lag_spans_every_partition_it_is_given() {
         let mut committed = TopicPartitionList::new();
@@ -1919,9 +1905,9 @@ mod tests {
         );
     }
 
-    /// An unavailable watermark fails the whole sample rather than silently
-    /// reporting a smaller number: a partial total is indistinguishable from a
-    /// genuine drop in backlog, which is the wrong thing to page on.
+    /// An unavailable watermark fails the whole sample instead of silently
+    /// reporting a smaller number. A partial total looks the same as a genuine
+    /// drop in backlog, which is the wrong thing to page on.
     #[test]
     fn group_lag_is_none_when_a_watermark_is_unavailable() {
         let committed = TopicPartitionList::new();
@@ -1942,9 +1928,9 @@ mod tests {
     fn subscription_identity_uses_the_effective_group_and_brokers() {
         // `to_client_config` applies `extra` AFTER the declared fields, so a
         // `.property("group.id", ...)` override is what librdkafka actually
-        // joins. Reading the declared field instead would accept two configs
-        // that end up in one group, and the group would then split the
-        // partitions between them -- each target silently missing messages.
+        // joins. The declared field would accept two configs that end up in
+        // one group. The group would then split the partitions between them,
+        // and each target would silently miss messages.
         let overridden = KafkaSourceConfig::new("b:9092", "declared", "orders")
             .property("group.id", "effective");
         assert_eq!(
@@ -1958,9 +1944,9 @@ mod tests {
         let b = KafkaSourceConfig::new("b:9092", "g2", "orders").property("group.id", "shared");
         assert_eq!(subscription_identity_for(&a), subscription_identity_for(&b));
         // A `bootstrap.servers` override is identity-bearing for the same
-        // reason, in the other direction: two clusters are independent
-        // subscriptions even when the group and topic match exactly, so
-        // omitting the brokers would REJECT a legitimate multi-cluster fan-in.
+        // reason, in the other direction. Two clusters are independent
+        // subscriptions even when the group and topic match exactly. Omitting
+        // the brokers would REJECT a legitimate multi-cluster fan-in.
         assert_ne!(
             subscription_identity_for(&KafkaSourceConfig::new("east:9092", "g", "orders")),
             subscription_identity_for(&KafkaSourceConfig::new("west:9092", "g", "orders")),
@@ -1977,9 +1963,9 @@ mod tests {
 
     #[test]
     fn subscription_identity_pairs_the_group_with_the_topic() {
-        // The group is load-bearing: two consumers on one topic under
-        // DISTINCT group ids each get the full stream, which is the fan-out
-        // the duplicate-source panic message itself recommends. Identifying a
+        // The group is load-bearing. Two consumers on one topic under
+        // DISTINCT group ids each get the full stream. The duplicate-source
+        // panic message itself recommends that fan-out. Identifying a
         // subscription by topic alone would reject it.
         let id = |brokers, group, topic| {
             subscription_identity_for(&KafkaSourceConfig::new(brokers, group, topic))
@@ -2002,15 +1988,14 @@ mod tests {
     fn subscription_identity_canonicalizes_the_broker_seed_list() {
         // `bootstrap.servers` is a SEED list, not an address: librdkafka
         // contacts one entry and learns the real cluster membership from its
-        // metadata. So two configs listing the same seeds in a different
-        // order (or with stray whitespace, or differing in host case, or
-        // repeating an entry) address the SAME cluster. Comparing the raw
-        // string makes them look like independent clusters, so the
-        // duplicate-subscription guard waves both through -- and then Kafka,
-        // which is looking at the group id and does not care about our string,
-        // splits the partitions between them. Two bindings targeting different
-        // workflows each silently receive a fraction of the records: exactly
-        // the failure the guard exists to prevent, with no error anywhere.
+        // metadata. Two configs can list the same seeds in a different order,
+        // with stray whitespace, in another host case, or with a repeat. They
+        // address the SAME cluster. The raw string makes them look like
+        // independent clusters, so the duplicate-subscription guard admits
+        // both. Kafka looks only at the group id, so it splits the partitions
+        // between them. Two bindings for different workflows each silently
+        // receive a fraction of the records. That is the failure the guard
+        // exists to prevent, with no error anywhere.
         let id =
             |brokers| subscription_identity_for(&KafkaSourceConfig::new(brokers, "g", "orders"));
         assert_eq!(
@@ -2038,10 +2023,10 @@ mod tests {
 
     #[test]
     fn a_committed_offset_below_the_low_watermark_is_clamped() {
-        // Kafka retention advances `low` past a group's old commit: those
-        // records are gone from the log, so counting them reports a backlog
-        // the consumer can never read and cannot ever work off. Only the 100
-        // records still between `low` and `high` are outstanding.
+        // Kafka retention advances `low` past a group's old commit. Those
+        // records are gone from the log. Counting them reports a backlog the
+        // consumer can never read or work off. Only the 100 records still
+        // between `low` and `high` are outstanding.
         assert_eq!(
             partition_lag(1000, 1100, Offset::Offset(0), OffsetReset::Earliest, None),
             Some(100)
@@ -2135,9 +2120,9 @@ mod tests {
 
     #[test]
     fn the_record_key_reaches_the_mapping_context() {
-        // The documented per-key ordering remedy tells an author to derive the
-        // `workflow_id` from the partition key, so the key must actually be
-        // reachable from `MessageCtx` — it was not until issue #944's review.
+        // The documented per-key ordering remedy derives the `workflow_id`
+        // from the partition key. So `MessageCtx` must expose the key. Pins
+        // the gap that the issue #944 review found.
         let msg = to_inbound(
             "orders",
             0,
@@ -2177,19 +2162,18 @@ mod tests {
         assert!(format!("{err}").contains("partition/offset"));
     }
 
-    /// Kafka has no per-message nack, so there is nothing for a
-    /// "broker-native" dead-letter mode to hand a poison message to: routing a
-    /// DLQ topic is a *producer* concern the consumer cannot perform by
-    /// abandoning. `KafkaSource` therefore never overrides
-    /// [`EventSource::has_native_dead_letter`] and inherits the trait's `false`
-    /// default, which makes the `BrokerNative` pairing unsupported — rejected
-    /// at build time rather than silently re-reading the poison message
-    /// forever.
+    /// Kafka has no per-message nack. So a "broker-native" dead-letter mode
+    /// has nothing to hand a poison message to. Routing to a DLQ topic is a
+    /// *producer* concern, and abandoning cannot do it. So `KafkaSource` never
+    /// overrides [`EventSource::has_native_dead_letter`]. It inherits the
+    /// trait's `false` default, which makes the `BrokerNative` pairing
+    /// unsupported. The build rejects it, instead of silently re-reading the
+    /// poison message forever.
     ///
-    /// Pinned as a drift guard for
-    /// [`SourceBindingBuilder::broker_native_dead_letter`]'s rustdoc, which
-    /// used to advertise "a Kafka DLQ topic" and would have walked a caller
-    /// straight into that build-time rejection.
+    /// Pinned as a drift guard for the rustdoc of
+    /// [`SourceBindingBuilder::broker_native_dead_letter`]. It used to
+    /// advertise "a Kafka DLQ topic". That walked a caller straight into the
+    /// build-time rejection.
     #[tokio::test]
     async fn kafka_reports_no_native_dead_letter_so_the_pairing_is_rejected() {
         let cfg = KafkaSourceConfig::new("localhost:9092", "g", "orders");
@@ -2217,10 +2201,10 @@ mod tests {
     fn a_recv_error_after_partial_drain_yields_the_batch_instead_of_dropping_it() {
         // Records already drained from the consumer have advanced librdkafka's
         // LOCAL position, whether or not they ever reach the runtime. Dropping
-        // them on a later `recv()` error is silent message loss: the next poll
-        // starts at a higher offset, that offset establishes the tracker's
-        // floor, its completion commits, and the dropped records are asserted
-        // done by the high-water mark without ever having been dispatched.
+        // them on a later `recv()` error is silent message loss. The next poll
+        // starts at a higher offset, which sets the tracker's floor. Its
+        // completion commits. The high-water mark then asserts the dropped
+        // records done, though they were never dispatched.
         assert!(
             defer_recv_error(1),
             "a partial batch must be returned, not dropped",
@@ -2234,15 +2218,15 @@ mod tests {
     /// A quiet topic must not strand an anchor whose commit failed.
     ///
     /// `anchors_needing_durability` keeps a failed partition owed so "the next
-    /// receive retries", and the failure is only tolerable because that retry
-    /// bounds the crash window to roughly one poll interval. Gating the attempt
-    /// on `drained > 0` -- the obvious reading of "commit the floor for the
-    /// records we just read" -- silently voids that bound: a topic that goes
-    /// quiet immediately after the failed commit never drains again, so the
-    /// owed anchor is never retried and the window stays open for as long as
-    /// the topic is idle. Under an otherwise-uncommitted `latest` group a crash
-    /// anywhere in that window re-resolves at the tail and permanently skips
-    /// the in-flight records this floor exists to protect.
+    /// receive retries". The failure is tolerable only because that retry
+    /// bounds the crash window to roughly one poll interval. The obvious
+    /// reading of "commit the floor for the records just read" gates the
+    /// attempt on `drained > 0`. That silently voids the bound. A topic that
+    /// goes quiet right after the failed commit never drains again. The owed
+    /// anchor is then never retried, and the window stays open while the topic
+    /// is idle. Under an otherwise-uncommitted `latest` group, a crash in that
+    /// window re-resolves at the tail. It permanently skips the in-flight
+    /// records this floor exists to protect.
     #[test]
     fn an_idle_pass_still_retries_an_anchor_commit_it_owes() {
         assert!(

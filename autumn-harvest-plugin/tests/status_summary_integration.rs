@@ -1,10 +1,11 @@
 //! Integration tests for `GET /admin/status` (issue #679).
 //!
-//! Exercises the rolled-up health summary end-to-end: a healthy fleet reports
-//! `healthy` with five subsystems; seeded dead-letters drive the `dead_letters`
-//! subsystem (and the overall verdict) non-healthy with a drill-down link; the
-//! route is admin-gated; and a down shard degrades (never 500s) with the shard
-//! named in `unavailable_shards`.
+//! Exercises the rolled-up health summary end-to-end:
+//! - a healthy fleet reports `healthy` with five subsystems;
+//! - seeded dead-letters make the `dead_letters` subsystem and the overall
+//!   verdict non-healthy, with a drill-down link;
+//! - the route is admin-gated;
+//! - a down shard degrades (never 500s) and is named in `unavailable_shards`.
 //!
 //! These tests require Docker/testcontainers and are compile-checked in
 //! sandboxes without a Docker daemon (matching the #543/#544/#601 precedent).
@@ -198,11 +199,12 @@ async fn seed_execution(url: &str, shard: i32, workflow_name: &str, state: &str)
     exec_id.as_uuid()
 }
 
-/// Insert a fresh (`NOW()`) `harvest_events` row for `exec_id` so the execution
-/// is not counted as stalled — the stalled predicate is: active state with no
-/// `harvest_events` row newer than the no-progress window. Without this, a
-/// seeded RUNNING execution with an empty history reads as stalled, so the
-/// healthy path would never actually be healthy against a real DB.
+/// Insert a fresh (`NOW()`) `harvest_events` row for `exec_id`, so the execution
+/// is not stalled.
+///
+/// A stalled execution is active with no `harvest_events` row newer than the
+/// no-progress window. A seeded RUNNING execution with an empty history reads
+/// as stalled. Without this row, the healthy path is never healthy on a real DB.
 async fn seed_recent_event(url: &str, exec_id: Uuid) {
     let mut conn = <AsyncPgConnection as AsyncConnection>::establish(url)
         .await
@@ -220,13 +222,13 @@ async fn seed_recent_event(url: &str, exec_id: Uuid) {
 
 /// Record every migration's version in `__diesel_schema_migrations`, mirroring
 /// what `diesel migration run` does. The raw-`up.sql` `with_init_sql` path never
-/// populates this table, so the shard-health readiness probe (which reads it,
-/// `shard_health.rs`) would otherwise report `schema_unreadable` and degrade the
-/// shards subsystem — making the healthy path impossible.
+/// populates this table. The shard-health readiness probe (`shard_health.rs`)
+/// reads it. Without it, the probe reports `schema_unreadable` and degrades the
+/// shards subsystem, so the healthy path is impossible.
 ///
 /// Versions are the numeric prefix of each directory under
-/// `autumn-harvest/migrations`, resolved at compile time via `CARGO_MANIFEST_DIR`
-/// so it is independent of the test's runtime CWD (matches the local-PG helper).
+/// `autumn-harvest/migrations`. `CARGO_MANIFEST_DIR` resolves that path at compile
+/// time, so the runtime CWD does not matter (as in the local-PG helper).
 async fn populate_migration_ledger(url: &str) {
     let mut conn = <AsyncPgConnection as AsyncConnection>::establish(url)
         .await

@@ -1,8 +1,8 @@
 //! Read-only retirement-check query for recorded workflow version-gate markers.
 //!
-//! Answers "is change id X safe to retire below version N?" by scanning
-//! `harvest_events` for `MarkerRecorded` rows whose recorded version is below the
-//! caller-supplied `min_safe_version` threshold and joining back to
+//! Answers "is change id X safe to retire below version N?". It scans
+//! `harvest_events` for `MarkerRecorded` rows whose recorded version is below
+//! the caller-supplied `min_safe_version`. It joins back to
 //! `harvest_workflow_executions` for execution state and start timestamp.
 
 use chrono::{DateTime, Utc};
@@ -226,10 +226,10 @@ fn retirement_check_sql() -> &'static str {
 /// Load retirement-check rows from a single shard without mutating state.
 ///
 /// Returns one row per `(workflow_name, recorded_version, shard_id)` triple
-/// where `recorded_version < filters.min_safe_version`.  An empty `Vec`
-/// signals that no old-version markers (and no pre-gate executions, when
-/// `workflow_name` is set) exist on this shard — a safe result when combined
-/// with a fully-inspected shard set.
+/// where `recorded_version < filters.min_safe_version`. An empty `Vec` means
+/// that this shard has no old-version markers. When `workflow_name` is set,
+/// it also has no pre-gate executions. With a fully-inspected shard set, that
+/// result is safe.
 ///
 /// When [`RetirementCheckFilters::workflow_name`] is provided, the query also
 /// includes active executions for that workflow that carry **no** `MarkerRecorded`
@@ -358,9 +358,8 @@ mod tests {
 
     #[test]
     fn sql_contains_codec_envelope_branch() {
-        // Verify that the SQL guard against opaque codec-envelope details is
-        // present so that non-identity PayloadCodec deployments are never
-        // silently excluded from the blocker set.
+        // Without the codec-envelope guard, a non-identity `PayloadCodec`
+        // deployment drops silently out of the blocker set.
         assert!(
             retirement_check_sql().contains("_harvest_codec_envelope"),
             "SQL must detect codec-envelope details to avoid false-safe reports"
@@ -369,10 +368,9 @@ mod tests {
 
     #[test]
     fn sql_contains_pre_gate_not_exists_branch() {
-        // Verify that the UNION ALL anti-join for pre-gate executions is present.
-        // Without it, executions that started before a version gate was inserted
-        // (and therefore have no MarkerRecorded event) are invisible to the check,
-        // causing a false-safe result.
+        // The UNION ALL anti-join catches pre-gate executions. These started
+        // before the version gate existed, so they have no MarkerRecorded event.
+        // Without the anti-join, the check misses them and reports false-safe.
         assert!(
             retirement_check_sql().contains("NOT EXISTS"),
             "SQL must include pre-gate anti-join to catch executions with no marker"

@@ -1,11 +1,10 @@
 //! `harvest dr` — cross-region DR operator commands (issue #954).
 //!
-//! Argument-surface guards. These are deliberately about the *shape* of the
-//! command rather than its effect, because the effect is proven against a live
-//! Postgres in the core crate's `cross_region_dr_tests`. What can only be
-//! checked here is that the destructive command is hard to run by accident: a
-//! fence bump stops an entire fleet, and a fat-fingered one during a healthy
-//! week is an outage.
+//! Argument-surface guards. They check the *shape* of the command, not its
+//! effect. The core crate's `cross_region_dr_tests` prove the effect against
+//! a live Postgres. Only this suite can check that the destructive command is
+//! hard to run by accident. A fence bump stops an entire fleet, and a
+//! fat-fingered one during a healthy week is an outage.
 
 use clap::Parser as _;
 
@@ -90,10 +89,10 @@ fn a_fully_specified_fence_parses() {
     assert!(rendered.contains("failover to region B"), "{rendered}");
 }
 
-/// `promote` is the step that advances sequences. It must exist as its own
-/// verb: folding it into `fence` would let an operator fence without ever
-/// advancing sequences, and the new primary's first append would then die on a
-/// duplicate key.
+/// `promote` is the step that advances sequences. It must be its own verb.
+/// Folded into `fence`, it would let an operator fence without advancing
+/// sequences. The new primary's first append would then die on a duplicate
+/// key.
 #[test]
 fn promote_is_its_own_verb() {
     let rendered =

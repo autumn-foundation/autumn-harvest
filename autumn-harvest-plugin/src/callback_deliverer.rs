@@ -17,14 +17,12 @@ pub const DEFAULT_DELIVERY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A [`CompletionCallbackDeliverer`] backed by a `reqwest::Client`.
 ///
-/// Redirects are never followed (`redirect::Policy::none()`): an
-/// allowlisted host that responds with a 3xx pointing at a non-allowlisted
-/// (e.g. internal) address must never be silently chased, or the SSRF guard
-/// enforced at registration/enqueue time would be bypassed at delivery
-/// time. A 3xx response is instead reported as its literal status code,
-/// which `DeliveryAttempt::is_success` correctly classifies as a failure
-/// (only 2xx is success), so it flows through the normal retry/backoff/
-/// dead-letter path like any other non-2xx response.
+/// Redirects are never followed (`redirect::Policy::none()`). An allowlisted
+/// host can respond with a 3xx that points at a non-allowlisted (e.g.
+/// internal) address. Chasing it would bypass the SSRF guard enforced at
+/// registration/enqueue time. A 3xx is reported as its literal status code.
+/// `DeliveryAttempt::is_success` classifies it as a failure, because only
+/// 2xx is success. So it takes the normal retry/backoff/dead-letter path.
 ///
 /// A `Retry-After` response header goes onto the attempt. Core uses it as
 /// the backoff floor (issue #1832).
@@ -42,9 +40,9 @@ impl ReqwestCallbackDeliverer {
     /// Build a deliverer with a custom per-request timeout.
     ///
     /// # Panics
-    /// Never panics in practice: the internal `expect` only guards against a
-    /// `reqwest::Client` builder failure, which cannot occur for this
-    /// static, valid configuration (a timeout and a redirect policy).
+    /// Never panics in practice. The internal `expect` guards a
+    /// `reqwest::Client` builder failure. That cannot occur for this static,
+    /// valid configuration (a timeout and a redirect policy).
     #[must_use]
     #[expect(
         clippy::expect_used,

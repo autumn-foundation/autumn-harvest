@@ -90,15 +90,14 @@ fn the_cargo_subcommand_token_is_tolerated() {
     let out = run(&["harvest-verify", "--help"]);
     assert_eq!(code(&out), 0, "stderr:\n{}", stderr(&out));
     assert!(stdout(&out).contains("--strict"), "{}", stdout(&out));
-    // Both spellings must produce the same help text.
     assert_eq!(stdout(&out), stdout(&run(&["--help"])));
 }
 
 #[test]
 fn list_boundaries_prints_every_boundary_name() {
     // `--list-boundaries` is the machine-readable half of the docs guard in
-    // D11: the feasibility report's boundary table is diffed against this
-    // output, so a boundary cannot be added to the code without appearing there.
+    // D11. The feasibility report's boundary table is diffed against this
+    // output. So a boundary cannot be added to the code without appearing there.
     let out = run(&["--list-boundaries"]);
     assert_eq!(code(&out), 0, "stderr:\n{}", stderr(&out));
     let text = stdout(&out);
@@ -254,7 +253,7 @@ fn strict_flips_a_boundary_only_run_from_zero_to_one() {
 #[test]
 fn a_run_that_discovers_no_workflow_warns_and_is_strict_only_failure() {
     // The failure this guards: a `.mir` with no readable `__autumn_workflow_info_*`
-    // marker used to print `analyzed 0` and exit 0 in every mode — a CI gate went
+    // marker used to print `analyzed 0` and exit 0 in every mode. A CI gate went
     // green on a run that verified nothing at all.
     let dir = tempfile::tempdir().expect("tempdir");
     let mir = dir.path().join("no_markers.mir");
@@ -304,9 +303,9 @@ fn a_run_that_discovers_no_workflow_warns_and_is_strict_only_failure() {
 #[test]
 fn a_bare_run_in_a_package_directory_analyzes_that_package() {
     // The failure this guards: with no `-p`, no target flag and no `--mir`, the
-    // pipeline used to skip emission entirely and report `analyzed 0`, exit 0 —
-    // a green gate over a run that built nothing. Cargo's own default for a
-    // bare invocation is "the package the manifest resolves to"; so is ours.
+    // pipeline used to skip emission entirely and report `analyzed 0`, exit 0.
+    // That is a green gate over a run that built nothing. Cargo's own default for
+    // a bare invocation is "the package the manifest resolves to"; so is ours.
     //
     // Slow: this is the only test in the file that actually builds. It emits
     // into its own directory (~1 min warm, longer cold).

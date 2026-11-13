@@ -4,23 +4,23 @@
 //! Two complementary proofs, driven through a **real** `Worker` against Postgres:
 //!
 //! * `worker_arms_business_day_timer_in_one_decision_cycle` — the falsifiable
-//!   correctness AC. Sat/Sun plus two holidays (placed on the next two
-//!   *weekdays* after the worker's own real anchor, so they genuinely enter the
-//!   resolution window on whichever weekday CI runs) must arm a durable timer
-//!   whose `harvest_timers.fires_at` lands on the resolved instant computed by
-//!   an **independent** reference implementation, skipping the weekend and the
-//!   holidays. Also asserts the ONE-DECISION-CYCLE property: exactly one
-//!   `TimerStarted` and exactly one `SideEffectRecorded` in history. Note this
-//!   is a *necessary*, not sufficient, condition — a split batch would still
-//!   record one of each, just across two cycles; the sufficient proof is the
+//!   correctness AC. The calendar excludes Sat/Sun and two holidays. The
+//!   holidays are the next two *weekdays* after the worker's real anchor, so
+//!   they enter the resolution window on any weekday CI runs. The worker must
+//!   arm a durable timer whose `harvest_timers.fires_at` skips the weekend and
+//!   the holidays. An **independent** reference implementation computes the
+//!   expected instant. The test also asserts the ONE-DECISION-CYCLE property:
+//!   exactly one `TimerStarted` and one `SideEffectRecorded` in history. That
+//!   is a *necessary*, not sufficient, condition. A split batch still records
+//!   one of each, across two cycles. The sufficient proof is the
 //!   `extract_started_timer_for_suspension_accepts_freeze_plus_timer` unit test
-//!   in `worker.rs`, whose allow-list is what makes the single batch legal
-//!   (deleting `RecordSideEffect` from it makes both tests here fail).
+//!   in `worker.rs`. Its allow-list makes the single batch legal. Deleting
+//!   `RecordSideEffect` from it makes both tests here fail.
 //!
 //! * `business_day_calendar_loaded_from_db_resolves` — the registration path an
-//!   embedder actually uses: holidays live in `harvest_calendar_exclusions`, are
-//!   loaded with the existing `load_exclusions_for_calendar`, and are handed to
-//!   the worker as a `BusinessCalendars` snapshot in shared state.
+//!   embedder uses. Holidays live in `harvest_calendar_exclusions`. The test
+//!   loads them with `load_exclusions_for_calendar` and hands them to the
+//!   worker as a `BusinessCalendars` snapshot in shared state.
 //!
 //! Execution: set `HARVEST_TEST_DATABASE_URL` to a migrated Postgres to run
 //! against it directly; otherwise a fresh testcontainers Postgres is booted with
@@ -317,7 +317,6 @@ async fn load_execution(url: &str, exec_id: ExecutionId) -> WorkflowExecution {
         .expect("reload workflow execution")
 }
 
-/// Read the durable timer row's absolute fire instant.
 async fn timer_fires_at(url: &str, exec_id: ExecutionId) -> DateTime<Utc> {
     #[derive(QueryableByName)]
     struct Row {
@@ -363,18 +362,18 @@ const fn day(y: i32, m: u32, d: u32) -> NaiveDate {
 
 /// The next `count` **weekdays** strictly after `from`.
 ///
-/// Holidays for these tests must be placed relative to the worker's real anchor
-/// (a fixed past date would never enter the resolution window and every
-/// holiday-skip assertion would pass vacuously) — but they must also land on
-/// days that are business days *without* them, or they contribute nothing. Naive
-/// `today + 1 day` / `today + 2 days` fails exactly that on a Friday, where both
-/// land on the weekend and the falsifiability assertion (`deadline >
-/// weekends_only`) becomes unsatisfiable. Walking forward over weekdays makes
-/// the fixture correct on all seven anchors.
+/// Holidays for these tests must sit relative to the worker's real anchor. A
+/// fixed past date never enters the resolution window, so every holiday-skip
+/// assertion would pass vacuously. They must also land on days that are
+/// business days *without* them, or they contribute nothing. Naive
+/// `today + 1 day` / `today + 2 days` fails that on a Friday: both land on the
+/// weekend. The falsifiability assertion (`deadline > weekends_only`) then
+/// becomes unsatisfiable. Walking forward over weekdays makes the fixture
+/// correct on all seven anchors.
 ///
-/// Weekday-only by construction — deliberately independent of
-/// `calendar::is_business_day` so the fixture cannot be co-broken with the
-/// production predicate it is meant to exercise.
+/// Weekday-only by construction. It is independent of
+/// `calendar::is_business_day`, so a broken production predicate cannot also
+/// break the fixture.
 fn next_weekdays_after(from: NaiveDate, count: usize) -> Vec<NaiveDate> {
     let mut out = Vec::with_capacity(count);
     let mut cursor = from;
@@ -394,9 +393,9 @@ fn next_weekdays_after(from: NaiveDate, count: usize) -> Vec<NaiveDate> {
 /// written differently from `calendar::add_business_days` (candidate-date scan
 /// rather than a cursor loop) so the integration assertion is not circular.
 ///
-/// Contract mirrored: Sat/Sun are never business days, `holidays` are never
-/// business days, `n = 0` means "the anchor if it is a business instant, else
-/// the next business instant", and the anchor's time-of-day is preserved.
+/// Contract mirrored: Sat/Sun and `holidays` are never business days. `n = 0`
+/// means "the anchor if it is a business instant, else the next business
+/// instant". The anchor's time-of-day is preserved.
 fn reference_business_deadline(
     anchor: DateTime<Utc>,
     n: u32,
@@ -436,11 +435,10 @@ fn reference_business_deadline(
 /// The issue's falsifiable correctness AC.
 ///
 /// The worker anchors on its own real clock, so the fixture cannot use a fixed
-/// date (a past anchor never enters the resolution window and every skip
-/// assertion passes vacuously). Instead the calendar excludes the **next two
-/// weekdays** after the anchor, guaranteeing both holidays bite on whichever
-/// weekday CI runs. `timer_business_days(_, 2, cal)` must step over the weekend
-/// and both holidays.
+/// date. A past anchor never enters the resolution window, and every skip
+/// assertion passes vacuously. Instead the calendar excludes the **next two
+/// weekdays** after the anchor, so both holidays bite on any weekday CI runs.
+/// `timer_business_days(_, 2, cal)` must skip the weekend and both holidays.
 ///
 /// **Falsifiability.** The expected value comes from `reference_business_deadline`
 /// — an independent reimplementation (candidate-date scan, not the production
@@ -449,22 +447,17 @@ fn reference_business_deadline(
 /// so a silently-broken holiday skip cannot pass. Deleting the holiday check
 /// from `calendar::is_business_day` fails this test (mutant-verified).
 ///
-/// The `harvest_timers.fires_at` row is asserted against the frozen deadline
-/// with a small tolerance: `fires_at` is anchored to the **Postgres** clock at
-/// persist time while the freeze anchors on the worker's clock, so the two are
-/// the same instant only up to worker↔DB skew plus the persist latency.
+/// The `harvest_timers.fires_at` row must match the frozen deadline within a
+/// small tolerance. `fires_at` anchors to the **Postgres** clock at persist
+/// time, and the freeze anchors on the worker's clock. They agree only up to
+/// worker↔DB skew plus the persist latency.
 #[tokio::test]
 async fn worker_arms_business_day_timer_in_one_decision_cycle() {
     let (url, _container) = setup_db().await;
     let pool = build_pool(&url);
     let mut conn = connect(&url).await;
 
-    // The worker anchors on its own real clock, so the holidays must be placed
-    // RELATIVE to now or they never enter the resolution window and the
-    // holiday-skip assertion below would pass vacuously. They must also land on
-    // WEEKDAYS -- blocking `today+1`/`today+2` verbatim puts both on the weekend
-    // when the suite runs on a Friday, where they change nothing and the
-    // falsifiability assertion below becomes unsatisfiable.
+    // Holidays sit RELATIVE to now and on WEEKDAYS (see `next_weekdays_after`).
     let today = Utc::now().date_naive();
     let holidays = next_weekdays_after(today, 2);
 
@@ -597,10 +590,7 @@ async fn business_day_calendar_loaded_from_db_resolves() {
     // HARVEST_TEST_DATABASE_URL points at a reused database.
     let cal_name = format!("biz-{}", Uuid::new_v4());
 
-    // Holidays are placed relative to now so they genuinely enter the resolution
-    // window (a fixed past date would make the assertions vacuous), and on
-    // weekdays so they actually bite on every anchor weekday (see
-    // `next_weekdays_after`).
+    // Holidays sit relative to now and on weekdays (see `next_weekdays_after`).
     let today = Utc::now().date_naive();
     let holidays = next_weekdays_after(today, 2);
 

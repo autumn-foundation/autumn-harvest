@@ -1,21 +1,24 @@
 //! Serializable DTOs + pure mapping for the single-execution replay-diagnosis
 //! endpoint (`POST /api/harvest/workflows/{id}/replay-diagnosis`, issue #614).
 //!
-//! This module is deliberately pure: it owns the response shape and the total
+//! This module is deliberately pure. It owns the response shape and the total
 //! mapping from a [`ReplayReport`](autumn_harvest::testing::ReplayReport) (or the
 //! two "not replayable" pre-checks) to a [`ReplayDiagnosisResponse`]. The HTTP
-//! handler in `api.rs` performs the I/O (load the execution + history from the
-//! owning shard, drive [`WorkflowReplayer`](autumn_harvest::testing::WorkflowReplayer)
-//! against the currently-registered handler) and calls the pure functions here,
-//! so the mapping is unit-testable with no database and no async.
+//! handler in `api.rs` performs the I/O. It loads the execution + history from
+//! the owning shard and drives
+//! [`WorkflowReplayer`](autumn_harvest::testing::WorkflowReplayer) against the
+//! currently-registered handler. It then calls the pure functions here. So the
+//! mapping is unit-testable with no database and no async.
 //!
-//! The endpoint is **read-only** — it appends no events and performs no writes
+//! The endpoint is **read-only**: it appends no events and performs no writes
 //! (issue #614 AC3). It returns a structured `200` verdict for every reachable
 //! outcome (clean / diverged / `workflow_failed` / `not_registered` /
-//! `not_replayable_dag`), reserving non-`200` statuses for the resource itself:
-//! `400` (malformed id), `404` (unknown execution), `408` (replay exceeded the
-//! bounded budget), `410` (history unavailable — pruned by retention, released on
-//! reset, or PII-erased per issue #495).
+//! `not_replayable_dag`). Non-`200` statuses are for the resource itself:
+//! - `400`: malformed id;
+//! - `404`: unknown execution;
+//! - `408`: replay exceeded the bounded budget;
+//! - `410`: history unavailable (pruned by retention, released on reset, or
+//!   PII-erased per issue #495).
 
 use autumn_harvest::testing::{NonDeterminismKind, ReplayReport, ReplayStatus};
 use autumn_harvest::types::ExecutionId;
@@ -85,9 +88,10 @@ pub struct ReplayDiagnosisResponse {
     pub execution_id: String,
     /// The execution's workflow type name.
     pub workflow_name: String,
-    /// The execution's current lifecycle state (RUNNING / COMPLETED / FAILED /
-    /// ...), for context — the diagnosis is independent of terminal state
-    /// (issue #614 AC4: a FAILED run can be diagnosed retroactively).
+    /// The current lifecycle state (RUNNING / COMPLETED / FAILED / ...).
+    ///
+    /// For context only. The diagnosis is independent of terminal state (issue
+    /// #614 AC4: a FAILED run can be diagnosed retroactively).
     pub state: String,
     /// The verdict.
     pub diagnosis: DiagnosisVerdict,
@@ -96,10 +100,11 @@ pub struct ReplayDiagnosisResponse {
     /// The classified divergence, present iff `diagnosis == diverged`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub divergence: Option<DivergenceDetail>,
-    /// The workflow error. Present for `workflow_failed`, and (issue #952) for a
-    /// `clean` verdict that REPRODUCED the run's recorded terminal failure —
-    /// reproducing a recorded failure is not a divergence, but the operator still
-    /// needs the error.
+    /// The workflow error.
+    ///
+    /// Present for `workflow_failed`. Since issue #952, also present for a
+    /// `clean` verdict that REPRODUCED the recorded terminal failure of the run.
+    /// That is not a divergence, but the operator still needs the error.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failure: Option<FailureDetail>,
     /// A one-line human summary of the mismatch (present for a divergence).
@@ -121,12 +126,12 @@ pub fn report_to_response(
 ) -> ReplayDiagnosisResponse {
     let events_replayed = report.events_replayed;
     let summary = report.mismatched_command_summary.clone();
-    // Issue #952: a history sealed by a terminal `WorkflowFailed` that replays to
-    // the same failure is a CLEAN replay (the recorded run failed and the code
-    // failed again — no divergence), and the harness carries the reproduced error
-    // in `reproduced_failure`. Surface it: this endpoint is the operator's
-    // post-mortem surface, and answering "clean" with no error at all would drop
-    // exactly the thing they came to read.
+    // Issue #952: a history sealed by a terminal `WorkflowFailed` can replay to
+    // the same failure. That is a CLEAN replay: the recorded run failed and the
+    // code failed again. The harness carries the reproduced error in
+    // `reproduced_failure`. Surface it. This endpoint is the operator's
+    // post-mortem surface. A "clean" answer with no error would drop exactly
+    // the thing the operator came to read.
     let reproduced = report.reproduced_failure.clone();
     match report.status {
         ReplayStatus::ReplaySucceeded => ReplayDiagnosisResponse {
@@ -185,21 +190,21 @@ pub fn report_to_response(
     }
 }
 
-/// Returns `true` when `actual` names a terminal-lifecycle event that represents
-/// an **external** seal — the run was sealed mid-flight by an outside force
-/// (execution timeout #243, operator cancel/terminate #504, reset #148), NOT by
-/// the workflow's own return path.
+/// Returns `true` when `actual` names a terminal event of an **external** seal.
 ///
-/// Deliberately excludes `WorkflowCompleted`: that is the workflow's OWN
-/// outcome, so a replay that lands on one means new code wants to do MORE work
-/// than the old run did — a genuine divergence that must stay `diverged`, not be
+/// An outside force sealed the run mid-flight: execution timeout (#243),
+/// operator cancel/terminate (#504) or reset (#148). The workflow's own return
+/// path did NOT seal it.
+///
+/// Deliberately excludes `WorkflowCompleted`, the workflow's OWN outcome. A
+/// replay that lands on one means new code wants to do MORE work than the old
+/// run did. That is a genuine divergence. It must stay `diverged`, not be
 /// masked as clean.
 ///
-/// `WorkflowFailed` is likewise excluded here, but since issue #952 it can no
-/// longer *reach* this reclassifier as an `actual`: a trailing terminal
-/// `WorkflowFailed` is transparent to the matcher, so a replay that runs past a
-/// failing cycle's own outcome reports clean at the source rather than producing
-/// a divergence for this function to reconsider.
+/// `WorkflowFailed` is excluded too. Since issue #952 it can no longer *reach*
+/// this reclassifier as an `actual`. A trailing terminal `WorkflowFailed` is
+/// transparent to the matcher. So a replay that runs past the outcome of a
+/// failing cycle reports clean at the source, with no divergence to reconsider.
 fn is_external_seal_event(actual: &str) -> bool {
     matches!(
         actual,
@@ -210,14 +215,14 @@ fn is_external_seal_event(actual: &str) -> bool {
 /// Reclassify a false `diverged` verdict to `clean` when it is caused by an
 /// execution that was **externally sealed mid-await** (issue #614 FIX 3).
 ///
-/// A run sealed mid-flight by execution timeout (#243), operator cancel/terminate
-/// (#504), or reset (#148) has its terminal-lifecycle seal recorded where the
-/// next command would go. When the current (unchanged) workflow code replays such
-/// a history, it faithfully consumes every recorded command and then issues the
-/// *next* command — which lands exactly on the external seal, so
-/// [`HistoryMatcher::match_activity`](autumn_harvest) reports a divergence whose
-/// `actual` is the seal event. That is not a code divergence: the run replayed
-/// cleanly and was killed by an outside force.
+/// A run can be sealed mid-flight by execution timeout (#243), operator
+/// cancel/terminate (#504), or reset (#148). Its terminal-lifecycle seal is
+/// recorded where the next command would go. The current (unchanged) workflow
+/// code replays such a history and faithfully consumes every recorded command.
+/// It then issues the *next* command, which lands exactly on the external seal.
+/// So [`HistoryMatcher::match_activity`](autumn_harvest) reports a divergence
+/// whose `actual` is the seal event. That is not a code divergence. The run
+/// replayed cleanly and was killed by an outside force.
 ///
 /// Reclassifies to `clean` **only** when ALL hold, so a genuine divergence is
 /// never masked:
@@ -228,21 +233,22 @@ fn is_external_seal_event(actual: &str) -> bool {
 ///     [`is_external_seal_event`]).
 ///
 /// The load-bearing condition is the last one. A genuine mid-history divergence
-/// (an activity rename) has `actual` naming a real command event; new code that
-/// does MORE work than a COMPLETED / FAILED run has `actual` = `WorkflowCompleted`
-/// / `WorkflowFailed` — neither is an external seal, so both correctly stay
-/// `diverged`. The terminal-state and seal-reached conditions are belt-and-braces
-/// (a RUNNING nd-blocked run has no terminal seal, and a redriven RUNNING run —
-/// whose mid-history `WorkflowFailed` would satisfy the seal scan — is excluded by
-/// the terminal-state gate).
+/// (an activity rename) has `actual` naming a real command event. New code that
+/// does MORE work than a COMPLETED / FAILED run has `actual` =
+/// `WorkflowCompleted` / `WorkflowFailed`. Neither is an external seal, so both
+/// correctly stay `diverged`. The terminal-state and seal-reached conditions
+/// are belt-and-braces. A RUNNING nd-blocked run has no terminal seal. A
+/// redriven RUNNING run can have a mid-history `WorkflowFailed` that satisfies
+/// the seal scan, and the terminal-state gate excludes it.
 ///
-/// Note the common single-activity sealed-mid-await shape
-/// (`WorkflowStarted + ActivityScheduled(a) + WorkflowExecutionTimedOut`, the
-/// activity never completed) never reaches this reclassification: the workflow
-/// *suspends* awaiting the in-progress activity's unrecorded result, which canary
-/// replay already reports as `clean` (a frontier suspension). This function
-/// handles the multi-activity shape, where the workflow consumes a completed
-/// activity and then issues a NEXT command that lands on the seal.
+/// The common single-activity sealed-mid-await shape never reaches this
+/// reclassification. In that shape the activity never completed:
+/// `WorkflowStarted + ActivityScheduled(a) + WorkflowExecutionTimedOut`. The
+/// workflow *suspends* awaiting the unrecorded result of the in-progress
+/// activity. Canary replay already reports that as `clean` (a frontier
+/// suspension). This function handles the multi-activity shape. There the
+/// workflow consumes a completed activity and then issues a NEXT command that
+/// lands on the seal.
 #[must_use]
 pub fn reclassify_sealed_mid_await(
     mut resp: ReplayDiagnosisResponse,
@@ -484,9 +490,9 @@ mod tests {
 
     #[test]
     fn does_not_reclassify_when_not_terminal_or_not_sealed() {
-        // External-seal actual, but the run is not terminal (e.g. a redriven
-        // RUNNING run whose mid-history WorkflowFailed satisfies the seal scan) —
-        // gated out by the terminal-state condition.
+        // External-seal actual, but the run is not terminal. An example is a
+        // redriven RUNNING run whose mid-history WorkflowFailed satisfies the
+        // seal scan. The terminal-state condition gates it out.
         let resp = diverged_with_actual("WorkflowCancelled");
         let out = reclassify_sealed_mid_await(resp, false, true);
         assert_eq!(out.diagnosis, DiagnosisVerdict::Diverged);

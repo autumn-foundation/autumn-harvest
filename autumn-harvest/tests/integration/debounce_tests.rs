@@ -11,17 +11,17 @@
 )]
 //! Debounce integration tests — issue #499.
 //!
-//! Verifies the core debounce ACs against a real Postgres container:
-//! AC5  — burst collapse: K upserts → 1 row → scanner starts exactly 1 execution
+//! Verifies the core debounce ACs against a real Postgres container.
+//! AC5  — burst collapse: K upserts → 1 row → scanner starts exactly 1 execution.
 //! AC6  — trailing-edge: upsert, advance < window, upsert again → NOT fired before
-//!         the extended deadline; fires after
-//! AC7  — last-input-wins: the started run's input equals the most recent request's input
-//! AC8  — independent keys: two distinct keys → two rows → two executions
-//! AC9  — max-wait cap: continuous upserts never push effective_fire_at past max_fire_at
+//!         the extended deadline; fires after.
+//! AC7  — last-input-wins: the started run's input equals the most recent request's input.
+//! AC8  — independent keys: two distinct keys → two rows → two executions.
+//! AC9  — max-wait cap: continuous upserts never push effective_fire_at past max_fire_at.
 //! AC10 — backward-compatible: start without a debounce policy → unchanged single
-//!         execution; no harvest_debounce row left behind
+//!         execution; no harvest_debounce row left behind.
 //! AC11 — operator visibility: list_pending_debounce returns the pending record with
-//!         the expected fields
+//!         the expected fields.
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
@@ -270,12 +270,10 @@ async fn burst_collapse_k_upserts_produce_one_row_and_one_execution() {
     assert_eq!(execution_count(&mut conn, wf, wf_id).await, 1);
 }
 
-// Regression (issue #605 code review): a per-execution completion_callbacks
-// target supplied on a request that resolves to the debounce admission path
-// must not be silently discarded -- it must reach the eventually-started
-// execution's `completion_callbacks` column, exactly like every other
-// operator-facing start option DebounceStartOptions already threads through
-// (owner, sla, memo, ...).
+// Regression (issue #605): a per-execution completion_callbacks target on a
+// request that takes the debounce admission path must not be dropped. It must
+// reach the started execution's `completion_callbacks` column. Every other
+// start option in DebounceStartOptions (owner, sla, memo, ...) does the same.
 #[tokio::test]
 async fn fire_due_debounced_starts_threads_completion_callbacks_into_the_started_execution() {
     let (mut conn, _c) = setup_db().await;
@@ -310,15 +308,13 @@ async fn fire_due_debounced_starts_threads_completion_callbacks_into_the_started
     );
 }
 
-// Regression (issue #921 review): `admit_debounced_start`'s conflict path is
-// otherwise last-input-wins (matching the documented semantics), but that must
-// not apply to completion_callbacks -- an earlier admission's registered
-// callback would silently vanish if a later burst member (which wins on every
-// other field) carried no callback, or a different one. Two admissions for the
-// same key with distinct callback targets must both survive into the single
-// started execution's completion_callbacks column, mirroring the identical
-// array-merge fix already shipped for the batched-start path
-// (admit_batched_start).
+// Regression (issue #921): the conflict path of `admit_debounced_start` is
+// last-input-wins, as documented. That must not apply to completion_callbacks.
+// A later burst member wins on every other field. If it carried no callback, or
+// a different one, an earlier admission's callback would vanish. Two admissions
+// for the same key with distinct targets must both reach the started
+// execution's completion_callbacks column. The batched-start path
+// (admit_batched_start) has the same array-merge fix.
 #[tokio::test]
 async fn debounce_conflict_merges_completion_callbacks_instead_of_overwriting() {
     let (mut conn, _c) = setup_db().await;
@@ -422,7 +418,6 @@ async fn trailing_edge_extends_deadline_and_scanner_respects_it() {
     let max_wait = Duration::from_secs(60);
     let metrics = no_op_metrics();
 
-    // First admission
     let first_outcome = admit_debounced_start_ungated(
         &mut conn,
         admit_params(

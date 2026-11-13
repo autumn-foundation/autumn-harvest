@@ -1,11 +1,13 @@
 //! Integration tests for `GET /admin/canary` (issue #796).
 //!
-//! Exercises the synthetic liveness canary freshness read model end-to-end: the
-//! route is admin-gated (401 without admin); a seeded recent COMPLETED canary
-//! execution reports a non-stale probe for its `(queue, shard)`; an old (or
-//! never-succeeded) canary execution reports `stale: true`; and with the canary
-//! disabled the endpoint returns an empty `complete` report rather than an
-//! error.
+//! Exercises the synthetic liveness canary freshness read model end-to-end:
+//!
+//! - The route is admin-gated (401 without admin).
+//! - A recent COMPLETED canary execution reports a non-stale probe for its
+//!   `(queue, shard)`.
+//! - An old or never-succeeded canary execution reports `stale: true`.
+//! - With the canary disabled, the endpoint returns an empty `complete`
+//!   report, not an error.
 //!
 //! **Distinct from the #512 replay canary** (`replay_canary_integration.rs`),
 //! which validates code changes by replaying histories — this reports the
@@ -13,12 +15,10 @@
 //!
 //! These tests use testcontainers by default, and are compile-checked in
 //! sandboxes without a Docker daemon (matching the #543/#544/#601 precedent).
-//! For a Docker-less run against a local Postgres, set
-//! `HARVEST_TEST_DATABASE_URL` to a base (migrated or empty) database whose role
-//! can `CREATE DATABASE`; each `setup_single_shard()` call then provisions a
-//! fresh, uniquely-named, migrated database, preserving the per-test isolation
-//! the testcontainers path gives (these tests assert on global `(queue, shard)`
-//! success/failure aggregates, so they cannot share a database).
+//! For a Docker-less run, set `HARVEST_TEST_DATABASE_URL` to a base database
+//! whose role can `CREATE DATABASE`. Each `setup_single_shard()` call then
+//! provisions a fresh migrated database. These tests assert on global
+//! `(queue, shard)` aggregates, so they cannot share a database.
 
 use std::time::Duration;
 

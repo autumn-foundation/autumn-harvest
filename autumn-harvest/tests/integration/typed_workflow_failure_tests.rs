@@ -5,17 +5,17 @@
 //! * **F1 (non-DB, headline success metric).** The parent's routing decision is
 //!   keyed *purely* on the child's typed `error_type` (via
 //!   [`HarvestError::workflow_error_type`]) with **zero** substring matching on
-//!   the failure message. Two histories that differ only in the child's message
-//!   text — but share the same `error_type` — must produce the *identical*
-//!   routing decision, across ≥3 distinct error categories. This runs without
-//!   Docker in the non-DB `--test integration` CI step.
+//!   the failure message. Two histories with the same `error_type` and a
+//!   different child message must produce the *identical* routing decision.
+//!   This holds across ≥3 distinct error categories. It runs without Docker in
+//!   the non-DB `--test integration` CI step.
 //!
-//! * **F2a (DB, handle surface / AC5).** A `FAILED` execution whose terminal
-//!   `WorkflowFailed` event carries typed fields surfaces those fields to an
-//!   embedder through [`WorkflowHandle::result_raw`],
-//!   `TypedWorkflowHandle::result`/`result_snapshot`, and preserves the
-//!   *human message* (never the wire envelope) in the `execution.error` column
-//!   (AC4). Requires Postgres (testcontainers); Docker-gated CI step.
+//! * **F2a (DB, handle surface / AC5).** A `FAILED` execution has a terminal
+//!   `WorkflowFailed` event with typed fields. An embedder sees those fields
+//!   through [`WorkflowHandle::result_raw`] and
+//!   `TypedWorkflowHandle::result`/`result_snapshot`. The `execution.error`
+//!   column keeps the *human message*, never the wire envelope (AC4). Requires
+//!   Postgres (testcontainers); Docker-gated CI step.
 
 use autumn_harvest::context::WorkflowContext;
 use autumn_harvest::error::HarvestError;
@@ -29,10 +29,9 @@ use serde_json::Value;
 // F1 — headline success metric (no DB).
 // ---------------------------------------------------------------------------
 
-/// Reconstruct the `HarvestError` a parent observes when a child fails with a
-/// typed `WorkflowFailure`, by replaying the parent's `spawn_child_workflow_raw`
-/// against a hand-built history whose child terminal is a typed
-/// `ChildWorkflowFailed`.
+/// Reconstruct the `HarvestError` a parent sees when a child fails with a typed
+/// `WorkflowFailure`. Replays the parent's `spawn_child_workflow_raw` against a
+/// hand-built history whose child terminal is a typed `ChildWorkflowFailed`.
 async fn observe_typed_child_failure(error_type: &str, message: &str) -> HarvestError {
     let child_id = ExecutionId::new();
     let decoded = decode_workflow_failure(
@@ -191,10 +190,10 @@ mod db_handle_surface {
         autumn_harvest::test_init_sql().as_bytes().to_vec()
     }
 
-    /// Dual-mode setup: prefer an operator-supplied `HARVEST_TEST_DATABASE_URL`
-    /// (creating a fresh per-test database off it so tests in this binary never
-    /// share state), else fall back to testcontainers. Mirrors
-    /// `retry_chain_routing_tests`, so this suite is runnable on a host with a
+    /// Dual-mode setup: prefer an operator-supplied `HARVEST_TEST_DATABASE_URL`,
+    /// else fall back to testcontainers. Each test creates a fresh database off
+    /// that URL, so tests in this binary never share state. Mirrors
+    /// `retry_chain_routing_tests`, so this suite runs on a host with a
     /// Postgres but no Docker.
     async fn setup() -> (String, Option<ContainerAsync<Postgres>>) {
         if let Ok(admin_url) = std::env::var("HARVEST_TEST_DATABASE_URL") {
@@ -304,9 +303,9 @@ mod db_handle_surface {
         exec_id
     }
 
-    /// Simulate exactly what `worker::persist_workflow_failure` now does
-    /// (issue #767): append a typed `WorkflowFailed` event, and stamp the
-    /// **human message** (not the wire envelope) into the `error` column.
+    /// Simulate `worker::persist_workflow_failure` (issue #767). Append a typed
+    /// `WorkflowFailed` event and stamp the **human message** (not the wire
+    /// envelope) into the `error` column.
     async fn seal_typed_failure(
         conn: &mut AsyncPgConnection,
         exec_id: ExecutionId,
@@ -399,19 +398,17 @@ mod db_handle_surface {
         }
     }
 
-    /// FIX A (issue #767): `result_raw` follows the workflow-level retry chain
-    /// (issue #523) via `load_effective_execution`, so for a retried workflow
-    /// whose *final* attempt failed with a DIFFERENT typed class than the first,
-    /// the caller must see the FINAL attempt's typed fields — enriched from the
+    /// Issue #767: `result_raw` follows the workflow-level retry chain (issue
+    /// #523) via `load_effective_execution`. A retried workflow can fail its
+    /// *final* attempt with a DIFFERENT typed class than the first. The caller
+    /// must then see the FINAL attempt's typed fields. They come from the
     /// *effective* execution, not the original handle id.
     ///
-    /// Also pins the issue #843 AC4 decision and its internal-consistency
-    /// requirement: `result_snapshot` DOES follow the chain (matching
-    /// `result_snapshot_with_wait` and the HTTP `/result` route, which already
-    /// did), and its typed `error_type`/`error_details`/`non_retryable` are
-    /// loaded from the execution the snapshot was actually read from — so a
-    /// routed snapshot can never pair an inner attempt's `error` with the
-    /// outer attempt's typed metadata.
+    /// Also pins the issue #843 AC4 decision. `result_snapshot` DOES follow the
+    /// chain, like `result_snapshot_with_wait` and the HTTP `/result` route.
+    /// Its typed `error_type`/`error_details`/`non_retryable` load from the
+    /// execution that the snapshot read. So a routed snapshot never pairs an
+    /// inner attempt's `error` with the outer attempt's typed metadata.
     #[tokio::test]
     async fn result_raw_enriches_from_the_effective_retry_execution() {
         let (db_url, _container) = setup().await;
@@ -459,11 +456,11 @@ mod db_handle_surface {
             Some(&serde_json::json!({ "cat": "FinalClass" }))
         );
 
-        // Issue #843 AC4: result_snapshot follows the chain too, so EVERY field
-        // it reports — the untyped `error`/`state` and the typed
-        // `error_type`/`error_details`/`non_retryable` alike — comes from the
-        // SAME (final-attempt) execution. Asserting both halves is what makes
-        // this a mixed-source regression guard rather than a state check.
+        // Issue #843 AC4: `result_snapshot` follows the chain too. EVERY field
+        // it reports comes from the SAME (final-attempt) execution. That covers
+        // the untyped `error`/`state` and the typed
+        // `error_type`/`error_details`/`non_retryable`. Asserting both halves
+        // makes this a mixed-source regression guard, not a state check.
         let typed = autumn_harvest::TypedWorkflowHandle::<Value>::new(handle.clone());
         let snap = typed.result_snapshot().await.unwrap();
         assert_eq!(snap.state, WorkflowResultState::Failed);

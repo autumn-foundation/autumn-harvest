@@ -3,15 +3,15 @@
 //!
 //! **Mechanism.** Forbidden effect. `helpers::pace()` awaits
 //! `tokio::time::sleep`. Nothing about the sleep flows into any command
-//! argument or branch condition, so taint analysis alone reports **nothing** —
-//! this is the case that proves the analyzer needs a reachability-only
-//! `[forbidden]` table beside its source table. The sleep is non-durable: it
-//! re-executes on every replay instead of being skipped after the first
-//! completion, and it is invisible to the replay engine.
+//! argument or branch condition. So taint analysis alone reports **nothing**.
+//! This case proves the analyzer needs a reachability-only `[forbidden]` table
+//! beside its source table. The sleep is non-durable: it re-executes on every
+//! replay instead of being skipped after the first completion. It is also
+//! invisible to the replay engine.
 //!
 //! **Launder.** HVG004 lists `tokio::time::sleep` and DET006 lists
-//! `tokio::time::sleep(` — again both know the call exactly, and again both are
-//! body-only / same-file-same-module, so one crate boundary defeats them.
+//! `tokio::time::sleep(`. Both know the call exactly, and both are body-only /
+//! same-file-same-module. So one crate boundary defeats them.
 //!
 //! **Expected trace hops.** `wf_tokio_sleep_in_helper` ⇒
 //! `harvest_verify_corpus_helpers::pace` ⇒ `tokio::time::sleep` (the forbidden

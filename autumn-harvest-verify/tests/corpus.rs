@@ -3,43 +3,42 @@
 //! Five claims, one per test, in the order they have to hold:
 //!
 //! 1. [`seeded_corpus_is_clean_under_the_syntactic_layer`] — the *premise*. The
-//!    whole corpus compiles under `RUSTFLAGS="-D warnings"` (which is the only
+//!    whole corpus compiles under `RUSTFLAGS="-D warnings"`. That is the only
 //!    available proof that HVG001–HVG011 produce **zero findings of any
-//!    severity**: hard blockers are `compile_error!`, warnings are a
-//!    `#[deprecated]` const, and `autumn-harvest-macros` is a `proc-macro`
-//!    crate that cannot export its visitor to a test), and
+//!    severity**. Hard blockers are `compile_error!`, and warnings are a
+//!    `#[deprecated]` const. `autumn-harvest-macros` is a `proc-macro` crate
+//!    that cannot export its visitor to a test. Also,
 //!    `det_check::check_paths` returns zero findings *and* zero suppressions,
 //!    with no `allow_nondeterministic_apis` and no `harvest-suppress` comment
 //!    anywhere. Without this, AC3's "guardrails pass, analyzer catches" claim
 //!    is unfounded and every number below is meaningless.
 //! 2. [`expectations_cover_every_corpus_workflow_and_vice_versa`] — the oracle
 //!    in `corpus/expectations.toml` is a *bijection* with the workflows on
-//!    disk, so neither a corpus module nor an expectation row can drift out of
+//!    disk. So neither a corpus module nor an expectation row can drift out of
 //!    the other's sight.
 //! 3. [`analyzer_matches_the_expectations_oracle`] — every verdict matches, and
 //!    every found case's trace names the helper it flowed through.
 //! 4. [`detection_rate_meets_the_success_metric`] — ≥ 90 % of the seeded cases
 //!    come back found *with a named trace*, computed live from the run.
 //! 5. [`every_unknown_names_its_boundary`] — AC2's three-valued honesty.
-//! 6. [`every_seeded_case_is_detected`] — the *ratchet*. Claim 4 is a floor;
-//!    this one pins the live count to the number of seeded rows, so a model
-//!    that quietly stops matching (the rustc 1.94 → 1.98 `Atomic<T>` incident)
-//!    turns red at the first lost case instead of at the sixth.
+//! 6. [`every_seeded_case_is_detected`] — the *ratchet*. Claim 4 is a floor.
+//!    This one pins the live count to the number of seeded rows. A model that
+//!    quietly stops matching then turns red at the first lost case instead of
+//!    at the sixth. The rustc 1.94 → 1.98 `Atomic<T>` incident was such a case.
 //!
 //! Tests 3–6 share one analyzer run through a [`OnceLock`], so the (slow) MIR
-//! build happens once per test binary. It emits into
-//! `target/harvest-verify/corpus`, its own directory: `examples_metrics.rs`
-//! drives cargo with a different feature set, and one shared emit directory
-//! doubles the cargo work for no benefit. (Since the driver accepts only
-//! artifacts whose `package_id` is one of the packages *this* run asked for, a
-//! shared directory would no longer poison a verdict — the split is now cache
-//! hygiene, not correctness. `tests/cli.rs` builds only once, for the default
-//! target selection, and into `target/harvest-verify/cli`; the rest of it
-//! analyzes the checked-in `.mir` fixtures.)
+//! build happens once per test binary. It emits into its own directory,
+//! `target/harvest-verify/corpus`. `examples_metrics.rs` drives cargo with a
+//! different feature set, and one shared emit directory doubles the cargo work
+//! for no benefit. (The driver accepts only artifacts whose `package_id` is one
+//! of the packages *this* run asked for. So a shared directory would no longer
+//! poison a verdict, and the split is now cache hygiene, not correctness.
+//! `tests/cli.rs` builds only once, for the default target selection, and into
+//! `target/harvest-verify/cli`; the rest of it analyzes the checked-in `.mir`
+//! fixtures.)
 
-// The matrix printers are long by nature: they exist to make a failure
-// diagnosable at a glance, and splitting them would hide the shape of the
-// report they print.
+// The matrix printers are long by nature. They make a failure diagnosable at
+// a glance, and splitting them would hide the shape of the report they print.
 #![allow(clippy::too_many_lines)]
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -358,11 +357,11 @@ fn seeded_corpus_is_clean_under_the_syntactic_layer() {
     cargo
         .current_dir(workspace_root())
         // BOTH spellings. Cargo's precedence is `CARGO_ENCODED_RUSTFLAGS` >
-        // `RUSTFLAGS` > `build.rustflags`, so in any environment that already
-        // exports the encoded form — a wrapper, a shim, some CI images — setting
-        // only `RUSTFLAGS` means the corpus builds with the *ambient* flags and
-        // `-D warnings` is silently dropped. The assertion below would then pass
-        // while proving nothing, which is the one thing this test may not do.
+        // `RUSTFLAGS` > `build.rustflags`. A wrapper, a shim or a CI image can
+        // already export the encoded form. Setting only `RUSTFLAGS` then builds
+        // the corpus with the *ambient* flags and silently drops `-D warnings`.
+        // The assertion below would then pass while proving nothing, which is
+        // the one thing this test may not do.
         // The encoded form is `\x1f`-separated, one flag per field.
         .env("RUSTFLAGS", "-D warnings")
         .env("CARGO_ENCODED_RUSTFLAGS", "-D\u{1f}warnings")
@@ -388,7 +387,7 @@ fn seeded_corpus_is_clean_under_the_syntactic_layer() {
     );
 
     // …and it must actually have built the corpus. A `cargo build` that
-    // selected nothing exits 0 too, so without this the proof is a no-op the
+    // selected nothing exits 0 too. Without this check the proof is a no-op the
     // day a package is renamed or a `-p` argument is lost.
     let built: BTreeSet<String> = String::from_utf8_lossy(&output.stdout)
         .lines()
@@ -466,7 +465,6 @@ fn expectations_cover_every_corpus_workflow_and_vice_versa() {
         );
     }
 
-    // Counts.
     let seeded = oracle
         .workflow
         .iter()
@@ -705,8 +703,8 @@ fn detection_rate_meets_the_success_metric() {
     let mut detected = 0usize;
     let mut misses = Vec::new();
     for expectation in seeded {
-        // `unknown` NEVER counts as a detection, and neither does a finding
-        // whose trace fails to name the helper it flowed through: the metric is
+        // `unknown` NEVER counts as a detection. Neither does a finding whose
+        // trace fails to name the helper it flowed through. The metric is
         // "detects with a named source→sink trace".
         let named = match verdicts.get(expectation.workflow.as_str()).copied() {
             Some(Verdict::NondeterminismFound { findings }) => {
@@ -748,15 +746,15 @@ fn detection_rate_meets_the_success_metric() {
 
 // ── Test 6: the ratchet ──────────────────────────────────────────────────────
 
-/// The floor in test 4 is a *threshold*, and a threshold has slack: at 29
+/// The floor in test 4 is a *threshold*, and a threshold has slack. At 29
 /// seeded rows, two cases can stop being detected and 27/29 = 93 % still passes.
 /// The rustc 1.94 → 1.98 `Atomic<T>` regression cost five at once and would have
 /// been caught, but nothing says the next one arrives in fives.
 ///
 /// So this test has no slack at all: every seeded row must come back
 /// `nondeterminism-found` with the trace it claims. It is the "detection
-/// ratchet" the feasibility report's C1 condition asks for, and the number it
-/// pins is not written down anywhere — it is the count of seeded rows in
+/// ratchet" the feasibility report's C1 condition asks for. The number it pins
+/// is not written down anywhere. It is the count of seeded rows in
 /// `corpus/expectations.toml`, so adding a case raises the bar automatically.
 #[test]
 fn every_seeded_case_is_detected() {

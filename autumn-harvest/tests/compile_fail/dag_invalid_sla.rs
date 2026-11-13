@@ -1,9 +1,9 @@
 use autumn_harvest::prelude::*;
 
-// A malformed sla duration string must be rejected at compile time by the
-// `#[dag]` macro (issue #743 AC10), mirroring how the `#[workflow]` macro
-// validates its own debounce/batch/throttle duration attributes rather than
-// deferring to a runtime `.expect(...)` panic.
+// The `#[dag]` macro rejects a malformed `sla` duration at compile time
+// (issue #743 AC10). The `#[workflow]` macro validates its debounce, batch
+// and throttle durations the same way. Neither defers to a runtime
+// `.expect(...)` panic.
 #[dag(sla = "three hours")]
 fn bad_sla_dag(dag: &mut DagBuilder) {
     let _ = dag;

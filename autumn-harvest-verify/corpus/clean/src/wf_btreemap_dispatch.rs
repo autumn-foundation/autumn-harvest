@@ -2,9 +2,9 @@
 //!
 //! `BTreeMap` iterates in key order, which is a total order fixed by the data,
 //! not by a per-process hash seed. Dispatching one activity per entry is
-//! deterministic. The analyzer's Order sources must be restricted to the
-//! hash-backed containers; flagging every map iteration would make the
-//! recommended fix for HVG011 look like a bug. Verdict:
+//! deterministic. The analyzer's Order sources must be only the hash-backed
+//! containers. Flagging every map iteration would make the recommended fix for
+//! HVG011 look like a bug. Verdict:
 //! `proven-deterministic`.
 
 use std::collections::BTreeMap;

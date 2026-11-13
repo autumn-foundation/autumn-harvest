@@ -22,10 +22,10 @@
 //!
 //! * TEST C (`auto_heartbeat_activity_still_reclaimed_by_start_to_close`): the
 //!   end-to-end complement to TEST B. A real activity installs
-//!   `ctx.start_auto_heartbeat_default()` and then wedges by sleeping past a
-//!   tight `start_to_close`; driven through the worker with a live scanner, it
-//!   IS reclaimed as `StartToClose` (never `Heartbeat`) and the workflow fails —
-//!   proving auto-heartbeat defeats only the heartbeat timeout, never the hard
+//!   `ctx.start_auto_heartbeat_default()`, then wedges by sleeping past a
+//!   tight `start_to_close`. Driven through the worker with a live scanner, it
+//!   IS reclaimed as `StartToClose` (never `Heartbeat`) and the workflow fails.
+//!   So auto-heartbeat defeats only the heartbeat timeout, never the hard
 //!   `start_to_close` ceiling.
 //!
 //! Execution: set `HARVEST_TEST_DATABASE_URL` to a migrated Postgres to run
@@ -307,9 +307,9 @@ fn long_auto_hb_activity(
         let _guard = ctx
             .start_auto_heartbeat_default()
             .map_err(|e| e.to_string())?;
-        // heartbeat_timeout is 6s (see ActivityInfo); auto interval is 2s, so
-        // the freshness margin is ~3s of leeway against the 6s window even on a
-        // loaded CI runner. Run for ~19s (> 3× the window).
+        // heartbeat_timeout is 6s (see ActivityInfo) and the auto interval is
+        // 2s. That leaves ~3s of leeway against the 6s window, even on a loaded
+        // CI runner. Run for ~19s (> 3× the window).
         let deadline = tokio::time::Instant::now() + Duration::from_secs(19);
         while tokio::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(150)).await;
@@ -506,9 +506,9 @@ async fn auto_heartbeat_prevents_spurious_heartbeat_reclaim() {
 // TEST B — a fresh heartbeat does not defeat start_to_close (wedge safety net).
 // ---------------------------------------------------------------------------
 
-/// Enqueue an activity task and drive it into `RUNNING` with explicit
-/// `started_at` / `last_heartbeat_at`, mirroring the state auto-heartbeat leaves
-/// behind (or, for the stale case, does not).
+/// Enqueue an activity task in `RUNNING` with explicit `started_at` and
+/// `last_heartbeat_at`. A fresh heartbeat mirrors what auto-heartbeat leaves
+/// behind. A stale one mirrors its absence.
 async fn seed_running_activity(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
@@ -559,8 +559,8 @@ async fn fresh_heartbeat_does_not_defeat_start_to_close() {
 
     let exec_id = seed_workflow(&mut conn, "wedge_wf", serde_json::json!(null)).await;
 
-    // Row 1 — FRESH heartbeat + start_to_close (started 10s ago, s2c 1s):
-    // a fresh heartbeat (what auto-heartbeat produces) must NOT shield a wedged
+    // Row 1 — FRESH heartbeat + start_to_close (started 10s ago, s2c 1s).
+    // A fresh heartbeat, as auto-heartbeat produces, must NOT shield a wedged
     // activity from the independent start_to_close ceiling. The fresh rows use
     // a 5s heartbeat timeout. It is shorter than the 10s since the start, so
     // only the heartbeat protects them. It also stays fresh on a loaded runner.
@@ -695,10 +695,9 @@ async fn auto_heartbeat_activity_still_reclaimed_by_start_to_close() {
 
     assert_eq!(execution.state, "FAILED");
 
-    // The wedge was reclaimed by StartToClose, NOT Heartbeat: the auto-heartbeat
-    // kept `last_heartbeat_at` fresh, so the ONLY thing that could reclaim it is
-    // the independent start_to_close ceiling. This is the airtight
-    // full-composition proof requested by the coordinator.
+    // The wedge was reclaimed by StartToClose, NOT Heartbeat. The auto-heartbeat
+    // kept `last_heartbeat_at` fresh, so only the independent start_to_close
+    // ceiling could reclaim it. This is the full-composition proof.
     let history = load_history(&url, exec_id).await;
     assert!(
         history.iter().any(|e| matches!(

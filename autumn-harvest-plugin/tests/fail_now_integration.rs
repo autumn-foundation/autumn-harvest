@@ -4,10 +4,10 @@
 //! `POST /workflows/{id}/activities/{activity_exec_id}/fail-now` end-to-end.
 //!
 //! Scenarios covered:
-//!   (a) Force-failing a RUNNING activity returns 202 with `forced: true` and
-//!       the distinct `error_type: "OperatorForceFailed"`, marks the task row
-//!       FAILED, appends the `ActivityFailed` event, and writes an audit row
-//!       under `OP_ACTIVITY_FAIL_NOW`.
+//!   (a) A force-fail of a RUNNING activity returns 202 with `forced: true`
+//!       and `error_type: "OperatorForceFailed"`. It marks the task row
+//!       FAILED, appends `ActivityFailed`, and writes an audit row under
+//!       `OP_ACTIVITY_FAIL_NOW`.
 //!   (b) Idempotent repeat: 202 with `forced: false, already_forced: true`
 //!       and exactly one `ActivityFailed` event in history.
 //!   (c) A PENDING (backing-off) task → 409.

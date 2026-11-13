@@ -1,11 +1,14 @@
 #![cfg(feature = "db")]
 //! In-place schedule update tests — issue #771.
 //!
-//! Verifies `scheduler::update_workflow_schedule`: partial (only-provided-
-//! fields-change) updates keyed by the schedule row id, `next_run_at`
-//! recomputation on cadence change only, pause/bookkeeping preservation,
-//! #478 exhaustion reconciliation in both directions, the #350 fire-claim
-//! anti-race gate, and validate-before-commit atomicity.
+//! Verifies `scheduler::update_workflow_schedule`:
+//!
+//! - partial (only-provided-fields-change) updates keyed by the schedule row id;
+//! - `next_run_at` recomputation on cadence change only;
+//! - pause/bookkeeping preservation;
+//! - #478 exhaustion reconciliation in both directions;
+//! - the #350 fire-claim anti-race gate;
+//! - validate-before-commit atomicity.
 
 use autumn_harvest::schema::harvest_schedules_ext;
 use autumn_harvest::table_split::SetExt;
@@ -732,15 +735,14 @@ async fn autopaused_schedule_patch_preserves_then_clears_auto_paused_at() {
     );
 }
 
-/// P1 regression (AC7 for non-cadence edits): the tick must fire from a fresh
+/// Regression (AC7 for non-cadence edits): the tick must fire from a fresh
 /// post-claim read of the row, never from its pre-claim due-list snapshot.
 ///
-/// An input/queue-only PATCH that commits between the tick's due-list SELECT
-/// and its HA claim leaves `next_run_at` unchanged, so the claim still
-/// succeeds — the fire must nevertheless dispatch the NEW input on the NEW
-/// queue. Driven deterministically by handing
-/// `claim_and_fire_workflow_schedule` a deliberately stale snapshot while the
-/// DB row already carries the edited values.
+/// An input/queue-only PATCH can commit between the tick's due-list SELECT and
+/// its HA claim. It leaves `next_run_at` unchanged, so the claim still
+/// succeeds. The fire must still dispatch the NEW input on the NEW queue.
+/// The test hands `claim_and_fire_workflow_schedule` a deliberately stale
+/// snapshot while the DB row already carries the edited values.
 #[tokio::test]
 async fn tick_fires_fresh_row_not_pre_claim_snapshot() {
     use harvest_schedules::dsl;
@@ -836,11 +838,13 @@ async fn tick_fires_fresh_row_not_pre_claim_snapshot() {
     );
 }
 
-/// P2 regression: `update_workflow_schedule`'s initial load takes the row
-/// lock (`FOR UPDATE`), so a PATCH blocks behind a concurrent transaction
-/// holding the row (a tick's claim/advance/finalize cycle) and then applies
-/// against the POST-commit row — never writing back a stale `next_run_at`
-/// (which would re-arm an already-fired slot → double fire).
+/// Regression: `update_workflow_schedule`'s initial load takes the row lock
+/// (`FOR UPDATE`).
+///
+/// A PATCH blocks behind a concurrent transaction that holds the row (a tick's
+/// claim/advance/finalize cycle). It then applies against the POST-commit row.
+/// It never writes back a stale `next_run_at`. A stale value would re-arm an
+/// already-fired slot (double fire).
 #[tokio::test]
 async fn patch_blocks_on_row_lock_and_applies_against_post_commit_row() {
     use diesel_async::SimpleAsyncConnection as _;
@@ -908,9 +912,11 @@ async fn patch_blocks_on_row_lock_and_applies_against_post_commit_row() {
     );
 }
 
-/// P2 regression: a PATCH that proceeds past an EXPIRED fire claim must fence
-/// the stale token (NULL it) so a straggler fire's token-guarded finalize
-/// matches zero rows and cannot clobber the edited row with old-spec values.
+/// Regression: a PATCH past an EXPIRED fire claim must fence (NULL) the stale
+/// token.
+///
+/// A straggler fire's token-guarded finalize then matches zero rows. It cannot
+/// clobber the edited row with old-spec values.
 #[tokio::test]
 async fn patch_on_expired_claim_fences_straggler_finalize() {
     use harvest_schedules::dsl;

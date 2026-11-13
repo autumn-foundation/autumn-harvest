@@ -7,8 +7,8 @@
 //! Postgres container:
 //!
 //! - An orphan under the threshold is re-queued with an incremented strike.
-//! - An orphan that reaches the threshold is quarantined to the DLQ, its queue
-//!   row is FAILED, its owning workflow is failed terminally, and the
+//! - An orphan that reaches the threshold is quarantined to the DLQ. Its queue
+//!   row is FAILED and its owning workflow fails terminally. The
 //!   `harvest.task.quarantined` metric is emitted.
 //! - A task whose worker is still heartbeating is never reclaimed.
 //! - A threshold of 0 disables quarantine (legacy requeue-forever behaviour).

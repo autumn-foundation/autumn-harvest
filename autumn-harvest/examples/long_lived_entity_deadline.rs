@@ -6,27 +6,26 @@
 //! An entity workflow (a subscription, a cart, a device) can run for weeks while
 //! recording only a handful of events per day. It never approaches the history
 //! event-count threshold that `should_continue_as_new()` watches — so it is
-//! never advised to checkpoint. But if it declares an `execution_timeout`
-//! (issue #243) for SLA / runaway protection, the hard timeout eventually kills
-//! it mid-flight, even though it is perfectly healthy.
+//! never advised to checkpoint. It may declare an `execution_timeout` (issue
+//! #243) for SLA / runaway protection. Then the hard timeout eventually kills it
+//! mid-flight, even though it is perfectly healthy.
 //!
 //! ## The solution
 //!
 //! `should_continue_as_new()` gains a **second, independent trigger**: it also
 //! returns `true` once the run has consumed a configurable fraction (default
 //! `0.8`) of its `execution_timeout` budget. A long-lived workflow can then
-//! checkpoint via `continue_as_new` *before* the hard deadline truncates it —
-//! carrying its state forward into a fresh run with a fresh deadline.
+//! checkpoint via `continue_as_new` *before* the hard deadline truncates it. It
+//! carries its state forward into a fresh run with a fresh deadline.
 //!
 //! Two new replay-safe, event-free accessors support this:
 //!
 //! - [`WorkflowContext::deadline`] — the **nominal** `WorkflowStarted` timestamp
 //!   + effective `execution_timeout`, or `None` when there is no timeout. Pure;
 //!   records nothing. This is replay-STABLE and **does not reflect pause
-//!   extensions** — the engine's internal `should_continue_as_new()` budget check
-//!   *does* account for a paused/resumed run's shifted deadline, but the public
-//!   accessor stays nominal so author code depending on it replays
-//!   deterministically.
+//!   extensions**. The internal `should_continue_as_new()` budget check *does*
+//!   use a paused/resumed run's shifted deadline. The public accessor stays
+//!   nominal, so author code that depends on it replays deterministically.
 //! - [`WorkflowContext::time_until_deadline`] — remaining time to the nominal
 //!   deadline, measured against the replay-safe recorded clock
 //!   ([`WorkflowContext::system_now`], issue #384), **never**
@@ -52,8 +51,8 @@
 //! ```
 //!
 //! Determinism: **no new `WorkflowEvent` variant, no migration.** The deadline
-//! is derived purely from the recorded `WorkflowStarted` timestamp; the clock
-//! read reuses the existing `SideEffectRecorded{Now}` event (issue #384), so a
+//! derives only from the recorded `WorkflowStarted` timestamp. The clock read
+//! reuses the existing `SideEffectRecorded{Now}` event (issue #384). So a
 //! history that crossed the deadline replays to the same `ContinueAsNew`
 //! command on every worker.
 //!
@@ -73,14 +72,16 @@ pub struct SubState {
     pub cycles: u32,
 }
 
-/// A long-lived subscription entity. At the top of each cycle it checks whether
-/// it should checkpoint (history size OR deadline fraction), forks a fresh run
-/// via `continue_as_new` if so, then processes one durable billing cycle.
+/// A long-lived subscription entity.
 ///
-/// `#[workflow(execution_timeout = "24h")]` gives the run a hard deadline; the
-/// deadline-aware `should_continue_as_new()` recommends a checkpoint once ~80%
-/// of that budget is consumed, so a run that would otherwise be killed by the
-/// hard timeout instead forks cleanly and carries its state forward.
+/// Each cycle first checks for a checkpoint (history size OR deadline
+/// fraction). On a checkpoint it forks a fresh run via `continue_as_new`. Then
+/// it processes one durable billing cycle.
+///
+/// `#[workflow(execution_timeout = "24h")]` gives the run a hard deadline.
+/// `should_continue_as_new()` recommends a checkpoint once ~80% of that budget
+/// is consumed. So the run forks cleanly and carries its state forward, before
+/// the hard timeout can kill it.
 #[workflow(execution_timeout = "24h")]
 async fn subscription_entity(ctx: &WorkflowContext, state: SubState) -> Result<SubState, String> {
     // Checkpoint before the hard execution_timeout (or unbounded history
@@ -117,9 +118,9 @@ fn main() {
     println!("  - no new WorkflowEvent variant, no migration");
 }
 
-// Gated on the `testing` feature as well as `test`: the example must keep
-// building under `--no-default-features`, while `autumn_harvest::testing` only
-// exists for external consumers when the `testing` feature is enabled.
+// Gated on the `testing` feature as well as `test`. The example must keep
+// building under `--no-default-features`. `autumn_harvest::testing` exists
+// for an external consumer only when the `testing` feature is on.
 #[cfg(all(test, feature = "testing"))]
 mod tests {
     use super::*;
@@ -164,9 +165,9 @@ mod tests {
         assert_eq!(next.cycles, 4, "one billing cycle was processed");
     }
 
-    /// AC4 — opt-in-safe with a deadline configured: a live run whose deadline is
-    /// far in the future still completes its cycle normally (the deadline branch
-    /// does not trip).
+    /// AC4 — opt-in-safe with a deadline configured. A live run with a deadline
+    /// far in the future completes its cycle normally. The deadline branch does
+    /// not trip.
     #[tokio::test]
     async fn entity_with_a_far_deadline_still_completes_normally() {
         let outcome = WorkflowTestEnv::new()
@@ -229,8 +230,8 @@ mod tests {
         );
     }
 
-    /// The two `should_continue_as_new` triggers compose: with no deadline the
-    /// context helper still trips on history size, and the deadline helper is a
+    /// The two `should_continue_as_new` triggers compose. With no deadline, the
+    /// context helper still trips on history size. The deadline helper is a
     /// pure, event-free read of the recorded start clock.
     #[test]
     fn deadline_helpers_are_pure_and_event_free() {

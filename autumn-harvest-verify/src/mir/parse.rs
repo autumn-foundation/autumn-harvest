@@ -1,9 +1,9 @@
 //! Parser entry point for the textual MIR that stable `rustc --emit=mir` emits.
 //!
 //! The format is not a stable API, so the parser is *tolerant by construction*
-//! (D1): it works item by item, every construct it does not understand is kept
-//! as opaque text, an item whose body will not parse is recorded in
-//! [`MirDoc::parse_failures`] and skipped, and nothing in here can panic on a
+//! (D1). It works item by item. It keeps every construct it does not understand
+//! as opaque text. It records an item whose body will not parse in
+//! [`MirDoc::parse_failures`] and skips it. Nothing in here can panic on a
 //! truncated or garbled dump.
 //!
 //! Shape of a dump (rustc 1.94.x):
@@ -19,8 +19,8 @@
 //! alloc1 (static: COUNTER, size: 8, align: 8) { .. }
 //! ```
 //!
-//! Items always start in column 0 and always end at a `}` in column 0, which
-//! is what the item scanner keys on; everything else is parsed per line.
+//! Items always start in column 0 and always end at a `}` in column 0. The item
+//! scanner keys on that. Everything else is parsed per line.
 
 use std::collections::BTreeMap;
 

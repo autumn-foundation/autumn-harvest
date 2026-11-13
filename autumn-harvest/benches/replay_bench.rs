@@ -1,10 +1,10 @@
 //! Criterion benchmark: replay throughput for large event histories.
 //!
-//! Verifies the requirement from issue #135:
+//! It verifies two requirements. Issue #135 requires:
 //! "Replaying a 10,000-event history completes in under 200ms on a
 //! laptop-class machine for a workflow whose user code is in-memory only."
 //!
-//! Also verifies the AC from issue #136:
+//! Issue #136 requires:
 //! "With telemetry disabled (the default), the call sites compile to a no-op
 //! that does not allocate or take a tracing subscriber lock."
 //!
@@ -12,19 +12,13 @@
 //!   cargo bench -p autumn-harvest --features testing --no-default-features --bench `replay_bench`
 //!
 //! The history builder lives in the shared end-to-end benchmark harness
-//! (`tests/integration/e2e_bench_support.rs`, issue #941), not here: the
-//! end-to-end suite publishes replay *throughput* over the same history this
-//! bench budgets, and a second copy of the builder would let the two quietly
-//! stop describing the same workload.
+//! (`tests/integration/e2e_bench_support.rs`, issue #941). The end-to-end suite
+//! publishes replay *throughput* over the same history that this bench budgets.
+//! One builder, moved and not copied, keeps both on byte-identical histories.
 
-// The history builder is shared with the end-to-end benchmark suite (issue
-// #941) rather than duplicated here, so the replay throughput that suite
-// publishes and the CPU budget this bench guards are measured over
-// byte-identical histories. Moving the builder — not copying it — is what makes
-// drift between the two impossible rather than merely unlikely.
 // The shared harness's `db` section reaches the percentile/redaction helpers in
-// `claim_bench_support` through the crate root, and `db` is a DEFAULT feature --
-// so this module must be declared here too, or a plain
+// `claim_bench_support` through the crate root. `db` is a DEFAULT feature, so
+// this module must be declared here too. Otherwise a plain
 // `cargo bench --bench replay_bench` fails to resolve it. It carries
 // `#![allow(dead_code)]`, so the only cost is compile time.
 #[path = "../tests/integration/claim_bench_support.rs"]

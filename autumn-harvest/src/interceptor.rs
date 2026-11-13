@@ -2,10 +2,10 @@
 //!
 //! An **activity interceptor** wraps *every* activity execution on the worker —
 //! both regular (task-queue-dispatched) and local (inline) activities — with a
-//! middleware-style continuation chain. Interceptors let an application add
-//! cross-cutting behavior (structured logging, custom metrics, header
-//! propagation, input/output shaping, fault injection in tests) *once*, at
-//! registration time, rather than editing every `#[activity]` function.
+//! middleware-style continuation chain. With interceptors, an application adds
+//! cross-cutting behavior *once*, at registration time. It does not edit every
+//! `#[activity]` function. Examples are structured logging, custom metrics,
+//! header propagation, input/output shaping, and fault injection in tests.
 //!
 //! # Chain ordering
 //!
@@ -30,18 +30,18 @@
 //!
 //! An interceptor future resolves to `Result<serde_json::Value, String>` — the
 //! *exact* `Output` type of [`ActivityHandlerFn`](crate::info::ActivityHandlerFn).
-//! Because the interceptor sits at the same fn-pointer boundary as the handler,
-//! its error rides the **same internal String channel** the handler uses, so
+//! The interceptor sits at the same fn-pointer boundary as the handler. So its
+//! error rides the **same internal String channel** that the handler uses, and
 //! everything downstream is transparent:
 //!
-//! - An `Err(String)` returned by an interceptor is treated identically to a
-//!   handler error — it flows through the normal retry / circuit-breaker /
-//!   dead-letter path with no special-casing. To emit a *typed* failure, use
+//! - An `Err(String)` from an interceptor is treated exactly like a handler
+//!   error. It flows through the normal retry / circuit-breaker / dead-letter
+//!   path with no special-casing. To emit a *typed* failure, use
 //!   [`crate::failure::ActivityFailure`]'s `retryable`/`non_retryable`
 //!   constructors and `into_error_payload()`.
 //! - A **panic** inside an interceptor (during construction or poll) is caught
-//!   by the same worker-side `catch_construct` + `catch_unwind` guard that
-//!   contains handler panics (issue #782), flattened into a retryable
+//!   by the worker-side `catch_construct` + `catch_unwind` guard. That guard
+//!   also contains handler panics (issue #782). The panic becomes a retryable
 //!   `HandlerPanic` failure. The worker process survives.
 //! - Interceptors run **after** the per-activity circuit-breaker admit gate, so
 //!   a circuit-open short-circuit correctly does **not** run interceptors
@@ -52,49 +52,49 @@
 //! Interceptors run only on the worker dispatch path. The deterministic replay
 //! engine never invokes activity handlers — it reads recorded
 //! `ActivityCompleted`/`ActivityFailed` events. For a **non-transactional**
-//! activity the value an interceptor chain returns *becomes* the recorded
-//! activity result, so replay simply reads it back; interceptors are never
-//! re-invoked during replay of a completed activity. (The one exception is a
-//! **transactional** activity, whose handler seals its own recorded outcome
-//! before the chain unwinds — see [Transactional activities](#transactional-activities)
-//! below.)
+//! activity, the value an interceptor chain returns *becomes* the recorded
+//! activity result. Replay simply reads it back. Interceptors never run again
+//! during replay of a completed activity. The one exception is a
+//! **transactional** activity. Its handler seals its own recorded outcome
+//! before the chain unwinds. See
+//! [Transactional activities](#transactional-activities) below.
 //!
-//! Transforming the `input` an interceptor passes to the handler changes only
-//! what the handler *computes*; it does **not** change the `ActivityScheduled`
-//! event, whose `input` is fixed by workflow code at schedule time and recorded
-//! before dispatch ever reaches the interceptor. An input transform therefore
-//! cannot diverge replay — the scheduled input on the record is unaffected.
+//! A transform of the `input` an interceptor passes to the handler changes only
+//! what the handler *computes*. It does **not** change the `ActivityScheduled`
+//! event. Workflow code fixes that `input` at schedule time, and it is recorded
+//! before dispatch reaches the interceptor. So an input transform cannot
+//! diverge replay; the scheduled input on the record is unaffected.
 //!
 //! # Transactional activities
 //!
 //! An interceptor **observes but cannot transform** the recorded outcome of an
 //! activity that calls [`ActivityContext::run_transactional`](crate::context::ActivityContext::run_transactional).
-//! A transactional activity atomically appends its `ActivityCompleted` event and
-//! marks its task `COMPLETED` *inside the user's transaction* — before an outer
-//! interceptor regains control from [`ActivityInterceptorNext::run`]. The sealed
-//! outcome is immutable, so a result transform (`Ok(V)` → `Ok(V′)`) or an error
-//! transform (`Ok(V)` → `Err(e)`) applied after `next.run` is **silently
-//! discarded from history**: the workflow always observes the committed value
-//! `V`. Result/error transforms therefore take effect only on **non-transactional**
-//! activities.
+//! A transactional activity atomically appends its `ActivityCompleted` event.
+//! It marks its task `COMPLETED` *inside the user's transaction*. That happens
+//! before an outer interceptor regains control from
+//! [`ActivityInterceptorNext::run`]. The sealed outcome is immutable. A result
+//! transform (`Ok(V)` → `Ok(V′)`) or an error transform (`Ok(V)` → `Err(e)`)
+//! after `next.run` is **silently discarded from history**. The workflow always
+//! observes the committed value `V`. So result/error transforms take effect
+//! only on **non-transactional** activities.
 //!
-//! For a transactional activity the engine keeps its observability consistent
-//! with the committed (sealed) outcome: metrics record the committed success and
-//! the per-activity circuit breaker is fed `Success`, ignoring any post-`next`
-//! transform — so an interceptor that maps a committed `Ok` to `Err` can never
-//! trip the breaker or record a failure that contradicts the recorded
+//! For a transactional activity, the engine keeps its observability consistent
+//! with the committed (sealed) outcome. Metrics record the committed success.
+//! The per-activity circuit breaker is fed `Success` and ignores any post-`next`
+//! transform. So an interceptor that maps a committed `Ok` to `Err` never trips
+//! the breaker. It never records a failure that contradicts the recorded
 //! `ActivityCompleted`. An interceptor may still legitimately *observe* a
-//! transactional activity (logging, metrics, input shaping before `next.run`);
-//! only its attempt to *change the outcome after* the seal is ignored, and such
-//! an attempt is surfaced with a `tracing::warn!`.
+//! transactional activity (logging, metrics, input shaping before `next.run`).
+//! Only its attempt to *change the outcome after* the seal is ignored. A
+//! `tracing::warn!` surfaces such an attempt.
 //!
 //! # Input is plaintext
 //!
 //! The `input` passed to an interceptor is the activity's already-decoded
 //! plaintext JSON. Payload codecs and large-payload offloading (issues #524,
-//! read-path decode) apply only to the `harvest_events` log; `harvest_task_queue`
-//! stores activity input in plaintext, so an interceptor observes the real input
-//! by construction — no decode step is required.
+//! read-path decode) apply only to the `harvest_events` log. `harvest_task_queue`
+//! stores activity input in plaintext. So an interceptor observes the real input
+//! by construction, with no decode step.
 //!
 //! # Local-activity timeout note
 //!
@@ -105,10 +105,10 @@
 //! Regular activities have no such inline timeout wrapping on the dispatch path.
 //!
 //! An interceptor sees the same [`ActivityContext`] capabilities the handler
-//! does. On a local activity that means no functioning heartbeat channel:
-//! `ctx.heartbeat(..)` returns a `Config` error and no checkpoint is available —
-//! this is the pre-existing local-activity contract, inherited by interceptors,
-//! not introduced by them.
+//! does. On a local activity, that means no functioning heartbeat channel.
+//! `ctx.heartbeat(..)` returns a `Config` error, and no checkpoint is
+//! available. This is the pre-existing local-activity contract. Interceptors
+//! inherit it; they do not introduce it.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -119,8 +119,8 @@ use crate::context::ActivityContext;
 /// The future an interceptor (or the terminal handler) resolves to.
 ///
 /// Mirrors the `Output` of [`ActivityHandlerFn`](crate::info::ActivityHandlerFn)
-/// exactly, so an interceptor sits at the same fn-pointer boundary as the
-/// handler and its error rides the same internal String channel.
+/// exactly. So an interceptor sits at the same fn-pointer boundary as the
+/// handler, and its error rides the same internal String channel.
 pub type ActivityInterceptorFuture<'a> =
     Pin<Box<dyn Future<Output = Result<serde_json::Value, String>> + Send + 'a>>;
 
@@ -150,7 +150,7 @@ impl<'a> ActivityInvocation<'a> {
     /// The registered activity name.
     ///
     /// Returns a borrow tied to the invocation's own lifetime (`'a`), not to
-    /// `&self`, so an interceptor may hold the name for the full invocation
+    /// `&self`. So an interceptor may hold the name for the full invocation
     /// (e.g. into the `next.run(..).await` continuation) without cloning.
     #[must_use]
     pub const fn name(&self) -> &'a str {
@@ -167,7 +167,7 @@ impl<'a> ActivityInvocation<'a> {
     /// owning workflow task's queue.
     ///
     /// Returns a borrow tied to the invocation's own lifetime (`'a`), not to
-    /// `&self`, so an interceptor may hold the queue name for the full
+    /// `&self`. So an interceptor may hold the queue name for the full
     /// invocation without cloning.
     #[must_use]
     pub const fn queue_name(&self) -> &'a str {
@@ -271,9 +271,9 @@ pub trait ActivityInterceptor: Send + Sync + 'static {
 /// Build the dispatch future for one activity execution, wrapping the terminal
 /// handler in the configured interceptor chain.
 ///
-/// When `interceptors` is empty this is a zero-overhead direct call to
-/// `terminal` (no boxing of the continuation), so a worker with no interceptors
-/// registered behaves byte-for-byte as it did before issue #680.
+/// With no `interceptors`, this is a zero-overhead direct call to `terminal`,
+/// with no boxing of the continuation. So a worker with no interceptors behaves
+/// byte-for-byte as it did before issue #680.
 #[must_use = "the future does nothing until awaited"]
 pub(crate) fn dispatch_with_interceptors<'a>(
     interceptors: &'a [Arc<dyn ActivityInterceptor>],

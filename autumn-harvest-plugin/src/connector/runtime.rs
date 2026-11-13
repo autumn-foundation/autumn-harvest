@@ -12,14 +12,13 @@
 //!
 //! # Ack ordering is structural
 //!
-//! [`EventSource::ack`] is called from exactly one place —
-//! [`ConnectorRuntime::settle`]'s `Ack` arm — and only ever for a
-//! [`MessageDisposition`] the pure decision function produced from an outcome
-//! that is already durable in Postgres. A harvest-side failure yields
-//! `Retry`, which never acks, so the broker redelivers. Killing the process
-//! between the dispatch commit and the ack is therefore safe: the redelivery
-//! dedupes on the derived idempotency key and resolves as an idempotent
-//! replay, not a duplicate run.
+//! [`EventSource::ack`] is called from exactly one place: the `Ack` arm of
+//! [`ConnectorRuntime::settle`]. It runs only for a [`MessageDisposition`]
+//! that the pure decision function produced from an outcome already durable
+//! in Postgres. A harvest-side failure yields `Retry`, which never acks, so
+//! the broker redelivers. So a kill between the dispatch commit and the ack
+//! is safe. The redelivery dedupes on the derived idempotency key and
+//! resolves as an idempotent replay, not a duplicate run.
 //!
 //! # Backpressure
 //!
@@ -53,12 +52,12 @@ use crate::api::HarvestApiState;
 pub struct ConnectorRuntimeConfig {
     /// Longest a `receive` call waits for the first message.
     ///
-    /// This is also the SQS **long-poll** window: the adapter passes it
-    /// straight through as `WaitTimeSeconds` (clamped to SQS's 20s maximum),
-    /// so a sub-second value degrades to *short polling* — an empty
-    /// `ReceiveMessage` returned immediately, billed, and retried as fast as
-    /// the network allows. The default is deliberately ≥ 1s so an idle SQS
-    /// binding costs roughly one API call per second rather than thousands.
+    /// This is also the SQS **long-poll** window. The adapter passes it
+    /// through as `WaitTimeSeconds`, clamped to the SQS maximum of 20s. A
+    /// sub-second value degrades to *short polling*: an empty `ReceiveMessage`
+    /// returns at once, is billed, and is retried as fast as the network
+    /// allows. The default is ≥ 1s, so an idle SQS binding costs about one API
+    /// call per second, not thousands.
     pub poll_timeout: std::time::Duration,
     /// Most messages pulled per `receive` call.
     pub max_batch: usize,
@@ -73,10 +72,10 @@ pub struct ConnectorRuntimeConfig {
     pub idle_backoff: std::time::Duration,
     /// Shortest interval between consumer-lag samples.
     ///
-    /// Lag is a per-call broker query (SQS bills a `GetQueueAttributes`;
-    /// Kafka does a `fetch_watermarks` round-trip), so sampling it on *every*
-    /// pass doubles the connector's idle call rate for a gauge that only
-    /// needs to move on a scrape cadence.
+    /// Lag is a broker query per call: SQS bills a `GetQueueAttributes`, and
+    /// Kafka does a `fetch_watermarks` round-trip. A sample on *every* pass
+    /// doubles the idle call rate of the connector. The gauge only needs to
+    /// move on a scrape cadence.
     pub lag_sample_interval: std::time::Duration,
     /// Fail the pass when a partition is holding this many completed offsets
     /// behind a prefix head that has not settled.
@@ -85,115 +84,110 @@ pub struct ConnectorRuntimeConfig {
     /// `max_in_flight`; `Some(0)` disables **this heuristic**; `Some(n)` sets
     /// it explicitly. See [`effective_stall_threshold`].
     ///
-    /// This is the *backstop* half of stall detection — a head blocked without
-    /// having gone through the retry path (a dispatch task lost to a panic).
-    /// A head the runtime knows it retried is reported immediately and is not
-    /// governed by this knob, because a volume bound cannot see a retry at the
-    /// tail of a quiet partition: nothing ever settles behind it.
+    /// This is the *backstop* half of stall detection. It catches a head that
+    /// is blocked without a pass through the retry path, such as a dispatch
+    /// task lost to a panic. A head the runtime knows it retried is reported
+    /// immediately, and this knob does not govern it. A volume bound cannot
+    /// see a retry at the tail of a quiet partition: nothing settles behind it.
     ///
     /// Both detect a **permanently blocked prefix**. On a positionally-ordered
     /// broker the commit mark can only advance over a contiguous completed
-    /// prefix, so a message that is retried rather than settled blocks its
+    /// prefix. So a message that is retried rather than settled blocks its
     /// partition. On Kafka that block is permanent by construction: `abandon`
-    /// is a no-op (not committing is not a nack), so nothing hands the message
-    /// back until the consumer is recreated and re-reads from the last commit.
-    /// Every later message keeps settling, so without this the stall is
-    /// **silent** — the partition simply stops committing while the connector
-    /// otherwise looks healthy.
+    /// is a no-op, because not committing is not a nack. Nothing hands the
+    /// message back until the consumer is recreated and re-reads from the last
+    /// commit. Every later message keeps settling, so without this the stall
+    /// is **silent**. The partition stops committing while the connector looks
+    /// healthy.
     ///
-    /// Failing the pass is the fix because the runtime's response *is* the
-    /// retry: `run` rebuilds the source, which re-reads from the last commit
-    /// and redelivers the blocked message.
+    /// Failing the pass is the fix, because the response of the runtime *is*
+    /// the retry. `run` rebuilds the source, which re-reads from the last
+    /// commit and redelivers the blocked message.
     ///
-    /// It is on by default because a stall that nobody configured a detector
-    /// for is exactly the one that goes unnoticed. Set `Some(0)` to opt out.
+    /// It is on by default, because a stall with no configured detector is
+    /// exactly the one that goes unnoticed. Set `Some(0)` to opt out.
     pub stall_threshold: Option<usize>,
     /// How long a broker-native dead-lettered message's strike history is kept
     /// after its last delivery.
     ///
     /// [`MessageDisposition::AbandonToBrokerDeadLetter`] is terminal for
-    /// harvest but not for the broker: SQS resets visibility, redelivers, and
-    /// eventually moves the message to its own DLQ — **without notifying this
+    /// harvest but not for the broker. SQS resets visibility, redelivers, and
+    /// eventually moves the message to its own DLQ, **without notifying this
     /// process**. So no later delivery and no terminal path can ever clear the
-    /// key, and the queue's redrive policy bounds *deliveries of one message*,
-    /// not the size of the in-process tracker across a stream of distinct
+    /// key. The redrive policy of the queue bounds *deliveries of one message*.
+    /// It does not bound the in-process tracker across a stream of distinct
     /// poison messages.
     ///
-    /// The window therefore has to be long enough for the broker's own redrive
-    /// to finish — roughly `visibility_timeout × (maxReceiveCount −
-    /// poison_threshold)` — because expiring mid-redrive restarts the strike
-    /// countdown, which is the churn keeping the strikes avoids. Expiring
-    /// *late* costs only memory, so the default is deliberately generous.
-    /// [`MAX_POISON_ENTRIES`] is the hard backstop.
+    /// So the window must be long enough for the broker redrive to finish:
+    /// roughly `visibility_timeout × (maxReceiveCount − poison_threshold)`.
+    /// Expiry mid-redrive restarts the strike countdown, which is the churn
+    /// that keeping the strikes avoids. Late expiry costs only memory, so the
+    /// default is generous. [`MAX_POISON_ENTRIES`] is the hard backstop.
     pub poison_retention: std::time::Duration,
     /// Longest the shutdown drain waits for in-flight dispatches to settle.
     ///
-    /// Cancelling `run` drops the in-flight pass, which **detaches** its
-    /// spawned dispatches — dropping a `JoinHandle` does not abort the task —
-    /// so each keeps its permit until it finishes on its own. One wedged in a
-    /// database call, a broker ack or a custom sink would otherwise hold the
-    /// drain forever, and `stop_harvest_runtime` awaits every connector
-    /// *before* it stops the runner, so that is a permanently hung shutdown
-    /// rather than a slow one.
+    /// Cancelling `run` drops the in-flight pass. That **detaches** its spawned
+    /// dispatches, because a dropped `JoinHandle` does not abort the task. So
+    /// each keeps its permit until it finishes on its own. A dispatch wedged in
+    /// a database call, a broker ack or a custom sink would hold the drain
+    /// forever. `stop_harvest_runtime` awaits every connector *before* it stops
+    /// the runner, so that is a permanently hung shutdown, not a slow one.
     ///
-    /// Bounding it is safe because the drain is an **optimisation, not an
-    /// invariant**: it exists so a dispatch that already committed also gets
-    /// acked, sparing a redelivery. Giving up early costs exactly that
-    /// redelivery, which at-least-once already permits and the idempotency key
-    /// already dedupes. Mirrors the engine's own `WorkerConfig::shutdown_timeout`.
+    /// The bound is safe because the drain is an **optimisation, not an
+    /// invariant**. It exists so that a dispatch that already committed also
+    /// gets acked, which spares a redelivery. Giving up early costs exactly
+    /// that redelivery. At-least-once already permits it, and the idempotency
+    /// key dedupes it. Mirrors the engine's own `WorkerConfig::shutdown_timeout`.
     pub shutdown_timeout: std::time::Duration,
 }
 
-/// Never derive a bound below this, so a binding with tiny `max_in_flight`
-/// does not fail its pass the moment a couple of messages settle out of order.
+/// The derived bound never falls below this, so a tiny `max_in_flight` does
+/// not fail its pass on a few out-of-order settlements.
 pub const MIN_DERIVED_STALL_THRESHOLD: usize = 32;
 
 /// The longest an [`EventSource::lag`] implementation may take to abort its
-/// own sample — and so the floor under the runtime's budget for one.
+/// own sample, and so the floor under the runtime budget for one.
 ///
-/// This is a **contract**, not merely a default. The runtime's `timeout` around
-/// `lag()` drops its own future; it cannot stop the adapter's work, and for a
-/// Kafka walk it definitively cannot — that runs on `spawn_blocking`, and a
-/// blocking task is never cancelled. Only the adapter's own internal bound
-/// stops it.
+/// This is a **contract**, not merely a default. The runtime `timeout` around
+/// `lag()` drops its own future, but it cannot stop the work of the adapter.
+/// A Kafka walk runs on `spawn_blocking`, and a blocking task is never
+/// cancelled. Only the internal bound of the adapter stops it.
 ///
-/// So the two have to agree: an adapter bounds its walk at or below this, the
-/// runtime never gives up sooner, and an abandoned sample is therefore always
-/// finished before the next one is armed. Without the floor a cadence shorter
-/// than the adapter's bound lets abandoned walks accumulate — one blocking
-/// thread and one round of broker traffic each, against the very broker whose
+/// So the two must agree. An adapter bounds its walk at or below this, and the
+/// runtime never gives up sooner. So an abandoned sample always finishes
+/// before the next one is armed. Without the floor, a cadence shorter than the
+/// adapter bound lets abandoned walks accumulate. Each costs one blocking
+/// thread and one round of broker traffic, against the very broker whose
 /// slowness caused the timeout.
 pub const ADAPTER_LAG_SAMPLE_CEILING: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// How long a hard-stopped dispatch may spend handing its message back.
 ///
-/// Short on purpose. By the time this runs the shutdown drain has already
-/// waited its full deadline, so the broker this call talks to is quite possibly
-/// the one that caused the timeout. Losing custody of one message costs a
-/// stranded record until the adapter's own lease expires; blocking here costs
-/// the shutdown the deadline was there to bound.
+/// Short on purpose. By the time this runs, the shutdown drain has waited its
+/// full deadline, so this broker is quite possibly the cause of the timeout.
+/// Losing custody of one message strands a record until the adapter lease
+/// expires. Blocking here costs the shutdown that the deadline bounds.
 const HARD_STOP_ABANDON_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// How long the drain waits for the dispatches it hard-stopped to finish
 /// handing their messages back.
 ///
-/// Each straggler's recovery is itself bounded by
-/// [`HARD_STOP_ABANDON_BUDGET`] and they run concurrently, so this is that
-/// bound plus slack for the runtime to actually schedule them under the load
-/// that caused the timeout. Defined *as* that constant rather than merely
-/// sized against it, so lengthening the per-message budget cannot silently
-/// outrun the wait that joins it.
+/// The recovery of each straggler is bounded by [`HARD_STOP_ABANDON_BUDGET`],
+/// and they run concurrently. So this is that bound plus slack to schedule
+/// them under the load that caused the timeout. It is defined *as* that
+/// constant, not sized against it. So a longer per-message budget cannot
+/// silently outrun the wait that joins it.
 const HARD_STOP_CLEANUP_BUDGET: std::time::Duration =
     HARD_STOP_ABANDON_BUDGET.saturating_add(std::time::Duration::from_secs(1));
 
 /// How many held offsets count as a stall, given the configured knob and the
 /// binding's concurrency.
 ///
-/// The derived bound is a multiple of `max_in_flight` because that is exactly
-/// what bounds *healthy* out-of-order settlement: only that many messages are
-/// ever outstanding, so a held depth well past it means the head is not
-/// settling at all rather than settling late. Explicit configuration always
-/// wins, and `Some(0)` disables the check.
+/// The derived bound is a multiple of `max_in_flight`, because that bounds
+/// *healthy* out-of-order settlement. Only that many messages are ever
+/// outstanding. So a held depth well past it means the head is not settling
+/// at all, not settling late. Explicit configuration always wins, and
+/// `Some(0)` disables the check.
 #[must_use]
 pub const fn effective_stall_threshold(configured: Option<usize>, max_in_flight: usize) -> usize {
     if let Some(explicit) = configured {
@@ -239,10 +233,9 @@ impl Default for ConnectorRuntimeConfig {
 
 /// Drives one event source against one binding.
 ///
-/// **Single-use.** A runtime that has hard-stopped is spent: [`Self::run`]
-/// refuses to start again and returns immediately (see the guard there for
-/// why the flag cannot simply be reset). Build a fresh `ConnectorRuntime` to
-/// resume consuming.
+/// **Single-use.** A runtime that has hard-stopped is spent. [`Self::run`]
+/// refuses to start again and returns at once. The guard there says why the
+/// flag cannot be reset. Build a fresh `ConnectorRuntime` to resume consuming.
 pub struct ConnectorRuntime {
     binding: Arc<SourceBinding>,
     source: Arc<dyn EventSource>,
@@ -260,28 +253,27 @@ pub struct ConnectorRuntime {
     /// Cancelled only when the shutdown drain gives up, to stop a dispatch
     /// that outlived its deadline.
     ///
-    /// Cancelling `run` detaches the in-flight dispatches rather than aborting
-    /// them, and this process may outlive harvest (an embedder stopping the
-    /// runtime while its web app keeps serving), so "detached and wedged"
-    /// means leaked, not merely late. Each spawned dispatch selects on this,
-    /// so it unwinds at its next await point — the same effect
-    /// `JoinHandle::abort` would have, without threading handles back out of
-    /// the pass.
+    /// Cancelling `run` detaches the in-flight dispatches but does not abort
+    /// them. This process may outlive harvest, as when an embedder stops the
+    /// runtime while its web app keeps serving. So "detached and wedged" means
+    /// leaked, not merely late. Each spawned dispatch selects on this, so it
+    /// unwinds at its next await point. That has the effect of
+    /// `JoinHandle::abort` without threading handles back out of the pass.
     ///
-    /// Deliberately NOT the binding's own cancellation token: that fires at
+    /// Deliberately NOT the binding's own cancellation token. That fires at
     /// the *start* of shutdown, which would abandon every in-flight dispatch
-    /// immediately and turn every clean stop into needless redelivery. This
-    /// fires only after the drain has already waited its full deadline.
+    /// at once and turn every clean stop into needless redelivery. This fires
+    /// only after the drain has waited its full deadline.
     hard_stop: Arc<CancellationToken>,
 }
 
 /// What a stall-recovery attempt achieved.
 ///
-/// The distinction between the two failure arms is load-bearing: only
+/// The two failure arms differ in a load-bearing way. Only
 /// [`Self::Unsupported`] justifies stopping an unsupervised binding for the
-/// life of the process, because it is a property of the *source type* rather
-/// than of the moment. A [`Self::Failed`] rebuild is retryable — and usually
-/// caused by the very outage that produced the stall.
+/// life of the process. It is a property of the *source type*, not of the
+/// moment. A [`Self::Failed`] rebuild is retryable, and the outage that
+/// produced the stall usually causes it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StallRecovery {
     /// The consumer was rebuilt; the blocked message will be redelivered.
@@ -309,19 +301,19 @@ pub struct PassSummary {
 
 /// What settling a message actually did to the broker.
 ///
-/// Carries more than the disposition because the harvest-sink dead-letter path
-/// learns something the disposition cannot express: whether the sink already
+/// Carries more than the disposition. The harvest-sink dead-letter path
+/// learns a fact the disposition cannot express: whether the sink already
 /// held a record for this idempotency key. That is the *durable* half of the
-/// poison dedupe — the in-process tracker only answers it within one process,
-/// and a restart between the sink write and the ack is exactly when the
+/// poison dedupe. The in-process tracker answers it only within one process.
+/// A restart between the sink write and the ack is exactly when the
 /// redelivery happens.
 #[derive(Debug)]
 struct Settlement {
     /// What actually happened, which may be a downgrade of what was decided.
     disposition: MessageDisposition,
-    /// The sink's verdict, on the one path that has one: `None` for every
-    /// disposition that never reaches a sink (including a dead-letter whose
-    /// write *failed*, which is downgraded to a retry and recorded nothing).
+    /// The sink verdict, on the one path that has one. `None` for every
+    /// disposition that never reaches a sink. That includes a dead-letter whose
+    /// write *failed*, which is downgraded to a retry and recorded nothing.
     dead_letter: Option<DeadLetterOutcome>,
 }
 
@@ -342,7 +334,7 @@ impl ConnectorRuntime {
     ///
     /// If `binding` asks for [`DeadLetterMode::BrokerNative`] but `source`
     /// reports no broker-native dead-letter destination
-    /// ([`EventSource::has_native_dead_letter`]) — that pairing quarantines
+    /// ([`EventSource::has_native_dead_letter`]). That pairing quarantines
     /// nothing and re-reads the poison message forever. See
     /// [`broker_native_dead_letter_is_supported`](super::broker_native_dead_letter_is_supported).
     #[must_use]
@@ -353,13 +345,13 @@ impl ConnectorRuntime {
         metrics: Arc<dyn MetricsRecorder>,
         idempotency_mode: IdempotencyMode,
     ) -> Self {
-        // Same rule the plugin enforces at build time, applied here because
-        // this constructor is exported: an embedder driving the runtime
-        // directly would otherwise reach `AbandonToBrokerDeadLetter`, whose
-        // nack is a no-op on such an adapter, and report a terminal
+        // The plugin enforces the same rule at build time. It applies here
+        // too, because this constructor is exported. An embedder that drives
+        // the runtime directly would otherwise reach `AbandonToBrokerDeadLetter`.
+        // Its nack is a no-op on such an adapter. So it reports a terminal
         // disposition for a message that reached no dead-letter destination
-        // and is not handed back in-session. Panicking matches the plugin's
-        // posture -- this is a wiring mistake, not a runtime condition.
+        // and is not handed back in-session. The panic matches the plugin:
+        // this is a wiring mistake, not a runtime condition.
         assert!(
             super::broker_native_dead_letter_is_supported(
                 binding.dead_letter_mode,
@@ -441,16 +433,16 @@ impl ConnectorRuntime {
     /// Tell the operator, once at startup, when this deployment narrows the
     /// `BrokerCoordinates` dedupe promise.
     ///
-    /// The claim `BrokerCoordinates` writes is shard-local while the dispatch
-    /// is routed by the explicit `workflow_id` (issue #808), so on a
-    /// multi-shard deployment a mapper whose id drifts across a redelivery
-    /// lands on a different shard and double-starts. A warning rather than a
-    /// hard failure: a deterministic mapper — the common case, and what every
-    /// example ships — is perfectly safe, so refusing to start would break
-    /// working deployments to guard against a mapper bug.
+    /// The claim that `BrokerCoordinates` writes is shard-local, but the
+    /// dispatch routes by the explicit `workflow_id` (issue #808). So on a
+    /// multi-shard deployment, a mapper whose id drifts across a redelivery
+    /// lands on a different shard and double-starts. This is a warning, not a
+    /// hard failure. A deterministic mapper is safe, and it is the common case
+    /// and what every example ships. A refusal to start would break working
+    /// deployments to guard against a mapper bug.
     ///
-    /// Silent when the runtime is not installed yet: this is advisory, and the
-    /// dispatch path already fails loudly on its own if storage is missing.
+    /// Silent when the runtime is not installed yet. This is advisory, and the
+    /// dispatch path already fails loudly if storage is missing.
     fn warn_if_coordinate_dedupe_is_shard_local_only(&self) {
         let Ok(runtime) = self.api_state.runtime() else {
             return;
@@ -476,14 +468,14 @@ impl ConnectorRuntime {
     /// Consume until `cancel` fires or the source closes.
     pub async fn run(&self, cancel: CancellationToken) {
         let source_name = self.binding.name;
-        // A runtime is single-use, and `hard_stop` is what records that it has
-        // been spent. It is never reset — it is an `Arc` shared with every
-        // dispatch already handed out, so clearing it would un-cancel
-        // stragglers still unwinding. Running on top of a fired one would
-        // consume messages and hand every single one straight back at its
-        // first await point: a hot receive-and-abandon loop that presents as a
-        // healthy consumer while making no progress, and spends a billed API's
-        // request budget doing it. Build a fresh runtime instead.
+        // A runtime is single-use, and `hard_stop` records that it is spent.
+        // It is never reset. It is an `Arc` shared with every dispatch already
+        // handed out, so a reset would un-cancel stragglers still unwinding.
+        // A run on top of a fired token would consume messages and hand each
+        // one straight back at its first await point. That is a hot
+        // receive-and-abandon loop that looks like a healthy consumer, makes
+        // no progress, and spends the request budget of a billed API. Build a
+        // fresh runtime instead.
         if self.hard_stop.is_cancelled() {
             tracing::error!(
                 source = source_name,
@@ -509,10 +501,9 @@ impl ConnectorRuntime {
                 () = cancel.cancelled() => break,
                 result = self.run_once() => match result {
                     Ok(summary) if summary.received == 0 => {
-                        // An adapter whose `receive` returns immediately when
-                        // idle would otherwise spin this loop (and, for a
-                        // billed API like SQS, the operator's invoice) as fast
-                        // as the network allows.
+                        // An adapter whose `receive` returns at once when idle
+                        // would spin this loop as fast as the network allows.
+                        // For a billed API like SQS, it spins the invoice too.
                         tokio::select! {
                             () = cancel.cancelled() => break,
                             () = tokio::time::sleep(self.config.idle_backoff) => {}
@@ -523,32 +514,31 @@ impl ConnectorRuntime {
                         tracing::info!(source = source_name, "connector source closed");
                         break;
                     }
-                    // A wedged consumer is not a transient error: re-polling
-                    // the same one accomplishes nothing, which is why this
-                    // cannot fall into the backoff arm below. Rebuild it so
-                    // the blocked message is actually redelivered; if the
-                    // source cannot rebuild itself there is no in-process
-                    // recovery, so stop rather than spin forever pretending to
-                    // retry.
+                    // A wedged consumer is not a transient error. Re-polling
+                    // the same one achieves nothing, so this cannot fall into
+                    // the backoff arm below. Rebuild it so the blocked message
+                    // is redelivered. If the source cannot rebuild itself,
+                    // there is no in-process recovery. So stop rather than
+                    // spin forever and pretend to retry.
                     Err(ConnectorError::Stalled { partition, .. }) => {
-                        // Only `Unsupported` stops the binding: it is a
-                        // property of the source TYPE, so retrying can never
+                        // Only `Unsupported` stops the binding. It is a
+                        // property of the source TYPE, so a retry can never
                         // change the answer. A `Failed` rebuild is the
-                        // opposite -- typically the same downstream outage
-                        // that caused the stall -- so it falls through to the
-                        // shared backoff below and is retried on the next
-                        // pass, which is what lets consumption resume once the
-                        // broker comes back.
-                        // Recovery must race cancellation, not merely be
-                        // *reached* from a `select!` that already resolved: a
-                        // rebuild is a network operation against the same
-                        // broker whose outage usually caused the stall, so it
-                        // can block indefinitely. Awaiting it bare would park
-                        // `run` *before* it reaches the bounded
-                        // `drain_in_flight` below, outside the reach of the
-                        // very deadline that exists to guarantee shutdown
-                        // terminates -- and `stop_harvest_runtime` awaits this
-                        // handle with none of its own.
+                        // opposite: the same downstream outage that caused the
+                        // stall typically causes it. So it falls through to
+                        // the shared backoff below and is retried on the next
+                        // pass. That lets consumption resume once the broker
+                        // comes back.
+                        // Recovery must race cancellation. It is not enough to
+                        // *reach* it from a `select!` that already resolved. A
+                        // rebuild is a network operation against the broker
+                        // whose outage usually caused the stall, so it can
+                        // block indefinitely. A bare await would park `run`
+                        // *before* it reaches the bounded `drain_in_flight`
+                        // below. That is outside the reach of the deadline
+                        // that guarantees shutdown terminates.
+                        // `stop_harvest_runtime` awaits this handle with no
+                        // deadline of its own.
                         let recovery = tokio::select! {
                             () = cancel.cancelled() => break,
                             recovery = self.recover_from_stall(partition) => recovery,
@@ -563,17 +553,17 @@ impl ConnectorRuntime {
                             );
                             break;
                         }
-                        // Rebuilding a Kafka consumer is not a free local
-                        // operation: it triggers a GROUP rebalance, revoking
-                        // and reassigning partitions across every consumer in
-                        // the group. The cause of a stall is usually a
+                        // A Kafka consumer rebuild is not a free local
+                        // operation. It triggers a GROUP rebalance, which
+                        // revokes and reassigns partitions across every
+                        // consumer in the group. A stall usually comes from a
                         // downstream outage (Postgres, an admission gate), so
-                        // the redelivered head fails again immediately —
-                        // without this pause the loop would rebuild as fast as
-                        // the group can rejoin, amplifying one binding's
-                        // outage into a rebalance storm across unrelated
-                        // partitions. Same knob as the transient-error arm
-                        // below, for the same reason.
+                        // the redelivered head fails again at once. Without
+                        // this pause, the loop would rebuild as fast as the
+                        // group can rejoin. That amplifies the outage of one
+                        // binding into a rebalance storm across unrelated
+                        // partitions. The transient-error arm below uses the
+                        // same knob for the same reason.
                         tokio::select! {
                             () = cancel.cancelled() => break,
                             () = tokio::time::sleep(self.config.error_backoff) => {}
@@ -594,25 +584,25 @@ impl ConnectorRuntime {
         tracing::info!(source = source_name, "harvest connector stopped");
     }
 
-    /// Wait — for a bounded time — for in-flight dispatches to settle.
+    /// Wait, for a bounded time, for in-flight dispatches to settle.
     ///
-    /// Cancelling `run` drops the in-flight pass, which **detaches** its
-    /// spawned dispatches (dropping a `JoinHandle` does not abort the task),
-    /// so each holds its permit until it finishes on its own. Draining is what
-    /// lets a dispatch that already committed also get acked, sparing the
+    /// Cancelling `run` drops the in-flight pass. That **detaches** its spawned
+    /// dispatches, because a dropped `JoinHandle` does not abort the task. So
+    /// each holds its permit until it finishes on its own. The drain lets a
+    /// dispatch that already committed also get acked, which spares the
     /// broker a redelivery.
     ///
-    /// That is an optimisation, not an invariant, which is exactly why it may
-    /// be abandoned: the contract is at-least-once, so an unacked message is
-    /// redelivered and deduped by its idempotency key. An **unbounded** wait
-    /// is not the safe choice — `stop_harvest_runtime` awaits every connector
-    /// before it stops the runner, so one dispatch wedged in a database call,
-    /// a broker ack or a custom sink hangs the whole application's shutdown,
-    /// beyond the reach of the engine's own `shutdown_timeout`.
+    /// That is an optimisation, not an invariant, so it may be abandoned. The
+    /// contract is at-least-once: an unacked message is redelivered and
+    /// deduped by its idempotency key. An **unbounded** wait is not the safe
+    /// choice. `stop_harvest_runtime` awaits every connector before it stops
+    /// the runner. So one dispatch wedged in a database call, a broker ack or a
+    /// custom sink hangs the shutdown of the whole application. The engine's
+    /// own `shutdown_timeout` cannot reach it.
     ///
-    /// On timeout the stragglers are hard-stopped rather than left detached:
-    /// this process may outlive harvest, and a task that will never return is
-    /// a leak, not a straggler.
+    /// On timeout the stragglers are hard-stopped, not left detached. This
+    /// process may outlive harvest, and a task that never returns is a leak,
+    /// not a straggler.
     async fn drain_in_flight(&self) {
         let permits = u32::try_from(self.binding.max_in_flight.max(1)).unwrap_or(u32::MAX);
         if tokio::time::timeout(
@@ -640,14 +630,14 @@ impl ConnectorRuntime {
 
             // Cancelling only *wakes* the stragglers. The recovery that hands
             // each message back runs inside a task this shutdown has already
-            // detached, so returning now would let `stop_harvest_runtime` see
-            // this connector as finished and the process exit before any
-            // `abandon` reaches the broker — trading a leaked task for a
-            // leaked message, which is what the hard stop exists to prevent.
+            // detached. A return now would let `stop_harvest_runtime` see this
+            // connector as finished, and the process could exit before any
+            // `abandon` reaches the broker. That trades a leaked task for a
+            // leaked message, which the hard stop exists to prevent.
             //
             // Re-acquiring joins exactly that cleanup: a straggler releases
-            // its permit only after its recovery returns. Bounded for the
-            // same reason the drain above is — a hard stop already means
+            // its permit only after its recovery returns. It is bounded for the
+            // same reason as the drain above. A hard stop already means
             // something is wedged, and the process must still be able to exit.
             if tokio::time::timeout(HARD_STOP_CLEANUP_BUDGET, self.permits.acquire_many(permits))
                 .await
@@ -670,44 +660,45 @@ impl ConnectorRuntime {
     /// the source will yield nothing further.
     pub async fn run_once(&self) -> Result<PassSummary, ConnectorError> {
         // Checked BEFORE receiving, for two reasons. A stalled partition often
-        // goes quiet (its head is blocked and the producer moves on), so a
-        // check that only ran when messages arrived would never report the
-        // stalls that matter most. And pulling a batch we are about to drop on
-        // the stall error is pure churn — on a positional broker it also
+        // goes quiet, because its head is blocked and the producer moves on.
+        // A check that ran only when messages arrived would never report the
+        // stalls that matter most. And a batch pulled only to be dropped on
+        // the stall error is pure churn. On a positional broker it also
         // advances the consumer past messages that were never dispatched.
         self.check_commit_stall().await?;
 
         // Retire broker-native terminal strikes whose redrive window has
-        // elapsed. Here rather than only at the mark, so a binding that
-        // dead-letters a burst and then goes quiet still releases them: `run`
-        // calls this every pass regardless of whether messages arrive. O(number
-        // expired), so a pass with nothing to retire costs one front peek.
+        // elapsed. This runs here, not only at the mark, so a binding that
+        // dead-letters a burst and then goes quiet still releases them. `run`
+        // calls this on every pass, with or without messages. The cost is
+        // O(number expired), so a pass with nothing to retire costs one front
+        // peek.
         self.poison
             .lock()
             .await
             .expire_stale_as_of(std::time::Instant::now(), self.config.poison_retention);
 
         // Sampled BEFORE receiving, so no message is ever in custody while this
-        // runs. `lag()` is a live broker round-trip -- SQS bills a
-        // `GetQueueAttributes`, Kafka does a metadata + watermark fetch -- and
-        // either can be slow or retry internally. On SQS the visibility timer
-        // starts at `ReceiveMessage`, not at dispatch, so sampling with a batch
-        // already in hand spends that batch's visibility budget: another
-        // replica receives the messages, their `ApproximateReceiveCount` climbs
-        // toward the queue's `maxReceiveCount`, and a perfectly processable
-        // message reaches the broker DLQ having never once failed. The gauge is
-        // throttled to a scrape cadence anyway, so which side of the receive it
-        // lands on is immaterial to its accuracy.
+        // runs. `lag()` is a live broker round-trip: SQS bills a
+        // `GetQueueAttributes`, and Kafka does a metadata and watermark fetch.
+        // Either can be slow or retry internally. On SQS the visibility timer
+        // starts at `ReceiveMessage`, not at dispatch. So a sample with a batch
+        // in hand spends the visibility budget of that batch. Another replica
+        // receives the messages, and their `ApproximateReceiveCount` climbs
+        // toward the `maxReceiveCount` of the queue. A processable message then
+        // reaches the broker DLQ without one failure. The gauge is throttled
+        // to a scrape cadence anyway, so the side of the receive it lands on
+        // does not affect its accuracy.
         //
-        // The sample is BUDGETED, because being on this side of the receive is
-        // what makes an unbounded one lethal: it blocks the pass outright, so
-        // the connector stops consuming entirely while it waits. That is worst
-        // exactly when it matters most — a degraded broker makes the round-trip
-        // slow AND makes the backlog grow, so the gauge you are paying for
-        // reports a number you cannot act on because the connector is too busy
-        // measuring it to consume. An over-budget sample is abandoned; the
-        // gauge simply does not update, which is the same honest failure mode
-        // the adapters already use when a partial answer is unavailable.
+        // The sample is BUDGETED, because on this side of the receive an
+        // unbounded one is lethal. It blocks the pass, so the connector stops
+        // consuming while it waits. That is worst exactly when it matters
+        // most. A degraded broker makes the round-trip slow AND grows the
+        // backlog. The paid-for gauge then reports a number nobody can act on,
+        // because the connector is too busy measuring it to consume. An
+        // over-budget sample is abandoned, and the gauge does not update. The
+        // adapters use the same honest failure mode when a partial answer is
+        // unavailable.
         if self.lag_sample_is_due() {
             match tokio::time::timeout(self.lag_sample_budget(), self.source.lag()).await {
                 Ok(Some(lag)) => self.metrics.record_connector_lag(self.binding.name, lag),
@@ -745,10 +736,10 @@ impl ConnectorRuntime {
         let mut handles = Vec::with_capacity(batch.len());
         for message in batch {
             self.metrics.record_connector_received(self.binding.name);
-            // Kept alongside the join handle: a panicked task never reaches
-            // `settle`, so the join arm below has to do the recovery marking
-            // and the abandon itself — and `message` is moved into the
-            // spawned task, so the handle has to be cloned out first.
+            // Kept beside the join handle. A panicked task never reaches
+            // `settle`, so the join arm below must do the recovery marking and
+            // the abandon itself. `message` moves into the spawned task, so
+            // the handle is cloned out first.
             let handle = message.handle.clone();
             let positional = match (message.handle.partition, message.handle.position) {
                 (Some(partition), Some(position)) => {
@@ -772,23 +763,22 @@ impl ConnectorRuntime {
                 positional,
                 tokio::spawn(async move {
                     // `hard_stop` fires only after the shutdown drain has
-                    // already waited its full deadline for this dispatch. It
-                    // gives up on the message rather than the process: no
-                    // settle runs, so it stays unacked and the broker
-                    // redelivers it — at-least-once, deduped by the
-                    // idempotency key. The alternative is a detached task
-                    // wedged forever in a process that outlives harvest.
+                    // waited its full deadline for this dispatch. It gives up
+                    // on the message, not the process. No settle runs, so the
+                    // message stays unacked and the broker redelivers it:
+                    // at-least-once, deduped by the idempotency key. The
+                    // alternative is a detached task wedged forever in a
+                    // process that outlives harvest.
                     let disposition = tokio::select! {
                         d = this.process(message) => d,
                         () = this.hard_stop.cancelled() => {
-                            // Cutting `process` short skipped `settle`, which
-                            // is the only thing that releases the adapter's
-                            // custody — so the same recovery the panic arm
-                            // performs is owed here, and for the same reason
-                            // it has to happen INSIDE this task: the returned
-                            // disposition goes to a join loop that a real
-                            // shutdown has already dropped along with
-                            // `run_once`.
+                            // Cutting `process` short skipped `settle`, and
+                            // only `settle` releases the custody of the
+                            // adapter. So this owes the same recovery as the
+                            // panic arm. For the same reason, it must run
+                            // INSIDE this task. The returned disposition goes
+                            // to a join loop that a real shutdown has already
+                            // dropped along with `run_once`.
                             this.release_custody_after_hard_stop(&abandon_handle, positional).await;
                             MessageDisposition::Retry
                         }
@@ -811,13 +801,13 @@ impl ConnectorRuntime {
                     // A panicking dispatch task must not ack: leaving the
                     // message unacknowledged is the safe direction.
                     //
-                    // A panic in the *mapping function* — the message-
-                    // attributable, deterministic case — is already contained
-                    // in `map_and_dispatch` and quarantined as `Malformed`, so
-                    // it never reaches here. What is left is an engine-side
-                    // panic, which is not a property of this message; retrying
-                    // is correct. Known limit: a persistently panicking engine
-                    // path redelivers forever rather than dead-lettering.
+                    // A panic in the *mapping function* is message-attributable
+                    // and deterministic. `map_and_dispatch` already contains
+                    // it and quarantines it as `Malformed`, so it never
+                    // reaches here. What is left is an engine-side panic,
+                    // which is not a property of this message, so a retry is
+                    // correct. Known limit: a persistently panicking engine
+                    // path redelivers forever and never dead-letters.
                     tracing::error!(
                         source = self.binding.name,
                         error = %e,
@@ -828,31 +818,31 @@ impl ConnectorRuntime {
                     // and which one is load-bearing depends on the source.
                     if self.source.abandon_redelivers() {
                         // `abandon_redelivers()` describes what `abandon`
-                        // DOES, not a promise the message returns on its own:
-                        // `MockSource` (a supported, exported adapter) and any
-                        // adapter needing an explicit nack redeliver solely
-                        // from that call, so skipping it strands the message
-                        // where no later pass can see it. Such a source is not
-                        // wedged, so no offset is marked — otherwise every
-                        // engine-side panic would recycle the consumer.
+                        // DOES. It does not promise that the message returns
+                        // on its own. `MockSource` (a supported, exported
+                        // adapter) and any adapter that needs an explicit nack
+                        // redeliver solely from that call. So a skip strands
+                        // the message where no later pass can see it. Such a
+                        // source is not wedged, so no offset is marked.
+                        // Otherwise every engine-side panic would recycle the
+                        // consumer.
                         self.abandon(&handle).await;
                     } else if let Some((partition, position)) = positional {
                         // The mirror case: `abandon` cannot force a
                         // redelivery, and the local position has already
                         // advanced past this record, so nothing hands it back.
-                        // Mark the head so recovery fires on it directly
-                        // rather than waiting for later offsets to pile up
-                        // behind it — at the tail of a quiet partition, none
-                        // ever will.
+                        // Mark the head so recovery fires on it directly. Do
+                        // not wait for later offsets to pile up behind it: at
+                        // the tail of a quiet partition, none ever will.
                         self.offsets.lock().await.retried(partition, position);
                     }
-                    // `record_metrics` lives inside `process`, which this task
-                    // died before finishing, so the settlement sample has to
-                    // be emitted here. `received` was already counted before
-                    // the spawn, and the dispatched series is documented as
-                    // the breakdown of it (ADR-0001 §7), so skipping this
-                    // would permanently widen the gap by one per panic and
-                    // hide the retry the runtime just performed.
+                    // `record_metrics` lives inside `process`, and this task
+                    // died before it finished. So the settlement sample is
+                    // emitted here. `received` was counted before the spawn,
+                    // and the dispatched series is its documented breakdown
+                    // (ADR-0001 §7). A skip would widen the gap by one per
+                    // panic for good and hide the retry the runtime just
+                    // performed.
                     self.metrics
                         .record_connector_dispatched(self.binding.name, ConnectorOutcome::Retried);
                     summary.retried += 1;
@@ -869,18 +859,18 @@ impl ConnectorRuntime {
 
     /// Fail the pass when a partition's commit prefix is permanently blocked.
     ///
-    /// A prefix head that never settles blocks its partition's commit on a
-    /// broker whose `abandon` cannot force a redelivery — Kafka, where not
-    /// committing is not a nack. The tracker cannot resolve that on its own:
-    /// only re-reading from the last commit hands the message back. So the
+    /// A prefix head that never settles blocks the partition commit on a
+    /// broker whose `abandon` cannot force a redelivery. Kafka is one: not
+    /// committing is not a nack. The tracker cannot resolve that on its own.
+    /// Only a re-read from the last commit hands the message back. So the
     /// pass fails with [`ConnectorError::Stalled`], and `run` rebuilds the
-    /// source ([`EventSource::recover`]), which is what performs the retry.
+    /// source ([`EventSource::recover`]), which performs the retry.
     ///
-    /// Two signals feed this (see [`OffsetTracker::stalled`]): a retried head,
-    /// which is a wedge by construction and reported immediately, and a
-    /// backlog of at least [`ConnectorRuntimeConfig::stall_threshold`]
-    /// completed offsets as a backstop. `0` disables only the backlog
-    /// heuristic; the retried head is a correctness signal and always fires.
+    /// Two signals feed this (see [`OffsetTracker::stalled`]). A retried head
+    /// is a wedge by construction and is reported immediately. A backlog of at
+    /// least [`ConnectorRuntimeConfig::stall_threshold`] completed offsets is
+    /// a backstop. `0` disables only the backlog heuristic. The retried head
+    /// is a correctness signal and always fires.
     async fn check_commit_stall(&self) -> Result<(), ConnectorError> {
         let threshold =
             effective_stall_threshold(self.config.stall_threshold, self.binding.max_in_flight);
@@ -903,27 +893,28 @@ impl ConnectorRuntime {
         })
     }
 
-    /// Perform the retry a detected stall calls for: rebuild the source's
-    /// consumer and discard the wedged generation's offset state.
+    /// Perform the retry that a detected stall calls for: rebuild the source
+    /// consumer and discard the offset state of the wedged generation.
     ///
-    /// Returns whether the source could rebuild itself. Clearing the tracker
-    /// is what makes the rebuild stick — a fresh consumer re-reads from the
-    /// last commit, so the redelivered offsets arrive *below* the stale
-    /// in-memory mark and would be mistaken for already-settled redeliveries,
-    /// leaving the prefix blocked exactly as it was.
+    /// Returns whether the source could rebuild itself. The tracker clear
+    /// makes the rebuild stick. A fresh consumer re-reads from the last
+    /// commit, so the redelivered offsets arrive *below* the stale in-memory
+    /// mark. They would be mistaken for already-settled redeliveries, and the
+    /// prefix would stay blocked exactly as it was.
     ///
-    /// The clear is **whole-tracker**, not just the reported partition, because
-    /// `recover` rebuilds the whole client: every assigned partition re-reads
-    /// from its own last commit. A downstream outage wedges all of them, but
-    /// `stalled` reports one at a time, so clearing only that one would leave
-    /// the rest stale (the failure above, for every partition but the first)
-    /// and cost one more rebuild — and one more group rebalance — per affected
-    /// partition. `partition` is retained for the diagnostic.
+    /// The clear is **whole-tracker**, not just the reported partition,
+    /// because `recover` rebuilds the whole client. Every assigned partition
+    /// re-reads from its own last commit. A downstream outage wedges all of
+    /// them, but `stalled` reports one at a time. A clear of only that one
+    /// would leave the rest stale, with the failure above for every partition
+    /// but the first. It would also cost one more rebuild, and one more group
+    /// rebalance, per affected partition. `partition` is kept for the
+    /// diagnostic.
     ///
-    /// Only the offsets are forgotten, never the poison strikes: a message
-    /// that has been rejected N times is still on strike N after the rebuild,
-    /// so it still reaches its threshold and dead-letters rather than
-    /// restarting its count on every recovery.
+    /// Only the offsets are forgotten, never the poison strikes. A message
+    /// rejected N times is still on strike N after the rebuild. So it still
+    /// reaches its threshold and dead-letters, and its count does not restart
+    /// on every recovery.
     pub async fn recover_from_stall(&self, partition: i32) -> StallRecovery {
         match self.source.recover().await {
             Ok(true) => {
@@ -938,13 +929,13 @@ impl ConnectorRuntime {
             }
             Ok(false) => StallRecovery::Unsupported,
             Err(e) => {
-                // Deliberately distinct from `Ok(false)`. The usual cause of a
-                // stall is a downstream outage, and the same outage is what
-                // makes the rebuild fail — so this is the *expected* error at
-                // exactly the moment the binding must not give up. Treating it
-                // as "cannot rebuild" would stop an unsupervised binding on a
-                // blip and never resume it, turning a transient broker
-                // hiccup into a silent permanent outage for that stream.
+                // Deliberately distinct from `Ok(false)`. A stall usually
+                // comes from a downstream outage, and the same outage makes
+                // the rebuild fail. So this is the *expected* error at exactly
+                // the moment the binding must not give up. If it counted as
+                // "cannot rebuild", a blip would stop an unsupervised binding
+                // for good. A transient broker hiccup would become a silent
+                // permanent outage for that stream.
                 tracing::warn!(
                     source = self.binding.name,
                     partition,
@@ -980,13 +971,13 @@ impl ConnectorRuntime {
     /// Re-stamp the throttle once a sample has finished.
     ///
     /// The gap between samples is then measured from **completion**, not from
-    /// the start. Measuring from the start is what turns an expensive sample
-    /// into a starvation loop: a sample that takes longer than
-    /// `lag_sample_interval` is due again the instant it returns, so the very
-    /// next pass samples again, and the runtime spends nearly all of its time
-    /// walking the broker rather than consuming. Measuring from completion
-    /// guarantees a full interval of message polling between samples however
-    /// expensive one turns out to be.
+    /// the start. A gap measured from the start turns an expensive sample into
+    /// a starvation loop. A sample that takes longer than
+    /// `lag_sample_interval` is due again the instant it returns. So the next
+    /// pass samples again, and the runtime spends nearly all its time walking
+    /// the broker, not consuming. A gap measured from completion guarantees a
+    /// full interval of message polling between samples, however expensive one
+    /// turns out to be.
     fn record_lag_sample_completed(&self) {
         *self
             .last_lag_sample
@@ -996,20 +987,19 @@ impl ConnectorRuntime {
 
     /// How long a single lag sample may block the message path.
     ///
-    /// Derived from the cadence — a sample that cannot finish within the
-    /// interval it is taken at is, by definition, too expensive for that
-    /// cadence, and the operator's remedy is the knob they already have —
-    /// but floored at [`ADAPTER_LAG_SAMPLE_CEILING`], because a budget shorter
-    /// than the adapter's own bound does not make the sample stop sooner. It
-    /// only makes the runtime stop *watching*, while the walk runs on and the
-    /// next one is armed on top of it.
+    /// Derived from the cadence. A sample that cannot finish within its own
+    /// interval is, by definition, too expensive for that cadence. The remedy
+    /// of the operator is the knob that already exists. The budget is floored
+    /// at [`ADAPTER_LAG_SAMPLE_CEILING`]. A budget shorter than the adapter's
+    /// own bound does not make the sample stop sooner. It only makes the
+    /// runtime stop *watching*, while the walk runs on and the next one is
+    /// armed on top of it.
     ///
     /// The floor raises; it never caps. A cadence already past the ceiling
-    /// keeps its own budget, so the default (and every generous cadence) is
-    /// unchanged. Together with the completion re-stamp this leaves the worst
-    /// case at budget-then-a-full-interval-of-polling, with the added
-    /// guarantee that an abandoned sample has finished before its successor
-    /// starts.
+    /// keeps its own budget, so the default and every generous cadence are
+    /// unchanged. With the completion re-stamp, the worst case is the budget
+    /// and then a full interval of polling. An abandoned sample has also
+    /// finished before its successor starts.
     fn lag_sample_budget(&self) -> std::time::Duration {
         self.config
             .lag_sample_interval
@@ -1045,14 +1035,14 @@ impl ConnectorRuntime {
 
         let outcome = self.map_and_dispatch(&message, &key, &coordinates).await;
 
-        // `poison_threshold(0)` documents the strike counter as *disabled*, and
-        // `decide_disposition` never reads the count in that case (it
-        // short-circuits on `threshold > 0`). Striking anyway would record an
-        // entry that nothing can ever remove: the resulting `Retry` is not a
-        // terminal disposition, so neither `clear` nor the terminal-retention
-        // sweep covers it, and a sustained stream of distinct rejected
-        // messages would grow the tracker without bound — for a counter the
-        // operator explicitly turned off.
+        // `poison_threshold(0)` documents the strike counter as *disabled*.
+        // `decide_disposition` never reads the count then: it short-circuits
+        // on `threshold > 0`. A strike anyway would record an entry that
+        // nothing can ever remove. The resulting `Retry` is not a terminal
+        // disposition, so neither `clear` nor the terminal-retention sweep
+        // covers it. A sustained stream of distinct rejected messages would
+        // grow the tracker without bound, for a counter the operator turned
+        // off.
         let strikes = if self.binding.poison_threshold > 0
             && matches!(outcome, DispatchOutcome::MappingRejected(_))
         {
@@ -1071,10 +1061,10 @@ impl ConnectorRuntime {
             self.binding.dead_letter_mode,
         );
 
-        // Settle first, then report: settling can *downgrade* a decision (a
-        // dead-letter whose sink write failed becomes a retry), and both the
-        // metrics and the strike bookkeeping must describe what actually
-        // happened rather than what was intended.
+        // Settle first, then report. Settling can *downgrade* a decision: a
+        // dead-letter whose sink write failed becomes a retry. The metrics and
+        // the strike bookkeeping must describe what happened, not what was
+        // intended.
         let Settlement {
             disposition: effective,
             dead_letter,
@@ -1091,49 +1081,50 @@ impl ConnectorRuntime {
             )
             .await;
 
-        // Once a message reaches a terminal disposition its strike history is
-        // no longer needed; dropping it keeps the tracker bounded. A message
-        // left for redelivery keeps its strikes so the threshold still bites.
-        // "Terminal" here means *the message will not come back* — which is
-        // true of a successful dispatch and, as the two paragraphs below
-        // explain, of neither dead-letter handoff.
+        // Once a message reaches a terminal disposition, its strike history is
+        // no longer needed. A drop keeps the tracker bounded. A message left
+        // for redelivery keeps its strikes, so the threshold still bites.
+        // "Terminal" here means *the message will not come back*. That is true
+        // of a successful dispatch. As the two paragraphs below explain, it is
+        // true of neither dead-letter handoff.
         //
         // `AbandonToBrokerDeadLetter` is terminal for *harvest* but not for
-        // the broker: it resets visibility so the message comes back and the
-        // broker counts the receive toward its own `maxReceiveCount`. Whenever
-        // that ceiling is above this binding's `poison_threshold` — the normal
-        // configuration, since the binding wants to nack well before the queue
-        // gives up — the message returns one or more times before the broker
-        // quarantines it. Clearing here would restart the strike countdown, so
+        // the broker. It resets visibility, so the message comes back, and the
+        // broker counts the receive toward its own `maxReceiveCount`. That
+        // ceiling is normally above the `poison_threshold` of this binding,
+        // because the binding wants to nack well before the queue gives up.
+        // Then the message returns one or more times before the broker
+        // quarantines it. A clear here would restart the strike countdown. So
         // each redelivery would crawl back through ordinary visibility-timeout
-        // retries and emit a fresh `dead_lettered` sample per lap. Keeping the
-        // strikes makes every later delivery re-nack on sight and lets the
-        // broker's own count be what ends it.
+        // retries and emit a fresh `dead_lettered` sample per lap. Kept strikes
+        // make every later delivery re-nack on sight, and the broker's own
+        // count ends it.
         //
-        // Such an entry outlives harvest's view of the message, and *nothing
-        // downstream can ever clear it*: SQS moves the message to its DLQ
-        // without notifying this process, so there is no later delivery and no
-        // terminal path to hook. The queue's redrive policy bounds deliveries
-        // of one message, not this map across a stream of distinct poison
-        // messages — so the entry carries a retention deadline instead, run
-        // from its LAST delivery (see `ConnectorRuntimeConfig::poison_retention`).
+        // Such an entry outlives the harvest view of the message, and *nothing
+        // downstream can ever clear it*. SQS moves the message to its DLQ
+        // without notifying this process. So there is no later delivery and no
+        // terminal path to hook. The redrive policy of the queue bounds
+        // deliveries of one message. It does not bound this map across a
+        // stream of distinct poison messages. So the entry carries a retention
+        // deadline instead, run from its LAST delivery (see
+        // `ConnectorRuntimeConfig::poison_retention`).
         // One physical poison message must contribute one `poisoned` sample,
-        // not one per redrive lap: the retained strikes above make every later
-        // redelivery re-nack on sight, so this arm is reached repeatedly for
+        // not one per redrive lap. The retained strikes above make every later
+        // redelivery re-nack on sight. So this arm is reached repeatedly for
         // the same message until the broker's own count ends it.
         //
         // The harvest-sink handoff needs the same treatment for a different
-        // reason. Its record is durable before the message is acked, and `ack`
-        // is deliberately best-effort — a failed commit is warned about, never
-        // escalated, precisely so a broker hiccup cannot lose a message. So
-        // the broker redelivers something harvest has already quarantined, and
-        // the redelivery is the same physical poison message. Marking it
-        // terminal stops the second sample. It deliberately does NOT retain
-        // the strikes the way the broker-native arm does: there, re-nacking on
-        // sight is the mechanism that lets the queue's own count end the
-        // message, whereas here the record is already durable and a return
-        // means only that the commit failed. So the countdown restarts exactly
-        // as the pre-dedupe `clear` made it — only the *counting* was wrong.
+        // reason. Its record is durable before the message is acked. `ack` is
+        // deliberately best-effort: a failed commit is warned about, never
+        // escalated, so that a broker hiccup cannot lose a message. So the
+        // broker redelivers a message that harvest has already quarantined,
+        // and the redelivery is the same physical poison message. A terminal
+        // mark stops the second sample. It deliberately does NOT retain the
+        // strikes as the broker-native arm does. There, a re-nack on sight is
+        // what lets the queue's own count end the message. Here, the record is
+        // already durable, and a return means only that the commit failed. So
+        // the countdown restarts exactly as the pre-dedupe `clear` made it.
+        // Only the *counting* was wrong.
         let mut count_poison = true;
         if matches!(effective, MessageDisposition::AbandonToBrokerDeadLetter(_)) {
             count_poison = self
@@ -1148,10 +1139,10 @@ impl ConnectorRuntime {
                 .await
                 .mark_sink_terminal_as_of(&key, std::time::Instant::now());
             // The in-process mark cannot survive a restart, and a restart is
-            // exactly when the redelivery happens: the process died between
-            // writing the record and acking. The sink's own conflict signal is
-            // the durable half of the same question, so both must agree before
-            // this counts as a new poison message.
+            // exactly when the redelivery happens. The process died between the
+            // record write and the ack. The sink's own conflict signal is the
+            // durable half of the same question. So both must agree before this
+            // counts as a new poison message.
             count_poison =
                 first_here && !matches!(dead_letter, Some(DeadLetterOutcome::AlreadyRecorded));
         } else if matches!(effective, MessageDisposition::Retry) {
@@ -1167,24 +1158,23 @@ impl ConnectorRuntime {
             //     the consecutive-rejection streak is broken and the strikes
             //     are stale.
             //
-            // Keeping them for the third case lets a later rejection continue
-            // a streak that was never consecutive, dead-lettering the message
-            // before its `poison_threshold` is genuinely reached. Gated on the
-            // OUTCOME rather than the disposition, because the failed
-            // dead-letter write also presents as `Retry` but carries a
-            // rejection outcome.
+            // Kept strikes in the third case let a later rejection continue a
+            // streak that was never consecutive. The message then dead-letters
+            // before its `poison_threshold` is genuinely reached. The gate is
+            // on the OUTCOME, not the disposition. The failed dead-letter write
+            // also presents as `Retry`, but it carries a rejection outcome.
             if matches!(outcome, DispatchOutcome::Transient(_)) {
                 self.poison.lock().await.clear(&key);
             }
             // On a source whose `abandon` cannot force a redelivery, this
-            // offset is now a permanently blocked prefix head: the local
+            // offset is now a permanently blocked prefix head. The local
             // position has already moved past it, so nothing hands it back.
-            // Record it so recovery fires on the head itself rather than
-            // waiting for later offsets to pile up behind it — at the tail of
-            // a quiet partition, none ever will.
+            // Record it so recovery fires on the head itself. Do not wait for
+            // later offsets to pile up behind it: at the tail of a quiet
+            // partition, none ever will.
             //
-            // A broker that does redeliver (SQS's visibility timeout) is not
-            // wedged and must not trigger a rebuild, or every transient
+            // A broker that does redeliver (the SQS visibility timeout) is not
+            // wedged and must not trigger a rebuild. Otherwise every transient
             // dispatch failure would recycle the consumer.
             if let (false, Some(partition), Some(position)) = (
                 self.source.abandon_redelivers(),
@@ -1208,15 +1198,14 @@ impl ConnectorRuntime {
         coordinates: &str,
     ) -> DispatchOutcome {
         let ctx = MessageCtx::new(self.binding.name, message);
-        // A mapping function is embedder code operating on an untrusted broker
-        // payload, so a stray `unwrap()` on a malformed message is a realistic
-        // failure. Contain it exactly like the engine contains a `#[workflow]`
-        // /`#[activity]` panic (issue #782): a panic here is deterministic in
-        // the message (the same bytes panic on every redelivery), so treating
-        // it as `Malformed` quarantines the one bad message rather than letting
-        // it wedge the partition forever. `AssertUnwindSafe` is sound: the
-        // mapper is a plain `fn` and its (discarded) output is the only state
-        // crossing the boundary.
+        // A mapping function is embedder code on an untrusted broker payload.
+        // So a stray `unwrap()` on a malformed message is a realistic failure.
+        // Contain it as the engine contains a `#[workflow]`/`#[activity]`
+        // panic (issue #782). A panic here is deterministic in the message:
+        // the same bytes panic on every redelivery. So `Malformed` quarantines
+        // the one bad message, and it cannot wedge the partition forever.
+        // `AssertUnwindSafe` is sound: the mapper is a plain `fn`, and its
+        // discarded output is the only state that crosses the boundary.
         let mapping =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (self.binding.mapper)(&ctx)));
         let mapped = match mapping {
@@ -1280,15 +1269,15 @@ impl ConnectorRuntime {
     /// **This is the only place `ack` is called.** Keeping it in one arm of
     /// one match is what makes the ack-after-commit contract auditable.
     ///
-    /// The returned disposition can differ from the decided one in exactly one
-    /// case: a [`MessageDisposition::DeadLetter`] whose sink write failed is
-    /// downgraded to [`MessageDisposition::Retry`], because the message was
-    /// *not* recorded anywhere and must come back rather than be counted as
-    /// quarantined.
+    /// The returned disposition differs from the decided one in exactly one
+    /// case. A [`MessageDisposition::DeadLetter`] whose sink write failed is
+    /// downgraded to [`MessageDisposition::Retry`]. The message was *not*
+    /// recorded anywhere, so it must come back and not count as quarantined.
     ///
     /// [`Settlement::dead_letter`] carries the sink's own verdict on whether
-    /// the record already existed — the durable half of the poison-dedupe
-    /// question the in-process tracker answers only within one process.
+    /// the record already existed. That is the durable half of the
+    /// poison-dedupe question, which the in-process tracker answers only
+    /// within one process.
     async fn settle(
         &self,
         message: &InboundMessage,
@@ -1352,10 +1341,9 @@ impl ConnectorRuntime {
                     reason = reason.as_str(),
                     "connector message abandoned to broker-native dead-lettering"
                 );
-                // The poison path wants the FASTEST redelivery (each one
-                // advances the broker's receive count toward its redrive
-                // threshold), unlike `abandon`, which is the gentler
-                // transient-retry return.
+                // The poison path wants the FASTEST redelivery, because each
+                // one advances the broker's receive count toward its redrive
+                // threshold. `abandon` is the gentler transient-retry return.
                 self.nack_for_dead_letter(&message.handle).await;
                 Settlement::of(MessageDisposition::AbandonToBrokerDeadLetter(reason))
             }
@@ -1384,54 +1372,53 @@ impl ConnectorRuntime {
             workflow_name: self.binding.target.workflow().to_string(),
             reason,
             detail,
-            // What actually happened, not what was configured: the strike
-            // count at the moment of quarantine. A deterministic poison
-            // (malformed payload, permanent rejection) is dead-lettered on
-            // its FIRST delivery, so it records 1 — recording the configured
-            // threshold there would tell an operator it had been retried
-            // twice when it never was.
+            // What happened, not what was configured: the strike count at the
+            // moment of quarantine. A deterministic poison (malformed payload,
+            // permanent rejection) is dead-lettered on its FIRST delivery, so
+            // it records 1. The configured threshold there would tell an
+            // operator it had been retried twice when it never was.
             attempts: i32::try_from(attempts.max(1)).unwrap_or(i32::MAX),
             payload: message.payload.clone(),
             failed_at: Utc::now(),
         }
     }
 
-    // The held guard below is the entire point of this function, and the lint's
-    // suggested remedy — collapse it into the `complete` call so it drops
-    // immediately — is precisely the ordering bug the comment there describes.
+    // The held guard below is the entire point of this function. The lint
+    // suggests a collapse into the `complete` call, so that it drops at once.
+    // That is precisely the ordering bug the comment there describes.
     #[allow(
         clippy::significant_drop_tightening,
         reason = "the guard is deliberately held across the commit submission to keep it monotonic"
     )]
     async fn ack(&self, handle: &MessageHandle) {
         // For a positionally-ordered broker (Kafka), only advance the
-        // high-water mark to the contiguous completed prefix — committing past
-        // an in-flight lower offset would silently skip it on a crash.
+        // high-water mark to the contiguous completed prefix. A commit past an
+        // in-flight lower offset would silently skip it on a crash.
         //
-        // The offset actually committed is the tracker's advanced mark, NOT
-        // this handle's own position: when offsets 2 then 1 settle in that
-        // order, offset 2 is held, and it is 1's completion that advances the
-        // prefix to 2. Committing 1's handle there would leave 2 uncommitted
-        // and re-read on a crash.
+        // The committed offset is the advanced mark of the tracker, NOT the
+        // position of this handle. When offsets 2 then 1 settle in that order,
+        // offset 2 is held, and the completion of 1 advances the prefix to 2.
+        // A commit of the handle of 1 there would leave 2 uncommitted and
+        // re-read on a crash.
         //
-        // So the mark goes through `commit_position`, not `ack`. Cloning this
-        // handle and overwriting its position would hand the adapter one
-        // message's token paired with another's offset, and `MessageHandle`
-        // documents the token as opaque, handed straight back, and the key
-        // adapters build their side tables on — so a token-keyed adapter would
-        // acknowledge the wrong record. There is often no handle for the mark
-        // to borrow anyway: its message settled earlier and was released.
+        // So the mark goes through `commit_position`, not `ack`. A clone of
+        // this handle with an overwritten position would pair the token of one
+        // message with the offset of another. `MessageHandle` documents the
+        // token as opaque, handed straight back, and the key that adapters
+        // build their side tables on. So a token-keyed adapter would
+        // acknowledge the wrong record. Often the mark has no handle to borrow
+        // anyway: its message settled earlier and was released.
         //
         // The lock is held across the *submission*, not merely across the
-        // computation of the mark. Concurrent settlements race otherwise: two
-        // dispatches finishing together compute marks 5 then 6 under the lock,
-        // then submit in whichever order the runtime happens to schedule them.
-        // Submitting 5 after 6 moves the committed offset BACKWARD, and offset
-        // 6 — durably settled — is re-read on the next crash. Only a
-        // positional broker reaches this branch (an SQS handle carries no
-        // partition and skips it entirely), and Kafka's commit is a local
-        // enqueue rather than a broker round-trip, so serializing here costs
-        // the ordering it buys and nothing more.
+        // computation of the mark. Otherwise concurrent settlements race. Two
+        // dispatches that finish together compute marks 5 then 6 under the
+        // lock. Then they submit in whatever order the runtime schedules them.
+        // A submit of 5 after 6 moves the committed offset BACKWARD, and the
+        // durably settled offset 6 is re-read on the next crash. Only a
+        // positional broker reaches this branch: an SQS handle carries no
+        // partition and skips it. The Kafka commit is a local enqueue, not a
+        // broker round-trip. So the serialization here costs only the ordering
+        // it buys.
         let result = if let (Some(partition), Some(position)) = (handle.partition, handle.position)
         {
             let mut offsets = self.offsets.lock().await;
@@ -1457,42 +1444,41 @@ impl ConnectorRuntime {
 
     /// Hand a hard-stopped message back to its adapter, bounded.
     ///
-    /// Mirrors the panic arm's two-step recovery, because the cause is the
-    /// same — a dispatch that ended without reaching `settle` — and so is the
-    /// remedy. Which step is load-bearing depends on the source: an adapter
-    /// whose redelivery *is* an explicit nack needs the `abandon`, while a
-    /// positional source needs its head marked so recovery fires on it rather
-    /// than waiting for offsets to pile up behind a partition that has stopped.
+    /// Mirrors the two-step recovery of the panic arm. The cause is the same,
+    /// a dispatch that ended without reaching `settle`, and so is the remedy.
+    /// The source decides which step is load-bearing. An adapter whose
+    /// redelivery *is* an explicit nack needs the `abandon`. A positional
+    /// source needs its head marked, so recovery fires on it. It must not
+    /// wait for offsets to pile up behind a partition that has stopped.
     ///
-    /// **Bounded, unlike the panic arm's.** This runs after the shutdown drain
-    /// has already spent its full deadline, so an unbounded `abandon` against
-    /// the same wedged broker that caused the timeout would reintroduce exactly
-    /// the hang the deadline exists to prevent. Failing to release custody
-    /// costs one stranded message; failing to return costs the process. The
-    /// budget is deliberately short — this is a courtesy on the way out, not a
-    /// second drain.
+    /// **Bounded, unlike the panic arm.** This runs after the shutdown drain
+    /// has spent its full deadline. An unbounded `abandon` against the wedged
+    /// broker that caused the timeout would bring back the hang the deadline
+    /// exists to prevent. A failure to release custody costs one stranded
+    /// message. A failure to return costs the process. The budget is short on
+    /// purpose: this is a courtesy on the way out, not a second drain.
     ///
     /// # Why the panic arm needs neither the bound nor a permit
     ///
-    /// The panic arm runs its recovery in `run_once`'s join loop, which holds
-    /// no permit — so [`Self::drain_in_flight`] does not wait for it, and an
-    /// ordinary shutdown drops it mid-await along with `run_once`. That would
-    /// matter if the call did broker I/O. For both shipped adapters it does
-    /// not: Kafka overrides `abandon_redelivers()` to `false` and takes the
-    /// mark-the-head branch, a local mutex write; SQS's `abandon` is a
-    /// deliberate no-op returning `Ok(())` without touching the network, since
-    /// its visibility timeout is what redelivers. Neither can hang the join
-    /// loop and neither has custody to strand.
+    /// The panic arm runs its recovery in the join loop of `run_once`, which
+    /// holds no permit. So [`Self::drain_in_flight`] does not wait for it, and
+    /// an ordinary shutdown drops it mid-await along with `run_once`. That
+    /// would matter if the call did broker I/O. For both shipped adapters it
+    /// does not. Kafka overrides `abandon_redelivers()` to `false` and takes
+    /// the mark-the-head branch, a local mutex write. The SQS `abandon` is a
+    /// deliberate no-op that returns `Ok(())` without network access, because
+    /// its visibility timeout redelivers. Neither can hang the join loop, and
+    /// neither has custody to strand.
     ///
-    /// The residual is a *custom* adapter whose `abandon` both blocks on the
-    /// network and is its only redelivery mechanism. There the dropped call
-    /// costs one message held until that adapter's own lease expires — the
-    /// same cost this function already accepts above, minus the warning.
-    /// Closing it properly means catching the dispatch panic *inside* the
-    /// spawned task so the recovery runs while its permit is still held (the
-    /// reason the hard-stop arm above is inline rather than in the join loop);
-    /// re-acquiring a permit in the join loop does not work, because a
-    /// cancelled `run` drops `run_once` and its permit before the drain starts.
+    /// The residual is a *custom* adapter whose `abandon` blocks on the
+    /// network and is also its only redelivery mechanism. There the dropped
+    /// call holds one message until the adapter's own lease expires. That is
+    /// the cost this function already accepts above, minus the warning. A
+    /// proper fix catches the dispatch panic *inside* the spawned task, so the
+    /// recovery runs while its permit is still held. That is why the hard-stop
+    /// arm above is inline and not in the join loop. A permit re-acquired in
+    /// the join loop does not work. A cancelled `run` drops `run_once` and its
+    /// permit before the drain starts.
     async fn release_custody_after_hard_stop(
         &self,
         handle: &MessageHandle,
@@ -1513,9 +1499,9 @@ impl ConnectorRuntime {
             self.offsets.lock().await.retried(partition, position);
         }
         // `record_metrics` lives inside `process`, which this dispatch never
-        // finished, so the settlement sample is owed here — same reason as the
-        // panic arm. Without it the dispatched series silently under-counts
-        // its own `received` total by one per hard stop.
+        // finished. So the settlement sample is owed here, as in the panic arm.
+        // Without it, the dispatched series silently under-counts its own
+        // `received` total by one per hard stop.
         self.metrics
             .record_connector_dispatched(self.binding.name, ConnectorOutcome::Retried);
     }
@@ -1550,25 +1536,25 @@ pub const fn dead_letter_mode_of(binding: &SourceBinding) -> DeadLetterMode {
 /// The batch size actually handed to a source: floored at one, and capped by
 /// the binding's dispatch capacity.
 ///
-/// A zero batch is a silent killer rather than a loud one: a source asked for
-/// zero messages returns an empty batch, the runtime reads that as an idle
-/// poll, and the binding consumes nothing forever with no error to alert on.
-/// Clamping here — at the runtime's single `receive` call site — covers every
-/// source including an embedder's own `EventSource`, not just the two adapters
-/// shipped in-tree.
+/// A zero batch is a silent killer, not a loud one. A source asked for zero
+/// messages returns an empty batch, and the runtime reads that as an idle
+/// poll. The binding then consumes nothing forever, with no error to alert
+/// on. The clamp sits at the single `receive` call site of the runtime. So it
+/// covers every source, an embedder's own `EventSource` included, not just
+/// the two adapters shipped in-tree.
 ///
-/// The `max_in_flight` cap exists because prefetching past dispatch capacity
+/// The `max_in_flight` cap exists because a prefetch past dispatch capacity
 /// buys nothing and costs something. The surplus cannot start until a permit
-/// frees up, so it just sits in memory — but on SQS the visibility timer starts
-/// at `ReceiveMessage`, not at dispatch. A message held behind the rest of the
-/// batch's dispatch latency can therefore have its visibility expire, be handed
-/// to another replica, and have its receive count incremented toward the
-/// queue's redrive policy — sending a perfectly processable message to the
-/// broker DLQ having never actually failed. The default config
-/// (`max_batch: 32`, `max_in_flight: 16`) already prefetched 16 past capacity,
-/// so this is the common path rather than an exotic one, and it is worst
-/// exactly where the docs send people: `.max_in_flight(1)`, the per-key
-/// ordering remedy, against SQS's ten-message batch.
+/// frees up, so it sits in memory. But on SQS the visibility timer starts at
+/// `ReceiveMessage`, not at dispatch. A message held behind the dispatch
+/// latency of the rest of the batch can have its visibility expire. It is
+/// then handed to another replica, and its receive count rises toward the
+/// redrive policy of the queue. So a processable message reaches the broker
+/// DLQ without one failure. The default config (`max_batch: 32`,
+/// `max_in_flight: 16`) already prefetched 16 past capacity. So this is the
+/// common path, not an exotic one. It is worst exactly where the docs send
+/// people: `.max_in_flight(1)`, the per-key ordering remedy, against the
+/// ten-message batch of SQS.
 #[must_use]
 pub const fn effective_max_batch(configured: usize, max_in_flight: usize) -> usize {
     let configured = if configured == 0 { 1 } else { configured };
@@ -1702,11 +1688,11 @@ mod tests {
     /// A sink whose `write` panics, so a dispatch task dies with a `JoinError`
     /// rather than returning a disposition.
     ///
-    /// This is the one *engine-side* panic seam reachable from a unit test:
-    /// the mapper's own panic is contained inside `map_and_dispatch`
-    /// (quarantined as `Malformed`) and never reaches the join arm, and the
+    /// This is the one *engine-side* panic seam that a unit test can reach.
+    /// The mapper's own panic is contained inside `map_and_dispatch`
+    /// (quarantined as `Malformed`) and never reaches the join arm. The
     /// dispatch path itself needs a live harvest runtime to fail. The sink is
-    /// injectable, so panicking there exercises the real `run_once` join arm.
+    /// injectable, so a panic there exercises the real `run_once` join arm.
     #[derive(Debug, Default)]
     struct PanickingDeadLetterSink;
 
@@ -1722,8 +1708,8 @@ mod tests {
 
     /// A sink that parks until released, so a dispatch can be caught mid-flight.
     ///
-    /// The hard stop only means anything while a task is genuinely running;
-    /// holding a bare permit stands in for that in the drain tests, but proving
+    /// The hard stop means something only while a task is genuinely running.
+    /// A bare held permit stands in for that in the drain tests. A proof that
     /// the *message* is handed back needs a real dispatch parked inside
     /// `process`.
     #[derive(Debug)]
@@ -1757,13 +1743,13 @@ mod tests {
 
     #[tokio::test]
     async fn a_panicked_dispatch_marks_its_offset_for_recovery() {
-        // A panicked task never reaches `settle`, so the normal `Retry` path's
-        // recovery marking does not run. On a positional broker whose
-        // `abandon` cannot force a redelivery (Kafka), the local position has
-        // already advanced past this record, so nothing hands it back: the
+        // A panicked task never reaches `settle`, so the recovery marking of
+        // the normal `Retry` path does not run. Take a positional broker whose
+        // `abandon` cannot force a redelivery (Kafka). The local position has
+        // already advanced past this record, so nothing hands it back. The
         // offset is a permanently blocked prefix head. At the tail of a quiet
-        // partition nothing ever settles behind it, so the backlog heuristic
-        // alone would wait forever -- the head itself must be marked.
+        // partition nothing ever settles behind it. So the backlog heuristic
+        // alone would wait forever, and the head itself must be marked.
         let source = Arc::new(MockSource::new("orders").without_redelivery());
         source.push_kafka(0, 7, b"{{{");
         let rt = ConnectorRuntime::new(
@@ -1777,11 +1763,11 @@ mod tests {
 
         let outcome = rt.run_once().await;
 
-        // Marking the head makes the pass fail as `Stalled`, which is what
-        // drives the consumer rebuild. `held: 0` is the load-bearing detail:
-        // nothing settled behind this offset, so the backlog heuristic cannot
-        // be what fired — only the marked retried head can be. That is exactly
-        // the tail-of-a-quiet-partition case a volume bound would miss.
+        // The head mark makes the pass fail as `Stalled`, which drives the
+        // consumer rebuild. `held: 0` is the load-bearing detail. Nothing
+        // settled behind this offset, so the backlog heuristic cannot have
+        // fired. Only the marked retried head can. That is exactly the
+        // tail-of-a-quiet-partition case that a volume bound would miss.
         match outcome {
             Err(ConnectorError::Stalled {
                 partition, held, ..
@@ -1808,8 +1794,8 @@ mod tests {
     #[tokio::test]
     async fn a_panicked_dispatch_on_a_redelivering_source_is_not_a_stall() {
         // The mirror image: a broker whose visibility timeout hands the
-        // message back (SQS) is not wedged, and must not trigger a consumer
-        // rebuild -- otherwise every engine-side panic would recycle it.
+        // message back (SQS) is not wedged. It must not trigger a consumer
+        // rebuild, or every engine-side panic would recycle it.
         let source = Arc::new(MockSource::new("orders"));
         source.push_kafka(0, 7, b"{{{");
         let rt = ConnectorRuntime::new(
@@ -1834,12 +1820,12 @@ mod tests {
     #[tokio::test]
     async fn a_panicked_dispatch_on_a_redelivering_source_is_abandoned() {
         // Marking no offset is right for a redelivering source, but doing
-        // *nothing* is not: "redelivers on abandon" is a statement about what
-        // `abandon` does, not a promise that the message comes back on its
-        // own. `MockSource` -- an exported, supported adapter -- redelivers
-        // exclusively from `abandon`, so a panicked task that never calls it
-        // strands the message in `in_flight` where no later pass can see it.
-        // Any custom adapter needing an explicit abandon fails the same way.
+        // *nothing* is not. "Redelivers on abandon" says what `abandon` does.
+        // It does not promise that the message comes back on its own.
+        // `MockSource`, an exported and supported adapter, redelivers only
+        // from `abandon`. So a panicked task that never calls it strands the
+        // message in `in_flight`, where no later pass can see it. Any custom
+        // adapter that needs an explicit abandon fails the same way.
         let source = Arc::new(MockSource::new("orders"));
         source.push_kafka(0, 7, b"{{{");
         let rt = ConnectorRuntime::new(
@@ -1869,12 +1855,13 @@ mod tests {
     #[tokio::test]
     async fn a_panicked_dispatch_records_a_retried_sample() {
         // `received` is incremented before the task is spawned, but a panicked
-        // task never reaches `record_metrics`. Both ADR-0001 §7 and
-        // `docs/telemetry.md` state that `harvest.connector.dispatched` is the
-        // settlement breakdown -- one sample per received message, so the
-        // series sums to `harvest.connector.received`. Without a sample here
-        // every panic permanently widens that gap, and the retry the runtime
-        // performed is invisible on the dashboard that exists to show it.
+        // task never reaches `record_metrics`. ADR-0001 §7 and
+        // `docs/telemetry.md` both state that `harvest.connector.dispatched`
+        // is the settlement breakdown. That is one sample per received
+        // message, so the series sums to `harvest.connector.received`. Without
+        // a sample here, every panic widens that gap for good. The retry the
+        // runtime performed is then invisible on the dashboard that exists to
+        // show it.
         let source = Arc::new(MockSource::new("orders"));
         source.push_kafka(0, 7, b"{{{");
         let metrics = Arc::new(RecordingMetrics::default());
@@ -1909,8 +1896,8 @@ mod tests {
     #[should_panic(expected = "broker-native dead-lettering")]
     fn constructing_a_runtime_rejects_broker_native_on_a_source_without_one() {
         // The plugin refuses this pairing at build time, but `ConnectorRuntime`
-        // is exported: an embedder driving it directly bypasses that guard, and
-        // the disposition then calls a nack that is a no-op, reporting a
+        // is exported. An embedder that drives it directly bypasses that guard.
+        // The disposition then calls a nack that is a no-op. It reports a
         // terminal outcome for a message that reached no dead-letter
         // destination and is never redelivered in-session.
         let binding = Arc::new(
@@ -1930,9 +1917,9 @@ mod tests {
 
     #[test]
     fn constructing_a_runtime_accepts_broker_native_on_a_source_with_one() {
-        // The guard must not reject the supported pairing: an adapter that
-        // genuinely feeds a broker DLQ (SQS with a redrive policy, which
-        // `MockSource` models) is exactly what the mode is for.
+        // The guard must not reject the supported pairing. The mode exists for
+        // an adapter that genuinely feeds a broker DLQ, such as SQS with a
+        // redrive policy, which `MockSource` models.
         let binding = Arc::new(
             SourceBinding::starts("orders", "orders", "order_flow")
                 .map_raw(|_ctx| Err(MappingError::Rejected("no thanks".to_string())))
@@ -1965,13 +1952,14 @@ mod tests {
     #[tokio::test]
     async fn broker_native_dead_letter_keeps_its_strikes_across_redeliveries() {
         // `AbandonToBrokerDeadLetter` is terminal for harvest but NOT for the
-        // broker: it resets visibility so the message comes back and the
+        // broker. It resets visibility, so the message comes back, and the
         // broker counts the receive toward its own `maxReceiveCount`. When
-        // that ceiling is above this binding's `poison_threshold` the message
-        // returns one or more times before the broker quarantines it. Clearing
-        // the strike history on the way out would restart the countdown, so
-        // each redelivery would crawl through ordinary visibility-timeout
-        // retries again and emit a fresh `dead_lettered` sample per lap.
+        // that ceiling is above the `poison_threshold` of this binding, the
+        // message returns one or more times before the broker quarantines it.
+        // A clear of the strike history on the way out would restart the
+        // countdown. Each redelivery would then crawl through ordinary
+        // visibility-timeout retries again and emit a fresh `dead_lettered`
+        // sample per lap.
         let binding = Arc::new(
             SourceBinding::starts("orders", "orders", "order_flow")
                 .map_raw(|_ctx| Err(MappingError::Rejected("no thanks".to_string())))
@@ -1984,9 +1972,9 @@ mod tests {
 
         // Same coordinates every time: one message, three deliveries. Lap 1
         // abandons, which this mock genuinely redelivers. Lap 2 nacks toward
-        // the broker's redrive -- the real SQS call resets visibility so the
-        // queue redelivers, which the mock cannot model without spinning, so
-        // lap 3's delivery is re-pushed explicitly.
+        // the broker's redrive. The real SQS call resets visibility so the
+        // queue redelivers. The mock cannot model that without spinning, so
+        // the delivery of lap 3 is re-pushed explicitly.
         source.push_kafka(0, 1, b"{}");
         let first = rt.run_once().await.unwrap();
         let second = rt.run_once().await.unwrap();
@@ -2012,13 +2000,13 @@ mod tests {
 
     #[tokio::test]
     async fn a_harvest_sink_poison_is_counted_once_when_its_ack_fails() {
-        // The harvest-sink terminal path acks after writing the record, and
-        // `ack` is deliberately best-effort — a failed commit is logged, not
-        // escalated, precisely so a broker hiccup cannot lose a message. The
-        // consequence is a redelivery of a message harvest has already
-        // quarantined, which must not contribute a SECOND `poisoned` sample:
-        // it is the same physical poison message, exactly as in the
-        // broker-native redrive case above.
+        // The harvest-sink terminal path acks after it writes the record.
+        // `ack` is deliberately best-effort: a failed commit is logged, not
+        // escalated, so that a broker hiccup cannot lose a message. The
+        // consequence is a redelivery of a message that harvest has already
+        // quarantined. It must not contribute a SECOND `poisoned` sample. It
+        // is the same physical poison message, exactly as in the broker-native
+        // redrive case above.
         let source = Arc::new(MockSource::new("orders"));
         let metrics = Arc::new(RecordingMetrics::default());
         let sink = Arc::new(RecordingDeadLetterSink::new());
@@ -2054,13 +2042,13 @@ mod tests {
 
     #[tokio::test]
     async fn a_poison_already_in_the_dead_letter_table_is_not_recounted_after_a_restart() {
-        // The in-process dedupe above cannot survive a restart, and the restart
-        // is exactly when a redelivery is most likely: the process died between
-        // writing the dead-letter record and acking the broker. The durable
-        // table is what still knows, and its insert is already
-        // `ON CONFLICT (idempotency_key) DO NOTHING` -- so whether that insert
-        // won is the authoritative "is this a new poison message" answer, and
-        // it has to reach the metric.
+        // The in-process dedupe above cannot survive a restart, and a restart
+        // is exactly when a redelivery is most likely. The process died
+        // between the dead-letter record write and the broker ack. The durable
+        // table still knows, and its insert is already
+        // `ON CONFLICT (idempotency_key) DO NOTHING`. So whether that insert
+        // won is the authoritative "is this a new poison message" answer. That
+        // answer must reach the metric.
         let sink = Arc::new(RecordingDeadLetterSink::new());
         let metrics = Arc::new(RecordingMetrics::default());
 
@@ -2107,12 +2095,12 @@ mod tests {
 
     #[tokio::test]
     async fn one_poison_message_is_counted_once_across_redrive_laps() {
-        // `harvest.connector.poisoned` counts poison MESSAGES. Because the
-        // retained strikes make every redelivery re-nack on sight, the same
-        // physical message reaches the broker-native handoff once per redrive
-        // lap -- and with SQS's `maxReceiveCount` above the binding threshold
-        // (the normal configuration) that is several laps. Counting each one
-        // would inflate poison alerts and dashboards by the lap count.
+        // `harvest.connector.poisoned` counts poison MESSAGES. The retained
+        // strikes make every redelivery re-nack on sight. So the same physical
+        // message reaches the broker-native handoff once per redrive lap. With
+        // the SQS `maxReceiveCount` above the binding threshold (the normal
+        // configuration), that is several laps. A count of each one would
+        // inflate poison alerts and dashboards by the lap count.
         let binding = Arc::new(
             SourceBinding::starts("orders", "orders", "order_flow")
                 .map_raw(|_ctx| Err(MappingError::Rejected("no thanks".to_string())))
@@ -2162,18 +2150,18 @@ mod tests {
 
     #[tokio::test]
     async fn a_successful_mapping_breaks_the_consecutive_rejection_streak() {
-        // The strike counter is documented as CONSECUTIVE rejections, and
-        // `MappingRejected` is explicitly the "possibly transient" refusal --
-        // a mapper waiting on a dependency that has not arrived yet. So a
-        // delivery that maps successfully broke the streak, even when its
-        // dispatch then fails transiently and the message is retried.
+        // The strike counter is documented as CONSECUTIVE rejections.
+        // `MappingRejected` is explicitly the "possibly transient" refusal: a
+        // mapper that waits on a dependency that has not arrived yet. So a
+        // delivery that maps successfully broke the streak. That holds even
+        // when its dispatch then fails transiently and the message is retried.
         //
-        // Retaining strikes across it conflates three different reasons for
-        // `Retry`: a rejection below threshold (must retain -- that IS the
-        // counter), a failed dead-letter write (must retain, so the next
-        // delivery quarantines on sight), and a transient dispatch failure
-        // (must clear). The message would then dead-letter a delivery early,
-        // on a streak that was never consecutive.
+        // Strikes retained across it conflate three reasons for `Retry`. A
+        // rejection below threshold must retain them: that IS the counter. A
+        // failed dead-letter write must retain them, so the next delivery
+        // quarantines on sight. A transient dispatch failure must clear them.
+        // Otherwise the message dead-letters a delivery early, on a streak
+        // that was never consecutive.
         let attempt = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let seen = Arc::clone(&attempt);
         let binding = Arc::new(
@@ -2221,11 +2209,11 @@ mod tests {
     #[tokio::test]
     async fn a_deterministic_poison_is_counted_on_its_first_broker_native_handoff() {
         // The other side of the dedupe. `Malformed` and `TargetRejected` are
-        // dead-lettered on sight and are never strike-counted, so the tracker
+        // dead-lettered on sight and never strike-counted. So the tracker
         // holds nothing for the key when the handoff happens. If a missing
         // entry read as "already counted", `harvest.connector.poisoned` would
-        // sit at zero for a malformed-payload flood -- the exact alert this
-        // metric exists to raise.
+        // sit at zero for a malformed-payload flood. That is the exact alert
+        // this metric exists to raise.
         let binding = Arc::new(
             SourceBinding::starts("orders", "orders", "order_flow")
                 .map_raw(|_ctx| Err(MappingError::Deserialize("not json".to_string())))
@@ -2270,12 +2258,12 @@ mod tests {
 
     #[tokio::test]
     async fn broker_native_strikes_do_not_accumulate_without_bound() {
-        // The other half of the contract above. Keeping the strikes is right
-        // for the redrive lifetime, but SQS moves the message to its DLQ
-        // *without telling this process*: there is no later delivery and no
-        // terminal path that can ever clear the key. The redrive policy bounds
+        // The other half of the contract above. Kept strikes are right for the
+        // redrive lifetime. But SQS moves the message to its DLQ *without
+        // telling this process*. There is no later delivery and no terminal
+        // path that can ever clear the key. The redrive policy bounds
         // deliveries of one message, not this map across a stream of distinct
-        // poison messages -- so the retention window has to.
+        // poison messages. So the retention window must bound it.
         let binding = Arc::new(
             SourceBinding::starts("orders", "orders", "order_flow")
                 .map_raw(|_ctx| Err(MappingError::Rejected("no thanks".to_string())))
@@ -2291,7 +2279,6 @@ mod tests {
             },
         );
 
-        // Ten distinct poison messages, each nacked to the broker's redrive.
         for offset in 0..10 {
             source.push_kafka(0, offset, b"{}");
             assert_eq!(rt.run_once().await.unwrap().dead_lettered, 1);
@@ -2333,9 +2320,9 @@ mod tests {
         // Acked so the poison message stops blocking the partition.
         assert_eq!(source.acked().len(), 1);
         // The recorded attempt count is what actually happened. A malformed
-        // payload is quarantined on its FIRST delivery, so recording the
-        // configured `poison_threshold` (3) would tell an operator it had been
-        // retried twice when it never was.
+        // payload is quarantined on its FIRST delivery. The configured
+        // `poison_threshold` (3) would tell an operator it had been retried
+        // twice when it never was.
         assert_eq!(entries[0].attempts, 1);
     }
 
@@ -2368,9 +2355,9 @@ mod tests {
     async fn a_panicking_mapping_function_is_quarantined_not_retried_forever() {
         // A mapping function is embedder code over an untrusted payload, so a
         // stray `unwrap()` is realistic. The panic is deterministic in the
-        // message, so retrying it forever would wedge the partition — the
-        // engine contains it exactly as it contains a `#[workflow]` panic
-        // (issue #782) and quarantines the one bad message.
+        // message, so a retry forever would wedge the partition. The engine
+        // contains it exactly as it contains a `#[workflow]` panic (issue
+        // #782), and it quarantines the one bad message.
         let source = Arc::new(MockSource::new("orders"));
         source.push_kafka(0, 1, b"boom");
         let sink = Arc::new(RecordingDeadLetterSink::new());
@@ -2432,8 +2419,8 @@ mod tests {
     #[tokio::test]
     async fn a_failed_dead_letter_write_preserves_the_strike_count() {
         // Corollary of the downgrade above: a message left for redelivery
-        // keeps its strikes, so the very next redelivery quarantines rather
-        // than restarting the countdown from zero.
+        // keeps its strikes. So the next redelivery quarantines and does not
+        // restart the countdown from zero.
         let source = Arc::new(MockSource::new("orders"));
         let sink = Arc::new(RecordingDeadLetterSink::new());
         let rt = runtime(rejecting_binding(2), Arc::clone(&source), Arc::clone(&sink));
@@ -2465,8 +2452,8 @@ mod tests {
         let rt = runtime(rejecting_binding(3), Arc::clone(&source), Arc::clone(&sink));
 
         // Pushed once: the mock genuinely redelivers an abandoned message
-        // (its `abandon_redelivers()` is true), so the redelivery is the real
-        // adapter behaviour rather than a hand-simulated re-push.
+        // (its `abandon_redelivers()` is true). So the redelivery is the real
+        // adapter behaviour, not a hand-simulated re-push.
         source.push_kafka(0, 7, b"payload");
         for _ in 0..3 {
             rt.run_once().await.unwrap();
@@ -2541,10 +2528,10 @@ mod tests {
     #[tokio::test]
     async fn a_transient_failure_uses_the_gentle_retry_return_not_the_poison_nack() {
         // The mirror image. A transient harvest failure must NOT rush the
-        // message back: on SQS that would both hammer an already-struggling
-        // harvest and burn `ApproximateReceiveCount` toward a redrive policy's
-        // `maxReceiveCount`, eventually dead-lettering a perfectly good
-        // message for a purely transient reason.
+        // message back. On SQS that would hammer an already-struggling harvest.
+        // It would also burn `ApproximateReceiveCount` toward the
+        // `maxReceiveCount` of a redrive policy. A good message would then
+        // dead-letter for a purely transient reason.
         let source = Arc::new(MockSource::new("orders"));
         source.push_opaque("m-1", b"{{{");
         // A sink that always fails downgrades the dead-letter to a Retry.
@@ -2568,11 +2555,11 @@ mod tests {
 
     #[tokio::test]
     async fn a_retry_at_the_tail_of_a_quiet_partition_still_stalls_it() {
-        // The volume signal cannot see this: one message at the tail of an
+        // The volume signal cannot see this. One message at the tail of an
         // otherwise idle partition is retried, so nothing ever settles behind
-        // it and `held` stays 0 under any threshold. On Kafka that message is
-        // simply lost — `abandon` is a no-op and the consumer position has
-        // already moved past it — so the wedge must be reported on the head.
+        // it, and `held` stays 0 under any threshold. On Kafka that message is
+        // simply lost. `abandon` is a no-op, and the consumer position has
+        // already moved past it. So the wedge must be reported on the head.
         let source = Arc::new(MockSource::new("orders").without_redelivery());
         source.push_kafka(0, 7, b"{{{");
         let sink = Arc::new(RecordingDeadLetterSink::new());
@@ -2601,9 +2588,9 @@ mod tests {
     #[tokio::test]
     async fn a_retry_on_a_redelivering_source_never_reports_a_stall() {
         // The mirror image, and the reason the signal is a source capability
-        // rather than "any retry": SQS's visibility timeout genuinely does
-        // hand the message back, so a transient dispatch failure is not a
-        // wedge. Firing here would recycle the consumer on every blip.
+        // and not "any retry". The SQS visibility timeout genuinely hands the
+        // message back, so a transient dispatch failure is not a wedge. A
+        // stall here would recycle the consumer on every blip.
         //
         // Kafka-shaped coordinates, so the only thing distinguishing this from
         // the test above is `abandon_redelivers`.
@@ -2679,13 +2666,13 @@ mod tests {
 
     /// A dispatch that never returns must not hang the whole application.
     ///
-    /// Cancelling `run` drops `run_once` mid-flight, which **detaches** its
-    /// spawned dispatches — a dropped `JoinHandle` does not abort the task —
-    /// and each one still holds an owned permit. If that task is wedged in a
+    /// Cancelling `run` drops `run_once` mid-flight. That **detaches** its
+    /// spawned dispatches, because a dropped `JoinHandle` does not abort the
+    /// task. Each one still holds an owned permit. If that task is wedged in a
     /// database call, a broker ack or a custom sink, its permit is never
     /// released. `stop_harvest_runtime` awaits every connector *before* it
-    /// stops the runner, so an unbounded drain here is not a slow shutdown:
-    /// it is a permanently hung one, outside the reach of the engine's own
+    /// stops the runner. So an unbounded drain here is not a slow shutdown.
+    /// It is a permanently hung one, outside the reach of the engine's own
     /// `shutdown_timeout`.
     #[tokio::test(start_paused = true)]
     async fn a_wedged_dispatch_cannot_hang_shutdown_forever() {
@@ -2718,19 +2705,19 @@ mod tests {
 
     /// Giving up on a dispatch must hand the message back to the adapter.
     ///
-    /// The hard stop cuts `process` short, so `settle` never runs — and
-    /// `settle` is the only thing that releases the adapter's custody. On a
-    /// source whose redelivery *is* an explicit `abandon` (`MockSource`, SQS,
-    /// any adapter needing a real nack) the message is otherwise stranded in
-    /// the adapter with nothing left to hand it back: the process is shutting
-    /// down, so there is no later pass, and reusing the source across a
+    /// The hard stop cuts `process` short, so `settle` never runs. Only
+    /// `settle` releases the custody of the adapter. Take a source whose
+    /// redelivery *is* an explicit `abandon`: `MockSource`, SQS, or any
+    /// adapter that needs a real nack. There the message is stranded in the
+    /// adapter with nothing left to hand it back. The process is shutting
+    /// down, so there is no later pass. A reuse of the source across a
     /// restart keeps the leak.
     ///
-    /// Returning `Retry` is not enough. That is a value handed to the join
-    /// loop, and during a real shutdown the join loop has already been dropped
-    /// with `run_once` — nobody is left to read it. The recovery has to happen
-    /// *inside* the spawned task, which is the same conclusion the panic arm
-    /// reached for the same reason.
+    /// A `Retry` return is not enough. That is a value handed to the join
+    /// loop. During a real shutdown the join loop was already dropped with
+    /// `run_once`, so nobody is left to read it. The recovery must happen
+    /// *inside* the spawned task. The panic arm reached the same conclusion
+    /// for the same reason.
     #[tokio::test(start_paused = true)]
     async fn a_hard_stopped_dispatch_hands_the_message_back() {
         let source = Arc::new(MockSource::new("orders"));
@@ -2808,12 +2795,11 @@ mod tests {
     /// Giving up must not outrun the handing-back it triggers.
     ///
     /// Cancelling `hard_stop` only *wakes* the stragglers. The recovery that
-    /// actually returns each message runs inside a task this shutdown has
-    /// already detached, so returning the instant the token is cancelled lets
-    /// `stop_harvest_runtime` observe this connector as finished and the
-    /// process exit before any `abandon` reaches the broker — trading a
-    /// leaked task for a leaked message, which is the very thing the hard
-    /// stop exists to prevent.
+    /// returns each message runs inside a task this shutdown has already
+    /// detached. A return the instant the token is cancelled lets
+    /// `stop_harvest_runtime` see this connector as finished. The process can
+    /// then exit before any `abandon` reaches the broker. That trades a leaked
+    /// task for a leaked message, which the hard stop exists to prevent.
     #[tokio::test(start_paused = true)]
     async fn the_drain_waits_for_the_stragglers_it_hard_stopped() {
         let source = Arc::new(MockSource::new("orders"));
@@ -2834,9 +2820,9 @@ mod tests {
         });
 
         // Let the pass reach the sink, then detach it exactly as cancelling
-        // `run` does: dropping `run_once` drops the join loop, and a dropped
-        // `JoinHandle` does not abort the dispatch it was holding. Awaiting
-        // the aborted handle is what makes the detached state deterministic.
+        // `run` does. A drop of `run_once` drops the join loop, and a dropped
+        // `JoinHandle` does not abort the dispatch it held. An await of the
+        // aborted handle makes the detached state deterministic.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         driver.abort();
         assert!(driver.await.is_err(), "the pass must have been cancelled");
@@ -2878,13 +2864,13 @@ mod tests {
 
     #[tokio::test]
     async fn a_hard_stopped_runtime_refuses_to_run_again() {
-        // `hard_stop` is terminal, and it is deliberately never reset: it is
-        // an `Arc` shared with every dispatch this runtime has already handed
-        // out, so clearing it would un-cancel stragglers still unwinding.
-        // Running again on top of it would consume messages and hand every one
-        // straight back at its first await point — a hot receive-and-abandon
-        // loop that reports itself as a healthy consumer while making no
-        // progress at all, and burns a billed API's request budget doing it.
+        // `hard_stop` is terminal, and it is deliberately never reset. It is an
+        // `Arc` shared with every dispatch this runtime has already handed out,
+        // so a reset would un-cancel stragglers still unwinding. A run on top
+        // of it would consume messages and hand each one straight back at its
+        // first await point. That is a hot receive-and-abandon loop. It looks
+        // like a healthy consumer, makes no progress at all, and burns the
+        // request budget of a billed API.
         let source = Arc::new(MockSource::new("orders"));
         let sink = Arc::new(RecordingDeadLetterSink::new());
         let rt = runtime(malformed_binding(), Arc::clone(&source), sink);
@@ -2916,21 +2902,19 @@ mod tests {
         let sink = Arc::new(RecordingDeadLetterSink::new());
         let rt = runtime(malformed_binding(), Arc::clone(&source), Arc::clone(&sink));
 
-        // Observe both offsets before either completes.
         rt.offsets.lock().await.observe(0, 4);
         rt.offsets.lock().await.observe(0, 5);
 
-        // Completing 5 first must NOT commit.
         rt.ack(&MessageHandle::positioned("orders:0:5", 0, 5)).await;
         assert!(
             source.acked().is_empty(),
             "offset 5 must not commit while 4 is in flight"
         );
 
-        // Completing 4 advances the prefix through 5 — and the commit MUST be
-        // at 5, the advanced mark, not at 4 (the handle that happened to
-        // trigger the advance). Committing 4 here would leave 5 uncommitted
-        // and re-read it on a crash, even though it is durably settled.
+        // Completing 4 advances the prefix through 5. The commit MUST be at 5,
+        // the advanced mark, not at 4, the handle that triggered the advance.
+        // A commit of 4 here would leave 5 uncommitted. A crash would re-read
+        // it, even though it is durably settled.
         rt.ack(&MessageHandle::positioned("orders:0:4", 0, 4)).await;
         assert_eq!(source.acked().len(), 1);
         assert_eq!(
@@ -2945,12 +2929,11 @@ mod tests {
     async fn a_positional_commit_never_pairs_one_messages_token_with_anothers_position() {
         // `MessageHandle` documents the token as opaque and handed *straight
         // back*, and tells adapters to key their own side table off it. But the
-        // contiguous prefix commits a MARK, not a message: when 5 settles
-        // before 4, it is 4's completion that advances the prefix to 5, and
-        // 4's handle is the only one in hand. Cloning it and overwriting the
-        // position hands the adapter token-of-4 paired with position-5 -- a
-        // token-keyed adapter then acknowledges the wrong record, or rejects
-        // every commit.
+        // contiguous prefix commits a MARK, not a message. When 5 settles
+        // before 4, the completion of 4 advances the prefix to 5. The handle of
+        // 4 is the only one in hand. A clone of it with an overwritten position
+        // pairs the token of 4 with position 5. A token-keyed adapter then
+        // acknowledges the wrong record, or rejects every commit.
         //
         // A positional commit is not an ack, so it must not arrive dressed as
         // one. The empty token is the signal: no message is being acknowledged.
@@ -3017,9 +3000,9 @@ mod tests {
 
     #[tokio::test]
     async fn an_adapter_overriding_commit_position_receives_bare_coordinates() {
-        // The affirmative half: an adapter whose commit genuinely cannot be
-        // expressed as an ack overrides the default and gets the mark as plain
-        // coordinates — never a handle borrowed from whichever message happened
+        // The affirmative half. An adapter whose commit genuinely cannot be
+        // expressed as an ack overrides the default. It gets the mark as plain
+        // coordinates, never a handle borrowed from the message that happened
         // to trigger the advance.
         let source = Arc::new(PositionalCommitSource {
             inner: MockSource::new("orders"),
@@ -3052,8 +3035,8 @@ mod tests {
 
     /// A source whose commit submission is slow for one chosen offset.
     ///
-    /// Stands in for the real asymmetry between two concurrent commits: they
-    /// do not reach the adapter in the order their marks were computed unless
+    /// Stands in for the real asymmetry between two concurrent commits. They
+    /// reach the adapter in the order their marks were computed only when
     /// something makes them.
     #[derive(Debug)]
     struct SlowAckSource {
@@ -3087,10 +3070,11 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_acks_never_submit_a_commit_out_of_order() {
-        // Computing the marks under the lock is not enough: released before
-        // the submission, two settlements that finish together can compute 0
-        // then 1 and *submit* 1 then 0, moving the committed offset backward
-        // and re-reading a durably settled message on the next crash.
+        // Marks computed under the lock are not enough. If the lock is
+        // released before the submission, two settlements that finish
+        // together can compute 0 then 1 and *submit* 1 then 0. That moves the
+        // committed offset backward. The next crash then re-reads a durably
+        // settled message.
         let source = Arc::new(SlowAckSource {
             inner: MockSource::new("orders"),
             slow_position: 0,
@@ -3142,11 +3126,10 @@ mod tests {
         // handle's own position. It is still a high-water mark rather than an
         // acknowledgement of that message, and it must arrive looking like one.
         //
-        // Passing the real token through *here* while withholding it whenever
-        // the mark ran ahead would be worse than either alternative: the
-        // adapter cannot tell the two cases apart, so it would have to treat a
-        // present token as untrustworthy anyway — and the one time it forgot,
-        // it would acknowledge the wrong record.
+        // Suppose the real token passes through *here* but is withheld when the
+        // mark ran ahead. That is worse than either alternative. The adapter
+        // cannot tell the two cases apart, so it must distrust a present token
+        // anyway. The one time it forgot, it would acknowledge the wrong record.
         let source = Arc::new(MockSource::new("orders"));
         let sink = Arc::new(RecordingDeadLetterSink::new());
         let rt = runtime(malformed_binding(), Arc::clone(&source), sink);
@@ -3179,20 +3162,20 @@ mod tests {
         assert_eq!(source.acked().len(), 1);
     }
 
-    // Multi-thread for the same reason as the peak test below: on a
-    // current-thread runtime every dispatch is serialized anyway, so an
-    // ordering assertion would hold vacuously and prove nothing.
+    // Multi-thread for the same reason as the peak test below. On a
+    // current-thread runtime every dispatch is serialized anyway. An ordering
+    // assertion would then hold vacuously and prove nothing.
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn max_in_flight_one_dispatches_in_broker_order() {
         // The ordering caveat in `13-broker-connectors.md` offers exactly one
-        // remedy for per-key order -- `.max_in_flight(1)` -- so that remedy
-        // has to be true. A permit is acquired BEFORE the next message is
-        // dispatched, so a single permit makes dispatch strictly sequential in
-        // batch order, which for one partition is broker order.
+        // remedy for per-key order, `.max_in_flight(1)`, so that remedy must
+        // be true. A permit is acquired BEFORE the next message is dispatched.
+        // So a single permit makes dispatch strictly sequential in batch
+        // order. For one partition, that is broker order.
         //
-        // Falsifiable: raising this to 4 makes the assertion fail (the
-        // observed order interleaves), so the test is measuring the bound and
-        // not the mock's insertion order.
+        // Falsifiable: a raise to 4 makes the assertion fail, because the
+        // observed order interleaves. So the test measures the bound and not
+        // the insertion order of the mock.
         let seen = Arc::new(std::sync::Mutex::new(Vec::<i64>::new()));
         let seen_m = Arc::clone(&seen);
 
@@ -3231,12 +3214,11 @@ mod tests {
         let sink = Arc::new(RecordingDeadLetterSink::new());
         let rt = runtime(binding, Arc::clone(&source), sink);
 
-        // A pass now pulls at most `max_in_flight` (see `effective_max_batch`),
-        // so draining twelve messages under `.max_in_flight(1)` takes twelve
-        // passes rather than one. Order across the whole drain is still what
-        // this asserts -- it is now guaranteed by two mechanisms rather than
-        // one: the permit, and the prefetch cap that stops the surplus being
-        // pulled at all.
+        // A pass now pulls at most `max_in_flight` (see `effective_max_batch`).
+        // So a drain of twelve messages under `.max_in_flight(1)` takes twelve
+        // passes, not one. This still asserts order across the whole drain.
+        // Two mechanisms now guarantee it: the permit, and the prefetch cap
+        // that stops the surplus from being pulled at all.
         let mut received = 0;
         while received < 12 {
             received += rt.run_once().await.unwrap().received;
@@ -3255,15 +3237,15 @@ mod tests {
         );
     }
 
-    // Multi-thread: the observation below blocks its worker thread, which on
-    // the default current-thread runtime would serialize the dispatches and
-    // make the test pass vacuously with a peak of 1.
+    // Multi-thread: the observation below blocks its worker thread. On the
+    // default current-thread runtime that would serialize the dispatches. The
+    // test would then pass vacuously with a peak of 1.
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn in_flight_dispatch_is_bounded_by_max_in_flight() {
         // AC5: the connector bounds its own concurrency so a backlog cannot
         // stampede the admission path. Assert the OBSERVED peak, not merely
-        // the semaphore's initial permit count -- a bound that is never
-        // actually taken would satisfy the latter while stampeding anyway.
+        // the initial permit count of the semaphore. A bound that is never
+        // taken would satisfy the latter and stampede anyway.
         const LIMIT: usize = 4;
         let peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let live = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -3404,28 +3386,28 @@ mod tests {
 
     /// A sample that outlasts its own cadence must not re-arm immediately.
     ///
-    /// The throttle stamps the sample instant, and stamping it on the way IN
-    /// means the gap is measured from when the sample STARTED. A sample that
-    /// takes longer than `lag_sample_interval` is therefore due again the
-    /// instant it finishes, on the very next pass — so the runtime spends
-    /// every pass sampling and only a sliver of each consuming. Measuring the
-    /// gap from COMPLETION guarantees a full interval of message polling
-    /// between samples no matter how expensive one turns out to be.
+    /// The throttle stamps the sample instant. A stamp on the way IN measures
+    /// the gap from when the sample STARTED. A sample that takes longer than
+    /// `lag_sample_interval` is then due again the instant it finishes, on the
+    /// very next pass. So the runtime spends every pass sampling and only a
+    /// sliver of each consuming. A gap measured from COMPLETION guarantees a
+    /// full interval of message polling between samples, however expensive
+    /// one turns out to be.
     /// A short cadence must not shorten the budget below what an adapter can
     /// actually abort within, or abandoned samples pile up.
     ///
-    /// The runtime's timeout only drops its own future. It cannot stop the
-    /// work: a Kafka sample runs on `spawn_blocking`, and a blocking task is
-    /// never cancelled — only the adapter's own internal bound stops it. So
+    /// The runtime timeout only drops its own future. It cannot stop the
+    /// work. A Kafka sample runs on `spawn_blocking`, and a blocking task is
+    /// never cancelled. Only the internal bound of the adapter stops it. So
     /// when the runtime gives up FIRST, the walk keeps running while the next
-    /// one is armed, and at a sub-ceiling cadence several overlap — each
-    /// holding a blocking-pool thread and hammering the very broker whose
-    /// slowness caused the timeout.
+    /// one is armed. At a sub-ceiling cadence several overlap. Each holds a
+    /// blocking-pool thread and hammers the very broker whose slowness caused
+    /// the timeout.
     ///
-    /// Flooring the budget at the ceiling every adapter honours makes overlap
-    /// impossible for ANY cadence: the next sample is armed a full interval
-    /// after the budget elapses, and the walk has already stopped by then.
-    /// Giving up earlier bought nothing anyway — the gauge is stale either
+    /// A budget floored at the ceiling that every adapter honours makes
+    /// overlap impossible for ANY cadence. The next sample is armed a full
+    /// interval after the budget elapses, and the walk has stopped by then.
+    /// An earlier give-up bought nothing anyway. The gauge is stale either
     /// way, and the work continues regardless.
     #[test]
     fn a_short_cadence_never_shortens_the_budget_below_the_adapter_ceiling() {
@@ -3491,13 +3473,12 @@ mod tests {
 
     /// An unbounded lag sample must never block the message path.
     ///
-    /// `lag()` is sampled before `receive` (so no message is ever in custody
-    /// across a billed broker round-trip), which means an unbounded sample
-    /// blocks the pass outright: the connector stops consuming entirely while
-    /// it waits. That is worst precisely when it matters most — a degraded
-    /// broker makes the sample slow AND makes the backlog grow. The sample is
-    /// therefore budgeted, and an over-budget one is abandoned so the pass
-    /// still polls.
+    /// `lag()` is sampled before `receive`, so no message is ever in custody
+    /// across a billed broker round-trip. So an unbounded sample blocks the
+    /// pass outright, and the connector stops consuming while it waits. That
+    /// is worst precisely when it matters most. A degraded broker makes the
+    /// sample slow AND makes the backlog grow. So the sample is budgeted, and
+    /// an over-budget one is abandoned so that the pass still polls.
     #[tokio::test(start_paused = true)]
     async fn an_over_budget_lag_sample_is_abandoned_so_the_pass_still_polls() {
         let source = Arc::new(CallOrderSource::new("orders"));
@@ -3518,13 +3499,13 @@ mod tests {
             ..ConnectorRuntimeConfig::default()
         });
 
-        // Paused clock: the budget is floored at `ADAPTER_LAG_SAMPLE_CEILING`
-        // (a short cadence must not abandon before the adapter's own walk can
-        // stop), so waiting it out for real would put ten seconds on every
-        // run of this suite. The guard sits above that floor so it catches an
-        // UNBOUNDED sample — which parks forever and so never lets the clock
-        // reach the guard's own deadline either — rather than the budget
-        // simply doing its job.
+        // Paused clock. The budget is floored at `ADAPTER_LAG_SAMPLE_CEILING`,
+        // because a short cadence must not abandon before the adapter's own
+        // walk can stop. A real wait would add ten seconds to every run of
+        // this suite. The guard sits above that floor, so it catches an
+        // UNBOUNDED sample and not the budget doing its job. An unbounded
+        // sample parks forever, so it never lets the clock reach the guard's
+        // own deadline either.
         tokio::time::timeout(std::time::Duration::from_secs(60), rt.run_once())
             .await
             .expect("an unbounded lag sample must not block the pass")
@@ -3547,19 +3528,19 @@ mod tests {
 
     /// Telemetry must never sit between `receive` and dispatch.
     ///
-    /// `lag()` is a live broker round-trip — SQS bills a `GetQueueAttributes`,
-    /// Kafka does a metadata + watermark fetch — and either can be slow or
+    /// `lag()` is a live broker round-trip: SQS bills a `GetQueueAttributes`,
+    /// and Kafka does a metadata and watermark fetch. Either can be slow or
     /// retry internally. On SQS the visibility timer starts at
-    /// `ReceiveMessage`, not at dispatch, so a lag call made while a batch is
-    /// already in hand spends that batch's visibility budget: another replica
-    /// receives the messages, their `ApproximateReceiveCount` climbs toward the
-    /// queue's `maxReceiveCount`, and a perfectly processable message reaches
-    /// the broker DLQ having never once failed.
+    /// `ReceiveMessage`, not at dispatch. So a lag call with a batch already in
+    /// hand spends the visibility budget of that batch. Another replica
+    /// receives the messages, and their `ApproximateReceiveCount` climbs toward
+    /// the `maxReceiveCount` of the queue. A processable message then reaches
+    /// the broker DLQ without one failure.
     ///
-    /// Sampling before `receive` costs nothing — the gauge is throttled to a
-    /// scrape cadence, so which side of the receive it lands on is immaterial
-    /// to its accuracy — and it means no message is ever in custody while the
-    /// call is outstanding.
+    /// A sample before `receive` costs nothing. The gauge is throttled to a
+    /// scrape cadence, so the side of the receive it lands on does not affect
+    /// its accuracy. And no message is ever in custody while the call is
+    /// outstanding.
     #[tokio::test]
     async fn lag_is_sampled_before_any_message_is_in_custody() {
         let source = Arc::new(CallOrderSource::new("orders"));
@@ -3630,9 +3611,9 @@ mod tests {
             vec![("orders".to_string(), PoisonReason::Malformed)],
         );
         // `harvest.connector.dispatched` is the SETTLEMENT breakdown, not a
-        // count of messages that reached harvest: every received message
-        // records exactly one outcome, so the series sums to
-        // `harvest.connector.received` and a dashboard can show the full mix.
+        // count of messages that reached harvest. Every received message
+        // records exactly one outcome. So the series sums to
+        // `harvest.connector.received`, and a dashboard can show the full mix.
         assert_eq!(
             metrics.dispatched(),
             vec![("orders".to_string(), ConnectorOutcome::DeadLettered)],
@@ -3642,8 +3623,8 @@ mod tests {
     #[tokio::test]
     async fn a_dead_letter_sink_failure_still_counts_the_poison_but_does_not_ack() {
         // The strike bookkeeping and the metric must describe what ACTUALLY
-        // happened: the message was poison, the record did not land, so the
-        // message is retried rather than silently dropped.
+        // happened. The message was poison and the record did not land. So the
+        // message is retried, not silently dropped.
         let source = Arc::new(MockSource::new("orders"));
         source.push_kafka(0, 1, b"{{{");
         let sink = Arc::new(RecordingDeadLetterSink::new());
@@ -3668,13 +3649,13 @@ mod tests {
     // ---- Stall detection ----
 
     /// A runtime whose partition-0 prefix head (offset 0) was delivered and
-    /// never settled, while `settled` later offsets did — the exact shape a
-    /// retried message leaves behind on Kafka, whose `abandon` cannot force a
-    /// redelivery.
+    /// never settled, while `settled` later offsets did.
     ///
-    /// Seeded through the tracker (as `ack_waits_for_the_contiguous_offset_prefix`
-    /// does) rather than through a mapper, because the point under test is the
-    /// commit prefix, not how a particular message came to be retried.
+    /// That is the exact shape a retried message leaves behind on Kafka, whose
+    /// `abandon` cannot force a redelivery. It is seeded through the tracker,
+    /// as `ack_waits_for_the_contiguous_offset_prefix` does, not through a
+    /// mapper. The point under test is the commit prefix, not how a particular
+    /// message came to be retried.
     async fn stalled_runtime(threshold: Option<usize>, settled: i64) -> ConnectorRuntime {
         let rt = runtime_with_metrics(
             malformed_binding(),
@@ -3703,11 +3684,11 @@ mod tests {
 
     #[tokio::test]
     async fn a_permanently_blocked_prefix_fails_the_pass_with_its_own_error() {
-        // Kafka's `abandon` is a no-op by design (not committing is not a
-        // nack), so a retried message is only handed back when the consumer is
-        // rebuilt and re-reads from the last commit. Left unreported the
-        // partition's prefix stays blocked forever and its commit never
-        // advances -- silently, because every later message settles fine.
+        // Kafka's `abandon` is a no-op by design: not committing is not a
+        // nack. So a retried message is handed back only when the consumer is
+        // rebuilt and re-reads from the last commit. Left unreported, the
+        // prefix of the partition stays blocked forever and its commit never
+        // advances. That is silent, because every later message settles fine.
         let rt = stalled_runtime(Some(3), 4).await;
         assert_eq!(rt.offsets.lock().await.held(0), 4);
 
@@ -3741,9 +3722,9 @@ mod tests {
 
     #[test]
     fn the_default_stall_bound_is_derived_from_the_concurrency_it_must_clear() {
-        // On by default: an unconfigured deployment must still surface a
-        // permanently blocked prefix, or the retry never happens for anyone
-        // who did not know to opt in.
+        // On by default. An unconfigured deployment must still surface a
+        // permanently blocked prefix. Otherwise the retry never happens for
+        // anyone who did not know to opt in.
         assert_eq!(ConnectorRuntimeConfig::default().stall_threshold, None);
 
         // Healthy out-of-order settlement is bounded by `max_in_flight` (only
@@ -3883,11 +3864,11 @@ mod tests {
     /// Never pull more than the binding can dispatch concurrently.
     ///
     /// A prefetched surplus buys nothing: it cannot start until a permit frees
-    /// up, so it just sits. On SQS it is actively harmful -- the visibility
-    /// timer runs from `ReceiveMessage`, so a message waiting behind the whole
-    /// batch's dispatch latency can time out, be handed to another replica, and
-    /// have its receive count incremented toward the queue's redrive policy.
-    /// A perfectly good message reaches the broker DLQ having never failed.
+    /// up, so it just sits. On SQS it is actively harmful. The visibility timer
+    /// runs from `ReceiveMessage`. So a message that waits behind the dispatch
+    /// latency of the whole batch can time out and go to another replica. Its
+    /// receive count then rises toward the redrive policy of the queue. A
+    /// perfectly good message reaches the broker DLQ without one failure.
     #[test]
     fn the_receive_size_never_exceeds_dispatch_capacity() {
         assert_eq!(
@@ -4062,10 +4043,10 @@ mod tests {
 
     /// A positional source that wedges itself on every pass and can rebuild.
     ///
-    /// Models the shape of a downstream outage on Kafka: each pass receives a
-    /// fresh record, its dispatch fails, and because `abandon` cannot force a
-    /// redelivery the offset becomes a permanently blocked prefix head — so
-    /// the next pass stalls, recovers, and the cycle repeats for as long as
+    /// Models the shape of a downstream outage on Kafka. Each pass receives a
+    /// fresh record, and its dispatch fails. `abandon` cannot force a
+    /// redelivery, so the offset becomes a permanently blocked prefix head.
+    /// The next pass stalls and recovers, and the cycle repeats for as long as
     /// the outage lasts.
     #[derive(Debug)]
     struct WedgingRecoverableSource {
@@ -4121,10 +4102,10 @@ mod tests {
 
     /// A source that wedges and whose rebuild never returns.
     ///
-    /// The realistic shape: a Kafka consumer rebuild waiting on a broker that
-    /// is unreachable — which is *the usual state* when a stall happens, since
-    /// the outage that blocked the prefix is generally the outage that blocks
-    /// the rebuild.
+    /// The realistic shape: a Kafka consumer rebuild that waits on an
+    /// unreachable broker. That is *the usual state* when a stall happens. The
+    /// outage that blocked the prefix is generally the outage that blocks the
+    /// rebuild.
     #[derive(Debug)]
     struct RebuildHangsSource {
         inner: MockSource,
@@ -4174,13 +4155,12 @@ mod tests {
     ///
     /// The stall arm awaits `recover_from_stall` inside the *body* of a
     /// `select!` arm that has already resolved, so the cancellation branch is
-    /// no longer racing it. A rebuild blocked on its broker therefore parks
-    /// `run` before it ever reaches `drain_in_flight` — bypassing the bounded
-    /// drain entirely — while `stop_harvest_runtime` awaits the connector
-    /// handle with no deadline of its own. That is a permanently hung
-    /// shutdown, and the outage that wedged the prefix is usually the same one
-    /// that wedges the rebuild, so the two coincide by default rather than by
-    /// coincidence.
+    /// no longer racing it. So a rebuild blocked on its broker parks `run`
+    /// before it ever reaches `drain_in_flight`, and bypasses the bounded
+    /// drain entirely. `stop_harvest_runtime` awaits the connector handle with
+    /// no deadline of its own. That is a permanently hung shutdown. The outage
+    /// that wedged the prefix usually also wedges the rebuild. So the two
+    /// coincide by default, not by coincidence.
     #[tokio::test]
     async fn a_wedged_rebuild_cannot_hang_shutdown() {
         let source = Arc::new(RebuildHangsSource::new("orders"));
@@ -4223,13 +4203,13 @@ mod tests {
             .expect("run task must not panic");
     }
 
-    /// Rebuilding a Kafka consumer is not a free local operation: it triggers
-    /// a **group rebalance**, which revokes and reassigns partitions across
+    /// A Kafka consumer rebuild is not a free local operation. It triggers a
+    /// **group rebalance**, which revokes and reassigns partitions across
     /// every consumer in the group, not just this one. During a downstream
-    /// outage the redelivered head fails again immediately, so a loop that
-    /// recovers without pausing rebuilds as fast as the group can rejoin —
-    /// amplifying one binding's outage into a rebalance storm that disrupts
-    /// unrelated partitions and every other consumer in the group.
+    /// outage the redelivered head fails again at once. So a loop that
+    /// recovers without a pause rebuilds as fast as the group can rejoin. That
+    /// amplifies the outage of one binding into a rebalance storm. The storm
+    /// disrupts unrelated partitions and every other consumer in the group.
     ///
     /// The recovery arm therefore has to honour the same `error_backoff` the
     /// transient-error arm does.
@@ -4277,9 +4257,9 @@ mod tests {
             "the fixture must actually wedge and recover, or this bound is \
              vacuous (saw {recoveries})"
         );
-        // 300ms / 50ms = 6 in theory; 12 leaves generous slack for a loaded
-        // CI runner while staying orders of magnitude below an unthrottled
-        // loop, which rebuilds as fast as the runtime can schedule it.
+        // 300ms / 50ms = 6 in theory. 12 leaves generous slack for a loaded
+        // CI runner. It stays orders of magnitude below an unthrottled loop,
+        // which rebuilds as fast as the runtime can schedule it.
         let ceiling = 2 * (window.as_millis() / backoff.as_millis()) as usize;
         assert!(
             recoveries <= ceiling,
@@ -4292,14 +4272,14 @@ mod tests {
     /// A downstream outage wedges *every* partition in the batch, not one.
     ///
     /// `EventSource::recover` rebuilds the whole client, so every partition
-    /// re-reads from its own last commit — but the stall is reported one
-    /// partition at a time (`stalled` returns the lowest wedged one). Clearing
-    /// only that one leaves the others' stale in-memory marks in place, and
-    /// their redelivered offsets then arrive *below* those marks and are
-    /// mistaken for already-settled redeliveries: exactly the failure
-    /// `forget` exists to prevent, left in place for every partition but the
-    /// first. It also costs one extra rebuild — and one group rebalance — per
-    /// affected partition before consumption can resume.
+    /// re-reads from its own last commit. But the stall is reported one
+    /// partition at a time: `stalled` returns the lowest wedged one. A clear
+    /// of only that one leaves the stale in-memory marks of the others in
+    /// place. Their redelivered offsets then arrive *below* those marks and
+    /// are mistaken for already-settled redeliveries. That is exactly the
+    /// failure `forget` exists to prevent, left in place for every partition
+    /// but the first. It also costs one extra rebuild, and one group
+    /// rebalance, per affected partition before consumption can resume.
     #[tokio::test]
     async fn recovery_clears_every_partition_because_the_rebuild_is_whole_client() {
         let source = Arc::new(RecoverableSource::new("orders"));
@@ -4339,9 +4319,9 @@ mod tests {
     }
 
     /// The whole justification for detecting a stall is that something then
-    /// *performs the retry*. Failing the pass only signals; the runtime has to
-    /// rebuild the consumer and clear the dead generation, or the partition
-    /// stays wedged exactly as it was before the detector existed.
+    /// *performs the retry*. Failing the pass only signals. The runtime must
+    /// rebuild the consumer and clear the dead generation. Otherwise the
+    /// partition stays wedged exactly as it was before the detector existed.
     #[tokio::test]
     async fn a_detected_stall_rebuilds_the_consumer_and_clears_the_dead_generation() {
         let source = Arc::new(RecoverableSource::new("orders"));
@@ -4407,8 +4387,8 @@ mod tests {
         );
     }
 
-    /// A wedged binding must stop pulling. Receiving a batch and then dropping
-    /// it on the stall error is pure churn — and on a positional broker it
+    /// A wedged binding must stop pulling. A batch received only to be dropped
+    /// on the stall error is pure churn. On a positional broker it also
     /// advances the consumer past messages that were never dispatched.
     #[tokio::test]
     async fn a_stalled_pass_never_pulls_a_batch_it_would_only_drop() {

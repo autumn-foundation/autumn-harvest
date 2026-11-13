@@ -24,11 +24,11 @@
 //! // this grant.
 //! ```
 //!
-//! The guard is a `#[must_use]` RAII handle: dropping it pushes exactly one
-//! event-less `ReleaseMutex` (no `harvest_events` footprint), and the engine's
-//! timeout-guard contract keeps the lock **held across suspensions** — a guard
-//! held while the workflow parks on an `.await` is NOT released under the still-
-//! parked holder.
+//! The guard is a `#[must_use]` RAII handle. Dropping it pushes exactly one
+//! event-less `ReleaseMutex`, with no `harvest_events` footprint. The engine's
+//! timeout-guard contract keeps the lock **held across suspensions**. A guard
+//! held while the workflow parks on an `.await` is NOT released under the
+//! still-parked holder.
 //!
 //! ## Semantics
 //!
@@ -54,9 +54,9 @@ struct LedgerOp {
 
 // ---------------------------------------------------------------------------
 // Two workflows serialize read-modify-write updates to the SAME per-account
-// balance. Both acquire `ledger:{account}` before touching the balance, so a
-// concurrent credit and debit for one account can never interleave their
-// critical sections — the second waits FIFO for the first to release.
+// balance. Both acquire `ledger:{account}` before they touch the balance. So a
+// concurrent credit and debit for one account never interleave their critical
+// sections. The second waits FIFO for the first to release.
 // ---------------------------------------------------------------------------
 
 /// Credit an account. Holds the per-account lock across the balance update.
@@ -116,9 +116,9 @@ async fn debit_account(ctx: &WorkflowContext, op: LedgerOp) -> Result<i64, Strin
 /// mutex protects.
 #[activity(start_to_close = "10s")]
 async fn apply_delta(_ctx: &ActivityContext, op: LedgerOp) -> Result<i64, String> {
-    // A stub: a production activity would read the current balance for
-    // `op.account`, add `op.amount`, and persist it — all under the durable lock
-    // the caller holds, so no other execution's activity can interleave.
+    // A stub. A production activity reads the balance for `op.account`, adds
+    // `op.amount`, and persists it. The caller holds the durable lock, so no
+    // other execution's activity can interleave.
     Ok(op.amount)
 }
 
@@ -135,10 +135,10 @@ fn main() {
     println!("  // guard drops (or guard.release()) => lock released, FIFO next waiter granted");
 }
 
-// Gated on the `testing` feature as well as `test`: the example itself must keep
-// building under `--no-default-features` (which CI exercises), while
-// `autumn_harvest::testing` only exists for external consumers when the
-// `testing` feature is enabled.
+// Gated on the `testing` feature as well as `test`. The example must keep
+// building under `--no-default-features`, which CI exercises.
+// `autumn_harvest::testing` exists for an external consumer only when the
+// `testing` feature is on.
 #[cfg(all(test, feature = "testing"))]
 mod tests {
     use super::*;
@@ -150,11 +150,10 @@ mod tests {
         json!({"account": "acct-1", "amount": 250})
     }
 
-    /// Happy path: the harness auto-grants the uncontended lock, the workflow
+    /// Happy path: the harness auto-grants the uncontended lock. The workflow
     /// runs its critical section under the lock, releases it (event-less), and
-    /// completes — with exactly one `MutexGranted` recorded. The recorded
-    /// history then replays cleanly against the same handler (the falsifiable
-    /// replay-safety bar #691's AC6 demands).
+    /// completes with exactly one `MutexGranted` recorded. The recorded history
+    /// then replays cleanly against the same handler, as #691's AC6 demands.
     #[tokio::test]
     async fn credit_acquires_lock_runs_critical_section_and_replays() {
         let outcome = WorkflowTestEnv::new()
@@ -189,9 +188,9 @@ mod tests {
     }
 
     /// Contended path: with the per-account key marked contended, the grant is
-    /// withheld — the workflow parks on `acquire()` (never completes) and no
-    /// `MutexGranted` for that key is ever recorded. This models a second
-    /// execution waiting FIFO behind a live holder.
+    /// withheld. The workflow parks on `acquire()` and never completes. No
+    /// `MutexGranted` for that key is recorded. This models a second execution
+    /// waiting FIFO behind a live holder.
     #[tokio::test]
     async fn debit_parks_when_the_account_lock_is_held() {
         let outcome = WorkflowTestEnv::new()

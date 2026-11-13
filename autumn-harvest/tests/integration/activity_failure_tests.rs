@@ -153,8 +153,7 @@ fn activity_failed_event_new_fields_round_trip() {
     }
 }
 
-/// `ActivityFailed` now carries the structured `details` payload so consumers
-/// reading workflow history (replay diagnostics, history exports, etc.) can
+/// `ActivityFailed` carries the structured `details` payload. History readers
 /// recover what `ActivityFailure::with_details(...)` attached at the call site.
 #[test]
 fn activity_failed_event_preserves_details_round_trip() {

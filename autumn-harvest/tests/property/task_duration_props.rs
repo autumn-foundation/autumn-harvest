@@ -57,9 +57,9 @@ proptest! {
         let _ = task_duration(&s);
     }
 
-    /// A string containing a control/punctuation character that is neither an
-    /// ASCII digit, ASCII letter, nor space is always rejected (never a panic,
-    /// never an accidental parse).
+    /// A string with a control or punctuation character is always rejected.
+    /// That is any character other than an ASCII digit, ASCII letter or space.
+    /// It never panics and never parses by accident.
     #[test]
     fn rejects_strings_with_disallowed_chars(
         prefix in "[0-9]{0,4}",

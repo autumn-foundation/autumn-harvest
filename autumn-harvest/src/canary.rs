@@ -1,11 +1,11 @@
 //! Synthetic liveness canary (issue #796).
 //!
 //! A built-in, throwaway workflow that continuously probes the *live*
-//! `start → dispatch → activity → durable-timer → complete` execution path so a
-//! wedged pipeline (workers polling but never completing, a stalled scheduler
-//! tick, a write-blocked shard) is detected within one probe interval — before
-//! any customer workflow misses its SLA — with zero operator-authored workflow
-//! code.
+//! `start → dispatch → activity → durable-timer → complete` execution path. It
+//! detects a wedged pipeline within one probe interval, before any customer
+//! workflow misses its SLA. Examples are workers that poll but never complete, a
+//! stalled scheduler tick, or a write-blocked shard. It needs no
+//! operator-authored workflow code.
 //!
 //! **Distinct from the #512 replay canary.** The replay canary (`run_workflow_canary`,
 //! `canary_mode`, `/admin/workflows/replay-canary`) validates *code changes* by
@@ -13,12 +13,12 @@
 //! liveness canary validates *the running pipeline* by actively executing a real
 //! throwaway workflow end to end. The two share only the word "canary".
 //!
-//! This module owns the reserved-name constants and the name-matching predicates
-//! that the engine (terminal-metric emission, fleet-count exclusion) and the
-//! plugin (schedule registration, `GET /admin/canary`) both key on. The canary
-//! is registered as an ordinary `#[workflow]`/`#[activity]` on the standard
-//! execution path, so it introduces no new `WorkflowEvent` variant, no migration,
-//! and no replay-determinism change.
+//! This module owns the reserved-name constants and the name-matching
+//! predicates. The engine (terminal-metric emission, fleet-count exclusion) and
+//! the plugin (schedule registration, `GET /admin/canary`) both key on them. The
+//! canary is an ordinary `#[workflow]`/`#[activity]` on the standard execution
+//! path. So it adds no new `WorkflowEvent` variant, no migration, and no
+//! replay-determinism change.
 
 /// The literal of [`CANARY_WORKFLOW_NAME_PREFIX`], for SQL built with `concat!`.
 macro_rules! canary_workflow_name_prefix {
@@ -30,9 +30,10 @@ macro_rules! canary_workflow_name_prefix {
 /// Name prefix shared by every built-in synthetic-liveness-canary workflow
 /// (issue #796).
 ///
-/// The plugin registers one canary workflow per configured probe queue, named
-/// `{CANARY_WORKFLOW_NAME_PREFIX}__{queue}` (double underscore + queue name), so
-/// a single wedged worker pool is distinguishable from "some queue is draining".
+/// The plugin registers one canary workflow per configured probe queue. Each
+/// is named `{CANARY_WORKFLOW_NAME_PREFIX}__{queue}` (double underscore + queue
+/// name). So a single wedged worker pool is distinguishable from "some queue
+/// is draining".
 /// All such names share this prefix, so [`is_canary_workflow`] matches them with
 /// a single `starts_with` check.
 pub const CANARY_WORKFLOW_NAME_PREFIX: &str = canary_workflow_name_prefix!();
@@ -58,10 +59,10 @@ pub const CANARY_ROWS_SQL: &str = concat!(
 
 /// Reserved name of the built-in synthetic-liveness-canary activity (issue #796).
 ///
-/// Unlike the two reserved worker-session internal activities (issue #606), whose
-/// handlers are never invoked, this activity has a *real* working handler — the
-/// canary must actually dispatch and complete a non-local activity to prove the
-/// dispatch path works end to end.
+/// The handlers of the two reserved worker-session internal activities (issue
+/// #606) never run. This activity has a *real* working handler. The canary must
+/// dispatch and complete a non-local activity to prove the dispatch path end to
+/// end.
 pub const CANARY_ACTIVITY_NAME: &str = "__harvest_canary_probe_activity";
 
 /// Returns `true` when `name` is a built-in synthetic-liveness-canary workflow
@@ -72,9 +73,9 @@ pub const CANARY_ACTIVITY_NAME: &str = "__harvest_canary_probe_activity";
 /// `__harvest_canary_probe__email` both match while an ordinary user workflow
 /// does not.
 ///
-/// Used at the workflow-terminal metric-emission sites to route a canary run to
-/// the `harvest.canary.*` metrics (and to *skip* `harvest.workflow.terminal`),
-/// and in the fleet-count exclusion so canary runs never pollute success-rate
+/// The workflow-terminal metric-emission sites use it to route a canary run to
+/// the `harvest.canary.*` metrics and *skip* `harvest.workflow.terminal`. The
+/// fleet-count exclusion uses it, so canary runs never pollute success-rate
 /// dashboards.
 #[must_use]
 pub fn is_canary_workflow(name: &str) -> bool {
@@ -126,10 +127,9 @@ mod tests {
         assert!(!is_canary_workflow("not__harvest_canary_probe"));
         // NOTE: the canary activity name shares the workflow prefix
         // (`__harvest_canary_probe_activity` starts with `__harvest_canary_probe`),
-        // so `is_canary_workflow` returns `true` for it. That is harmless:
-        // `is_canary_workflow` is only ever called with *workflow* names (at the
-        // terminal-metric sites and in the fleet-count SQL), never activity names
-        // — activities have no `harvest_workflow_executions` rows. Use
+        // so `is_canary_workflow` returns `true` for it. That is harmless. Its
+        // only callers pass *workflow* names: the terminal-metric sites and the
+        // fleet-count SQL. Activities have no `harvest_workflow_executions` rows. Use
         // `is_reserved_canary_name` when both kinds must be recognised.
     }
 
@@ -147,13 +147,13 @@ mod tests {
         assert!(!is_reserved_canary_name("__harvest_session_acquire"));
     }
 
-    /// The terminal-metric choke point (`telemetry::emit_workflow_terminal`,
-    /// exercised end to end at `worker.rs::process_workflow_task` and
-    /// `timeout.rs::enforce_workflow_execution_timeouts`) routes a run to the
-    /// `harvest.canary.*` metrics — and SKIPS `harvest.workflow.terminal` and
-    /// the other business SLO counters (issue #796, AC8) — exactly when
-    /// [`is_canary_workflow`] returns `true` for the execution's
-    /// `workflow_name`. This pins the *predicate* for the per-queue naming
+    /// The terminal-metric choke point is `telemetry::emit_workflow_terminal`.
+    /// `worker.rs::process_workflow_task` and
+    /// `timeout.rs::enforce_workflow_execution_timeouts` exercise it end to end.
+    /// It routes a run to the `harvest.canary.*` metrics exactly when
+    /// [`is_canary_workflow`] returns `true` for the `workflow_name`. Such a run
+    /// SKIPS `harvest.workflow.terminal` and the other business SLO counters
+    /// (issue #796, AC8). This pins the *predicate* for the per-queue naming
     /// scheme a real probe registration uses, and confirms an ordinary workflow
     /// still takes the business-metric path. The choke point's own
     /// record-vs-skip behavior is unit-tested at

@@ -1,25 +1,25 @@
 //! Generic substitution: what `[T := HashMap<String, u32>]` means to a callee path.
 //!
 //! MIR prints a generic body **once**, with its type parameters still spelled
-//! `T`, and prints the concrete type only at the call site
+//! `T`. It prints the concrete type only at the call site
 //! (`pairs::<HashMap<String, u32>>`, or in the declared type of the argument
 //! local). Without threading that binding into the callee, the Order source
-//! inside `pairs` — `<T as IntoIterator>::into_iter` — is invisible (D6/D7).
+//! inside `pairs` (`<T as IntoIterator>::into_iter`) is invisible (D6/D7).
 //!
 //! Two mechanisms, in this order:
 //!
 //! 1. **Unification** of each callee parameter's declared type against the
 //!    call site's actual argument type, plus the callee's return type against
 //!    the destination local's type. This is order-free and needs no knowledge
-//!    of the parameter list, so it works even when the source file that
+//!    of the parameter list. So it works even when the source file that
 //!    declares the callee was never read.
 //! 2. **The turbofish, by elimination**: whatever unification left unbound is
-//!    bound positionally from `f::<A, B>`, in the callee's declared parameter
-//!    order (recovered with `syn`) or, failing that, in order of first
-//!    appearance in the body.
+//!    bound positionally from `f::<A, B>`. The order is the callee's declared
+//!    parameter order (recovered with `syn`). Failing that, it is the order of
+//!    first appearance in the body.
 //!
 //! [`Substitution::apply`] rewrites a path at the **token** level, never as a
-//! substring: `T` must not match inside `Tuple`, and nothing inside a
+//! substring. `T` must not match inside `Tuple`. Nothing inside a
 //! `{closure@file.rs:1:1: 1:2}` brace form may be rewritten at all.
 
 use std::collections::BTreeMap;
@@ -76,8 +76,8 @@ impl Substitution {
     /// Rewrite every type parameter in `path` under this substitution.
     ///
     /// Token-level: an identifier is replaced only when it is the *whole*
-    /// identifier, and never inside a `{...}` brace form (a closure/coroutine
-    /// span, whose file path is not a type).
+    /// identifier. It is never replaced inside a `{...}` brace form. That form
+    /// is a closure/coroutine span, whose file path is not a type.
     #[must_use]
     pub fn apply(&self, path: &str) -> String {
         if self.0.is_empty() {

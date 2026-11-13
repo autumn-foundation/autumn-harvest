@@ -2,33 +2,32 @@
 //! `ActivityContext::info()` / `deadline()` / `time_remaining()` behavioural
 //! tests — issue #783.
 //!
-//! These prove the *worker threading*: the pure helpers and the accessor
-//! surface are unit-tested in `src/context.rs`, but only a real dispatch can
-//! show that the values an author reads actually describe the run and agree
-//! with the mechanism that kills the attempt.
+//! These prove the *worker threading*. `src/context.rs` unit-tests the pure
+//! helpers and the accessor surface. Only a real dispatch can show that the
+//! values an author reads describe the run. They must also agree with the
+//! mechanism that kills the attempt.
 //!
 //! * TEST A (`regular_dispatch_reports_the_owning_run_and_a_usable_task_id`):
-//!   AC1 + AC3. A queue-dispatched activity captures `ctx.info()`; every field
-//!   matches the seeded run, `execution_id` round-trips through its string form
-//!   back to the seeded `ExecutionId` (the management-API path segment), and
-//!   `task_id` is the real `harvest_task_queue` PK — the id the operator
+//!   AC1 + AC3. A queue-dispatched activity captures `ctx.info()`. Every field
+//!   matches the seeded run. `execution_id` round-trips through its string form
+//!   back to the seeded `ExecutionId` (the management-API path segment).
+//!   `task_id` is the real `harvest_task_queue` PK, which the operator
 //!   `retry-now` / `fail-now` routes address.
 //!
 //! * TEST B (`reported_deadline_agrees_with_the_start_to_close_scanner`): AC2,
-//!   in two composed halves. Part 1 asserts the reported deadline *is* the
-//!   `started_at + start_to_close` arithmetic read off the very row the scanner
-//!   reads — exact `DateTime` equality, so a `scheduled_at` anchor fails. Part 2
-//!   drives the real `timeout::find_timed_out_tasks` against two probe rows
-//!   positioned by shifting `started_at` around the scanner's own `NOW()`: one
-//!   just short of that same arithmetic (spared) and one just past it
-//!   (reclaimed). Together they pin `reported == f(row)` and `scanner enforces
-//!   f(row)`. (The scanner takes no injectable clock, hence the probe rows
-//!   rather than a probe *time*.)
+//!   in two composed halves. Part 1 asserts the reported deadline *is*
+//!   `started_at + start_to_close`, read off the very row the scanner reads.
+//!   Exact `DateTime` equality makes a `scheduled_at` anchor fail. Part 2
+//!   drives the real `timeout::find_timed_out_tasks` against two probe rows.
+//!   Their `started_at` sits around the scanner's own `NOW()`. One is just
+//!   short of the deadline (spared), one just past it (reclaimed). Together they
+//!   pin `reported == f(row)` and `scanner enforces f(row)`. (The scanner takes
+//!   no injectable clock, hence the probe rows rather than a probe *time*.)
 //!
 //! * TEST C (`schedule_to_close_shortens_the_reported_deadline`): the
-//!   min-of-two-clocks rule. With a `schedule_to_close` closer than the
-//!   per-attempt `start_to_close`, the reported deadline is the *earlier*
-//!   one — over-reporting here would let an activity work right up to a kill
+//!   min-of-two-clocks rule. A `schedule_to_close` may come before the
+//!   per-attempt `start_to_close`. The reported deadline is then the *earlier*
+//!   one. Over-reporting here would let an activity work right up to a kill
 //!   that discards everything.
 //!
 //! * TEST D (`identity_is_stable_across_a_real_retry`): AC4. A real
@@ -36,10 +35,10 @@
 //!   and 2 while `attempt` advances and the deadline moves forward.
 //!
 //! * TEST E (`local_dispatch_reports_is_local_and_the_configured_cap`): AC5.
-//!   A local activity reports `is_local == true`, `task_id == None`, a bounded
-//!   deadline drawn from `WorkerConfig::max_local_activity_start_to_close` when
-//!   `start_to_close` is unset, and the *cap* (not the larger declared value)
-//!   when the declared budget exceeds it.
+//!   A local activity reports `is_local == true` and `task_id == None`. With
+//!   `start_to_close` unset, its deadline comes from
+//!   `WorkerConfig::max_local_activity_start_to_close`. A declared budget above
+//!   that cap reports the *cap*, not the larger declared value.
 //!
 //! * TEST F (`checkpointing_activity_loses_zero_completed_work`): the success
 //!   metric. An activity processes items one at a time, heartbeating a
@@ -156,10 +155,10 @@ fn worker_config(worker_id: &str, local_cap: Duration) -> WorkerRuntimeConfig {
         scanner: autumn_harvest::scanner_lease::ScannerConfig::default(),
         dr: autumn_harvest::replication::DrConfig::default(),
         worker_id: worker_id.to_string(),
-        // Two queues so `info().queue_name` is falsifiable: with a single
-        // "default" queue, the workflow queue, the activity queue and the
-        // asserted value are all the same string, so the assertion could not
-        // distinguish "the activity's queue" from a hardcoded constant.
+        // Two queues make `info().queue_name` falsifiable. With one "default"
+        // queue, the workflow queue, activity queue and asserted value are the
+        // same string. The assertion then cannot tell "the activity's queue"
+        // from a hardcoded constant.
         queues: vec!["default".to_string(), "activity-q".to_string()],
         notification_database_url: None,
         max_concurrent_workflows: 2,
@@ -379,9 +378,8 @@ async fn seed_workflow(
 }
 
 /// Seeds a standalone RUNNING activity task row with a chosen
-/// `(started_at, start_to_close)` pair so the real start-to-close scanner can
-/// be driven against a deadline positioned relative to its own `NOW()`.
-/// Returns the task id.
+/// `(started_at, start_to_close)` pair. The real start-to-close scanner then
+/// sees a deadline relative to its own `NOW()`. Returns the task id.
 async fn seed_running_activity_probe(
     conn: &mut AsyncPgConnection,
     workflow_name: &'static str,
@@ -455,12 +453,12 @@ async fn wait_for_state(
 // ---------------------------------------------------------------------------
 // Observation plumbing.
 //
-// An activity handler is a plain `fn`, so it cannot capture per-test state.
-// Rather than a process-wide static (which would make these tests order- and
-// parallelism-dependent within the shared integration binary), each test
-// registers its own `Arc<Observations>` in the registry's shared state and the
-// handler reads it back with `ctx.state::<Arc<Observations>>()` — the same
-// pattern `integration_e2e.rs` uses for its retry observations.
+// An activity handler is a plain `fn`, so it cannot capture per-test state. A
+// process-wide static would make these tests order- and parallelism-dependent
+// within the shared integration binary. Instead, each test registers its own
+// `Arc<Observations>` in the registry's shared state. The handler reads it
+// back with `ctx.state::<Arc<Observations>>()`. `integration_e2e.rs` uses the
+// same pattern for its retry observations.
 // ---------------------------------------------------------------------------
 
 /// Everything a handler observed, in attempt order.
@@ -540,11 +538,11 @@ fn observe_activity(
     })
 }
 
-/// Same, but declared with NO `start_to_close` and NO `schedule_to_close`, and
-/// dispatched on a non-default queue — so a single dispatch pins both AC2's
-/// "`None` when unbounded" clause through the real worker (a mutant that
-/// substituted a fabricated budget would be caught) and the `queue_name` field
-/// against a value that differs from the workflow's own queue.
+/// Same, but with NO `start_to_close`, NO `schedule_to_close`, and a
+/// non-default queue. One dispatch pins AC2's "`None` when unbounded" clause
+/// through the real worker. A mutant that substitutes a fabricated budget
+/// fails. It also pins `queue_name` against a value that differs from the
+/// workflow's own queue.
 fn unbounded_activity(
     ctx: &autumn_harvest::ActivityContext,
     _input: serde_json::Value,
@@ -619,35 +617,33 @@ fn wf_retry_observe(ctx: &WorkflowContext, input: serde_json::Value) -> BoxFut<'
 // --- Success metric: checkpointing activity ---------------------------------
 
 /// Total items the checkpointing activity must process across all attempts.
-/// Twelve items x 700ms is ~8.4s of work against an 8s per-attempt budget, so a
-/// single attempt provably cannot finish them all — the retry is real, not
-/// incidental, which is what makes the 0%-rework claim meaningful.
+/// Twelve items x 700ms is ~8.4s of work against an 8s per-attempt budget. So a
+/// single attempt cannot finish them all, and the retry is real. That makes the
+/// 0%-rework claim meaningful.
 const TOTAL_ITEMS: u32 = 12;
-/// Simulated per-item cost.
 const ITEM_COST: Duration = Duration::from_millis(700);
 /// Per-attempt `start_to_close` budget.
 const ATTEMPT_BUDGET: Duration = Duration::from_secs(8);
 /// Reserve: return early while there is still time to flush the checkpoint.
 ///
 /// The guard is checked once per item, so remaining-at-trip lands in
-/// `(RESERVE - ITEM_COST, RESERVE]` — 3.8s..4.5s. Subtracting `FLUSH_WAIT`
-/// leaves 1.8s..2.5s of clearance before the kill, and that margin is
-/// independent of dispatch overhead because the trip is evaluated against the
-/// real deadline rather than an item count. A kill mid-flush would lose the
-/// last checkpoint and the test would (correctly) fail.
+/// `(RESERVE - ITEM_COST, RESERVE]`, that is 3.8s..4.5s. Subtracting
+/// `FLUSH_WAIT` leaves 1.8s..2.5s of clearance before the kill. Dispatch
+/// overhead does not change that margin, because the trip reads the real
+/// deadline, not an item count. A kill mid-flush would lose the last
+/// checkpoint, and the test would (correctly) fail.
 const RESERVE: Duration = Duration::from_millis(4_500);
 /// The batched heartbeat flusher ticks once a second and does NOT drain on
 /// cancel, so a checkpoint sent immediately before returning can be lost. Wait
-/// out one full interval plus a full second of slack — the slack has to cover
-/// `pool.get()` and the UPDATE being *issued*, so it is load-bearing, not
-/// cosmetic.
+/// out one full interval plus a full second of slack. The slack covers
+/// `pool.get()` and the issue of the UPDATE, so it is load-bearing.
 const FLUSH_WAIT: Duration = Duration::from_secs(2);
 
 /// Reads `{"next": n}` from the heartbeat checkpoint, defaulting to 0.
 ///
-/// A read *failure* is fatal rather than silently resuming from 0: that would
-/// re-execute completed work, which the 0%-rework assertion would then report
-/// as a duplicate — a correct failure with a misleading cause.
+/// A read *failure* is fatal rather than a silent resume from 0. A resume would
+/// re-execute completed work. The 0%-rework assertion would then report a
+/// duplicate: a correct failure with a misleading cause.
 fn checkpoint_start(ctx: &autumn_harvest::ActivityContext) -> u32 {
     ctx.heartbeat_details::<serde_json::Value>()
         .expect("reading the resume checkpoint must not fail")
@@ -656,8 +652,8 @@ fn checkpoint_start(ctx: &autumn_harvest::ActivityContext) -> u32 {
         .unwrap_or(0)
 }
 
-/// The success-metric activity: processes items one at a time from the
-/// checkpoint, heartbeating after each, and returns early (retryable) once the
+/// The success-metric activity. It processes items one at a time from the
+/// checkpoint and heartbeats after each. It returns early (retryable) once the
 /// attempt deadline is within `RESERVE`. The retry resumes from the checkpoint.
 fn checkpointing_activity(
     ctx: &autumn_harvest::ActivityContext,
@@ -693,10 +689,10 @@ fn wf_checkpointing(ctx: &WorkflowContext, input: serde_json::Value) -> BoxFut<'
     })
 }
 
-/// Negative control: identical, but WITHOUT the deadline guard. It is killed
-/// mid-item by the `start_to_close` scanner — a terminal, non-retryable
-/// timeout — so the remaining items are never processed at all and the run
-/// fails. This is the failure mode `ctx.time_remaining()` exists to avoid.
+/// Negative control: identical, but WITHOUT the deadline guard. The
+/// `start_to_close` scanner kills it mid-item with a terminal, non-retryable
+/// timeout. The remaining items never run, and the run fails. This is the
+/// failure mode `ctx.time_remaining()` exists to avoid.
 fn unguarded_activity(
     ctx: &autumn_harvest::ActivityContext,
     _input: serde_json::Value,
@@ -845,9 +841,9 @@ async fn regular_dispatch_reports_the_owning_run_and_a_usable_task_id() {
     assert_unbounded_sibling(&infos[1], info, observed.deadlines()[1]);
 }
 
-/// AC3: the reported `execution_id` IS the management-API path segment — it
-/// round-trips through its rendered string form back to the same id, and that
-/// id selects exactly the seeded row.
+/// AC3: the reported `execution_id` IS the management-API path segment. It
+/// round-trips through its rendered string form back to the same id. That id
+/// selects exactly the seeded row.
 async fn assert_execution_id_is_the_api_path_segment(
     url: &str,
     info: &ActivityExecutionInfo,
@@ -867,9 +863,9 @@ async fn assert_execution_id_is_the_api_path_segment(
 /// The second half of TEST A's single run, on the sibling activity dispatched
 /// with no budget and on a different queue.
 ///
-/// Kept as a helper so both halves observe the *same* run — the shared
-/// `execution_id` next to the differing `queue_name` is what makes the queue
-/// assertion attributable to the dispatch rather than to the workflow.
+/// Both halves observe the *same* run. The shared `execution_id` beside the
+/// differing `queue_name` ties the queue assertion to the dispatch, not the
+/// workflow.
 fn assert_unbounded_sibling(
     unbounded: &ActivityExecutionInfo,
     bounded: &ActivityExecutionInfo,
@@ -938,11 +934,10 @@ async fn reported_deadline_agrees_with_the_start_to_close_scanner() {
 
     let deadline = observed.deadlines()[0].expect("a start_to_close activity has a deadline");
 
-    // ── Part 1: the reported deadline is exactly the arithmetic the scanner
-    // performs — `started_at + start_to_close` — read straight off the row the
-    // scanner would have compared against. A "plausible-looking" deadline
-    // computed from any other anchor (e.g. `scheduled_at`, or a local
-    // `Instant`) fails here.
+    // ── Part 1: the reported deadline is exactly the scanner's arithmetic,
+    // `started_at + start_to_close`, read off the row the scanner compares
+    // against. A "plausible-looking" deadline from any other anchor (e.g.
+    // `scheduled_at`, or a local `Instant`) fails here.
     let (row_started_at, row_stc): (Option<DateTime<Utc>>, Option<chrono::Duration>) =
         harvest_task_queue::table
             .filter(harvest_task_queue::workflow_exec_id.eq(exec_id.as_uuid()))
@@ -963,11 +958,11 @@ async fn reported_deadline_agrees_with_the_start_to_close_scanner() {
          very row the start-to-close scanner reads"
     );
 
-    // ── Part 2: prove that arithmetic really is what the scanner enforces, by
-    // driving the real `find_timed_out_tasks` against two probe rows that
-    // straddle its `NOW()`. The scanner has no injectable clock, so the probes
-    // are positioned by shifting `started_at` instead: same `start_to_close`,
-    // one deadline 5s in the future and one 5s in the past.
+    // ── Part 2: prove the scanner enforces that arithmetic. Drive the real
+    // `find_timed_out_tasks` against two probe rows that straddle its `NOW()`.
+    // The scanner has no injectable clock, so the probes shift `started_at`
+    // instead. Both use the same `start_to_close`. One deadline is 5s in the
+    // future, one 5s in the past.
     let not_yet = seed_running_activity_probe(
         &mut conn,
         "stc_probe_future",
@@ -1255,9 +1250,9 @@ async fn local_dispatch_reports_is_local_and_the_configured_cap() {
 
     let after2 = Utc::now();
     let capped = observed2.deadlines()[0].expect("a local activity is always capped");
-    // Same two-sided sandwich. The upper bound is what proves the clamp (the
-    // declared 600s budget would blow past it); the lower bound proves the
-    // clamp landed *at* the cap rather than somewhere arbitrarily below it.
+    // Same two-sided sandwich. The upper bound proves the clamp, because the
+    // declared 600s budget would blow past it. The lower bound proves the
+    // clamp landed *at* the cap, not somewhere arbitrarily below it.
     assert!(
         capped <= after2 + cap_budget,
         "an above-cap start_to_close must be clamped to the cap ({local_cap:?}), \
@@ -1366,10 +1361,10 @@ async fn checkpointing_activity_loses_zero_completed_work() {
     assert_control_work_was_discarded(&url, &mut conn, exec2, &control_state, &observed2).await;
 }
 
-/// The contrast that makes the guard load-bearing: the guarded run reached
-/// COMPLETED with every item durably accounted for exactly once, while the
-/// unguarded one — doing the same work at the same cost under the same budget —
-/// had its work DISCARDED when the deadline killed it.
+/// The contrast that makes the guard load-bearing. The guarded run reached
+/// COMPLETED with every item durably accounted for exactly once. The unguarded
+/// one did the same work at the same cost under the same budget. Its work was
+/// DISCARDED when the deadline killed it.
 async fn assert_control_work_was_discarded(
     url: &str,
     conn: &mut AsyncPgConnection,
@@ -1384,8 +1379,8 @@ async fn assert_control_work_was_discarded(
          in-process ledger was {control:?}"
     );
 
-    // Pin the control to the *specific* failure mode, so a future change that
-    // fails it for an unrelated reason does not quietly keep this test green.
+    // Pin the control to the *specific* failure mode. A future change that
+    // fails it for an unrelated reason must not keep this test green.
     let control_error: Option<String> = harvest_task_queue::table
         .filter(harvest_task_queue::workflow_exec_id.eq(exec2.as_uuid()))
         .filter(harvest_task_queue::task_type.eq("activity"))
@@ -1409,12 +1404,12 @@ async fn assert_control_work_was_discarded(
          'work was discarded' contrast is vacuous"
     );
 
-    // Second: none of that work became durable. Note the in-process ledger is
-    // NOT the measure here — the scanner reclaims the task ROW while the
-    // in-flight future keeps running in memory, so the control's ledger can
-    // well show every item even though the run failed. What was discarded is
-    // the *durable* record: no `ActivityCompleted` was ever appended, so from
-    // the engine's point of view the activity produced nothing at all.
+    // Second: none of that work became durable. The in-process ledger is NOT
+    // the measure here. The scanner reclaims the task ROW while the in-flight
+    // future keeps running in memory. So the control's ledger can show every
+    // item even though the run failed. The *durable* record was discarded: no
+    // `ActivityCompleted` was ever appended. To the engine, the activity
+    // produced nothing at all.
     let control_history = {
         let mut conn = connect(url).await;
         store::load_history(&mut conn, exec2)

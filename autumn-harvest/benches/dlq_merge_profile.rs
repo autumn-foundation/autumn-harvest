@@ -6,11 +6,11 @@
 //! `docs/performance-dlq-aggregate.md`) is the **per-shard** stage: it turns
 //! that shard's raw dead-letter rows into a `HashMap<key, DlqRawGroup>`.
 //! `merge_dlq_aggregates` is the separate, later **cross-shard** stage this
-//! harness targets: it takes one `DlqAggregatePartial` per shard (each
-//! already collapsed to that shard's own distinct groups) and folds them
+//! harness targets. It takes one `DlqAggregatePartial` per shard, each
+//! already collapsed to that shard's own distinct groups. It folds them
 //! into one final, Top-N-rolled-up response. The two stages are distinct
-//! functions with distinct loops, so a finding about one says nothing about
-//! the other -- this harness exists because `merge_dlq_aggregates` has never
+//! functions with distinct loops. So a finding about one says nothing about
+//! the other. This harness exists because `merge_dlq_aggregates` has never
 //! been profiled.
 //!
 //! Wall-clock timing is unreliable on this (shared-vCPU) machine, so this
@@ -24,27 +24,30 @@
 //! # Workload
 //!
 //! A DLQ "flood" (the shape `docs/performance-dlq-aggregate.md` also uses)
-//! collapses into a handful of root causes -- but it does so **on every
-//! shard independently**: an operator's `GET /dead-letters/aggregate` fans
-//! out to every shard first (`aggregate_dead_letters` -> per-shard
-//! `group_dead_letter_rows`), so the merge step this harness profiles sees
-//! `MERGE_PROFILE_SHARDS` partials (default 8, a plausible mid-size fleet;
-//! see `docs/sharding.md`), each already carrying `MERGE_PROFILE_GROUPS`
-//! (default 25, matching `dlq_aggregate_profile.rs`'s own default and the
-//! Vantage UI's `DEFAULT_DLQ_SUMMARY_GROUP_BY` collapse ratio) distinct
-//! `(workflow_name, failure_signature)` groups. Every shard reports the
-//! *same* 25 root causes (a real incident's failure classes are
-//! fleet-wide, not shard-local), so the merge loop is dominated by the
-//! hit path -- exactly like the per-row grouping loop in
-//! `group_dead_letter_rows` -- which is what makes the two functions'
+//! collapses into a handful of root causes. But it does so **on every shard
+//! independently**. An operator's `GET /dead-letters/aggregate` fans out to
+//! every shard first (`aggregate_dead_letters` -> per-shard
+//! `group_dead_letter_rows`).
+//!
+//! So the merge step this harness profiles sees `MERGE_PROFILE_SHARDS`
+//! partials. The default is 8, a plausible mid-size fleet (see
+//! `docs/sharding.md`). Each partial already carries `MERGE_PROFILE_GROUPS`
+//! distinct `(workflow_name, failure_signature)` groups. That default is 25.
+//! It matches `dlq_aggregate_profile.rs`'s own default and the Vantage UI's
+//! `DEFAULT_DLQ_SUMMARY_GROUP_BY` collapse ratio.
+//!
+//! Every shard reports the *same* 25 root causes, because a real incident's
+//! failure classes are fleet-wide, not shard-local. So the hit path dominates
+//! the merge loop, exactly as in the per-row grouping loop of
+//! `group_dead_letter_rows`. That makes the two functions'
 //! `entry(key.clone())` costs comparable.
 //!
 //! `MERGE_PROFILE_REPS` (default 500) repeats the whole build-partials +
-//! merge cycle -- each rep builds its own fresh `Vec<DlqAggregatePartial>`
-//! (never reuses/clones a prior one), so no extra `Clone` cost leaks into
-//! the measured `merge_dlq_aggregates` call -- to trade process-startup
-//! noise for (linearly) more valgrind wall time when a single rep's signal
-//! is too close to one-time process overhead.
+//! merge cycle. It trades process-startup noise for (linearly) more valgrind
+//! wall time when a single rep's signal is too close to one-time process
+//! overhead. Each rep builds its own fresh `Vec<DlqAggregatePartial>` and never
+//! reuses or clones a prior one. So no extra `Clone` cost leaks into the
+//! measured `merge_dlq_aggregates` call.
 //!
 //! # Running
 //!
@@ -82,9 +85,11 @@ fn env_usize(key: &str, default: usize) -> usize {
 }
 
 /// Build one shard's partial: `groups` distinct `(workflow_name,
-/// failure_signature)` root causes, each with a per-shard sample-id set and
-/// timestamps offset by `shard_id` so `min_instant`/`max_instant` genuinely
-/// do comparison work across shards rather than folding identical values.
+/// failure_signature)` root causes.
+///
+/// Each has a per-shard sample-id set and timestamps offset by `shard_id`. So
+/// `min_instant`/`max_instant` genuinely do comparison work across shards
+/// rather than folding identical values.
 fn build_partial(shard_id: usize, groups: usize, samples_per_group: usize) -> DlqAggregatePartial {
     let base = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
     let count_per_group = 100 + i64::try_from(shard_id).unwrap_or(0);
@@ -106,9 +111,9 @@ fn build_partial(shard_id: usize, groups: usize, samples_per_group: usize) -> Dl
             }
         })
         .collect();
-    // Reconcile with the per-group counts above, matching the invariant a real
-    // per-shard aggregate_dead_letters() result satisfies: total/filtered_total
-    // is the sum of every group's count on that shard.
+    // Reconcile with the per-group counts above. A real per-shard
+    // aggregate_dead_letters() result satisfies the same invariant:
+    // total/filtered_total is the sum of every group's count on that shard.
     let shard_total = i64::try_from(groups)
         .unwrap_or(i64::MAX)
         .saturating_mul(count_per_group);
@@ -161,7 +166,7 @@ fn main() {
     let limit = params.limit_groups as usize;
     let regular_groups_per_rep = groups.min(limit);
     // rollup_top_n adds one extra "_other" row per rep when the input exceeds
-    // `limit` -- every group here has a positive count, so truncation always
+    // `limit`. Every group here has a positive count, so truncation always
     // implies a non-empty rollup.
     let rep_is_truncated = groups > limit;
     let expected_groups_per_rep = regular_groups_per_rep + usize::from(rep_is_truncated);

@@ -226,17 +226,20 @@ pub enum SqliteError {
     Unsupported(String),
 
     /// A caller-supplied payload exceeded its configured byte cap at an ingress
-    /// boundary (issue #252). Mirrors the Postgres path's
+    /// boundary (issue #252).
+    ///
+    /// Mirrors the
     /// [`HarvestError::PayloadTooLarge`](autumn_harvest::HarvestError::PayloadTooLarge)
-    /// rejection: the oversized payload is refused BEFORE it is persisted, so an
-    /// unbounded workflow input or signal payload can never enter `harvest_events`
-    /// (which would bloat history and make this backend accept a payload other
-    /// backends reject). `kind` names the boundary (`"workflow_input"` /
-    /// `"signal_payload"`); `observed_bytes`/`cap_bytes` mirror the core error's
-    /// fields. An oversized activity *result* is NOT surfaced through this variant
-    /// — it is normalized into a non-retryable `PayloadTooLarge` `ActivityFailed`
-    /// event (the workflow observes the failure), exactly as the Postgres worker
-    /// does, so the run continues rather than the caller erroring.
+    /// rejection of the Postgres path. The oversized payload is refused BEFORE it
+    /// is persisted. So an unbounded workflow input or signal payload never enters
+    /// `harvest_events`. It would bloat history, and this backend would accept a
+    /// payload that other backends reject. `kind` names the boundary
+    /// (`"workflow_input"` / `"signal_payload"`). `observed_bytes`/`cap_bytes`
+    /// mirror the fields of the core error.
+    ///
+    /// An oversized activity *result* does NOT use this variant. It becomes a
+    /// non-retryable `PayloadTooLarge` `ActivityFailed` event, as in the Postgres
+    /// worker. The workflow observes the failure, and the run continues.
     #[error(
         "payload too large: {kind} exceeded cap of {cap_bytes} bytes \
          (observed {observed_bytes} bytes)"
@@ -276,13 +279,14 @@ pub enum SqliteError {
 
     /// A start carrying the [`RejectDuplicate`](autumn_harvest::WorkflowIdReusePolicy::RejectDuplicate)
     /// reuse policy collided with an existing, non-sealed execution for the same
-    /// `(workflow_name, workflow_id)` key (issue #1068). Mirrors the Postgres core
-    /// start path's [`HarvestError::AlreadyExists`](autumn_harvest::HarvestError::AlreadyExists):
-    /// the second request is refused rather than attaching a signal / silently
-    /// returning the prior, so the caller can decide what to do. A prior in a
-    /// SEALED state (`CONTINUED_AS_NEW`/`TERMINATED`) is invisible to the reuse
-    /// check and never triggers this — matching core's uniqueness-index-excludes-
-    /// terminal nuance.
+    /// `(workflow_name, workflow_id)` key (issue #1068).
+    ///
+    /// Mirrors [`HarvestError::AlreadyExists`](autumn_harvest::HarvestError::AlreadyExists)
+    /// on the Postgres core start path. The second request is refused. It does
+    /// not attach a signal or silently return the prior, so the caller decides
+    /// what to do. A prior in a SEALED state (`CONTINUED_AS_NEW`/`TERMINATED`) is
+    /// invisible to the reuse check and never triggers this. That matches the
+    /// core uniqueness index, which excludes those states.
     #[error(
         "workflow execution already exists for this (workflow_name, workflow_id) key: \
          {existing_exec_id} (state: {existing_state})"
@@ -374,15 +378,16 @@ pub enum SqliteError {
         max_depth: usize,
     },
 
-    /// The engine detected a replay **non-determinism** divergence: the current
-    /// workflow code produced a command stream that disagrees with the recorded
-    /// history (workflow-code drift across a deploy). This is **non-terminal**
-    /// (mirroring the Postgres engine's issue-#603 semantics): the divergent
-    /// decision cycle is **discarded** — nothing is appended to history, no
-    /// bookkeeping command is persisted, and the execution stays `RUNNING` /
-    /// resumable. A fixed or rolled-back workflow build can then re-drive the
-    /// **unchanged** history to completion; the run is never sealed `FAILED` and
-    /// its history is never poisoned by the bad build.
+    /// The engine detected a replay **non-determinism** divergence.
+    ///
+    /// The current workflow code produced a command stream that disagrees with
+    /// the recorded history (workflow-code drift across a deploy). This is
+    /// **non-terminal**, as in the issue #603 semantics of the Postgres engine.
+    /// The divergent decision cycle is **discarded**. Nothing is appended to
+    /// history, and no bookkeeping command is persisted. The execution stays
+    /// `RUNNING` and resumable. A fixed or rolled-back build can then re-drive the
+    /// **unchanged** history to completion. The run is never sealed `FAILED`, and
+    /// the bad build never poisons its history.
     ///
     /// This backend surfaces the divergence to the caller instead of sealing it,
     /// so the operator fixes/rolls back the code and re-drives. The full
@@ -404,15 +409,16 @@ pub enum SqliteError {
     },
 
     /// A `#[workflow]` handler **panicked** (rather than returning `Err`) and the
-    /// engine caught it at the dispatch boundary (issue #782). Like a replay
-    /// non-determinism divergence, this is **non-terminal and resumable**: the
-    /// panicked decision cycle is **discarded** (no event appended, no bookkeeping
-    /// command persisted), the execution stays `RUNNING`, and the divergence is
-    /// surfaced so the drive loop stops instead of spinning. Under the panic budget
-    /// a fixed/rolled-back build can re-drive the **unchanged** history to
-    /// completion; only after the budget is exhausted is the run sealed `FAILED`
-    /// with the typed `HandlerPanic` error (returned as a normal
-    /// [`RunState::Failed`](crate::RunState::Failed), not this error).
+    /// engine caught it at the dispatch boundary (issue #782).
+    ///
+    /// Like a replay non-determinism divergence, this is **non-terminal and
+    /// resumable**. The panicked decision cycle is **discarded**: no event is
+    /// appended, and no bookkeeping command is persisted. The execution stays
+    /// `RUNNING`. The divergence is surfaced, so the drive loop stops and does not
+    /// spin. Under the panic budget, a fixed/rolled-back build can re-drive the
+    /// **unchanged** history to completion. Only an exhausted budget seals the run
+    /// `FAILED` with the typed `HandlerPanic` error. That returns as a normal
+    /// [`RunState::Failed`](crate::RunState::Failed), not this error.
     ///
     /// A genuine author `Err(...)` carries no panic flag and still fails terminally
     /// on the first strike, unchanged.
@@ -510,25 +516,27 @@ pub enum SqliteError {
     /// signal and no other run, so this error surfaces it instead of a loop.
     /// It also names a run that spent its cycle budget in one
     /// `run_until_blocked` call.
-    /// The most common cause is a task stranded `RUNNING` by a crash that the
+    /// The most common cause is a task that a crash stranded `RUNNING`. The
     /// orphan reclaim on [`SqliteRuntime::open`](crate::SqliteRuntime::open) did
-    /// not clear (e.g. a different database file).
+    /// not clear it (e.g. a different database file).
     #[error("execution {0} made no progress and could not be classified (stuck)")]
     Stuck(ExecutionId),
 
     /// The fleet-wide driver
     /// ([`run_until_idle`](crate::SqliteRuntime::run_until_idle)) never quiesced
-    /// within its iteration safety bound — surfaced honestly rather than swallowed
-    /// as a clean `Ok(())` a caller could not distinguish from genuine
-    /// quiescence. The per-execution analog is [`Stuck`](Self::Stuck).
+    /// within its iteration safety bound.
+    ///
+    /// It surfaces as an error, not a clean `Ok(())`. A caller could not tell
+    /// such an `Ok(())` from genuine quiescence. The per-execution analog is
+    /// [`Stuck`](Self::Stuck).
     #[error("fleet driver made no progress within the iteration safety bound (runaway)")]
     Runaway,
 }
 
 impl SqliteError {
     // These are internal constructors. `SqliteError` is re-exported publicly, so
-    // `pub` here would leak them into the crate's public API — `pub(crate)` is
-    // deliberate and NOT redundant despite the private enclosing module.
+    // `pub` here would leak them into the public API of the crate. So
+    // `pub(crate)` is deliberate and NOT redundant, despite the private module.
     #[allow(clippy::redundant_pub_crate)]
     pub(crate) fn corrupt(field: &str) -> Self {
         Self::Corrupt(field.to_string())

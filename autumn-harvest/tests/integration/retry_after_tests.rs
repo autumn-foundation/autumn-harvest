@@ -1,8 +1,8 @@
 //! Activity-driven next-retry delay — honor downstream `Retry-After` (issue #744).
 //!
 //! `ActivityFailure::with_retry_after(Duration)` lets an activity author hand the
-//! engine a downstream-supplied delay hint (e.g. an HTTP `Retry-After` header) so
-//! the NEXT retry attempt is scheduled at `now + hint` instead of the
+//! engine a downstream-supplied delay hint (e.g. an HTTP `Retry-After` header).
+//! The NEXT retry attempt is then scheduled at `now + hint` instead of the
 //! `RetryPolicy`-computed backoff, for that one attempt only.
 //!
 //! `ActivityFailure`/`resolve_retry_after_hint` themselves are pure and already
@@ -11,38 +11,34 @@
 //! covers the two things those unit tests cannot:
 //!
 //! - **AC6 (replay determinism)** — a history produced by a retry_after-delayed
-//!   retry contains nothing a replay could observe differently (`replay_tests`,
-//!   requires only the `testing` feature; no DB).
-//! - **AC2 / AC3 / AC4 / AC5 / the success metric** — proving the hint actually
-//!   reaches the real `harvest_task_queue.scheduled_at` column end-to-end
-//!   through a live worker (`db_tests`, requires the `db` feature + Postgres).
-//! - **Local activities** (`#[activity(local = true)]`) — a Codex review finding
-//!   on PR #1140 caught that `run_local_activity_inline`'s retry-sleep still read
-//!   only `run.retry_policy.next_delay(attempt)`, ignoring `retry_after` and the
-//!   ceiling entirely (local activities retry INLINE in the workflow task, never
-//!   through `harvest_task_queue`, so this is a genuinely separate code path from
-//!   the remote/task-queue retry loop `next_retry_delay` governs above). Covered
-//!   by `local_retry_after_end_to_end_test` (`db_tests`) plus a dedicated pure
-//!   unit-test suite on the extracted `worker::local_retry_delay` helper.
+//!   retry contains nothing a replay could observe differently. See
+//!   `replay_tests`, which needs only the `testing` feature and no DB.
+//! - **AC2 / AC3 / AC4 / AC5 / the success metric** — the hint reaches the real
+//!   `harvest_task_queue.scheduled_at` column end-to-end through a live worker.
+//!   See `db_tests`, which needs the `db` feature and Postgres.
+//! - **Local activities** (`#[activity(local = true)]`) — PR #1140 found that
+//!   `run_local_activity_inline`'s retry-sleep read only
+//!   `run.retry_policy.next_delay(attempt)`. It ignored `retry_after` and the
+//!   ceiling. Local activities retry INLINE in the workflow task, never through
+//!   `harvest_task_queue`. So this path is separate from the remote retry loop
+//!   that `next_retry_delay` governs. `local_retry_after_end_to_end_test`
+//!   (`db_tests`) covers it, with pure unit tests on `worker::local_retry_delay`.
 //!
-//! RED PHASE (TDD): before `worker.rs`'s `next_retry_delay`/`handle_activity_result`
-//! consult `ActivityFailure::retry_after` / `resolve_retry_after_hint`, every test
-//! in `db_tests` below fails at RUNTIME (the observed `scheduled_at` reflects the
-//! unmodified `RetryPolicy` delay, not the hint) — this file compiles against
-//! today's code (no new public API is exercised here beyond the already-shipped
-//! `ActivityFailure::with_retry_after` / `HandlerRegistry::with_retry_after_ceiling`
-//! builder methods), so RED is a runtime assertion failure, not a compile error.
+//! If `worker.rs`'s `next_retry_delay`/`handle_activity_result` stops consulting
+//! `ActivityFailure::retry_after` / `resolve_retry_after_hint`, every test in
+//! `db_tests` fails at RUNTIME. The observed `scheduled_at` then reflects the
+//! unmodified `RetryPolicy` delay, not the hint.
 
 // ---------------------------------------------------------------------------
 // AC6 — replay determinism: a retry_after-influenced history replays unchanged.
 // ---------------------------------------------------------------------------
 //
-// `retry_after` never appears in `harvest_events`: an in-progress (non-terminal)
-// retry attempt leaves NO event at all (only the task row's `scheduled_at`/`error`
-// columns change), and the eventual terminal `ActivityFailed`/`ActivityCompleted`
-// event carries no `retry_after` field. So a history that resulted from a
-// retry_after-delayed retry is byte-identical to one that did not, and replays
-// identically. This test locks that invariant in explicitly.
+// `retry_after` never appears in `harvest_events`. A non-terminal retry
+// attempt leaves NO event; only the task row's `scheduled_at`/`error` columns
+// change. The terminal `ActivityFailed`/`ActivityCompleted` event carries no
+// `retry_after` field. So a history from a retry_after-delayed retry is
+// byte-identical to one without, and replays identically. This test locks
+// that invariant in.
 #[cfg(feature = "testing")]
 mod replay_tests {
     use std::future::Future;
@@ -67,25 +63,24 @@ mod replay_tests {
         })
     }
 
-    /// A history whose terminal `ActivityFailed.attempt == 2` is what a
-    /// two-attempt run — one retry, delayed by a `retry_after` hint rather than
-    /// the policy's own backoff — produces: the intermediate (non-terminal)
-    /// attempt-1 failure leaves no event at all, only the transient task row's
-    /// `scheduled_at`/`error` columns change, so no `retry_after`-specific
-    /// event ever exists to replay differently.
+    /// A two-attempt run produces a history whose terminal
+    /// `ActivityFailed.attempt == 2`. Its one retry is delayed by a
+    /// `retry_after` hint, not the policy's own backoff. The non-terminal
+    /// attempt-1 failure leaves no event. Only the transient task row's
+    /// `scheduled_at`/`error` columns change. So no `retry_after`-specific
+    /// event exists to replay differently.
     ///
-    /// This snapshot is deliberately SIMPLIFIED relative to what a real worker
-    /// would record: a genuine run also appends an `ActivityStarted` event on
-    /// EVERY claim attempt (`worker::append_activity_started_if_pending`), so
-    /// a real two-attempt history would carry two `ActivityStarted` events
-    /// this snapshot omits entirely. That omission does not weaken the test —
-    /// `HistoryMatcher::scan_activity_terminal`'s forward scan explicitly
-    /// tolerates any number (including zero) of `ActivityStarted` events for a
-    /// matching `activity_id` before it reaches the terminal event, precisely
-    /// so a snapshot like this one — carrying only the events replay actually
-    /// depends on — still exercises the real matcher path. Replay must
-    /// succeed regardless of what wall-clock delay (or `ActivityStarted`
-    /// count) produced this sequence.
+    /// This snapshot is deliberately SIMPLIFIED. A real run also appends an
+    /// `ActivityStarted` event on EVERY claim attempt
+    /// (`worker::append_activity_started_if_pending`). A real two-attempt
+    /// history carries two `ActivityStarted` events that this snapshot omits.
+    /// The omission does not weaken the test.
+    /// `HistoryMatcher::scan_activity_terminal`'s forward scan tolerates any
+    /// number (including zero) of `ActivityStarted` events for a matching
+    /// `activity_id` before the terminal event. So a snapshot with only the
+    /// events replay depends on still exercises the real matcher path. Replay
+    /// must succeed whatever wall-clock delay (or `ActivityStarted` count)
+    /// produced this sequence.
     #[tokio::test]
     async fn retry_after_delayed_retry_history_replays_unchanged() {
         let exec_id = ExecutionId::new();
@@ -232,10 +227,10 @@ mod db_tests {
         })
     }
 
-    /// Always fails with a fast (2s) `retry_after` hint, while the registered
-    /// `RetryPolicy` would compute a 999s delay -- proves the hint OVERRIDES the
-    /// policy delay (AC2) without granting extra attempts (the policy's
-    /// `max_attempts` cap is untouched).
+    /// Always fails with a fast (2s) `retry_after` hint; the registered
+    /// `RetryPolicy` would compute a 999s delay. Proves the hint OVERRIDES the
+    /// policy delay (AC2). It grants no extra attempts: the policy's
+    /// `max_attempts` cap is untouched.
     fn fail_retry_after_2s(
         _ctx: &autumn_harvest::ActivityContext,
         _input: serde_json::Value,
@@ -275,9 +270,9 @@ mod db_tests {
         })
     }
 
-    /// Fails NON-retryably with a (fast) `retry_after` hint present -- proves
-    /// `non_retryable` wins: the task must go straight to terminal failure,
-    /// never requeued, regardless of the hint (AC4).
+    /// Fails NON-retryably with a (fast) `retry_after` hint present. Proves
+    /// `non_retryable` wins (AC4). The task goes straight to terminal failure
+    /// and is never requeued, whatever the hint.
     fn fail_non_retryable_with_retry_after(
         _ctx: &autumn_harvest::ActivityContext,
         _input: serde_json::Value,
@@ -289,11 +284,10 @@ mod db_tests {
         })
     }
 
-    /// Always fails with a LARGE (5s) `retry_after` hint while the registered
-    /// `RetryPolicy` delay is small (50ms) -- used to prove the interaction
-    /// with `schedule_to_close` (AC5): the hint alone crosses a tight
-    /// `schedule_to_close` deadline that the policy's own small delay would
-    /// not have crossed.
+    /// Always fails with a LARGE (5s) `retry_after` hint; the registered
+    /// `RetryPolicy` delay is small (50ms). Proves the interaction with
+    /// `schedule_to_close` (AC5). The hint alone crosses a tight
+    /// `schedule_to_close` deadline that the policy's small delay does not.
     fn fail_retry_after_5s(
         _ctx: &autumn_harvest::ActivityContext,
         _input: serde_json::Value,
@@ -323,12 +317,13 @@ mod db_tests {
         })
     }
 
-    /// Local activity: records `Instant::now()` on every attempt (via shared
-    /// state, since `ActivityHandlerFn` is a plain fn pointer with no closure
-    /// capture), fails attempt 1 with a fast (1.5s) `retry_after` hint against a
-    /// vastly slower (999s) registered policy delay, then succeeds on attempt 2.
-    /// If the hint is ignored (the bug this test exists to catch), the observed
-    /// gap between the two timestamps would be ~999s, not ~1.5s.
+    /// Local activity that records `Instant::now()` on every attempt.
+    ///
+    /// It uses shared state, since `ActivityHandlerFn` is a plain fn pointer
+    /// with no closure capture. Attempt 1 fails with a fast (1.5s)
+    /// `retry_after` hint against a 999s registered policy delay. Attempt 2
+    /// succeeds. If the hint is ignored (the bug this test catches), the gap
+    /// between the two timestamps is ~999s, not ~1.5s.
     fn local_retry_after_2s(
         ctx: &autumn_harvest::ActivityContext,
         _input: serde_json::Value,
@@ -452,11 +447,11 @@ mod db_tests {
         Arc::new(registry)
     }
 
-    /// `ActivityInfo` for a local (`is_local: true`) activity. Local activities
-    /// have no `harvest_task_queue` row, so `default_queue` is irrelevant; the
-    /// retry policy is supplied at the call site
-    /// (`ctx.execute_local_activity_raw`), not read from this info, so it is
-    /// left `None` here.
+    /// `ActivityInfo` for a local (`is_local: true`) activity.
+    ///
+    /// Local activities have no `harvest_task_queue` row, so `default_queue` is
+    /// irrelevant. The call site (`ctx.execute_local_activity_raw`) supplies the
+    /// retry policy, so it is `None` here.
     fn local_act_info(
         name: &'static str,
         handler: autumn_harvest::info::ActivityHandlerFn,
@@ -745,9 +740,8 @@ mod db_tests {
         );
         assert_eq!(task.state, "FAILED");
 
-        // The ONE requeue (after attempt 1's failure) set scheduled_at to
-        // roughly t_before + 2s (the retry_after hint), never anywhere near
-        // t_before + 999s (the policy's own delay).
+        // The ONE requeue (after attempt 1 fails) sets scheduled_at to about
+        // t_before + 2s (the retry_after hint), not t_before + 999s (policy).
         let observed_delay = task.scheduled_at - t_before;
         assert!(
             observed_delay > chrono::Duration::milliseconds(500)
@@ -935,24 +929,22 @@ mod db_tests {
 
         // schedule_to_close = 2s, set once at the FIRST schedule (~test
         // start) and never refreshed on retry. `fail_retry_after_5s` returns
-        // retry_after = 5s on every attempt, including the very first one --
-        // so the deadline check fires on attempt 1's failure, not after any
-        // accumulated retries: `handle_activity_result` calls
-        // `schedule_to_close_deadline_exceeded(task, delay)` right after
-        // EVERY failed attempt (this file's own worker.rs read confirms
-        // there is no "wait until near-exhaustion" special case), and
-        // `now_at_attempt_1_failure + 5s` is *mathematically* guaranteed to
-        // exceed `enqueue_time + 2s` by a full 3-second margin, since
-        // `now_at_attempt_1_failure >= enqueue_time` always holds (time only
-        // moves forward) -- no wall-clock race, however slow the runner.
+        // retry_after = 5s on every attempt, including the first one. So the
+        // deadline check fires on attempt 1's failure, not after accumulated
+        // retries. `handle_activity_result` calls
+        // `schedule_to_close_deadline_exceeded(task, delay)` right after EVERY
+        // failed attempt. `worker.rs` has no "wait until near-exhaustion"
+        // special case. `now_at_attempt_1_failure + 5s` always exceeds
+        // `enqueue_time + 2s` by at least 3 seconds, because
+        // `now_at_attempt_1_failure >= enqueue_time`. No wall-clock race exists,
+        // however slow the runner.
         //
-        // Without the retry_after fix, `next_retry_delay` would use the
-        // 50ms/attempt policy delay instead (which never crosses 2s across
-        // all 5 attempts), so the run would instead exhaust its 5 retries
-        // and reach a plain retry-exhaustion `ActivityFailed` with NO
-        // `ActivityTimedOut { ScheduleToClose }` in history at all -- that is
-        // the actual RED/GREEN discriminator this test locks in, not a
-        // timing margin.
+        // Without the retry_after fix, `next_retry_delay` uses the 50ms/attempt
+        // policy delay, which never crosses 2s across all 5 attempts. The run
+        // then exhausts its 5 retries and reaches a plain retry-exhaustion
+        // `ActivityFailed`. History has NO `ActivityTimedOut { ScheduleToClose }`.
+        // That is the RED/GREEN discriminator this test locks in, not a timing
+        // margin.
         let registry = build_registry(
             vec![wf_info("wf_one_activity", wf_one_activity)],
             vec![act_info(
@@ -998,13 +990,12 @@ mod db_tests {
     }
 
     // -------------------------------------------------------------------
-    // Codex review (PR #1140) -- local activities (`local = true`) must
-    // honor `retry_after` too. Local-activity retries run INLINE in the
-    // workflow task via `run_local_activity_inline`, a code path entirely
-    // separate from the remote/task-queue `next_retry_delay` the tests
-    // above cover; before this fix it read only
-    // `run.retry_policy.next_delay(attempt)`, silently ignoring both the
-    // hint and the configured ceiling.
+    // PR #1140: local activities (`local = true`) must honor `retry_after`
+    // too. Local-activity retries run INLINE in the workflow task via
+    // `run_local_activity_inline`. That path is separate from the
+    // remote/task-queue `next_retry_delay` that the tests above cover. Before
+    // this fix it read only `run.retry_policy.next_delay(attempt)`. It ignored
+    // both the hint and the configured ceiling.
     // -------------------------------------------------------------------
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

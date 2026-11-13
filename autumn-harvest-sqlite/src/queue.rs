@@ -6,32 +6,31 @@
 //! many concurrent worker processes can pull disjoint rows without blocking each
 //! other. `SQLite` has no row-level locking and no `SKIP LOCKED`; instead this
 //! backend assumes a **single writer process**. A claim is a `BEGIN IMMEDIATE`
-//! transaction (which takes `SQLite`'s database-level write lock up front) that
-//! `SELECT`s the oldest ready `PENDING` row and flips it to `RUNNING`, then
-//! `COMMIT`s. Under the single-writer assumption this is exactly-once by
-//! construction — no two claimers ever race. **Multi-writer `SQLite` is explicitly
-//! out of scope**; supporting it would need an external lease or a
-//! `busy_timeout`/retry protocol layered on the `BEGIN IMMEDIATE` claim, which is
-//! precisely the complexity the edge/local-first use case avoids.
+//! transaction, which takes the database-level write lock up front. It `SELECT`s
+//! the oldest ready `PENDING` row, flips it to `RUNNING`, then `COMMIT`s. Under
+//! the single-writer assumption this is exactly-once by construction: no two
+//! claimers ever race. **Multi-writer `SQLite` is explicitly out of scope.** It
+//! needs an external lease or a `busy_timeout`/retry protocol on the
+//! `BEGIN IMMEDIATE` claim. The edge/local-first use case avoids that complexity.
 //!
 //! # Polling replaces `LISTEN`/`NOTIFY`
 //!
 //! The Postgres backend wakes idle workers with `LISTEN`/`NOTIFY`. `SQLite` has no
 //! push notification, so the driver ([`SqliteRuntime`](crate::SqliteRuntime))
-//! **polls**: it drains all currently-ready tasks and due timers, re-runs the
-//! workflow, and repeats until the run reaches a terminal state or blocks on an
-//! external input. A production edge runtime would wrap this in a
-//! sleep-and-repoll loop; the tests drive the poll explicitly (and advance a
-//! virtual clock) so they never sleep.
+//! **polls**. It drains all ready tasks and due timers and re-runs the workflow.
+//! It repeats until the run reaches a terminal state or blocks on an external
+//! input. A production edge runtime would wrap this in a sleep-and-repoll loop.
+//! The tests drive the poll explicitly and advance a virtual clock, so they never
+//! sleep.
 //!
 //! # Orphan reclaim (single-server crash recovery)
 //!
-//! Because there is one server, any task left `RUNNING` when the process starts
-//! is an orphan from a crash — the previous process claimed it, may have run the
-//! body, but did not commit the terminal finalize (see the atomicity discussion
-//! in [`worker`](crate::worker)). [`reclaim_orphaned_running`] flips every such
-//! row back to `PENDING` on [`SqliteRuntime::open`](crate::SqliteRuntime::open)
-//! so the body re-runs. This makes activity execution **at-least-once**.
+//! There is one server, so any task left `RUNNING` at process start is an orphan
+//! from a crash. The previous process claimed it and may have run the body. It
+//! did not commit the terminal finalize (see the atomicity discussion in
+//! [`worker`](crate::worker)). [`reclaim_orphaned_running`] flips every such row
+//! back to `PENDING` on [`SqliteRuntime::open`](crate::SqliteRuntime::open). The
+//! body then re-runs, so activity execution is **at-least-once**.
 
 use autumn_harvest::policy::RetryPolicy;
 use autumn_harvest::{ActivityExecId, ExecutionId};
@@ -48,70 +47,71 @@ pub struct ClaimedTask {
     pub input: Value,
     /// Attempts already consumed (0 before the first run).
     pub attempt: u32,
-    /// Per-call retry cap carried from the scheduling command's
-    /// `retry_policy_override` (issue #1069 P2). `Some` when the workflow used the
-    /// typed `execute_activity`/`execute_activity_with_opts` path (which resolves
-    /// the activity's declared/per-call `RetryPolicy`); `None` for the raw
-    /// `execute_activity_raw` path, in which case the worker falls back to the
-    /// registered [`ActivitySpec`](crate::runtime::ActivitySpec)'s default.
+    /// Per-call retry cap from the scheduling command's `retry_policy_override`
+    /// (issue #1069). `Some` on the typed `execute_activity` /
+    /// `execute_activity_with_opts` path, which resolves the declared or per-call
+    /// `RetryPolicy`. `None` on the raw `execute_activity_raw` path. The worker then
+    /// uses the registered [`ActivitySpec`](crate::runtime::ActivitySpec)'s default.
     pub max_attempts: Option<u32>,
-    /// The workflow's declared/per-call [`RetryPolicy`], carried from the
-    /// scheduling command's `retry_policy_override` (issue #1069 P2, Codex
-    /// `runtime.rs:985`). `Some(policy)` when the workflow used the typed
-    /// `execute_activity`/`execute_activity_with_opts` path (which resolves the
-    /// activity's declared/per-call `RetryPolicy`); `None` for the raw
-    /// `execute_activity_raw` path. The worker reads it to honor the WHOLE policy
-    /// — backoff timing (`compute_retry_delay`) and non-retryable classification
-    /// (`is_non_retryable`, incl. the `non_retryable_errors` list) — not just
-    /// `max_attempts`. `None` = immediate requeue with no policy non-retryable
-    /// list (a typed-payload `non_retryable: true` is still honored).
+    /// The workflow's declared or per-call [`RetryPolicy`], from the scheduling
+    /// command's `retry_policy_override` (issue #1069). `Some` on the typed
+    /// `execute_activity` / `execute_activity_with_opts` path. `None` on the raw
+    /// `execute_activity_raw` path. The worker honors the WHOLE policy, not just
+    /// `max_attempts`. That covers back-off timing (`compute_retry_delay`) and
+    /// non-retryable classification (`is_non_retryable`, `non_retryable_errors`).
+    /// `None` means an immediate requeue with no policy non-retryable list. A
+    /// typed-payload `non_retryable: true` still applies.
     pub retry_policy: Option<RetryPolicy>,
-    /// Per-activity start-to-close budget in milliseconds, carried from the
-    /// scheduling command's `start_to_close_override` (issue #1069 P2). `Some(ms)`
-    /// when the workflow's declared/per-call activity has a start-to-close timeout
-    /// (via `#[activity(start_to_close = "…")]` or `execute_activity_with_opts`);
-    /// `None` = no budget (unbounded, prior behavior). Enforced by the worker as a
-    /// **post-execution outcome**: a synchronous body cannot be cancelled mid-flight
-    /// in a single-writer runtime, but a body whose real wall-clock runtime exceeds
-    /// this budget records a terminal `ActivityTimedOut { StartToClose }` instead of
-    /// `ActivityCompleted` — byte-equivalent to the durable event the Postgres
-    /// timeout scanner (`enforce_activity_timeout`) records.
+    /// Per-activity start-to-close budget in milliseconds, from the scheduling
+    /// command's `start_to_close_override` (issue #1069). `Some(ms)` when the
+    /// declared or per-call activity has a start-to-close timeout, through
+    /// `#[activity(start_to_close = "…")]` or `execute_activity_with_opts`. `None`
+    /// means no budget. The worker enforces it as a **post-execution outcome**. A
+    /// single-writer runtime cannot cancel a synchronous body mid-flight. A body
+    /// whose wall-clock runtime exceeds the budget records a terminal
+    /// `ActivityTimedOut { StartToClose }` instead of `ActivityCompleted`. That
+    /// event is byte-equivalent to the one the Postgres timeout scanner
+    /// (`enforce_activity_timeout`) records.
     pub start_to_close_ms: Option<i64>,
-    /// The ABSOLUTE epoch-millisecond this task's `ScheduleActivity` command was
-    /// first persisted (== its initial `run_at`), never mutated by a retry requeue.
-    /// The STABLE anchor from which the worker resolves the activity's total
-    /// (cross-retry) `schedule_to_close` deadline at CLAIM time (issue #378, Codex
-    /// #1069 P2 `runtime.rs:944`): `scheduled_at + spec.default_schedule_to_close`.
-    /// Unlike [`Self::run_at`-mutating retries], it always denotes when the activity
-    /// was first scheduled, so a wait for LATE registration cannot extend the budget.
+    /// The ABSOLUTE epoch-millisecond at which the `ScheduleActivity` command was
+    /// first persisted (its initial `run_at`). A retry requeue never changes it.
+    /// The worker resolves the total (cross-retry) `schedule_to_close` deadline from
+    /// this anchor at CLAIM time (issues #378, #1069):
+    /// `scheduled_at + spec.default_schedule_to_close`. Retries move `run_at`, but
+    /// this field always marks the first schedule. So a wait for LATE registration
+    /// cannot extend the budget.
     pub scheduled_at: i64,
     /// The activity's ABSOLUTE total (cross-retry) deadline as an epoch-millisecond,
-    /// **read from the frozen `schedule_to_close_at` column** (issue #1068). For a
-    /// FROZEN task (`defaults_frozen == true`) this is the immutable value resolved
-    /// once at schedule/claim time; for an UNFROZEN task it is whatever is currently
-    /// on the row (`None` until the worker resolves it from the registered spec,
-    /// anchored to [`Self::scheduled_at`], and freezes it — mirroring the Postgres
-    /// worker resolving `ActivityInfo` from its `HandlerRegistry`). `Some(at)` = the
-    /// whole activity (all attempts + back-off sleeps combined) must finish before
-    /// `at`; `None` = no total deadline (the activity has no declared
-    /// `schedule_to_close`, or was raw-registered). Enforced by the worker: a task
-    /// drained at/after `at`, or a retry whose next attempt would land at/after `at`,
-    /// records a terminal `ActivityTimedOut { ScheduleToClose }` instead of
-    /// running/retrying — byte-equivalent to the Postgres
-    /// `schedule_to_close_deadline_exceeded` path.
+    /// **read from the frozen `schedule_to_close_at` column** (issue #1068). On a
+    /// FROZEN task (`defaults_frozen == true`) it is the immutable value resolved
+    /// once at schedule or claim time. On an UNFROZEN task it is whatever the row
+    /// holds. That is `None` until the worker resolves it from the registered spec,
+    /// anchored to [`Self::scheduled_at`], and freezes it. This mirrors the Postgres
+    /// worker, which resolves `ActivityInfo` from its `HandlerRegistry`.
+    ///
+    /// `Some(at)` means the whole activity, all attempts and back-off sleeps
+    /// included, must finish before `at`. `None` means no total deadline: the
+    /// activity has no declared `schedule_to_close`, or was raw-registered. A task
+    /// drained at or after `at` records a terminal `ActivityTimedOut { ScheduleToClose }`
+    /// instead of running. So does a retry whose next attempt lands at or after
+    /// `at`. This matches the Postgres `schedule_to_close_deadline_exceeded` path
+    /// byte for byte.
     pub schedule_to_close_at: Option<i64>,
-    /// Whether this task's four resolved-default scalars (`retry_policy`,
-    /// `max_attempts`, `start_to_close_ms`, `schedule_to_close_at`) are FROZEN on the
-    /// row (issue #1068). `true` = they were resolved once (at schedule time when the
-    /// activity was already registered, or at first claim for a late-registered one)
-    /// and persisted — the worker reads them VERBATIM and never re-consults the
-    /// mutable registry for them, so an in-flight activity's retry/deadline contract
-    /// is immutable across a crash/reopen or a re-registration under a changed spec.
-    /// `false` = not yet resolved (the activity was scheduled before its
-    /// body/`ActivityInfo` was registered): the worker resolves the four fields from
-    /// the now-present spec, persists them via [`freeze_task_defaults`], and sets this
-    /// to `true`. The activity BODY is always resolved from the registry regardless —
-    /// only the policy/deadline scalars are frozen.
+    /// Whether this task's four resolved-default scalars are FROZEN on the row
+    /// (issue #1068): `retry_policy`, `max_attempts`, `start_to_close_ms` and
+    /// `schedule_to_close_at`.
+    ///
+    /// `true` means they were resolved once and persisted. That happens at schedule
+    /// time for a registered activity, or at first claim for a late-registered one.
+    /// The worker reads them VERBATIM and never re-consults the mutable registry.
+    /// So an in-flight activity keeps its retry and deadline contract across a
+    /// crash, a reopen, or a re-registration under a changed spec.
+    ///
+    /// `false` means not yet resolved: the activity was scheduled before its body
+    /// or `ActivityInfo` was registered. The worker then resolves the four fields
+    /// from the spec, persists them with [`freeze_task_defaults`], and sets this to
+    /// `true`. The activity BODY always comes from the registry. Only the policy and
+    /// deadline scalars are frozen.
     pub defaults_frozen: bool,
     /// The task's queue (issue #2024). `ActivityContext::info().queue_name`
     /// reports it.
@@ -130,14 +130,15 @@ fn next_task_seq(conn: &Connection) -> SqliteResult<i64> {
     Ok(max.map_or(0, |m| m + 1))
 }
 
-/// The next monotonic timer arm sequence (the deterministic same-`fire_at`
-/// tie-breaker, issue #1069 P2). Computed as `MAX(arm_seq) + 1` over ALL timer
-/// rows so it is globally monotonic within the database — two timers armed in the
-/// same [`apply_commands`](crate::runtime) transaction (e.g.
-/// `tokio::join!(ctx.timer("a", 1), ctx.timer("b", 1))`) get consecutive values in
-/// command order, because the first `enqueue_timer` commits its row before the
-/// second reads `MAX`. Robust to `VACUUM` (unlike an implicit `rowid`, which
-/// `VACUUM` may renumber).
+/// The next monotonic timer arm sequence, the deterministic same-`fire_at`
+/// tie-breaker (issue #1069).
+///
+/// It is `MAX(arm_seq) + 1` over ALL timer rows, so it is globally monotonic in
+/// the database. Two timers armed in one [`apply_commands`](crate::runtime)
+/// transaction get consecutive values in command order. An example is
+/// `tokio::join!(ctx.timer("a", 1), ctx.timer("b", 1))`. The first
+/// `enqueue_timer` writes its row before the second reads `MAX`. Unlike an
+/// implicit `rowid`, it survives `VACUUM`, which may renumber `rowid`.
 fn next_timer_arm_seq(conn: &Connection) -> SqliteResult<i64> {
     let max: Option<i64> = conn.query_row(NEXT_TIMER_ARM_SEQ_SQL, [], |row| row.get(0))?;
     Ok(max.map_or(0, |m| m + 1))
@@ -180,31 +181,32 @@ pub fn reclaim_orphaned_running(conn: &Connection) -> SqliteResult<usize> {
 
 /// Enqueue a fresh activity task in the `PENDING` state.
 ///
-/// `max_attempts` is the per-call retry cap from the scheduling command's
-/// `retry_policy_override` (issue #1069 P2): `Some(n)` honors the workflow's
-/// declared/per-call [`RetryPolicy`](autumn_harvest::policy::RetryPolicy), `None`
-/// leaves the worker to fall back to the registered `ActivitySpec` default.
+/// `max_attempts` is the per-call retry cap from the command's
+/// `retry_policy_override` (issue #1069). `Some(n)` honors the declared or
+/// per-call [`RetryPolicy`](autumn_harvest::policy::RetryPolicy). `None` makes the
+/// worker use the registered `ActivitySpec` default.
 ///
-/// `start_to_close_ms` is the per-activity start-to-close budget (milliseconds)
-/// from the command's `start_to_close_override` (issue #1069 P2): `Some(ms)`
-/// persists the declared/per-call timeout for the worker to enforce; `None` = no
-/// budget (unbounded).
+/// `start_to_close_ms` is the start-to-close budget in milliseconds, from the
+/// command's `start_to_close_override` (issue #1069). `None` means no budget.
 ///
 /// `retry_policy_json` is the WHOLE serialized [`RetryPolicy`] from the command's
-/// `retry_policy_override` (issue #1069 P2, Codex `runtime.rs:985`): `Some(json)`
-/// persists it so the worker honors backoff timing + non-retryable classification;
-/// `None` for the raw path (immediate requeue, no policy list).
+/// `retry_policy_override` (issue #1069). The worker uses it for back-off timing
+/// and non-retryable classification. `None` on the raw path means an immediate
+/// requeue with no policy list.
 ///
-/// `schedule_to_close_at` is the FROZEN absolute (epoch-millisecond) total
-/// (cross-retry) deadline (issue #1068): `Some(at)` when the activity is registered
-/// at schedule time and declares a `schedule_to_close` (`scheduled_at +
-/// default_schedule_to_close`), `None` otherwise. `defaults_frozen` records whether
-/// the four resolved-default scalars are frozen on this row (`true` when the caller
-/// resolved them from the registered spec at schedule time; `false` when the
-/// activity was scheduled before it was registered, so the worker resolves and
-/// freezes them at first claim). The initial `run_at` is also recorded as the stable
-/// `scheduled_at` anchor so the frozen deadline is always measured from when the
-/// activity was first scheduled, never mutated by a retry requeue.
+/// `schedule_to_close_at` is the FROZEN absolute total (cross-retry) deadline in
+/// epoch milliseconds (issue #1068). It is `scheduled_at + default_schedule_to_close`
+/// when the activity is registered at schedule time and declares a
+/// `schedule_to_close`. Otherwise it is `None`.
+///
+/// `defaults_frozen` records whether the four resolved-default scalars are frozen
+/// on this row. It is `true` when the caller resolved them from the registered
+/// spec at schedule time. It is `false` when the activity is not yet registered.
+/// The worker then resolves and freezes them at first claim.
+///
+/// The initial `run_at` is also the stable `scheduled_at` anchor. So the frozen
+/// deadline always counts from the first schedule, and a retry requeue never moves
+/// it.
 #[allow(clippy::too_many_arguments)]
 pub fn enqueue_activity(
     conn: &Connection,
@@ -249,20 +251,19 @@ pub fn enqueue_activity(
 /// Freeze the four resolved-default scalars onto a task row and set
 /// `defaults_frozen = 1` (issue #1068).
 ///
-/// Called by [`drain_ready`](crate::worker::drain_ready) at CLAIM time for a task
-/// that was scheduled before its activity was registered (`defaults_frozen == 0`):
-/// once the body/`ActivityInfo` is present, the worker resolves `retry_policy_json`,
-/// `max_attempts`, `start_to_close_ms`, and the absolute `schedule_to_close_at` from
-/// the registered spec, persists them here, and reads them verbatim thereafter — so
-/// a later claim (crash/reopen, or a re-registration under a changed spec) sees the
-/// SAME values rather than re-resolving against a mutated registry. A single
-/// `UPDATE` scoped to `task_id`, run **inside the caller's open claim transaction**
-/// (issue #1068; Codex #1080 P2) — `conn` here is the still-open `BEGIN IMMEDIATE`
-/// claim transaction (a `&Transaction` deref-coerces to `&Connection`), NOT a fresh
-/// autocommit connection, so this freeze and the claim's `RUNNING` flip commit
-/// atomically (or roll back together if either fails). A `None` argument is written
-/// as SQL `NULL` (= "resolved to no value"), which the frozen claim path reads back
-/// as `None`.
+/// [`drain_ready`](crate::worker::drain_ready) calls it at CLAIM time for a task
+/// scheduled before its activity was registered (`defaults_frozen == 0`). The
+/// worker resolves `retry_policy_json`, `max_attempts`, `start_to_close_ms` and the
+/// absolute `schedule_to_close_at` from the registered spec. It persists them here
+/// and reads them verbatim from then on. So a later claim sees the SAME values
+/// after a crash, a reopen, or a re-registration under a changed spec.
+///
+/// The `UPDATE` runs **inside the caller's open claim transaction** (issues #1068,
+/// #1080). `conn` is the open `BEGIN IMMEDIATE` claim transaction, not a fresh
+/// autocommit connection. A `&Transaction` deref-coerces to `&Connection`. So this
+/// freeze and the claim's `RUNNING` flip commit or roll back together. A `None`
+/// argument is stored as SQL `NULL` ("resolved to no value"). The frozen claim path
+/// reads it back as `None`.
 pub fn freeze_task_defaults(
     conn: &Connection,
     task_id: &str,
@@ -286,27 +287,28 @@ pub fn freeze_task_defaults(
     Ok(())
 }
 
-/// Claim the oldest ready (`PENDING`, `run_at <= now`) task for `exec_id`, flipping
-/// it to `RUNNING` inside a `BEGIN IMMEDIATE` transaction — and return the STILL-OPEN
-/// transaction so the caller can freeze the task's resolved defaults in the SAME
-/// transaction before committing (issue #1068; Codex #1080 P2). See the module docs
-/// for why this replaces `SKIP LOCKED`.
+/// Claim the oldest ready (`PENDING`, `run_at <= now`) task for `exec_id` and flip
+/// it to `RUNNING` in a `BEGIN IMMEDIATE` transaction.
 ///
-/// The returned transaction is NOT committed. The caller (`worker::drain_ready`)
-/// resolves the activity's registered spec and, for an UNFROZEN (late-registered)
-/// task, calls [`freeze_task_defaults`] through the same transaction, then commits —
-/// so the `RUNNING` flip and the default-freeze commit ATOMICALLY. This closes the
-/// gap where the old (self-committing) claim left a committed `RUNNING`+unfrozen row:
-/// a crash between the claim commit and a SEPARATE freeze commit could then be
-/// reclaimed `PENDING` (still unfrozen) and re-frozen against a CHANGED registry,
-/// silently altering an "already-claimed" late-registered task's frozen contract. If
-/// the caller instead DROPS the transaction (an unregistered activity, or a crash
-/// before commit), the whole claim rolls back and the row stays `PENDING` — no
-/// orphaned `RUNNING` row, and nothing for a reopen to mis-handle.
+/// It returns the STILL-OPEN transaction (issues #1068, #1080). The caller freezes
+/// the task's resolved defaults in the SAME transaction before it commits. See the
+/// module docs for why this replaces `SKIP LOCKED`.
 ///
-/// The `Transaction` is held only across the caller's spec lookup + freeze (a hash
-/// lookup + a pure resolution + one `UPDATE`) — never across the activity BODY, which
-/// runs after the caller commits — so the write lock is held for microseconds.
+/// The caller (`worker::drain_ready`) resolves the activity's registered spec. For
+/// an UNFROZEN (late-registered) task, it calls [`freeze_task_defaults`] through
+/// this transaction, then commits. So the `RUNNING` flip and the freeze commit
+/// ATOMICALLY. An older self-committing claim left a committed `RUNNING` row that
+/// was not frozen. A crash before a SEPARATE freeze commit let a reopen reclaim it
+/// as `PENDING`. It was then frozen against a CHANGED registry. That silently
+/// altered the frozen contract of a task that was already claimed.
+///
+/// If the caller DROPS the transaction instead, the whole claim rolls back and the
+/// row stays `PENDING`. That happens for an unregistered activity or a crash before
+/// commit. No orphaned `RUNNING` row is left for a reopen to mis-handle.
+///
+/// The caller holds the `Transaction` only across a hash lookup, a pure resolution
+/// and one `UPDATE`. The activity BODY runs after the commit. So the write lock is
+/// held for microseconds.
 pub fn claim_next_ready_task_tx(
     conn: &mut Connection,
     exec_id: ExecutionId,
@@ -364,10 +366,9 @@ pub fn claim_next_ready_task_tx(
         return Ok(None);
     };
 
-    // Parse the fallible fields BEFORE mutating: a `?`-return here drops `tx`
-    // un-committed, rolling back the `BEGIN IMMEDIATE` transaction so the task
-    // stays `PENDING` and can be re-claimed — a mutate-then-parse ordering would
-    // strand it `RUNNING` on a corrupt-row error.
+    // Parse the fallible fields BEFORE mutating. A `?`-return here drops `tx`
+    // un-committed and rolls back, so the task stays `PENDING` and claimable.
+    // Mutate-then-parse would strand it `RUNNING` on a corrupt-row error.
     let activity_id = act_s
         .parse()
         .map_err(|_| SqliteError::corrupt("activity_id"))?;
@@ -398,10 +399,8 @@ pub fn claim_next_ready_task_tx(
         retry_policy,
         start_to_close_ms,
         scheduled_at,
-        // Read straight from the row (issue #1068). For a frozen task this is the
-        // immutable resolved deadline; for an unfrozen task it is whatever is on the
-        // row (`None` until the worker resolves and freezes it from the now-present
-        // registered spec, anchored to `scheduled_at`).
+        // Read straight from the row (issue #1068). An unfrozen task has `None`
+        // until the worker resolves and freezes it from the registered spec.
         schedule_to_close_at,
         defaults_frozen: defaults_frozen != 0,
         queue,
@@ -434,16 +433,16 @@ pub fn task_state(conn: &Connection, task_id: &str) -> SqliteResult<Option<Strin
 
 /// True iff `exec_id` has any `PENDING` activity task.
 ///
-/// When the driver's [`classify_block`](crate::SqliteRuntime) reaches here (the
-/// workflow suspended and neither a command nor a drain made progress this cycle),
-/// any `PENDING` activity task is necessarily one BACKING OFF with a future
-/// `run_at`: a `PENDING` task whose `run_at <= now` would already have been claimed
-/// and run by [`claim_next_ready_task_tx`] in this cycle's `drain_ready` pass. A
-/// delayed retry (`run_at = now + backoff`, issue #1069 P2, Codex `runtime.rs:985`)
-/// is therefore a genuine time-based block — the driver returns
-/// [`RunState::WaitingTimer`](crate::RunState) (a no-progress state) so a poll
-/// before the deadline neither re-runs the body nor spins to `Stuck`; the caller
-/// advances the clock and re-drives.
+/// The driver's [`classify_block`](crate::SqliteRuntime) calls it when the
+/// workflow suspended and no command or drain made progress this cycle. Any
+/// `PENDING` task is then one BACKING OFF with a future `run_at`. This cycle's
+/// `drain_ready` pass already ran each task with `run_at <= now` through
+/// [`claim_next_ready_task_tx`].
+///
+/// A delayed retry (`run_at = now + backoff`, issue #1069) is therefore a real
+/// time-based block. The driver returns [`RunState::WaitingTimer`](crate::RunState),
+/// a no-progress state. A poll before the deadline neither re-runs the body nor
+/// spins to `Stuck`. The caller advances the clock and drives again.
 pub fn has_pending_activity(conn: &Connection, exec_id: ExecutionId) -> SqliteResult<bool> {
     let exists: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM harvest_tasks WHERE exec_id = ?1 AND state = 'PENDING')",
@@ -483,12 +482,13 @@ pub fn pending_tasks(
 }
 
 /// Requeue a task for another attempt at `run_at`, recording the consumed
-/// attempt. The task's `seq` (its ready-queue ordering key) is **preserved** — use
-/// this for a FUTURE-`run_at` backoff retry, which yields to siblings naturally
-/// (its future `run_at` keeps it out of `claim_next_ready_task_tx`'s `run_at <= now`
-/// window this pass), so keeping its low `seq` is correct and leaves existing
-/// ordering undisturbed. For an IMMEDIATE (zero-delay) retry, use
-/// [`requeue_task_to_back`] instead.
+/// attempt.
+///
+/// The task keeps its `seq`, the ready-queue ordering key. Use this for a
+/// FUTURE-`run_at` back-off retry. Its future `run_at` keeps it out of the
+/// `run_at <= now` window of `claim_next_ready_task_tx`, so it yields to siblings.
+/// Its low `seq` then leaves the existing order undisturbed. For an IMMEDIATE
+/// (zero-delay) retry, use [`requeue_task_to_back`] instead.
 ///
 /// `last_error` is the failed attempt's message. The next attempt reads it as
 /// `ActivityContext::previous_failure` (issue #2024).
@@ -507,23 +507,22 @@ pub fn requeue_task(
     Ok(())
 }
 
-/// Requeue a task for another attempt at `run_at`, moving it to the **BACK** of
-/// the ready queue by assigning it a fresh, highest `seq` (issue #1068, hardening
-/// item 3).
+/// Requeue a task for another attempt at `run_at` at the **BACK** of the ready
+/// queue, with a fresh, highest `seq` (issue #1068).
 ///
 /// This is the fairness variant of [`requeue_task`], for an IMMEDIATE (zero-delay)
-/// retry — one whose `run_at <= now`, so the just-failed task would otherwise be
-/// re-claimable in the SAME drain pass. Because [`claim_next_ready_task_tx`] selects
-/// the oldest ready task (`ORDER BY seq LIMIT 1`), keeping the failed task's
-/// ORIGINAL (lower) `seq` would let it re-select itself before any ready SIBLING
-/// gets a turn — a low-index `ctx.race()` branch that fails-and-retries with zero
-/// delay could then monopolize the drain and settle the race before a faster
-/// sibling ever runs. Assigning a fresh `MAX(seq) + 1` (the same monotonic
-/// allocator [`enqueue_activity`] uses via [`next_task_seq`]) sorts the requeued
-/// task AFTER every currently-queued task, so the claim loop yields to every other
-/// ready sibling before returning to it — round-robin fairness. Outside a race a
-/// zero-delay-retrying activity has no siblings, so the bump is harmless: it is
-/// simply re-claimed immediately anyway.
+/// retry. Its `run_at <= now`, so the failed task is claimable again in the SAME
+/// drain pass. [`claim_next_ready_task_tx`] selects the oldest ready task
+/// (`ORDER BY seq LIMIT 1`). With its ORIGINAL lower `seq`, the task would select
+/// itself again before any ready SIBLING. A low-index `ctx.race()` branch that
+/// retries with zero delay could then monopolize the drain. It could settle the
+/// race before a faster sibling ever runs.
+///
+/// A fresh `MAX(seq) + 1` from [`next_task_seq`], the allocator that
+/// [`enqueue_activity`] uses, sorts the task AFTER every queued task. So the claim
+/// loop gives every other ready sibling a turn first: round-robin fairness.
+/// Outside a race the activity has no siblings, so the bump is harmless. It is
+/// claimed again at once.
 ///
 /// `last_error` has the same role as in [`requeue_task`].
 pub fn requeue_task_to_back(
@@ -559,13 +558,12 @@ pub fn record_heartbeat(conn: &Connection, task_id: &str, details: &Value) -> Sq
 /// actually cancelled.
 ///
 /// The loser-cancellation primitive for a losing activity branch of a resolved
-/// `ctx.race()` (issue #600), mirroring the Postgres `queue::cancel_activity_task`.
-/// An activity that
-/// genuinely completed first (a real completion raced the cancellation) is
-/// already `DONE`, matches nothing, and returns `false` — so its real terminal
-/// event is never shadowed by a synthetic one. A `CANCELLED` row is terminal for
-/// this queue: [`claim_next_ready_task_tx`] only selects `state = 'PENDING'`, so a
-/// cancelled loser is never re-run.
+/// `ctx.race()` (issue #600). It mirrors the Postgres `queue::cancel_activity_task`.
+/// An activity whose real completion beat the cancellation is already `DONE`. It
+/// matches nothing and returns `false`, so no synthetic event shadows its real
+/// terminal event. A `CANCELLED` row is terminal for this queue:
+/// [`claim_next_ready_task_tx`] only selects `state = 'PENDING'`, so a cancelled
+/// loser never runs again.
 pub fn cancel_activity_task(
     conn: &Connection,
     exec_id: ExecutionId,
@@ -591,19 +589,16 @@ pub fn enqueue_timer(
     timer_id: &str,
     fire_at: i64,
 ) -> SqliteResult<()> {
-    // `INSERT OR REPLACE` (not `OR IGNORE`) so a timer id can be RE-ARMED under the
+    // `INSERT OR REPLACE`, not `OR IGNORE`, so a timer id can be RE-ARMED under the
     // same name after a prior fire (the poll-loop idiom). The caller
-    // (`apply_commands`) only reaches this for a genuinely-new arm — occurrence
-    // idempotency (`store::pending_timer_arms == 0`) guarantees no *pending* arm of
-    // this id exists — so any conflicting `(exec_id, timer_id)` row is a spent
-    // (`fired = 1`) row from a previous arm that is safe to supersede with the
-    // fresh unfired arm. `OR IGNORE` would instead silently keep the spent row and
-    // wedge the re-arm at `Stuck`.
-    // Assign a fresh monotonic `arm_seq` so this arm sorts AFTER every timer armed
-    // earlier (issue #1069 P2). A re-arm of the same id (the poll-loop idiom) is an
-    // `INSERT OR REPLACE`, which deletes the spent row and inserts fresh — so it
-    // correctly gets a NEW, higher `arm_seq`, sorting after any concurrently-armed
-    // sibling as its re-arm implies.
+    // (`apply_commands`) only reaches this for a new arm. Occurrence idempotency
+    // (`store::pending_timer_arms == 0`) guarantees no *pending* arm of this id.
+    // So a conflicting `(exec_id, timer_id)` row is a spent (`fired = 1`) row of a
+    // previous arm, and the fresh arm can supersede it. `OR IGNORE` would keep the
+    // spent row and wedge the re-arm at `Stuck`.
+    // A fresh monotonic `arm_seq` sorts this arm AFTER every earlier timer (issue
+    // #1069). The replace deletes the spent row and inserts a new one. So a re-arm
+    // gets a NEW, higher `arm_seq` and sorts after any sibling armed with it.
     let arm_seq = next_timer_arm_seq(conn)?;
     conn.execute(
         "INSERT OR REPLACE INTO harvest_timers (timer_id, exec_id, fire_at, fired, arm_seq) \
@@ -641,9 +636,8 @@ pub fn arm_awaited_timer(
 
 /// Return the ids of all unfired timers for `exec_id` whose deadline has passed.
 pub fn due_timers(conn: &Connection, exec_id: ExecutionId, now: i64) -> SqliteResult<Vec<String>> {
-    // `ORDER BY fire_at, arm_seq`: the secondary `arm_seq` key makes the fire order
-    // of equal-deadline timers deterministic and equal to their `TimerStarted`
-    // append order, which the core matcher requires (issue #1069 P2).
+    // The secondary `arm_seq` key fires equal-deadline timers in `TimerStarted`
+    // append order. The core matcher requires that order (issue #1069).
     let mut stmt = conn.prepare_cached(
         "SELECT timer_id FROM harvest_timers \
          WHERE exec_id = ?1 AND fired = 0 AND fire_at <= ?2 ORDER BY fire_at, arm_seq",
@@ -714,17 +708,16 @@ pub fn mark_timer_fired(
 /// Delete a single still-pending (`fired = 0`) durable timer row by its
 /// `timer_id`. A no-op if the timer already fired or does not exist.
 ///
-/// The loser-cancellation primitive for a losing timer branch of a resolved race
-/// — `ctx.race()` (issue #600) and, in particular, the deadline timer of a
+/// The loser-cancellation primitive for a losing timer branch of a resolved
+/// `ctx.race()` (issue #600). It also removes the deadline timer of a
 /// `wait_for_signal_timeout` / `receive_signal_timeout` whose **signal wins**
-/// (issue #476). Mirrors the Postgres `queue::delete_pending_timer`. Deleting
-/// the unfired row is what keeps the completed workflow from being pinned by a
-/// stray armed timer (and from a stray later `TimerFired`).
+/// (issue #476). It mirrors the Postgres `queue::delete_pending_timer`. The delete
+/// keeps a stray armed timer from pinning the completed workflow. It also prevents
+/// a stray later `TimerFired`.
 ///
-/// Returns `true` iff a row was actually removed. This lets the (idempotent)
-/// re-push of the same teardown on every subsequent replay cycle report *no*
-/// progress once the row is gone, so the decision loop still converges instead
-/// of spinning on a repeated no-op delete.
+/// Returns `true` iff a row was actually removed. Each later replay cycle pushes
+/// the same idempotent teardown again. Once the row is gone, that reports *no*
+/// progress, so the decision loop converges instead of spinning on a no-op delete.
 pub fn delete_pending_timer(
     conn: &Connection,
     exec_id: ExecutionId,
@@ -737,12 +730,13 @@ pub fn delete_pending_timer(
     Ok(n > 0)
 }
 
-/// Delete every PENDING task row for an execution (issue #1068) — used by the
-/// reuse-policy `TerminateIfRunning` case when it seals a still-RUNNING prior, so
-/// no orphan task can be claimed against a run that will never be driven again.
-/// Returns the number of rows deleted. DONE/RUNNING rows are left untouched: in
-/// the single-writer runtime no drive is in flight during a start call (a crashed
-/// mid-claim RUNNING row is reset to PENDING by the orphan reclaim on open), so
+/// Delete every PENDING task row for an execution (issue #1068).
+///
+/// The reuse-policy `TerminateIfRunning` case calls it when it seals a
+/// still-RUNNING prior. So no orphan task is claimed for a run that is never
+/// driven again. Returns the number of rows deleted. DONE and RUNNING rows stay.
+/// In the single-writer runtime no drive is in flight during a start call. The
+/// orphan reclaim on open resets a crashed mid-claim RUNNING row to PENDING. So
 /// PENDING is exactly the set of claimable orphans.
 pub fn delete_pending_tasks_for_execution(
     conn: &Connection,
@@ -754,11 +748,12 @@ pub fn delete_pending_tasks_for_execution(
     )?)
 }
 
-/// Delete every unfired timer row for an execution (issue #1068) — companion to
-/// [`delete_pending_tasks_for_execution`] for the `TerminateIfRunning` seal, so a
-/// durable timer armed by the sealed prior cannot fire against a run that will
-/// never be driven again. Returns the number of rows deleted. Fired timer rows are
-/// left untouched (they are inert audit history).
+/// Delete every unfired timer row for an execution (issue #1068).
+///
+/// It is the companion of [`delete_pending_tasks_for_execution`] for the
+/// `TerminateIfRunning` seal. A timer armed by the sealed prior then cannot fire
+/// for a run that is never driven again. Returns the number of rows deleted. Fired
+/// rows stay as inert audit history.
 pub fn delete_unfired_timers_for_execution(
     conn: &Connection,
     exec_id: ExecutionId,
@@ -1002,13 +997,11 @@ mod tests {
         conn
     }
 
-    // FINDING 1 (Codex #1069 P2): the deterministic `arm_seq` tie-break makes the
-    // fire order of equal-`fire_at` timers well-defined and equal to arm order.
-    // (SQLite's `ORDER BY fire_at`-only tie order is *unspecified* — it may happen
-    // to coincide with arm order or not — so the hard-falsifiable proof that this
-    // order is load-bearing lives in the end-to-end reversed-history control in
-    // `tests/timer_arm_order.rs`; here we pin the guarantee.) Rows are inserted so
-    // arm order (a, z) is the reverse of insertion (rowid) order (z, a).
+    // Issue #1069: the `arm_seq` tie-break fires equal-`fire_at` timers in arm
+    // order. The tie order of `ORDER BY fire_at` alone is *unspecified*. It may
+    // match arm order by chance. So the falsifiable proof lives in the reversed-history
+    // control in `tests/timer_arm_order.rs`. This test pins the guarantee. Arm
+    // order (a, z) is the reverse of insertion (rowid) order (z, a).
     #[test]
     fn due_timers_break_equal_deadlines_by_arm_seq() {
         let conn = open();
@@ -1039,10 +1032,9 @@ mod tests {
         );
     }
 
-    // `enqueue_timer` assigns a strictly increasing `arm_seq` in call order, so two
-    // timers armed in one batch (the `join!` case) fire in `TimerStarted`-append
-    // order — and a re-arm of the same id (INSERT OR REPLACE) gets a fresh, higher
-    // `arm_seq` rather than keeping the spent row's value.
+    // `enqueue_timer` assigns a strictly increasing `arm_seq` in call order. So two
+    // timers armed in one batch (the `join!` case) fire in `TimerStarted` order. A
+    // re-arm of the same id gets a fresh, higher `arm_seq`, not the spent value.
     #[test]
     fn enqueue_timer_assigns_monotonic_arm_seq_including_on_rearm() {
         let conn = open();

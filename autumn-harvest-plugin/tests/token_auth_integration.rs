@@ -1,8 +1,8 @@
 //! Integration tests for scoped API tokens + rotation (issue #942).
 //!
-//! Tests run against a real Postgres (set `HARVEST_TEST_DATABASE_URL` to a
-//! migrated database to run directly with `--test-threads=1`, otherwise a fresh
-//! testcontainers Postgres is booted with the full migration set).
+//! Tests run against a real Postgres. Set `HARVEST_TEST_DATABASE_URL` to a
+//! migrated database to run directly with `--test-threads=1`. Otherwise a fresh
+//! testcontainers Postgres boots with the full migration set.
 //!
 //! End-to-end coverage of the management token layer:
 //!   - create returns the secret exactly once; only the hash is stored (AC2)

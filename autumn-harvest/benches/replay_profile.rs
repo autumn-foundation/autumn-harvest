@@ -9,9 +9,9 @@
 //! across runs. See `docs/performance-replay.md` for the numbers this
 //! produces and how to reproduce them.
 //!
-//! `harness = false`, own `main()` -- same shape as `claim_bench.rs` -- so the
-//! compiled artifact is a plain executable a profiler can be pointed at
-//! directly, with no criterion wall-clock loop diluting the measured work.
+//! `harness = false` and its own `main()`, as in `claim_bench.rs`. So the
+//! artifact is a plain executable for a profiler, and no criterion wall-clock
+//! loop dilutes the measured work.
 //!
 //! # Running
 //!
@@ -33,11 +33,10 @@
 //! `REPLAY_PROFILE_N` (default `5_000`, matching `replay_bench.rs`'s
 //! `bench_replay_10k` -- `5_000` activities = `10_001` events, the exact size
 //! issue #135 budgets) sets the activity count. `REPLAY_PROFILE_REPS`
-//! (default 1) repeats the whole build+replay cycle -- each rep rebuilds its
-//! own history (never reuses/clones a prior one), so no extra `Clone` cost
-//! leaks into the measured `replay_from_events` call; use it to trade
-//! process-startup noise for (linearly) more valgrind wall time when a
-//! single rep's signal is too close to one-time process overhead.
+//! (default 1) repeats the whole build+replay cycle. Each rep rebuilds its own
+//! history and never clones a prior one. So no extra `Clone` cost leaks into
+//! the measured `replay_from_events` call. Raise it when one rep's signal is
+//! too close to process-startup overhead. Valgrind wall time grows linearly.
 
 #[path = "replay_profile_support.rs"]
 mod support;

@@ -4,16 +4,17 @@
 //! Stable MIR prints an inherent or trait impl block as a *span*, not as a
 //! path: `<impl at src/lib.rs:240:1: 240:30>::steps`. The only way back to
 //! "`Plan::steps` for `HashSet<String>`" is to open the file and read the
-//! header the span points at — which is exactly what [`SourceIndex`] does. The
-//! span is anchored on the `impl` keyword, so the header text is recovered by
-//! scanning from (line, column) to the block's opening brace; that is more
-//! robust than a token-span comparison and needs no extra dependency.
+//! header the span points at. [`SourceIndex`] does exactly that. The span is
+//! anchored on the `impl` keyword. So a scan from (line, column) to the block's
+//! opening brace recovers the header text. That is more robust than a
+//! token-span comparison and needs no extra dependency.
 //!
-//! `syn` is used for the two questions a span cannot answer: which functions
-//! are **foreign** (an `unsafe extern "C"` fn has no MIR body and must become an
-//! `ffi` boundary rather than a silent "clean"), and what each generic
-//! function's **type parameters** are called, in declaration order (the
-//! turbofish is positional).
+//! `syn` answers the two questions a span cannot answer:
+//!
+//! * Which functions are **foreign**? An `unsafe extern "C"` fn has no MIR body.
+//!   It must become an `ffi` boundary rather than a silent "clean".
+//! * What is each generic function's **type parameter** called, in declaration
+//!   order? The turbofish is positional.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -176,8 +177,8 @@ pub struct SourceIndex {
     /// Source file → why it could not be indexed.
     ///
     /// A file MIR named that the source roots could not produce, or that `syn`
-    /// rejected: either way the impl headers, foreign-fn declarations and
-    /// generic parameter lists it holds are invisible, and every resolution that
+    /// rejected. Either way, the impl headers, foreign-fn declarations and
+    /// generic parameter lists it holds are invisible. Every resolution that
     /// needed them must become a named boundary rather than a silent "clean".
     pub unreadable: BTreeMap<String, String>,
 }
@@ -190,8 +191,8 @@ impl SourceIndex {
     pub fn build(roots: &[PathBuf], files: &BTreeSet<String>) -> Self {
         let mut index = Self::default();
         let mut expanded: BTreeSet<String> = files.clone();
-        // A file with an `extern` block but no impl and no closure is invisible
-        // to MIR spans; its siblings are cheap to read and usually contain it.
+        // MIR spans never name a file with an `extern` block but no impl and no
+        // closure. Its siblings are cheap to read and usually contain it.
         for file in files {
             if let Some(parent) = Path::new(file).parent() {
                 for sibling in siblings(roots, parent) {
@@ -360,13 +361,13 @@ impl SourceIndex {
 
     /// The impl a `#[derive(..)]` entry stands for.
     ///
-    /// A derived impl has no `impl` keyword to point at, so rustc anchors its
-    /// span on the **derive macro's own path** inside the attribute:
+    /// A derived impl has no `impl` keyword to point at. So rustc anchors its
+    /// span on the **derive macro's own path** inside the attribute.
     /// `#[derive(Debug, Serialize, Deserialize, Clone)]` at `25:41: 25:46` is
-    /// `impl Clone for <the item the attribute is on>`. Reading it back matters
-    /// because the derived body *is* in the dump — skipping the header is what
-    /// made `<Order as Clone>::clone` an `external-crate-body` boundary on a
-    /// type defined three lines away.
+    /// `impl Clone for <the item the attribute is on>`. Reading it back matters,
+    /// because the derived body *is* in the dump. Skipping the header made
+    /// `<Order as Clone>::clone` an `external-crate-body` boundary on a type
+    /// defined three lines away.
     fn derive_header_at(&self, file: &str, line: usize, column: usize) -> Option<ImplHeader> {
         let lines = self.files.get(file)?;
         let at = lines.get(line.checked_sub(1)?)?;

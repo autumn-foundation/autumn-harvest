@@ -5,9 +5,9 @@
 //! No activity argument changes; what diverges is the *duration* recorded in
 //! the timer command, which is enough to diverge the history.
 //!
-//! **Launder.** Identical to S04: HVG001 is body-only and this body has no
-//! clock token; DET001 resolves one hop, same file and same module, and
-//! `backoff_secs` is a crate away with `stamp` a crate beyond that.
+//! **Launder.** Identical to S04. HVG001 is body-only and this body has no
+//! clock token. DET001 resolves one hop, same file and same module.
+//! `backoff_secs` is a crate away, with `stamp` a crate beyond that.
 //!
 //! **Expected trace hops.** `wf_time_dependent_timer_duration` ⇒
 //! `harvest_verify_corpus_helpers::backoff_secs` ⇒

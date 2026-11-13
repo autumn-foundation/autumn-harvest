@@ -173,11 +173,11 @@ async fn seed_execution(
     conn: &mut AsyncPgConnection,
     workflow_id: &str,
 ) -> (ExecutionId, Vec<WorkflowEvent>) {
-    // Deliberately a NON-default shard (issue #697 AC4): the reset fork must
-    // inherit the *source's* shard, so seeding on shard 0 -- which is this
-    // fixture's default shard -- would let a "always use default_shard"
-    // regression pass. Only the encoded shard changes; the row is still written
-    // through the single test pool, which every shard id resolves to here.
+    // Deliberately a NON-default shard (issue #697 AC4). The reset fork must
+    // inherit the shard of the source. Shard 0 is the default shard of this
+    // fixture, so a seed there lets an "always use default_shard" regression
+    // pass. Only the encoded shard changes. Every shard id resolves to the
+    // single test pool here.
     let exec_id = ExecutionId::new_for_shard(ShardId::new(4));
     start_or_load_workflow_execution(
         conn,
@@ -601,10 +601,10 @@ async fn reset_on_terminal_source_returns_conflict() {
     assert!(body["message"].as_str().unwrap().contains("terminal"));
 }
 
-/// Regression test (code-review fix, issue #603): resetting a currently
-/// ND-blocked execution (the documented escalation path) must strip the six
-/// replay-non-determinism diagnostic keys from the fork's `search_attrs`
-/// while preserving unrelated business attributes.
+/// Regression test for issue #603: a reset of an ND-blocked execution strips
+/// the six replay-non-determinism diagnostic keys from the fork's `search_attrs`.
+/// It keeps unrelated business attributes. That reset is the documented
+/// escalation path.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reset_strips_stale_nd_diagnostic_search_attrs_from_fork() {
     let (url, _container) = setup_database().await;

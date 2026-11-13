@@ -1,6 +1,6 @@
-//! Fixture: a coroutine with three suspend points, so the MIR uses
-//! `as variant#3`, `as variant#4` and `as variant#5`, and a struct field
-//! projection is held live across the awaits.
+//! Fixture: a coroutine with three suspend points.
+//! Its MIR uses `as variant#3`, `as variant#4` and `as variant#5`. A struct
+//! field projection is held live across the awaits.
 //!
 //!   rustc --crate-type lib --edition 2024 --emit=mir \
 //!         -o async_multi_await.mir async_multi_await.rs

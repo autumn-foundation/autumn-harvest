@@ -48,15 +48,15 @@ async fn setup_test_database_url() -> (String, Option<ContainerAsync<Postgres>>)
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .try_init();
 
-    // Local-Postgres path (no Docker): when HARVEST_TEST_DATABASE_URL points at
-    // a live Postgres, create a fresh per-test database, apply the full
-    // migration bundle, and hand back its URL. CI leaves the env var unset and
-    // uses the testcontainers path below (which is the authoritative path).
+    // Local-Postgres path (no Docker): HARVEST_TEST_DATABASE_URL points at a
+    // live Postgres. Create a fresh per-test database, apply the full migration
+    // bundle, and hand back its URL. CI leaves the env var unset and uses the
+    // authoritative testcontainers path below.
     if let Ok(base_url) = std::env::var("HARVEST_TEST_DATABASE_URL") {
         use diesel_async::SimpleAsyncConnection;
-        // The per-test `harvest678_<uuid>` database is intentionally NOT dropped:
-        // this local-dev-only path is env-gated, and CI leaves the env var unset
-        // so it uses the testcontainers path (which self-cleans on container drop).
+        // The per-test `harvest678_<uuid>` database is intentionally NOT dropped.
+        // This local-dev-only path is env-gated. CI leaves the env var unset and
+        // uses the testcontainers path, which self-cleans on container drop.
         let db_name = format!("harvest678_{}", uuid::Uuid::new_v4().simple());
         let mut admin = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&base_url)
             .await
@@ -226,9 +226,9 @@ fn mixed_suspension_cancel_workflow<'a>(
 
 // Issue #678 correctness guard: resolve an external op INLINE (cycle 1, its
 // terminal appended this cycle), THEN park a PURE `ctx.timer()` in a later cycle.
-// The earlier, fully-observed external op must NOT false-wake the pure timer —
-// `resolved_external_ids` is scoped to the ids resolved on the *current* cycle,
-// which for the timer-park cycle is empty.
+// The earlier, fully-observed external op must NOT false-wake the pure timer.
+// `resolved_external_ids` holds only the ids resolved on the *current* cycle,
+// and the timer-park cycle resolves none.
 fn external_then_timer_workflow<'a>(
     ctx: &'a WorkflowContext,
     input: serde_json::Value,
@@ -255,18 +255,18 @@ fn external_then_timer_workflow<'a>(
 //
 // The #678 fix wired the inline-external self-wake only into the TIMER
 // remaining-command shape (`persist_started_timer`). These three workflow
-// bodies mirror the #678 `mixed_suspension_workflow` construction EXACTLY, but
-// replace the timer branch with the two OTHER remaining-command shapes:
+// bodies mirror the #678 `mixed_suspension_workflow` construction EXACTLY.
+// They replace the timer branch with the two OTHER remaining-command shapes:
 // a `receive_signal` wait (→ persist_signal_wait_park) and an `execute_activity`
-// (→ persist_scheduled_activities). Neither receives `resolved_inline_external`,
-// so the parent never self-wakes on the inline external terminal (issue #1034):
-// the signal-wait shape HANGS; the activity shape wakes only when the (slow)
+// (→ persist_scheduled_activities). Neither receives `resolved_inline_external`.
+// So the parent never self-wakes on the inline external terminal (issue #1034).
+// The signal-wait shape HANGS. The activity shape wakes only when the (slow)
 // activity finishes.
 
 // select! { receive_signal (never sent) , signal_external_workflow(target) }.
 // Batch = [WaitForSignal, SignalExternalWorkflow]. After inline resolution +
 // split, remaining = [WaitForSignal] → persist_signal_wait_park (no
-// resolved_inline_external) → the caller's own signal never arrives and the
+// resolved_inline_external). The caller's own signal never arrives. The
 // stripped external id is not in `commands`, so NO self-wake → HANGS.
 fn mixed_signal_wait_external_signal_workflow<'a>(
     ctx: &'a WorkflowContext,
@@ -336,10 +336,10 @@ fn mixed_signal_wait_external_cancel_workflow<'a>(
 // A deliberately slow activity (sleeps 60s) with NO start_to_close, so the
 // timeout scanner never fails it early. On the buggy code the parent's activity
 // park (persist_scheduled_activities) is only woken when this activity
-// completes, so the parent cannot finish before ~60s. The long sleep is orphaned
-// work on the green path (the parent completes on the external branch in ~seconds
-// and never awaits it; the worker's 1s shutdown drain abandons it), so it does
-// NOT slow the passing test — it only widens the margin for slow CI.
+// completes, so the parent cannot finish before ~60s. On the green path the
+// long sleep is orphaned work. The parent completes on the external branch in
+// ~seconds and never awaits it, and the worker's 1s shutdown drain abandons it.
+// So it does NOT slow the passing test. It only widens the margin for slow CI.
 fn slow_activity<'a>(
     _ctx: &'a ActivityContext,
     _input: serde_json::Value,
@@ -353,8 +353,8 @@ fn slow_activity<'a>(
 // select! { execute_activity("slow_noop") , signal_external_workflow(target) }.
 // Batch = [ScheduleActivity, SignalExternalWorkflow]. After inline resolution +
 // split, remaining = [ScheduleActivity] → persist_scheduled_activities (no
-// resolved_inline_external) → the inline external terminal is durable but
-// nothing self-wakes → parent only wakes when the 20s activity finishes.
+// resolved_inline_external). The inline external terminal is durable, but
+// nothing self-wakes. The parent wakes only when the 20s activity finishes.
 fn mixed_activity_external_signal_workflow<'a>(
     ctx: &'a WorkflowContext,
     input: serde_json::Value,
@@ -391,8 +391,8 @@ fn mixed_activity_external_signal_workflow<'a>(
 // buggy code the parent's child-workflow park (persist_all_started_child_workflows)
 // is only woken when this child COMPLETES (~60s), mirroring the slow-activity case
 // one level up. The child is orphaned when the parent completes on the external
-// branch (awaited child, no parent-close cascade; the worker's 1s shutdown drain
-// abandons it), so it does NOT slow the passing test.
+// branch: awaited child, no parent-close cascade. The worker's 1s shutdown drain
+// abandons it, so it does NOT slow the passing test.
 fn slow_child_workflow<'a>(
     ctx: &'a WorkflowContext,
     _input: serde_json::Value,
@@ -472,9 +472,9 @@ fn slow_act_info() -> ActivityInfo {
     }
 }
 
-// Compact WorkflowInfo builder mirroring the exact field set used by the inline
-// struct literals elsewhere in this file (kept in one place so field drift
-// breaks every test together rather than silently diverging).
+// Compact WorkflowInfo builder with the field set of the inline struct literals
+// elsewhere in this file. It keeps them in one place, so field drift breaks
+// every test together rather than silently diverging.
 fn wf_info(name: &'static str, handler: autumn_harvest::info::WorkflowHandlerFn) -> WorkflowInfo {
     WorkflowInfo {
         quota: None,
@@ -725,7 +725,6 @@ async fn test_same_shard_not_found_retry() {
     let caller_state = load_execution_from_url(&database_url, caller_exec_id).await;
     assert_eq!(caller_state.state, "RUNNING");
 
-    // Now start the target workflow.
     let start_target_params = StartWorkflowParams {
         exec_id: target_exec_id,
         workflow_name: "target_workflow",
@@ -892,7 +891,6 @@ async fn test_cross_shard_outbox_delivery() {
 
     let mut conn = pool.get().await.unwrap();
 
-    // Start target first
     let start_target_params = StartWorkflowParams {
         exec_id: target_exec_id,
         workflow_name: "target_workflow",
@@ -944,7 +942,6 @@ async fn test_cross_shard_outbox_delivery() {
         .await
         .unwrap();
 
-    // Start caller
     let start_params = StartWorkflowParams {
         exec_id: caller_exec_id,
         workflow_name: "caller_workflow",
@@ -1079,7 +1076,6 @@ async fn test_grace_window_expiration() {
 
     let mut conn = pool.get().await.unwrap();
 
-    // Start caller
     let start_params = StartWorkflowParams {
         exec_id: caller_exec_id,
         workflow_name: "caller_workflow",
@@ -1317,7 +1313,6 @@ async fn test_mixed_timer_suspension_signal_wakes_timer() {
     let caller_state = load_execution_from_url(&database_url, caller_exec_id).await;
     assert_eq!(caller_state.state, "RUNNING");
 
-    // Now start the target workflow.
     let start_target_params = StartWorkflowParams {
         exec_id: target_exec_id,
         workflow_name: "target_workflow",
@@ -1598,8 +1593,8 @@ async fn test_mixed_timer_suspension_cancel_resolves_inline_wakes_immediately() 
         runner.run(&pool_for_run).await;
     });
 
-    // Start the TARGET FIRST and confirm it is RUNNING (parked on a signal that
-    // never arrives), so the caller's cancel resolves inline against a live run.
+    // Start the TARGET FIRST and confirm it is RUNNING, parked on a signal that
+    // never arrives. The caller's cancel then resolves inline against a live run.
     let mut conn = pool.get().await.unwrap();
     start_or_load_workflow_execution(
         &mut conn,
@@ -1709,9 +1704,9 @@ async fn test_mixed_timer_suspension_cancel_resolves_inline_wakes_immediately() 
 // ── Issue #678 correctness guard: pure timer after inline external ──────────
 //
 // The inline self-wake must be scoped to the ids resolved THIS cycle. A
-// workflow that resolves an external op inline (cycle 1) and THEN parks a PURE
-// `ctx.timer()` (later cycle) must not be false-woken by the earlier op: the
-// timer's park cycle appends no external terminal, so `resolved_external_ids`
+// workflow resolves an external op inline (cycle 1), THEN parks a PURE
+// `ctx.timer()` (later cycle). The earlier op must not false-wake it. The
+// timer's park cycle appends no external terminal. So `resolved_external_ids`
 // is empty and the row parks normally. This proves the fix does not degrade
 // the pure-timer contract (the timer must actually sleep out its duration).
 #[tokio::test]
@@ -1829,12 +1824,12 @@ async fn test_pure_timer_after_inline_external_does_not_false_wake() {
 // ── Issue #1034: mixed NON-timer suspension + inline external op self-wake ───
 //
 // The #678 fix wired the inline-external self-wake ONLY into the timer
-// remaining-command shape (`persist_started_timer`). The two other shapes —
-// a signal-wait park and a scheduled-activities park — never receive
-// `resolved_inline_external`, so a caller that races `receive_signal` /
+// remaining-command shape (`persist_started_timer`). The two other shapes, a
+// signal-wait park and a scheduled-activities park, never receive
+// `resolved_inline_external`. A caller races `receive_signal` /
 // `execute_activity` against a same-shard `signal_external_workflow` /
-// `request_cancel_external_workflow` resolves the external terminal INLINE but
-// is never self-woken. These three tests mirror the #678 inline tests exactly
+// `request_cancel_external_workflow`. It resolves the external terminal INLINE
+// but is never self-woken. These three tests mirror the #678 inline tests exactly
 // (target started FIRST → inline resolution; select! in a raw handler) but on
 // the non-timer shapes.
 
@@ -2029,8 +2024,8 @@ async fn test_mixed_signal_wait_suspension_external_cancel_resolves_inline_wakes
         runner.run(&pool_for_run).await;
     });
 
-    // Start the TARGET FIRST and confirm it is RUNNING (parked on a signal that
-    // never arrives), so the caller's cancel resolves inline against a live run.
+    // Start the TARGET FIRST and confirm it is RUNNING, parked on a signal that
+    // never arrives. The caller's cancel then resolves inline against a live run.
     let mut conn = pool.get().await.unwrap();
     start_or_load_workflow_execution(
         &mut conn,
@@ -2134,7 +2129,7 @@ async fn test_mixed_signal_wait_suspension_external_cancel_resolves_inline_wakes
 // SignalExternalWorkflow] → remaining [ScheduleActivity] →
 // persist_scheduled_activities (no resolved_inline_external). The inline
 // ExternalSignalDelivered is durable, but nothing self-wakes the parked
-// activity task — so on the buggy code the caller cannot complete until the
+// activity task. So on the buggy code the caller cannot complete until the
 // deliberately-slow (20s) activity finishes. The 10s bound proves the fix wakes
 // the caller on the external branch immediately; without it → RED (~20s > 10s).
 #[tokio::test]
@@ -2218,9 +2213,9 @@ async fn test_mixed_activity_suspension_external_signal_resolves_inline_wakes_im
     .await
     .unwrap();
 
-    // 30s bound with a 60s slow activity: the ONLY way to complete within 30s is
-    // by self-waking on the inline external terminal (the fixed path completes in
-    // ~seconds, independent of the activity length). Without the fix the caller
+    // 30s bound with a 60s slow activity. The ONLY way to complete within 30s is
+    // by self-waking on the inline external terminal. The fixed path completes in
+    // ~seconds, independent of the activity length. Without the fix the caller
     // cannot finish until ~60s → this bound trips → RED. The 30s ceiling stays
     // well below 60s so the buggy path still fails, while giving the fixed path a
     // large cushion on slow CI.
@@ -2277,8 +2272,8 @@ async fn test_mixed_activity_suspension_external_signal_resolves_inline_wakes_im
 // [StartChildWorkflow, SignalExternalWorkflow]; after inline resolution + split,
 // remaining = [StartChildWorkflow] → persist_all_started_child_workflows (a
 // RUNNING park). This backs the changelog claim that the arm-level wake covers
-// more than the three named shapes: without the arm-level self-wake the parent
-// only wakes when the 60s child completes; with it the parent wakes immediately
+// more than the three named shapes. Without the arm-level self-wake, the parent
+// wakes only when the 60s child completes. With it, the parent wakes at once
 // on the inline ExternalSignalDelivered.
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
@@ -2361,9 +2356,9 @@ async fn test_mixed_child_workflow_suspension_external_signal_resolves_inline_wa
     .await
     .unwrap();
 
-    // 30s bound with a 60s slow child: the ONLY way to complete within 30s is by
-    // self-waking on the inline external terminal (the fixed path completes in
-    // ~seconds, independent of the child length). Without the fix the caller
+    // 30s bound with a 60s slow child. The ONLY way to complete within 30s is by
+    // self-waking on the inline external terminal. The fixed path completes in
+    // ~seconds, independent of the child length. Without the fix the caller
     // cannot finish until the 60s child completes → this bound trips → RED.
     let completed = tokio::time::timeout(Duration::from_secs(30), async {
         loop {

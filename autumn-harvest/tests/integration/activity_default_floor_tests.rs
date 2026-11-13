@@ -1,20 +1,18 @@
 #![cfg(feature = "db")]
 //! Builder-level default activity retry + `start_to_close` floor — issue #620.
 //!
-//! RED PHASE (TDD): these tests reference the not-yet-existing
-//! `HandlerRegistry::with_activity_defaults(retry, start_to_close)` builder, so
-//! the file fails to COMPILE against the missing symbol until the green phase
-//! adds it (the #543/#593 "red = compile error" precedent). They pin the
-//! schedule-time precedence the feature must implement:
+//! These tests drive the
+//! `HandlerRegistry::with_activity_defaults(retry, start_to_close)` builder.
+//! They pin the schedule-time precedence the feature must implement:
 //!
 //!   call-site override  →  activity `#[activity(retry=…/start_to_close=…)]`
 //!   default  →  builder default  →  implicit fallback
 //!
-//! Harness (DB setup, pool, worker, seed, load helpers) is copied verbatim from
-//! `activity_interceptor_tests.rs` so this suite EXECUTES against a migrated
-//! Postgres when `HARVEST_TEST_DATABASE_URL` is set, otherwise boots a fresh
-//! testcontainers Postgres 16. Each test uses a unique task queue + unique
-//! `ExecutionId` so a shared cluster run stays isolated.
+//! The harness (DB setup, pool, worker, seed, load helpers) is a copy of
+//! `activity_interceptor_tests.rs`. The suite runs against a migrated Postgres
+//! when `HARVEST_TEST_DATABASE_URL` is set. Otherwise it boots a fresh
+//! testcontainers Postgres 16. Each test uses a unique task queue and a unique
+//! `ExecutionId`, so a shared cluster run stays isolated.
 //!
 //! Assertions read the *enqueued* activity task's `max_attempts` /
 //! `start_to_close` / `retry_policy` columns (regular path) and the recorded
@@ -90,7 +88,6 @@ async fn connect(url: &str) -> AsyncPgConnection {
 type BoxFut<'a> =
     Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>>;
 
-/// Regular activity: echoes its input.
 fn echo_activity(_ctx: &autumn_harvest::ActivityContext, input: serde_json::Value) -> BoxFut<'_> {
     Box::pin(async move { Ok(input) })
 }
@@ -175,10 +172,10 @@ fn wf_slower_local(ctx: &WorkflowContext, input: serde_json::Value) -> BoxFut<'_
     })
 }
 
-/// Local activity that sleeps ~50ms then echoes — well under a 500ms subsecond
-/// builder-default STC, so it MUST complete. Without the full-`Duration` fix
-/// (issue #620, Codex P2) the 500ms builder default truncates to
-/// `Duration::from_secs(0)` and even this 50ms activity is instantly timed out.
+/// Local activity that sleeps ~50ms then echoes. That is well under a 500ms
+/// subsecond builder-default STC, so it MUST complete. Without the
+/// full-`Duration` fix (issue #620), the 500ms builder default truncates to
+/// `Duration::from_secs(0)`. Even this 50ms activity then times out at once.
 fn fast_local(_ctx: &autumn_harvest::ActivityContext, input: serde_json::Value) -> BoxFut<'_> {
     Box::pin(async move {
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -222,9 +219,9 @@ fn wf_one_activity_stc_override(ctx: &WorkflowContext, input: serde_json::Value)
 fn wf_session_acquire(ctx: &WorkflowContext, input: serde_json::Value) -> BoxFut<'_> {
     Box::pin(async move {
         let queue = ctx.queue_name().to_string();
-        // Reserved engine-internal session-acquire activity name (issue #606);
-        // the public `is_reserved_session_activity_name` helper classifies it,
-        // and the worker auto-registers an `ActivityInfo` stub for it so the
+        // Reserved engine-internal session-acquire activity name (issue #606).
+        // The public `is_reserved_session_activity_name` helper classifies it.
+        // The worker auto-registers an `ActivityInfo` stub for it, so the
         // enqueue-time lookup succeeds.
         ctx.execute_activity_raw(RESERVED_SESSION_ACQUIRE, input, &queue)
             .await
@@ -242,9 +239,6 @@ const RESERVED_SESSION_ACQUIRE: &str = "__harvest_session_acquire";
 // ---------------------------------------------------------------------------
 
 /// Build a registry, optionally installing builder-level activity defaults.
-///
-/// RED PHASE: `HandlerRegistry::with_activity_defaults` does not exist yet —
-/// this is the not-yet-existing symbol these tests fail to compile against.
 fn build_registry(
     workflows: Vec<WorkflowInfo>,
     activities: Vec<ActivityInfo>,
@@ -395,17 +389,18 @@ async fn seed_workflow(
     exec_id
 }
 
-/// Seed a RUNNING execution whose local activity is MID-RETRY: its history
-/// already carries `LocalActivityScheduled` (frozen with `recorded_resolved` /
-/// `recorded_retry` / `recorded_stc_nanos`) and one
-/// `LocalActivityFailed(attempt=1)`, and a workflow task is enqueued so a
-/// worker resumes it. This reproduces the crash-recovery window for AC8: the
-/// original retry budget/timeout is frozen in history and must survive a later
+/// Seed a RUNNING execution whose local activity is MID-RETRY.
+///
+/// Its history carries `LocalActivityScheduled` (frozen with
+/// `recorded_resolved` / `recorded_retry` / `recorded_stc_nanos`) and one
+/// `LocalActivityFailed(attempt=1)`. A workflow task is enqueued, so a worker
+/// resumes it. This reproduces the crash-recovery window for AC8. The original
+/// retry budget and timeout are frozen in history. They must survive a later
 /// change to the builder-level default.
 ///
-/// `recorded_resolved` is the #620 disambiguation marker (Codex P2): `true`
-/// models a #620+ event whose frozen values are authoritative (even `None`);
-/// `false` models a pre-#620 legacy event that falls back to live re-derivation.
+/// `recorded_resolved` is the #620 disambiguation marker. `true` models a #620+
+/// event whose frozen values are authoritative, even `None`. `false` models a
+/// pre-#620 legacy event that falls back to live re-derivation.
 #[allow(clippy::too_many_arguments)]
 async fn seed_local_activity_in_progress(
     conn: &mut AsyncPgConnection,
@@ -681,11 +676,10 @@ fn count_local_failed(history: &[WorkflowEvent]) -> usize {
 }
 
 /// The `start_to_close_nanos` the worker FROZE onto the recorded
-/// `LocalActivityScheduled` — i.e. the fully-resolved effective per-attempt
-/// timeout, in nanoseconds (issue #620, Codex P2). This is the pre-clamp
-/// resolved `Duration` value, so asserting it proves the resolution carried the
-/// configured `Duration` with no truncation at any unit — deterministically,
-/// with no wall-clock timing dependence.
+/// `LocalActivityScheduled`: the fully-resolved effective per-attempt timeout,
+/// in nanoseconds (issue #620). This is the pre-clamp resolved `Duration`. An
+/// assertion on it proves the resolution kept the configured `Duration` with
+/// no truncation at any unit. It needs no wall-clock timing.
 fn local_scheduled_stc_nanos(history: &[WorkflowEvent]) -> Option<u64> {
     history.iter().find_map(|e| match e {
         WorkflowEvent::LocalActivityScheduled {
@@ -904,14 +898,12 @@ async fn call_site_override_wins_over_builder_default() {
 // ---------------------------------------------------------------------------
 // AC6 — no defaults set anywhere is byte-for-byte today's behaviour.
 //
-// NOTE (RED-phase deviation, flagged to the coordinator): the task brief said
-// to assert `max_attempts == 1`, but the CURRENT engine enqueues a no-retry
-// activity with `max_attempts == 3` (the `EnqueueParams::new` default) and a
-// NULL `retry_policy` — and `worker::next_retry_delay` actively retries up to
-// `max_attempts` when `retry_policy` is None. So today a no-`retry` activity
-// gets 3 attempts, NOT a single attempt. Since AC6 is explicitly "byte-for-byte
-// today's behaviour", this test asserts the real current values (3 + NULL). The
-// green phase MUST NOT change this no-default path.
+// The engine enqueues a no-retry activity with `max_attempts == 3` (the
+// `EnqueueParams::new` default) and a NULL `retry_policy`.
+// `worker::next_retry_delay` retries up to `max_attempts` when `retry_policy`
+// is None. So a no-`retry` activity gets 3 attempts, NOT a single attempt. AC6
+// is "byte-for-byte today's behaviour", so this test asserts 3 + NULL. The
+// feature MUST NOT change this no-default path.
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1023,10 +1015,9 @@ async fn local_activity_honours_builder_default_retry() {
 // AC7 (discriminating) — a local activity's builder-default STC BELOW the
 // worker cap is enforced at its EXACT value.
 //
-// This is the discriminating rework of the original clamp test: builder-default
-// STC = 1s (well below the 60s worker cap), local activity sleeps ~2s. The
-// local path's per-attempt timeout is
-// `run.start_to_close.unwrap_or(max).min(max)` — WITH the feature the resolved
+// Builder-default STC = 1s (well below the 60s worker cap), and the local
+// activity sleeps ~2s. The local path's per-attempt timeout is
+// `run.start_to_close.unwrap_or(max).min(max)`. WITH the feature, the resolved
 // `Duration` is `Some(1s)`, so the timeout is `min(1s, 60s) = 1s` and the 2s
 // activity FAILS. WITHOUT the feature it is `None`, so the timeout is the 60s
 // cap and the 2s activity would COMPLETE. The outcome therefore depends on the
@@ -1149,7 +1140,7 @@ async fn local_activity_builder_default_stc_larger_than_cap_is_clamped() {
 }
 
 // ---------------------------------------------------------------------------
-// FIX 1 (issue #606 interaction) — the builder-level floor must NOT leak onto
+// Issue #606 interaction — the builder-level floor must NOT leak onto
 // the reserved worker-session internal activities. They are engine machinery
 // bounded by schedule_to_start / acquisition-timeout, not a user retry/timeout
 // floor; inheriting a builder default would govern session acquire/release.
@@ -1178,8 +1169,8 @@ async fn reserved_session_activity_does_not_inherit_builder_default() {
     .await;
 
     // A deliberately conspicuous builder default (max_attempts = 9, STC = 30s).
-    // The reserved session-acquire activity declares neither its own retry nor
-    // start_to_close, so WITHOUT the guard it would inherit 9 / 30s; WITH the
+    // The reserved session-acquire activity declares no retry or
+    // start_to_close. WITHOUT the guard it would inherit 9 / 30s. WITH the
     // guard it must stay at the pre-feature values (3 / NULL).
     let registry = build_registry(
         vec![wf_info("wf_session_acquire", wf_session_acquire)],
@@ -1225,10 +1216,10 @@ async fn reserved_session_activity_does_not_inherit_builder_default() {
 }
 
 // ---------------------------------------------------------------------------
-// FIX 2 (AC8) — a local activity mid-retry must keep its ORIGINAL retry budget
-// across a crash even if the builder-level default is changed in the recovery
+// AC8 — a local activity mid-retry keeps its ORIGINAL retry budget across a
+// crash. That holds even if the builder-level default changes in the recovery
 // window. The budget is frozen into the `LocalActivityScheduled` event at first
-// schedule; the recovery path reads it back rather than re-deriving from the
+// schedule. The recovery path reads it back rather than re-deriving from the
 // (now-changed) builder default.
 //
 // Scenario: original builder default fixed(2). The activity ran attempt 1 and
@@ -1298,11 +1289,11 @@ async fn local_activity_mid_retry_keeps_original_budget_across_default_change() 
 }
 
 // ---------------------------------------------------------------------------
-// FIX 2 (backward compat) — a PRE-#620 partial history (no recorded
-// `retry_policy` on `LocalActivityScheduled`, i.e. `None`) falls back to the
-// current re-derived builder default on recovery, exactly as today. Here the
-// resumed builder default is fixed(3): with no frozen budget the recovery path
-// re-derives fixed(3) and runs to 3 failures.
+// Backward compat — a PRE-#620 partial history has no recorded `retry_policy`
+// on `LocalActivityScheduled`. On recovery it falls back to the current
+// re-derived builder default, exactly as today. Here the resumed builder
+// default is fixed(3). With no frozen budget, the recovery path re-derives
+// fixed(3) and runs to 3 failures.
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1359,12 +1350,12 @@ async fn local_activity_mid_retry_without_recorded_budget_uses_current_default()
 }
 
 // ---------------------------------------------------------------------------
-// FIX 2 (AC8 — Codex P2, the resolution-marker refinement). A #620+ event that
-// resolved to NO floor (retry = None) is serialized identically to a genuine
-// pre-#620 legacy event (field absent → None). The `resolved` marker
-// disambiguates them: a #620+ event with `resolved = true` must keep its FROZEN
-// "no floor" (implicit 1 attempt) on recovery, NOT fall through to a builder
-// default that was ADDED FROM NOTHING after the activity was scheduled.
+// AC8, the resolution marker. A #620+ event that resolved to NO floor
+// (retry = None) serializes like a genuine pre-#620 legacy event (field
+// absent → None). The `resolved` marker tells them apart. A #620+ event with
+// `resolved = true` keeps its FROZEN "no floor" (implicit 1 attempt) on
+// recovery. It must NOT fall through to a builder default ADDED FROM NOTHING
+// after the activity was scheduled.
 //
 // Scenario: original schedule had NO retry floor of any kind (resolved = true,
 // retry = None → implicit 1 attempt). History: LocalActivityScheduled{resolved,
@@ -1382,8 +1373,8 @@ async fn local_activity_resolved_to_no_floor_ignores_a_later_added_default() {
     let mut conn = connect(&url).await;
 
     // A #620+ event that resolved to NO retry AND NO STC floor: resolved = true,
-    // retry = None, stc = None — exactly what the worker writes when there is no
-    // call-site / activity-level / builder default at first schedule.
+    // retry = None, stc = None. The worker writes exactly that when no
+    // call-site, activity-level or builder default exists at first schedule.
     let exec_id = seed_local_activity_in_progress(
         &mut conn,
         "wf_failing_local",
@@ -1437,7 +1428,7 @@ async fn local_activity_resolved_to_no_floor_ignores_a_later_added_default() {
 }
 
 // ---------------------------------------------------------------------------
-// FIX 3 (Codex P2, value proof) — the EFFECTIVE resolved local start_to_close
+// Value proof — the EFFECTIVE resolved local start_to_close
 // must EQUAL the configured Duration with NO loss at any unit. The command and
 // the frozen `LocalActivityScheduled.start_to_close_nanos` carry the full
 // Duration (nanoseconds), so:
@@ -1445,10 +1436,10 @@ async fn local_activity_resolved_to_no_floor_ignores_a_later_added_default() {
 //     (1_500_000_000 ns) — not 1s (a seconds field would truncate it);
 //   * a `from_micros(500)` sub-millisecond value is preserved as 500_000 ns —
 //     NON-ZERO (a millis field would zero it → instant timeout).
-// This asserts the resolved Duration VALUE from recorded history — deterministic,
-// no wall-clock timing race — and subsumes the "subsecond not zeroed" outcome
-// assertion below (which additionally proves the worker HONORS the value
-// end-to-end at a robust 10x margin).
+// This asserts the resolved Duration VALUE from recorded history, with no
+// wall-clock timing race. It subsumes the "subsecond not zeroed" outcome
+// assertion below. That assertion also proves the worker HONORS the value
+// end-to-end at a robust 10x margin.
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1500,7 +1491,7 @@ async fn local_activity_resolved_stc_equals_configured_duration_no_truncation() 
 
     // Scenario 2: from_micros(500) → 500_000 ns frozen (NON-ZERO), proving
     // sub-millisecond precision survives. The 500µs per-attempt timeout kills
-    // the 50ms activity (→ FAILED), but the FROZEN value is recorded at schedule
+    // the 50ms activity (→ FAILED). The FROZEN value is recorded at schedule
     // time regardless, so the value assertion is outcome-independent.
     {
         let queue = "q620-stc-value-500us";
@@ -1545,7 +1536,7 @@ async fn local_activity_resolved_stc_equals_configured_duration_no_truncation() 
 }
 
 // ---------------------------------------------------------------------------
-// FIX 3 (Codex P2) — a SUBSECOND builder-default start_to_close must NOT
+// A SUBSECOND builder-default start_to_close must NOT
 // truncate to 0 and instantly time out every local activity. The command now
 // carries millis (not seconds), so `Duration::from_millis(500)` is honored
 // rather than `Duration::from_secs(0)`.
@@ -1667,9 +1658,9 @@ async fn local_activity_subsecond_builder_default_stc_still_enforces_the_deadlin
 }
 
 // ---------------------------------------------------------------------------
-// Item 3 (P1) — the builder-default start_to_close reaches a REGULAR activity's
-// enqueued task.start_to_close (the positive STC path — the retry equivalent is
-// already covered by no_retry_activity_under_builder_default_gets_max_attempts_n).
+// The builder-default start_to_close reaches a REGULAR activity's enqueued
+// task.start_to_close. This is the positive STC path.
+// no_retry_activity_under_builder_default_gets_max_attempts_n covers retry.
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1719,8 +1710,8 @@ async fn regular_activity_under_builder_default_gets_start_to_close() {
 }
 
 // ---------------------------------------------------------------------------
-// Item 6 (P2) — STC precedence on the regular path: a call-site START_TO_CLOSE
-// override wins over the builder-default STC (the STC mirror of AC5 for retry).
+// STC precedence on the regular path. A call-site START_TO_CLOSE override wins
+// over the builder-default STC. This is the STC mirror of AC5 for retry.
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1773,7 +1764,7 @@ async fn call_site_stc_override_wins_over_builder_default_stc() {
 }
 
 // ---------------------------------------------------------------------------
-// Item 6 (P2) — STC precedence on the regular path: an activity-declared
+// STC precedence on the regular path: an activity-declared
 // #[activity(start_to_close = …)] default wins over the builder-default STC.
 // ---------------------------------------------------------------------------
 
@@ -1830,9 +1821,9 @@ async fn declared_activity_stc_wins_over_builder_default_stc() {
 }
 
 // ---------------------------------------------------------------------------
-// Item 7 (P3) — the FULL builder-default retry policy (not just max_attempts)
-// round-trips into the enqueued task.retry_policy JSON: an EXPONENTIAL default
-// with a distinct initial_interval + backoff must be observable after decode.
+// The FULL builder-default retry policy, not just max_attempts, round-trips
+// into the enqueued task.retry_policy JSON. An EXPONENTIAL default with a
+// distinct initial_interval + backoff must be observable after decode.
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1905,9 +1896,9 @@ async fn builder_default_exponential_retry_policy_round_trips_into_task() {
 }
 
 // ---------------------------------------------------------------------------
-// Item 8 (P3) — with builder defaults UNSET, a failing LOCAL activity records
-// exactly ONE LocalActivityFailed (the local fallback is 1 attempt, vs 3 for a
-// regular activity). Guards the local no-op path byte-for-byte.
+// With builder defaults UNSET, a failing LOCAL activity records exactly ONE
+// LocalActivityFailed. The local fallback is 1 attempt, vs 3 for a regular
+// activity. Guards the local no-op path byte-for-byte.
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

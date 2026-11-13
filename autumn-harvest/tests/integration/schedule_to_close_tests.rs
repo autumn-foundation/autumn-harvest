@@ -367,14 +367,16 @@ async fn scanner_does_not_affect_tasks_without_schedule_to_close() {
 
 // ── Pre-retry deadline check ─────────────────────────────────────────────────
 
-/// When a task's `schedule_to_close_at` is already in the past at the point the
-/// worker computes the next retry delay, `record_schedule_to_close_activity_timeout`
-/// must be called instead of re-queuing. The task ends up FAILED and history
-/// carries `ActivityTimedOut { ScheduleToClose }`.
+/// A task whose `schedule_to_close_at` has passed must time out, not re-queue.
+///
+/// The deadline is checked when the worker computes the next retry delay. If it
+/// has passed, the worker calls `record_schedule_to_close_activity_timeout`
+/// instead of re-queuing. The task ends up FAILED and history carries
+/// `ActivityTimedOut { ScheduleToClose }`.
 ///
 /// This test sets up the scenario directly in the database (expired deadline +
-/// attempt 1 of 10) and confirms the scanner fires, which mirrors the pre-retry
-/// code path for the PENDING case.
+/// attempt 1 of 10). It confirms that the scanner fires. That mirrors the
+/// pre-retry code path for the PENDING case.
 #[tokio::test]
 async fn pre_retry_deadline_check_prevents_requeue_when_deadline_exceeded() {
     let (mut conn, _container) = setup_db().await;
@@ -475,9 +477,9 @@ async fn pre_retry_deadline_check_prevents_requeue_when_deadline_exceeded() {
 
 // ── schedule_to_close_at is persisted via EnqueueParams ─────────────────────
 
-/// Verify that `EnqueueParams::schedule_to_close_at` is correctly persisted to
-/// the `harvest_task_queue` table and that a task enqueued with a future deadline
-/// is NOT timed out by the scanner.
+/// `EnqueueParams::schedule_to_close_at` persists to `harvest_task_queue`.
+///
+/// The scanner does NOT time out a task enqueued with a future deadline.
 #[tokio::test]
 async fn enqueue_params_schedule_to_close_at_persisted_and_not_prematurely_fired() {
     let (mut conn, _container) = setup_db().await;

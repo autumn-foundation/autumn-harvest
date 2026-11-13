@@ -566,25 +566,23 @@ async fn batch_limit_is_applied_after_global_history_timestamp_ordering() {
 
 #[tokio::test]
 async fn batch_export_carries_deadline_metadata_for_replay() {
-    // Issue #772 (Codex Finding B): a batch history export of a deadline-aware
-    // workflow must carry `execution_timeout`/`deadline_at` at the top level so
-    // the exported JSON round-trips the continue-as-new deadline budget into the
-    // `replay_from_json` / `harvest-replay` path — exactly as the single-execution
-    // export already does. Before the fix, the batch candidate query did not
-    // SELECT those columns, so every batch export serialized them as `None`;
-    // replaying such a fixture disabled the deadline branch, left the recorded
-    // `SideEffectRecorded{Now}` deadline probe unconsumed, and false-reported
+    // Issue #772: a batch history export of a deadline-aware workflow must carry
+    // `execution_timeout`/`deadline_at` at the top level, like the
+    // single-execution export. The exported JSON then carries the
+    // continue-as-new deadline budget into `replay_from_json` / `harvest-replay`.
+    // The batch candidate query once omitted those columns, so they exported
+    // as `None`. A replay then disabled the deadline branch and left the
+    // `SideEffectRecorded{Now}` probe unconsumed. It reported false
     // non-determinism.
     let Some((database_url, _container)) = setup_database_url_with_migrations().await else {
         return;
     };
 
-    // A deadline-aware history whose recorded activity PINS the
-    // `should_continue_as_new()` decision: `checkpoint_now` was scheduled because
-    // the deadline branch tripped (27s of a 30s budget consumed => 0.9 >= 0.8).
-    // On replay WITHOUT the threaded deadline, the branch would instead schedule
-    // `keep_working` and diverge — so a clean replay proves the deadline metadata
-    // was carried, not merely that the export shape parsed.
+    // The recorded activity PINS the `should_continue_as_new()` decision.
+    // `checkpoint_now` was scheduled because the deadline branch tripped
+    // (27s of a 30s budget => 0.9 >= 0.8). A replay WITHOUT the deadline would
+    // schedule `keep_working` and diverge. So a clean replay proves the export
+    // carried the deadline metadata.
     let t0 = chrono::DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
     let recorded_now = t0 + Duration::seconds(27);
     let activity_id = ActivityExecId::new();
@@ -668,10 +666,10 @@ async fn batch_export_carries_deadline_metadata_for_replay() {
     );
 }
 
-/// Deadline-aware decision probe (issue #772): the `should_continue_as_new()`
-/// outcome selects which activity is scheduled, so a *wrong* decision (a
-/// disabled deadline branch) schedules the other activity and diverges on
-/// replay — making the batch-export deadline round-trip falsifiable.
+/// Deadline-aware decision probe (issue #772). The `should_continue_as_new()`
+/// outcome selects the scheduled activity. A *wrong* decision schedules the
+/// other activity and diverges on replay. That makes the batch-export deadline
+/// round-trip falsifiable.
 fn deadline_branch_probe_workflow<'a>(
     ctx: &'a WorkflowContext,
     _input: Value,

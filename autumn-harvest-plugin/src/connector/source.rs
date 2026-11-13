@@ -1,10 +1,10 @@
 //! The broker adapter seam (issue #944).
 //!
 //! [`EventSource`] is the *only* thing a new broker adapter has to implement.
-//! Everything else — binding descriptors, idempotency-key derivation, ack
-//! ordering, poison isolation, backpressure, metrics — is broker-agnostic and
-//! shared, so NATS, `RabbitMQ`, Pub/Sub and Kinesis adapters are follow-ups
-//! rather than rewrites.
+//! Everything else is broker-agnostic and shared: binding descriptors,
+//! idempotency-key derivation, ack ordering, poison isolation, backpressure and
+//! metrics. So NATS, `RabbitMQ`, Pub/Sub and Kinesis adapters are follow-ups,
+//! not rewrites.
 
 use super::message::{InboundMessage, MessageHandle};
 
@@ -20,14 +20,15 @@ pub enum ConnectorError {
     /// The source has been shut down and will yield no further messages.
     #[error("connector source is closed")]
     Closed,
-    /// A partition's commit prefix is permanently blocked: a message was
-    /// retried rather than settled, and on a positional broker nothing hands
-    /// it back until the consumer is rebuilt.
+    /// A partition's commit prefix is permanently blocked.
     ///
-    /// Distinct from [`Self::Broker`] because the response differs: a broker
-    /// error is transient and worth re-polling the same consumer after a
-    /// backoff, whereas re-polling a wedged consumer accomplishes nothing —
-    /// it has to be rebuilt (see [`EventSource::recover`]).
+    /// A message was retried rather than settled. On a positional broker,
+    /// nothing hands it back until the consumer is rebuilt.
+    ///
+    /// It is distinct from [`Self::Broker`] because the response differs. A
+    /// broker error is transient, so the runtime re-polls the same consumer
+    /// after a backoff. A re-poll of a wedged consumer does nothing. The
+    /// consumer must be rebuilt (see [`EventSource::recover`]).
     #[error(
         "partition {partition} commit prefix is blocked: {held} completed offsets held behind an \
          unsettled head (bound {threshold}); the consumer must be rebuilt to redeliver it"
@@ -51,11 +52,10 @@ pub type ConnectorFuture<'a, T> =
 /// # Ack contract
 ///
 /// The runtime calls [`Self::ack`] **only after** the message's dispatch is
-/// durable in Postgres (or was recognized as an idempotent replay, or was
-/// durably parked by a throttle). A message whose dispatch failed transiently
-/// is left for [`Self::abandon`] or simply not acknowledged, so the broker's
-/// own redelivery brings it back. An adapter must therefore never
-/// auto-acknowledge on receive.
+/// durable in Postgres. An idempotent replay and a durable throttle park also
+/// count. A message whose dispatch failed transiently goes to
+/// [`Self::abandon`] or stays unacknowledged, so the broker's own redelivery
+/// brings it back. An adapter must therefore never auto-acknowledge on receive.
 ///
 /// # Ordering
 ///
@@ -115,13 +115,13 @@ pub trait EventSource: Send + Sync {
     /// Return a message to the broker for **retry** after a transient
     /// harvest-side failure.
     ///
-    /// The message should come back *eventually*, with whatever natural
-    /// backoff the broker provides — an SQS visibility timeout lapsing, a
-    /// Kafka offset simply not being committed. Deliberately **not** an
-    /// "immediately redeliver" request: a transient failure is usually harvest
-    /// being under pressure, and hammering it with a tight redelivery loop
-    /// makes that worse. Use [`Self::nack_for_dead_letter`] when the intent is
-    /// to push a *poison* message toward the broker's own redrive policy.
+    /// The message should come back *eventually*, with the natural backoff of
+    /// the broker: an SQS visibility timeout lapses, or a Kafka offset stays
+    /// uncommitted. This is deliberately **not** an "immediately redeliver"
+    /// request. A transient failure usually means harvest is under pressure,
+    /// and a tight redelivery loop makes that worse. Use
+    /// [`Self::nack_for_dead_letter`] to push a *poison* message toward the
+    /// broker's own redrive policy.
     ///
     /// # Errors
     ///
@@ -142,8 +142,8 @@ pub trait EventSource: Send + Sync {
     ///
     /// Only called for a binding in
     /// [`DeadLetterMode::BrokerNative`][bn], which
-    /// [`Self::has_native_dead_letter`] gates. Unlike [`Self::abandon`] this
-    /// *does* want the fastest possible redelivery, because each one advances
+    /// [`Self::has_native_dead_letter`] gates. Unlike [`Self::abandon`], this
+    /// *does* want the fastest possible redelivery. Each redelivery advances
     /// the broker's receive count toward the threshold that moves the message
     /// to its DLQ.
     ///
@@ -170,29 +170,29 @@ pub trait EventSource: Send + Sync {
     /// Commit a **high-water mark** for `partition`, asserting that everything
     /// at or below `position` is durably handled.
     ///
-    /// Deliberately separate from [`Self::ack`], because it is not an
-    /// acknowledgement of a message. The runtime commits the *contiguous
-    /// completed prefix*, and the offset that prefix reaches is usually not the
-    /// one whose settlement triggered the advance: when 5 completes before 4,
-    /// it is 4's completion that carries the mark to 5. There may be no handle
-    /// for `position` in hand at all — its message settled earlier and was
-    /// released — so there is nothing honest to pass to `ack`.
+    /// It is deliberately separate from [`Self::ack`], because it does not
+    /// acknowledge one message. The runtime commits the *contiguous completed
+    /// prefix*. The offset that prefix reaches is usually not the one whose
+    /// settlement triggered the advance. When 5 completes before 4, the
+    /// completion of 4 carries the mark to 5. The runtime may hold no handle
+    /// for `position`, because its message settled earlier and was released.
+    /// So there is nothing honest to pass to `ack`.
     ///
     /// Only a positional broker ever reaches this. A handle with no
     /// `partition`/`position` is acknowledged per-message through
     /// [`Self::ack`] and never comes here.
     ///
     /// The default delegates to [`Self::ack`] with a **token-less** handle
-    /// carrying only the coordinates, which is right for any adapter whose
-    /// commit is addressed by `(partition, position)` — the in-tree Kafka
-    /// adapter is one. The token is empty rather than borrowed from some other
-    /// message precisely so an adapter that *does* key off it cannot silently
-    /// acknowledge the wrong record: it sees an obviously-absent token instead
-    /// of a plausible, wrong one. Such an adapter should override this.
+    /// that carries only the coordinates. That is right for any adapter whose
+    /// commit is addressed by `(partition, position)`, such as the in-tree
+    /// Kafka adapter. The token is empty, not borrowed from another message.
+    /// So an adapter that *does* key off it cannot silently acknowledge the
+    /// wrong record. It sees an obviously absent token, not a plausible wrong
+    /// one. Such an adapter should override this.
     ///
-    /// An adapter that cannot commit by position at all is not positional, and
-    /// should leave `partition`/`position` unset on its handles
-    /// ([`MessageHandle::opaque`]) so its messages are acknowledged
+    /// An adapter that cannot commit by position is not positional. It should
+    /// leave `partition`/`position` unset on its handles
+    /// ([`MessageHandle::opaque`]), so its messages are acknowledged
     /// individually.
     ///
     /// # Errors
@@ -229,12 +229,12 @@ pub trait EventSource: Send + Sync {
     /// An implementation must abort within
     /// [`ADAPTER_LAG_SAMPLE_CEILING`](super::runtime::ADAPTER_LAG_SAMPLE_CEILING).
     /// The runtime budgets this call, but a timeout only drops the runtime's
-    /// own future — it cannot stop work already under way, and for a sample
-    /// running on `spawn_blocking` it definitively cannot, because a blocking
-    /// task is never cancelled. The runtime floors its budget at that ceiling
-    /// so it never gives up first; an implementation that outruns the ceiling
-    /// breaks the other half of the bargain, and abandoned samples accumulate
-    /// against a broker that is already struggling.
+    /// own future. It cannot stop work already under way. A sample on
+    /// `spawn_blocking` is never stopped, because a blocking task is never
+    /// cancelled. The runtime floors its budget at that ceiling, so it never
+    /// gives up first. An implementation that outruns the ceiling breaks the
+    /// other half of the bargain. Then abandoned samples accumulate against a
+    /// broker that already struggles.
     fn lag<'life0, 'async_trait>(&'life0 self) -> ConnectorFuture<'async_trait, Option<i64>>
     where
         'life0: 'async_trait,
@@ -246,19 +246,19 @@ pub trait EventSource: Send + Sync {
     /// Rebuild this source's underlying client, so messages it has already
     /// drained but not settled are handed back.
     ///
-    /// Called when the runtime detects that a partition's commit prefix is
-    /// **permanently blocked**: a message was retried rather than settled, and
-    /// on a positional broker [`Self::abandon`] cannot force redelivery
-    /// in-session because the local consumer position has already advanced
-    /// past it. Rebuilding the consumer makes it re-read from the last
-    /// committed offset, which is what actually performs the retry.
+    /// The runtime calls this when a partition's commit prefix is
+    /// **permanently blocked**. A message was retried rather than settled. On
+    /// a positional broker, [`Self::abandon`] cannot force redelivery
+    /// in-session, because the local consumer position is already past it. A
+    /// rebuilt consumer re-reads from the last committed offset, and that
+    /// performs the retry.
     ///
-    /// Returns `true` when the source rebuilt itself, `false` when it has no
-    /// such capability — the two must be distinguishable, or the runtime would
-    /// loop forever believing it had fixed something. The default is `false`,
-    /// which is correct for every source that does not need this: SQS's
-    /// visibility timeout already redelivers an abandoned message, so its
-    /// prefix cannot wedge in the first place.
+    /// Returns `true` when the source rebuilt itself, and `false` when it has
+    /// no such capability. The two must differ, or the runtime loops forever
+    /// in the belief that it fixed something. The default is `false`. That is
+    /// correct for every source that does not need this. The SQS visibility
+    /// timeout already redelivers an abandoned message, so its prefix cannot
+    /// wedge.
     ///
     /// # Errors
     ///
@@ -277,17 +277,17 @@ pub trait EventSource: Send + Sync {
     /// Whether [`Self::abandon`] actually causes the message to come back.
     ///
     /// True for any broker with per-message acknowledgement and its own
-    /// redelivery clock — SQS, whose visibility timeout lapses and hands the
-    /// message back with no further action from us.
+    /// redelivery clock. On SQS the visibility timeout lapses and hands the
+    /// message back with no further action.
     ///
     /// **False for a positional broker.** On Kafka `abandon` is a no-op by
-    /// construction (not committing *is* the mechanism), and the consumer's
-    /// local read position has already advanced past the message, so nothing
-    /// hands it back within the session: the message is not retried, it is
-    /// dropped, and its offset blocks the partition's commit prefix forever.
-    /// The runtime treats a retry on such a source as an immediate wedge and
-    /// rebuilds the consumer (see [`Self::recover`]), which re-reads from the
-    /// last commit and is what actually performs the retry.
+    /// construction, because not committing *is* the mechanism. The local read
+    /// position of the consumer is already past the message. So nothing hands
+    /// it back within the session. The message is dropped, not retried, and
+    /// its offset blocks the partition's commit prefix forever. The runtime
+    /// treats a retry on such a source as an immediate wedge. It rebuilds the
+    /// consumer (see [`Self::recover`]), which re-reads from the last commit
+    /// and so performs the retry.
     ///
     /// The default is `true` — the conservative choice, because it only ever
     /// declines to rebuild. An adapter that returns `true` when it should not
@@ -306,12 +306,13 @@ pub trait EventSource: Send + Sync {
     /// the broker eventually acts on — SQS's `ApproximateReceiveCount` against
     /// a redrive policy's `maxReceiveCount`.
     ///
-    /// Kafka has no such thing: `abandon` is a no-op (not committing is the
-    /// whole mechanism), so a poison message would be re-read **forever** and
-    /// never reach any dead-letter destination — precisely the partition wedge
-    /// the poison-message handling exists to prevent. The default is therefore
-    /// `false`, and a binding that asks for broker-native dead-lettering on
-    /// such a source is rejected at build time rather than silently wedging.
+    /// Kafka has no such counter. Its `abandon` is a no-op, because not
+    /// committing is the whole mechanism. So a poison message is re-read
+    /// **forever** and never reaches a dead-letter destination. That is the
+    /// partition wedge that the poison-message handling exists to prevent. The
+    /// default is therefore `false`. A binding that asks for broker-native
+    /// dead-lettering on such a source fails at build time, so it cannot wedge
+    /// silently.
     fn has_native_dead_letter(&self) -> bool {
         false
     }
@@ -325,20 +326,20 @@ pub trait EventSource: Send + Sync {
     /// it: separately constructed sources over one queue or one consumer group
     /// have distinct pointers.
     ///
-    /// It is a *subscription* identity, not a *stream* identity — the two
+    /// It is a *subscription* identity, not a *stream* identity. The two
     /// differ wherever the broker has a consumer-group concept. Two Kafka
     /// consumers on one topic under **distinct group ids** each receive the
-    /// whole stream, which is the sanctioned way to fan one topic out to two
-    /// targets, so Kafka's identity pairs the group with the topic. SQS has no
-    /// such concept — every receiver on a queue competes — so its identity is
-    /// the queue URL.
+    /// whole stream. That is the sanctioned way to fan one topic out to two
+    /// targets, so the Kafka identity pairs the group with the topic. SQS has
+    /// no such concept, because every receiver on a queue competes. So its
+    /// identity is the queue URL.
     ///
     /// The default is `None`: an adapter that cannot name its subscription is
     /// not evidence of a clash, and a `None` never matches another `None`.
     /// Such a source keeps the object-identity check only. Override this when
-    /// the adapter knows what it is subscribed to; returning an identity that
-    /// is *coarser* than the real subscription would reject legitimate
-    /// fan-out, so include everything that makes two consumers independent.
+    /// the adapter knows what it is subscribed to. An identity *coarser* than
+    /// the real subscription rejects legitimate fan-out. So include everything
+    /// that makes two consumers independent.
     fn subscription_identity(&self) -> Option<String> {
         None
     }

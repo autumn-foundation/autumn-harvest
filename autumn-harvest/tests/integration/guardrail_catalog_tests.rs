@@ -368,9 +368,9 @@ fn catalog_lookup_missing_id_returns_none() {
 
 // ── HVG011: HashMap/HashSet iteration order (issue #785) ─────────────────────
 //
-// NOTE on the rule ID: issue #785's text proposed HVG010, but HVG010 was
-// already permanently assigned to SelectMacro (issue #600) and rule IDs are
-// never reused, so the iteration-order rule ships as HVG011.
+// NOTE on the rule ID: issue #785 proposed HVG010. HVG010 already belongs to
+// SelectMacro (issue #600), and rule IDs are never reused. So the
+// iteration-order rule ships as HVG011.
 
 #[test]
 fn catalog_contains_hvg011_nondeterministic_iteration() {
@@ -401,10 +401,10 @@ fn catalog_contains_hvg011_nondeterministic_iteration() {
 
 // ── HVG010: SelectMacro (issue #600) + combinator functions (issue #799) ─────
 //
-// NOTE on the rule ID: issue #799's text proposed "HVG011", but HVG011 was
-// already permanently assigned to NonDeterministicIteration (issue #785) and
-// rule IDs are never reused — the select rule is HVG010 (issue #600), extended
-// by issue #799 to also flag the futures combinator FUNCTIONS.
+// NOTE on the rule ID: issue #799 proposed "HVG011". HVG011 already belongs
+// to NonDeterministicIteration (issue #785), and rule IDs are never reused.
+// The select rule is HVG010 (issue #600). Issue #799 extends it to also flag
+// the futures combinator FUNCTIONS.
 
 #[test]
 fn catalog_hvg010_is_select_macro_hard_blocker() {

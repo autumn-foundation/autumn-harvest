@@ -17,40 +17,41 @@
 //! | Mixing concerns | Awkward with more than one concurrent signal | Natural — register one handler per signal name |
 //! | Return value | Caller gets the payload directly | Fire-and-forget; handler mutates captured state |
 //!
-//! Buffered signals are never dropped: a signal delivered before its handler
-//! is registered (e.g. it arrived on an earlier workflow-task cycle) is still
-//! dispatched once the handler exists, in the same workflow task. The pull
-//! and push styles coexist for different signal names without any special
-//! coordination -- and even for the *same* name, at most one style receives
-//! any given recorded `SignalReceived` event (no double delivery).
+//! Buffered signals are never dropped. A signal can arrive before its handler
+//! is registered, for example on an earlier workflow-task cycle. It is still
+//! dispatched once the handler exists, in the same workflow task. The pull and
+//! push styles coexist for different signal names with no special
+//! coordination. Even for the *same* name, at most one style receives a given
+//! recorded `SignalReceived` event, so there is no double delivery.
 //!
-//! **Dispatch timing.** `register_signal_handler*` only stores the handler --
-//! it does not fire inline. Dispatch happens on the *next* history-consulting
-//! call the workflow body makes (an activity, timer, another signal wait, or
-//! a deterministic primitive like `system_now()`), and at the latest once
-//! more when the cycle ends. A workflow that reads handler-mutated state
-//! should do so only after at least one such call; reading it on the literal
-//! next line with nothing in between sees pre-dispatch state. See the
-//! `system_now()` call below for the minimal way to force this when nothing
-//! else in the workflow body would trigger it naturally.
+//! **Dispatch timing.** `register_signal_handler*` only stores the handler. It
+//! does not fire inline. Dispatch happens on the *next* history-consulting call
+//! of the workflow body: an activity, timer, another signal wait, or a
+//! deterministic primitive like `system_now()`. At the latest, it happens once
+//! more when the cycle ends. So read handler-mutated state only after at least
+//! one such call. A read on the next line, with nothing in between, sees
+//! pre-dispatch state. The `system_now()` call below is the minimal way to
+//! force dispatch when nothing else in the body would.
 //!
 //! ## Handlers must be idempotent, replay-safe state mutation only
 //!
-//! There is no persisted "already delivered" marker for a signal handler
-//! (unlike the `update` primitive's `UpdateCompleted` event) -- a handler
-//! fires once per recorded `SignalReceived` event **every time the workflow
-//! replays from the top of its function** (e.g. after every activity in this
-//! example completes, or after a worker restart), not just once over the
-//! execution's lifetime. That is safe and correct for pure state
-//! reconstruction, exactly as shown below: `state` is a fresh
-//! `Arc<Mutex<..>>` created at the top of the function on every cycle, so
-//! replaying the same handful of recorded signals into it always rebuilds
-//! the identical final value. It is **not** safe for a handler that performs
-//! a non-idempotent side effect (an external HTTP call, an unconditional log
-//! line meant to fire once, an increment sent to another system) -- that
-//! side effect repeats on every subsequent replay of this same history.
-//! Keep signal handlers limited to mutating captured in-memory state; route
-//! anything with an external side effect through a regular activity instead.
+//! A signal handler has no persisted "already delivered" marker, unlike the
+//! `UpdateCompleted` event of the `update` primitive. So a handler fires once
+//! per recorded `SignalReceived` event **every time the workflow replays from
+//! the top of its function**. In this example that is after every activity
+//! completes, and after a worker restart. It is not once over the execution's
+//! lifetime.
+//!
+//! That is safe for pure state reconstruction, exactly as shown below. `state`
+//! is a fresh `Arc<Mutex<..>>`, created at the top of the function on every
+//! cycle. So a replay of the same recorded signals always rebuilds the
+//! identical final value.
+//!
+//! It is **not** safe for a handler with a non-idempotent side effect. Examples
+//! are an external HTTP call, a log line meant to fire once, or an increment
+//! sent to another system. That side effect repeats on every later replay of
+//! this history. Keep signal handlers to mutating captured in-memory state.
+//! Route anything with an external side effect through a regular activity.
 //!
 //! Deliver signals over the existing management route:
 //!   POST /api/harvest/workflows/{exec_id}/signal
@@ -87,23 +88,23 @@ async fn charge_billing_cycle(_ctx: &ActivityContext, tier: String) -> Result<()
 /// Lock the subscription state, recovering from poisoning instead of
 /// panicking.
 ///
-/// A push signal handler runs on the workflow's own replay/live cycle: a
-/// panic inside one is caught and logged rather than propagated (fire-and-
-/// forget delivery), but if it panics *while holding this lock*, the
-/// `std::sync::Mutex` still poisons per ordinary Rust semantics -- that
-/// panic-catching does not "un-poison" a mutex a different piece of code
-/// happened to be holding when it unwound. Using `PoisonError::into_inner`
-/// here means a later `.lock()` elsewhere in the same cycle (like the final
-/// read below) does not itself panic on a poisoned lock it had nothing to
-/// do with.
+/// A push signal handler runs on the workflow's own replay/live cycle. A panic
+/// inside one is caught and logged, not propagated (fire-and-forget delivery).
+/// But a panic *while it holds this lock* still poisons the `std::sync::Mutex`,
+/// per ordinary Rust semantics. Catching the panic does not "un-poison" a mutex
+/// that the unwinding code held. With `PoisonError::into_inner`, a later
+/// `.lock()` in the same cycle, such as the final read below, does not panic
+/// on that unrelated poisoned lock.
 fn lock_state(state: &Mutex<SubscriptionState>) -> MutexGuard<'_, SubscriptionState> {
     state.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// A long-running subscription workflow. Three signal handlers registered up
-/// front react to `cancel` / `pause` / `upgrade` at any point while the
-/// workflow otherwise runs its billing loop -- no `tokio::select!`, no
-/// `await_condition` polling loop, no hand-rolled interleaving.
+/// A long-running subscription workflow.
+///
+/// Three signal handlers, registered up front, react to `cancel` / `pause` /
+/// `upgrade` at any point while the workflow runs its billing loop. It needs no
+/// `tokio::select!`, no `await_condition` polling loop, and no hand-rolled
+/// interleaving.
 #[workflow]
 async fn subscription(
     ctx: &WorkflowContext,
@@ -136,19 +137,17 @@ async fn subscription(
         lock_state(&upgrade_state).tier = req.tier;
     });
 
-    // Registration only stores a handler -- it does not dispatch inline.
-    // Dispatch happens on the next history-consulting call the workflow body
-    // makes (an activity, timer, or a cheap deterministic primitive like
-    // `system_now()` below), so a signal already recorded at the start of
-    // this cycle is only visible to the reads further down *after* such a
-    // call. Any real activity/timer/loop later in the workflow provides this
-    // for free; `system_now()` is the minimal way to force it here since
-    // this example checks the flags before doing anything else.
+    // Registration only stores a handler. It does not dispatch inline.
+    // Dispatch happens on the next history-consulting call of the workflow
+    // body: an activity, a timer, or a cheap deterministic primitive like
+    // `system_now()` below. A signal recorded at the start of this cycle is
+    // visible to the reads below only *after* such a call. A real
+    // activity/timer/loop provides that for free. This example checks the
+    // flags first, so `system_now()` forces dispatch here.
     let _ = ctx.system_now();
 
-    // The rest of the workflow body is free to run its own logic --
-    // deterministic replay of the handlers above happens transparently at
-    // the top of every cycle, regardless of where this code has gotten to.
+    // The handlers above replay deterministically at the top of every cycle,
+    // wherever the rest of the body has reached.
     let tier_to_charge = lock_state(&state).tier.clone();
     if !lock_state(&state).cancelled && !lock_state(&state).paused {
         let _: () = ctx
@@ -199,11 +198,10 @@ mod tests {
 
     #[tokio::test]
     async fn cancel_signal_recorded_before_start_skips_billing_charge() {
-        // Regression (PR #890 review): a signal already recorded before this
-        // cycle even starts must still be observed by the billing decision
-        // below, despite there being zero commands between the three
-        // `register_signal_handler*` calls and this cancellation check other
-        // than the `system_now()` flush point.
+        // Regression (PR #890 review): the billing decision below must observe
+        // a signal recorded before this cycle starts. The only command between
+        // the three `register_signal_handler*` calls and this cancellation
+        // check is the `system_now()` flush point.
         let events = vec![
             started_event("gold"),
             WorkflowEvent::SignalReceived {

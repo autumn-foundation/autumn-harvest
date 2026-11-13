@@ -1,10 +1,10 @@
 //! Coverage guards for the builtin determinism model (`harvest-verify.model.toml`).
 //!
-//! The model is data, and data rots differently from code: nothing in `src/`
+//! The model is data, and data rots differently from code. Nothing in `src/`
 //! stops a `WorkflowContext` method from being added, used across the examples,
-//! and never classified. An unclassified ctx method is not a silent pass — the
-//! analyzer emits `unknown("unmodeled-ctx-method")` — but an `unknown` verdict
-//! is exactly as useless as a wrong one for the success metrics, and it
+//! and never classified. An unclassified ctx method is not a silent pass: the
+//! analyzer emits `unknown("unmodeled-ctx-method")`. But for the success
+//! metrics an `unknown` verdict is exactly as useless as a wrong one. It
 //! degrades quietly while CI stays green.
 //!
 //! These guards close that loop in both directions:
@@ -13,14 +13,14 @@
 //!     the OUTSIDE in — every `ctx.<method>(` this repo's examples and tests
 //!     actually call must land in some bucket.
 //!   * [`every_pub_method_on_workflow_context_is_classified`] works from the
-//!     INSIDE out — it parses `autumn-harvest/src/context.rs` with `syn` and
+//!     INSIDE out. It parses `autumn-harvest/src/context.rs` with `syn`. It
 //!     requires every public method of `impl WorkflowContext` to be classified,
 //!     including the ~55 % of the surface no example happens to exercise.
 //!
-//! Deliberately NOT guarded: whether a classification is *correct*. That is a
-//! judgement backed by the `reason` on each row (every one cites the line in
-//! `context.rs` that proves it) and by the seeded corpus, not by a test that
-//! could only restate the table.
+//! Deliberately NOT guarded: whether a classification is *correct*. The
+//! `reason` on each row backs that judgement, and each cites the line in
+//! `context.rs` that proves it. The seeded corpus backs it too. A test of
+//! correctness could only restate the table.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -101,9 +101,9 @@ fn builtin_model_parses() {
         model.version
     );
 
-    // Every table must be populated. An empty one is the failure mode that
-    // silently turns the analysis into a no-op: no sinks means nothing is ever
-    // a finding, no sources means nothing is ever tainted.
+    // Every table must be populated. An empty one silently turns the analysis
+    // into a no-op: no sinks means nothing is ever a finding, no sources means
+    // nothing is ever tainted.
     assert!(!model.source.is_empty(), "no `[[source]]` rows");
     assert!(!model.sink.is_empty(), "no `[[sink]]` rows");
     assert!(!model.sanctioned.is_empty(), "no `[[sanctioned]]` rows");
@@ -173,9 +173,9 @@ fn builtin_model_parses() {
 
 /// `side_effect` is simultaneously a sink (it emits a `RecordSideEffect` command)
 /// and a sanctioned source (its recorded result replays verbatim). Getting that
-/// backwards in either direction is the single most consequential modelling
-/// error available: sink-only turns every correct `ctx.side_effect` in the corpus
-/// into a false positive; sanctioned-only drops the control-taint finding that
+/// backwards in either direction is the most consequential modelling error
+/// available. Sink-only turns every correct `ctx.side_effect` in the corpus into
+/// a false positive. Sanctioned-only drops the control-taint finding that
 /// motivates the analysis.
 ///
 /// The same dual shape holds for the recorded-primitive family. This guard pins
@@ -243,7 +243,7 @@ fn dual_role_rows_are_exactly_the_recorded_primitive_family() {
 ///   itself — universal trait methods, not engine surface.
 /// * `read_logs` appears only inside a `//!` doc table in
 ///   `autumn-harvest/examples/workflow_logs.rs`, which says *there is no such
-///   method*; `current_time` appears only inside a string literal in
+///   method*. `current_time` appears only inside a string literal in
 ///   `guardrail_catalog_tests.rs` (the guardrail's suggested-alternative text).
 ///   Both are grep artifacts, and both are listed rather than filtered by a
 ///   cleverer regex so the exemption is visible.
@@ -290,8 +290,8 @@ fn collect_rs(dir: &Path, recurse: bool, out: &mut Vec<PathBuf>) {
 /// Every `ctx.<ident>(` in `text`, ignoring whole-line `//` comments.
 ///
 /// Line comments are stripped because two of this repo's files *describe* ctx
-/// methods in prose — one doc table says, of a method that deliberately does not
-/// exist, "there is no `ctx.read_logs()`". Counting that would make the guard
+/// methods in prose. One doc table says "there is no `ctx.read_logs()`", of a
+/// method that deliberately does not exist. Counting that would make the guard
 /// demand a model row for it.
 fn ctx_calls(text: &str) -> BTreeSet<String> {
     let mut found = BTreeSet::new();
@@ -521,16 +521,15 @@ fn every_pub_async_method_on_durable_promise_is_a_sink() {
     );
 }
 
-/// A `[[trusted]]` crate is modelled as a pure taint-propagator. That is what
-/// makes `format!` tractable — and it is also how a source could be silently
-/// swallowed: `chrono` is trusted, so if `Utc::now` were not *also* a source row
-/// it would propagate cleanly and every clock read through chrono would vanish.
+/// A `[[trusted]]` crate is modelled as a pure taint-propagator. That makes
+/// `format!` tractable. It is also how a source could be silently swallowed.
+/// `chrono` is trusted, so if `Utc::now` were not *also* a source row it would
+/// propagate cleanly. Then every clock read through chrono would vanish.
 ///
 /// The precedence rule ("sources match before the trusted default") lives in the
-/// matcher, which is GREEN-phase code. What this guard can check structurally,
-/// today, is the other half: that the source rows which the precedence rule
-/// exists to protect are actually present for every trusted crate that ships a
-/// non-deterministic entry point.
+/// matcher, which is GREEN-phase code. This guard checks the other half
+/// structurally, today. The source rows that the precedence rule protects must
+/// be present for every trusted crate that ships a non-deterministic entry point.
 #[test]
 fn sources_never_shadowed_by_trusted_crates() {
     // (trusted crate, a source/forbidden row that must exist for it)
@@ -583,9 +582,9 @@ fn sources_never_shadowed_by_trusted_crates() {
         problems.join("\n  ")
     );
 
-    // `indexmap` must stay OUT of the order sources: its deterministic iteration
-    // is the recommended fix for a hash-order finding, and a source row for it
-    // would turn the fix into a finding of its own.
+    // `indexmap` must stay OUT of the order sources. Its deterministic iteration
+    // is the recommended fix for a hash-order finding. A source row for it would
+    // turn the fix into a finding of its own.
     assert!(
         !model
             .source
@@ -599,7 +598,7 @@ fn sources_never_shadowed_by_trusted_crates() {
 /// The bare `var` suffix problem, pinned.
 ///
 /// MIR prints `std::env::var` as the bare callee `var`, so the row cannot key on
-/// a path prefix; a bare `var` rule would match any user function named `var`.
+/// a path prefix. A bare `var` rule would match any user function named `var`.
 /// The `dest_type` field exists solely to close that, and this guard fails if
 /// someone removes the pin.
 #[test]
@@ -623,9 +622,9 @@ fn ambiguous_bare_suffix_rows_are_pinned_by_dest_type() {
         );
     }
 
-    // Both `sleep` rows are bare suffixes and both must be pinned: rustc trims
-    // `tokio::time::sleep` and `std::thread::sleep` to the same one segment, and
-    // only their destination types tell them apart (a `Sleep` future vs `()`).
+    // Both `sleep` rows are bare suffixes and both must be pinned. rustc trims
+    // `tokio::time::sleep` and `std::thread::sleep` to the same one segment.
+    // Only their destination types tell them apart (a `Sleep` future vs `()`).
     let sleeps: BTreeSet<Option<&str>> = model
         .forbidden
         .iter()
@@ -657,9 +656,9 @@ fn ambiguous_bare_suffix_rows_are_pinned_by_dest_type() {
 fn every_dual_role_sink_that_checks_all_arguments_is_accounted_for() {
     // `Model::classify` returns `Sink` before `Sanctioned` and the analyzer's
     // sink arm is total, so a method in both tables is treated as a sink. A sink
-    // row with `args` unset checks *every* argument, which is right for the
-    // recorded-primitive family — a tainted day count or a tainted `patched` id
-    // really does diverge the recorded history — but it is a decision, not a
+    // row with `args` unset checks *every* argument. That is right for the
+    // recorded-primitive family: a tainted day count or a tainted `patched` id
+    // really does diverge the recorded history. But it is a decision, not a
     // default. Pinning the set means a *new* dual-role row has to say which of
     // the two it is instead of inheriting "check everything" by accident.
     const CHECKS_EVERY_ARGUMENT: &[&str] = &[
@@ -704,8 +703,8 @@ fn every_dual_role_sink_that_checks_all_arguments_is_accounted_for() {
 
 #[test]
 fn an_overlay_with_an_unknown_table_or_field_is_an_error() {
-    // A typo in an overlay used to be silently ignored: the intended rule never
-    // entered the model and the run reported `proven` under a model the user
+    // A typo in an overlay used to be silently ignored. The intended rule never
+    // entered the model. The run reported `proven` under a model the user
     // believed they had widened.
     let typo_table = Model::from_toml(
         r#"
@@ -807,12 +806,13 @@ mod api_gap {
     //! Rule *matching* — path-suffix matching, receiver narrowing, `dest_type`
     //! pinning and the source-beats-trusted precedence order — lives in the
     //! analyzer, which is GREEN-phase code. Until it exists there is no API to
-    //! assert precedence against, so
+    //! assert precedence against. So
     //! [`super::sources_never_shadowed_by_trusted_crates`] asserts the
-    //! structural precondition (the carve-out rows exist) rather than the
-    //! behaviour (they win).
+    //! structural precondition (the carve-out rows exist), not the behaviour
+    //! (they win).
     //!
-    //! When the matcher lands, that test should grow a behavioural half:
-    //! resolve `autumn_harvest::chrono::Utc::now` against the full model and
-    //! assert the answer is the `[[source]]` row, not the `[[trusted]]` default.
+    //! When the matcher lands, that test should grow a behavioural half. It
+    //! should resolve `autumn_harvest::chrono::Utc::now` against the full model.
+    //! It should assert the answer is the `[[source]]` row, not the `[[trusted]]`
+    //! default.
 }

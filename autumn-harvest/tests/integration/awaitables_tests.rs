@@ -1,16 +1,16 @@
 //! Tests for issue #615 — the open-awaitables diagnostic projection.
 //!
-//! These are **pure** tests (no DB, no testcontainers): they exercise the core
+//! These are **pure** tests (no DB, no testcontainers). They run the core
 //! `awaitables::project_awaitables` projection over hand-built timestamped
-//! histories plus the read-only replay driver `executor::drive_query_replay`
-//! (issue #612) — the exact composition the plugin's
-//! `GET /workflows/{id}/awaitables` endpoint uses.
+//! histories, plus the read-only replay driver `executor::drive_query_replay`
+//! (issue #612). The plugin's `GET /workflows/{id}/awaitables` endpoint uses
+//! exactly that composition.
 //!
 //! The falsifiable delta from the issue: a workflow parked on
 //! `ctx.receive_signal("approval")` with **no signal yet sent** must report an
 //! awaitable naming `"approval"`. The pre-existing side-table panel reports
-//! nothing here, because the awaited-but-unsent signal exists only as a parked
-//! `WaitForSignal` command inside the replayed coroutine — never as a row.
+//! nothing here. The awaited-but-unsent signal exists only as a parked
+//! `WaitForSignal` command inside the replayed coroutine, never as a row.
 //!
 //! The HTTP status mapping, admin gating, and shard routing are covered by
 //! `autumn-harvest-plugin/tests/awaitables_integration.rs`.
@@ -169,10 +169,9 @@ fn events_of(rows: &[(DateTime<Utc>, WorkflowEvent)]) -> Vec<WorkflowEvent> {
     rows.iter().map(|(_, e)| e.clone()).collect()
 }
 
-/// A benign trailing event: appended AFTER an awaitable's own scheduling event
-/// so `last_event_at` differs from the scheduling timestamp — proving `since`
-/// is derived from the awaitable's own event, not the last-event fallback
-/// (test review T1).
+/// A benign trailing event, appended AFTER an awaitable's own scheduling event.
+/// So `last_event_at` differs from the scheduling timestamp. That proves
+/// `since` comes from the awaitable's own event, not the last-event fallback.
 fn marker_row(at: DateTime<Utc>) -> (DateTime<Utc>, WorkflowEvent) {
     (
         at,
@@ -510,12 +509,13 @@ fn in_flight_update_result_command_suppresses_pending_update() {
         },
         AWAITABLE_CATEGORY_CAP,
     );
-    // The cycle's only drained command is a RecordUpdateResult — an in-flight
+    // The cycle's only drained command is a RecordUpdateResult: an in-flight
     // update-result commit, NOT a command-less `await_condition` cold park. The
-    // result must be empty: the resolving update is suppressed AND no phantom
-    // Condition is inferred (issue #615 Codex P2 — a `RecordUpdateResult` leaves
-    // `awaitables` empty and `transitioning` false, which the old
-    // `awaitables.is_empty() && !transitioning` gate misread as a condition park).
+    // result must be empty. The resolving update is suppressed, and no phantom
+    // Condition is inferred (issue #615). A `RecordUpdateResult` leaves
+    // `awaitables` empty and `transitioning` false. The old
+    // `awaitables.is_empty() && !transitioning` gate misread that as a
+    // condition park.
     assert!(
         projection.awaitables.is_empty(),
         "a RecordUpdateResult-only cycle waits on nothing — no phantom \
@@ -898,9 +898,9 @@ fn per_category_cap_truncates_with_flag() {
 
 #[test]
 fn ten_thousand_event_history_projects() {
-    // 5k scheduled+completed activity pairs, then one open activity: the
-    // projection over a 10k-event history must stay correct (the p95 < 1s
-    // budget is release-mode evidence; this test pins correctness at scale).
+    // 5k scheduled+completed activity pairs, then one open activity. The
+    // projection over a 10k-event history must stay correct. The p95 < 1s
+    // budget is release-mode evidence. This test pins correctness at scale.
     let mut rows = vec![started_row(ts(0))];
     for i in 0..4_999_i64 {
         let id = ActivityExecId::new();
@@ -984,7 +984,7 @@ fn awaitable_kinds_serialize_snake_case() {
     );
 }
 
-// ── Multi-awaitable replayed projection (test review T3) ──────────────────
+// ── Multi-awaitable replayed projection ───────────────────────────────────
 
 /// Parks on an activity AND a timer concurrently (`futures::join!`).
 fn join_activity_timer_workflow<'a>(
@@ -1029,7 +1029,7 @@ fn joined_activity_and_timer_both_reported() {
     assert_eq!(timer.id.as_deref(), Some("cooldown"));
 }
 
-// ── Replayed-mode pending update (test review T2) ─────────────────────────
+// ── Replayed-mode pending update ──────────────────────────────────────────
 
 #[test]
 fn replayed_mode_reports_pending_update_alongside_wait() {
@@ -1074,7 +1074,7 @@ fn replayed_mode_reports_pending_update_alongside_wait() {
     assert_eq!(update.since, Some(ts(20)), "since = admission time (T1)");
 }
 
-// ── Synthetic-buffer arm coverage (test review T5/T6) ─────────────────────
+// ── Synthetic-buffer arm coverage ─────────────────────────────────────────
 
 #[test]
 fn external_activity_command_reports_external_with_deadline() {
@@ -1212,8 +1212,7 @@ fn external_workflow_commands_report_targets() {
 #[test]
 fn orphan_race_timer_falls_back_to_timer_awaitable() {
     // Defensive: a reserved race timer with NO matching signal wait in the
-    // drained buffer must not be silently dropped — it degrades to a plain
-    // timer awaitable.
+    // drained buffer degrades to a plain timer awaitable. It is not dropped.
     let rows = vec![
         started_row(ts(0)),
         (
@@ -1251,11 +1250,11 @@ fn duplicate_signal_race_waiters_each_keep_their_own_deadline() {
     // Two concurrent signal-or-deadline waits on the SAME signal name with
     // distinct deadlines — join!(receive_signal_timeout("approval", 60s),
     // receive_signal_timeout("approval", 120s)) — must each retain their own
-    // deadline. The reserved race deadlines are paired to the Signal awaitables
-    // in command order (per-name FIFO), not collapsed by name (issue #615 Codex
-    // P2 — the old per-name HashMap let the second race overwrite the first, and
-    // the per-name position map only ever updated the first awaitable, so the
-    // second open wait dropped its deadline).
+    // deadline. The reserved race deadlines pair with the Signal awaitables in
+    // command order (per-name FIFO), not collapsed by name (issue #615). The old
+    // per-name HashMap let the second race overwrite the first. The per-name
+    // position map only updated the first awaitable. So the second open wait
+    // dropped its deadline.
     let rows = vec![
         started_row(ts(0)),
         (
@@ -1329,7 +1328,7 @@ fn duplicate_signal_race_waiters_each_keep_their_own_deadline() {
     assert_eq!(projection.awaitables[1].since, Some(ts(20)));
 }
 
-// ── Child-or-deadline race fold (test review T8, issue #779) ──────────────
+// ── Child-or-deadline race fold (issue #779) ──────────────────────────────
 
 #[test]
 fn child_timeout_race_folds_deadline_into_child_awaitable() {
@@ -1395,10 +1394,9 @@ fn child_timeout_race_folds_deadline_into_child_awaitable() {
 #[test]
 fn duplicate_child_race_waiters_each_keep_their_own_deadline() {
     // Mirror of duplicate_signal_race_waiters for the child-or-deadline race
-    // (issue #779): two concurrent child-timeout waits on the SAME child
-    // workflow type with distinct deadlines each retain their own deadline,
-    // paired in command order rather than collapsed by name (issue #615 Codex
-    // P2).
+    // (issue #779). Two concurrent child-timeout waits on the SAME child
+    // workflow type have distinct deadlines. Each keeps its own deadline,
+    // paired in command order, not collapsed by name (issue #615).
     let child_a = ExecutionId::new();
     let child_b = ExecutionId::new();
     let rows = vec![
@@ -1531,11 +1529,11 @@ fn history_only_child_timeout_race_folds_deadline() {
 
 #[test]
 fn history_only_duplicate_child_race_waiters_each_keep_their_own_deadline() {
-    // History-only mirror of duplicate_child_race_waiters (issue #615 Codex P2):
-    // two concurrent child-timeout waits on the SAME child workflow type with
-    // distinct deadlines must each retain their own deadline, paired in
-    // recorded order — a per-name FIFO, not a single deadline per name that the
-    // later reserved `TimerStarted` would overwrite.
+    // History-only mirror of duplicate_child_race_waiters (issue #615). Two
+    // concurrent child-timeout waits on the SAME child workflow type have
+    // distinct deadlines. Each must keep its own deadline, paired in recorded
+    // order. That is a per-name FIFO, not one deadline per name that the later
+    // reserved `TimerStarted` would overwrite.
     let child_a = ExecutionId::new();
     let child_b = ExecutionId::new();
     let rows = vec![
@@ -1599,7 +1597,7 @@ fn history_only_duplicate_child_race_waiters_each_keep_their_own_deadline() {
     );
 }
 
-// ── Resolved races leave no stale arms (replay review R3) ─────────────────
+// ── Resolved races leave no stale arms ────────────────────────────────────
 
 #[test]
 fn history_only_signal_win_race_is_not_reported_open() {
@@ -1726,19 +1724,19 @@ fn history_only_child_win_race_is_not_reported_open() {
 
 #[test]
 fn history_only_resolved_signal_race_closes_oldest_arm_by_recorded_order() {
-    // Two concurrent same-name signal-or-deadline waiters (issue #476) armed in
-    // ONE suspension: both reserved `__signal_timeout` timers are persisted in a
-    // single transaction, so their `TimerStarted` rows share a `DEFAULT NOW()`
-    // timestamp — modeled here as identical `ts(10)`, with distinct deadlines.
-    // The FIRST approval signal resolves the K=1 (oldest, seq 1) waiter FIFO, so
-    // the surviving K=2 waiter (seq 2, 120s) must keep ITS OWN deadline.
+    // Two concurrent same-name signal-or-deadline waiters (issue #476) arm in
+    // ONE suspension. One transaction persists both reserved `__signal_timeout`
+    // timers, so their `TimerStarted` rows share a `DEFAULT NOW()` timestamp.
+    // Here that is identical `ts(10)`, with distinct deadlines. The FIRST
+    // approval signal resolves the K=1 (oldest, seq 1) waiter FIFO. The
+    // surviving K=2 waiter (seq 2, 120s) must keep ITS OWN deadline.
     //
     // A timestamp tie-break (`arm.since`) closes an ARBITRARY arm across the two
-    // `open_timer_arms` HashMap entries (HashMap iteration order is
-    // nondeterministic), so the pre-fix code leaves the surviving waiter with
+    // `open_timer_arms` HashMap entries, because HashMap iteration order is
+    // nondeterministic. The pre-fix code then leaves the surviving waiter with
     // the resolved waiter's 60s deadline ~half the time. The fix closes the
     // front-most `index.timer_order` arm. Loop many times to defeat the
-    // per-HashMap seed and pin the RED reliably (issue #615 Codex P2).
+    // per-HashMap seed and pin the RED reliably (issue #615).
     let deadline_120s = ts(10) + ChronoDuration::seconds(120);
     for _ in 0..1000 {
         let rows = vec![
@@ -1795,13 +1793,13 @@ fn history_only_resolved_signal_race_closes_oldest_arm_by_recorded_order() {
 
 #[test]
 fn history_only_resolved_child_race_closes_oldest_arm_by_recorded_order() {
-    // The #779 child-or-deadline mirror of the signal test above: two
-    // `fulfillment_flow` children each in a child-or-deadline race, their two
-    // reserved `__child_timeout` timers armed in one suspension (tied `ts(11)`),
-    // with distinct deadlines. Child A (started first, K=1) completes → its race
-    // resolves, so the surviving child B (K=2, 600s) must keep ITS OWN deadline.
-    // A timestamp tie-break closes an arbitrary reserved arm; loop to pin the
-    // RED reliably (issue #615 Codex P2).
+    // The #779 child-or-deadline mirror of the signal test above. Two
+    // `fulfillment_flow` children each run a child-or-deadline race. Their two
+    // reserved `__child_timeout` timers arm in one suspension (tied `ts(11)`),
+    // with distinct deadlines. Child A (started first, K=1) completes, so its
+    // race resolves. The surviving child B (K=2, 600s) must keep ITS OWN
+    // deadline. A timestamp tie-break closes an arbitrary reserved arm. Loop to
+    // pin the RED reliably (issue #615).
     let child_a = ExecutionId::new();
     let child_b = ExecutionId::new();
     let deadline_600s = ts(11) + ChronoDuration::seconds(600);
@@ -1886,7 +1884,7 @@ fn history_only_resolved_child_race_closes_oldest_arm_by_recorded_order() {
 
 #[test]
 fn history_only_reports_in_flight_external_signal_and_cancel() {
-    // Codex P2: an ExternalSignalRequested / ExternalCancelRequested with no
+    // An ExternalSignalRequested / ExternalCancelRequested with no
     // Delivered/Failed terminal is still parked on that external op — the
     // crash-recovery / cross-shard-outbox window. The history-only fallback
     // (unregistered handler, decode failure) must report it, not drop it into
@@ -2009,7 +2007,7 @@ fn history_only_extended_external_deadline_is_cleared() {
     );
 }
 
-// ── Truncation boundary (test review T10) ─────────────────────────────────
+// ── Truncation boundary ───────────────────────────────────────────────────
 
 #[test]
 fn exactly_cap_entries_are_not_truncated() {
@@ -2093,19 +2091,18 @@ fn truncation_is_per_category_not_global() {
     );
 }
 
-// ── Dormant cancellable timer arms in history-only mode (Codex P2 #1134) ──
+// ── Dormant cancellable timer arms in history-only mode (#1134) ───────────
 
 #[test]
 fn history_only_dormant_timer_arm_is_filtered_when_not_fire_eligible() {
     // A cancellable `ctx.start_timer` arm (issue #768,
     // `WorkflowCommand::ArmTimer { for_await: false }`) records `TimerStarted`
     // but inserts NO `harvest_timers` row, so it cannot fire until
-    // `await_fire()`. In the history-only fallback we cannot tell an
-    // armed-but-dormant timer from a fire-eligible one — the authoritative
-    // signal is the live `harvest_timers` table, threaded in via
-    // `WaitSetInput::HistoryOnly { fire_eligible_timers }`. The projection drops
-    // any `Timer` awaitable whose id is absent from that set, keeping genuine
-    // timers and all non-timer waits.
+    // `await_fire()`. History alone cannot tell an armed-but-dormant timer from
+    // a fire-eligible one. The live `harvest_timers` table is authoritative. It
+    // comes in via `WaitSetInput::HistoryOnly { fire_eligible_timers }`. The
+    // projection drops any `Timer` awaitable whose id is absent from that set.
+    // It keeps genuine timers and all non-timer waits.
     let activity_id = ActivityExecId::new();
     let rows = vec![
         started_row(ts(0)),
@@ -2179,12 +2176,12 @@ fn history_only_dormant_timer_arm_is_filtered_when_not_fire_eligible() {
 
 #[test]
 fn history_only_fire_eligible_timer_beyond_cap_is_not_crowded_out() {
-    // Filter-before-cap (issue #615 Codex P2): with more than `category_cap`
-    // dormant cancellable arms AHEAD of the single fire-eligible timer, a
-    // filter that ran AFTER the per-category cap would keep only the first
-    // `category_cap` (all dormant) timers, then drop them all — losing the real
-    // timer, which was never kept. Threading the live set into the projection
-    // filters dormant arms BEFORE the cap, so the fire-eligible timer survives.
+    // Filter-before-cap (issue #615). More than `category_cap` dormant
+    // cancellable arms sit AHEAD of the single fire-eligible timer. A filter
+    // AFTER the per-category cap would keep only the first `category_cap`
+    // (all dormant) timers, then drop them all. The real timer was never kept.
+    // The live set filters dormant arms BEFORE the cap, so the fire-eligible
+    // timer survives.
     let mut rows = vec![started_row(ts(0))];
     for i in 0..(AWAITABLE_CATEGORY_CAP + 5) {
         rows.push((

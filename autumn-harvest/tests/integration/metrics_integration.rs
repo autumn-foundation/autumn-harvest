@@ -232,7 +232,7 @@ impl MetricsRecorder for RecordingMetrics {
     // ── Signal & update lifecycle counters (issue #684) ───────────────────
 
     fn record_signal_received(&self, workflow_name: &str, queue: &str) {
-        // Issue #684 (Codex P2): no `name` label — free-form send route.
+        // Issue #684: no `name` label, because the send route is free-form.
         self.push(
             METRIC_SIGNAL_RECEIVED,
             vec![
@@ -243,7 +243,7 @@ impl MetricsRecorder for RecordingMetrics {
     }
 
     fn record_signal_unhandled(&self, workflow_name: &str, queue: &str) {
-        // Issue #684 (Codex P2): no `name` label — free-form send route.
+        // Issue #684: no `name` label, because the send route is free-form.
         self.push(
             METRIC_SIGNAL_UNHANDLED,
             vec![
@@ -443,23 +443,18 @@ async fn wait_for_nd_block(database_url: &str, exec_id: ExecutionId) -> Workflow
 /// Wait until `history_bloat_warned_at` is stamped (issue #704's soft-
 /// threshold early-warning guard column).
 ///
-/// Issue #1074 CI-flake fix, hardened per Codex review: calling
-/// `Worker::shutdown()` and then awaiting the worker handle alone is not an
-/// unconditional completion barrier for the trailing `mark_history_bloat_warned`
-/// write that follows a hard-cap terminal fail, since `Worker::drain_in_flight`
-/// races the in-flight decision cycle against a BOUNDED `shutdown_timeout` (2s
-/// in this test's `build_worker`) and returns early with just a
-/// `tracing::warn!` if that elapses first, leaving the cycle's tail (this
-/// stamp write) still running in the background. A single point-in-time
-/// reload after the handle resolves therefore cannot rule out observing the
-/// row before that trailing write lands under sufficient DB/CI delay --
-/// the exact same race, just requiring a longer delay to reproduce. Polling
-/// with its own generous, independent timeout (mirroring
-/// `wait_for_nd_block`/`wait_for_state` above) removes the dependency on the
-/// worker's internal drain deadline entirely: it is robust to any delay up
-/// to the poll's own bound, and a genuine regression (the mark never being
-/// set at all) still times out clearly rather than hanging, preserving the
-/// original test's "clear timeout on a real regression" design intent.
+/// Issue #1074: `Worker::shutdown()` plus awaiting the worker handle is not a
+/// completion barrier for the trailing `mark_history_bloat_warned` write after
+/// a hard-cap terminal fail. `Worker::drain_in_flight` races the in-flight
+/// cycle against a BOUNDED `shutdown_timeout` (2s in `build_worker`). If that
+/// elapses first, it returns with only a `tracing::warn!`. The stamp write then
+/// still runs in the background. So one reload after the handle resolves can
+/// see the row before that write lands, under enough DB or CI delay.
+///
+/// This poll has its own generous, independent timeout, like
+/// `wait_for_nd_block` and `wait_for_state` above. It does not depend on the
+/// worker drain deadline. A real regression (the mark is never set) still
+/// times out clearly and does not hang.
 async fn wait_for_history_bloat_warned(
     database_url: &str,
     exec_id: ExecutionId,
@@ -477,10 +472,11 @@ async fn wait_for_history_bloat_warned(
     .expect("history_bloat_warned_at was never stamped within timeout")
 }
 
-/// Wait until a recorded `TimerStarted { timer_id, .. }` event with the given
-/// id appears in the execution's history -- the durable, unambiguous proof
-/// that a specific live decision cycle actually ran (rather than merely
-/// polling a coarser state signal that a *later* cycle could satisfy too).
+/// Wait until a `TimerStarted { timer_id, .. }` event with the given id is in
+/// the execution's history.
+///
+/// That event proves that one specific live decision cycle ran. A coarser
+/// state signal could also be satisfied by a *later* cycle.
 async fn wait_for_timer_started(database_url: &str, exec_id: ExecutionId, timer_id: &str) {
     tokio::time::timeout(Duration::from_secs(15), async {
         loop {
@@ -611,11 +607,12 @@ fn unfinished_updates_probe_update(
 /// the workflow can deterministically drive the pre-admitted update (issue #684).
 const FIX1_UPDATE_UUID: Uuid = Uuid::from_u128(0x0684_0000_0000_7001_8000_0000_0000_0001);
 
-/// Issue #684 (FIX 1): drives its pre-admitted `set_val` update to completion,
-/// then suspends forever on a signal that never arrives. The update's
-/// `RecordUpdateResult` therefore rides out on the SUSPENDED outcome (not a
-/// terminal one) — the common suspend path on which an earlier cut collected
-/// the metric only from `pending_cmds` (empty on suspend) and undercounted.
+/// Issue #684: drives its pre-admitted `set_val` update to completion, then
+/// suspends forever on a signal that never arrives.
+///
+/// The update's `RecordUpdateResult` therefore leaves on the SUSPENDED
+/// outcome, not a terminal one. An earlier cut collected the metric only from
+/// `pending_cmds`, which is empty on suspend, and undercounted.
 ///
 /// The update id is fixed so `execute_admitted_update` replays deterministically
 /// (once completed, `match_update` short-circuits without re-running).
@@ -739,18 +736,20 @@ fn history_cap_never_finishing_child<'a>(
     })
 }
 
-/// Issue #704: consumes two pre-seeded `side_effect` markers (mirroring
-/// `suspended_command_reaches_history_cap`'s proven "near-cap" pattern -- a
-/// legacy `MarkerRecorded { name: "side_effect:{name}" }` event genuinely
-/// matches/consumes a `ctx.side_effect(name, ...)` call, unlike an orphan
-/// marker the code never touches), then parks on a fresh, unpolled long
-/// timer so the worker observes a genuine `WorkflowOutcome::Suspended`.
+/// Issue #704: consumes two pre-seeded `side_effect` markers, then parks on a
+/// fresh, unpolled long timer.
 ///
-/// Reused by two tests with different `event_hard_cap` values: a generous
-/// cap (8) drives the plain `Suspended`-persist soft-threshold path, while a
-/// tight cap (4) drives the SAME decision through the terminal
-/// `fail_workflow_for_history_cap` hard-cap path instead (PR #1139 review,
-/// finding #1) -- the soft-threshold counter must fire on both.
+/// This mirrors the "near-cap" pattern of
+/// `suspended_command_reaches_history_cap`. A legacy
+/// `MarkerRecorded { name: "side_effect:{name}" }` event really consumes a
+/// `ctx.side_effect(name, ...)` call. An orphan marker would not. The long
+/// timer makes the worker observe a real `WorkflowOutcome::Suspended`.
+///
+/// Two tests use it with different `event_hard_cap` values. A generous cap
+/// (8) drives the plain `Suspended`-persist soft-threshold path. A tight cap
+/// (4) drives the SAME decision through the terminal
+/// `fail_workflow_for_history_cap` path (PR #1139). The soft-threshold
+/// counter must fire on both.
 fn history_bloat_soft_threshold_probe<'a>(
     ctx: &'a WorkflowContext,
     _input: serde_json::Value,
@@ -769,15 +768,14 @@ fn history_bloat_soft_threshold_probe<'a>(
     })
 }
 
-/// PR #1139 review (Codex P2): parks on a *contended* `ctx.mutex(key).acquire()`
-/// -- the lock is pre-seeded as held by a phantom holder, so this decision
-/// cycle merely enqueues into `harvest_mutex_waiters` and appends **no**
-/// `MutexGranted` event. `suspended_command_event_count`'s `AcquireMutex`
-/// branch is deliberately conservative and counts +1 regardless of whether the
-/// acquire is actually granted this cycle -- fine for the hard-cap preflight
-/// (which only needs to fail fast on a genuine overflow), but wrong for the
-/// soft-threshold *crossing* decision, which must be based on what was
-/// actually durably persisted.
+/// PR #1139: parks on a *contended* `ctx.mutex(key).acquire()`.
+///
+/// A phantom holder holds the pre-seeded lock. So this cycle only enqueues
+/// into `harvest_mutex_waiters` and appends **no** `MutexGranted` event. The
+/// `AcquireMutex` branch of `suspended_command_event_count` always counts +1,
+/// granted or not. That is fine for the hard-cap preflight, which only fails
+/// fast on a real overflow. The soft-threshold *crossing* decision must use
+/// what was durably persisted.
 fn history_bloat_mutex_waiter_probe<'a>(
     ctx: &'a WorkflowContext,
     input: serde_json::Value,
@@ -793,17 +791,16 @@ fn history_bloat_mutex_waiter_probe<'a>(
     })
 }
 
-/// Issue #704 (AC3 exactly-once, double-suspension): parks on a SHORT
-/// (genuinely-firing) timer first, so the SAME execution is driven through a
-/// second, real, live `WorkflowOutcome::Suspended` decision cycle -- proving
-/// the counter's exactly-once guarantee end-to-end across two real cycles,
-/// not just via a second *direct* `store::mark_history_bloat_warned` call
-/// from test code (which the sibling
+/// Issue #704 (AC3 exactly-once, double suspension): parks on a SHORT timer
+/// that fires, then on a long timer that never fires.
+///
+/// The short timer drives the SAME execution through a second live
+/// `WorkflowOutcome::Suspended` cycle. That proves exactly-once across two
+/// real cycles. The sibling test
 /// `history_bloat_counter_fires_once_when_a_still_suspended_execution_crosses_the_soft_threshold`
-/// test already covers, but only proves the SQL guard is race-safe -- not
-/// that a genuine second live cycle actually respects it). After the short
-/// timer fires and the workflow replays past it, it parks again on a long,
-/// never-firing timer so the test can safely observe final state.
+/// calls `store::mark_history_bloat_warned` directly a second time. That only
+/// proves the SQL guard is race-safe, not that a live second cycle respects
+/// it. The long timer lets the test observe the final state safely.
 fn history_bloat_double_suspension_probe<'a>(
     ctx: &'a WorkflowContext,
     _input: serde_json::Value,
@@ -815,19 +812,16 @@ fn history_bloat_double_suspension_probe<'a>(
         let _: serde_json::Value = ctx
             .side_effect("padding-2", || serde_json::json!({}))
             .map_err(|error| error.to_string())?;
-        // Cycle 1 suspends here. The soft threshold is crossed on this very
-        // cycle (see the test's cap/fraction setup), so the counter must
-        // fire exactly once as this timer's `TimerStarted` is persisted.
+        // Cycle 1 suspends here. This cycle crosses the soft threshold (see
+        // the cap and fraction of the test). The counter must fire exactly
+        // once when this `TimerStarted` is persisted.
         ctx.timer("history-bloat-first-suspension", 1)
             .await
             .map_err(|error| error.to_string())?;
-        // Cycle 2: the short timer above fired, waking this execution for a
-        // genuine SECOND live decision cycle. Replaying the two side effects
-        // and the now-fired first timer contributes no new events; only the
-        // fresh long timer below is new. The soft threshold was already
-        // crossed in cycle 1 (`history_bloat_warned_at` is already stamped),
-        // so this cycle's crossing check must be a no-op -- the counter must
-        // NOT fire a second time.
+        // Cycle 2: the short timer above fired and woke a SECOND live
+        // decision cycle. The replayed side effects and first timer add no
+        // events. Only the long timer below is new. Cycle 1 already stamped
+        // `history_bloat_warned_at`, so the counter must NOT fire again.
         ctx.timer("history-bloat-second-suspension", 3_600)
             .await
             .map_err(|error| error.to_string())?;
@@ -835,16 +829,13 @@ fn history_bloat_double_suspension_probe<'a>(
     })
 }
 
-/// PR #1139 review (second round, Codex worker.rs:11017): proposes a WIDE
-/// batch of pending bookkeeping commands (8 `ctx.side_effect(...)` calls,
-/// none of them durably appended before the hard cap rejects the whole
-/// decision) followed by a single fresh timer arm, so this decision's
-/// PROSPECTIVE event count (predicted by `suspended_command_event_count`
-/// for the pending, not-yet-persisted batch) is far larger than the DURABLE
-/// event count that will actually land in `harvest_events` once the
-/// terminal `WorkflowFailed` event is appended instead. See the sibling
-/// test using this probe for the exact arithmetic and the bug this proves
-/// is fixed.
+/// PR #1139: proposes a WIDE batch of 8 `ctx.side_effect(...)` calls, then one
+/// fresh timer arm.
+///
+/// The hard cap rejects the whole decision, so none of the batch is appended.
+/// The PROSPECTIVE count from `suspended_command_event_count` is therefore far
+/// above the DURABLE count in `harvest_events` after `WorkflowFailed`. The
+/// test that uses this probe gives the arithmetic and the bug it pins.
 fn history_bloat_prospective_overcount_probe<'a>(
     ctx: &'a WorkflowContext,
     _input: serde_json::Value,
@@ -1700,9 +1691,8 @@ async fn workflow_hard_cap_dlq_preserves_terminal_attempt_count() {
 // Test 2 — dlq.entries gauge is sampled by the background ticker
 // ---------------------------------------------------------------------------
 
-/// Inserts a dead-letter entry, starts the worker (which spawns the DLQ
-/// depth sampler), waits for at least one sampler tick, and asserts that
-/// `harvest.dlq.entries` was recorded with depth >= 1.
+/// Verifies that the DLQ depth sampler records `harvest.dlq.entries` with
+/// depth >= 1 after a dead-letter insert.
 #[allow(clippy::too_many_lines)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn suspended_commands_that_reach_hard_cap_move_to_dlq_immediately() {
@@ -1961,15 +1951,15 @@ async fn suspended_commands_that_reach_hard_cap_move_to_dlq_immediately() {
 // harvest.workflow.history_bloat operator early-warning (issue #704)
 // ---------------------------------------------------------------------------
 
-/// AC3 + AC5 (soft-threshold crossing): a still-RUNNING (non-terminal,
-/// suspended) execution's history crossing `history_bloat_warn_fraction *
-/// event_hard_cap` durably stamps `history_bloat_warned_at` and emits
-/// `harvest.workflow.history_bloat` exactly once, end-to-end through a real
-/// worker and a real Postgres transaction. Also exercises the guarded
-/// `UPDATE ... WHERE history_bloat_warned_at IS NULL`'s exactly-once
-/// semantics directly against the real row -- something the pure
-/// `history_bloat_threshold_crossed` unit tests in `worker.rs` cannot reach
-/// on their own, since they never touch SQL.
+/// AC3 + AC5 (soft-threshold crossing): a suspended RUNNING execution crosses
+/// `history_bloat_warn_fraction * event_hard_cap`.
+///
+/// It must durably stamp `history_bloat_warned_at` and emit
+/// `harvest.workflow.history_bloat` exactly once, through a real worker and
+/// Postgres. The test also runs the guarded
+/// `UPDATE ... WHERE history_bloat_warned_at IS NULL` against the real row.
+/// The `history_bloat_threshold_crossed` unit tests in `worker.rs` never
+/// touch SQL, so they cannot do that.
 #[allow(clippy::too_many_lines)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn history_bloat_counter_fires_once_when_a_still_suspended_execution_crosses_the_soft_threshold()
@@ -2029,13 +2019,11 @@ async fn history_bloat_counter_fires_once_when_a_still_suspended_execution_cross
         .await
         .expect("failed to insert workflow execution row");
 
-    // Pre-seed 3 events (WorkflowStarted + 2 inert markers, never consumed by
-    // any call the handler makes). The handler's ONLY live call is a fresh,
-    // unpolled `ctx.timer(...)`, which contributes exactly one new event on
-    // this cycle -- confirmed against the engine's own
-    // `suspended_command_event_count` -> `extract_started_timer_for_suspension`
-    // path: a genuinely new (never-before-recorded) timer arm is
-    // `bookkeeping_events(0) + 1`. So this cycle's
+    // Pre-seed 3 events: WorkflowStarted and 2 markers that the handler never
+    // consumes. The ONLY live call is a fresh, unpolled `ctx.timer(...)`. It
+    // adds exactly one event on this cycle. In the engine path
+    // `suspended_command_event_count` -> `extract_started_timer_for_suspension`,
+    // a new timer arm is `bookkeeping_events(0) + 1`. So this cycle has
     // `current_history_event_count = 3 (loaded) + 1 (this cycle) = 4`.
     store::append_events(
         &mut conn,
@@ -2124,9 +2112,8 @@ async fn history_bloat_counter_fires_once_when_a_still_suspended_execution_cross
         runner.run(&pool_for_run).await;
     });
 
-    // The execution parks on a long, unpolled timer -- it never reaches a
-    // terminal state, so poll the guard column directly (mirrors
-    // `wait_for_nd_block`'s pattern for a non-terminal signal).
+    // The execution parks on a long timer and never becomes terminal. So poll
+    // the guard column directly, like `wait_for_nd_block` does.
     let execution = tokio::time::timeout(Duration::from_secs(15), async {
         loop {
             let ex = load_execution(&database_url, exec_id).await;
@@ -2170,9 +2157,8 @@ async fn history_bloat_counter_fires_once_when_a_still_suspended_execution_cross
         history_bloat_hits[0]
     );
 
-    // Exercise the guarded UPDATE's exactly-once semantics directly against
-    // the real row: a second call for the same already-stamped execution
-    // must be a no-op (`Ok(false)`), proving the
+    // A second call for the already-stamped row must be a no-op
+    // (`Ok(false)`). That proves the
     // `WHERE history_bloat_warned_at IS NULL` guard is race-safe.
     let second_mark = store::mark_history_bloat_warned(&mut conn, exec_id)
         .await
@@ -2183,34 +2169,31 @@ async fn history_bloat_counter_fires_once_when_a_still_suspended_execution_cross
     );
 }
 
-/// PR #1139 review (Codex P2): a `Suspended` decision cycle whose only live
-/// call is a *contended* `ctx.mutex(key).acquire()` must NOT stamp
-/// `history_bloat_warned_at` on the strength of the pre-transaction
-/// prospective event-count estimate alone. `suspended_command_event_count`'s
-/// `AcquireMutex` branch deliberately over-counts by +1 (it cannot know,
-/// before the persist transaction runs, whether the acquire will be granted
-/// this cycle or merely enqueued) -- correct for the hard-cap preflight
-/// (fail fast on a genuine overflow), but wrong for the soft-threshold
-/// *crossing* decision, which must reflect what is actually durably
-/// persisted.
+/// PR #1139: a `Suspended` cycle whose only live call is a *contended*
+/// `ctx.mutex(key).acquire()` must NOT stamp `history_bloat_warned_at`.
 ///
-/// Setup: the mutex key is pre-seeded as held by a phantom holder (a
-/// `harvest_mutex_locks` row with a lease far in the future, no relation to
-/// any real execution), so the probe workflow's `AcquireMutex` command can
-/// only enqueue into `harvest_mutex_waiters` -- no `MutexGranted` event is
-/// appended. `event_hard_cap = 4`, `fraction = 0.5` (both exact in binary
-/// floating point: `4.0 * 0.5 = 2.0`, `threshold = 2`).
+/// The pre-transaction prospective event count alone is not enough. The
+/// `AcquireMutex` branch of `suspended_command_event_count` over-counts by +1.
+/// Before the persist transaction, it cannot know if the acquire is granted or
+/// only enqueued. That is correct for the hard-cap preflight, which fails fast
+/// on a real overflow. The soft-threshold *crossing* must use the durable
+/// count.
 ///
-/// - Pre-transaction PROSPECTIVE count: 1 (`WorkflowStarted`, pre-seeded) + 1
-///   (the `AcquireMutex` over-count) = 2. `2 >= threshold(2)` -- crosses, so
-///   the pre-fix code stamped `history_bloat_warned_at` here (a false
-///   positive).
-/// - Post-commit DURABLE count: 1 (`WorkflowStarted` only -- the acquire
-///   only enqueued). `1 >= threshold(2)` is false -- must NOT cross.
+/// Setup: a phantom holder holds the mutex key. Its `harvest_mutex_locks` row
+/// has a lease far in the future and no real execution. So the probe can only
+/// enqueue into `harvest_mutex_waiters`, and no `MutexGranted` event is
+/// appended. `event_hard_cap = 4` and `fraction = 0.5` are exact in binary
+/// floating point: `4.0 * 0.5 = 2.0`, `threshold = 2`.
 ///
-/// Also confirms `2 (prospective) < cap(4)`, so the hard-cap preflight (which
-/// legitimately uses the prospective estimate) does not fire either --
-/// isolating this test to the soft-threshold decision alone.
+/// - Pre-transaction PROSPECTIVE count: 1 (`WorkflowStarted`) + 1 (the
+///   `AcquireMutex` over-count) = 2. `2 >= threshold(2)` crosses, so the
+///   pre-fix code stamped `history_bloat_warned_at` (a false positive).
+/// - Post-commit DURABLE count: 1 (`WorkflowStarted` only, because the
+///   acquire only enqueued). `1 >= threshold(2)` is false, so it must NOT
+///   cross.
+///
+/// Also `2 (prospective) < cap(4)`, so the hard-cap preflight does not fire.
+/// The test isolates the soft-threshold decision.
 #[allow(clippy::too_many_lines)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn history_bloat_soft_threshold_not_crossed_by_a_contended_mutex_acquires_prospective_over_count()
@@ -2271,10 +2254,9 @@ async fn history_bloat_soft_threshold_not_crossed_by_a_contended_mutex_acquires_
         .await
         .expect("failed to insert workflow execution row");
 
-    // Pre-seed exactly WorkflowStarted (1 event). The handler's only live
-    // call is the contended `ctx.mutex(key).acquire()`, which contributes
-    // the conservative +1 to the PROSPECTIVE count but zero to the DURABLE
-    // count (enqueue-only, no grant this cycle).
+    // Pre-seed only WorkflowStarted (1 event). The only live call is the
+    // contended `ctx.mutex(key).acquire()`. It adds +1 to the PROSPECTIVE
+    // count and zero to the DURABLE count, because it only enqueues.
     store::append_events(
         &mut conn,
         exec_id,
@@ -2290,9 +2272,8 @@ async fn history_bloat_soft_threshold_not_crossed_by_a_contended_mutex_acquires_
     .await
     .expect("append initial history failed");
 
-    // Pre-seed the mutex key as held by a phantom holder with a lease far in
-    // the future, so the probe workflow's acquire is genuinely contended: it
-    // can only enqueue, never grant, for the duration of this test.
+    // A phantom holder with a far-future lease holds the key. So the probe
+    // acquire is contended and only enqueues for the whole test.
     diesel::insert_into(harvest_mutex_locks::table)
         .values(NewHarvestMutexLock {
             lock_key: mutex_key.clone(),
@@ -2363,10 +2344,8 @@ async fn history_bloat_soft_threshold_not_crossed_by_a_contended_mutex_acquires_
         runner.run(&pool_for_run).await;
     });
 
-    // Poll until the decision cycle has run and the acquire has enqueued
-    // (proving the workflow was actually driven through its one live cycle),
-    // then give the (deliberately absent, post-fix) warning a moment to land
-    // if it were ever going to.
+    // Poll until the acquire has enqueued, which proves the one live cycle
+    // ran. Then give the absent warning a moment to land if it ever would.
     tokio::time::timeout(Duration::from_secs(15), async {
         loop {
             let waiter_count: i64 = harvest_mutex_waiters::table
@@ -2432,28 +2411,22 @@ async fn history_bloat_soft_threshold_not_crossed_by_a_contended_mutex_acquires_
     );
 }
 
-/// PR #1139 review (finding #1): the soft-threshold early-warning must still
-/// fire even when the SAME decision cycle that crosses it ALSO reaches (or
-/// exceeds) the event-count hard cap and takes the terminal
-/// `fail_workflow_for_history_cap` DLQ path instead of a normal
-/// `WorkflowOutcome::Suspended` persist. An earlier cut only checked the soft
-/// threshold inside the `Suspended` persist branch, so a workflow whose
-/// history bloat is severe enough to trip the hard cap in a single decision
-/// -- arguably the MOST important case for an early-warning signal -- never
-/// got a warning at all: it went straight from "healthy" to "DLQ'd" with the
-/// soft-threshold counter skipped entirely.
+/// PR #1139: the soft-threshold warning must fire even when the same cycle
+/// also hits the hard cap.
 ///
-/// Reuses `history_bloat_soft_threshold_probe`'s exact handler and
-/// pre-seeding pattern (3 events pre-seeded: `WorkflowStarted` + two inert
-/// markers; the handler's only live call is a fresh `ctx.timer(...)`, adding
-/// exactly one new event -- see that test's own comment for the arithmetic),
-/// but with `event_hard_cap` lowered to 4 (from 8) so that this decision's
-/// `current_history_event_count` (3 loaded + 1 new = 4) satisfies
-/// `event_count >= cap` (4 >= 4) and routes through the hard-cap
-/// `fail_workflow_for_history_cap` path (the "main"/non-local-activity call
-/// site) rather than the soft-threshold-only `Suspended` persist branch the
-/// sibling test above exercises. `fraction` stays 0.5, so the soft threshold
-/// (`(4.0 * 0.5) as u64 = 2`) is also crossed in this same decision (4 >= 2).
+/// Such a cycle takes the terminal `fail_workflow_for_history_cap` DLQ path,
+/// not a normal `WorkflowOutcome::Suspended` persist. An earlier cut checked
+/// the soft threshold only in the `Suspended` branch. So a workflow that
+/// tripped the hard cap in one decision never got a warning. That is the MOST
+/// important case for an early warning.
+///
+/// It reuses the handler and pre-seeding of
+/// `history_bloat_soft_threshold_probe`: 3 events, plus one new timer event.
+/// That test's comment gives the arithmetic. Here `event_hard_cap` is 4, not
+/// 8. So `current_history_event_count` (3 + 1 = 4) satisfies
+/// `event_count >= cap`. The decision takes the "main" (non-local-activity)
+/// `fail_workflow_for_history_cap` call site. `fraction` stays 0.5, so the
+/// soft threshold (`(4.0 * 0.5) as u64 = 2`) is crossed in the same decision.
 #[allow(clippy::too_many_lines)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn history_bloat_counter_fires_even_when_the_same_decision_reaches_the_hard_cap() {
@@ -2553,10 +2526,9 @@ async fn history_bloat_counter_fires_even_when_the_same_decision_reaches_the_har
             .metrics(Arc::clone(&recording) as Arc<dyn MetricsRecorder>)
             .build(),
     );
-    // cap=4, fraction=0.5 -> threshold=(4.0*0.5) as u64=2. This decision's
-    // event count (3 loaded + 1 new timer arm = 4) satisfies BOTH
-    // `event_count >= cap` (4 >= 4, hard-cap path) AND
-    // `event_count >= threshold` (4 >= 2, soft-threshold crossing) at once.
+    // cap=4, fraction=0.5 -> threshold=(4.0*0.5) as u64=2. The event count
+    // (3 loaded + 1 new timer arm = 4) satisfies BOTH `event_count >= cap`
+    // (hard-cap path) AND `event_count >= threshold` (soft-threshold crossing).
     let policy = WorkflowHistoryPolicy::default()
         .with_event_hard_cap(4)
         .with_history_bloat_warn_fraction(0.5);
@@ -2602,34 +2574,26 @@ async fn history_bloat_counter_fires_even_when_the_same_decision_reaches_the_har
         runner.run(&pool_for_run).await;
     });
 
-    // Unlike the sibling soft-threshold test, this execution DOES reach a
-    // terminal state -- the hard cap fails it. Poll for that terminal state
-    // rather than the (still-eventually-true) `history_bloat_warned_at`
-    // guard column, so a regression that skips the mark entirely times out
-    // clearly instead of racing a state check that would pass anyway.
+    // Here the hard cap fails the execution, so it DOES reach a terminal
+    // state. Poll for that state, not the `history_bloat_warned_at` column.
+    // A regression that skips the mark then times out clearly below.
     wait_for_state(&database_url, exec_id, "FAILED").await;
 
     worker.shutdown();
     handle.await.expect("worker task should join cleanly");
 
-    // Issue #1074 CI-flake fix (hardened per Codex review):
-    // `move_workflow_to_dlq_for_history_cap` (state -> FAILED) and
-    // `emit_history_bloat_warning_if_crossed` (`history_bloat_warned_at`
-    // stamp) are two SEPARATE, sequential commits within the same decision
-    // cycle -- not one atomic transaction (see `fail_workflow_for_history_cap`'s
-    // own comments on this deliberate "narrow crash window"). The
-    // `wait_for_state` poll above can therefore observe state=FAILED in the
-    // gap BEFORE the second commit lands. A single reload right after
-    // `worker.shutdown(); handle.await` is NOT a reliable fix for this: the
-    // worker's own drain (`drain_in_flight`) races the in-flight cycle
-    // against a BOUNDED `shutdown_timeout` (2s in `build_worker`) and
-    // returns early -- with only a log warning -- if that elapses first,
-    // so `handle.await` unblocking does not guarantee the trailing write
-    // has landed under sufficient delay. `wait_for_history_bloat_warned`
-    // polls with its OWN generous, independent timeout instead, which is
-    // robust to arbitrary delay in the trailing write (not bounded by the
-    // worker's internal 2s drain deadline) while still timing out clearly
-    // on a genuine regression (the mark never being set at all).
+    // Issue #1074: `move_workflow_to_dlq_for_history_cap` (state -> FAILED)
+    // and `emit_history_bloat_warning_if_crossed` (the stamp) are two
+    // SEPARATE, sequential commits in one decision cycle. The comments on
+    // `fail_workflow_for_history_cap` call this the "narrow crash window".
+    // So `wait_for_state` above can see FAILED before the second commit.
+    //
+    // One reload after `worker.shutdown(); handle.await` does NOT fix this.
+    // `drain_in_flight` races the cycle against a BOUNDED `shutdown_timeout`
+    // (2s in `build_worker`). If that elapses, it returns with only a log
+    // warning, and the trailing write can still be pending.
+    // `wait_for_history_bloat_warned` polls with its OWN generous timeout. A
+    // real regression (the mark is never set) still times out clearly.
     let execution = wait_for_history_bloat_warned(&database_url, exec_id).await;
 
     let error = execution
@@ -2682,36 +2646,30 @@ async fn history_bloat_counter_fires_even_when_the_same_decision_reaches_the_har
     );
 }
 
-/// PR #1139 review (second round, Codex `worker.rs:11017`): the hard-cap
-/// preflight's soft-threshold crossing decision must be based on the
-/// DURABLE post-failure event count, never the PROSPECTIVE count of a
-/// pending, not-yet-persisted suspension batch.
+/// PR #1139 (`worker.rs:11017`): the soft-threshold crossing in the hard-cap
+/// preflight must use the DURABLE post-failure event count.
 ///
-/// Setup: only `WorkflowStarted` is pre-seeded (1 durable event, so
-/// `next_event_id == 1` when the decision runs). The probe proposes 8
-/// pending `RecordSideEffect` bookkeeping commands plus a fresh `StartTimer`
-/// in ONE live decision -- none of which are ever durably appended, because
-/// `event_hard_cap = 8` makes this decision's PROSPECTIVE event count
-/// (1 loaded + 8 side effects + 1 new timer = 10) satisfy `>= cap` and
-/// route straight to the terminal `fail_workflow_for_history_cap` DLQ path
-/// instead of a normal `Suspended` persist. `fraction = 0.75` against
-/// `cap = 8` computes a soft threshold of `(8.0 * 0.75) as u64 = 6`.
+/// It must never use the PROSPECTIVE count of a pending suspension batch.
 ///
-/// Before the fix, `should_warn_history_bloat` was computed off the
-/// PROSPECTIVE count (10) -- `10 >= 6` is `true`, so the counter fired and
-/// `history_bloat_warned_at` was permanently stamped for an execution whose
-/// actual recorded history never grew past 2 events (`WorkflowStarted` +
-/// the terminal `WorkflowFailed`), well below the threshold of 6. Worse,
-/// once stamped, that execution is *terminal* -- the live (non-terminal)
-/// discovery query (AC1/AC2) can never surface it, so the operator-facing
-/// counter and the discovery filter would permanently disagree about
-/// whether this execution ever crossed the soft threshold.
+/// Setup: only `WorkflowStarted` is pre-seeded, so `next_event_id == 1`. The
+/// probe proposes 8 pending `RecordSideEffect` commands and a fresh
+/// `StartTimer` in ONE live decision. None is ever appended. With
+/// `event_hard_cap = 8`, the PROSPECTIVE count (1 + 8 + 1 = 10) satisfies
+/// `>= cap`. The decision goes to the terminal `fail_workflow_for_history_cap`
+/// DLQ path. `fraction = 0.75` gives a soft threshold of
+/// `(8.0 * 0.75) as u64 = 6`.
 ///
-/// After the fix, the decision is based on the DURABLE count instead: 1
-/// event loaded plus 1 for the about-to-be-appended `WorkflowFailed` event
-/// = 2, and `2 >= 6` is `false` -- the counter must NOT fire and
-/// `history_bloat_warned_at` must stay unset, even though the hard cap DID
-/// terminally fail the execution.
+/// Before the fix, `should_warn_history_bloat` used the PROSPECTIVE count
+/// (10), and `10 >= 6` is `true`. So the counter fired and stamped
+/// `history_bloat_warned_at` permanently. The real history had only 2 events
+/// (`WorkflowStarted` and `WorkflowFailed`). The stamped execution is
+/// *terminal*, so the live discovery query (AC1/AC2) never shows it. The
+/// counter and the discovery filter would then disagree forever.
+///
+/// After the fix, the decision uses the DURABLE count: 1 loaded plus 1 for
+/// `WorkflowFailed` = 2. `2 >= 6` is `false`. The counter must NOT fire and
+/// `history_bloat_warned_at` must stay unset, though the hard cap DID fail
+/// the execution.
 #[allow(clippy::too_many_lines)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn history_bloat_counter_does_not_fire_off_a_prospective_pending_command_count() {
@@ -2801,11 +2759,9 @@ async fn history_bloat_counter_does_not_fire_off_a_prospective_pending_command_c
             .metrics(Arc::clone(&recording) as Arc<dyn MetricsRecorder>)
             .build(),
     );
-    // cap=8, fraction=0.75 -> threshold=(8.0*0.75) as u64=6. This decision's
-    // PROSPECTIVE event count (1 loaded + 8 pending side effects + 1 new
-    // timer = 10) satisfies `event_count >= cap` (10 >= 8, hard-cap path),
-    // but the DURABLE post-failure count (1 loaded + 1 WorkflowFailed = 2)
-    // never reaches the threshold (2 >= 6 is false).
+    // cap=8, fraction=0.75 -> threshold=(8.0*0.75) as u64=6. The PROSPECTIVE
+    // count (1 + 8 side effects + 1 timer = 10) takes the hard-cap path. The
+    // DURABLE count (1 + 1 WorkflowFailed = 2) never reaches the threshold.
     let policy = WorkflowHistoryPolicy::default()
         .with_event_hard_cap(8)
         .with_history_bloat_warn_fraction(0.75);
@@ -2899,10 +2855,9 @@ async fn history_bloat_counter_does_not_fire_off_a_prospective_pending_command_c
         dlq_row.error
     );
 
-    // Confirm the DURABLE count matches the arithmetic the doc comment
-    // above claims: exactly 2 events (`WorkflowStarted` + `WorkflowFailed`),
-    // proving the 8 proposed side effects and the proposed timer arm were
-    // genuinely never persisted.
+    // The DURABLE count is exactly 2 (`WorkflowStarted` + `WorkflowFailed`),
+    // as the doc comment claims. The 8 side effects and the timer arm were
+    // never persisted.
     let final_history = store::load_history(&mut conn, exec_id)
         .await
         .expect("failed to load final history");
@@ -2915,13 +2870,13 @@ async fn history_bloat_counter_does_not_fire_off_a_prospective_pending_command_c
     );
 }
 
-/// AC3 exactly-once, proven across TWO genuine live decision cycles rather
-/// than a second *direct* `store::mark_history_bloat_warned` test call: the
-/// same execution crosses the soft threshold on cycle 1 (fires the counter
-/// once), then a real timer fire drives a second, independent, live
-/// `WorkflowOutcome::Suspended` cycle for the SAME execution -- and the
-/// counter must NOT fire again, because `history_bloat_warned_at` is already
-/// stamped by then.
+/// AC3 exactly-once across TWO live decision cycles, not a second *direct*
+/// `store::mark_history_bloat_warned` call.
+///
+/// Cycle 1 crosses the soft threshold and fires the counter once. A real
+/// timer fire then drives a second live `WorkflowOutcome::Suspended` cycle
+/// for the SAME execution. The counter must NOT fire again, because
+/// `history_bloat_warned_at` is already stamped.
 #[allow(clippy::too_many_lines)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn history_bloat_counter_fires_exactly_once_across_two_real_live_suspension_cycles() {
@@ -2981,9 +2936,8 @@ async fn history_bloat_counter_fires_exactly_once_across_two_real_live_suspensio
         .expect("failed to insert workflow execution row");
 
     // Same shape as the single-suspension test: WorkflowStarted + 2 inert
-    // markers (3 events loaded), so cycle 1's fresh `ctx.timer(...)` (the
-    // handler's first live call) contributes exactly one new event, crossing
-    // cap=8, fraction=0.5 -> threshold=4 (3 loaded + 1 this cycle = 4 >= 4).
+    // markers (3 events loaded). The first live `ctx.timer(...)` adds one
+    // event. With cap=8 and fraction=0.5, threshold=4, and 3 + 1 = 4 crosses.
     store::append_events(
         &mut conn,
         exec_id,
@@ -3097,10 +3051,8 @@ async fn history_bloat_counter_fires_exactly_once_across_two_real_live_suspensio
     );
 
     // Cycle 2: the SHORT `history-bloat-first-suspension` timer (1s) fires
-    // for real, waking this SAME execution for a genuine second live
-    // decision cycle. The workflow replays past the two side effects and the
-    // now-fired first timer (no new events for those), then arms a fresh,
-    // long, never-firing timer -- proving cycle 2 actually ran end-to-end.
+    // and wakes this SAME execution. The replay adds no events for the side
+    // effects and the first timer. The fresh long timer proves cycle 2 ran.
     wait_for_timer_started(&database_url, exec_id, "history-bloat-second-suspension").await;
 
     worker.shutdown();
@@ -3121,10 +3073,9 @@ async fn history_bloat_counter_fires_exactly_once_across_two_real_live_suspensio
         "the stamped timestamp must not change on a second (already-warned) crossing"
     );
 
-    // The headline assertion: draining again after the genuine second live
-    // suspension cycle must show ZERO new `harvest.workflow.history_bloat`
-    // emissions -- the counter fired exactly once across both real cycles,
-    // not once per suspension.
+    // The headline assertion: after the second live cycle, a drain shows
+    // ZERO new `harvest.workflow.history_bloat` emissions. The counter fired
+    // once across both cycles, not once per suspension.
     let emissions_after_cycle_two = recording.drain();
     let has_second_hit = emissions_after_cycle_two
         .iter()
@@ -3285,11 +3236,9 @@ async fn history_bloat_counter_never_fires_when_the_soft_threshold_is_disabled()
         runner.run(&pool_for_run).await;
     });
 
-    // There is no "stamped" signal to poll for here (that is the point of
-    // this test), so instead poll until the timer the workflow arms on its
-    // first live cycle is actually recorded -- proof the decision cycle ran
-    // to completion (suspended on the timer) -- then assert the guard column
-    // was never touched.
+    // This test has no "stamped" signal to poll. So poll until the timer of
+    // the first live cycle is recorded, which proves the cycle completed.
+    // Then assert that the guard column was never touched.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     loop {
         let history = load_history(&database_url, exec_id).await;
@@ -4275,9 +4224,9 @@ async fn workflow_non_determinism_metric_and_search_attrs_are_recorded() {
         runner.run(&pool_for_run).await;
     });
 
-    // Wait for the engine-detected divergence to non-terminally BLOCK the run
-    // (issue #603): the execution stays RUNNING with `nd_blocked_at` and the
-    // `search_attrs` diagnostic stamped, rather than reaching FAILED.
+    // Wait for the detected divergence to BLOCK the run (issue #603). The
+    // execution stays RUNNING with `nd_blocked_at` and the `search_attrs`
+    // diagnostic stamped. It does not reach FAILED.
     let ex = wait_for_nd_block(&database_url, exec_id).await;
     assert_eq!(
         ex.state, "RUNNING",
@@ -4340,9 +4289,11 @@ fn sts_test_workflow<'a>(
     Box::pin(async move { Ok(serde_json::Value::Null) })
 }
 
-/// Verifies that `harvest.queue.schedule_to_start` is emitted when a worker
-/// picks up and runs a task, labeled by `queue`, with a wait value that reflects
-/// real queue time net of the immediate-enqueue skew allowance (issue #501).
+/// Verifies that a claimed task emits `harvest.queue.schedule_to_start`,
+/// labeled by `queue` (issue #501).
+///
+/// The wait is the real queue time net of the immediate-enqueue skew
+/// allowance.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(clippy::too_many_lines)]
 async fn schedule_to_start_histogram_emitted_at_dispatch() {
@@ -4494,10 +4445,10 @@ async fn schedule_to_start_histogram_emitted_at_dispatch() {
         "emission must be labeled by queue; got: {}",
         sts.labels_debug
     );
-    // wait_secs is recorded as a formatted f64 string. With eligibility 13s in the
-    // past (GREATEST(scheduled_at, created_at), both backdated 13s), the recorded
-    // wait must be a robustly positive value (>= 5s, growing with claim/dispatch
-    // delay) — proving the SLI reports a real wait from the true eligibility floor.
+    // wait_secs is a formatted f64 string. Eligibility is
+    // GREATEST(scheduled_at, created_at), both backdated 13s. So the wait
+    // must be >= 5s and grows with claim delay. That proves the SLI measures
+    // from the true eligibility floor.
     let wait_secs: f64 = sts
         .labels_debug
         .split(',')
@@ -4511,9 +4462,11 @@ async fn schedule_to_start_histogram_emitted_at_dispatch() {
     );
 }
 
-/// Verifies that `oldest_pending_ages` returns a positive age when there are
-/// eligible pending tasks, and returns an empty slice when the queue is drained
-/// (which is what causes the sampler to reset the gauge to 0).
+/// Verifies that `oldest_pending_ages` returns a positive age for eligible
+/// pending tasks.
+///
+/// It returns an empty slice for a drained queue. The sampler then resets the
+/// gauge to 0.
 #[allow(clippy::too_many_lines)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn oldest_pending_age_query_positive_then_zero_after_drain() {
@@ -4634,10 +4587,12 @@ async fn oldest_pending_age_query_positive_then_zero_after_drain() {
     );
 }
 
-/// Verifies that `oldest_pending_ages` excludes a pending workflow task whose
-/// execution is PAUSED, mirroring `claim_task`'s pause gating (issue #383 / #501
-/// review): a paused execution is intentionally not claimable, so counting its
-/// age would inflate the saturation signal and fire false alerts.
+/// Verifies that `oldest_pending_ages` excludes a workflow task of a PAUSED
+/// execution.
+///
+/// This mirrors the pause gating of `claim_task` (issues #383 and #501). A
+/// paused execution is not claimable. Its age would inflate the saturation
+/// signal and fire false alerts.
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn oldest_pending_age_excludes_paused_executions() {
     let (database_url, _container) = setup_test_database_url().await;
@@ -4743,13 +4698,14 @@ async fn oldest_pending_age_excludes_paused_executions() {
     );
 }
 
-/// Verifies that `oldest_pending_ages` excludes a rate-limited activity task whose
-/// token bucket is below one token, mirroring `claim_task`'s rate-limit gating
-/// (issue #369 / #501 review): a deliberately throttled task is intentionally not
-/// claimable until tokens refill, so counting its age would page for *intended*
-/// rate limiting. A circuit-breaker activity (passed in `circuit_breaker_activities`)
-/// is exempt because it skips the claim-time rate-limit gate, exactly as in
-/// `claim_task`.
+/// Verifies that `oldest_pending_ages` excludes a rate-limited activity task
+/// whose token bucket holds less than one token.
+///
+/// This mirrors the rate-limit gating of `claim_task` (issues #369 and #501).
+/// A throttled task is not claimable until tokens refill. Its age would page
+/// for *intended* rate limiting. A circuit-breaker activity (in
+/// `circuit_breaker_activities`) skips the claim-time gate, as in
+/// `claim_task`, so it is exempt.
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 #[allow(clippy::too_many_lines)]
 async fn oldest_pending_age_excludes_rate_limited_tasks() {
@@ -4892,11 +4848,12 @@ async fn oldest_pending_age_excludes_rate_limited_tasks() {
     );
 }
 
-/// Verifies that `oldest_pending_ages` excludes a task behind a saturated per-key
-/// concurrency cap, mirroring `claim_task`'s cap gating (issue #247 / #501 review):
-/// while `COUNT(RUNNING for key) >= concurrency_cap` no worker may claim more work
-/// for that key, so counting a deferred row's age would page for *intended*
-/// fair-share capping.
+/// Verifies that `oldest_pending_ages` excludes a task behind a saturated
+/// per-key concurrency cap.
+///
+/// This mirrors the cap gating of `claim_task` (issues #247 and #501). While
+/// `COUNT(RUNNING for key) >= concurrency_cap`, no worker claims more work for
+/// that key. A deferred row's age would page for *intended* fair-share capping.
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 #[allow(clippy::too_many_lines)]
 async fn oldest_pending_age_excludes_saturated_concurrency_cap() {
@@ -5215,10 +5172,11 @@ async fn workflow_completed_with_unfinished_updates_emits_metric() {
     );
 }
 
-/// Issue #684 (FIX 1): an admitted update that completes while the workflow
-/// SUSPENDS (loops back to a wait, does not terminate) must emit exactly one
-/// `harvest.update.completed`. An earlier cut collected the metric only from
-/// `pending_cmds`, which is empty on the suspend path, so this fired zero times.
+/// Issue #684: an admitted update that completes while the workflow SUSPENDS
+/// must emit exactly one `harvest.update.completed`.
+///
+/// An earlier cut collected the metric only from `pending_cmds`. That is
+/// empty on the suspend path, so the metric fired zero times.
 #[tokio::test]
 #[allow(clippy::too_many_lines)] // linear DB setup + drive + assertions
 async fn update_completed_metric_fires_on_the_suspend_path() {
@@ -5273,9 +5231,9 @@ async fn update_completed_metric_fires_on_the_suspend_path() {
         .await
         .expect("insert execution row");
 
-    // Pre-admit the update (WorkflowStarted + UpdateAdmitted). The workflow body
-    // drives it to completion on its first cycle and then suspends, so the
-    // update result rides out on the SUSPENDED outcome — FIX 1's exact scenario.
+    // Pre-admit the update (WorkflowStarted + UpdateAdmitted). The body
+    // completes it on the first cycle and then suspends. So the update result
+    // leaves on the SUSPENDED outcome, the issue #684 case.
     store::append_events(
         &mut conn,
         exec_id,
@@ -5352,9 +5310,9 @@ async fn update_completed_metric_fires_on_the_suspend_path() {
         runner.run(&pool_for_run).await;
     });
 
-    // The workflow drives the pre-admitted update on its first cycle, appends
-    // UpdateCompleted, and suspends on wait_for_signal("done"); the row stays
-    // RUNNING (SUSPENDED is not a persisted state).
+    // The workflow completes the update and suspends on
+    // wait_for_signal("done"). The row stays RUNNING, because SUSPENDED is
+    // not a persisted state.
     wait_for_state(&database_url, exec_id, "RUNNING").await;
 
     // Poll history until UpdateCompleted is durably appended on the suspend path.

@@ -2,9 +2,9 @@
 //! Example: retry-aware activity using `ctx.attempt()`, `ctx.previous_failure()`,
 //! `ctx.is_last_attempt()`, and `ctx.max_attempts()` (issue #381).
 //!
-//! This is the five-line escape hatch described in the issue: an activity that
-//! changes strategy on the last attempt, surfaces the previous error in its
-//! log, and avoids sending duplicate notifications on retries.
+//! This is the five-line escape hatch from the issue. The activity changes
+//! strategy on the last attempt and logs the previous error. It sends no
+//! duplicate notifications on retries.
 //!
 //! Run with:
 //!   cargo run --example retry_aware_activity
@@ -35,7 +35,6 @@ async fn send_notification(
         );
     }
 
-    // Simulate a transient upstream call.
     let result = simulate_upstream_call(&payload);
 
     match result {

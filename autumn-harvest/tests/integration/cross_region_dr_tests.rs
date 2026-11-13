@@ -13,17 +13,17 @@
 //! # Topology
 //!
 //! Two *databases* in one Postgres instance, wired together with stock logical
-//! replication (`CREATE PUBLICATION` / `CREATE SUBSCRIPTION`). That is a real
-//! walsender, a real replication slot, real LSNs and a real `replay_lag` — the
-//! same machinery a cross-region deployment uses — without the container-to-
-//! container networking a two-instance topology would need for no extra
-//! fidelity. The human drill in `docs/runbooks/cross-region-failover.md` uses
+//! replication (`CREATE PUBLICATION` / `CREATE SUBSCRIPTION`). That gives a real
+//! walsender, a real replication slot, real LSNs and a real `replay_lag`. A
+//! cross-region deployment uses the same machinery. A two-instance topology
+//! would add container-to-container networking for no extra fidelity. The
+//! human drill in `docs/runbooks/cross-region-failover.md` uses
 //! the two-container compose topology; this suite proves the engine behaviour
 //! that drill depends on.
 //!
-//! Requires `wal_level = logical`. The replication tests skip with an explicit
-//! message when the server is not configured for it; the fencing tests do not
-//! depend on replication at all and always run.
+//! Requires `wal_level = logical`. Without it, the replication tests skip with
+//! an explicit message. The fencing tests do not depend on replication and
+//! always run.
 #![cfg(feature = "db")]
 #![allow(
     clippy::doc_markdown,
@@ -53,9 +53,9 @@ static DB_SEQ: AtomicU32 = AtomicU32::new(0);
 
 /// Sampler cadence these tests beat at.
 ///
-/// Near-zero on purpose: the beat is now rate-limited to one write per shard
-/// per half-interval, and a test that wants several distinct watermarks in
-/// quick succession must not be throttled by that gate.
+/// Near-zero on purpose. The beat is rate-limited to one write per shard per
+/// half-interval. A test that wants several distinct watermarks in quick
+/// succession must not be throttled by that gate.
 const BEAT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(1);
 
 /// The slot-name prefix the tests create their DR slots with — the same
@@ -63,16 +63,14 @@ const BEAT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(1);
 /// to. Anything not carrying it is deliberately NOT counted as a DR standby.
 const DR_PREFIX: &str = autumn_harvest::replication::DEFAULT_DR_SLOT_PREFIX;
 
-/// [`FenceRegistry`] is process-global; every test that pins a generation must
-/// hold this so a sibling test cannot observe a half-built registry.
-/// Async-aware, because the guard is deliberately held across `.await`s: the
-/// whole point is to keep a sibling test from observing a half-built registry
-/// while this one is mid-scenario.
+/// [`FenceRegistry`] is process-global. Every test that pins a generation must
+/// hold this, so a sibling test cannot observe a half-built registry.
+/// Async-aware: the guard is held across `.await`s for the whole scenario.
 static REGISTRY_SERIAL: std::sync::LazyLock<tokio::sync::Mutex<()>> =
     std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
 
-/// A codec that always succeeds and changes the bytes -- enough for the sweep
-/// to have real work to do, without pulling a real cipher into a DR test.
+/// A codec that always succeeds and changes the bytes. That gives the sweep
+/// real work without a real cipher in a DR test.
 struct DrXorCodec(u8);
 
 impl autumn_harvest::payload_codec::PayloadCodec for DrXorCodec {
@@ -123,18 +121,18 @@ fn unique_prefix(db: &str) -> String {
 /// The shared Postgres these tests create their per-test databases on.
 ///
 /// Prefers a caller-supplied `HARVEST_TEST_DATABASE_URL`; otherwise starts one
-/// throwaway container for the whole suite (CI's path). The container is
-/// started with **`wal_level = logical`**, which is not the image default and
-/// without which the three replication tests below would silently skip — i.e.
-/// AC6(b) and AC6(c) would be permanently unproven while CI stayed green. That
-/// is the single most important line in this file.
+/// throwaway container for the whole suite (CI's path). The container starts
+/// with **`wal_level = logical`**, which is not the image default. Without it,
+/// the three replication tests below would silently skip. AC6(b) and AC6(c)
+/// would then stay unproven while CI stayed green. That is the single most
+/// important line in this file.
 ///
-/// One container for the suite, not one per test: `pg_replication_slots` and
-/// `pg_stat_replication` are cluster-wide, and the module under test scopes
-/// every query to `current_database()` precisely so several shard databases can
-/// share a cluster. Sharing one here therefore exercises that scoping rather
-/// than dodging it — but it is also why the suite must run `--test-threads=1`
-/// (the manifest's `linux` osclass supplies that).
+/// One container for the suite, not one per test. `pg_replication_slots` and
+/// `pg_stat_replication` are cluster-wide. The module under test scopes every
+/// query to `current_database()`, so several shard databases can share a
+/// cluster. Sharing one here exercises that scoping rather than dodging it.
+/// It is also why the suite must run `--test-threads=1` (the manifest's
+/// `linux` osclass supplies that).
 static SHARED_PG: tokio::sync::OnceCell<Option<SharedPg>> = tokio::sync::OnceCell::const_new();
 
 struct SharedPg {
@@ -1402,11 +1400,11 @@ async fn a_fenced_worker_cannot_re_encrypt_history() {
     // own assertion.
     //
     // The failure this prevents is the worst one the sweep has. A worker still
-    // pinned to the old generation reconnects to the promoted primary; its
-    // appends are refused, but an unfenced sweep would happily re-encode rows
-    // the new region now owns -- under *its* active key, which the promoted
-    // region may already have retired. That is silent, permanent, and destroys
-    // payloads rather than merely forking history.
+    // pinned to the old generation reconnects to the promoted primary. Its
+    // appends are refused. But an unfenced sweep would re-encode rows the new
+    // region now owns, under *its* active key. The promoted region may already
+    // have retired that key. That is silent and permanent. It destroys payloads
+    // rather than merely forking history.
     let _serial = registry_guard().await;
     let (url, _db) = require_db!("rotate");
     let mut conn = connect(&url).await;
@@ -1991,14 +1989,13 @@ async fn a_fenced_worker_cannot_claim_through_claim_task_batched() {
 
 /// The fence bump is a **commit-order barrier**, not a racy read.
 ///
-/// This is the property the whole mechanism rests on: a persist that passes the
-/// fence check must be guaranteed to commit *before* the fence takes effect, so
-/// there is never a "one last append" from a worker that has just lost write
-/// authority. The barrier is `bump_generation`'s `ACCESS EXCLUSIVE` table lock
-/// conflicting with the `ACCESS SHARE` that `assert_fence`'s plain read takes
-/// implicitly — deliberately not a shared row lock, which on a
-/// one-row-per-shard table would make every claim in the fleet a MultiXactId
-/// producer.
+/// The whole mechanism rests on this property. A persist that passes the fence
+/// check must commit *before* the fence takes effect. So a worker that has
+/// just lost write authority never makes "one last append". The barrier is
+/// `bump_generation`'s `ACCESS EXCLUSIVE` table lock. It conflicts with the
+/// `ACCESS SHARE` that `assert_fence`'s plain read takes implicitly. It is
+/// deliberately not a shared row lock. On a one-row-per-shard table, that
+/// would make every claim in the fleet a MultiXactId producer.
 #[tokio::test]
 async fn a_fence_bump_cannot_commit_while_a_persist_holds_the_fence() {
     let _serial = registry_guard().await;
@@ -2182,12 +2179,12 @@ async fn a_batched_append_does_not_hold_the_fence_across_its_offload_upload() {
 /// A sequence owned by a **view** must never reach the promotion helper.
 ///
 /// `ALTER SEQUENCE s OWNED BY <view>.<col>` is accepted by Postgres. Without a
-/// `relkind` filter the helper would emit `... FROM <view>`, executing that
-/// view's query — including any volatile function in it — on the operator's
-/// high-privilege DR connection, during an incident, on a command whose output
-/// nobody reads closely. Anyone with `CREATE` in the schema can plant it months
-/// ahead, and the prescribed `FOR ALL TABLES` publication replicates it to the
-/// standby too.
+/// `relkind` filter the helper would emit `... FROM <view>`. That runs the
+/// view's query, including any volatile function in it. It runs on the
+/// operator's high-privilege DR connection, during an incident. Nobody reads
+/// the command's output closely. Anyone with `CREATE` in the schema can plant
+/// it months ahead. The prescribed `FOR ALL TABLES` publication replicates it
+/// to the standby too.
 #[tokio::test]
 async fn promotion_never_executes_a_view_that_owns_a_sequence() {
     let (url, _db) = require_db!("viewown");
@@ -2232,11 +2229,11 @@ async fn promotion_never_executes_a_view_that_owns_a_sequence() {
 /// Promotion must never rewind a sequence that is already ahead of its table.
 ///
 /// A sequence legitimately sits ahead of `MAX(col)` after cached values, a
-/// rolled-back transaction, or deleted rows — and a *physical* replica
-/// replicates sequences already, which is why the docs call this command a
-/// harmless no-op there. Setting it to `MAX(col)` unconditionally would rewind
-/// it and start re-issuing ids the database has already handed out: a
-/// duplicate-key outage caused by the very command that exists to prevent one.
+/// rolled-back transaction, or deleted rows. A *physical* replica already
+/// replicates sequences, so the docs call this command a harmless no-op there.
+/// An unconditional set to `MAX(col)` would rewind it. It would re-issue ids
+/// the database has already handed out. That is a duplicate-key outage caused
+/// by the very command that exists to prevent one.
 #[tokio::test]
 async fn promotion_never_rewinds_a_sequence_that_is_ahead_of_its_table() {
     let (url, _db) = require_db!("seqahead");
@@ -2296,10 +2293,10 @@ async fn promotion_never_rewinds_a_sequence_that_is_ahead_of_its_table() {
 
 /// Identifiers that are not plain lowercase must be advanced, not skipped.
 ///
-/// An earlier revision screened identifiers instead of quoting them: an
-/// embedder on a `PascalCase` ORM schema had **every** sequence silently skipped
-/// while `harvest dr promote` reported success, and an ordinary table named
-/// `user` or `order` passed the screen and then failed as a bare keyword.
+/// An earlier revision screened identifiers instead of quoting them. An
+/// embedder on a `PascalCase` ORM schema had **every** sequence silently
+/// skipped while `harvest dr promote` reported success. An ordinary table named
+/// `user` or `order` passed the screen, then failed as a bare keyword.
 #[tokio::test]
 async fn promotion_advances_reserved_word_and_mixed_case_relations() {
     let (url, _db) = require_db!("quoting");
@@ -2473,12 +2470,12 @@ async fn promotion_never_rewinds_a_descending_sequence() {
 ///
 /// The single-writer gate uses `pg_try_advisory_xact_lock`, not the
 /// session-scoped variant. A session lock is released only by an explicit
-/// unlock, so any error between acquire and release leaks it — and on a
-/// **pooled** connection it leaks permanently: every other worker's sampler
-/// then skips its beat forever, re-acquiring on the same session only bumps the
-/// lock count, and the measured RPO goes stale during exactly the database
-/// trouble it exists to measure. (Verified against live Postgres: an advisory
-/// lock does survive a failed statement in the same session.)
+/// unlock, so any error between acquire and release leaks it. On a **pooled**
+/// connection it leaks permanently. Every other worker's sampler then skips
+/// its beat forever. Re-acquiring on the same session only bumps the lock
+/// count. The measured RPO then goes stale during exactly the database trouble
+/// it exists to measure. (Verified against live Postgres: an advisory lock
+/// does survive a failed statement in the same session.)
 #[tokio::test]
 async fn the_watermark_beat_leaves_no_advisory_lock_behind() {
     let (url, _db) = require_db!("beatlock");
@@ -2543,9 +2540,9 @@ async fn the_promotion_runs_inside_a_transaction_so_its_timeout_applies() {
 
     // A table whose `MAX()` scan is slow enough to prove the timeout is armed
     // would make this test slow too. Instead, assert the property the timeout
-    // depends on: the helper must not leave `statement_timeout` set at session
-    // level (which would mean it used `SET`, leaking the ceiling onto every
-    // later query on a pooled connection), and must succeed — which under
+    // depends on. The helper must not leave `statement_timeout` set at session
+    // level. That would mean it used `SET`, which leaks the ceiling onto every
+    // later query on a pooled connection. It must also succeed, which under
     // `SET LOCAL` is only possible inside a transaction.
     autumn_harvest::replication::advance_sequences_after_promotion(&mut conn)
         .await
@@ -2569,17 +2566,17 @@ async fn the_promotion_runs_inside_a_transaction_so_its_timeout_applies() {
 
 /// The subscription conninfo must address the server, not the test client.
 ///
-/// Regression guard for the CI-only failure that the three two-region tests hit
-/// the first time they ever ran under Docker: the conninfo was built from the
+/// Regression guard for a CI-only failure. The three two-region tests hit it
+/// the first time they ran under Docker. The conninfo came from the
 /// *client-side* URL, so it carried the host-mapped port (`localhost:33624`).
-/// `CREATE SUBSCRIPTION` dials the publisher from inside the server, where that
-/// port does not exist, and every two-region test died with "could not connect
-/// to the publisher ... Connection refused".
+/// `CREATE SUBSCRIPTION` dials the publisher from inside the server, where
+/// that port does not exist. Every two-region test died with "could not
+/// connect to the publisher ... Connection refused".
 ///
-/// It passed on a host-installed Postgres because there the client port and the
-/// server port are the same number, which is exactly why no local run could
-/// catch it. This test creates that divergence deliberately by passing a URL
-/// whose port is wrong, and asserts the conninfo ignores it.
+/// It passed on a host-installed Postgres, where the client port and the
+/// server port are the same number. That is why no local run could catch it.
+/// This test passes a URL whose port is wrong, and asserts the conninfo
+/// ignores it.
 #[tokio::test]
 async fn the_subscription_conninfo_uses_the_servers_own_port_not_the_clients() {
     let (url, _db) = require_db!("conninfo");
@@ -2711,12 +2708,12 @@ async fn one_unmeasurable_slot_beside_a_measurable_one_is_a_partial_reading() {
 /// An unrelated logical-decoding consumer must not read as a DR standby.
 ///
 /// A shard database can legitimately host a CDC pipeline's slot alongside its
-/// DR subscription. Counting every walsender for the database meant that if the
-/// real cross-region subscriber disconnected, `connected_standbys()` stayed
-/// non-zero, `harvest dr status` reported the shard protected, and
-/// `harvest_replication_down` never fired — the most dangerous false negative
-/// this feature has, because it is silent and it is wrong in the safe-looking
-/// direction.
+/// DR subscription. An earlier count took every walsender for the database.
+/// If the real cross-region subscriber disconnected, `connected_standbys()`
+/// stayed non-zero. `harvest dr status` reported the shard protected, and
+/// `harvest_replication_down` never fired. That is the most dangerous false
+/// negative this feature has. It is silent, and it is wrong in the
+/// safe-looking direction.
 #[tokio::test]
 async fn a_non_dr_slot_is_not_counted_as_a_dr_standby() {
     let (url, _db) = require_db!("cdcslot");
@@ -2749,8 +2746,8 @@ async fn a_non_dr_slot_is_not_counted_as_a_dr_standby() {
         "its WAL backlog is not this shard's DR backlog"
     );
 
-    // Sanity: the same query DOES see a slot carrying the DR prefix, so the
-    // assertions above are about the filter and not about an empty database.
+    // Sanity: the same query DOES see a slot carrying the DR prefix. So the
+    // assertions above test the filter, not an empty database.
     let dr_slot = format!("{DR_PREFIX}_cdcprobe_{}", std::process::id());
     diesel::sql_query("SELECT pg_create_logical_replication_slot($1, 'pgoutput')")
         .bind::<diesel::sql_types::Text, _>(dr_slot.clone())
@@ -2824,19 +2821,20 @@ async fn a_slot_matching_the_prefix_only_under_like_wildcards_is_not_counted() {
 
 /// A DR-enabled worker pins at startup, and a fence stops it.
 ///
-/// The claim gate and the persist assert are proven above at the SQL layer;
-/// this covers the half that only exists at runtime — `pin_dr_generations`
-/// (which must run *before* fleet registration and the first poll),
-/// `spawn_replication_sampler`'s self-fence check, the `harvest.shard.fenced`
-/// counter, and the worker actually shutting down rather than idling forever
-/// claiming nothing.
+/// The tests above prove the claim gate and the persist assert at the SQL
+/// layer. This one covers the half that only exists at runtime:
 ///
-/// Deliberately a **single-pool** worker with no `ShardedDbPool`: that is the
-/// deployment shape the topology doc documents (`.with_dr_fencing(true)` and
-/// nothing else), and an earlier revision gated the sampler on
-/// `sharded_pool.is_some()` — so exactly this configuration got the claim gate
-/// but never beat a watermark, never measured an RPO, and never stopped when
-/// fenced.
+/// - `pin_dr_generations`, which must run *before* fleet registration and the
+///   first poll.
+/// - `spawn_replication_sampler`'s self-fence check.
+/// - The `harvest.shard.fenced` counter.
+/// - The worker shutting down rather than idling forever, claiming nothing.
+///
+/// Deliberately a **single-pool** worker with no `ShardedDbPool`. The topology
+/// doc documents that shape: `.with_dr_fencing(true)` and nothing else. An
+/// earlier revision gated the sampler on `sharded_pool.is_some()`. So exactly
+/// this configuration got the claim gate but never beat a watermark. It never
+/// measured an RPO, and never stopped when fenced.
 #[tokio::test]
 async fn a_dr_enabled_worker_pins_at_startup_and_stops_when_fenced() {
     let _serial = registry_guard().await;
@@ -6240,15 +6238,15 @@ fn dr_worker_config() -> autumn_harvest::worker::WorkerRuntimeConfig {
 /// The host and port are deliberately NOT taken from `url`. `url` is the
 /// *client-side* address, and under testcontainers that is a host-mapped port
 /// (`localhost:33624`) which exists only on the Docker host. `CREATE
-/// SUBSCRIPTION` makes Postgres dial the publisher from inside its own network
-/// namespace, where that port is closed — the subscription then fails with
+/// SUBSCRIPTION` makes Postgres dial the publisher from its own network
+/// namespace, where that port is closed. The subscription then fails with
 /// "could not connect to the publisher ... Connection refused". Both "regions"
-/// are databases in one instance, so the address the server needs is its own:
-/// loopback on the port it is actually listening on, which it can be asked for.
+/// are databases in one instance, so the server needs its own address. That
+/// is loopback on the port it listens on, which the server reports.
 ///
-/// `127.0.0.1` rather than `localhost` on purpose: `localhost` resolved to
-/// `::1` in CI, and a server not listening on IPv6 refuses that even when the
-/// port is right.
+/// `127.0.0.1` rather than `localhost` on purpose. `localhost` resolved to
+/// `::1` in CI. A server not listening on IPv6 refuses that, even on the
+/// right port.
 async fn server_side_conninfo(conn: &mut AsyncPgConnection, url: &str, db: &str) -> String {
     #[derive(diesel::QueryableByName)]
     struct Port {
@@ -6282,7 +6280,7 @@ async fn server_side_conninfo(conn: &mut AsyncPgConnection, url: &str, db: &str)
 }
 
 /// A primary ("region A") and a standby ("region B") wired with stock logical
-/// replication, plus the teardown that must run even on failure — an orphaned
+/// replication. The teardown must run even on failure. An orphaned
 /// replication slot pins WAL on the shared test server forever.
 struct Regions {
     primary_url: String,
@@ -6376,11 +6374,11 @@ async fn two_regions(tag: &str) -> Option<Regions> {
 
     // The slot is created on its own connection, BEFORE the subscription, and
     // the subscription is told not to create one. `CREATE SUBSCRIPTION` runs in
-    // a transaction, and slot creation waits for transactions older than itself
-    // to end — so when publisher and subscriber live in the same Postgres
-    // instance, letting it create its own slot deadlocks against itself. (Two
-    // separate instances would not, but they buy no extra fidelity and cost
-    // container-to-container networking.)
+    // a transaction. Slot creation waits for transactions older than itself to
+    // end. So with publisher and subscriber in the same Postgres instance, a
+    // `CREATE SUBSCRIPTION` that creates its own slot deadlocks against itself.
+    // (Two separate instances would not, but they buy no extra fidelity and
+    // cost container-to-container networking.)
     diesel::sql_query("SELECT pg_create_logical_replication_slot($1, 'pgoutput')")
         .bind::<diesel::sql_types::Text, _>(slot.clone())
         .execute(&mut a)
@@ -6413,13 +6411,11 @@ async fn two_regions(tag: &str) -> Option<Regions> {
     // connection. It depends on the runner's container networking, not on
     // this test's logic, and Postgres places no timeout on it. A bad or
     // momentarily-unreachable address here therefore hangs this `.await`
-    // forever rather than erroring, which is exactly what
-    // pinned `Test DB (linux, shard 1)` for a full 6-hour CI job on a run whose
-    // diff never touched this file (see the PR discussion this comment was
-    // added from). Bounding it turns that into a fast, clear skip — consistent
-    // with this function's existing "server cannot host it" contract
-    // (`wal_level_is_logical` above already skips for the same class of
-    // reason), not a special case.
+    // forever rather than erroring. That pinned `Test DB (linux, shard 1)` for a
+    // full 6-hour CI job, on a run whose diff never touched this file. The
+    // bound turns that into a fast, clear skip. That matches this function's
+    // existing "server cannot host it" contract. `wal_level_is_logical` above
+    // already skips for the same class of reason.
     match tokio::time::timeout(
         std::time::Duration::from_secs(60),
         b.batch_execute(&create_subscription),
@@ -6436,8 +6432,8 @@ async fn two_regions(tag: &str) -> Option<Regions> {
                  NOTHING."
             );
             // Best-effort cleanup: an orphaned slot pins WAL on the shared test
-            // server indefinitely (the same concern the disconnected-standby
-            // test below already guards against for its own slot).
+            // server indefinitely. The disconnected-standby test below guards
+            // its own slot for the same reason.
             let _ = diesel::sql_query("SELECT pg_drop_replication_slot($1)")
                 .bind::<diesel::sql_types::Text, _>(slot.clone())
                 .execute(&mut a)
@@ -6569,8 +6565,8 @@ async fn rpo_body(regions: &Regions) -> Result<(), String> {
 
     // Inject lag: hold ACCESS EXCLUSIVE on a replicated table so the
     // subscriber's apply worker blocks. This is the realistic shape of the
-    // incident — the walsender stays connected and the stream keeps flowing,
-    // only apply stalls — and it is exactly the case where
+    // incident. The walsender stays connected and the stream keeps flowing;
+    // only apply stalls. In exactly this case
     // `pg_stat_replication.replay_lag` goes blind.
     let mut blocker = connect(&regions.standby_url).await;
     blocker
@@ -6592,9 +6588,9 @@ async fn rpo_body(regions: &Regions) -> Result<(), String> {
         .map_err(|e| e.to_string())?
     {
         WatermarkReading::Measured(v) => v,
-        // A stall shorter than the retained trail must stay a MEASUREMENT: the
-        // floor is for a standby that has fallen off the end of the trail
-        // entirely, which a 12s stall against an hour of retention is not.
+        // A stall shorter than the retained trail must stay a MEASUREMENT. The
+        // floor is for a standby that has fallen off the end of the trail. A
+        // 12s stall against an hour of retention has not.
         other => {
             blocker.batch_execute("ROLLBACK").await.ok();
             return Err(format!(
@@ -6613,9 +6609,9 @@ async fn rpo_body(regions: &Regions) -> Result<(), String> {
         ));
     }
 
-    // …and the reading is honest about *which* source it came from: with apply
-    // blocked, Postgres' own replay_lag is blind, which is the whole reason the
-    // watermark trail exists.
+    // …and the reading is honest about *which* source it came from. With apply
+    // blocked, Postgres' own replay_lag is blind. That is why the watermark
+    // trail exists.
     let status = autumn_harvest::replication::query_replication_status(&mut a, shard, DR_PREFIX)
         .await
         .map_err(|e| e.to_string())?;
@@ -6661,8 +6657,8 @@ async fn rpo_body(regions: &Regions) -> Result<(), String> {
 #[tokio::test]
 async fn a_disconnected_standby_reports_bytes_and_an_unknown_rpo_never_zero() {
     let regions = require_regions!("discon");
-    // The body is polled to completion inside `AssertUnwindSafe` so a failed
-    // assertion still drops the replication slot: an orphaned slot pins WAL on
+    // The body runs to completion inside `AssertUnwindSafe`, so a failed
+    // assertion still drops the replication slot. An orphaned slot pins WAL on
     // the shared test server indefinitely.
     let out = std::panic::AssertUnwindSafe(async {
         let shard = ShardId::new(0);
@@ -6914,7 +6910,6 @@ async fn promotion_body(regions: &Regions) -> Result<(), String> {
     Ok(())
 }
 
-/// The number of rows in `table`.
 async fn count_rows(conn: &mut AsyncPgConnection, table: &str) -> i64 {
     #[derive(diesel::QueryableByName)]
     struct Rows {

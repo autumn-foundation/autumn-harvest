@@ -7,9 +7,9 @@
 //! `url` crate's parser plus the IPv4/IPv6 literal classification over
 //! byte-level malformed URL input.
 //!
-//! We use the *most permissive* policy (allow http + IP literals) so the fuzzer
-//! reaches the deepest branches — the parse, the userinfo/host extraction, and
-//! the routable-IP classification — rather than short-circuiting on scheme.
+//! The target uses the *most permissive* policy (allow http + IP literals). So
+//! the fuzzer does not stop at the scheme check. It reaches the parse, the
+//! userinfo/host extraction and the routable-IP classification.
 //!
 //! Invariant: `validate_target_url` returns `Ok`/`Err` and never panics.
 #![no_main]

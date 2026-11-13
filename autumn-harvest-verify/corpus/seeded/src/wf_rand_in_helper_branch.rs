@@ -7,10 +7,9 @@
 //! record histories of different *lengths*.
 //!
 //! **Launder.** HVG002 and DET002 both list `rand::random`; both are body-only
-//! / same-file-same-module, and `coin` is one crate away. Note also that the
-//! tainted value never reaches an argument — only a branch — so even a
-//! value-only taint model that *did* cross the crate boundary would report
-//! nothing here.
+//! / same-file-same-module, and `coin` is one crate away. The tainted value
+//! never reaches an argument, only a branch. So even a value-only taint model
+//! that *did* cross the crate boundary would report nothing here.
 //!
 //! **Expected trace hops.** `wf_rand_in_helper_branch` ⇒
 //! `harvest_verify_corpus_helpers::coin` ⇒ `rand::random` (the source) ⇒

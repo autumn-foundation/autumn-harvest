@@ -5,18 +5,18 @@
 //!   1. Start a workflow with `POST /api/harvest/workflows/{name}/start`.
 //!   2. Block until it finishes with `GET /api/harvest/workflows/{id}/result?wait=30s`.
 //!
-//! The `?wait=` parameter turns the GET into a bounded long-poll — the server
-//! holds the connection open (using LISTEN/NOTIFY, not busy-polling) and returns
-//! `200 OK` as soon as the workflow reaches a terminal state, or `204 No Content`
-//! + `Retry-After: 1` if the deadline expires first.
+//! The `?wait=` parameter turns the GET into a bounded long-poll. The server
+//! holds the connection open with LISTEN/NOTIFY, not busy-polling. It returns
+//! `200 OK` once the workflow reaches a terminal state. It returns
+//! `204 No Content` + `Retry-After: 1` if the deadline expires first.
 //!
 //! Values of `?wait=` above the server ceiling (default **30 s**, configurable
 //! via `HarvestApiState::set_workflow_result_max_wait`) are **silently clamped**,
 //! not rejected.
 //!
-//! If the requested execution is in state `CONTINUED_AS_NEW`, the endpoint
-//! follows the successor chain to the final run and returns its output — so
-//! callers never have to handle the sentinel themselves.
+//! For an execution in state `CONTINUED_AS_NEW`, the endpoint follows the
+//! successor chain to the final run and returns its output. Callers never
+//! handle the sentinel themselves.
 //!
 //! Run with:
 //!   cargo run --example await_workflow_result_http

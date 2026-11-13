@@ -18,20 +18,20 @@
 //!   (f) A blank or oversized queue name is rejected 400 (never a 500).
 //!   (g) Admin gate: without the admin boundary the mutating routes 401.
 //!   (h) AC1 durability — a pause survives a full teardown of the API state
-//!       (the "plugin restart" proxy): a fresh router over the same database
+//!       (the "plugin restart" proxy). A fresh router over the same database
 //!       still reports the queue as held, because the gate is a row, not a
 //!       process-local cache.
 //!   (i) AC7 — the read endpoint's `effective_scope` reports what a hold
-//!       ACTUALLY covers (`fleet` / `partial_fleet` / `shard`), derived from the
-//!       shards that hold the queue rather than the recorded `scope_shard_id`
-//!       intent, which is identical for a complete and a partially-applied
-//!       fleet-wide hold.
-//!   (j) A typo'd field in a queue-control body is rejected 400 rather than
-//!       silently widening a shard-scoped request to fleet-wide — on the resume
-//!       route that would release every hold mid-outage.
+//!       ACTUALLY covers (`fleet` / `partial_fleet` / `shard`). It derives
+//!       that from the shards that hold the queue. The recorded
+//!       `scope_shard_id` is identical for a complete and a partial fleet-wide
+//!       hold.
+//!   (j) A typo'd field in a queue-control body is rejected 400. It must not
+//!       widen a shard-scoped request to fleet-wide. On the resume route that
+//!       would release every hold mid-outage.
 //!   (k) A failed pause-state lookup on the eligibility explainer propagates as
-//!       a 5xx rather than being read as "no queues paused", which would tell a
-//!       triaging operator a held queue is unimpeded.
+//!       a 5xx, not as "no queues paused". That would tell a triaging operator
+//!       a held queue is unimpeded.
 
 // Test-code style lints, consistent with `queue_pause_tests.rs` in the core
 // crate: the module docs name response/database fields verbatim.
@@ -83,10 +83,10 @@ fn replace_db_name(url: &str, db: &str) -> String {
 
 /// Provision a pristine, migrated Postgres database for one test.
 ///
-/// When `HARVEST_TEST_DATABASE_URL` is set it is treated as an admin base URL
-/// and a fresh, uniquely-named database is created on that server, so the
-/// exact-count assertions are never contaminated by a sibling test. Otherwise a
-/// throwaway testcontainers Postgres is booted (requires Docker).
+/// `HARVEST_TEST_DATABASE_URL`, when set, is an admin base URL. Each test
+/// creates a uniquely-named database there, so no sibling test skews the
+/// exact counts. Otherwise a throwaway testcontainers Postgres boots
+/// (requires Docker).
 async fn setup_database() -> (String, Option<ContainerAsync<Postgres>>) {
     let (admin_url, container) = if let Ok(url) = std::env::var("HARVEST_TEST_DATABASE_URL") {
         (url, None)
@@ -398,21 +398,19 @@ async fn pause_list_resume_round_trip_with_audit() {
 }
 
 /// An idempotent re-pause must audit the hold actually IN EFFECT, not the
-/// reason the retry happened to carry (issue #807 review).
+/// reason the retry happened to carry (issue #807).
 ///
-/// `pause_queue` preserves the ORIGINAL row on a re-pause — that is the whole
-/// point of the idempotence — so a second pause carrying a different reason (or
-/// omitting one entirely, which resolves to the default) leaves every shard
-/// still held for the *first* incident. The response body already reports the
-/// effective provenance; the durable audit row is what survives the resume's
-/// `DELETE`, so a row echoing the request would be the only permanent record of
-/// the hold and would name a reason that was in effect nowhere.
+/// `pause_queue` preserves the ORIGINAL row on a re-pause, by design. A second
+/// pause with a different or omitted reason leaves every shard held for the
+/// *first* incident. The response body already reports the effective
+/// provenance. The durable audit row survives the resume's `DELETE`. A row
+/// that echoed the request would be the only permanent record of the hold. It
+/// would name a reason that was in effect nowhere.
 ///
-/// This is the wiring-level assertion for that contract: it drives the real
-/// route and reads the real `harvest_audit_log` row, so it fails if the handler
-/// is ever pointed back at the request's reason. The per-activity sibling
-/// shares the same `held_holds_audit_reason` helper and call-site shape, and is
-/// unit-covered alongside this one.
+/// This is the wiring-level assertion for that contract. It drives the real
+/// route and reads the real `harvest_audit_log` row. So it fails if the handler
+/// ever uses the request's reason again. The per-activity sibling shares the
+/// `held_holds_audit_reason` helper and call-site shape, and is unit-covered.
 #[tokio::test]
 async fn a_re_pause_audits_the_effective_hold_not_the_new_request() {
     let (url, _c) = setup_database().await;
@@ -465,8 +463,8 @@ async fn a_re_pause_audits_the_effective_hold_not_the_new_request() {
 // ── (e): resume of an unpaused queue is a no-op ─────────────────────────────
 
 /// Resuming a queue that is not paused is an idempotent success, never a 404 or
-/// a 500 — an operator retrying a resume after a lost response must not have to
-/// distinguish "already resumed" from "failed".
+/// a 500. An operator who retries after a lost response must not have to tell
+/// "already resumed" from "failed".
 #[tokio::test]
 async fn resume_of_an_unpaused_queue_is_an_idempotent_no_op() {
     let (url, _c) = setup_database().await;
@@ -526,14 +524,13 @@ async fn invalid_queue_names_are_rejected_with_400() {
 
 /// A reason padded past the truncation cap must still hold the queue.
 ///
-/// The route validates the reason for non-emptiness and then bounds it with
-/// `truncate_operator_reason`. Validating the raw string but storing a truncated
-/// one let the two disagree: 500+ leading spaces followed by real text passed the
-/// check (it trims to something) but truncated to pure whitespace, which the core
-/// then rejected on every shard — surfacing as an opaque 500 with the queue still
-/// dispatching, exactly when the operator needs the hold. Normalizing at the
-/// point of validation makes the two agree, and preserves the operator's words
-/// instead of letting padding eat the budget.
+/// The route checks that the reason is not empty, then bounds it with
+/// `truncate_operator_reason`. The check once ran on the raw string, but the
+/// stored string was truncated. So 500+ leading spaces before real text passed
+/// the check but truncated to pure whitespace. The core then rejected that on
+/// every shard. The operator got an opaque 500, and the queue kept
+/// dispatching. Normalizing at validation makes the two agree. It also keeps
+/// the operator's words, so padding cannot eat the budget.
 #[tokio::test]
 async fn a_reason_padded_past_the_cap_still_holds_the_queue() {
     let (url, _c) = setup_database().await;
@@ -624,10 +621,9 @@ async fn pause_and_resume_require_admin() {
 // ── (h): AC1 durability across a "plugin restart" ───────────────────────────
 
 /// AC1: the paused state is durable and is re-applied before the worker pool
-/// begins claiming. Because the gate is a ROW consulted by the claim query —
-/// not a process-local cache seeded at boot — a completely fresh router over
-/// the same database observes the hold with no re-application step and no boot
-/// window in which a held queue is briefly claimable.
+/// begins claiming. The gate is a ROW that the claim query reads, not a
+/// process-local cache seeded at boot. So a fresh router over the same database
+/// sees the hold at once. No boot window leaves a held queue claimable.
 #[tokio::test]
 async fn pause_survives_a_full_api_state_teardown() {
     let (url, _c) = setup_database().await;
@@ -713,17 +709,17 @@ fn build_two_shard_app(pool: &DbPool) -> HarvestApiApp {
 /// AC7, the write half: `shard_id` scopes the hold to one shard, and the read
 /// endpoint reports that scope back.
 ///
-/// Every other test in this file exercises the fleet-wide default; this one
-/// pins the *scoped* branch of `queue_pause_target_pools`, which is the half an
-/// operator reaches for when only one shard's downstream is degraded.
+/// Every other test in this file exercises the fleet-wide default. This one
+/// pins the *scoped* branch of `queue_pause_target_pools`. An operator uses it
+/// when only one shard's downstream is degraded.
 #[tokio::test]
 async fn a_shard_scoped_pause_targets_only_that_shard() {
     let (url, _c) = setup_database().await;
     let pool = build_pool(&url);
     let app = build_two_shard_app(&pool);
 
-    // Shard 0 is the live one, so a hold scoped to it must fully apply (200)
-    // even though shard 1 is unreachable — a scoped request must not fan out.
+    // Shard 0 is live, so a hold scoped to it must fully apply (200), even
+    // with shard 1 unreachable. A scoped request must not fan out.
     let (status, body) = post_json(
         &app,
         "/admin/queues/payments/pause",
@@ -760,10 +756,9 @@ async fn a_shard_scoped_pause_targets_only_that_shard() {
 /// A *fleet-wide* hold that reaches only some shards is NOT in effect
 /// fleet-wide, and must not be reported as an unqualified success.
 ///
-/// The shards it missed keep dispatching into exactly the outage the operator
-/// is riding out, so a `200 {"ok": true}` here is the one way this feature can
-/// silently fail an incident. Asserts the honest `207` / `ok: false` /
-/// `status: "partial"` shape instead.
+/// The missed shards keep dispatching into the outage the operator is riding
+/// out. A `200 {"ok": true}` here would silently fail the incident. The test
+/// asserts the `207` / `ok: false` / `status: "partial"` shape instead.
 #[tokio::test]
 async fn a_partially_applied_fleet_wide_pause_is_reported_as_partial() {
     let (url, _c) = setup_database().await;
@@ -852,19 +847,18 @@ async fn rejected_pause_attempts_are_audited() {
 }
 
 /// A partially-applied hold must READ BACK as `partial_fleet`, not `fleet`
-/// (issue #619 review, Codex).
+/// (issue #619).
 ///
-/// The `207` on the pause request only helps the operator who is watching that
-/// request. Minutes later — a different operator, a fresh process, the Vantage
-/// banner — the only surface is `GET /admin/queues/paused`, and the stored
-/// `scope_shard_id: null` is byte-identical to a complete fleet-wide hold: the
-/// shards that were missed persist **no row at all**. Reading intent there would
-/// present a half-open queue as fully held while it kept dispatching into the
-/// outage.
+/// The `207` on the pause request only helps the operator watching that
+/// request. Minutes later, for another operator, process or the Vantage
+/// banner, the only surface is `GET /admin/queues/paused`. There the stored
+/// `scope_shard_id: null` is byte-identical to a complete fleet-wide hold. The
+/// missed shards persist **no row at all**. A read of intent would show a
+/// half-open queue as fully held while it kept dispatching into the outage.
 ///
 /// Exercises the real fan-out (`pools_by_shard` + `expected_shards`) that the
 /// pure `effective_scope_reflects_real_coverage_not_stored_intent` unit test
-/// mocks: shard 1 is unreachable, so it is expected-but-not-holding.
+/// mocks. Shard 1 is unreachable, so it is expected-but-not-holding.
 #[tokio::test]
 async fn a_partially_applied_hold_reads_back_as_partial_fleet_not_fleet_wide() {
     let (url, _c) = setup_database().await;
@@ -896,9 +890,8 @@ async fn a_partially_applied_hold_reads_back_as_partial_fleet_not_fleet_wide() {
          fleet -- reporting `fleet` here is the mis-read that lets an operator \
          believe an outage is contained when it is not: {body}"
     );
-    // The recorded INTENT is still reported verbatim, and is exactly what makes
-    // deriving coverage necessary: it is null for both a complete and a
-    // partially-applied fleet-wide hold.
+    // The recorded INTENT is still reported verbatim. It is null for both a
+    // complete and a partial fleet-wide hold, so coverage must be derived.
     assert!(
         entry["scope_shard_id"].is_null(),
         "the stored intent is unchanged (fleet-wide request): {body}"
@@ -1039,9 +1032,8 @@ async fn a_typod_resume_field_is_rejected_and_the_hold_survives() {
     );
 }
 
-/// The operator `reason` is bounded at the API boundary, so it can never be
-/// persisted (and re-rendered into the Vantage Workers page on every load) at
-/// an unbounded size.
+/// The operator `reason` is bounded at the API boundary. So it is never stored
+/// at an unbounded size, or rendered at one on every Vantage Workers page load.
 #[tokio::test]
 async fn an_oversized_reason_is_truncated_not_stored_whole() {
     let (url, _c) = setup_database().await;
@@ -1064,16 +1056,15 @@ async fn an_oversized_reason_is_truncated_not_stored_whole() {
     );
 }
 
-/// An idempotent re-pause must echo the hold that is actually in effect —
-/// including its **scope** (issue #619 review, Codex).
+/// An idempotent re-pause must echo the hold that is actually in effect,
+/// including its **scope** (issue #619).
 ///
-/// `pause_queue` deliberately preserves the ORIGINAL provenance on a re-pause,
-/// and the handler already echoes the preserved `reason`/`paused_by`/`paused_at`.
-/// The scope must travel with them: re-pausing a shard-scoped hold with a
-/// fleet-wide request previously reported `scope_shard_id: null` alongside
-/// `newly_paused: false` and the original reason — describing a hold that
-/// covers one shard as though it covered the fleet, which is exactly the
-/// mis-read that lets an operator believe an outage is contained when it is not.
+/// `pause_queue` preserves the ORIGINAL provenance on a re-pause, by design.
+/// The handler already echoes the preserved `reason`/`paused_by`/`paused_at`.
+/// The scope must travel with them. A fleet-wide re-pause of a shard-scoped
+/// hold once reported `scope_shard_id: null` with `newly_paused: false`. That
+/// described a one-shard hold as fleet-wide. An operator could then believe an
+/// outage was contained when it was not.
 #[tokio::test]
 async fn an_idempotent_repause_echoes_the_effective_scope_not_the_request() {
     let (url, _c) = setup_database().await;
@@ -1121,17 +1112,15 @@ async fn an_idempotent_repause_echoes_the_effective_scope_not_the_request() {
 
 /// A pause-state lookup that FAILS must not be read as "no queues paused".
 ///
-/// The eligibility explainer's whole job during an incident is to answer "why
-/// is nothing being claimed from this queue?". Swallowing a database error into
-/// an empty paused set answers that question with a confident, wrong "nothing is
-/// holding it" — the single most misleading thing this endpoint can say. The
-/// sibling rate-limit read in the same function already propagates, so this is
-/// also an internal-consistency fix.
+/// During an incident, the eligibility explainer answers "why is nothing being
+/// claimed from this queue?". A database error read as an empty paused set
+/// gives a confident, wrong "nothing is holding it". That is the most
+/// misleading answer this endpoint can give. The sibling rate-limit read in the
+/// same function already propagates, so this also restores consistency.
 ///
-/// The fault is injected by dropping `harvest_queue_pauses`, which is the one
-/// way to make the lookup fail without reaching into the pool internals; the
-/// lookup is a plain query with no `to_regclass` guard, so a missing table is a
-/// genuine error rather than a silent empty result.
+/// The test drops `harvest_queue_pauses` to inject the fault. That is the one
+/// way to fail the lookup without reaching into the pool internals. The lookup
+/// has no `to_regclass` guard, so a missing table is a genuine error.
 #[tokio::test]
 async fn a_failed_pause_lookup_surfaces_as_an_error_not_an_empty_paused_set() {
     let (url, _c) = setup_database().await;

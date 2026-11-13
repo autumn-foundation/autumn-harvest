@@ -8,12 +8,11 @@
 //! - AC6/AC8: a canary past its per-probe execution timeout emits `harvest.canary.failure` and none of `harvest.workflow.terminal`/`timeout`.
 //! - A NORMAL workflow still increments `harvest.workflow.terminal` (non-canary behavior is byte-identical).
 //!
-//! The probe workflow here is a faithful, hand-built copy of the plugin's
-//! built-in canary (which lives in `autumn-harvest-plugin` and so cannot be
-//! imported from the core crate): its `name` carries the reserved
-//! `__harvest_canary_probe` prefix so `is_canary_workflow` matches, and its body
-//! dispatches one non-local activity then waits on a short durable timer, exactly
-//! like the real probe.
+//! The probe workflow here is a hand-built copy of the plugin's built-in
+//! canary. The core crate cannot import it from `autumn-harvest-plugin`. Its
+//! `name` carries the reserved `__harvest_canary_probe` prefix, so
+//! `is_canary_workflow` matches. Like the real probe, its body dispatches one
+//! non-local activity, then waits on a short durable timer.
 
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -194,11 +193,11 @@ async fn setup() -> (String, Option<ContainerAsync<Postgres>>) {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .try_init();
-    // Local-PG runs: provision a fresh, uniquely-named, migrated database off the
-    // base URL per call (mirroring the testcontainers per-test isolation), so the
-    // suite is re-runnable against a persistent Postgres. These tests reuse fixed
-    // workflow_ids, so a shared database would let a prior run's terminal
-    // execution short-circuit a fresh start and starve the worker of the probe.
+    // Local-PG runs get a fresh, uniquely-named, migrated database per call, as
+    // testcontainers does. So the suite can re-run against a persistent
+    // Postgres. These tests reuse fixed workflow_ids. In a shared database, a
+    // prior run's terminal execution would short-circuit a fresh start and
+    // starve the worker of the probe.
     if let Ok(base_url) = std::env::var("HARVEST_TEST_DATABASE_URL") {
         return (provision_ephemeral_db(&base_url).await, None);
     }
@@ -562,9 +561,9 @@ async fn canary_execution_timeout_emits_failure_not_terminal() {
     let mut conn = connect(&url).await;
     let recording = Arc::new(RecordingMetrics::default());
 
-    // Start the probe and give it a past deadline (no worker runs it, so it
-    // stays RUNNING); run the execution-timeout scanner directly for a
-    // deterministic timeout — mirroring a wedged probe that never completes.
+    // No worker runs the probe, so it stays RUNNING with a past deadline. The
+    // scanner then runs directly for a deterministic timeout, like a wedged
+    // probe that never completes.
     let exec_id = start_workflow(&mut conn, CANARY_WF, "canary-timeout-1").await;
     expire_deadline_now(&mut conn, exec_id).await;
 

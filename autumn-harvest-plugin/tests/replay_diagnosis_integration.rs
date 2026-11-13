@@ -1,11 +1,10 @@
 //! Integration tests for `POST /api/harvest/workflows/{id}/replay-diagnosis`
 //! (issue #614).
 //!
-//! Tests run against a real Postgres instance (see the Execution note below) and
-//! exercise the single-execution replay-diagnosis endpoint end-to-end: it loads one
-//! execution's recorded history from its owning shard and replays it against the
-//! currently-registered `#[workflow]` handler via `WorkflowReplayer`, returning a
-//! structured verdict.
+//! The suite runs against a real Postgres instance (see the Execution note below).
+//! The endpoint loads the recorded history of one execution from its owning shard.
+//! It replays that history against the registered `#[workflow]` handler via
+//! `WorkflowReplayer` and returns a structured verdict.
 //!
 //! Scenarios covered:
 //!   (1)  A `COMPLETED` run whose history matches the registered handler → 200
@@ -135,19 +134,20 @@ fn progress_info() -> WorkflowInfo {
     }
 }
 
-/// Typed shared state injected on the registry (issue #614/#1107 regression):
-/// modelled after a real deployment that registers config via
-/// `HarvestBuilder::state(...)` and reads it during replay with `ctx.state::<T>()`.
+/// Typed shared state on the registry (issue #614/#1107 regression).
+///
+/// A real deployment registers it via `HarvestBuilder::state(...)` and reads it
+/// with `ctx.state::<T>()` during replay.
 struct DiagConfig {
     greeting: String,
 }
 
-/// Reads typed shared state via `ctx.state::<DiagConfig>()` and returns it as the
-/// output; when the state is absent it returns `Err`. This is the regression
-/// probe for PR #1107: the live worker replays with `registry.shared_state()`, so
-/// a faithful diagnosis replay MUST see the same state — otherwise `ctx.state`
-/// returns `None` under diagnosis and this workflow spuriously fails, yielding a
-/// `workflow_failed` verdict for a run that replays cleanly on the worker.
+/// Returns `ctx.state::<DiagConfig>()` as the output, or `Err` when the state is absent.
+///
+/// This is the regression probe for PR #1107. The live worker replays with
+/// `registry.shared_state()`, so a faithful diagnosis replay must see the same state.
+/// Otherwise `ctx.state` returns `None` under diagnosis and this workflow fails. The
+/// verdict is then `workflow_failed` for a run that replays cleanly on the worker.
 fn state_reading_workflow<'a>(
     ctx: &'a WorkflowContext,
     _input: Value,
@@ -188,15 +188,14 @@ fn state_reading_info() -> WorkflowInfo {
     }
 }
 
-/// Branches its command set on `ctx.should_continue_as_new()` (issue #614/#1107
-/// regression): schedules `checkpoint` when the history-size trigger has fired,
-/// else `keep_going`. Because `should_continue_as_new()` reads the history
-/// policy's `continue_as_new_threshold`, this workflow's replay is faithful only
-/// when the SAME policy the live worker uses (`registry.history_policy()`) is
-/// threaded into the diagnosis replay. Under the default policy (large
-/// threshold) the trigger never fires for a small history, so the diagnosis
-/// would schedule `keep_going` and diverge from a history recorded under a
-/// low-threshold deployment that scheduled `checkpoint`.
+/// Schedules `checkpoint` when `ctx.should_continue_as_new()` fires, else `keep_going`.
+///
+/// Issue #614/#1107 regression. The trigger reads the `continue_as_new_threshold` of
+/// the history policy. So the replay is faithful only when the diagnosis replay gets
+/// the policy of the live worker (`registry.history_policy()`). Under the default
+/// policy (large threshold), the trigger never fires for a small history. The
+/// diagnosis then schedules `keep_going` and diverges from a low-threshold history
+/// that scheduled `checkpoint`.
 fn policy_branch_workflow<'a>(
     ctx: &'a WorkflowContext,
     _input: Value,
@@ -278,9 +277,8 @@ fn build_app(pool: &DbPool) -> HarvestApiApp {
     let api_state = HarvestApiState::new();
     api_state.set_admin_auth_boundary(true);
     api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
-    // Register `progress_wf` as a workflow, and `classic_dag` as a classic DAG
-    // name (present in the DAG-name set but NOT in `registry.workflows`), so the
-    // not_replayable_dag verdict is reachable.
+    // `classic_dag` is in the DAG-name set but not in `registry.workflows`. That
+    // makes the `not_replayable_dag` verdict reachable.
     let runtime = HarvestApiRuntime::new(
         Arc::new(HandlerRegistry::new(vec![progress_info()], vec![])),
         Arc::new(DagCatalog::default()),
@@ -296,12 +294,11 @@ fn build_app(pool: &DbPool) -> HarvestApiApp {
     harvest_api_router(api_state)
 }
 
-/// Like [`build_app`] but registers `policy_branch_wf` on a registry carrying a
-/// NON-default history policy (`continue_as_new_threshold = 2`) — mirroring a
-/// deployment that tunes `HarvestBuilder::history_policy(...)`. Used by the
-/// issue #614 regression test to prove the diagnosis replay threads
-/// `registry.history_policy()` into the replayer exactly as the live worker does,
-/// so a `should_continue_as_new`-branching workflow replays under the same policy.
+/// Like [`build_app`], but registers `policy_branch_wf` with `continue_as_new_threshold = 2`.
+///
+/// This mirrors a deployment that tunes `HarvestBuilder::history_policy(...)`. The
+/// issue #614 regression test uses it. It proves that the diagnosis replay threads
+/// `registry.history_policy()` into the replayer, as the live worker does.
 fn build_app_with_history_policy(pool: &DbPool) -> HarvestApiApp {
     let api_state = HarvestApiState::new();
     api_state.set_admin_auth_boundary(true);
@@ -461,9 +458,9 @@ fn progress_history(items: &[&str], should_fail: bool) -> (Value, Vec<WorkflowEv
     (input, events)
 }
 
-/// A history whose FIRST activity is recorded under a name (`renamed_activity`)
-/// that the registered `progress_wf` handler no longer schedules — so replaying
-/// the handler (which schedules `process_item`) diverges at event index 1.
+/// A history whose first activity is `renamed_activity`, which `progress_wf` no
+/// longer schedules. The handler schedules `process_item`, so replay diverges at
+/// event index 1.
 fn diverging_history() -> (Value, Vec<WorkflowEvent>) {
     let input = json!({ "items": ["a"], "should_fail": false });
     let id = ActivityExecId::new();
@@ -489,10 +486,10 @@ fn diverging_history() -> (Value, Vec<WorkflowEvent>) {
     (input, events)
 }
 
-/// A history with a CLEAN PREFIX (one matching `process_item` activity) followed
-/// by a divergence: the SECOND recorded activity is `renamed_activity`, which the
-/// registered `progress_wf` handler (scheduling `process_item` for both items)
-/// does not schedule — so replay matches item 1, then diverges at event index 3.
+/// A history with a clean prefix (one matching `process_item` activity), then a
+/// divergence. The second recorded activity is `renamed_activity`, which
+/// `progress_wf` does not schedule. Replay matches item 1, then diverges at event
+/// index 3.
 fn diverging_history_with_clean_prefix() -> (Value, Vec<WorkflowEvent>) {
     let input = json!({ "items": ["a", "b"], "should_fail": false });
     let a = ActivityExecId::new();
@@ -592,9 +589,9 @@ async fn completed_run_matching_handler_is_clean() {
     let app = build_app(&pool);
 
     let (input, mut events) = progress_history(&["a", "b"], false);
-    // A real COMPLETED run always seals its history with `WorkflowCompleted`;
-    // the seal-gate (issue #614) 410s a terminal execution whose history is
-    // truncated before its seal, so seed the realistic terminal history.
+    // A real COMPLETED run always seals its history with `WorkflowCompleted`.
+    // The seal-gate (issue #614) 410s a terminal execution whose history is
+    // truncated before its seal. So seed the realistic terminal history.
     events.push(WorkflowEvent::WorkflowCompleted {
         output: Value::Null,
     });
@@ -615,11 +612,10 @@ async fn history_diverging_from_handler_is_diverged() {
     let app = build_app(&pool);
 
     let (input, mut events) = diverging_history();
-    // A real COMPLETED run (recorded under old code that scheduled
-    // `renamed_activity`) seals with `WorkflowCompleted`; the divergence is
-    // detected at event index 1, well before this trailing seal, so the
-    // `diverged` verdict is unchanged while the seal-gate (issue #614) is
-    // satisfied.
+    // A real COMPLETED run, recorded under old code that scheduled
+    // `renamed_activity`, seals with `WorkflowCompleted`. The divergence is at
+    // event index 1, well before this seal. So the verdict stays `diverged`, and
+    // the seal-gate (issue #614) is satisfied.
     events.push(WorkflowEvent::WorkflowCompleted {
         output: Value::Null,
     });
@@ -651,13 +647,13 @@ async fn failed_run_is_diagnosable_retroactively() {
     let pool = build_pool(&url);
     let app = build_app(&pool);
 
-    // should_fail=true → the handler returns Err after processing all items, so a
+    // With `should_fail = true`, the handler returns `Err` after all items. A
     // faithful replay reports `workflow_failed` (AC4: retroactive forensics on a
     // terminal FAILED run, still a 200).
     let (input, mut events) = progress_history(&["a"], true);
-    // A real FAILED run always seals its history with `WorkflowFailed`; the
+    // A real FAILED run always seals its history with `WorkflowFailed`. The
     // seal-gate (issue #614) 410s a terminal execution truncated before its
-    // seal, so seed the realistic terminal history.
+    // seal. So seed the realistic terminal history.
     events.push(WorkflowEvent::WorkflowFailed {
         error: "activity failed after processing all items".into(),
         error_type: None,
@@ -668,10 +664,9 @@ async fn failed_run_is_diagnosable_retroactively() {
 
     let (status, body) = post_diagnosis(&app, &exec.to_string()).await;
     assert_eq!(status, StatusCode::OK, "body={body}");
-    // Issue #952: a history sealed by a terminal `WorkflowFailed` that replays to
-    // the same failure has NOT diverged — the verdict is `clean`, and the
-    // reproduced error is surfaced in `failure` so this endpoint stays the
-    // post-mortem surface it was built to be (#614 AC4).
+    // Issue #952: a history sealed by `WorkflowFailed` that replays to the same
+    // failure has NOT diverged. The verdict is `clean`. The reproduced error is in
+    // `failure`, so the endpoint stays a post-mortem surface (#614 AC4).
     assert_eq!(body["diagnosis"], json!("clean"));
     assert!(
         body["failure"]["error"].as_str().is_some(),
@@ -745,15 +740,15 @@ async fn erased_history_returns_410() {
     assert_eq!(status, StatusCode::GONE);
 }
 
-/// Issue #614 seal-gate (Codex review): a TERMINAL execution whose recorded
-/// event rows are truncated BEFORE its terminal lifecycle event (pruned by
-/// retention / released on reset — incomplete, not PII-erased) replays only to
-/// a frontier suspension, which canary would report as `clean` — falsely
-/// implying "no divergence, safe to rule out" for a run whose real seal we can
-/// no longer see. Refuse it with 410, mirroring the #612 terminal-query path
-/// (`classify_terminal_query` maps a terminal execution with no seal to
-/// `HistoryUnavailable`). Here the state is `TIMED_OUT` (terminal) but the
-/// seeded history has NO `WorkflowExecutionTimedOut` seal.
+/// Issue #614 seal-gate: a terminal execution with a truncated history gets a 410.
+///
+/// Retention or a reset can prune the rows before the terminal lifecycle event.
+/// Such a history is incomplete, not PII-erased. It replays only to a frontier
+/// suspension, which canary reports as `clean`. That falsely implies "no
+/// divergence" for a run whose real seal is no longer visible. The 410 mirrors the
+/// #612 terminal-query path: `classify_terminal_query` maps a terminal execution
+/// with no seal to `HistoryUnavailable`. Here the state is `TIMED_OUT`, but the
+/// seeded history has no `WorkflowExecutionTimedOut` seal.
 #[tokio::test]
 async fn terminal_run_with_truncated_history_returns_410() {
     let (url, _c) = setup_database().await;
@@ -860,13 +855,13 @@ async fn nd_blocked_running_run_diagnoses_its_divergence() {
     assert_eq!(div["actual"], json!("ActivityScheduled(renamed_activity)"));
 }
 
-/// FIX 2 (canary replay mode): a healthy in-flight RUNNING run parked mid-flight
-/// — its recorded history stops after the first activity, with no trailing
-/// terminal event and no divergence. Under STRICT replay the workflow's next
-/// command (schedule item 2) at the frontier is classified as a non-determinism
-/// suspension → a FALSE `diverged`. Under CANARY replay (the fix) that frontier
-/// suspension is `clean`. This is the endpoint's headline use case and the
-/// falsifiable proof of FIX 2 (it fails under strict, passes under canary).
+/// FIX 2 (canary replay mode): a healthy RUNNING run parked mid-flight is `clean`.
+///
+/// Its recorded history stops after the first activity, with no terminal event and
+/// no divergence. Strict replay classifies the next command (schedule item 2) as a
+/// non-determinism suspension, a false `diverged`. Canary replay reports that
+/// frontier suspension as `clean`. This is the headline use case of the endpoint.
+/// The test fails under strict replay and passes under canary.
 #[tokio::test]
 async fn running_healthy_run_parked_mid_activity_is_clean() {
     let (url, _c) = setup_database().await;
@@ -907,14 +902,13 @@ async fn running_healthy_run_parked_mid_activity_is_clean() {
     assert!(body.get("divergence").is_none(), "clean has no divergence");
 }
 
-/// FIX 3 (sealed-mid-await terminal, single-activity shape): a `TIMED_OUT` run
-/// whose recorded history is `WorkflowStarted + ActivityScheduled(a) +
-/// WorkflowExecutionTimedOut` — the activity was scheduled but never completed
-/// before the execution-timeout scanner sealed the run. The workflow replays its
-/// one recorded command faithfully and then *suspends* awaiting the in-progress
-/// activity's (unrecorded) result, which canary replay reports as `clean`. The
-/// run replayed faithfully up to where it was externally sealed — there is no
-/// code divergence.
+/// FIX 3 (sealed-mid-await, single-activity shape): a `TIMED_OUT` run is `clean`.
+///
+/// The history is `WorkflowStarted + ActivityScheduled(a) + WorkflowExecutionTimedOut`.
+/// The execution-timeout scanner sealed the run before the activity completed. The
+/// workflow replays its one command, then *suspends* on the unrecorded activity
+/// result. Canary replay reports that as `clean`. The run replayed faithfully up to
+/// its external seal, so there is no code divergence.
 #[tokio::test]
 async fn timed_out_run_sealed_mid_activity() {
     let (url, _c) = setup_database().await;
@@ -951,15 +945,16 @@ async fn timed_out_run_sealed_mid_activity() {
     assert!(body.get("divergence").is_none());
 }
 
-/// FIX 3 (sealed-mid-await terminal, multi-activity shape): a `TIMED_OUT` run whose
-/// recorded history is `WorkflowStarted + ActivityScheduled(a) +
-/// ActivityCompleted(a) + WorkflowExecutionTimedOut` — item 1 completed, then the
-/// run was sealed while awaiting item 2. On replay the workflow consumes item 1
-/// and issues the NEXT command (schedule item 2), which lands exactly on the
-/// external `WorkflowExecutionTimedOut` seal → a raw `diverged{actual:
-/// "WorkflowExecutionTimedOut"}`. The handler's `reclassify_sealed_mid_await`
-/// rewrites this false positive to `clean` (terminal state + seal reached +
-/// external-seal actual). Proves the reclassification wiring fires end-to-end.
+/// FIX 3 (sealed-mid-await, multi-activity shape): a `TIMED_OUT` run is `clean`.
+///
+/// The history is `WorkflowStarted + ActivityScheduled(a) + ActivityCompleted(a) +
+/// WorkflowExecutionTimedOut`. Item 1 completed, then the run was sealed while it
+/// awaited item 2. On replay, the workflow consumes item 1 and schedules item 2.
+/// That command lands on the external seal, a raw
+/// `diverged{actual: "WorkflowExecutionTimedOut"}`. The handler's
+/// `reclassify_sealed_mid_await` rewrites this false positive to `clean` (terminal
+/// state + seal reached + external-seal actual). The test proves that wiring end to
+/// end.
 #[tokio::test]
 async fn timed_out_run_sealed_awaiting_second_activity_is_clean() {
     let (url, _c) = setup_database().await;
@@ -1001,18 +996,16 @@ async fn timed_out_run_sealed_awaiting_second_activity_is_clean() {
     assert!(body.get("divergence").is_none(), "reclassified to clean");
 }
 
-/// PR #1107 (Codex review): the diagnosis replay must thread the runtime
+/// PR #1107: the diagnosis replay must thread the runtime
 /// registry's shared state into `WorkflowReplayer`, exactly as the live worker
 /// replays with `registry.shared_state()`. `state_reading_wf` reads
 /// `ctx.state::<DiagConfig>()` and completes cleanly only when that state is
 /// present; its recorded history is a clean `WorkflowStarted + WorkflowCompleted`.
 ///
-/// WITH the fix the diagnosis replayer receives the registry's `DiagConfig`, so
-/// `ctx.state` returns `Some` → the workflow completes matching history → `clean`.
-/// WITHOUT the fix the replayer defaults to `empty_shared_state()`, so
-/// `ctx.state` returns `None` → the workflow returns `Err` → a spurious
-/// `workflow_failed` verdict, and this assertion fails. It therefore fails
-/// against the pre-fix code and passes against the fix.
+/// With the fix, the replayer gets the `DiagConfig` of the registry, so `ctx.state`
+/// returns `Some` and the workflow matches history (`clean`). Without the fix, the
+/// replayer defaults to `empty_shared_state()`. Then `ctx.state` returns `None`, the
+/// workflow returns `Err`, and the spurious `workflow_failed` verdict fails this test.
 #[tokio::test]
 async fn state_registering_workflow_diagnoses_clean_with_registry_shared_state() {
     let (url, _c) = setup_database().await;
@@ -1050,12 +1043,11 @@ async fn state_registering_workflow_diagnoses_clean_with_registry_shared_state()
 /// `checkpoint` branch. A faithful diagnosis replay under the SAME policy trips
 /// the trigger and schedules `checkpoint`, matching history → `clean`.
 ///
-/// WITHOUT the fix the replayer defaults to `WorkflowHistoryPolicy::default()`
-/// (a large threshold the 4-event history never exceeds), so
-/// `should_continue_as_new()` returns `false` → the workflow schedules
-/// `keep_going` → the replay diverges from the recorded `checkpoint` at event
-/// index 1 → a spurious `diverged` verdict, and this assertion fails. It
-/// therefore fails against the pre-fix code and passes against the fix.
+/// Without the fix, the replayer defaults to `WorkflowHistoryPolicy::default()`.
+/// The 4-event history never exceeds its large threshold, so
+/// `should_continue_as_new()` returns `false`. The workflow schedules `keep_going`
+/// and diverges from `checkpoint` at event index 1. That spurious `diverged`
+/// verdict fails this test.
 #[tokio::test]
 async fn policy_branching_workflow_diagnoses_clean_with_registry_history_policy() {
     let (url, _c) = setup_database().await;
@@ -1103,22 +1095,22 @@ async fn policy_branching_workflow_diagnoses_clean_with_registry_history_policy(
     assert!(body.get("failure").is_none(), "clean has no failure");
 }
 
-// ─── Issue #608 read-path decode gate (PR #1107 Codex review, finding #5) ─────
+// ─── Issue #608 read-path decode gate (PR #1107, finding #5) ──────────────────
 //
-// The merged endpoint decoded history with the runtime's codecs UNCONDITIONALLY,
-// so on a non-identity-codec deployment it (a) decoded encrypted payloads even
-// with the operator's read-path decode gate OFF (surfacing plaintext via
-// failure/divergence fields) and (b) wrote no `payload.decode_read` audit row.
-// The fix gates the codec decode behind `read_path_decoder`
-// (`decode_payloads_on_read` + admin) and audits when it decodes. These tests
-// exercise a genuine non-identity codec + both decode-flag states. Identity
-// deployments (all the tests above) hit the decode-OFF identity-load branch and
-// are byte-identical to the merged behavior — confirmed by their unchanged pass.
+// The merged endpoint always decoded history with the codecs of the runtime. On a
+// non-identity-codec deployment, it decoded encrypted payloads even with the
+// read-path decode gate OFF. That surfaced plaintext via failure and divergence
+// fields. It also wrote no `payload.decode_read` audit row. The fix gates the decode behind
+// `read_path_decoder` (`decode_payloads_on_read` + admin) and audits each decode.
+// These tests use a real non-identity codec and both decode-flag states. Identity
+// deployments (the tests above) take the decode-OFF identity-load branch. That
+// branch is byte-identical to the merged behavior.
 
-/// A trivial invertible non-identity codec (byte reversal). Encoding a payload
-/// produces a `_harvest_codec_envelope` with `codec_id = "test-reverse"`, so a
-/// history seeded with it is only decodable by a `PayloadCodecs` that has this
-/// codec registered — the identity default hard-errors `UnknownPayloadCodec`.
+/// A trivial invertible non-identity codec (byte reversal).
+///
+/// It encodes a payload as a `_harvest_codec_envelope` with
+/// `codec_id = "test-reverse"`. Only a `PayloadCodecs` with this codec decodes such
+/// a history. The identity default hard-errors with `UnknownPayloadCodec`.
 #[derive(Clone, Copy)]
 struct ReverseCodec;
 
@@ -1237,15 +1229,15 @@ async fn count_decode_audit_rows(pool: &DbPool, exec_id: ExecutionId) -> i64 {
 #[tokio::test]
 async fn encrypted_history_decode_on_diagnoses_clean_and_writes_audit_row() {
     // Encrypted deployment + decode-on-read ENABLED (admin): the endpoint decodes
-    // the codec-encoded history exactly as the live worker does, so it replays
-    // clean, AND writes a `payload.decode_read` audit row (issue #608 AC8).
+    // the history as the live worker does, so it replays clean. It also writes a
+    // `payload.decode_read` audit row (issue #608 AC8).
     let (url, _c) = setup_database().await;
     let pool = build_pool(&url);
 
     let (input, mut events) = progress_history(&["a"], false);
-    // A real COMPLETED run seals its history; the seal-gate (issue #614) 410s a
-    // terminal execution truncated before its seal, so seed the realistic
-    // terminal history (encoded, like every other event).
+    // A real COMPLETED run seals its history. The seal-gate (issue #614) 410s a
+    // terminal execution truncated before its seal. So seed the realistic
+    // terminal history, encoded like every other event.
     events.push(WorkflowEvent::WorkflowCompleted {
         output: Value::Null,
     });
@@ -1277,17 +1269,17 @@ async fn encrypted_history_decode_on_diagnoses_clean_and_writes_audit_row() {
 #[tokio::test]
 async fn encrypted_history_decode_off_returns_honest_410_and_no_audit_row() {
     // Encrypted deployment + decode-on-read DISABLED (the default): the endpoint
-    // must NOT decode. It loads with the identity codec (no gate), which
-    // hard-errors on the reverse envelopes, and returns an HONEST 410 pointing at
-    // decode-on-read — never leaking ciphertext into a verdict, never 503-ing —
-    // and writes NO `payload.decode_read` audit row.
+    // must NOT decode. It loads with the identity codec, which hard-errors on the
+    // reverse envelopes. It returns an honest 410 that points at decode-on-read.
+    // It never leaks ciphertext into a verdict and never returns 503. It writes no
+    // `payload.decode_read` audit row.
     let (url, _c) = setup_database().await;
     let pool = build_pool(&url);
 
     let (input, mut events) = progress_history(&["a"], false);
-    // A real COMPLETED run seals its history; the seal-gate (issue #614) 410s a
-    // terminal execution truncated before its seal, so seed the realistic
-    // terminal history (encoded, like every other event).
+    // A real COMPLETED run seals its history. The seal-gate (issue #614) 410s a
+    // terminal execution truncated before its seal. So seed the realistic
+    // terminal history, encoded like every other event.
     events.push(WorkflowEvent::WorkflowCompleted {
         output: Value::Null,
     });

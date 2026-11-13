@@ -1,27 +1,26 @@
 //! Recursive cross-shard execution lineage tree (issue #621).
 //!
-//! When a saga or fan-out workflow spawns children that spawn grandchildren, a
-//! DLQ/stuck alert lands with a single execution id and no map of the family it
-//! belongs to. The only relationship primitive before this module was
-//! [`store::load_workflow_children`](autumn_harvest::store::load_workflow_children),
-//! which returns **direct** children from a **single shard** — doubly
-//! insufficient for triage, because a spawned child gets a fresh
-//! rendezvous-hashed [`ExecutionId`] and can land on a *different* shard than
-//! its parent.
+//! A saga or fan-out workflow can spawn children that spawn grandchildren.
+//! A DLQ/stuck alert then lands with a single execution id and no map of the
+//! family. Before this module, the only relationship primitive was
+//! [`store::load_workflow_children`](autumn_harvest::store::load_workflow_children).
+//! It returns **direct** children from a **single shard**. That is doubly
+//! insufficient for triage: a spawned child gets a fresh rendezvous-hashed
+//! [`ExecutionId`] and can land on a *different* shard than its parent.
 //!
 //! This module owns the **pure** half of the answer: a bounded, cycle-safe
 //! frontier walk ([`LineageWalk`]) plus the nesting/summarisation of its result.
 //! The async cross-shard fan-out that feeds it lives in
-//! [`crate::api::build_lineage_report`], which drives the walk level by level
+//! [`crate::api::build_lineage_report`]. It drives the walk level by level
 //! over [`iter_shards`](crate::state::HarvestDbPool::iter_shards).
 //!
 //! ## Why the walk is a state machine rather than a recursive `async fn`
 //!
-//! Splitting "decide what to admit" from "go fetch it" keeps every bound —
-//! node budget, depth cap, cycle rejection, deterministic truncation order —
-//! unit-testable without a database, and keeps the DB layer to two batched
-//! queries per level (`parent_id = ANY($1)` plus one existence probe) instead
-//! of one query per parent per shard.
+//! Splitting "decide what to admit" from "go fetch it" keeps every bound
+//! unit-testable without a database. The bounds are node budget, depth cap,
+//! cycle rejection and deterministic truncation order. The split also keeps
+//! the DB layer to two batched queries per level (`parent_id = ANY($1)` plus
+//! one existence probe), not one query per parent per shard.
 //!
 //! ## Bounds
 //!
@@ -30,16 +29,15 @@
 //!   **including the root**.
 //!
 //! Hitting either sets `truncated: true` with a machine-readable
-//! [`TruncationReason`] — never a silent cap — and names the parents whose
-//! subtrees were dropped so an operator can re-root the call there and
-//! continue.
+//! [`TruncationReason`], never a silent cap. The report names the parents
+//! whose subtrees were dropped, so an operator can re-root the call there.
 //!
 //! ## Consistency
 //!
 //! Shards are read independently, so a tree may be marginally time-skewed
-//! across shards (a child on shard B may be observed a few milliseconds after
-//! its parent on shard A). That is acceptable for incident triage and is
-//! documented on the endpoint; there is no cross-shard transaction.
+//! across shards. A child on shard B may be observed a few milliseconds after
+//! its parent on shard A. That is acceptable for incident triage and is
+//! documented on the endpoint. There is no cross-shard transaction.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
@@ -105,8 +103,8 @@ impl LineageLimits {
     /// Validate caller-supplied bounds, falling back to the documented
     /// defaults when absent.
     ///
-    /// Out-of-range values are **rejected**, not clamped: the response echoes
-    /// the `limits` it applied, and silently clamping would make that echo lie
+    /// Out-of-range values are **rejected**, not clamped. The response echoes
+    /// the `limits` it applied, and a silent clamp would make that echo lie
     /// about what the operator asked for.
     ///
     /// # Errors
@@ -176,9 +174,10 @@ pub struct LineageNode {
     pub children: Vec<Self>,
 }
 
-/// Compact root identity echoed by the `?summary=true` response, so a
-/// summary caller still knows *whose* roll-up this is (and the root's own
-/// state, which the descendant counts deliberately exclude).
+/// Compact root identity echoed by the `?summary=true` response.
+///
+/// A summary caller still knows *whose* roll-up this is. It also gets the
+/// root's own state, which the descendant counts exclude.
 #[derive(Debug, Clone, Serialize)]
 pub struct LineageRootRef {
     /// The root execution's id.
@@ -208,10 +207,10 @@ pub struct LineageTreeReport {
     /// Execution ids of nodes in the returned tree whose child subtrees were
     /// dropped. Re-root the call at one of these to continue the walk.
     ///
-    /// Every id listed **provably** has children (either observed and dropped
-    /// for budget, or confirmed by the existence probe) — a childless leaf is
-    /// never named, so an operator is never sent chasing a subtree that does
-    /// not exist. On a `max_nodes` truncation the list may be *incomplete*: a
+    /// Every id listed **provably** has children: observed and dropped for
+    /// budget, or confirmed by the existence probe. A childless leaf is never
+    /// named, so an operator never chases a subtree that does not exist.
+    /// On a `max_nodes` truncation the list may be *incomplete*: a
     /// parent whose children all fell beyond the per-shard fetch window is not
     /// observed. `truncated` is the authoritative "this tree is incomplete"
     /// signal; this list is the actionable, bounded subset.
@@ -227,15 +226,16 @@ pub struct LineageTreeReport {
     /// Shards that could not be read, named with a reason. Empty when
     /// `status == complete`.
     pub unavailable_shards: Vec<UnavailableShard>,
-    /// Execution ids of nodes in the returned tree that have at least one child
-    /// **demoted into a retention summary** (issue #752) and therefore omitted
-    /// from the tree, along with anything beneath it.
+    /// Execution ids of tree nodes with a child **demoted into a retention
+    /// summary** (issue #752).
+    ///
+    /// The tree omits that child and anything beneath it.
     ///
     /// Empty on the default configuration: tiered summary retention is opt-in,
     /// and with it off there are no summary rows to omit. When it is on, a
-    /// terminal child can be collected independently of its still-live parent,
-    /// so `truncated == false` and `status == complete` alone do NOT mean every
-    /// descendant is present — check this list too. The demoted rows remain
+    /// terminal child can be collected independently of its still-live parent.
+    /// So `truncated == false` and `status == complete` alone do NOT mean every
+    /// descendant is present. Check this list too. The demoted rows remain
     /// readable via `GET /workflows/summaries`.
     ///
     /// Only the *nearest live ancestor* of omitted lineage is named; a summary
@@ -273,15 +273,16 @@ pub struct LineageSummaryReport {
     pub status: FanoutStatus,
     /// Shards that could not be read.
     pub unavailable_shards: Vec<UnavailableShard>,
-    /// Execution ids of nodes in the returned tree that have at least one child
-    /// **demoted into a retention summary** (issue #752) and therefore omitted
-    /// from the tree, along with anything beneath it.
+    /// Execution ids of tree nodes with a child **demoted into a retention
+    /// summary** (issue #752).
+    ///
+    /// The tree omits that child and anything beneath it.
     ///
     /// Empty on the default configuration: tiered summary retention is opt-in,
     /// and with it off there are no summary rows to omit. When it is on, a
-    /// terminal child can be collected independently of its still-live parent,
-    /// so `truncated == false` and `status == complete` alone do NOT mean every
-    /// descendant is present — check this list too. The demoted rows remain
+    /// terminal child can be collected independently of its still-live parent.
+    /// So `truncated == false` and `status == complete` alone do NOT mean every
+    /// descendant is present. Check this list too. The demoted rows remain
     /// readable via `GET /workflows/summaries`.
     ///
     /// Only the *nearest live ancestor* of omitted lineage is named; a summary
@@ -289,9 +290,10 @@ pub struct LineageSummaryReport {
     pub retained_summary_parent_ids: Vec<String>,
 }
 
-/// Project a lineage row into the tree's **root** node: depth `0`, no children
-/// yet, and its own `parent_id` preserved so a mid-tree re-root is visible as
-/// such.
+/// Project a lineage row into the tree's **root** node.
+///
+/// The node has depth `0` and no children yet. It keeps its own `parent_id`,
+/// so a mid-tree re-root is visible as such.
 #[must_use]
 pub fn lineage_root_node(row: &LineageChildRow) -> LineageNode {
     LineageNode {
@@ -340,10 +342,11 @@ pub fn root_row_from_execution(execution: &WorkflowExecution) -> LineageChildRow
 
 /// Bounded, cycle-safe frontier walk over `parent_id` edges.
 ///
-/// The caller drives it level by level: fetch the current frontier's children
-/// (across shards), hand them to [`admit_level`](Self::admit_level), and repeat
-/// with the returned next frontier until it is empty, the depth cap is reached,
-/// or [`is_exhausted`](Self::is_exhausted) reports the node budget is spent.
+/// The caller drives it level by level. Fetch the current frontier's children
+/// across shards and hand them to [`admit_level`](Self::admit_level). Repeat
+/// with the returned next frontier until it is empty or the depth cap is
+/// reached. Also stop when [`is_exhausted`](Self::is_exhausted) reports that
+/// the node budget is spent.
 /// Then probe that final, unexpanded frontier for surviving children, feed the
 /// answer to [`record_probe_result`](Self::record_probe_result), and
 /// [`finish`](Self::finish).
@@ -356,9 +359,9 @@ pub struct LineageWalk {
     root_id: uuid::Uuid,
     /// Every id ever *seen* (root included). This is the cycle/duplicate
     /// guard: an id is considered at most once, so a malformed `parent_id`
-    /// loop terminates instead of recursing forever. Note this is a superset
-    /// of the returned tree — a budget-rejected row stays marked here — so it
-    /// must not be used to enumerate the response's nodes.
+    /// loop terminates instead of recursing forever. It is a superset of the
+    /// returned tree, because a budget-rejected row stays marked here. Do not
+    /// use it to enumerate the response's nodes.
     visited: HashSet<uuid::Uuid>,
     /// Admitted descendant rows, in admission order.
     nodes: Vec<LineageChildRow>,
@@ -381,8 +384,7 @@ impl LineageWalk {
     /// walk's hard *ceiling* -- an operator-accepted request can set it as
     /// high as `LINEAGE_MAX_NODES_CEILING`. It is not a prediction of this
     /// walk's actual size, and most triage calls target a small or leaf
-    /// family. An earlier cut of this fix reserved the ceiling up front
-    /// here (Codex review on the PR that introduced it). That would make
+    /// family. A reservation of the whole ceiling up front here would make
     /// every sparse walk pay for the rare wide one. Both collections
     /// instead grow incrementally, right-sized per level, in
     /// [`admit_level`](Self::admit_level).
@@ -440,10 +442,10 @@ impl LineageWalk {
 
     /// Admit one level's discovered rows and return the next frontier.
     ///
-    /// Rows arrive per-shard and are therefore re-sorted `(started_at,
-    /// exec_id)` before any budget cut: which rows survive a truncation must
-    /// not depend on shard iteration order, or the tree an operator sees would
-    /// vary between identical calls.
+    /// Rows arrive per-shard, so they are re-sorted `(started_at, exec_id)`
+    /// before any budget cut. Otherwise the rows that survive a truncation
+    /// depend on shard iteration order, and identical calls return different
+    /// trees.
     pub fn admit_level(&mut self, depth: u8, mut rows: Vec<LineageChildRow>) -> Vec<uuid::Uuid> {
         rows.sort_by(|a, b| {
             a.started_at
@@ -455,9 +457,8 @@ impl LineageWalk {
         // duplicate or a budget-rejected one is inserted there. So
         // `rows.len()` bounds how much `visited` can grow this call. Sizing
         // from this level's own batch is deliberate, not from
-        // `limits.max_nodes`. An earlier cut of this fix reserved the
-        // walk's whole ceiling up front instead. That would make a sparse
-        // walk pay for the rare wide one (Codex review).
+        // `limits.max_nodes`. A reservation of the walk's whole ceiling up
+        // front would make a sparse walk pay for the rare wide one.
         self.visited.reserve(rows.len());
 
         // `next` only grows for rows actually admitted, which can never
@@ -466,7 +467,7 @@ impl LineageWalk {
         // `remaining_budget + 1` rows per shard into one `rows` batch. The
         // fetch-window sentinel `note_saturated_fetch_window` documents
         // this. So `rows.len()` alone can run well past what this call
-        // could ever admit (Codex review). `next` is fresh every call,
+        // could ever admit. `next` is fresh every call,
         // never reused across levels. So a single `with_capacity` here
         // costs one allocation for its whole lifetime, no regrowth.
         //
@@ -476,9 +477,8 @@ impl LineageWalk {
         // here interacts badly with `Vec`'s amortized doubling. Each level
         // that must grow jumps to double *whatever `self.nodes`' capacity
         // already was*, not to this level's own small top-up. Those jumps
-        // do not line up with the walk's real total. This was measured
-        // directly (Codex review, backed by this page's own dhat
-        // artifacts). On this harness's 9-level, 999-row shape, reserving
+        // do not line up with the walk's real total. The dhat artifacts of
+        // this page measure it. On this harness's 9-level, 999-row shape, reserving
         // `self.nodes` per level left it at capacity 1776 for 999 rows
         // (23,398,800 bytes at this allocation site). Plain `push`-driven
         // growth's capacity 1024 (13,899,200 bytes) does better. That is a
@@ -499,11 +499,11 @@ impl LineageWalk {
                 // Over budget: keep scanning (rather than breaking) so every
                 // observed dropped parent is named, not just the first.
                 //
-                // The id stays in `visited`. Exhaustion is monotone — once
-                // `is_exhausted()` is true it never becomes false again — so
-                // no admission can follow a rejection, and leaving the id
-                // marked keeps a duplicate of a rejected row from being
-                // admitted if that invariant is ever relaxed.
+                // The id stays in `visited`. Exhaustion is monotone: once
+                // `is_exhausted()` is true, it never becomes false again.
+                // So no admission can follow a rejection. The marked id still
+                // keeps a duplicate of a rejected row out if that invariant
+                // is ever relaxed.
                 self.reason.get_or_insert(TruncationReason::MaxNodes);
                 if let Some(parent) = row.parent_id {
                     self.dropped_parents.insert(parent.as_uuid());
@@ -526,11 +526,11 @@ impl LineageWalk {
     /// childless leaf is never reported as truncated. An empty result is the
     /// signal that the walk genuinely finished — it must not truncate.
     ///
-    /// Which bound to blame is decided by the live budget rather than assumed
-    /// to be the depth cap: a level can spend the budget *exactly* (no row is
-    /// ever rejected, so `admit_level` never sets a reason) and still be what
-    /// stopped the walk. Blaming `max_depth` there would send an operator to
-    /// raise a bound that was nowhere near its limit.
+    /// The live budget decides which bound to blame; it is not assumed to be
+    /// the depth cap. A level can spend the budget *exactly* and still be what
+    /// stopped the walk. No row is rejected then, so `admit_level` sets no
+    /// reason. Blaming `max_depth` there would send an operator to raise a
+    /// bound that was nowhere near its limit.
     pub fn record_probe_result(&mut self, parents_with_children: &[uuid::Uuid]) {
         if parents_with_children.is_empty() {
             return;
@@ -550,9 +550,9 @@ impl LineageWalk {
     /// Record nodes whose children were demoted into retention summaries
     /// (issue #752) and are therefore absent from the tree.
     ///
-    /// Deliberately **not** a truncation: no bound was hit and re-rooting the
-    /// walk at one of these ids would not surface the omitted rows (they are
-    /// not in `harvest_workflow_executions` at all). It is a separate, additive
+    /// Deliberately **not** a truncation: no bound was hit. Re-rooting the walk
+    /// at one of these ids would not surface the omitted rows, because they
+    /// are not in `harvest_workflow_executions` at all. It is a separate, additive
     /// incompleteness signal so the response cannot imply a completeness it
     /// does not have.
     pub fn record_retained_summary_parents(&mut self, parents: &[uuid::Uuid]) {
@@ -560,15 +560,16 @@ impl LineageWalk {
             .extend(parents.iter().copied());
     }
 
-    /// Ids present in the returned tree (root included) — the probe input for
-    /// retained summary children, which can hang off *any* node in the tree,
-    /// not just an unexpanded leaf.
+    /// Ids present in the returned tree, root included.
+    ///
+    /// They are the probe input for retained summary children, which can hang
+    /// off *any* node in the tree, not just an unexpanded leaf.
     ///
     /// Derived from `root_id` + [`nodes`](Self::nodes), i.e. exactly what
     /// [`finish`](Self::finish) assembles into the response, and deliberately
     /// **not** from `visited`. `visited` is the cycle/duplicate guard and is a
-    /// strict superset: `admit_level` inserts an id there *before* the budget
-    /// check and leaves a budget-rejected id in place on purpose. Probing that
+    /// strict superset. `admit_level` inserts an id there *before* the budget
+    /// check, and it leaves a budget-rejected id in place on purpose. Probing that
     /// superset would let `retained_summary_parent_ids` name a node the caller
     /// cannot find in the tree it was handed, breaking the field's contract.
     #[must_use]
@@ -582,13 +583,12 @@ impl LineageWalk {
     /// Note that a shard's fetch window came back full.
     ///
     /// `fetch_limit` is `remaining_budget + 1` precisely so an overflow row is
-    /// *observed* and its parent named. That sentinel is defeated when a row
-    /// in the window is dropped by the cycle/duplicate guard, which consumes a
-    /// slot without consuming budget — the SQL `LIMIT` may then have cut real
-    /// rows that were never seen. A saturated window with no budget rejection
-    /// is therefore reported as a `MaxNodes` truncation: over-reporting sends
-    /// an operator to re-root needlessly, while under-reporting is the silent
-    /// cap the bounds exist to prevent.
+    /// *observed* and its parent named. The cycle/duplicate guard defeats that
+    /// sentinel when it drops a row in the window. That row consumes a slot
+    /// without consuming budget, so the SQL `LIMIT` may have cut real rows that
+    /// were never seen. So a saturated window with no budget rejection is a
+    /// `MaxNodes` truncation. Over-reporting sends an operator to re-root
+    /// needlessly. Under-reporting is the silent cap the bounds exist to prevent.
     pub fn note_saturated_fetch_window(&mut self) {
         self.reason.get_or_insert(TruncationReason::MaxNodes);
     }
@@ -621,14 +621,14 @@ impl LineageWalk {
         // That bound can be extremely loose, though. A broad, shallow tree
         // has many children directly under one parent -- exactly the wide
         // fan-out shape this endpoint exists for. Such a tree has
-        // `self.nodes.len()` rows and as few as one distinct parent. An
-        // earlier cut of this fix reserved `self.nodes.len()` here. That
-        // traded a real growth-step cost this walk's dominant shape rarely
-        // pays for a worst-case over-allocation it always would (Codex
-        // review). Unlike `nodes`, `next` and `node.children` below, there
-        // is no cheap tight bound on the real distinct-parent count without
-        // a second pass over `self.nodes`. That pass would itself hash
-        // every row's parent id, undoing the saving it exists to buy.
+        // `self.nodes.len()` rows and as few as one distinct parent. A
+        // reservation of `self.nodes.len()` here trades a growth-step cost
+        // that the dominant shape rarely pays for a worst-case
+        // over-allocation that it always pays. Unlike `nodes`, `next` and
+        // `node.children` below, there is no cheap tight bound on the real
+        // distinct-parent count without a second pass over `self.nodes`. That
+        // pass would itself hash every row's parent id, undoing the saving it
+        // exists to buy.
         let mut by_parent: HashMap<uuid::Uuid, Vec<LineageChildRow>> = HashMap::new();
         for row in self.nodes {
             if let Some(parent) = row.parent_id {
@@ -710,10 +710,10 @@ fn attach_children(
 impl LineageTreeReport {
     /// Collapse the tree into a per-state descendant roll-up.
     ///
-    /// The root is deliberately excluded from `counts` (they are *descendant*
-    /// counts) and echoed separately on `root`, so "does anything under here
-    /// look bad?" is answerable without reasoning about whether the node you
-    /// already know about is included.
+    /// The root is deliberately excluded from `counts`, which are *descendant*
+    /// counts. It is echoed separately on `root`. So a caller can answer "does
+    /// anything under here look bad?" without asking whether the known node
+    /// is included.
     #[must_use]
     pub fn into_summary(self) -> LineageSummaryReport {
         let mut counts: BTreeMap<String, i64> = KNOWN_WORKFLOW_STATES
@@ -879,7 +879,7 @@ mod tests {
     fn a_saturated_fetch_window_is_reported_as_a_budget_truncation() {
         // The `remaining + 1` fetch sentinel assumes the overflow row reaches
         // the budget check. A row dropped by the cycle/duplicate guard
-        // consumes a window slot WITHOUT consuming budget, so the SQL LIMIT
+        // consumes a window slot WITHOUT consuming budget. So the SQL LIMIT
         // may have cut real rows that were never observed. Over-reporting is
         // the safe direction; a silent cap is the one the bounds forbid.
         let root = id(1);
@@ -940,10 +940,10 @@ mod tests {
 
     #[test]
     fn admit_level_sorts_by_started_at_not_by_execution_id() {
-        // Ids are DECORRELATED from timestamps here on purpose: real
-        // execution ids are random, so a fixture where uuid order happens to
-        // match `started_at` order cannot tell a correct sort from one keyed
-        // on the id. `started_at` must win.
+        // Ids are DECORRELATED from timestamps here on purpose, because real
+        // execution ids are random. If uuid order matched `started_at` order,
+        // the fixture could not tell a correct sort from one keyed on the id.
+        // `started_at` must win.
         let root = id(1);
         let mut walk = LineageWalk::new(root, generous());
         let next = walk.admit_level(
@@ -985,7 +985,7 @@ mod tests {
     #[test]
     fn admit_level_sorts_cross_shard_rows_deterministically() {
         // Rows arrive per-shard, so the merged level must be re-sorted before
-        // any node-budget cut — otherwise which rows survive truncation would
+        // any node-budget cut. Otherwise the rows that survive truncation
         // depend on shard iteration order.
         let root = id(1);
         let mut walk = LineageWalk::new(root, generous());
@@ -1008,13 +1008,12 @@ mod tests {
 
     #[test]
     fn admitted_ids_excludes_budget_rejected_rows() {
-        // `visited` is the cycle/duplicate guard, and `admit_level`
-        // deliberately LEAVES a budget-rejected id in it (so a duplicate of a
-        // rejected row can never be admitted later). It is therefore a
-        // superset of the returned tree. `admitted_ids` feeds the retained
-        // summary probe, whose output names nodes an operator is told to look
-        // up *in the tree* — so sourcing it from `visited` would emit an id
-        // that cannot be found there.
+        // `visited` is the cycle/duplicate guard. `admit_level` deliberately
+        // LEAVES a budget-rejected id in it, so a duplicate of a rejected row
+        // can never be admitted later. It is therefore a superset of the
+        // returned tree. `admitted_ids` feeds the retained summary probe. Its
+        // output names nodes that an operator looks up *in the tree*. So an
+        // id sourced from `visited` might not be found there.
         let root = id(1);
         let mut walk = LineageWalk::new(
             root,

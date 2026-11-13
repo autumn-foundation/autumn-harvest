@@ -4,18 +4,17 @@
 //! sends a real evaluator down a dead end. This test keeps three promises
 //! mechanically rather than by review discipline alone:
 //!
-//! 1. the guide and its worked example both exist, and the guide covers the
-//!    required ground — every required section, and at least 25
-//!    concept-mapping table rows (issue #947 AC1's literal minimum);
-//! 2. every `#NNN` issue citation inside the guide actually appears in
-//!    `docs/shipped-work.md` — the repository's own record of what has shipped — so a
-//!    claim can never cite a number nobody can verify (issue #947 AC1's
-//!    "verifiable in under a minute" bar, and the "no unshipped capability
-//!    presented as shipped" bar);
-//! 3. the guide is linked from every place a reader would look for it:
-//!    `README.md`, `docs/getting-started/README.md`, and — completing the
-//!    forward reference `docs/comparison.md` shipped with a `_planned_`
-//!    placeholder — `docs/comparison.md` itself (issue #947 AC5).
+//! 1. The guide and its worked example both exist. The guide has every
+//!    required section and at least 25 concept-mapping table rows (the
+//!    literal minimum of issue #947 AC1).
+//! 2. Every `#NNN` issue citation in the guide appears in
+//!    `docs/shipped-work.md`, the record of what has shipped. So no claim
+//!    cites a number that nobody can verify. This is the "verifiable in under
+//!    a minute" bar of issue #947 AC1, and the "no unshipped capability
+//!    presented as shipped" bar.
+//! 3. The guide is linked from every place a reader would look for it:
+//!    `README.md`, `docs/getting-started/README.md` and `docs/comparison.md`
+//!    (issue #947 AC5). The last one replaces a `_planned_` placeholder.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -44,11 +43,11 @@ const REQUIRED_SECTIONS: &[&str] = &[
     "## Related",
 ];
 
-/// One literal substring per named primitive the guide must cover. This is
-/// a *coverage* check (each of these must be mentioned), not a row-count
-/// check — the row count is verified separately by
-/// `concept_mapping_table_has_at_least_25_rows` against the actual markdown
-/// table structure, so the two checks cannot silently drift apart.
+/// One literal substring per named primitive the guide must cover.
+///
+/// This is a *coverage* check, not a row-count check.
+/// `concept_mapping_table_has_at_least_25_rows` counts rows against the real
+/// table structure. So the two checks cannot silently drift apart.
 const REQUIRED_CONCEPTS: &[&str] = &[
     "`#[workflow]`",
     "`#[activity]`",
@@ -153,10 +152,10 @@ fn guide_covers_every_required_concept() {
 }
 
 /// AC1's literal bar: "a concept-mapping table ... covering at minimum
-/// workflows/activities, signals, ... (25+ items)". Counts actual markdown
-/// table data rows inside the `## Concept mapping` section (from that
-/// heading to the next `## ` heading), excluding header and separator rows
-/// from each of the per-category sub-tables.
+/// workflows/activities, signals, ... (25+ items)".
+///
+/// Counts table data rows from the `## Concept mapping` heading to the next
+/// `## ` heading. Header and separator rows of each sub-table do not count.
 #[test]
 fn concept_mapping_table_has_at_least_25_rows() {
     let guide = read_doc(GUIDE_PATH);
@@ -277,7 +276,7 @@ fn comparison_page_links_back_to_the_migration_guide() {
 /// to harvest's own schedule pause and catchup primitives rather than leave
 /// them to guess.
 ///
-/// Five PR reviews (Codex, all P1) found real defects here. The first said
+/// Five PR reviews found real defects here. The first said
 /// Temporal exposes a per-firing list an operator can inspect and accept or
 /// reject; it does not. The second said harvest's `CatchupPolicy::SkipAll`
 /// suppresses an entire missed interval; it does not, it fires the oldest
@@ -457,11 +456,10 @@ fn dual_run_playbook_covers_schedule_driven_capture_and_reconciliation() {
 /// hosts it right now. It must never route by the current flag value, or
 /// by a fact fixed at start time.
 ///
-/// Six PR reviews (Codex, five P1 and one P2) found real gaps here across
-/// five successive attempts at this rule. A persisted "record at start
-/// time" cannot cover a schedule-driven execution, or one that predates
-/// the record. Comparing a start time to a cutover timestamp fails when a
-/// Temporal slot fires late.
+/// Six PR reviews found real gaps here across five successive attempts at
+/// this rule. A persisted "record at start time" cannot cover a
+/// schedule-driven execution, or one that predates the record. Comparing a
+/// start time to a cutover timestamp fails when a Temporal slot fires late.
 ///
 /// A live "query harvest, active beats terminal" resolution fixes both
 /// of those. It creates a new gap, though. It misroutes an ordinary
@@ -779,10 +777,10 @@ fn ci_workflow_exercises_the_worked_example() {
 }
 
 /// The guide embeds the harvest side of the worked example as a Rust code
-/// fence, next to the Temporal TypeScript original, so a reader can compare
-/// the two without leaving the page. A copy that drifts from the real,
-/// compiling file is worse than no copy at all -- it teaches the wrong
-/// thing. Keep the embedded snippet byte-identical to the source of truth.
+/// fence, next to the Temporal TypeScript original.
+///
+/// A copy that drifts from the real, compiling file teaches the wrong thing.
+/// Keep the embedded snippet byte-identical to the source of truth.
 #[test]
 fn worked_example_code_block_matches_the_real_file() {
     let guide = read_doc(GUIDE_PATH);
@@ -818,26 +816,25 @@ fn worked_example_code_block_matches_the_real_file() {
     );
 }
 
-/// `.github/workflows/ci.yml` skips its `test` job's steps entirely on a
-/// docs-only PR (every step there is gated on `changes.outputs.code ==
-/// 'true'`), and a PR touching only `docs/migrating-from-temporal.md` is
-/// exactly a docs-only PR. Without a step outside that gate, these guards
-/// -- the ones enforcing every promise this module makes -- would never
-/// execute on the change class most likely to break them: a stale link, a
-/// drifted citation, an edited worked-example snippet.
+/// The guards of this module must run in the ungated `lint` job.
+///
+/// `.github/workflows/ci.yml` gates every `test` step on
+/// `changes.outputs.code == 'true'`, so it skips them on a docs-only PR. A PR
+/// that touches only `docs/migrating-from-temporal.md` is docs-only. With no
+/// step outside that gate, these guards never run on the changes most likely
+/// to break them. Examples are a stale link, a drifted citation or an edited
+/// snippet.
 ///
 /// `docs/performance.md` and `docs/rnd/sqlite-feasibility.md` hit this same
 /// gap before this module existed and fixed it the same way: a dedicated
-/// step in the ungated `lint` job. This asserts that step exists for this
-/// module too, lives in `lint` (not the gated `test` matrix), and has not
-/// grown an `if:` condition that would put it back behind the same gate.
+/// step in the ungated `lint` job. This test asserts that the step exists,
+/// lives in `lint` (not the gated `test` matrix) and has no `if:` condition.
 #[test]
 fn guards_run_on_docs_only_changes() {
     let workflow = read_normalized(&workspace_path(".github/workflows/ci.yml"));
 
-    // The step must exist, and must name this module as its filter -- a step
-    // that ran some *other* test would satisfy a looser check while leaving
-    // these guards just as unexecuted.
+    // The step must name this module as its filter. A step that ran some
+    // *other* test would pass a looser check and still skip these guards.
     let step = workflow
         .lines()
         .find(|line| line.contains("--test integration migrating_from_temporal_docs::"))
@@ -900,12 +897,12 @@ fn flatten_whitespace(text: &str) -> String {
 ///
 /// Every needle search in this module -- markdown headers, code-fence
 /// markers, table separators, workflow-file structural boundaries such as
-/// `"\n  lint:"` -- is anchored on `\n`. A Windows checkout hands
-/// `fs::read_to_string` `\r\n` line endings by default, so each needle
-/// silently misses and a test fails with a panic that has nothing to do
-/// with the file's actual contents. Normalising once here (`read_doc`
-/// delegates to this too) keeps every needle search platform-agnostic
-/// rather than spreading `\r?` handling across each one.
+/// `"\n  lint:"` -- is anchored on `\n`. A Windows checkout gives
+/// `fs::read_to_string` `\r\n` line endings by default. Each needle then
+/// misses, and a test panics for a reason unrelated to the file contents.
+/// Normalising once here (`read_doc` delegates to this too) keeps every
+/// needle search platform-agnostic rather than spreading `\r?` handling across
+/// each one.
 fn read_normalized(path: &Path) -> String {
     fs::read_to_string(path)
         .unwrap_or_else(|error| panic!("read {}: {error}", path.display()))

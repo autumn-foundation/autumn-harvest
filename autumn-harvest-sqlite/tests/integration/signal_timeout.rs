@@ -1,19 +1,17 @@
 //! Regression tests for the signal-or-deadline wait (`wait_for_signal_timeout` /
-//! `receive_signal_timeout`, issue #476) on the single-writer backend — Codex
-//! #1069 P2.
+//! `receive_signal_timeout`, issue #476) on the single-writer backend (issue
+//! #1069).
 //!
 //! When such a race's **signal wins**, the determinism core pushes a
 //! `WorkflowCommand::CancelRaceLosers { timers: [<deadline timer>], .. }` to tear
-//! down the still-armed deadline timer. Before the fix, both the suspending-batch
-//! path (`apply_commands`) and the terminal drain
-//! (`persist_terminal_pending_commands`) treated that command as
-//! `Unsupported("Unknown")`, so after `SignalReceived` had already been committed
-//! the next cycle errored and the execution could never complete — wedging every
-//! normal pull-style signal workflow that adds a timeout.
+//! down the still-armed deadline timer. The suspending-batch path
+//! (`apply_commands`) and the terminal drain (`persist_terminal_pending_commands`)
+//! once treated that command as `Unsupported("Unknown")`. After the commit of
+//! `SignalReceived`, the next cycle errored and the execution never completed. That
+//! wedged every normal pull-style signal workflow with a timeout.
 //!
-//! These tests drive the runtime with the injected `*_as_of` clock seam so the
-//! signal-wins and deadline-wins branches are exercised deterministically without
-//! sleeping.
+//! These tests drive the runtime with the injected `*_as_of` clock seam. So the
+//! signal-wins and deadline-wins branches run deterministically without sleeping.
 
 // The `#[workflow]` macro references the workflow's input parameter, so a
 // deliberately-unused param reads as a "used underscore binding" through the
@@ -95,9 +93,9 @@ async fn wait_for_signal_timeout_signal_wins_completes_and_deletes_deadline_time
     // Deliver the signal BEFORE the deadline.
     rt.send_signal(exec, "approval", json!("alice")).unwrap();
 
-    // Drive again, still before the deadline. The signal wins; the core pushes
-    // `CancelRaceLosers` to delete the losing deadline timer and the workflow
-    // COMPLETES. Pre-fix this `.unwrap()` panicked on
+    // Drive again, still before the deadline. The signal wins. The core pushes
+    // `CancelRaceLosers` to delete the losing deadline timer, and the workflow
+    // COMPLETES. With the bug, this `.unwrap()` panicked on
     // `Err(Unsupported("Unknown"))` from the terminal drain.
     let state = rt
         .run_until_blocked_as_of(exec, t0 + chrono::Duration::seconds(1))
@@ -187,15 +185,13 @@ async fn wait_for_signal_timeout_deadline_wins_returns_none() {
 
 // ── Arrival-time ordering: a LATE signal must NOT beat an expired deadline ─────
 //
-// Codex #1069 P1 (runtime.rs:562). When a workflow is parked in
-// `wait_for_signal_timeout`, the decision cycle used to consume any staged signal
-// BEFORE the due `TimerFired` was appended, so a signal delivered AFTER the
-// deadline (while the runtime was idle) recorded `SignalReceived` first and
-// wrongly won the race as an approval. The fix interleaves the signal against the
-// due deadline timer by ARRIVAL time (mirroring the core `merge_wake_events`): a
-// deadline that expired at or before the signal arrived fires FIRST, so the
-// timeout wins and the (still-recorded) signal stays observable to a later plain
-// wait.
+// Issue #1069. A workflow parked in `wait_for_signal_timeout` once consumed any
+// staged signal BEFORE the due `TimerFired` was appended. A signal delivered AFTER
+// the deadline, while the runtime was idle, recorded `SignalReceived` first. It
+// wrongly won the race as an approval. Now the signal and the due deadline timer
+// interleave by ARRIVAL time, as in the core `merge_wake_events`. A deadline that
+// expired at or before the signal arrival fires FIRST. So the timeout wins, and the
+// still-recorded signal stays observable to a later plain wait.
 
 fn event_pos(history: &[WorkflowEvent], pred: impl Fn(&WorkflowEvent) -> bool) -> Option<usize> {
     history.iter().position(pred)
@@ -215,8 +211,8 @@ async fn late_signal_does_not_beat_expired_timeout() {
         "got {state:?}"
     );
 
-    // Deliver the signal AFTER the deadline (received_at = t0 + 3601 > t0 + 3600),
-    // as if it arrived while the idle runtime had already blown past the deadline.
+    // Deliver the signal AFTER the deadline (received_at = t0 + 3601 > t0 + 3600).
+    // It arrives while the idle runtime is already past the deadline.
     rt.send_signal_as_of(
         exec,
         "approval",
@@ -264,8 +260,8 @@ async fn late_signal_does_not_beat_expired_timeout() {
 #[tokio::test]
 async fn on_time_signal_still_wins() {
     // The OTHER branch: a signal that arrived BEFORE the deadline still wins, even
-    // when the run is only driven PAST the deadline (the fix orders by arrival
-    // time, not by consumption/drive order).
+    // when the run is only driven PAST the deadline. Arrival time sets the order,
+    // not drive order.
     let mut rt = SqliteRuntime::open_in_memory().unwrap();
     rt.register_workflow(&approval_gate_info());
     let t0: DateTime<Utc> = DateTime::from_timestamp(3_000_000, 0).unwrap();
@@ -328,9 +324,9 @@ struct Approval {
     approver: String,
 }
 
-/// Typed variant: also does real work (an activity) AFTER the resolved race, so
-/// the `CancelRaceLosers` teardown rides a **suspending** batch (`apply_commands`)
-/// rather than the terminal drain — covering the second call site of the fix.
+/// Typed variant: it also runs an activity AFTER the resolved race. So the
+/// `CancelRaceLosers` teardown rides a **suspending** batch (`apply_commands`), not
+/// the terminal drain. That covers the second call site of the fix.
 #[workflow]
 async fn typed_approval_then_work(ctx: &WorkflowContext, n: i64) -> Result<i64, String> {
     let decision: Option<Approval> = ctx

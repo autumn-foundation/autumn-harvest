@@ -453,17 +453,17 @@ pub async fn admit_batched_start_with_codecs(
     }
 
     if let Some(m) = metrics {
-        // issue #618, F-round17: the IMMEDIATE (max_size-reached) flush starts the
-        // workflow SYNCHRONOUSLY in this request path — mirror the scanner's
-        // deferred-fire bypass count (`fire_due_on_conn` above) so a max_size flush
-        // that fires after a gate is raised (post the HTTP admission pre-check)
-        // never slips the gate silently. Gated on `is_flushed` (this call actually
-        // consumed the batch and started the workflow — the branch that ran
-        // start_or_load + DELETEd the row). A not-yet-full admission has
-        // `is_flushed == false` and is counted only at its later scanner flush, so a
-        // given batch is counted on EXACTLY ONE path: immediate XOR scanner. The two
-        // are mutually exclusive because the immediate flush DELETEs the row inside
-        // the same transaction as the start, so the scanner can never claim it.
+        // Issue #618: the IMMEDIATE (max_size-reached) flush starts the workflow
+        // SYNCHRONOUSLY in this request path. Mirror the scanner's deferred-fire
+        // bypass count (`fire_due_on_conn` above). Then a max_size flush that
+        // fires after a gate is raised (post the HTTP admission pre-check) never
+        // slips the gate silently. Gated on `is_flushed`: this call consumed the
+        // batch and started the workflow, in the branch that ran start_or_load
+        // and DELETEd the row. A not-yet-full admission has `is_flushed == false`.
+        // It is counted only at its later scanner flush. So a given batch is
+        // counted on EXACTLY ONE path: immediate XOR scanner. The immediate flush
+        // DELETEs the row inside the same transaction as the start. So the
+        // scanner can never claim it, and the two paths are mutually exclusive.
         if outcome.is_flushed {
             m.record_admission_bypassed(crate::admission_gate::StartProducer::EventBatch.as_str());
         }
@@ -519,15 +519,14 @@ fn decode_buffered_payloads(
 }
 
 /// Push a quota-blocked event-batch row's `fire_at` forward by
-/// [`QUOTA_REDEFER_BACKOFF`] (issue #946, Task #7 hardening) so it is
-/// re-attempted less often instead of thrashing the claim batch every
-/// scanner tick.
+/// [`QUOTA_REDEFER_BACKOFF`] (issue #946). So it is re-attempted less often
+/// and does not thrash the claim batch every scanner tick.
 ///
-/// Unlike the generic non-transient-error path in [`fire_claimed_batch_row`]
-/// (which deletes the row outright -- correct for a request that can never
-/// succeed, e.g. a payload validation failure), a quota exhaustion is
-/// TEMPORARY: the tenant's usage frees up as an existing execution completes
-/// or is deleted. Deleting the row here would silently drop the batch's
+/// The generic non-transient-error path in [`fire_claimed_batch_row`] deletes
+/// the row outright. That is correct for a request that can never succeed,
+/// e.g. a payload validation failure. A quota exhaustion is TEMPORARY: the
+/// tenant's usage frees up as an existing execution completes or is deleted.
+/// A delete of the row here would silently drop the batch's
 /// accumulated `buffered_payloads` forever. `harvest_event_batches` has no
 /// `max_fire_at`-style absolute cap (unlike `harvest_debounce`), so no clamp
 /// is needed. Runs inside the caller's fire transaction so the row-level
@@ -672,9 +671,9 @@ async fn fire_due_on_conn(
                 .await;
             }
             if let Some(m) = metrics {
-                // issue #618, F1: the event-batch scanner relays a start already
-                // admitted through the gate at HTTP time; count the deferred fire
-                // as an exempt bypass so it never slips a gate silently. See
+                // Issue #618: the event-batch scanner relays a start already
+                // admitted through the gate at HTTP time. Count the deferred fire
+                // as an exempt bypass, so it never slips a gate silently. See
                 // `admission_gate::producer_contract`.
                 m.record_admission_bypassed(
                     crate::admission_gate::StartProducer::EventBatch.as_str(),
@@ -857,17 +856,16 @@ async fn fire_claimed_batch_row(
             );
             Ok(None)
         }
-        // issue #946 (Task #7 hardening): a declared per-tenant quota is
-        // exhausted at fire time. Unlike the generic `Err(e)` non-transient
-        // path below (which deletes the row -- correct for a request that
-        // can never succeed) this is TEMPORARY, so the row is RE-DEFERRED
-        // (left, `fire_at` bumped with backoff) rather than dropped, and
-        // rather than propagated. Must be matched BEFORE the generic
-        // `Err(e)` arm: `is_transient_error` classifies `QuotaExceeded` as
-        // non-transient, so without this dedicated arm it would fall
-        // through to the delete-and-audit path, silently discarding the
-        // batch's accumulated `buffered_payloads` forever the moment a
-        // tenant's aggregate usage happened to be at its cap.
+        // Issue #946: a declared per-tenant quota is exhausted at fire time.
+        // The generic `Err(e)` non-transient path below deletes the row. That
+        // is correct for a request that can never succeed. This case is
+        // TEMPORARY, so the row is RE-DEFERRED (left, `fire_at` bumped with
+        // backoff). It is not dropped and not propagated. Match it BEFORE the
+        // generic `Err(e)` arm. `is_transient_error` classifies `QuotaExceeded`
+        // as non-transient. Without this arm, it would fall through to the
+        // delete-and-audit path. That silently discards the batch's
+        // accumulated `buffered_payloads` forever, whenever a tenant's
+        // aggregate usage happens to be at its cap.
         Err(HarvestError::QuotaExceeded {
             workflow_name: quota_workflow_name,
             key,

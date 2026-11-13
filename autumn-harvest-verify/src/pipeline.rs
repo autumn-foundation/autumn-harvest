@@ -1,9 +1,9 @@
 //! The end-to-end run: emit, parse, resolve, analyze, allowlist, report.
 //!
-//! This is the only place that knows the order of the stages, and the only
-//! place that turns a MIR body path into the *user-visible* workflow path. MIR
-//! prints a trimmed item path (`wf_uuid_in_helper`), while every consumer — the
-//! corpus oracle, the allowlist, the report — names a workflow by its full
+//! This is the only place that knows the order of the stages. It is also the
+//! only place that turns a MIR body path into the *user-visible* workflow path.
+//! MIR prints a trimmed item path (`wf_uuid_in_helper`). Every consumer (the
+//! corpus oracle, the allowlist, the report) names a workflow by its full
 //! `crate::module::fn`. The module segment survives in exactly one place: the
 //! async shim's return type, `{async fn body of wf_uuid_in_helper::wf_uuid_in_helper()}`,
 //! which [`qualified_workflow`] reads back.
@@ -23,12 +23,11 @@ const VALIDATED_RUSTC: &[&str] = &["1.94", "1.95", "1.96", "1.97", "1.98"];
 
 /// Emit MIR for `build`, analyze it, and return the report.
 ///
-/// A `build` that selects no target *and* no `--mir` input is not an empty run:
-/// it is the bare `cargo harvest-verify` invocation, and it resolves to cargo's
-/// own default — the package the manifest points at
-/// ([`driver::default_request`]). Skipping emission there reported `analyzed 0`
-/// with exit 0, which is the one outcome a gate must never be able to reach by
-/// accident.
+/// A `build` that selects no target *and* no `--mir` input is not an empty run.
+/// It is the bare `cargo harvest-verify` invocation. It resolves to cargo's own
+/// default, the package the manifest points at ([`driver::default_request`]).
+/// Skipping emission there reported `analyzed 0` with exit 0. A gate must never
+/// reach that outcome by accident.
 ///
 /// # Errors
 /// On cargo/build failure, a malformed model or allowlist, or unreadable inputs.
@@ -71,8 +70,8 @@ pub fn run(build: &BuildRequest, opts: &Options) -> crate::Result<Report> {
             source: e,
         })?;
         let display = item.path.display().to_string();
-        // A dump that is not valid UTF-8 is a corrupt dump, not a tool error: it
-        // becomes a `mir-parse` boundary on every workflow of that crate, so one
+        // A dump that is not valid UTF-8 is a corrupt dump, not a tool error. It
+        // becomes a `mir-parse` boundary on every workflow of that crate. So one
         // damaged file can never abort the analysis of the others.
         let (text, lossy) = match String::from_utf8(raw) {
             Ok(text) => (text, false),
@@ -96,9 +95,9 @@ pub fn run(build: &BuildRequest, opts: &Options) -> crate::Result<Report> {
 
     let roots = source_roots(build, opts, &emitted);
     let entries = entry::discover(&docs);
-    // Zero entries is a *reported* outcome, never a quiet clean run: with no
-    // entry there is no per-workflow verdict to carry a boundary, so the only
-    // place the failure can surface is the run itself.
+    // Zero entries is a *reported* outcome, never a quiet clean run. With no
+    // entry, no per-workflow verdict carries a boundary. So the failure can
+    // surface only on the run itself.
     let discovery_failed = entries.is_empty();
     if discovery_failed {
         let failures: usize = docs.iter().map(|d| d.parse_failures.len()).sum();
@@ -202,12 +201,12 @@ fn finish_verdicts(
 /// matched nothing.
 ///
 /// Only `nondeterminism-found` and `unknown` consume an entry. A
-/// `proven-deterministic` workflow has nothing to suppress, and marking it
-/// `allowed` would spend the entry on it twice over: the run's `allowed` count
-/// would claim a suppressed problem that does not exist, and the entry would
-/// never be reported as unused — so the justification for a bug that has since
-/// been fixed would sit in the file forever, silently ready to hide the *next*
-/// finding on that workflow. Leaving it unused is what makes it deletable.
+/// `proven-deterministic` workflow has nothing to suppress. Marking it `allowed`
+/// would spend the entry on it twice over. The run's `allowed` count would claim
+/// a suppressed problem that does not exist. The entry would never be reported
+/// as unused. So the justification for a fixed bug would sit in the file
+/// forever, silently ready to hide the *next* finding on that workflow. Leaving
+/// it unused makes it deletable.
 fn apply_allowlist(
     allowlist: &Allowlist,
     workflows: &mut [WorkflowVerdict],

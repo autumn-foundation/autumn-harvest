@@ -4,25 +4,24 @@
 //! PART 2 adds on top of the #373 schema machinery:
 //!
 //!   AC3 — `GET /workflows/registered/{name}/interface` returns the workflow
-//!         type's published signal/query/update handlers, each with an optional
-//!         `arg_schema`/`response_schema`/`description`, sorted by name and
-//!         deterministic across calls. Unknown names → 404. A workflow with no
+//!         type's published signal/query/update handlers. Each has an optional
+//!         `arg_schema`/`response_schema`/`description`. The list is sorted by
+//!         name and deterministic. Unknown names → 404. A workflow with no
 //!         published schemas omits the schema fields, and a workflow with *no
 //!         handlers at all* returns three empty arrays.
-//!   AC4 — a signal or update payload is validated against its handler's
-//!         published `arg_schema` *before* durable enqueue at every HTTP
-//!         boundary (`.../signal/{name}`, `.../signal-with-start`,
-//!         `.../update/{name}`, `.../update-with-start`), returning `400` with
+//!   AC4 — every HTTP boundary validates a signal or update payload against
+//!         its handler's published `arg_schema` *before* durable enqueue
+//!         (`.../signal/{name}`, `.../signal-with-start`, `.../update/{name}`,
+//!         `.../update-with-start`). A violation returns `400` with
 //!         `{ "error": "...", "violations": [{ "message", "field_path" }] }`
 //!         (RFC 6901 pointer). A handler with no published schema is not
-//!         validated (today's behaviour). When a handler carries BOTH an
-//!         `arg_schema` and a semantic validator, the structural schema gate
-//!         (400) runs *before* the validator (422).
+//!         validated. When a handler carries BOTH an `arg_schema` and a
+//!         semantic validator, the schema gate (400) runs *before* the
+//!         validator (422).
 //!
-//! Runs against a real Postgres: uses `HARVEST_TEST_DATABASE_URL` (creating a
-//! fresh per-test database via `psql`) when set, otherwise a testcontainers
-//! Postgres 16 container. Docker-backed in CI (per the #543/#544/#601
-//! precedent).
+//! Runs against a real Postgres. With `HARVEST_TEST_DATABASE_URL` set, it
+//! creates a fresh per-test database via `psql`. Otherwise it uses a
+//! testcontainers Postgres 16 container, as CI does.
 
 #![allow(clippy::similar_names)]
 #![allow(clippy::too_many_lines)]
@@ -61,10 +60,9 @@ use tower::ServiceExt;
 #[path = "support/wire_contract.rs"]
 mod wire_contract;
 
-/// The full migration schema, mirroring every other plugin integration
-/// suite (e.g. `query_integration.rs`) — uses `test_init_sql()` so the
-/// test schema always tracks trunk and never hand-rolls a bundle (which the
-/// `migration_hygiene` guard forbids).
+/// The full migration schema from `test_init_sql()`, like every other plugin
+/// integration suite. The test schema always tracks trunk. The
+/// `migration_hygiene` guard forbids a hand-rolled bundle.
 fn init_sql() -> Vec<u8> {
     autumn_harvest::test_init_sql().as_bytes().to_vec()
 }
@@ -165,7 +163,7 @@ fn plain_info() -> WorkflowInfo {
 }
 
 /// A workflow with ZERO query/update/signal handlers — its `/interface`
-/// document must have all three arrays empty (FIX 4 / AC3).
+/// document must have all three arrays empty (AC3).
 fn empty_info() -> WorkflowInfo {
     WorkflowInfo {
         quota: None,
@@ -222,10 +220,9 @@ fn query_handlers() -> Vec<QueryHandlerInfo> {
     ]
 }
 
-/// Semantic validator for `set_priority_gated`: rejects `priority > 10`. A
-/// well-typed payload (integer `priority`) that violates this business rule
-/// must reach the validator (422), *after* the #610 schema gate (400) has
-/// already accepted its shape.
+/// Semantic validator for `set_priority_gated`: rejects `priority > 10`.
+/// A well-typed payload that breaks this rule passes the #610 schema gate
+/// (400) first. It then reaches the validator (422).
 fn reject_priority_over_ten(args: &Value) -> Result<(), String> {
     match args.get("priority").and_then(Value::as_i64) {
         Some(p) if p > 10 => Err(format!("priority {p} exceeds the maximum of 10")),
@@ -250,7 +247,7 @@ fn update_handlers() -> Vec<UpdateHandlerInfo> {
             response_schema: Some(priority_response_schema),
         },
         // Carries BOTH a published arg_schema AND a semantic validator, so the
-        // schema-400-before-validator-422 ordering is observable (FIX 2 / AC4).
+        // schema-400-before-validator-422 ordering is observable (AC4).
         UpdateHandlerInfo {
             name: "set_priority_gated",
             workflow: "iface_wf",
@@ -315,8 +312,8 @@ static DB_SEQ: AtomicU64 = AtomicU64::new(0);
 /// container guard that must be kept alive for the test's duration.
 ///
 /// - `HARVEST_TEST_DATABASE_URL` set → create a fresh, uniquely-named database
-///   via `psql` against that server and apply `INIT_SQL` into it (lets the
-///   suite run against a locally-installed Postgres without Docker).
+///   via `psql` on that server and apply `INIT_SQL`. The suite then runs
+///   without Docker.
 /// - unset → start a fresh testcontainers Postgres 16 (the CI path).
 async fn setup_database() -> (String, Option<ContainerAsync<Postgres>>) {
     if let Ok(base_url) = std::env::var("HARVEST_TEST_DATABASE_URL") {
@@ -403,9 +400,9 @@ fn build_app(pool: &DbPool) -> HarvestApiApp {
     build_app_with_state(pool).0
 }
 
-/// Like [`build_app`] but also returns the `HarvestApiState` the router reads,
-/// so a test can reach into `api_state.gate_cache()` to raise an admission gate
-/// (the route consults the state's own per-instance cache, not the global one).
+/// Like [`build_app`] but also returns the `HarvestApiState` the router reads.
+/// A test can then raise an admission gate in `api_state.gate_cache()`. The
+/// route reads that per-instance cache, not the global one.
 fn build_app_with_state(pool: &DbPool) -> (HarvestApiApp, HarvestApiState) {
     let api_state = HarvestApiState::new();
     api_state.set_admin_auth_boundary(true);
@@ -440,11 +437,11 @@ fn build_app_with_state(pool: &DbPool) -> (HarvestApiApp, HarvestApiState) {
 
 /// Build the interface-schema app on a TWO-shard pool: shard 0 is the live test
 /// DB, shard 1 points at an unreachable URL (connection refused). Mirrors the
-/// partial-outage harness in `workflow_reachability_integration.rs`. Used to
-/// prove the committed-replay HIT path never touches fresh-start shard routing:
-/// the pre-fix `found_shard` scan / `pick_for_new_workflow` would reach the dead
-/// shard and 503, whereas a dedupe hit resolves audit + polling on its own
-/// (live) shard via `db_conn_for_execution`.
+/// partial-outage harness in `workflow_reachability_integration.rs`. It proves
+/// that the committed-replay HIT path never touches fresh-start shard routing.
+/// The old `found_shard` scan / `pick_for_new_workflow` reached the dead shard
+/// and returned 503. A dedupe hit resolves on its own live shard via
+/// `db_conn_for_execution`.
 fn build_app_two_shard_dead_second(live_pool: &DbPool) -> HarvestApiApp {
     let mut shard_pools = std::collections::BTreeMap::new();
     shard_pools.insert(ShardId::new(0), live_pool.clone());
@@ -555,10 +552,9 @@ async fn seed_running_execution(pool: &DbPool, workflow_name: &str) -> Execution
 
 /// State-parameterized variant of [`seed_running_execution`]. The multi-shard
 /// `found_shard` scan in signal-/update-with-start excludes only
-/// `CONTINUED_AS_NEW`/`TERMINATED`, so `COMPLETED`/`PAUSED` rows are found and
-/// route correctly — and the read-only committed-replay probes join
-/// `harvest_signals`/`harvest_events` with no state filter at all, so they
-/// resolve a dedup hit against a terminal prior too.
+/// `CONTINUED_AS_NEW`/`TERMINATED`, so it finds `COMPLETED`/`PAUSED` rows. The
+/// read-only committed-replay probes join `harvest_signals`/`harvest_events`
+/// with no state filter. So they resolve a dedup hit on a terminal prior too.
 async fn seed_execution_in_state(pool: &DbPool, workflow_name: &str, state: &str) -> ExecutionId {
     let mut conn = pool.get().await.expect("pooled conn");
     let exec_id = ExecutionId::new();
@@ -589,9 +585,9 @@ async fn seed_execution_in_state(pool: &DbPool, workflow_name: &str, state: &str
     exec_id
 }
 
-// Reproduce the deterministic update_id the update-with-start handler derives
-// from an idempotency key (UUIDv5 over the DNS namespace), so a test can seed a
-// matching UpdateAdmitted event that the committed-replay probe will find.
+// Reproduces the update_id that the update-with-start handler derives from an
+// idempotency key (UUIDv5 over the DNS namespace). A test seeds a matching
+// UpdateAdmitted event with it, which the committed-replay probe finds.
 fn derive_uws_update_id(key: &str) -> UpdateId {
     UpdateId::from_uuid(uuid::Uuid::new_v5(
         &uuid::Uuid::NAMESPACE_DNS,
@@ -690,7 +686,7 @@ async fn interface_lists_sorted_handlers_with_schemas() {
     assert!(body["queries"][1].get("response_schema").is_none());
 
     // Updates: sorted by name → set_priority, set_priority_gated (the latter
-    // carries both an arg_schema and a semantic validator; see FIX 2 tests).
+    // carries both an arg_schema and a semantic validator; see the AC4 tests).
     assert_eq!(
         names(&body["updates"]),
         vec!["set_priority", "set_priority_gated"]
@@ -730,10 +726,10 @@ async fn interface_is_deterministic_across_calls() {
 
 // ── Issue #802 AC5: declared dependencies on the discovery routes ──────────
 //
-// These drive the two REAL routes rather than `RegisteredWorkflowRecord::from_info`
-// directly, because `GET /workflows/registered/{name}/schema` is a SEPARATE call
-// site from the list route and `docs/api-contract.json` now claims both carry the
-// fields. This suite is Docker-backed and RUNS in CI (`.github/ci/integration-suites.txt`).
+// These drive the two REAL routes, not `RegisteredWorkflowRecord::from_info`.
+// `GET /workflows/registered/{name}/schema` is a SEPARATE call site from the
+// list route, and `docs/api-contract.json` claims both carry the fields. This
+// suite is Docker-backed and RUNS in CI (`.github/ci/integration-suites.txt`).
 
 #[tokio::test]
 async fn registered_list_surfaces_declared_dependencies() {
@@ -937,13 +933,12 @@ async fn count_signal_rows(pool: &DbPool, exec_id: ExecutionId, idempotency_key:
     row.n
 }
 
-/// Regression for the Codex P2 (issue #610): the #610 schema gate (and the
-/// #252 cap) must NOT reject a *committed keyed replay* of a signal that was
-/// accepted before the schema was published/tightened. A same-key retry
-/// carrying a now-schema-invalid payload must return `202 signal_delivered:
-/// false` and enqueue no second row — preserving #521's exactly-once contract.
-/// A *fresh* keyed malformed delivery is still validated (400), and a fresh
-/// valid keyed delivery still succeeds (`signal_delivered: true`).
+/// Issue #610: the #610 schema gate and the #252 cap must NOT reject a
+/// *committed keyed replay* of a signal accepted before the schema changed.
+/// A same-key retry with a now-invalid payload must return
+/// `202 signal_delivered: false` and enqueue no second row. That keeps #521's
+/// exactly-once contract. A *fresh* keyed malformed delivery still gets 400.
+/// A fresh valid keyed delivery still succeeds (`signal_delivered: true`).
 #[tokio::test]
 async fn signal_route_committed_keyed_replay_short_circuits_before_schema_gate() {
     let (url, _guard) = setup_database().await;
@@ -951,9 +946,8 @@ async fn signal_route_committed_keyed_replay_short_circuits_before_schema_gate()
     let app = build_app(&pool);
     let exec_id = seed_running_execution(&pool, "iface_wf").await;
 
-    // A signal accepted *before* the `approve` schema existed: seed it directly
-    // with a payload that is invalid under the now-published schema (`reason`
-    // is required + must be a string).
+    // A signal accepted *before* the `approve` schema existed. Its payload is
+    // invalid under the published schema, which requires a string `reason`.
     let committed_key = "k-committed";
     seed_signal_row(
         &pool,
@@ -1135,7 +1129,7 @@ async fn schema_less_workflow_signal_and_update_are_not_validated() {
     assert_eq!(upd_status, StatusCode::ACCEPTED, "body: {upd_body}");
 }
 
-// ── FIX 2 / AC4: schema-400 precedes semantic-validator-422 ────────────────
+// ── AC4: schema-400 precedes semantic-validator-422 ─────────────────────────
 
 #[tokio::test]
 async fn update_schema_gate_400_precedes_validator_when_shape_is_wrong() {
@@ -1145,8 +1139,8 @@ async fn update_schema_gate_400_precedes_validator_when_shape_is_wrong() {
     let exec_id = seed_running_execution(&pool, "iface_wf").await;
 
     // Wrong TYPE for `priority` (string, not integer). The #610 schema gate
-    // must reject with a field-level 400 *before* the semantic validator runs,
-    // so the response is the structural-violation body, not the validator body.
+    // must reject with a field-level 400 *before* the semantic validator runs.
+    // So the response is the structural-violation body.
     let (status, body) = post_json(
         &app,
         &format!("/workflows/{exec_id}/update/set_priority_gated?wait=admitted"),
@@ -1169,9 +1163,8 @@ async fn update_validator_422_runs_after_schema_gate_accepts_shape() {
     let app = build_app(&pool);
     let exec_id = seed_running_execution(&pool, "iface_wf").await;
 
-    // Well-typed integer `priority` (passes the schema gate) but violates the
-    // business rule (> 10): the pre-existing validator path must still fire and
-    // return the 422 validator body, unbroken by the new #610 schema gate.
+    // A well-typed integer `priority` passes the schema gate but breaks the
+    // business rule (> 10). The validator must still return its 422 body.
     let (status, body) = post_json(
         &app,
         &format!("/workflows/{exec_id}/update/set_priority_gated?wait=admitted"),
@@ -1214,7 +1207,7 @@ async fn update_gated_accepts_a_valid_within_bounds_payload() {
     assert_eq!(status, StatusCode::ACCEPTED, "body: {body}");
 }
 
-// ── FIX 3 / AC4: update-with-start boundary validation ─────────────────────
+// ── AC4: update-with-start boundary validation ─────────────────────────────
 
 #[tokio::test]
 async fn update_with_start_rejects_malformed_payload_with_400() {
@@ -1263,7 +1256,7 @@ async fn update_with_start_accepts_valid_payload() {
     );
 }
 
-// ── FIX 4 / AC3: fully-empty interface + signal-with-start happy path ───────
+// ── AC3: fully-empty interface + signal-with-start happy path ───────────────
 
 #[tokio::test]
 async fn interface_is_all_empty_for_workflow_with_no_handlers() {
@@ -1316,22 +1309,21 @@ async fn signal_with_start_accepts_valid_payload() {
     );
 }
 
-// ── with-start keyed committed-replay: validation ordering (this PR) ─────────
+// ── with-start keyed committed-replay: validation ordering ──────────────────
 //
-// A retry of an already-committed keyed signal-/update-with-start must replay to
-// its documented no-op BEFORE any fresh-start-only validation runs (#610 schema
-// gate, #373 start_input schema, #684 validator). Otherwise, if validation
-// TIGHTENED between the original delivery and the retry (schema published/made
-// stricter, payload cap lowered), the retry is wrongly rejected 400/422 instead
-// of returning the cached outcome. This mirrors #808 (plain start route) and
-// #1092 (plain signal route). A probe MISS falls through to the untouched
-// authoritative in-lock path, which stays the source of truth.
+// A retry of a committed keyed signal-/update-with-start must replay to its
+// documented no-op BEFORE any fresh-start-only validation. That covers the
+// #610 schema gate, the #373 start_input schema and the #684 validator.
+// Validation can TIGHTEN between the original delivery and the retry. Without
+// this order, the retry gets a wrong 400/422, not the cached outcome. This
+// mirrors #808 (plain start route) and #1092 (plain signal route). A probe MISS
+// falls through to the authoritative in-lock path.
 
-// P1 symmetry (PR #1105 review): the signal-with-start probe already precedes
-// the #377 admission gate; lock that in against regression. A committed keyed
-// signal-with-start replay must dedup to 200 even while a `WorkflowName` gate is
-// raised for the workflow — a retry that delivers no new signal must not be
-// blocked by an operator-raised gate. No second signal row is enqueued.
+// Symmetry (PR #1105): the signal-with-start probe already precedes the #377
+// admission gate, and this test pins that. A committed keyed signal-with-start
+// replay must dedup to 200 while a `WorkflowName` gate is raised. A retry that
+// delivers no new signal must not be blocked by an operator-raised gate. No
+// second signal row is enqueued.
 #[tokio::test]
 async fn sws_committed_keyed_replay_bypasses_a_raised_admission_gate() {
     let (url, _guard) = setup_database().await;
@@ -1399,10 +1391,10 @@ async fn sws_committed_keyed_replay_bypasses_a_raised_admission_gate() {
     );
 }
 
-/// AC1: a committed keyed signal-with-start that ATTACHED to a live (RUNNING)
-/// run replays to `200 signal_delivered: false` even when the retry payload is
-/// now schema-invalid — the committed-replay probe short-circuits before the
-/// #610 signal-payload schema gate. No second signal row is enqueued.
+/// AC1: a committed keyed signal-with-start that ATTACHED to a RUNNING run
+/// replays to `200 signal_delivered: false`, even with a now-invalid payload.
+/// The committed-replay probe short-circuits before the #610 schema gate. No
+/// second signal row is enqueued.
 #[tokio::test]
 async fn sws_committed_keyed_replay_after_attach_short_circuits_before_schema_gate() {
     let (url, _guard) = setup_database().await;
@@ -1466,8 +1458,8 @@ async fn sws_committed_keyed_replay_after_attach_short_circuits_before_schema_ga
 
 /// AC2: the same short-circuit holds when the committed prior is TERMINAL
 /// (COMPLETED). The in-lock path would escalate a terminal prior to a fresh
-/// start, but the idempotency-key dedup (and the probe mirroring it) recognizes
-/// the committed key first and replays the no-op. Payload again now-invalid.
+/// start. The idempotency-key dedup and its probe see the committed key first
+/// and replay the no-op. The payload is again now-invalid.
 #[tokio::test]
 async fn sws_committed_keyed_replay_after_terminal_fresh_start_short_circuits() {
     let (url, _guard) = setup_database().await;
@@ -1576,15 +1568,14 @@ async fn uws_committed_keyed_replay_after_running_short_circuits_before_validati
     );
 }
 
-// P1 (PR #1105 review): a committed keyed update-with-start replay must short-
-// circuit BEFORE the #377 admission gate, mirroring signal-with-start (whose
-// probe already precedes the gate). Seeded against a RUNNING run with a
-// committed `UpdateAdmitted` event; a `WorkflowName` admission gate is then
-// raised for `iface_wf` on the router's own cache. The retry of the same key
-// must return the cached admission (200, started_fresh: false), NOT a 503 — a
-// retry that admits no new update must not be blocked by an operator-raised gate
-// (the #808 invariant: a committed replay precedes ALL fresh-start-only
-// rejections, including the admission gate). No second `UpdateAdmitted` event.
+// PR #1105: a committed keyed update-with-start replay must short-circuit
+// BEFORE the #377 admission gate, like signal-with-start. The test seeds a
+// RUNNING run with a committed `UpdateAdmitted` event. It then raises a
+// `WorkflowName` gate for `iface_wf` on the router's own cache. A retry of the
+// same key must return the cached admission (200, started_fresh: false), NOT a
+// 503. A retry that admits no new update must not be blocked by that gate.
+// That is the #808 invariant: a committed replay precedes ALL fresh-start-only
+// rejections, the admission gate included. No second `UpdateAdmitted` event.
 #[tokio::test]
 async fn uws_committed_keyed_replay_bypasses_a_raised_admission_gate() {
     let (url, _guard) = setup_database().await;
@@ -1657,30 +1648,28 @@ async fn uws_committed_keyed_replay_bypasses_a_raised_admission_gate() {
     );
 }
 
-// P2 (PR #1105 review, Codex): a committed keyed update-with-start replay HIT
-// must NOT be rejected by fresh-start-only shard routing. Pre-fix, on a hit the
-// handler still ran the multi-shard `found_shard` scan / `pick_for_new_workflow`
-// before the `match probe_outcome`, so a dead fresh-start shard returned a
-// spurious 503 even though the dedupe hit was already found and no fresh work is
-// needed — partially undoing the admission-gate hoist via fresh-start infra.
+// PR #1105: a committed keyed update-with-start replay HIT must NOT be rejected
+// by fresh-start-only shard routing. The handler once ran the multi-shard
+// `found_shard` scan / `pick_for_new_workflow` before `match probe_outcome`,
+// even on a hit. A dead fresh-start shard then returned a spurious 503, though
+// the hit needs no fresh work. That partly undid the admission-gate hoist.
 //
-// Reproduction (the "terminal prior" case Codex named): a TERMINATED prior on
-// the live shard 0 with a committed `UpdateAdmitted` event. The read-only probe
-// (no state filter) resolves the hit on shard 0; the `found_shard` scan EXCLUDES
-// `TERMINATED`, so pre-fix it finds nothing on shard 0 and proceeds to the dead
-// shard 1 (connection refused) → 503. Post-fix the hit path acquires ONLY the
-// hit execution's own (live) shard via `db_conn_for_execution` and skips the
-// scan entirely → 200 with the cached admission (`started_fresh: false`). This
-// is the #808 invariant: a committed replay is never rejected by fresh-start-only
-// infrastructure. `signal-with-start` is already clean here (its probe returns a
-// finished response before the routing scan), so this guard is uws-only.
+// Reproduction (the "terminal prior" case): a TERMINATED prior on the live
+// shard 0 with a committed `UpdateAdmitted` event. The read-only probe has no
+// state filter, so it resolves the hit on shard 0. The `found_shard` scan
+// EXCLUDES `TERMINATED`, so it found nothing on shard 0 and reached the dead
+// shard 1 → 503. Now the hit path takes ONLY the hit execution's own shard via
+// `db_conn_for_execution` and skips the scan → 200 with the cached admission
+// (`started_fresh: false`). This is the #808 invariant: fresh-start-only
+// infrastructure never rejects a committed replay. The `signal-with-start`
+// probe returns before the routing scan, so this guard is uws-only.
 #[tokio::test]
 async fn uws_committed_keyed_replay_hit_never_503s_on_dead_fresh_start_shard() {
     let (url, _guard) = setup_database().await;
     let pool = build_pool(&url);
-    // TERMINATED prior on the live shard: the read-only probe still resolves it
-    // (no state filter), but the fresh-start `found_shard` scan excludes it,
-    // forcing the pre-fix path onward to the dead shard.
+    // TERMINATED prior on the live shard. The read-only probe still resolves
+    // it, but the fresh-start `found_shard` scan excludes it. The old path then
+    // went on to the dead shard.
     let exec_id = seed_execution_in_state(&pool, "iface_wf", "TERMINATED").await;
     let wid = exec_id.to_string();
     let committed_key = "k-uws-dead-shard";
@@ -1735,10 +1724,9 @@ async fn uws_committed_keyed_replay_hit_never_503s_on_dead_fresh_start_shard() {
 }
 
 /// AC4: a committed keyed update-with-start replay does not re-run the #684
-/// semantic validator. Seeded against a COMPLETED prior with `set_priority_gated`
-/// (validator rejects `priority > 10`); the retry carries `priority: 99` which
-/// would 422, but the committed-replay probe returns the cached outcome (200)
-/// before the validator runs.
+/// semantic validator. The prior is COMPLETED, with `set_priority_gated`, whose
+/// validator rejects `priority > 10`. The retry carries `priority: 99`, which
+/// would 422. The committed-replay probe returns the cached 200 first.
 #[tokio::test]
 async fn uws_committed_keyed_replay_validator_not_rerun() {
     let (url, _guard) = setup_database().await;

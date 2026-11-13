@@ -12,10 +12,10 @@ use uuid::Uuid;
 /// User-provided idempotency key for a workflow execution.
 ///
 /// This is the business-level identifier chosen by the caller (e.g.
-/// `"user-123"` or `"order-456"`). It is NOT the run ID. Reusing the same
+/// `"user-123"` or `"order-456"`). It is NOT the run ID. The same
 /// `WorkflowId` for the same workflow name should resolve to the same logical
-/// workflow start; explicit reruns should use a fresh key until Harvest grows a
-/// dedicated restart API.
+/// workflow start. Until Harvest has a dedicated restart API, an explicit
+/// rerun should use a fresh key.
 ///
 /// ## Examples
 ///
@@ -69,9 +69,8 @@ impl fmt::Display for WorkflowId {
 ///
 /// A process running against a sharded Harvest deployment holds one `DbPool`
 /// per shard; the `ShardId` picks which pool a given workflow lives in. The
-/// value is encoded into the first two bytes of each `ExecutionId` so that any
-/// holder of an `ExecutionId` can recover the shard in O(1) without a lookup
-/// table.
+/// first two bytes of each `ExecutionId` encode it. So any holder of an
+/// `ExecutionId` recovers the shard in O(1) without a lookup table.
 ///
 /// The reserved sentinel value [`ShardId::UNENCODED`] (`0xFFFF`) is emitted
 /// by [`ExecutionId::new`] when the caller has not explicitly picked a shard
@@ -140,12 +139,11 @@ impl fmt::Display for ShardId {
 
 /// Unique identifier for a single workflow execution (run).
 ///
-/// Stored as UUID in Postgres. When a workflow is started by the framework,
-/// the first two bytes of the UUID carry the [`ShardId`] the workflow is
-/// routed to so that any `ExecutionId` can be resolved back to its database
-/// shard in O(1). Values produced outside the start path (tests, replay) use
-/// the reserved sentinel [`ShardId::UNENCODED`], which routers handle by
-/// falling back to the default shard.
+/// Stored as UUID in Postgres. When the framework starts a workflow, the
+/// first two bytes of the UUID carry its [`ShardId`]. So any `ExecutionId`
+/// resolves back to its database shard in O(1). Values made outside the start
+/// path (tests, replay) use the reserved sentinel [`ShardId::UNENCODED`].
+/// Routers send the sentinel to the default shard.
 ///
 /// ## Examples
 ///
@@ -284,32 +282,31 @@ impl FromStr for ExecutionId {
 ///   is the pre-#751 addressing mode (`ctx.signal_external_workflow`,
 ///   `ctx.request_cancel_external_workflow`, issue #492).
 /// - [`ExternalTarget::WorkflowId`] — a stable `(workflow_name, workflow_id)`
-///   business key, resolved to whichever run is *current* **at delivery
-///   time** (not at request time), so a continuation started between request
-///   and delivery is the one that receives the signal/cancel.
+///   business key. It resolves to the run that is *current* **at delivery
+///   time**, not at request time. So a continuation started between request
+///   and delivery receives the signal/cancel.
 ///
 /// ## Wire format
 ///
-/// Serialized with `#[serde(untagged)]` so a bare `ExecutionId` target
-/// round-trips as a plain UUID string — byte-for-byte identical to every
+/// Serialized with `#[serde(untagged)]`. A bare `ExecutionId` target
+/// round-trips as a plain UUID string. That is byte-for-byte identical to each
 /// `ExternalSignalRequested`/`ExternalCancelRequested` event stored before
 /// this feature shipped. A `WorkflowId` target serializes as a JSON object
-/// (`{"workflow_name": ..., "workflow_id": ...}`), which can never be
-/// confused with a bare UUID string, so there is no deserialization
-/// ambiguity between the two variants regardless of declaration order.
+/// (`{"workflow_name": ..., "workflow_id": ...}`). An object never looks like
+/// a bare UUID string. So deserialization is unambiguous in any declaration
+/// order.
 ///
 /// ## Extending this enum
 ///
 /// `#[serde(untagged)]` tries each variant's `Deserialize` impl in
-/// declaration order until one succeeds, with no discriminator field to
-/// disambiguate. The current two variants are safe because their wire shapes
-/// are structurally disjoint (bare string vs. JSON object). **A future third
-/// addressing mode must preserve that disjointness** — its wire shape must
-/// not be satisfiable by a bare UUID string *or* by an object carrying
-/// exactly `workflow_name`/`workflow_id` string fields (a superset/subset
-/// overlap would either mis-route to the wrong variant or fail
-/// deserialization with a misleading "expected type" error naming the wrong
-/// variant). Any new variant must ship with a round-trip test proving no
+/// declaration order until one succeeds, with no discriminator field. The
+/// current two variants are safe because their wire shapes are structurally
+/// disjoint (bare string vs. JSON object). **A future third addressing mode
+/// must preserve that disjointness.** A bare UUID string must not satisfy its
+/// wire shape. Nor must an object with exactly `workflow_name`/`workflow_id`
+/// string fields. A superset or subset overlap mis-routes to the wrong
+/// variant. Or it fails with a misleading "expected type" error that names
+/// the wrong variant. A new variant needs a round-trip test that proves no
 /// collision with the existing two, not just a variant-local test.
 ///
 /// ## Examples
@@ -448,9 +445,9 @@ impl FromStr for ActivityExecId {
 
 /// Unique identifier for a single workflow update invocation.
 ///
-/// Generated when an update request is admitted (validator passed) and embedded
-/// in the `UpdateAdmitted`, `UpdateCompleted`, and `UpdateFailed` events so the
-/// result can be looked up by any worker after a restart.
+/// Generated when an update request is admitted (validator passed). The
+/// `UpdateAdmitted`, `UpdateCompleted`, and `UpdateFailed` events carry it, so
+/// any worker can look up the result after a restart.
 ///
 /// ## Examples
 ///
@@ -505,10 +502,10 @@ impl FromStr for UpdateId {
 
 /// Opaque single-use token that uniquely identifies a pending external activity.
 ///
-/// The token is embedded in the `ActivityAwaitingExternal` event when a workflow
-/// calls `execute_activity_external`, and is round-tripped by external systems
-/// through the management API to deliver a result (`/complete`, `/fail`) or extend
-/// the deadline (`/heartbeat`).
+/// The `ActivityAwaitingExternal` event carries it when a workflow calls
+/// `execute_activity_external`. An external system sends it back through the
+/// management API to deliver a result (`/complete`, `/fail`) or extend the
+/// deadline (`/heartbeat`).
 ///
 /// ## Examples
 ///
@@ -569,10 +566,10 @@ impl FromStr for ExternalActivityToken {
 
 /// Unique identifier for a single `signal_external_workflow` invocation.
 ///
-/// Generated when the workflow calls `ctx.signal_external_workflow(...)` and
-/// embedded in the `ExternalSignalRequested`, `ExternalSignalDelivered`, and
-/// `ExternalSignalFailed` events so the request can be correlated with its
-/// outcome during replay.
+/// Generated when the workflow calls `ctx.signal_external_workflow(...)`. The
+/// `ExternalSignalRequested`, `ExternalSignalDelivered`, and
+/// `ExternalSignalFailed` events carry it, so replay can match the request
+/// with its outcome.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "fuzzing", derive(arbitrary::Arbitrary))]
 pub struct ExternalSignalId(Uuid);
@@ -618,10 +615,10 @@ impl FromStr for ExternalSignalId {
 
 /// Unique identifier for a single `request_cancel_external_workflow` invocation.
 ///
-/// Generated when the workflow calls `ctx.request_cancel_external_workflow(...)` and
-/// embedded in the `ExternalCancelRequested`, `ExternalCancelDelivered`, and
-/// `ExternalCancelFailed` events so the request can be correlated with its
-/// outcome during replay.
+/// Generated when the workflow calls `ctx.request_cancel_external_workflow(...)`.
+/// The `ExternalCancelRequested`, `ExternalCancelDelivered`, and
+/// `ExternalCancelFailed` events carry it, so replay can match the request
+/// with its outcome.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "fuzzing", derive(arbitrary::Arbitrary))]
 pub struct ExternalCancelId(Uuid);
@@ -667,10 +664,10 @@ impl FromStr for ExternalCancelId {
 
 /// Unique identifier for a single `await_external_workflow` invocation (issue #757).
 ///
-/// Generated when the workflow calls `ctx.await_external_workflow(...)` and
-/// embedded in the `ExternalAwaitRequested`, `ExternalAwaitResolved`, and
-/// `ExternalAwaitFailed` events so the request can be correlated with its
-/// outcome during replay. Exact clone of [`ExternalCancelId`].
+/// Generated when the workflow calls `ctx.await_external_workflow(...)`. The
+/// `ExternalAwaitRequested`, `ExternalAwaitResolved`, and
+/// `ExternalAwaitFailed` events carry it, so replay can match the request
+/// with its outcome. Exact clone of [`ExternalCancelId`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "fuzzing", derive(arbitrary::Arbitrary))]
 pub struct ExternalAwaitId(Uuid);
@@ -716,10 +713,10 @@ impl FromStr for ExternalAwaitId {
 
 /// Unique identifier for a worker session (issue #606).
 ///
-/// Recorded deterministically via the existing `MarkerRecorded` mechanism when
-/// a workflow calls `ctx.create_session(...)` — the *identity* is replayed
-/// like any other marker, but the *physical worker binding* it resolves to is
-/// non-replayed runtime routing state, exactly like activity placement today.
+/// A `MarkerRecorded` event records it when a workflow calls
+/// `ctx.create_session(...)`. Replay restores the *identity* like any other
+/// marker. The *physical worker binding* it resolves to is not replayed. That
+/// binding is runtime routing state, exactly like activity placement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SessionId(Uuid);
 
@@ -867,9 +864,8 @@ impl fmt::Display for WorkerId {
 /// Controls how a duplicate `(workflow_name, workflow_id)` start is handled.
 ///
 /// The policy is a *caller* concern chosen at request time. It has no effect
-/// on the first start of a given `workflow_id`; it only changes behaviour when
-/// a prior execution already exists for the same `(workflow_name, workflow_id)`
-/// pair.
+/// on the first start of a given `workflow_id`. It applies only when a prior
+/// execution exists for the same `(workflow_name, workflow_id)` pair.
 ///
 /// ## Examples
 ///
@@ -908,8 +904,8 @@ pub enum WorkflowIdReusePolicy {
     /// run unconditionally if the prior execution is already terminal.
     ///
     /// The cancel and the new start are two separate transactions. A failure
-    /// between them leaves the prior workflow CANCELLED with no new run started;
-    /// retrying with the same policy starts a fresh run on the next attempt.
+    /// between them leaves the prior workflow CANCELLED with no new run. A
+    /// retry with the same policy starts a fresh run.
     TerminateIfRunning,
 }
 
@@ -917,11 +913,11 @@ pub enum WorkflowIdReusePolicy {
 /// (RUNNING or PAUSED) prior execution of the same `(workflow_name, workflow_id)`.
 ///
 /// This is *orthogonal* to [`WorkflowIdReusePolicy`], which governs TERMINAL
-/// priors (`COMPLETED`/`FAILED`/`CANCELLED`/`TIMED_OUT`). The two axes compose in the
-/// start-path admission logic: the conflict policy has no effect on a terminal
-/// prior, and the reuse policy has no effect on an active prior (except via the
-/// [`WorkflowIdConflictPolicy::Unspecified`] default, which defers to the reuse
-/// policy's *native* active behavior).
+/// priors (`COMPLETED`/`FAILED`/`CANCELLED`/`TIMED_OUT`). The start-path
+/// admission logic composes the two axes. The conflict policy has no effect on
+/// a terminal prior. The reuse policy has no effect on an active prior. The
+/// exception is the [`WorkflowIdConflictPolicy::Unspecified`] default, which
+/// defers to the reuse policy's *native* active behavior.
 ///
 /// Like [`WorkflowIdReusePolicy`], this is a *caller* concern chosen at request
 /// time; it is never persisted.
@@ -941,12 +937,11 @@ pub enum WorkflowIdReusePolicy {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkflowIdConflictPolicy {
-    /// Default. Do not override the active-prior behavior — the reuse policy's
-    /// NATIVE active behavior applies (`AllowDuplicate` → return existing;
-    /// `RejectDuplicate` → `Err(AlreadyExists)`; `AllowDuplicateFailedOnly` →
-    /// return existing; `TerminateIfRunning` → cancel + start fresh). Preserves
-    /// the exact documented behavior of all four reuse policies, so no existing
-    /// caller changes.
+    /// Default. The reuse policy's NATIVE active-prior behavior applies.
+    /// `AllowDuplicate` and `AllowDuplicateFailedOnly` return the existing run.
+    /// `RejectDuplicate` returns `Err(AlreadyExists)`. `TerminateIfRunning`
+    /// cancels and starts fresh. All four reuse policies keep their documented
+    /// behavior, so no existing caller changes.
     #[default]
     Unspecified,
 
@@ -964,15 +959,11 @@ pub enum WorkflowIdConflictPolicy {
     TerminateExisting,
 }
 
-// ---------------------------------------------------------------------------
-// StartSource
-// ---------------------------------------------------------------------------
-
 /// A bounded classifier for *how* a workflow execution was started (issue #740).
 ///
-/// Recorded durably on every execution across all start paths so operators can
-/// answer "where did this run come from?" — an API call, a schedule tick, a
-/// child spawn, a completion trigger, and so on. This is distinct from the
+/// Every start path records it durably on the execution. It tells operators
+/// where a run came from: an API call, a schedule tick, a child spawn, a
+/// completion trigger, and so on. It is distinct from the
 /// `origin` column (issue #534), which classifies scheduled dispatch sub-kinds;
 /// the two coexist.
 ///
@@ -1012,9 +1003,9 @@ pub enum StartSource {
     CompletionTrigger,
     /// Started by an inbound webhook delivery.
     Webhook,
-    /// Started by a broker event-source connector consuming a message from a
-    /// topic/queue (issue #944) — Kafka, SQS, or any adapter built on the
-    /// same broker-agnostic binding layer.
+    /// Started by a broker event-source connector from a topic/queue message
+    /// (issue #944). Kafka, SQS, or any adapter on the same broker-agnostic
+    /// binding layer.
     Broker,
     /// Spawned as a child workflow (awaited or detached).
     Child,
@@ -1117,10 +1108,6 @@ impl StartSource {
     }
 }
 
-// ---------------------------------------------------------------------------
-// StartProvenance
-// ---------------------------------------------------------------------------
-
 /// Where a run came from (issue #2082).
 ///
 /// Workflow code reads it through `ctx.info()`. It comes from the execution
@@ -1165,10 +1152,6 @@ impl StartProvenance {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// IdempotencyKey
-// ---------------------------------------------------------------------------
 
 /// A stable, deterministic idempotency key for a single logical activity
 /// invocation.

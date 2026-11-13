@@ -2,14 +2,14 @@
 //! (issue #679).
 //!
 //! Composes five existing read models into one JSON document with a single
-//! worst-of verdict so an operator (or a dashboard/CI gate) can answer *"is
-//! Harvest healthy right now?"* in one request instead of polling
+//! worst-of verdict. An operator (or a dashboard/CI gate) can then answer *"is
+//! Harvest healthy right now?"* in one request. The alternative is to poll
 //! `/workers/health`, `/admin/shards/health`, `/dead-letters/aggregate`, and
-//! `/workflows?no_progress_minutes=N` separately and reconciling them by hand.
+//! `/workflows?no_progress_minutes=N` and reconcile them by hand.
 //!
-//! This module never duplicates or changes any per-domain check's semantics:
-//! the `shards` subsystem is [`crate::shard_health::build_shard_health_report`]
-//! verbatim; the worker/DLQ/queue/stalled numbers come from the same core
+//! This module never duplicates or changes the semantics of a per-domain check.
+//! The `shards` subsystem is [`crate::shard_health::build_shard_health_report`]
+//! verbatim. The worker/DLQ/queue/stalled numbers come from the same core
 //! helpers those endpoints use, fanned out across shards with the shared
 //! [`crate::shard_fanout`] scaffold. All the classification logic (thresholds →
 //! `healthy`/`degraded`/`critical`) is in pure, unit-testable functions.
@@ -110,9 +110,10 @@ pub struct StatusThresholds {
     /// Dead-letter total at or above this marks dead-letters `critical`
     /// (default `100`).
     pub dlq_critical_total: i64,
-    /// If the newest dead letter is younger than this many seconds, treat it as
-    /// an active failure and mark dead-letters `critical` (default `300` — a
-    /// dead-letter within 5 minutes).
+    /// A newest dead letter younger than this many seconds is an active failure.
+    ///
+    /// It marks dead-letters `critical`. Default `300`: a dead-letter within
+    /// 5 minutes.
     pub dlq_critical_recent_secs: i64,
     /// Busiest-queue claimable backlog at or above this marks queues `degraded`
     /// (default `1000`).
@@ -196,9 +197,9 @@ pub struct HealthSummaryReport {
 
 /// Classify the worker fleet from its deduped counts.
 ///
-/// Two independent sub-verdicts are combined with [`worst_status`], drawing a
-/// deliberate line between the workers that can *claim* new work and the
-/// workers that are merely *supposed to be running*:
+/// [`worst_status`] combines two independent sub-verdicts. It draws a
+/// deliberate line between workers that can *claim* new work and workers that
+/// are merely *supposed to be running*:
 ///
 /// - `active` = workers that can CLAIM new work = **Healthy AND status
 ///   `Active`**. Draining workers refuse new tasks, and Stale or Stopped
@@ -209,12 +210,11 @@ pub struct HealthSummaryReport {
 ///   silently dead fleet is still visible to the fraction check.
 ///
 /// 1. **Capacity check.** `active == 0 && queue_backlog > 0` ⇒ `critical`
-///    (`worker_no_active`): work is queued with nothing able to run it. This
-///    fires for an empty, an all-`Stopped`, an all-`Draining`, *and* an
-///    all-`Stale`-`Active` fleet whenever a backlog exists — because in every
-///    one of those cases no worker can claim the pending work (issue #679
-///    review P2: the earlier `supposed_running == 0` short-circuit let a
-///    drain window with a backlog read `healthy`).
+///    (`worker_no_active`): work is queued with nothing able to run it. With
+///    a backlog, this fires for an empty, an all-`Stopped`, an all-`Draining`,
+///    *and* an all-`Stale`-`Active` fleet. In each case no worker can claim
+///    the pending work. Issue #679: the earlier `supposed_running == 0`
+///    short-circuit let a drain window with a backlog read `healthy`.
 /// 2. **Health-fraction check.** Runs whenever `supposed_running > 0`,
 ///    independent of the backlog, so a stale/crashed fleet is flagged even
 ///    with nothing queued. `unhealthy / supposed_running` is compared against
@@ -607,9 +607,9 @@ fn collect_unavailable_shards(
 /// Assemble the rolled-up response from the shard-health report and the merged
 /// bundle numbers (pure, no DB).
 ///
-/// When the bundle pass was `incomplete` (a shard was unreachable in it), each
-/// of the four non-shard subsystems degrades to at least `degraded` and carries
-/// the `shard_unreachable` reason code — they cannot assert `healthy` on
+/// The bundle pass is `incomplete` when a shard was unreachable in it. Each of
+/// the four non-shard subsystems then degrades to at least `degraded`, with the
+/// `shard_unreachable` reason code. They cannot assert `healthy` on
 /// incomplete data. The `shards` subsystem reflects an unreachable shard via
 /// its own readiness instead. The two unavailable-shard lists are merged and
 /// deduped by `shard_id`. Top-level `status` is the worst of all five.
@@ -620,7 +620,6 @@ pub fn build_status_response(
     bundle: &StatusBundleMerge,
     thresholds: &StatusThresholds,
 ) -> HealthSummaryReport {
-    // workers
     let (mut workers_status, mut workers_codes) = classify_workers(
         bundle.workers_active,
         bundle.workers_supposed_running,
@@ -651,8 +650,8 @@ pub fn build_status_response(
         }),
     );
 
-    // shards (never gets the bundle-incomplete escalation; reflects its own
-    // readiness)
+    // Shards never get the bundle-incomplete escalation. They reflect their
+    // own readiness.
     let (shards_status, shards_codes, ready, degraded, unavailable) = classify_shards(shard_report);
     let shards = make_subsystem(
         "shards",
@@ -667,7 +666,6 @@ pub fn build_status_response(
         }),
     );
 
-    // dead_letters
     let (dl_status, dl_codes) =
         classify_dead_letters(bundle.dlq_total, bundle.dlq_newest_age_secs, thresholds);
     let dead_letters = make_subsystem(
@@ -682,7 +680,6 @@ pub fn build_status_response(
         }),
     );
 
-    // queues
     let (queues_status, queues_codes) = classify_queues(bundle.queue_max_backlog, thresholds);
     let queues = make_subsystem(
         "queues",
@@ -696,7 +693,6 @@ pub fn build_status_response(
         }),
     );
 
-    // stalled_workflows
     let (stalled_status, stalled_codes) = classify_stalled(bundle.stalled_count, thresholds);
     let stalled = make_subsystem(
         "stalled_workflows",
@@ -735,12 +731,12 @@ pub async fn build_status_report(
 ) -> HealthSummaryReport {
     let as_of = Utc::now();
     // Activity names with a circuit-breaker policy skip the rate-limit gate at
-    // claim, so the per-shard claimable-backlog scan must exempt them from its
-    // rate-limit filter to match `claim_task` (and the shard-health coverage
-    // gate, which resolves the same set — see `shard_health.rs`). Resolved once
-    // here: the tracked-names set is per-runtime (in-process/global), not
-    // per-shard. Empty when no runtime is installed (early boot) or no breakers
-    // are configured — the safe under-count-free fallback.
+    // claim. So the per-shard claimable-backlog scan exempts them from its
+    // rate-limit filter, to match `claim_task`. The shard-health coverage gate
+    // resolves the same set (see `shard_health.rs`). Resolved once here: the
+    // tracked-names set is per-runtime (in-process/global), not per-shard.
+    // Empty when no runtime is installed (early boot) or no breakers are
+    // configured. That is the safe under-count-free fallback.
     let circuit_breaker_activities: Vec<String> = api_state
         .runtime()
         .ok()
@@ -837,10 +833,10 @@ async fn gather_bundle(
     let dlq_newest_age_secs = dlq_newest_age_secs(conn).await?;
 
     // Reuse the same claimable-demand core helper the shard-health coverage
-    // gate uses. Pass the circuit-breaker-tracked activity names so their rows
-    // are counted as claimable even when the rate-limit bucket is empty (they
-    // skip the rate-limit gate at claim), matching `claim_task` and the
-    // shard-health scan — otherwise this under-counts real claimable backlog.
+    // gate uses. Circuit-breaker-tracked activities skip the rate-limit gate
+    // at claim. So their rows count as claimable even with an empty rate-limit
+    // bucket, as in `claim_task` and the shard-health scan. Otherwise this
+    // under-counts real claimable backlog.
     let demands =
         autumn_harvest::queue::claimable_pending_demand_by_queue(conn, circuit_breaker_activities)
             .await
@@ -1259,8 +1255,6 @@ mod tests {
         assert_eq!(resp.subsystems[0].status, SubsystemStatus::Healthy);
     }
 
-    // ── worst_status ─────────────────────────────────────────────────────────
-
     #[test]
     fn worst_status_of_empty_is_healthy() {
         assert_eq!(worst_status(std::iter::empty()), SubsystemStatus::Healthy);
@@ -1295,8 +1289,6 @@ mod tests {
         );
     }
 
-    // ── StatusThresholds::default ──────────────────────────────────────────────
-
     #[test]
     fn thresholds_default_sanity() {
         let t = StatusThresholds::default();
@@ -1309,8 +1301,6 @@ mod tests {
         assert!(t.worker_critical_unhealthy_fraction > t.worker_degraded_unhealthy_fraction);
     }
 
-    // ── classify_workers ───────────────────────────────────────────────────────
-
     #[test]
     fn classify_workers_empty_fleet_no_backlog_is_healthy() {
         // No workers, no queued work ⇒ genuinely idle fresh install ⇒ healthy.
@@ -1321,8 +1311,8 @@ mod tests {
 
     #[test]
     fn classify_workers_empty_fleet_with_backlog_is_critical() {
-        // FIX 2 (issue #679 review): no workers but work is queued ⇒ nothing to
-        // run it ⇒ critical.
+        // Issue #679: no workers but work is queued ⇒ nothing to run it ⇒
+        // critical.
         let (status, codes) = classify_workers(0, 0, 0, 0, 42, &thresholds());
         assert_eq!(status, SubsystemStatus::Critical);
         assert!(codes.contains(&"worker_no_active".to_string()));
@@ -1332,9 +1322,9 @@ mod tests {
     fn classify_workers_zero_active_with_workers_is_critical() {
         // No active workers, but the sole supposed-running (Active/Draining)
         // worker is stale ⇒ fraction 1/1 = 1.0 ≥ critical ⇒ critical. With no
-        // backlog the capacity check is skipped, so this surfaces as
-        // worker_unhealthy_fraction rather than worker_no_active (which now
-        // requires active == 0 AND a pending backlog).
+        // backlog the capacity check is skipped. So this surfaces as
+        // worker_unhealthy_fraction, not worker_no_active, which now requires
+        // active == 0 AND a pending backlog.
         let (status, codes) = classify_workers(0, 1, 1, 3, 0, &thresholds());
         assert_eq!(status, SubsystemStatus::Critical);
         assert!(codes.contains(&"worker_unhealthy_fraction".to_string()));
@@ -1343,7 +1333,7 @@ mod tests {
 
     #[test]
     fn classify_workers_stopped_only_no_backlog_is_healthy() {
-        // Codex #679 review P2: after a clean scale-to-zero the fleet holds
+        // Issue #679: after a clean scale-to-zero the fleet holds
         // only Stopped rows (supposed_running == 0, total > 0) and no work is
         // queued. This must read healthy, not a false worker_no_active critical.
         let (status, codes) = classify_workers(0, 0, 0, 7, 0, &thresholds());
@@ -1445,8 +1435,8 @@ mod tests {
     #[test]
     fn classify_workers_healthy_saturated_fleet_with_huge_backlog_stays_healthy() {
         // A fully healthy, saturated fleet (active > 0) with a large backlog is
-        // healthy on the WORKERS axis — a deep queue is the queues subsystem's
-        // concern, not a worker-fleet fault.
+        // healthy on the WORKERS axis. A deep queue concerns the queues
+        // subsystem. It is not a worker-fleet fault.
         let (status, codes) = classify_workers(3, 6, 0, 6, 1_000_000, &thresholds());
         assert_eq!(status, SubsystemStatus::Healthy);
         assert_eq!(codes, [] as [std::string::String; 0]);
@@ -1462,8 +1452,6 @@ mod tests {
         assert!(codes.contains(&"worker_unhealthy_fraction".to_string()));
         assert!(!codes.contains(&"worker_no_active".to_string()));
     }
-
-    // ── classify_dead_letters ──────────────────────────────────────────────────
 
     #[test]
     fn classify_dead_letters_none_is_healthy() {
@@ -1496,8 +1484,6 @@ mod tests {
         assert!(codes.contains(&"dlq_backlog".to_string()));
     }
 
-    // ── classify_queues ────────────────────────────────────────────────────────
-
     #[test]
     fn classify_queues_below_thresholds_is_healthy() {
         let (status, codes) = classify_queues(10, &thresholds());
@@ -1519,8 +1505,6 @@ mod tests {
         assert!(codes.contains(&"queue_backlog".to_string()));
     }
 
-    // ── classify_stalled ───────────────────────────────────────────────────────
-
     #[test]
     fn classify_stalled_zero_is_healthy() {
         let (status, codes) = classify_stalled(0, &thresholds());
@@ -1541,8 +1525,6 @@ mod tests {
         assert_eq!(status, SubsystemStatus::Critical);
         assert!(codes.contains(&"stalled_workflows".to_string()));
     }
-
-    // ── classify_shards ────────────────────────────────────────────────────────
 
     #[test]
     fn classify_shards_ready_maps_to_healthy() {
@@ -1595,8 +1577,6 @@ mod tests {
         assert_eq!(status, SubsystemStatus::Critical);
         assert_eq!((ready, degraded, unavailable), (0, 0, 1));
     }
-
-    // ── build_status_response ──────────────────────────────────────────────────
 
     #[test]
     fn build_status_response_all_healthy() {

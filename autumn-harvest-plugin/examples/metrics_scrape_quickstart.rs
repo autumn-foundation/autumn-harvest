@@ -13,39 +13,35 @@
 //! curl http://localhost:3000/actuator/prometheus | grep ^harvest_
 //! ```
 //!
-//! `HarvestPlugin::with_metrics_scrape()` is the only line needed to make
-//! Harvest's nine ADR-0001 §7 catalogue metrics appear on the app's shared
-//! `/actuator/prometheus` endpoint -- no exporter to install, no route to
-//! wire, no new dependency. This example drives every one of the nine
-//! within a few seconds of boot:
+//! `HarvestPlugin::with_metrics_scrape()` alone puts Harvest's nine ADR-0001
+//! §7 catalogue metrics on the app's shared `/actuator/prometheus` endpoint.
+//! There is no exporter to install, no route to wire, no new dependency. This
+//! example drives all nine within a few seconds of boot:
 //!
 //! - `harvest_workflow_started_total` / `harvest_workflow_duration_{count,sum}`
 //!   -- the `onboarding` workflow below is started once, right after boot.
 //! - `harvest_activity_duration_{count,sum}` -- `onboarding` calls one activity.
 //! - `harvest_timer_started_total` -- `onboarding` also waits on a durable timer.
 //! - `harvest_queue_depth` / `harvest_dlq_entries` -- sampled every
-//!   `poll_interval` (500ms by default) regardless of whether either is
-//!   nonzero, so both appear within about a second of boot with no
-//!   dedicated setup.
+//!   `poll_interval` (500ms by default), even at zero. Both appear within
+//!   about a second of boot with no dedicated setup.
 //! - `harvest_schedule_runs_total` / `harvest_schedule_skipped_total` -- the
-//!   `every_3_seconds` DAG below fires every 3s; its activity intentionally
-//!   takes ~4s, so every other fire collides with the still-running
-//!   previous one and is skipped (observed reason: `max_active_runs_reached`,
-//!   a DAG's default concurrency cap of 1).
-//! - `harvest_retention_deleted_total` -- retention is configured with a 1s
-//!   `max_age`/tick interval so the family appears quickly. Verified against
-//!   a live run: the family and its `# HELP`/`# TYPE` lines are always
-//!   present once retention is configured, but the *count* can legitimately
-//!   stay at 0 for a while -- a completed execution keeps its last-processed
-//!   worker's id stamped on it, which the retention candidate query
-//!   deliberately excludes, so deletion only proceeds once that stamp is
-//!   cleared through normal fleet churn. Present-but-zero is still a
-//!   correctly emitted sample (the same is true of `harvest_dlq_entries` and
-//!   `harvest_queue_depth` above whenever nothing is backlogged).
+//!   `every_3_seconds` DAG below fires every 3s. Its activity takes ~4s, so
+//!   every other fire collides with the previous run and is skipped. The
+//!   observed reason is `max_active_runs_reached`, a DAG's default
+//!   concurrency cap of 1.
+//! - `harvest_retention_deleted_total` -- retention uses a 1s
+//!   `max_age`/tick interval so the family appears quickly. A live run
+//!   confirms that the family and its `# HELP`/`# TYPE` lines are always
+//!   present once retention is configured. The *count* can stay at 0 for a while. A
+//!   completed execution keeps its last-processed worker's id. The retention
+//!   candidate query deliberately excludes such rows. So deletion proceeds
+//!   only after normal fleet churn clears that stamp. Present-but-zero is
+//!   still a correct sample, as for `harvest_dlq_entries` and
+//!   `harvest_queue_depth` above when nothing is backlogged.
 //!
-//! None of this is meant as production retention/schedule tuning advice --
-//! the intervals here are deliberately short so the demo is observable in
-//! seconds rather than hours.
+//! None of this is production retention/schedule tuning advice. The intervals
+//! are short so the demo is observable in seconds, not hours.
 
 use std::time::Duration;
 
@@ -76,9 +72,8 @@ async fn onboarding(ctx: &WorkflowContext, user_id: i64) -> Result<(), String> {
 
 #[activity]
 async fn slow_background_task(_ctx: &ActivityContext) -> Result<(), String> {
-    // Deliberately outlasts the schedule's 3s interval so every other fire
-    // collides with this one and is skipped -- this is what drives
-    // `harvest_schedule_skipped_total` in this demo.
+    // Outlasts the schedule's 3s interval, so every other fire collides with
+    // this one and is skipped. That drives `harvest_schedule_skipped_total`.
     tokio::time::sleep(Duration::from_secs(4)).await;
     Ok(())
 }
@@ -116,9 +111,8 @@ async fn main() {
     );
 
     tokio::spawn(async move {
-        // Give the plugin's on_startup hook time to install the runtime
-        // before dispatching the demo's single workflow run, over the same
-        // HTTP API a real caller would use.
+        // Give the plugin's on_startup hook time to install the runtime.
+        // Then start the single demo run over the HTTP API a real caller uses.
         tokio::time::sleep(Duration::from_secs(2)).await;
         let resp = autumn_harvest_plugin::http::client_builder()
             .build()

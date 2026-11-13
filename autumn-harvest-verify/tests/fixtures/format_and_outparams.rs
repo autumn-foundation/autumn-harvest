@@ -4,9 +4,9 @@
 //!   rustc --crate-type lib --edition 2024 --emit=mir \
 //!         -o format_and_outparams.mir format_and_outparams.rs
 //!
-//! `WorkflowContext` is a *stand-in* for the real `autumn_harvest::WorkflowContext`:
-//! the model matches sinks/sanctioned primitives on the receiver's LAST path
-//! segment plus the method name, so a local struct with the same name and the
+//! `WorkflowContext` is a *stand-in* for the real `autumn_harvest::WorkflowContext`.
+//! The model matches sinks/sanctioned primitives on the receiver's LAST path
+//! segment plus the method name. So a local struct with the same name and the
 //! same method names exercises the same rules without pulling the engine in.
 //!
 //! Every workflow-like fn has an `__autumn_workflow_info_<name>` companion, which

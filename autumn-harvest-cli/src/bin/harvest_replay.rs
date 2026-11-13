@@ -1,8 +1,8 @@
 //! `harvest-replay` — offline replay-safety validator for `#[workflow]` functions.
 //!
-//! Loads a recorded event history from a JSON file (or, with the `db` feature,
-//! directly from Postgres) and replays it against registered workflow handlers
-//! to detect non-determinism before deploying a code change.
+//! Loads a recorded event history from a JSON file, or from Postgres with the
+//! `db` feature. It replays the history against registered workflow handlers to
+//! detect non-determinism before a code change deploys.
 //!
 //! # Usage
 //!
@@ -120,7 +120,6 @@ async fn run_json_replay(replayer: &WorkflowReplayer, args: &Args) -> Result<(),
 
     // Optionally override the workflow name embedded in the snapshot.
     let report = if let Some(name) = &args.workflow {
-        // Deserialise snapshot, override workflow name, then replay.
         let mut snapshot: HistorySnapshot = serde_json::from_str(&json)
             .map_err(|e| format!("failed to parse history JSON: {e}"))?;
         snapshot.workflow_name = name.clone();
@@ -132,7 +131,6 @@ async fn run_json_replay(replayer: &WorkflowReplayer, args: &Args) -> Result<(),
             .map_err(|e| format!("failed to parse history JSON: {e}"))?
     };
 
-    // Print the report.
     println!("{report}");
 
     if args.fail_on_error {

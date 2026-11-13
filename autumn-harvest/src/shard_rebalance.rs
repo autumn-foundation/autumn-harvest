@@ -3,10 +3,10 @@
 //! ## Why
 //!
 //! The sharding contract used to end at *"cross-shard rebalancing of existing
-//! workflows is out of scope"*. The consequences compound: adding a shard only
-//! helps **new** starts, so a hot shard stays hot for as long as its residents
-//! live — forever, for a continue-as-new entity workflow — and a shard can
-//! never be decommissioned. This module is the operator-initiated primitive
+//! workflows is out of scope"*. The consequences compound. A new shard only
+//! helps **new** starts. So a hot shard stays hot for as long as its residents
+//! live, which is forever for a continue-as-new entity workflow. And a shard
+//! can never be decommissioned. This module is the operator-initiated primitive
 //! that fixes that, scoped to what the replay engine can actually prove.
 //!
 //! ## The shape
@@ -15,22 +15,22 @@
 //! copy ──▶ replay-verify ──▶ ONE atomic cutover commit ──▶ sealed source
 //! ```
 //!
-//! Restricting to **quiescent** executions is the move that makes the rest
-//! tractable: it converts a live distributed-migration problem into a
-//! copy-verify-cutover of an *inert, append-only event log* — exactly the
-//! artifact Harvest's replay engine exists to verify. That is what deletes the
-//! catch-up phase every online shard-move in the literature needs, and with it
-//! the dual-write and the two-phase commit.
+//! The restriction to **quiescent** executions makes the rest tractable. It
+//! turns a live distributed-migration problem into a copy-verify-cutover of an
+//! *inert, append-only event log*. That is exactly the artifact Harvest's
+//! replay engine exists to verify. So the design needs no catch-up phase,
+//! which every online shard-move in the literature needs. With it go the
+//! dual-write and the two-phase commit.
 //!
 //! ## The identity decision (issue #964 AC4)
 //!
-//! **A migrated execution keeps its `ExecutionId`.** The first two bytes stop
-//! meaning "the shard this run lives on" and start meaning "the shard this run
-//! **originated** on" — its routing entry point, not its residence. Nothing
-//! that holds an id has to learn anything, because no id changed: parents'
-//! recorded `ChildWorkflowStarted.child_id`, stored handles, external
-//! signal/cancel targets, webhooks and schedule lineage all keep resolving
-//! structurally rather than by enumeration.
+//! **A migrated execution keeps its `ExecutionId`.** The first two bytes no
+//! longer mean "the shard this run lives on". They mean "the shard this run
+//! **originated** on": its routing entry point, not its residence. No holder
+//! of an id has to learn anything, because no id changed. These all keep
+//! resolving structurally, not by enumeration: parents' recorded
+//! `ChildWorkflowStarted.child_id`, stored handles, external signal/cancel
+//! targets, webhooks and schedule lineage.
 //!
 //! Resolution is two-level:
 //!
@@ -50,9 +50,9 @@
 //!
 //! Nothing here appends to, reorders, or rewrites `harvest_events`. The copy
 //! `INSERT`s new rows on a **different** database and never touches a stored row
-//! on the source. Shard rebalancing is therefore **not** a fourth exception to
-//! the `harvest_events` invariant in `CLAUDE.md` — it is an instance of it, and
-//! it introduces **zero** new `WorkflowEvent` variants.
+//! on the source. So shard rebalancing is **not** a fourth exception to the
+//! `harvest_events` invariant in `CLAUDE.md`. It is an instance of it, and it
+//! introduces **zero** new `WorkflowEvent` variants.
 
 use sha2::{Digest, Sha256};
 
@@ -64,12 +64,12 @@ use crate::types::ShardId;
 
 /// Everything the quiescence decision needs, gathered explicitly.
 ///
-/// The predicate is a pure function over this struct rather than a SQL `WHERE`
-/// clause precisely so every branch is unit-testable without Postgres. That
-/// matters more here than almost anywhere else in the engine: the first draft
-/// of the predicate said "no task rows at all", which would have refused to
-/// migrate every timer-parked workflow — i.e. the entire population this
-/// feature exists to move.
+/// The predicate is a pure function over this struct, not a SQL `WHERE`
+/// clause, so every branch is unit-testable without Postgres. That matters
+/// more here than almost anywhere else in the engine. The first draft of the
+/// predicate said "no task rows at all". It would have refused every
+/// timer-parked workflow, which is the entire population this feature exists
+/// to move.
 ///
 /// Each bool is an independent fact, and several can hold at once. The
 /// predicate names every blocker, so an enum would lose information.
@@ -167,14 +167,14 @@ pub enum QuiescenceBlocker {
     /// An in-flight cross-shard child lifecycle row is parented here.
     CrossShardChildRow,
     /// The execution holds a durable mutex lock. The lock row is shard-local
-    /// and keyed by the holder, so moving the holder away would leave the key
-    /// held by an execution that no longer lives here — and every waiter on it
-    /// blocked forever.
+    /// and keyed by the holder. If the holder moves away, an execution that
+    /// no longer lives here holds the key. Every waiter on it then blocks
+    /// forever.
     HoldsMutexLock,
-    /// The execution is queued for a durable mutex lock. The grant is delivered
-    /// by waking the waiter on **this** shard, so a migrated waiter's grant
-    /// would be delivered to a sealed row: a lost wake, which is exactly what
-    /// the quiescence bar exists to prevent.
+    /// The execution is queued for a durable mutex lock. The grant wakes the
+    /// waiter on **this** shard. So the grant of a migrated waiter would reach
+    /// a sealed row. That is a lost wake, which the quiescence bar exists to
+    /// prevent.
     QueuedForMutex,
     /// A dead-letter row is attributed to this execution. Redriving it enqueues
     /// a task on this shard, which after a migration would target a sealed row.
@@ -188,10 +188,10 @@ pub enum QuiescenceBlocker {
     /// `RUNNING`/`PAUSED` executions on **its own** shard to honour
     /// `max_active_runs`, and its `CancelOther`/`TerminateOther` overlap
     /// policies cancel priors with the same shard-local query. After a
-    /// migration the local row reads `MIGRATED`, so the scheduler stops
-    /// counting the still-running copy and stops cancelling it: the schedule
-    /// silently exceeds its own cap, or starts a run without terminating the
-    /// prior it was told to replace.
+    /// migration the local row reads `MIGRATED`. The scheduler then stops
+    /// counting the still-running copy and stops cancelling it. So the
+    /// schedule silently exceeds its own cap, or starts a run without
+    /// terminating the prior it was told to replace.
     ///
     /// Out of scope by design, like in-flight activity work and held mutexes.
     /// Making it safe means teaching schedule overlap enforcement to see
@@ -280,10 +280,10 @@ impl Quiescence {
 
 /// Decide whether one execution is quiescent enough to migrate.
 ///
-/// Pure, total, and evaluated **twice** in a real migration: once to select
+/// Pure and total. A real migration evaluates it **twice**: once to select
 /// candidates, and again inside the cutover statement's own `WHERE` clause
-/// against the same facts. The second evaluation is what makes a wake arriving
-/// mid-migration abort cleanly rather than get lost.
+/// against the same facts. Due to the second evaluation, a wake that arrives
+/// mid-migration aborts cleanly and is not lost.
 #[must_use]
 pub fn assess_quiescence(obs: &QuiescenceObservation) -> Quiescence {
     let mut blockers = Vec::new();
@@ -410,8 +410,8 @@ impl MigrationPhase {
 
     /// Has this migration passed the single atomic cutover commit?
     ///
-    /// Past it the source is sealed, so "the source is no longer quiescent" is
-    /// not a reason to stop — the only correct move is forward.
+    /// Past it the source is sealed. So "the source is no longer quiescent" is
+    /// not a reason to stop. The only correct move is forward.
     #[must_use]
     pub const fn is_past_cutover(self) -> bool {
         matches!(self, Self::Committed | Self::Done)
@@ -480,36 +480,36 @@ pub const fn next_migration_action(obs: &MigrationObservation) -> MigrationActio
 /// How many forwarding hops an id-routed lookup will follow before failing
 /// closed.
 ///
-/// Deliberately small. A chain longer than this means either a cycle (which a
-/// routing call must never spin on) or a run migrated more often than the
-/// best-effort chain collapse could keep up with, and both are operator-visible
-/// problems rather than things to paper over with a longer walk.
+/// Deliberately small. A longer chain means a cycle, which a routing call must
+/// never spin on. Or it means a run migrated more often than the best-effort
+/// chain collapse could keep up with. Both are operator-visible problems. A
+/// longer walk would only hide them.
 pub const MAX_FORWARD_HOPS: usize = 4;
 
 /// How many phase transitions one `resume_incomplete_migrations` call will drive
 /// for a single migration row before leaving it for the next call.
 ///
 /// The phase machine is a five-step line (`PENDING → COPIED → VERIFIED →
-/// COMMITTED → DONE`), so a row picked up at its very first phase settles in
-/// four steps; the extra one is headroom for a step that legitimately does not
-/// advance the phase. It exists so a row that cannot make progress is abandoned
-/// rather than spun on.
+/// COMMITTED → DONE`). So a row picked up at its very first phase settles in
+/// four steps. The extra step is headroom for a step that legitimately does
+/// not advance the phase. The bound abandons a row that cannot make progress,
+/// rather than spin on it.
 pub const MAX_RESUME_STEPS: usize = 6;
 
 /// Follow a forwarding chain from an execution's origin shard to the shard it
 /// currently lives on.
 ///
 /// `lookup` answers "where did this shard forward this execution to?" —
-/// `None` meaning "it lives here". Chains arise when a run is migrated more
+/// `None` meaning "it lives here". A chain arises when a run migrates more
 /// than once (A→B, then B→C) before the best-effort chain collapse rewrites
-/// A's pointer straight to C; correctness comes from following the chain,
+/// A's pointer straight to C. Correctness comes from following the chain,
 /// performance from collapsing it.
 ///
 /// # Errors
 ///
 /// Returns [`HarvestError::ShardUnavailable`] when the chain exceeds
-/// [`MAX_FORWARD_HOPS`], which is how a cycle surfaces as a typed, retryable
-/// error instead of an infinite loop inside a routing call.
+/// [`MAX_FORWARD_HOPS`]. So a cycle surfaces as a typed, retryable error, not
+/// an infinite loop inside a routing call.
 pub fn resolve_forward_chain(
     origin: ShardId,
     mut lookup: impl FnMut(ShardId) -> Option<ShardId>,
@@ -536,9 +536,9 @@ pub fn resolve_forward_chain(
 /// Parents first. `harvest_events` is copied separately because its `id` is a
 /// shard-local `BIGSERIAL` that must **not** be carried across.
 ///
-/// Named here rather than inline so the schema-parity guard and the copy walk
-/// the same list: a relation added to one and not the other is a compile-time
-/// impossibility rather than a silent data loss.
+/// Named here, not inline, so the schema-parity guard and the copy walk the
+/// same list. A relation added to one and not the other is then impossible
+/// at compile time, not a silent data loss.
 pub const COPIED_RELATIONS: &[&str] = &[
     "harvest_workflow_executions",
     "harvest_timers",
@@ -552,13 +552,13 @@ pub const COPIED_RELATIONS: &[&str] = &[
 /// Relations whose schemas must match between source and target before a
 /// migration may start.
 ///
-/// A superset of [`COPIED_RELATIONS`]: it also carries `harvest_events` (copied
-/// with an explicit column list) and `harvest_task_queue`, whose parked row is
-/// restored on the target **at activation** — that is, *past* the cutover, where
-/// there is no longer anything to abort. A column mismatch discovered there
-/// would leave the run `RUNNING` on the target with no task row on either shard,
-/// so `harvest_task_queue` has to be checked here, before the seal, even though
-/// it is not part of the staged copy.
+/// A superset of [`COPIED_RELATIONS`]. It also carries `harvest_events`
+/// (copied with an explicit column list) and `harvest_task_queue`. The parked
+/// task row is restored on the target **at activation**. That is *past* the
+/// cutover, where there is nothing left to abort. A column mismatch found
+/// there would leave the run `RUNNING` on the target with no task row on
+/// either shard. So `harvest_task_queue` is checked here, before the seal,
+/// although it is not part of the staged copy.
 pub const SCHEMA_PARITY_RELATIONS: &[&str] = &[
     "harvest_workflow_executions",
     "harvest_events",
@@ -573,11 +573,11 @@ pub const SCHEMA_PARITY_RELATIONS: &[&str] = &[
 
 /// The columns copied out of `harvest_events`.
 ///
-/// Deliberately *not* `SELECT *`: `id` is a shard-local `BIGSERIAL` and
-/// `cohort` (issue #958 partitioning) is the row's append instant on *this*
-/// shard, so both are re-derived by the target's own defaults. Everything that
-/// is part of the history's meaning — `event_id`, `event_type`, `event_data`,
-/// `timestamp` — is carried byte-for-byte.
+/// Deliberately *not* `SELECT *`. `id` is a shard-local `BIGSERIAL`. `cohort`
+/// (issue #958 partitioning) is the row's append instant on *this* shard. So
+/// the target's own defaults re-derive both. Everything that is part of the
+/// history's meaning is carried byte-for-byte: `event_id`, `event_type`,
+/// `event_data`, `timestamp`.
 pub const COPIED_EVENT_COLUMNS: &[&str] = &[
     "workflow_exec_id",
     "event_id",
@@ -588,28 +588,29 @@ pub const COPIED_EVENT_COLUMNS: &[&str] = &[
 
 /// A `WorkflowReplayer`-grade fingerprint of the state a history replays to.
 ///
-/// Two histories with the same fingerprint agree on every decoded event
-/// *and* on the next-command state the replay cursor reaches after
-/// consuming them: the terminal-failure frontier, whether unconsumed
-/// non-lifecycle history remains, which signals are still unconsumed and at
-/// what multiplicity, and which update handlers are still unfinished. That
-/// is precisely the state that decides what command the workflow issues
-/// next, which is what "replays to the identical next-command state" means.
+/// Two histories with the same fingerprint agree on every decoded event.
+/// They *also* agree on the next-command state the replay cursor reaches
+/// after it consumes them. That state has four parts:
 ///
-/// Hashed rather than compared structurally so the value can be stored on
-/// the migration row and shown to an operator: verification says not only
-/// *that* it passed but *what* it agreed on.
+/// - the terminal-failure frontier;
+/// - whether unconsumed non-lifecycle history remains;
+/// - which signals are still unconsumed, and at what multiplicity;
+/// - which update handlers are still unfinished.
+///
+/// That state decides the next command of the workflow. It is what "replays
+/// to the identical next-command state" means.
+///
+/// Hashed, not compared structurally, so the migration row can store it and
+/// an operator can see it. Verification says *that* it passed, and also
+/// *what* it agreed on.
 #[must_use]
 pub fn history_fingerprint(events: &[crate::event::WorkflowEvent]) -> String {
     let mut hasher = Sha256::new();
 
-    // 1. The decoded events themselves, in order. `canonical` is one
-    // buffer, reused across every event. A fresh `String` per event is
-    // not needed. `serde_json::to_writer` emits the same bytes
-    // `serde_json::to_string` does, into a caller-owned buffer instead of
-    // a new one. The hashed bytes are therefore identical either way.
-    // This is not a behavior change. It only removes allocations, on a
-    // loop that can run to however many events a history holds.
+    // 1. The decoded events themselves, in order. `canonical` is one buffer,
+    // reused across every event. `serde_json::to_writer` emits the same
+    // bytes as `serde_json::to_string`, so the hash is unchanged. The reuse
+    // only saves one allocation per event of the history.
     let mut canonical = Vec::new();
     for event in events {
         canonical.clear();
@@ -694,8 +695,8 @@ pub use db::{
     set_legal_hold_forwarded, shard_of_held_row, stage_copy, verify_target_copy,
 };
 
-// This is `pub(crate)`, not part of the `pub use` block above (issue #1596
-// review). `forwarding_hop_conflict` itself is a plain `pub` function inside
+// This is `pub(crate)`, not part of the `pub use` block above (issue #1596).
+// `forwarding_hop_conflict` itself is a plain `pub` function inside
 // a private module, so this re-export is what actually bounds it to the
 // crate. Only a crate-internal caller, such as
 // `crate::execution::walk_retry_chain`, may reach it here.
@@ -736,9 +737,10 @@ mod db {
 
     /// The fork lineage of every open fork, as `lineage.source_ref` rows (issue
     /// #2000). It starts at the source of each open fork. It then follows
-    /// `start_source_ref` up while the row is a fork, for at most 65 links. A reset of a fork names the sealed fork as its source, but its
-    /// marker names the original source. So the walk must reach past the
-    /// sealed fork. A macro, so both predicates use one literal.
+    /// `start_source_ref` up while the row is a fork, for at most 65 links. A
+    /// reset of a fork names the sealed fork as its source, but its marker
+    /// names the original source. So the walk must reach past the sealed
+    /// fork. A macro, so both predicates use one literal.
     ///
     /// The partial index `idx_harvest_we_fork_source` serves the seed, so it
     /// reads only fork rows. The step joins on the primary key. A reference
@@ -824,14 +826,14 @@ mod db {
     /// exactly the history verification passed on".
     ///
     /// Quiescence alone is not enough to license a seal. Verification proves the
-    /// copy matches the source *as of the copy*; the cutover happens afterwards —
+    /// copy matches the source *as of the copy*. The cutover happens afterwards:
     /// immediately in the end-to-end path, but possibly hours later on a resume
     /// after a crash at `VERIFIED`. In between, the run can legitimately wake,
     /// execute a full decision cycle, append events and park again on a fresh
     /// timer. It is quiescent once more, and every predicate in
-    /// [`QUIESCENCE_SQL`] passes — so a cutover checking only quiescence would seal
-    /// it and activate a copy missing everything that cycle did. Lost progress, not
-    /// a lost wake, and invisible afterwards.
+    /// [`QUIESCENCE_SQL`] passes. A cutover that checks only quiescence would
+    /// seal it and activate a copy without that cycle. Lost progress, not a
+    /// lost wake, and invisible afterwards.
     ///
     /// Events are append-only with a monotonic per-execution `event_id`, so the
     /// `(count, max)` pair recorded at verification moves on any append. A record
@@ -1046,12 +1048,12 @@ mod db {
     /// Refuse to copy between shards whose schemas disagree.
     ///
     /// The copy is deliberately column-list-free (`to_jsonb` on the source,
-    /// `jsonb_populate_record` on the target) so that adding a column to
-    /// `harvest_workflow_executions` can never silently drop it from a
-    /// migration. The price of that is the converse hazard: if the target shard
-    /// is behind on migrations, its row type lacks the column,
-    /// `jsonb_populate_record` **ignores the unknown key silently**, and the
-    /// value is lost with no error. This guard converts that into a refusal
+    /// `jsonb_populate_record` on the target). So a new column on
+    /// `harvest_workflow_executions` can never silently drop out of a
+    /// migration. The price is the converse hazard. A target shard that is
+    /// behind on migrations has a row type without the column.
+    /// `jsonb_populate_record` then **ignores the unknown key silently**, and
+    /// the value is lost with no error. This guard turns that into a refusal
     /// before anything is written.
     ///
     /// # Errors
@@ -1190,11 +1192,11 @@ mod db {
 
     /// Open (or re-open) a migration for one execution.
     ///
-    /// The primary key on `execution_id` is what makes two concurrent operators
-    /// safe: the second `INSERT` collides rather than opening a second
-    /// migration for the same run. A previously settled row (`DONE`/`ABORTED`)
-    /// is reset to `PENDING`, so a run that failed verification once can be
-    /// retried without operator surgery.
+    /// The primary key on `execution_id` makes two concurrent operators safe.
+    /// The second `INSERT` collides, so it cannot open a second migration for
+    /// the same run. A previously settled row (`DONE`/`ABORTED`) is reset to
+    /// `PENDING`. So a run that failed verification once can be retried
+    /// without operator surgery.
     ///
     /// Every field a fresh `verify_target_copy` will re-stamp must be reset
     /// here alongside the phase (issue #1317). A reopened row that kept a
@@ -1444,16 +1446,16 @@ mod db {
     ///
     /// Everything is written in **one target-shard transaction**, so a crash
     /// mid-copy leaves the target either untouched or fully staged, never
-    /// half-copied. The staged copy is inert on two independent grounds: its
-    /// execution state is `MIGRATING` (which no dispatch path treats as
-    /// runnable) and it has **no workflow task row at all** — that row is held
-    /// in `harvest_shard_migrations.staged_task` on the source until activation.
+    /// half-copied. The staged copy is inert on two independent grounds. Its
+    /// execution state is `MIGRATING`, which no dispatch path treats as
+    /// runnable. And it has **no workflow task row at all**. The source holds
+    /// that row in `harvest_shard_migrations.staged_task` until activation.
     ///
     /// The copy is column-list-free by design: `to_jsonb` on the source and
-    /// `jsonb_populate_record` on the target mean a column added to
-    /// `harvest_workflow_executions` is carried automatically rather than
-    /// silently dropped by a hand-maintained list that nobody remembered to
-    /// update. [`assert_schema_parity`] closes the converse hazard.
+    /// `jsonb_populate_record` on the target. So a new column on
+    /// `harvest_workflow_executions` is carried automatically. A
+    /// hand-maintained list could silently drop it if nobody updated the list.
+    /// [`assert_schema_parity`] closes the converse hazard.
     ///
     /// The source is not modified in any way.
     ///
@@ -1509,11 +1511,11 @@ mod db {
         )
         .await?;
 
-        // Author-emitted `ctx.logger()` lines. Copied rather than left behind
-        // for a privacy reason as much as an operational one: they are free
-        // text, so a classic PII sink, and `erase.rs` scrubs them via the
-        // execution's own shard. A run whose logs stayed on the source would
-        // have them out of reach of an erasure issued against the run.
+        // Author-emitted `ctx.logger()` lines. They are copied, not left
+        // behind, for a privacy reason as much as an operational one. They are
+        // free text, so a classic PII sink. `erase.rs` scrubs them via the
+        // execution's own shard. Logs left on the source would be out of reach
+        // of an erasure issued against the run.
         let workflow_logs = read_json(
             source,
             "SELECT COALESCE(jsonb_agg(to_jsonb(l)), '[]'::jsonb) AS payload \
@@ -1556,25 +1558,25 @@ mod db {
 
         Box::pin(target.transaction::<(), HarvestError, _>(async |conn| {
             // On a REVERSE migration (A -> B -> A) the target is a shard this
-            // run has already lived on, so it holds A's `MIGRATED` seal — the
-            // forwarding pointer every id that routes to A resolves through.
+            // run has already lived on. So it holds A's `MIGRATED` seal: the
+            // forwarding pointer that every id routed to A resolves through.
             // Staging replaces that row, so the pointer is carried onto the
             // staged copy and kept there until activation clears it.
             //
-            // Without this, ids routing to A would stop at an inert `MIGRATING`
-            // copy for the whole staging window instead of reaching live B, and
-            // an abort would delete even that, leaving the execution with no row
+            // Without this, ids routed to A would stop at an inert `MIGRATING`
+            // copy for the whole staging window, and not reach live B. An abort
+            // would delete even that copy. The execution would then have no row
             // on its origin shard at all: an id that resolves nowhere.
             let prior_seal = existing_seal(&mut *conn, exec_id).await?;
             discard_staged_copy(&mut *conn, exec_id).await?;
 
             // A retained terminal copy of an UNRELATED execution can already
             // hold the target's active-uniqueness slot for this business key
-            // (issue #1317 review, P1). Reconciliation lets a fresh run
-            // start on a shard the key was released on. An old terminal row
-            // for the same key can still stay behind on a shard the key
-            // visited earlier. Migrating that fresh run onward to the old
-            // row's shard must not collide with it.
+            // (issue #1317). Reconciliation lets a fresh run start on a shard
+            // the key was released on. An old terminal row for the same key can
+            // still stay behind on a shard the key visited earlier. Migrating
+            // that fresh run onward to the old row's shard must not collide
+            // with it.
             //
             // Vacate it exactly like a fresh start replacing a terminal
             // prior does elsewhere (`replace_execution`): seal it
@@ -1582,7 +1584,7 @@ mod db {
             // without touching this migration's own row or its completion
             // timestamp.
             //
-            // The seal must be reversible (issue #1317 review, P1).
+            // The seal must be reversible (issue #1317).
             // Staging can succeed while verification or cutover later
             // aborts. The vacated row must then return to exactly the
             // state it had, not stay misreported as a continuation that
@@ -1616,14 +1618,13 @@ mod db {
                     "RUNNING" | "PAUSED" | "MIGRATING" | "MIGRATED"
                 )
             {
-                // `staging_vacated_by` names the execution THIS staging is
-                // for, i.e. the row that will occupy the slot this vacate
-                // frees (issue #1596 review, comment_id 4055601106). Set in
-                // the SAME statement as the vacate itself, so the link is
-                // exactly as durable as the vacate: no cross-database
-                // write, no retry race. `activate_target` reads it back to
-                // finalize this row's marker with a direct match on the
-                // execution id, no inference or business-key ambiguity
+                // `staging_vacated_by` names the execution THIS staging is for,
+                // i.e. the row that will occupy the slot this vacate frees
+                // (issue #1596). Set in the SAME statement as the vacate
+                // itself, so the link is exactly as durable as the vacate: no
+                // cross-database write, no retry race. `activate_target` reads
+                // it back to finalize this row's marker with a direct match on
+                // the execution id, no inference or business-key ambiguity
                 // possible.
                 diesel::sql_query(
                     "UPDATE harvest_workflow_executions \
@@ -1720,13 +1721,13 @@ mod db {
 
             // `harvest_workflow_logs` gets an EXPLICIT column list, for exactly
             // the reason `harvest_events` does: its `id` is a shard-local
-            // `BIGSERIAL`. Carrying the source's value would either collide
-            // with a row the target already has -- two independent sequences
-            // hand out the same small integers -- or, worse, land in a gap
-            // WITHOUT advancing the target's sequence, so a later log insert on
-            // the target collides with the copy instead. Letting the target
-            // mint the id keeps `seq`, which is the per-execution ordering that
-            // actually carries the meaning.
+            // `BIGSERIAL`. Two independent sequences hand out the same small
+            // integers. So the source's value could collide with a row the
+            // target already has. Worse, it could land in a gap WITHOUT
+            // advancing the target's sequence. A later log insert on the target
+            // then collides with the copy. So the target mints the id. `seq`
+            // stays, and it is the per-execution ordering that carries the
+            // meaning.
             diesel::sql_query(
                 "INSERT INTO harvest_workflow_logs \
                      (workflow_exec_id, seq, level, message, occurred_at) \
@@ -1766,21 +1767,15 @@ mod db {
         .await
     }
 
-    /// Delete a staged (`MIGRATING`) copy from the target, or verify there is
-    /// nothing to delete.
-    ///
-    /// Refuses loudly if the target holds a row for this id in any other state:
-    /// that is a live execution the copy would clobber, and the only safe
-    /// answer is to stop.
     /// Undo a staged copy, **restoring** any forwarding seal the target shard
     /// held before staging replaced it.
     ///
     /// [`discard_staged_copy`] deletes the row outright, which is right when the
     /// target never hosted this run. On a reverse migration (A → B → A) it is
-    /// not: the row staging replaced was A's own seal, and deleting it leaves
-    /// every id that routes to A resolving nowhere. A staged row that carries a
-    /// forwarding pointer is therefore returned to `MIGRATED` in place rather
-    /// than removed — its copied history is discarded either way, since the live
+    /// not. There the row that staging replaced was A's own seal. Deleting it
+    /// leaves every id that routes to A resolving nowhere. So a staged row that
+    /// carries a forwarding pointer returns to `MIGRATED` in place, and is not
+    /// removed. Its copied history is discarded either way, because the live
     /// copy on the other shard is a superset of it.
     async fn discard_staged_copy_restoring_seal(
         conn: &mut AsyncPgConnection,
@@ -1801,8 +1796,8 @@ mod db {
         // standing in `MIGRATING`. A row already gone, or moved on to some
         // other state, has already left the active-uniqueness slot for
         // this business key on its own. `TERMINATED` is one such state: a
-        // force-terminate can race this abort before cutover (issue #1596
-        // review, P1). Neither case owes this function any row cleanup.
+        // force-terminate can race this abort before cutover (issue #1596).
+        // Neither case owes this function any row cleanup.
         // Both still owe the vacated-row restoration after this `if`. That
         // restoration depends only on the slot being free, not on how it
         // became free.
@@ -1848,22 +1843,21 @@ mod db {
             }
         }
 
-        // Restore an unrelated same-key row `stage_copy` vacated to make
-        // room for this copy (issue #1317 review, P1). Matched by
-        // `staging_vacated_by`, not by business key (issue #1596 review,
-        // comment_id 4055601106). `staging_vacated_by` names exactly the
-        // row this migration's own staging vacated, set in the same
-        // statement as the vacate itself. This match needs no
-        // continuous-occupancy argument to be safe.
+        // Restore an unrelated same-key row `stage_copy` vacated to make room
+        // for this copy (issue #1317). Matched by `staging_vacated_by`, not by
+        // business key (issue #1596). `staging_vacated_by` names exactly the
+        // row this migration's own staging vacated, set in the same statement
+        // as the vacate itself. This match needs no continuous-occupancy
+        // argument to be safe.
         //
-        // This runs LAST, after the `if let` above resolves the staged
-        // row. That row may end up gone, sealed back to `MIGRATED`,
-        // deleted outright, or left untouched in some other terminal state
-        // (issue #1596 review, P1). Every one of those outcomes already
-        // frees this business key's slot in the active-uniqueness index
-        // once. Restoring the vacated row any earlier would briefly hold
-        // two active rows for the same key at once. That fails against the
-        // very index this whole scheme exists to respect.
+        // This runs LAST, after the `if let` above resolves the staged row.
+        // That row may end up gone, sealed back to `MIGRATED`, deleted
+        // outright, or left untouched in some other terminal state
+        // (issue #1596). Every one of those outcomes already frees this
+        // business key's slot in the active-uniqueness index once. Restoring
+        // the vacated row any earlier would briefly hold two active rows for
+        // the same key at once. That fails against the very index this whole
+        // scheme exists to respect.
         diesel::sql_query(
             "UPDATE harvest_workflow_executions \
               SET state = staging_vacated_state, staging_vacated_state = NULL, \
@@ -1898,6 +1892,12 @@ mod db {
         "DELETE FROM harvest_task_queue WHERE workflow_exec_id = $1",
     ];
 
+    /// Delete a staged (`MIGRATING`) copy from the target, or verify there is
+    /// nothing to delete.
+    ///
+    /// Refuses loudly if the target holds a row for this id in any other
+    /// state. That is a live execution the copy would clobber, and the only
+    /// safe answer is to stop.
     async fn discard_staged_copy(
         conn: &mut AsyncPgConnection,
         exec_id: ExecutionId,
@@ -1914,10 +1914,10 @@ mod db {
             None => return Ok(()),
             // Either a staged copy from this or a previous attempt, or a row
             // this execution left behind when it was migrated OFF this shard
-            // earlier. Accepting the latter is what makes a drain reversible:
-            // without it, `--from A --to B` over a large population could never
-            // be undone by `--from B --to A`, because A still holds the sealed
-            // row. The fresh copy carries the same history plus everything that
+            // earlier. Acceptance of the latter makes a drain reversible.
+            // Otherwise `--from B --to A` could never undo `--from A --to B`
+            // over a large population, because A still holds the sealed row.
+            // The fresh copy carries the same history plus everything that
             // happened since, so replacing it loses nothing.
             Some("MIGRATING" | "MIGRATED") => {}
             Some(other) => {
@@ -1949,14 +1949,14 @@ mod db {
     /// The forwarding pointer a shard is currently holding for `exec_id`, if it
     /// holds a sealed row for it at all.
     ///
-    /// Read **before** a staging discard on a reverse migration (A → B → A), so
-    /// the seal can be carried onto the staged copy and restored if the
-    /// migration aborts. Without it, staging onto A deletes A's `MIGRATED` row
-    /// and replaces it with a `MIGRATING` row whose pointer is NULL: every id
-    /// that routes to A stops at an inert copy instead of reaching live B, and
-    /// an abort then deletes even that, leaving the execution with no row on its
-    /// origin shard and no pointer anywhere — an id that resolves nowhere, the
-    /// one outcome this design must never produce.
+    /// Read **before** a staging discard on a reverse migration (A → B → A).
+    /// So the seal can be carried onto the staged copy and restored if the
+    /// migration aborts. Without it, staging onto A deletes A's `MIGRATED` row.
+    /// It replaces it with a `MIGRATING` row whose pointer is NULL. Every id
+    /// that routes to A then stops at an inert copy and does not reach live B.
+    /// An abort then deletes even that copy. The execution has no row on its
+    /// origin shard and no pointer anywhere. That is an id that resolves
+    /// nowhere, the one outcome this design must never produce.
     ///
     /// Matched on the POINTER, not on `state = 'MIGRATED'` (issue #1317). A
     /// prior `stage_copy` call can leave A in state `MIGRATING`, still
@@ -2695,21 +2695,21 @@ mod db {
         let fingerprint =
             resolve_migration_fingerprint(exec_id, source_result, target_result, &source_raw)?;
 
-        // Stamp the high-water mark of THE HISTORY THIS CALL ACTUALLY VERIFIED,
-        // derived from `source_raw` — the very rows the byte-identity check
-        // above compared — rather than re-queried here.
+        // Stamp the high-water mark of THE HISTORY THIS CALL ACTUALLY VERIFIED.
+        // It comes from `source_raw`, the very rows the byte-identity check
+        // above compared. It is not re-queried here.
         //
-        // Re-querying would reopen the hole the mark exists to close, one step
-        // earlier: the source can wake, run a decision cycle, append and re-park
-        // between the fingerprint reads and this UPDATE, and a freshly-computed
-        // mark would then record a history that was never copied. The cutover
-        // would find both quiescence and the mark unchanged and seal, losing
-        // that cycle silently — exactly the failure the guard was added for,
-        // just with a shorter window.
+        // A re-query would reopen the hole the mark exists to close, one step
+        // earlier. The source can wake, run a decision cycle, append and
+        // re-park between the fingerprint reads and this UPDATE. A fresh mark
+        // would then record a history that was never copied. The cutover would
+        // find both quiescence and the mark unchanged, and seal. That cycle is
+        // lost silently: exactly the failure the guard exists for, with a
+        // shorter window.
         //
         // Binding what was read makes the mark and the verified copy the same
-        // artifact by construction. If the source moved on in the meantime, the
-        // mark simply no longer matches the live history and the cutover
+        // artifact by construction. If the source moved on in the meantime,
+        // the mark no longer matches the live history. The cutover then
         // declines, which is the fail-closed direction.
         let (verified_count, verified_max) = history_high_water_mark(&source_raw);
 
@@ -2798,9 +2798,9 @@ mod db {
             return (0, -1);
         };
         let count = i64::try_from(rows.len()).unwrap_or(i64::MAX);
-        // `as_slice()` on both: the diesel prelude is in scope here and brings
-        // `LimitDsl::first` with it, which shadows `Vec`'s inherent method and
-        // sends inference off into query-builder traits.
+        // `as_slice()` on both: the diesel prelude in scope brings
+        // `LimitDsl::first`. It shadows the inherent method of `Vec` and sends
+        // inference off into query-builder traits.
         let max = rows
             .as_slice()
             .last()
@@ -2825,14 +2825,14 @@ mod db {
     ///
     /// This is the **only** step that changes who is authoritative, and it is a
     /// single statement on the source shard. Its `WHERE` clause re-evaluates the
-    /// full quiescence predicate, so a wake that landed at any point since the
-    /// candidate scan makes it match zero rows: the migration aborts and the
-    /// source — untouched — processes the wake normally. That is what makes a
-    /// mid-migration signal *aborting* rather than *lost*.
+    /// full quiescence predicate. So a wake that landed at any point since the
+    /// candidate scan makes it match zero rows. The migration aborts, and the
+    /// untouched source processes the wake normally. So a mid-migration signal
+    /// *aborts* the migration and is not *lost*.
     ///
     /// In the same statement the source's parked workflow task row is
-    /// `CANCELLED`. That is not belt-and-braces: the claim query filters on the
-    /// *task's* state, not the execution's, so a sealed `MIGRATED` execution
+    /// `CANCELLED`. That is not belt-and-braces. The claim query filters on the
+    /// *task's* state, not the execution's. So a sealed `MIGRATED` execution
     /// with a live parked row would still be claimable on the source.
     ///
     /// Returns `true` when the cutover committed, `false` when the source was no
@@ -2847,15 +2847,14 @@ mod db {
         target_shard: ShardId,
     ) -> HarvestResult<bool> {
         // NOTE: no `--` comments inside this literal. Every line ends in `\`,
-        // which strips the newline, so the whole statement is ONE line — a `--`
-        // would comment out everything after it, including the final SELECT,
-        // and Postgres would answer `syntax error at end of input`. Explanations
-        // go here instead.
+        // which strips the newline, so the whole statement is ONE line. A `--`
+        // would comment out everything after it, including the final SELECT.
+        // Postgres would answer `syntax error at end of input`. Explanations go
+        // here instead.
         //
-        // `cancelled` and `advanced` are data-modifying CTEs, which Postgres
-        // always executes to completion whether or not the primary query reads
-        // them; only the seal's row count is needed to answer "did the cutover
-        // happen?".
+        // `cancelled` and `advanced` are data-modifying CTEs. Postgres always
+        // executes them to completion, whether or not the primary query reads
+        // them. Only the seal's row count answers "did the cutover happen?".
         //
         // `forgotten` removes the entity state row of the sealed run (issue
         // #2259). The target now holds the live row. A stale copy here would
@@ -2888,15 +2887,15 @@ mod db {
         // takes the execution row `FOR UPDATE` first.
         //
         // Without that lock the re-check is a single autocommit statement under
-        // READ COMMITTED, and its cross-table `EXISTS (... harvest_signals ...)`
-        // subqueries are evaluated against the statement snapshot. Postgres
-        // re-evaluates a qual only when the *target tuple* was updated, and
-        // `signal::send_signal_idempotent` merely takes `SELECT ... FOR UPDATE`
-        // on the execution row — a lock, not an update. So a signal committing
-        // between our snapshot and our write would not be seen: we would seal a
-        // run that had just been woken, and cancel the task row the wake had
-        // just re-pended. Taking the same lock the signal path takes is what
-        // makes "aborts cleanly rather than losing the wake" true.
+        // READ COMMITTED. Its cross-table `EXISTS (... harvest_signals ...)`
+        // subqueries read the statement snapshot. Postgres re-evaluates a qual
+        // only when the *target tuple* was updated.
+        // `signal::send_signal_idempotent` only takes `SELECT ... FOR UPDATE`
+        // on the execution row: a lock, not an update. So this statement would
+        // miss a signal that commits between its snapshot and its write. It
+        // would seal a run that was just woken, and cancel the task row the
+        // wake just re-pended. The same lock as the signal path makes "aborts
+        // cleanly rather than losing the wake" true.
         let row: CutoverRow = Box::pin(source.transaction::<CutoverRow, HarvestError, _>(
             async |conn| {
                 diesel::sql_query(
@@ -2915,13 +2914,13 @@ mod db {
                     .map_err(database_error)?;
 
                 if row.sealed_rows > 0 {
-                    // The seal happened, so the phase MUST advance with it —
+                    // The seal happened, so the phase MUST advance with it:
                     // they are the same commit. A zero here means a concurrent
-                    // abort claimed the record out from under us (it takes the
-                    // same row lock above, so it cannot have interleaved *within*
-                    // this transaction, only before it). Fail, which rolls the
-                    // seal back rather than leaving a sealed row whose record
-                    // still says it was never cut over.
+                    // abort claimed the record first. It takes the same row
+                    // lock above, so it cannot interleave *within* this
+                    // transaction, only before it. Fail, which rolls the seal
+                    // back. Otherwise a sealed row would keep a record that
+                    // says it was never cut over.
                     let advanced = diesel::sql_query(
                         "UPDATE harvest_shard_migrations \
                             SET phase = 'COMMITTED', updated_at = NOW() \
@@ -3002,8 +3001,8 @@ mod db {
     // ── Phase 4: activate the target ─────────────────────────────────────────
 
     /// Make the target copy claimable. Idempotent, and safe to re-run after any
-    /// crash: it is driven entirely off the durable `COMMITTED` record on the
-    /// source, which by then is already sealed.
+    /// crash. The durable `COMMITTED` record on the source drives it entirely,
+    /// and the source is already sealed by then.
     ///
     /// Up to four things happen in one target-shard transaction:
     ///
@@ -3013,21 +3012,20 @@ mod db {
     ///    Unconditional: safe on every call, including one where step 1 is a
     ///    no-op.
     /// 3. The parked workflow task row captured at stage time is restored.
-    /// 4. If any signal arrived between the cutover and now — forwarded to the
-    ///    target through the sealed source — the restored task is re-pended
-    ///    `PENDING` at `NOW()` so the wake is delivered rather than left waiting
-    ///    for a timer that may be days out. This is what closes the
-    ///    "never lost" half of the wake contract on the post-cutover side.
+    /// 4. A signal may have arrived between the cutover and now, forwarded to
+    ///    the target through the sealed source. Then the restored task is
+    ///    re-pended `PENDING` at `NOW()`. So the wake is delivered, and does not
+    ///    wait for a timer that may be days out. This closes the "never lost"
+    ///    half of the wake contract on the post-cutover side.
     ///
-    /// Steps 3 and 4 are gated on step 1 actually matching a row. An
-    /// operator can force-terminate the staged copy during the supported
-    /// `COMMITTED`-before-activation window (issue #1596 review, finding
-    /// 1). Step 1 can then legitimately match zero rows against an
-    /// already-`TERMINATED` row. Restoring a `PENDING` task in that case
-    /// would undo termination's own attempt to fail every open task for the
-    /// execution. `claim_task_query` does not require the owning execution
-    /// to be `RUNNING`, so a resurrected task could then be claimed and
-    /// dispatched against a terminated run.
+    /// Steps 3 and 4 are gated on step 1 actually matching a row. An operator
+    /// can force-terminate the staged copy during the supported
+    /// `COMMITTED`-before-activation window (issue #1596). Step 1 can then
+    /// legitimately match zero rows against an already-`TERMINATED` row.
+    /// Restoring a `PENDING` task in that case would undo termination's own
+    /// attempt to fail every open task for the execution. `claim_task_query`
+    /// does not require the owning execution to be `RUNNING`, so a resurrected
+    /// task could then be claimed and dispatched against a terminated run.
     ///
     /// Step 2 has no such gate (issue #1596 review, finding 2, hardened by
     /// `comment_id` 4055454415 and `comment_id` 4055601106). The migration
@@ -3127,13 +3125,13 @@ mod db {
                 // closing that gap.
                 //
                 // `migrated_to_shard`/`migrated_at` are CLEARED here. They are
-                // normally already NULL, but on a reverse migration the staged
-                // copy deliberately carried the target shard's own old seal
-                // forward so ids kept resolving during staging. Leaving it set
-                // on a now-live row would make the run forward to the shard it
-                // just came from — a cycle, and `read_forward` matches on the
-                // pointer rather than the state, so the live row's state would
-                // not save it.
+                // normally already NULL. On a reverse migration, though, the
+                // staged copy deliberately carried the target shard's own old
+                // seal forward, so ids kept resolving during staging. If it
+                // stays set on a now-live row, the run forwards to the shard it
+                // just came from. That is a cycle. `read_forward` matches on the
+                // pointer, not the state, so the live row's state would not
+                // save it.
                 let activated = diesel::sql_query(
                     "UPDATE harvest_workflow_executions \
                         SET state = 'RUNNING', \
@@ -3280,9 +3278,9 @@ mod db {
         .await?;
 
         // `staged_task` carries the parked task row, whose `input` is the run's
-        // payload. Once the target holds it there is no reason to keep a third
-        // copy on the source in a table neither `erase.rs` nor the retention
-        // janitor knows about, so the settling UPDATE clears it.
+        // payload. Once the target holds it, a third copy on the source serves
+        // no purpose. Neither `erase.rs` nor the retention janitor knows this
+        // table. So the settling UPDATE clears it.
         let settled = Box::pin(source.transaction::<bool, HarvestError, _>(async |conn| {
             if fenced && let Some(settle) = settle {
                 crate::replication::assert_fence(conn, settle.source_shard).await?;
@@ -3326,9 +3324,9 @@ mod db {
         target_shard: ShardId,
         reason: &str,
     ) -> HarvestResult<()> {
-        // Serialize against `commit_cutover` on the execution row it locks, so
-        // the claim below and the seal there are mutually exclusive rather than
-        // merely unlikely to interleave.
+        // Serialize against `commit_cutover` on the execution row it locks. So
+        // the claim below and the seal there are mutually exclusive, not merely
+        // unlikely to interleave.
         diesel::sql_query("SELECT id FROM harvest_workflow_executions WHERE id = $1 FOR UPDATE")
             .bind::<SqlUuid, _>(exec_id.as_uuid())
             .execute(&mut *source)
@@ -3337,17 +3335,17 @@ mod db {
 
         // CLAIM the abort atomically, before touching the target.
         //
-        // A plain read-then-act would still race: two operators can legitimately
-        // drive the same migration (the runbook tells them to run
-        // `rebalance-resume` after an interruption), and a concurrent
-        // `commit_cutover` could seal the source in the window between the read
-        // and the delete — leaving a `MIGRATED` source forwarding to a copy this
-        // call has just destroyed. The execution would then exist nowhere.
+        // A plain read-then-act would still race. Two operators can
+        // legitimately drive the same migration: the runbook tells them to run
+        // `rebalance-resume` after an interruption. A concurrent
+        // `commit_cutover` could seal the source between the read and the
+        // delete. The `MIGRATED` source would then forward to a copy this call
+        // has just destroyed. The execution would then exist nowhere.
         //
         // So the phase transition happens FIRST, as a conditional UPDATE that
-        // only a pre-cutover row matches. Winning it is what licenses the
-        // delete; `commit_cutover`'s own seal is conditional on the phase still
-        // being `VERIFIED`, so the two are mutually exclusive by the same row.
+        // only a pre-cutover row matches. Only the winner may delete. The seal
+        // of `commit_cutover` requires the phase to still be `VERIFIED`. So the
+        // same row makes the two mutually exclusive.
         let claimed = diesel::sql_query(
             "UPDATE harvest_shard_migrations \
                 SET phase = 'ABORTED', abort_reason = $2, staged_task = NULL, \
@@ -3381,9 +3379,9 @@ mod db {
         }
 
         // The seal-restoring variant, because a reverse migration's target is a
-        // shard this run has lived on before: the row staging replaced there was
-        // that shard's own forwarding seal, and deleting it outright would leave
-        // every id routing to it resolving nowhere.
+        // shard this run has lived on before. The row that staging replaced
+        // there was that shard's own forwarding seal. Deleting it outright
+        // would leave every id routing to it resolving nowhere.
         //
         // Run unconditionally, whether this call just won the claim above or
         // is retrying one an earlier call already won (issue #1317). The
@@ -3396,18 +3394,18 @@ mod db {
         // here is always safe, not merely safe on the first attempt.
         //
         // Gated behind a fresh lock on this exact `harvest_shard_migrations`
-        // row, held open for the target call's whole duration (issue #1317
-        // review, P1 follow-up). The claim above can be arbitrarily old by
-        // now. It only proves ABORTED was true at its own commit, and a
-        // retrying call's read of it is older still. `begin_migration` can
-        // reopen this exact record in the gap, running a whole new attempt
-        // through staging and cutover before this line runs.
+        // row, held open for the target call's whole duration (issue #1317).
+        // The claim above can be arbitrarily old by now. It only proves ABORTED
+        // was true at its own commit, and a retrying call's read of it is older
+        // still. `begin_migration` can reopen this exact record in the gap,
+        // running a whole new attempt through staging and cutover before this
+        // line runs.
         //
         // `target` is the connection this specific call's caller already
         // resolved, to `target_shard`, before the claim above ever ran. It
         // does not move if the row reopens elsewhere. So the row's CURRENT
         // `target_shard` is what decides whether cleaning up `target` here
-        // is still this call's job. Two cases (fresh review, P1 follow-up):
+        // is still this call's job. Two cases:
         //
         // - The reopened attempt targets `target_shard` too. Cleaning up
         //   here would then hit that new attempt's now-live copy on the
@@ -3506,10 +3504,9 @@ mod db {
     ///
     /// The cheap `RUNNING` / root / not-blocked filter runs in SQL; the verdict
     /// itself comes from [`assess_quiescence`] over a per-execution observation.
-    /// That is one query per candidate rather than one query total, and it is
-    /// the deliberate trade: an operator batch tool can afford it, and it makes
-    /// it structurally impossible for the SQL scan and the pure predicate to
-    /// disagree about what "quiescent" means.
+    /// That is one query per candidate, not one query total. The trade is
+    /// deliberate. An operator batch tool can afford it. And the SQL scan and
+    /// the pure predicate then cannot disagree about what "quiescent" means.
     ///
     /// `scan_limit` bounds how many executions are *examined*; the caller
     /// decides how many of the eligible ones to actually move.
@@ -3689,9 +3686,9 @@ mod db {
     /// Migrate one execution end to end: stage → verify → cutover → activate.
     ///
     /// Every pre-cutover failure aborts with the source untouched. Past the
-    /// cutover there is no rollback — the source is sealed — so a failure there
-    /// leaves the durable `COMMITTED` record for
-    /// [`resume_incomplete_migrations`] and is surfaced as an error rather than
+    /// cutover there is no rollback, because the source is sealed. A failure
+    /// there leaves the durable `COMMITTED` record for
+    /// [`resume_incomplete_migrations`]. It surfaces as an error and is not
     /// swallowed.
     ///
     /// # Errors
@@ -3712,13 +3709,13 @@ mod db {
             });
         }
         // Two distinct shard ids can still address the identical physical
-        // database (issue #1596 follow-up review, comment 5256791103), a
-        // supported pre-split staging shape. Checking out both connections
-        // below would then wait on the source checkout's own pool. It
-        // needs a second connection that pool cannot hand out until this
-        // call returns. Reject before either checkout, not just on
-        // literal id equality. A larger aliased pool is equally nonsensical: staging would find
-        // the source row itself already sitting in the "target" table.
+        // database (issue #1596), a supported pre-split staging shape.
+        // Checking out both connections below would then wait on the source
+        // checkout's own pool. It needs a second connection that pool cannot
+        // hand out until this call returns. Reject before either checkout,
+        // not just on literal id equality. A larger aliased pool is equally
+        // nonsensical: staging would find the source row itself already
+        // sitting in the "target" table.
         if pool.same_physical_pool(source_shard, target_shard) {
             return Ok(MigrationOutcome::Aborted {
                 execution_id: exec_id,
@@ -3784,10 +3781,10 @@ mod db {
         // ── The point of no return ───────────────────────────────────────────
         //
         // A cutover that *fails* is as abortable as one that declines: nothing
-        // was sealed either way. Propagating the error instead would leave the
-        // staged `MIGRATING` copy holding the target's `(workflow_name,
-        // workflow_id)` uniqueness slot, blocking every new run of that
-        // business key on the target, with no abort reason recorded anywhere.
+        // was sealed either way. A propagated error would leave the staged
+        // `MIGRATING` copy in the target's `(workflow_name, workflow_id)`
+        // uniqueness slot. It would block every new run of that business key
+        // on the target, with no abort reason recorded anywhere.
         let cutover = commit_cutover(&mut source, exec_id, target_shard).await;
         let reason = match cutover {
             Ok(true) => None,
@@ -3820,10 +3817,10 @@ mod db {
     /// `target_shard`.
     ///
     /// A dry run walks **the same code path** up to (and excluding) the first
-    /// write, reporting `WouldMigrate` for exactly the population a real run
-    /// would attempt. It is deliberately not a separate estimator: an operator
-    /// running this during an incident must be able to trust that the dry run
-    /// and the real run agree.
+    /// write. It reports `WouldMigrate` for exactly the population a real run
+    /// would attempt. It is deliberately not a separate estimator. An operator
+    /// who runs this during an incident must be able to trust that the dry
+    /// run and the real run agree.
     ///
     /// # Errors
     ///
@@ -3978,9 +3975,9 @@ mod db {
             if matches!(outcome, MigrationOutcome::Migrated { .. }) || unexpected_error {
                 moved += 1;
             }
-            // Audited HERE, per outcome, not after the loop: a later error
-            // would otherwise discard the audit record of a migration that has
-            // already sealed its source — the one record an operator most needs.
+            // Audited HERE, per outcome, not after the loop. Otherwise a later
+            // error would discard the audit record of a migration that already
+            // sealed its source. That is the record an operator most needs.
             {
                 let mut source = checkout(pool, source_shard).await?;
                 record_migration_audit(&mut source, driver, source_shard, target_shard, &outcome)
@@ -4001,8 +3998,7 @@ mod db {
 
         // Every candidate the loop reaches, without breaking first, pushes
         // exactly one outcome. This count matches the loop's own work,
-        // never the wider `fetched` window (issue #1596 follow-up review,
-        // comment 4052737057).
+        // never the wider `fetched` window (issue #1596).
         let examined = outcomes.len();
 
         Ok(MigrationBatchReport {
@@ -4034,9 +4030,9 @@ mod db {
     ///
     /// On the **source** shard: the shard whose residents are moving, and the
     /// one an operator reads `GET /audit` against when asking "who moved this
-    /// run?". Note the honest limit — a shard being decommissioned is
-    /// eventually retired, taking this trail with it, so ship audit off-box
-    /// (issue #953's audit export) before step 5 of the decommission runbook.
+    /// run?". Note the honest limit. A decommissioned shard is eventually
+    /// retired, and this trail goes with it. So ship audit off-box (issue
+    /// #953's audit export) before step 5 of the decommission runbook.
     async fn record_migration_audit(
         conn: &mut AsyncPgConnection,
         driver: MigrationDriver<'_>,
@@ -4045,10 +4041,10 @@ mod db {
         outcome: &MigrationOutcome,
     ) -> HarvestResult<()> {
         // `harvest_audit_log.status` is CHECK-constrained to exactly
-        // ('succeeded', 'failed') -- the audit trail records whether the
+        // ('succeeded', 'failed'). The audit trail records whether the
         // OPERATION succeeded, not what it decided. A skip is a successful
-        // evaluation that declined to move the run, so it is `succeeded` with
-        // the blockers in `error_summary`; only an abort is a `failed` attempt.
+        // evaluation that declined to move the run. So it is `succeeded`, with
+        // the blockers in `error_summary`. Only an abort is a `failed` attempt.
         let (status, error_summary) = match outcome {
             MigrationOutcome::Migrated { .. } | MigrationOutcome::WouldMigrate { .. } => {
                 ("succeeded", None)
@@ -4102,19 +4098,18 @@ mod db {
 
     /// Drive every unsettled migration on one shard to a **settled** phase.
     ///
-    /// This is the crash-recovery half of the design: a process that dies at any
-    /// point leaves a durable row whose phase says what is outstanding, and
+    /// This is the crash-recovery half of the design. A process that dies at
+    /// any point leaves a durable row whose phase says what is outstanding.
     /// [`next_migration_action`] turns that into the one correct next step.
     ///
     /// Each row is stepped repeatedly until it reaches `Retire` (i.e. `DONE` or
-    /// `ABORTED`), so **one call finishes the job** rather than leaving a
-    /// half-migrated run parked between phases until an operator happens to run
-    /// the sweep again. That matters most at exactly the phase an operator is
-    /// least likely to notice: a crash between the cutover commit and the
-    /// target's activation leaves the run claimable on *neither* shard, and a
-    /// one-step-per-call sweep would leave it that way. The step count is
-    /// bounded by [`MAX_RESUME_STEPS`] so a row that cannot make progress is
-    /// abandoned to the next call instead of spinning.
+    /// `ABORTED`). So **one call finishes the job**. It does not leave a
+    /// half-migrated run between phases until an operator runs the sweep
+    /// again. That matters most at the phase an operator is least likely to
+    /// notice. A crash between the cutover commit and the target's activation
+    /// leaves the run claimable on *neither* shard. A one-step-per-call sweep
+    /// would leave it that way. [`MAX_RESUME_STEPS`] bounds the step count. So
+    /// a row that cannot make progress is left to the next call, not spun on.
     ///
     /// Past the cutover the only action is `ActivateTarget`, which is
     /// idempotent, so re-running the whole sweep converges rather than
@@ -4229,10 +4224,10 @@ mod db {
         let mut phase = record.phase;
 
         for _ in 0..MAX_RESUME_STEPS {
-            // Propagated, never swallowed: `unwrap_or(false)` here would turn a
-            // pool blip into "the source is no longer quiescent", and the phase
-            // machine would abort a perfectly good migration and record a reason
-            // naming a wake that never happened.
+            // Propagated, never swallowed. `unwrap_or(false)` here would turn a
+            // pool blip into "the source is no longer quiescent". The phase
+            // machine would then abort a good migration, and record a reason
+            // that names a wake that never happened.
             let source_still_quiescent = if phase.is_past_cutover() {
                 false
             } else {
@@ -4266,12 +4261,11 @@ mod db {
                         } else {
                             // A declined cutover has to CLEAN UP, not merely
                             // report. Without this the record stays
-                            // `VERIFIED`, the target keeps its `MIGRATING`
-                            // copy and that shard's uniqueness slot, and the
-                            // loop exits because the phase did not advance —
-                            // so the command says "aborted" while nothing was
-                            // undone, and a second resume is needed to
-                            // actually finish the job.
+                            // `VERIFIED`. The target keeps its `MIGRATING`
+                            // copy and that shard's uniqueness slot. The loop
+                            // exits because the phase did not advance. So the
+                            // command says "aborted" while nothing was undone.
+                            // A second resume then has to finish the job.
                             let reason = cutover_decline_reason(&mut source, exec_id)
                                 .await?
                                 .to_string();
@@ -4342,9 +4336,9 @@ mod db {
             match stepped {
                 Ok(Some(outcome)) => {
                     // The resume path performs real cutovers and activations,
-                    // so it is audited exactly like the batch path; without this
-                    // a migration completed by `rebalance-resume` would leave no
-                    // audit record at all.
+                    // so it is audited exactly like the batch path. Otherwise a
+                    // migration that `rebalance-resume` completes would leave
+                    // no audit record at all.
                     if !audited {
                         record_migration_audit(
                             &mut source,
@@ -4372,9 +4366,9 @@ mod db {
                 }
             }
 
-            // Re-read rather than infer: `commit_cutover` can decline (the run
-            // woke) and `abort_migration` can be a no-op past the cutover, so
-            // the stored phase is the only honest source of what happened.
+            // Re-read, do not infer. `commit_cutover` can decline (the run
+            // woke). `abort_migration` can be a no-op past the cutover. So the
+            // stored phase is the only honest source of what happened.
             let Some(next) = load_migration(&mut source, exec_id).await? else {
                 break;
             };
@@ -4504,11 +4498,11 @@ mod db {
     /// Resolve where an execution physically lives, following the forwarding
     /// chain a migration leaves behind.
     ///
-    /// This is the runtime half of the identity decision: the `ExecutionId` is
-    /// never re-minted, so its encoded shard remains the **entry point**, and
-    /// this walk turns that entry point into the current residence. For the
-    /// overwhelmingly common case — an execution that never moved — it is one
-    /// indexed lookup on the shard the id already pointed at.
+    /// This is the runtime half of the identity decision. The `ExecutionId` is
+    /// never re-minted, so its encoded shard remains the **entry point**. This
+    /// walk turns that entry point into the current residence. The common
+    /// case is an execution that never moved. For it, the walk is one indexed
+    /// lookup on the shard the id already pointed at.
     ///
     /// # Errors
     ///
@@ -4520,20 +4514,19 @@ mod db {
     ) -> HarvestResult<ShardId> {
         let origin = pool.routed_shard_for_execution(exec_id);
         // Did routing apply an operator-declared retired-shard forward? If so
-        // `origin` is a SUCCESSOR, which names one specific database exactly as
-        // a `migrated_to_shard` pointer does: the operator has asserted A is
-        // gone and its ids now live on B, so answering from the default shard
+        // `origin` is a SUCCESSOR. It names one specific database, exactly as a
+        // `migrated_to_shard` pointer does. The operator has asserted that A is
+        // gone and its ids now live on B. An answer from the default shard
         // instead of B reads the wrong database and returns a confident 404.
         // Tolerate a missing pool only for an id resolving to its own encoded
-        // shard -- the single-pool case `checkout_entry` exists for.
+        // shard: the single-pool case `checkout_entry` exists for.
         let forwarded = !exec_id.shard().is_unencoded() && origin != exec_id.shard();
-        // `checkout_entry` falls back to the default pool when `origin` has
-        // no pool of its own (issue #1317 review). `entry_shard` is the
-        // shard that fallback actually reads from. A resolution ending at
-        // the entry hop then reports where the connection came from, not
-        // the id's decoded origin. Only the entry hop can fall back --
-        // every later hop follows a stored pointer through `checkout`,
-        // which has none.
+        // `checkout_entry` falls back to the default pool when `origin` has no
+        // pool of its own (issue #1317). `entry_shard` is the shard that
+        // fallback actually reads from. A resolution ending at the entry hop
+        // then reports where the connection came from, not the id's decoded
+        // origin. Only the entry hop can fall back -- every later hop follows a
+        // stored pointer through `checkout`, which has none.
         let entry_shard = if !forwarded && pool.exact_pool_for(origin).is_none() {
             pool.default_shard()
         } else {
@@ -4542,8 +4535,8 @@ mod db {
         let mut current = origin;
         for hop in 0..MAX_FORWARD_HOPS {
             // The ORIGIN hop is tolerant (see `checkout_entry`) unless routing
-            // already forwarded it; every hop after it follows a stored pointer
-            // that names one specific database and must resolve there or fail.
+            // already forwarded it. Every later hop follows a stored pointer
+            // that names one specific database. It must resolve there or fail.
             let mut conn = if hop == 0 && !forwarded {
                 checkout_entry(pool, current).await?
             } else {
@@ -4562,15 +4555,14 @@ mod db {
     /// [`resolve_execution_shard`], for a caller already holding a connection
     /// from the pool that serves `held_shard`.
     ///
-    /// The hop-walk above has no notion of an already-held connection, so a
-    /// hop landing on `held_shard`'s own pool still calls `checkout`, an
+    /// The hop-walk above has no notion of an already-held connection, so a hop
+    /// landing on `held_shard`'s own pool still calls `checkout`, an
     /// unconditional `pool.get()`. Under the documented pool-size-1
     /// configuration that pool has nothing left to hand out, and the call
-    /// blocks forever (issue #1324, Codex review). A migration's forwarding
-    /// pointer is usually collapsed straight to the live shard, in one hop.
-    /// The walk still confirms with one more read past it. That
-    /// confirmation is exactly where a rebalanced target lands back on the
-    /// caller's own pool.
+    /// blocks forever (issue #1324). A migration's forwarding pointer is
+    /// usually collapsed straight to the live shard, in one hop. The walk still
+    /// confirms with one more read past it. That confirmation is exactly where
+    /// a rebalanced target lands back on the caller's own pool.
     ///
     /// Every hop whose shard resolves to the SAME physical pool as
     /// `held_shard` reads on `conn` instead of checking one out. Only a
@@ -4603,18 +4595,18 @@ mod db {
             // genuinely unconfigured forwarded hop alias onto `held_shard`'s
             // pool by coincidence. It would then read `conn`'s database in
             // its place, and report a never-inspected hop as resolved
-            // (issue #1324, Codex review).
+            // (issue #1324).
             //
-            // Each branch also records `actual_shard`: the shard whose
-            // database this hop's read really ran against. It is not always
-            // `current` (fresh review, P2 follow-up). An unconfigured origin
-            // reaches a database only through a default-pool fallback.
-            // That fallback sits on either side of the read: `pool_for`'s
-            // here, or `checkout_entry`'s own inside the "else" branch
-            // below. A resolution that ends at this hop must report the
-            // shard that fallback actually used. Reporting the unconfigured
-            // `current` instead hands the caller a value `conn_for_shard`
-            // cannot open, even though the row was just read successfully.
+            // Each branch also records `actual_shard`: the shard whose database
+            // this hop's read really ran against. It is not always `current`.
+            // An unconfigured origin reaches a database only through a
+            // default-pool fallback. That fallback sits on either side of the
+            // read: `pool_for`'s here, or `checkout_entry`'s own inside the
+            // "else" branch below. A resolution that ends at this hop must
+            // report the shard that fallback actually used. Reporting the
+            // unconfigured `current` instead hands the caller a value
+            // `conn_for_shard` cannot open, even though the row was just read
+            // successfully.
             let (forward, actual_shard) = if hop == 0 && !forwarded {
                 if crate::external_target_location::same_underlying_pool(
                     pool.pool_for(current),
@@ -4662,37 +4654,37 @@ mod db {
     /// Every shard this execution has ever physically occupied, oldest first,
     /// ending with the shard that hosts it **now**.
     ///
-    /// [`resolve_execution_shard`] answers "where do I write?" and is what the
+    /// [`resolve_execution_shard`] answers "where do I write?", which the
     /// runtime paths want. This answers "where does a copy of this run's data
-    /// still sit?", which is a different and strictly larger question: a
+    /// still sit?". That is a different and strictly larger question. A
     /// rebalance leaves the source copy in place, sealed, until retention
-    /// collects it. Anything that must reach **all** of an execution's bytes
-    /// rather than just its live ones — GDPR payload erasure above all — has to
+    /// collects it. Some callers must reach **all** of an execution's bytes,
+    /// not just its live ones. GDPR payload erasure is the main one. They
     /// visit this whole list, not only its last element.
     ///
     /// **It is read from `migrated_from_shards`, not walked backwards along the
     /// forwarding pointers, and that distinction is load-bearing.** The pointers
-    /// are deliberately *collapsed*: a completed migration best-effort rewrites
-    /// the origin's pointer to skip straight to the newest residence, so hops do
-    /// not accumulate past [`MAX_FORWARD_HOPS`]. After A → B → C that leaves A
-    /// pointing at C and no trace of B anywhere in the pointer graph — while B's
-    /// sealed copy still holds the run's full payloads. A chain derived from the
-    /// pointers would therefore report `[A, C]` and an erasure built on it would
-    /// claim success having never touched B. The durable array is appended to at
-    /// every activation and is never collapsed, so it is exact regardless of
-    /// what the routing layer does to the pointers.
+    /// are deliberately *collapsed*. A completed migration best-effort rewrites
+    /// the origin's pointer to skip straight to the newest residence. So hops
+    /// do not accumulate past [`MAX_FORWARD_HOPS`]. After A → B → C, A points
+    /// at C and the pointer graph has no trace of B. Yet B's sealed copy still
+    /// holds the run's full payloads. A chain derived from the pointers would
+    /// report `[A, C]`. An erasure built on it would claim success without
+    /// touching B. Every activation appends to the durable array, and nothing
+    /// collapses it. So it is exact, whatever the routing layer does to the
+    /// pointers.
     ///
-    /// The chain is `[origin]` for every execution that has never moved, which
-    /// is every execution on a single-shard deployment and all but a handful
+    /// The chain is `[origin]` for every execution that has never moved. That
+    /// is every execution on a single-shard deployment, and all but a handful
     /// anywhere else.
     ///
     /// # Errors
     ///
     /// [`HarvestError::ShardUnavailable`] when the live shard has no pool here
-    /// or the forwarding walk exceeds [`MAX_FORWARD_HOPS`];
+    /// or the forwarding walk exceeds [`MAX_FORWARD_HOPS`].
     /// [`HarvestError::Database`] when the stored residence array cannot be
-    /// decoded — fail closed, because a caller that must reach every copy must
-    /// not be handed a silently-shortened list.
+    /// decoded. That fails closed, because a caller that must reach every copy
+    /// must not get a silently-shortened list.
     pub async fn residence_chain(
         pool: &ShardedDbPool,
         exec_id: ExecutionId,
@@ -4701,13 +4693,13 @@ mod db {
         let mut conn = checkout_entry(pool, live).await?;
         // The execution row first, and the SUMMARY as the fallback. After a
         // migrated run terminates, the live shard's retention janitor deletes
-        // the execution row and keeps only a compact
-        // `harvest_execution_summaries` row — while the sealed source copies
-        // survive, because retention deliberately never purges a `MIGRATED` row
-        // (that would destroy the forwarding pointer). Reading "never migrated"
-        // from the execution row's absence would therefore report a clean
-        // erasure over exactly the copies that still hold the data, so the
-        // array is carried onto the summary at demotion time and read back here.
+        // the execution row. It keeps only a compact
+        // `harvest_execution_summaries` row. The sealed source copies survive,
+        // because retention deliberately never purges a `MIGRATED` row. That
+        // would destroy the forwarding pointer. The absent execution row does
+        // not mean "never migrated". That reading would report a clean erasure
+        // over the copies that still hold the data. So demotion carries the
+        // array onto the summary, and this reads it back.
         let row: Option<PriorShardsRow> = diesel::sql_query(
             "SELECT COALESCE(e.migrated_from_shards, s.migrated_from_shards) AS shards \
                FROM (SELECT $1::uuid AS id) k \
@@ -4735,13 +4727,13 @@ mod db {
         };
         // De-duplicate PRESERVING THE LIVE SHARD AS THE LAST ELEMENT.
         //
-        // A reverse migration (A → B → A, which the design supports so a drain
-        // can be undone) stores `[A, B]` and is live on A, giving `[A, B, A]`.
-        // A first-occurrence dedup would collapse that to `[A, B]` and leave B
-        // in the final position — and every consumer reads the last element as
-        // the live residence. `erase_workflow_payloads_all_residences` would
-        // then apply the terminal-state and legal-hold gates to the SEALED copy
-        // and report its outcome as the answer. So the live shard's earlier
+        // The design supports a reverse migration (A → B → A), so a drain can
+        // be undone. It stores `[A, B]` and is live on A, giving `[A, B, A]`.
+        // A first-occurrence dedup would collapse that to `[A, B]`, with B in
+        // the final position. Every consumer reads the last element as the
+        // live residence. `erase_workflow_payloads_all_residences` would then
+        // apply the terminal-state and legal-hold gates to the SEALED copy. It
+        // would report that outcome as the answer. So the live shard's earlier
         // occurrence is dropped, not its final one.
         chain.retain(|shard| *shard != live);
         let mut seen = std::collections::HashSet::new();
@@ -4771,24 +4763,25 @@ mod db {
     /// The shard an execution **currently** lives on, read from a connection
     /// that already holds it — no pool checkout of any kind.
     ///
-    /// This is the caller-side companion to [`resolve_execution_shard`], and it
+    /// This is the caller-side companion to [`resolve_execution_shard`]. It
     /// exists because that function cannot be used here. The engine's outbox
-    /// sweeps run inside a transaction on the caller's own shard and then decide
-    /// whether the delivery target resolves to that *same pool*; getting that
-    /// comparison wrong sends them down the cross-pool branch, which checks out
-    /// a second connection from the pool already driving the transaction and
-    /// self-deadlocks a pool of the supported minimum size one. `ExecutionId`
-    /// encodes where a run *originated*, so a caller that has itself been
-    /// rebalanced compares its origin against the target's residence and the
-    /// two disagree even when both are the same database.
+    /// sweeps run inside a transaction on the caller's own shard. They then
+    /// decide whether the delivery target resolves to that *same pool*. A
+    /// wrong answer sends them down the cross-pool branch. That branch checks
+    /// out a second connection from the pool already driving the transaction.
+    /// It self-deadlocks a pool of the supported minimum size one.
+    /// `ExecutionId` encodes where a run *originated*. So a rebalanced caller
+    /// compares its origin against the target's residence. The two disagree
+    /// even when both are the same database.
     ///
     /// Resolving the caller's residence the usual way would need a checkout of
-    /// its own — the same deadlock, one level down. Its `shard_id` column
-    /// follows the run across a migration (the copy carries every column and the
-    /// cutover updates it), so the connection in hand already knows the answer.
+    /// its own: the same deadlock, one level down. Its `shard_id` column
+    /// follows the run across a migration. The copy carries every column and
+    /// the cutover updates it. So the connection in hand already knows the
+    /// answer.
     ///
-    /// Returns `None` when the row is not on this connection at all, leaving the
-    /// caller to fall back to the id's encoded shard, which is the pre-#964
+    /// Returns `None` when the row is not on this connection at all. The
+    /// caller then falls back to the id's encoded shard, which is the pre-#964
     /// behaviour.
     pub async fn shard_of_held_row(
         conn: &mut AsyncPgConnection,
@@ -4814,18 +4807,17 @@ mod db {
     /// Where an execution's row on the **held** database forwards to, or
     /// `None` when it has not moved.
     ///
-    /// The connection-based twin of [`resolve_execution_shard`]'s first hop,
-    /// and the reason it exists is a hard constraint rather than a convenience:
-    /// a caller inside a transaction is holding a connection from one of
-    /// `pool`'s databases, and taking a SECOND connection from that same pool
-    /// blocks forever under the documented pool-size-1 configuration (issue
-    /// #751). Any residence lookup performed while such a connection is held
-    /// must therefore read on it, not check out beside it.
+    /// The connection-based twin of [`resolve_execution_shard`]'s first hop.
+    /// It exists for a hard constraint, not for convenience. A caller inside a
+    /// transaction holds a connection from one of `pool`'s databases. A SECOND
+    /// connection from that same pool blocks forever under the documented
+    /// pool-size-1 configuration (issue #751). So a residence lookup made while
+    /// such a connection is held must read on it, not check out beside it.
     ///
-    /// One read is the whole answer: `collapse_forward_chain` rewrites an
-    /// origin's pointer straight to the final target, so a pointer read here
-    /// does not need the hop loop that [`resolve_execution_shard`] runs for the
-    /// window in which a chain has not yet been collapsed.
+    /// One read is the whole answer. `collapse_forward_chain` rewrites an
+    /// origin's pointer straight to the final target. So a pointer read here
+    /// does not need the hop loop of [`resolve_execution_shard`]. That loop
+    /// covers the window before a chain is collapsed.
     pub async fn forward_of_held_row(
         conn: &mut AsyncPgConnection,
         exec_id: ExecutionId,
@@ -4836,12 +4828,11 @@ mod db {
     /// [`resolve_target_shard`], for a caller already holding a connection from
     /// the pool that serves `held_shard`.
     ///
-    /// Identical in result. The difference is where the lookups run: every one
-    /// that would land on the held database is issued on `conn`, because
-    /// checking out a second connection from the pool that lent it
-    /// self-deadlocks a size-1 pool (issue #751). Only a genuinely different
-    /// database is reached through `pool`, where a checkout cannot contend with
-    /// the connection the caller is holding.
+    /// Identical in result. The difference is where the lookups run. Each one
+    /// that would land on the held database runs on `conn`. A second
+    /// connection from the pool that lent it self-deadlocks a size-1 pool
+    /// (issue #751). Only a genuinely different database is reached through
+    /// `pool`. There a checkout cannot contend with the held connection.
     pub async fn resolve_target_shard_holding(
         conn: &mut AsyncPgConnection,
         pool: &ShardedDbPool,
@@ -4858,13 +4849,12 @@ mod db {
             return unforwarded;
         }
         // `same_underlying_pool`, NOT `std::ptr::eq` on the two `&DbPool`
-        // (issue #1146): `ShardedDbPool` stores every shard's pool in its own
-        // map slot, so pointer equality of the slots is really *shard-id*
-        // equality and calls two aliases of one database different. Here that
-        // would be worse than cosmetic — an alias judged "not held" sends this
-        // lookup to check out a second connection from the very pool the caller
-        // is holding one from, which is the deadlock this function exists to
-        // avoid.
+        // (issue #1146). `ShardedDbPool` stores every shard's pool in its own
+        // map slot. So pointer equality of the slots is really *shard-id*
+        // equality, and calls two aliases of one database different. Here that
+        // would be worse than cosmetic. An alias judged "not held" makes this
+        // lookup check out a second connection from the very pool the caller
+        // holds one from. That is the deadlock this function exists to avoid.
         let on_held = |shard: ShardId| {
             crate::external_target_location::same_underlying_pool(
                 pool.pool_for(shard),
@@ -4904,8 +4894,8 @@ mod db {
     /// Check out a connection to one specific shard, failing closed when this
     /// node has no pool for it.
     ///
-    /// Exposed for the cross-residence sweeps that walk a [`residence_chain`]:
-    /// they already hold the shard ids and must not re-derive them through any
+    /// Exposed for the cross-residence sweeps that walk a [`residence_chain`].
+    /// They already hold the shard ids. They must not re-derive them through a
     /// path that can fall back to the default shard.
     ///
     /// # Errors
@@ -5011,9 +5001,9 @@ mod db {
         exec_id: ExecutionId,
     ) -> HarvestResult<Option<ShardId>> {
         // Matched on the POINTER, not on `state = 'MIGRATED'`. A sealed row can
-        // legitimately be force-written to another state afterwards --
+        // legitimately be force-written to another state afterwards.
         // `terminate_workflow_execution` carries no state precondition by
-        // design -- and an id must keep resolving across that, or an operator
+        // design. An id must keep resolving across that. Otherwise an operator
         // override would silently orphan every reference to the run.
         let row: Option<ForwardRow> = diesel::sql_query(
             "SELECT migrated_to_shard AS forward FROM harvest_workflow_executions \
@@ -5029,17 +5019,16 @@ mod db {
     /// Check out a connection to the shard that **currently hosts** `exec_id`,
     /// following the forwarding pointer a rebalance leaves behind.
     ///
-    /// This is the id-routed read/write path's half of the identity contract:
-    /// because the `ExecutionId` is never re-minted, the first checkout goes
-    /// exactly where it always did, and only a run that has actually moved pays
-    /// for a second hop.
+    /// This is the id-routed read/write path's half of the identity contract.
+    /// The `ExecutionId` is never re-minted. So the first checkout goes exactly
+    /// where it always did, and only a run that has actually moved pays for a
+    /// second hop.
     ///
-    /// **A single-shard deployment pays nothing at all.** With one pool there is
-    /// nowhere to migrate to, so the probe is skipped entirely and the returned
-    /// connection is byte-for-byte the one `pool_for_execution` would have
-    /// handed back before issue #964. A multi-shard deployment pays one
-    /// primary-key lookup against a partial index that is empty until an
-    /// operator rebalances.
+    /// **A single-shard deployment pays nothing at all.** With one pool there
+    /// is nowhere to migrate to, so the probe is skipped entirely. The returned
+    /// connection is byte-for-byte the one `pool_for_execution` gave before
+    /// issue #964. A multi-shard deployment pays one primary-key lookup
+    /// against a partial index that is empty until an operator rebalances.
     ///
     /// # Errors
     ///
@@ -5055,7 +5044,7 @@ mod db {
     }
 
     /// [`conn_for_execution_forwarded`], also returning the shard the
-    /// connection was checked out from (issue #1317 review).
+    /// connection was checked out from (issue #1317).
     ///
     /// A caller that must attribute the connection to a shard afterwards
     /// (an audit log, say) would otherwise have to re-resolve it. It would
@@ -5072,12 +5061,12 @@ mod db {
         pool: &ShardedDbPool,
         exec_id: ExecutionId,
     ) -> HarvestResult<(crate::replication::FencedConn, ShardId)> {
-        // The first hop keeps `pool_for_execution`'s default-shard fallback, so
-        // every pre-#964 routing behaviour (including the mid-rollout cases
-        // where the pool map and the router legitimately disagree) is
-        // unchanged.
+        // The first hop keeps `pool_for_execution`'s default-shard fallback.
+        // So every pre-#964 routing behaviour is unchanged. That includes the
+        // mid-rollout cases where the pool map and the router legitimately
+        // disagree.
         let origin = pool.routed_shard_for_execution(exec_id);
-        // `pool_for` (issue #1317 review) silently substitutes the default
+        // `pool_for` (issue #1317) silently substitutes the default
         // shard's pool when `origin` has none configured. The returned
         // shard must name the pool the connection actually comes from, not
         // `origin`. Otherwise a caller attributing this connection to a
@@ -5230,19 +5219,20 @@ mod db {
     /// the forwarding pointer a rebalance leaves behind.
     ///
     /// The async, forwarding-aware companion to
-    /// [`ShardedDbPool::exact_pool_for_target`]. It exists because the engine's
-    /// own id-routed delivery paths — the external-signal, external-cancel and
-    /// external-await outboxes — decode the raw shard bytes and would otherwise
-    /// deliver to the shard a migrated run *originated* on. Landing there is not
-    /// a delayed delivery but a permanent wrong answer: the sealed row reads as
-    /// terminal, so the sender's history records `ExternalSignalFailed` with
-    /// `target_terminal` for a workflow that is alive and well on another shard.
+    /// [`ShardedDbPool::exact_pool_for_target`]. The engine's own id-routed
+    /// delivery paths need it: the external-signal, external-cancel and
+    /// external-await outboxes. They decode the raw shard bytes. Without this,
+    /// they would deliver to the shard a migrated run *originated* on. That is
+    /// not a delayed delivery but a permanent wrong answer. The sealed row
+    /// reads as terminal. So the sender's history records
+    /// `ExternalSignalFailed` with `target_terminal` for a workflow that is
+    /// alive and well on another shard.
     ///
     /// **Best-effort by design.** A failure to resolve returns the
-    /// un-forwarded shard, which is exactly the pre-#964 behaviour, so a
-    /// transient error degrades to "route as before" rather than stalling the
-    /// outbox. Single-shard deployments and `WorkflowId`-shaped targets skip the
-    /// lookup entirely.
+    /// un-forwarded shard, which is exactly the pre-#964 behaviour. So a
+    /// transient error degrades to "route as before" and does not stall the
+    /// outbox. Single-shard deployments and `WorkflowId`-shaped targets skip
+    /// the lookup entirely.
     pub async fn resolve_target_shard(
         pool: &ShardedDbPool,
         target: &crate::types::ExternalTarget,
@@ -5259,14 +5249,14 @@ mod db {
         }
         let exec_id = match target {
             crate::types::ExternalTarget::ExecutionId(id) => *id,
-            // A business-key target hashes to a fixed shard, and that shard is
-            // exactly where a rebalanced run's SEAL still sits — the migration
-            // deliberately keeps `MIGRATED` inside the active-uniqueness index,
-            // so the business key never moves. Stopping there would deliver to
-            // the seal: the cancel outbox reads it as terminal and records
-            // `ExternalCancelDelivered` for a workflow that keeps running, and
-            // the signal outbox sits on it forever. So resolve the key to its
-            // execution id on the hashed shard first, then follow that id's
+            // A business-key target hashes to a fixed shard. A rebalanced run's
+            // SEAL still sits exactly there. The migration deliberately keeps
+            // `MIGRATED` inside the active-uniqueness index, so the business
+            // key never moves. A stop there would deliver to the seal. The
+            // cancel outbox reads it as terminal and records
+            // `ExternalCancelDelivered` for a workflow that keeps running. The
+            // signal outbox sits on it forever. So resolve the key to its
+            // execution id on the hashed shard first. Then follow that id's
             // pointer like any other.
             crate::types::ExternalTarget::WorkflowId {
                 workflow_name,
@@ -5285,9 +5275,9 @@ mod db {
     /// `shard`, if any.
     ///
     /// Best-effort, like its caller: `None` means "route as before", never an
-    /// error. The lookup deliberately includes `MIGRATED`/`MIGRATING` — that is
-    /// the whole point, since the seal is what still holds the business key on
-    /// the hashed shard after the run itself has moved.
+    /// error. The lookup deliberately includes `MIGRATED`/`MIGRATING`. That is
+    /// the whole point. The seal still holds the business key on the hashed
+    /// shard after the run itself has moved.
     async fn resolve_business_key(
         pool: &ShardedDbPool,
         shard: ShardId,
@@ -5383,22 +5373,22 @@ mod db {
     /// its id hashes to, or the shard it lives on now.
     ///
     /// Unlike [`checkout`], this falls back to the pool's default shard when no
-    /// pool is registered for `shard`, which is exactly the contract of
-    /// [`ShardedDbPool::pool_for`] that every other read path in the engine uses
-    /// to reach a run's own database. A single-pool deployment -- the default,
-    /// and every non-sharded test harness -- registers one pool under one shard
-    /// id, so an `ExecutionId` whose shard bits name anything else would
-    /// otherwise be unreachable even though its row is sitting right there.
+    /// pool is registered for `shard`. That is exactly the contract of
+    /// [`ShardedDbPool::pool_for`]. Every other read path in the engine uses it
+    /// to reach a run's own database. A single-pool deployment registers one
+    /// pool under one shard id. That is the default, and every non-sharded test
+    /// harness. Without the fallback, an `ExecutionId` whose shard bits name
+    /// anything else would be unreachable, although its row sits right there.
     ///
-    /// Safe because every query behind it is keyed by execution id: a fallback
+    /// Safe because every query behind it is keyed by execution id. A fallback
     /// that lands on the wrong database finds no row and answers `NotFound`,
     /// never another run's data.
     ///
     /// Deliberately NOT used for a shard named by a `migrated_to_shard` pointer,
     /// by a migration record, or by an operator-declared retired-shard forward.
-    /// Each of those names one specific database, and a silent fallback to the
-    /// default there would resolve the run to the wrong shard -- or, on the
-    /// erase path, scrub the wrong copy.
+    /// Each of those names one specific database. A silent fallback to the
+    /// default there would resolve the run to the wrong shard. On the erase
+    /// path, it would scrub the wrong copy.
     ///
     /// The fence check names `shard`, not the pool the fallback reaches. The
     /// authorizer hook shows the policy the shard an id routes to, and the

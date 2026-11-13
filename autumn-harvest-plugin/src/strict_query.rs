@@ -4,23 +4,22 @@
 //! shared by every other route swept in issue #1151.
 //!
 //! axum's built-in `Query<T>` extractor is backed by
-//! `serde_urlencoded`/`form_urlencoded`, both of which *always* succeed by
-//! silently substituting `U+FFFD` (the Unicode replacement character) for a
-//! malformed percent-encoded byte sequence instead of rejecting the request.
-//! A caller sending `?queue_name=%FF` (an invalid UTF-8 byte, not a valid
-//! percent-encoding target) gets no error — the query decodes to a
-//! *different*, legitimate-looking value rather than the intended one. For
-//! any route that filters/scopes its response by such a param, this means a
-//! genuinely malformed request can silently produce a false-clean result
-//! instead of the documented `400`.
+//! `serde_urlencoded`/`form_urlencoded`. Both *always* succeed. They silently
+//! substitute `U+FFFD` (the Unicode replacement character) for a malformed
+//! percent-encoded byte sequence, and never reject the request.
+//! A caller that sends `?queue_name=%FF` (an invalid UTF-8 byte) gets no error.
+//! The query decodes to a *different*, legitimate-looking value. A route that
+//! filters or scopes its response by such a param can then return a
+//! false-clean result instead of the documented `400`.
 //!
-//! Every route in [`crate::api`] that consumes a raw `(key, value)` pair list
-//! (rather than a single-field derive-based `Query<T>`) is expected to read
-//! the raw query string via `axum::extract::RawQuery` and decode it with
-//! [`parse_raw_query_pairs_strict`] instead of axum's lossy `Query<Vec<(String,
-//! String)>>` extractor, mapping [`InvalidQueryEncoding`] to the same
-//! documented `400` JSON error shape the route already uses for other
-//! invalid-param cases — see [`bad_request_response`] for the shared shape.
+//! So every route in [`crate::api`] that consumes a raw `(key, value)` pair
+//! list must read the raw query string via `axum::extract::RawQuery`. (A
+//! single-field derive-based `Query<T>` is exempt.) It must decode the string
+//! with [`parse_raw_query_pairs_strict`], not with axum's lossy
+//! `Query<Vec<(String, String)>>` extractor. It must map
+//! [`InvalidQueryEncoding`] to the `400` JSON error shape that the route
+//! already uses for other invalid params. See
+//! [`bad_request_response`] for the shared shape.
 
 use autumn_web::error::AutumnError;
 use autumn_web::reexports::axum;
@@ -28,18 +27,18 @@ use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 
-/// The message every strict-query route's `400` carries for
-/// [`InvalidQueryEncoding`], shared so the wording can never drift between
-/// the 20 call sites that need it (issue #1151).
+/// The message of every strict-query `400` for [`InvalidQueryEncoding`].
+///
+/// Shared so the wording can never drift between call sites (issue #1151).
 pub const MALFORMED_QUERY_MESSAGE: &str = "malformed query string: invalid percent-encoded UTF-8";
 
 /// A query string component's percent-decoded bytes are not valid UTF-8, or
 /// contain a syntactically malformed `%` escape.
 ///
-/// Returned by [`parse_raw_query_pairs_strict`]; callers map this to a `400`
-/// JSON response (see [`bad_request_response`]) rather than silently
-/// substituting `U+FFFD`, the fallback axum's built-in `Query<T>` extractor
-/// performs via `serde_urlencoded`/`form_urlencoded` (issue #774 review).
+/// Returned by [`parse_raw_query_pairs_strict`]. Callers map this to a `400`
+/// JSON response (see [`bad_request_response`]). They never silently
+/// substitute `U+FFFD`, as axum's built-in `Query<T>` extractor does via
+/// `serde_urlencoded`/`form_urlencoded` (issue #774 review).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InvalidQueryEncoding;
 
@@ -57,14 +56,13 @@ impl std::error::Error for InvalidQueryEncoding {}
 /// The `400` JSON response body `GET /admin/queue-coverage` returns for
 /// [`InvalidQueryEncoding`].
 ///
-/// The original, already-shipped and tested (issue #774) `{"error": "..."}`
-/// shape, distinct from [`AutumnError`]'s RFC-7807-flavored `{"detail":
-/// "...", "status": 400, ...}` shape every *other* strict-query route uses.
-/// Kept exactly as issue #774 shipped it (see
-/// `queue_coverage_integration.rs`'s existing malformed-encoding tests, which
-/// assert on this literal shape) rather than folded into
-/// [`decode_or_autumn_error_response`] purely for issue #1151's sweep —
-/// changing a shipped, tested route's error contract is out of scope here.
+/// This is the original `{"error": "..."}` shape that issue #774 shipped and
+/// tested. Every *other* strict-query route uses the RFC-7807-flavored
+/// `{"detail": "...", "status": 400, ...}` shape of [`AutumnError`].
+/// The malformed-encoding tests in `queue_coverage_integration.rs` assert on
+/// this literal shape. So it is not folded into
+/// [`decode_or_autumn_error_response`] for the issue #1151 sweep. A change to
+/// the error contract of a shipped, tested route is out of scope here.
 #[must_use]
 pub fn bad_request_response() -> Response {
     (
@@ -111,10 +109,9 @@ pub fn decode_or_autumn_error(
 /// Returns a ready-made [`bad_request_response`] on [`InvalidQueryEncoding`]
 /// for the caller to `return` directly.
 ///
-/// `Response` is a large `Err` variant, but every strict-query call site
-/// already `match`es and returns it immediately without storing or
-/// propagating it further, so boxing would only add an allocation with no
-/// benefit here.
+/// `Response` is a large `Err` variant. Every strict-query call site
+/// `match`es and returns it at once, and never stores or propagates it. So a
+/// box would only add an allocation.
 #[allow(clippy::result_large_err)]
 pub fn decode_or_queue_coverage_bad_request(
     raw_query: Option<&str>,
@@ -129,13 +126,13 @@ pub fn decode_or_queue_coverage_bad_request(
 /// Decode an optional raw query string into `(key, value)` pairs for a
 /// handler whose return type is `axum::response::Response`.
 ///
-/// For an infallible-signature handler (one that converts errors internally
-/// via `.into_response()`) whose *other* invalid-param `400`s are
-/// [`AutumnError`]-shaped (the `Err(error) => return error.into_response()`
-/// idiom used throughout [`crate::api`]). Using this instead of
-/// [`decode_or_queue_coverage_bad_request`] keeps a route's malformed-query `400` in the
-/// SAME body shape as its own other `400`s, rather than introducing a
-/// second, inconsistent error shape on the same route (issue #1151 review).
+/// For an infallible-signature handler that converts errors internally via
+/// `.into_response()`. Its *other* invalid-param `400`s are
+/// [`AutumnError`]-shaped: the `Err(error) => return error.into_response()`
+/// idiom used throughout [`crate::api`]. This function, not
+/// [`decode_or_queue_coverage_bad_request`], keeps the malformed-query `400`
+/// in the SAME body shape as the other `400`s of the route. So one route
+/// never has two inconsistent error shapes (issue #1151 review).
 ///
 /// # Errors
 ///
@@ -143,8 +140,8 @@ pub fn decode_or_queue_coverage_bad_request(
 /// [`AutumnError::bad_request_msg`] on [`InvalidQueryEncoding`], for the
 /// caller to `return` directly.
 ///
-/// See [`decode_or_queue_coverage_bad_request`]'s doc comment for why the large `Err`
-/// variant is allowed rather than boxed.
+/// See the doc comment of [`decode_or_queue_coverage_bad_request`] for why the
+/// large `Err` variant is allowed, not boxed.
 #[allow(clippy::result_large_err)]
 pub fn decode_or_autumn_error_response(
     raw_query: Option<&str>,
@@ -160,29 +157,33 @@ pub fn decode_or_autumn_error_response(
 
 /// Strictly percent-decodes a raw query string into `(key, value)` pairs.
 ///
-/// A malformed value like `?queue_name=%FF` would otherwise silently decode
-/// to `queue_name=<U+FFFD>` via axum's lossy `Query<T>` extractor — a
-/// legitimate-looking but wrong filter that lets a scoped read route return a
-/// false-clean result instead of rejecting the request with the documented
-/// `400` (issue #774 review; swept to every other raw-pairs route by issue
-/// #1151).
+/// Axum's lossy `Query<T>` extractor would silently decode a malformed value
+/// like `?queue_name=%FF` to `queue_name=<U+FFFD>`. That filter looks
+/// legitimate but is wrong. A scoped read route could then return a
+/// false-clean result instead of the documented `400` (issue #774 review).
+/// Issue #1151 swept the fix to every other raw-pairs route.
 ///
-/// Mirrors `form_urlencoded::parse`'s grammar exactly: split on `&`, split
-/// each segment on the first `=` (a segment with no `=` is a key with an
-/// empty value), `+` decodes to a literal space *before* percent-decoding.
+/// Mirrors the grammar of `form_urlencoded::parse` exactly:
+/// - split on `&`;
+/// - split each segment on the first `=` (a segment with no `=` is a key with
+///   an empty value);
+/// - decode `+` to a literal space *before* percent-decoding.
+///
 /// An empty segment (from a leading/trailing/doubled `&`, or an entirely
 /// empty query string) is skipped.
 ///
 /// # Errors
 ///
 /// Returns [`InvalidQueryEncoding`] on the first key or value that is
-/// malformed in either of two ways: a syntactically invalid `%` escape (not
-/// followed by exactly two hex digits, e.g. `%`, `%2`, `%GG`), or a
-/// syntactically valid escape whose decoded bytes are not valid UTF-8 (e.g.
-/// `%FF`). This is the one place in a strict-query request path that *can*
-/// reject an input outright — the route-local `XxxQuery::from_query_pairs`
-/// helper that consumes this function's output stays infallible by
-/// construction.
+/// malformed in either of two ways:
+/// - a syntactically invalid `%` escape, not followed by exactly two hex
+///   digits (e.g. `%`, `%2`, `%GG`);
+/// - a syntactically valid escape whose decoded bytes are not valid UTF-8
+///   (e.g. `%FF`).
+///
+/// This is the one place in a strict-query request path that *can* reject an
+/// input outright. The route-local `XxxQuery::from_query_pairs` helper that
+/// consumes this output stays infallible by construction.
 pub fn parse_raw_query_pairs_strict(
     raw_query: &str,
 ) -> Result<Vec<(String, String)>, InvalidQueryEncoding> {
@@ -218,14 +219,14 @@ fn decode_form_component_strict(raw: &str) -> Result<String, InvalidQueryEncodin
 /// hex digits.
 ///
 /// `percent_encoding::percent_decode_str` does **not** reject a malformed
-/// escape on its own: an incomplete (`%`, `%2`) or non-hex (`%GG`) sequence
-/// is left as a **literal, undecoded** run of bytes rather than an error --
-/// and since those bytes (`%`, `G`, digits, ...) are themselves valid ASCII,
-/// `decode_utf8()` still succeeds trivially. Without this pre-check,
-/// `?queue_name=orders%GG` would silently decode to the literal string
-/// `"orders%GG"` and query that (almost certainly nonexistent) value instead
-/// of being rejected -- a second, distinct malformed-encoding shape from the
-/// already-handled `%FF`-decodes-to-invalid-UTF-8 case (issue #774 review).
+/// escape on its own. It leaves an incomplete (`%`, `%2`) or non-hex (`%GG`)
+/// sequence as a **literal, undecoded** run of bytes, not an error. Those
+/// bytes (`%`, `G`, digits, ...) are valid ASCII, so `decode_utf8()` still
+/// succeeds trivially. Without this pre-check, `?queue_name=orders%GG` would
+/// silently decode to the literal string `"orders%GG"`. The route would query
+/// that (almost certainly nonexistent) value instead of rejecting it. This is
+/// a second malformed-encoding shape, distinct from the `%FF` case that
+/// decodes to invalid UTF-8 (issue #774 review).
 fn has_only_well_formed_percent_escapes(s: &str) -> bool {
     let bytes = s.as_bytes();
     let mut i = 0;
@@ -309,8 +310,8 @@ mod tests {
 
     #[test]
     fn parse_raw_query_pairs_strict_rejects_a_lone_trailing_percent() {
-        // `%` with nothing after it -- percent_decode_str leaves it as a
-        // literal `%` (still valid UTF-8 on its own), so only an explicit
+        // `%` with nothing after it. percent_decode_str leaves it as a
+        // literal `%`, which is valid UTF-8 on its own. Only an explicit
         // hex-escape well-formedness check catches this.
         assert_eq!(
             parse_raw_query_pairs_strict("queue_name=orders%"),

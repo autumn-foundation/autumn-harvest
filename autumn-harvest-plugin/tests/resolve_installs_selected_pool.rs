@@ -1,5 +1,4 @@
-//! Issue #1146 review (Codex P1): the runtime's *effective* pool and the
-//! process global must not diverge.
+//! Issue #1146: the runtime's *effective* pool and the process global must not diverge.
 //!
 //! `ShardedDbPool::single` / `from_map` self-install into `GLOBAL_SHARDED_POOL`
 //! at construction, so the global reflects whichever pool was built **last**.
@@ -11,11 +10,11 @@
 //! while the global says single-shard.
 //!
 //! That divergence is not cosmetic. Every consumer of the global reads the
-//! wrong topology, including `deployment_is_multi_shard`, which gates inline
-//! by-id delivery: it answers "single shard", inline delivery is allowed, and a
-//! caller whose shard holds a stale terminal copy of the key records a
-//! permanent `not_running` against a run that is live on another shard — the
-//! exact wrong terminal issue #1146 exists to remove.
+//! wrong topology. One is `deployment_is_multi_shard`, which gates inline by-id
+//! delivery. It answers "single shard", so inline delivery is allowed. A caller
+//! whose shard holds a stale terminal copy of the key then records a permanent
+//! `not_running`. Yet the run is live on another shard. Issue #1146 exists to
+//! remove exactly that wrong terminal.
 //!
 //! Own binary: `GLOBAL_SHARDED_POOL` is a process global, so a parallel test
 //! constructing any `ShardedDbPool` would race the assertions below.

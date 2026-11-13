@@ -1,8 +1,8 @@
 //! Management read model for the version-gate retirement check.
 //!
-//! Answers "is change id X safe to retire below version N?" by aggregating
-//! [`load_retirement_check`] results across all configured shards and surfacing
-//! per-shard availability status so callers know whether the result is
+//! Answers "is change id X safe to retire below version N?" It aggregates
+//! [`load_retirement_check`] results across all configured shards. It also
+//! surfaces per-shard availability, so callers know whether the result is
 //! conclusive.
 
 use std::collections::{BTreeMap, BTreeSet};

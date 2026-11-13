@@ -244,12 +244,12 @@ async fn harness() -> (
 
 /// `(visible, in_flight)` message counts straight from the broker.
 ///
-/// This is what makes the ack assertion falsifiable. A message that was
-/// *received but never deleted* is **invisible** for its visibility timeout,
-/// so a follow-up `receive` returns nothing whether or not the ack actually
-/// deleted it — `received == 0` alone cannot tell the two apart. The queue's
-/// own attributes can: an acked message leaves BOTH counters at zero, while a
-/// no-op ack parks the messages in `NotVisible`.
+/// This makes the ack assertion falsifiable. A message *received but never
+/// deleted* is **invisible** for its visibility timeout. So a follow-up
+/// `receive` returns nothing whether or not the ack deleted it, and
+/// `received == 0` cannot tell the two apart. The queue's own attributes can.
+/// An acked message leaves BOTH counters at zero. A no-op ack parks the
+/// messages in `NotVisible`.
 async fn queue_depth(client: &Client, queue_url: &str) -> (i64, i64) {
     use aws_sdk_sqs::types::QueueAttributeName;
 
@@ -309,10 +309,10 @@ async fn a_burst_on_a_real_queue_yields_exactly_one_execution_per_message() {
         "exactly one execution per message"
     );
 
-    // The falsifiable half of AC4: an ack really is a DeleteMessage. Asking
-    // the broker directly is what makes this a real assertion -- a no-op ack
-    // would leave all twelve sitting in `NotVisible` until their visibility
-    // timeout expired, which a mere `received == 0` could never distinguish.
+    // The falsifiable half of AC4: an ack really is a DeleteMessage. A no-op
+    // ack would leave all twelve in `NotVisible` until their visibility timeout
+    // expired. Only the broker's own counts can show that; `received == 0`
+    // cannot.
     let (visible, in_flight) = queue_depth(&client, &queue_url).await;
     assert_eq!(
         (visible, in_flight),

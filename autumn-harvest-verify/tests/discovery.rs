@@ -3,9 +3,9 @@
 //!
 //! `entry::discover` keys on the `__autumn_workflow_info_*` companion the
 //! `#[workflow]` macro emits. If MIR syntax drift makes that *header*
-//! unparseable, the companion never reaches `MirDoc::bodies` — and a discovery
-//! pass that only reads `bodies` would then report `analyzed 0` and exit `0`,
-//! even under `--strict`. That is the one failure mode a verifier must not
+//! unparseable, the companion never reaches `MirDoc::bodies`. A discovery pass
+//! that only reads `bodies` would then report `analyzed 0` and exit `0`, even
+//! under `--strict`. That is the one failure mode a verifier must not
 //! have: "I found nothing" reading as "there is nothing to find".
 //!
 //! So the two halves are guarded here. Per workflow, a failed marker header is

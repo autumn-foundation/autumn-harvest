@@ -6,17 +6,19 @@
 //! the hot-swap + single-active invariant, composite-PK independence, the
 //! concurrent-publish race, the oversized-module reject, and startup-publish.
 //!
-//! Worker seam (AC1/AC2/AC4/AC5): a published WASM activity dispatched through the
-//! real worker loop reaches COMPLETED with only ordinary
-//! `ActivityScheduled`/`ActivityCompleted` events; a sandbox denial fails the
-//! workflow terminally as an ordinary `ActivityFailed` with `error_type ==
-//! SandboxDenied`; an in-flight attempt is pinned to the loaded module version
-//! across a mid-flight republish; and a fuel-exhausting guest is retried.
+//! Worker seam (AC1/AC2/AC4/AC5):
+//! - A published WASM activity dispatched through the real worker loop reaches
+//!   COMPLETED with only ordinary `ActivityScheduled`/`ActivityCompleted` events.
+//! - A sandbox denial fails the workflow terminally as an ordinary
+//!   `ActivityFailed` with `error_type == SandboxDenied`.
+//! - An in-flight attempt stays pinned to the loaded module version across a
+//!   mid-flight republish.
+//! - A fuel-exhausting guest is retried.
 //!
 //! Execution: set `HARVEST_TEST_DATABASE_URL` to a migrated Postgres to run
-//! against it directly (single-threaded; each test scrubs first); otherwise a
-//! fresh testcontainers Postgres is booted with the full migration bundle
-//! (`autumn_harvest::test_init_sql()`).
+//! against it directly. Each test scrubs first, so run single-threaded.
+//! Otherwise a fresh testcontainers Postgres boots with the full migration
+//! bundle (`autumn_harvest::test_init_sql()`).
 
 use autumn_harvest::HarvestBuilder;
 use autumn_harvest::event::WorkflowEvent;
@@ -96,11 +98,10 @@ async fn scrub(conn: &mut AsyncPgConnection) {
 
 /// A correct bump-allocator echo guest (mirrors the M1 `ECHO_WAT`): `run`
 /// returns `packed(in_ptr, in_len)`, so the host reads back the exact input.
-/// The echo guest, loaded from the shared guests directory so the tests and the
-/// `wasm_activity` example execute the SAME bytes the docs point at (issue #965
-/// review). Previously each site carried its own inline copy, so
-/// `examples/wasm-guests/echo.wat` was unreferenced and free to drift from what
-/// CI actually ran.
+/// The echo guest comes from the shared guests directory (issue #965). So the
+/// tests and the `wasm_activity` example run the SAME bytes the docs point at.
+/// An inline copy per site would let `examples/wasm-guests/echo.wat` drift from
+/// what CI runs.
 const ECHO_WAT: &str = include_str!("../../examples/wasm-guests/echo.wat");
 
 const ECHO_WAT_V2: &str = r#"
@@ -344,9 +345,9 @@ async fn oversized_module_is_rejected_before_insert() {
 
 #[tokio::test]
 async fn seed_registered_modules_are_resolvable() {
-    // The single startup batch helper: on an empty shard it activates each
-    // seeded module (activate-only-if-absent → absent → activate), and is
-    // idempotent across a worker restart re-run.
+    // On an empty shard the startup batch helper activates each seeded module
+    // (activate-only-if-absent → absent → activate). A worker restart re-run is
+    // idempotent.
     let (pool, _c) = conn_and_pool().await;
     let mut conn = pool.get().await.expect("conn");
     scrub(&mut conn).await;
@@ -385,13 +386,13 @@ async fn seed_registered_modules_are_resolvable() {
 
 #[tokio::test]
 async fn seed_registered_batch_helper_does_not_clobber_an_active_version() {
-    // Finding 25 (issue #965 review): the ONE documented/exported startup batch
-    // helper (`seed_registered_wasm_modules`, wired into `Worker::run`) must use
-    // SEED (not-clobber) semantics — the same rolling-deploy hazard the single
-    // `seed_wasm_module` closes, but exercised through the batch entry point.
-    // The DB is already hot-swapped to v2; a restarted OLDER worker whose builder
-    // registered v1 seeds it at startup. v2 must STAY active (no flip-back to v1),
-    // and v1 must be present + fetchable-by-hash but NOT activated.
+    // Issue #965: the ONE exported startup batch helper
+    // (`seed_registered_wasm_modules`, wired into `Worker::run`) must use SEED
+    // (not-clobber) semantics. The single `seed_wasm_module` closes the same
+    // rolling-deploy hazard; this test drives the batch entry point. The DB is
+    // already hot-swapped to v2. A restarted OLDER worker that registered v1
+    // seeds it at startup. v2 must STAY active (no flip-back to v1). v1 must be
+    // present and fetchable by hash, but NOT activated.
     let (pool, _c) = conn_and_pool().await;
     let mut conn = pool.get().await.expect("conn");
     scrub(&mut conn).await;
@@ -512,10 +513,10 @@ async fn resolve_dispatch_invokes_a_published_echo() {
 
 #[tokio::test]
 async fn resolve_dispatch_invalid_surfaces_at_invoke_not_resolve() {
-    // Finding 6 (issue #965 review): compilation is deferred off the async
-    // resolve path, so garbage bytes resolve to `Invoke` and the integrity/
-    // compile failure surfaces (still non-retryable `WasmModuleInvalid`) only
-    // from `invoke`, which the worker runs on the blocking pool.
+    // Issue #965: compilation is deferred off the async resolve path. So garbage
+    // bytes resolve to `Invoke`. The integrity/compile failure (still
+    // non-retryable `WasmModuleInvalid`) surfaces only from `invoke`. The worker
+    // runs `invoke` on the blocking pool.
     let (pool, _c) = conn_and_pool().await;
     let mut conn = pool.get().await.expect("conn");
     scrub(&mut conn).await;
@@ -557,14 +558,14 @@ async fn resolve_dispatch_invalid_surfaces_at_invoke_not_resolve() {
     );
 }
 
-// ── Finding 6: cache-miss compilation is deferred off the async path ─────────
+// ── Issue #965: cache-miss compilation is deferred off the async path ────────
 
 #[tokio::test]
 async fn resolve_dispatch_defers_compile_to_invoke_on_cache_miss() {
-    // The async resolve must NOT call `get_or_compile` on a miss: it returns an
-    // Invoke carrying the raw bytes, and compilation happens inside `invoke`
-    // (which the worker runs on the blocking pool). Observable via the store
-    // cache: empty right after resolve, populated only after invoke.
+    // The async resolve must NOT call `get_or_compile` on a miss. It returns an
+    // `Invoke` with the raw bytes. Compilation happens inside `invoke`, on the
+    // blocking pool of the worker. The store cache shows it: empty right after
+    // resolve, populated only after invoke.
     let (pool, _c) = conn_and_pool().await;
     let mut conn = pool.get().await.expect("conn");
     scrub(&mut conn).await;
@@ -611,7 +612,7 @@ async fn resolve_dispatch_defers_compile_to_invoke_on_cache_miss() {
     );
 }
 
-// ── Finding 5: startup seed activates only when no active version exists ──────
+// ── Issue #965: startup seed activates only when no active version exists ─────
 
 #[tokio::test]
 async fn seed_activates_only_when_no_active_version_exists() {
@@ -638,10 +639,10 @@ async fn seed_activates_only_when_no_active_version_exists() {
 
 #[tokio::test]
 async fn seed_does_not_clobber_an_existing_active_version() {
-    // (b) The rolling-deploy hazard: the DB is already on v2 (active); a
-    // restarted OLDER worker that embeds v1 seeds it. v2 must STAY active, and
-    // v1 must be present + fetchable-by-hash (so in-flight pinned v1 attempts
-    // and this worker can still run v1) but NOT activated — no flip-back.
+    // (b) The rolling-deploy hazard: the DB is already on v2 (active). A
+    // restarted OLDER worker that embeds v1 seeds it. v2 must STAY active. v1
+    // must be present and fetchable by hash, but NOT activated (no flip-back).
+    // In-flight pinned v1 attempts and this worker can then still run v1.
     let (pool, _c) = conn_and_pool().await;
     let mut conn = pool.get().await.expect("conn");
     scrub(&mut conn).await;
@@ -684,10 +685,10 @@ async fn seed_does_not_clobber_an_existing_active_version() {
 
 #[tokio::test]
 async fn duplicate_registration_seeds_the_later_bytes() {
-    // Finding 12 (issue #965 review): registering the same activity name twice
-    // with DIFFERENT bytes must keep only the LATER blob in the builder's
-    // registration vector, so seeding a clean shard activates the module that
-    // matches the last binding/retry/queue metadata — not the stale first blob.
+    // Issue #965: one activity name registered twice with DIFFERENT bytes must
+    // keep only the LATER blob in the registration vector of the builder. A
+    // clean-shard seed then activates the module that matches the last
+    // binding/retry/queue metadata, not the stale first blob.
     let v1 = echo_bytes();
     let v2 = echo_bytes_v2();
     assert_ne!(v1, v2, "the two versions must differ for this test");
@@ -1156,9 +1157,9 @@ async fn worker_runs_wasm_echo_to_completion_with_ordinary_events() {
     let (url, _c) = setup_db().await;
     let queue = "q-wasm-echo";
     let mut conn = connect(&url).await;
-    // Isolate the module table: startup-SEED (activate-only-if-absent) will not
-    // swap in this test's bytes if a prior test's `echo_wasm` is still active on
-    // a shared HARVEST_TEST_DATABASE_URL run (a no-op on CI's per-test DB).
+    // Isolate the module table. On a shared `HARVEST_TEST_DATABASE_URL` run, a
+    // prior test's `echo_wasm` can still be active. Startup-SEED
+    // (activate-only-if-absent) then keeps it. A no-op on the per-test DB of CI.
     scrub(&mut conn).await;
     let input = serde_json::json!({"hello": "wasm", "n": 7});
     let exec_id = seed_workflow(&mut conn, "wf_run_wasm", input.clone(), queue).await;
@@ -1448,30 +1449,29 @@ async fn wasm_guest_does_not_start_when_its_start_is_not_recorded() {
     );
 }
 
-// ── Finding 24: default single-shard worker (empty shard_assignments) seeds ─
+// ── Issue #965: default single-shard worker (empty shard_assignments) seeds ─
 //    builder-registered WASM modules on the default pool ──────────────────────
 
-/// A worker started with EMPTY `shard_assignments` — the supported default,
-/// legacy single-shard shape, where the poll loop treats `[] => pool` (the
-/// caller's default pool). The startup-seeding loop must handle that same shape
-/// and seed the default pool; otherwise the embedded module bytes are never
-/// inserted and the WASM activity resolves to a non-retryable
-/// `WasmModuleUnavailable` forever (issue #965 review, Finding 24).
+/// A worker started with EMPTY `shard_assignments`. That is the supported
+/// default, legacy single-shard shape. The poll loop treats `[] => pool` (the
+/// default pool of the caller). The startup-seeding loop must handle that shape
+/// and seed the default pool. Otherwise the embedded module bytes are never
+/// inserted. The WASM activity then resolves to a non-retryable
+/// `WasmModuleUnavailable` forever (issue #965).
 ///
-/// This test FAILS against the pre-fix code (the seeding loop iterates an empty
-/// `shard_targets` and seeds nothing, so the workflow reaches FAILED with a
-/// `WasmModuleUnavailable` `ActivityFailed` instead of COMPLETED) and PASSES
-/// once seeding mirrors the poll loop's `[] => pool` normalization.
+/// This test FAILS against the pre-fix code. That seeding loop iterates an
+/// empty `shard_targets` and seeds nothing. The workflow then reaches FAILED
+/// with a `WasmModuleUnavailable` `ActivityFailed`, not COMPLETED. The test
+/// PASSES once seeding mirrors the `[] => pool` normalization of the poll loop.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn worker_with_empty_shard_assignments_seeds_wasm_on_default_pool() {
     let (url, _c) = setup_db().await;
     let queue = "q-wasm-default-shard";
     let mut conn = connect(&url).await;
-    // Isolate the module table: startup-SEED (activate-only-if-absent) would not
-    // swap in this test's bytes if a prior test's `echo_wasm` is still active on
-    // a shared HARVEST_TEST_DATABASE_URL run — but here that would MASK the bug,
-    // so scrubbing first guarantees the module is absent unless *this* worker
-    // seeds it (a no-op on CI's per-test DB).
+    // Isolate the module table. On a shared `HARVEST_TEST_DATABASE_URL` run, a
+    // prior test's `echo_wasm` can still be active, and that would MASK the bug.
+    // The scrub makes the module absent unless *this* worker seeds it. A no-op
+    // on the per-test DB of CI.
     scrub(&mut conn).await;
     let input = serde_json::json!({"hello": "default-shard", "n": 24});
     let exec_id = seed_workflow(&mut conn, "wf_run_wasm", input.clone(), queue).await;
@@ -1529,17 +1529,17 @@ async fn worker_with_empty_shard_assignments_seeds_wasm_on_default_pool() {
     );
 }
 
-// ── fail-closed on seed failure (issue #965 review, Finding 14) ─────────────
+// ── fail-closed on seed failure (issue #965) ────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn worker_fails_closed_when_seeding_wasm_modules_fails() {
     // A worker that cannot seed its advertised WASM modules on startup must
-    // refuse to start rather than enter the poll loop and advertise activities
-    // that resolve to a non-retryable WasmModuleUnavailable forever. We force a
-    // seed failure with an oversized module (rejected before any DB work), then
-    // assert `run()` returns ON ITS OWN — without any `shutdown()` — proving the
-    // fail-closed `return` fired. A worker that did NOT fail closed would poll
-    // indefinitely and this join would time out.
+    // refuse to start. Otherwise it polls and advertises activities that resolve
+    // to a non-retryable `WasmModuleUnavailable` forever. An oversized module
+    // forces a seed failure before any DB work. `run()` must then return ON ITS
+    // OWN, without any `shutdown()`. That proves the fail-closed `return` fired.
+    // A worker that did NOT fail closed would poll forever, and the join would
+    // time out.
     let (url, _c) = setup_db().await;
     let queue = "q-wasm-failclosed";
     let mut conn = connect(&url).await;
@@ -1580,7 +1580,7 @@ async fn worker_fails_closed_when_seeding_wasm_modules_fails() {
     );
 }
 
-// ── bounded seed acquisition on multi-shard (issue #1212, Finding 2) ───────
+// ── bounded seed acquisition on multi-shard (issue #1212) ──────────────────
 
 /// A single exhausted shard pool must not park the seed loop forever. It
 /// still fails closed, but within a bound, on the multi-shard path.
@@ -1718,11 +1718,11 @@ async fn worker_wasm_sandbox_denial_fails_workflow_terminally() {
 
 // ── AC4: an in-flight attempt is pinned to the loaded module version ────────
 //
-// Deterministic (no wall-clock race): the worker resolves+compiles a module
-// ONCE per attempt at dispatch and holds the resulting `Arc<Module>` for the
-// attempt's whole lifetime. This test proves that invariant at the dispatch
-// primitive: a `PreparedWasmActivity` resolved for v1 keeps running v1 even
-// after v2 is published as the new active version; a fresh resolution sees v2.
+// Deterministic (no wall-clock race): the worker resolves and compiles a module
+// ONCE per attempt at dispatch. It holds the `Arc<Module>` for the whole
+// attempt. This test proves that invariant at the dispatch primitive. A
+// `PreparedWasmActivity` resolved for v1 keeps running v1 after v2 becomes the
+// active version. A fresh resolution sees v2.
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn in_flight_dispatch_is_pinned_across_a_mid_flight_republish() {
@@ -1849,13 +1849,13 @@ async fn worker_wasm_fuel_exhaustion_is_retried_then_terminal() {
         "a retryable resource exhaustion must be retried"
     );
 
-    // AC5 explicitly requires that a runaway module must NOT trip the poison-pill
-    // quarantine (#367) — that mechanism stays defence-in-depth for a worker that
+    // AC5 requires that a runaway module must NOT trip the poison-pill
+    // quarantine (#367). That mechanism stays defence-in-depth for a worker that
     // actually dies. A guest burning its fuel returns a clean `Err` from a live
     // worker, so no crash strike is recorded and nothing is quarantined. Assert
-    // it rather than inferring it: the structural argument (poison-pill keys on a
-    // MISSING worker heartbeat) is sound but silent, and a future refactor that
-    // routed guest failures through the crash path would go unnoticed.
+    // it, do not infer it. The structural argument (poison-pill keys on a
+    // MISSING worker heartbeat) is sound but silent. A refactor that routed
+    // guest failures through the crash path would otherwise go unnoticed.
     let crash_strikes: i64 = diesel::sql_query(
         "SELECT COALESCE(MAX(crash_strikes), 0)::int8 AS n FROM harvest_task_queue \
          WHERE workflow_exec_id = $1",
@@ -1885,10 +1885,10 @@ async fn worker_wasm_fuel_exhaustion_is_retried_then_terminal() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// SUCCESS METRIC (AC1 headline): a single workflow runs 1 NATIVE + 1 WASM
-// activity to completion, through the standard dispatch path, and the recorded
-// history is indistinguishable from an all-native run (AC6: ordinary
-// ActivityScheduled/ActivityCompleted events only, no wasm-specific variant).
+// SUCCESS METRIC (AC1 headline): one workflow runs 1 NATIVE + 1 WASM activity
+// to completion through the standard dispatch path. The recorded history is
+// indistinguishable from an all-native run (AC6). It has only ordinary
+// ActivityScheduled/ActivityCompleted events, no wasm-specific variant.
 // ═══════════════════════════════════════════════════════════════════════════
 
 type ActFut<'a> = std::pin::Pin<
@@ -1959,10 +1959,10 @@ fn native_act_info(
     }
 }
 
-/// Build a registry wiring BOTH native `ActivityInfo`s (with real handlers) and
-/// WASM activities (bindings + shared store + startup-publish registrations),
-/// so `worker.run()` publishes the WASM modules before polling and dispatches
-/// native and WASM activities side by side.
+/// Build a registry with BOTH native `ActivityInfo`s (with real handlers) and
+/// WASM activities (bindings, shared store, startup-publish registrations).
+/// `worker.run()` then publishes the WASM modules before polling. It
+/// dispatches native and WASM activities side by side.
 fn build_mixed_registry(
     workflows: Vec<WorkflowInfo>,
     native: Vec<ActivityInfo>,
@@ -2033,10 +2033,10 @@ fn workflow_completed_output(history: &[WorkflowEvent]) -> Option<serde_json::Va
 /// AC4 + success metric: a module swap reaches the next attempt on a **live**
 /// worker, with **zero restarts**, in well under 5 s.
 ///
-/// The pinning test proves the two halves at the dispatch primitive; this proves
-/// them where the AC actually makes its claim — one worker process that keeps
-/// running across the publish. The worker is started ONCE and shut down ONCE, so
-/// "0 worker restarts" is a property of the test's structure, not an assertion
+/// The pinning test proves the two halves at the dispatch primitive. This test
+/// proves them where the AC makes its claim: one worker process that keeps
+/// running across the publish. The worker starts ONCE and shuts down ONCE. So
+/// "0 worker restarts" is a property of the test structure, not an assertion
 /// that could quietly become vacuous.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn hot_swap_reaches_the_next_attempt_on_a_live_worker_without_restart() {
@@ -2111,11 +2111,11 @@ async fn hot_swap_reaches_the_next_attempt_on_a_live_worker_without_restart() {
 /// The **`AssemblyScript`** guest, compiled to wasm with `asc` and committed.
 ///
 /// AC1 asks for a guest "compiled from at least one non-Rust language".
-/// `echo.wat` does not satisfy that on its own: WebAssembly Text is the textual
-/// encoding of the wasm binary format itself, and `wat::parse_str` is an
-/// assembler, not a compiler from a distinct source language — it exercises no
-/// real toolchain's codegen, allocator, or memory layout. These bytes come from
-/// `AssemblyScript`'s compiler, so they do.
+/// `echo.wat` does not satisfy that on its own. WebAssembly Text is the textual
+/// encoding of the wasm binary format itself. `wat::parse_str` is an assembler,
+/// not a compiler from a distinct source language. It exercises no real
+/// toolchain codegen, allocator or memory layout. These bytes come from the
+/// `AssemblyScript` compiler, so they do.
 ///
 /// Committed rather than built in CI so the suite needs no npm toolchain and the
 /// bytes are deterministic. Regenerate with the `asc` command in
@@ -2125,9 +2125,9 @@ const ECHO_ASSEMBLYSCRIPT_WASM: &[u8] = include_bytes!("../../examples/wasm-gues
 /// AC1 (non-Rust guest): a module compiled by the **`AssemblyScript`** toolchain
 /// runs end-to-end through the standard dispatch path.
 ///
-/// Deliberately exercises the whole seam — startup publish, task-queue claim,
-/// `resolve_wasm_dispatch`, sandboxed invoke, ordinary `ActivityCompleted` — not
-/// just the runtime, so this proves polyglot reach rather than merely that
+/// Deliberately exercises the whole seam, not just the runtime: startup
+/// publish, task-queue claim, `resolve_wasm_dispatch`, sandboxed invoke and an
+/// ordinary `ActivityCompleted`. So this proves polyglot reach, not merely that
 /// wasmtime can run a foreign module.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn worker_runs_an_assemblyscript_compiled_guest_to_completion() {
@@ -2138,9 +2138,9 @@ async fn worker_runs_an_assemblyscript_compiled_guest_to_completion() {
     let input = serde_json::json!({ "guest": "assemblyscript", "payload": [1, 2, 3] });
     let exec_id = seed_workflow(&mut conn, "wf_run_wasm", input.clone(), queue).await;
 
-    // Sanity-check the committed artifact really is a wasm binary, so a
-    // truncated or mis-copied file fails loudly here rather than as an opaque
-    // "module invalid" deep inside dispatch.
+    // Check that the committed artifact is a wasm binary. A truncated or
+    // mis-copied file then fails loudly here, not as an opaque "module invalid"
+    // deep inside dispatch.
     assert_eq!(
         &ECHO_ASSEMBLYSCRIPT_WASM[..4],
         b"\0asm",
@@ -2249,8 +2249,8 @@ async fn runs_one_native_and_one_wasm_activity_to_completion() {
     );
 
     // AC6: the WASM activity is INDISTINGUISHABLE from the native one in
-    // history — exactly two ordinary ActivityScheduled + two ActivityCompleted,
-    // and NO wasm-specific event variant of any kind.
+    // history. Exactly two ordinary `ActivityScheduled` and two
+    // `ActivityCompleted`, and NO wasm-specific event variant of any kind.
     let types: Vec<&str> = history.iter().map(WorkflowEvent::type_name).collect();
     assert_eq!(
         types.iter().filter(|t| **t == "ActivityScheduled").count(),
@@ -2276,12 +2276,12 @@ async fn runs_one_native_and_one_wasm_activity_to_completion() {
 //   cargo test -p autumn-harvest --features wasm-activities --test integration \
 //     -- --ignored dispatch_overhead --nocapture
 //
-// Measures the PER-INVOCATION overhead of a trivial cached WASM echo
-// (instantiate + call — the module is compiled/cached ONCE up front, so
-// compilation is excluded) against a native Rust closure baseline. This is
-// deliberately the pure invocation primitive (`invoke_wasm_activity`), not the
-// full worker round-trip, so the number isolates WASM instantiation cost from
-// task-queue and DB latency (which native and WASM activities share equally).
+// Measures the PER-INVOCATION overhead of a trivial cached WASM echo against a
+// native Rust closure baseline. That is instantiate + call. The module is
+// compiled and cached ONCE up front, so compilation is excluded. This uses the
+// pure invocation primitive (`invoke_wasm_activity`), not the worker
+// round-trip. So the number isolates WASM instantiation cost from task-queue
+// and DB latency, which native and WASM activities share equally.
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[test]
@@ -2349,11 +2349,11 @@ fn dispatch_overhead_wasm_echo_vs_native() {
     println!("  overhead (wasm - native)  p50={d50:?}  p99={d99:?}");
     println!("  success-metric target: p99 overhead < 10ms");
 
-    // ASSERT the success metric rather than only reporting it (issue #965
-    // review). Printing "MET"/"NOT MET" meant this test could not fail on the
-    // one number it exists to establish, so a regression that doubled dispatch
-    // cost would still show a green run. It stays `#[ignore]`d — a percentile
-    // microbenchmark is not a per-PR gate — but when it IS run, it now enforces.
+    // ASSERT the success metric, do not only report it (issue #965). A printed
+    // "MET"/"NOT MET" cannot fail on the one number this test exists to
+    // establish. A regression that doubled dispatch cost would still run green.
+    // It stays `#[ignore]`d, because a percentile microbenchmark is not a
+    // per-PR gate. When it IS run, it enforces.
     assert!(
         d99 < Duration::from_millis(10),
         "WASM dispatch overhead must stay under the 10ms p99 success metric, but measured \

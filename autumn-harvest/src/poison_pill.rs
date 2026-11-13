@@ -1,17 +1,15 @@
 //! Poison-pill task quarantine (Phase 4, issue #367).
 //!
 //! A *poison-pill* task is one that crashes the worker **process** (panic, OOM,
-//! segfault, SIGKILL, hard exit) instead of returning a clean `Err`. Because of
-//! `SKIP LOCKED` re-claim semantics, the row left behind in `RUNNING` state by
-//! the dead worker is eventually reclaimed and re-dispatched — and crashes the
-//! next worker too, cascading across the fleet.
+//! segfault, SIGKILL, hard exit) instead of returning a clean `Err`. A `SKIP
+//! LOCKED` re-claim later re-dispatches the `RUNNING` row that the dead worker
+//! left behind. The task then crashes the next worker too, across the fleet.
 //!
-//! This module adds a worker-liveness-driven reclaim path that is independent
-//! of per-task timeout configuration (so an un-timed orphan is recovered rather
-//! than stuck in `RUNNING` forever), counts how many times a task has crashed a
-//! worker (`crash_strikes`), and *quarantines* a task to the dead-letter queue
-//! once it has consumed `poison_pill_threshold` workers in a row — instead of
-//! re-queueing it for yet another doomed attempt.
+//! This module adds a reclaim path driven by worker liveness. It does not
+//! depend on per-task timeouts, so an un-timed orphan does not stay `RUNNING`
+//! forever. It counts how many times a task crashed a worker
+//! (`crash_strikes`). A task that consumed `poison_pill_threshold` workers in
+//! a row goes to the dead-letter queue instead of another doomed attempt.
 //!
 //! The pure decision logic ([`quarantine_decision`]) carries no database
 //! dependency and is unit-tested without the `db` feature. The DB scanner
@@ -46,9 +44,10 @@ pub enum ReclaimAction {
     Quarantine,
 }
 
-/// Decide whether a reclaimed poison-pill task should be re-queued or
-/// quarantined, given the crash-strike count **after** this reclaim has
-/// incremented it and the configured quarantine threshold.
+/// Decide whether to re-queue or quarantine a reclaimed poison-pill task.
+///
+/// `strikes_after_increment` is the crash-strike count **after** this
+/// reclaim incremented it.
 ///
 /// Semantics:
 /// - `threshold <= 0` disables quarantine entirely — the task is always
@@ -205,10 +204,10 @@ pub const fn quarantine_confirm_secs(worker_stale_secs: i64) -> i64 {
 
 /// Upper bound (one year, in seconds) applied to the worker-stale threshold.
 ///
-/// The reclaim path multiplies this value into a Postgres `INTERVAL` and into a
-/// [`chrono::Duration`]; clamping here keeps both well inside their valid range
-/// so an absurd `worker_heartbeat_interval` can never overflow or panic. A
-/// one-year staleness window is already far beyond any sane fleet config.
+/// The reclaim path multiplies this value into a Postgres `INTERVAL` and a
+/// [`chrono::Duration`]. The clamp keeps both inside their valid range, so an
+/// absurd `worker_heartbeat_interval` cannot overflow or panic. A one-year
+/// staleness window is already far beyond any sane fleet config.
 pub const MAX_WORKER_STALE_SECS: i64 = 31_536_000;
 
 /// Upper bound (one year, in seconds) applied to the stuck-running threshold.
@@ -219,12 +218,11 @@ pub const MAX_STUCK_RUNNING_SECS: i64 = 31_536_000;
 
 /// SQL selecting `RUNNING` tasks whose claiming worker is no longer live.
 ///
-/// A worker is considered dead when no `harvest_workers` row carries its
-/// `worker_id` with a `last_heartbeat_at` newer than `$1` seconds ago. This is
-/// the authoritative liveness signal (issue #367 AC1): reclaim does **not**
-/// depend on the per-task `start_to_close` / `heartbeat_timeout` columns, so an
-/// orphan with neither configured is still recovered rather than stuck in
-/// `RUNNING` forever.
+/// A worker is dead when no `harvest_workers` row carries its `worker_id`
+/// with a `last_heartbeat_at` newer than `$1` seconds ago. This is the
+/// authoritative liveness signal (issue #367 AC1). Reclaim does **not** read
+/// the per-task `start_to_close` / `heartbeat_timeout` columns. So an orphan
+/// with neither one set is still recovered, not stuck in `RUNNING` forever.
 ///
 /// `$1` is the worker-stale threshold in seconds (BIGINT).
 #[must_use]
@@ -429,8 +427,8 @@ mod scanner {
     /// crash-strike count. Clears the dead worker's claim and sticky pin so any
     /// healthy worker can pick it up immediately.
     ///
-    /// Returns `true` if the row was actually transitioned (it was still a
-    /// `RUNNING` orphan with the expected strike count), `false` if a
+    /// Returns `true` if the row transitioned, because it was still a
+    /// `RUNNING` orphan with the expected strike count. Returns `false` if a
     /// concurrent actor already handled it.
     async fn requeue_orphan(
         conn: &mut AsyncPgConnection,
@@ -691,11 +689,10 @@ mod scanner {
         else {
             return Ok((None, Vec::new(), Vec::new(), Vec::new()));
         };
-        // PAUSED is a non-terminal active state (issue #383): an in-flight
-        // activity that was admitted before the pause can still be running, so a
-        // poison-pill quarantine of that activity must terminally fail the
-        // owning workflow rather than leave it parked in PAUSED forever with a
-        // dead task. Treat PAUSED like RUNNING here.
+        // PAUSED is a non-terminal active state (issue #383). An activity
+        // admitted before the pause can still run. Its quarantine must fail the
+        // owning workflow, not leave it parked in PAUSED forever with a dead
+        // task. So treat PAUSED like RUNNING here.
         if state != "RUNNING" && state != "PAUSED" {
             return Ok((None, Vec::new(), Vec::new(), Vec::new()));
         }
@@ -729,10 +726,10 @@ mod scanner {
         .map_err(crate::error::database_error)?;
 
         // Drain any sibling tasks still open for this execution. `claim_task`
-        // filters only on task state, so without this a PENDING/RUNNING sibling
-        // activity could be claimed and run user code after the workflow has
-        // already failed (the timeout/cancellation paths drain for this same
-        // reason). The quarantined task itself is already FAILED.
+        // filters only on task state. Without the drain, a PENDING/RUNNING
+        // sibling activity could run user code after the workflow failed. The
+        // timeout and cancellation paths drain for the same reason. The
+        // quarantined task itself is already FAILED.
         {
             use crate::schema::harvest_task_queue::dsl as task_dsl;
             diesel::update(
@@ -769,10 +766,9 @@ mod scanner {
             .await?;
         deferred.extend(failed_triggers);
 
-        // Wake a parent that is blocked on this child. When a parent-close
-        // policy is set the cascade above owns the parent relationship, so we
-        // only nudge the parent for detached children (mirrors the timeout
-        // enforcement path).
+        // Wake a parent that is blocked on this child. With a parent-close
+        // policy, the cascade above owns the parent relationship. So only a
+        // detached child nudges its parent, as in the timeout enforcement path.
         if parent_close_policy.is_none()
             && let Some(parent_uuid) = parent_id
         {
@@ -820,9 +816,11 @@ mod scanner {
         Option<chrono::DateTime<Utc>>,
     );
 
-    /// Quarantine an orphaned poison-pill task: move it to the dead-letter
-    /// queue with a [`PoisonPill`](super::super::dlq::DeadLetterReason) reason,
-    /// mark the queue row `FAILED`, and fail the owning workflow terminally.
+    /// Quarantine an orphaned poison-pill task.
+    ///
+    /// The task moves to the dead-letter queue with a
+    /// [`PoisonPill`](super::super::dlq::DeadLetterReason) reason. The queue
+    /// row becomes `FAILED`, and the owning workflow fails terminally.
     ///
     /// Returns what happened to the row. See [`QuarantineOutcome`].
     #[allow(clippy::too_many_lines)]
@@ -884,10 +882,10 @@ mod scanner {
         };
         let workflow_exec_id = task.workflow_exec_id;
 
-        // The transaction returns whether the row was acted on, plus the owning
-        // workflow's (id, name, schedule_id, origin) when it was actually failed
-        // RUNNING → FAILED so the schedule failure counter can be bumped (with
-        // the correct origin) after commit.
+        // The transaction returns whether it acted on the row. When it moved
+        // the owning workflow RUNNING → FAILED, it also returns the workflow's
+        // (id, name, schedule_id, origin). The caller bumps the schedule
+        // failure counter, with the correct origin, after commit.
         //
         // `fail_owning_workflow` wakes a detached parent, which raises a
         // dispatch hint (issue #1429). This scanner runs on its own timer,
@@ -901,8 +899,8 @@ mod scanner {
         // `buffered_settled_in_background` already covers. An inline
         // `buffered_settled` awaits the dispatch channel's publish call
         // after every commit. That can cost up to `DISPATCH_CALL_TIMEOUT`
-        // per quarantined row when the channel is slow (Codex review, issue
-        // #1429). It delays the rest of the sweep even though Postgres
+        // per quarantined row when the channel is slow (issue #1429). It
+        // delays the rest of the sweep even though Postgres
         // already committed. Reconciliation is the durability fallback
         // regardless, so `buffered_settled_in_background` hands the hint to
         // the existing non-blocking background publisher instead of
@@ -1197,9 +1195,8 @@ mod scanner {
     /// the previous sweep too. The worker also wrote no heartbeat for
     /// [`quarantine_confirm_secs`], on the database clock. A worker with no
     /// row needs that long of unbroken sightings instead. Until then the row
-    /// stays `RUNNING` and
-    /// gets no strike. A worker that heartbeats again keeps its task. A
-    /// requeue under the threshold does not wait.
+    /// stays `RUNNING` and gets no strike. A worker that heartbeats again
+    /// keeps its task. A requeue under the threshold does not wait.
     ///
     /// Use one `witness` for all sweeps of one reclaim loop. The sweep reads
     /// `clock` once, after the orphan scan returns. A delay before the scan
@@ -1294,9 +1291,9 @@ mod scanner {
         let worker_stale_secs = worker_stale_secs.clamp(0, super::MAX_WORKER_STALE_SECS);
         let confirm_secs = super::quarantine_confirm_secs(worker_stale_secs);
         // Chaos: inject a transient DB/connection error before the orphan scan
-        // (issue #940 AC1(b)). The reclaim is idempotent and the poll loop
-        // retries it on the next tick, so a transient error must not strand an
-        // orphaned RUNNING task with a dead worker.
+        // (issue #940 AC1(b)). The reclaim is idempotent, and the poll loop
+        // retries it on the next tick. So a transient error must not strand
+        // an orphaned RUNNING task with a dead worker.
         crate::chaos_fallible!(POISON_RECLAIM_BEFORE_LOAD);
         let orphans: Vec<TaskQueueItem> = diesel::sql_query(orphaned_running_tasks_query())
             .bind::<diesel::sql_types::BigInt, _>(worker_stale_secs)
@@ -1385,9 +1382,9 @@ mod scanner {
     ///
     /// Equivalent to [`spawn_poison_pill_reclaimer_for_shard`] with no shard
     /// attributed and the issue #1459 stuck-running backstop disabled. The
-    /// shard is only used to label this loop in the `scanner_liveness` health
-    /// check (issue #797); it never affects which tasks the loop reclaims --
-    /// that is the connection's own database.
+    /// shard only labels this loop in the `scanner_liveness` health check
+    /// (issue #797). The connection's own database decides which tasks the
+    /// loop reclaims.
     ///
     /// This function's signature is frozen. See
     /// `the_public_spawn_signatures_are_unchanged_by_shard_attribution` in
@@ -1424,16 +1421,15 @@ mod scanner {
     /// `shard` in the `scanner_liveness` health check (issue #797).
     ///
     /// A multi-shard worker spawns one reclaimer per assigned shard, all
-    /// registered under the same `poison_pill` scanner label. Passing the shard
-    /// here is what lets the health check say *which* shard's loop is wedged --
-    /// the metric carries no shard label, so this is the only surface that can
-    /// localize it.
+    /// registered under the same `poison_pill` scanner label. The shard lets
+    /// the health check say *which* shard's loop is wedged. The metric carries
+    /// no shard label, so only this surface can localize it.
     ///
     /// Pass `None` for a process-wide loop or a single-shard deployment.
     #[must_use]
-    // Issue #1243: the codec registry pushed this spawner past the
-    // pedantic argument limit; its parameters are already a flat
-    // shard-runtime bundle and restructuring them is out of scope here.
+    // Issue #1243: the codec registry pushed this spawner past the pedantic
+    // argument limit. Its parameters are already a flat shard-runtime bundle,
+    // and restructuring them is out of scope here.
     #[allow(clippy::too_many_arguments)]
     pub fn spawn_poison_pill_reclaimer_for_shard(
         pool: diesel_async::pooled_connection::deadpool::Pool<AsyncPgConnection>,

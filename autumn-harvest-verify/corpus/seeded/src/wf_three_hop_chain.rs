@@ -2,11 +2,11 @@
 //!
 //! **Mechanism.** `Value` at depth three. `wf_three_hop_chain` calls
 //! `helpers::a`, which calls `helpers::b`, which calls
-//! `helpers_deep::fine_stamp` — and only that leaf reads the clock. `a` and `b`
-//! are pure arithmetic pass-throughs, so the analyzer's bottom-up summaries have
-//! to *compose*: `fine_stamp` is a source, `b`'s return is `FromSource`, `a`'s
-//! return is `FromParam`-plus-`FromSource`, and the workflow's activity argument
-//! is tainted only if all three summaries chain correctly.
+//! `helpers_deep::fine_stamp`, and only that leaf reads the clock. `a` and `b`
+//! are pure arithmetic pass-throughs. So the analyzer's bottom-up summaries
+//! must *compose*. `fine_stamp` is a source. The return of `b` is
+//! `FromSource`. The return of `a` is `FromParam`-plus-`FromSource`. The
+//! activity argument is tainted only if all three summaries chain correctly.
 //!
 //! **Launder.** AC3 asks for "at least one helper-function layer"; this is
 //! three, across two crates. det_check resolves exactly one hop and only

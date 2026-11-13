@@ -2,9 +2,9 @@
 //!
 //! `det_check::check_source` is a hand-rolled, line-oriented scanner over
 //! arbitrary Rust source text (`#[workflow]` body extraction, brace tracking,
-//! binding tracking). It has a long history of parity/edge-case churn against
-//! the sibling proc-macro lint, and it must never panic on malformed input —
-//! it is run over user code in CI and editor tooling. Raw-bytes fuzzing (via
+//! binding tracking). It has a long history of parity and edge-case churn
+//! against the sibling proc-macro lint. It must never panic on malformed input,
+//! because CI and editor tooling run it over user code. Raw-bytes fuzzing (via
 //! lossy UTF-8) is the highest-value target here: it exercises the parser's
 //! own byte/line handling far past what curated proptest strategies reach.
 //!

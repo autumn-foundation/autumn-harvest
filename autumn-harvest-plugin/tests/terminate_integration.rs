@@ -4,9 +4,9 @@
 //! `POST /workflows/{id}/terminate` end-to-end.
 //!
 //! Scenarios covered:
-//!   (a) Terminating a RUNNING execution seals it `TERMINATED`, returns 202 with
-//!       `newly_terminated: true`, records the reason, and surfaces as a terminal
-//!       failure via `GET /workflows/{id}/result` (AC #1, #4).
+//!   (a) Terminating a RUNNING execution seals it `TERMINATED` and returns 202
+//!       with `newly_terminated: true`. It records the reason and surfaces as a
+//!       terminal failure via `GET /workflows/{id}/result` (AC #1, #4).
 //!   (b) Terminate affects ONLY the addressed id — a concurrent execution of the
 //!       same workflow type/queue is untouched (AC #3).
 //!   (c) Idempotent no-op against an already-terminal execution: `newly_terminated:
@@ -561,9 +561,9 @@ async fn post_empty_json(app: &HarvestApiApp, uri: &str) -> StatusCode {
     response.status()
 }
 
-/// (P1, #787 review) Terminating an **awaited** child wakes the parent: a
-/// `ChildWorkflowFailed` event carrying the termination reason is appended to
-/// the parent's history, so a parent parked on the child's await is not stuck.
+/// Issue #787: terminating an **awaited** child wakes the parent. A
+/// `ChildWorkflowFailed` event with the termination reason goes into the
+/// parent's history. So a parent parked on the child's await is not stuck.
 #[tokio::test]
 async fn terminate_awaited_child_notifies_parent() {
     let (url, _container) = setup_database().await;
@@ -599,9 +599,9 @@ async fn terminate_awaited_child_notifies_parent() {
     );
 }
 
-/// (P1, #787 review) A **detached** child (`parent_close_policy` set) is the
-/// parent-close cascade's responsibility, not this path — terminating it must
-/// NOT append a `ChildWorkflowFailed` to the parent.
+/// Issue #787: the parent-close cascade owns a **detached** child
+/// (`parent_close_policy` set), not this path. Terminating it must NOT append a
+/// `ChildWorkflowFailed` to the parent.
 #[tokio::test]
 async fn terminate_detached_child_does_not_notify_parent() {
     let (url, _container) = setup_database().await;

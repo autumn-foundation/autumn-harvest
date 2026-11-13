@@ -6,9 +6,9 @@
 //!
 //! # Ack semantics
 //!
-//! SQS acknowledgement is a per-message `DeleteMessage`, so there is no
-//! high-water mark to protect and no offset ordering to respect: the runtime's
-//! [`OffsetTracker`][ot] gate is bypassed entirely for opaque handles. A
+//! SQS acknowledgement is a per-message `DeleteMessage`. So there is no
+//! high-water mark to protect and no offset ordering to respect. The runtime
+//! bypasses its [`OffsetTracker`][ot] gate for opaque handles. A
 //! message is deleted only after its dispatch is durable; otherwise SQS
 //! redelivers it, where it dedupes on the connector's derived key.
 //!
@@ -19,9 +19,9 @@
 //!   deleting the message is already sufficient, so it reappears once its
 //!   existing visibility timeout lapses. **The visibility timeout is the retry
 //!   backoff**; size it with [`SqsSourceConfig::visibility_timeout_secs`].
-//!   Zeroing visibility here would turn a transient failure — usually harvest
-//!   under pressure — into a tight redelivery loop against an already-struggling
-//!   system, and burn `ApproximateReceiveCount` toward a redrive policy's
+//!   A transient failure usually means harvest is under pressure. Zeroed
+//!   visibility turns it into a tight redelivery loop against a struggling
+//!   system. It also burns `ApproximateReceiveCount` toward a redrive policy's
 //!   `maxReceiveCount` faster than the failure warrants.
 //! * **Poison redrive.** [`EventSource::nack_for_dead_letter`] *does* reset
 //!   visibility to zero, because there fast redelivery is the point: each
@@ -69,10 +69,10 @@ pub struct SqsSourceConfig {
     /// Whether the queue has a redrive policy, i.e. whether SQS actually has
     /// somewhere to move a poison message.
     ///
-    /// `None` means "not declared": [`SqsSource::connect`] probes the queue,
-    /// while [`SqsSource::new`] cannot (it is sync and takes an already-built
-    /// client), so an undeclared, unprobed source reports **no** native
-    /// dead-letter destination. See [`SqsSourceConfig::has_redrive_policy`].
+    /// `None` means "not declared". [`SqsSource::connect`] probes the queue.
+    /// [`SqsSource::new`] cannot, because it is sync and takes an already-built
+    /// client. An undeclared, unprobed source reports **no** native dead-letter
+    /// destination. See [`SqsSourceConfig::has_redrive_policy`].
     pub has_redrive_policy: Option<bool>,
 }
 
@@ -111,9 +111,9 @@ impl SqsSourceConfig {
     /// you. An explicit declaration always wins over the probe, so a queue
     /// whose IAM policy denies `GetQueueAttributes` can still opt in.
     ///
-    /// Declaring `true` for a queue that has **no** redrive policy re-arms the
-    /// exact failure `broker_native_dead_letter` exists to prevent: an
-    /// abandoned poison message is redelivered forever instead of quarantined.
+    /// A `true` for a queue with **no** redrive policy re-arms the failure that
+    /// `broker_native_dead_letter` exists to prevent. An abandoned poison
+    /// message is then redelivered forever instead of quarantined.
     #[must_use]
     pub const fn has_redrive_policy(mut self, has_redrive: bool) -> Self {
         self.has_redrive_policy = Some(has_redrive);
@@ -248,8 +248,8 @@ pub fn redrive_policy_is_configured(attribute: Option<&str>) -> bool {
 /// Resolve a possibly-undeclared redrive answer into the trait's `bool`.
 ///
 /// Fails **closed**: an undeclared, unprobed queue reports no native
-/// dead-letter destination, so `broker_native_dead_letter()` is rejected at
-/// build time with an actionable message rather than silently degrading into a
+/// dead-letter destination. So `broker_native_dead_letter()` fails at build
+/// time with an actionable message. It cannot silently become a
 /// poison-redelivery loop at runtime.
 #[must_use]
 pub const fn native_dead_letter_supported(has_redrive_policy: Option<bool>) -> bool {
@@ -259,22 +259,22 @@ pub const fn native_dead_letter_supported(has_redrive_policy: Option<bool>) -> b
 /// Pick the stable broker coordinate for one SQS message.
 ///
 /// Prefers the broker-assigned `MessageId`, which is what a connector
-/// coordinate is *for*: it is stable across every redelivery of the same
-/// message and distinct for every distinct message.
+/// coordinate is *for*. It is stable across every redelivery of a message and
+/// distinct for every distinct message.
 ///
-/// A FIFO `MessageDeduplicationId` looks like a stronger identity — the
-/// *producer* controls it, so it survives a re-publish — but it is the wrong
+/// A FIFO `MessageDeduplicationId` looks like a stronger identity. The
+/// *producer* controls it, so it survives a re-publish. But it is the wrong
 /// tool here, in both directions:
 ///
 /// * **Inside** SQS's five-minute deduplication interval, SQS already collapses
 ///   a re-publish carrying the same dedup id. The second publish never reaches
 ///   a consumer, so preferring the dedup id buys nothing in the only window
 ///   where it would.
-/// * **Outside** that interval, a legitimately reused dedup id (a nightly job
-///   keyed on a business id, say) produces a genuinely *new* message with a new
-///   `MessageId`. Coordinating on the dedup id would collapse it onto the
-///   earlier message's key, so the connector would ack it as an idempotent
-///   replay and silently drop a valid event.
+/// * **Outside** that interval, a legitimately reused dedup id produces a
+///   genuinely *new* message with a new `MessageId`. An example is a nightly
+///   job keyed on a business id. A coordinate on the dedup id collapses it onto
+///   the key of the earlier message. The connector then acks it as an
+///   idempotent replay and silently drops a valid event.
 ///
 /// The dedup id is therefore only a fallback, for the pathological case where
 /// the broker gave us no `MessageId` at all.
@@ -294,10 +294,10 @@ pub fn coordinate_id(dedup_id: Option<&str>, message_id: Option<&str>) -> Option
 
 /// The physical-subscription identity for a queue URL.
 ///
-/// The URL rather than the stream name: two queues can share a name across
-/// accounts or regions, and the stream name is caller-overridable via
-/// [`SqsSourceConfig::stream`], so neither is a reliable identity. SQS has no
-/// consumer-group concept, so every receiver on one queue competes.
+/// It uses the URL, not the stream name. Two queues can share a name across
+/// accounts or regions. The caller can override the stream name via
+/// [`SqsSourceConfig::stream`]. So neither name is a reliable identity. SQS has
+/// no consumer-group concept, so every receiver on one queue competes.
 #[must_use]
 fn subscription_identity_for(queue_url: &str) -> String {
     format!("sqs:{queue_url}")
@@ -348,9 +348,9 @@ impl EventSource for SqsSource {
         let mut out = Vec::new();
         for message in response.messages.unwrap_or_default() {
             let Some(receipt) = message.receipt_handle.clone() else {
-                // Without a receipt handle the message can never be deleted;
-                // skipping it lets the visibility timeout redeliver it rather
-                // than dispatching something we could not acknowledge.
+                // Without a receipt handle the message cannot be deleted. A
+                // skip lets the visibility timeout redeliver it, so nothing
+                // unacknowledgeable is dispatched.
                 tracing::warn!(
                     stream = %self.stream,
                     "sqs message has no receipt handle; skipping"
@@ -409,32 +409,25 @@ impl EventSource for SqsSource {
 
     fn has_native_dead_letter(&self) -> bool {
         // Redelivery drives `ApproximateReceiveCount` toward the queue's
-        // `maxReceiveCount`, at which point SQS moves the message to the
-        // redrive policy's target — that is what `DeadLetterMode::BrokerNative`
-        // relies on. *Without* a redrive policy there is no target, so the
-        // poison message is simply redelivered forever. Hence the answer is
-        // the queue's actual configuration, not an unconditional `true`.
+        // `maxReceiveCount`. Then SQS moves the message to the redrive target.
+        // `DeadLetterMode::BrokerNative` relies on that. *Without* a redrive
+        // policy there is no target, so the poison message is redelivered
+        // forever. Hence the answer is the queue's actual configuration, not
+        // an unconditional `true`.
         native_dead_letter_supported(self.has_redrive_policy)
     }
 
     async fn abandon(&self, _handle: &MessageHandle) -> Result<(), ConnectorError> {
-        // Deliberately a no-op. Simply *not* deleting the message is already
-        // sufficient for redelivery: its visibility timeout lapses and SQS
-        // hands it back. Zeroing the visibility here (as this once did) would
-        // turn a transient harvest failure — usually harvest under pressure —
-        // into a tight redelivery loop against an already-struggling system,
-        // and would burn `ApproximateReceiveCount` faster than necessary
-        // toward a redrive policy's `maxReceiveCount`.
-        //
-        // The visibility timeout *is* the retry backoff; size it with
-        // `SqsSourceConfig::visibility_timeout_secs`.
+        // Deliberately a no-op: the visibility timeout lapses and SQS hands
+        // the message back. The module doc explains why this must not zero
+        // the visibility. The visibility timeout *is* the retry backoff.
         Ok(())
     }
 
     async fn nack_for_dead_letter(&self, handle: &MessageHandle) -> Result<(), ConnectorError> {
-        // The poison path, where fast redelivery is exactly the point: each
-        // one increments `ApproximateReceiveCount`, driving the message toward
-        // the queue's redrive `maxReceiveCount` and thus its DLQ.
+        // On the poison path, fast redelivery is the point. Each one
+        // increments `ApproximateReceiveCount` toward the queue's redrive
+        // `maxReceiveCount`, and so toward its DLQ.
         self.client
             .change_message_visibility()
             .queue_url(&self.queue_url)
@@ -450,15 +443,15 @@ impl EventSource for SqsSource {
     ///
     /// `ApproximateNumberOfMessages` alone is the *visible* count, and a
     /// message this connector abandoned for retry is invisible until its
-    /// visibility timeout lapses. During a downstream outage — precisely when
-    /// the gauge matters — successive polls would therefore drive the reported
-    /// lag toward zero while a large population is still in flight or waiting
-    /// to reappear, masking the backlog. `NotVisible` is what makes the number
-    /// mean "still owed to harvest" rather than "immediately fetchable".
+    /// visibility timeout lapses. A downstream outage is when the gauge matters
+    /// most. Then successive polls drive the reported lag toward zero, while
+    /// many messages are still in flight or wait to reappear. That masks the
+    /// backlog. `NotVisible` makes the number mean "still owed to harvest", not
+    /// "immediately fetchable".
     ///
-    /// A missing or unparseable attribute contributes zero rather than
-    /// discarding the whole sample, so losing one of the two never reports a
-    /// wildly wrong total; both missing yields `None` and skips the sample.
+    /// A missing or unparseable attribute contributes zero, so the sample is
+    /// kept. The loss of one of the two never reports a wildly wrong total.
+    /// When both are missing, this returns `None` and skips the sample.
     async fn lag(&self) -> Option<i64> {
         use aws_sdk_sqs::types::QueueAttributeName;
 
@@ -561,9 +554,9 @@ mod tests {
         // The bug this preference order exists to prevent: a FIFO producer
         // legitimately reuses a `MessageDeduplicationId` after SQS's 5-minute
         // deduplication interval. SQS accepts it as a *new* message with a new
-        // `MessageId`. Coordinating on the dedup id would collapse the two
-        // onto one key, so the second would be acked as an idempotent replay
-        // and its event silently dropped.
+        // `MessageId`. A coordinate on the dedup id collapses the two onto
+        // one key. The second is then acked as an idempotent replay, and its
+        // event is silently dropped.
         let first = coordinate_id(Some("nightly-rollup"), Some("msg-aaa"));
         let second = coordinate_id(Some("nightly-rollup"), Some("msg-bbb"));
         assert_ne!(
@@ -605,9 +598,9 @@ mod tests {
 
     #[test]
     fn native_dead_lettering_fails_closed_until_a_redrive_policy_is_known() {
-        // The safety property: an unprobed source must NOT claim a native
-        // dead-letter destination, or `broker_native_dead_letter()` would be
-        // accepted at build time and poison messages would loop forever.
+        // An unprobed source must NOT claim a native dead-letter destination.
+        // Otherwise the build accepts `broker_native_dead_letter()`, and
+        // poison messages loop forever.
         assert!(!native_dead_letter_supported(None));
         assert!(!native_dead_letter_supported(Some(false)));
         assert!(native_dead_letter_supported(Some(true)));

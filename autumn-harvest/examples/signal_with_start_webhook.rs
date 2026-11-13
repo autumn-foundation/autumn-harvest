@@ -6,10 +6,9 @@
 //! call.  The signal lands deterministically in the workflow's first tick on
 //! a fresh start, and goes to the existing live execution on a duplicate.
 //!
-//! The before/after below is the *Success Metric* for the issue: the
-//! canonical "idempotent webhook → workflow" snippet shrinks from ≥3 calls
-//! and ≥30 lines of error-handling glue to a single call and ≤5 lines of
-//! logic.
+//! The before/after below is the *Success Metric* for the issue. The canonical
+//! "idempotent webhook → workflow" snippet had ≥3 calls and ≥30 lines of
+//! error-handling glue. It shrinks to a single call and ≤5 lines of logic.
 //!
 //! Run with:
 //!   cargo run --example signal_with_start_webhook
@@ -26,10 +25,9 @@ use serde_json::json;
 /// change the workflow side of the contract.
 #[workflow]
 async fn onboarding(ctx: &WorkflowContext, user_id: String) -> Result<(), String> {
-    // Wait for the *stripe.subscription_created* signal to arrive.  When the
-    // workflow is started via `signal_with_start`, this signal is staged in
-    // the same Postgres transaction as the WorkflowStarted event, so the
-    // very first dispatch already sees it.
+    // A `signal_with_start` stages this signal in the same Postgres
+    // transaction as the WorkflowStarted event. So the very first dispatch
+    // already sees it.
     let _payload = ctx
         .wait_for_signal("stripe.subscription_created")
         .await

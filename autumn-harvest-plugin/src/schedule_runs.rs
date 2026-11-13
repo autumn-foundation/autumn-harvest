@@ -1,13 +1,16 @@
 //! Management read model for per-schedule run history (issue #534).
 //!
 //! Answers the first triage question an operator asks of a misbehaving cron:
-//! *"show me this schedule's last N runs and which ones failed."* A schedule's
-//! runs are attributed at start time via
+//!
+//! > *Show me this schedule's last N runs and which ones failed.*
+//!
+//! Runs are attributed to a schedule at start time via
 //! [`schedule_id`](autumn_harvest::StartWorkflowParams::schedule_id) +
-//! [`origin`](autumn_harvest::StartWorkflowParams::origin), so this endpoint can
-//! list exactly the executions a schedule launched — without conflating them with
-//! manually-started, signal-with-start, or unrelated runs of the same workflow
-//! type — and break a backfill storm or ad-hoc trigger out from normal cadence.
+//! [`origin`](autumn_harvest::StartWorkflowParams::origin). So this endpoint
+//! lists exactly the executions a schedule launched. It never conflates them
+//! with manually-started, signal-with-start, or unrelated runs of the same
+//! workflow type. It also breaks a backfill storm or ad-hoc trigger out from
+//! normal cadence.
 //!
 //! The runs may be spread across shards, so the handler fans
 //! [`list_schedule_runs`](autumn_harvest::list_schedule_runs) and
@@ -19,10 +22,10 @@
 //!
 //! ## Partial answers
 //!
-//! When a shard is unreachable it is reported in `shards` (never silently
-//! dropped) and the report `status` becomes `partial` (some inspected) or
-//! `unavailable` (none inspected) — never a hard 500. The cadence summary and run
-//! list then reflect only the inspected shards.
+//! An unreachable shard is reported in `shards`, never silently dropped. The
+//! report `status` becomes `partial` (some inspected) or `unavailable` (none
+//! inspected), never a hard 500. The cadence summary and run list then reflect
+//! only the inspected shards.
 
 use autumn_harvest::{ScheduleRunRow, ScheduleRunStateCount};
 use chrono::{DateTime, Utc};
@@ -33,9 +36,9 @@ use crate::shard_fanout::FanoutStatus;
 
 /// Cross-shard completeness of a run-history response.
 ///
-/// A type alias onto the shared [`FanoutStatus`] (rather than its own enum)
-/// so the complete/partial/unavailable derivation rule lives in exactly one
-/// place, alongside `workflow_reachability`'s and `workflow_count`'s reports.
+/// A type alias onto the shared [`FanoutStatus`], not its own enum. So the
+/// complete/partial/unavailable rule lives in one place, shared with the
+/// `workflow_reachability` and `workflow_count` reports.
 pub type RunsReportStatus = FanoutStatus;
 
 /// Per-shard run + summary observation fed into [`build_runs_response`].
@@ -78,8 +81,8 @@ pub struct ScheduleRunEntry {
 /// Collapse an execution `state` into a compact per-run outcome bucket (issue #762).
 ///
 /// Returns the six buckets the AC names (`completed`/`failed`/`timed_out`/
-/// `cancelled`/`terminated`/`running`) plus `continued_as_new`/`paused`/`other`
-/// for the states outside that list, so an unexpected/active state is never
+/// `cancelled`/`terminated`/`running`). States outside that list map to
+/// `continued_as_new`/`paused`/`other`. So an unexpected/active state is never
 /// mislabelled as one of the six.
 #[must_use]
 pub fn collapse_outcome(state: &str) -> &'static str {
@@ -96,8 +99,9 @@ pub fn collapse_outcome(state: &str) -> &'static str {
     }
 }
 
-/// The terminal failure cause for display: the raw `error`'s first line, but only
-/// when the run is terminally-*failed* (`FAILED`/`TIMED_OUT`) — a cancel/terminate
+/// The terminal failure cause for display: the first line of the raw `error`.
+///
+/// Only for a terminally-*failed* run (`FAILED`/`TIMED_OUT`). A cancel/terminate
 /// carries no failure cause, so its `error` (if any) is suppressed (issue #762).
 fn terminal_failed_error(state: &str, error: Option<String>) -> Option<String> {
     if state == "FAILED" || state == "TIMED_OUT" {
@@ -219,11 +223,14 @@ pub const MAX_LIMIT: i64 = 200;
 
 /// Parsed query parameters for `GET /admin/schedules/{id}/runs` (issue #534).
 ///
-/// Pure and testable: `state`/`origin` are repeatable (and each value may be a
-/// comma-separated list); `since`/`until` accept an RFC 3339 timestamp or a
-/// relative duration (`24h`); `limit` is clamped to `[1, MAX_LIMIT]`. Domain
-/// validation of `state`/`origin` values is left to the caller (it owns the
-/// authoritative state/origin vocabularies).
+/// Pure and testable:
+/// - `state`/`origin` are repeatable, and each value may be a comma-separated
+///   list;
+/// - `since`/`until` accept an RFC 3339 timestamp or a relative duration (`24h`);
+/// - `limit` is clamped to `[1, MAX_LIMIT]`.
+///
+/// The caller validates `state`/`origin` values, because it owns the
+/// authoritative state/origin vocabularies.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ScheduleRunsParams {
     /// State filter (empty = all states).
@@ -324,9 +331,9 @@ pub fn parse_cursor(raw: &str) -> Result<(DateTime<Utc>, Uuid), String> {
 /// Runs are merged across shards, sorted newest-slot-first
 /// (`COALESCE(scheduled_for, started_at) DESC, execution_id DESC` — the same
 /// logical-slot key [`ScheduleRunRow::sort_key`] the core query orders by), and
-/// truncated to `limit`. Each shard is queried for `limit + 1` rows, so a merged
-/// total exceeding `limit` means a further page exists: the list is truncated and
-/// `next_cursor` is derived from the last kept row's slot key. The cadence summary
+/// truncated to `limit`. Each shard is queried for `limit + 1` rows. So a merged
+/// total over `limit` means a further page exists. The list is then truncated,
+/// and `next_cursor` comes from the slot key of the last kept row. The cadence summary
 /// sums each shard's scheduled-origin per-state counts. `status` is `complete` only
 /// when every shard was inspected. `next_run_at` is echoed from the schedule row.
 #[must_use]
@@ -355,7 +362,7 @@ pub fn build_runs_response(
     });
 
     // A merged total beyond `limit` means at least one more row exists in the
-    // window: truncate and emit a cursor anchored on the last kept row's slot key.
+    // window. Truncate, and anchor the cursor on the slot key of the last kept row.
     let keep = usize::try_from(limit).unwrap_or(usize::MAX);
     let has_more = merged.len() > keep;
     if has_more {

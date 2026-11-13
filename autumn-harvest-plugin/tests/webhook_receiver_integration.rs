@@ -49,10 +49,10 @@ fn map_order(_ctx: &WebhookCtx, evt: OrderEvent) -> Result<WorkflowId, String> {
     Ok(WorkflowId::new(format!("order-{}", evt.order_id)))
 }
 
-// A throttled Starts target (issue #607). Used to prove that an upstream
-// provider `Idempotency-Key` header does NOT trip issue #808's
-// `idempotency_key` + throttle mutual-exclusion `400` on a webhook start --
-// the webhook receiver strips the raw header before delegating.
+// A throttled Starts target (issue #607). It proves that an upstream provider
+// `Idempotency-Key` header does NOT trip the `idempotency_key` + throttle
+// mutual-exclusion `400` of issue #808 on a webhook start. The webhook
+// receiver strips the raw header before it delegates.
 #[workflow(throttle(rate = "100/m", burst = 100))]
 async fn throttled_order_flow(_ctx: &WorkflowContext, order_id: String) -> Result<String, String> {
     Ok(order_id)
@@ -116,12 +116,12 @@ struct CountRow {
 
 /// Env-aware test-DB handle for the #740 provenance test.
 ///
-/// Honours `HARVEST_TEST_DATABASE_URL` (a **blank** Postgres that the test
-/// migrates itself via `autumn_web::migrate::run_pending`, exactly as it does
-/// against a fresh testcontainer) so it can run against a local instance when
-/// Docker/testcontainers is unavailable; otherwise falls back to the shared
-/// testcontainers `TestDb`. Mirrors the `setup_*_or_env` fallback pattern used
-/// by the core `integration_e2e` suite and `start_source_integration.rs`.
+/// Honours `HARVEST_TEST_DATABASE_URL`, a **blank** Postgres. The test migrates
+/// it via `autumn_web::migrate::run_pending`, as it does a fresh testcontainer.
+/// So the test can run against a local instance without Docker. Otherwise it
+/// falls back to the shared testcontainers `TestDb`. Mirrors the
+/// `setup_*_or_env` fallback of the core `integration_e2e` suite and
+/// `start_source_integration.rs`.
 ///
 /// Exposes the same `url()` / `pool()` / `execute_sql()` surface the test
 /// relied on from `TestDb`, so only the DB-acquisition line of the test
@@ -184,9 +184,9 @@ impl WebhookTestDb {
 /// deliveries; exactly one workflow execution is created; both responses
 /// return the same `workflow_exec_id`."
 // Multi-thread runtime: `TestApp::plugin(HarvestPlugin)` runs the plugin
-// startup hook on a spawned thread via `Handle::block_on` while the test thread
-// blocks on its join, which deadlocks a current-thread runtime (see the fuller
-// note on `webhook_start_records_webhook_source`).
+// startup hook on a spawned thread via `Handle::block_on`. The test thread
+// blocks on its join, which deadlocks a current-thread runtime (see the note on
+// `webhook_start_records_webhook_source`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn duplicate_webhook_delivery_creates_exactly_one_execution_with_same_exec_id() {
     let _ = tracing_subscriber::fmt::try_init();
@@ -279,8 +279,8 @@ async fn duplicate_webhook_delivery_creates_exactly_one_execution_with_same_exec
 /// `start_source = "webhook"`, distinguishing it from an ordinary `api` start.
 ///
 /// Uses a multi-thread runtime: `TestApp::plugin(HarvestPlugin)` runs the
-/// plugin startup hook on a spawned thread via `Handle::block_on` while the
-/// test thread blocks on its join, which deadlocks a current-thread runtime.
+/// plugin startup hook on a spawned thread via `Handle::block_on`. The test
+/// thread blocks on its join, which deadlocks a current-thread runtime.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn webhook_start_records_webhook_source() {
     #[derive(diesel::QueryableByName)]
@@ -422,11 +422,11 @@ async fn duplicate_webhook_delivery_to_signals_target_delivers_signal_exactly_on
     assert_eq!(signal_count, 1, "the signal must be admitted exactly once");
 }
 
-/// A blank top-level `"id"` field (`autumn_web::webhook`'s JSON-body
-/// delivery-id fallback has no non-empty guard) must be treated as "no
-/// delivery id resolved" -- not a genuine, if empty, id that would let two
-/// unrelated `SignalsWithStart` deliveries collide on the same namespaced
-/// idempotency key (Codex review, PR #918).
+/// A blank top-level `"id"` field means "no delivery id resolved" (PR #918).
+///
+/// The JSON-body delivery-id fallback of `autumn_web::webhook` has no non-empty
+/// guard. An empty id must not count as a real id. Otherwise two unrelated
+/// `SignalsWithStart` deliveries collide on the same namespaced idempotency key.
 // Multi-thread runtime: `TestApp::plugin` deadlocks a current-thread runtime
 // (see `webhook_start_records_webhook_source`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -471,7 +471,7 @@ async fn blank_delivery_id_is_rejected_as_missing_for_signals_target() {
     resp.assert_body_contains("missing_idempotency");
 }
 
-/// Regression (Codex P2, PR #992): a webhook `Starts` target whose workflow
+/// Regression (PR #992): a webhook `Starts` target whose workflow
 /// carries a throttle policy must NOT be broken by an upstream provider
 /// `Idempotency-Key` header. Issue #808 made `start_workflow` read that header
 /// as a start-dedup key and reject it with a `400` when the workflow has a
@@ -547,13 +547,12 @@ async fn upstream_idempotency_key_header_does_not_trip_throttle_mutual_exclusion
     );
 }
 
-/// Regression (Codex P2, PR #992): two DISTINCT webhook deliveries that map to
-/// DIFFERENT `workflow_id`s but carry the SAME upstream provider
-/// `Idempotency-Key` header must produce TWO distinct executions. Without the
-/// header strip, issue #808's key dedup (claim keyed by
-/// `(workflow_name, idempotency_key)`) would collapse the second delivery into
-/// the first even though it is a genuinely different order. Webhook starts
-/// dedupe via the mapper's `workflow_id` (reuse policy on
+/// Regression (PR #992): two DISTINCT webhook deliveries with DIFFERENT
+/// `workflow_id`s and the SAME upstream `Idempotency-Key` header must produce
+/// TWO executions. Without the header strip, the key dedup of issue #808 (a
+/// claim keyed by `(workflow_name, idempotency_key)`) collapses the second
+/// delivery into the first. Yet it is a different order. Webhook starts dedupe
+/// via the mapper's `workflow_id` (reuse policy on
 /// `(workflow_name, workflow_id)`), never the provider's header.
 // Multi-thread runtime: `TestApp::plugin` deadlocks a current-thread runtime
 // (see `webhook_start_records_webhook_source`).

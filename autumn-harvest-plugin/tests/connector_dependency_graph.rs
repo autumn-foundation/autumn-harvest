@@ -1,13 +1,12 @@
 //! AC1 guard: the core engine crate gains ZERO broker dependencies (issue #944).
 //!
-//! The whole reason the connector lives in `autumn-harvest-plugin` rather than
-//! `autumn-harvest` is that the engine is Postgres-only. A broker client
-//! leaking into the core dependency graph would silently break that invariant
-//! for every embedder — including ones that never enable a connector feature.
+//! The connector lives in `autumn-harvest-plugin` because the engine is
+//! Postgres-only. A broker client in the core dependency graph would break that
+//! invariant for every embedder, even one with no connector feature.
 //!
-//! This test shells out to `cargo tree -p autumn-harvest` (with every core
-//! feature on, so a feature-gated leak cannot hide) and fails if a broker or
-//! cloud client ever appears.
+//! This test runs `cargo tree -p autumn-harvest` with every core feature on,
+//! so a feature-gated leak cannot hide. It fails if a broker or cloud client
+//! appears.
 
 use std::process::Command;
 

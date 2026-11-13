@@ -30,9 +30,9 @@ pub const SESSION_DIR_PREFIX: &str = "session-";
 ///
 /// Sessions deliberately do **not** live directly in the system temp
 /// directory. `/tmp` is world-writable, and the reaper stops processes by pid
-/// and deletes directory trees — so a session record there is an instruction
-/// any other local user could plant. The root is created `0700` and owned by
-/// us, and the reaper refuses to work in one that is not.
+/// and deletes directory trees. So any other local user could plant a session
+/// record there. The root is created `0700` and owned by this user. The reaper
+/// refuses to work in a root that is not.
 pub const SESSION_ROOT_PREFIX: &str = "harvest-dev-";
 
 /// What one dev-runtime session left on disk.
@@ -43,8 +43,8 @@ pub struct SessionRecord {
     /// The owner's start time, as the kernel reports it.
     ///
     /// The same reasoning as [`postmaster_start_token`](Self::postmaster_start_token),
-    /// applied to the other pid in this record: a force-killed run frees its
-    /// pid, and an unrelated process that inherits the number would make the
+    /// applied to the other pid in this record. A force-killed run frees its
+    /// pid. An unrelated process that inherits the number would make the
     /// session look permanently alive, so it would never be reclaimed.
     #[serde(default)]
     pub owner_start_token: Option<String>,
@@ -57,26 +57,25 @@ pub struct SessionRecord {
     ///
     /// Recorded because *discovery cannot always find it again*. A default
     /// `cargo dev` on a machine with no `PostgreSQL` downloads one into a
-    /// per-user cache that `PostgresBinaries::discover` does not search — so
-    /// after a force-kill, the reaper had no `pg_ctl` for that cluster. On
-    /// Windows it also had no fallback: `process_start_token` returns `None`
-    /// there, so the identity check that gates a direct `taskkill` can never
-    /// pass, and the orphaned postmaster and its data directory would have
-    /// survived every later start, forever.
+    /// per-user cache. `PostgresBinaries::discover` does not search that cache.
+    /// So after a force-kill, the reaper had no `pg_ctl` for that cluster. On
+    /// Windows it also had no fallback. `process_start_token` returns `None`
+    /// there, so the identity check that gates a direct `taskkill` never
+    /// passes. The orphaned postmaster and its data directory would then
+    /// survive every later start, forever.
     ///
     /// `#[serde(default)]` so a record written before this field existed still
-    /// parses rather than being skipped as unreadable.
+    /// parses, and is not skipped as unreadable.
     #[serde(default)]
     pub bin_dir: Option<PathBuf>,
     /// The postmaster's start time, as the kernel reports it.
     ///
-    /// A pid alone does not identify a process: pids are reused, and the gap
-    /// between a `SIGKILL`ed run and the next `cargo dev` is exactly long
-    /// enough for that to happen. Recording the start time turns "pid 4243"
-    /// into "the process that started at tick 87231", so the reaper can prove
-    /// the thing it is about to stop is the thing it recorded. `None` where the
-    /// platform cannot supply it, in which case the reaper never signals — it
-    /// stops the cluster through `pg_ctl` or leaves it alone.
+    /// A pid alone does not identify a process. Pids are reused, and the gap
+    /// between a `SIGKILL`ed run and the next `cargo dev` is long enough for
+    /// that. The start time turns "pid 4243" into "the process that started at
+    /// tick 87231". So the reaper can prove that it stops the process it
+    /// recorded. `None` where the platform cannot supply it. The reaper then
+    /// never signals: it stops the cluster through `pg_ctl` or leaves it alone.
     #[serde(default)]
     pub postmaster_start_token: Option<String>,
     /// When the session started, for diagnostics — and, since issue #1299,
@@ -101,8 +100,8 @@ impl SessionRecord {
     ///
     /// # Errors
     ///
-    /// Returns the `serde_json` error for malformed or incomplete input. A
-    /// record we cannot read is reported, never guessed at: the reaper stops
+    /// Returns the `serde_json` error for malformed or incomplete input. An
+    /// unreadable record is reported, never guessed at. The reaper stops
     /// processes and deletes directories, so it acts only on records it fully
     /// understands.
     pub fn from_json(raw: &str) -> Result<Self, serde_json::Error> {
@@ -174,12 +173,12 @@ pub enum PostmasterIdentity {
     ProcessFound,
 }
 
-/// Whether a session record describes a directory we are willing to act on.
+/// Whether a session record describes a directory the reaper may act on.
 ///
 /// The reaper stops processes and deletes trees, so it acts only on records
-/// whose claims are self-consistent: the data directory must be the one this
-/// layout puts inside the session directory. A record pointing anywhere else is
-/// either corrupt or planted, and either way is not ours to act on.
+/// whose claims are self-consistent. The data directory must be the one that
+/// this layout puts inside the session directory. A record that points
+/// anywhere else is corrupt or planted, and the reaper leaves it alone.
 #[must_use]
 pub fn record_is_self_consistent(record: &SessionRecord, session_dir: &Path) -> bool {
     record.data_dir == session_dir.join("data")
@@ -228,12 +227,12 @@ pub fn decide_reap(
     // Liveness first, and `owner_alive` is an *identity* answer: the caller
     // computes it from the recorded owner start token, not from the pid alone.
     //
-    // Matching our own pid used to short-circuit ahead of it, which inverted
-    // the guarantee the token was added for. Receiving a dead predecessor's pid
-    // is not exotic — supervisors and pid namespaces hand out low, repeatable
-    // pids — and that session would then be skipped by *every* later run,
-    // leaking its postmaster and data directory forever. The pid now only
-    // chooses which reason to report.
+    // A match on this process's own pid used to short-circuit ahead of it.
+    // That inverted the guarantee the token was added for. A new run can
+    // receive a dead predecessor's pid. That is not exotic: supervisors and
+    // pid namespaces hand out low, repeatable pids. *Every* later run would then
+    // skip that session, and leak its postmaster and data directory forever.
+    // The pid now only chooses which reason to report.
     if owner_alive {
         return if record.owner_pid == self_pid {
             ReapDecision::Skip(SkipReason::OwnedByThisProcess)
@@ -263,13 +262,13 @@ pub fn decide_reap(
 
 /// The postmaster pid to act on for one session.
 ///
-/// The record is written **before** the server starts (so a crash during
-/// startup still leaves something the reaper can find), which means its
-/// `postmaster_pid` is `None` for the whole start window. Postgres's own
-/// `postmaster.pid` covers exactly that window, so it is the fallback: without
-/// it, a crash between `pg_ctl start` and the record update would leave a
-/// record saying "no server" next to a running server, and the reaper would
-/// delete a live cluster's data directory out from under it.
+/// The record is written **before** the server starts, so a crash during
+/// startup still leaves something the reaper can find. So its `postmaster_pid`
+/// is `None` for the whole start window. The `postmaster.pid` of Postgres
+/// covers exactly that window, so it is the fallback. Without it, a crash
+/// between `pg_ctl start` and the record update would leave a record that
+/// says "no server" next to a running server. The reaper would then delete
+/// the data directory of a live cluster.
 #[must_use]
 pub fn effective_postmaster_pid(
     record: &SessionRecord,
@@ -282,9 +281,9 @@ pub fn effective_postmaster_pid(
 
 /// Read the postmaster's pid from a `postmaster.pid` file's contents.
 ///
-/// Postgres writes the pid on the first line. A truncated or half-written file
-/// — which is exactly what a crash leaves — yields `None` rather than a wrong
-/// pid, because the reaper would otherwise stop an unrelated process.
+/// Postgres writes the pid on the first line. A crash leaves a truncated or
+/// half-written file. That yields `None`, not a wrong pid, because the reaper
+/// would otherwise stop an unrelated process.
 #[must_use]
 pub fn parse_postmaster_pid(contents: &str) -> Option<u32> {
     contents.lines().next()?.trim().parse().ok()

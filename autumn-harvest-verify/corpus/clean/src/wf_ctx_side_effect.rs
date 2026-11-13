@@ -1,12 +1,12 @@
 //! **C03** — `ctx.side_effect` whose **closure reads the wall clock**.
 //!
-//! The sharpest AC4 test. `helpers_deep::stamp()` is `SystemTime::now()` — a
-//! genuine source — but it runs *inside* a `side_effect` closure, so the value
-//! is recorded on the first execution and replayed verbatim afterwards. The
-//! analyzer must therefore **stop at the `side_effect` boundary**: its return is
-//! clean and its closure body is not descended into. An analyzer that walks
-//! into every closure argument reports a false positive here, and a false
-//! positive on `side_effect` would make the tool unusable on real code.
+//! The sharpest AC4 test. `helpers_deep::stamp()` is `SystemTime::now()`, a
+//! genuine source. But it runs *inside* a `side_effect` closure, so the first
+//! execution records the value and replay returns it verbatim. The analyzer
+//! must **stop at the `side_effect` boundary**: its return is clean and its
+//! closure body is not descended into. An analyzer that walks into every
+//! closure argument reports a false positive here. A false positive on
+//! `side_effect` would make the tool unusable on real code.
 //!
 //! Verdict: `proven-deterministic`.
 

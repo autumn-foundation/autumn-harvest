@@ -1,45 +1,50 @@
-//! Deterministic (non-criterion) instruction/allocation-count profiling
-//! harness for `autumn_harvest::critical_path::CriticalPathAnalyzer::analyze`
-//! — the longest-path computation behind the crate's DAG bottleneck-analysis
-//! API (`crate::critical_path`, re-exported at the crate root and consumed by
-//! `dag_export::export_mermaid_with_critical_path`'s highlighting). Wall-clock
-//! timing is not admissible evidence on this (shared-vCPU) machine — every
-//! number this harness produces evidence for is a deterministic instruction
-//! count (`valgrind --tool=callgrind`) or allocation count/bytes
-//! (`valgrind --tool=dhat`), both reproducible bit-for-bit on any machine.
+//! Deterministic (non-criterion) instruction/allocation-count profiling harness.
+//!
+//! It profiles `autumn_harvest::critical_path::CriticalPathAnalyzer::analyze`.
+//! That is the longest-path computation behind the crate's DAG
+//! bottleneck-analysis API (`crate::critical_path`). The crate root re-exports
+//! it, and `dag_export::export_mermaid_with_critical_path`'s highlighting
+//! consumes it. Wall-clock timing is not admissible evidence on this
+//! (shared-vCPU) machine. Every number this harness produces evidence for is a
+//! deterministic instruction count (`valgrind --tool=callgrind`) or allocation
+//! count/bytes (`valgrind --tool=dhat`). Both reproduce bit-for-bit on any machine.
 //!
 //! # Workload
 //!
-//! A realistic wide, multi-stage DAG: `STAGES` sequential barrier stages,
-//! each with `WIDTH` parallel activity nodes that ALL depend on EVERY node in
-//! the previous stage (a full fan-in/fan-out barrier) — the shape a
-//! map-then-synchronize batch/ETL pipeline produces when each stage must
-//! fully complete before the next begins (e.g. "extract N shards, then
-//! transform N shards, then load N shards", repeated). This is deliberately
-//! dense (not a sparse chain): `analyze`'s inner upstream-scan loop is the
-//! part under profile, so the workload needs many (task, upstream-edge)
-//! pairs, not just many tasks. Activity durations are set via
-//! `mock_duration` (by name, the same API `dag_export`'s own tests and any
-//! real caller uses) for FIVE of the six activity types, which forces the
-//! analyzer's per-task name-keyed lookup path rather than the per-task
-//! `start_to_close` override shortcut — the common case for a caller
-//! comparing named-activity cost estimates rather than per-instance
-//! overrides. The sixth type is deliberately left unmocked so ~1/6 of tasks
-//! exercise the `default_duration` fallback (a lookup miss) every call,
-//! alongside the other five (hits) — ordinary usage, and the regime that
-//! bounds how large `CriticalPathAnalyzer::LINEAR_SCAN_CARDINALITY_LIMIT`
-//! can safely be (a miss must scan every candidate; a hit can stop early).
+//! A realistic wide, multi-stage DAG of `STAGES` sequential barrier stages.
+//! Each stage has `WIDTH` parallel activity nodes. Each node depends on EVERY
+//! node in the previous stage (a full fan-in/fan-out barrier). A
+//! map-then-synchronize batch/ETL pipeline has this shape when each stage must
+//! fully complete before the next begins. An example is "extract N shards,
+//! then transform N shards, then load N shards", repeated.
+//!
+//! This is deliberately dense, not a sparse chain. `analyze`'s inner
+//! upstream-scan loop is the part under profile. So the workload needs many
+//! (task, upstream-edge) pairs, not just many tasks.
+//!
+//! `mock_duration` sets activity durations by name for FIVE of the six activity
+//! types. That forces the analyzer's per-task name-keyed lookup path, not the
+//! per-task `start_to_close` override shortcut. It is the common case for a
+//! caller that compares named-activity cost estimates, not per-instance
+//! overrides. `dag_export`'s own tests and any real caller use the same API.
+//!
+//! The sixth type is deliberately left unmocked. So ~1/6 of tasks exercise the
+//! `default_duration` fallback (a lookup miss) every call, alongside the other
+//! five (hits). That is ordinary usage. It is also the regime that bounds how
+//! large `CriticalPathAnalyzer::LINEAR_SCAN_CARDINALITY_LIMIT` can safely be.
+//! A miss must scan every candidate; a hit can stop early.
 //!
 //! `CRITICAL_PATH_PROFILE_STAGES` (default `40`) and
-//! `CRITICAL_PATH_PROFILE_WIDTH` (default `40`) size the DAG (`40×40` = 1,600
-//! tasks, ~62,400 upstream edges — stage 0 has no upstream, so 39 dense
-//! stages × 40×40 edges each). `CRITICAL_PATH_PROFILE_REPS` (default `50`)
-//! sets how many times the same (fixed) `CriticalPathAnalyzer` is asked to
-//! `analyze()` — the DAG and the analyzer are built ONCE, outside the
-//! measured loop, isolating `analyze()`'s own cost from `DagBuilder::build`'s
-//! (already covered by a prior Bolt fix in `dag.rs`, see its
-//! `execution_levels.push` comment) and from `mock_duration`'s registration
-//! cost.
+//! `CRITICAL_PATH_PROFILE_WIDTH` (default `40`) size the DAG. `40×40` gives
+//! 1,600 tasks and ~62,400 upstream edges. Stage 0 has no upstream, so there are
+//! 39 dense stages × 40×40 edges each.
+//!
+//! `CRITICAL_PATH_PROFILE_REPS` (default `50`) sets how many times the same
+//! (fixed) `CriticalPathAnalyzer` runs `analyze()`. The DAG and the analyzer are
+//! built ONCE, outside the measured loop. That isolates `analyze()`'s own cost
+//! from `mock_duration`'s registration cost. It also isolates it from
+//! `DagBuilder::build`'s cost. A prior Bolt fix in `dag.rs` already covers that
+//! (see its `execution_levels.push` comment).
 //!
 //! # Baseline
 //!
@@ -86,12 +91,11 @@ fn env_usize(key: &str, default: usize) -> usize {
     }
 }
 
-// Six distinct activity functions, cycled by column index within a stage, so
-// the DAG carries a realistic small set of repeated named activities (a
-// wide fan-out map stage in production runs the SAME handful of activity
-// types across many parallel shards) rather than either one universal name
-// or an unrealistic one-name-per-node cardinality that would never
-// legitimately collide in `activity_durations`.
+// Six distinct activity functions, cycled by column index within a stage. So
+// the DAG carries a realistic small set of repeated named activities. A wide
+// fan-out map stage in production runs the SAME handful of activity types
+// across many parallel shards. One universal name would be unrealistic. So
+// would one name per node, which never collides in `activity_durations`.
 const fn extract_shard() {}
 const fn transform_shard() {}
 const fn validate_shard() {}
@@ -159,12 +163,12 @@ fn main() {
         "build_dag(stages={stages}, width={width}) should produce {expected_tasks} tasks"
     );
 
-    // Five of the six activity types are mocked; `checkpoint_shard` is
-    // deliberately left unmocked so ~1/6 of tasks exercise the
-    // `default_duration` fallback (a miss) on every `analyze()` call --
-    // ordinary usage (an operator typically has historical timing data for
-    // some activity types, not all), and the shape `analyze`'s duration
-    // lookup must stay correct and non-regressive under (see
+    // Five of the six activity types are mocked. `checkpoint_shard` is
+    // deliberately left unmocked, so ~1/6 of tasks exercise the
+    // `default_duration` fallback (a miss) on every `analyze()` call. That is
+    // ordinary usage: an operator typically has historical timing data for
+    // some activity types, not all. `analyze`'s duration lookup must stay
+    // correct and non-regressive under this shape (see
     // `CriticalPathAnalyzer`'s `LINEAR_SCAN_CARDINALITY_LIMIT` doc comment).
     let analyzer = CriticalPathAnalyzer::new(dag)
         .with_default_duration(Duration::from_millis(100))
@@ -178,11 +182,10 @@ fn main() {
     for _ in 0..reps {
         let result = analyzer.analyze();
         // The dense barrier shape always terminates at a stage-(stages-1)
-        // node, so the critical path always has exactly `stages` hops
-        // (one winning node per stage) — self-checked so a change that
-        // silently altered predecessor selection (not just its cost) would
-        // fail this harness rather than produce a quietly-wrong "faster"
-        // number.
+        // node. So the critical path always has exactly `stages` hops, one
+        // winning node per stage. The self-check makes a change that silently
+        // alters predecessor selection (not just its cost) fail this harness.
+        // It must not produce a quietly-wrong "faster" number.
         assert_eq!(
             result.path_indices.len(),
             stages,

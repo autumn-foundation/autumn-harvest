@@ -3,24 +3,23 @@
 //!
 //! Two jobs:
 //!
-//! 1. **Launder** the raw sources in `harvest-verify-corpus-helpers-deep` behind
-//!    one more crate boundary and behind *type-level* indirection (a generic
-//!    function, a trait impl, a trait object, a closure parameter) so that even a
-//!    hypothetical whole-workspace one-hop *syntactic* resolver would still see
-//!    nothing: `pairs::<T>` contains no `HashMap` token, `<HashSet<String> as
-//!    Plan>::steps` contains no `HashMap`/`HashSet` token at the call site, and
-//!    `<dyn Jitter as Jitter>::ms` contains no `rand` token anywhere the caller
-//!    can see.
+//! 1. **Launder** the raw sources in `harvest-verify-corpus-helpers-deep`. They
+//!    sit behind one more crate boundary and behind *type-level* indirection:
+//!    a generic function, a trait impl, a trait object, a closure parameter.
+//!    So even a whole-workspace one-hop *syntactic* resolver would see nothing.
+//!    `pairs::<T>` contains no `HashMap` token. `<HashSet<String> as
+//!    Plan>::steps` contains no `HashMap`/`HashSet` token at the call site.
+//!    `<dyn Jitter as Jitter>::ms` contains no `rand` token the caller can see.
 //! 2. Own the **ambient state** (statics, thread-locals, interior mutability)
-//!    that no HVG or DET rule models at all. HVG007 is the only ambient-state
-//!    rule in either layer and it fires exclusively on a literal `.lock()` whose
-//!    receiver is an ALL-CAPS path **inside a workflow body**; `fetch_add`,
-//!    `load`, `RwLock::read`, `OnceLock::get_or_init`, `LocalKey::with`,
+//!    that no HVG or DET rule models. HVG007 is the only ambient-state rule in
+//!    either layer. It fires only on a literal `.lock()` whose receiver is an
+//!    ALL-CAPS path **inside a workflow body**. `fetch_add`, `load`,
+//!    `RwLock::read`, `OnceLock::get_or_init`, `LocalKey::with`,
 //!    `RefCell::borrow_mut` and `Cell::get` are all unmodeled everywhere.
 //!
-//! Nothing here carries `#[workflow]`, so the proc-macro guardrails never run on
-//! it, and every workflow that reaches it does so across a crate boundary that
-//! `det_check`'s same-file/same-module one-hop resolver cannot cross.
+//! Nothing here carries `#[workflow]`, so the proc-macro guardrails never run
+//! on it. Every workflow reaches it across a crate boundary that the
+//! same-file/same-module one-hop resolver of `det_check` cannot cross.
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
@@ -243,9 +242,9 @@ impl Plan for HashSet<String> {
     }
 }
 
-/// Destroys the order of a **deterministic** input by round-tripping it through
-/// a `HashMap` and re-iterating the map — the disorder is manufactured entirely
-/// inside this helper, from clean data.
+/// Destroys the order of a **deterministic** input with a `HashMap` round trip.
+///
+/// The disorder comes entirely from inside this helper, from clean data.
 #[must_use]
 pub fn normalize(rows: Vec<(String, u32)>) -> Vec<(String, u32)> {
     let indexed: HashMap<String, u32> = rows.into_iter().collect();
@@ -317,10 +316,11 @@ impl Jitter for Live {
     }
 }
 
-/// Constructs the trait object **inside the analyzed set**, so an RTA-lite pass
-/// over unsizing coercions sees exactly one concrete type flowing into
-/// `dyn Jitter` and can devirtualize `<dyn Jitter as Jitter>::ms` to
-/// `<Live as Jitter>::ms`. The verdict for the caller must therefore be
+/// Constructs the trait object **inside the analyzed set**.
+///
+/// So an RTA-lite pass over unsizing coercions sees exactly one concrete type
+/// flow into `dyn Jitter`. It can devirtualize `<dyn Jitter as Jitter>::ms` to
+/// `<Live as Jitter>::ms`. The caller's verdict must be
 /// `nondeterminism-found`, **not** `unknown`.
 #[must_use]
 pub fn default_jitter() -> Box<dyn Jitter> {
@@ -359,10 +359,11 @@ pub fn fixed_fetcher(v: u64) -> Box<dyn Fetcher> {
     Box::new(Fixed(v))
 }
 
-/// The other `dyn Fetcher` construction site. With two impl types unsized in
-/// the analyzed set, RTA-lite cannot pick one, so a caller that dispatches
-/// through `dyn Fetcher` must be reported `unknown` with a `dyn-dispatch`
-/// boundary — never guessed.
+/// The other `dyn Fetcher` construction site.
+///
+/// Two impl types are unsized in the analyzed set, so RTA-lite cannot pick
+/// one. A caller that dispatches through `dyn Fetcher` must be reported
+/// `unknown` with a `dyn-dispatch` boundary, never guessed.
 #[must_use]
 pub fn drifting_fetcher() -> Box<dyn Fetcher> {
     Box::new(Drifting)
@@ -381,9 +382,11 @@ fn drifting_pick(xs: &[u32]) -> u32 {
         .wrapping_add(u32::try_from(deep::stamp() % 7).unwrap_or(0))
 }
 
-/// Hands back a **function pointer**. At the call site MIR emits an indirect
-/// call (`_0 = move _1(move _2)`) with no callee path at all, so the analyzer
-/// must report an `indirect-call` boundary rather than follow it.
+/// Hands back a **function pointer**.
+///
+/// At the call site MIR emits an indirect call (`_0 = move _1(move _2)`) with
+/// no callee path. So the analyzer must report an `indirect-call` boundary
+/// rather than follow it.
 #[must_use]
 pub fn picker(drift: bool) -> fn(&[u32]) -> u32 {
     if drift { drifting_pick } else { first_or_zero }

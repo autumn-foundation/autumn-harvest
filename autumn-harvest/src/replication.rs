@@ -2,9 +2,9 @@
 //! measurement (issue #954).
 //!
 //! Harvest does **not** ship replication. Stock Postgres logical (or physical)
-//! replication moves the bytes to a standby region; this module supplies the
-//! two things stock Postgres cannot: a way to **revoke a region's write
-//! authority**, and a **measured RPO**.
+//! replication moves the bytes to a standby region. This module supplies two
+//! things stock Postgres cannot: a way to **revoke the write authority of a
+//! region**, and a **measured RPO**.
 //!
 //! # The fence
 //!
@@ -19,35 +19,34 @@
 //!   all. No extra round trip; the check rides the statement that was already
 //!   being issued.
 //! * **Persist assert** — [`assert_fence`] takes the generation row `FOR
-//!   SHARE` at the top of a persist. `FOR SHARE` is the load-bearing detail:
-//!   the fence bump takes the same row exclusively, so it cannot commit while
-//!   any in-flight persist holds it, and any persist that begins after it
-//!   commits observes the new generation and fails. That is a commit-order
-//!   barrier, not a best-effort read — the same technique
-//!   [`crate::queue::claim_task`] already uses for the queue-pause hold.
+//!   SHARE` at the top of a persist. `FOR SHARE` is the load-bearing detail.
+//!   The fence bump takes the same row exclusively. So it cannot commit while
+//!   any in-flight persist holds the row. Any persist that begins after the
+//!   bump commits observes the new generation and fails. That is a
+//!   commit-order barrier, not a best-effort read. [`crate::queue::claim_task`]
+//!   uses the same technique for the queue-pause hold.
 //!
-//! Promoting a standby therefore looks like: bump the generation on the new
-//! primary, and every worker still pinned to the old one is structurally
-//! unable to claim or append — it self-fences loudly with
-//! [`crate::error::HarvestError::ShardFenced`] rather than forking a history.
+//! To promote a standby, bump the generation on the new primary. Every worker
+//! still pinned to the old one then cannot claim or append. It self-fences
+//! loudly with [`crate::error::HarvestError::ShardFenced`] and never forks a
+//! history.
 //!
 //! # What this does NOT do — read this before relying on it
 //!
 //! Fencing is a property of **one database**. It cannot stop a worker in a
-//! partitioned old region from writing to that region's *own*, still-running
-//! Postgres: nothing on the promoted primary can reach it. The fence bites at
-//! exactly two moments, which are the two that decide whether a history forks:
+//! partitioned old region from writing to the *own*, still-running Postgres of
+//! that region. Nothing on the promoted primary can reach it. The fence bites
+//! at exactly two moments, which decide whether a history forks:
 //!
 //! 1. When a surviving old-region worker reconnects **to the promoted
 //!    primary** (a DSN flip, a DNS failover, a restart) it is rejected.
 //! 2. When the old region is re-seeded from the new primary for fail-back, the
-//!    bumped generation arrives with the data, and every worker still pinned to
-//!    the pre-failover epoch is rejected there too.
+//!    bumped generation arrives with the data. Every worker still pinned to the
+//!    pre-failover epoch is rejected there too.
 //!
-//! Isolating the old primary's database — demote it, cut it off, or take its
-//! role's connections to zero — remains a **mandatory** operator step, not an
-//! optional one. See `docs/cross-region-dr.md` and
-//! `docs/runbooks/cross-region-failover.md`.
+//! Isolate the database of the old primary: demote it, cut it off, or take the
+//! connections of its role to zero. That is a **mandatory** operator step. See
+//! `docs/cross-region-dr.md` and `docs/runbooks/cross-region-failover.md`.
 //!
 //! # On by default where DR is configured (issue #1823)
 //!
@@ -74,18 +73,17 @@
 /// How long `bump_generation` waits for the fencing table's exclusive lock
 /// before giving up.
 ///
-/// Long enough to ride out an ordinary in-flight persist, short enough that an
-/// operator under RTO pressure gets an actionable `lock_timeout` error rather
-/// than a hang — while it waits, it is itself blocking every claim and persist
-/// queued behind it.
+/// Long enough to ride out an ordinary in-flight persist. Short enough that an
+/// operator under RTO pressure gets an actionable `lock_timeout` error, not a
+/// hang. While it waits, it blocks every claim and persist queued behind it.
 #[cfg(feature = "db")]
 const BUMP_LOCK_TIMEOUT_MS: u64 = 5_000;
 
 /// Per-statement ceiling for `advance_sequences_after_promotion`.
 ///
 /// Generous, because a `MAX(col)` over a large un-indexed serial column on a
-/// cold standby is legitimately slow — but bounded, because this runs inside a
-/// 15-minute RTO budget and an unbounded hang is indistinguishable from a wedge.
+/// cold standby is legitimately slow. Bounded, because this runs inside a
+/// 15-minute RTO budget, and an unbounded hang looks like a wedge.
 #[cfg(feature = "db")]
 const PROMOTE_STATEMENT_TIMEOUT_MS: u64 = 120_000;
 
@@ -97,10 +95,10 @@ use crate::types::ShardId;
 
 /// A shard's write-authority epoch.
 ///
-/// Monotonic and per-shard. `0` is the value a freshly-migrated database
-/// starts at; every [`bump_generation`] increments it by one and the sequence
-/// travels to the standby with the data, so a promoted standby inherits the
-/// epoch its primary had and continues from there.
+/// Monotonic and per-shard. A freshly migrated database starts at `0`. Each
+/// [`bump_generation`] increments it by one. The value travels to the standby
+/// with the data, so a promoted standby continues from the epoch of its
+/// primary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ShardGeneration(i64);
 
@@ -110,9 +108,9 @@ impl ShardGeneration {
 
     /// Wrap a raw epoch value.
     ///
-    /// The field is private to match [`ShardId`]'s newtype convention: a
-    /// generation only ever originates from the database, so there is no reason
-    /// for a caller to reach past the constructor.
+    /// The field is private to match the newtype convention of [`ShardId`]. A
+    /// generation only ever comes from the database, so a caller has no reason
+    /// to reach past the constructor.
     #[must_use]
     pub const fn new(generation: i64) -> Self {
         Self(generation)
@@ -149,9 +147,9 @@ pub struct StandbyLag {
 /// One replication slot, as reported by `pg_replication_slots` on the primary.
 ///
 /// Slots outlive their walsender: a disabled subscription or a dead standby
-/// leaves an inactive slot pinning WAL. The time lag is then unknowable from
-/// the primary, but the byte backlog is not — which is why this is tracked
-/// separately from [`StandbyLag`] rather than folded into it.
+/// leaves an inactive slot pinning WAL. The primary then cannot know the time
+/// lag, but it knows the byte backlog. So this is tracked apart from
+/// [`StandbyLag`].
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct SlotLag {
@@ -210,10 +208,10 @@ pub enum WatermarkReading {
     /// true RPO is at least `floor_seconds` and unbounded above.
     ///
     /// This must never fall back to `pg_stat_replication.replay_lag`. That
-    /// column freezes for a stuck logical apply worker, and a stuck apply
-    /// worker is precisely how a trail gets exhausted — so the fallback would
-    /// replace a known-enormous RPO with a small stale one, at the moment an
-    /// operator is deciding whether to fail over.
+    /// column freezes for a stuck logical apply worker. A stuck apply worker is
+    /// precisely how a trail gets exhausted. So the fallback would replace a
+    /// known-enormous RPO with a small stale one, just as an operator decides
+    /// whether to fail over.
     BeyondTrail {
         /// The age of the *oldest* retained watermark: a lower bound.
         floor_seconds: f64,
@@ -273,25 +271,25 @@ impl ReplicationStatus {
     /// The measured RPO in seconds — how much acknowledged work failing over
     /// right now would lose.
     ///
-    /// Prefers the watermark trail over `pg_stat_replication.replay_lag`, and
-    /// that precedence is the whole point rather than a tie-break. `replay_lag`
-    /// is derived from the subscriber's reply messages, so a subscriber whose
-    /// apply worker is **stuck** — precisely the incident an RPO number exists
-    /// for — stops replying and leaves `replay_lag` NULL or frozen while real
-    /// data loss accumulates. This was measured, not assumed: blocking a
-    /// subscriber's apply worker grew the byte backlog monotonically while
-    /// `replay_lag` never left NULL.
+    /// Prefers the watermark trail over `pg_stat_replication.replay_lag`. That
+    /// precedence is the whole point, not a tie-break. `replay_lag` comes from
+    /// the reply messages of the subscriber. A subscriber whose apply worker is
+    /// **stuck** stops replying. That is precisely the incident an RPO number
+    /// exists for. `replay_lag` then stays NULL or frozen while real data loss
+    /// accumulates. This was measured: blocking the apply worker of a
+    /// subscriber grew the byte backlog monotonically while `replay_lag` stayed
+    /// NULL.
     ///
     /// `None` means unknown, and unknown is not zero. See
     /// [`Self::max_replay_lag_seconds`].
     ///
-    /// When the standby has fallen off the end of the retained trail this
-    /// returns the **lower bound** rather than `None`: an absent series alarms
-    /// on nothing, and `standbys` is still non-zero there, so the shard would
+    /// When the standby has fallen off the end of the retained trail, this
+    /// returns the **lower bound**, not `None`. An absent series alarms on
+    /// nothing, and `standbys` is still non-zero there. So the shard would
     /// page on neither signal. The floor is at least the retention window,
-    /// which clears any sane threshold — it understates the number while
-    /// telling the truth about the severity. [`Self::rpo_is_lower_bound`]
-    /// distinguishes the two.
+    /// which clears any sane threshold. It understates the number but tells the
+    /// truth about the severity. [`Self::rpo_is_lower_bound`] distinguishes
+    /// the two.
     #[must_use]
     pub fn rpo_seconds(&self) -> Option<f64> {
         match self {
@@ -332,8 +330,8 @@ impl ReplicationStatus {
 
     /// Whether [`Self::rpo_seconds`] is an exact reading or only a lower bound.
     ///
-    /// An operator deciding whether to fail over needs the difference:
-    /// "42 seconds" and "at least an hour, we cannot see how much more" are
+    /// An operator deciding whether to fail over needs the difference.
+    /// "42 seconds" and "at least an hour, how much more is unknown" are
     /// different decisions.
     #[must_use]
     pub const fn rpo_is_lower_bound(&self) -> bool {
@@ -349,9 +347,9 @@ impl ReplicationStatus {
     /// Worst-case replay lag across every connected standby, in seconds, as
     /// Postgres itself reports it.
     ///
-    /// Exposed alongside [`Self::rpo_seconds`] rather than hidden behind it so
-    /// an operator can see the two disagree — a large watermark RPO next to a
-    /// NULL `replay_lag` is the signature of a stuck apply worker.
+    /// Exposed beside [`Self::rpo_seconds`], so an operator can see the two
+    /// disagree. A large watermark RPO next to a NULL `replay_lag` is the
+    /// signature of a stuck apply worker.
     ///
     /// `None` means *unknown*, and unknown is the honest answer in three
     /// distinct situations that all look like "no number". The views were
@@ -400,9 +398,9 @@ impl ReplicationStatus {
 
     /// How many standbys currently have a walsender on the primary.
     ///
-    /// `0` is the "replication is down" signal the starter alert keys on —
-    /// deliberately *not* expressed as a lag threshold, because a dead standby
-    /// produces no lag reading to threshold.
+    /// `0` is the "replication is down" signal of the starter alert. It is
+    /// deliberately *not* a lag threshold, because a dead standby produces no
+    /// lag reading.
     #[must_use]
     pub const fn connected_standbys(&self) -> usize {
         match self {
@@ -425,21 +423,20 @@ impl ReplicationStatus {
 
 /// The DR knobs, published once per process.
 ///
-/// These live beside [`FenceRegistry`] rather than on `WorkerRuntimeConfig`
-/// for the reason `crate::mutex::set_mutex_lease_ttl` does: the runtime config
-/// is constructed literally at ~50 call sites, and three new required fields
-/// would be 50 mechanical edits obscuring the change that matters. It is also
-/// the more coherent home — the pin these knobs govern is *already* process-
-/// global, because the persist assert has to reach 100+ `append_events` call
-/// sites without a config in hand.
+/// These live beside [`FenceRegistry`], not on `WorkerRuntimeConfig`, for the
+/// reason of `crate::mutex::set_mutex_lease_ttl`. The runtime config is built
+/// literally at ~50 call sites. Three new required fields would be 50
+/// mechanical edits that obscure the real change. It is also the more coherent
+/// home. The pin these knobs govern is *already* process-global. The persist
+/// assert must reach 100+ `append_events` call sites without a config in hand.
 ///
 /// Published by `From<WorkerConfig> for WorkerRuntimeConfig`, which is the
 /// single choke point every worker's configuration passes through.
-// Deliberately NOT `#[non_exhaustive]`: that attribute forbids external
-// struct-expression construction entirely — including `..Default::default()` —
-// so no downstream crate could ever build one to hand to the public
-// `set_dr_config`. Every field is `pub` and the type is `Copy`; growing it is a
-// breaking change we accept in exchange for the setter being usable.
+// Deliberately NOT `#[non_exhaustive]`. That attribute forbids external
+// struct-expression construction, `..Default::default()` included. Then no
+// downstream crate could build one for the public `set_dr_config`. Every field
+// is `pub` and the type is `Copy`. Growing it is an accepted breaking change,
+// so that the setter stays usable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DrConfig {
     /// How this process decides whether to fence (issue #1823).
@@ -451,11 +448,11 @@ pub struct DrConfig {
     pub watermark_retain: std::time::Duration,
     /// Slot-name prefix identifying **this shard's DR replication**.
     ///
-    /// Without it, every walsender for the shard's database counts as a DR
-    /// standby — including an unrelated logical-decoding consumer such as a CDC
-    /// pipeline. A shard with CDC attached would then report itself protected
-    /// while its actual cross-region subscriber was disconnected, and
-    /// `harvest_replication_down` would never fire: the most dangerous possible
+    /// Without it, every walsender for the shard database counts as a DR
+    /// standby. That includes an unrelated logical-decoding consumer such as a
+    /// CDC pipeline. A shard with CDC attached then reports itself protected
+    /// while its real cross-region subscriber is disconnected. And
+    /// `harvest_replication_down` never fires. That is the most dangerous
     /// false negative for this feature.
     ///
     /// Defaults to `harvest_dr`, which is the naming the topology doc's setup
@@ -585,17 +582,16 @@ static DR_CONFIG: RwLock<Option<DrConfig>> = RwLock::new(None);
 
 /// Publish this process's DR configuration.
 ///
-/// Called from `From<WorkerConfig> for WorkerRuntimeConfig`. Last write wins;
-/// a process running two workers with different DR settings is a
-/// misconfiguration this deliberately does not try to paper over — the
-/// registry it governs is process-global too, so there is no coherent
-/// per-worker answer.
+/// Called from `From<WorkerConfig> for WorkerRuntimeConfig`. Last write wins.
+/// Two workers in one process with different DR settings are a
+/// misconfiguration, and this does not paper over it. The registry it governs
+/// is process-global too, so no per-worker answer is coherent.
 pub fn set_dr_config(config: DrConfig) {
     let mut config = config;
     // Mirrors `crate::mutex::set_mutex_lease_ttl`, which rejects degenerate
-    // durations for the same reason: a zero interval turns the sampler's
-    // `tokio::time::sleep(interval)` into a hot loop issuing several queries
-    // per iteration per shard, against the database a failover depends on.
+    // durations for the same reason. A zero interval turns the sampler's
+    // `tokio::time::sleep(interval)` into a hot loop. Each iteration issues
+    // several queries per shard, against the database a failover depends on.
     if config.sample_interval.is_zero() {
         tracing::warn!(
             "replication_sample_interval of zero would spin the DR sampler; using {:?}",
@@ -797,14 +793,13 @@ impl From<DefaultShardConflict> for PublishConflict {
 ///
 /// Populated once by the worker at startup (before its first poll) and never
 /// mutated afterwards. **A worker must never re-read and adopt a newer
-/// generation**: adopting is exactly the split-brain the epoch exists to
-/// prevent, so a bump is only ever resolved by restarting the fleet. That
-/// asymmetry is the whole mechanism, and it is why this is a pin rather than
-/// a cache.
+/// generation**. Adopting is exactly the split-brain the epoch prevents. So
+/// only a fleet restart resolves a bump. That asymmetry is the whole
+/// mechanism, and it makes this a pin, not a cache.
 ///
-/// Global rather than threaded through call sites because the persist assert
-/// has to reach 100+ `store::append_events*` call sites; the same shape
-/// [`crate::chaos`] uses for its injection state.
+/// Global, not threaded through call sites, because the persist assert must
+/// reach 100+ `store::append_events*` call sites. [`crate::chaos`] uses the
+/// same shape for its injection state.
 pub struct FenceRegistry;
 
 impl FenceRegistry {
@@ -853,31 +848,31 @@ impl FenceRegistry {
     ///
     /// The whole registry becomes visible at once, default shard included.
     /// [`Self::register`] plus a trailing [`Self::set_default_shard`] is not
-    /// equivalent: a startup that failed partway through that sequence left
-    /// `ENABLED` true with a partial map and *no* default shard, under which
-    /// [`Self::expected`] returns `None` for [`ShardId::UNENCODED`] and every
-    /// pre-sharding execution id in the process silently persists **unfenced**.
+    /// equivalent. A startup that failed partway through that sequence left
+    /// `ENABLED` true with a partial map and *no* default shard. Then
+    /// [`Self::expected`] returns `None` for [`ShardId::UNENCODED`]. Every
+    /// pre-sharding execution id in the process then persists **unfenced**.
     /// A worker pins every shard it can reach or none of them, so it publishes
     /// once.
     ///
     /// # A pin is immutable once published
     ///
     /// Publishing a *different* generation for a shard this process has already
-    /// pinned is **refused**, and that refusal is the whole "never adopt a newer
-    /// epoch" invariant made structural rather than documented.
+    /// pinned is **refused**. That refusal makes the "never adopt a newer
+    /// epoch" invariant structural, not only documented.
     ///
     /// Without it, a process hosting more than one worker had a hole straight
-    /// through the fence: a worker started *after* a fence would publish the new
-    /// generation, overwrite the shared pin, and the already-running worker —
-    /// the one the fence was for — would read the replacement in both its claim
-    /// gate and its persist assert and silently **regain write authority**. It
-    /// would go on appending to a history another region owns, which is exactly
+    /// through the fence. A worker started *after* a fence would publish the
+    /// new generation and overwrite the shared pin. The already-running worker
+    /// is the one the fence was for. It would read the replacement in its claim
+    /// gate and its persist assert, and silently **regain write authority**. It
+    /// would go on appending to a history another region owns. That is exactly
     /// the split-brain this module exists to prevent.
     ///
     /// So the fencing unit is the **process**, not the worker, and the error
-    /// says so: a process cannot host workers at two different epochs, and the
+    /// says so. A process cannot host workers at two different epochs, and the
     /// remedy is to restart it. Re-publishing the *same* generation is fine and
-    /// idempotent — that is two workers covering the same shards at the same
+    /// idempotent. That is two workers covering the same shards at the same
     /// epoch, which is ordinary.
     ///
     /// # Errors
@@ -1374,20 +1369,18 @@ impl FenceRegistry {
 /// **complete**, not a best-effort screen.
 ///
 /// An earlier revision screened instead: it accepted only `[a-z_][a-z0-9_]*`
-/// and silently skipped everything else. That was wrong in both directions —
-/// an embedder on a `PascalCase` ORM schema had *every* sequence skipped while
-/// the command reported success, and a perfectly ordinary table named `user` or
-/// `order` passed the screen and then failed as a bare keyword in the generated
-/// SQL. Doubling embedded quotes inside `"…"` is the complete, universal escape
-/// for a Postgres identifier, so there is nothing left to screen for and
-/// nothing to skip.
+/// and silently skipped everything else. That was wrong in both directions.
+/// An embedder on a `PascalCase` ORM schema had *every* sequence skipped while
+/// the command reported success. An ordinary table named `user` or `order`
+/// passed the screen, then failed as a bare keyword in the generated SQL.
+/// Doubling embedded quotes inside `"…"` is the complete escape for a Postgres
+/// identifier. So nothing is left to screen for or to skip.
 ///
-/// Note this is *not* the whole defence: the catalog query that feeds it also
+/// This is *not* the whole defence. The catalog query that feeds it also
 /// restricts the owning relation to `relkind IN ('r','p')`. A sequence can be
-/// `OWNED BY` a **view** column, and `FROM <view>` would execute that view's
-/// query — including any volatile function in it — on the operator's
-/// high-privilege DR connection. No amount of quoting addresses that; the
-/// relation-kind filter does.
+/// `OWNED BY` a **view** column. `FROM <view>` would execute the query of that
+/// view, volatile functions included, on the high-privilege DR connection of
+/// the operator. Quoting cannot address that. The relation-kind filter does.
 #[cfg(feature = "db")]
 #[must_use]
 fn quote_ident(name: &str) -> String {
@@ -1405,13 +1398,13 @@ fn quote_ident(name: &str) -> String {
 
 /// Schema-qualify a quoted identifier.
 ///
-/// Qualification is load-bearing, not tidiness: `pg_temp` is searched *ahead
-/// of* the resolved `search_path` for relation lookups while
-/// `current_schema()` still reports `public`, so an unqualified `FROM t` can
-/// silently resolve to a session-local temp table and set a sequence from the
-/// wrong data — producing exactly the duplicate-key outage
-/// `advance_sequences_after_promotion` exists to prevent, with no error.
-/// A qualified name is immune.
+/// Qualification is load-bearing, not tidiness. Relation lookups search
+/// `pg_temp` *ahead of* the resolved `search_path`, while `current_schema()`
+/// still reports `public`. So an unqualified `FROM t` can silently resolve to a
+/// session-local temp table. It then sets a sequence from the wrong data, with
+/// no error. That is exactly the duplicate-key outage that
+/// `advance_sequences_after_promotion` exists to prevent. A qualified name is
+/// immune.
 #[cfg(feature = "db")]
 #[must_use]
 fn qualified(schema: &str, name: &str) -> String {
@@ -1464,11 +1457,11 @@ mod db {
     /// Provision this shard's fencing row if it is absent, and return the
     /// epoch now in force.
     ///
-    /// Idempotent, and idempotent in the direction that matters: `ON CONFLICT
-    /// DO NOTHING` means re-provisioning an already-fenced shard **returns**
-    /// its epoch rather than resetting it to zero. A reset would silently hand
-    /// write authority back to the region that was just fenced off, which is
-    /// the single worst thing this function could do — pinned by
+    /// Idempotent, and idempotent in the direction that matters. With `ON
+    /// CONFLICT DO NOTHING`, re-provisioning an already-fenced shard
+    /// **returns** its epoch and does not reset it to zero. A reset would
+    /// silently hand write authority back to the region just fenced off. That
+    /// is the worst thing this function could do. Pinned by
     /// `a_fresh_database_provisions_generation_zero_and_is_idempotent`.
     ///
     /// The fallback read is a **separate statement**, not a `UNION ALL`
@@ -1546,22 +1539,21 @@ mod db {
 
     /// Revoke the old region's write authority: bump this shard's epoch.
     ///
-    /// **This is the fence.** Run it on the promoted primary. Every worker
-    /// still pinned to the previous epoch — anywhere — becomes structurally
-    /// unable to claim tasks or append events against this database, and stops
-    /// with [`crate::error::HarvestError::ShardFenced`] rather than forking a
-    /// history.
+    /// **This is the fence.** Run it on the promoted primary. Every worker,
+    /// anywhere, still pinned to the previous epoch then cannot claim tasks or
+    /// append events against this database. It stops with
+    /// [`crate::error::HarvestError::ShardFenced`] and never forks a history.
     ///
-    /// It is also a **fleet-stopping** operation: workers in the *new* region
-    /// pinned to the old epoch are fenced too, which is why the runbook's order
-    /// is fence → promote → verify → **start workers**, and why healthy-region
-    /// use is a mistake to be recovered by restarting the fleet, never by
-    /// bumping again.
+    /// It is also a **fleet-stopping** operation. Workers in the *new* region
+    /// pinned to the old epoch are fenced too. So the runbook order is
+    /// fence → promote → verify → **start workers**. Use on a healthy region
+    /// is a mistake. Recover from it by restarting the fleet, never by bumping
+    /// again.
     ///
-    /// The `UPDATE` takes the row's exclusive lock, which is what makes
-    /// [`assert_fence`]'s `FOR SHARE` a commit-order barrier rather than a
-    /// racy read: this cannot commit while an in-flight persist holds the row,
-    /// and every persist that starts afterwards sees the new epoch.
+    /// The `UPDATE` takes the exclusive lock of the row. That makes the
+    /// `FOR SHARE` of [`assert_fence`] a commit-order barrier, not a racy read.
+    /// This cannot commit while an in-flight persist holds the row. Every
+    /// persist that starts afterwards sees the new epoch.
     ///
     /// A bump takes at least six seconds. That wait lets a pass
     /// that lost its guard stop before the bump commits. See
@@ -1573,10 +1565,10 @@ mod db {
     ///
     /// # Errors
     ///
-    /// Returns [`crate::error::HarvestError::Database`] on query failure, or
-    /// [`crate::error::HarvestError::NotFound`] when the shard has no fencing
-    /// row to bump (provision it first — bumping a shard that was never
-    /// provisioned would fence nothing while looking like it worked).
+    /// Returns [`crate::error::HarvestError::Database`] on query failure.
+    /// Returns [`crate::error::HarvestError::NotFound`] when the shard has no
+    /// fencing row to bump. Provision it first. A bump of an unprovisioned
+    /// shard would fence nothing while it looks like it worked.
     pub async fn bump_generation(
         conn: &mut AsyncPgConnection,
         shard: ShardId,
@@ -2886,14 +2878,14 @@ mod db {
     /// found no DR marker at startup (issue #1823).
     ///
     /// When it does run it takes the fencing row `FOR SHARE`. Inside a
-    /// transaction that makes the check a commit-order barrier:
-    /// [`bump_generation`]'s exclusive `UPDATE` cannot commit while this
-    /// transaction holds the row, so a persist that passes this check is
-    /// guaranteed to commit *before* the fence takes effect, and one that
-    /// starts after the fence commits observes the new epoch and fails. Called
-    /// outside a transaction the lock is released at statement end, so the
-    /// check is a very tight read rather than a barrier — the claim gate, not
-    /// this assert, is the structural guarantee for work that has not started.
+    /// transaction that makes the check a commit-order barrier. The exclusive
+    /// `UPDATE` of [`bump_generation`] cannot commit while this transaction
+    /// holds the row. So a persist that passes this check commits *before* the
+    /// fence takes effect. A persist that starts after the fence commits
+    /// observes the new epoch and fails. Outside a transaction the lock is
+    /// released at statement end. The check is then a very tight read, not a
+    /// barrier. For work that has not started, the claim gate is the
+    /// structural guarantee, not this assert.
     ///
     /// Inside a decision that pinned an owner tenure, it also fences the
     /// owner row, after the generation row (issue #2251). A caller can hold
@@ -3710,10 +3702,10 @@ mod db {
     // `pg_replication_slots` and `pg_stat_replication` are CLUSTER-wide, but a
     // Harvest shard is a *database*. Every query below therefore carries
     // `(s.database IS NULL OR s.database = current_database())`. Without it a
-    // cluster hosting two shards reports each shard's lag as the worst of both,
-    // and a cluster hosting anything else at all — another application's slot,
-    // a leftover slot from a decommissioned standby — pegs every shard's RPO to
-    // a stranger.
+    // cluster hosting two shards reports the lag of each shard as the worst of
+    // both. A cluster hosting anything else pegs the RPO of every shard to a
+    // stranger. That stranger is a slot of another application, or a leftover
+    // slot of a decommissioned standby.
     //
     // Logical slots carry their database. Physical slots have `database IS
     // NULL` because physical replication ships the whole cluster, so they
@@ -3728,22 +3720,21 @@ mod db {
     ///   `pg_stat_replication` has no database column of its own, so the join
     ///   is also what stops a sibling shard's walsender being counted here.
     /// * It holds **no slot at all** and its `application_name` carries the
-    ///   prefix. A physical standby configured without `primary_slot_name`
-    ///   (WAL archiving, `wal_keep_size`) is a supported topology and appears
-    ///   in `pg_stat_replication` with no slot row; an inner join dropped it,
-    ///   `connected_standbys()` returned `0` — the value documented as
-    ///   "replication is down" — and the starter alert paged permanently on
-    ///   healthy replication.
+    ///   prefix. A physical standby without `primary_slot_name` (WAL archiving,
+    ///   `wal_keep_size`) is a supported topology. It appears in
+    ///   `pg_stat_replication` with no slot row. An inner join dropped it, and
+    ///   `connected_standbys()` returned `0`, the "replication is down" value.
+    ///   The starter alert then paged permanently on healthy replication.
     ///
-    /// The prefix is what makes this a *DR* count rather than a walsender
-    /// count. Without it an unrelated logical-decoding consumer — a CDC
-    /// pipeline, say — reads as a connected standby, and a shard whose real
-    /// cross-region subscriber had disconnected would report itself protected
-    /// while `harvest_replication_down` stayed silent.
+    /// The prefix makes this a *DR* count, not a walsender count. Without it an
+    /// unrelated logical-decoding consumer, such as a CDC pipeline, reads as a
+    /// connected standby. A shard whose real cross-region subscriber had
+    /// disconnected would then report itself protected. And
+    /// `harvest_replication_down` would stay silent.
     ///
-    /// `replay_lag` is left `NULL` rather than coerced: Postgres reports NULL
-    /// until a feedback round-trip has completed, and "we have not measured
-    /// this standby yet" must not read as "this standby is caught up".
+    /// `replay_lag` stays `NULL`, not coerced. Postgres reports NULL until a
+    /// feedback round-trip completes. "This standby is not measured yet" must
+    /// not read as "this standby is caught up".
     ///
     /// `starts_with($1)`, not `LIKE $1 || '%'` (finding 7). `LIKE` treats `_`
     /// and `%` as wildcards, and the shipped default prefix `harvest_dr`
@@ -3788,26 +3779,26 @@ mod db {
     /// the trail backwards from a standby's confirmed position to turn "how far
     /// behind in bytes" into "how far behind in seconds".
     ///
-    /// The write is also load-bearing on an **idle** primary: with no other
-    /// traffic, WAL does not advance, the standby has nothing to confirm, and
-    /// any position-based lag reading would drift upward on a perfectly healthy
-    /// system. A beat keeps the position moving so an idle deployment reports a
-    /// live RPO.
+    /// The write is also load-bearing on an **idle** primary. With no other
+    /// traffic, WAL does not advance and the standby has nothing to confirm.
+    /// Any position-based lag reading would then drift upward on a healthy
+    /// system. A beat keeps the position moving, so an idle deployment reports
+    /// a live RPO.
     ///
     /// `ON CONFLICT DO NOTHING` because the primary key is
-    /// `(shard_id, beat_lsn)`: two beats within a single WAL position are the
+    /// `(shard_id, beat_lsn)`. Two beats within a single WAL position are the
     /// same observation, not a conflict worth failing on.
     ///
-    /// `interval` is the sampler cadence, and it is what makes the beat rate
-    /// **per shard** rather than per worker: a beat is written only when the
-    /// newest one is older than half an interval. The advisory lock alone would
-    /// only stop simultaneous writers, so staggered workers would each still
-    /// beat once per interval and the trail would scale with fleet size.
+    /// `interval` is the sampler cadence. It makes the beat rate **per shard**,
+    /// not per worker: a beat is written only when the newest one is older than
+    /// half an interval. The advisory lock alone stops only simultaneous
+    /// writers. Staggered workers would each still beat once per interval, and
+    /// the trail would scale with fleet size.
     ///
     /// The prune keeps `retain` of trailing history. That window is the ceiling
-    /// on the lag this can *measure*: a standby further behind than the oldest
-    /// retained watermark reports `None` (unknown) rather than a floor value
-    /// that would understate the loss.
+    /// on the lag this can *measure*. A standby further behind than the oldest
+    /// retained watermark reports `None` (unknown). A floor value would
+    /// understate the loss.
     ///
     /// # Errors
     ///
@@ -3829,22 +3820,21 @@ mod db {
         Box::pin(
             conn.transaction::<(), crate::error::HarvestError, _>(async move |conn| {
                 // One writer per shard per tick, whatever the fleet size. Every
-                // worker runs this sampler (each also needs its own self-fence
-                // check), so without the gate a 200-worker fleet writes 200
-                // watermarks and 200 prunes per tick per shard — and the trail
-                // then holds `N x retention` rows rather than the `retention`
-                // the migration comment assumes, which is also what
-                // `measure_rpo` has to scan.
+                // worker runs this sampler, because each needs its own
+                // self-fence check. Without the gate a 200-worker fleet writes
+                // 200 watermarks and 200 prunes per tick per shard. The trail
+                // then holds `N x retention` rows, not the `retention` the
+                // migration comment assumes. `measure_rpo` must scan them all.
                 //
-                // **`_xact_` is load-bearing.** A session-scoped
-                // `pg_try_advisory_lock` is released only by an explicit
-                // unlock, so any `?` between acquire and release leaks it — and
-                // on a pooled connection it then leaks *permanently*: every
-                // other sampler skips its beat forever, re-acquiring on the
-                // same session only bumps the lock count, and the measured RPO
-                // goes stale during exactly the database trouble it exists to
-                // measure. A transaction-scoped lock is released by the commit
-                // *and* by the rollback, so there is no error path to get wrong.
+                // **`_xact_` is load-bearing.** Only an explicit unlock
+                // releases a session-scoped `pg_try_advisory_lock`. So any `?`
+                // between acquire and release leaks it. On a pooled connection
+                // it then leaks *permanently*. Every other sampler skips its
+                // beat forever. Re-acquiring on the same session only bumps the
+                // lock count. The measured RPO goes stale during exactly the
+                // database trouble it exists to measure. The commit *and* the
+                // rollback release a transaction-scoped lock, so no error path
+                // can get it wrong.
                 let locked: Vec<LockRow> =
                     diesel::sql_query("SELECT pg_try_advisory_xact_lock($1) AS locked")
                         .bind::<BigInt, _>(heartbeat_lock_key(shard_id))
@@ -3862,16 +3852,16 @@ mod db {
                 assert_fence_group(conn, shard).await?;
 
                 // The lock alone only prevents SIMULTANEOUS writers. Workers
-                // sampling on staggered schedules each take it uncontended a
-                // moment apart, so without this predicate every worker still
-                // writes and prunes once per interval and the trail scales with
-                // fleet size — the exact cost the lock was added to remove.
+                // on staggered schedules each take it uncontended a moment
+                // apart. Without this predicate every worker still writes and
+                // prunes once per interval, and the trail scales with fleet
+                // size. That is the exact cost the lock was added to remove.
                 //
                 // `WHERE NOT EXISTS (a beat newer than one interval)` makes the
-                // cadence per SHARD rather than per worker: the first sampler
-                // to arrive in a window writes, the rest no-op. Enforced in the
-                // statement rather than in Rust because the fleet has no shared
-                // clock, and Postgres' `NOW()` is the one all of them agree on.
+                // cadence per SHARD, not per worker. The first sampler in a
+                // window writes, and the rest no-op. The statement enforces
+                // it, not Rust. The fleet has no shared clock, and all workers
+                // agree on the `NOW()` of Postgres.
                 //
                 // Half an interval of slack, so ordinary scheduling jitter does
                 // not skip a window outright and halve the effective cadence.
@@ -3929,17 +3919,17 @@ mod db {
     /// The single-argument advisory key for a shard's watermark writer.
     ///
     /// **Single-argument by requirement, not preference.** `queue_pause` owns
-    /// the two-argument `(classid, objid)` keyspace outright — its keys spend
-    /// all 64 bits on a SHA-256 of the queue name and reserve no class id, so a
+    /// the two-argument `(classid, objid)` keyspace outright. Its keys spend
+    /// all 64 bits on a SHA-256 of the queue name and reserve no class id. So a
     /// second user there could silently stall queue dispatch. That ownership is
     /// enforced by `queue_pause::tests::queue_pause_owns_the_two_argument_advisory_keyspace`,
     /// which walks every other source file in the crate.
     ///
     /// The single-argument space is shared with the concurrency-key locks, but
-    /// those are `hashtext(key)::bigint` and `hashtext` returns `int4` — so
+    /// those are `hashtext(key)::bigint` and `hashtext` returns `int4`. So
     /// they occupy only `i32::MIN..=i32::MAX`. Shifting the issue number into
-    /// the high word puts these keys far outside that range, so a collision is
-    /// impossible by construction rather than by luck. The shard id occupies
+    /// the high word puts these keys far outside that range. A collision is
+    /// then impossible by construction, not by luck. The shard id occupies
     /// the low word, so two shards never contend with each other either.
     #[allow(clippy::cast_sign_loss)]
     pub(super) const fn heartbeat_lock_key(shard_id: i32) -> i64 {
@@ -4023,13 +4013,13 @@ mod db {
         //      slots leave `confirmed_flush_lsn` NULL.
         //   3. `s.restart_lsn` — a physical slot with no walsender attached.
         //
-        // `restart_lsn` is deliberately LAST and never preferred: it is the
-        // oldest WAL the slot still needs *retained*, not the standby's replay
-        // position, and it can sit far behind a fully caught-up standby. Using
-        // it as the progress signal reported an inflated RPO for the physical
-        // topology this feature claims to support. It remains the right input
-        // for the byte backlog (`SLOT_SQL`), which is a retention and
-        // disk-pressure signal — that is exactly what `restart_lsn` measures.
+        // `restart_lsn` is deliberately LAST and never preferred. It is the
+        // oldest WAL the slot still needs *retained*, not the replay position
+        // of the standby. It can sit far behind a fully caught-up standby. As
+        // the progress signal it reported an inflated RPO for the physical
+        // topology this feature supports. It stays the right input for the
+        // byte backlog (`SLOT_SQL`). That is a retention and disk-pressure
+        // signal, which is exactly what `restart_lsn` measures.
         //
         // `starts_with($1)`, not `LIKE $1 || '%'` (finding 7). `LIKE` treats
         // `_` and `%` as wildcards, and the shipped default prefix
@@ -4093,10 +4083,10 @@ mod db {
         position: String,
     ) -> HarvestResult<WatermarkReading> {
         // One query, two answers, so the two cannot disagree across a round
-        // trip: the age of the newest CONSUMED watermark (the reading), and the
-        // age of the OLDEST retained one (the floor, used only when nothing has
-        // been consumed but the trail is non-empty — i.e. the standby has
-        // fallen off the end of it).
+        // trip. The first is the age of the newest CONSUMED watermark (the
+        // reading). The second is the age of the OLDEST retained one (the
+        // floor). The floor applies only when nothing is consumed but the
+        // trail is non-empty: the standby has fallen off the end of it.
         //
         // Both are single index probes on `(shard_id, beat_lsn)` /
         // `(shard_id, beat_at DESC)`; neither aggregates the trail.
@@ -4153,14 +4143,14 @@ mod db {
             return Ok(WatermarkReading::Unknown);
         };
 
-        // A negative reading is impossible in principle (`NOW()` is monotonic
-        // relative to a row already committed) but clamps to `0.0` rather than
-        // being emitted as a nonsense negative RPO if the clock is adjusted.
+        // A negative reading is impossible in principle, because `NOW()` is
+        // monotonic relative to a committed row. A clock adjustment could
+        // still cause one, so it clamps to `0.0`, not a negative RPO.
         Ok(match (row.lag_seconds, row.oldest_seconds) {
             (Some(lag), _) => WatermarkReading::Measured(lag.max(0.0)),
             // Nothing consumed, but the trail is NOT empty: the standby is
-            // behind every watermark we still hold. The RPO is at least the
-            // oldest one's age — which is at least the retention window — and
+            // behind every retained watermark. The RPO is at least the age of
+            // the oldest one, which is at least the retention window. It is
             // unbounded above.
             (None, Some(oldest)) => WatermarkReading::BeyondTrail {
                 floor_seconds: oldest.max(0.0),
@@ -4205,13 +4195,12 @@ mod db {
     /// promoting a **logical** standby.
     ///
     /// Logical replication copies rows; it does **not** copy sequence values.
-    /// A promoted logical standby therefore holds a full copy of
-    /// `harvest_events` while `harvest_events_id_seq` still sits where it was
-    /// when the subscription was created, so the new primary's very first
-    /// append collides with an already-replicated primary key. The failure is
-    /// immediate, total, and mystifying if you have not seen it before, which
-    /// is why this ships as a function the runbook calls rather than a sentence
-    /// in the runbook hoping to be read.
+    /// A promoted logical standby holds a full copy of `harvest_events`. But
+    /// `harvest_events_id_seq` still sits where it was when the subscription
+    /// was created. So the very first append of the new primary collides with
+    /// an already-replicated primary key. The failure is immediate, total, and
+    /// mystifying on first sight. So this ships as a function the runbook
+    /// calls, not as a sentence in the runbook that may go unread.
     ///
     /// Physical (streaming) replicas do not need this — they replicate the
     /// WAL itself, sequences included. Running it there is harmless. The
@@ -4225,25 +4214,25 @@ mod db {
     ///
     /// **Every** sequence whose owning relation is an ordinary or partitioned
     /// table in the connection's `current_schema()`, not only Harvest's. A
-    /// promoted primary with any stale sequence is broken, and an embedder's
-    /// own tables — replicated by the same `FOR ALL TABLES` publication the
-    /// topology doc prescribes — carry the identical hazard. A helper that
-    /// fixed only `harvest_*` would leave the operator with a half-promoted
-    /// database and no signal. Every sequence it touches is returned, so the
-    /// scope is visible rather than assumed.
+    /// promoted primary with any stale sequence is broken. The tables of an
+    /// embedder carry the identical hazard. The `FOR ALL TABLES` publication
+    /// of the topology doc replicates them too. A helper that fixed only
+    /// `harvest_*` would leave the operator with a half-promoted database and
+    /// no signal. Every sequence it touches is returned, so the scope is
+    /// visible rather than assumed.
     ///
     /// # Why the relation-kind filter is a security control
     ///
     /// `relkind IN ('r','p')` is **not** tidiness. A sequence can be
     /// `ALTER SEQUENCE ... OWNED BY <view>.<column>`, and Postgres accepts it.
-    /// Without the filter a view reaches the `FROM {tbl}` below and its query
-    /// body — including any volatile function in it — **executes** on the
-    /// operator's DR connection, which is the highest-privilege connection
-    /// anyone opens all quarter, during an incident, on a command whose output
-    /// nobody is reading closely. Anyone with `CREATE` in the schema can plant
-    /// that view months in advance; the `FOR ALL TABLES` publication even
-    /// replicates it to the standby. Identifier quoting does not help, because
-    /// the attacker's names are already ordinary identifiers.
+    /// Without the filter a view reaches the `FROM {tbl}` below. Its query
+    /// body, volatile functions included, then **executes** on the DR
+    /// connection of the operator. That is the highest-privilege connection
+    /// anyone opens all quarter. It runs during an incident, on a command
+    /// whose output nobody reads closely. Anyone with `CREATE` in the schema
+    /// can plant that view months in advance. The `FOR ALL TABLES` publication
+    /// even replicates it to the standby. Identifier quoting does not help,
+    /// because the names of the attacker are already ordinary identifiers.
     ///
     /// Names are quoted with [`quote_ident`] and schema-qualified with
     /// [`qualified`] — see those for why screening and unqualified names were
@@ -4268,25 +4257,24 @@ mod db {
 
     /// The body of [`advance_sequences_after_promotion`], inside a transaction.
     ///
-    /// The transaction exists for `SET LOCAL`, which Postgres **ignores** —
-    /// with only a `WARNING` — outside a transaction block. Verified: issued
-    /// standalone, `statement_timeout` reads back as `0`, so the ceiling this
-    /// function documents was silently absent and a `MAX()` scan on a large or
-    /// blocked table could hang the promotion past the RTO budget with no
-    /// signal.
+    /// The transaction exists for `SET LOCAL`. Outside a transaction block
+    /// Postgres **ignores** it, with only a `WARNING`. Verified: issued
+    /// standalone, `statement_timeout` reads back as `0`. The documented
+    /// ceiling was then silently absent. A `MAX()` scan on a large or blocked
+    /// table could hang the promotion past the RTO budget with no signal.
     ///
-    /// It does **not** make the promotion atomic, and must not be described as
-    /// if it did: `setval` is explicitly non-transactional in Postgres, so a
-    /// rollback does not rewind the sequences already advanced. The returned
-    /// list remains the record of what actually changed.
+    /// It does **not** make the promotion atomic. Never describe it so.
+    /// `setval` is explicitly non-transactional in Postgres, so a rollback
+    /// does not rewind the sequences already advanced. The returned list
+    /// remains the record of what actually changed.
     async fn advance_sequences_in_transaction(
         conn: &mut AsyncPgConnection,
     ) -> HarvestResult<Vec<(String, i64)>> {
-        // Promotion sits on the RTO critical path and `MAX(col)` on a serial
+        // Promotion sits on the RTO critical path. `MAX(col)` on a serial
         // column with no index is a full sequential scan of a cold table on a
-        // freshly promoted standby. Bound it: a timeout names the table it gave
-        // up on, which an operator can act on; an unbounded hang inside a
-        // 15-minute RTO budget cannot be distinguished from a wedge.
+        // freshly promoted standby. Bound it. A timeout names the table it
+        // gave up on, and an operator can act on that. An unbounded hang
+        // inside a 15-minute RTO budget looks like a wedge.
         diesel::sql_query(format!(
             "SET LOCAL statement_timeout = '{PROMOTE_STATEMENT_TIMEOUT_MS}ms'"
         ))
@@ -4330,9 +4318,9 @@ mod db {
 
         let mut advanced = Vec::with_capacity(columns.len());
         for col in columns {
-            // `setval`'s first argument is `regclass`, i.e. a *name* rather
-            // than a relation reference, so the schema-qualified identifier is
-            // passed as a single-quoted literal with any `'` doubled.
+            // The first argument of `setval` is `regclass`: a *name*, not a
+            // relation reference. So the schema-qualified identifier goes in
+            // as a single-quoted literal with any `'` doubled.
             let seq = qualified(&col.sequence_schema, &col.sequence_name);
             let seq_literal = seq.replace('\'', "''");
             let tbl = qualified(&col.table_schema, &col.table_name);
@@ -4396,10 +4384,9 @@ mod db {
     /// Read this primary's replication position views.
     ///
     /// A permission or availability failure is reported as
-    /// [`ReplicationStatus::Unavailable`], not as an `Err`: reading these views
-    /// needs `pg_monitor`, and a deployment that has not run that `GRANT` must
-    /// lose the RPO *signal*, not have its metrics sampler fail. The runbook
-    /// names the grant.
+    /// [`ReplicationStatus::Unavailable`], not as an `Err`. Reading these views
+    /// needs `pg_monitor`. A deployment without that `GRANT` must lose the RPO
+    /// *signal*, not its metrics sampler. The runbook names the grant.
     ///
     /// # Errors
     ///
@@ -4516,11 +4503,11 @@ pub(crate) mod tests {
 
     /// The watermark reading wins over `pg_stat_replication.replay_lag`.
     ///
-    /// Measured against a live pair of databases: with the subscriber's apply
-    /// worker blocked, byte lag grew while `replay_lag` never left NULL,
-    /// because a stuck logical apply worker stops sending the reply messages
-    /// `replay_lag` is derived from. Preferring the watermark is what makes the
-    /// RPO real in the only situation where anyone reads it.
+    /// Measured against a live pair of databases. With the apply worker of the
+    /// subscriber blocked, byte lag grew while `replay_lag` never left NULL. A
+    /// stuck logical apply worker stops sending the reply messages that
+    /// `replay_lag` comes from. Preferring the watermark makes the RPO real in
+    /// the only situation where anyone reads it.
     #[test]
     fn the_watermark_reading_wins_over_replay_lag() {
         let s = ReplicationStatus::Observed {
@@ -4535,12 +4522,12 @@ pub(crate) mod tests {
     /// A standby that has fallen off the end of the retained trail must NOT
     /// fall back to `replay_lag`.
     ///
-    /// `replay_lag` freezes for a stuck logical apply worker, and a stuck apply
-    /// worker is precisely how a trail gets exhausted — so the fallback would
-    /// replace a known-enormous RPO with a small stale one, at the moment an
-    /// operator is deciding whether to fail over. The floor is reported
-    /// instead: it clears any threshold, so the shard still pages, and it is
-    /// flagged as a lower bound rather than passed off as a measurement.
+    /// `replay_lag` freezes for a stuck logical apply worker. A stuck apply
+    /// worker is precisely how a trail gets exhausted. So the fallback would
+    /// replace a known-enormous RPO with a small stale one, just as an operator
+    /// decides whether to fail over. The floor is reported instead. It clears
+    /// any threshold, so the shard still pages. It is flagged as a lower bound,
+    /// not passed off as a measurement.
     #[test]
     fn an_exhausted_trail_reports_its_floor_not_a_stale_replay_lag() {
         let s = ReplicationStatus::Observed {
@@ -4707,8 +4694,8 @@ pub(crate) mod tests {
     #[test]
     fn a_connected_standby_with_null_replay_lag_is_not_silently_zero() {
         // pg_stat_replication.replay_lag is NULL until the first feedback
-        // round-trip. Treating NULL as 0.0 would report a perfect RPO for a
-        // standby we know nothing about.
+        // round-trip. Treating NULL as 0.0 would report a perfect RPO for an
+        // unmeasured standby.
         let s = observed(vec![standby("catchup", None, Some(4_096))], vec![]);
         assert_eq!(s.max_replay_lag_seconds(), None);
         assert_eq!(s.max_lag_bytes(), Some(4_096));
@@ -4737,9 +4724,9 @@ pub(crate) mod tests {
     /// earlier one.
     ///
     /// Without this, a process hosting two workers had a hole straight through
-    /// the fence — a worker started *after* a fence publishes the new
-    /// generation, overwrites the shared pin, and the already-running worker
-    /// reads the replacement in its claim gate and persist assert and silently
+    /// the fence. A worker started *after* a fence publishes the new generation
+    /// and overwrites the shared pin. The already-running worker reads the
+    /// replacement in its claim gate and persist assert. It then silently
     /// regains write authority over a database another region owns.
     #[test]
     fn a_published_pin_cannot_be_overwritten_with_a_different_generation() {
@@ -4894,10 +4881,10 @@ pub(crate) mod tests {
     /// shares the single-argument advisory keyspace with.
     ///
     /// Those are `hashtext(key)::bigint`, and `hashtext` returns `int4`, so
-    /// they can only land in `i32::MIN..=i32::MAX`. Keeping these keys strictly
-    /// above that range makes a collision impossible by construction — and this
-    /// pins it, because the alternative failure is a DR sampler silently
-    /// blocking a workflow's concurrency-key claim.
+    /// they can only land in `i32::MIN..=i32::MAX`. Keys strictly above that
+    /// range make a collision impossible by construction. This test pins that.
+    /// Otherwise a DR sampler could silently block the concurrency-key claim of
+    /// a workflow.
     #[cfg(feature = "db")]
     #[test]
     fn heartbeat_lock_keys_sit_outside_the_concurrency_key_range() {
@@ -4933,20 +4920,20 @@ pub(crate) mod tests {
 
     // ── promotion: identifier quoting ──────────────────────────────────────
     //
-    // `db`-gated with the helpers themselves: without that feature — which is
-    // how `autumn-harvest-sqlite` builds this crate — they are not compiled,
-    // and CI's `clippy -p autumn-harvest-sqlite -- -D warnings` fails the build
-    // on the unused items.
+    // `db`-gated with the helpers themselves. `autumn-harvest-sqlite` builds
+    // this crate without that feature, so the helpers are not compiled. CI's
+    // `clippy -p autumn-harvest-sqlite -- -D warnings` fails the build on the
+    // unused items.
 
     /// Catalog identifiers go into `setval` SQL inline (they cannot be bind
     /// parameters), so they must be *quoted*, not merely *screened*.
     ///
     /// An earlier revision screened with a lowercase-only predicate and
-    /// silently skipped anything else. That was wrong twice over: an embedder
+    /// silently skipped anything else. That was wrong twice over. An embedder
     /// on a `PascalCase` ORM schema (Prisma, `TypeORM`, EF Core) had **every**
-    /// sequence skipped while `harvest dr promote` reported success, and an
-    /// ordinary table named `user` or `order` passed the screen and then blew
-    /// up as a bare keyword in the generated SQL.
+    /// sequence skipped while `harvest dr promote` reported success. An
+    /// ordinary table named `user` or `order` passed the screen, then failed as
+    /// a bare keyword in the generated SQL.
     #[cfg(feature = "db")]
     #[test]
     fn identifiers_are_quoted_not_screened() {

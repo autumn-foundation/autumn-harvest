@@ -1,9 +1,10 @@
 //! Postgres LISTEN/NOTIFY helpers for wake-on-enqueue.
 //!
-//! Instead of polling the task queue on a fixed interval, workers can subscribe
-//! to a Postgres NOTIFY channel and wake immediately when a new task is enqueued.
-//! This module provides the channel naming convention, the notification payload
-//! type, and a [`QueueListener`] that wraps `tokio-postgres` for async LISTEN.
+//! Workers can subscribe to a Postgres NOTIFY channel instead of polling the
+//! task queue on a fixed interval. They then wake immediately when a new task
+//! is enqueued. This module provides the channel naming convention, the
+//! notification payload type, and a [`QueueListener`] that wraps
+//! `tokio-postgres` for async LISTEN.
 //!
 //! # Post-commit delivery
 //!
@@ -110,8 +111,8 @@ pub const fn workflow_events_channel() -> &'static str {
 /// within Postgres' 63-byte identifier limit.
 ///
 /// Unlike [`workflow_events_channel`] (a single global channel fired on real
-/// event appends), progress is per-execution so a subscriber LISTENs only to
-/// the one run it is streaming and is never woken by unrelated workflows.
+/// event appends), progress is per-execution. A subscriber LISTENs only to the
+/// one run it streams, so unrelated workflows never wake it.
 ///
 /// # Examples
 ///
@@ -158,10 +159,6 @@ pub fn durable_stream_channel(exec_id: Uuid) -> String {
 fn quote_pg_identifier(identifier: &str) -> String {
     format!("\"{}\"", identifier.replace('"', "\"\""))
 }
-
-// ---------------------------------------------------------------------------
-// NotifyPayload
-// ---------------------------------------------------------------------------
 
 /// Payload sent via Postgres NOTIFY when a task is enqueued.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -2100,11 +2097,11 @@ impl Drop for Unsent<'_> {
 /// Fire a `NOTIFY` carrying one ephemeral progress chunk on the per-execution
 /// progress channel (issue #791).
 ///
-/// Delivered on commit when called inside a transaction — so a rolled-back
-/// workflow-decision cycle's progress is discarded (never delivered) and the
-/// retried cycle re-fires live, and a committed chunk is delivered exactly once
-/// per commit. Best-effort by contract: callers should treat a failure as
-/// non-fatal (the chunk is disposable).
+/// Delivered on commit when called inside a transaction. So a rolled-back
+/// workflow-decision cycle's progress is discarded (never delivered), and the
+/// retried cycle re-fires live. A committed chunk is delivered exactly once per
+/// commit. Best-effort by contract: callers should treat a failure as non-fatal
+/// (the chunk is disposable).
 ///
 /// # Errors
 ///
@@ -2371,10 +2368,6 @@ where
     ListenConnection { client, rx, driver }
 }
 
-// ---------------------------------------------------------------------------
-// QueueListener (using tokio-postgres)
-// ---------------------------------------------------------------------------
-
 /// Async listener for Postgres NOTIFY events on task queue channels.
 ///
 /// Uses a dedicated `tokio-postgres` connection (separate from the diesel pool)
@@ -2417,7 +2410,6 @@ impl QueueListener {
         let ListenConnection { client, rx, driver } =
             open_listen_connection(database_url, "postgres listener connection error").await?;
 
-        // Subscribe to all queue channels.
         for queue in queues {
             let channel = queue_channel(queue);
             let quoted_channel = quote_pg_identifier(&channel);
@@ -3114,10 +3106,6 @@ fn parse_owner_wake(notification: &tokio_postgres::Notification) -> Option<Owner
     Some(OwnerWake { partition, payload })
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3769,10 +3757,10 @@ mod tests {
     fn progress_notify_payload_stays_within_pg_notify_limit() {
         // Postgres `pg_notify` payloads are hard-capped at 8000 bytes. The
         // context caps each chunk's serialized JSON at
-        // `PROGRESS_CHUNK_MAX_BYTES` (7000) and this envelope wraps it as
+        // `PROGRESS_CHUNK_MAX_BYTES` (7000), and this envelope wraps it as
         // `{"seq":..,"chunk":..}`. Pin the worst case directly: a max-`u64` seq
-        // (20 decimal digits) plus a chunk serialized right at the cap must
-        // still leave the whole envelope under the 8000-byte NOTIFY limit.
+        // (20 decimal digits) plus a chunk serialized right at the cap. The
+        // whole envelope must still stay under the 8000-byte NOTIFY limit.
         let cap = crate::context::PROGRESS_CHUNK_MAX_BYTES;
         // A JSON string of (cap - 2) chars serializes (with its two quotes) to
         // exactly `cap` bytes — the largest chunk the context will forward.

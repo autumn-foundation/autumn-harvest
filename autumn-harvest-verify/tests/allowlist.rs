@@ -188,10 +188,10 @@ fn unused_reports_entries_that_matched_nothing() {
 // ── what an entry may suppress (pipeline level) ─────────────────────────────
 //
 // An allowlist entry is an escape hatch for a verdict the author has decided to
-// live with. A `proven-deterministic` workflow has no such verdict, so there is
-// nothing for the entry to suppress: it must be reported as unused, so the
-// entry — and the justification nobody has re-read since — gets deleted rather
-// than quietly outliving the problem it was written for.
+// live with. A `proven-deterministic` workflow has no such verdict, so the entry
+// has nothing to suppress. It must be reported as unused. Then the entry, and
+// the justification nobody has re-read since, gets deleted. It must not quietly
+// outlive the problem it was written for.
 
 fn fixtures_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))

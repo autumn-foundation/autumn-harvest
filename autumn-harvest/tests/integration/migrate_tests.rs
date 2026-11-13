@@ -2,11 +2,11 @@
 //! `autumn_harvest::migrate` against a live Postgres (issue #1240).
 //!
 //! The unit tests in `src/migrate.rs` cover the pure half (version extraction,
-//! plan classification, directory reading). What can only be proven against a
-//! real database is the half that matters to an operator running `harvest
-//! migrate` before rolling replicas: that Harvest's schema actually lands, that
-//! a second run is a no-op, that a failing migration takes its ledger row down
-//! with it, and that the ledger this writes is the one Diesel and Autumn read.
+//! plan classification, directory reading). These tests prove the half that
+//! needs a real database, which an operator running `harvest migrate` relies
+//! on before rolling replicas.
+//! Harvest's schema lands, and a second run is a no-op. A failing migration
+//! takes its ledger row down with it. Diesel and Autumn read the same ledger.
 
 use autumn_harvest::migrate::{self, MigrationScript};
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
@@ -130,9 +130,9 @@ async fn applies_harvests_own_schema_to_an_empty_database_and_is_idempotent() {
 
 #[tokio::test]
 async fn an_extra_set_applies_alongside_the_embedded_one() {
-    // The `--include-dir` case: a set this binary does not embed (the plugin's
-    // connector dead-letter table, or an application's own) rides along with
-    // Harvest's and lands in the same ledger.
+    // The `--include-dir` case: a set this binary does not embed lands in the
+    // same ledger as Harvest's. Examples are the plugin's connector
+    // dead-letter table, or an application's own set.
     let (_container, url) = empty_postgres().await;
 
     let mut scripts = migrate::embedded();
@@ -264,9 +264,9 @@ async fn a_unique_violation_from_the_migrations_own_sql_is_a_failure_not_a_skip(
 #[tokio::test]
 async fn a_nontransactional_migration_may_create_an_index_concurrently() {
     // The `metadata.toml` case: Postgres rejects `CREATE INDEX CONCURRENTLY`
-    // inside a transaction block, so wrapping this body -- as an applier that
-    // ignores `run_in_transaction = false` would -- fails a migration that
-    // `diesel migration run` applies happily.
+    // inside a transaction block. An applier that ignores
+    // `run_in_transaction = false` wraps this body, and so fails a migration
+    // that `diesel migration run` applies.
     let (_container, url) = empty_postgres().await;
 
     let table = MigrationScript::new(
@@ -294,9 +294,9 @@ async fn a_nontransactional_migration_may_create_an_index_concurrently() {
         "a non-transactional migration must still be recorded"
     );
 
-    // It ran unserialized however privileged this role is -- there is no
-    // transaction for the ledger lock to be held in -- and the report has to
-    // say so, naming only that migration.
+    // It ran unserialized, however privileged this role is. There is no
+    // transaction to hold the ledger lock. The report must say so and name
+    // only that migration.
     assert!(
         report.ledger_lock_available,
         "the superuser this connects as can lock the ledger"
@@ -315,8 +315,8 @@ async fn a_nontransactional_migration_may_create_an_index_concurrently() {
 #[tokio::test]
 async fn a_failing_nontransactional_migration_is_not_recorded() {
     // Nothing rolls back without a transaction, but the version must not be
-    // recorded: a ledger row for a migration that never finished is the one
-    // state no later run can repair.
+    // recorded. No later run can repair a ledger row for a migration that
+    // never finished.
     let (_container, url) = empty_postgres().await;
 
     let broken = MigrationScript::with_metadata(
@@ -388,12 +388,11 @@ async fn ledger_rows_this_binary_does_not_know_are_reported_not_removed() {
 
 #[tokio::test]
 async fn a_migration_body_does_not_see_its_own_version_in_the_ledger() {
-    // Diesel runs a migration's body first and records its version afterwards,
-    // so a body may condition its DDL on its own version being absent. Record
-    // the version first and that body reads its own row through the
-    // transaction's writes, skips the DDL, and still commits the version —
-    // an incomplete schema permanently marked applied, from a file
-    // `diesel migration run` applies correctly.
+    // Diesel runs a migration's body first and records its version after. So
+    // a body may condition its DDL on its own version being absent. If the
+    // version is recorded first, that body reads its own row, skips the DDL,
+    // and still commits the version. The result is an incomplete schema marked
+    // applied forever, from a file `diesel migration run` applies correctly.
     let (_container, url) = empty_postgres().await;
 
     let self_inspecting = probe_migration(
@@ -424,15 +423,14 @@ async fn a_migration_body_does_not_see_its_own_version_in_the_ledger() {
 
 #[tokio::test]
 async fn the_ledger_lock_does_not_block_another_migrators_ledger_insert() {
-    // The lock this takes while running a body must not conflict with the
+    // The lock held while a body runs must not conflict with the
     // `ROW EXCLUSIVE` an INSERT takes. Diesel's order is body-then-insert with
-    // no ledger lock, so a `diesel migration run` racing us takes the schema
-    // object first and the ledger second — the opposite order to ours. A mode
-    // that blocked its insert (`SHARE ROW EXCLUSIVE`, the obvious first choice)
-    // would close that cycle: we would hold the ledger waiting on its table,
-    // it would wait on the ledger to record the body it just finished, and
-    // Postgres would abort one — reporting a failed migration while the other
-    // migrator applied it correctly.
+    // no ledger lock. So a racing `diesel migration run` takes the schema
+    // object first and the ledger second, the opposite order to this module.
+    // A mode that blocked its insert (`SHARE ROW EXCLUSIVE`) would close that
+    // cycle. This module would hold the ledger and wait on the table. Diesel
+    // would wait on the ledger to record the body it just finished. Postgres
+    // would abort one and report a failed migration that the other applied.
     //
     // Asserted against a real server's conflict table, not against the mode
     // string, so it stays true if the mode changes.
@@ -482,16 +480,15 @@ async fn the_ledger_lock_does_not_block_another_migrators_ledger_insert() {
 
 #[tokio::test]
 async fn a_nontransactional_unique_violation_that_records_nothing_is_a_failure() {
-    // With no transaction the body has already run when the ledger insert is
-    // attempted, so a unique violation there is normally a concurrent migrator
-    // having recorded this version first — both ran the DDL, and the run is
-    // honestly reported as applied.
+    // With no transaction, the body has already run at the ledger insert. So
+    // a unique violation there is normally a concurrent migrator that recorded
+    // this version first. Both ran the DDL, and the run reports as applied.
     //
-    // But this module is pointed at ledgers it did not create. One may carry an
+    // But this module runs against ledgers it did not create. One may carry an
     // extra constraint or an insert trigger that raises `unique_violation`
-    // while recording nothing. Reading that as "someone else recorded it" would
-    // exit 0 over a schema change no ledger row covers, and the next run would
-    // replay a body that cannot be rolled back.
+    // while recording nothing. If read as "someone else recorded it", the run
+    // exits 0 over a schema change no ledger row covers. The next run then
+    // replays a body that cannot roll back.
     let (_container, url) = empty_postgres().await;
     migrate::apply(&url, &[]).await.expect("ledger created");
 
@@ -543,13 +540,12 @@ async fn a_nontransactional_unique_violation_that_records_nothing_is_a_failure()
 
 #[tokio::test]
 async fn a_role_with_only_select_and_insert_on_the_ledger_can_still_migrate() {
-    // Diesel's bookkeeping reads the ledger and inserts into it — `SELECT` and
-    // `INSERT`, nothing more. Postgres, though, requires `UPDATE`, `DELETE` or
-    // `TRUNCATE` on a table to lock it in any mode above `ROW EXCLUSIVE`. So a
-    // least-privilege role granted exactly what Diesel needs on a ledger it
-    // does not own is denied this module's ledger lock — and taking that lock
-    // unconditionally would refuse a migration set `diesel migration run`
-    // applies for that role perfectly well, mid-deploy.
+    // Diesel's bookkeeping needs only `SELECT` and `INSERT` on the ledger.
+    // Postgres requires `UPDATE`, `DELETE` or `TRUNCATE` on a table to lock it
+    // in any mode above `ROW EXCLUSIVE`. So a least-privilege role with only
+    // what Diesel needs, on a ledger it does not own, cannot take this
+    // module's ledger lock. An unconditional lock would refuse, mid-deploy, a
+    // migration set that `diesel migration run` applies for that role.
     let (_container, url) = empty_postgres().await;
     migrate::apply(&url, &[]).await.expect("ledger created");
 
@@ -593,29 +589,26 @@ async fn a_role_with_only_select_and_insert_on_the_ledger_can_still_migrate() {
 
 #[tokio::test]
 async fn a_nontransactional_body_that_loses_the_ledger_race_is_still_reported_unserialized() {
-    // Without a transaction the body runs first and the ledger insert can lose
-    // afterwards, with nothing to roll the body back. The version is then
-    // another migrator's, so the migration is `applied_concurrently` -- but
-    // this run really did execute unlocked DDL, and the unserialized list
-    // exists to say so. Reporting only `applied_concurrently` would let the
-    // safety signal claim no unlocked body ran when one did.
+    // Without a transaction, the body runs first and the ledger insert can
+    // lose after it. Nothing rolls the body back. The version is then another
+    // migrator's, so the migration is `applied_concurrently`. But this run did
+    // execute unlocked DDL, and the unserialized list exists to say so. With
+    // only `applied_concurrently`, the safety signal would hide an unlocked body.
     let (_container, url) = empty_postgres().await;
     migrate::apply(&url, &[]).await.expect("ledger created");
 
     // Stand in for the migrator that wins the race, from *inside* the body.
     //
-    // The timing this test is about is narrow and load-bearing: the competing
-    // row has to land after this run reads the ledger to build its plan and
-    // before this run's own insert. Recording it up front instead -- the
-    // obvious way to write this -- misses the path entirely: `build_plan`
-    // reads the ledger first, sees the version, and files the migration under
-    // `already_applied`, so the body never runs and the report comes back
-    // empty on all three lists.
+    // The timing is narrow and load-bearing. The competing row must land after
+    // this run reads the ledger for its plan, and before this run's own insert.
+    // A row recorded up front misses the path. `build_plan` reads the ledger
+    // first, sees the version, and files the migration under
+    // `already_applied`. The body never runs, and all three lists are empty.
     //
-    // Putting the insert in the body hits the window exactly, and
-    // deterministically: `run_in_transaction = false` means each statement
-    // commits as it executes, so the row is visible to this run's insert the
-    // moment the body finishes -- no second connection, no thread, no sleep.
+    // An insert inside the body hits the window exactly and deterministically.
+    // With `run_in_transaction = false`, each statement commits as it runs.
+    // So this run's insert sees the row the moment the body finishes. There is
+    // no second connection, no thread, no sleep.
     let nontransactional = MigrationScript::with_metadata(
         "29990106000000_harvest_migrate_probe_raced",
         "CREATE TABLE IF NOT EXISTS harvest_migrate_raced (id INTEGER PRIMARY KEY); \

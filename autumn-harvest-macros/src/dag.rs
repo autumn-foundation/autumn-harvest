@@ -16,9 +16,10 @@ struct DagAttrs {
     severity: Option<String>,
     mcp: bool,
     /// `#[dag(execution_timeout = "4h")]` (issue #743): a hard wall-clock
-    /// deadline for the whole scheduled DAG run, propagated to the shadow
-    /// `WorkflowInfo::execution_timeout` and enforced by the EXISTING #243
-    /// `enforce_workflow_execution_timeouts` scanner — no new scanner.
+    /// deadline for the whole scheduled DAG run.
+    ///
+    /// It goes to the shadow `WorkflowInfo::execution_timeout`. The EXISTING
+    /// #243 `enforce_workflow_execution_timeouts` scanner enforces it.
     execution_timeout: Option<String>,
     /// `#[dag(sla = "3h")]` (issue #743): a soft SLA observed by the EXISTING
     /// #487 `enforce_workflow_sla_breaches` scanner without altering the run's
@@ -309,10 +310,9 @@ fn emit_workflow_companion(
         .map_or_else(|| quote! { None }, |s| quote! { Some(#s) });
     let mcp = attrs.mcp;
     // issue #743: the shadow WorkflowInfo must carry the SAME
-    // execution_timeout/sla the DagInfo companion carries, so the unified
-    // start path (`start_or_load_workflow_execution`) resolves an identical
-    // deadline/sla regardless of whether the run was dispatched via the DAG
-    // trigger route or a plain workflow start.
+    // execution_timeout/sla as the DagInfo companion. The unified start path
+    // (`start_or_load_workflow_execution`) then resolves an identical
+    // deadline/sla for the DAG trigger route and for a plain workflow start.
     let execution_timeout_expr = attrs.execution_timeout.as_deref().map_or_else(
         || quote! { None },
         |s| quote! { ::autumn_harvest::task_duration(#s) },
@@ -326,13 +326,14 @@ fn emit_workflow_companion(
         /// Shadow `WorkflowInfo` for this DAG, emitted when the
         /// `unified-dag-execution` feature is enabled (issue #256 Step 1).
         ///
-        /// The handler builds the compiled [`DagDefinition`] in a scoped block
-        /// (so the non-`Send` `DagBuilder` is dropped before any `.await`), then
-        /// hands the `(levels, tasks)` to the single shared level walker
-        /// `::autumn_harvest::dag::run_unified_dag`. That walker dispatches each
-        /// activity through `ctx.execute_activity_raw_with_opts`, evaluates
-        /// trigger rules / conditions from the accumulated task statuses, and
-        /// awaits any signal/timer gate node — deterministic and replay-safe.
+        /// The handler builds the compiled [`DagDefinition`] in a scoped block,
+        /// so the non-`Send` `DagBuilder` drops before any `.await`. It hands
+        /// the `(levels, tasks)` to the shared level walker
+        /// `::autumn_harvest::dag::run_unified_dag`. The walker dispatches
+        /// each activity through `ctx.execute_activity_raw_with_opts`. It
+        /// evaluates trigger rules / conditions from the accumulated task
+        /// statuses. It awaits any signal/timer gate node. All of this is
+        /// deterministic and replay-safe.
         #[doc(hidden)]
         pub fn #companion_name() -> ::autumn_harvest::WorkflowInfo {
             ::autumn_harvest::WorkflowInfo {
@@ -370,10 +371,9 @@ fn emit_workflow_companion(
                 debounce: ::std::option::Option::None,
                 batch: ::std::option::Option::None,
                 throttle: ::std::option::Option::None,
-                // DAGs carry no per-tenant quota (issue #946) -- the
-                // `#[dag]` macro has no `quota` attribute and DAG start
-                // paths bypass the registry-aware admission gates quota
-                // enforcement runs on.
+                // DAGs carry no per-tenant quota (issue #946). The `#[dag]`
+                // macro has no `quota` attribute. DAG start paths bypass the
+                // registry-aware admission gates that enforce quotas.
                 quota: ::std::option::Option::None,
                 max_input_bytes: ::std::option::Option::None,
                 owner: #owner_expr,
@@ -389,10 +389,9 @@ fn emit_workflow_companion(
                 // exact `WorkflowInfo.mcp` flag by
                 // `mcp_tools::collect_descriptors`, mirroring `#[workflow(mcp)]`.
                 // The DAG-specific trigger contract (admission gates,
-                // `max_active_runs`) is preserved separately: the MCP
-                // generator detects this is a DAG via `DagInfo` and routes
-                // its `start` tool through `trigger_dag_run` rather than the
-                // generic `start_workflow` path.
+                // `max_active_runs`) stays separate. The MCP generator finds
+                // the DAG via `DagInfo`. It routes the `start` tool through
+                // `trigger_dag_run`, not the generic `start_workflow` path.
                 mcp: #mcp,
                 // Issue #802 targets the IMPERATIVE path: a `#[dag]` already
                 // declares its activity references structurally, and preflight

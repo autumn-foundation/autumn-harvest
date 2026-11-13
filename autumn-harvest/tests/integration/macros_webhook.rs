@@ -1,9 +1,8 @@
 //! Macro expansion tests for `#[webhook]` and `webhooks![]` (issue #344).
 //!
-//! `#[webhook]` mapping functions must take their typed payload parameter by
-//! value (the dispatch shim deserializes an owned `T` from JSON) and some
-//! fixture functions here never take the error branch -- both are inherent
-//! to exercising the macro's calling convention, not style issues.
+//! `#[webhook]` mapping functions take their typed payload by value, because
+//! the dispatch shim deserializes an owned `T` from JSON. Some fixtures never
+//! take the error branch. Both come from the macro's calling convention.
 #![allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
 
 use autumn_harvest::prelude::*;
