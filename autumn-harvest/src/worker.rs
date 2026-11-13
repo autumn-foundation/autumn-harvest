@@ -46459,6 +46459,110 @@ mod tests {
         );
     }
 
+    // ── Issue #2668: the population samplers use their own interval ──────
+    //
+    // Each population sampler counts the whole active population of a
+    // shard. On `poll_interval` they used 77% of the buffers at 1M runs.
+    // These tests count real connections, as the #1428 tests above do.
+
+    /// A recorder that reads as enabled and records nothing.
+    struct EnabledMetrics;
+
+    impl crate::telemetry::MetricsRecorder for EnabledMetrics {}
+
+    fn enabled_telemetry() -> Arc<crate::telemetry::TelemetryConfig> {
+        let telemetry = crate::telemetry::TelemetryConfig {
+            metrics: Arc::new(EnabledMetrics),
+            ..crate::telemetry::TelemetryConfig::default()
+        };
+        assert!(telemetry.metrics.is_enabled());
+        Arc::new(telemetry)
+    }
+
+    /// A runtime config with a fast poll interval and the default
+    /// population interval. The poll interval is the test default.
+    fn population_cadence_config() -> WorkerRuntimeConfig {
+        let mut cfg = default_runtime_config();
+        cfg.poll_interval = Duration::from_millis(50);
+        cfg.population_sample_interval = DEFAULT_POPULATION_SAMPLE_INTERVAL;
+        cfg
+    }
+
+    /// Issue #2668: with metrics on, the population samplers wait for the
+    /// population interval. They open no connection on a poll tick.
+    #[tokio::test(start_paused = true)]
+    async fn population_samplers_wait_for_the_population_interval_not_the_poll_interval() {
+        let cfg = population_cadence_config();
+        let listener = accept_counting_pool().await;
+        let cancel = CancellationToken::new();
+        let handles = spawn_population_samplers(
+            &cfg,
+            vec![listener.pool.clone()],
+            &cancel,
+            &enabled_telemetry(),
+            100,
+        );
+
+        // Stop one poll tick before the population interval ends.
+        let poll_ticks_before_first_sample = usize::try_from(
+            cfg.population_sample_interval.as_millis() / cfg.poll_interval.as_millis() - 1,
+        )
+        .expect("tick count fits usize");
+        advance_sampler_ticks(cfg.poll_interval, poll_ticks_before_first_sample).await;
+        let touches_before = listener.touch_count();
+
+        // The accept is real loopback I/O. Tick until it lands, under a
+        // deadline in real time.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while listener.touch_count() == 0 && std::time::Instant::now() < deadline {
+            advance_sampler_ticks(cfg.poll_interval, 1).await;
+        }
+        let touches_after = listener.touch_count();
+        cancel.cancel();
+        for handle in handles {
+            let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+        }
+        listener.stop();
+
+        assert_eq!(
+            touches_before, 0,
+            "the population samplers must not query on a poll_interval tick"
+        );
+        assert!(
+            touches_after > 0,
+            "the population samplers must query once the population interval ends"
+        );
+    }
+
+    /// Issue #2668: a cancel during the long sleep ends both samplers at
+    /// once. A shutdown never waits for the population interval.
+    #[tokio::test(start_paused = true)]
+    async fn population_samplers_stop_on_cancel_during_the_sleep() {
+        let cfg = population_cadence_config();
+        let listener = accept_counting_pool().await;
+        let cancel = CancellationToken::new();
+        let handles = spawn_population_samplers(
+            &cfg,
+            vec![listener.pool.clone()],
+            &cancel,
+            &enabled_telemetry(),
+            100,
+        );
+        advance_sampler_ticks(cfg.poll_interval, 1).await;
+
+        cancel.cancel();
+        for handle in handles {
+            // Time does not advance here, so only the cancel can end the task.
+            let joined = tokio::time::timeout(Duration::from_millis(1), handle).await;
+            assert!(
+                joined.is_ok(),
+                "a sampler must end on cancel without waiting for its sleep"
+            );
+        }
+        listener.stop();
+        assert_eq!(listener.touch_count(), 0);
+    }
+
     #[test]
     fn a_two_connection_pool_serving_one_shard_is_sufficient() {
         use crate::types::ShardId;
@@ -46581,6 +46685,7 @@ mod tests {
             codec_rotation_batch_size: crate::codec_rotation::CODEC_ROTATION_DEFAULT_BATCH,
             scanner: crate::scanner_lease::ScannerConfig::default(),
             fairness_keys: false,
+            population_sample_interval: DEFAULT_POPULATION_SAMPLE_INTERVAL,
         }
     }
 
@@ -46612,6 +46717,33 @@ mod tests {
             vec![crate::types::ShardId::new(0), crate::types::ShardId::new(1)],
             "a duplicate shard must not reach the per-shard monitor fan-out, \
              which spawns one control-loop set per assignment entry",
+        );
+    }
+
+    /// Issue #2668: the conversion copies the population interval and
+    /// keeps it apart from the poll interval.
+    #[test]
+    fn runtime_config_carries_the_population_sample_interval() {
+        let worker_config = crate::builder::WorkerConfig::default()
+            .with_population_sample_interval(Duration::from_secs(42));
+        let runtime_config = WorkerRuntimeConfig::from(worker_config);
+        assert_eq!(
+            runtime_config.population_sample_interval,
+            Duration::from_secs(42)
+        );
+        assert_eq!(runtime_config.poll_interval, DEFAULT_WORKER_POLL_INTERVAL);
+    }
+
+    /// Issue #2668: a runtime config that skips the builder can still hold
+    /// a zero interval. `validate` rejects it, so `Worker::new` fails.
+    #[test]
+    fn validate_rejects_a_zero_population_sample_interval() {
+        let mut cfg = default_runtime_config();
+        cfg.population_sample_interval = Duration::ZERO;
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("population_sample_interval"),
+            "the error must name the knob: {err}"
         );
     }
 
