@@ -46555,10 +46555,11 @@ mod tests {
         );
     }
 
-    // ── Issue #2668: the population samplers use their own interval ──────
+    // ── Issue #2668: the database gauge samplers use their own interval ───
     //
-    // Each population sampler counts the whole active population of a
-    // shard. On `poll_interval` they used 77% of the buffers at 1M runs.
+    // Each gauge sampler reads the database for every shard. On
+    // `poll_interval` the two population samplers used 77% of the buffers at
+    // 1M runs, and the stranded-work query was 80% at 10,000 pending rows.
     // These tests count real connections, as the #1428 tests above do.
 
     /// A recorder that reads as enabled and records nothing.
@@ -46575,38 +46576,57 @@ mod tests {
         Arc::new(telemetry)
     }
 
-    /// A runtime config with a 50 ms poll interval and a 3 s population
+    /// A runtime config with a 50 ms poll interval and a 3 s gauge
     /// interval. No other setting uses 3 s, so a test proves that the
     /// samplers read this field and not a constant.
-    fn population_cadence_config() -> WorkerRuntimeConfig {
+    fn gauge_cadence_config() -> WorkerRuntimeConfig {
         let mut cfg = default_runtime_config();
         cfg.poll_interval = Duration::from_millis(50);
-        cfg.population_sample_interval = Duration::from_secs(3);
+        cfg.gauge_sample_interval = Duration::from_secs(3);
         cfg
     }
 
-    /// Issue #2668: with metrics on, the population samplers wait for the
-    /// population interval. They open no connection on a poll tick. They
-    /// open one within three poll ticks after the interval ends.
+    /// Every gauge sampler input points at the one counting pool.
+    fn counting_gauge_inputs(pool: &DbPool) -> GaugeSamplerInputs {
+        GaugeSamplerInputs {
+            pools: vec![pool.clone()],
+            dlq_pools: vec![(0, pool.clone())],
+            stranded: Some(crate::shard::ShardedDbPool::single(pool.clone())),
+            queues: vec!["default".to_string()],
+            circuit_breaker_activities: Vec::new(),
+            activity_requirements: std::collections::HashMap::new(),
+            soft_threshold: 100,
+            stranded_freshness: Duration::from_secs(10),
+        }
+    }
+
+    /// The samplers that `spawn_gauge_samplers` starts with every input set:
+    /// queue depth, concurrency, rate limit, one DLQ shard, queue pause,
+    /// history oversized, workflow active and stranded work.
+    const GAUGE_SAMPLERS: usize = 8;
+
+    /// Issue #2668: with metrics on, every database gauge sampler waits for
+    /// the gauge interval. None opens a connection on a poll tick. They open
+    /// one within three poll ticks after the interval ends.
     #[tokio::test(start_paused = true)]
-    async fn population_samplers_wait_for_the_population_interval_not_the_poll_interval() {
-        let cfg = population_cadence_config();
+    async fn gauge_samplers_wait_for_the_gauge_interval_not_the_poll_interval() {
+        let cfg = gauge_cadence_config();
         let listener = accept_counting_pool().await;
         let cancel = CancellationToken::new();
-        let handles = spawn_population_samplers(
+        let handles = spawn_gauge_samplers(
             &cfg,
-            vec![listener.pool.clone()],
+            counting_gauge_inputs(&listener.pool),
             &cancel,
             &enabled_telemetry(),
-            100,
-        );
+        )
+        .into_vec();
+        assert_eq!(handles.len(), GAUGE_SAMPLERS);
 
         // The samplers start their sleep in the first tick. So this stops
         // two poll ticks before the first sample.
-        let ticks_in_interval = usize::try_from(
-            cfg.population_sample_interval.as_millis() / cfg.poll_interval.as_millis(),
-        )
-        .expect("tick count fits usize");
+        let ticks_in_interval =
+            usize::try_from(cfg.gauge_sample_interval.as_millis() / cfg.poll_interval.as_millis())
+                .expect("tick count fits usize");
         advance_sampler_ticks(cfg.poll_interval, ticks_in_interval - 1).await;
         let touches_before = listener.touch_count();
 
@@ -46628,28 +46648,61 @@ mod tests {
 
         assert_eq!(
             touches_before, 0,
-            "the population samplers must not query on a poll_interval tick"
+            "no gauge sampler may query on a poll_interval tick"
         );
         assert!(
             touches_after > 0,
-            "the population samplers must query once the population interval ends"
+            "the gauge samplers must query once the gauge interval ends"
         );
     }
 
-    /// Issue #2668: a cancel during the long sleep ends both samplers at
-    /// once. A shutdown never waits for the population interval.
+    /// Issue #2668: the stranded-work sampler needs a sharded pool and a
+    /// recorder. Without either, the helper does not start it.
     #[tokio::test(start_paused = true)]
-    async fn population_samplers_stop_on_cancel_during_the_sleep() {
-        let cfg = population_cadence_config();
+    async fn the_stranded_work_sampler_needs_a_sharded_pool_and_a_recorder() {
+        let cfg = gauge_cadence_config();
         let listener = accept_counting_pool().await;
         let cancel = CancellationToken::new();
-        let handles = spawn_population_samplers(
+
+        let mut no_pool = counting_gauge_inputs(&listener.pool);
+        no_pool.stranded = None;
+        let without_pool = spawn_gauge_samplers(&cfg, no_pool, &cancel, &enabled_telemetry());
+        assert!(without_pool.stranded_work.is_none());
+
+        let disabled = Arc::new(crate::telemetry::TelemetryConfig::default());
+        let without_recorder = spawn_gauge_samplers(
             &cfg,
-            vec![listener.pool.clone()],
+            counting_gauge_inputs(&listener.pool),
+            &cancel,
+            &disabled,
+        );
+        assert!(without_recorder.stranded_work.is_none());
+
+        cancel.cancel();
+        for handle in without_pool
+            .into_vec()
+            .into_iter()
+            .chain(without_recorder.into_vec())
+        {
+            let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+        }
+        listener.stop();
+    }
+
+    /// Issue #2668: a cancel during the long sleep ends every gauge sampler
+    /// at once. A shutdown never waits for the gauge interval.
+    #[tokio::test(start_paused = true)]
+    async fn gauge_samplers_stop_on_cancel_during_the_sleep() {
+        let cfg = gauge_cadence_config();
+        let listener = accept_counting_pool().await;
+        let cancel = CancellationToken::new();
+        let handles = spawn_gauge_samplers(
+            &cfg,
+            counting_gauge_inputs(&listener.pool),
             &cancel,
             &enabled_telemetry(),
-            100,
-        );
+        )
+        .into_vec();
         advance_sampler_ticks(cfg.poll_interval, 1).await;
 
         cancel.cancel();
@@ -46823,29 +46876,26 @@ mod tests {
         );
     }
 
-    /// Issue #2668: the conversion copies the population interval and
-    /// keeps it apart from the poll interval.
+    /// Issue #2668: the conversion copies the gauge interval and keeps it
+    /// apart from the poll interval.
     #[test]
-    fn runtime_config_carries_the_population_sample_interval() {
+    fn runtime_config_carries_the_gauge_sample_interval() {
         let worker_config = crate::builder::WorkerConfig::default()
-            .with_population_sample_interval(Duration::from_secs(42));
+            .with_gauge_sample_interval(Duration::from_secs(42));
         let runtime_config = WorkerRuntimeConfig::from(worker_config);
-        assert_eq!(
-            runtime_config.population_sample_interval,
-            Duration::from_secs(42)
-        );
+        assert_eq!(runtime_config.gauge_sample_interval, Duration::from_secs(42));
         assert_eq!(runtime_config.poll_interval, DEFAULT_WORKER_POLL_INTERVAL);
     }
 
     /// Issue #2668: a runtime config that skips the builder can still hold
     /// a zero interval. `validate` rejects it, so `Worker::new` fails.
     #[test]
-    fn validate_rejects_a_zero_population_sample_interval() {
+    fn validate_rejects_a_zero_gauge_sample_interval() {
         let mut cfg = default_runtime_config();
-        cfg.population_sample_interval = Duration::ZERO;
+        cfg.gauge_sample_interval = Duration::ZERO;
         let err = cfg.validate().unwrap_err();
         assert!(
-            err.to_string().contains("population_sample_interval"),
+            err.to_string().contains("gauge_sample_interval"),
             "the error must name the knob: {err}"
         );
     }

@@ -536,7 +536,8 @@ fn worker_config(
     max_local_activity_start_to_close: Duration,
 ) -> WorkerRuntimeConfig {
     WorkerRuntimeConfig {
-        population_sample_interval: autumn_harvest::worker::DEFAULT_POPULATION_SAMPLE_INTERVAL,
+        // The DLQ gauge test waits for a sample (issue #2668).
+        gauge_sample_interval: Duration::from_millis(25),
         codec_rotation_batch_size: 0,
         scanner: autumn_harvest::scanner_lease::ScannerConfig::default(),
         dr: autumn_harvest::replication::DrConfig::default(),

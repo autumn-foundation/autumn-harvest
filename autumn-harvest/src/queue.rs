@@ -12323,6 +12323,27 @@ mod tests {
         );
     }
 
+    /// The stranded-work demand query probes for a `PAUSED` execution with
+    /// `NOT EXISTS`, as `oldest_pending_ages` does. A `LEFT JOIN` on the
+    /// executions let the planner pick a nested loop that scans every
+    /// execution for each pending row. At 100,000 pending rows one call ran
+    /// for more than 300 s.
+    #[test]
+    fn claimable_pending_demand_query_probes_paused_executions_with_not_exists() {
+        let sql = claimable_pending_demand_query();
+        assert!(
+            !sql.contains("JOIN harvest_workflow_executions"),
+            "the demand query must not join the executions; got:\n{sql}"
+        );
+        assert!(
+            sql.contains(
+                "NOT EXISTS ( SELECT 1 FROM harvest_workflow_executions e \
+                 WHERE e.id = tq.workflow_exec_id AND e.state = 'PAUSED' )"
+            ),
+            "the demand query must probe for a PAUSED execution; got:\n{sql}"
+        );
+    }
+
     /// A pause holds *dispatch*: the gate lives in the PENDING-selection
     /// predicate, never in the terminal/RUNNING paths, so in-flight work is
     /// untouched (AC2).

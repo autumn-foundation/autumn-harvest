@@ -26,6 +26,9 @@
 //! which most are per-tenant keys. The sampler filters those keys out, but the
 //! scan still reads them.
 //!
+//! Before its fix, one stranded-work call took minutes at 100,000 pending rows.
+//! Set `PERF_SKIP_STRANDED=1` to leave that statement out of a run.
+//!
 //! The capture is `#[ignore]`d. It needs a superuser and a preloaded
 //! `pg_stat_statements`. `HARVEST_TEST_DATABASE_URL` names an admin URL.
 //! Without it the harness starts a Postgres container. Output goes to
@@ -156,6 +159,8 @@ async fn seed(conn: &mut AsyncPgConnection, size: &Size) {
          CREATE TEMP TABLE ex AS \
              SELECT id, row_number() OVER (ORDER BY workflow_id) AS rn \
              FROM harvest_workflow_executions; \
+         CREATE UNIQUE INDEX ON ex (rn); \
+         ANALYZE ex; \
          INSERT INTO harvest_task_queue \
              (queue_name, task_type, input, state, priority, scheduled_at, workflow_exec_id, \
               activity_name, schedule_to_close_at, concurrency_key, concurrency_cap, \
@@ -288,9 +293,11 @@ async fn tick(conn: &mut AsyncPgConnection, queues: &[String], worker_id: &str) 
     autumn_harvest::queue_pause::paused_queue_names(conn)
         .await
         .expect("paused queues");
-    queue::claimable_pending_demand_by_queue(conn, &[])
-        .await
-        .expect("stranded demand");
+    if std::env::var_os("PERF_SKIP_STRANDED").is_none() {
+        queue::claimable_pending_demand_by_queue(conn, &[])
+            .await
+            .expect("stranded demand");
+    }
     if let Some(task) = queue::claim_task(conn, queues, worker_id, "", None, &[], &[])
         .await
         .expect("claim")
@@ -473,4 +480,128 @@ async fn zz_capture_worker_sampler_statement_costs() {
     }
     std::fs::write(dir.join(format!("{label}-statement-costs.md")), &table).expect("write table");
     eprintln!("{table}");
+}
+
+/// The stranded-work demand query as it stood before its `PAUSED` gate became a
+/// `NOT EXISTS` probe. It is the equivalence oracle.
+const REFERENCE_DEMAND_SQL: &str = "SELECT tq.queue_name, tq.required_capabilities::text AS caps, \
+     tq.required_build_id AS build_id, \
+     CASE WHEN tq.sticky_worker_id IS NOT NULL AND tq.sticky_until IS NOT NULL \
+          AND tq.sticky_until > NOW() THEN tq.sticky_worker_id ELSE NULL END AS sticky_owner, \
+     tq.activity_name, COUNT(*)::BIGINT AS cnt \
+     FROM harvest_task_queue tq \
+     LEFT JOIN harvest_workflow_executions e ON e.id = tq.workflow_exec_id \
+     WHERE tq.state = 'PENDING' AND tq.scheduled_at <= NOW() \
+       AND NOT EXISTS (SELECT 1 FROM harvest_queue_pauses qp WHERE qp.queue_name = tq.queue_name) \
+       AND NOT EXISTS (SELECT 1 FROM harvest_activity_pauses ap \
+                       WHERE ap.activity_name = tq.activity_name AND tq.task_type = 'activity') \
+       AND (tq.schedule_to_close_at IS NULL OR tq.schedule_to_close_at > NOW()) \
+       AND (tq.task_type <> 'workflow' OR tq.workflow_exec_id IS NULL OR e.id IS NULL \
+            OR e.state <> 'PAUSED') \
+       AND (tq.concurrency_key IS NULL OR tq.concurrency_cap IS NULL OR \
+            (SELECT COUNT(*) FROM harvest_task_queue inner_q \
+             WHERE inner_q.concurrency_key = tq.concurrency_key \
+               AND inner_q.task_type = tq.task_type AND inner_q.state = 'RUNNING' \
+               AND inner_q.worker_id IS NOT NULL) < tq.concurrency_cap) \
+       AND (tq.rate_limit_key IS NULL OR tq.activity_name = ANY($1) OR EXISTS \
+            (SELECT 1 FROM harvest_rate_limit_buckets b WHERE b.key = tq.rate_limit_key \
+             AND b.tokens >= 1.0)) \
+     GROUP BY tq.queue_name, tq.required_capabilities, tq.required_build_id, \
+              CASE WHEN tq.sticky_worker_id IS NOT NULL AND tq.sticky_until IS NOT NULL \
+                   AND tq.sticky_until > NOW() THEN tq.sticky_worker_id ELSE NULL END, \
+              tq.activity_name";
+
+#[derive(diesel::QueryableByName, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct DemandRow {
+    #[diesel(sql_type = Text)]
+    queue_name: String,
+    #[diesel(sql_type = diesel::sql_types::Nullable<Text>)]
+    sticky_owner: Option<String>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<Text>)]
+    activity_name: Option<String>,
+    #[diesel(sql_type = BigInt)]
+    cnt: i64,
+}
+
+/// The new demand query returns the same groups as the reference on the edge
+/// cases of its `PAUSED` gate. The buckets hold no override, so the plain
+/// token test of the reference matches the effective one.
+#[tokio::test]
+async fn stranded_demand_matches_the_reference_query() {
+    let (admin, _guard) = setup_server().await;
+    let db = ThrowawayDb::create_on(&admin, "stranded_demand_edge").await;
+    let mut conn = AsyncPgConnection::establish(&db.url())
+        .await
+        .expect("connection");
+    conn.batch_execute(
+        "INSERT INTO harvest_workflow_executions \
+             (id, workflow_name, workflow_id, shard_id, state, input, queue_name) VALUES \
+         ('00000000-0000-0000-0000-000000000001', 'wf', 'running', 0, 'RUNNING', '{}', 'q0'), \
+         ('00000000-0000-0000-0000-000000000002', 'wf', 'paused', 0, 'PAUSED', '{}', 'q0'), \
+         ('00000000-0000-0000-0000-000000000003', 'wf', 'done', 0, 'COMPLETED', '{}', 'q0'); \
+         INSERT INTO harvest_rate_limit_buckets \
+             (key, refill_rate, burst, tokens, last_refilled_at, created_at, updated_at) VALUES \
+         ('empty', 0, 1, 0, now(), now(), now()), ('full', 0, 5, 5, now(), now(), now()); \
+         INSERT INTO harvest_task_queue \
+             (queue_name, task_type, input, state, scheduled_at, workflow_exec_id, activity_name, \
+              concurrency_key, concurrency_cap, rate_limit_key, worker_id, sticky_worker_id, \
+              sticky_until) VALUES \
+         ('q0', 'workflow', '{}', 'PENDING', now() - interval '1 minute', \
+              '00000000-0000-0000-0000-000000000001', NULL, NULL, NULL, NULL, NULL, NULL, NULL), \
+         ('q0', 'workflow', '{}', 'PENDING', now() - interval '1 minute', \
+              '00000000-0000-0000-0000-000000000002', NULL, NULL, NULL, NULL, NULL, NULL, NULL), \
+         ('q0', 'workflow', '{}', 'PENDING', now() - interval '1 minute', \
+              '00000000-0000-0000-0000-000000000003', NULL, NULL, NULL, NULL, NULL, NULL, NULL), \
+         ('q0', 'workflow', '{}', 'PENDING', now() - interval '1 minute', \
+              '00000000-0000-0000-0000-0000000000ff', NULL, NULL, NULL, NULL, NULL, NULL, NULL), \
+         ('q0', 'workflow', '{}', 'PENDING', now() - interval '1 minute', \
+              NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL), \
+         ('q1', 'activity', '{}', 'PENDING', now() - interval '1 minute', \
+              '00000000-0000-0000-0000-000000000002', 'act', NULL, NULL, NULL, NULL, NULL, NULL), \
+         ('q1', 'activity', '{}', 'PENDING', now() - interval '1 minute', \
+              NULL, 'capped', 'ck', 1, NULL, NULL, NULL, NULL), \
+         ('q1', 'activity', '{}', 'RUNNING', now() - interval '1 minute', \
+              NULL, 'capped', 'ck', 1, NULL, 'w1', NULL, NULL), \
+         ('q1', 'activity', '{}', 'PENDING', now() - interval '1 minute', \
+              NULL, 'limited', NULL, NULL, 'empty', NULL, NULL, NULL), \
+         ('q1', 'activity', '{}', 'PENDING', now() - interval '1 minute', \
+              NULL, 'limited', NULL, NULL, 'full', NULL, NULL, NULL), \
+         ('q2', 'activity', '{}', 'PENDING', now() - interval '1 minute', \
+              NULL, 'sticky', NULL, NULL, NULL, NULL, 'w2', now() + interval '1 hour'), \
+         ('q2', 'activity', '{}', 'PENDING', now() + interval '1 hour', \
+              NULL, 'future', NULL, NULL, NULL, NULL, NULL, NULL);",
+    )
+    .await
+    .expect("seed the edge cases");
+
+    let mut reference: Vec<DemandRow> = diesel::sql_query(REFERENCE_DEMAND_SQL)
+        .bind::<diesel::sql_types::Array<Text>, _>(Vec::<String>::new())
+        .load(&mut conn)
+        .await
+        .expect("reference query");
+    let mut actual: Vec<DemandRow> = queue::claimable_pending_demand_by_queue(&mut conn, &[])
+        .await
+        .expect("demand query")
+        .into_iter()
+        .map(|d| DemandRow {
+            queue_name: d.queue_name,
+            sticky_owner: d.sticky_owner,
+            activity_name: d.activity_name,
+            cnt: d.count,
+        })
+        .collect();
+    reference.sort();
+    actual.sort();
+    // Four q0 workflow rows count: RUNNING, COMPLETED, a missing execution and
+    // no execution. The PAUSED one does not. The q1 activity of the PAUSED
+    // run counts, as does the bucket with tokens.
+    assert_eq!(actual, reference);
+    let q0: i64 = actual
+        .iter()
+        .filter(|r| r.queue_name == "q0")
+        .map(|r| r.cnt)
+        .sum();
+    assert_eq!(q0, 4, "only the PAUSED workflow row is held: {actual:?}");
+    drop(conn);
+    drop(db);
 }

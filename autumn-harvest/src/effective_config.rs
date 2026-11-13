@@ -1016,20 +1016,20 @@ mod tests {
         assert_eq!(view.retry_after_ceiling_ms, 90_000);
     }
 
-    /// Issue #2668: the snapshot reports the population sampler cadence.
+    /// Issue #2668: the snapshot reports the gauge sampler cadence.
     #[test]
-    fn population_sample_interval_ms_surfaces_the_default_and_an_override() {
+    fn gauge_sample_interval_ms_surfaces_the_default_and_an_override() {
         let default_view = WorkerConfigView::from_worker_config(
             &WorkerConfig::default(),
             Duration::from_millis(500),
         );
-        assert_eq!(default_view.population_sample_interval_ms, 15_000);
+        assert_eq!(default_view.gauge_sample_interval_ms, 15_000);
 
         let configured =
-            WorkerConfig::default().with_population_sample_interval(Duration::from_secs(45));
+            WorkerConfig::default().with_gauge_sample_interval(Duration::from_secs(45));
         let view = WorkerConfigView::from_worker_config(&configured, Duration::from_millis(500));
         let json = serde_json::to_value(&view).expect("serialize");
-        assert_eq!(json["population_sample_interval_ms"], 45_000);
+        assert_eq!(json["gauge_sample_interval_ms"], 45_000);
     }
 
     #[cfg(feature = "db")]

@@ -5844,36 +5844,36 @@ mod tests {
         );
     }
 
-    /// Issue #2668: the population samplers default to 15 s, not to the
-    /// 500 ms poll interval.
+    /// Issue #2668: the database gauge samplers default to 15 s, not to
+    /// the 500 ms poll interval.
     #[test]
-    fn population_sample_interval_defaults_to_15s() {
+    fn gauge_sample_interval_defaults_to_15s() {
         assert_eq!(
-            WorkerConfig::default().population_sample_interval,
+            WorkerConfig::default().gauge_sample_interval,
             Duration::from_secs(15)
         );
-        assert_eq!(DEFAULT_POPULATION_SAMPLE_INTERVAL, Duration::from_secs(15));
+        assert_eq!(DEFAULT_GAUGE_SAMPLE_INTERVAL, Duration::from_secs(15));
     }
 
     #[test]
-    fn with_population_sample_interval_sets_the_field() {
+    fn with_gauge_sample_interval_sets_the_field() {
         let config =
-            WorkerConfig::default().with_population_sample_interval(Duration::from_secs(60));
-        assert_eq!(config.population_sample_interval, Duration::from_secs(60));
+            WorkerConfig::default().with_gauge_sample_interval(Duration::from_secs(60));
+        assert_eq!(config.gauge_sample_interval, Duration::from_secs(60));
     }
 
-    /// Issue #2668: a zero interval spins both samplers, so the builder
-    /// rejects it.
+    /// Issue #2668: a zero interval spins every gauge sampler, so the
+    /// builder rejects it.
     #[test]
-    fn population_sample_interval_zero_is_rejected() {
+    fn gauge_sample_interval_zero_is_rejected() {
         let result = HarvestBuilder::new()
-            .worker(WorkerConfig::default().with_population_sample_interval(Duration::ZERO))
+            .worker(WorkerConfig::default().with_gauge_sample_interval(Duration::ZERO))
             .try_build();
         let Err(HarvestBuilderError::InvalidWorkerConfig(message)) = result else {
             panic!("expected InvalidWorkerConfig but got {result:?}");
         };
         assert!(
-            message.contains("population_sample_interval"),
+            message.contains("gauge_sample_interval"),
             "the error must name the knob: {message}"
         );
     }
