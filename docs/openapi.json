@@ -4015,7 +4015,7 @@
                       "type": "string"
                     },
                     "truncated": {
-                      "description": "Schedules ({id, name}) that fire so often that the forecast stopped reading them, or whose run budget is too far ahead to project. A schedule listed here before the window opens is not forecast.",
+                      "description": "Schedules ({id, name}) that fire so often that the forecast stopped reading them, or whose run budget at the window cannot be projected: too many slots before the window, or an overdue next_run_at whose catch-up policy decides the budget. Such a schedule is not forecast.",
                       "type": "array"
                     },
                     "unanchored": {

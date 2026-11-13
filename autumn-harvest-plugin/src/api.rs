@@ -49463,7 +49463,8 @@ pub(crate) struct ScheduleHerdReport {
     /// Schedules that fire so often that the forecast stopped reading them.
     ///
     /// It also lists a budgeted schedule with too many slots before the
-    /// window. Its budget at the window is unknown, so it is not forecast.
+    /// window, or with an overdue `next_run_at`. Its budget at the window is
+    /// unknown, so it is not forecast.
     pub truncated: Vec<HerdScheduleRef>,
     /// `complete`, or `partial` when a shard did not answer.
     pub status: FanoutStatus,
@@ -49523,12 +49524,18 @@ fn slots_before(
 
 /// The schedules to forecast, with the run budget each one has at `from`.
 ///
-/// Each budget drops by the slots before the window. A schedule whose walk is
-/// too long to project goes into the third list and is not forecast. A `None`
-/// budget means no run limit.
+/// Each budget drops by the slots before the window. A `None` budget means no
+/// run limit. Two kinds of budgeted schedule go into the third list and are
+/// not forecast, because their budget at the window is unknown:
+///
+/// - one whose walk before the window is too long to project;
+/// - one whose `next_run_at` is before `now`. Its catch-up policy decides how
+///   many missed slots spend a run, and the scheduler applies it on its next
+///   tick.
 #[allow(clippy::type_complexity)]
 fn project_herd_budgets(
     candidates: Vec<(&HarvestSchedule, Schedule)>,
+    now: chrono::DateTime<chrono::Utc>,
     from: chrono::DateTime<chrono::Utc>,
 ) -> (
     Vec<(&HarvestSchedule, Schedule)>,
@@ -49540,7 +49547,11 @@ fn project_herd_budgets(
     let mut unprojected = Vec::new();
     for (row, schedule) in candidates {
         let budget = schedule_remaining_runs(row.max_runs, row.runs_started);
+        let overdue = row.next_run_at.is_some_and(|next| next < now);
         let projected = budget.map_or(Some(None), |left| {
+            if overdue {
+                return None;
+            }
             slots_before(&schedule, row.next_run_at, from, left).map(|spent| Some(left - spent))
         });
         if let Some(budget) = projected {
@@ -49592,6 +49603,7 @@ fn partition_herd_rows(
 /// applied.
 pub(crate) fn build_herd_report(
     rows: &[HarvestSchedule],
+    now: chrono::DateTime<chrono::Utc>,
     from: chrono::DateTime<chrono::Utc>,
     hours: u32,
     bucket_secs: u64,
@@ -49607,7 +49619,7 @@ pub(crate) fn build_herd_report(
     let until = from + chrono::Duration::hours(i64::from(hours));
 
     let (candidates, inactive) = partition_herd_rows(rows);
-    let (active, mut budgets, unprojected) = project_herd_budgets(candidates, from);
+    let (active, mut budgets, unprojected) = project_herd_budgets(candidates, now, from);
 
     // The forecast keys each schedule by its row id, so two rows with one
     // name stay two schedules.
@@ -49714,6 +49726,7 @@ async fn schedule_herd_handler(
     let mut report = tokio::task::spawn_blocking(move || {
         build_herd_report(
             &rows,
+            chrono::Utc::now(),
             from,
             params.hours,
             params.bucket_secs,
@@ -59963,7 +59976,7 @@ mod tests {
             herd_row(2, "etl", "cron:0 * * * *"),
             herd_row(3, "digest", "cron:17 * * * *"),
         ];
-        let report = build_herd_report(&rows, herd_epoch(), 3, 60, 2, 50);
+        let report = build_herd_report(&rows, herd_epoch(), herd_epoch(), 3, 60, 2, 50);
         assert_eq!(report.fires, 9);
         assert_eq!(report.spot_count, 3);
         let names: Vec<&str> = report.spots[0]
@@ -60002,7 +60015,7 @@ mod tests {
             herd_row(5, "broken", "not a schedule"),
             herd_row(6, "every", "interval:3600"),
         ];
-        let report = build_herd_report(&rows, herd_epoch(), 1, 60, 2, 50);
+        let report = build_herd_report(&rows, herd_epoch(), herd_epoch(), 1, 60, 2, 50);
         assert_eq!(report.spot_count, 0, "only one schedule is live");
         let inactive: Vec<&str> = report.inactive.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(inactive, ["paused", "exhausted", "spent", "broken"]);
@@ -60023,7 +60036,7 @@ mod tests {
                 ..herd_row(2, "once-b", "cron:0 * * * *")
             },
         ];
-        let report = build_herd_report(&budgeted, herd_epoch(), 24, 60, 2, 50);
+        let report = build_herd_report(&budgeted, herd_epoch(), herd_epoch(), 24, 60, 2, 50);
         assert_eq!(report.fires, 2, "each schedule has one run left");
         assert_eq!(report.spot_count, 1);
 
@@ -60034,7 +60047,7 @@ mod tests {
                 ..herd_row(2, "b", "cron:0 * * * *")
             },
         ];
-        let report = build_herd_report(&ending, herd_epoch(), 24, 60, 2, 50);
+        let report = build_herd_report(&ending, herd_epoch(), herd_epoch(), 24, 60, 2, 50);
         assert_eq!(report.fires, 24 + 2, "b fires at 00:00 and 01:00 only");
         assert_eq!(report.spot_count, 2);
     }
@@ -60047,11 +60060,27 @@ mod tests {
             next_run_at: Some(herd_epoch()),
             ..herd_row(n, &format!("s{n}"), "cron:0 * * * *")
         };
-        let spent = build_herd_report(&[row(1, 1), row(2, 1)], tomorrow, 24, 60, 2, 50);
+        let spent = build_herd_report(
+            &[row(1, 1), row(2, 1)],
+            herd_epoch(),
+            tomorrow,
+            24,
+            60,
+            2,
+            50,
+        );
         assert_eq!(spent.fires, 0, "both runs happen before the window");
         assert_eq!(spent.spot_count, 0);
 
-        let left = build_herd_report(&[row(1, 30), row(2, 30)], tomorrow, 24, 60, 2, 50);
+        let left = build_herd_report(
+            &[row(1, 30), row(2, 30)],
+            herd_epoch(),
+            tomorrow,
+            24,
+            60,
+            2,
+            50,
+        );
         assert_eq!(
             left.fires,
             2 * 6,
@@ -60069,7 +60098,7 @@ mod tests {
             ..herd_row(1, "dense", "cron:* * * * * *")
         };
         let plain = herd_row(2, "plain", "cron:0 * * * *");
-        let report = build_herd_report(&[dense, plain], far, 1, 60, 2, 50);
+        let report = build_herd_report(&[dense, plain], herd_epoch(), far, 1, 60, 2, 50);
         let truncated: Vec<&str> = report.truncated.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(
             truncated,
@@ -60077,6 +60106,28 @@ mod tests {
             "two days of seconds pass the walk cap"
         );
         assert_eq!(report.fires, 1, "only the plain schedule is forecast");
+    }
+
+    #[test]
+    fn the_herd_report_does_not_guess_the_budget_of_an_overdue_schedule() {
+        let now = herd_epoch() + chrono::Duration::hours(10);
+        let overdue = autumn_harvest::models::HarvestSchedule {
+            max_runs: Some(3),
+            next_run_at: Some(herd_epoch()),
+            ..herd_row(1, "overdue", "cron:0 * * * *")
+        };
+        let unlimited = autumn_harvest::models::HarvestSchedule {
+            next_run_at: Some(herd_epoch()),
+            ..herd_row(2, "unlimited", "cron:0 * * * *")
+        };
+        let report = build_herd_report(&[overdue, unlimited], now, now, 3, 60, 2, 50);
+        let truncated: Vec<&str> = report.truncated.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(
+            truncated,
+            ["overdue"],
+            "its catch-up policy sets its budget"
+        );
+        assert_eq!(report.fires, 3, "the unlimited schedule is still forecast");
     }
 
     #[test]
@@ -60089,7 +60140,7 @@ mod tests {
         };
         let fire = effective_fire_time(row.id, Some(herd_epoch()), row.jitter_secs).unwrap();
         assert!(fire >= end_at, "the fixture needs jitter past the end");
-        let report = build_herd_report(&[row], herd_epoch(), 24, 60, 2, 50);
+        let report = build_herd_report(&[row], herd_epoch(), herd_epoch(), 24, 60, 2, 50);
         assert_eq!(report.fires, 0, "the scheduler never dispatches this slot");
     }
 
@@ -60104,8 +60155,8 @@ mod tests {
         let plain: Vec<_> = (0..8)
             .map(|n| herd_row(n, &format!("s{n}"), "cron:0 * * * *"))
             .collect();
-        let spread = build_herd_report(&jittered, herd_epoch(), 1, 60, 8, 50);
-        let herd = build_herd_report(&plain, herd_epoch(), 1, 60, 8, 50);
+        let spread = build_herd_report(&jittered, herd_epoch(), herd_epoch(), 1, 60, 8, 50);
+        let herd = build_herd_report(&plain, herd_epoch(), herd_epoch(), 1, 60, 8, 50);
         assert_eq!(herd.spot_count, 1, "eight schedules on one minute");
         assert_eq!(spread.spot_count, 0, "an hour of jitter spreads them");
         assert_eq!(spread.fires, 8);
@@ -60116,7 +60167,7 @@ mod tests {
         let rows: Vec<_> = (0..3)
             .map(|n| herd_row(n, &format!("s{n}"), "cron:0 * * * *"))
             .collect();
-        let report = build_herd_report(&rows, herd_epoch(), 10_000, 0, 0, 0);
+        let report = build_herd_report(&rows, herd_epoch(), herd_epoch(), 10_000, 0, 0, 0);
         assert_eq!(report.until - report.from, chrono::Duration::hours(744));
         assert_eq!(report.bucket_secs, 1);
         assert_eq!(report.min_herd, 2);
