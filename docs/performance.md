@@ -3109,3 +3109,9 @@ standalone note rather than part of the claim-path attribution table above:
   sends in one statement, and the low-risk poll-tick scanners stay
   prepared (`throughput` 71.8 to 78.5 workflows/s, the median of six
   alternating pairs, `pg_stat_statements`).
+* [`docs/performance-worker-task-stats-prune.md`](performance-worker-task-stats-prune.md)
+  — each worker heartbeat ran `prune_worker_task_stats` as a sequential scan
+  that parsed every cohort key. The prune now states the retention bound that
+  `harvest_worker_task_stats_updated_at_idx` serves (prune buffers -97.5%,
+  -98.3% and -98.2% for live fleets of 500, 2,000 and 8,000 workers,
+  `pg_stat_statements`).

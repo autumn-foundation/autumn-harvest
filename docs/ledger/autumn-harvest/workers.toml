@@ -68,7 +68,7 @@ driver = "per_tick"
 backend = ["postgres"]
 kind = ["write"]
 tables = ["harvest_worker_task_stats"]
-measured = "unmeasured"
+measured = "docs/performance-worker-task-stats-prune.md"
 plan = "docs/ledger/plans/autumn-harvest/workers.md"
 
 ["read_draining_worker_deadline"]

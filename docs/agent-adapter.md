@@ -1766,6 +1766,7 @@ idempotency key. An app without the module sends the same signal.
 | `control: reset_memory` | Clears the memory: the scope `agent:<id>`, or the state memory. It also removes each lesson of the kind that names the agent (section 24). |
 | `control: clear_transcript` | Clears the transcript. Only the labels of the memory and of the workspace files stay (issues #2272, #2274). |
 | `control: reset_workspace` | Deletes every workspace snapshot of the agent (issue #2274). |
+| `control: reload_profile` | Reads the profile of the kind again. A good read ends the run at a checkpoint, so the next op runs on the new profile. A failed read keeps the run and sets `last_error` (issue #2658). |
 
 A control op applies at once, also while the agent is paused. The kernel
 `agent::inbox::admit` makes the choice. Verus proves it, see
@@ -1791,6 +1792,63 @@ A control op applies at once, also while the agent is paused. The kernel
   notice holds the agent id, the execution id and the signal. Pass the last
   two to `decide`. A restart during the wait sends no second notice, so a
   chat app needs no poll of `agent_status`.
+
+### Reload the profile (issue #2658)
+
+A run reads its profile once, at its start. A long-lived agent keeps one
+run, so a new harness does not reach it. A restart does not help, because
+replay reads the recorded profile. Send `Control::ReloadProfile` to give
+the agent the new profile at its next op.
+
+```rust
+use std::sync::Arc;
+use autumn_harvest_agent::{AgentHarness, AgentId, sqlite};
+use autumn_harvest_sqlite::SqliteRuntime;
+
+async fn reload(
+    rt: &mut SqliteRuntime,
+    harness: AgentHarness,
+) -> Result<Vec<AgentId>, Box<dyn std::error::Error>> {
+    // Register the new harness first. The reload reads it.
+    sqlite::register(rt, Arc::new(harness));
+    let agents = sqlite::reload_profiles(rt, "support")?;
+    for id in &agents {
+        sqlite::drive(rt, id).await?;
+    }
+    Ok(agents)
+}
+```
+
+- The op reads the profile through the recorded activity `agent_profile`,
+  then discovers the peers again. Replay reads both results from history.
+  The op uses only the success of the discovery. The next run discovers
+  the peers again.
+- A good read ends the run at a checkpoint after the op. The next run reads
+  the profile at its start, as each run does, and the ops that wait move to
+  it. `Entity::run_with_wakes_and_checkpoints` takes that checkpoint.
+- The reload op books the heartbeat and sets the search attributes with
+  the profile that it read. A changed interval drops the old booking, so
+  the next tick comes one new interval after the reload.
+- Every other field changes at the next run, `max_ops_per_run` and the
+  mandate included.
+- A waiting op that does not fit the checkpoint input runs first, on the
+  old profile. The checkpoint follows it.
+- An active overlay applies to the new profile at each later op.
+- A failed read keeps the current profile. The op adds one to `failures`
+  and names the error in `last_error`. The kernel
+  `profile_read::reloaded` makes the choice. Verus proves it, see
+  `formal/verus/src/agent_profile_read.rs`.
+- `sqlite::reload_profiles` sends the op to each running agent of a kind,
+  by the workflow id prefix `<kind>/`. `postgres::reload_profiles` does the
+  same by the search attribute `agent_kind`, which each op sets. So it
+  skips an agent that has run no op yet. Both send the op to the live run
+  only, so an ended agent stays ended. `harvest agents reload <id>` sends
+  the op to one agent.
+- In a rolling deploy, send the op only after every worker runs this
+  release. An older worker cannot decode it, and cannot replay a run that
+  holds it.
+- A control op applies at once, also while the agent is paused. A held op
+  runs on the new profile at the resume.
 
 ### Heartbeats and follow-ups (issue #2266)
 
@@ -1849,6 +1907,7 @@ so a list of the agents due to wake reads only those agents.
 | `harvest agents describe <kind>/<name>` | `GET /workflows/by-id/agent/{id}/query/harvest.entity.state` |
 | `harvest agents pause <id> --reason <text>` | `POST /workflows/by-id/agent/{id}/signal/harvest.entity.op` |
 | `harvest agents resume <id>` | the same route, with `resume` |
+| `harvest agents reload <id>` | the same route, with `reload_profile` |
 | `harvest agents erase <id>` | the signal route, then `POST /workflows/{exec}/erase-payloads` for each run and each scheduled pass |
 | `harvest agents profile list <kind>` | `GET /agents/{kind}/profile/versions` |
 | `harvest agents profile show <kind> [--version v]` | `GET /agents/{kind}/profile`, or `GET /agents/{kind}/profile/versions/{v}` |
@@ -2434,7 +2493,9 @@ fn with_overlays(db: &Path, base: AgentHarness) -> Result<AgentHarness, Box<dyn 
 - The version must still validate under the current harness profile.
   Then it applies to the run profile under the run ceilings. The op takes
   only the fields that an overlay can set. The mandate, the peers and the heartbeat stay those of the
-  run, so a deploy still changes the next run only.
+  run, so a deploy still changes the next run only. A
+  `Control::ReloadProfile` ends the run, so the next run reads them (see
+  "Reload the profile").
 - With no store, the op schedules no read. With no active version, the
   read records `overlay_version: None`, and the op runs on the run
   profile.

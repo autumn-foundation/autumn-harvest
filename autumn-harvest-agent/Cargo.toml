@@ -207,6 +207,10 @@ name = "overlay_read"
 required-features = ["sqlite"]
 
 [[test]]
+name = "profile_reload"
+required-features = ["sqlite"]
+
+[[test]]
 name = "overlay_read_postgres"
 required-features = ["postgres"]
 

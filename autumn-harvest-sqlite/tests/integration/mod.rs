@@ -19,6 +19,7 @@ mod cross_backend;
 mod docs_start_contract;
 mod drive_clock_refresh;
 mod durability;
+mod entity_checkpoint_request;
 mod execution_timeout;
 mod external_activities;
 mod fleet_fault_isolation;
