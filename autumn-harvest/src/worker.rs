@@ -4455,7 +4455,8 @@ fn existing_external_await_terminal(
 ///
 /// `new_events` contains ONLY the `External{Signal,Cancel}Requested` events plus
 /// any inline terminal (`Delivered`/`Failed`) appended for this batch. So the
-/// resolved-id set is fully derivable from it alone, without the batch items. A `Requested` event with no matching terminal (still pending → outbox
+/// resolved-id set is fully derivable from it alone, without the batch items.
+/// A `Requested` event with no matching terminal (still pending → outbox
 /// route) contributes no id.
 fn resolved_external_ids(new_events: &[WorkflowEvent]) -> ResolvedExternalIds {
     let mut resolved = ResolvedExternalIds::default();
@@ -21958,8 +21959,9 @@ fn arm_timer_events(commands: &[WorkflowCommand]) -> Vec<Option<WorkflowEvent>> 
 ///
 /// A same-batch `CancelTimer(X)` supersedes an `ArmTimer(X)` re-arm in
 /// **batch order**. A `for_await: true` (await) arm for X contributes its
-/// deadline iff **no `CancelTimer(X)` appears after it in the batch**. A `for_await: false` (fresh start/reset) arm never
-/// contributes a firing row on its own. Without this exclusion, an `await_fire`
+/// deadline iff **no `CancelTimer(X)` appears after it in the batch**. A
+/// `for_await: false` (fresh start/reset) arm never contributes a firing row on
+/// its own. Without this exclusion, an `await_fire`
 /// racing a sibling `cancel_timer(X)` in the same task would reschedule the parked
 /// task to a now-deleted row's deadline instead of waking immediately to consume
 /// the recorded `TimerCancelled`. The per-await-arm order-sensitivity has two
@@ -22581,8 +22583,9 @@ async fn handle_suspended_workflow(
     // Both already catch it locally at their own transaction boundary, so it
     // never surfaces this far. The other is `DetachedSpawnPersistence::persist`
     // inside any of the OTHER branches above. An example is a bookkeeping-only
-    // or activity-scheduling cycle that also detaches a child. Defer with a bounded backoff rather than terminally
-    // failing this execution over an unrelated tenant's quota.
+    // or activity-scheduling cycle that also detaches a child. Defer with a
+    // bounded backoff rather than terminally failing this execution over an
+    // unrelated tenant's quota.
     if let Err(ref error) = result
         && recover_from_child_quota_exceeded(
             conn,
@@ -25489,10 +25492,11 @@ enum TerminalMetricsKind {
 /// `SuspendedClaimAmbiguous`). The other is an operator pause caught by
 /// `check_paused_and_park`. Either way the metrics still counted a decision
 /// that was never durably persisted. The eventual real attempt then counts it
-/// again. A canary could even report SUCCESS for a discarded decision. Callers must call this ONLY after the
-/// persist transaction has actually committed (the `Persisted` arm), never
-/// speculatively -- mirrors the discipline issue #684 already established
-/// for `harvest.update.completed`/`.failed` and `harvest.signal.unhandled`.
+/// again. A canary could even report SUCCESS for a discarded decision.
+/// Callers must call this ONLY after the persist transaction has actually
+/// committed (the `Persisted` arm), never speculatively -- mirrors the
+/// discipline issue #684 already established for
+/// `harvest.update.completed`/`.failed` and `harvest.signal.unhandled`.
 ///
 /// Issue #1348 adds the other half of the ordering. Call this BEFORE any
 /// `.await` in the `Persisted` arm, right after the commit. A
@@ -29841,10 +29845,10 @@ async fn process_workflow_task(
                 );
                 return Err(error);
             }
-            // Issue #946: `persist_terminal_outcome_commands` calls `create_detached_child_executions`
-            // directly, so a `QuotaExceeded` from a detached child's target
-            // quota can surface here for the `is_terminal_with_commands`
-            // path. Defer with a bounded backoff rather than terminally
+            // Issue #946: `persist_terminal_outcome_commands` calls
+            // `create_detached_child_executions` directly, so a `QuotaExceeded`
+            // from a detached child's target quota can surface here for the
+            // `is_terminal_with_commands` path. Defer with a bounded backoff rather than terminally
             // failing this execution over an unrelated tenant's quota; the
             // transaction above already rolled back the whole cycle, so
             // nothing durable was created.
@@ -30265,8 +30269,9 @@ async fn process_task(
     capability_miss_policy: CapabilityMissPolicy,
     // Issue #804: the issue #494 wall-clock budget. It applies HERE around the
     // workflow decision cycle alone, not at the dispatch site around this
-    // whole function. So it can never cancel the capability-miss cleanup below. `None` on the activity path (never bounded
-    // by it) and when `workflow_task_timeout` is zero.
+    // whole function. So it can never cancel the capability-miss cleanup below.
+    // `None` on the activity path (never bounded by it) and when
+    // `workflow_task_timeout` is zero.
     workflow_body_timeout: Option<Duration>,
     // Issue #1815: the activity path records each attempt here.
     task_outcomes: &crate::worker_outlier::TaskOutcomeWindow,
@@ -31687,11 +31692,11 @@ pub enum TerminalWriteOutcome {
 ///
 /// **Evidence, not just ownership.** A peer re-registering clears itself from
 /// the task's `capability_miss_workers` without touching `worker_id` or
-/// `crash_strikes`, so the claim guard above is blind to it: the escalation
+/// `crash_strikes`, so the claim guard above is blind to it. The escalation
 /// would still commit and terminally fail a run the newly-capable peer could
-/// serve. When `recheck` is `Some`, the escalation is
-/// therefore re-decided from evidence read *under the task lock* — the
-/// authoritative decision. The pre-transaction check in
+/// serve. When `recheck` is `Some`, the escalation is therefore re-decided
+/// from evidence read *under the task lock*. That is the authoritative
+/// decision. The pre-transaction check in
 /// [`prepare_escalation_commit`] is kept as a cheap early exit, not as the
 /// guarantee. Both read no new locks (the miss state is the row already held;
 /// the fleet read is an unlocked `SELECT`), so adding the re-read introduces no
@@ -31741,18 +31746,19 @@ where
             crate::replication::assert_decision_fence(conn).await?;
             // Lock the execution row FIRST (the documented execution -> task
             // order) and re-derive the event id under that lock. The preloaded
-            // id was read *before* this transaction opened, so a parallel
-            // activity completing in between has already consumed it; appending
-            // at a consumed id aborts the whole terminal transaction on
-            // `UNIQUE(workflow_exec_id, event_id)` and leaves the row `RUNNING`
-            // under a LIVE incapable worker -- unclaimable, and invisible to
-            // orphan reclamation, which requires a dead heartbeat (issue #804).
+            // id was read *before* this transaction opened. A parallel activity
+            // completing in between has already consumed it. Appending at a
+            // consumed id aborts the whole terminal transaction on
+            // `UNIQUE(workflow_exec_id, event_id)`. That leaves the row
+            // `RUNNING` under a LIVE incapable worker. The row is then
+            // unclaimable, and invisible to orphan reclamation, which requires
+            // a dead heartbeat (issue #804).
             //
-            // This does not undo the history hoist. What the hoist moved out of
-            // the window was the *full* `store::load_history`, whose cost grows with
-            // the history; `next_event_id_for` is an indexed `MAX(event_id)`
-            // whose cost does not, and it takes the same execution-row lock, so
-            // it replaces the explicit lock rather than adding a read.
+            // This does not undo the history hoist. The hoist moved the *full*
+            // `store::load_history` out of the window, whose cost grows with
+            // the history. `next_event_id_for` is an indexed `MAX(event_id)`
+            // whose cost does not. It takes the same execution-row lock, so it
+            // replaces the explicit lock rather than adding a read.
             let preloaded = match preloaded {
                 PreloadedFailureHistory::Loaded { exec_id, .. } => {
                     PreloadedFailureHistory::Loaded {
@@ -31844,8 +31850,8 @@ async fn escalate_capability_miss(
 
     let (preloaded, revalidation) =
         prepare_escalation_commit(conn, ctx, policy, frontier_reset_committed).await;
-    // The re-decided resolution, not the one from a moment ago: an escalation
-    // that still stands may stand for a *different* cause now, and the cause is
+    // The re-decided resolution, not the one from a moment ago. An escalation
+    // that still stands may stand for a *different* cause now. The cause is
     // what the reason string, the metric label, and the log line report
     // (issue #804).
     let EscalationRevalidation::Stands(resolution) = revalidation else {
@@ -31865,10 +31871,10 @@ async fn escalate_capability_miss(
     // and the log line from it, so the three can never tell an operator
     // different stories about the same escalation.
     //
-    // The decision was made on the POST-increment distinct count (this claim is
-    // evidence), but the *reported* counts are the persisted ones: this branch
-    // never runs the release UPDATE, so no redelivery and no distinct-worker
-    // append actually happened for this claim. Reporting the
+    // The decision was made on the POST-increment distinct count, because this
+    // claim is evidence. But the *reported* counts are the persisted ones. This
+    // branch never runs the release UPDATE. So no redelivery and no
+    // distinct-worker append actually happened for this claim. Reporting the
     // post-increment total here would tell an operator that N+1 redeliveries
     // occurred when only N did.
     let escalation = escalation_from_persisted(
@@ -32592,17 +32598,17 @@ fn spawn_schedule_overdue_sampler(
         if !telemetry.metrics.is_enabled() {
             return;
         }
-        // Labels emitted on the previous pass, so a series that disappears from a
-        // COMPLETE pass (schedule deleted/renamed) can be zeroed instead of
+        // Labels emitted on the previous pass. A series that disappears from a
+        // COMPLETE pass (schedule deleted/renamed) is then zeroed instead of
         // sticking at its last value.
         let mut previous_emitted: std::collections::HashSet<ScheduleGaugeKey> =
             std::collections::HashSet::new();
         loop {
-            // Sample FIRST, then sleep: an eager pass on
-            // startup emits the gauge and learns the adaptive cadence
-            // immediately, so a worker that starts while a fast schedule is
-            // already wedged detects it within one cadence grace window rather
-            // than only after the initial ceiling sleep.
+            // Sample FIRST, then sleep. An eager pass on startup emits the
+            // gauge and learns the adaptive cadence immediately. A worker that
+            // starts while a fast schedule is already wedged then detects it
+            // within one cadence grace window, not after the initial ceiling
+            // sleep.
             let now = chrono::Utc::now();
             // Aggregate verdicts across ALL shard pools into one (kind, name) map
             // (overdue if any shard's same-named schedule is overdue) BEFORE
@@ -33827,8 +33833,8 @@ fn spawn_stranded_work_sampler(
                 };
 
                 // Back-fill effective requirements for activity rows that did not
-                // snapshot required_capabilities (legacy/manual enqueues), so the
-                // coverage check below applies the same activity eligibility
+                // snapshot required_capabilities (legacy/manual enqueues). The
+                // coverage check below then applies the same activity eligibility
                 // claim_task's $6 gate enforces.
                 crate::queue::apply_activity_requirements(&mut demands, &activity_requirements);
 
@@ -34385,8 +34391,8 @@ fn spawn_history_oversized_sampler(
             // gauge.
             let mut count_by_workflow: std::collections::HashMap<String, u64> =
                 std::collections::HashMap::new();
-            // Skip the whole tick on any shard read failure so a partial aggregate
-            // (or the zero-fill below) does not clear the gauge during an outage
+            // Skip the whole tick on any shard read failure. A partial aggregate
+            // (or the zero-fill below) must not clear the gauge during an outage
             // (#522).
             let mut read_failed = false;
             for pool in &pools {
@@ -37737,10 +37743,10 @@ impl Worker {
         // eventually clears it, and the poll loop must observe the clearing to
         // resume claiming on that shard. See `may_claim_tasks`.
         //
-        // Every per-shard acquisition here is bounded (issue #961):
-        // this loop is sequential, so an unreachable or exhausted
-        // pool on ONE shard would otherwise park it forever and the poll loop
-        // below would never start at all — stranding every healthy shard. A
+        // Every per-shard acquisition here is bounded (issue #961). This loop
+        // is sequential. An unreachable or exhausted pool on ONE shard would
+        // otherwise park it forever, and the poll loop below would never start
+        // at all. That would strand every healthy shard. A
         // bounded failure instead arms that shard's pending flag, which its own
         // heartbeat task retries. See `shard_acquire_bound`.
         // Cross-shard reads need a connection this process does not already
@@ -39091,16 +39097,16 @@ impl Worker {
                 )
             })
             .collect();
-        // Worker-session local-registry reconciler (issue #606): a session's
-        // `harvest_sessions` row may live on any shard this worker touches
-        // (session identity does not self-encode a shard the way ExecutionId
-        // does), so — mirroring the poison-pill reclaimer above — one
-        // reconciler per assigned shard pool checks this worker's *entire*
-        // local registry against that shard's rows; a session hosted on a
-        // different shard simply matches zero rows there and is a no-op for
-        // that pool. Reuses the heartbeat cadence, matching the other
-        // session-adjacent scanners (the broken-session scanner shares this
-        // same interval via `enforce_timeouts_once`).
+        // Worker-session local-registry reconciler (issue #606). A session's
+        // `harvest_sessions` row may live on any shard this worker touches.
+        // Session identity does not self-encode a shard the way ExecutionId
+        // does. So, as with the poison-pill reclaimer above, one reconciler
+        // per assigned shard pool checks this worker's *entire* local registry
+        // against that shard's rows. A session hosted on a different shard
+        // simply matches zero rows there and is a no-op for that pool. Reuses
+        // the heartbeat cadence, matching the other session-adjacent scanners
+        // (the broken-session scanner shares this same interval via
+        // `enforce_timeouts_once`).
         let session_slot_reconcilers: Vec<_> = shard_pools_for_monitors
             .iter()
             .map(|(shard_pool, shard)| {
@@ -39520,9 +39526,9 @@ impl Worker {
         // worker (not the scheduler tick) and no-ops internally when metrics are
         // disabled. Uses `sampler_pools` so single-shard and multi-shard
         // deployments both aggregate the full schedule set. The interval is
-        // adaptive: a coarse 30s ceiling for a slow/Manual fleet,
-        // adapting down toward the fastest active cadence (never below
-        // `poll_interval`) so a sub-30s schedule is still detected within its
+        // adaptive, with a coarse 30s ceiling for a slow/Manual fleet. It
+        // adapts down toward the fastest active cadence, never below
+        // `poll_interval`. So a sub-30s schedule is still detected within its
         // grace window.
         #[cfg(feature = "db")]
         let schedule_overdue_sampler = Some(spawn_schedule_overdue_sampler(
@@ -39572,7 +39578,7 @@ impl Worker {
     // to before this field existed.
     /// `registration_pending` is this **pool's own** flag, returned by
     /// `register_in_fleet` for this same pool. It is deliberately not a field
-    /// on `Worker`: `run_multi_shard` spawns one heartbeat per shard, and a
+    /// on `Worker`, because `run_multi_shard` spawns one heartbeat per shard. A
     /// shared flag would let a shard whose registration succeeded clear the
     /// retry a *failed* shard still needs (issue #804).
     #[allow(clippy::too_many_arguments)]
@@ -41099,16 +41105,16 @@ impl Worker {
 
         // This registration may be a RESTART of the same configured worker_id
         // onto a NEW build (register_worker upserts on worker_id and refreshes
-        // build_id/started_at). Capability-miss evidence stores bare IDs, so
-        // the restarted -- possibly now capable -- instance would otherwise be
-        // indistinguishable from the old incapable one, and another claimant
-        // would derive `AllLiveWorkersMissed` and terminally fail a run at
+        // build_id/started_at). Capability-miss evidence stores bare IDs. So
+        // the restarted, possibly now capable, instance would otherwise be
+        // indistinguishable from the old incapable one. Another claimant would
+        // then derive `AllLiveWorkersMissed` and terminally fail a run at
         // exactly the moment the fix arrived (issue #804).
         //
         // Publishing the worker while that cleanup fails is strictly worse than
-        // not publishing it, so the two are ATOMIC: a failed
-        // invalidation rolls the registration back, and the heartbeat's
-        // `Ok(0)` self-heal retries the pair within one interval. See
+        // not publishing it, so the two are ATOMIC. A failed invalidation rolls
+        // the registration back. The heartbeat's `Ok(0)` self-heal retries the
+        // pair within one interval. See
         // `register_worker_and_clear_stale_miss_evidence`.
         let registration = crate::workers::WorkerRegistration {
             worker_id: self.config.worker_id.clone(),
@@ -41143,12 +41149,11 @@ impl Worker {
                         false
                     }
                     Err(error) => {
-                        // Arm the heartbeat retry. Necessary because the
-                        // heartbeat's own `Ok(0)` re-registration only fires
-                        // when the row is ABSENT: a reused `worker_id` leaves
-                        // the previous row alive, the heartbeat updates it, and
-                        // without this the atomic pair would never be retried
-                        // (issue #804).
+                        // Arm the heartbeat retry. The heartbeat's own `Ok(0)`
+                        // re-registration only fires when the row is ABSENT. A
+                        // reused `worker_id` leaves the previous row alive, and
+                        // the heartbeat updates it. Without this the atomic pair
+                        // would never be retried (issue #804).
                         tracing::warn!(
                             worker_id = %self.config.worker_id,
                             error = %error,
@@ -42665,8 +42670,8 @@ impl Worker {
         //
         // Deliberately `capability_miss_fleet_stale_secs`, NOT the bare
         // `worker_stale_secs` the poison-pill reclaimer and broken-session
-        // scanner use: those judge rows with a window they
-        // chose, whereas this judges *peers* by a cadence they did not. Without
+        // scanner use. Those judge rows with a window they chose. This judges
+        // *peers* by a cadence they did not choose. Without
         // the floor a fast-heartbeating claimant drops a live peer on the
         // default cadence and terminally fails an execution it could have run.
         let capability_miss_policy = CapabilityMissPolicy {
@@ -44861,10 +44866,10 @@ pub(crate) struct PoolShortfall {
 /// spawns one timeout checker per logical *assignment* — so a colocated
 /// topology puts N scanners on one pool, each holding a connection for its
 /// whole pass. Counting per logical shard therefore under-counts demand by
-/// exactly the aliasing factor: shards 0 and 1 sharing a pool at `max_size = 2`
-/// look fine twice over, while between them they can hold both connections and
-/// leave a third shard's checker unable to probe that database at all (issue
-/// #1146).
+/// exactly the aliasing factor. Shards 0 and 1 sharing a pool at
+/// `max_size = 2` look fine twice over. But between them they can hold both
+/// connections. A third shard's checker is then unable to probe that database
+/// at all (issue #1146).
 ///
 /// The requirement for one physical pool is therefore `local scanners + 1`, not
 /// a flat 2. Identity comes from `same_underlying_pool`, the same test the
@@ -45479,8 +45484,8 @@ mod tests {
     /// The release and escalation branches must report OPPOSITE distinct-worker
     /// bases, and it is easy to swap both (issue #804).
     ///
-    /// This is the pin that catches a swap: a tracing field is invisible
-    /// to every other test in the suite, so the choice is routed through one
+    /// This is the pin that catches a swap. A tracing field is invisible to
+    /// every other test in the suite. So the choice is routed through one
     /// helper and asserted here.
     #[test]
     fn the_two_branches_report_opposite_distinct_worker_bases() {
@@ -45495,9 +45500,9 @@ mod tests {
         };
         // The release branch reports what its own UPDATE returned. The durable
         // value (2) is deliberately lower than BOTH the snapshot's
-        // `distinct_after` (4) and its `distinct_before` (3) -- the case
-        // with two peers re-registering and having their evidence
-        // invalidated between the read and the write. Two rather than one so
+        // `distinct_after` (4) and its `distinct_before` (3). Here two peers
+        // re-register and their evidence is invalidated between the read and
+        // the write. Two rather than one so
         // the durable count cannot coincide with either snapshot field, which
         // is what makes the assertions below discriminating.
         assert_eq!(
@@ -46448,7 +46453,7 @@ mod tests {
 
     /// The aliased case the per-logical-shard check could not see. Two logical
     /// shards on one physical pool at `max_size = 2` passed a `max_size < 2`
-    /// test twice, while between them holding both connections and starving a
+    /// test twice. Between them they held both connections. That starved a
     /// third shard's cross-shard read (issue #1146).
     #[test]
     fn two_shards_aliased_onto_one_pool_need_a_third_connection() {
@@ -49707,8 +49712,8 @@ mod tests {
 
     /// Issue #768: a fresh `ArmTimer { for_await: false }`
     /// (from `start_timer`/`reset`) emits a `TimerStarted` event for positional
-    /// replay but the pure `arm_timer_events` never signals a `harvest_timers`
-    /// row insert — a cancellable timer becomes fire-eligible only when it is
+    /// replay. But the pure `arm_timer_events` never signals a `harvest_timers`
+    /// row insert. A cancellable timer becomes fire-eligible only when it is
     /// awaited (`for_await: true`, resolved by the DB loop). So a `start_timer`
     /// that arms and then completes/parks in the same task records its arm event
     /// without leaking a never-firing row.
@@ -49748,12 +49753,12 @@ mod tests {
         );
     }
 
-    /// Issue #768: an `await_fire` re-arm (`for_await: true`) followed by a
-    /// same-task sibling branch's `cancel_timer` in the SAME batch must NOT
-    /// contribute a deadline to `min_fires_at` (`armed_indices` empty → the caller's
-    /// `armed_fires_at` is `None` → the parked task wakes NOW instead of being
-    /// rescheduled to the deleted row's deadline), and the cancel must emit
-    /// `TimerCancelled`.
+    /// Issue #768: take an `await_fire` re-arm (`for_await: true`) followed by
+    /// a same-task sibling branch's `cancel_timer` in the SAME batch. The
+    /// re-arm must NOT contribute a deadline to `min_fires_at`. Then
+    /// `armed_indices` is empty and the caller's `armed_fires_at` is `None`.
+    /// So the parked task wakes NOW instead of being rescheduled to the deleted
+    /// row's deadline. The cancel must emit `TimerCancelled`.
     #[test]
     fn plan_timer_lifecycle_pure_excludes_a_same_batch_cancelled_await_arm() {
         let commands = vec![
@@ -49977,8 +49982,8 @@ mod tests {
     }
 
     /// A LIVE cancellable arm colliding with a same-batch classic `StartTimer`
-    /// for the same id is a hard invariant violation (issue #768): the
-    /// arm's `TimerStarted` would be silently dropped, corrupting history. The
+    /// for the same id is a hard invariant violation (issue #768). The arm's
+    /// `TimerStarted` would be silently dropped, corrupting history. The
     /// persist guard must flag it.
     #[test]
     fn uncancelled_arm_start_collision_is_detected() {
@@ -50001,9 +50006,9 @@ mod tests {
         );
     }
 
-    /// Order-independence (issue #768): a classic `StartTimer(x)`
-    /// placed BEFORE a same-id cancellable `ArmTimer(x)` in the batch is the reverse
-    /// order of the prefix-only check, and must still be flagged.
+    /// Order-independence (issue #768). A classic `StartTimer(x)` placed BEFORE
+    /// a same-id cancellable `ArmTimer(x)` in the batch is the reverse order of
+    /// the prefix-only check. It must still be flagged.
     #[test]
     fn start_before_uncancelled_arm_collision_is_detected() {
         let commands = vec![
@@ -50988,8 +50993,8 @@ mod tests {
         ];
         let batch = extract_mixed_suspension_batch(&commands).expect("a mixed batch");
         // The arm in `suspended_command_event_count` counts exactly these three
-        // buckets on top of `pre_suspension_event_count`'s bookkeeping — but it
-        // resolves the timer and child buckets against the DB first, since
+        // buckets on top of `pre_suspension_event_count`'s bookkeeping. But it
+        // resolves the timer and child buckets against the DB first.
         // `persist_mixed_suspension_batch` emits their events only for genuinely
         // NEW rows. Taking the vector lengths would inflate the prospective
         // count on every re-park. This assertion is therefore the
@@ -51115,10 +51120,10 @@ mod tests {
         );
     }
 
-    /// `TimerHandle::await_fire()` is a durable await that
-    /// emits `ArmTimer { for_await: true }` — the ONE path that inserts the
-    /// `harvest_timers` row and makes a cancellable timer fire-eligible — and
-    /// then parks. Joined with a local activity it must be rejected like every
+    /// `TimerHandle::await_fire()` is a durable await that emits
+    /// `ArmTimer { for_await: true }` and then parks. It is the ONE path that
+    /// inserts the `harvest_timers` row and makes a cancellable timer
+    /// fire-eligible. Joined with a local activity it must be rejected like every
     /// other durable sibling.
     ///
     /// Without this it slipped through the conflict list into the
@@ -51904,9 +51909,9 @@ mod tests {
     #[test]
     fn configured_total_bound_requires_confirmed_fleet_coverage() {
         let budget = 5_u32;
-        // `Unavailable`: the registry gave no usable answer, so `budget` total
-        // releases may all have been won by the SAME worker -- exactly the
-        // hazard the distinct bound exists to prevent. The tight bound must
+        // `Unavailable`: the registry gave no usable answer. So `budget` total
+        // releases may all have been won by the SAME worker. That is exactly
+        // the hazard the distinct bound exists to prevent. The tight bound must
         // NOT fire; the ceiling remains the only backstop.
         assert_eq!(
             capability_miss_decision(1, 6, budget, FleetCapabilityEvidence::Unavailable),
@@ -52271,16 +52276,18 @@ mod tests {
 
     /// The absolute release ceiling must NOT claim the fleet-wide conclusion.
     ///
-    /// A secondary bound exists —
-    /// `CAPABILITY_MISS_TOTAL_BUDGET_MULTIPLIER x budget` total releases — so a
-    /// fleet SMALLER than the budget still terminates (with one incapable
-    /// worker the distinct set can never exceed a budget of 5, so the primary
-    /// bound alone would bounce forever and AC3 would not hold). If that branch
-    /// resolved to `BudgetExhausted`, it would report "escalated
-    /// after {budget} capability-miss redeliveries; no live worker on this queue
-    /// has the handler" — two false statements at once: the real release count
-    /// is `10 x` higher, and the task may have been missed by a single worker
-    /// while a capable peer merely lost the claim races.
+    /// A secondary bound exists:
+    /// `CAPABILITY_MISS_TOTAL_BUDGET_MULTIPLIER x budget` total releases. So a
+    /// fleet SMALLER than the budget still terminates. With one incapable
+    /// worker the distinct set can never exceed a budget of 5. The primary
+    /// bound alone would then bounce forever, and AC3 would not hold.
+    ///
+    /// Suppose that branch resolved to `BudgetExhausted`. It would report
+    /// "escalated after {budget} capability-miss redeliveries; no live worker
+    /// on this queue has the handler". That is two false statements at once.
+    /// The real release count is `10 x` higher. And the task may have been
+    /// missed by a single worker while a capable peer merely lost the claim
+    /// races.
     ///
     /// That is precisely the failure the exhaustive `EscalationCause` match was
     /// introduced to prevent, so the ceiling gets its own variant that states
@@ -52603,9 +52610,9 @@ mod tests {
     /// lose information — it *asserts the opposite*, silently dropping every
     /// cross-build peer `claim_task` would still let claim through
     /// `harvest_build_compat`. The narrowed fleet then contains only the
-    /// incapable claimer, `fleet_capability_evidence` fabricates
-    /// `AllLiveWorkersMissed`, and the configured-total bound fires at
-    /// `budget + 1` — terminally failing an execution a live capable peer was
+    /// incapable claimer, and `fleet_capability_evidence` fabricates
+    /// `AllLiveWorkersMissed`. The configured-total bound then fires at
+    /// `budget + 1`. That terminally fails an execution a live capable peer was
     /// eligible to run, on the strength of one transient `SELECT` failure.
     ///
     /// This is the same doctrine the unparseable-`required_capabilities` case
@@ -52919,10 +52926,10 @@ mod tests {
                 distinct_after: 1,
                 completed_releases: 50,
                 released_workers: 1,
-                // `Unavailable`, not confirmed coverage: the
-                // configured budget also bounds TOTAL releases once coverage is
-                // confirmed, so a one-worker fleet could never reach 50
-                // releases under `AllLiveWorkersMissed`. The ceiling wording
+                // `Unavailable`, not confirmed coverage. The configured budget
+                // also bounds TOTAL releases once coverage is confirmed. So a
+                // one-worker fleet could never reach 50 releases under
+                // `AllLiveWorkersMissed`. The ceiling wording
                 // this test is about is reachable only here.
                 evidence: FleetCapabilityEvidence::Unavailable,
             },
@@ -53633,7 +53640,7 @@ mod tests {
     #[test]
     fn capability_miss_fleet_window_never_shrinks_the_liveness_window() {
         // The whole safety argument for the floor is that it can only ever
-        // RETAIN more peers than the window without the floor, so no fleet that
+        // RETAIN more peers than the window without the floor. So no fleet that
         // escalated correctly before can start escalating spuriously now.
         for secs in [0, 1, 2, 5, 10, 30, 59, 60, 61, 120, 600, 86_400] {
             let interval = Duration::from_secs(secs);
@@ -53851,10 +53858,10 @@ mod tests {
 
     #[test]
     fn missing_local_activity_handler_names_the_activity_that_cannot_run() {
-        // Issue #804: the inline local-activity arm commits
+        // Issue #804: the inline local-activity arm commits several things
+        // BEFORE `run_local_activity_inline` consults the registry. They are
         // durable logs (#790), progress notifications (#791), search-attribute
-        // and current-details patches, and mutex releases (#691) BEFORE
-        // `run_local_activity_inline` consults the registry. Once a miss became
+        // and current-details patches, and mutex releases (#691). Once a miss became
         // releasable, every incapable redelivery re-ran those commits. This
         // preflight is what lets the arm bail out ahead of them.
         let registry = registry_knowing("known_wf", "known_act");
@@ -53903,11 +53910,11 @@ mod tests {
 
     #[test]
     fn persist_capability_miss_finds_each_handler_bearing_command() {
-        // Issue #804: the three commands whose PERSISTENCE
-        // resolves a handler must all be caught by the pre-pass that runs
-        // *ahead* of the terminal telemetry, mirroring the in-transaction
-        // checks in persist_scheduled_activities /
-        // persist_all_started_child_workflows / create_detached_child_executions.
+        // Issue #804: the three commands whose PERSISTENCE resolves a handler
+        // must all be caught by the pre-pass that runs *ahead* of the terminal
+        // telemetry. That mirrors the in-transaction checks in
+        // persist_scheduled_activities / persist_all_started_child_workflows /
+        // create_detached_child_executions.
         let registry = registry_knowing("known_wf", "known_act");
 
         assert_eq!(
@@ -54213,8 +54220,8 @@ mod tests {
     }
 
     /// A row with no frontier recorded yet reads as a mismatch, which is the
-    /// safe direction: a full budget releases, where a fabricated match could
-    /// charge a spend nobody made (issue #804).
+    /// safe direction (issue #804). A full budget releases. A fabricated match
+    /// could charge a spend nobody made.
     #[test]
     fn an_unrecorded_frontier_reads_as_a_fresh_budget() {
         let task = TaskQueueItem {
@@ -54270,9 +54277,9 @@ mod tests {
 
     /// A re-read that matches no owned row is POSITIVE evidence that the claim
     /// is gone, not merely an absence of fresh data. It must not fall back to
-    /// the snapshot and let the decision proceed: the escalation write is not
-    /// ownership-guarded (`queue::fail_task` accepts any PENDING/RUNNING row
-    /// regardless of `worker_id`), so a stale dispatcher deciding `Escalate`
+    /// the snapshot and let the decision proceed. The escalation write is not
+    /// ownership-guarded: `queue::fail_task` accepts any PENDING/RUNNING row
+    /// regardless of `worker_id`. So a stale dispatcher deciding `Escalate`
     /// terminally fails a task another worker now owns.
     #[test]
     fn a_lost_claim_is_distinguished_from_an_unreadable_row() {
@@ -54764,9 +54771,9 @@ mod tests {
 
     #[test]
     fn capability_miss_budget_is_not_consumed_twice_by_the_same_worker() {
-        // Issue #804: the backoff makes a released task
-        // eligible to EVERY worker again, including the one that just released
-        // it, and the claim query has no capability filter. Under plain
+        // Issue #804: the backoff makes a released task eligible to EVERY
+        // worker again, including the one that just released it. The claim
+        // query has no capability filter. Under plain
         // total-miss accounting, six consecutive claim-race wins by ONE
         // incapable worker terminally failed the run while a capable peer was
         // live — the exact rolling-deploy outage #804 exists to prevent.
