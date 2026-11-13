@@ -9484,7 +9484,7 @@ fn format_herd_table(value: &Value) -> String {
     for (key, label) in [
         ("unanchored", "Not forecast (interval schedules)"),
         ("inactive", "Not forecast (paused, exhausted or unparsable)"),
-        ("truncated", "Cut short (too many fires)"),
+        ("truncated", "Cut short (too many fires to forecast)"),
     ] {
         let names = herd_names(value.get(key));
         if !names.is_empty() {

@@ -49461,6 +49461,9 @@ pub(crate) struct ScheduleHerdReport {
     /// Paused, exhausted and unparsable schedules. The scheduler fires none.
     pub inactive: Vec<HerdScheduleRef>,
     /// Schedules that fire so often that the forecast stopped reading them.
+    ///
+    /// It also lists a budgeted schedule with too many slots before the
+    /// window. Its budget at the window is unknown, so it is not forecast.
     pub truncated: Vec<HerdScheduleRef>,
     /// `complete`, or `partial` when a shard did not answer.
     pub status: FanoutStatus,
@@ -49481,23 +49484,32 @@ fn herd_schedule_ref(row: &HarvestSchedule) -> HerdScheduleRef {
     }
 }
 
+/// The most slots that one schedule walks before the herd window opens.
+const HERD_MAX_SLOTS_BEFORE: i32 = 100_000;
+
 /// The slots of `schedule` from `next_run_at` up to `from`, at most `cap`.
 ///
 /// The scheduler spends a run of the budget on each of these slots before the
 /// window opens. With no `next_run_at`, or one at or after `from`, it is 0.
+///
+/// Returns `None` when the walk reaches [`HERD_MAX_SLOTS_BEFORE`] first. The
+/// budget at the window is then unknown, so the caller does not forecast it.
 fn slots_before(
     schedule: &Schedule,
     next_run_at: Option<chrono::DateTime<chrono::Utc>>,
     from: chrono::DateTime<chrono::Utc>,
     cap: i32,
-) -> i32 {
+) -> Option<i32> {
     let Some(first) = next_run_at.filter(|&first| first < from) else {
-        return 0;
+        return Some(0);
     };
     let walker = autumn_harvest::schedule_plan::SlotWalker::new(schedule);
     let mut count = 1;
     let mut cursor = first;
     while count < cap {
+        if count >= HERD_MAX_SLOTS_BEFORE {
+            return None;
+        }
         match walker.next_after(cursor).filter(|&slot| slot < from) {
             Some(slot) => {
                 count += 1;
@@ -49506,7 +49518,39 @@ fn slots_before(
             None => break,
         }
     }
-    count.min(cap)
+    Some(count.min(cap))
+}
+
+/// The schedules to forecast, with the run budget each one has at `from`.
+///
+/// Each budget drops by the slots before the window. A schedule whose walk is
+/// too long to project goes into the third list and is not forecast. A `None`
+/// budget means no run limit.
+#[allow(clippy::type_complexity)]
+fn project_herd_budgets(
+    candidates: Vec<(&HarvestSchedule, Schedule)>,
+    from: chrono::DateTime<chrono::Utc>,
+) -> (
+    Vec<(&HarvestSchedule, Schedule)>,
+    Vec<Option<i32>>,
+    Vec<HerdScheduleRef>,
+) {
+    let mut active = Vec::new();
+    let mut budgets = Vec::new();
+    let mut unprojected = Vec::new();
+    for (row, schedule) in candidates {
+        let budget = schedule_remaining_runs(row.max_runs, row.runs_started);
+        let projected = budget.map_or(Some(None), |left| {
+            slots_before(&schedule, row.next_run_at, from, left).map(|spent| Some(left - spent))
+        });
+        if let Some(budget) = projected {
+            budgets.push(budget);
+            active.push((row, schedule));
+        } else {
+            unprojected.push(herd_schedule_ref(row));
+        }
+    }
+    (active, budgets, unprojected)
 }
 
 /// Split `rows` into the schedules that the scheduler fires and the rest.
@@ -49562,7 +49606,8 @@ pub(crate) fn build_herd_report(
     let limit = limit.clamp(1, HERD_MAX_LIMIT);
     let until = from + chrono::Duration::hours(i64::from(hours));
 
-    let (active, inactive) = partition_herd_rows(rows);
+    let (candidates, inactive) = partition_herd_rows(rows);
+    let (active, mut budgets, unprojected) = project_herd_budgets(candidates, from);
 
     // The forecast keys each schedule by its row id, so two rows with one
     // name stay two schedules.
@@ -49571,13 +49616,6 @@ pub(crate) fn build_herd_report(
         .iter()
         .zip(&active)
         .map(|(key, (_, schedule))| (key.as_str(), schedule))
-        .collect();
-    let mut budgets: Vec<Option<i32>> = active
-        .iter()
-        .map(|(row, schedule)| {
-            schedule_remaining_runs(row.max_runs, row.runs_started)
-                .map(|left| left - slots_before(schedule, row.next_run_at, from, left))
-        })
         .collect();
     let forecast = forecast_shifted(
         &pairs,
@@ -49648,7 +49686,10 @@ pub(crate) fn build_herd_report(
         offenders,
         unanchored: refs(&forecast.unanchored),
         inactive,
-        truncated: refs(&forecast.truncated),
+        truncated: refs(&forecast.truncated)
+            .into_iter()
+            .chain(unprojected)
+            .collect(),
         status: FanoutStatus::Complete,
         unavailable_shards: Vec::new(),
     }
@@ -60017,6 +60058,25 @@ mod tests {
             "24 of the 30 runs come before the window"
         );
         assert_eq!(left.spot_count, 6);
+    }
+
+    #[test]
+    fn the_herd_report_does_not_project_a_budget_too_far_ahead() {
+        let far = herd_epoch() + chrono::Duration::days(2);
+        let dense = autumn_harvest::models::HarvestSchedule {
+            max_runs: Some(2_000_000_000),
+            next_run_at: Some(herd_epoch()),
+            ..herd_row(1, "dense", "cron:* * * * * *")
+        };
+        let plain = herd_row(2, "plain", "cron:0 * * * *");
+        let report = build_herd_report(&[dense, plain], far, 1, 60, 2, 50);
+        let truncated: Vec<&str> = report.truncated.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(
+            truncated,
+            ["dense"],
+            "two days of seconds pass the walk cap"
+        );
+        assert_eq!(report.fires, 1, "only the plain schedule is forecast");
     }
 
     #[test]
