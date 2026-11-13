@@ -9867,6 +9867,11 @@ pub struct ClaimablePendingDemand {
 /// Mirrors **every** claim-time gate in [`claim_task_query`], including the
 /// issue #619 queue-pause and issue #807 activity-pause anti-joins. Bind: `$1`
 /// circuit-breaker-tracked activities.
+///
+/// The `PAUSED` gate is a `NOT EXISTS` probe, as in `oldest_pending_ages`. A
+/// `LEFT JOIN` on the executions let the planner pick a nested loop. That loop
+/// scanned every execution for each pending row. At 100,000 pending rows one
+/// call ran for more than 300 s. The probe reads `idx_harvest_we_paused`.
 #[must_use]
 pub fn claimable_pending_demand_query() -> String {
     // `sticky_owner` is NULL unless an unexpired lease binds the row to a
@@ -9901,7 +9906,6 @@ pub fn claimable_pending_demand_query() -> String {
                 {sticky_owner_expr} AS sticky_owner, tq.activity_name, \
                 COUNT(*)::BIGINT AS cnt \
          FROM harvest_task_queue tq \
-         LEFT JOIN harvest_workflow_executions e ON e.id = tq.workflow_exec_id \
          WHERE tq.state = 'PENDING' \
            AND tq.scheduled_at <= NOW() \
            AND {queue_pause_gate} \
@@ -9913,8 +9917,8 @@ pub fn claimable_pending_demand_query() -> String {
            AND ( \
                tq.task_type <> 'workflow' \
                OR tq.workflow_exec_id IS NULL \
-               OR e.id IS NULL \
-               OR e.state <> 'PAUSED' \
+               OR NOT EXISTS ( SELECT 1 FROM harvest_workflow_executions e \
+                   WHERE e.id = tq.workflow_exec_id AND e.state = 'PAUSED' ) \
            ) \
            AND ( \
                tq.concurrency_key IS NULL \

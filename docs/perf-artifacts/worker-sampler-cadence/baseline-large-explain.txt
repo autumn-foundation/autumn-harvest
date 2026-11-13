@@ -1,0 +1,51 @@
+-- concurrency_key_stats
+Finalize GroupAggregate  (cost=26410.59..26436.16 rows=80 width=33) (actual time=45.044..50.377 rows=56 loops=1)
+  Group Key: concurrency_key, task_type
+  Buffers: shared hit=6462 read=13768
+  ->  Gather Merge  (cost=26410.59..26433.36 rows=160 width=33) (actual time=45.031..50.339 rows=168 loops=1)
+        Workers Planned: 2
+        Workers Launched: 2
+        Buffers: shared hit=6462 read=13768
+        ->  Partial GroupAggregate  (cost=25410.57..25414.87 rows=80 width=33) (actual time=33.412..33.621 rows=56 loops=3)
+              Group Key: concurrency_key, task_type
+              Buffers: shared hit=6462 read=13768
+              ->  Sort  (cost=25410.57..25411.01 rows=175 width=28) (actual time=33.397..33.444 rows=1150 loops=3)
+                    Sort Key: concurrency_key, task_type
+                    Sort Method: quicksort  Memory: 124kB
+                    Buffers: shared hit=6462 read=13768
+                    Worker 0:  Sort Method: quicksort  Memory: 80kB
+                    Worker 1:  Sort Method: quicksort  Memory: 107kB
+                    ->  Parallel Seq Scan on harvest_task_queue  (cost=0.05..25404.05 rows=175 width=28) (actual time=0.387..32.850 rows=1150 loops=3)
+                          Filter: ((concurrency_key IS NOT NULL) AND (concurrency_cap IS NOT NULL) AND (queue_name = ANY ('{q0,q1,q2,q3,q4,q5,q6,q7,q8,q9,q10,q11,q12,q13,q14,q15,q16,q17,q18,q19}'::text[])) AND ((state = 'PENDING'::text) OR ((state = 'RUNNING'::text) AND (worker_id IS NOT NULL))))
+                          Rows Removed by Filter: 208850
+                          Buffers: shared hit=6386 read=13768
+Planning:
+  Buffers: shared hit=8
+Planning Time: 0.371 ms
+Execution Time: 50.424 ms
+
+-- sample_rate_limit_buckets
+Seq Scan on harvest_rate_limit_buckets  (cost=0.00..282.00 rows=909 width=35) (actual time=0.010..1.007 rows=1000 loops=1)
+  Filter: (((key)::text !~~ 'dyn-rate:%'::text) AND ((key)::text !~~ 'start-throttle:%'::text))
+  Rows Removed by Filter: 9000
+  Buffers: shared hit=132
+Planning Time: 0.100 ms
+Execution Time: 1.096 ms
+
+-- dead_letter_count
+Finalize Aggregate  (cost=26250.26..26250.27 rows=1 width=8) (actual time=140.101..145.782 rows=1 loops=1)
+  Buffers: shared hit=744148
+  ->  Gather  (cost=26250.04..26250.25 rows=2 width=8) (actual time=140.017..145.773 rows=3 loops=1)
+        Workers Planned: 2
+        Workers Launched: 2
+        Buffers: shared hit=744148
+        ->  Partial Aggregate  (cost=25250.04..25250.05 rows=1 width=8) (actual time=130.109..130.111 rows=1 loops=3)
+              Buffers: shared hit=744148
+              ->  Parallel Index Only Scan using idx_harvest_dl_failed_at on harvest_dead_letters  (cost=0.42..24208.25 rows=416719 width=0) (actual time=0.058..113.747 rows=333333 loops=3)
+                    Heap Fetches: 0
+                    Buffers: shared hit=744148
+Planning:
+  Buffers: shared hit=3
+Planning Time: 0.134 ms
+Execution Time: 145.847 ms
+

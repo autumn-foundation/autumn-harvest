@@ -39,7 +39,7 @@ The issue records two rejected rewrites. An early-exit oversized check costs
 
 ## 🔧 Change
 
-- `WorkerConfig::population_sample_interval`, default 15 s, drives both
+- `WorkerConfig::gauge_sample_interval`, default 15 s, drives both
   samplers. Every other sampler keeps `poll_interval`.
 - The gauge semantics do not change. Each worker still emits the fleet-wide
   value.
