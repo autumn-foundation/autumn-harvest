@@ -49637,14 +49637,20 @@ async fn schedule_herd_handler(
         status,
         unavailable_shards,
     } = load_schedules_from_shards(&api_state).await?;
-    let mut report = build_herd_report(
-        &rows,
-        from,
-        params.hours,
-        params.bucket_secs,
-        params.min_herd,
-        params.limit,
-    );
+    // The forecast is CPU work with no await point. Run it on the blocking
+    // pool, so a large window does not stall the async worker of other tasks.
+    let mut report = tokio::task::spawn_blocking(move || {
+        build_herd_report(
+            &rows,
+            from,
+            params.hours,
+            params.bucket_secs,
+            params.min_herd,
+            params.limit,
+        )
+    })
+    .await
+    .map_err(AutumnError::internal_server_error)?;
     report.status = status;
     report.unavailable_shards = unavailable_shards;
     Ok(Json(report))
