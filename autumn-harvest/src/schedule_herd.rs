@@ -133,7 +133,10 @@ pub fn forecast_shifted(
         .unwrap_or(i64::MAX)
         .max(1_000);
     let min_herd = if min_herd == 0 { 2 } else { min_herd };
-    let mut buckets: BTreeMap<i64, Vec<String>> = BTreeMap::new();
+    // Each bucket holds schedule indices, not names. A schedule that fires
+    // again in the same bucket adds no entry, so the memory follows the
+    // distinct members and not the fires.
+    let mut buckets: BTreeMap<i64, Vec<usize>> = BTreeMap::new();
     let mut fires = 0;
     let mut unanchored = Vec::new();
     let mut truncated = Vec::new();
@@ -165,7 +168,10 @@ pub fn forecast_shifted(
             };
             read += 1;
             let key = start.timestamp_millis().div_euclid(width);
-            buckets.entry(key).or_default().push(name.to_string());
+            let members = buckets.entry(key).or_default();
+            if members.last() != Some(&index) {
+                members.push(index);
+            }
         }
         fires += read;
     }
@@ -173,13 +179,24 @@ pub fn forecast_shifted(
     let mut spots: Vec<HerdSpot> = buckets
         .into_iter()
         .filter_map(|(key, mut members)| {
-            // A caller can pass one name twice, so dedup before the threshold.
-            members.sort();
+            // A jittered schedule can come back to a bucket after another one.
+            members.sort_unstable();
             members.dedup();
+            if members.len() < min_herd {
+                return None;
+            }
+            // A caller can pass one name twice, so dedup names before the
+            // threshold too.
+            let mut names: Vec<String> = members
+                .into_iter()
+                .map(|index| schedules[index].0.to_string())
+                .collect();
+            names.sort();
+            names.dedup();
             let at = DateTime::from_timestamp_millis(key.saturating_mul(width))?;
-            (members.len() >= min_herd).then_some(HerdSpot {
+            (names.len() >= min_herd).then_some(HerdSpot {
                 at,
-                schedules: members,
+                schedules: names,
             })
         })
         .collect();
@@ -392,6 +409,18 @@ mod tests {
         assert_eq!(report.fires, 4, "a fires 3 times, b only once");
         assert_eq!(report.spots.len(), 1);
         assert_eq!(report.spots[0].at, at(0));
+    }
+
+    #[test]
+    fn many_dense_schedules_make_one_herd_per_bucket() {
+        let every_second = cron("* * * * * *");
+        let names: Vec<String> = (0..50).map(|n| format!("s{n}")).collect();
+        let schedules: Vec<(&str, &Schedule)> =
+            names.iter().map(|n| (n.as_str(), &every_second)).collect();
+        let report = forecast(&schedules, at(0), at(HOUR), MINUTE, 2);
+        assert_eq!(report.fires, 50 * 3_600);
+        assert_eq!(report.spots.len(), 60);
+        assert!(report.spots.iter().all(|s| s.size() == 50));
     }
 
     #[test]
