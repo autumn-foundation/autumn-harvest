@@ -1,15 +1,18 @@
 ## Phase X.Y — Schedule herd forecast
 
-`schedule_herd::forecast` finds the moments when many schedules fire
+The schedule herd forecast finds the moments when many schedules fire
 together. Twenty schedules on `0 * * * *` each pass validation, but the
 scheduler then starts twenty runs at the top of each hour.
 
-- The forecast walks each cron schedule over a window with `SlotWalker`. It
-  groups the fires into buckets of fixed width.
-- `spots` lists each bucket with at least `min_herd` schedules, the largest
-  first. `peak` gives the largest one.
-- `offenders` ranks the schedules by the number of spots that include them.
-  Move the top one to another minute first.
-- Interval and manual schedules have no fixed phase. The forecast lists them
-  as `unanchored` and leaves them out of the buckets.
-- The module is pure and sends no SQL.
+- `GET /admin/schedules/herd` reads every schedule and reports the herds in
+  a window. It takes `from`, `hours`, `bucket_secs`, `min_herd` and `limit`.
+  It is read-only, and a shard that does not answer makes it `partial`.
+- `harvest schedule herd` calls the endpoint. It prints a table of the herds
+  and of the schedules to move first. Pass `--output json` for the raw body.
+- The report applies the jitter of each schedule, as the scheduler does. It
+  lists paused, auto-paused and exhausted schedules as `inactive`. Interval
+  schedules have no fixed phase, so it lists them as `unanchored`.
+- Calendar exclusions and the `end_at` cutoff are not applied yet.
+- `schedule_herd::forecast` and `forecast_shifted` hold the arithmetic. They
+  are pure and send no SQL.
+- The SQLite backend answers `501` for the endpoint. It has no port yet.

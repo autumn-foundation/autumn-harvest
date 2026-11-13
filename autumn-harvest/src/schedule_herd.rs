@@ -104,6 +104,24 @@ pub fn forecast(
     bucket: Duration,
     min_herd: usize,
 ) -> HerdForecast {
+    forecast_shifted(schedules, from, until, bucket, min_herd, |_, fire| fire)
+}
+
+/// [`forecast`] with a shift applied to each fire before it goes into a bucket.
+///
+/// `shift` gets the index of the schedule in `schedules` and the slot time.
+/// It returns the time at which the run really starts. The scheduler adds a
+/// jitter offset to each slot, so pass that offset here. The window check uses
+/// the slot time, as the scheduler does.
+#[must_use]
+pub fn forecast_shifted(
+    schedules: &[(&str, &Schedule)],
+    from: DateTime<Utc>,
+    until: DateTime<Utc>,
+    bucket: Duration,
+    min_herd: usize,
+    shift: impl Fn(usize, DateTime<Utc>) -> DateTime<Utc>,
+) -> HerdForecast {
     // The width counts in milliseconds, so a fractional bucket keeps its size.
     let width = i64::try_from(bucket.as_millis())
         .unwrap_or(i64::MAX)
@@ -114,7 +132,7 @@ pub fn forecast(
     let mut unanchored = Vec::new();
     let mut truncated = Vec::new();
 
-    for &(name, schedule) in schedules {
+    for (index, &(name, schedule)) in schedules.iter().enumerate() {
         if !matches!(
             schedule,
             Schedule::Cron(_) | Schedule::CronInTimezone { .. }
@@ -137,7 +155,7 @@ pub fn forecast(
                 break;
             }
             read += 1;
-            let key = next.timestamp_millis().div_euclid(width);
+            let key = shift(index, next).timestamp_millis().div_euclid(width);
             buckets.entry(key).or_default().push(name.to_string());
         }
         fires += read;
@@ -172,7 +190,7 @@ mod tests {
 
     use chrono::{DateTime, Utc};
 
-    use super::{MAX_FIRES_PER_SCHEDULE, forecast};
+    use super::{MAX_FIRES_PER_SCHEDULE, forecast, forecast_shifted};
     use crate::policy::Schedule;
 
     fn at(secs: i64) -> DateTime<Utc> {
@@ -334,6 +352,25 @@ mod tests {
         let join = forecast(&[("five", &five), ("six", &six)], at(0), at(10), width, 2);
         let start = DateTime::from_timestamp_millis(5_000).unwrap();
         assert_eq!(join.spots[0].at, start);
+    }
+
+    #[test]
+    fn a_shift_moves_a_fire_out_of_its_herd() {
+        let a = cron("0 * * * *");
+        let b = cron("0 * * * *");
+        let schedules = [("a", &a), ("b", &b)];
+        let jitter = |index: usize, t: DateTime<Utc>| {
+            if index == 1 {
+                t + chrono::Duration::seconds(90)
+            } else {
+                t
+            }
+        };
+        let apart = forecast_shifted(&schedules, at(0), at(HOUR), MINUTE, 2, jitter);
+        assert_eq!(apart.fires, 2);
+        assert_eq!(apart.spots, []);
+        let still = forecast_shifted(&schedules, at(0), at(HOUR), MINUTE, 2, |_, t| t);
+        assert_eq!(still, forecast(&schedules, at(0), at(HOUR), MINUTE, 2));
     }
 
     #[test]
