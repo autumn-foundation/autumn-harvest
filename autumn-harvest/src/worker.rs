@@ -88,6 +88,15 @@ pub const DEFAULT_WORKER_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 pub use crate::builder::DEFAULT_MAX_CONCURRENT_CLAIMS;
 
+/// Default interval of the two population samplers (issue #2668).
+///
+/// The samplers feed `harvest.workflow.history_oversized` and
+/// `harvest.workflow.active`. Each sample counts the whole active population
+/// of each shard. Prometheus scrapes a gauge each 15 to 60 s, so a sample at
+/// `poll_interval` is almost always discarded. See
+/// [`crate::builder::WorkerConfig::population_sample_interval`].
+pub const DEFAULT_POPULATION_SAMPLE_INTERVAL: Duration = Duration::from_secs(15);
+
 /// Ceiling for the overdue-schedule gauge's adaptive sampling interval (issue
 /// #696).
 ///
@@ -195,6 +204,9 @@ pub struct WorkerRuntimeConfig {
     pub claim_slots_per_shard: Option<std::num::NonZeroU16>,
     /// Interval between queue poll attempts when idle.
     pub poll_interval: Duration,
+    /// Interval of the two population samplers (issue #2668). Must not be
+    /// zero. See [`crate::builder::WorkerConfig::population_sample_interval`].
+    pub population_sample_interval: Duration,
     /// Maximum time to wait for in-flight tasks during shutdown.
     pub shutdown_timeout: Duration,
     /// Grace period for an activity handler to unwind cooperatively after
@@ -372,6 +384,11 @@ impl WorkerRuntimeConfig {
                 crate::builder::MAX_CLAIM_SLOTS_PER_SHARD
             )));
         }
+        if self.population_sample_interval.is_zero() {
+            return Err(HarvestError::Config(
+                "population_sample_interval is 0; the population samplers would spin".into(),
+            ));
+        }
         if self.cancellation_grace_period > MAX_CANCELLATION_GRACE_PERIOD {
             return Err(HarvestError::Config(format!(
                 "cancellation_grace_period of {}s exceeds the maximum of {}s",
@@ -505,6 +522,7 @@ impl From<WorkerConfig> for WorkerRuntimeConfig {
             max_concurrent_claims: cfg.max_concurrent_claims,
             claim_slots_per_shard: cfg.claim_slots_per_shard,
             poll_interval: DEFAULT_WORKER_POLL_INTERVAL,
+            population_sample_interval: cfg.population_sample_interval,
             shutdown_timeout: cfg.shutdown_timeout,
             cancellation_grace_period: cfg.cancellation_grace_period,
             sticky_timeout: cfg.sticky_timeout,
@@ -34395,6 +34413,35 @@ fn spawn_pause_auto_resumer(
     })
 }
 
+/// Spawn the two population samplers on `population_sample_interval`
+/// (issue #2668).
+///
+/// The history-oversized sampler (#493) and the active-workflow sampler
+/// (#770) each count the whole active population of each shard. On
+/// `poll_interval` they used 77% of the buffers at 1M executions. So they
+/// use their own interval, and no other sampler does. Returns the history
+/// sampler first, then the active sampler.
+fn spawn_population_samplers(
+    config: &WorkerRuntimeConfig,
+    pools: Vec<DbPool>,
+    cancel: &CancellationToken,
+    telemetry: &Arc<crate::telemetry::TelemetryConfig>,
+    soft_threshold: u64,
+) -> [tokio::task::JoinHandle<()>; 2] {
+    let interval = config.population_sample_interval;
+    [
+        spawn_history_oversized_sampler(
+            pools.clone(),
+            cancel.clone(),
+            telemetry.clone(),
+            soft_threshold,
+            interval,
+        ),
+        // Self-no-ops when metrics are disabled.
+        spawn_workflow_active_sampler(pools, cancel.clone(), telemetry.clone(), interval),
+    ]
+}
+
 /// Periodically sample the count of in-flight (RUNNING) executions per
 /// workflow type whose history size exceeds the soft `continue_as_new`
 /// threshold and emit it as a gauge metric (issue #493, AC2).
@@ -34505,6 +34552,9 @@ fn spawn_history_oversized_sampler(
 /// Query the count of RUNNING executions per workflow type that have
 /// accumulated more than `soft_threshold` events.
 ///
+/// `SUSPENDED` is not a stored state (see `replay_sample.rs`), so the
+/// predicate names `RUNNING` only (issue #2668).
+///
 /// Returns `(workflow_name, count)` pairs; omits workflow types with zero
 /// oversized executions.
 async fn sample_history_oversized_counts(
@@ -34522,7 +34572,7 @@ async fn sample_history_oversized_counts(
     let rows: Vec<Row> = diesel::sql_query(
         "SELECT wf.workflow_name, COUNT(*)::bigint AS oversized_count \
          FROM harvest_workflow_executions wf \
-         WHERE wf.state IN ('RUNNING', 'SUSPENDED') \
+         WHERE wf.state = 'RUNNING' \
          AND (SELECT COUNT(*) FROM harvest_events he WHERE he.workflow_exec_id = wf.id) > $1 \
          GROUP BY wf.workflow_name",
     )
@@ -39314,20 +39364,12 @@ impl Worker {
                 ))
             })
             .collect();
-        let history_oversized_sampler = spawn_history_oversized_sampler(
+        let [history_oversized_sampler, workflow_active_sampler] = spawn_population_samplers(
+            &self.config,
             sampler_pools.clone(),
-            self.shutdown.clone(),
-            self.registry.telemetry().clone(),
+            &self.shutdown,
+            self.registry.telemetry(),
             self.registry.history_policy().continue_as_new_threshold(),
-            self.config.poll_interval,
-        );
-        // Active-workflow population gauge (issue #770): the live in-progress
-        // count per (workflow, state). Self-no-ops when metrics are disabled.
-        let workflow_active_sampler = spawn_workflow_active_sampler(
-            sampler_pools.clone(),
-            self.shutdown.clone(),
-            self.registry.telemetry().clone(),
-            self.config.poll_interval,
         );
         // Adaptive slot-tuner control loop (issue #548): only spawned when
         // `WorkerConfig::with_slot_tuner` was configured. Unlike the sampler
@@ -47650,6 +47692,7 @@ mod tests {
             replication_slot_prefix: crate::replication::DEFAULT_DR_SLOT_PREFIX.to_string(),
             replication_sample_interval: Duration::from_secs(15),
             replication_watermark_retain: Duration::from_secs(3600),
+            population_sample_interval: Duration::from_secs(20),
             queues: vec!["email".to_string(), "billing".to_string()],
             notification_database_url: Some("postgres://localhost/test".to_string()),
             shard_notification_database_urls: Vec::new(),
@@ -47711,6 +47754,10 @@ mod tests {
         assert_eq!(runtime_cfg.max_concurrent_claims, 3);
         assert_eq!(runtime_cfg.shutdown_timeout, Duration::from_secs(60));
         assert_eq!(runtime_cfg.poll_interval, Duration::from_millis(500));
+        assert_eq!(
+            runtime_cfg.population_sample_interval,
+            Duration::from_secs(20)
+        );
         assert_eq!(
             runtime_cfg.cancellation_grace_period,
             Duration::from_secs(10)

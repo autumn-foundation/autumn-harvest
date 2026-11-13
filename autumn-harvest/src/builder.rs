@@ -2833,6 +2833,11 @@ impl HarvestBuilder {
                 "worker_heartbeat_interval must be greater than zero".to_string(),
             ));
         }
+        if self.worker_config.population_sample_interval.is_zero() {
+            return Err(HarvestBuilderError::InvalidWorkerConfig(
+                "population_sample_interval must be greater than zero".to_string(),
+            ));
+        }
         // Issue #804 (Codex round-19 P1): surface a cadence the fleet-wide
         // capability-miss liveness window cannot vouch for. Never rejects — an
         // already-deployed slow fleet must keep booting.
@@ -4173,6 +4178,18 @@ pub struct WorkerConfig {
     /// floor value that would understate the loss. Only used when the worker is
     /// fenced; see [`Self::dr_fencing`]. Default: 1 hour.
     pub replication_watermark_retain: Duration,
+    /// How often the two population samplers run (issue #2668).
+    ///
+    /// They feed `harvest.workflow.history_oversized` and
+    /// `harvest.workflow.active`. Each sample counts the whole active
+    /// population of each shard, on every worker. At 1M executions that
+    /// cost 77% of the buffers when the samplers ran on the poll interval.
+    ///
+    /// A lower value gives a fresher gauge at a higher database cost. The
+    /// first sample comes one interval after the worker starts. Every other
+    /// sampler keeps the poll interval. Must not be zero. Default: 15
+    /// seconds ([`crate::worker::DEFAULT_POPULATION_SAMPLE_INTERVAL`]).
+    pub population_sample_interval: Duration,
     /// Slot-name prefix identifying this shard's DR replication (issue #954).
     ///
     /// Defaults to `harvest_dr`, matching the setup SQL in
@@ -4596,6 +4613,7 @@ impl Default for WorkerConfig {
             dr_fencing: crate::replication::DrFencing::Auto,
             replication_sample_interval: Duration::from_secs(15),
             replication_watermark_retain: Duration::from_secs(3600),
+            population_sample_interval: crate::worker::DEFAULT_POPULATION_SAMPLE_INTERVAL,
             replication_slot_prefix: crate::replication::DEFAULT_DR_SLOT_PREFIX.to_string(),
             max_workflow_start_delay: DEFAULT_MAX_WORKFLOW_START_DELAY,
             unknown_target_grace_window: Duration::from_secs(5),
@@ -4888,6 +4906,27 @@ impl WorkerConfig {
     #[must_use]
     pub const fn with_replication_sample_interval(mut self, interval: Duration) -> Self {
         self.replication_sample_interval = interval;
+        self
+    }
+
+    /// Set the interval of the two population samplers (issue #2668).
+    ///
+    /// See [`WorkerConfig::population_sample_interval`]. A zero interval
+    /// fails `HarvestBuilder::build`.
+    ///
+    /// ## Examples
+    ///
+    /// ```rust
+    /// use std::time::Duration;
+    /// use autumn_harvest::builder::WorkerConfig;
+    ///
+    /// let config =
+    ///     WorkerConfig::default().with_population_sample_interval(Duration::from_secs(60));
+    /// assert_eq!(config.population_sample_interval, Duration::from_secs(60));
+    /// ```
+    #[must_use]
+    pub const fn with_population_sample_interval(mut self, interval: Duration) -> Self {
+        self.population_sample_interval = interval;
         self
     }
 

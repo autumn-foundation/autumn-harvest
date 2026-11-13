@@ -154,6 +154,8 @@ pub struct WorkerConfigView {
     pub claim_slots_per_shard: Option<u16>,
     /// Worker poll interval, milliseconds.
     pub poll_interval_ms: u64,
+    /// Population sampler interval, milliseconds (issue #2668).
+    pub population_sample_interval_ms: u64,
     /// Graceful shutdown timeout, milliseconds.
     pub shutdown_timeout_ms: u64,
     /// In-memory workflow LRU cache size (entries).
@@ -456,6 +458,7 @@ impl WorkerConfigView {
             dr_fencing,
             replication_sample_interval,
             replication_watermark_retain,
+            population_sample_interval,
             replication_slot_prefix,
             max_workflow_start_delay,
             unknown_target_grace_window,
@@ -495,6 +498,7 @@ impl WorkerConfigView {
             max_concurrent_claims: *max_concurrent_claims,
             claim_slots_per_shard: claim_slots_per_shard.map(std::num::NonZeroU16::get),
             poll_interval_ms: dur_ms(poll_interval),
+            population_sample_interval_ms: dur_ms(*population_sample_interval),
             shutdown_timeout_ms: dur_ms(*shutdown_timeout),
             workflow_cache_size: *workflow_cache_size,
             resident_workflows: *resident_workflows && !sticky_timeout.is_zero(),
