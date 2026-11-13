@@ -1,0 +1,213 @@
+# Task-stats prune capture: baseline
+
+4 measured workers, 5 s heartbeat, 500 ms poll, 60 s window, pg_stat_statements per database.
+
+## Live fleet of 500
+
+Stats rows at seed 664, after the first prune 655 (md5 `68defbbd08b5a74166c50b2e0d731c8a`). Heap 2383872 bytes, TOAST 0 bytes, average cohort key 6853 bytes.
+
+| total buffers | hit | read | total calls | WAL bytes | temp blocks written |
+|--:|--:|--:|--:|--:|--:|
+| 33815 | 33815 | 0 | 22175 | 148320 | 0 |
+
+Prune: 14210 buffers (42.0% of buffers), 48 calls (0.2% of calls), 5 rows deleted, 296.0 buffers per call.
+
+harvest_worker_task_stats over the window: seq_scan 56, seq_tup_read 34970, idx_scan on harvest_worker_task_stats_updated_at_idx 0, heap blocks 20557, index blocks 6502, TOAST blocks 0. At the end n_live_tup 1322, n_dead_tup 553.
+
+### Top 10 by buffers
+
+| buffers | % | calls | rows | statement |
+|--:|--:|--:|--:|---|
+| 14210 | 42.0 | 48 | 5 | `DELETE FROM harvest_worker_task_stats s WHERE s.updated_at < NOW() - (GREATEST($1::bigint, LEAST(GREATEST(COALESCE((s.cohort::json` |
+| 5263 | 15.6 | 475 | 0 | `WITH worker_info AS ( SELECT COALESCE((SELECT labels FROM harvest_workers WHERE worker_id = $1), $7::jsonb) AS labels ), paused_qu` |
+| 2724 | 8.1 | 1362 | 0 | `SELECT e.* FROM harvest_events e JOIN LATERAL ( SELECT $3 AS running_exec FROM harvest_workflow_executions x WHERE x.id = e.workfl` |
+| 986 | 2.9 | 240 | 240 | `INSERT INTO harvest_decision_owner_candidates (holder, seen_at) VALUES ($1, clock_timestamp()) ON CONFLICT (holder) DO UPDATE SET ` |
+| 960 | 2.8 | 240 | 240 | `SELECT m.enabled, m.partitions, EXISTS (SELECT $1 FROM pg_trigger t WHERE t.tgname = $2 AND t.tgrelid = $3::regclass AND t.tgenabl` |
+| 950 | 2.8 | 475 | 0 | `SELECT DISTINCT q.activity_name FROM harvest_task_queue q JOIN harvest_rate_limit_buckets b ON b.key = q.rate_limit_key WHERE q.qu` |
+| 908 | 2.7 | 454 | 0 | `DELETE FROM harvest_start_idempotency WHERE ctid IN ( SELECT ctid FROM harvest_start_idempotency WHERE shard_id = $1 AND created_a` |
+| 908 | 2.7 | 454 | 0 | `SELECT "harvest_completion_trigger_outbox"."id", "harvest_completion_trigger_outbox"."source_exec_id", "harvest_completion_trigger` |
+| 908 | 2.7 | 454 | 0 | `SELECT "harvest_completion_trigger_outbox"."id", "harvest_completion_trigger_outbox"."source_exec_id", "harvest_completion_trigger` |
+| 908 | 2.7 | 454 | 0 | `SELECT "harvest_completion_trigger_outbox"."id", "harvest_completion_trigger_outbox"."source_exec_id", "harvest_completion_trigger` |
+
+### Top 10 by calls
+
+| calls | % | buffers | statement |
+|--:|--:|--:|---|
+| 3199 | 14.4 | 0 | `COMMIT` |
+| 2724 | 12.3 | 0 | `BEGIN` |
+| 2270 | 10.2 | 125 | `SELECT to_regclass($1) IS NOT NULL AS present` |
+| 1533 | 6.9 | 0 | `SELECT $1` |
+| 1362 | 6.1 | 2724 | `SELECT e.* FROM harvest_events e JOIN LATERAL ( SELECT $3 AS running_exec FROM harvest_workflow_executions x WHERE x.id = e.workfl` |
+| 475 | 2.1 | 0 | `BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED` |
+| 475 | 2.1 | 950 | `SELECT DISTINCT q.activity_name FROM harvest_task_queue q JOIN harvest_rate_limit_buckets b ON b.key = q.rate_limit_key WHERE q.qu` |
+| 475 | 2.1 | 0 | `SET LOCAL enable_bitmapscan = off` |
+| 475 | 2.1 | 0 | `SET LOCAL enable_sort = off` |
+| 475 | 2.1 | 0 | `SET LOCAL jit = off` |
+
+### Top 10 by WAL bytes
+
+| WAL bytes | calls | statement |
+|--:|--:|---|
+| 98529 | 48 | `INSERT INTO harvest_worker_task_stats (worker_id, window_tasks, window_failures, p99_latency_ms, snapshot_seq, cohort, updated_at)` |
+| 30966 | 240 | `INSERT INTO harvest_decision_owner_candidates (holder, seen_at) VALUES ($1, clock_timestamp()) ON CONFLICT (holder) DO UPDATE SET ` |
+| 15141 | 48 | `UPDATE "harvest_workers" SET "last_heartbeat_at" = CURRENT_TIMESTAMP, "in_flight_count" = $1, "labels" = $2, "in_use_sessions" = $` |
+| 2590 | 8 | `UPDATE "harvest_workers" SET "status" = $1 WHERE ("harvest_workers"."worker_id" = $2)` |
+| 878 | 48 | `DELETE FROM harvest_worker_task_stats s WHERE s.updated_at < NOW() - (GREATEST($1::bigint, LEAST(GREATEST(COALESCE((s.cohort::json` |
+| 216 | 4 | `DELETE FROM harvest_decision_owner_candidates WHERE holder = $1 OR seen_at < clock_timestamp() - interval $2` |
+
+Statements with temp_blks_written > 0: 0.
+
+### Wait-event samples (1 per second)
+
+* CPU or none (active): 10
+* CPU or none (idle): 1
+* Client:ClientRead (active): 1
+* Client:ClientRead (idle in transaction): 2
+* Client:ClientRead (idle): 730
+
+### Prune statement
+
+* 14210 buffers, 48 calls, 5 rows:
+  `DELETE FROM harvest_worker_task_stats s WHERE s.updated_at < NOW() - (GREATEST($1::bigint, LEAST(GREATEST(COALESCE((s.cohort::jsonb ->> $3)::bigint, $2), $4), $5)) * INTERVAL $6)`
+
+## Live fleet of 2000
+
+Stats rows at seed 2644, after the first prune 2616 (md5 `e1b9dd76039eb115a541c54207e1a1a5`). Heap 9510912 bytes, TOAST 0 bytes, average cohort key 6855 bytes.
+
+| total buffers | hit | read | total calls | WAL bytes | temp blocks written |
+|--:|--:|--:|--:|--:|--:|
+| 76169 | 76169 | 0 | 22360 | 149823 | 0 |
+
+Prune: 56036 buffers (73.6% of buffers), 48 calls (0.2% of calls), 24 rows deleted, 1167.4 buffers per call.
+
+harvest_worker_task_stats over the window: seq_scan 56, seq_tup_read 139040, idx_scan on harvest_worker_task_stats_updated_at_idx 0, heap blocks 80468, index blocks 30288, TOAST blocks 0. At the end n_live_tup 5263, n_dead_tup 2072.
+
+### Top 10 by buffers
+
+| buffers | % | calls | rows | statement |
+|--:|--:|--:|--:|---|
+| 56036 | 73.6 | 48 | 24 | `DELETE FROM harvest_worker_task_stats s WHERE s.updated_at < NOW() - (GREATEST($1::bigint, LEAST(GREATEST(COALESCE((s.cohort::json` |
+| 5308 | 7.0 | 476 | 0 | `WITH worker_info AS ( SELECT COALESCE((SELECT labels FROM harvest_workers WHERE worker_id = $1), $7::jsonb) AS labels ), paused_qu` |
+| 2754 | 3.6 | 1377 | 0 | `SELECT e.* FROM harvest_events e JOIN LATERAL ( SELECT $3 AS running_exec FROM harvest_workflow_executions x WHERE x.id = e.workfl` |
+| 970 | 1.3 | 240 | 240 | `INSERT INTO harvest_decision_owner_candidates (holder, seen_at) VALUES ($1, clock_timestamp()) ON CONFLICT (holder) DO UPDATE SET ` |
+| 960 | 1.3 | 240 | 240 | `SELECT m.enabled, m.partitions, EXISTS (SELECT $1 FROM pg_trigger t WHERE t.tgname = $2 AND t.tgrelid = $3::regclass AND t.tgenabl` |
+| 952 | 1.2 | 476 | 0 | `SELECT DISTINCT q.activity_name FROM harvest_task_queue q JOIN harvest_rate_limit_buckets b ON b.key = q.rate_limit_key WHERE q.qu` |
+| 940 | 1.2 | 48 | 48 | `UPDATE "harvest_workers" SET "last_heartbeat_at" = CURRENT_TIMESTAMP, "in_flight_count" = $1, "labels" = $2, "in_use_sessions" = $` |
+| 919 | 1.2 | 48 | 48 | `INSERT INTO harvest_worker_task_stats (worker_id, window_tasks, window_failures, p99_latency_ms, snapshot_seq, cohort, updated_at)` |
+| 918 | 1.2 | 459 | 0 | `DELETE FROM harvest_start_idempotency WHERE ctid IN ( SELECT ctid FROM harvest_start_idempotency WHERE shard_id = $1 AND created_a` |
+| 918 | 1.2 | 459 | 0 | `SELECT "harvest_completion_trigger_outbox"."id", "harvest_completion_trigger_outbox"."source_exec_id", "harvest_completion_trigger` |
+
+### Top 10 by calls
+
+| calls | % | buffers | statement |
+|--:|--:|--:|---|
+| 3230 | 14.4 | 0 | `COMMIT` |
+| 2754 | 12.3 | 0 | `BEGIN` |
+| 2295 | 10.3 | 175 | `SELECT to_regclass($1) IS NOT NULL AS present` |
+| 1543 | 6.9 | 0 | `SELECT $1` |
+| 1377 | 6.2 | 2754 | `SELECT e.* FROM harvest_events e JOIN LATERAL ( SELECT $3 AS running_exec FROM harvest_workflow_executions x WHERE x.id = e.workfl` |
+| 476 | 2.1 | 0 | `BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED` |
+| 476 | 2.1 | 952 | `SELECT DISTINCT q.activity_name FROM harvest_task_queue q JOIN harvest_rate_limit_buckets b ON b.key = q.rate_limit_key WHERE q.qu` |
+| 476 | 2.1 | 0 | `SET LOCAL enable_bitmapscan = off` |
+| 476 | 2.1 | 0 | `SET LOCAL enable_sort = off` |
+| 476 | 2.1 | 0 | `SET LOCAL jit = off` |
+
+### Top 10 by WAL bytes
+
+| WAL bytes | calls | statement |
+|--:|--:|---|
+| 98531 | 48 | `INSERT INTO harvest_worker_task_stats (worker_id, window_tasks, window_failures, p99_latency_ms, snapshot_seq, cohort, updated_at)` |
+| 31203 | 240 | `INSERT INTO harvest_decision_owner_candidates (holder, seen_at) VALUES ($1, clock_timestamp()) ON CONFLICT (holder) DO UPDATE SET ` |
+| 15395 | 48 | `UPDATE "harvest_workers" SET "last_heartbeat_at" = CURRENT_TIMESTAMP, "in_flight_count" = $1, "labels" = $2, "in_use_sessions" = $` |
+| 2521 | 8 | `UPDATE "harvest_workers" SET "status" = $1 WHERE ("harvest_workers"."worker_id" = $2)` |
+| 1957 | 48 | `DELETE FROM harvest_worker_task_stats s WHERE s.updated_at < NOW() - (GREATEST($1::bigint, LEAST(GREATEST(COALESCE((s.cohort::json` |
+| 216 | 4 | `DELETE FROM harvest_decision_owner_candidates WHERE holder = $1 OR seen_at < clock_timestamp() - interval $2` |
+
+Statements with temp_blks_written > 0: 0.
+
+### Wait-event samples (1 per second)
+
+* CPU or none (active): 6
+* CPU or none (idle in transaction): 1
+* CPU or none (idle): 1
+* Client:ClientRead (active): 2
+* Client:ClientRead (idle in transaction): 2
+* Client:ClientRead (idle): 1128
+
+### Prune statement
+
+* 56036 buffers, 48 calls, 24 rows:
+  `DELETE FROM harvest_worker_task_stats s WHERE s.updated_at < NOW() - (GREATEST($1::bigint, LEAST(GREATEST(COALESCE((s.cohort::jsonb ->> $3)::bigint, $2), $4), $5)) * INTERVAL $6)`
+
+## Live fleet of 8000
+
+Stats rows at seed 10564, after the first prune 10464 (md5 `0a2f5c3d7de6f6b01957d3ef631a4a93`). Heap 38019072 bytes, TOAST 0 bytes, average cohort key 6855 bytes.
+
+| total buffers | hit | read | total calls | WAL bytes | temp blocks written |
+|--:|--:|--:|--:|--:|--:|
+| 243595 | 243595 | 0 | 22378 | 153625 | 0 |
+
+Prune: 223339 buffers (91.7% of buffers), 48 calls (0.2% of calls), 96 rows deleted, 4652.9 buffers per call.
+
+harvest_worker_task_stats over the window: seq_scan 54, seq_tup_read 555480, idx_scan on harvest_worker_task_stats_updated_at_idx 0, heap blocks 293689, index blocks 84610, TOAST blocks 0. At the end n_live_tup 10469, n_dead_tup 8144.
+
+### Top 10 by buffers
+
+| buffers | % | calls | rows | statement |
+|--:|--:|--:|--:|---|
+| 223339 | 91.7 | 48 | 96 | `DELETE FROM harvest_worker_task_stats s WHERE s.updated_at < NOW() - (GREATEST($1::bigint, LEAST(GREATEST(COALESCE((s.cohort::json` |
+| 5229 | 2.1 | 474 | 0 | `WITH worker_info AS ( SELECT COALESCE((SELECT labels FROM harvest_workers WHERE worker_id = $1), $7::jsonb) AS labels ), paused_qu` |
+| 2760 | 1.1 | 1380 | 0 | `SELECT e.* FROM harvest_events e JOIN LATERAL ( SELECT $3 AS running_exec FROM harvest_workflow_executions x WHERE x.id = e.workfl` |
+| 1072 | 0.4 | 48 | 48 | `INSERT INTO harvest_worker_task_stats (worker_id, window_tasks, window_failures, p99_latency_ms, snapshot_seq, cohort, updated_at)` |
+| 994 | 0.4 | 48 | 48 | `UPDATE "harvest_workers" SET "last_heartbeat_at" = CURRENT_TIMESTAMP, "in_flight_count" = $1, "labels" = $2, "in_use_sessions" = $` |
+| 967 | 0.4 | 240 | 240 | `INSERT INTO harvest_decision_owner_candidates (holder, seen_at) VALUES ($1, clock_timestamp()) ON CONFLICT (holder) DO UPDATE SET ` |
+| 960 | 0.4 | 240 | 240 | `SELECT m.enabled, m.partitions, EXISTS (SELECT $1 FROM pg_trigger t WHERE t.tgname = $2 AND t.tgrelid = $3::regclass AND t.tgenabl` |
+| 948 | 0.4 | 474 | 0 | `SELECT DISTINCT q.activity_name FROM harvest_task_queue q JOIN harvest_rate_limit_buckets b ON b.key = q.rate_limit_key WHERE q.qu` |
+| 920 | 0.4 | 460 | 0 | `DELETE FROM harvest_start_idempotency WHERE ctid IN ( SELECT ctid FROM harvest_start_idempotency WHERE shard_id = $1 AND created_a` |
+| 920 | 0.4 | 460 | 0 | `SELECT "harvest_completion_trigger_outbox"."id", "harvest_completion_trigger_outbox"."source_exec_id", "harvest_completion_trigger` |
+
+### Top 10 by calls
+
+| calls | % | buffers | statement |
+|--:|--:|--:|---|
+| 3234 | 14.5 | 0 | `COMMIT` |
+| 2760 | 12.3 | 0 | `BEGIN` |
+| 2300 | 10.3 | 150 | `SELECT to_regclass($1) IS NOT NULL AS present` |
+| 1542 | 6.9 | 0 | `SELECT $1` |
+| 1380 | 6.2 | 2760 | `SELECT e.* FROM harvest_events e JOIN LATERAL ( SELECT $3 AS running_exec FROM harvest_workflow_executions x WHERE x.id = e.workfl` |
+| 474 | 2.1 | 0 | `BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED` |
+| 474 | 2.1 | 948 | `SELECT DISTINCT q.activity_name FROM harvest_task_queue q JOIN harvest_rate_limit_buckets b ON b.key = q.rate_limit_key WHERE q.qu` |
+| 474 | 2.1 | 0 | `SET LOCAL enable_bitmapscan = off` |
+| 474 | 2.1 | 0 | `SET LOCAL enable_sort = off` |
+| 474 | 2.1 | 0 | `SET LOCAL jit = off` |
+
+### Top 10 by WAL bytes
+
+| WAL bytes | calls | statement |
+|--:|--:|---|
+| 98575 | 48 | `INSERT INTO harvest_worker_task_stats (worker_id, window_tasks, window_failures, p99_latency_ms, snapshot_seq, cohort, updated_at)` |
+| 31204 | 240 | `INSERT INTO harvest_decision_owner_candidates (holder, seen_at) VALUES ($1, clock_timestamp()) ON CONFLICT (holder) DO UPDATE SET ` |
+| 15105 | 48 | `UPDATE "harvest_workers" SET "last_heartbeat_at" = CURRENT_TIMESTAMP, "in_flight_count" = $1, "labels" = $2, "in_use_sessions" = $` |
+| 5790 | 48 | `DELETE FROM harvest_worker_task_stats s WHERE s.updated_at < NOW() - (GREATEST($1::bigint, LEAST(GREATEST(COALESCE((s.cohort::json` |
+| 2735 | 8 | `UPDATE "harvest_workers" SET "status" = $1 WHERE ("harvest_workers"."worker_id" = $2)` |
+| 216 | 4 | `DELETE FROM harvest_decision_owner_candidates WHERE holder = $1 OR seen_at < clock_timestamp() - interval $2` |
+
+Statements with temp_blks_written > 0: 0.
+
+### Wait-event samples (1 per second)
+
+* CPU or none (active): 8
+* CPU or none (idle): 1
+* Client:ClientRead (active): 2
+* Client:ClientRead (idle in transaction): 2
+* Client:ClientRead (idle): 1067
+
+### Prune statement
+
+* 223339 buffers, 48 calls, 96 rows:
+  `DELETE FROM harvest_worker_task_stats s WHERE s.updated_at < NOW() - (GREATEST($1::bigint, LEAST(GREATEST(COALESCE((s.cohort::jsonb ->> $3)::bigint, $2), $4), $5)) * INTERVAL $6)`
+
+## Edge rows
+
+fallback 120: deleted 12, kept 7: fast-0, fast-3598, huge-31535998, huge-3602, negative-3598, slow-10798, slow-3602
+fallback 7200: deleted 8, kept 11: empty-3602, fast-0, fast-3598, huge-31535998, huge-3602, negative-3598, nofield-3602, nofield-7198, null-3602, slow-10798, slow-3602

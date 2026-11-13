@@ -366,7 +366,7 @@ mod tests {
             signal: "tool_approval:0:0:w1".into(),
             tool: "write".into(),
             reason: "a secret reason".into(),
-            arguments: serde_json::json!({"card": "4111-1111"}),
+            arguments: serde_json::json!({"card": "pan-4111-1111"}),
             arguments_truncated: false,
             timeout_secs,
         }
@@ -462,7 +462,9 @@ mod tests {
         assert!(text.contains("tool_approval:0:0:w1"), "{text}");
         assert!(text.contains("write"), "{text}");
         assert!(text.contains("support/acct-1"), "{text}");
-        assert!(!text.contains("4111"), "the arguments leak: {text}");
+        // The deadline and the execution id are digits and hex. `p` and `n` are
+        // neither, so only the arguments can hold this text.
+        assert!(!text.contains("pan-4111"), "the arguments leak: {text}");
         assert!(!text.contains("secret"), "the reason leaks: {text}");
     }
 

@@ -111,11 +111,11 @@ impl Plugin {
         runs
     }
 
-    /// The state of the agent `id`, or `None` while it is not ready.
+    /// The state of the agent `id`, or `None` before its run serves the
+    /// state query. A new run registers the query in its first drive.
     async fn state(&self, id: &AgentId) -> Option<AgentState> {
         match agent::state(self.handle(), id).await {
             Ok(state) => state,
-            // The agent reads its profile before it registers the query.
             Err(HarvestSqliteError::Sqlite(SqliteError::QueryNotFound { .. })) => None,
             Err(error) => panic!("the state reads: {error}"),
         }

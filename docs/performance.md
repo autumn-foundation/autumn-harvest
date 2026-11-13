@@ -1763,8 +1763,8 @@ The median of about 195 sampled claim plans in each half of run 2:
   `PENDING` rows. It adds one index entry per enqueue and per non-HOT
   update of a `PENDING` row. It was 33 MB for 700,000 pending rows with distinct due times, against
   27 MB for `idx_harvest_tq_poll`, and took 2.0 s to build.
-- **One more round trip, on a capped key only.** A claim on a capped key
-  adds one for the cap re-check. The planner settings were a batch of
+- **One more statement, on a capped key only.** It rides the recheck
+  pipeline, so it adds no round trip. The planner settings were a batch of
   their own, one more round trip on every claim, until issue #2651 put
   them in the `BEGIN` batch. See
   [what is actually timed](#what-is-actually-timed).
@@ -2269,7 +2269,7 @@ a single round trip either. It issues, in order:
 3. *(hit only)* `queue_pause::try_lock_queue_for_claim` — a
    `pg_try_advisory_xact_lock` on the queue. If it loses the race against a
    concurrent pause or resume, `queue_pause::release_claim` hands the row back
-   and the call returns "no task": same round-trip count, no claim.
+   and the call returns "no task".
 4. *(hit only)* `queue_pause::release_claim_if_queue_paused` — the authoritative
    queue-pause re-check. It is a *separate statement* precisely so it takes a
    snapshot the claim could not have; folding it into the CTE would defeat it.
@@ -2282,11 +2282,14 @@ a single round trip either. It issues, in order:
    cap.
 6. `COMMIT`.
 
-So a claim is **six** client↔server round trips when it lands on a row,
-**seven** on a capped key and **three** when the queue is empty —
-plus transaction overhead. A workflow task without a run skips the type-gated
-pause re-check, so it takes five. The
-`EXPLAIN` plan explains the *dominant* statement rather than the whole
+Steps 3 to 5 go to the server in one pipeline (see
+[the round-trip page](performance-hot-path-round-trips.md)). The server
+still runs them in order, each with its own snapshot. On a warm connection
+a hit costs **four** client↔server round trips, with or without a capped
+key. A miss costs **three**. Both add transaction overhead. A cold
+statement prepares inside the pipeline, at one more round trip.
+A lost queue lock adds one round trip for `queue_pause::release_claim`.
+The `EXPLAIN` plan explains the *dominant* statement rather than the whole
 measured operation. The seeded scenarios claim at most a fifth of the backlog
 they seed, so their samples are overwhelmingly hits.
 
@@ -2295,13 +2298,14 @@ were then a batch of their own. The queue lock and each re-check ran
 unnamed, at two round trips each. So a hit cost ten round trips, and a
 miss four. See
 [the hot-path statement cache](performance-hot-path-statement-cache.md).
+Before issue #2654, steps 3 to 5 each took a round trip.
 The tables measured before issue #1971 had no settings batch and no step
 5, but their claim statement ran unnamed too. A hit there also cost ten
 round trips.
 
 That distinction is the first thing to reason about when moving this workload to
 a **remote** database: the round-trip count, not the query plan, is what network
-latency multiplies. Six round trips at 1 ms of network RTT is 6 ms of floor per
+latency multiplies. Four round trips at 1 ms of network RTT is 4 ms of floor per
 claim that no amount of index tuning removes. Every number on this page was
 measured against a loopback server, so that floor is ~0 here and the plan
 dominates; that ordering inverts across a network.
@@ -3099,3 +3103,15 @@ standalone note rather than part of the claim-path attribution table above:
   planning against 18.6 s of execution in one `throughput` run.
   `cached_stmt` keeps them prepared (`throughput` 47.8 to 82.0 workflows/s,
   the median of six alternating pairs, `pg_stat_statements` and `perf`).
+* [`docs/performance-hot-path-round-trips.md`](performance-hot-path-round-trips.md)
+  — the round trips that the audit left (issue #2654). The claim rechecks
+  and the wake-ingest reads go in pipelines, the notify sender reads and
+  sends in one statement, and the low-risk poll-tick scanners stay
+  prepared (`throughput` 71.8 to 78.5 workflows/s, the median of six
+  alternating pairs, `pg_stat_statements`).
+* [`docs/performance-worker-task-stats-prune.md`](performance-worker-task-stats-prune.md)
+  — each worker heartbeat ran `prune_worker_task_stats` as a sequential scan
+  that parsed every cohort key. The prune now states the retention bound that
+  `harvest_worker_task_stats_updated_at_idx` serves (prune buffers -97.5%,
+  -98.3% and -98.2% for live fleets of 500, 2,000 and 8,000 workers,
+  `pg_stat_statements`).

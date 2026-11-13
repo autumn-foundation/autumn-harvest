@@ -677,7 +677,7 @@ async fn outbox_signal_by_id_reaches_a_target_pinned_off_its_hash_shard() {
     );
 
     // And the signal is genuinely queued on the TARGET's database.
-    let pending = autumn_harvest::signal::load_pending_signals(&mut conn1, target)
+    let pending = autumn_harvest::signal::load_pending_signals(&conn1, target)
         .await
         .expect("load pending signals on the target shard");
     assert_eq!(
@@ -1277,7 +1277,7 @@ async fn outbox_signal_by_id_prefers_the_live_run_over_a_stale_terminal_on_the_c
          shard; got {types:?}"
     );
     assert_eq!(
-        autumn_harvest::signal::load_pending_signals(&mut conn1, live)
+        autumn_harvest::signal::load_pending_signals(&conn1, live)
             .await
             .expect("load pending on shard 1")
             .len(),
@@ -1285,7 +1285,7 @@ async fn outbox_signal_by_id_prefers_the_live_run_over_a_stale_terminal_on_the_c
         "the signal must be queued against the LIVE run"
     );
     assert!(
-        autumn_harvest::signal::load_pending_signals(&mut conn0, stale)
+        autumn_harvest::signal::load_pending_signals(&conn0, stale)
             .await
             .expect("load pending on shard 0")
             .is_empty(),
@@ -1359,7 +1359,7 @@ async fn outbox_by_id_delivery_completes_when_each_shard_pool_holds_one_connecti
         "the cross-shard by-id signal must be delivered"
     );
     assert_eq!(
-        autumn_harvest::signal::load_pending_signals(&mut conn1, target)
+        autumn_harvest::signal::load_pending_signals(&conn1, target)
             .await
             .expect("load pending signals")
             .len(),
@@ -2415,7 +2415,7 @@ async fn outbox_signal_by_id_keyed_retry_does_not_double_deliver_across_a_shard_
          fulfilled against the predecessor"
     );
     assert!(
-        autumn_harvest::signal::load_pending_signals(&mut conn1, successor)
+        autumn_harvest::signal::load_pending_signals(&conn1, successor)
             .await
             .expect("load pending on shard 1")
             .is_empty(),
@@ -2423,7 +2423,7 @@ async fn outbox_signal_by_id_keyed_retry_does_not_double_deliver_across_a_shard_
          shard-crossing successor -- the key was already delivered on shard 0"
     );
     assert_eq!(
-        autumn_harvest::signal::load_pending_signals(&mut conn0, predecessor)
+        autumn_harvest::signal::load_pending_signals(&conn0, predecessor)
             .await
             .expect("load pending on shard 0")
             .len(),

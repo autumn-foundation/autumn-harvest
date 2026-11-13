@@ -58,6 +58,20 @@ kind = ["read"]
 tables = []
 measured = "unmeasured"
 
+["read_gate"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read"]
+tables = []
+measured = "docs/performance-hot-path-round-trips.md"
+
+["read_gate_only"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read"]
+tables = []
+measured = "docs/performance-hot-path-round-trips.md"
+
 ["resolve_owner_notes"]
 driver = "per_task"
 backend = ["postgres"]
@@ -84,14 +98,6 @@ plan = "docs/ledger/plans/autumn-harvest/notify.md"
 
 ["send_wakes"]
 driver = "per_task"
-backend = ["postgres"]
-kind = ["read"]
-tables = []
-measured = "unmeasured"
-plan = "docs/ledger/plans/autumn-harvest/notify.md"
-
-["tick"]
-driver = "per_tick"
 backend = ["postgres"]
 kind = ["read"]
 tables = []

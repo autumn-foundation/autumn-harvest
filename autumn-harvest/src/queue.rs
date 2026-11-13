@@ -1279,6 +1279,30 @@ macro_rules! claim_order_by_sql {
 /// `$counts` names the running-count CTE that the concurrency gate reads.
 /// Each candidate scan and `seek_held` use this text, so every gate is the
 /// same in each.
+///
+/// Clone-class note: this macro expands the `required_build_id` and
+/// `required_capabilities` eligibility checks. jscpd (min-tokens 50,
+/// min-lines 5) finds two matches against
+/// [`claim_task_batched_candidates_query`]: 97 and 211 tokens, about 50
+/// lines total. Both copies use the same `$3` bind. Both read
+/// `worker_info.labels` and `harvest_task_queue.`.
+///
+/// [`build_and_capability_eligibility_predicate`] already names and shares
+/// this exact rule across three other sites, from issue #1340's bug 13
+/// chain. This pair cannot call that function as written. That function
+/// takes a runtime `String` for a `$10`-bound query. This macro, and
+/// [`claim_task_batched_candidates_query`]'s own body, must stay the
+/// compile-time `concat!` text that [`claim_task_query`]'s `const fn`
+/// return relies on.
+///
+/// A merge needs either a second `concat!`-only macro carrying the `$3`
+/// bind, or giving up `claim_task_query`'s const-ness. That is a tradeoff
+/// on the hottest claim path (#2651, #2652), not a drop-in change. No
+/// direct co-change or missed-fix ties these two copies to each other.
+/// Both trace to one shared origin, commit 7bf37898 (#1971, #2052). The
+/// duplication stays. A merge here needs sign-off from someone who can
+/// re-run the Ledger profile and the claim perf repro. See the issue
+/// #1340 scope note on [`claim_task_batched_candidates_query`].
 macro_rules! claim_candidate_gates_sql {
     ($counts:literal) => {
         concat!(
@@ -3803,18 +3827,20 @@ enum ClaimOutcome {
 /// the residual window that strategy accepts. See
 /// [`apply_post_claim_rechecks`] below for how those strategies differ.
 pub(crate) async fn release_claim_via(
-    conn: &mut AsyncPgConnection,
+    conn: &AsyncPgConnection,
     sql: &'static str,
     task_id: Uuid,
     worker_id: &str,
 ) -> HarvestResult<bool> {
     // Each caller passes a constant, so the cache holds one statement per
     // recheck (issue #2651). Two or three of them run on every claim.
+    // A shared reference lets the claim pipeline the rechecks.
+    let mut shared = conn;
     let released = diesel::sql_query(sql)
         .bind::<diesel::sql_types::Uuid, _>(task_id)
         .bind::<diesel::sql_types::Text, _>(worker_id)
         .cache_prepared()
-        .execute(conn)
+        .execute(&mut shared)
         .await
         .map_err(crate::error::database_error)?;
     Ok(released > 0)
@@ -3871,11 +3897,41 @@ pub const fn release_claim_if_over_cap_query() -> &'static str {
 ///
 /// Returns [`crate::error::HarvestError::Database`] on query failure.
 async fn release_claim_if_over_cap(
-    conn: &mut AsyncPgConnection,
+    conn: &AsyncPgConnection,
     task_id: Uuid,
     worker_id: &str,
 ) -> HarvestResult<bool> {
     release_claim_via(conn, release_claim_if_over_cap_query(), task_id, worker_id).await
+}
+
+/// What the claim does after its post-claim rechecks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecheckVerdict {
+    /// The queue lock holds and no recheck gave the row back.
+    Keep,
+    /// A recheck gave the row back. It is `PENDING` again at commit.
+    Released,
+    /// The queue lock failed and the row is still claimed. The claim must
+    /// give it back.
+    Release,
+}
+
+/// The verdict of the post-claim rechecks.
+///
+/// `acquired` is the result of the queue lock. `released` is true when a
+/// recheck gave the row back. The claim keeps a row only when the lock holds
+/// and no recheck released it. `formal/verus/src/claim_recheck.rs` proves
+/// that the pipeline keeps a row exactly when the sequential rechecks keep it.
+/// The proof does not cover the order on the server. A DB test covers it.
+#[must_use]
+pub const fn recheck_verdict(acquired: bool, released: bool) -> RecheckVerdict {
+    if released {
+        RecheckVerdict::Released
+    } else if acquired {
+        RecheckVerdict::Keep
+    } else {
+        RecheckVerdict::Release
+    }
 }
 
 /// The post-claim re-checks shared by [`claim_task_on_shard`] and
@@ -3884,8 +3940,32 @@ async fn release_claim_if_over_cap(
 /// Runs inside the caller's `READ COMMITTED` transaction, after the claim
 /// statement returned a row. See the long comment on [`claim_task_on_shard`]
 /// for why each step exists.
+///
+/// # One pipeline
+///
+/// The queue lock and the rechecks go to the server in one pipeline, so they
+/// cost one round trip, not three. The server runs them in the order that
+/// they arrive, each with its own snapshot. The client sends them in the
+/// order of the `join4` arguments:
+///
+/// - The driver sends a statement on the first poll of its future. `join4`
+///   polls its futures in argument order.
+/// - A statement that is not prepared yet holds the statement cache lock
+///   while it prepares. That lock is fair, so the next statement waits for
+///   it and sends after it.
+///
+/// The order also needs builtin bind types. A custom type makes the driver
+/// look up its oid before the statement cache lock, and that lookup can let a
+/// later statement send first. Each statement here binds a uuid, a text or an
+/// int4 only.
+///
+/// `claim_recheck_pipeline_db_tests` proves the order on a cold, a warm and
+/// a mixed connection. Each statement also runs when an earlier one gave the
+/// row back. It then matches no row, because each release requires
+/// `state = 'RUNNING'`. When the lock fails, the rechecks still run without
+/// it. A recheck can only give the row back, so that is safe.
 async fn apply_post_claim_rechecks(
-    conn: &mut AsyncPgConnection,
+    shared: &AsyncPgConnection,
     task: TaskQueueItem,
     worker_id: &str,
 ) -> HarvestResult<ClaimOutcome> {
@@ -3904,10 +3984,7 @@ async fn apply_post_claim_rechecks(
     // a failed `try` simply means a pause or resume is committing right now,
     // so we give the claim back and let the next poll re-decide against
     // committed state. See `queue_pause::try_lock_queue_for_claim`.
-    if !crate::queue_pause::try_lock_queue_for_claim(conn, &task.queue_name).await? {
-        crate::queue_pause::release_claim(conn, task.id, worker_id).await?;
-        return Ok(ClaimOutcome::Released(task.id));
-    }
+    let lock = crate::queue_pause::try_lock_queue_for_claim(shared, &task.queue_name);
 
     // Authoritative queue-pause re-check (issue #619). The anti-join in the
     // claim above is evaluated against that statement's snapshot, so a pause
@@ -3920,9 +3997,8 @@ async fn apply_post_claim_rechecks(
     // its own snapshot. See `queue_pause::release_claim_if_queue_paused` for
     // why an exclusive lock inside the claim itself was rejected: it would
     // serialize all claims for a queue and defeat `SKIP LOCKED`.
-    if crate::queue_pause::release_claim_if_queue_paused(conn, task.id, worker_id).await? {
-        return Ok(ClaimOutcome::Released(task.id));
-    }
+    let queue_paused =
+        crate::queue_pause::release_claim_if_queue_paused(shared, task.id, worker_id);
 
     // Authoritative activity-pause re-check (issue #807). Same reasoning as the
     // queue-pause re-check directly above: the `paused_activities` pre-filter
@@ -3930,8 +4006,8 @@ async fn apply_post_claim_rechecks(
     // committing while the claim was in flight is invisible to it. This is a
     // separate statement and therefore takes a fresh snapshot.
     //
-    // Gated on `task_type` so a workflow task -- which can never be held by an
-    // activity pause -- pays no extra round trip on the hot claim path. The
+    // Gated on `task_type`. An activity pause can never hold a workflow task,
+    // so a workflow task pays no extra statement on the hot claim path. The
     // guard is not merely an optimization: it makes the added cost fall only on
     // the rows the feature can actually hold.
     //
@@ -3940,12 +4016,7 @@ async fn apply_post_claim_rechecks(
     // commit. See the "Residual window" section on
     // `activity_pause::release_claim_if_activity_paused` for the precise bound
     // and why it is accepted.
-    if task.task_type == crate::activity_pause::ACTIVITY_TASK_TYPE
-        && crate::activity_pause::release_claim_if_activity_paused(conn, task.id, worker_id).await?
-    {
-        return Ok(ClaimOutcome::Released(task.id));
-    }
-
+    //
     // Authoritative workflow-pause re-check (issue #1640). The reasoning
     // matches the two re-checks above. The claim's own anti-join against
     // `harvest_workflow_executions` is evaluated against that statement's
@@ -3953,27 +4024,65 @@ async fn apply_post_claim_rechecks(
     // flight stays invisible to it.
     //
     // Gated on `task_type` and a non-null `workflow_exec_id`. An activity
-    // claim can never be held by a workflow pause, so it pays no extra round
-    // trip. See `execution::release_claim_if_workflow_paused` for the
+    // claim can never be held by a workflow pause, so it pays no extra
+    // statement. See `execution::release_claim_if_workflow_paused` for the
     // residual-window trade-off this re-check accepts.
-    if task.task_type == TaskType::Workflow.as_str()
-        && task.workflow_exec_id.is_some()
-        && crate::execution::release_claim_if_workflow_paused(conn, task.id, worker_id).await?
-    {
-        return Ok(ClaimOutcome::Released(task.id));
-    }
+    let activity = task.task_type == crate::activity_pause::ACTIVITY_TASK_TYPE;
+    let workflow = task.task_type == TaskType::Workflow.as_str() && task.workflow_exec_id.is_some();
+    let kind_paused = async {
+        if activity {
+            crate::activity_pause::release_claim_if_activity_paused(shared, task.id, worker_id)
+                .await
+        } else if workflow {
+            crate::execution::release_claim_if_workflow_paused(shared, task.id, worker_id).await
+        } else {
+            Ok(false)
+        }
+    };
 
     // Authoritative concurrency-cap re-check. The claim counts the key under
     // the snapshot of its own statement. See `release_claim_if_over_cap`.
-    // Gated on a capped key, so other claims pay no extra round trip.
-    if task.concurrency_key.is_some()
-        && task.concurrency_cap.is_some()
-        && release_claim_if_over_cap(conn, task.id, worker_id).await?
-    {
-        return Ok(ClaimOutcome::Released(task.id));
-    }
+    // Gated on a capped key, so other claims pay no extra statement.
+    let capped = task.concurrency_key.is_some() && task.concurrency_cap.is_some();
+    let over_cap = async {
+        if capped {
+            release_claim_if_over_cap(shared, task.id, worker_id).await
+        } else {
+            Ok(false)
+        }
+    };
 
-    Ok(ClaimOutcome::Claimed(Box::new(task)))
+    // `join4` waits for every reply, so no statement is in flight on return.
+    let (acquired, queue_paused, kind_paused, over_cap) =
+        futures::future::join4(lock, queue_paused, kind_paused, over_cap).await;
+    // The first error is the cause. A later statement fails only because the
+    // transaction is aborted.
+    let acquired = acquired?;
+    let released = queue_paused? | kind_paused? | over_cap?;
+    match recheck_verdict(acquired, released) {
+        RecheckVerdict::Keep => Ok(ClaimOutcome::Claimed(Box::new(task))),
+        RecheckVerdict::Released => Ok(ClaimOutcome::Released(task.id)),
+        RecheckVerdict::Release => {
+            crate::queue_pause::release_claim(shared, task.id, worker_id).await?;
+            Ok(ClaimOutcome::Released(task.id))
+        }
+    }
+}
+
+/// [`apply_post_claim_rechecks`] for a test. Returns `true` when the claim
+/// keeps its row.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on query failure.
+#[doc(hidden)]
+pub async fn apply_post_claim_rechecks_for_test(
+    conn: &mut AsyncPgConnection,
+    task: TaskQueueItem,
+    worker_id: &str,
+) -> HarvestResult<bool> {
+    let outcome = apply_post_claim_rechecks(conn, task, worker_id).await?;
+    Ok(matches!(outcome, ClaimOutcome::Claimed(_)))
 }
 
 /// Claim one **named** `harvest_task_queue` row (issue #1312).
@@ -11027,6 +11136,14 @@ pub async fn pending_queue_demand_by_queue_name(
 /// redesigns, out of scope
 /// here. Named explicitly, alongside the gaps above, as what a reviewer
 /// needs before this becomes the default claim path.
+///
+/// Clone-class note: this function's own `required_build_id` and
+/// `required_capabilities` checks repeat verbatim in the
+/// `claim_candidate_gates_sql!` macro above. See the note on that macro
+/// for the token counts and the shared origin commit. It also explains
+/// why the two copies cannot fold into
+/// [`build_and_capability_eligibility_predicate`] as that function stands
+/// today.
 // The body is one SQL string literal; the line count is the query's, not
 // control flow's -- the same allow `claim_task_query` carries.
 #[allow(clippy::too_many_lines)]

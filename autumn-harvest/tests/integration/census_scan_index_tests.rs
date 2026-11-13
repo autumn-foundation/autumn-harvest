@@ -574,7 +574,7 @@ async fn pending_signal_reads_keep_the_partial_index() {
         .await
         .expect("has_pending_signals");
     let exists = take_statement(&log, "SELECT EXISTS");
-    autumn_harvest::signal::load_pending_signals(&mut conn, exec_id)
+    autumn_harvest::signal::load_pending_signals(&conn, exec_id)
         .await
         .expect("load_pending_signals");
     let load = take_statement(&log, "SELECT");

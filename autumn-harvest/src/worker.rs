@@ -12337,103 +12337,118 @@ async fn persist_scheduled_activities(
     // activity-completion races, this is a *fresh* dispatch (the activities
     // being scheduled here cannot have completed yet), so no other in-band
     // check exists to catch it.
-    let (deferred, had_wake_requested, synthesized_outcome) =
-        Box::pin(conn.transaction::<_, HarvestError, _>(async |conn| {
-            // Issue #2251: the owner fence comes first.
-            crate::replication::assert_decision_fence(conn).await?;
-            // Cancellable/renewable timer bookkeeping (issue #768): resolve
-            // the ArmTimer/CancelTimer row mutations FIRST, then build the
-            // event list in command emission order -- markers, detached-spawn
-            // events, interleaved TimerStarted/TimerCancelled, and
-            // ActivityScheduled events all at their actual command positions
-            // so the replay engine's sequential cursor sees the same order as
-            // command emission (armed timers observed on next wake; deadline
-            // unused here).
-            let (mut timer_events, _min_fires_at) =
-                plan_timer_lifecycle(conn, exec_id, commands).await?;
-            let mut act_iter = activity_events.into_iter();
-            let events = build_suspension_events(commands, &mut timer_events, |cmd| {
-                if matches!(cmd, WorkflowCommand::ScheduleActivity { .. }) {
-                    act_iter.next()
-                } else {
-                    None
-                }
-            });
-            let events_len = i32::try_from(events.len()).unwrap_or(i32::MAX);
-            store::append_events_offloaded_with_codecs(
-                conn,
-                exec_id,
-                &events,
-                next_event_id,
-                offloader,
-                registry.payload_codecs(),
-            )
-            .await?;
-            detached_spawns.persist(conn, commands).await?;
-            // Lazily register any dynamic per-key rate-limit buckets (issue
-            // #699) in the same transaction as the enqueue so the fail-closed
-            // claim/dispatch gate always finds a bucket row (else the task
-            // would stall forever). ON CONFLICT DO NOTHING preserves operator
-            // overrides and is idempotent across replays/re-dispatch.
-            // The plan hands them over sorted by key, which is what keeps the
-            // registration's rare stale-bucket row lock deadlock-free (issue
-            // #1127) — see `ActivityEnqueuePlan`.
-            for (bucket_key, refill_rate, burst) in &dynamic_rate_buckets {
-                queue::ensure_rate_limit_bucket(conn, bucket_key, *refill_rate, *burst).await?;
+    //
+    // With no caller transaction, the body opens its own. Inside one, it takes
+    // a savepoint only when the caller can recover from one of its errors. See
+    // [`suspension_needs_savepoint`].
+    let body = async |conn: &mut AsyncPgConnection| -> HarvestResult<_> {
+        // Issue #2251: the owner fence comes first.
+        crate::replication::assert_decision_fence(conn).await?;
+        // Cancellable/renewable timer bookkeeping (issue #768): resolve
+        // the ArmTimer/CancelTimer row mutations FIRST, then build the
+        // event list in command emission order -- markers, detached-spawn
+        // events, interleaved TimerStarted/TimerCancelled, and
+        // ActivityScheduled events all at their actual command positions
+        // so the replay engine's sequential cursor sees the same order as
+        // command emission (armed timers observed on next wake; deadline
+        // unused here).
+        let (mut timer_events, _min_fires_at) =
+            plan_timer_lifecycle(conn, exec_id, commands).await?;
+        let mut act_iter = activity_events.into_iter();
+        let events = build_suspension_events(commands, &mut timer_events, |cmd| {
+            if matches!(cmd, WorkflowCommand::ScheduleActivity { .. }) {
+                act_iter.next()
+            } else {
+                None
             }
-            // One multi-row INSERT for the whole fan-out, not one per
-            // activity (Ledger perf pass). A decision that schedules N
-            // activities in one suspension used to cost N single-row
-            // INSERT statements here. See `queue::enqueue_batch`'s doc
-            // comment for the mechanism and the rare sticky-pin
-            // follow-up it still issues per row.
-            let activity_task_ids = queue::enqueue_batch(conn, &enqueued).await?;
-            let mut race_next_event_id = next_event_id.saturating_add(events_len);
-            let (deferred, _race_loser_events) = apply_race_loser_cancellations(
-                conn,
-                exec_id,
-                commands,
-                &mut race_next_event_id,
-                registry,
-            )
-            .await?;
-
-            // Issue #2000: a fork resolves each activity from its record
-            // here. It runs before the session check, which skips each
-            // settled activity.
-            let fork = crate::fork::serve_recorded_activities(
-                conn,
-                exec_id,
-                is_fork,
-                &scheduled_activity_ids(scheduled_activities),
-                &mut race_next_event_id,
-                registry,
-            )
-            .await?;
-            // Worker sessions (issue #606): fail any member activity whose
-            // session already left ACTIVE, so the workflow observes
-            // SessionBroken on its next decision cycle instead of hanging on a
-            // task hard-pinned to a dead host.
-            let synthesized_broken_session_failure = fail_activities_for_broken_sessions(
-                conn,
-                exec_id,
-                scheduled_activities,
-                &activity_task_ids,
-                &fork.settled,
-                &mut race_next_event_id,
-                registry.payload_codecs(),
-            )
-            .await?;
-            let served_from_fork = fork.served;
-
-            let had_wake_requested = queue::park_workflow_task(conn, task_id, sticky).await?;
-            Ok((
-                deferred,
-                had_wake_requested,
-                synthesized_broken_session_failure || served_from_fork,
-            ))
-        }))
+        });
+        let events_len = i32::try_from(events.len()).unwrap_or(i32::MAX);
+        store::append_events_offloaded_with_codecs(
+            conn,
+            exec_id,
+            &events,
+            next_event_id,
+            offloader,
+            registry.payload_codecs(),
+        )
         .await?;
+        detached_spawns.persist(conn, commands).await?;
+        // Lazily register any dynamic per-key rate-limit buckets (issue
+        // #699) in the same transaction as the enqueue so the fail-closed
+        // claim/dispatch gate always finds a bucket row (else the task
+        // would stall forever). ON CONFLICT DO NOTHING preserves operator
+        // overrides and is idempotent across replays/re-dispatch.
+        // The plan hands them over sorted by key, which is what keeps the
+        // registration's rare stale-bucket row lock deadlock-free (issue
+        // #1127) — see `ActivityEnqueuePlan`.
+        for (bucket_key, refill_rate, burst) in &dynamic_rate_buckets {
+            queue::ensure_rate_limit_bucket(conn, bucket_key, *refill_rate, *burst).await?;
+        }
+        // One multi-row INSERT for the whole fan-out, not one per
+        // activity (Ledger perf pass). A decision that schedules N
+        // activities in one suspension used to cost N single-row
+        // INSERT statements here. See `queue::enqueue_batch`'s doc
+        // comment for the mechanism and the rare sticky-pin
+        // follow-up it still issues per row.
+        let activity_task_ids = queue::enqueue_batch(conn, &enqueued).await?;
+        let mut race_next_event_id = next_event_id.saturating_add(events_len);
+        let (deferred, _race_loser_events) = apply_race_loser_cancellations(
+            conn,
+            exec_id,
+            commands,
+            &mut race_next_event_id,
+            registry,
+        )
+        .await?;
+
+        // Issue #2000: a fork resolves each activity from its record
+        // here. It runs before the session check, which skips each
+        // settled activity.
+        let fork = crate::fork::serve_recorded_activities(
+            conn,
+            exec_id,
+            is_fork,
+            &scheduled_activity_ids(scheduled_activities),
+            &mut race_next_event_id,
+            registry,
+        )
+        .await?;
+        // Worker sessions (issue #606): fail any member activity whose
+        // session already left ACTIVE, so the workflow observes
+        // SessionBroken on its next decision cycle instead of hanging on a
+        // task hard-pinned to a dead host.
+        let synthesized_broken_session_failure = fail_activities_for_broken_sessions(
+            conn,
+            exec_id,
+            scheduled_activities,
+            &activity_task_ids,
+            &fork.settled,
+            &mut race_next_event_id,
+            registry.payload_codecs(),
+        )
+        .await?;
+        let served_from_fork = fork.served;
+
+        let had_wake_requested = queue::park_workflow_task(conn, task_id, sticky).await?;
+        Ok((
+            deferred,
+            had_wake_requested,
+            synthesized_broken_session_failure || served_from_fork,
+        ))
+    };
+    let in_transaction = {
+        use diesel_async::TransactionManager as _;
+        diesel_async::AnsiTransactionManager::transaction_manager_status_mut(conn)
+            .transaction_depth()
+            .map_err(crate::error::database_error)?
+            .is_some()
+    };
+    let (deferred, had_wake_requested, synthesized_outcome) =
+        if in_transaction && !suspension_needs_savepoint(commands, is_fork) {
+            body(conn).await?
+        } else {
+            Box::pin(conn.transaction::<_, HarvestError, _>(body)).await?
+        };
 
     for start in deferred {
         start.spawn();
@@ -12447,6 +12462,27 @@ async fn persist_scheduled_activities(
     }
 
     Ok(())
+}
+
+/// Whether the suspension body of [`persist_scheduled_activities`] needs a
+/// savepoint.
+///
+/// The caller recovers from two errors and then commits the persist
+/// transaction: a full tenant quota and an unavailable shard (see
+/// `recover_from_child_quota_exceeded`). Two steps of this body can raise
+/// them: a detached child spawn, and the cancel of a losing child of a race.
+/// The cancel of a child on a moving shard raises the shard error. A fork
+/// reads the history of its source here. The savepoint stays for a fork, so
+/// a new error path in that read stays safe. The savepoint discards the events that the body
+/// appended before such an error. Every other error rolls back the whole
+/// persist transaction, so it needs no savepoint.
+fn suspension_needs_savepoint(commands: &[WorkflowCommand], is_fork: bool) -> bool {
+    is_fork
+        || commands.iter().any(|cmd| match cmd {
+            WorkflowCommand::SpawnDetachedChildWorkflow { .. } => true,
+            WorkflowCommand::CancelRaceLosers { children, .. } => !children.is_empty(),
+            _ => false,
+        })
 }
 
 #[allow(clippy::too_many_lines)]
@@ -15113,19 +15149,27 @@ pub async fn ingest_due_timers_and_signals(
 ) -> HarvestResult<(Vec<TimerId>, Vec<String>)> {
     use crate::schema::harvest_timers::dsl;
 
-    let due_timers = dsl::harvest_timers
-        .filter(dsl::workflow_exec_id.eq(exec_id.as_uuid()))
-        .filter(dsl::fired.eq(false))
-        // Use the database clock here so timer replay stays consistent with the
-        // queue claim path, which also uses Postgres NOW().
-        .filter(dsl::fires_at.le(crate::cached_stmt::pg_now()))
-        .order((dsl::fires_at.asc(), dsl::timer_id.asc()))
-        .select(HarvestTimer::as_select())
-        .load(conn)
-        .await
-        .map_err(crate::error::database_error)?;
-
-    let pending_signals = signal::load_pending_signals(conn, exec_id).await?;
+    // The two reads are independent, so they go in one pipeline. The server
+    // runs them in this order, each with its own snapshot.
+    let shared: &AsyncPgConnection = conn;
+    let due_timers = async {
+        let mut shared = shared;
+        dsl::harvest_timers
+            .filter(dsl::workflow_exec_id.eq(exec_id.as_uuid()))
+            .filter(dsl::fired.eq(false))
+            // Use the database clock here so timer replay stays consistent with the
+            // queue claim path, which also uses Postgres NOW().
+            .filter(dsl::fires_at.le(crate::cached_stmt::pg_now()))
+            .order((dsl::fires_at.asc(), dsl::timer_id.asc()))
+            .select(HarvestTimer::as_select())
+            .load(&mut shared)
+            .await
+            .map_err(crate::error::database_error)
+    };
+    let pending_signals = signal::load_pending_signals(shared, exec_id);
+    let (due_timers, pending_signals) = futures::future::join(due_timers, pending_signals).await;
+    let due_timers: Vec<HarvestTimer> = due_timers?;
+    let pending_signals = pending_signals?;
 
     if due_timers.is_empty() && pending_signals.is_empty() {
         return Ok((vec![], vec![]));
@@ -22733,8 +22777,27 @@ pub async fn fail_execution_on_error<T>(
     if crate::tx_retry::classify_conflict(&error).is_some() {
         return Err(error);
     }
-    fail_task_and_execution(conn, task, worker_id, &error.to_string(), codecs).await?;
+    if let Err(fail_error) =
+        fail_task_and_execution(conn, task, worker_id, &error.to_string(), codecs).await
+    {
+        // A failed statement with no savepoint aborts the persist transaction.
+        // The failure write then fails too, and the caller rolls back. So the
+        // first error is the cause to report.
+        if is_aborted_transaction(&fail_error) {
+            return Err(error);
+        }
+        return Err(fail_error);
+    }
     Err(error)
+}
+
+/// True when `error` is the reply to a statement in an aborted transaction
+/// (SQLSTATE `25P02`). Diesel exposes no SQLSTATE, so this reads the message.
+/// With a localized `lc_messages` it returns false. The caller then reports
+/// the failure-write error.
+fn is_aborted_transaction(error: &HarvestError) -> bool {
+    matches!(error, HarvestError::Database(message)
+        if message.contains(crate::notify::ABORTED_BLOCK_MESSAGE))
 }
 
 /// Lower/upper bounds for the randomized reschedule delay after a child
@@ -50620,6 +50683,72 @@ mod tests {
             "a child + ordinary (non-`__child_timeout:`) timer must NOT match the \
              child-timeout race"
         );
+    }
+
+    // ── the savepoint of the suspension persist ─────────────────────────────
+
+    #[test]
+    fn a_plain_fan_out_needs_no_savepoint() {
+        let commands = vec![
+            mixed_schedule_activity("a"),
+            mixed_schedule_activity("b"),
+            mixed_start_timer("t", 5),
+        ];
+        assert!(!suspension_needs_savepoint(&commands, false));
+        assert!(!suspension_needs_savepoint(&[], false));
+    }
+
+    #[test]
+    fn a_detached_spawn_or_a_fork_keeps_the_savepoint() {
+        let spawn = WorkflowCommand::SpawnDetachedChildWorkflow {
+            child_id: ExecutionId::new(),
+            workflow_name: "audit".to_string(),
+            input: serde_json::json!({}),
+            parent_close_policy: crate::types::ParentClosePolicy::Abandon,
+        };
+        let commands = vec![mixed_schedule_activity("a"), spawn];
+        assert!(suspension_needs_savepoint(&commands, false));
+        assert!(suspension_needs_savepoint(
+            &[mixed_schedule_activity("a")],
+            true
+        ));
+    }
+
+    /// The cancel of a losing child can raise the shard error that the
+    /// caller recovers from. A race with no losing child needs no savepoint.
+    #[test]
+    fn a_race_with_a_losing_child_keeps_the_savepoint() {
+        let losers = |children: Vec<ExecutionId>| WorkflowCommand::CancelRaceLosers {
+            reason: crate::context::LoserCancelReason::RaceLoser,
+            activities: vec![crate::types::ActivityExecId::new()],
+            children,
+            timers: vec![],
+        };
+        assert!(suspension_needs_savepoint(
+            &[
+                mixed_schedule_activity("a"),
+                losers(vec![ExecutionId::new()])
+            ],
+            false
+        ));
+        assert!(!suspension_needs_savepoint(
+            &[mixed_schedule_activity("a"), losers(vec![])],
+            false
+        ));
+    }
+
+    #[test]
+    fn only_the_aborted_transaction_reply_counts_as_aborted() {
+        assert!(is_aborted_transaction(&HarvestError::Database(
+            "current transaction is aborted, commands ignored until end of transaction block"
+                .to_string()
+        )));
+        assert!(!is_aborted_transaction(&HarvestError::Database(
+            "duplicate key value violates unique constraint".to_string()
+        )));
+        assert!(!is_aborted_transaction(&HarvestError::Config(
+            "current transaction is aborted".to_string()
+        )));
     }
 
     // ── extract_mixed_suspension_batch (issue #950) ──────────────────────────

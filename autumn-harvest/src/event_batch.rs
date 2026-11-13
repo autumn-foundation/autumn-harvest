@@ -6,6 +6,8 @@
     clippy::cast_sign_loss
 )]
 
+#[cfg(feature = "db")]
+use crate::cached_stmt::CachePreparedDsl as _;
 use crate::debounce::DebounceStartOptions;
 #[cfg(feature = "db")]
 use crate::error::{HarvestError, HarvestResult};
@@ -588,6 +590,7 @@ async fn fire_due_on_conn(
     }
     let exists: TableExists =
         diesel::sql_query("SELECT to_regclass('harvest_event_batches') IS NOT NULL AS present")
+            .cache_prepared()
             .get_result(conn)
             .await
             .map_err(crate::error::database_error)?;
@@ -636,6 +639,7 @@ async fn fire_due_on_conn(
                     .bind::<diesel::sql_types::Timestamptz, _>(now)
                     .bind::<diesel::sql_types::BigInt, _>(1i64)
                     .bind::<diesel::sql_types::Integer, _>(sid)
+                    .cache_prepared()
                     .load(conn)
                     .await
                     .map_err(crate::error::database_error)?
@@ -643,6 +647,7 @@ async fn fire_due_on_conn(
                 diesel::sql_query(due_sql)
                     .bind::<diesel::sql_types::Timestamptz, _>(now)
                     .bind::<diesel::sql_types::BigInt, _>(1i64)
+                    .cache_prepared()
                     .load(conn)
                     .await
                     .map_err(crate::error::database_error)?

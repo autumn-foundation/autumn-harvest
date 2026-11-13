@@ -33,4 +33,5 @@ mod agent_vote;
 mod agent_stores;
 mod refine_rule;
 mod notify_settle;
+mod claim_recheck;
 mod restore_target;
