@@ -2706,9 +2706,9 @@ pub async fn enqueue_completion_deliveries(
 const COMPLETION_DELIVERY_FIRE_BATCH_SIZE: i64 = 100;
 
 /// How long a claimed row stays `INFLIGHT` before it becomes reclaimable
-/// again. Protects against a scanner crashing between claim and
-/// record-outcome: the row is not stuck forever, but it is also not
-/// immediately double-claimed by a concurrent scanner tick.
+/// again. It protects against a scanner crash between claim and
+/// record-outcome. The row is not stuck forever. It is also not immediately
+/// double-claimed by a concurrent scanner tick.
 #[cfg(feature = "db")]
 const INFLIGHT_LEASE_SECS: i64 = 30;
 

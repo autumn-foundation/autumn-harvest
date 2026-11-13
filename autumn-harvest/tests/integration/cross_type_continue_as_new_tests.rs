@@ -1304,9 +1304,9 @@ async fn a_live_run_of_the_target_type_blocks_the_transition_terminally() {
 /// intent. `live_workers_on_queue_query` deliberately selects on heartbeat
 /// freshness alone (a `Draining` worker is a rollback away from being capable,
 /// so excluding it could fabricate an escalation), and every worker this module
-/// runs shares the `default` queue. A sibling test's worker therefore stays
-/// "live" for the whole freshness window after it stops — far longer than the
-/// gap between two tests — and reads as an untried peer that may hold the
+/// runs shares the `default` queue. So a sibling test's worker stays "live"
+/// for the whole freshness window after it stops. That is far longer than the
+/// gap between two tests. The worker reads as an untried peer that may hold the
 /// handler, which correctly *withholds* the escalation bound (issue #804).
 /// In production those pods are gone and age out on their own. Here the shared
 /// database keeps their last heartbeat. So the test clears the fleet

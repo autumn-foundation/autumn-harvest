@@ -949,9 +949,10 @@ async fn throttle_override_activates_immediately_and_reverts_at_ttl_via_real_sta
     assert_eq!(body["override_active"], json!(true));
     assert_eq!(body["effective_refill_rate"], json!(1000.0));
 
-    // Simulate a scanner tick clearing job-2's backlog: `reserve_or_defer`'s
-    // FIFO fast-path guard defers any NEW start for a key with a still-
-    // pending backlog entry, so that a burst cannot jump the queue. That
+    // Simulate a scanner tick clearing job-2's backlog.
+    // `reserve_or_defer`'s FIFO fast-path guard defers any NEW start for a key
+    // with a still-pending backlog entry, so that a burst cannot jump the
+    // queue. That
     // guard would otherwise mask the override's effect on a *fresh*
     // admission below.
     let bucket_key = autumn_harvest::throttle::bucket_key(name, "");
@@ -2109,9 +2110,9 @@ async fn get_start_throttle_pacing_override_reports_disagreement_across_live_sha
 
 /// Issue #945: `GET /admin/rate-limits` (the LIST endpoint) merged every key
 /// down to the shard with the fewest raw `tokens`, and converted ONLY that
-/// row. So a fully reachable, genuinely disagreeing fleet (one shard actively
-/// overridden, one not) could report `override_active: false` for a key that
-/// is still overridden on another live shard. The single-key
+/// row. Take a fully reachable, genuinely disagreeing fleet: one shard
+/// actively overridden, one not. It could report `override_active: false` for
+/// a key that is still overridden on another live shard. The single-key
 /// `get_start_throttle_pacing_override` read had the same class of bug. This
 /// test proves that the fix also covers the plain rate-limit list.
 #[tokio::test]

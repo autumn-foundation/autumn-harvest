@@ -1298,10 +1298,10 @@ impl WorkflowReplayer {
                 // replay of a `should_continue_as_new`-branching workflow stays
                 // faithful to the live worker (which uses `registry.history_policy()`).
                 self.history_policy,
-                // Issue #798: the candidate worker's payload
-                // limits, for the same reason as the build id above — a build
-                // that lowers a cap breaks the very in-flight runs the gate
-                // sampled, and the library default would certify it.
+                // Issue #798: the candidate worker's payload limits, for the
+                // same reason as the build id above. A build that lowers a cap
+                // breaks the very in-flight runs the gate sampled. The library
+                // default would certify it.
                 payload_limits,
                 // Issue #798: the candidate's declarative
                 // `#[query]`/`#[update]` handlers. The live worker registers
@@ -1334,10 +1334,10 @@ impl WorkflowReplayer {
                 // replay of a `should_continue_as_new`-branching workflow stays
                 // faithful to the live worker (which uses `registry.history_policy()`).
                 self.history_policy,
-                // Issue #798: the candidate worker's payload
-                // limits, for the same reason as the build id above — a build
-                // that lowers a cap breaks the very in-flight runs the gate
-                // sampled, and the library default would certify it.
+                // Issue #798: the candidate worker's payload limits, for the
+                // same reason as the build id above. A build that lowers a cap
+                // breaks the very in-flight runs the gate sampled. The library
+                // default would certify it.
                 payload_limits,
                 // Issue #798: the candidate's declarative
                 // `#[query]`/`#[update]` handlers. The live worker registers
@@ -1615,10 +1615,10 @@ impl WorkflowReplayer {
                 // replay of a `should_continue_as_new`-branching workflow stays
                 // faithful to the live worker (which uses `registry.history_policy()`).
                 self.history_policy,
-                // Issue #798: the candidate worker's payload
-                // limits, for the same reason as the build id above — a build
-                // that lowers a cap breaks the very in-flight runs the gate
-                // sampled, and the library default would certify it.
+                // Issue #798: the candidate worker's payload limits, for the
+                // same reason as the build id above. A build that lowers a cap
+                // breaks the very in-flight runs the gate sampled. The library
+                // default would certify it.
                 payload_limits,
                 // Issue #798: the candidate's declarative
                 // `#[query]`/`#[update]` handlers. The live worker registers
@@ -1650,10 +1650,10 @@ impl WorkflowReplayer {
                 // replay of a `should_continue_as_new`-branching workflow stays
                 // faithful to the live worker (which uses `registry.history_policy()`).
                 self.history_policy,
-                // Issue #798: the candidate worker's payload
-                // limits, for the same reason as the build id above — a build
-                // that lowers a cap breaks the very in-flight runs the gate
-                // sampled, and the library default would certify it.
+                // Issue #798: the candidate worker's payload limits, for the
+                // same reason as the build id above. A build that lowers a cap
+                // breaks the very in-flight runs the gate sampled. The library
+                // default would certify it.
                 payload_limits,
                 // Issue #798: the candidate's declarative
                 // `#[query]`/`#[update]` handlers. The live worker registers
@@ -4184,8 +4184,8 @@ impl ReplayVerifier {
     #[must_use]
     pub fn register(mut self, workflows: Vec<crate::info::WorkflowInfo>) -> Self {
         for wf in workflows {
-            // Issue #798: retain the per-workflow input-cap
-            // override so each fixture replays under the cap the promoted worker
+            // Issue #798: retain the per-workflow input-cap override. Each
+            // fixture then replays under the cap that the promoted worker
             // resolves for *its* workflow type, not one bundle-wide value.
             if let Some(per) = wf.max_input_bytes {
                 self.replay_defaults
@@ -4938,8 +4938,8 @@ enum FixtureReplayMode {
 /// Every replay-context value here is a *fallback* carried from the caller's
 /// builder (issue #798). The real #798 export writes `workflow_id`,
 /// `parent_execution_id`, `execution_timeout` and `context_headers` onto the
-/// snapshot, and `replay_from_snapshot` prefers the snapshot's own value — so
-/// these only take effect for a hand-built or legacy fixture that omits the
+/// snapshot. `replay_from_snapshot` prefers the snapshot's own value. So these
+/// only take effect for a hand-built or legacy fixture that omits the
 /// metadata. Dropping them (as this construction used to) silently ignored
 /// `WorkflowReplayer::with_workflow_id` and friends on the bundle path,
 /// reporting drift for a workflow that never drifted — the same bug class the
@@ -4980,13 +4980,13 @@ fn fixture_replayer(
         // it via `ReplayVerifier::with_history_policy`. Defaults to the default
         // policy — unchanged pre-#614 behavior for anyone who never customized it.
         history_policy: defaults.history_policy,
-        // Issue #798: like the build id, authoritative rather
-        // than a fallback — the bundle describes executions, not the runtime that
-        // will resume them, so the candidate's limits come from the caller.
+        // Issue #798: like the build id, authoritative and not a fallback. The
+        // bundle describes executions, not the runtime that will resume them.
+        // So the candidate's limits come from the caller.
         payload_limits: defaults.payload_limits,
-        // Issue #798: same authoritative treatment — the live
-        // worker registers these before any workflow code runs, so a replay that
-        // omits them is not replaying the candidate.
+        // Issue #798: same authoritative treatment. The live worker registers
+        // these before any workflow code runs. So a replay that omits them is
+        // not replaying the candidate.
         declarative_queries: defaults.declarative_queries.clone(),
         declarative_updates: defaults.declarative_updates.clone(),
         // Issue #798: the per-workflow input-cap overrides the
@@ -8743,12 +8743,11 @@ mod tests {
 
     #[test]
     fn opaque_payload_fixture_reason_detects_a_genuine_erased_tombstone() {
-        // The genuine-detection half of the wrapper: a real erasure
-        // tombstone (issue #495), built via the same canonical helper
-        // production erasure code uses, must still be caught after routing
-        // through the combined wrapper -- confirming the shared prefix scan
-        // does not accidentally reject what erased_fixture_reason alone
-        // would have caught.
+        // The genuine-detection half of the wrapper. A real erasure tombstone
+        // (issue #495) is built via the same canonical helper that production
+        // erasure code uses. The combined wrapper must still catch it. That
+        // confirms the shared prefix scan does not accidentally reject what
+        // erased_fixture_reason alone would have caught.
         let snapshot = HistorySnapshot {
             workflow_name: "erased_wf".to_string(),
             execution_id: ExecutionId::new(),

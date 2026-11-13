@@ -410,8 +410,8 @@ pub enum ThrottleAdmission {
     /// caller must **not** start; over HTTP it returns `202 Accepted`.
     Deferred(ThrottleDeferOutcome),
     /// An active execution already exists for this `(workflow_name,
-    /// workflow_id)` under a reuse policy that makes admission a no-op
-    /// (`AllowDuplicate`, `RejectDuplicate`) or resolves against a
+    /// workflow_id)`. Its reuse policy makes admission a no-op
+    /// (`AllowDuplicate`, `RejectDuplicate`). Or the policy resolves against a
     /// non-terminal prior (`AllowDuplicateFailedOnly` when the existing row
     /// is not FAILED/CANCELLED). No token was reserved and no pending row was
     /// written. The caller must proceed straight to
@@ -869,7 +869,7 @@ async fn admit(
 
     // (0) Bypass entirely when an active execution already makes this
     // admission a no-op or an immediate reject under the caller's reuse
-    // policy. TerminateIfRunning always starts fresh (cancel + replace), so
+    // policy. TerminateIfRunning always starts fresh (cancel + replace). So
     // it is excluded from the lookup and always proceeds to normal pacing.
     let reuse_policy = params
         .start_options

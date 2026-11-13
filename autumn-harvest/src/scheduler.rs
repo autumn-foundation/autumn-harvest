@@ -8529,9 +8529,9 @@ mod tests {
 
     #[test]
     fn due_run_plan_without_catchup_anchors_next_slot_to_first_due() {
-        // When now is only slightly past first_due (e.g. jitter delay of 3 min
-        // inside a 60-min interval), next slot must be first_due + period, not
-        // now + period, so the schedule does not drift on every fired slot.
+        // Now is only slightly past first_due (e.g. jitter delay of 3 min
+        // inside a 60-min interval). The next slot must be first_due + period,
+        // not now + period. So the schedule does not drift on every fired slot.
         let schedule = Schedule::Interval(Duration::from_secs(3600));
         let first_due = parse_utc("2026-04-06T10:00:00Z");
         let now = parse_utc("2026-04-06T10:03:00Z"); // 3 min jitter delay

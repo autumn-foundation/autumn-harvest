@@ -1421,12 +1421,12 @@ fn required_queues(runtime: &crate::api::HarvestApiRuntime) -> BTreeSet<String> 
     for activity in runtime.registry().activities.values() {
         // Worker sessions (issue #606): the two reserved internal
         // activities (`__harvest_session_acquire`/`__harvest_session_release`)
-        // are always registered so the enqueue-time handler lookup never
-        // hard-fails on them, but they're dispatched on the *caller-supplied*
-        // session queue at the point `create_session`/`Session::complete` is
-        // called, never on `default_queue`. Counting them here would
-        // spuriously report a deployment with no session-based workflow at
-        // all as requiring a worker on `"default"`.
+        // are always registered, so the enqueue-time handler lookup never
+        // hard-fails on them. But they are dispatched on the *caller-supplied*
+        // session queue when `create_session`/`Session::complete` is called,
+        // never on `default_queue`. Counting them here would spuriously report
+        // a deployment with no session-based workflow at all as requiring a
+        // worker on `"default"`.
         // Synthetic liveness canary (issue #796): the built-in canary activity
         // has `default_queue: None` but is always dispatched on the probe's
         // *target* queue (carried in the workflow input), never on

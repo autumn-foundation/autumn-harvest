@@ -248,8 +248,9 @@ fn bound_key_component(component: &str) -> String {
 /// `dyn-rate:{expr}:U` can never coincide with a *resolved* bucket — in
 /// particular with `dyn-rate:{expr}:L0:`, which is a legitimately-resolved
 /// **empty-string** tenant (`Some("")`). The previous `.unwrap_or_default()` at
-/// the call site collapsed both `None` (unresolved / missing / malformed input)
-/// and `Some("")` (a real empty-string tenant) onto the same `L0:` bucket. That
+/// the call site collapsed two values onto the same `L0:` bucket. One is
+/// `None` (unresolved / missing / malformed input). The other is `Some("")` (a
+/// real empty-string tenant). That
 /// cross-throttled malformed/missing executions against a legitimate empty
 /// tenant (issue #699, worker.rs:4720).
 const UNRESOLVED_RESOLVED_MARKER: &str = "U";
@@ -267,10 +268,10 @@ const UNRESOLVED_RESOLVED_MARKER: &str = "U";
 /// [`UNRESOLVED_RESOLVED_MARKER`] (`U`), giving one shared fallback bucket per
 /// expression (`dyn-rate:{expr}:U`) so an unkeyed execution is still bounded
 /// rather than unbounded. Crucially, that unresolved bucket is **distinct** from
-/// `Some("")` — a legitimately-resolved empty-string tenant — which buckets
-/// under `L0:` (`dyn-rate:{expr}:L0:`); the `U`/`L`-tag disjointness stops a
+/// `Some("")`. That is a legitimately-resolved empty-string tenant, which buckets
+/// under `L0:` (`dyn-rate:{expr}:L0:`). The `U`/`L`-tag disjointness stops a
 /// malformed/missing input from cross-throttling a real empty-string tenant
-/// (issue #699 review).
+/// (issue #699).
 ///
 /// `key_expr` is normalized by stripping a leading `input.` (issue #699 review):
 /// `resolve_concurrency_key` treats `"input.tenant_id"` and `"tenant_id"` as the
@@ -312,9 +313,9 @@ pub fn dynamic_rate_bucket_key(key_expr: &str, resolved: Option<&str>) -> String
     // The expr component is self-delimiting (`L{len}:{bytes}` or `H{16hex}`);
     // the resolved component is either the same (`Some`) or the disjoint
     // single-byte `U` marker (`None`, unresolved). `None` (missing/null/
-    // non-object input) is kept DISTINCT from `Some("")` (a legitimately-
-    // resolved empty-string tenant, which encodes as `L0:`), so the two never
-    // share a bucket (issue #699). The whole composite
+    // non-object input) is kept DISTINCT from `Some("")`. That is a
+    // legitimately-resolved empty-string tenant, which encodes as `L0:`. So
+    // the two never share a bucket (issue #699). The whole composite
     // key stays injective (the `L`/`H`/`U` first-byte tags are disjoint).
     let resolved_component = resolved.map_or_else(
         || UNRESOLVED_RESOLVED_MARKER.to_string(),
@@ -7794,10 +7795,10 @@ async fn announce_deferred_task(
 ///   workflow body ran to a conclusion
 ///   ([`crate::error::CapabilityMissPhase::clears_crash_strikes`]): issue
 ///   #367's counter counts the worker processes a task has killed, so a
-///   pre-/mid-handler miss ran nothing and is not evidence about it. Zeroing
-///   unconditionally would let an incapable claim landing between two capable
-///   crashes reset the streak every time, so `poison_pill_threshold` is never
-///   reached in a heterogeneous fleet. No variant ever
+///   pre-/mid-handler miss ran nothing and is not evidence about it. Suppose
+///   an incapable claim lands between two capable crashes. An unconditional
+///   zero resets the streak every time, so a heterogeneous fleet never reaches
+///   `poison_pill_threshold`. No variant ever
 ///   *increments* it, which is what AC4 actually requires.
 /// - **`attempt = GREATEST(attempt - 1, 0)`** only when the handler was never
 ///   reached ([`crate::error::CapabilityMissPhase::restores_dispatch_attempt`]):
@@ -7963,17 +7964,17 @@ pub const fn release_task_for_capability_miss_query(
 ///   [`claim_task`] increments it on claim, and a pre-handler miss ran nothing,
 ///   so it must not drain the retry budget (the exact bug issue #369 fixed for
 ///   rate-limit deferrals). Once the handler has *begun*, `record_workflow_started`
-///   has already fired for this execution, and restoring `attempt` would make
-///   the next capable claim look like a first dispatch and emit that counter a
-///   second time. Every activity-task miss is
-///   pre-handler, so the budget is still always restored where it is a budget.
+///   has already fired for this execution. Restoring `attempt` would then make
+///   the next capable claim look like a first dispatch. That claim would emit
+///   the counter a second time. Every activity-task miss is pre-handler, so the
+///   budget is still always restored where it is a budget.
 /// - **`crash_strikes` is never incremented, and is reset only when the handler
 ///   ran** (`clear_crash_strikes`) — the poison-pill threshold (#367) measures
 ///   *consecutive* crashes, so only a dispatch that watched the body reach a
 ///   conclusion without dying is evidence the streak is broken. A pre-/mid-handler
-///   miss ran nothing and leaves the column alone: zeroing it would let an
-///   incapable claim landing between two capable crashes launder the task's
-///   history forever. Either way the release takes the row
+///   miss ran nothing and leaves the column alone. Zeroing it would let an
+///   incapable claim between two capable crashes launder the task's history
+///   forever. Either way the release takes the row
 ///   out of `RUNNING` with `worker_id NULL`, so the orphan reclaimer — the only
 ///   writer that *increments* the column — cannot see it at all.
 /// - **`capability_misses` is incremented** — the only counter a capability
@@ -8015,8 +8016,8 @@ pub const fn release_task_for_capability_miss_query(
 /// by construction instead of by a timing assumption.
 ///
 /// `claim_crash_strikes` is the `crash_strikes` value the dispatcher observed
-/// when it claimed the row, and is what makes this release apply to **that**
-/// claim rather than merely to that *worker*.
+/// when it claimed the row. It makes this release apply to **that** claim, not
+/// merely to that *worker*.
 /// [`crate::poison_pill::requeue_orphan`] hands an orphaned row back as
 /// `PENDING` / `worker_id = NULL` with `crash_strikes + 1`, and nothing stops
 /// the same worker from winning it again — so a `(state, worker_id)` guard also
@@ -8125,10 +8126,10 @@ pub const fn reset_capability_misses_after_inline_progress_query() -> &'static s
 /// no reset at all: newly INGESTED history (a due timer fire, a pending signal,
 /// an external delta appended by `prepare_workflow_task_with_cache` before the
 /// capability gate) can move the frontier with no park and no inline progress
-/// in between. That one is handled by keying the evidence to the missed handler
-/// (`capability_miss_handler`) rather than by resetting: the
-/// counters simply do not apply to a handler they were not recorded against, so
-/// a stale key needs no cleanup. It also makes THIS reset belt-and-braces for
+/// in between. The evidence key on the missed handler
+/// (`capability_miss_handler`) handles that one, not a reset. The counters
+/// simply do not apply to a handler they were not recorded against. So a stale
+/// key needs no cleanup. It also makes THIS reset belt-and-braces for
 /// the inline case — a row left keyed to a retired frontier reads as a fresh
 /// budget either way — while the reset keeps its independent job of clearing
 /// the absolute-ceiling count, which the key alone does not touch.
@@ -8165,11 +8166,11 @@ pub async fn reset_capability_misses_after_inline_progress(
 /// `capability_miss_workers`, so a queue with real history accumulates terminal
 /// rows still naming past missers. Rewriting those is pure cost: a terminal task
 /// is never redelivered and never escalated, so its array cannot influence any
-/// decision. Worse, it is cost paid on the *startup* path — this runs in the
-/// same transaction as `register_worker`, so the worker is not published to the
-/// fleet until it finishes, and the `queue_name` indexes are partial to pending
-/// rows. The `state` filter bounds the scan to the rows the
-/// evidence can actually affect.
+/// decision. Worse, the cost is on the *startup* path. This runs in the same
+/// transaction as `register_worker`, so the worker is not published to the
+/// fleet until it finishes. The `queue_name` indexes are partial to pending
+/// rows. The `state` filter bounds the scan to the rows the evidence can
+/// actually affect.
 ///
 /// # The empty-array guard is load-bearing
 ///
@@ -8274,13 +8275,13 @@ pub async fn invalidate_capability_miss_evidence_for_worker(
 #[must_use]
 pub const fn read_capability_miss_state_query() -> &'static str {
     // `$3` is the frontier this dispatch is missing (`{kind}:{name}`, from
-    // `MissingHandler::frontier_key`). When it differs from the one the row
-    // records, the stored counters are evidence about a frontier that is now
-    // behind us, and charging their spend to a frontier no peer has ever been
-    // offered is what terminally fails a run the fleet can still finish
-    // (issue #804). Zeroing here rather than in the caller
-    // keeps the comparison ATOMIC with the read: the row cannot change frontier
-    // between deciding which counters apply and reading them.
+    // `MissingHandler::frontier_key`). It can differ from the one the row
+    // records. The stored counters are then evidence about an earlier frontier.
+    // No peer has ever been offered the current frontier. Charging their spend
+    // to it terminally fails a run that the fleet can still finish (issue
+    // #804). Zeroing here and not in the caller keeps the comparison ATOMIC
+    // with the read. The row cannot change frontier between deciding which
+    // counters apply and reading them.
     //
     // `IS DISTINCT FROM` (not `<>`) so a `NULL` handler — no frontier recorded
     // yet — reads as a mismatch and therefore as a full budget.
@@ -8594,9 +8595,9 @@ const fn release_suspended_workflow_claim_query() -> &'static str {
 /// row, so it sits forever until an unrelated poison-pill/heartbeat sweep
 /// eventually notices.
 ///
-/// This is called only *after* the entire enclosing persistence transaction
-/// -- the one that holds the execution row's `FOR UPDATE` lock for its whole
-/// duration -- has rolled back, in response to
+/// The enclosing persistence transaction holds the execution row's
+/// `FOR UPDATE` lock for its whole duration. This is called only *after* that
+/// entire transaction has rolled back, in response to
 /// [`crate::error::HarvestError::SuspendedClaimAmbiguous`] propagating out of
 /// [`crate::worker::fail_suspended_workflow_if_still_claimed`] with `?`
 /// (issue #1182). A nested `SAVEPOINT` release inside that
@@ -10224,9 +10225,9 @@ fn idle_rate_limit_bucket_predicates() -> String {
 /// are. So every batch re-walks the whole retained prefix ahead of its victims.
 /// It re-evaluates the fullness arithmetic and both anti-joins over it, up to
 /// [`MAX_RATE_LIMIT_SWEEP_BATCHES_PER_TICK`] times a tick (issue #1127).
-/// Measured with 200k retained buckets sorting ahead of 50k collectable ones:
-/// 6,737 ms for a 50-batch tick without the cursor, 2,622 ms with it, for the
-/// same 50,000 deletions. The gap widens with the retained prefix, on exactly
+/// The test had 200k retained buckets sorting ahead of 50k collectable ones.
+/// For the same 50,000 deletions, a 50-batch tick took 6,737 ms without the
+/// cursor and 2,622 ms with it. The gap widens with the retained prefix, on exactly
 /// the large tables this pass exists to serve.
 ///
 /// The cost is that a row skipped by `SKIP LOCKED` below the cursor waits for
@@ -10273,10 +10274,10 @@ fn idle_rate_limit_bucket_sweep_sql() -> String {
 /// sibling passes: this one is on by default and only destroys.
 ///
 /// Takes a keyset cursor (`$3`, an exclusive lower bound on `key`) that the
-/// sweep does not need. A real pass pages by *deleting* what it counted; a
-/// preview removes nothing, so without a cursor it would re-read the same first
-/// batch forever and could only ever forecast `batch_size` — under-reporting by
-/// up to [`MAX_RATE_LIMIT_SWEEP_BATCHES_PER_TICK`]× against the pass it is
+/// sweep does not need. A real pass pages by *deleting* what it counted. A
+/// preview removes nothing. Without a cursor it would re-read the same first
+/// batch forever and could only forecast `batch_size`. It would under-report
+/// by up to [`MAX_RATE_LIMIT_SWEEP_BATCHES_PER_TICK`]× against the pass it is
 /// supposed to predict (issue #1127).
 #[must_use]
 fn idle_rate_limit_bucket_preview_sql() -> String {
@@ -14291,12 +14292,13 @@ mod tests {
 
     #[test]
     fn dynamic_rate_bucket_key_none_unresolved_is_distinct_from_empty_string_tenant() {
-        // Regression (issue #699 review): `None` (the key
-        // expression could NOT be resolved -- missing / null / non-object input)
-        // must NOT share a bucket with `Some("")` (a legitimately-resolved
-        // empty-string tenant). The previous `.unwrap_or_default()` at the call
-        // site collapsed both onto the same `L0:` bucket, cross-throttling
-        // malformed/missing executions against a real empty tenant.
+        // Regression (issue #699): `None` must NOT share a bucket with
+        // `Some("")`. `None` means the key expression could NOT be resolved
+        // (missing / null / non-object input). `Some("")` is a
+        // legitimately-resolved empty-string tenant. The previous
+        // `.unwrap_or_default()` at the call site collapsed both onto the same
+        // `L0:` bucket. That cross-throttled malformed/missing executions
+        // against a real empty tenant.
         let unresolved = dynamic_rate_bucket_key("input.tenant_id", None);
         // The unresolved fallback encodes with the distinct `U` marker.
         assert_eq!(unresolved, "dyn-rate:L9:tenant_id:U");
@@ -15964,9 +15966,9 @@ mod tests {
                  RUNNING under a live worker that orphan reclamation skips \
                  (issue #804, Codex round-22 P2)",
             );
-            // The saturating increment is the SAME-frontier arm: a release that
-            // lands on a different handler than the row records restarts at 1,
-            // and does not inherit a prior frontier's spend (issue #804). Both
+            // The saturating increment is the SAME-frontier arm. A release that
+            // lands on a different handler than the row records restarts at 1.
+            // It does not inherit a prior frontier's spend (issue #804). Both
             // arms are pinned, so that neither can be dropped alone.
             assert!(
                 sql.contains("WHEN capability_miss_handler IS DISTINCT FROM $5 THEN 1"),

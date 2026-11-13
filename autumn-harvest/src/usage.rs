@@ -116,11 +116,11 @@ pub const fn default_usage_window_ceiling() -> std::time::Duration {
 /// Default cap on the number of distinct groups `GET /admin/usage` will
 /// return before failing loudly with a `413`-mappable error (issue #596).
 ///
-/// Unlike `GET /workflows/count`'s top-N + `other` rollup, a chargeback
-/// report must never silently drop a low-volume tenant's data — so
-/// exceeding this cap is a hard error that names the ceiling, not a silent
-/// rollup. Two layers enforce the cap. [`usage_sql`] binds it (plus one) as a
-/// `LIMIT`, so a single high-cardinality shard cannot materialize an
+/// `GET /workflows/count` uses a top-N + `other` rollup. A chargeback report
+/// must never silently drop a low-volume tenant's data. So exceeding this cap
+/// is a hard error that names the ceiling, not a silent rollup. Two layers
+/// enforce the cap. [`usage_sql`] binds it (plus one) as a `LIMIT`, so a
+/// single high-cardinality shard cannot materialize an
 /// unbounded result set. The plugin's `build_usage_response` checks the
 /// merged cross-shard count before it constructs the response. The DB-side
 /// `LIMIT` bounds the expensive part (the query and its memory). The

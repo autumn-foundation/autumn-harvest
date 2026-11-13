@@ -820,9 +820,9 @@ async fn resume_credits_a_task_enqueued_between_the_two_shift_passes() {
     );
 }
 
-/// Issue #619 — the partition between the two resume passes must
-/// be decided by values that are **fixed on the row**, not by when a statement
-/// happens to *see* it.
+/// Issue #619 — values that are **fixed on the row** must decide the partition
+/// between the two resume passes. When a statement happens to *see* the row
+/// must not decide it.
 ///
 /// An earlier revision split on `created_at < transaction_timestamp()`
 /// ("existed when this resume began"). But `created_at` records when the
@@ -2952,9 +2952,9 @@ async fn pause_credits_the_backlog_scan_interval() {
 /// committing after its scan still suppresses the timeout. It originally took the
 /// **exclusive** mode, the same one `pause_queue`/`resume_queue` take. With the
 /// claim barrier that is a dispatch outage. `try_lock_queue_for_claim` takes the
-/// **shared** mode of that key on every claim, and exclusive blocks shared. So for
-/// the whole enforcement transaction every claim on the queue fails its `try` and
-/// releases its task, on a queue with no pause at all. The workflow sibling holds
+/// **shared** mode of that key on every claim, and exclusive blocks shared. So
+/// during the whole enforcement transaction every claim on the queue fails its
+/// `try`. Each releases its task, on a queue with no pause at all. The workflow sibling holds
 /// the lock across `append_events`, the parent-close cascade and trigger
 /// evaluation. So a backlog of expired tasks can halt unrelated work repeatedly.
 ///
@@ -2963,8 +2963,8 @@ async fn pause_credits_the_backlog_scan_interval() {
 /// the claim barrier.
 ///
 /// Both halves are asserted. Dropping the lock entirely would also make the
-/// first half pass, but silently destroy the pause-suppression guarantee: a
-/// pause committed after the scan still suppresses the timeout.
+/// first half pass. But it would silently destroy the pause-suppression
+/// guarantee: a pause committed after the scan still suppresses the timeout.
 ///
 /// Parking the enforcer *inside* the window is the whole difficulty. A table lock
 /// on `harvest_queue_pauses` does not work: `find_timed_out_tasks` consults it for

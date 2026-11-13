@@ -1043,8 +1043,8 @@ async fn gate_blocks_terminate_if_running_start_over_a_live_prior() {
 }
 
 /// Issue #618: `AllowDuplicateFailedOnly` over a prior that is
-/// FAILED/CANCELLED at read time creates a replacement, so it is a genuine
-/// admission and MUST be blocked by an active gate.
+/// FAILED/CANCELLED at read time creates a replacement. So it is a genuine
+/// admission, and an active gate MUST block it.
 #[tokio::test]
 async fn gate_blocks_allow_duplicate_failed_only_start_over_a_failed_prior() {
     let Some(url) = db_url() else {

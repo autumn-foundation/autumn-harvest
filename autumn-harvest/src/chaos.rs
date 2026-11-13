@@ -1763,8 +1763,8 @@ mod controller {
         }
 
         // ---- Fix 4 (issue #1202 / #940 follow-up): the entry point used to
-        //      read `ARMED` (a bare bool) and `ARMED_GEN` (the generation) as
-        //      two SEPARATE atomics. A task preempted between those two reads
+        //      read `ARMED` (a bare bool) and `ARMED_GEN` (the generation)
+        //      separately. A task preempted between those two reads
         //      could observe `ARMED == true` under an outgoing plan. It could
         //      then resume after a *full* disarm + re-arm to a different plan,
         //      and read the *incoming* plan's `ARMED_GEN`/`STATE` pair. That
