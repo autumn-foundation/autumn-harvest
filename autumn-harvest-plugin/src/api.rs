@@ -49448,7 +49448,8 @@ pub(crate) struct ScheduleHerdReport {
     pub bucket_secs: u64,
     /// The fewest schedules that make a herd.
     pub min_herd: usize,
-    /// The number of fires in the window, over every active schedule.
+    /// The number of runs that start inside the window, over every active
+    /// schedule. A start is the slot plus its jitter.
     pub fires: usize,
     /// The number of spots before `limit` applies.
     pub spot_count: usize,
@@ -49619,7 +49620,20 @@ pub(crate) fn build_herd_report(
     let until = from + chrono::Duration::hours(i64::from(hours));
 
     let (candidates, inactive) = partition_herd_rows(rows);
-    let (active, mut budgets, unprojected) = project_herd_budgets(candidates, now, from);
+    // A slot up to one jitter window before `from` can still start inside the
+    // window, so the walk looks back by the widest jitter.
+    let lookback = std::time::Duration::from_secs(
+        candidates
+            .iter()
+            .map(|(row, _)| row.jitter_secs.max(0).cast_unsigned())
+            .max()
+            .unwrap_or(0),
+    );
+    let walk_from = chrono::Duration::from_std(lookback)
+        .ok()
+        .and_then(|back| from.checked_sub_signed(back))
+        .unwrap_or(from);
+    let (active, mut budgets, unprojected) = project_herd_budgets(candidates, now, walk_from);
 
     // The forecast keys each schedule by its row id, so two rows with one
     // name stay two schedules.
@@ -49635,6 +49649,7 @@ pub(crate) fn build_herd_report(
         until,
         std::time::Duration::from_secs(bucket_secs),
         min_herd,
+        lookback,
         |index, slot| {
             let row = active[index].0;
             // The scheduler exhausts a schedule at its last run, and at the
@@ -60128,6 +60143,29 @@ mod tests {
             "its catch-up policy sets its budget"
         );
         assert_eq!(report.fires, 3, "the unlimited schedule is still forecast");
+    }
+
+    #[test]
+    fn the_herd_report_counts_a_jittered_start_inside_the_window() {
+        let rows: Vec<_> = (1..=2)
+            .map(|n| autumn_harvest::models::HarvestSchedule {
+                jitter_secs: 3_600,
+                ..herd_row(n, &format!("s{n}"), "cron:0 * * * *")
+            })
+            .collect();
+        // Start the window one second after the 00:00 slot. Each slot starts
+        // somewhere in the hour after it, by its own jitter.
+        let from = herd_epoch() + chrono::Duration::seconds(1);
+        let starts: Vec<_> = rows
+            .iter()
+            .map(|row| effective_fire_time(row.id, Some(herd_epoch()), row.jitter_secs).unwrap())
+            .collect();
+        assert!(
+            starts.iter().all(|&start| start >= from),
+            "the fixture needs a start in the window"
+        );
+        let report = build_herd_report(&rows, herd_epoch(), from, 1, 60, 2, 50);
+        assert_eq!(report.fires, 2, "both 00:00 slots start inside the hour");
     }
 
     #[test]

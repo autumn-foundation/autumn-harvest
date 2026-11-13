@@ -47,7 +47,7 @@ impl HerdSpot {
 /// The result of a herd forecast.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HerdForecast {
-    /// The total number of fires that the forecast read.
+    /// The number of fires that start inside the window.
     pub fires: usize,
     /// The buckets with at least `min_herd` schedules.
     ///
@@ -104,17 +104,27 @@ pub fn forecast(
     bucket: Duration,
     min_herd: usize,
 ) -> HerdForecast {
-    forecast_shifted(schedules, from, until, bucket, min_herd, |_, fire| {
-        Some(fire)
-    })
+    forecast_shifted(
+        schedules,
+        from,
+        until,
+        bucket,
+        min_herd,
+        Duration::ZERO,
+        |_, fire| Some(fire),
+    )
 }
 
 /// [`forecast`] with a shift applied to each fire before it goes into a bucket.
 ///
 /// `shift` gets the index of the schedule in `schedules` and the slot time.
 /// It returns the time at which the run really starts. The scheduler adds a
-/// jitter offset to each slot, so pass that offset here. The window check uses
-/// the slot time, as the scheduler does.
+/// jitter offset to each slot, so pass that offset here.
+///
+/// The window bounds the start, not the slot. A slot before `from` can start
+/// inside the window, so the walk begins `lookback` before `from`. Pass the
+/// largest shift here. A start outside `[from, until)` is not counted, but
+/// `shift` still sees its slot.
 ///
 /// A `None` from `shift` ends the walk of that schedule, and the slot does not
 /// count. A run budget or an end time stops a schedule in this way. The calls
@@ -126,6 +136,7 @@ pub fn forecast_shifted(
     until: DateTime<Utc>,
     bucket: Duration,
     min_herd: usize,
+    lookback: Duration,
     mut shift: impl FnMut(usize, DateTime<Utc>) -> Option<DateTime<Utc>>,
 ) -> HerdForecast {
     // The width counts in milliseconds, so a fractional bucket keeps its size.
@@ -138,6 +149,10 @@ pub fn forecast_shifted(
     // distinct members and not the fires.
     let mut buckets: BTreeMap<i64, Vec<usize>> = BTreeMap::new();
     let mut fires = 0;
+    let walk_from = chrono::Duration::from_std(lookback)
+        .ok()
+        .and_then(|back| from.checked_sub_signed(back))
+        .unwrap_or(from);
     let mut unanchored = Vec::new();
     let mut truncated = Vec::new();
 
@@ -151,12 +166,12 @@ pub fn forecast_shifted(
         }
         let walker = SlotWalker::new(schedule);
         // The walk looks for fires strictly after its reference. So it starts
-        // one second before `from` to include a fire at `from` itself.
-        let mut cursor = from - chrono::Duration::seconds(1);
+        // one second before `walk_from` to include a fire at `walk_from` itself.
+        let mut cursor = walk_from - chrono::Duration::seconds(1);
         let mut read = 0;
         while let Some(next) = walker.next_after(cursor).filter(|&t| t < until) {
             cursor = next;
-            if next < from {
+            if next < walk_from {
                 continue;
             }
             if read == MAX_FIRES_PER_SCHEDULE {
@@ -167,13 +182,16 @@ pub fn forecast_shifted(
                 break;
             };
             read += 1;
+            if start < from || start >= until {
+                continue;
+            }
+            fires += 1;
             let key = start.timestamp_millis().div_euclid(width);
             let members = buckets.entry(key).or_default();
             if members.last() != Some(&index) {
                 members.push(index);
             }
         }
-        fires += read;
     }
 
     let mut spots: Vec<HerdSpot> = buckets
@@ -392,10 +410,26 @@ mod tests {
                 t
             })
         };
-        let apart = forecast_shifted(&schedules, at(0), at(HOUR), MINUTE, 2, jitter);
+        let apart = forecast_shifted(
+            &schedules,
+            at(0),
+            at(HOUR),
+            MINUTE,
+            2,
+            Duration::ZERO,
+            jitter,
+        );
         assert_eq!(apart.fires, 2);
         assert_eq!(apart.spots, []);
-        let still = forecast_shifted(&schedules, at(0), at(HOUR), MINUTE, 2, |_, t| Some(t));
+        let still = forecast_shifted(
+            &schedules,
+            at(0),
+            at(HOUR),
+            MINUTE,
+            2,
+            Duration::ZERO,
+            |_, t| Some(t),
+        );
         assert_eq!(still, forecast(&schedules, at(0), at(HOUR), MINUTE, 2));
     }
 
@@ -405,7 +439,15 @@ mod tests {
         let b = cron("0 * * * *");
         let schedules = [("a", &a), ("b", &b)];
         let cap = |index: usize, t: DateTime<Utc>| (index == 0 || t < at(HOUR)).then_some(t);
-        let report = forecast_shifted(&schedules, at(0), at(3 * HOUR), MINUTE, 2, cap);
+        let report = forecast_shifted(
+            &schedules,
+            at(0),
+            at(3 * HOUR),
+            MINUTE,
+            2,
+            Duration::ZERO,
+            cap,
+        );
         assert_eq!(report.fires, 4, "a fires 3 times, b only once");
         assert_eq!(report.spots.len(), 1);
         assert_eq!(report.spots[0].at, at(0));
@@ -421,6 +463,36 @@ mod tests {
         assert_eq!(report.fires, 50 * 3_600);
         assert_eq!(report.spots.len(), 60);
         assert!(report.spots.iter().all(|s| s.size() == 50));
+    }
+
+    #[test]
+    fn the_window_bounds_the_shifted_start_not_the_slot() {
+        let a = cron("0 * * * *");
+        let b = cron("0 * * * *");
+        let schedules = [("a", &a), ("b", &b)];
+        let late = |_: usize, t: DateTime<Utc>| Some(t + chrono::Duration::minutes(5));
+        let back = Duration::from_secs(600);
+        // The 00:00 slots are before the window but start at 00:05, inside it.
+        let early = forecast_shifted(&schedules, at(60), at(HOUR), MINUTE, 2, back, late);
+        assert_eq!(early.fires, 2);
+        assert_eq!(early.spots.len(), 1);
+        assert_eq!(early.spots[0].at, at(300));
+        // With no lookback the walk never sees those slots.
+        let blind = forecast_shifted(
+            &schedules,
+            at(60),
+            at(HOUR),
+            MINUTE,
+            2,
+            Duration::ZERO,
+            late,
+        );
+        assert_eq!(blind.fires, 0);
+        // The 00:00 slots are inside a window that ends at 00:03, but start
+        // after it.
+        let cut = forecast_shifted(&schedules, at(0), at(180), MINUTE, 2, back, late);
+        assert_eq!(cut.fires, 0);
+        assert_eq!(cut.spots, []);
     }
 
     #[test]

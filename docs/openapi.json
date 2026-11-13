@@ -3983,7 +3983,7 @@
                       "type": "integer"
                     },
                     "fires": {
-                      "description": "Number of fires in the window over every active schedule.",
+                      "description": "Number of runs that start inside the window over every active schedule. A start is the slot plus its jitter, so a slot just before from can count and a slot just before until can fall outside.",
                       "type": "integer"
                     },
                     "from": {
