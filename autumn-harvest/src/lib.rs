@@ -592,6 +592,8 @@ pub mod test_generator;
 pub mod testing;
 /// Workflow-start throttle — pace admissions, defer the excess (issue #607).
 pub mod throttle;
+/// Forecast when each throttled start runs, from bursts or real schedules.
+pub mod throttle_forecast;
 /// Per-execution timeline read model (issue #739).
 pub mod timeline;
 #[cfg(any(test, feature = "testing"))]
