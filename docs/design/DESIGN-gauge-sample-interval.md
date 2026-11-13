@@ -1,6 +1,6 @@
 # Design — every database gauge sampler runs on one sample interval
 
-Issue #2668 moved two population samplers off `poll_interval`. Five more
+Issue #2668 moved two population samplers off `poll_interval`. Six more
 gauge samplers still read the database on each poll tick of each worker:
 
 | sampler | statement | gauge |
@@ -44,7 +44,7 @@ metric.**
 | B2 | `ANALYZE` the two pause tables, so the planner sees zero rows. | Rejected. Autovacuum never analyzes an empty table that never changes. A dump and restore loses the statistics again. |
 | B3 | `SET LOCAL enable_nestloop = off` around the query. | Rejected. It is blunt, and it hides the cause. |
 | B4 | One sample interval for every sampler that reads the database. | **Adopted.** It cuts the calls by 30 times at the default poll interval. |
-| B5 | A separate knob for each sampler. | Rejected. Nine knobs for one trade-off. |
+| B5 | A separate knob for each sampler. | Rejected. Eight knobs for one trade-off. |
 | B6 | Keep `population_sample_interval` and add a second knob. | Rejected. Two knobs with the same default and the same meaning. |
 | B7 | Rename `population_sample_interval` to `gauge_sample_interval`. | **Adopted.** The knob has not shipped, so the rename breaks no user. |
 | B8 | Elect one sampler per shard through `scanner_lease`. | Deferred, as in DESIGN-2668. It changes who emits the gauge. |
@@ -55,7 +55,7 @@ metric.**
 | # | How to make it harmful | Mitigation |
 |---|------------------------|------------|
 | R1 | Slow a sampler that drives behaviour, not a gauge. | Each moved sampler only records gauges. Load shedding and the schedule-overdue sampler keep their own cadence. |
-| R2 | Slow a gauge that an alert needs within seconds. | The alert pack reads these gauges over windows of 10 minutes or more. |
+| R2 | Slow a gauge that an alert needs within seconds. | Each alert rule on these gauges uses a window of 10 minutes or more, or a `for` of 2 minutes or more. The instant oldest-pending-age rule fires up to 15 s later. |
 | R3 | An integration test waits for a gauge with a short timeout. | Those tests set `gauge_sample_interval` to their poll interval. |
 | R4 | The rewrite changes which rows count as demand. | A database test compares the new query with the old one on edge cases. |
 | R5 | A later change wires a sampler to `poll_interval` again. | One helper spawns every database gauge sampler. A test counts real connections through it. |

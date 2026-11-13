@@ -32820,7 +32820,7 @@ fn spawn_schedule_overdue_sampler(
 /// Spawn the worker slot-occupancy sampler (issue #531).
 ///
 /// Reads the two dispatch `Semaphore`s' `available_permits()` against the
-/// *live* dispatch target on the same cadence as the queue/DLQ samplers and
+/// *live* dispatch target on `poll_interval` and
 /// emits the `harvest.worker.slots_in_use` / `harvest.worker.slots_available`
 /// gauges, labelled by `slot_type`. This is a pure in-memory read — no DB
 /// access, no new lock contention. Skipped entirely when no metrics recorder
@@ -34520,7 +34520,8 @@ impl GaugeSamplerHandles {
 /// Spawn every sampler that reads the database for a gauge, on
 /// `gauge_sample_interval` (issue #2668).
 ///
-/// Each sample reads every shard, on every worker. On `poll_interval` these
+/// Each one reads the database on every worker. The fleet-wide samplers read
+/// every shard. On `poll_interval` these
 /// samplers used most of the buffers of a large deployment. Prometheus
 /// scrapes a gauge each 15 to 60 s, so a slower sample loses no reading.
 ///
@@ -39629,8 +39630,8 @@ impl Worker {
             };
 
         // Worker slot-occupancy gauges (issue #531): a pure in-memory read of the
-        // two dispatch semaphores against their configured maxima, on the same
-        // cadence as the other samplers. Only started when metrics are enabled,
+        // two dispatch semaphores against their configured maxima, on
+        // `poll_interval`. It reads no table. Only started when metrics are enabled,
         // matching the stranded_work_sampler opt-in pattern.
         let worker_slot_sampler = self.registry.telemetry().metrics.is_enabled().then(|| {
             spawn_worker_slot_sampler(
@@ -46611,7 +46612,7 @@ mod tests {
 
     // ── Issue #2668: the database gauge samplers use their own interval ───
     //
-    // Each gauge sampler reads the database for every shard. On
+    // Each gauge sampler reads the database on every worker. On
     // `poll_interval` the two population samplers used 77% of the buffers at
     // 1M runs, and the stranded-work query was 80% at 10,000 pending rows.
     // These tests count real connections, as the #1428 tests above do.
@@ -46660,7 +46661,7 @@ mod tests {
     const GAUGE_SAMPLERS: usize = 8;
 
     /// Issue #2668: with metrics on, every database gauge sampler waits for
-    /// the gauge interval. None opens a connection on a poll tick. They open
+    /// the gauge interval. None opens a connection on a poll tick. Each opens
     /// one within three poll ticks after the interval ends.
     #[tokio::test(start_paused = true)]
     async fn gauge_samplers_wait_for_the_gauge_interval_not_the_poll_interval() {
@@ -46684,13 +46685,14 @@ mod tests {
         advance_sampler_ticks(cfg.poll_interval, ticks_in_interval - 1).await;
         let touches_before = listener.touch_count();
 
-        // Move past the first sample, then stop the clock. A longer
-        // interval than the configured one then opens no connection.
+        // Move past the first sample, then stop the clock. A sampler on a
+        // longer interval then opens no connection, so the count stays short.
         advance_sampler_ticks(cfg.poll_interval, 3).await;
         // The accept is real loopback I/O. A yield polls I/O and does not
-        // advance the paused clock. Wait under a deadline in real time.
+        // advance the paused clock. Each failed connect frees the one pool
+        // slot for the next sampler. Wait under a deadline in real time.
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while listener.touch_count() == 0 && std::time::Instant::now() < deadline {
+        while listener.touch_count() < GAUGE_SAMPLERS && std::time::Instant::now() < deadline {
             tokio::task::yield_now().await;
         }
         let touches_after = listener.touch_count();
@@ -46705,8 +46707,9 @@ mod tests {
             "no gauge sampler may query on a poll_interval tick"
         );
         assert!(
-            touches_after > 0,
-            "the gauge samplers must query once the gauge interval ends"
+            touches_after >= GAUGE_SAMPLERS,
+            "each gauge sampler must query once the gauge interval ends; \
+             saw {touches_after} of {GAUGE_SAMPLERS}"
         );
     }
 

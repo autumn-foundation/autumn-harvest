@@ -1,7 +1,7 @@
 # The database gauge samplers ran on the poll interval
 
-This page follows issue #2668. Seven gauge samplers read the database on each
-500 ms poll tick of each worker. The stranded-work query also had a plan
+This page follows issue #2668. Six gauge samplers, with seven statements, read
+the database on each 500 ms poll tick of each worker. The stranded-work query also had a plan
 defect. The fix rewrites that query and moves every database gauge sampler to
 `WorkerConfig::gauge_sample_interval`, 15 s by default.
 `docs/design/DESIGN-gauge-sample-interval.md` records the decision.
@@ -77,7 +77,8 @@ After the fix the `PAUSED` gate is a hashed subplan over
 `idx_harvest_we_paused`. The same call reads 114,965 buffers in 0.23 s
 (`explain-stranded-new-medium.txt`). The old query was cancelled at 300 s
 (`explain-stranded-old-medium.txt`). At the small size the old query read
-22,801 buffers and the new one 9,704 (`explain-stranded-*-small.txt`).
+22,801 buffers and the new one 9,704 (`explain-stranded-*-small.txt`). That is
+57% fewer. EXPLAIN counts differ a little from the per-call table below.
 
 ## 💡 Hypothesis
 
@@ -103,7 +104,7 @@ the stranded-work query changes per call:
 
 | statement | small | medium | large |
 |:--|--:|--:|--:|
-| `claimable_pending_demand_by_queue` | 9,681 (−57%) | 114,943 | 448,314 |
+| `claimable_pending_demand_by_queue` | 9,681 | 114,943 | 448,314 |
 
 Buffers per worker per hour for the seven statements. Before is 7,200 calls
 at 500 ms. After is 240 calls at 15 s:

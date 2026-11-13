@@ -85,8 +85,9 @@ pub const DEFAULT_MAX_CONCURRENT_CLAIMS: usize = 2;
 
 /// Default interval of the database gauge samplers: 15 s (issue #2668).
 ///
-/// Each sample reads the database for every shard. Prometheus scrapes a gauge
-/// each 15 to 60 s, so no scrape reads most samples at the poll interval. See
+/// Each sampler reads the database on every worker. Prometheus scrapes a
+/// gauge each 15 to 60 s, so no scrape reads most samples at the poll
+/// interval. See
 /// [`WorkerConfig::gauge_sample_interval`].
 pub const DEFAULT_GAUGE_SAMPLE_INTERVAL: Duration = Duration::from_secs(15);
 
@@ -4187,10 +4188,11 @@ pub struct WorkerConfig {
     pub replication_watermark_retain: Duration,
     /// How often the database gauge samplers run (issue #2668).
     ///
-    /// Each one reads the database for every shard, on every worker. They
-    /// feed the queue depth and age, concurrency, rate-limit, DLQ, queue-pause,
-    /// stranded-work, history-oversized and active-workflow gauges. On the
-    /// poll interval they used most of the buffers of a large deployment.
+    /// Each sampler reads the database on every worker, and most read every
+    /// shard. They feed the queue depth and age, concurrency, rate-limit, DLQ,
+    /// queue-pause, stranded-work, history-oversized and active-workflow
+    /// gauges. On the poll interval they used most of the buffers of a large
+    /// deployment.
     ///
     /// A lower value gives a fresher gauge at a higher database cost. The
     /// first sample comes one interval after the worker starts. The

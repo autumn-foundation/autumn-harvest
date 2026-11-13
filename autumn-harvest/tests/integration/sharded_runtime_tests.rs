@@ -818,6 +818,7 @@ async fn shutdown_completes_when_a_shard_pool_is_exhausted_after_monitors_have_t
             // reclaimer, session reconciler, pause auto-resumer, and
             // quota reconciler.
             cfg.poll_interval = Duration::from_millis(100);
+            cfg.gauge_sample_interval = cfg.poll_interval;
             cfg.worker_heartbeat_interval = Duration::from_millis(500);
         },
     );

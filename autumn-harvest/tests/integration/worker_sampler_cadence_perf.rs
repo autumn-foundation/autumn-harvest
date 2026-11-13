@@ -1,8 +1,9 @@
 #![cfg(feature = "db")]
 //! Ledger investigation: the poll-interval gauge samplers (follow-up to #2668).
 //!
-//! Issue #2668 moved the two population samplers to their own interval. Four
-//! more gauge samplers still run on `poll_interval`, on every worker:
+//! Issue #2668 moved the two population samplers to their own interval.
+//! Before this change, six more gauge samplers ran on `poll_interval`, on
+//! every worker:
 //!
 //! | sampler | statement |
 //! |:--|:--|
@@ -13,8 +14,7 @@
 //! | `spawn_queue_pause_sampler` | `queue_pause::paused_queue_names` |
 //! | `spawn_stranded_work_sampler` | `queue::claimable_pending_demand_by_queue` |
 //!
-//! The last two also read the database on each poll tick, so the harness
-//! measures them too. The stranded-work sampler runs only with a sharded pool.
+//! The stranded-work sampler runs only with a sharded pool.
 //!
 //! The harness seeds a fixture at three sizes. It then replays poll ticks of
 //! two workers. One tick runs the seven sampler statements and one claim with
@@ -425,7 +425,7 @@ async fn measure(admin: &str, size: &Size) -> (Point, String, String) {
 /// Writes the per-call evidence for every size.
 #[tokio::test]
 #[ignore = "evidence generator, not a CI assertion -- see \
-            docs/performance-worker-sampler-cadence.md"]
+            docs/performance-gauge-sample-interval.md"]
 async fn zz_capture_worker_sampler_statement_costs() {
     let (admin, _guard) = setup_server().await;
     let label = std::env::var("PERF_LABEL").unwrap_or_else(|_| "baseline".to_owned());

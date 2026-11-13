@@ -1,14 +1,15 @@
 ## Every database gauge sampler runs on one interval (follow-up to issue #2668)
 
-PR #2671 moved two population samplers off the 500 ms poll interval. Seven
-more gauge samplers still read the database on each poll tick of each worker.
+PR #2671 moved two population samplers off the 500 ms poll interval. Six
+more gauge samplers, with seven statements, still read the database on each
+poll tick of each worker.
 A replay of poll ticks measured them:
 
 - The stranded-work demand query had a plan defect. The planner scanned every
   execution for each pending row. At 100,000 pending rows one call ran for
   more than 300 s. Its `PAUSED` gate is now a `NOT EXISTS` probe. The same
   call reads 114,965 buffers in 0.23 s and returns the same groups. The
-  plugin shard-health route runs this query too.
+  plugin shard-health and status-summary routes run this query too.
 - At 1,000,000 dead letters the DLQ depth count read 744,158 buffers per
   call. At 300,000 pending rows the concurrency stats read 20,230.
 
