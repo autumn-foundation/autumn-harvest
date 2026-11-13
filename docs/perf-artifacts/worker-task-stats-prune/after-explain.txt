@@ -1,0 +1,120 @@
+## Live fleet of 500
+
+### plan_cache_mode = force_custom_plan
+
+    Delete on public.harvest_worker_task_stats s  (cost=0.28..32.85 rows=0 width=0) (actual time=0.309..0.309 rows=0 loops=1)
+      Buffers: shared hit=7
+      ->  Index Scan using harvest_worker_task_stats_updated_at_idx on public.harvest_worker_task_stats s  (cost=0.28..32.85 rows=3 width=6) (actual time=0.309..0.309 rows=0 loops=1)
+            Output: ctid
+            Index Cond: (s.updated_at < (now() - '01:00:00'::interval))
+            Filter: (s.updated_at < (now() - ((GREATEST('3600'::bigint, LEAST(GREATEST(COALESCE((((s.cohort)::jsonb ->> 'peer_stale_secs'::text))::bigint, '120'::bigint), '0'::bigint), '31536000'::bigint)))::double precision * '00:00:01'::interval)))
+            Rows Removed by Filter: 5
+            Buffers: shared hit=7
+    Settings: plan_cache_mode = 'force_custom_plan'
+    Query Identifier: 2269463794702880530
+    Planning Time: 0.087 ms
+    Execution Time: 0.325 ms
+
+### plan_cache_mode = force_generic_plan
+
+    Delete on public.harvest_worker_task_stats s  (cost=10.00..312.83 rows=0 width=0) (actual time=0.276..0.276 rows=0 loops=1)
+      Buffers: shared hit=5
+      ->  Bitmap Heap Scan on public.harvest_worker_task_stats s  (cost=10.00..312.83 rows=75 width=6) (actual time=0.275..0.275 rows=0 loops=1)
+            Output: ctid
+            Recheck Cond: (s.updated_at < (now() - (($1)::double precision * '00:00:01'::interval)))
+            Filter: (s.updated_at < (now() - ((GREATEST($1, LEAST(GREATEST(COALESCE((((s.cohort)::jsonb ->> 'peer_stale_secs'::text))::bigint, $2), '0'::bigint), '31536000'::bigint)))::double precision * '00:00:01'::interval)))
+            Rows Removed by Filter: 5
+            Heap Blocks: exact=3
+            Buffers: shared hit=5
+            ->  Bitmap Index Scan on harvest_worker_task_stats_updated_at_idx  (cost=0.00..9.98 rows=226 width=0) (actual time=0.007..0.007 rows=5 loops=1)
+                  Index Cond: (s.updated_at < (now() - (($1)::double precision * '00:00:01'::interval)))
+                  Buffers: shared hit=2
+    Settings: plan_cache_mode = 'force_generic_plan'
+    Query Identifier: 2269463794702880530
+    Planning Time: 0.063 ms
+    Execution Time: 0.292 ms
+
+Statement:
+
+    DELETE FROM harvest_worker_task_stats s WHERE s.updated_at < NOW() - ($1::bigint * INTERVAL '1 second') AND s.updated_at < NOW() - (GREATEST($1::bigint, LEAST(GREATEST(COALESCE((s.cohort::jsonb ->> 'peer_stale_secs')::bigint, $2), 0), 31536000)) * INTERVAL '1 second')
+
+## Live fleet of 2000
+
+### plan_cache_mode = force_custom_plan
+
+    Delete on public.harvest_worker_task_stats s  (cost=0.28..121.42 rows=0 width=0) (actual time=0.747..0.748 rows=0 loops=1)
+      Buffers: shared hit=18
+      ->  Index Scan using harvest_worker_task_stats_updated_at_idx on public.harvest_worker_task_stats s  (cost=0.28..121.42 rows=15 width=6) (actual time=0.747..0.747 rows=0 loops=1)
+            Output: ctid
+            Index Cond: (s.updated_at < (now() - '01:00:00'::interval))
+            Filter: (s.updated_at < (now() - ((GREATEST('3600'::bigint, LEAST(GREATEST(COALESCE((((s.cohort)::jsonb ->> 'peer_stale_secs'::text))::bigint, '120'::bigint), '0'::bigint), '31536000'::bigint)))::double precision * '00:00:01'::interval)))
+            Rows Removed by Filter: 16
+            Buffers: shared hit=18
+    Settings: plan_cache_mode = 'force_custom_plan'
+    Query Identifier: -4648553633217282497
+    Planning Time: 0.073 ms
+    Execution Time: 0.761 ms
+
+### plan_cache_mode = force_generic_plan
+
+    Delete on public.harvest_worker_task_stats s  (cost=23.02..1212.55 rows=0 width=0) (actual time=0.783..0.784 rows=0 loops=1)
+      Buffers: shared hit=12
+      ->  Bitmap Heap Scan on public.harvest_worker_task_stats s  (cost=23.02..1212.55 rows=296 width=6) (actual time=0.783..0.783 rows=0 loops=1)
+            Output: ctid
+            Recheck Cond: (s.updated_at < (now() - (($1)::double precision * '00:00:01'::interval)))
+            Filter: (s.updated_at < (now() - ((GREATEST($1, LEAST(GREATEST(COALESCE((((s.cohort)::jsonb ->> 'peer_stale_secs'::text))::bigint, $2), '0'::bigint), '31536000'::bigint)))::double precision * '00:00:01'::interval)))
+            Rows Removed by Filter: 16
+            Heap Blocks: exact=10
+            Buffers: shared hit=12
+            ->  Bitmap Index Scan on harvest_worker_task_stats_updated_at_idx  (cost=0.00..22.94 rows=887 width=0) (actual time=0.006..0.006 rows=16 loops=1)
+                  Index Cond: (s.updated_at < (now() - (($1)::double precision * '00:00:01'::interval)))
+                  Buffers: shared hit=2
+    Settings: plan_cache_mode = 'force_generic_plan'
+    Query Identifier: -4648553633217282497
+    Planning Time: 0.058 ms
+    Execution Time: 0.798 ms
+
+Statement:
+
+    DELETE FROM harvest_worker_task_stats s WHERE s.updated_at < NOW() - ($1::bigint * INTERVAL '1 second') AND s.updated_at < NOW() - (GREATEST($1::bigint, LEAST(GREATEST(COALESCE((s.cohort::jsonb ->> 'peer_stale_secs')::bigint, $2), 0), 31536000)) * INTERVAL '1 second')
+
+## Live fleet of 8000
+
+### plan_cache_mode = force_custom_plan
+
+    Delete on public.harvest_worker_task_stats s  (cost=0.29..458.65 rows=0 width=0) (actual time=3.242..3.242 rows=0 loops=1)
+      Buffers: shared hit=67
+      ->  Index Scan using harvest_worker_task_stats_updated_at_idx on public.harvest_worker_task_stats s  (cost=0.29..458.65 rows=59 width=6) (actual time=3.233..3.234 rows=1 loops=1)
+            Output: ctid
+            Index Cond: (s.updated_at < (now() - '01:00:00'::interval))
+            Filter: (s.updated_at < (now() - ((GREATEST('3600'::bigint, LEAST(GREATEST(COALESCE((((s.cohort)::jsonb ->> 'peer_stale_secs'::text))::bigint, '120'::bigint), '0'::bigint), '31536000'::bigint)))::double precision * '00:00:01'::interval)))
+            Rows Removed by Filter: 64
+            Buffers: shared hit=66
+    Settings: plan_cache_mode = 'force_custom_plan'
+    Query Identifier: 435336514753452175
+    Planning Time: 0.087 ms
+    Execution Time: 3.259 ms
+
+### plan_cache_mode = force_generic_plan
+
+    Delete on public.harvest_worker_task_stats s  (cost=75.04..4807.39 rows=0 width=0) (actual time=3.327..3.327 rows=0 loops=1)
+      Buffers: shared hit=44
+      ->  Bitmap Heap Scan on public.harvest_worker_task_stats s  (cost=75.04..4807.39 rows=1176 width=6) (actual time=3.319..3.320 rows=1 loops=1)
+            Output: ctid
+            Recheck Cond: (s.updated_at < (now() - (($1)::double precision * '00:00:01'::interval)))
+            Filter: (s.updated_at < (now() - ((GREATEST($1, LEAST(GREATEST(COALESCE((((s.cohort)::jsonb ->> 'peer_stale_secs'::text))::bigint, $2), '0'::bigint), '31536000'::bigint)))::double precision * '00:00:01'::interval)))
+            Rows Removed by Filter: 64
+            Heap Blocks: exact=41
+            Buffers: shared hit=43
+            ->  Bitmap Index Scan on harvest_worker_task_stats_updated_at_idx  (cost=0.00..74.75 rows=3527 width=0) (actual time=0.013..0.013 rows=65 loops=1)
+                  Index Cond: (s.updated_at < (now() - (($1)::double precision * '00:00:01'::interval)))
+                  Buffers: shared hit=2
+    Settings: plan_cache_mode = 'force_generic_plan'
+    Query Identifier: 435336514753452175
+    Planning Time: 0.105 ms
+    Execution Time: 3.350 ms
+
+Statement:
+
+    DELETE FROM harvest_worker_task_stats s WHERE s.updated_at < NOW() - ($1::bigint * INTERVAL '1 second') AND s.updated_at < NOW() - (GREATEST($1::bigint, LEAST(GREATEST(COALESCE((s.cohort::jsonb ->> 'peer_stale_secs')::bigint, $2), 0), 31536000)) * INTERVAL '1 second')
+

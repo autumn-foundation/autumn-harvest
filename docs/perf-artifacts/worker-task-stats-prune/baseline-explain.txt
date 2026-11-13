@@ -1,0 +1,102 @@
+## Live fleet of 500
+
+### plan_cache_mode = force_custom_plan
+
+    Delete on public.harvest_worker_task_stats s  (cost=0.00..327.99 rows=0 width=0) (actual time=33.579..33.580 rows=0 loops=1)
+      Buffers: shared hit=299
+      ->  Seq Scan on public.harvest_worker_task_stats s  (cost=0.00..327.99 rows=227 width=6) (actual time=33.574..33.575 rows=0 loops=1)
+            Output: ctid
+            Filter: (s.updated_at < (now() - ((GREATEST('3600'::bigint, LEAST(GREATEST(COALESCE((((s.cohort)::jsonb ->> 'peer_stale_secs'::text))::bigint, '120'::bigint), '0'::bigint), '31536000'::bigint)))::double precision * '00:00:01'::interval)))
+            Rows Removed by Filter: 659
+            Buffers: shared hit=299
+    Settings: plan_cache_mode = 'force_custom_plan'
+    Query Identifier: -8484810464541012642
+    Planning Time: 0.081 ms
+    Execution Time: 33.601 ms
+
+### plan_cache_mode = force_generic_plan
+
+    Delete on public.harvest_worker_task_stats s  (cost=0.00..327.99 rows=0 width=0) (actual time=34.262..34.263 rows=0 loops=1)
+      Buffers: shared hit=299
+      ->  Seq Scan on public.harvest_worker_task_stats s  (cost=0.00..327.99 rows=227 width=6) (actual time=34.260..34.260 rows=0 loops=1)
+            Output: ctid
+            Filter: (s.updated_at < (now() - ((GREATEST($1, LEAST(GREATEST(COALESCE((((s.cohort)::jsonb ->> 'peer_stale_secs'::text))::bigint, $2), '0'::bigint), '31536000'::bigint)))::double precision * '00:00:01'::interval)))
+            Rows Removed by Filter: 659
+            Buffers: shared hit=299
+    Settings: plan_cache_mode = 'force_generic_plan'
+    Query Identifier: -8484810464541012642
+    Planning Time: 0.095 ms
+    Execution Time: 34.287 ms
+
+Statement:
+
+    DELETE FROM harvest_worker_task_stats s WHERE s.updated_at < NOW() - (GREATEST($1::bigint, LEAST(GREATEST(COALESCE((s.cohort::jsonb ->> 'peer_stale_secs')::bigint, $2), 0), 31536000)) * INTERVAL '1 second')
+
+## Live fleet of 2000
+
+### plan_cache_mode = force_custom_plan
+
+    Delete on public.harvest_worker_task_stats s  (cost=0.00..1282.13 rows=0 width=0) (actual time=128.135..128.136 rows=0 loops=1)
+      Buffers: shared hit=1169
+      ->  Seq Scan on public.harvest_worker_task_stats s  (cost=0.00..1282.13 rows=887 width=6) (actual time=128.132..128.133 rows=0 loops=1)
+            Output: ctid
+            Filter: (s.updated_at < (now() - ((GREATEST('3600'::bigint, LEAST(GREATEST(COALESCE((((s.cohort)::jsonb ->> 'peer_stale_secs'::text))::bigint, '120'::bigint), '0'::bigint), '31536000'::bigint)))::double precision * '00:00:01'::interval)))
+            Rows Removed by Filter: 2620
+            Buffers: shared hit=1169
+    Settings: plan_cache_mode = 'force_custom_plan'
+    Query Identifier: 4894289363906521350
+    Planning Time: 0.093 ms
+    Execution Time: 128.162 ms
+
+### plan_cache_mode = force_generic_plan
+
+    Delete on public.harvest_worker_task_stats s  (cost=0.00..1282.13 rows=0 width=0) (actual time=127.811..127.813 rows=0 loops=1)
+      Buffers: shared hit=1169
+      ->  Seq Scan on public.harvest_worker_task_stats s  (cost=0.00..1282.13 rows=887 width=6) (actual time=127.809..127.810 rows=0 loops=1)
+            Output: ctid
+            Filter: (s.updated_at < (now() - ((GREATEST($1, LEAST(GREATEST(COALESCE((((s.cohort)::jsonb ->> 'peer_stale_secs'::text))::bigint, $2), '0'::bigint), '31536000'::bigint)))::double precision * '00:00:01'::interval)))
+            Rows Removed by Filter: 2620
+            Buffers: shared hit=1169
+    Settings: plan_cache_mode = 'force_generic_plan'
+    Query Identifier: 4894289363906521350
+    Planning Time: 0.127 ms
+    Execution Time: 127.839 ms
+
+Statement:
+
+    DELETE FROM harvest_worker_task_stats s WHERE s.updated_at < NOW() - (GREATEST($1::bigint, LEAST(GREATEST(COALESCE((s.cohort::jsonb ->> 'peer_stale_secs')::bigint, $2), 0), 31536000)) * INTERVAL '1 second')
+
+## Live fleet of 8000
+
+### plan_cache_mode = force_custom_plan
+
+    Delete on public.harvest_worker_task_stats s  (cost=0.00..5097.65 rows=0 width=0) (actual time=590.481..590.482 rows=0 loops=1)
+      Buffers: shared hit=4650
+      ->  Seq Scan on public.harvest_worker_task_stats s  (cost=0.00..5097.65 rows=3527 width=6) (actual time=109.582..590.413 rows=2 loops=1)
+            Output: ctid
+            Filter: (s.updated_at < (now() - ((GREATEST('3600'::bigint, LEAST(GREATEST(COALESCE((((s.cohort)::jsonb ->> 'peer_stale_secs'::text))::bigint, '120'::bigint), '0'::bigint), '31536000'::bigint)))::double precision * '00:00:01'::interval)))
+            Rows Removed by Filter: 10466
+            Buffers: shared hit=4648
+    Settings: plan_cache_mode = 'force_custom_plan'
+    Query Identifier: 7084320188199052340
+    Planning Time: 0.094 ms
+    Execution Time: 590.506 ms
+
+### plan_cache_mode = force_generic_plan
+
+    Delete on public.harvest_worker_task_stats s  (cost=0.00..5097.65 rows=0 width=0) (actual time=569.309..569.309 rows=0 loops=1)
+      Buffers: shared hit=4651
+      ->  Seq Scan on public.harvest_worker_task_stats s  (cost=0.00..5097.65 rows=3527 width=6) (actual time=60.682..569.285 rows=3 loops=1)
+            Output: ctid
+            Filter: (s.updated_at < (now() - ((GREATEST($1, LEAST(GREATEST(COALESCE((((s.cohort)::jsonb ->> 'peer_stale_secs'::text))::bigint, $2), '0'::bigint), '31536000'::bigint)))::double precision * '00:00:01'::interval)))
+            Rows Removed by Filter: 10465
+            Buffers: shared hit=4648
+    Settings: plan_cache_mode = 'force_generic_plan'
+    Query Identifier: 7084320188199052340
+    Planning Time: 0.101 ms
+    Execution Time: 569.333 ms
+
+Statement:
+
+    DELETE FROM harvest_worker_task_stats s WHERE s.updated_at < NOW() - (GREATEST($1::bigint, LEAST(GREATEST(COALESCE((s.cohort::jsonb ->> 'peer_stale_secs')::bigint, $2), 0), 31536000)) * INTERVAL '1 second')
+
