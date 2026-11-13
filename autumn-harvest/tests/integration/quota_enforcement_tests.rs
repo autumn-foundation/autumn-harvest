@@ -2203,8 +2203,9 @@ async fn mixed_fan_out_rolls_back_the_whole_decision_when_the_sequential_group_e
 // ---------------------------------------------------------------------------
 // Issue #946 — the child-timeout-race primitive
 // (`ctx.spawn_child_workflow_timeout`, issue #779) dispatches through
-// `persist_child_timeout_race` -> `insert_awaited_child_execution`, a THIRD
-// distinct child-spawn code path from the two above (fan-out and detached).
+// `persist_child_timeout_race` -> `insert_awaited_child_execution`. That is a
+// THIRD child-spawn code path, distinct from the two above (fan-out and
+// detached).
 // Its own local `QuotaExceeded` catch must likewise park rather than fail
 // the parent.
 // ---------------------------------------------------------------------------
@@ -2372,11 +2373,11 @@ async fn child_timeout_race_spawn_honors_target_quota_parks_parent_then_succeeds
 
 /// A child-timeout-race child spawn (`persist_child_timeout_race` ->
 /// `insert_awaited_child_execution`) must not be wrongly rejected by its OWN
-/// just-appended `ChildWorkflowStarted`/`WorkflowStarted` events counting
-/// toward the `history_bytes` admission it is itself part of (issue #946 —
-/// see the section comment above
+/// just-appended `ChildWorkflowStarted`/`WorkflowStarted` events. Those events
+/// must not count toward the `history_bytes` admission the spawn is part of
+/// (issue #946). See the section comment above
 /// [`detached_child_spawn_quota_check_excludes_its_own_just_appended_history_bytes`]
-/// for the full rationale).
+/// for the full rationale.
 #[tokio::test]
 async fn child_timeout_race_spawn_quota_check_excludes_its_own_just_appended_history_bytes() {
     let _serial = serial().await;
@@ -2930,7 +2931,7 @@ async fn replace_execution_allow_duplicate_failed_only_enforces_quota_on_resurre
 
     // 3. Before the quota fix, `replace_execution` (reached here via
     //    `AllowDuplicateFailedOnly` over a FAILED prior) never called
-    //    `enforce_quota_admission` at all -- this would have silently
+    //    `enforce_quota_admission` at all. This would have silently
     //    resurrected the failed row into a fresh ACTIVE execution.
     let exec_id2 = ExecutionId::new();
     let mut p = params(
@@ -3058,9 +3059,9 @@ async fn replace_execution_terminate_if_running_enforces_the_new_requests_resolv
     // this request body resolves to "victim-tenant" -- the
     // ALREADY-SATURATED key. Before the quota fix, `replace_execution`
     // (`ActiveConflictBehavior::Terminate`) never called
-    // `enforce_quota_admission`, so E would have been silently sealed and
-    // replaced by a fresh execution counted against "victim-tenant",
-    // growing that key's population to 2 past its declared cap of 1.
+    // `enforce_quota_admission`. So E would have been silently sealed and
+    // replaced by a fresh execution counted against "victim-tenant". That
+    // grows the population of that key to 2, past its declared cap of 1.
     let exec_id_e2 = ExecutionId::new();
     let mut p = params(
         wf,
@@ -3152,12 +3153,12 @@ async fn replace_execution_paths_still_succeed_when_not_over_cap() {
     assert_eq!(active_count(&mut conn, wf, "roomy").await, 2);
 }
 
-/// Issue #946: `history_bytes`, not just
-/// `active_executions`, must be exempted for the row a `TerminateIfRunning`
-/// replace is about to seal -- and specifically on Site 1 (the
-/// `ActiveConflictBehavior::Terminate` path over a RUNNING/PAUSED existing,
-/// reached via the pre-check-cancel shortcut before the fix and via
-/// the atomic `inline_cancel` + `replace_execution` fallthrough after it).
+/// Issue #946: `history_bytes`, not just `active_executions`, must be
+/// exempted for the row a `TerminateIfRunning` replace is about to seal. This
+/// applies specifically on Site 1: the `ActiveConflictBehavior::Terminate`
+/// path over a RUNNING/PAUSED existing row. Before the fix, that path went
+/// through the pre-check-cancel shortcut. After it, the path is the atomic
+/// `inline_cancel` + `replace_execution` fallthrough.
 ///
 /// Before the fix, `enforce_quota_before_terminate_pre_check` only ever
 /// subtracted the existing row's own contribution from
@@ -3693,11 +3694,11 @@ async fn continue_as_new_cross_type_oversized_quota_key_still_records_its_abando
 }
 
 // ---------------------------------------------------------------------------
-// Issue #946 — a SAME-SHARD completion trigger whose
-// TARGET's per-tenant quota is exhausted at fire time must defer the start
-// to the durable outbox for retry, NOT propagate `Err` out of
-// `evaluate_triggers_for_execution` and roll back the SOURCE execution's own
-// terminal commit along with it. Worker-driven end to end.
+// Issue #946 — a SAME-SHARD completion trigger can find the per-tenant quota
+// of its TARGET exhausted at fire time. It must defer the start to the
+// durable outbox for retry. It must NOT propagate `Err` out of
+// `evaluate_triggers_for_execution`, which would roll back the terminal
+// commit of the SOURCE execution with it. Worker-driven end to end.
 // ---------------------------------------------------------------------------
 
 fn quota_trigger_source<'a>(

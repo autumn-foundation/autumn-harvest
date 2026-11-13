@@ -293,13 +293,13 @@ fn collect_descriptors_by(
             );
         }
     }
-    // Process unique names in *effective-registration* order: the index of
-    // the occurrence `effective` actually resolved to (its last occurrence),
-    // not the index of the name's first mention (code review, PR #908). The
+    // Process unique names in *effective-registration* order (PR #908). That
+    // is the index of the occurrence `effective` actually resolved to (its
+    // last occurrence), not the index of the first mention of the name. The
     // operation-id collision check below is documented and tested as
-    // "first-registered wins." When a name is registered more than once, the
-    // registration that matters is the one `effective` (and thus the runtime)
-    // uses. An earlier, superseded registration of that name is history, not
+    // "first-registered wins". When a name is registered more than once, the
+    // registration that matters is the one that `effective` (and thus the
+    // runtime) uses. An earlier, superseded registration of that name is history, not
     // a real claim on "registered first." Example: `[invoice_status(non-mcp),
     // start_invoice(mcp), invoice_status(mcp)]`. The *effective* registration
     // of `invoice_status` is the third entry. It comes after the only (and
