@@ -9,8 +9,8 @@ executions they use 77% of the buffers of the workload.
 | `spawn_history_oversized_sampler` (#493) | `sample_history_oversized_counts` | 164,171 |
 | `spawn_workflow_active_sampler` (#770) | `sample_active_workflow_counts` | 26,039 |
 
-The cost per call is inherent. The waste is the call rate. Prometheus
-scrapes a gauge each 15 to 60 s, so almost every sample is thrown away.
+The count sets the cost per call. The waste is the call rate. Prometheus
+scrapes a gauge each 15 to 60 s, so no scrape reads most samples.
 
 **No migration. No new `WorkflowEvent` variant. No route change. No new
 metric.**
@@ -39,8 +39,8 @@ metric.**
 | R1 | Set the interval to zero. The sampler then spins and sends SQL in a hot loop. | `HarvestBuilder::build` rejects zero. `WorkerRuntimeConfig::validate` also rejects it, so a config that skips the builder fails in `Worker::new`. |
 | R2 | A later change passes `poll_interval` to the samplers again. | A test drives the samplers from a runtime config and counts real pool connections. Zero connections before the population interval ends. |
 | R3 | A long sleep delays shutdown. | The sleep selects on the cancel token. A test cancels in the sleep and the task ends. |
-| R4 | The new knob is not visible to an operator. | `EffectiveWorkerConfig` reports `population_sample_interval_ms`. The exhaustive destructure forces this. |
-| R5 | A dashboard or alert needs a value faster than 15 s. | The alert pack reads `harvest_workflow_active` over one hour and `harvest_workflow_history_oversized > 0`. Both are coarse. An operator can lower the interval. |
+| R4 | The new knob is not visible to an operator. | `WorkerConfigView` (`GET /api/harvest/admin/config`, key `worker.population_sample_interval_ms`) reports it. The exhaustive destructure forces this. |
+| R5 | A dashboard or alert needs a value faster than 15 s. | The starter alert reads `harvest_workflow_active` over one hour. The history-ceiling runbook alerts on `harvest_workflow_history_oversized > 0`. Both are coarse. An operator can lower the interval. |
 | R6 | A `sum` across workers changes. | Option A keeps one emitter per worker, so `sum`, `max` and `last` give the same value as before. |
 | R7 | The docs still say "poll interval". | The telemetry table and the history-ceiling runbook change in the same commit. |
 | R8 | The name suggests that the knob governs every metric sampler. | The name is `population_sample_interval`. It governs the two population samplers only. |
@@ -51,7 +51,8 @@ metric.**
   The statements are #1 and #2 by buffers. Each worker computes the same
   fleet-wide value. The first sample comes one interval after start.
 - **Red (feelings).** A gauge that refreshes each 15 s feels normal. It
-  matches the default scrape interval and `replication_sample_interval`.
+  matches the 15 s scrape interval of the Prometheus example config and
+  `replication_sample_interval`.
 - **Black (risks).** Option B changes who emits the gauge. The starter alert
   `harvest_workflow_active` sums over workers. A single emitter changes its
   value and its threshold. Option B also needs a lease per shard while
@@ -84,6 +85,6 @@ state (see `replay_sample.rs`). The result does not change.
 5. With a 50 ms poll interval and the default population interval, the two
    samplers open no connection for 15 s, then open one.
 6. A cancel during the sleep ends both samplers.
-7. `EffectiveWorkerConfig` reports `population_sample_interval_ms`.
+7. `WorkerConfigView` reports `population_sample_interval_ms`.
 8. `docs/telemetry.md` and `docs/runbooks/history-ceiling.md` name the new
    cadence.

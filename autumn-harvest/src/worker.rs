@@ -92,8 +92,8 @@ pub use crate::builder::DEFAULT_MAX_CONCURRENT_CLAIMS;
 ///
 /// The samplers feed `harvest.workflow.history_oversized` and
 /// `harvest.workflow.active`. Each sample counts the whole active population
-/// of each shard. Prometheus scrapes a gauge each 15 to 60 s, so a sample at
-/// `poll_interval` is almost always discarded. See
+/// of each shard. Prometheus scrapes a gauge each 15 to 60 s, so no scrape
+/// reads most samples at `poll_interval`. See
 /// [`crate::builder::WorkerConfig::population_sample_interval`].
 pub const DEFAULT_POPULATION_SAMPLE_INTERVAL: Duration = Duration::from_secs(15);
 
@@ -204,8 +204,8 @@ pub struct WorkerRuntimeConfig {
     pub claim_slots_per_shard: Option<std::num::NonZeroU16>,
     /// Interval between queue poll attempts when idle.
     pub poll_interval: Duration,
-    /// Interval of the two population samplers (issue #2668). Must not be
-    /// zero. See [`crate::builder::WorkerConfig::population_sample_interval`].
+    /// Interval of the two population samplers (issue #2668). The value
+    /// must not be zero. See [`crate::builder::WorkerConfig::population_sample_interval`].
     pub population_sample_interval: Duration,
     /// Maximum time to wait for in-flight tasks during shutdown.
     pub shutdown_timeout: Duration,
@@ -34429,6 +34429,7 @@ fn spawn_population_samplers(
     soft_threshold: u64,
 ) -> [tokio::task::JoinHandle<()>; 2] {
     let interval = config.population_sample_interval;
+    // Each sampler returns at once when no metrics recorder is set.
     [
         spawn_history_oversized_sampler(
             pools.clone(),
@@ -34437,7 +34438,6 @@ fn spawn_population_samplers(
             soft_threshold,
             interval,
         ),
-        // Self-no-ops when metrics are disabled.
         spawn_workflow_active_sampler(pools, cancel.clone(), telemetry.clone(), interval),
     ]
 }
@@ -46521,8 +46521,8 @@ mod tests {
         Arc::new(telemetry)
     }
 
-    /// A runtime config with a fast poll interval and the default
-    /// population interval. The poll interval is the test default.
+    /// A runtime config with a 50 ms poll interval and the default
+    /// population interval.
     fn population_cadence_config() -> WorkerRuntimeConfig {
         let mut cfg = default_runtime_config();
         cfg.poll_interval = Duration::from_millis(50);

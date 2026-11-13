@@ -4182,12 +4182,12 @@ pub struct WorkerConfig {
     ///
     /// They feed `harvest.workflow.history_oversized` and
     /// `harvest.workflow.active`. Each sample counts the whole active
-    /// population of each shard, on every worker. At 1M executions that
-    /// cost 77% of the buffers when the samplers ran on the poll interval.
+    /// population of each shard, on every worker. At 1M executions on the
+    /// poll interval, the samplers used 77% of the buffers.
     ///
     /// A lower value gives a fresher gauge at a higher database cost. The
     /// first sample comes one interval after the worker starts. Every other
-    /// sampler keeps the poll interval. Must not be zero. Default: 15
+    /// sampler keeps the poll interval. The value must not be zero. Default: 15
     /// seconds ([`crate::worker::DEFAULT_POPULATION_SAMPLE_INTERVAL`]).
     pub population_sample_interval: Duration,
     /// Slot-name prefix identifying this shard's DR replication (issue #954).

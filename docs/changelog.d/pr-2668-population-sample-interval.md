@@ -8,7 +8,7 @@ used 77% of the buffers of the workload.
 - New knob `WorkerConfig::population_sample_interval`, default 15 s
   (`worker::DEFAULT_POPULATION_SAMPLE_INTERVAL`). Set it with
   `with_population_sample_interval`. At the default poll interval the two
-  samplers now run 30 times less often.
+  samplers now make 30 times fewer calls.
 - Every other sampler keeps `poll_interval`.
 - The gauge semantics do not change. Each worker still emits the fleet-wide
   value, so `sum`, `max` and `last` queries read as before.

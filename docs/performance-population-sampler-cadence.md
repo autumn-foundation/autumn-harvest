@@ -20,8 +20,8 @@ each. PG 16, `pg_stat_statements`, default `shared_buffers`.
 
 | executions | total buffers | oversized sampler | active sampler | both |
 |--:|--:|--:|--:|--:|
-| 100k | 754,897 | 208,888 | 51,092 | 34.5% |
-| 300k | 1,183,672 | 516,369 | 152,740 | 56.5% |
+| 100k | 754,897 | 208,888 | 51,092 | 34.4% |
+| 300k | 1,183,672 | 516,369 | 152,740 | 56.4% |
 | 1M | 2,548,217 | 1,502,995 | 456,640 | 76.9% |
 
 At 1M executions, with 13.6M events on the active runs, one call costs:
@@ -31,9 +31,8 @@ At 1M executions, with 13.6M events on the active runs, one call costs:
 
 ## 💡 Hypothesis
 
-The cost per call is inherent to the count. The call rate is the waste.
-Prometheus scrapes a gauge each 15 to 60 s. A sample at 500 ms is almost
-always discarded.
+The count sets the cost per call. The call rate is the waste. Prometheus
+scrapes a gauge each 15 to 60 s. No scrape reads most samples at 500 ms.
 
 The issue records two rejected rewrites. An early-exit oversized check costs
 74% more. A covering partial index is worse than no index before a vacuum.
@@ -62,7 +61,7 @@ That is 30 times fewer calls. At 1M executions the buffer touches per worker
 per hour go from about 1.37 billion to about 46 million.
 
 `population_samplers_wait_for_the_population_interval_not_the_poll_interval`
-in `autumn-harvest/src/worker.rs` pins the after state. It counts real
+in `autumn-harvest/src/worker.rs` proves the new cadence. It counts real
 loopback connections. With a 50 ms poll interval, both samplers open no
 connection for 15 s, then open one. The test fails when the samplers use
 `poll_interval`.
