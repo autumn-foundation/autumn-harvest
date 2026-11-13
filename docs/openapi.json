@@ -4015,7 +4015,7 @@
                       "type": "string"
                     },
                     "truncated": {
-                      "description": "Schedules ({id, name}) that fire so often that the forecast stopped reading them, or whose run budget at the window cannot be projected: too many slots before the window, or an overdue next_run_at whose catch-up policy decides the budget. Such a schedule is not forecast.",
+                      "description": "Schedules ({id, name}) that fire so often that the forecast stopped reading them, or whose run budget at the window cannot be projected: too many slots before the window, or an overdue next_run_at whose catch-up policy decides the budget. It also lists a schedule whose jitter carries a run to or past its next slot, since its catch-up policy then decides which later slots run. Such a schedule is not forecast.",
                       "type": "array"
                     },
                     "unanchored": {

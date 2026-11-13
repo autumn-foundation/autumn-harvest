@@ -49465,7 +49465,8 @@ pub(crate) struct ScheduleHerdReport {
     ///
     /// It also lists a budgeted schedule with too many slots before the
     /// window, or with an overdue `next_run_at`. Its budget at the window is
-    /// unknown, so it is not forecast.
+    /// unknown, so it is not forecast. So is a schedule whose jitter carries a
+    /// run past its next slot.
     pub truncated: Vec<HerdScheduleRef>,
     /// `complete`, or `partial` when a shard did not answer.
     pub status: FanoutStatus,
@@ -49533,11 +49534,16 @@ fn slots_before(
 /// - one whose `next_run_at` is before `now`. Its catch-up policy decides how
 ///   many missed slots spend a run, and the scheduler applies it on its next
 ///   tick.
+///
+/// A schedule whose jitter can carry a run past its next slot also goes into
+/// the third list, with or without a budget. Its catch-up policy then decides
+/// which later slots run.
 #[allow(clippy::type_complexity)]
 fn project_herd_budgets(
     candidates: Vec<(&HarvestSchedule, Schedule)>,
     now: chrono::DateTime<chrono::Utc>,
     from: chrono::DateTime<chrono::Utc>,
+    until: chrono::DateTime<chrono::Utc>,
 ) -> (
     Vec<(&HarvestSchedule, Schedule)>,
     Vec<Option<i32>>,
@@ -49547,6 +49553,10 @@ fn project_herd_budgets(
     let mut budgets = Vec::new();
     let mut unprojected = Vec::new();
     for (row, schedule) in candidates {
+        if jitter_crosses_a_slot(row, &schedule, from, until) {
+            unprojected.push(herd_schedule_ref(row));
+            continue;
+        }
         let budget = schedule_remaining_runs(row.max_runs, row.runs_started);
         let overdue = row.next_run_at.is_some_and(|next| next < now);
         let projected = budget.map_or(Some(None), |left| {
@@ -49563,6 +49573,42 @@ fn project_herd_budgets(
         }
     }
     (active, budgets, unprojected)
+}
+
+/// `true` when the jitter of `row` carries one of its runs to or past its next
+/// slot, between `from` and `until`.
+///
+/// The scheduler waits for the jittered start of a slot before it moves on.
+/// Its catch-up policy then decides which of the passed slots run. The walk
+/// stops after [`autumn_harvest::schedule_herd::MAX_FIRES_PER_SCHEDULE`] slots.
+fn jitter_crosses_a_slot(
+    row: &HarvestSchedule,
+    schedule: &Schedule,
+    from: chrono::DateTime<chrono::Utc>,
+    until: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    if row.jitter_secs <= 0 {
+        return false;
+    }
+    let walker = autumn_harvest::schedule_plan::SlotWalker::new(schedule);
+    let mut slot = match walker.next_after(from - chrono::Duration::seconds(1)) {
+        Some(slot) if slot < until => slot,
+        _ => return false,
+    };
+    for _ in 0..autumn_harvest::schedule_herd::MAX_FIRES_PER_SCHEDULE {
+        let Some(next) = walker.next_after(slot) else {
+            return false;
+        };
+        let start = effective_fire_time(row.id, Some(slot), row.jitter_secs).unwrap_or(slot);
+        if start >= next {
+            return true;
+        }
+        if next >= until {
+            return false;
+        }
+        slot = next;
+    }
+    false
 }
 
 /// The lookback of a herd walk and the time at which the walk starts.
@@ -49642,7 +49688,8 @@ pub(crate) fn build_herd_report(
 
     let (candidates, inactive) = partition_herd_rows(rows);
     let (lookback, walk_from) = herd_lookback(&candidates, from);
-    let (active, mut budgets, unprojected) = project_herd_budgets(candidates, now, walk_from);
+    let (active, mut budgets, unprojected) =
+        project_herd_budgets(candidates, now, walk_from, until);
 
     // The forecast keys each schedule by its row id, so two rows with one
     // name stay two schedules.
@@ -60203,6 +60250,38 @@ mod tests {
             "each budget is spent at 11:00, not at 10:00"
         );
         assert_eq!(report.spots[0].at, eleven);
+    }
+
+    #[test]
+    fn the_herd_report_does_not_project_jitter_that_crosses_a_slot() {
+        // An every-minute schedule with an hour of jitter starts most runs
+        // after its next slot. The scheduler then skips slots by its policy.
+        let crossing = autumn_harvest::models::HarvestSchedule {
+            jitter_secs: 3_600,
+            ..herd_row(1, "crossing", "cron:* * * * *")
+        };
+        let hourly = herd_row(2, "hourly", "cron:0 * * * *");
+        let report = build_herd_report(
+            &[crossing, hourly],
+            herd_epoch(),
+            herd_epoch(),
+            2,
+            60,
+            2,
+            50,
+        );
+        let truncated: Vec<&str> = report.truncated.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(truncated, ["crossing"]);
+        assert_eq!(report.fires, 2, "only the hourly schedule is forecast");
+
+        // A jitter that stays inside the period is still forecast.
+        let narrow = autumn_harvest::models::HarvestSchedule {
+            jitter_secs: 600,
+            ..herd_row(3, "narrow", "cron:0 * * * *")
+        };
+        let report = build_herd_report(&[narrow], herd_epoch(), herd_epoch(), 2, 60, 2, 50);
+        assert_eq!(report.truncated, []);
+        assert_eq!(report.fires, 2);
     }
 
     #[test]
