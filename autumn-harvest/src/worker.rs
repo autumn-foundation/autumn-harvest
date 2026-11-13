@@ -46654,9 +46654,9 @@ mod tests {
         }
     }
 
-    /// The samplers that `spawn_gauge_samplers` starts with every input set:
-    /// queue depth, concurrency, rate limit, one DLQ shard, queue pause,
-    /// history oversized, workflow active and stranded work.
+    /// The samplers that `spawn_gauge_samplers` starts with every input set.
+    /// They are queue depth, concurrency, rate limit, one DLQ shard, queue
+    /// pause, history oversized, workflow active and stranded work.
     const GAUGE_SAMPLERS: usize = 8;
 
     /// Issue #2668: with metrics on, every database gauge sampler waits for

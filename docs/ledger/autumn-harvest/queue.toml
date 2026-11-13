@@ -108,7 +108,7 @@ driver = "per_tick"
 backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_rate_limit_buckets", "harvest_task_queue", "harvest_workflow_executions"]
-measured = "unmeasured"
+measured = "docs/performance-gauge-sample-interval.md"
 plan = "docs/ledger/plans/autumn-harvest/queue.md"
 
 ["complete_task_inner"]
@@ -120,11 +120,11 @@ measured = "unmeasured"
 plan = "docs/ledger/plans/autumn-harvest/queue.md"
 
 ["concurrency_key_stats"]
-driver = "per_request"
+driver = "per_tick"
 backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_task_queue"]
-measured = "unmeasured"
+measured = "docs/performance-gauge-sample-interval.md"
 plan = "docs/ledger/plans/autumn-harvest/queue.md"
 
 ["concurrency_key_workflows"]
@@ -489,7 +489,7 @@ driver = "per_tick"
 backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_rate_limit_buckets"]
-measured = "unmeasured"
+measured = "docs/performance-gauge-sample-interval.md"
 plan = "docs/ledger/plans/autumn-harvest/queue.md"
 
 ["session_has_other_live_tasks"]

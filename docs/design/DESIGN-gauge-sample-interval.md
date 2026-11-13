@@ -27,7 +27,8 @@ metric.**
   row out of the queue-pause anti-join. It then runs a sequential scan of
   `harvest_workflow_executions` for each pending row. At 100,000 pending rows
   one call ran for more than 300 s. With a `NOT EXISTS` probe it reads
-  121,068 buffers in 0.9 s and returns the same 740 groups.
+  114,965 buffers in 0.23 s. A database test shows that it returns the same
+  groups.
 - At 10,000 pending rows the stranded-work query was 80% of all buffers. The
   age query was the next cost.
 - Every sampler runs on each 500 ms tick of each worker, and the

@@ -7,7 +7,7 @@ A replay of poll ticks measured them:
 - The stranded-work demand query had a plan defect. The planner scanned every
   execution for each pending row. At 100,000 pending rows one call ran for
   more than 300 s. Its `PAUSED` gate is now a `NOT EXISTS` probe. The same
-  call reads 121,068 buffers in 0.9 s and returns the same groups. The
+  call reads 114,965 buffers in 0.23 s and returns the same groups. The
   plugin shard-health route runs this query too.
 - At 1,000,000 dead letters the DLQ depth count read 744,158 buffers per
   call. At 300,000 pending rows the concurrency stats read 20,230.

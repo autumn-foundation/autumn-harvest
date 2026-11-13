@@ -2818,6 +2818,11 @@ standalone note rather than part of the claim-path attribution table above:
   — two population samplers ran on the 500 ms poll interval and used 77% of
   the buffers at 1M executions (issue #2668). A 15 s interval cuts the calls
   by 30 times.
+* [`docs/performance-gauge-sample-interval.md`](performance-gauge-sample-interval.md)
+  — seven more gauge samplers ran on the poll interval, and the stranded-work
+  query had a quadratic plan. A `NOT EXISTS` probe fixes the plan. One 15 s
+  gauge interval cuts the sampler buffers per worker-hour by 98.3% at the
+  small size.
 * [`docs/performance-completion-trigger-outbox-queue.md`](performance-completion-trigger-outbox-queue.md)
   — the per-row `harvest_schedules` lookup in
   `completion_trigger::enforce_completion_triggers_outbox`'s cross-shard
