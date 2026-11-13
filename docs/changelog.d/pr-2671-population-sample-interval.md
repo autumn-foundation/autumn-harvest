@@ -9,7 +9,7 @@ used 77% of the buffers of the workload.
   (`builder::DEFAULT_GAUGE_SAMPLE_INTERVAL`). Set it with
   `with_gauge_sample_interval`. At the default poll interval the two
   samplers now make 30 times fewer calls.
-- `pr-2668-gauge-sample-interval.md` moves the other database gauge samplers
+- `pr-2676-gauge-sample-interval.md` moves the other database gauge samplers
   onto this interval.
 - The gauge semantics do not change. Each worker still emits the fleet-wide
   value, so `max` and `last` queries read as before.

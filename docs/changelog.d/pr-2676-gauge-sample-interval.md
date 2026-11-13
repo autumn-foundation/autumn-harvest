@@ -1,4 +1,4 @@
-## Every database gauge sampler runs on one interval (follow-up to issue #2668)
+## Every database gauge sampler runs on one interval (follow-up to issue #2668, PR #2676)
 
 PR #2671 moved two population samplers off the 500 ms poll interval. Six
 more gauge samplers, with seven statements, still read the database on each
