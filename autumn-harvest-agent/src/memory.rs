@@ -161,7 +161,6 @@ pub fn apply_op(block: &mut MemoryBlock, op: &MemoryOp) -> Result<(), AgentError
     match op {
         MemoryOp::Add { text, .. } => {
             let text = non_empty(text)?;
-            // An entry that is there already is not added twice.
             if block.entries.iter().any(|entry| entry == text) {
                 return Ok(());
             }

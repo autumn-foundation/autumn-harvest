@@ -1,169 +1,147 @@
 //! Registry-aware `quota_key` backfill for pre-upgrade executions (issue #1226).
 //!
-//! `harvest_workflow_executions.quota_key` is resolved once, at admission
-//! time. The source is the workflow type's declared
-//! [`crate::quota::QuotaPolicy`] (issue #946). An execution already
-//! `RUNNING`/`PAUSED` before its type's policy existed never went through
-//! that admission path. It therefore keeps `quota_key = NULL` for the rest
-//! of its life, invisible to [`crate::quota::load_quota_usage`]. A tenant
-//! with enough such pre-existing runs can admit a full new quota limit on
-//! top of usage the engine cannot see. See the migration
-//! `20260725000000_harvest_workflow_quotas`'s own "KNOWN LIMITATION" comment
-//! and [`crate::quota`]'s module doc for the full gap description.
+//! Admission resolves `harvest_workflow_executions.quota_key` once, from the
+//! declared [`crate::quota::QuotaPolicy`] of the workflow type (issue #946).
+//! An execution already `RUNNING`/`PAUSED` before its type's policy existed
+//! never went through that path. It keeps `quota_key = NULL` for life,
+//! invisible to [`crate::quota::load_quota_usage`]. A tenant with enough such
+//! runs can admit a full new quota limit on top of usage the engine cannot
+//! see. See the "KNOWN LIMITATION" comment of the migration
+//! `20260725000000_harvest_workflow_quotas` and the [`crate::quota`] module
+//! doc.
 //!
 //! This module closes the gap with a periodic, shard-local sweep. It finds
 //! non-terminal rows with `quota_key IS NULL` and re-resolves the key with
-//! the SAME [`crate::quota::resolve_quota_key`] the live admission path
-//! uses, then backfills it. A row with no declared policy, an unresolvable
-//! key, or an over-cap key is left `quota_key = NULL`. That matches the
-//! fail-open outcome admission itself would produce for such a row today.
+//! the SAME [`crate::quota::resolve_quota_key`] that admission uses. A row
+//! with no declared policy, an unresolvable key or an over-cap key keeps
+//! `quota_key = NULL`. Admission fails open the same way for such a row.
 //!
 //! # Idempotent by construction
 //!
-//! The sweep's own `WHERE quota_key IS NULL` predicate is what makes a
-//! re-run a no-op. A backfilled row drops out of every later scan on its
-//! own, with no completion marker to maintain. Contrast
-//! [`crate::codec_rotation`]: its rows can cycle between "on the active
-//! key" and "not" as the active key itself changes. `quota_key` here is set
-//! at most once, ever, per row.
+//! The `WHERE quota_key IS NULL` predicate of the sweep makes a re-run a
+//! no-op. A backfilled row drops out of every later scan, with no completion
+//! marker. Contrast [`crate::codec_rotation`]: its rows can cycle between "on
+//! the active key" and "not" as the active key changes. Here `quota_key` is
+//! set at most once per row.
 //!
 //! # Fairness: a keyset cursor, not a bare `LIMIT`
 //!
-//! A row this sweep can never resolve -- no declared policy, an
-//! unresolvable key, or an over-cap key -- never leaves the candidate set.
-//! A bare `LIMIT` with no stable order could therefore return the SAME
-//! stuck rows every tick. That would starve a genuinely resolvable row
-//! sorted behind them, indefinitely -- the very quota-bypass gap this
-//! module exists to close.
+//! A row this sweep can never resolve (no declared policy, an unresolvable
+//! key or an over-cap key) never leaves the candidate set. A bare `LIMIT`
+//! with no stable order could return the SAME stuck rows every tick. That
+//! starves a resolvable row sorted behind them indefinitely: the quota-bypass
+//! gap this module exists to close.
 //!
-//! [`reconcile_quota_keys_from`] returns a resumable `id` cursor instead,
-//! and [`spawn_quota_key_reconciler_for_shard`] carries it forward across
-//! ticks. Every tick therefore moves strictly past whatever it just
-//! examined. A full pass over the CURRENT candidate set completes in a
-//! bounded number of ticks as a result. At most `ceil(candidates /
-//! batch_size)`, however large that backlog is. Nothing short-circuits
-//! that count early, on purpose. An early, fixed-tick wrap would abandon
-//! a large permanently-stuck prefix before the pass reaches the
-//! resolvable rows sorted behind it. That reopens the exact starvation
-//! this cursor exists to prevent.
+//! [`reconcile_quota_keys_from`] returns a resumable `id` cursor instead, and
+//! [`spawn_quota_key_reconciler_for_shard`] carries it across ticks. Each
+//! tick moves strictly past what it just examined. A full pass over the
+//! CURRENT candidate set takes at most `ceil(candidates / batch_size)` ticks,
+//! however large the backlog. Nothing cuts that count short, on purpose. An
+//! early, fixed-tick wrap would abandon a large stuck prefix before the pass
+//! reaches the resolvable rows behind it. That reopens the starvation this
+//! cursor prevents.
 //!
-//! `quota_key IS NULL` is not itself a stable cursor: a policy declared
-//! mid-uptime changes some rows' outcome between passes. Only `id` order
-//! does not. A row sorted AHEAD of the current cursor sees a newly
-//! declared policy on the very next tick. A row sorted BEHIND it is not
-//! revisited until the current pass finishes and wraps. Its staleness is
-//! bounded by that pass's own length, not by a fixed number of ticks.
+//! `quota_key IS NULL` is not a stable cursor: a policy declared mid-uptime
+//! changes the outcome of some rows between passes. Only `id` order is
+//! stable. A row sorted AHEAD of the cursor sees a newly declared policy on
+//! the next tick. A row sorted BEHIND it waits until the current pass wraps.
+//! The length of that pass bounds its staleness, not a fixed number of ticks.
 //!
-//! The scan is also restricted to workflow types with a currently-
-//! registered `QuotaPolicy` ([`registered_quota_workflow_names`]). A
-//! deployment with no such policy anywhere skips the scan entirely; a
-//! mixed deployment never fetches a no-policy type's rows at all. That
-//! avoids sweeping rows it already knows it cannot act on.
+//! The scan reads only workflow types with a registered `QuotaPolicy`
+//! ([`registered_quota_workflow_names`]). A deployment with no such policy
+//! skips the scan. A mixed deployment never fetches the rows of a no-policy
+//! type, which it cannot act on.
 //!
 //! # Runs periodically, not once at startup
 //!
-//! A one-time startup pass would only close the rollout-window gap the
-//! migration describes. It would miss a `QuotaPolicy` declared on an
-//! already-running workflow type mid-uptime, with no accompanying
-//! restart -- the second design question issue #1226 raises.
-//! A periodic sweep (mirroring [`crate::poison_pill`]/[`crate::sessions`])
-//! closes both cases with one mechanism. It never touches the startup
-//! path, so it cannot delay boot on a deployment with a large non-terminal
-//! backlog. `spawn_quota_key_reconciler_for_shard`'s per-tick work is
-//! bounded by `batch_size` regardless of how many eligible rows exist.
-//! The SCAN that finds them is bounded too, thanks to
-//! `idx_harvest_we_quota_reconcile_name_id` (see
-//! `quota_reconcile_candidate_query`'s doc comment). The scan reads at most
-//! `batch_size` rows per registered workflow name. The existing
+//! A one-time startup pass would close only the rollout-window gap that the
+//! migration describes. It would miss a `QuotaPolicy` declared on a running
+//! workflow type mid-uptime, with no restart. Issue #1226 raises that as its
+//! second design question. A periodic sweep (as in [`crate::poison_pill`] and
+//! [`crate::sessions`]) closes both cases with one mechanism. It never
+//! touches the startup path, so a large non-terminal backlog cannot delay
+//! boot.
+//!
+//! `batch_size` bounds the per-tick work of
+//! `spawn_quota_key_reconciler_for_shard`, however many rows are eligible.
+//! `idx_harvest_we_quota_reconcile_name_id` bounds the scan that finds them
+//! (see the doc comment of `quota_reconcile_candidate_query`). The scan reads
+//! at most `batch_size` rows per registered workflow name. The
 //! `idx_harvest_we_state` index covers only `RUNNING`, not `PAUSED`, so it
-//! cannot serve this query on its own; the dedicated index closes that gap.
+//! cannot serve this query alone. The dedicated index closes that gap.
 //!
 //! # Multiple workers on one shard: redundant, not coordinated
 //!
-//! `spawn_monitoring_tasks` starts one reconciler per assigned shard, on
-//! every worker process assigned to that shard. Nothing elects a single
-//! reconciler or claims disjoint batches between them: two workers can
-//! fetch overlapping candidate rows on the same tick.
+//! `spawn_monitoring_tasks` starts one reconciler per assigned shard, on each
+//! worker process assigned to that shard. Nothing elects one reconciler or
+//! splits batches between them, so two workers can fetch overlapping rows on
+//! the same tick.
 //!
-//! This mirrors [`crate::poison_pill::reclaim_orphaned_tasks`] and
-//! [`crate::sessions::spawn_session_slot_reconciler`]. Neither
-//! coordinates across workers on a shard either. It is this codebase's
-//! standing pattern for periodic per-shard scanners, not a gap unique to
-//! this module.
+//! [`crate::poison_pill::reclaim_orphaned_tasks`] and
+//! [`crate::sessions::spawn_session_slot_reconciler`] do not coordinate
+//! across workers either. That is the standing pattern for periodic
+//! per-shard scanners, not a gap unique to this module.
 //!
-//! Correctness does not depend on exclusivity. `WHERE quota_key IS NULL`
-//! on both the scan and the UPDATE means a row a concurrent worker
-//! already backfilled simply is not there to re-write. The loser's
-//! `rows_affected == 0`, and its count is not credited (see
-//! [`reconcile_quota_keys_from`]'s doc comment).
+//! Correctness does not need exclusivity. The scan and the UPDATE both
+//! filter on `quota_key IS NULL`, so a row that another worker backfilled is
+//! not there to rewrite. The loser gets `rows_affected == 0` and credits no
+//! count (see the doc comment of [`reconcile_quota_keys_from`]).
 //!
-//! The cost of an overlapping tick is wasted work. An extra transaction
-//! and advisory lock acquisition per redundantly-fetched row, scaling
-//! with worker count on a shard. Electing one reconciler, or having each
-//! worker claim a disjoint batch first, would remove that waste. But
-//! doing so only here, while every sibling scanner stays uncoordinated,
-//! would be an inconsistent one-off. It is a cross-cutting improvement,
-//! if wanted, not a fix this module owes on
-//! its own.
+//! An overlapping tick wastes work: one more transaction and advisory lock
+//! per row fetched twice, scaling with the worker count of a shard. An
+//! election, or a disjoint batch claim, would remove that waste. Doing that
+//! only here, while each sibling scanner stays uncoordinated, would be an
+//! inconsistent one-off. It is a cross-cutting improvement, not a fix this
+//! module owes alone.
 //!
 //! # Residual window
 //!
-//! This sweep runs on `worker_heartbeat_interval` cadence, not
-//! synchronously inside admission. A row backfilled by a policy declared
-//! moments ago therefore stays invisible to `load_quota_usage` for up to
-//! one reconcile interval after the policy takes effect. That is the same
-//! order of magnitude as the rollout gap the migration already documents
-//! as bounded and self-healing, not a new risk class.
+//! This sweep runs on the `worker_heartbeat_interval` cadence, not inside
+//! admission. A row backfilled for a policy declared moments ago stays
+//! invisible to `load_quota_usage` for up to one reconcile interval. The
+//! migration documents a rollout gap of the same order as bounded and
+//! self-healing, so this is not a new risk class.
 //!
-//! Concretely, this can transiently admit ONE execution over a cap. That
-//! is not merely delayed enforcement: an admission racing a
-//! not-yet-processed backfill can read a stale, undercounted usage and
-//! admit. The physical count lands one over `max_active_executions` once
-//! both commit.
+//! This can transiently admit ONE execution over a cap, not merely delay
+//! enforcement. An admission that races a pending backfill can read a stale,
+//! undercounted usage and admit. Once both commit, the count is one over
+//! `max_active_executions`.
 //!
-//! The backfill's own UPDATE takes [`crate::quota::lock_quota_key`]. That
-//! is the same advisory lock
-//! [`crate::execution::enforce_quota_admission`] holds around its own
-//! check-then-admit, so whichever side acquires the lock first sees a
-//! consistent count. This narrows the window: it now depends on ordinary
-//! transaction-start ordering, not the entire interleaving space.
+//! The backfill UPDATE takes [`crate::quota::lock_quota_key`].
+//! [`crate::execution::enforce_quota_admission`] holds the same advisory lock
+//! around its check-then-admit, so the side that takes the lock first sees a
+//! consistent count. The window then depends on ordinary transaction-start
+//! order, not on the whole interleaving space.
 //!
-//! It cannot fully close the window, though. Consider an admission that
-//! already committed before this sweep's next tick even begins. It was
-//! never going to see the not-yet-backfilled rows, no matter what lock
-//! either side holds.
+//! The lock cannot fully close the window. An admission that committed
+//! before the next tick of this sweep never sees the rows that still wait for
+//! a backfill, whatever lock either side holds.
 //!
-//! Closing that residual slice would require resolving `quota_key`
-//! synchronously inside every admission for a pre-existing row. That is
-//! the design this module deliberately avoids (see "Runs periodically,
-//! not once at startup" above).
+//! To close that slice, each admission for a pre-existing row would have to
+//! resolve `quota_key` synchronously. This module avoids that design on
+//! purpose (see "Runs periodically, not once at startup" above).
 //!
 //! # Cross-region DR fencing (issue #954)
 //!
-//! Every backfill UPDATE asserts [`crate::replication::assert_fence`]
-//! first, inside the same transaction, exactly like
-//! [`crate::store::append_single_event`] does for `harvest_events`.
+//! Each backfill UPDATE first asserts [`crate::replication::assert_fence`] in
+//! the same transaction, as [`crate::store::append_single_event`] does for
+//! `harvest_events`.
 //!
-//! Consider a worker pinned to a superseded shard generation. It must
-//! release without writing a quota key derived from its own
-//! possibly-stale registry view, onto a database another region now
-//! owns. The assert is a cheap in-process check when this worker has no
-//! pinned generation for the shard. A process that pins no generation
-//! pays nothing extra.
+//! A worker pinned to a superseded shard generation must release. It must
+//! not write a quota key from its possibly stale registry view onto a
+//! database that another region now owns. With no pinned generation for the
+//! shard, the assert is a cheap in-process check.
 //!
 //! # Out of scope: `harvest_dead_letters.quota_key`
 //!
-//! This sweep only ever reads and writes `harvest_workflow_executions`. A
-//! dead letter denormalizes its `quota_key` from its owning execution's row
-//! at DLQ-insert time ([`crate::dlq::dead_letter`]). One inserted before
-//! that execution's own row was backfilled -- or before this module existed
-//! -- keeps `quota_key = NULL` permanently, since nothing ever revisits
-//! `harvest_dead_letters` afterward. `max_dead_letters` accounting for such
-//! historical rows stays blind. Issue #1226's own draft acceptance criteria
-//! scope this module to non-terminal execution rows only, and call a
-//! separate DLQ backfill lower priority. It is tracked, not silently
-//! dropped, but is a deliberately separate follow-up rather than part of
-//! this sweep.
+//! This sweep reads and writes only `harvest_workflow_executions`. A dead
+//! letter copies its `quota_key` from the row of its execution at DLQ-insert
+//! time ([`crate::dlq::dead_letter`]). A dead letter inserted before that
+//! backfill, or before this module existed, keeps `quota_key = NULL` for
+//! good. Nothing revisits `harvest_dead_letters`, so `max_dead_letters`
+//! accounting stays blind to such rows. The draft acceptance criteria of
+//! issue #1226 scope this module to non-terminal execution rows. They call a
+//! separate DLQ backfill lower priority. It is a tracked, separate follow-up.
 
 use crate::quota::{QuotaPolicy, quota_key_over_cap, resolve_quota_key};
 
@@ -177,25 +155,20 @@ use uuid::Uuid;
 #[cfg(feature = "db")]
 use crate::error::{HarvestError, HarvestResult, database_error};
 
-// ---------------------------------------------------------------------------
-// Pure decision logic -- no DB dependency, unit-tested without the `db` feature
-// ---------------------------------------------------------------------------
-
 /// Outcome of resolving one candidate row's backfill.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReconcileOutcome {
-    /// The workflow type has a declared policy and the key resolved --
-    /// carries the value to write to `quota_key`.
+    /// The type has a declared policy and the key resolved. Carries the
+    /// value to write to `quota_key`.
     Backfilled(String),
     /// The workflow type has a declared policy but `key_expr` did not
     /// resolve against the row's input. Matches admission's fail-open
     /// behavior for an unresolvable key: `quota_key` stays NULL.
     Unresolvable,
     /// The resolved key exceeds [`crate::quota::MAX_QUOTA_KEY_BYTES`].
-    /// Admission rejects an over-cap key before a row ever exists. A
-    /// pre-existing row predates that check, so it is left NULL rather
-    /// than risking a raw Postgres index-row-size error on the UPDATE.
-    /// Carries the observed byte length.
+    /// Admission rejects an over-cap key before a row exists. A pre-existing
+    /// row predates that check. It stays NULL, so the UPDATE cannot hit a
+    /// Postgres index-row-size error. Carries the observed byte length.
     OverCap(u64),
     /// The workflow type has no declared `QuotaPolicy` at reconcile time.
     NoPolicy,
@@ -203,11 +176,9 @@ pub enum ReconcileOutcome {
 
 /// Decide the backfill outcome for one candidate row.
 ///
-/// Pure and side-effect-free: re-resolves `policy.key_expr` against `input`
-/// via the exact function the live admission path calls
-/// (`start_or_load_workflow_execution_collect` in `execution.rs`). A
-/// backfilled value can therefore never drift from what a fresh admission
-/// would have computed for the same input.
+/// Pure: it re-resolves `policy.key_expr` against `input` with the function
+/// that admission calls (`start_or_load_workflow_execution_collect` in
+/// `execution.rs`). So a backfilled value cannot drift from a fresh admission.
 #[must_use]
 pub fn resolve_backfill(
     policy: Option<QuotaPolicy>,
@@ -243,16 +214,12 @@ impl ReconcileSummary {
     }
 }
 
-// ---------------------------------------------------------------------------
-// DB-gated sweep and periodic spawner
-// ---------------------------------------------------------------------------
-
-/// Default per-shard, per-tick batch size (mirrors
-/// [`crate::codec_rotation::CODEC_ROTATION_DEFAULT_BATCH`]).
+/// Default per-shard, per-tick batch size.
 ///
-/// Ungated (unlike the sweep itself) so `WorkerConfig::default()` can
-/// reference it without the `db` feature, mirroring
-/// `CODEC_ROTATION_DEFAULT_BATCH`'s identical placement.
+/// It mirrors [`crate::codec_rotation::CODEC_ROTATION_DEFAULT_BATCH`].
+///
+/// Ungated, unlike the sweep, so `WorkerConfig::default()` can reference it
+/// without the `db` feature.
 pub const QUOTA_RECONCILE_DEFAULT_BATCH: i64 = 200;
 
 #[cfg(feature = "db")]
@@ -286,7 +253,7 @@ struct CandidateRow {
 /// rows per tick than the old scan did.
 ///
 /// A row leaves the index when its `quota_key` is backfilled or its
-/// execution turns terminal. The index therefore covers only the current
+/// execution turns terminal. So the index covers only the current
 /// candidate set.
 ///
 /// The old form was one scan with `workflow_name = ANY($1) ORDER BY id
@@ -297,29 +264,22 @@ struct CandidateRow {
 ///
 /// Only types with a registered `QuotaPolicy` are candidates (see
 /// [`registered_quota_workflow_names`]). A `NoPolicy` row never gets a
-/// `quota_key`. Without the name filter, a mixed deployment would
-/// re-fetch every no-policy row on every tick. `$1` is re-read from the
-/// live registry on every call. A policy declared mid-uptime, or removed,
-/// therefore takes effect on the next tick. See this module's doc comment
-/// for when a given row becomes visible.
+/// `quota_key`. Without the name filter, a mixed deployment would re-fetch every no-policy row on every tick. Each
+/// call re-reads `$1` from the live registry, so a policy declared or
+/// removed mid-uptime takes effect on the next tick. The module doc says
+/// when a given row becomes visible.
 ///
 /// `AND id >= COALESCE($2, <nil uuid>) AND ($2 IS NULL OR id > $2) ORDER BY
 /// id LIMIT $3` is a keyset cursor, not a bare `LIMIT`. The `>=` bound keeps
 /// the cursor an index condition in a generic plan. An `IS NULL OR` form
 /// alone would become a filter, and each tick would re-walk the rows below
 /// the cursor. The second clause makes the cursor strict. It also keeps a
-/// row with the nil UUID id in the first page. A row this sweep can never
-/// resolve --
-/// [`ReconcileOutcome::Unresolvable`] or [`ReconcileOutcome::OverCap`] --
-/// never leaves the index. A bare `LIMIT` with no stable order could
-/// therefore return the SAME stuck rows every tick, starving every
-/// resolvable row sorted behind them, indefinitely.
+/// row with the nil UUID id in the first page.
 ///
-/// The cursor makes every tick move strictly past whatever it just
-/// examined. A full pass over the candidate set therefore completes in a
-/// bounded number of ticks, regardless of how many rows are permanently
-/// stuck. See [`reconcile_quota_keys_from`]'s doc comment for how the
-/// cursor wraps.
+/// A row this sweep can never resolve ([`ReconcileOutcome::Unresolvable`]
+/// or [`ReconcileOutcome::OverCap`]) never leaves the index. Without the
+/// cursor, such rows could fill every tick and starve the resolvable rows
+/// behind them. See [`reconcile_quota_keys_from`] for how the cursor wraps.
 #[cfg(feature = "db")]
 const CANDIDATE_SQL: &str = "\
     SELECT c.id, c.workflow_name, c.input \
@@ -337,17 +297,17 @@ const CANDIDATE_SQL: &str = "\
     ORDER BY c.id \
     LIMIT $3";
 
-/// The exact SQL text [`reconcile_quota_keys`] executes for its candidate
-/// scan. Exposed read-only for tests, mirroring
-/// [`crate::quota::quota_usage_query`]'s identical purpose.
+/// The exact SQL text of the candidate scan of [`reconcile_quota_keys`].
+///
+/// Exposed read-only for tests, as [`crate::quota::quota_usage_query`] is.
 #[cfg(feature = "db")]
 #[must_use]
 pub const fn quota_reconcile_candidate_query() -> &'static str {
     CANDIDATE_SQL
 }
 
-/// Look up the currently-registered [`QuotaPolicy`] for a workflow type, from
-/// the same process-global mirror the live admission path reads.
+/// The registered [`QuotaPolicy`] of a workflow type, from the
+/// process-global mirror that admission reads.
 #[cfg(feature = "db")]
 fn registered_quota_policy(workflow_name: &str) -> Option<QuotaPolicy> {
     crate::completion_trigger::GLOBAL_WORKFLOW_METADATA
@@ -373,21 +333,17 @@ const fn reconciles_key(quota: Option<crate::quota::QuotaPolicy>) -> bool {
     }
 }
 
-/// Names of every currently-registered workflow type declaring a
-/// [`QuotaPolicy`], anywhere in the process.
+/// Names of every registered workflow type that declares a [`QuotaPolicy`].
 ///
-/// [`reconcile_quota_keys_from`] binds this as `CANDIDATE_SQL`'s
-/// `$1` name list, so a workflow type with no declared
-/// policy is never a candidate at all. `NoPolicy` never sets
-/// `quota_key`, so a no-policy row never leaves the candidate index.
-/// Without this filter, a mixed deployment (some workflow types
-/// quota'd, others not) would re-fetch every no-policy row forever.
+/// [`reconcile_quota_keys_from`] binds this as the `$1` name list of
+/// `CANDIDATE_SQL`, so a type with no declared policy is never a candidate.
+/// `NoPolicy` never sets `quota_key`, so a no-policy row never leaves the
+/// candidate index. Without this filter, a mixed deployment would re-fetch
+/// every no-policy row forever.
 ///
-/// An empty result means the scan skips the query entirely. `unnest('{}')`
-/// yields no names, so the query would return nothing. Issuing it is still
-/// a real round trip. [`reconcile_quota_keys_from`] special-cases this to
-/// avoid the round trip. That matches issue #946 AC9's zero-overhead
-/// promise for a deployment that has not adopted quotas at all.
+/// On an empty result, [`reconcile_quota_keys_from`] skips the query. It
+/// would return nothing but still cost a round trip. That keeps the
+/// zero-overhead promise of issue #946 AC9 for a deployment with no quotas.
 #[cfg(feature = "db")]
 fn registered_quota_workflow_names() -> Vec<String> {
     crate::completion_trigger::GLOBAL_WORKFLOW_METADATA
@@ -406,39 +362,34 @@ fn registered_quota_workflow_names() -> Vec<String> {
 
 /// Scan up to `batch_size` non-terminal executions with `quota_key IS NULL`.
 ///
-/// Starts strictly after `after_id` in `id` order, and backfills any row
-/// whose workflow type currently has a declared `QuotaPolicy`.
+/// Starts strictly after `after_id` in `id` order, and backfills each row
+/// whose workflow type has a declared `QuotaPolicy`.
 ///
-/// Returns the summary and the cursor for the NEXT call. That cursor is
-/// the id of the last row examined, or `None` once a batch returns fewer
-/// rows than `batch_size`. A short batch means the scan reached the end
-/// of the candidate set's current `id` order. The next call should then
-/// wrap back to the start.
+/// Returns the summary and the cursor for the NEXT call: the id of the last
+/// row examined, or `None` once a batch returns fewer than `batch_size`
+/// rows. A short batch reached the end of the candidate set, so the next
+/// call wraps to the start.
 ///
-/// A caller that keeps feeding the returned cursor back in (as
-/// [`spawn_quota_key_reconciler_for_shard`] does) is guaranteed to make
-/// forward progress past any row it cannot resolve. That row is never
-/// re-examined until a full pass wraps around. It can therefore never
-/// pin every tick's candidate scan on rows sorted ahead of it. An
-/// unordered `LIMIT` with no cursor could (see [`CANDIDATE_SQL`]'s doc
-/// comment).
+/// A caller that feeds the cursor back in (as
+/// [`spawn_quota_key_reconciler_for_shard`] does) always moves past a row
+/// it cannot resolve. That row waits until a full pass wraps, so it cannot
+/// pin every tick on the rows sorted ahead of it. An unordered `LIMIT` with
+/// no cursor could (see [`CANDIDATE_SQL`]).
 ///
-/// `batch_size <= 0`, or no workflow type anywhere currently declaring a
-/// `QuotaPolicy` (see [`registered_quota_workflow_names`]), is a no-op
-/// that returns `after_id` unchanged and issues no query at all.
+/// `batch_size <= 0`, or no registered `QuotaPolicy` (see
+/// [`registered_quota_workflow_names`]), is a no-op. It returns `after_id`
+/// unchanged and sends no query.
 ///
 /// Idempotent: a row already backfilled, by this call or a concurrent one,
-/// no longer matches the candidate scan's `quota_key IS NULL` predicate.
-/// The UPDATE itself repeats that predicate, so a race between two sweeps
-/// skips rather than double-writes.
+/// no longer matches the `quota_key IS NULL` predicate of the scan. The
+/// UPDATE repeats that predicate, so a race between two sweeps skips rather
+/// than double-writes.
 ///
-/// `shard` is asserted via [`crate::replication::assert_fence`] before
-/// every write, exactly like [`crate::store::append_single_event`] does
-/// for `harvest_events` (cross-region DR, issue #954).
-///
-/// Consider a worker pinned to a superseded shard generation. Its
-/// registry view may be stale. It must not write a `quota_key` derived
-/// from that view onto a database another region now owns.
+/// Before each write, [`crate::replication::assert_fence`] checks `shard`,
+/// as [`crate::store::append_single_event`] does for `harvest_events`
+/// (cross-region DR, issue #954). A worker pinned to a superseded shard
+/// generation can hold a stale registry view. It must not write a
+/// `quota_key` from that view onto a database that another region owns.
 ///
 /// # Errors
 ///
@@ -484,9 +435,8 @@ pub async fn reconcile_quota_keys_from_with_codecs(
     if batch_size <= 0 || workflow_names.is_empty() {
         return Ok((summary, after_id));
     }
-    // Mirrors `queue::fence_binding`. `UNENCODED` is the documented
-    // sentinel for "let the fence registry resolve its pinned default
-    // shard", the right fallback for a deployment with one unsharded pool.
+    // As `queue::fence_binding`. `UNENCODED` lets the fence registry
+    // resolve its pinned default shard, as a single unsharded pool needs.
     let shard = shard.unwrap_or(crate::types::ShardId::UNENCODED);
 
     let rows: Vec<CandidateRow> = diesel::sql_query(CANDIDATE_SQL)
@@ -512,20 +462,16 @@ pub async fn reconcile_quota_keys_from_with_codecs(
         match outcome {
             ReconcileOutcome::Backfilled(key) => {
                 let workflow_name = row.workflow_name.clone();
-                // Same lock `enforce_quota_admission` takes around its own
+                // `enforce_quota_admission` takes the same lock around its
                 // check-then-admit (`quota::lock_quota_key`). A concurrent
-                // admission for this exact key reads a stale, pre-backfill
-                // count only if it wins the race to acquire this lock
-                // first. See this function's doc comment for why that
-                // residual, ordering-dependent window cannot be closed
-                // further without a synchronous-with-admission design.
+                // admission for this key reads a stale, pre-backfill count
+                // only if it takes this lock first. See this function's doc
+                // comment for why only a synchronous design closes that window.
                 let rows_affected = Box::pin(conn.transaction::<usize, HarvestError, _>(
                     async move |conn| {
                         // Cross-region DR fence (issue #954), before the
-                        // quota lock. A fenced worker must release
-                        // without ever taking a lock the owning region
-                        // needs, not just skip the write after acquiring
-                        // it.
+                        // quota lock. A fenced worker must release without
+                        // taking a lock that the owning region needs.
                         crate::replication::assert_fence(conn, shard).await?;
                         crate::quota::lock_quota_key(conn, &workflow_name, &key).await?;
                         diesel::sql_query(
@@ -540,10 +486,9 @@ pub async fn reconcile_quota_keys_from_with_codecs(
                     },
                 ))
                 .await?;
-                // A concurrent sweep may have already backfilled this exact
-                // row, between this call's candidate scan and its UPDATE.
-                // `rows_affected == 0` then. The count must not credit a
-                // write that did not happen.
+                // A concurrent sweep can backfill this row between the scan
+                // and the UPDATE. Then `rows_affected == 0`, and the count
+                // must not credit it.
                 if rows_affected > 0 {
                     summary.backfilled += 1;
                 }
@@ -562,11 +507,9 @@ pub async fn reconcile_quota_keys_from_with_codecs(
         }
     }
 
-    // A short batch means the scan reached the end of the id-ordered
-    // candidate set. Wrap to the start so the next call's pass covers rows
-    // that sort ahead of every row already seen this pass. That includes
-    // any row inserted after this pass began. `batch_size` is already
-    // checked positive above, so this cast cannot wrap.
+    // A short batch reached the end of the candidate set. Wrap, so the next
+    // pass covers rows that sort ahead of this pass, new rows included.
+    // `batch_size` is positive here, so the cast cannot wrap.
     let next_cursor = if returned < usize::try_from(batch_size).unwrap_or(usize::MAX) {
         None
     } else {
@@ -577,12 +520,10 @@ pub async fn reconcile_quota_keys_from_with_codecs(
 
 /// Single-pass convenience wrapper over [`reconcile_quota_keys_from`].
 ///
-/// Always starts from the beginning of the candidate set (`after_id =
-/// None`). Prefer this for a one-shot sweep, e.g. in tests. A long-lived
-/// periodic caller should instead use [`reconcile_quota_keys_from`]
-/// directly and carry its cursor forward. Otherwise a large
-/// permanently-stuck prefix can pin every call to the same rows (see
-/// [`CANDIDATE_SQL`]'s doc comment).
+/// Always starts at the beginning of the candidate set (`after_id = None`),
+/// for a one-shot sweep such as a test. A periodic caller carries the cursor
+/// of [`reconcile_quota_keys_from`] instead. Otherwise a large stuck prefix
+/// can pin every call to the same rows (see [`CANDIDATE_SQL`]).
 ///
 /// # Errors
 ///
@@ -600,17 +541,15 @@ pub async fn reconcile_quota_keys(
         .map(|(summary, _next_cursor)| summary)
 }
 
-/// Spawn a background task that periodically backfills `quota_key` on
-/// pre-upgrade non-terminal executions for one shard. Stops when `cancel`
-/// is triggered.
+/// Spawn a task that periodically backfills `quota_key` on pre-upgrade
+/// non-terminal executions of one shard, until `cancel` fires.
 ///
-/// `batch_size <= 0` disables the sweep: the task returns immediately
-/// without polling, mirroring `codec_rotation_batch_size = 0`.
+/// `batch_size <= 0` disables the sweep: the task returns at once without
+/// polling, as with `codec_rotation_batch_size = 0`.
 ///
-/// `shard` is passed to every tick's [`reconcile_quota_keys_from_with_codecs`] call
-/// for its cross-region DR fence assertion (issue #954) -- see that
-/// function's doc comment. `codecs` decodes each candidate's input (issue
-/// #1979).
+/// Each tick passes `shard` to [`reconcile_quota_keys_from_with_codecs`] for
+/// its cross-region DR fence (issue #954). `codecs` decodes the input of
+/// each candidate (issue #1979).
 #[cfg(feature = "db")]
 #[must_use]
 pub fn spawn_quota_key_reconciler_for_shard(
@@ -626,10 +565,8 @@ pub fn spawn_quota_key_reconciler_for_shard(
         if batch_size <= 0 {
             return;
         }
-        // Carried across ticks so a permanently-stuck prefix of the
-        // candidate set (see `CANDIDATE_SQL`'s doc comment) cannot pin
-        // every tick to the same rows. Each tick resumes strictly past
-        // the last row the previous tick examined.
+        // Carried across ticks, so a stuck prefix of the candidate set
+        // cannot pin every tick to the same rows (see `CANDIDATE_SQL`).
         let mut cursor: Option<Uuid> = None;
         loop {
             tokio::select! {
@@ -641,12 +578,10 @@ pub fn spawn_quota_key_reconciler_for_shard(
             if crate::replication::shard_writes_held(shard) {
                 continue;
             }
-            // Selected against `cancel` (issue #1426). A pool may have no
-            // deadpool `Timeouts`, so `pool.get()` alone can park this task
-            // indefinitely on an exhausted shard pool. The top-of-loop select
-            // only guards the sleep between ticks. A tick already parked
-            // here would otherwise never observe shutdown. The join in
-            // `shutdown_and_cleanup_monitors` would then wait forever.
+            // Selected against `cancel` (issue #1426). A pool can have no
+            // deadpool `Timeouts`, so `pool.get()` can park forever on an
+            // exhausted pool. The first select guards only the sleep. Without
+            // this one, the join in `shutdown_and_cleanup_monitors` could hang.
             let get_result = tokio::select! {
                 () = cancel.cancelled() => break,
                 result = pool.get() => result,
@@ -726,8 +661,6 @@ mod tests {
         )));
     }
 
-    // -- resolve_backfill ----------------------------------------------
-
     #[test]
     fn no_registered_policy_is_no_policy() {
         let input = serde_json::json!({ "tenant_id": "acme" });
@@ -767,10 +700,9 @@ mod tests {
 
     #[test]
     fn policy_with_no_caps_declared_still_backfills() {
-        // Matches admission: `execution.rs` resolves and stamps `quota_key`
-        // from any declared policy, unconditionally on `has_any_cap()`.
-        // The key is stamped for future usage accounting even when the
-        // policy itself enforces nothing yet.
+        // As admission: `execution.rs` stamps `quota_key` from any declared
+        // policy, whatever `has_any_cap()` says. Usage accounting needs the
+        // key even when the policy enforces nothing yet.
         let policy = QuotaPolicy::new("tenant_id");
         let input = serde_json::json!({ "tenant_id": "acme" });
         assert_eq!(
@@ -792,8 +724,6 @@ mod tests {
         );
     }
 
-    // -- ReconcileSummary -------------------------------------------------
-
     #[test]
     fn total_scanned_sums_every_outcome_kind() {
         let summary = ReconcileSummary {
@@ -809,8 +739,6 @@ mod tests {
     fn default_summary_scanned_nothing() {
         assert_eq!(ReconcileSummary::default().total_scanned(), 0);
     }
-
-    // -- SQL shape ----------------------------------------------------------
 
     #[cfg(feature = "db")]
     #[test]

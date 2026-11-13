@@ -259,7 +259,7 @@ async fn result_raw_wakes_on_harvest_events_notification() {
     assert_eq!(result, serde_json::json!({"ok": true}));
 }
 
-/// Issue #1317 review, P1: a listener stays bound to whichever shard it
+/// Issue #1317: a listener stays bound to whichever shard it
 /// resolved at connect time. If the execution migrates to a different
 /// shard while `result_raw` is waiting, the old connection stays healthy,
 /// with no `ChannelClosed`. Nothing wakes it again unless it rebinds on
@@ -356,7 +356,7 @@ async fn result_raw_rebinds_its_listener_after_a_migration() {
     assert_eq!(result, serde_json::json!({"ok": true}));
 }
 
-/// Issue #1317 review, P1 follow-up (companion to the test above).
+/// Issue #1317 follow-up, a companion to the test above.
 /// `result_raw_with_timeout` connects its listener once. Before this fix,
 /// it waited the entire caller-supplied timeout on it. A migration
 /// landing mid-wait would go unnoticed until that timeout elapsed, which
@@ -450,7 +450,7 @@ async fn result_raw_with_timeout_rebinds_its_listener_after_a_migration() {
     assert_eq!(result, serde_json::json!({"ok": true}));
 }
 
-/// Issue #1317 review, P1 follow-up (companion to the tests above):
+/// Issue #1317 follow-up, a companion to the tests above.
 /// `result_snapshot_with_wait` has the same single-connect listener
 /// pattern. A 30-second wait timeout would fail this test's own 10-second
 /// outer timeout if the fix regressed.

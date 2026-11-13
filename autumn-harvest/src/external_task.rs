@@ -2,9 +2,9 @@
 //!
 //! When a workflow calls `execute_activity_external`, the worker records a row
 //! here that maps the opaque `ExternalActivityToken` to the pending
-//! `(workflow_exec_id, activity_id)`.  The management API resolves that mapping
-//! in O(log n) via the `idx_harvest_ext_token` index and then appends the
-//! appropriate terminal event and wakes the workflow.
+//! `(workflow_exec_id, activity_id)`. The management API resolves that mapping
+//! in O(log n) through the `idx_harvest_ext_token` index. It then appends the
+//! terminal event and wakes the workflow.
 
 use chrono::Utc;
 use diesel::{ExpressionMethods, OptionalExtension, QueryDsl, SelectableHelper};
@@ -122,8 +122,8 @@ impl From<ExternalHandoffProjection> for ExternalHandoffRow {
 
 /// Insert a new external-task row, linking `token` → `(exec_id, activity_id)`.
 ///
-/// Uses `ON CONFLICT DO NOTHING` so replaying a workflow that already recorded
-/// the awaiting event is safely idempotent.
+/// `ON CONFLICT DO NOTHING` makes a replay of a workflow that already recorded
+/// the awaiting event idempotent.
 ///
 /// # Errors
 ///
@@ -190,9 +190,8 @@ pub async fn find_by_token(
 
 /// List external activity handoffs for operator read surfaces.
 ///
-/// Rows intentionally expose only task identity, token, state, and timing
-/// metadata. Raw workflow/activity payloads remain in event history and are
-/// not selected here.
+/// By design, rows expose only task identity, token, state and timing.
+/// Workflow and activity payloads stay in event history and are not selected.
 ///
 /// # Errors
 ///
@@ -278,9 +277,9 @@ pub async fn find_handoff_by_token(
 
 /// Look up an external task by its opaque token, acquiring a row-level lock.
 ///
-/// Like [`find_by_token`] but uses `FOR UPDATE`, serializing the caller
-/// against concurrent writers (complete/fail) that also lock this row.
-/// Must be called inside a transaction.
+/// Like [`find_by_token`], but takes the row `FOR UPDATE`. This serializes
+/// the caller against a concurrent complete or fail, which also locks this
+/// row. Call it inside a transaction.
 ///
 /// Returns `None` when the token is unknown (wrong shard, already deleted, etc.).
 ///
@@ -304,7 +303,7 @@ pub async fn find_by_token_locked(
 /// Mark an external activity as successfully completed.
 ///
 /// Appends `ActivityCompletedExternally` to the event history and wakes the
-/// parked workflow task.  Returns `true` if the state transition happened,
+/// parked workflow task. Returns `true` if the state transition happened,
 /// `false` if the token was already in a terminal state (idempotent), or if
 /// the run has ended. A late push for an ended run writes nothing.
 ///
@@ -393,7 +392,7 @@ pub async fn complete_externally_with_codecs(
 /// Mark an external activity as failed.
 ///
 /// Appends `ActivityFailedExternally` to the event history and wakes the
-/// parked workflow task.  Returns `true` if the state transition happened,
+/// parked workflow task. Returns `true` if the state transition happened,
 /// `false` if the token was already in a terminal state (idempotent), or if
 /// the run has ended. A late push for an ended run writes nothing.
 ///

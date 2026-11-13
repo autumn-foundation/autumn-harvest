@@ -1047,8 +1047,6 @@ async fn concurrent_fair_claims_keep_every_charge() {
         .into_iter()
         .map(|s| (s.fairness_key, s.pass))
         .collect();
-    // Weight 1: each charge adds 1, and a key enters at V, so the pass is at
-    // least the claim count.
     // Weight 1: each charge adds exactly 1. A key that falls behind the
     // clock restarts at V, which can only skip ahead. Concurrent claimers
     // can serve B back to back, and each B claim moves V by at most 1. So

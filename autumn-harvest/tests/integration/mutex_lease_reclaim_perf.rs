@@ -40,10 +40,10 @@
 //! previous statement's writes.
 //!
 //! Evidence is `pg_stat_statements` call/buffer counts, not wall-clock.
-//! Wall-clock is not admissible on a shared-vCPU machine. This mirrors
-//! `scheduler_overdue_pass_perf.rs`'s harness for the sibling investigation
-//! into a periodic background pass, not a per-HTTP-request path: same
-//! tool, same fixture-then-snapshot structure.
+//! Wall-clock is not admissible on a shared-vCPU machine. The harness
+//! mirrors `scheduler_overdue_pass_perf.rs`, which measures another
+//! periodic background pass: same tool, same fixture-then-snapshot
+//! structure.
 
 #![allow(clippy::too_many_lines)]
 

@@ -173,8 +173,6 @@ impl EffectLedger {
 
     /// Builds the ledger of `history`.
     ///
-    /// # Errors
-    ///
     /// `torn_down_timers` names the timers that a won race removed. That
     /// teardown writes no event, so history alone leaves them open.
     ///

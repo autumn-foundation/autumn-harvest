@@ -72,9 +72,9 @@ async fn setup_server() -> (String, DbGuard) {
 }
 
 /// Creates a fresh, uniquely-named, fully-migrated database off `admin_url`.
-/// This mirrors `schedule_overdue_aux_perf.rs`'s own convention. This
-/// harness's fixture and `pg_stat_statements` capture then cannot collide
-/// with -- or be polluted by -- any other test/run sharing the same server.
+/// No other run on the server can then collide with the fixture or pollute
+/// the `pg_stat_statements` capture. `schedule_overdue_aux_perf.rs` does the
+/// same.
 async fn create_fresh_db(admin_url: &str, name: &str) -> String {
     let mut admin = AsyncPgConnection::establish(admin_url)
         .await
@@ -105,9 +105,8 @@ fn unique(prefix: &str) -> String {
 /// to. Every calendar's exclusion set includes this exact date, so
 /// `resolve_effective_fire_at`/`resolve_effective_fire_at_pure` actually
 /// rebase it (not a vacuous "calendar present but never excluded" no-op).
-/// This is the identical fixture shape as `schedule_overdue_aux_perf.rs` --
-/// same investigation family, same class of bug -- so the two measurements
-/// are directly comparable.
+/// `schedule_overdue_aux_perf.rs` uses the same fixture shape, so the two
+/// measurements are directly comparable.
 const PINNED_CALENDAR_SLOT: &str = "2026-06-15T12:00:00+00:00";
 const CALENDAR_COUNT: i64 = 3;
 
@@ -115,7 +114,7 @@ const CALENDAR_COUNT: i64 = 3;
 /// `CALENDAR_COUNT` calendars (every 10th schedule references one, cycling
 /// through them). It also seeds `RUNNING`/`PAUSED` executions for every 4th
 /// schedule's workflow, and pending-throttle rows for every 7th schedule's
-/// workflow. Pure set-based SQL, not a per-row Rust loop -- identical to
+/// workflow. The seed is set-based SQL, not a per-row Rust loop, identical to
 /// `schedule_overdue_aux_perf.rs::seed_fixture`.
 async fn seed_fixture(conn: &mut AsyncPgConnection, n: i64) {
     conn.batch_execute(&format!(
@@ -238,10 +237,9 @@ async fn reset_stats_for_db(conn: &mut AsyncPgConnection, db_name: &str) {
 }
 
 /// Every statement recorded for this database since the last reset, in ONE
-/// query. See `schedule_overdue_aux_perf.rs::snapshot_statements`'s doc
-/// comment for why a second `pg_stat_statements` query here would pollute
-/// whatever total is computed from it. That is a real bug caught in that
-/// sibling investigation's own review.
+/// query. A second `pg_stat_statements` query would pollute the total
+/// computed from it. The doc comment of
+/// `schedule_overdue_aux_perf.rs::snapshot_statements` explains why.
 async fn snapshot_statements(conn: &mut AsyncPgConnection, db_name: &str) -> Vec<StatRow> {
     diesel::sql_query(format!(
         "SELECT query, calls, shared_blks_hit, shared_blks_read, \
@@ -263,9 +261,8 @@ async fn snapshot_statements(conn: &mut AsyncPgConnection, db_name: &str) -> Vec
 /// That set is: the running-basis count on `harvest_workflow_executions`,
 /// the throttle existence-check (`to_regclass`) and count on
 /// `harvest_start_throttle`, and the calendar-exclusions lookup on
-/// `harvest_calendar_exclusions`. Mirrors
-/// `schedule_overdue_aux_perf.rs::is_aux_lookup_statement` exactly -- same
-/// underlying lookups, same statement shapes.
+/// `harvest_calendar_exclusions`. It mirrors
+/// `schedule_overdue_aux_perf.rs::is_aux_lookup_statement` exactly.
 fn is_aux_lookup_statement(row: &StatRow) -> bool {
     let q = row.query.to_ascii_lowercase();
     (q.contains("harvest_workflow_executions") && q.contains("workflow_name"))
@@ -293,9 +290,9 @@ async fn measure_one_pass(admin: &str, label: &str, n: i64) -> SizePoint {
     ensure_pg_stat_statements(&mut seed_conn).await;
     seed_fixture(&mut seed_conn, n).await;
 
-    // The one real public entry point: the exact function every worker's
-    // adaptive-interval sampler tick calls, once per shard
-    // (`worker.rs`'s `overdue_schedule_pass` call site).
+    // The public entry point that each worker's adaptive-interval sampler
+    // tick calls once per shard (`worker.rs`'s `overdue_schedule_pass` call
+    // site).
     let mut pass_conn = AsyncPgConnection::establish(&url)
         .await
         .expect("pass connection");
@@ -453,11 +450,10 @@ async fn overdue_schedule_pass_matches_the_original_per_schedule_loop() {
     );
 
     // "After": the batched pass, via the pure predicate's own inputs.
-    // `overdue_schedule_pass`'s internal `at_capacity` / `effective_fire_at`
-    // are private to its loop. So this test instead calls the same batched
-    // building blocks `overdue_schedule_pass` now uses, the identical way
-    // it uses them. This proves the *inputs* to the overdue predicate
-    // match, which is exactly what the "before" loop above computed.
+    // `overdue_schedule_pass` keeps `at_capacity` / `effective_fire_at`
+    // private to its loop. So this test calls the same batched building
+    // blocks in the same way. It proves that the *inputs* to the overdue
+    // predicate match the "before" loop above.
     let schedule_names: Vec<(uuid::Uuid, &str)> = schedules
         .iter()
         .map(|s| {

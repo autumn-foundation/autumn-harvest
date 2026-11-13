@@ -535,8 +535,8 @@ pub enum ShardJob {
 
 impl ShardJob {
     /// Run the job on one shard. Returns the changed rows, the rows left
-    /// unresolved and whether a newer change stopped the job. `workflow_name` is the activity name for an
-    /// activity job.
+    /// unresolved and whether a newer change stopped the job. `workflow_name`
+    /// is the activity name for an activity job.
     async fn run(
         self,
         conn: &mut AsyncPgConnection,

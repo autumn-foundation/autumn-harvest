@@ -1,4 +1,5 @@
-//! `cargo xtask perf capability-labels-claim`: the port of `autumn-harvest/scripts/capability_labels_claim_perf_repro.sh`.
+//! `cargo xtask perf capability-labels-claim`: the port of
+//! `autumn-harvest/scripts/capability_labels_claim_perf_repro.sh`.
 //!
 //! The reproduction harness for the capability-labels claim-predicate
 //! measurement (issue #382, Ledger perf pass). `docs/performance-capability-labels.md`

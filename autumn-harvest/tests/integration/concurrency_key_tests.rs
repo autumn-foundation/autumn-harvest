@@ -125,7 +125,6 @@ fn resolve_integer_value_as_string() {
 
 #[test]
 fn resolve_against_non_object_input() {
-    // Input is a plain string, not an object
     let input = serde_json::json!("plain_string");
     let resolved = resolve_concurrency_key("tenant_id", &input);
     assert_eq!(resolved, None);

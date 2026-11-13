@@ -454,8 +454,6 @@ fn an_associated_const_of_a_crate_outside_the_analysis_is_a_boundary() {
     );
 }
 
-// ── end to end with the core check ─────────────────────────────────────────
-
 mod end_to_end {
     use std::future::Future;
     use std::pin::Pin;

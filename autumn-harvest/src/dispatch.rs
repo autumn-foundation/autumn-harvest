@@ -227,11 +227,11 @@ pub trait TaskDispatch: Send + Sync + std::fmt::Debug {
     /// with no batched path stays correct. An implementation that can dispose
     /// of a batch in one round trip should override this.
     ///
-    /// One lease's `ack` failing must not skip the rest of the batch (Codex
-    /// review, issue #1429). The pre-batch worker path called `ack` once per
-    /// lease independently, so one lease's error never stranded a sibling
-    /// lease's reference pending until visibility recovery. Every lease is
-    /// attempted; the first error, if any, is returned after the loop.
+    /// One failed `ack` must not skip the rest of the batch (issue #1429).
+    /// The worker path before batching called `ack` once per lease, and each
+    /// call was independent. So one lease's error never left a sibling's
+    /// reference pending until visibility recovery. Every lease is attempted.
+    /// The first error, if any, is returned after the loop.
     fn ack_many<'life0, 'life1, 'async_trait>(
         &'life0 self,
         leases: &'life1 [DispatchLease],
@@ -258,10 +258,9 @@ pub trait TaskDispatch: Send + Sync + std::fmt::Debug {
     /// The default calls [`Self::release`] once per lease. An implementation
     /// that can requeue a batch in one round trip should override this.
     ///
-    /// One lease's `release` failing must not skip the rest of the batch,
-    /// for the same reason as [`Self::ack_many`]'s default above (Codex
-    /// review, issue #1429). Every lease is attempted; the first error, if
-    /// any, is returned after the loop.
+    /// One failed `release` must not skip the rest of the batch, for the
+    /// reason that [`Self::ack_many`] gives (issue #1429). Every lease is
+    /// attempted. The first error, if any, is returned after the loop.
     fn release_many<'life0, 'life1, 'async_trait>(
         &'life0 self,
         leases: &'life1 [(DispatchLease, Duration)],
@@ -318,7 +317,7 @@ pub struct InstalledDispatch {
     pub settings: DispatchSettings,
     /// The generation [`install`]/[`install_for_shard`] stamped on this
     /// install, for [`uninstall_if_current`]/[`uninstall_all_shards_if_current`]
-    /// (Codex review, issue #1429 follow-up). Not read by anything else.
+    /// (issue #1429 follow-up). Not read by anything else.
     generation: u64,
 }
 
@@ -344,7 +343,7 @@ static INSTALLED: RwLock<Option<InstalledDispatch>> = RwLock::new(None);
 pub(crate) static TEST_SLOT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Shared source for every install's generation stamp, across both the
-/// single-shard and per-shard slots (Codex review, issue #1429 follow-up).
+/// single-shard and per-shard slots (issue #1429 follow-up).
 ///
 /// One counter for both slots keeps the ownership check simple. A caller
 /// that captured a generation from either [`install`] or
@@ -354,7 +353,7 @@ pub(crate) static TEST_SLOT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::c
 static INSTALL_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Serializes every dispatch install/uninstall call, across both slots
-/// (Codex review, issue #1429 follow-up).
+/// (issue #1429 follow-up).
 ///
 /// Each mutating function writes its own slot, then separately reads the
 /// *other* slot to recompute [`ANY_INSTALLED`] and decide whether to stop
@@ -375,9 +374,9 @@ static DISPATCH_SLOT_LOCK: Mutex<()> = Mutex::new(());
 ///
 /// Returns the generation this install was stamped with. A caller that may
 /// need to undo only *this* install keeps this value, for
-/// [`uninstall_if_current`] (Codex review, issue #1429 follow-up). That
-/// call, unlike the unconditional [`uninstall`], never also clears a later
-/// install that has since replaced this one.
+/// [`uninstall_if_current`] (issue #1429 follow-up). That call, unlike the
+/// unconditional [`uninstall`], never also clears a later install that has
+/// since replaced this one.
 pub fn install(channel: Arc<dyn TaskDispatch>, settings: DispatchSettings) -> u64 {
     let _guard = lock(&DISPATCH_SLOT_LOCK);
     let Ok(mut slot) = INSTALLED.write() else {
@@ -409,7 +408,7 @@ pub fn install(channel: Arc<dyn TaskDispatch>, settings: DispatchSettings) -> u6
 /// reconcile sweep republishes its row.
 ///
 /// Clears [`ANY_INSTALLED`] only when [`INSTALLED_BY_SHARD`] is also empty
-/// (Codex review, issue #1429), mirroring the check [`uninstall_all_shards`]
+/// (issue #1429), mirroring the check [`uninstall_all_shards`]
 /// already runs for the inverse case. A direct embedder using the
 /// per-shard API can call this on the independent single-shard slot while
 /// shard channels are still installed. Clearing the flag unconditionally
@@ -429,7 +428,7 @@ pub fn uninstall() {
 }
 
 /// Remove the process-global channel, but only if `generation` still names
-/// the currently installed one (Codex review, issue #1429 follow-up).
+/// the currently installed one (issue #1429 follow-up).
 /// `generation` is a value [`install`] returned earlier.
 ///
 /// A process may start a replacement runner before stopping the previous
@@ -512,8 +511,8 @@ static INSTALLED_BY_SHARD: RwLock<
 /// Returns the generation this shard's install was stamped with, drawn from
 /// the same counter [`install`] uses. A caller that may need to undo only
 /// the shards it installed keeps these values, for
-/// [`uninstall_all_shards_if_current`] (Codex review, issue #1429
-/// follow-up). That call, unlike the unconditional [`uninstall_all_shards`],
+/// [`uninstall_all_shards_if_current`] (issue #1429 follow-up). That call,
+/// unlike the unconditional [`uninstall_all_shards`],
 /// never also clears a later install that has since replaced one of them.
 pub fn install_for_shard(
     shard: crate::types::ShardId,
@@ -548,7 +547,7 @@ pub fn installed_for_shard(shard: crate::types::ShardId) -> Option<InstalledDisp
 }
 
 /// The channel installed for `shard`, but only while it still carries
-/// exactly `generation` (Codex review, issue #1429 follow-up).
+/// exactly `generation` (issue #1429 follow-up).
 ///
 /// `generation` is the value [`install_for_shard`]/[`install_shards`]
 /// stamped on the caller's own install. A caller that installed `shard`'s
@@ -568,7 +567,7 @@ pub fn installed_for_shard_if_current(
 }
 
 /// Each of `assignments`' own per-shard channel, all read from one
-/// `INSTALLED_BY_SHARD` snapshot (Codex review, issue #1429 follow-up).
+/// `INSTALLED_BY_SHARD` snapshot (issue #1429 follow-up).
 ///
 /// [`installed_for_shard`] called once per shard, in a caller's own loop,
 /// takes a separate read-lock acquisition each time. A concurrent
@@ -614,9 +613,9 @@ pub fn installed_for_shards(
 
 /// Remove every per-shard channel. Tests use this between cases.
 ///
-/// Also stops the background publisher, mirroring [`uninstall`] (Codex
-/// review, issue #1429). A multi-shard runtime can start that publisher
-/// through [`crate::dispatch::buffered_settled_in_background`]. It can
+/// Also stops the background publisher, mirroring [`uninstall`] (issue
+/// #1429). A multi-shard runtime can start that publisher through
+/// [`crate::dispatch::buffered_settled_in_background`]. It can
 /// never actually publish there, though: `publish_now` only ever reads
 /// the single-shard slot, never a per-shard one. Left running past this
 /// call, its task and channel sender would otherwise leak across an
@@ -634,8 +633,7 @@ pub fn uninstall_all_shards() {
 }
 
 /// Remove both the single-shard slot and every per-shard channel, in one
-/// [`DISPATCH_SLOT_LOCK`] acquisition (Codex review, issue #1429
-/// follow-up).
+/// [`DISPATCH_SLOT_LOCK`] acquisition (issue #1429 follow-up).
 ///
 /// A caller that instead calls [`uninstall`] and [`uninstall_all_shards`]
 /// separately still leaves a gap between the two clears. [`install_shards`]
@@ -657,7 +655,7 @@ pub fn uninstall_all_shards() {
 /// of `uninstall()` followed by `uninstall_all_shards()`. A caller whose
 /// own startup can still fail after that same clear uses
 /// [`uninstall_all_capturing`] instead. It can then undo the clear on
-/// that later failure (Codex review, issue #1429 follow-up).
+/// that later failure (issue #1429 follow-up).
 pub fn uninstall_all() {
     let _guard = lock(&DISPATCH_SLOT_LOCK);
     if let Ok(mut slot) = INSTALLED.write() {
@@ -671,8 +669,7 @@ pub fn uninstall_all() {
 }
 
 /// As [`uninstall_all`], but returns a [`TopologySnapshot`] of both slots
-/// as they stood immediately before the clear (Codex review, issue #1429
-/// follow-up).
+/// as they stood immediately before the clear (issue #1429 follow-up).
 ///
 /// A caller turning Redis dispatch off for *this* startup, while a still-
 /// running previous runtime owns whatever this clears, keeps this
@@ -699,8 +696,8 @@ pub fn uninstall_all_capturing() -> TopologySnapshot {
 }
 
 /// Undo [`uninstall_all_capturing`], restoring the topology `snapshot`
-/// names, but only while both dispatch slots are still empty (Codex
-/// review, issue #1429 follow-up).
+/// names, but only while both dispatch slots are still empty (issue
+/// #1429 follow-up).
 ///
 /// Neither the clear nor this restore mints a generation, unlike
 /// [`install_single`]/[`install_shards`] and their own
@@ -734,9 +731,8 @@ pub fn restore_cleared_if_still_empty(snapshot: &TopologySnapshot) {
 /// still carries the generation [`install_for_shard`] stamped on it.
 ///
 /// `expected` holds the values that call returned earlier, one per shard
-/// (Codex review, issue #1429 follow-up). A shard whose generation has
-/// moved on was reinstalled by a later,
-/// unrelated call since `expected` was captured. This leaves it alone,
+/// (issue #1429 follow-up). A shard whose generation has moved on was
+/// reinstalled by a later, unrelated call since `expected` was captured. This leaves it alone,
 /// rather than tearing out a replacement runner's channel for that shard.
 /// See [`uninstall_if_current`] for the single-shard version of the same
 /// race.
@@ -774,7 +770,7 @@ pub fn uninstall_all_shards_if_current(expected: &[(crate::types::ShardId, u64)]
 
 /// Replace the whole multi-shard topology atomically: clear both slots and
 /// install every given shard's channel in one [`DISPATCH_SLOT_LOCK`]
-/// acquisition (Codex review, issue #1429 follow-up).
+/// acquisition (issue #1429 follow-up).
 ///
 /// A caller that instead clears the slots and then calls
 /// [`install_for_shard`] once per shard still leaves a gap between those
@@ -792,9 +788,9 @@ pub fn uninstall_all_shards_if_current(expected: &[(crate::types::ShardId, u64)]
 /// immediately before this call replaced them.
 ///
 /// A caller whose own startup can still fail after this call keeps that
-/// snapshot (Codex review, issue #1429 follow-up). It passes the
-/// snapshot to [`restore_shards_if_current`] on that later failure, to
-/// put the previous topology back rather than leave the slots empty. The
+/// snapshot (issue #1429 follow-up). It passes the snapshot to
+/// [`restore_shards_if_current`] on that later failure, to put the previous
+/// topology back rather than leave the slots empty. The
 /// snapshot is captured under the same [`DISPATCH_SLOT_LOCK`] acquisition
 /// as the replacement itself. No concurrent install can therefore land
 /// between the two and be captured as "previous" by mistake.
@@ -837,8 +833,7 @@ pub fn install_shards(
 
 /// Replace the single-shard topology atomically: clear both slots and
 /// install `channel` into the single-shard slot, in one
-/// [`DISPATCH_SLOT_LOCK`] acquisition (Codex review, issue #1429
-/// follow-up).
+/// [`DISPATCH_SLOT_LOCK`] acquisition (issue #1429 follow-up).
 ///
 /// Mirrors [`install_shards`]'s own reasoning, for the single-shard case.
 /// A caller that instead clears both slots and then calls [`install`]
@@ -879,8 +874,7 @@ pub fn install_single(
 }
 
 /// Both dispatch slots exactly as [`install_single`]/[`install_shards`]
-/// found them, immediately before replacing them (Codex review, issue
-/// #1429 follow-up).
+/// found them, immediately before replacing them (issue #1429 follow-up).
 ///
 /// A caller whose own startup can still fail after that replacement keeps
 /// this, and passes it to [`restore_single_if_current`] or
@@ -900,7 +894,7 @@ pub struct TopologySnapshot {
 
 /// Undo [`install_single`], restoring the topology `snapshot` names, but
 /// only while `generation` still names the single-shard slot's current
-/// occupant (Codex review, issue #1429 follow-up).
+/// occupant (issue #1429 follow-up).
 ///
 /// A later, unrelated install may have already replaced this one since
 /// `snapshot` was captured. Restoring over it would discard that install
@@ -943,7 +937,7 @@ pub fn restore_single_if_current(snapshot: &TopologySnapshot, generation: u64) {
 
 /// Undo [`install_shards`], restoring the topology `snapshot` names, but
 /// only while `generations` still names exactly the per-shard slot's
-/// current occupants (Codex review, issue #1429 follow-up).
+/// current occupants (issue #1429 follow-up).
 ///
 /// Every shard `install_shards` installed must still carry the same
 /// generation, and no other shard may be present, or this leaves the
@@ -1112,7 +1106,7 @@ where
 
 /// Same contract as [`buffered_settled`], but hands a committed `f`'s hints
 /// to the background publisher instead of awaiting the channel inline
-/// (Codex review, issue #1429).
+/// (issue #1429).
 ///
 /// `buffered_settled` is right for a caller that processes one row and then
 /// waits, such as a worker's own dispatch loop. A caller that instead loops
@@ -1140,8 +1134,8 @@ where
     outcome
 }
 
-/// Run `f` and tie its own hints to its own outcome, nested or not (Codex
-/// review, issue #1429).
+/// Run `f` and tie its own hints to its own outcome, nested or not (issue
+/// #1429).
 ///
 /// `f` owns a nested transaction (typically a SAVEPOINT) inside an already
 /// active scope: a worker's outer [`buffered`] call around the whole task
@@ -1160,8 +1154,8 @@ where
 /// A length checkpoint on the *shared* enclosing buffer cannot isolate two
 /// sibling `run_transactional` calls an activity joins concurrently — say
 /// with `tokio::join!`. `run_transactional` takes `&self` and pools its
-/// own connection per call, so this interleaving is supported (Codex
-/// review, issue #1429). Both calls would capture the same checkpoint
+/// own connection per call, so this interleaving is supported (issue
+/// #1429). Both calls would capture the same checkpoint
 /// before either transaction finishes. A later rollback would then
 /// truncate away an earlier sibling's already-committed hint, not just its
 /// own. `tokio::task_local!`'s `.scope()` sets its ambient value only for
@@ -2133,8 +2127,7 @@ mod tests {
     }
 
     /// `install_shards` replaces the whole topology — both slots, and
-    /// every shard — in one atomic step (Codex review, issue #1429
-    /// follow-up).
+    /// every shard — in one atomic step (issue #1429 follow-up).
     ///
     /// A caller that instead clears both slots and then calls
     /// `install_for_shard` once per shard leaves a gap between those
@@ -2200,8 +2193,8 @@ mod tests {
     }
 
     /// `install_single` is the single-shard mirror of `install_shards`
-    /// (Codex review, issue #1429 follow-up): it replaces both slots, not
-    /// only the single-shard one, in one `DISPATCH_SLOT_LOCK` acquisition.
+    /// (issue #1429 follow-up). It replaces both slots, not only the
+    /// single-shard one, in one `DISPATCH_SLOT_LOCK` acquisition.
     #[tokio::test]
     async fn install_single_replaces_both_slots_atomically() {
         let _guard = INSTALL_LOCK.lock().await;
@@ -2239,7 +2232,7 @@ mod tests {
 
     /// `restore_single_if_current` puts the previous single-shard channel
     /// back with its own, original generation, not a freshly minted one
-    /// (Codex review, issue #1429 follow-up).
+    /// (issue #1429 follow-up).
     ///
     /// A caller whose own startup fails after `install_single` replaced
     /// the topology restores it this way, rather than through `install`.
@@ -2286,8 +2279,8 @@ mod tests {
     }
 
     /// `restore_single_if_current` is a no-op once a newer, unrelated
-    /// install has already replaced the one it was meant to undo (Codex
-    /// review, issue #1429 follow-up).
+    /// install has already replaced the one it was meant to undo (issue
+    /// #1429 follow-up).
     ///
     /// A restore that ignored this could discard that newer install
     /// instead of undoing its own caller's failed startup.
@@ -2318,7 +2311,7 @@ mod tests {
 
     /// `restore_shards_if_current` mirrors
     /// `restore_single_if_current_puts_back_the_previous_channel_and_its_generation`
-    /// for the per-shard slot (Codex review, issue #1429 follow-up).
+    /// for the per-shard slot (issue #1429 follow-up).
     #[tokio::test]
     async fn restore_shards_if_current_puts_back_the_previous_shards_and_their_generations() {
         let _guard = INSTALL_LOCK.lock().await;
@@ -2350,7 +2343,7 @@ mod tests {
 
     /// `restore_shards_if_current` is a no-op once a newer, unrelated
     /// install has already replaced the shards it was meant to undo
-    /// (Codex review, issue #1429 follow-up).
+    /// (issue #1429 follow-up).
     #[tokio::test]
     async fn restore_shards_if_current_is_a_no_op_once_a_newer_install_has_replaced_it() {
         let _guard = INSTALL_LOCK.lock().await;
@@ -2603,10 +2596,10 @@ mod tests {
 
     #[tokio::test]
     async fn checkpoint_discards_only_its_own_hints_on_error_when_nested() {
-        // Codex review, issue #1429. `buffered_settled` degrades to a no-op
-        // passthrough when nested. So a nested owner's own failure could
-        // not stop its hint from riding out with the enclosing scope. This
-        // is the guarantee `buffered_checkpoint` adds.
+        // Issue #1429. `buffered_settled` degrades to a no-op passthrough
+        // when nested. So a nested owner's own failure could not stop its
+        // hint from riding out with the enclosing scope. This is the
+        // guarantee `buffered_checkpoint` adds.
         let _guard = INSTALL_LOCK.lock().await;
         let channel = Arc::new(MemoryDispatch::new());
         install(
@@ -2692,9 +2685,9 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_checkpoints_do_not_clobber_each_others_hints() {
-        // Codex review, issue #1429. `run_transactional` takes `&self` and
-        // pools its own connection per call, so an activity can join two
-        // calls concurrently. A length checkpoint on the shared enclosing
+        // Issue #1429. `run_transactional` takes `&self` and pools its own
+        // connection per call, so an activity can join two calls
+        // concurrently. A length checkpoint on the shared enclosing
         // buffer cannot isolate them. Both capture the same checkpoint
         // before either pushes a hint, so a later rollback truncates away
         // an earlier sibling's already-committed hint too. Forcing that
@@ -2755,8 +2748,7 @@ mod tests {
     }
 
     /// `uninstall_all_shards` stops the background publisher, the
-    /// multi-shard mirror of `uninstall`'s own cleanup (Codex review,
-    /// issue #1429).
+    /// multi-shard mirror of `uninstall`'s own cleanup (issue #1429).
     ///
     /// A multi-shard runtime can start the publisher through
     /// `buffered_settled_in_background`, even though `publish_now` only
@@ -2783,7 +2775,7 @@ mod tests {
     }
 
     /// `uninstall` must not clear [`is_installed`] while a per-shard
-    /// channel is still installed (Codex review, issue #1429).
+    /// channel is still installed (issue #1429).
     ///
     /// A direct embedder can call the single-shard `install`/`uninstall`
     /// pair alongside the independent per-shard API. Clearing the flag
@@ -2821,8 +2813,7 @@ mod tests {
     }
 
     /// Concurrent install/uninstall calls never leave `is_installed()`
-    /// disagreeing with `installed()` (Codex review, issue #1429
-    /// follow-up).
+    /// disagreeing with `installed()` (issue #1429 follow-up).
     ///
     /// `uninstall_if_current` used to drop its slot's write lock, then
     /// separately read the other slot to recompute `ANY_INSTALLED`. A
@@ -2926,8 +2917,7 @@ mod tests {
 
     /// Wraps [`MemoryDispatch`] and fails `ack`/`release` on one named
     /// lease. `ack_many`'s and `release_many`'s trait-default sequential
-    /// loops then have something to fail partway through (Codex review,
-    /// issue #1429).
+    /// loops then have something to fail partway through (issue #1429).
     #[derive(Debug)]
     struct FailOneLease {
         inner: MemoryDispatch,
@@ -2994,9 +2984,9 @@ mod tests {
         };
         let result = channel.ack_many(&leases).await;
         assert!(result.is_err(), "the injected failure surfaces");
-        // `b` still got acked despite `a`'s failure (Codex review, issue
-        // #1429): the default loop attempts every lease rather than
-        // stopping at the first error.
+        // `b` still got acked despite `a`'s failure (issue #1429): the
+        // default loop attempts every lease rather than stopping at the
+        // first error.
         assert_eq!(channel.inner.acked_ids(), vec![b.task_id]);
     }
 

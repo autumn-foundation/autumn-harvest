@@ -1148,7 +1148,6 @@ mod tests {
         assert_eq!(warm.resumes, 1);
     }
 
-    /// Panics after the first activity.
     fn panic_after_activity_workflow(ctx: &WorkflowContext, _input: Value) -> HandlerFuture<'_> {
         Box::pin(async move {
             ctx.execute_activity_raw("step", json!({}), "default")
@@ -1300,7 +1299,6 @@ mod tests {
         })
     }
 
-    /// Races two activities.
     fn race_workflow(ctx: &WorkflowContext, _input: Value) -> HandlerFuture<'_> {
         Box::pin(async move {
             let winner = ctx
@@ -1356,7 +1354,6 @@ mod tests {
         })
     }
 
-    /// Starts a child workflow.
     fn child_workflow(ctx: &WorkflowContext, _input: Value) -> HandlerFuture<'_> {
         Box::pin(async move {
             ctx.spawn_child_workflow_raw("child", json!({}))

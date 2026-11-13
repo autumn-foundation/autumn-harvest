@@ -123,9 +123,8 @@ fn is_first_party_cli(headers: &HeaderMap) -> bool {
 
 /// Whether `headers` declares `Content-Type: application/json`, the one
 /// value a documented direct API client sends with no browser-origin
-/// evidence at all. Admitted only as the last resort in [`is_same_origin`],
-/// after `Sec-Fetch-Site` and `Origin` were both checked and neither was
-/// present.
+/// evidence. [`is_same_origin`] admits it only when neither
+/// `Sec-Fetch-Site` nor `Origin` is present.
 fn is_json_content_type(headers: &HeaderMap) -> bool {
     let Some(raw) = headers.get(header::CONTENT_TYPE) else {
         return false;
@@ -357,7 +356,7 @@ mod tests {
 
     #[tokio::test]
     async fn http_origin_is_rejected_without_a_proxy_scheme_signal() {
-        // Regression (Codex): with no `X-Forwarded-Proto`, this server
+        // Regression: with no `X-Forwarded-Proto`, this server
         // cannot independently confirm the scheme. An `http` claim gets no
         // benefit of the doubt here, since it is indistinguishable from a
         // downgrade attack against an HTTPS deployment.
@@ -371,7 +370,7 @@ mod tests {
 
     #[tokio::test]
     async fn https_origin_is_rejected_without_a_proxy_scheme_signal() {
-        // Regression (Codex): `Origin` proves only that the requesting
+        // Regression: `Origin` proves only that the requesting
         // page used `https`. It proves nothing about the scheme this
         // connection arrived over. A mixed-content form on an `https`
         // page can still target a plain `http` listener on the same
@@ -490,7 +489,7 @@ mod tests {
 
     #[tokio::test]
     async fn ping_content_type_without_fetch_metadata_or_origin_is_rejected() {
-        // Regression (Codex): the last-resort content-type fallback used to
+        // Regression: the last-resort content-type fallback used to
         // admit any non-CORS-simple type, not only `application/json`. An
         // `<a ping>` request can reach this server with neither
         // `Sec-Fetch-Site` nor `Origin` present. An old browser, or an
@@ -504,7 +503,7 @@ mod tests {
 
     #[tokio::test]
     async fn cross_site_fetch_metadata_beats_a_non_simple_content_type() {
-        // Regression (Codex): hyperlink auditing (`<a ping>`) and
+        // Regression: hyperlink auditing (`<a ping>`) and
         // `navigator.sendBeacon` reach a server with a non-CORS-simple
         // `Content-Type` and no preflight, credentialed, and still carry a
         // truthful `Sec-Fetch-Site`. That must reject the request even

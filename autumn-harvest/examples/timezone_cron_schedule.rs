@@ -36,7 +36,7 @@
 //! ```rust
 //! use autumn_harvest::policy::Schedule;
 //!
-//! // Fires at 09:00 UTC year-round — that's 01:00 or 02:00 Pacific depending on DST.
+//! // Fires at 09:00 UTC year-round — that is 01:00 or 02:00 Pacific, depending on DST.
 //! let drifting = Schedule::Cron("0 9 * * 1-5".into());
 //!
 //! // Fires at 09:00 Pacific year-round — correct regardless of DST.

@@ -48,7 +48,6 @@ async fn database() -> (String, Option<ContainerAsync<Postgres>>) {
     (url, container)
 }
 
-/// A kind that no earlier test or run used, so a reused database works.
 /// A plain activation by `ops`.
 const fn mv(
     version: u64,
@@ -64,6 +63,7 @@ const fn mv(
     }
 }
 
+/// A kind that no earlier test or run used, so a reused database works.
 fn unique(prefix: &str) -> String {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

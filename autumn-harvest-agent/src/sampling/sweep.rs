@@ -712,7 +712,6 @@ fn row_verdict(report: &SampleReport) -> Option<Verdict> {
     })
 }
 
-/// The totals of `rows`.
 fn totals(items: u32, rows: &[SweepRow]) -> SweepTotals {
     let count = |status: SweepItemStatus| {
         let n = rows.iter().filter(|row| row.status == status).count();

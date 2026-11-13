@@ -8,9 +8,9 @@
 //! "Quick example" of `README.md` and
 //! `docs/getting-started/01-project-skeleton.md`. Both bill it as needing "no
 //! database, no Docker, and nothing to configure" or "only the Rust toolchain
-//! installed". Neither used to mention that PostgreSQL refuses
-//! to run as `root`. So `cargo dev` refuses too, deliberately, per the doc
-//! comment of `autumn-harvest-plugin/src/dev/postgres.rs`.
+//! installed". Neither used to mention that PostgreSQL refuses to run as
+//! `root`. So `cargo dev` refuses too, deliberately, per the doc comment of
+//! `autumn-harvest-plugin/src/dev/postgres.rs`.
 //!
 //! That is not a corner case. Docker devcontainers, many CI base images and
 //! some cloud sandboxes default to a root shell. A newcomer who follows

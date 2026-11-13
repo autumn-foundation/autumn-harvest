@@ -23,8 +23,7 @@
 //! most of the work. The rewrite matters when the planner's row estimate goes
 //! stale, which is what a drained outage backlog leaves behind.
 //!
-//! Which gate covers which half is worth stating, because they are not
-//! symmetric:
+//! The gates do not cover the two halves symmetrically:
 //!
 //! - [`outbox_claim_plans_are_index_only`] gates the MIGRATION. The legacy
 //!   query also produces an all-index plan once these indexes exist, so this

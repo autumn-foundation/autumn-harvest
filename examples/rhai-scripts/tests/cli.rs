@@ -6,7 +6,6 @@ use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
 
-/// The built binary.
 const BIN: &str = env!("CARGO_BIN_EXE_harvest-rhai");
 
 /// A `harvest-rhai` command that runs in `dir` with the database there.
@@ -19,12 +18,10 @@ fn harvest(dir: &Path) -> Command {
     command
 }
 
-/// Run `command` and capture its output.
 fn output(command: &mut Command) -> Output {
     command.output().expect("the binary runs")
 }
 
-/// The standard output of `out` as text.
 fn stdout(out: &Output) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }

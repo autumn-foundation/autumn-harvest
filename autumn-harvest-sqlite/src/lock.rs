@@ -181,7 +181,6 @@ fn acquire_memory(conn: &Connection, requested: &Path) -> SqliteResult<Option<Wr
     Ok(Some(WriterLock::Memory(token)))
 }
 
-/// The canonical form of the database path.
 fn canonicalize(db_path: &Path) -> SqliteResult<PathBuf> {
     std::fs::canonicalize(db_path).map_err(|source| SqliteError::Io {
         path: db_path.to_path_buf(),

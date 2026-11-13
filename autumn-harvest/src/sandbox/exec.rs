@@ -25,8 +25,7 @@
 //! process in it.
 //!
 //! Without a cgroup, a process that calls `setsid` leaves the group, and the
-//! host executor
-//! cannot kill it. On a root host, concurrent runs share the uid `nobody`
+//! host executor cannot kill it. On a root host, concurrent runs share the uid `nobody`
 //! unless `run_as` names another. Inside a microVM, neither matters: the
 //! microVM ends after one run.
 

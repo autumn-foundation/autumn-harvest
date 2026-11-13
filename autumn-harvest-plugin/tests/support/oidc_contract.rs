@@ -454,7 +454,6 @@ pub async fn round_trip_logs_in_maps_claims_and_enforces_roles(backend: &impl Oi
     let api = browser.get(&format!("{MOUNT}/workflows")).await;
     assert_eq!(api.status, StatusCode::UNAUTHORIZED);
 
-    // The round trip.
     let done = browser.login().await;
     assert_eq!(done.status, StatusCode::SEE_OTHER, "{}", done.body);
     assert_eq!(done.location.as_deref(), Some("/api/harvest/ui"));

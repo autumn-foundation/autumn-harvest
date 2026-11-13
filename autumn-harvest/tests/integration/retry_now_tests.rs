@@ -120,7 +120,6 @@ async fn backing_off_task_is_advanced_to_now() {
     let after = Utc::now();
 
     assert!(outcome.advanced, "backing-off task should be advanced");
-    // scheduled_at should have been moved to approximately now.
     assert!(
         outcome.scheduled_at >= before - Duration::seconds(15)
             && outcome.scheduled_at <= after + Duration::seconds(5),
@@ -137,7 +136,6 @@ async fn attempt_counter_is_not_changed() {
 
     let task_id = enqueue_backing_off_activity(&mut conn, workflow_exec_id, 300).await;
 
-    // Record the attempt count before.
     let row_before = harvest_task_queue::table
         .filter(harvest_task_queue::id.eq(task_id))
         .select((
@@ -223,7 +221,7 @@ async fn running_task_returns_conflict_error() {
     let (mut conn, _container) = setup_test_db().await;
     let workflow_exec_id = Uuid::new_v4();
 
-    // Enqueue and then claim the task to put it in RUNNING state.
+    // Claim the task so it is RUNNING.
     let task_id = enqueue_eligible_activity(&mut conn, workflow_exec_id).await;
     queue::claim_task(
         &mut conn,

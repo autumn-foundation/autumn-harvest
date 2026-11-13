@@ -17,9 +17,9 @@
 //! keeps the samples apart. The [`episode`] log records each op, and
 //! [`consolidate`] turns the episodes into facts (issue #2454).
 //! [`consolidate_all`] starts the passes of many agents from one schedule
-//! (issue #2540). The [`recall`] module measures what an agent forgets across ops (issue
-//! #2455). The `eval` feature adds the `eval` module. That module re-drives
-//! a recorded run with a candidate model or prompt. The
+//! (issue #2540). The [`recall`] module measures what an agent forgets
+//! across ops (issue #2455). The `eval` feature adds the `eval` module. That
+//! module re-drives a recorded run with a candidate model or prompt. The
 //! `sandbox` feature adds the `sandbox` module. Its `SandboxTool` runs agent
 //! code in a sandbox.
 //!

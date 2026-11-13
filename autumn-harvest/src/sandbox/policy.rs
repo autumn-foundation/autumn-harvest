@@ -640,7 +640,6 @@ fn path_json_bytes() -> u64 {
         .saturating_mul(6)
 }
 
-/// A count as `u64`.
 fn count(n: usize) -> u64 {
     u64::try_from(n).unwrap_or(u64::MAX)
 }

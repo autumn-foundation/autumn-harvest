@@ -397,7 +397,6 @@ impl SignalStash {
     }
 }
 
-/// Adds `push` to the queue of `name`.
 fn queue_push(names: &mut NameQueues, name: &str, push: usize) {
     if let Some(queue) = names.get_mut(name) {
         queue.push_back(push);

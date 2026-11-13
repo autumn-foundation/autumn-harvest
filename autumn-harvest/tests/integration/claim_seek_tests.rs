@@ -1865,8 +1865,8 @@ async fn key_of(conn: &mut AsyncPgConnection, id: Uuid) -> (i32, i32, f64) {
 /// Each round seeds two queues with a random mix of rows. The mix covers
 /// priorities, new starts, pins to this worker and to others, a paused
 /// activity and a saturated concurrency key. Then it drains part of the
-/// backlog. Each claim must take
-/// a row with the best reference key. Ties may go either way.
+/// backlog. Each claim must take a row with the best reference key. Ties
+/// may go either way.
 #[tokio::test]
 async fn randomized_drains_follow_the_reference_order() {
     let (mut conn, _container) = setup_db().await;

@@ -309,7 +309,6 @@ impl AgentHarness {
         self
     }
 
-    /// The overlay composer, if one is installed.
     #[cfg(feature = "eval")]
     pub(crate) fn overlay_composer(&self) -> Option<&Arc<dyn crate::refine::OverlayComposer>> {
         self.composer.as_ref()
@@ -324,7 +323,6 @@ impl AgentHarness {
         self
     }
 
-    /// The selector, if one is installed.
     #[cfg(feature = "eval")]
     pub(crate) fn overlay_selector(&self) -> Option<&Arc<dyn crate::refine::OverlaySelector>> {
         self.selector.as_ref()
@@ -431,12 +429,10 @@ impl AgentHarness {
         self
     }
 
-    /// The overlay store, if one is installed.
     pub(crate) fn overlays(&self) -> Option<&Arc<dyn ProfileOverlayStore>> {
         self.overlays.as_ref()
     }
 
-    /// The overlay proposer, if one is installed.
     pub(crate) fn overlay_proposer(&self) -> Option<&Arc<dyn OverlayProposer>> {
         self.proposer.as_ref()
     }
@@ -462,7 +458,6 @@ impl AgentHarness {
         self.scorers.contains_key(id)
     }
 
-    /// The scorer with this id.
     pub(crate) fn scorer_of(&self, id: &str) -> Option<&Arc<dyn Scorer>> {
         self.scorers.get(id)
     }
@@ -491,7 +486,6 @@ impl AgentHarness {
         self.answer_keys.contains_key(id)
     }
 
-    /// The app key function with this id.
     pub(crate) fn answer_key_of(&self, id: &str) -> Option<&Arc<dyn AnswerKeyFn>> {
         self.answer_keys.get(id)
     }
@@ -1655,7 +1649,6 @@ impl AgentHarness {
         )
     }
 
-    /// The workspace store, if one is installed.
     #[cfg(feature = "eval")]
     pub(crate) const fn workspace_store_opt(&self) -> Option<&WorkspaceStore> {
         self.workspace.as_ref()
@@ -2342,7 +2335,6 @@ mod tests {
         let cap = DEFAULT_MAX_ACTIVITY_RESULT_BYTES;
         let max = max_tool_result_bytes(cap);
         for unit in ["x", "\u{0}", "é", "\""] {
-            // At the limit, one byte under it, and far over it.
             for len in [max - 1, max, max + 1, 2 * max] {
                 let text: String = unit.repeat(len).chars().take(len).collect();
                 let outcome = ToolOutcome::ok(fit_result(text, cap));

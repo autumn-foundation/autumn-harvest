@@ -225,7 +225,7 @@ async fn reset_stats_for_db(conn: &mut AsyncPgConnection, db_name: &str) {
 /// Every statement recorded for this database since the last reset, in ONE
 /// query. See `schedule_overdue_aux_perf.rs`'s identical helper for why a
 /// second query against `pg_stat_statements` here would self-pollute
-/// whatever total this later computes from it (Codex review, PR #1314).
+/// whatever total this later computes from it (PR #1314).
 async fn snapshot_statements(conn: &mut AsyncPgConnection, db_name: &str) -> Vec<StatRow> {
     diesel::sql_query(format!(
         "SELECT query, calls, shared_blks_hit, shared_blks_read, \
@@ -313,7 +313,7 @@ async fn capture_bulk_action_evidence(action: &str, label_prefix: &str) {
     // pollute the total. This must also run before the acted-on count check
     // just below. That check is itself a SQL statement. Running it first
     // would fold harness bookkeeping into "the whole request"'s totals
-    // (Codex review, PR #1407).
+    // (PR #1407).
     let all_rows = snapshot_statements(&mut stats_conn, &db_name).await;
 
     let acted_on: i64 = diesel::sql_query(if action == "bulk-resume" {

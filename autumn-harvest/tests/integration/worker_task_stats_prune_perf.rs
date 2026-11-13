@@ -64,8 +64,6 @@ const WINDOW: Duration = Duration::from_secs(60);
 /// The fallback that a worker with a 5 s heartbeat passes to the prune.
 const FAST_FALLBACK: i64 = 120;
 
-// ── workers ──────────────────────────────────────────────────────────────────
-
 type BoxFut<'a> = Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>>;
 
 fn idle(_ctx: &WorkflowContext, _input: Value) -> BoxFut<'_> {
@@ -142,8 +140,6 @@ fn worker(worker_id: &str) -> Arc<Worker> {
     config.scanner.elect = false;
     Arc::new(Worker::new(config, registry).expect("the worker builds"))
 }
-
-// ── database ─────────────────────────────────────────────────────────────────
 
 async fn setup_server() -> (String, Option<ContainerAsync<Postgres>>) {
     use testcontainers::ImageExt;

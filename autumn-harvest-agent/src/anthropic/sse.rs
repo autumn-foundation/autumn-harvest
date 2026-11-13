@@ -218,7 +218,6 @@ impl StreamAssembler {
     }
 }
 
-/// The `index` of a content-block event.
 fn block_index(event: &Value) -> Result<usize, AgentError> {
     event["index"]
         .as_u64()
@@ -237,7 +236,6 @@ mod tests {
     use crate::anthropic::{parse_response, replayable};
     use crate::{ContentPart, StopReason};
 
-    /// One SSE event with `data`.
     fn sse(data: &Value) -> String {
         format!("event: x\ndata: {data}\n\n")
     }

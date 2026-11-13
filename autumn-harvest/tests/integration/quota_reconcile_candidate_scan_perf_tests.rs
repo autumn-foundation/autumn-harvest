@@ -42,17 +42,16 @@
 //!
 //! Alongside it sits a large population of 50 distinct NON-quota'd
 //! workflow types with no declared `QuotaPolicy`. Those rows are also
-//! non-terminal and also `quota_key IS NULL`. This is the realistic case
-//! a busy shard produces. Most workflow types never adopt quotas, but
-//! their non-terminal rows still sit under the same partial index
-//! forever, since nothing ever sets their `quota_key`. [`NOISE_SWEEP`]
-//! scales that population across three sizes: 20,000 / 100,000 /
-//! 500,000. The target population and `batch_size`
-//! (`QUOTA_RECONCILE_DEFAULT_BATCH` = 200) stay fixed throughout, so any
-//! change in rows touched per batch isolates the noise population's
-//! effect. A 10% terminal (`COMPLETED`) population is also seeded per
-//! noise size, outside the index's `state IN (...)` predicate, for a
-//! realistic terminal/non-terminal mix.
+//! non-terminal and `quota_key IS NULL`. A busy shard produces this case.
+//! Most workflow types never adopt quotas, but their non-terminal rows stay
+//! under the same partial index, because nothing sets their `quota_key`.
+//! [`NOISE_SWEEP`] scales that population across three sizes: 20,000 /
+//! 100,000 / 500,000. The target population and `batch_size`
+//! (`QUOTA_RECONCILE_DEFAULT_BATCH` = 200) stay fixed, so any change in rows
+//! touched per batch isolates the noise population's effect. Each noise
+//! size also seeds a 10% terminal (`COMPLETED`) population, outside the
+//! index's `state IN (...)` predicate, for a realistic terminal/non-terminal
+//! mix.
 //!
 //! Row ids are deterministic: `md5()` of a row-unique, namespace-prefixed
 //! seed string, cast to `uuid`, not `gen_random_uuid()` (issue #1226
@@ -105,8 +104,8 @@ const NOISE_WORKFLOW_TYPES: i64 = 50;
 const SHARD: Option<ShardId> = Some(ShardId::new(0));
 
 /// Serializes access to the process-global `GLOBAL_WORKFLOW_METADATA`
-/// mirror across this file's tests, mirroring `quota_reconcile_tests.rs`'s
-/// identical `TEST_SERIAL` convention.
+/// mirror across this file's tests, as `quota_reconcile_tests.rs`'s
+/// `TEST_SERIAL` does.
 static TEST_SERIAL: LazyLock<tokio::sync::Mutex<()>> =
     LazyLock::new(|| tokio::sync::Mutex::new(()));
 
@@ -191,14 +190,12 @@ async fn seed_fixture(conn: &mut diesel_async::AsyncPgConnection, noise_count: i
         .await
         .expect("truncate quota_reconcile fixture table");
 
-    // Ids are deterministic, not gen_random_uuid(): md5() of a row-unique,
-    // namespace-prefixed seed string, cast to uuid. Postgres's uuid input
-    // parser accepts a bare 32-hex-digit string. md5 output spreads
-    // uniformly over the id space. Target and noise rows therefore still
-    // interleave uniformly in `id` order, the property this file's
-    // module doc relies on. The exact interleaving, and therefore
-    // every buffer count this file reports, now reproduces byte-for-byte
-    // across runs (Codex Review finding, PR #1691).
+    // Ids are `md5()` of a row-unique, namespace-prefixed seed, cast to uuid,
+    // not gen_random_uuid(). Postgres's uuid input parser accepts a bare
+    // 32-hex-digit string. md5 output spreads uniformly over the id space, so
+    // target and noise rows still interleave uniformly in `id` order, as the
+    // module doc requires. The exact interleaving, and so every buffer count
+    // this file reports, reproduces byte-for-byte across runs (PR #1691).
     diesel::sql_query(format!(
         "INSERT INTO harvest_workflow_executions \
            (id, workflow_name, workflow_id, shard_id, state, input, quota_key) \
@@ -617,14 +614,13 @@ async fn zz_capture_quota_reconcile_candidate_scan_evidence() {
     eprintln!("== capture complete: artifacts in {} ==", out_dir.display());
 }
 
-/// Locks in the fixture constants this file's module doc publishes. A
-/// future edit that silently changes them then fails a fast, no-database
-/// test. Otherwise only a slow manual comparison against a committed
-/// artifact would catch it. No live Postgres required.
+/// Locks in the fixture constants that this file's module doc publishes. A
+/// change to them then fails a fast test with no database. Otherwise only a
+/// slow manual comparison against a committed artifact would catch it.
 ///
-/// This file's evidence-capture test above is `#[ignore]`d by design (a
-/// one-shot tool, not a repeatable CI assertion). This test exists so the
-/// module still has an un-ignored case for CI to execute, mirroring
+/// The evidence-capture test above is `#[ignore]`d by design: it is a
+/// one-shot tool, not a repeatable CI assertion. This test gives CI an
+/// un-ignored case in the module, as in
 /// `quota_history_bytes_perf_tests::event_count_ranges_match_documentation`.
 #[test]
 fn fixture_constants_match_documentation() {

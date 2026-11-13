@@ -434,8 +434,8 @@ impl WorkspaceBlobs for InMemoryWorkspaceBlobs {
 ///
 /// A put returns only after the data is on disk. It syncs the scratch file
 /// and renames it. It then syncs the folder and its parent. It also syncs the
-/// parent of each folder that it creates. Retention can delete the previous snapshot, so a lost head would
-/// lose the workspace.
+/// parent of each folder that it creates. Retention can delete the previous
+/// snapshot, so a lost head would lose the workspace.
 ///
 /// A put that stops before its rename leaves its scratch file. A crash, a
 /// timeout or a cancel can cause that. The store lists the scratch name, so
@@ -621,7 +621,7 @@ const ANCESTOR_DEPTH: usize = 2;
 /// can create a folder and then fail before it syncs the parent. So until one
 /// put has synced every ancestor of the folder, each put syncs all of them. The
 /// `settled` flag records that. An ancestor above the root that denies the open
-/// is skipped. After it, a put syncs the folder and its
+/// is skipped. Once `settled` is set, a put syncs only the folder and its
 /// parent, which covers a new scope folder.
 ///
 /// On Windows the rename is not durable, because a directory cannot be opened

@@ -11,8 +11,6 @@ use serde::{Deserialize, Serialize};
 
 use autumn_harvest::prelude::*;
 
-// ── Test Workflow Declaration ───────────────────────────────────────────────
-
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct SubscriptionInput {
     pub user_id: String,
@@ -29,7 +27,6 @@ async fn subscription_flow(
         input.user_id, input.plan_name
     );
 
-    // Wait for the plan upgrade or activation signal
     let signal_val = ctx
         .wait_for_signal("activate_subscription")
         .await

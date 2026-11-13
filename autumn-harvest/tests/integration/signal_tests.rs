@@ -98,17 +98,14 @@ async fn test_send_and_load_signals() {
         .await
         .unwrap();
 
-    // Load initial - should be empty
     let signals = load_pending_signals(&mut conn, exec_id).await.unwrap();
     assert!(signals.is_empty());
 
-    // Send a signal
     let payload = serde_json::json!({"key": "value"});
     send_signal(&mut conn, exec_id, "test_signal", payload.clone())
         .await
         .unwrap();
 
-    // Load again
     let signals = load_pending_signals(&mut conn, exec_id).await.unwrap();
     assert_eq!(signals.len(), 1);
     assert_eq!(signals[0].signal_name, "test_signal");
@@ -121,7 +118,6 @@ async fn test_mark_signals_consumed() {
     let (mut conn, _container) = setup_test_db().await;
     let exec_id = ExecutionId::new();
 
-    // Create workflow execution
     let new_exec = NewWorkflowExecution {
         quota_key: None,
         continued_from_exec_id: None,
@@ -169,7 +165,6 @@ async fn test_mark_signals_consumed() {
         .await
         .unwrap();
 
-    // Send signals
     send_signal(&mut conn, exec_id, "sig1", serde_json::json!(1))
         .await
         .unwrap();
@@ -180,13 +175,11 @@ async fn test_mark_signals_consumed() {
     let signals = load_pending_signals(&mut conn, exec_id).await.unwrap();
     assert_eq!(signals.len(), 2);
 
-    // Mark first signal consumed
     let ids_to_mark = vec![signals[0].id];
     mark_signals_consumed(&mut conn, &ids_to_mark)
         .await
         .unwrap();
 
-    // Load again
     let pending_signals = load_pending_signals(&mut conn, exec_id).await.unwrap();
     assert_eq!(pending_signals.len(), 1);
     assert_eq!(pending_signals[0].id, signals[1].id);
@@ -195,7 +188,7 @@ async fn test_mark_signals_consumed() {
     let ids_to_mark = vec![];
     mark_signals_consumed(&mut conn, &ids_to_mark)
         .await
-        .unwrap(); // Empty list test
+        .unwrap(); // An empty list marks nothing.
     let pending_signals = load_pending_signals(&mut conn, exec_id).await.unwrap();
     assert_eq!(pending_signals.len(), 1);
 }
@@ -275,7 +268,6 @@ async fn idempotent_signal_with_same_key_lands_exactly_once() {
         delivered_flags.push(delivered);
     }
 
-    // Exactly one row queued.
     let signals = load_pending_signals(&mut conn, exec_id).await.unwrap();
     assert_eq!(
         signals.len(),

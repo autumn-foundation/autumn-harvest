@@ -66,7 +66,6 @@ impl Fleet {
         wal_of(&self.path)
     }
 
-    /// The bytes of the main file.
     fn main_bytes(&self) -> Vec<u8> {
         std::fs::read(&self.path).expect("main file")
     }
@@ -89,7 +88,6 @@ impl Fleet {
             .expect("checkpoint")
     }
 
-    /// Close the replicator connection.
     fn close_replicator(&mut self) {
         if let Some(conn) = self.replicator.take() {
             conn.close().expect("close");

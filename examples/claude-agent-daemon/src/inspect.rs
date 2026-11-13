@@ -1305,9 +1305,8 @@ fn ambiguous_history(conn: &Connection, exec_id: &str) -> Result<Option<String>,
 /// shell. It refuses two more shapes the type accepts. One is a turn that
 /// ends and still asks for a tool. The other is a finished turn carrying no
 /// text and no call. A recorded one reaches the operator by the same route.
-/// A reply this
-/// daemon would never have accepted is therefore not a history it can
-/// resume.
+/// A reply this daemon would never have accepted is therefore not a history
+/// it can resume.
 ///
 /// The test is [`crate::claude::unusable_reply`] itself, which is the WHOLE
 /// set the live path applies. One of its three rules was applied here once,
@@ -1415,9 +1414,11 @@ pub fn executions(
     // every match first. Measured on 20000 sessions, the first page took
     // 11.7ms through the index and 0.1ms by the walk. The walk loses only
     // where this workflow is a small minority of the file. This daemon owns
-    // its file and starts one workflow in it, so that case does not arise. It matches the name by its BYTES. A
-    // session recorded as a `BLOB` was once missing from the listing. Then
-    // `status` and `history` reported that it does not exist.
+    // its file and starts one workflow in it, so that case does not arise.
+    //
+    // The backend matches the name by its BYTES. A session recorded as a
+    // `BLOB` was once missing from the listing. Then `status` and `history`
+    // reported that it does not exist.
     //
     // Each row arrives with its payloads, one row at a time. It is cut to a
     // bounded summary before the next row, so the page never holds a whole

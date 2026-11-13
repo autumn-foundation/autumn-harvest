@@ -350,7 +350,6 @@ struct FileStamp {
 }
 
 impl FileStamp {
-    /// The stamp of the file at `path`.
     fn of(path: &Path) -> std::io::Result<Self> {
         use std::os::unix::fs::MetadataExt as _;
         let meta = std::fs::metadata(path)?;
@@ -706,7 +705,6 @@ impl Tenancy {
             });
     }
 
-    /// Whether no cgroup is kept.
     fn is_empty(&self) -> bool {
         self.leftovers
             .lock()
@@ -1427,7 +1425,6 @@ impl FirecrackerLauncher {
     ) -> Result<Prepared, SandboxError> {
         use std::os::unix::fs::DirBuilderExt as _;
         let config = &self.config;
-        // The image that this launcher pinned at its start.
         let pinned = self.tenancy.pinned.as_ref();
         if let Some(pinned) = pinned {
             pinned.check()?;
@@ -2067,7 +2064,6 @@ struct FileId {
 }
 
 impl FileId {
-    /// The identity in `meta`.
     fn of(meta: &std::fs::Metadata) -> Self {
         use std::os::unix::fs::MetadataExt as _;
         Self {
@@ -2080,7 +2076,6 @@ impl FileId {
     }
 }
 
-/// The identity of the file at `path`.
 fn file_id(path: &Path) -> Result<FileId, SandboxError> {
     let meta = std::fs::metadata(path)
         .map_err(|e| SandboxError::Config(format!("cannot inspect {}: {e}", path.display())))?;
@@ -2558,12 +2553,10 @@ fn check_socket_paths(vm_root: &Path, confinement: &Confinement) -> Result<(), S
     Ok(())
 }
 
-/// The error of a failed launch step.
 fn prepare_error(id: &str, what: &str, e: &std::io::Error) -> SandboxError {
     SandboxError::Unavailable(format!("cannot prepare {what} of VM {id}: {e}"))
 }
 
-/// The VM directory root of a confinement.
 fn vm_root_of(confinement: &Confinement, exec_name: &str) -> PathBuf {
     match confinement {
         Confinement::Jailer(jailer) => jailer.chroot_base.join(exec_name),
@@ -5456,13 +5449,11 @@ while True:
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    /// Write the snapshot manifest of `config` for `files`.
     fn write_snapshot_meta(config: &LauncherConfig, files: &SnapshotFiles) {
         let image = (config.image.kernel.as_path(), config.image.rootfs.as_path());
         write_meta(files, &SnapshotMeta::of(config, image, (1, 17, 0)).unwrap());
     }
 
-    /// Write `meta` as the snapshot manifest of `files`.
     fn write_meta(files: &SnapshotFiles, meta: &SnapshotMeta) {
         let meta = serde_json::to_vec(meta).unwrap();
         std::fs::write(SnapshotMeta::path(&files.state), meta).unwrap();

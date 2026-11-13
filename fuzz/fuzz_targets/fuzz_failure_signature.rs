@@ -1,11 +1,12 @@
 //! Fuzz target: DLQ failure-signature normalization is total and bounded.
 //!
-//! `dlq::failure_signature` (issue #385) normalizes an arbitrary error string
-//! (first line, UUID/hex/decimal runs collapsed to placeholders, truncated to
-//! `SIGNATURE_MAX_LEN` chars) into a shard-stable grouping key. It is fed raw,
-//! unbounded error text, so it must never panic and must respect its length
-//! cap even under adversarial unicode / multi-byte-boundary input. The
-//! `dlq` module is `#[cfg(feature = "db")]`, so this target requires the
+//! `dlq::failure_signature` (issue #385) turns an error string into a
+//! shard-stable grouping key. It keeps the first line, collapses UUID, hex
+//! and decimal runs to placeholders, and truncates to `SIGNATURE_MAX_LEN`
+//! chars. Its input is raw, unbounded error text. So it must never panic,
+//! and it must keep its length cap, also for adversarial unicode that
+//! splits a multi-byte boundary.
+//! The `dlq` module is `#[cfg(feature = "db")]`, so this target needs the
 //! `db` feature on the `autumn-harvest` dependency (see `fuzz/Cargo.toml`).
 //!
 //! Invariants: never panics; output char count is always `<= SIGNATURE_MAX_LEN`.

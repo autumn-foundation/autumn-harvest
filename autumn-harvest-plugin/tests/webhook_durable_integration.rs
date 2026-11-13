@@ -26,7 +26,7 @@ use testcontainers_modules::testcontainers::runners::AsyncRunner;
 async fn test_durable_signed_webhook_via_harvest_workflow() {
     let _ = tracing_subscriber::fmt::try_init();
 
-    // 1. Start Postgres 16 and run the migrations. `TestDb` starts Postgres 11.
+    // Start Postgres 16 and run the migrations. `TestDb` starts Postgres 11.
     // There, the worker claim query fails on `MATERIALIZED`, so no task runs.
     // `test_init_sql()` loads the Harvest schema. A second `run_pending` call
     // skips six Harvest migrations that share a framework migration version.
@@ -51,11 +51,9 @@ async fn test_durable_signed_webhook_via_harvest_workflow() {
     .build()
     .expect("failed to build pool");
 
-    // 2. Setup the Webhook Outbound Plugin with a process-local InMemory handler
     let handler = Arc::new(InMemoryOutboundWebhookHandler::new());
     let webhook_plugin = OutboundWebhookPlugin::new(handler.clone());
 
-    // Create a subscription targeting the mock receiver
     let sub = WebhookSubscription {
         id: "sub_durable".to_owned(),
         target_url: "http://mock-receiver/webhooks/durable".to_owned(),
@@ -66,8 +64,7 @@ async fn test_durable_signed_webhook_via_harvest_workflow() {
     };
     handler.create_subscription(sub).await.unwrap();
 
-    // 3. Build the TestApp, mounting both OutboundWebhookPlugin and HarvestPlugin
-    // with the "webhooks" feature enabled (which autowires the webhook workflow/activity)
+    // The `webhooks` feature autowires the webhook workflow and activity.
     let config = autumn_web::config::AutumnConfig {
         profile: Some("test".into()),
         security: autumn_web::security::SecurityConfig {
@@ -94,7 +91,6 @@ async fn test_durable_signed_webhook_via_harvest_workflow() {
         )
         .with_db(pool);
 
-    // Register HTTP mock for the outbound signed webhook target
     let mock = app_builder
         .http_mock("http://mock-receiver/webhooks/durable")
         .post("/webhooks/durable")
@@ -103,7 +99,6 @@ async fn test_durable_signed_webhook_via_harvest_workflow() {
     let app = app_builder.build();
     let state = app.state();
 
-    // 4. Dispatch the webhook using the WebhookOutboundManager
     let manager = state
         .extension::<WebhookOutboundManager>()
         .expect("WebhookOutboundManager should be registered");
@@ -118,12 +113,12 @@ async fn test_durable_signed_webhook_via_harvest_workflow() {
         .await
         .unwrap();
 
-    // 5. Wait up to 30 s for the Harvest workflow and activity to run.
+    // Wait up to 30 s for the Harvest workflow and activity to run.
     let mut logs = Vec::new();
     for _ in 0..300 {
         logs = handler.get_delivery_logs().await.unwrap();
         if let Some(log) = logs.first() {
-            // Wait until response status is logged (indicating HTTP request completed)
+            // A logged response status means the HTTP request completed.
             if log.response_status.is_some() {
                 break;
             }
@@ -131,10 +126,8 @@ async fn test_durable_signed_webhook_via_harvest_workflow() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
-    // 6. Verify mock receiver was called and signature is correct
     mock.expect_called(1);
 
-    // Verify delivery logs were recorded successfully
     let log = logs.first().expect("a delivery log is recorded");
     assert_eq!(log.subscription_id, "sub_durable");
     assert_eq!(log.topic, "order.completed");

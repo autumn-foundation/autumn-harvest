@@ -1,4 +1,5 @@
-//! `cargo xtask perf sticky-routing-claim`: the port of `autumn-harvest/scripts/sticky_routing_claim_perf_repro.sh`.
+//! `cargo xtask perf sticky-routing-claim`: the port of
+//! `autumn-harvest/scripts/sticky_routing_claim_perf_repro.sh`.
 //!
 //! The reproduction harness for the ordinary sticky-routing claim-predicate
 //! measurement (issue #235, Ledger perf pass).

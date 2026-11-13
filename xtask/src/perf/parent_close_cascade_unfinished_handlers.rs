@@ -1,4 +1,5 @@
-//! `cargo xtask perf parent-close-cascade-unfinished-handlers`: the port of `autumn-harvest/scripts/parent_close_cascade_unfinished_handlers_perf_repro.sh`.
+//! `cargo xtask perf parent-close-cascade-unfinished-handlers`: the port of
+//! `autumn-harvest/scripts/parent_close_cascade_unfinished_handlers_perf_repro.sh`.
 //!
 //! The reproduction harness for the N+1 fix in the unfinished-update-handler
 //! check of the parent-close cascade (Ledger perf pass).
@@ -47,9 +48,10 @@
 //!   shipped `check_and_report_unfinished_handlers_batch`. It issues one
 //!   `eq_any` `harvest_events` SELECT and reports the same pairs.
 //!
-//! Preconditions: a Rust toolchain that can build this crate. The command also needs Docker
-//! for the testcontainer fallback of the harness, or a reachable Postgres that
-//! `HARVEST_TEST_DATABASE_URL` names. That server needs `pg_stat_statements` in `shared_preload_libraries`.
+//! Preconditions: a Rust toolchain that can build this crate. The command
+//! also needs Docker for the testcontainer fallback of the harness, or a
+//! reachable Postgres that `HARVEST_TEST_DATABASE_URL` names. That server
+//! needs `pg_stat_statements` in `shared_preload_libraries`.
 
 use std::process::ExitCode;
 

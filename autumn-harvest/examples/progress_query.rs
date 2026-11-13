@@ -17,10 +17,6 @@ use std::sync::{Arc, Mutex};
 use autumn_harvest::prelude::*;
 use serde_json::json;
 
-// ---------------------------------------------------------------------------
-// Query request / response types
-// ---------------------------------------------------------------------------
-
 #[derive(serde::Deserialize)]
 struct ProgressQuery {
     /// When true, include a human-readable summary string in the response.
@@ -35,18 +31,13 @@ struct ProgressResponse {
     summary: Option<String>,
 }
 
-// ---------------------------------------------------------------------------
-// Workflow definition
-// ---------------------------------------------------------------------------
-
 #[workflow]
 async fn batch_processor(ctx: &WorkflowContext, _input: ()) -> Result<(), String> {
     let total: u64 = 1_000;
     let processed = Arc::new(Mutex::new(0u64));
 
-    // Register a typed query handler. The closure captures `processed` and
-    // `total` from the surrounding scope. No events are ever written to
-    // `harvest_events` — the registry lives only in-memory.
+    // A query writes no event to `harvest_events`. The registry lives only
+    // in memory.
     let query_state = processed.clone();
     ctx.register_query_handler("progress", move |req: &ProgressQuery| {
         let n = *query_state.lock().unwrap();
@@ -67,7 +58,6 @@ async fn batch_processor(ctx: &WorkflowContext, _input: ()) -> Result<(), String
         })
     });
 
-    // Register a simple no-arg query alongside the typed one.
     ctx.register_query("status", || json!("running"));
 
     // Simulate batch work (in a real workflow these would be activities).

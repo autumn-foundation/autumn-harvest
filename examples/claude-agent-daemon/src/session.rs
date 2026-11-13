@@ -350,11 +350,11 @@ pub async fn agent_session(
         // how large its results will be. The count above is answered before
         // it, because the reply does say how many calls it asks for.
         //
-        // The size bound is the results ALONE against the cap a request may carry.
-        // That is conservative. Results over the cap cannot fit a request
-        // whatever the transcript holds beside them. No batch that would have
-        // fit is therefore stopped here. A batch that fits is still measured whole
-        // at the next turn, by the check above.
+        // The size bound is the results ALONE against the cap a request may
+        // carry. That is conservative. Results over the cap cannot fit a
+        // request whatever the transcript holds beside them. No batch that
+        // would have fit is therefore stopped here. A batch that fits is
+        // still measured whole at the next turn, by the check above.
         //
         // The outcome does not change, only the work. The session ends under
         // the same stop reason, and on the same turn number, as it would have
@@ -458,7 +458,6 @@ pub fn tool_result_block(tool_use_id: &str, outcome: &ToolOutcome) -> Value {
     })
 }
 
-/// Assemble the operator-facing report.
 fn report(answer: &str, turns: u32, tool_calls: u32, stop: &str) -> SessionReport {
     SessionReport {
         answer: answer.to_string(),

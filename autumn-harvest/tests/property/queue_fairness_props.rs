@@ -47,7 +47,6 @@ proptest! {
         let output: HashSet<&str> = order.iter().copied().collect();
         prop_assert_eq!(&output, &input, "output is not a set-permutation of the input");
 
-        // No duplicates in the output (set len == vec len).
         prop_assert_eq!(output.len(), order.len(), "output contains a duplicate queue");
     }
 

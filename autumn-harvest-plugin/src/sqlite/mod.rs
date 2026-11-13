@@ -291,7 +291,6 @@ pub(crate) fn build(app: AppBuilder, parts: SqliteParts) -> AppBuilder {
     app.nest(&path, router.with_state(()))
 }
 
-/// The API state of a SQLite app.
 fn sqlite_api_state(allow_unauthenticated_mutations: bool, boundary: bool) -> HarvestApiState {
     let api_state = HarvestApiState::new();
     // MCP, webhook and connector starts go through the SQLite handle
@@ -304,7 +303,6 @@ fn sqlite_api_state(allow_unauthenticated_mutations: bool, boundary: bool) -> Ha
     api_state
 }
 
-/// Register the startup and the shutdown hook.
 fn lifecycle_hooks(
     app: AppBuilder,
     slot: Arc<Mutex<Slot>>,

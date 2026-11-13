@@ -21,18 +21,17 @@
 //! `autumn-harvest-plugin/src/connector/dead_letter.rs` says that it "records
 //! into memory, exported for tests and local development". Its `write()` only
 //! pushes into an in-process `Mutex<Vec<...>>`, and nothing reaches Postgres.
-//! The sink that writes `harvest_connector_dead_letters` is
-//! `PostgresDeadLetterSink`. `HarvestPlugin` itself installs that sink in
-//! `autumn-harvest-plugin/src/plugin.rs`, as the "default mode" that this
-//! example claims to reproduce.
+//! `PostgresDeadLetterSink` writes `harvest_connector_dead_letters`.
+//! `HarvestPlugin` installs it in `autumn-harvest-plugin/src/plugin.rs`, as
+//! the "default mode" that this example claims to reproduce.
 //!
-//! This section addresses a newcomer who embeds a runtime directly. A copy of
+//! The section addresses a newcomer who embeds a runtime directly. A copy of
 //! option (a) compiles and runs with no error. Poison messages are
-//! acknowledged, so the binding makes progress. But they are never durably
-//! recorded. An in-process restart loses them all. Every triage query that
-//! the chapter documents (`SELECT ... FROM harvest_connector_dead_letters`)
-//! returns nothing. That is silent data loss in the one code path whose whole
-//! purpose is "a poison message must never be silently lost".
+//! acknowledged, so the binding makes progress, but nothing records them
+//! durably. An in-process restart loses them all. Every triage query of the
+//! chapter (`SELECT ... FROM harvest_connector_dead_letters`) returns nothing.
+//! That is silent data loss in the one path whose purpose is "a poison
+//! message must never be silently lost".
 
 use std::path::Path;
 use std::process::ExitCode;

@@ -41,10 +41,9 @@ use uuid::Uuid;
 // Shared harness
 // ---------------------------------------------------------------------------
 
-/// Every row in this file is inserted with `shard_id = 0` (see
-/// `insert_execution`). Fed straight through to `reconcile_quota_keys`'s
-/// DR-fence assertion, which is a no-op unless this process has a pinned
-/// generation for the shard.
+/// Every row in this file has `shard_id = 0` (see `insert_execution`). It
+/// goes to `reconcile_quota_keys`'s DR-fence assertion, which is a no-op
+/// unless this process has a pinned generation for the shard.
 const SHARD: Option<autumn_harvest::types::ShardId> = Some(autumn_harvest::types::ShardId::new(0));
 
 async fn setup_db() -> (AsyncPgConnection, ContainerAsync<Postgres>) {
@@ -112,8 +111,8 @@ async fn read_quota_key(conn: &mut AsyncPgConnection, exec_id: Uuid) -> Option<S
 }
 
 /// Serializes access to the process-global `GLOBAL_WORKFLOW_METADATA` mirror
-/// across this file's tests, mirroring `quota_enforcement_tests.rs`'s
-/// identical `TEST_SERIAL` convention.
+/// across this file's tests, as `quota_enforcement_tests.rs`'s `TEST_SERIAL`
+/// does.
 static TEST_SERIAL: LazyLock<tokio::sync::Mutex<()>> =
     LazyLock::new(|| tokio::sync::Mutex::new(()));
 
@@ -157,7 +156,6 @@ impl MetadataGuard {
         }
     }
 
-    /// Convenience for the common single-workflow-type case.
     async fn install_one(workflow_name: &str, quota: QuotaPolicy) -> Self {
         let mut map = HashMap::new();
         map.insert(workflow_name.to_string(), wf_meta(quota));
@@ -391,15 +389,13 @@ async fn over_cap_resolved_key_is_left_null() {
 async fn workflow_type_with_no_declared_policy_is_never_a_candidate() {
     let (mut conn, _container) = setup_db().await;
     let workflow_name = leaked("wf_no_policy");
-    // A DIFFERENT workflow type has a policy, so the registry is
-    // non-empty (not the zero-registrations early exit, covered
-    // separately by `zero_registered_policies_anywhere_skips_the_scan_
-    // entirely`). `workflow_name` itself is absent from the registered
-    // set. `CANDIDATE_SQL`'s `workflow_name = ANY($1)` filter therefore
-    // excludes this row from the scan entirely -- it is never fetched,
-    // not fetched-then-classified `NoPolicy`. That is what stops a mixed
-    // deployment from re-fetching every no-policy row's JSON input on
-    // every tick forever.
+    // A DIFFERENT workflow type has a policy, so the registry is non-empty.
+    // `zero_registered_policies_anywhere_skips_the_scan_entirely` covers the
+    // empty-registry early exit. `workflow_name` itself is not in the
+    // registered set, so `CANDIDATE_SQL`'s `workflow_name = ANY($1)` filter
+    // excludes this row from the scan. The row is never fetched, not fetched
+    // and then classified `NoPolicy`. That stops a mixed deployment from
+    // re-fetching the JSON input of every no-policy row on every tick.
     let other_workflow_name = leaked("wf_has_policy");
     let policy = QuotaPolicy::new("tenant_id").with_max_active_executions(10);
     let _guard = MetadataGuard::install_one(other_workflow_name, policy).await;
@@ -542,15 +538,14 @@ async fn batch_size_bounds_a_single_sweep_and_the_rest_finish_on_the_next_one() 
 async fn cursor_advances_past_permanently_stuck_rows_so_a_resolvable_row_is_not_starved() {
     let (mut conn, _container) = setup_db().await;
     // Both workflow types carry a registered policy, so `CANDIDATE_SQL`'s
-    // `workflow_name = ANY($1)` filter returns rows for each. Otherwise
-    // this test would pass on the very first tick regardless of cursor
-    // behavior, since an unregistered type's rows are never fetched at
-    // all. `wf_stuck`'s input omits the policy's key field, so every one
-    // of its rows classifies `Unresolvable` and can never leave the
-    // candidate set. Row `id`s are random UUIDs, so a stuck row can sort
-    // before OR after the one resolvable row. A fixed `LIMIT` with no
-    // cursor could therefore keep re-examining the same stuck rows
-    // forever, and never reach the resolvable one.
+    // `workflow_name = ANY($1)` filter returns rows for each. Otherwise the
+    // test would pass on the first tick whatever the cursor does, because an
+    // unregistered type's rows are never fetched. `wf_stuck`'s input omits the
+    // policy's key field, so each of its rows classifies `Unresolvable` and
+    // never leaves the candidate set. Row `id`s are random UUIDs, so a stuck
+    // row can sort before OR after the one resolvable row. A fixed `LIMIT`
+    // with no cursor could then re-examine the same stuck rows forever and
+    // never reach the resolvable one.
     let stuck_workflow_name = leaked("wf_stuck");
     let resolvable_workflow_name = leaked("wf_resolvable");
     let policy = QuotaPolicy::new("tenant_id").with_max_active_executions(10);

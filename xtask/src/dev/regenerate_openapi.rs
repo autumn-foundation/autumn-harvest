@@ -27,8 +27,6 @@ const PRETTY: &str = "docs/openapi.json";
 const COMPACT: &str = "autumn-harvest-plugin/openapi.json";
 
 /// Arguments of `cargo xtask dev regenerate-openapi`.
-///
-/// The command takes no argument, so the type is `Copy`.
 #[derive(Debug, Clone, Copy, Args)]
 pub struct Args {}
 

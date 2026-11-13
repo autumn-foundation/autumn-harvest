@@ -525,7 +525,6 @@ async fn a_due_timer_fires_through_the_owner_scan() {
     db.drop_db().await;
 }
 
-/// Seed one execution and its workflow task.
 async fn seed_task(
     conn: &mut AsyncPgConnection,
     queue: &str,
@@ -931,7 +930,6 @@ async fn a_saturated_owner_takes_a_high_priority_run_first() {
     db.drop_db().await;
 }
 
-/// Start one instant run on `queue`.
 async fn start_instant(
     conn: &mut AsyncPgConnection,
     client: &WorkflowHandleClient,

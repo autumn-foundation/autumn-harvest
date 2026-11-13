@@ -90,10 +90,8 @@ use serde_json::{Value, json};
 /// The profile lookup activity name.
 const PROFILE: &str = "agent_profile";
 
-/// The model-turn activity name.
 const MODEL_TURN: &str = "agent_model_turn";
 
-/// The tool-call activity name.
 const TOOL_CALL: &str = "agent_tool_call";
 
 /// The tool that the `tool` shape calls.
@@ -171,12 +169,10 @@ fn profile() -> AgentProfile {
         .system("You are a support agent. Use the tools. Answer in one short paragraph.")
 }
 
-/// The text of user message `op`.
 fn user_text(op: u64) -> String {
     format!("Ticket {op}: the customer asks where the refund of order ord-{op:05} is.")
 }
 
-/// The answer of op `op`.
 fn answer_text(op: u64) -> String {
     format!("Ticket {op}: the refund of order ord-{op:05} is approved. It reaches the card soon.")
 }
@@ -432,7 +428,6 @@ fn span_meta() -> WorkflowExecuteSpanMeta {
     }
 }
 
-/// Decode the history file.
 #[inline(never)]
 fn decode(bytes: &[u8]) -> Recording {
     serde_json::from_slice(bytes).expect("the history file decodes")

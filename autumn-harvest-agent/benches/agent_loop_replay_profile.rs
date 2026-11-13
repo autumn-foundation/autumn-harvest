@@ -71,10 +71,8 @@ use autumn_harvest_agent::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-/// The model-turn activity name.
 const MODEL_TURN: &str = "agent_model_turn";
 
-/// The tool-call activity name.
 const TOOL_CALL: &str = "agent_tool_call";
 
 /// The tool that each round calls.
@@ -333,7 +331,6 @@ fn span_meta() -> WorkflowExecuteSpanMeta {
     }
 }
 
-/// Decode the history file.
 #[inline(never)]
 fn decode(bytes: &[u8]) -> Recording {
     serde_json::from_slice(bytes).expect("the history file decodes")

@@ -495,11 +495,9 @@ async fn audit_list_ordered_by_occurred_at_desc() {
     .expect("list");
 
     assert_eq!(rows.len(), 3);
-    // Verify descending order.
     for pair in rows.windows(2) {
         assert!(pair[0].occurred_at >= pair[1].occurred_at);
     }
-    // Newest (schedule.delete) should be first.
     assert_eq!(rows[0].operation, "schedule.delete");
 }
 

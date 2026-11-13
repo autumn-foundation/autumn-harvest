@@ -178,8 +178,8 @@ fn worker_config_with_priority_aging() {
 
 #[test]
 fn worker_config_priority_aging_zero_disables() {
-    // Setting 0 seconds is equivalent to no aging (would divide by zero in SQL).
-    // The builder should normalize this to None.
+    // Zero seconds means no aging, because zero would divide by zero in SQL.
+    // The builder normalizes it to `None`.
     let cfg = WorkerConfig::default().with_priority_aging_secs(0);
     assert!(cfg.priority_aging_secs.is_none());
 }

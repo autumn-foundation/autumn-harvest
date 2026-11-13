@@ -15,7 +15,7 @@
 //! "repeat until quiescent". A multi-cycle execution then needed several
 //! external `run_until_idle()` calls to finish, instead of one.
 //!
-//! A follow-up review of the #1555 fix (Codex P1) found that a naive
+//! A later review of the #1555 fix found that a naive
 //! "keep looping" fix re-drives a broken execution on EVERY internal pass.
 //! For a WORKFLOW-handler panic, each re-drive strikes the bounded panic
 //! budget (`WORKFLOW_PANIC_MAX_ATTEMPTS`). A persistently-panicking
@@ -25,8 +25,8 @@
 
 // The `#[workflow]` macro references its input param through expansion.
 #![allow(clippy::used_underscore_binding)]
-// `healthy_wf` holds no `.await` — it completes in one synchronous cycle by
-// design, so it lands past the broken execution in the very same pass.
+// `healthy_wf` holds no `.await`. It completes in one synchronous cycle by
+// design, so it lands past the broken execution in the same pass.
 #![allow(clippy::unused_async)]
 
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -402,7 +402,7 @@ async fn four_step_wf(ctx: &WorkflowContext, start: i64) -> Result<i64, String> 
     Ok(step4.as_i64().unwrap_or_default())
 }
 
-/// Codex P1 follow-up on the #1555 fix. A single `run_until_idle()` call
+/// A follow-up on the #1555 fix. A single `run_until_idle()` call
 /// must strike a persistently-panicking execution AT MOST ONCE, even while
 /// an unrelated execution needs many more internal passes to converge.
 /// Re-striking it every pass would exhaust

@@ -65,7 +65,6 @@ pub const MAX_OVERLAY_BYTES: usize = 64 * 1024;
 /// cannot pick the day of its cap. A test sets a fixed clock.
 pub type StoreClock = Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>;
 
-/// The system clock.
 fn system_clock() -> StoreClock {
     Arc::new(Utc::now)
 }
@@ -2240,7 +2239,6 @@ impl PostgresOverlayStore {
     }
 }
 
-/// Decode one stored row of `kind`.
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
 fn decode_one(
     kind: &str,
@@ -2250,7 +2248,6 @@ fn decode_one(
         .transpose()
 }
 
-/// Decode the stored rows of `kind`.
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
 fn decode_all(kind: &str, rows: Vec<OverlayRow>) -> Result<Vec<StoredOverlay>, OverlayStoreError> {
     rows.into_iter()

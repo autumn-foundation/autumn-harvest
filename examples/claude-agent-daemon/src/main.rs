@@ -280,7 +280,6 @@ fn printable(socket: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Dispatch one command.
 async fn run(cli: Cli) -> Result<(), String> {
     printable(&cli.socket)?;
     match cli.command {
