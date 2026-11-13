@@ -402,15 +402,15 @@ async fn handle_webhook(
     headers: axum::http::HeaderMap,
     hook: Result<SignedWebhook, autumn_web::AutumnError>,
 ) -> axum::response::Response {
-    // Check the verification result *before* the runtime-installed check: a
-    // sender's bad signature is their problem, not ours, and must be
-    // reported as such (401/400) even during the boot window before
-    // `on_startup` installs the runtime -- masking it behind a generic
-    // "runtime not started" would misdirect a legitimate integration
-    // debugging a real signature/secret mismatch. Metrics are best-effort
-    // here: if the runtime isn't up yet there is no `MetricsRecorder` to
-    // record against (documented boot-window limitation, consistent with
-    // every other management route).
+    // Check the verification result *before* the runtime-installed check. A
+    // bad signature is a sender problem, not a server problem. It must be
+    // reported as such (401/400), even during the boot window before
+    // `on_startup` installs the runtime. A generic "runtime not started"
+    // would misdirect a legitimate integration that debugs a real
+    // signature/secret mismatch. Metrics are best-effort here. If the
+    // runtime is not up yet, there is no `MetricsRecorder` to record against.
+    // That is a documented boot-window limitation, as on every other
+    // management route.
     let hook = match hook {
         Ok(hook) => hook,
         Err(err) => {
@@ -431,12 +431,11 @@ async fn handle_webhook(
     // the `SignedWebhook` extractor above has already reserved this
     // delivery's replay key, and autumn-web's `webhook_replay_cleanup_middleware`
     // (wired automatically into every app's router) only releases a reserved
-    // key when the response is a `5xx`. "The harvest runtime hasn't started
-    // yet" is a transient boot-window condition, not a bad request -- a `400`
-    // here would permanently consume the delivery id, so the provider's
-    // automatic retry (arriving after the app finishes booting) would 409 as
-    // a false duplicate forever instead of ever actually dispatching
-    // (Codex review, PR #918).
+    // key when the response is a `5xx`. "The harvest runtime has not started
+    // yet" is a transient boot-window condition, not a bad request. A `400`
+    // here would permanently consume the delivery id. The automatic retry of
+    // the provider arrives after the app finishes booting. It would then 409
+    // as a false duplicate forever and never dispatch (Codex review, PR #918).
     let metrics = match api_state.trigger_metrics() {
         Ok(metrics) => metrics,
         Err(e) => {
@@ -540,7 +539,7 @@ async fn handle_webhook(
                 // `from_webhook` already sets the body `idempotency_key` to `None`;
                 // the header is the sole remaining source, so removing it fully
                 // disables #808 dedup for webhook-delegated starts. Use the same
-                // header-name constant the handler reads so the two can't drift.
+                // header-name constant the handler reads so the two cannot drift.
                 let mut start_headers = headers.clone();
                 start_headers.remove(HEADER_IDEMPOTENCY_KEY);
                 // A lost fence session stops the dispatch with a `503`.
@@ -718,11 +717,11 @@ struct DispatchAuditCtx<'a> {
 /// `SignalWithStartResponse` -- both carry `execution_id`/`workflow_id`,
 /// which is all this module needs to build its own envelope. Reading only
 /// these two fields (rather than the private response types) avoids
-/// widening either type's visibility beyond what's needed. `signal_delivered`
-/// is present only on `SignalWithStartResponse`: a `SignalsWithStart` target
-/// reports `200 OK` for both "attached to an existing execution and
-/// delivered a genuinely new signal" and "deduped redelivery" -- the boolean
-/// is the only way this module can tell them apart.
+/// widening the visibility of either type beyond what is needed.
+/// `signal_delivered` is present only on `SignalWithStartResponse`. A
+/// `SignalsWithStart` target reports `200 OK` for both "attached to an
+/// existing execution and delivered a genuinely new signal" and "deduped
+/// redelivery". The boolean is the only way this module can tell them apart.
 #[derive(serde::Deserialize)]
 struct DispatchIds {
     execution_id: String,
@@ -757,10 +756,10 @@ async fn reshape_dispatch_response(
     }
 
     // The delegate itself rejected the request (e.g. issue #373 schema
-    // validation, a debounce/start_at conflict, a batching-max-size limit)
-    // -- a caller/config problem, not an internal failure of this handler.
-    // Pass the delegate's own structured error body through unchanged rather
-    // than manufacturing a new one, and don't count it as an internal error.
+    // validation, a debounce/start_at conflict, a batching-max-size limit).
+    // That is a caller/config problem, not an internal failure of this handler.
+    // Pass the structured error body of the delegate through unchanged rather
+    // than manufacturing a new one, and do not count it as an internal error.
     if status.is_client_error() {
         record_outcome(metrics, path, WebhookOutcome::ParseFailed);
         write_dispatch_audit(

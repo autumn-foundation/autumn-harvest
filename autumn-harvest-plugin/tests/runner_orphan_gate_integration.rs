@@ -4,7 +4,7 @@
 //!
 //! Before this, a standalone deployment could boot with orphaned non-terminal
 //! executions (a workflow type with in-flight runs but no registered handler)
-//! entirely unflagged — the same latent leak the #700 P1 fix closed for the
+//! entirely unflagged. The #700 fix closed the same latent leak for the
 //! plugin. These tests drive the REAL entry point (`HarvestRunner::start`), not
 //! the decision helper, so they pin the wiring and not just the policy.
 //!
@@ -692,10 +692,10 @@ async fn standalone_gate_warns_instead_of_aborting_when_a_shard_is_unavailable()
         HarvestRunnerResources::new(build_test_pool(&database_url)).with_shard_router(router);
 
     // Capture what an operator would read in the boot log. This is the MIXED
-    // case — `fail`, an orphan found on a reachable shard, and another shard
-    // uninspectable — and it is the one that most needs explaining (Codex round
-    // 1, P2): the operator configured `fail`, and it was downgraded to a warning
-    // because detection did not run everywhere.
+    // case: `fail`, an orphan found on a reachable shard, and another shard
+    // uninspectable. It is the case that most needs explaining. The operator
+    // configured `fail`, and it was downgraded to a warning because detection
+    // did not run everywhere.
     let logs = CapturedLogs::default();
     let subscriber = tracing_subscriber::fmt()
         .with_writer(logs.clone())

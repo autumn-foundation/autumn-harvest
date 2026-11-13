@@ -930,9 +930,9 @@ async fn paused_queue_is_excluded_from_the_uncovered_list() {
         report.get("items").and_then(Value::as_array).map(Vec::len),
         Some(0)
     );
-    // The pause exclusion is not invisible: a paused, pollerless queue that
-    // has real pending work must still be named so it doesn't silently
-    // outlast `harvest_queue_paused_too_long`'s own grace window.
+    // The pause exclusion is not invisible. A paused, pollerless queue that
+    // has real pending work must still be named. Otherwise it silently
+    // outlasts the grace window of `harvest_queue_paused_too_long`.
     assert_eq!(
         report.get("excluded_paused_queues"),
         Some(&json!(["seasonal-batch"])),

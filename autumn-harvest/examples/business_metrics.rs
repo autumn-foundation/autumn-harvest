@@ -8,7 +8,7 @@
 //!
 //! - `ctx.metrics().counter(...)`   from a **workflow branch** — suppressed on
 //!   every replay cycle, emitted exactly once at the live execution frontier.
-//!   This is the shape activities can't cover: the meaningful event here is an
+//!   This is the shape activities cannot cover: the meaningful event here is an
 //!   orchestration *decision* ("took the auto-reject branch").
 //! - `ctx.metrics().histogram(...)` from an **activity** — never suppressed;
 //!   each retry attempt is a separate execution and emits independently.

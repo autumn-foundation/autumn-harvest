@@ -874,7 +874,7 @@ mod tests {
         let off = offloader(store.clone(), 16);
         let mut event = event_with_output(serde_json::json!("q".repeat(1_000)));
         off.offload_event_value(&mut event).await.unwrap();
-        // Rewrite the envelope's store_id to a store we don't have.
+        // Rewrite the envelope's store_id to a store that is not configured.
         event["data"]["output"]["store_id"] = serde_json::json!("other");
         let err = off.inflate_event_value(&mut event).await.unwrap_err();
         assert!(err.to_string().contains("unknown store"));

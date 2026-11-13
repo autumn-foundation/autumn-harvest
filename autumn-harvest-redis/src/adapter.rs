@@ -131,7 +131,7 @@ pub trait TaskQueueAdapter: Send + Sync {
     /// Refresh the visibility timeout on a task that is still being worked on.
     ///
     /// Equivalent to the heartbeat path on the Postgres adapter: it tells the
-    /// queue "I'm still alive, don't reclaim this task yet".
+    /// queue that the worker is still alive, so it must not reclaim this task yet.
     fn record_heartbeat<'life0, 'life1, 'async_trait>(
         &'life0 self,
         task: &'life1 ClaimedTask,

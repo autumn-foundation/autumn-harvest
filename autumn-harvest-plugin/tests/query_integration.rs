@@ -204,11 +204,11 @@ fn continue_as_new_info() -> WorkflowInfo {
     }
 }
 
-/// Issue #772 (round 6): a workflow with an `execution_timeout` that performs
-/// the deadline-aware `should_continue_as_new()` checkpoint check (recording /
-/// consuming the reserved `__harvest_deadline_probe` side-effect) BEFORE
-/// processing each item. Its recorded history therefore carries the probe
-/// event — a query replay context that fails to thread the execution's
+/// Issue #772: a workflow with an `execution_timeout`. It performs the
+/// deadline-aware `should_continue_as_new()` checkpoint check BEFORE it
+/// processes each item. The check records or consumes the reserved
+/// `__harvest_deadline_probe` side-effect. So its recorded history carries the
+/// probe event. A query replay context that does not thread the execution's
 /// `execution_timeout`/`deadline_at` leaves that probe unconsumed and diverges.
 fn deadline_probe_workflow<'a>(
     ctx: &'a WorkflowContext,
@@ -847,15 +847,16 @@ async fn ac6_spinning_replay_returns_408() {
     );
 }
 
-// ── Issue #772 (round 6): deadline probe × query hydration ───────────────────
+// ── Issue #772: deadline probe × query hydration ─────────────────────────────
 //
 // A workflow with an `execution_timeout` records a `__harvest_deadline_probe`
-// side-effect whenever it calls `should_continue_as_new()`. The query hydration
-// paths (`hydrate_ctx_for_query` for the HTTP API here, and the in-process
-// `execute_query_in_process` in `handle.rs`) must thread the execution row's
-// `execution_timeout` + `deadline_at` into their replay context, or the probe is
-// left unconsumed and the query diverges (500 during drive, or a spurious 410 on
-// the terminal drift check). These DB-backed tests exercise the real HTTP path.
+// side-effect whenever it calls `should_continue_as_new()`. Two query hydration
+// paths exist: `hydrate_ctx_for_query` for the HTTP API here, and the in-process
+// `execute_query_in_process` in `handle.rs`. Each must thread the execution
+// row's `execution_timeout` + `deadline_at` into its replay context. Otherwise
+// the probe stays unconsumed and the query diverges. The result is a 500 during
+// drive, or a spurious 410 on the terminal drift check. These DB-backed tests
+// exercise the real HTTP path.
 
 /// Seed an execution row carrying `execution_timeout` (INTERVAL) and
 /// `deadline_at` (TIMESTAMPTZ) plus a history whose events include the deadline

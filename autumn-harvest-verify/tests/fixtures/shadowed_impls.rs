@@ -1,4 +1,4 @@
-//! Fixture (review round 2, finding 3): two inherent impls whose SELF TYPE
+//! Fixture: two inherent impls whose SELF TYPE
 //! shares a last path segment, with different bodies.
 //!
 //! Compiled standalone (no workspace deps) with:

@@ -293,27 +293,26 @@ fn collect_descriptors_by(
             );
         }
     }
-    // Process unique names in *effective-registration* order -- the index of
+    // Process unique names in *effective-registration* order: the index of
     // the occurrence `effective` actually resolved to (its last occurrence),
-    // not the index of the name's first mention (code review, PR #908,
-    // round 2 of this fix). The operation-id collision check below is
-    // documented and tested as "first-registered wins," but when a name is
-    // registered more than once, the registration that matters is the one
-    // `effective` (and thus the runtime) actually uses -- an earlier,
-    // superseded registration of that same name is irrelevant history, not a
-    // real claim on "registered first." Example: `[invoice_status(non-mcp),
-    // start_invoice(mcp), invoice_status(mcp)]` -- `invoice_status`'s
-    // *effective* registration is the third entry, which comes after
-    // `start_invoice`'s only (and thus effective) registration; ordering by
-    // first-mention would have processed `invoice_status` first anyway
-    // (since its first, now-superseded mention was earliest), incorrectly
-    // letting it win the `start_invoice_status` collision over
-    // `start_invoice`, which is the one actually "first" among registrations
-    // that matter. Sorting by `effective_index` (populated in lockstep with
-    // `effective` above) fixes this while leaving the earlier, no-duplicates
-    // regression fix (registration order beats alphabetical order) intact --
-    // the two coincide whenever no name repeats. The final returned `Vec` is
-    // still sorted by name below, independent of processing order.
+    // not the index of the name's first mention (code review, PR #908). The
+    // operation-id collision check below is documented and tested as
+    // "first-registered wins." When a name is registered more than once, the
+    // registration that matters is the one `effective` (and thus the runtime)
+    // uses. An earlier, superseded registration of that name is history, not
+    // a real claim on "registered first." Example: `[invoice_status(non-mcp),
+    // start_invoice(mcp), invoice_status(mcp)]`. The *effective* registration
+    // of `invoice_status` is the third entry. It comes after the only (and
+    // thus effective) registration of `start_invoice`. Ordering by first
+    // mention processes `invoice_status` first, because its superseded mention
+    // is earliest. That incorrectly lets it win the `start_invoice_status`
+    // collision over `start_invoice`, which is the one actually "first" among
+    // registrations that matter. Sorting by `effective_index` (populated in
+    // lockstep with `effective` above) fixes this. The earlier no-duplicates
+    // regression fix (registration order beats alphabetical order) stays
+    // intact, because the two coincide whenever no name repeats. The final
+    // returned `Vec` is still sorted by name below, independent of processing
+    // order.
     let mut names: Vec<&str> = effective.keys().copied().collect();
     names.sort_by_key(|name| effective_index[name]);
 
@@ -474,7 +473,7 @@ pub fn tool_route_specs(prefix: &str, descriptor: &McpWorkflowDescriptor) -> Vec
         .map_or_else(String::new, |d| format!(" {d}"));
 
     // The DAG-vs-workflow behavioral difference lives right here: which
-    // handler the start tool routes to (and how it's described). A DAG start
+    // handler the start tool routes to (and how it is described). A DAG start
     // always routes through the DAG trigger contract (admission gates,
     // max_active_runs), regardless of whether the DAG consumes signals.
     let (start_kind, start_description) = if descriptor.is_dag {
@@ -782,14 +781,14 @@ pub fn record_schemas(descriptors: &[McpWorkflowDescriptor]) {
 /// when an existing entry with the same name carries genuinely different
 /// content.
 ///
-/// `MCP_SCHEMAS` has no per-`HarvestPlugin`-instance scoping — it can't,
-/// since autumn-web's `ApiDoc::register_schemas` hook is a bare fn pointer
-/// with no captured state (see the module doc above `MCP_SCHEMAS`). Two
-/// `HarvestPlugin::mcp_tools()` builds in one process (parallel tests, or a
-/// multi-tenant embedder) that register a same-named workflow with
-/// different schemas will still have the later build's schema win — this
-/// cannot be fixed without an upstream autumn-web change — but the collision
-/// is no longer silent.
+/// `MCP_SCHEMAS` has no per-`HarvestPlugin`-instance scoping. It cannot
+/// have one: autumn-web's `ApiDoc::register_schemas` hook is a bare fn
+/// pointer with no captured state (see the module doc above `MCP_SCHEMAS`).
+/// Two `HarvestPlugin::mcp_tools()` builds in one process (parallel tests,
+/// or a multi-tenant embedder) can register a same-named workflow with
+/// different schemas. The schema of the later build still wins. Only an
+/// upstream autumn-web change can fix that, but the collision is no longer
+/// silent.
 fn insert_schema_warn_on_divergence(
     map: &mut HashMap<String, serde_json::Value>,
     name: String,
@@ -1787,11 +1786,11 @@ mod tests {
         );
     }
 
-    /// Code-review regression test (issue #597, PR #908, round 2 of the
-    /// collision-order fix): when a name is registered more than once, the
-    /// registration that determines "registered first" for collision
-    /// purposes must be the *effective* (last, runtime-executed)
-    /// registration, not the name's first, possibly-superseded mention.
+    /// Code-review regression test for the collision-order fix (issue #597,
+    /// PR #908). When a name is registered more than once, the registration
+    /// that determines "registered first" for collision purposes must be the
+    /// *effective* (last, runtime-executed) registration. It must not be the
+    /// first, possibly-superseded mention of the name.
     /// `invoice_status`'s effective registration (the third entry) comes
     /// after `start_invoice`'s only registration (the second entry), so
     /// `start_invoice` must win the `start_invoice_status` collision even
@@ -1991,7 +1990,7 @@ mod tests {
     }
 
     /// The reverse direction: the first registration IS `mcp`-flagged, so
-    /// its schema/hint must be what's advertised even if a later duplicate
+    /// its schema/hint must be what is advertised even if a later duplicate
     /// for the same `(workflow, name)` differs.
     #[test]
     fn collect_descriptors_update_first_mcp_registration_wins_over_later_duplicate() {

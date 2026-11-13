@@ -1162,8 +1162,8 @@ async fn workflow_list_pagination_asc_order() {
 #[tokio::test]
 async fn workflow_list_pagination_keyset_stability_under_concurrent_inserts() {
     // Fetch page 1, insert new rows with newer created_at, then fetch page 2
-    // via cursor. The new rows must NOT appear on page 2 (they'd be on page 0
-    // if re-fetched from scratch) and no rows must be duplicated or skipped.
+    // via cursor. The new rows must NOT appear on page 2. A fresh fetch puts
+    // them on page 0. No row may be duplicated or skipped.
     let (database_url, _container) = setup_single_database().await;
     let pool = build_pool(&database_url);
     let api_state = HarvestApiState::new();
@@ -1195,7 +1195,7 @@ async fn workflow_list_pagination_keyset_stability_under_concurrent_inserts() {
     let cursor1 = next_cursor(&page1).expect("must have next_cursor");
 
     // Insert 2 "new" rows with future timestamps that would sort before the
-    // cursor, i.e. they'd appear on page 1 if requested fresh.
+    // cursor. A fresh request shows them on page 1.
     for i in 0..2u64 {
         let exec_id = seed_workflow(
             &database_url,

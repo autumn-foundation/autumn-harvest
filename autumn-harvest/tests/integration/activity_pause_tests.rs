@@ -1023,7 +1023,7 @@ async fn backdate_queue_paused_at(conn: &mut AsyncPgConnection, queue: &str, sec
 /// A task held by BOTH its queue (#619) and its activity type at once is
 /// over-credited — and that is the deliberate, bounded, *safe* direction.
 ///
-/// Issue #807 review, Codex round 15. Each resume path applies the same
+/// Issue #807. Each resume path applies the same
 /// relative `scheduled_at` shift with no knowledge of the other, so the
 /// overlapping interval is credited twice and the task's genuine pre-pause wait
 /// is erased. `resume_shift_scheduled_at_query`'s "Overlapping queue and
@@ -1566,7 +1566,7 @@ async fn hold_execution_row_lock(conn: &mut AsyncPgConnection, exec_id: Uuid) {
 }
 
 /// A pause that commits while enforcement is BLOCKED on the execution row lock
-/// must still suppress the timeout (issue #807 review, Codex round 17, P1).
+/// must still suppress the timeout (issue #807).
 ///
 /// `enforce_activity_timeout` re-checks the activity pause near the top of its
 /// transaction, and that re-check was documented as leaving only a residual

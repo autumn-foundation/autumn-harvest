@@ -1730,13 +1730,12 @@ async fn publishing_verifies_the_signature_it_is_asked_to_store() {
 
 #[tokio::test]
 async fn signing_can_be_introduced_and_rotated_on_an_existing_build() {
-    // Codex review round 4. The identical-bytes republish path cleared
-    // `retired_at` and left the row's OLD (or NULL) signature in place. So a
-    // republish carrying a signature valid under a NEW key returned success and
-    // then made the next sync with that key reject the very row it had just
-    // accepted — introducing or rotating signing would have required minting a
-    // new build id, i.e. a deploy, which is exactly the coupling this design
-    // exists to remove.
+    // The identical-bytes republish path cleared `retired_at` and left the
+    // row's OLD (or NULL) signature in place. So a republish carrying a
+    // signature valid under a NEW key returned success. The next sync with that
+    // key then rejected the very row it had just accepted. Introducing or
+    // rotating signing would have required a new build id, i.e. a deploy. That
+    // is exactly the coupling this design exists to remove.
     let (mut conn, _c) = db().await;
     let bytes = pipeline_v1_bytes();
     let hash = compute_module_hash(&bytes);
@@ -1794,12 +1793,11 @@ async fn signing_can_be_introduced_and_rotated_on_an_existing_build() {
 
 #[tokio::test]
 async fn an_unsigned_republish_does_not_erase_an_existing_signature() {
-    // Codex review round 5, correcting round 4. Writing the signature
-    // unconditionally meant a publisher supplying none would NULL a valid one —
-    // so mid-rollout, an older or unsigned publisher re-seeding the same build
-    // would turn a harmless duplicate publish into a fleet-wide refusal, every
-    // worker syncing with the key rejecting a row that was correctly signed a
-    // moment earlier. An explicit (verified) signature replaces; `None` leaves
+    // A republish must not write the signature unconditionally. A publisher
+    // supplying none would then NULL a valid one. Mid-rollout, an older or
+    // unsigned publisher re-seeding the same build would turn a harmless
+    // duplicate publish into a fleet-wide refusal. Every worker syncing with
+    // the key would reject a row that was correctly signed a moment earlier. An explicit (verified) signature replaces; `None` leaves
     // the stored attestation alone.
     let (mut conn, _c) = db().await;
     let bytes = pipeline_v1_bytes();
@@ -2478,7 +2476,7 @@ mod one_worker_process {
     }
 }
 
-// ══ Codex review round 1 regressions ══════════════════════════════════════════
+// ══ Review regressions ════════════════════════════════════════════════════════
 //
 // One test per finding, each written to fail against the code as reviewed.
 
@@ -2623,10 +2621,8 @@ async fn the_trampoline_never_yields_between_decisions() {
 
 #[tokio::test]
 async fn decisions_are_reused_across_separate_workflow_tasks() {
-    // Codex review round 2 corrected my round-1 fix, and the reason my own test
-    // missed it is worth stating: it asserted the cache had ENTRIES, not that it
-    // ever produced a HIT. Insertions prove nothing — the broken version
-    // inserted on every step too.
+    // This test asserts a HIT, not only that the cache has ENTRIES. Insertions
+    // prove nothing: a broken per-task cache inserts on every step too.
     //
     // The substance: an ordinary activity ENDS the workflow task. Only local
     // activities re-drive in place, so a hosted workflow resumes in a NEW
@@ -2697,12 +2693,11 @@ async fn a_capability_enabled_host_never_uses_the_decision_cache() {
 
 #[test]
 fn the_run_budget_is_charged_and_checked_once_for_both_cache_paths() {
-    // Codex review round 5, correcting round 4. Charging cache hits was the
-    // right fix; keeping a *separate* check on each path was not. The miss path
-    // checked before computing and never re-checked after adding the cost, so a
-    // fresh decision that pushed the run over budget was accepted while the same
-    // total served from cache was rejected — the residency dependence surviving
-    // inside its own fix.
+    // Cache hits are charged, but a *separate* check on each path is wrong.
+    // A miss path that checks before computing and never re-checks after adding
+    // the cost accepts a fresh decision that pushes the run over budget. The
+    // same total served from cache is then rejected. That is the residency
+    // dependence again, inside its own fix.
     //
     // Guarded structurally rather than functionally. Reproducing it needs a
     // guest expensive enough to exhaust the cumulative fuel budget, which is
@@ -2811,8 +2806,8 @@ async fn the_decision_cache_never_serves_one_builds_answer_to_another() {
     // demonstrate. The key digests the request TOGETHER WITH
     // `(build_id, module_hash)`.
     //
-    // Sharper now than in round 1: the cache is process-wide, so both builds
-    // genuinely share one map rather than merely sharing a host.
+    // The cache is process-wide, so both builds genuinely share one map rather
+    // than merely sharing a host.
     let registry = registry_with(&[
         ("wf-v1", "pipeline", pipeline_v1_bytes()),
         ("wf-v2", "pipeline", pipeline_v2_bytes()),
@@ -2839,13 +2834,11 @@ async fn the_decision_cache_never_serves_one_builds_answer_to_another() {
 
 #[test]
 fn the_decision_cache_is_bounded_in_bytes_not_just_entries() {
-    // Codex review round 3, and the finding is a regression my own round-2 fix
-    // introduced: a count is NOT a memory bound. The key is a 32-byte digest but
-    // the VALUE is a whole `DecideResponse`, which a guest may return at up to
-    // `WASM_MAX_OUTPUT_BYTES` (4 MiB) — so 4096 entries could retain ~16 GiB and
-    // OOM the worker, walking straight past the per-invocation memory ceiling
-    // the sandbox enforces. I had written "entries are small" in the doc comment
-    // and never checked what made them small.
+    // A count is NOT a memory bound. The key is a 32-byte digest, but the VALUE
+    // is a whole `DecideResponse`. A guest may return one at up to
+    // `WASM_MAX_OUTPUT_BYTES` (4 MiB). So 4096 entries could retain ~16 GiB and
+    // OOM the worker, past the per-invocation memory ceiling the sandbox
+    // enforces. Do not assume that entries are small; bound them in bytes.
     let mut cache = DecisionCache::new();
 
     // A response over the per-entry ceiling is not cached at all, so one fat
@@ -2886,8 +2879,8 @@ fn the_decision_cache_is_bounded_in_bytes_not_just_entries() {
 
 #[test]
 fn a_cache_hit_is_charged_to_the_run_budget_like_a_recomputation() {
-    // Codex review round 4. A hit used to be free, which made the run's TERMINAL
-    // OUTCOME depend on cache residency: the same workflow with the same history
+    // A free hit would make the run's TERMINAL OUTCOME depend on cache
+    // residency: the same workflow with the same history
     // would complete when its earlier decisions were still resident and fail
     // when unrelated executions had evicted them, or when one response exceeded
     // `MAX_CACHED_RESPONSE_BYTES` and was never cached. That is the class of
@@ -3069,7 +3062,7 @@ fn the_example_readme_documents_the_wire_format_the_host_actually_sends() {
         "the ABI version is a host-side constant and is never sent"
     );
 
-    // Codex review round 4: the failure outcome's shape must be documented as
+    // The failure outcome's shape must be documented as
     // the host actually sends it. An example showing only `kind` and `error`
     // would make a guest with a strict schema reject every failed-activity
     // request, and would push a guest that does parse it onto `error` — a

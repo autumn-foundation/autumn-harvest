@@ -41,7 +41,7 @@ pub struct HarvestOutboxConfig {
 /// Tunables for the batch-operations executor (issue #102).
 ///
 /// `concurrency` caps the number of in-flight per-target operations so a
-/// 10k-target batch can't monopolise the connection pool. `tick_interval_ms`
+/// 10k-target batch cannot monopolise the connection pool. `tick_interval_ms`
 /// is how often the background loop wakes up to scan for new open jobs;
 /// the same loop drains in-progress jobs synchronously within a tick.
 #[derive(Debug, Clone, PartialEq, Eq)]

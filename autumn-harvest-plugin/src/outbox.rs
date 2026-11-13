@@ -707,8 +707,8 @@ pub(crate) async fn dispatch_workflow_start_request(
     // then fails, the row stays eligible past its claim TTL and the retry re-enters
     // this path (`start_or_load` returns the SAME existing execution), so counting
     // here would report one committed start as multiple bypasses. Counting only
-    // once the mark succeeds mirrors round 6's "gate the count on the row delete
-    // actually removing the row". See `admission_gate::producer_contract`.
+    // once the mark succeeds mirrors the delete-path rule: count only when the
+    // row delete actually removes the row. See `admission_gate::producer_contract`.
     Ok(start.exec_id)
 }
 

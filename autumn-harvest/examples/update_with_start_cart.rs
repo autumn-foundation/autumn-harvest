@@ -151,7 +151,7 @@ async fn add_item_atomic(
             update_id,
             update_name: "add_item".to_string(),
             update_args: serde_json::to_value(&item).unwrap(),
-            // Caller-supplied idempotency key so retried HTTP requests don't
+            // Caller-supplied idempotency key so retried HTTP requests do not
             // admit the same item twice.
             idempotency_key,
             max_workflow_input_bytes: 0,

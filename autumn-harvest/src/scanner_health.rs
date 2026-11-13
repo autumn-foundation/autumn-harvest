@@ -10,7 +10,7 @@
 //! connection, or stalls on a never-returning query, it fails **silently**
 //! — and the
 //! operator only finds out when a downstream correctness symptom (a workflow
-//! that should have timed out but didn't, an SLA that never fired) surfaces
+//! that should have timed out but did not, an SLA that never fired) surfaces
 //! minutes to hours later.
 //!
 //! The pre-existing loop metrics cannot catch this: `record_retention_tick`,

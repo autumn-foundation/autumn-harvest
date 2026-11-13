@@ -205,7 +205,7 @@ pub async fn publish_workflow_module(
         // republishing the same bytes revives it — which is the whole reason
         // retirement is a tombstone rather than a delete.
         //
-        // The SIGNATURE is written too (issue #967, Codex review round 4), and
+        // The SIGNATURE is written too (issue #967), and
         // that is not cosmetic: it is the only way to introduce or rotate
         // signing for a build that already exists. Clearing `retired_at` alone
         // left the old (or NULL) signature in place, so a republish carrying a
@@ -222,8 +222,8 @@ pub async fn publish_workflow_module(
         // `(build_id, workflow_name, module_hash)` tuple — it cannot smuggle in
         // different code.
         //
-        // `COALESCE`, not a bare assignment (issue #967, Codex review round 5,
-        // correcting round 4). A publisher that supplies no signature must not
+        // `COALESCE`, not a bare assignment (issue #967). A publisher that
+        // supplies no signature must not
         // *erase* one: mid-rollout, an older or unsigned publisher re-seeding
         // the same build would otherwise NULL a valid attestation, and every
         // worker syncing with the signing key would then reject the row as
@@ -477,8 +477,8 @@ pub async fn sync_build_into_registry(
 
     // Fetch, verify and compile ONE module at a time, then bind them all at
     // once. The obvious shape — read every payload into a `Vec`, then compile —
-    // holds the whole build's source bytes resident simultaneously (issue #967,
-    // Codex review round 2). Each row is capped at 32 MiB by the table's CHECK,
+    // holds the whole build's source bytes resident simultaneously (issue #967).
+    // Each row is capped at 32 MiB by the table's CHECK,
     // but nothing caps the number of workflow names in a build, so the aggregate
     // is unbounded and a large enough build OOMs the worker during sync. Here a
     // payload is dropped as soon as it has been compiled, so peak residency in
@@ -537,7 +537,7 @@ pub async fn sync_build_into_registry(
     }
 
     // Re-read the build's manifest and refuse to commit if it moved under us
-    // (issue #967, Codex review round 3). The listing above is a snapshot, and
+    // (issue #967). The listing above is a snapshot, and
     // publishing a NEW `(build_id, workflow_name)` under an existing build is
     // allowed by design — the primary key only makes an existing name's bytes
     // immutable. So a module published mid-sync would be missed, and the sync
@@ -552,8 +552,8 @@ pub async fn sync_build_into_registry(
     // confidently half-serving a build, which §8 argues is worse than not
     // serving it at all.
     //
-    // BUT THIS DETECTS THE RACE, IT DOES NOT CLOSE IT (Codex review round 4,
-    // correcting a claim round 3 made too strongly). A publish landing after
+    // BUT THIS DETECTS THE RACE, IT DOES NOT CLOSE IT. An earlier version of
+    // this comment claimed too strongly that it closed it. A publish landing after
     // this re-read and before `commit_prepared` below is still missed. The
     // window shrinks from "the whole fetch-and-compile pass", which is N
     // compilations long, to "one `spawn_blocking` dispatch" — worth having,

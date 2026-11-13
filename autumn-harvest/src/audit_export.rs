@@ -591,11 +591,11 @@ pub struct AuditExportBuilderConfig {
 ///
 /// A SIEM ingest endpoint routinely carries its credential in the path or the
 /// query string (`.../services/collector/<token>`, `?api_key=...`), so the full
-/// URL is a secret in the same way the HMAC key is (issue #953, Codex review
-/// round 23 P1). `AuditExportBuilderConfig`'s `Debug` is hand-written precisely
-/// to keep secrets out of logs and panic messages — it already redacts the HMAC
-/// key and the sink — but it printed the URL verbatim, which is the same leak
-/// `audit_sink::describe_without_url` exists to prevent on the error path. The
+/// URL is a secret in the same way the HMAC key is (issue #953). The `Debug`
+/// impl of `AuditExportBuilderConfig` is hand-written to keep secrets out of
+/// logs and panic messages. It already redacts the HMAC key and the sink, but
+/// it printed the URL verbatim. That is the same leak that
+/// `audit_sink::describe_without_url` prevents on the error path. The
 /// origin is what makes a config dump useful ("which host is this pointed at?")
 /// and is the part that is not a credential.
 ///
@@ -706,8 +706,8 @@ impl AuditExportBuilderConfig {
         if self.sink.is_some() || self.webhook_url.is_none() {
             return false;
         }
-        // An *explicitly empty* secret is missing, not configured (issue #953,
-        // Codex review round 3 P1). `audit_export_secret(env::var("...")
+        // An *explicitly empty* secret is missing, not configured (issue #953).
+        // `audit_export_secret(env::var("...")
         // .unwrap_or_default())` with the variable unset yields
         // `Some(CallbackSecret(b""))`, which an `is_none()` check waves through
         // — and produces exactly the publicly-reproducible signature this
@@ -743,8 +743,8 @@ impl AuditExportBuilderConfig {
         let policy = self.ssrf_policy();
         crate::completion_callback::validate_target_url(url, &policy)
             .map(|_| ())
-            // The REDACTED origin, never the full URL (issue #953, Codex
-            // review round 24 P1). This pair becomes
+            // The REDACTED origin, never the full URL (issue #953). This pair
+            // becomes
             // `HarvestBuilderError::AuditSinkRejected`, whose `Display` a
             // startup failure writes straight to the logs -- and a SIEM ingest
             // URL carries its credential in the path or query. Redacting here
@@ -1150,7 +1150,7 @@ pub struct ClaimedBatch {
     /// written to the cursor row inside the claim transaction.
     ///
     /// Delivery is bounded by what **remains** of this, not by the full lease
-    /// (issue #953, Codex review round 19 P1). The lease starts running when
+    /// (issue #953). The lease starts running when
     /// the claim commits; serializing the batch and reaching the sink consumes
     /// some of it. Bounding the sink call by the whole lease therefore lets a
     /// delivery outlive the row lease, at which point another exporter can
@@ -1194,9 +1194,9 @@ pub async fn ensure_cursor_row(
     //    stamped row (issue #953).
     // 2. The INSERT arm still seeds from `MAX(export_seq)` rather than 0, for
     //    the paths where the row genuinely went missing anyway: a manual
-    //    DELETE, a partial restore (round 4 P1). Restarting at 0 there would
-    //    also violate the cursor's `last_acked_seq <= last_assigned_seq` CHECK
-    //    the moment a retained batch was acknowledged.
+    //    DELETE, a partial restore. Restarting at 0 there would also violate
+    //    the cursor's `last_acked_seq <= last_assigned_seq` CHECK the moment a
+    //    retained batch is acknowledged.
     //
     // On a fresh INSERT `last_acked_seq` stays 0, so a cursor rebuilt from
     // stamped rows re-delivers them rather than assuming they shipped:
@@ -2129,8 +2129,8 @@ pub async fn decommission_cursor(
 
 /// [`decommission_cursor`] without the surrounding transaction.
 ///
-/// The **explicit decommission step** for audit export (issue #953, Codex
-/// review round 3 P1). While a cursor row exists,
+/// The **explicit decommission step** for audit export (issue #953). While a
+/// cursor row exists,
 /// [`crate::audit::purge_old_audit_records`] will not delete a record that
 /// shard still owes the sink — the row's presence, not a timeout, is what says
 /// "an exporter is responsible for this shard".
@@ -2148,7 +2148,7 @@ pub async fn decommission_cursor(
 /// So retiring an export configuration is an operator action, not an inferred
 /// one. See `docs/audit-export.md`.
 ///
-/// The row is **retired, never deleted** (issue #953, Codex review round 7 P1).
+/// The row is **retired, never deleted** (issue #953).
 /// `last_assigned_seq` has to outlive the audit rows themselves, and retiring
 /// the cursor is precisely what lets retention purge them: seeding a recreated
 /// cursor from `MAX(export_seq)` preserves the counter only while at least one
@@ -2195,7 +2195,7 @@ pub async fn decommission_cursor_locked(
     }
 
     // Bumping `claim_epoch` invalidates any delivery still in flight (issue
-    // #953, Codex review round 13 P2). `apply_outcome` is guarded on
+    // #953). `apply_outcome` is guarded on
     // `(shard_id, claim_epoch)` alone, so without this an attempt claimed
     // before the retirement could land after it -- advancing the cursor or
     // writing backoff state onto a row the status route now reports as a
@@ -2703,7 +2703,7 @@ pub fn delivery_state(
     retired_at: Option<DateTime<Utc>>,
 ) -> &'static str {
     // A retired cursor's other columns are a frozen snapshot of whatever the
-    // exporter last did (issue #953, Codex review round 9 P2). Deriving IDLE,
+    // exporter last did (issue #953). Deriving IDLE,
     // BACKOFF or RETRYING from them would tell an operator that records are
     // pending delivery when no exporter owes them and retention is free to
     // purge them. `RETIRED` is checked first because it overrides every other
@@ -2939,7 +2939,7 @@ pub async fn export_status(
     };
 
     // A retired cursor owes nothing, so there is no backlog to report (issue
-    // #953, Codex review round 10 P2). Recomputing it from the live audit table
+    // #953). Recomputing it from the live audit table
     // would keep `pending_records` and `lag_seconds` climbing for a shard no
     // exporter is responsible for -- firing backlog alerts that no action can
     // clear, and contradicting the contract's promise that a retired entry's
@@ -3060,11 +3060,11 @@ pub async fn rewind_cursor_locked(
                 .optional()
                 .map_err(crate::error::database_error)?;
 
-            // A *retired* cursor is not a rewindable one (issue #953, Codex
-            // review round 8 P2). The row now outlives a decommission so its
-            // sequence high-water mark survives — but retention deliberately
-            // ignores retired cursors and is free to purge the very records a
-            // rewind would target, and no exporter is running to ship them.
+            // A *retired* cursor is not a rewindable one (issue #953). The row
+            // now outlives a decommission so its sequence high-water mark
+            // survives. But retention deliberately ignores retired cursors and
+            // is free to purge the very records a rewind would target. No
+            // exporter is running to ship them either.
             // Answering 200 "rewound" there is a promise the system cannot
             // keep, so a retired shard is reported exactly as an unconfigured
             // one was before the row began to persist.
@@ -3251,7 +3251,7 @@ pub async fn redrive_window_truncated(
 
 /// Deliver `batch`, bounded by what remains of this claim's database lease.
 ///
-/// Never the full `config.lease` (issue #953, Codex review round 19 P1). The
+/// Never the full `config.lease` (issue #953). The
 /// lease starts running when the claim commits, and claiming, serializing and
 /// signing the batch have already consumed part of it. Bounding by the whole
 /// lease would let the call outlive the row lease, after which another exporter
@@ -3293,8 +3293,8 @@ async fn deliver_within_lease(
 ///
 /// `read_global_audit_export_config` clones the `Arc` at the top of a tick, so
 /// a second runtime publishing a different sink does not disturb that clone and
-/// the batch reaches the OLD destination (issue #953, Codex review round 25
-/// P1). `apply_outcome` is guarded on `claim_epoch`, which a config swap does
+/// the batch reaches the OLD destination (issue #953). `apply_outcome` is
+/// guarded on `claim_epoch`, which a config swap does
 /// not change, so a 2xx from the old sink would advance the cursor: the records
 /// would be delivered, marked delivered, and absent from the SIEM the operator
 /// actually configured.
@@ -5019,7 +5019,7 @@ mod tests {
     }
 
     /// Delivery is bounded by what REMAINS of the claim's lease, not the full
-    /// lease (issue #953, Codex review round 19 P1). A sink that answers just
+    /// lease (issue #953). A sink that answers just
     /// inside the full lease but outside the remainder must be timed out here,
     /// because the database lease has expired and another exporter may already
     /// have reclaimed the shard and bumped the epoch — an acknowledgement from
@@ -5077,7 +5077,7 @@ mod tests {
     }
 
     /// A SIEM ingest URL routinely carries its credential in the path or query,
-    /// so `Debug` must not echo it (issue #953, Codex review round 23 P1). The
+    /// so `Debug` must not echo it (issue #953). The
     /// hand-written impl already redacted the HMAC key; the URL is a secret in
     /// the same way.
     #[test]
@@ -5175,7 +5175,7 @@ mod tests {
     /// A delivery whose sink was swapped mid-flight must not advance the
     /// cursor: the records went to the OLD destination, and marking them
     /// delivered would leave the newly configured SIEM without them (issue
-    /// #953, Codex review round 25 P1).
+    /// #953).
     ///
     /// Fully deterministic — the decision is a pure function of its arguments,
     /// so this touches no process-wide state and cannot race the 33 other tests

@@ -333,7 +333,7 @@ async fn snapshot_statements(conn: &mut AsyncPgConnection, db_name: &str) -> Vec
 /// existence-check (`to_regclass`) and count on `harvest_start_throttle`, and
 /// the calendar-exclusions lookup on `harvest_calendar_exclusions` -- each
 /// identified by a distinctive table/function + column substring so this
-/// can't accidentally match an unrelated statement shape (e.g. the
+/// cannot accidentally match an unrelated statement shape (e.g. the
 /// schedule-list's own `SELECT * FROM harvest_schedules`).
 ///
 /// `to_regclass` is matched on its own: `pg_stat_statements` normalizes the
@@ -579,7 +579,7 @@ async fn schedule_running_basis_batch_matches_per_schedule_loop() {
 /// carrying schedule A's `schedule_id` but schedule B's `workflow_name` -- must
 /// count toward BOTH the batched and per-schedule running basis for schedule
 /// A, additively on top of A's own same-type count (which still includes a
-/// manual-trigger run of A's own type, proving the disjunct doesn't regress
+/// manual-trigger run of A's own type, proving the disjunct does not regress
 /// existing same-type counting).
 #[tokio::test]
 async fn schedule_running_basis_counts_a_cross_type_successor_additively() {

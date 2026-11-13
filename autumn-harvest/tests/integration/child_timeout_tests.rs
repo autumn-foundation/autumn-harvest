@@ -972,8 +972,8 @@ async fn materialize_due_child_timeout_deadlines_fires_only_due_child_timeout_ti
 }
 
 /// Exactly-once coordination between the two `__child_timeout` deadline-fire
-/// paths (issue #779, Codex P2-A). Since the P1 fix there are two writers that
-/// can fire a due deadline: the parent-claim ingest
+/// paths (issue #779). Two writers can fire a due deadline: the parent-claim
+/// ingest
 /// (`ingest_due_timers_and_signals`) and the out-of-band materializer
 /// (`materialize_due_child_timeout_deadlines`). Both append `TimerFired` **and**
 /// set `fired = true` atomically in one transaction, so a second attempt for the
@@ -1182,7 +1182,7 @@ async fn race_loser_child_cancel_materializing_deadline_advances_event_id_past_a
     );
 }
 
-/// #779 (Codex round-12 P2, HEALTHY-RUN-KILLER): the child-timeout SUSPENSION
+/// #779 (HEALTHY-RUN-KILLER): the child-timeout SUSPENSION
 /// persist path ([`persist_child_timeout_race`]) must append its parent events
 /// with `append_single_event` (parent-row `FOR UPDATE` + `MAX(event_id)`
 /// re-read per insert), byte-for-byte like the plain
@@ -1571,7 +1571,7 @@ async fn transient_event_id_conflict_requeues_parent_instead_of_failing() {
     );
 }
 
-/// Lock-order regression (issue #779, Codex round-11 review, P2 ABBA claim):
+/// Lock-order regression (issue #779, ABBA claim):
 /// [`materialize_due_child_timeout_deadlines`] MUST acquire the parent
 /// EXECUTION row `FOR UPDATE` **before** it takes the due `harvest_timers` rows
 /// `FOR UPDATE`.

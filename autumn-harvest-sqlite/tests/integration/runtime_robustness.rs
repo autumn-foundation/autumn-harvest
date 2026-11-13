@@ -1,5 +1,5 @@
-//! Regression tests for the Codex #1069 (P1/P2) and round-8 healthy-run-killer
-//! findings on the single-writer backend:
+//! Regression tests for the Codex #1069 (P1/P2) healthy-run-killer findings on
+//! the single-writer backend:
 //!
 //! - **FIX 1 (P1)** — engine-detected replay non-determinism is NON-TERMINAL: the
 //!   divergent decision cycle is discarded (nothing appended, execution stays
@@ -9,10 +9,10 @@
 //! - **FIX 2 (P2)** — a workflow that schedules an UNREGISTERED activity releases
 //!   the just-claimed task back to `PENDING` (instead of stranding it `RUNNING`),
 //!   so a later drain re-claims it once the body is registered — no DB reopen.
-//! - **FIX 3 (round 8)** — a PANICKING activity body is contained and routed
+//! - **FIX 3** — a PANICKING activity body is contained and routed
 //!   through the normal retryable-failure path (retry per policy, else terminal
 //!   `ActivityFailed`) instead of unwinding past the finalize and wedging the run.
-//! - **FIX 4 (round 8)** — a single decision cycle emitting BOTH a timer and an
+//! - **FIX 4** — a single decision cycle emitting BOTH a timer and an
 //!   activity (`tokio::join!`) records its schedule events in command order and
 //!   replays cleanly on the core `WorkflowReplayer` (the matcher tolerates the
 //!   interleaved sibling terminals).
@@ -395,7 +395,7 @@ async fn timer_and_activity(ctx: &WorkflowContext, n: i64) -> Result<i64, String
 /// order and the core matcher tolerates the interleaved sibling terminals
 /// (`ActivityCompleted` then `TimerFired`).
 ///
-/// **Command/history-order note (Codex round 4).** `apply_commands` appends a
+/// **Command/history-order note.** `apply_commands` appends a
 /// cycle's schedule events in COMMAND order (the `drain_commands()` order), so
 /// the interleave the Codex spike saw go Stuck is a poll-order concern, not a
 /// schedule-order one: here the activity is the first joined future, so on

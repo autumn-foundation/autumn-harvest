@@ -236,8 +236,8 @@ fn build_query_dispatch(fn_name: &syn::Ident, param_names: &[&syn::Ident]) -> To
 // `mod` for the nested-module case. See `update.rs`'s
 // `same_module_vs_nested_module_parity_tests` for the sibling case (and a
 // real missed-fix defect this shape produced there, commit 896978eb). Query
-// handlers have no update-with-start analogue, so there's no missed-fix
-// history here yet, but the same two-copy risk exists.
+// handlers have no update-with-start analogue, so no missed-fix history
+// exists here yet. The same two-copy risk exists.
 #[cfg(test)]
 mod same_module_vs_nested_module_parity_tests {
     use super::query_macro;

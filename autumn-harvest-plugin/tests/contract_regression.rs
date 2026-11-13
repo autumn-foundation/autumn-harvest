@@ -72,9 +72,9 @@ fn management_routes_match_contract() {
 ///
 /// `audit.rs`'s own exhaustiveness tests only check `CLASSIFIED_ROUTES` and
 /// `ALL_MUTATION_ROUTES` against each other, which stays green even if a route
-/// is added to `harvest_api_router` and never classified at all — as happened
-/// here. This test walks the live router for this one route so the specific
-/// regression this diff fixed can't silently reappear.
+/// is added to `harvest_api_router` and never classified at all. That happened
+/// here. This test walks the live router for this one route, so that the
+/// regression cannot silently come back.
 ///
 /// A broader "every route in `harvest_api_router` must be classified" sweep
 /// was tried here and found 27 pre-existing, unrelated routes with the same

@@ -470,7 +470,7 @@ fn classify_does_not_read_a_uri_userinfo_as_a_query_parameter() {
 
 #[test]
 fn classify_locates_the_query_string_after_the_userinfo_as_the_client_does() {
-    // Codex round 1 (P2). The first `?` is NOT the query delimiter.
+    // The first `?` is NOT the query delimiter.
     // `tokio_postgres` reads userinfo with `take_until(&['@'])` over the whole
     // remaining string BEFORE it looks for a query, so everything here up to
     // the `@` is the *username* and these DSNs have no query string at all.
@@ -511,7 +511,7 @@ fn classify_locates_the_query_string_after_the_userinfo_as_the_client_does() {
 
 #[test]
 fn redaction_survives_leading_whitespace_before_the_scheme() {
-    // Codex round 2 (P1). `is_uri_dsn` ignores leading whitespace for the
+    // `is_uri_dsn` ignores leading whitespace for the
     // *decision*, so `redact_dsn` takes the URI branch — and the query locator
     // has to ignore it the same way or it finds no scheme, reports no query,
     // and hands back a DSN whose password was never looked at. The gate allows
@@ -1105,7 +1105,7 @@ fn a_malformed_stat_line_yields_no_start_token() {
 
 #[test]
 fn a_session_record_remembers_the_binaries_that_started_its_cluster() {
-    // Codex round 1 (P2). A default `cargo dev` on a machine with no
+    // A default `cargo dev` on a machine with no
     // PostgreSQL downloads one into a per-user cache that discovery does not
     // search. Without this field the reaper had no `pg_ctl` for such a
     // cluster — and on Windows no fallback either, since `process_start_token`
@@ -1119,7 +1119,7 @@ fn a_session_record_remembers_the_binaries_that_started_its_cluster() {
 
 #[test]
 fn an_ipv6_host_produces_a_parseable_url() {
-    // Codex round 2 (P2). `format!("http://{host}:{port}")` turns the valid
+    // `format!("http://{host}:{port}")` turns the valid
     // loopback host `::1` into `http://::1:3000`, which no URL parser accepts —
     // so the readiness poll could never succeed and the runtime would report
     // `ServerNotReady` after its full budget, with the real cause absent from
@@ -1160,7 +1160,7 @@ fn a_record_written_before_bin_dir_existed_still_parses() {
 
 #[test]
 fn a_session_record_remembers_the_owner_that_created_it() {
-    // Codex round 2 (P2). Liveness alone lets a REUSED owner pid make an
+    // Liveness alone lets a REUSED owner pid make an
     // abandoned session look permanently active, so its cluster and data
     // directory would survive every later start. The start time tells the
     // recorded run apart from whoever inherited its pid.
@@ -1504,7 +1504,7 @@ fn redaction_is_not_confused_by_an_at_sign_after_the_authority() {
 
 #[test]
 fn banner_does_not_promise_a_restart_demonstration_provisioned_storage_cannot_give() {
-    // Codex round 1 (P1). The banner used to say "kill this process mid-timer
+    // The banner used to say "kill this process mid-timer
     // and start it again to watch the run resume from history". With
     // provisioned storage that is impossible — `shutdown` deletes the cluster
     // and the reaper reclaims a killed run's directory — so a new user
@@ -1542,7 +1542,7 @@ fn banner_offers_the_restart_demonstration_only_for_a_database_we_did_not_create
 
 #[test]
 fn redaction_survives_a_quoted_password_containing_whitespace() {
-    // Codex round 1 (P2). `split_whitespace()` redacted `password='foo` and
+    // `split_whitespace()` redacted `password='foo` and
     // left `hunter2'` in a string whose whole purpose is to be safe to paste.
     for dsn in [
         "host=localhost password='foo hunter2' dbname=app",
@@ -2055,12 +2055,12 @@ fn workspace_root() -> PathBuf {
 }
 
 // ---------------------------------------------------------------------------
-// Codex round 3
+// Quoted DSN values, session record writes and the root refusal
 // ---------------------------------------------------------------------------
 
 #[test]
 fn redaction_survives_a_quoted_password_containing_a_question_mark() {
-    // Codex round 3 (P2). `?` starts a query string in a URI and is an ordinary
+    // `?` starts a query string in a URI and is an ordinary
     // character in a keyword/value string. Splitting on it before knowing which
     // syntax the DSN was in cut `password='abc?hunter2'` in half: the scanner
     // redacted the head and the tail was appended back verbatim.
@@ -2094,7 +2094,7 @@ fn redaction_still_treats_a_real_uri_query_as_a_query() {
 
 #[test]
 fn a_session_record_is_replaced_rather_than_truncated_in_place() {
-    // Codex round 3 (P2). The record is rewritten once the postmaster is up. A
+    // The record is rewritten once the postmaster is up. A
     // truncating writer killed mid-rewrite leaves empty or partial JSON, and
     // `reap_stale_sessions` deliberately skips a record it cannot parse — so
     // the very mechanism meant to reclaim a killed run's postmaster would leak
@@ -2153,7 +2153,7 @@ fn a_session_record_is_written_owner_only() {
 
 #[test]
 fn root_is_refused_before_any_session_state_is_touched() {
-    // Codex round 3 (P1). As `root`, `provision_storage` used to create and
+    // As `root`, `provision_storage` used to create and
     // harden the session root and run the reaper — which executes a recorded
     // `bin_dir`'s `pg_ctl` — before Postgres's own "cannot run as root" refusal
     // was reached. Any unprivileged local user can pre-create `harvest-dev-0`,
@@ -2230,12 +2230,12 @@ async fn provisioning_as_root_creates_no_session_root() {
 }
 
 // ---------------------------------------------------------------------------
-// Codex round 4
+// Percent-encoded keys, reused owner pids and the loopback-only host
 // ---------------------------------------------------------------------------
 
 #[test]
 fn redaction_decodes_a_percent_encoded_password_key() {
-    // Codex round 4 (P2). `tokio_postgres`'s URI parser percent-decodes query
+    // `tokio_postgres`'s URI parser percent-decodes query
     // keys before matching them (`config.rs`, `parse_params`), so
     // `?%70assword=` IS the password parameter to the code that dials — while
     // a comparison against the raw key printed the whole credential.
@@ -2262,7 +2262,7 @@ fn redaction_leaves_other_query_parameters_byte_for_byte() {
 
 #[test]
 fn a_reused_owner_pid_does_not_strand_a_session_forever() {
-    // Codex round 4 (P2). `owner_alive` is an identity answer — the caller
+    // `owner_alive` is an identity answer — the caller
     // computes it from the recorded owner start token. Matching our own pid
     // used to short-circuit ahead of it, so a run that received a dead
     // predecessor's pid (ordinary under supervisors and pid namespaces) would
@@ -2320,7 +2320,7 @@ fn a_reused_owner_pid_does_not_strand_a_session_forever() {
 #[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn a_non_loopback_http_host_is_refused() {
-    // Codex round 4 (P2). `http_host` is public and documented as
+    // `http_host` is public and documented as
     // loopback-only, but a doc comment is not an enforcement — and the
     // management router is mounted with `.api(...)`, not `api_with_auth`,
     // precisely because it is supposed to be unreachable.
@@ -2347,13 +2347,13 @@ async fn a_non_loopback_http_host_is_refused() {
 }
 
 // ---------------------------------------------------------------------------
-// Codex round 5
+// Effective uid parsing and reaping during the start window
 // ---------------------------------------------------------------------------
 
 #[cfg(target_os = "linux")]
 #[test]
 fn the_uid_parser_reads_the_effective_id_not_the_real_one() {
-    // Codex round 5 (P2). The `Uid:` line is `real effective saved filesystem`,
+    // The `Uid:` line is `real effective saved filesystem`,
     // and `id -u` reports the *effective* id (`id -ru` is the real one). Reading
     // the first column made the two sources disagree for exactly the process the
     // root refusal must not fail open on: a setuid-root launcher, real uid 1000,
@@ -2373,7 +2373,7 @@ fn the_uid_parser_reads_the_effective_id_not_the_real_one() {
 
 #[test]
 fn an_unreadable_postmaster_pid_file_leaves_the_session_alone() {
-    // Codex round 5 (P2). During the start window the record carries no
+    // During the start window the record carries no
     // postmaster pid, so `postmaster.pid` is the only evidence a cluster is
     // running. A truncated file — exactly what a crash mid-write leaves —
     // parsed to `None`, which reads as "no server": `decide_reap` answered

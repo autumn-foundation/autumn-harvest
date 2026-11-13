@@ -2226,7 +2226,7 @@ pub(crate) fn build_mcp_routes(
         return None;
     }
     // Codex review (PR #908, P1): `HarvestPlugin` cannot detect or
-    // intercept `AppBuilder::secure_mcp(...)` -- that's configured on
+    // intercept `AppBuilder::secure_mcp(...)` -- that is configured on
     // the outer app builder, after this `Plugin::build` call returns
     // -- so there is no way to *guarantee* these routes are
     // protected. `secure_mcp` only gates the `/mcp` JSON-RPC
@@ -2645,17 +2645,17 @@ async fn start_harvest_runtime(
         }
     }
 
-    // Issue #700 AC4 (P1 fix): boot-time orphaned-workflow-type reachability gate.
+    // Issue #700 AC4: boot-time orphaned-workflow-type reachability gate.
     // Run it HERE — BEFORE `HarvestRunner::start` spawns the worker poll loop and
     // the scanners, and before any admission global is published — not after.
     // Under `orphaned_workflows = fail` + `worker_enabled`, a worker spawned by
-    // `HarvestRunner::start` could CLAIM and terminally FAIL an orphaned-type
-    // execution (no registered handler -> WorkflowFailed + FAILED state) during
-    // the boot window before an after-the-fact abort tore the runner down —
-    // defeating the gate's protective purpose. Placing the gate before any task
-    // can be claimed closes that window; on Abort we `return Err` with nothing to
-    // tear down (no runner / gate-refresh / outbox spawned yet, no admission
-    // globals published).
+    // `HarvestRunner::start` can CLAIM and terminally FAIL an orphaned-type
+    // execution (no registered handler -> WorkflowFailed + FAILED state). It can
+    // do so in the boot window, before an after-the-fact abort tears the runner
+    // down. That defeats the protective purpose of the gate. Placing the gate
+    // before any task can be claimed closes that window. On Abort the function
+    // returns `Err` with nothing to tear down (no runner / gate-refresh / outbox
+    // spawned yet, no admission globals published).
     //
     // The gate itself lives in `runner::run_startup_orphan_gate` (issue #1128),
     // which `HarvestRunner::start` also calls so the STANDALONE embedder path
@@ -2797,7 +2797,7 @@ async fn start_harvest_runtime(
                     state.extension::<std::sync::Arc<autumn_harvest::worker::HandlerRegistry>>();
                 // Metrics recorder for the admission-gate block counter (issue #618,
                 // Finding A). Best-effort: absent only in a degenerate boot window
-                // where the registry extension isn't installed yet.
+                // where the registry extension is not installed yet.
                 let metrics = registry
                     .as_ref()
                     .map(|r| std::sync::Arc::clone(&r.telemetry().metrics));
@@ -2854,27 +2854,27 @@ async fn start_harvest_runtime(
                             autumn_web::error::AutumnError::internal_server_error_msg(e.to_string())
                         })?;
 
-                    // Issue #618, Finding A (round 9 → round 12): the OUTBOUND
-                    // webhook-delivery producer is gated as a FRESH in-process start —
-                    // but an idempotent RETRY for the same webhook log (deterministic
-                    // workflow id `webhook-delivery-{log.id}`, `AllowDuplicate` reuse)
-                    // does NOT admit a fresh run: `start_or_load` just LOADS the existing
-                    // execution, so gating that retry would wrongly block a non-admission
-                    // and inflate the block counter.
+                    // Issue #618, Finding A: the OUTBOUND webhook-delivery producer is
+                    // gated as a FRESH in-process start. An idempotent RETRY for the same
+                    // webhook log (deterministic workflow id `webhook-delivery-{log.id}`,
+                    // `AllowDuplicate` reuse) does NOT admit a fresh run. `start_or_load`
+                    // just LOADS the existing execution. Gating that retry would wrongly
+                    // block a non-admission and inflate the block counter.
                     //
-                    // Round 9 decided this with an UNLOCKED `try_load_by_key`, which had a
-                    // TOCTOU: if the existing run sealed (CONTINUED_AS_NEW / TERMINATED)
-                    // between the read-only check and `start_or_load`, the core start path
-                    // (default `AllowDuplicate`) admitted a FRESH replacement — and because
-                    // the unlocked check had already decided to skip the gate, that fresh
-                    // start slipped an active gate uncounted. Round 12 closes the window by
-                    // making the gate-skip decision CONSISTENT with `start_or_load`'s own
-                    // create-vs-attach decision: `gate_checked_start_or_load` locks the
-                    // existing active run (`FOR UPDATE`) so it cannot seal underneath us,
-                    // decides the gate on that LOCKED state, and runs `start_or_load` in the
-                    // SAME transaction — so a live run is attached (gate skipped) and a
-                    // sealed/absent run's fresh create is gated (matching gate → block+count;
-                    // fail-closed sentinel → block a fresh start, per round 5).
+                    // An UNLOCKED `try_load_by_key` check is not enough: it has a TOCTOU.
+                    // The existing run can seal (CONTINUED_AS_NEW / TERMINATED) between
+                    // the read-only check and `start_or_load`. The core start path (default
+                    // `AllowDuplicate`) then admits a FRESH replacement. The unlocked check
+                    // has already decided to skip the gate, so that fresh start slips an
+                    // active gate uncounted.
+                    //
+                    // The gate-skip decision therefore follows the create-vs-attach
+                    // decision of `start_or_load`. `gate_checked_start_or_load` locks the
+                    // existing active run (`FOR UPDATE`), so it cannot seal underneath. It
+                    // decides the gate on that LOCKED state and runs `start_or_load` in the
+                    // SAME transaction. A live run is attached and skips the gate. A fresh
+                    // create for a sealed or absent run is gated: a matching gate blocks
+                    // and counts, and the fail-closed sentinel blocks a fresh start.
                     let start_params = autumn_harvest::execution::StartWorkflowParams {
                         reuse_policy: autumn_harvest::WorkflowIdReusePolicy::default(),
                         concurrency_on_conflict:

@@ -980,7 +980,7 @@ fn parse_accepts_a_bare_registered_workflow_array() {
 #[test]
 fn entries_are_sorted_and_deduplicated_last_wins() {
     // The runtime collapses duplicate workflow names into a HashMap (last wins);
-    // the generator must match or it publishes a schema the runtime won't use.
+    // the generator must match or it publishes a schema the runtime will not use.
     let c = WorkflowSchemaContract::from_entries(
         "0.0.0-test",
         vec![
@@ -1910,7 +1910,7 @@ fn cross_referencing_definitions_do_not_fan_out_exponentially() {
     assert!(!diff.has_breaking(), "{:#?}", diff.deltas);
 }
 
-// ── review round: sibling clobber, opaque `$ref`, malformed bounds, version ───
+// ── Sibling clobber, opaque `$ref`, malformed bounds, version ─────────────────
 
 /// A node carrying BOTH `enum` and `oneOf` must keep its `enum`.
 ///
@@ -4466,7 +4466,7 @@ fn relaxing_an_integer_cardinality_bound_is_still_compatible() {
     );
 }
 
-// ── Round 19: unit-enum collapse must not drop per-branch types ─────────────
+// ── Unit-enum collapse must not drop per-branch types ───────────────────────
 
 #[test]
 fn swapping_types_between_mixed_type_singleton_branches_is_breaking() {
@@ -4561,7 +4561,7 @@ fn reordering_mixed_type_singleton_branches_is_not_reported() {
     );
 }
 
-// ── Round 19: what the engine actually enforces ────────────────────────────
+// ── What the engine actually enforces ──────────────────────────────────────
 
 #[test]
 fn every_keyword_the_engine_enforces_is_in_the_analysed_set() {
@@ -4694,7 +4694,7 @@ fn narrowing_an_array_typed_singleton_branch_set_is_breaking() {
     );
 }
 
-// ── Round 20: a memoized $ref must not silence the branch-overlap guard ────
+// ── A memoized $ref must not silence the branch-overlap guard ──────────────
 
 /// `A` is referenced from an ordinary property AND from a `oneOf` branch.
 /// `properties` is a sorted map, so `a_common` is traversed first and consumes

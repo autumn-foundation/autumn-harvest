@@ -708,7 +708,7 @@ async fn boot_gate_fail_action_allows_clean_boot() {
 }
 
 // -------------------------------------------------------------------------
-// Issue #700 AC4 (P1 fix): the boot-time orphan gate runs BEFORE workers spawn.
+// Issue #700 AC4: the boot-time orphan gate runs BEFORE workers spawn.
 //
 // The production race (a worker claiming/failing an orphaned run in the boot
 // window before an after-the-fact abort) cannot be booted from a test — the
@@ -723,7 +723,7 @@ async fn boot_gate_fail_action_allows_clean_boot() {
 /// The boot-gate core resolves the abort decision from just a `registered` set
 /// and a shard pool — with NO `HarvestApiState`/runtime constructed. That is
 /// the compile-time + runtime evidence that the gate can run before
-/// `HarvestRunner::start` spawns any worker (the whole point of the P1 fix).
+/// `HarvestRunner::start` spawns any worker (the whole point of the issue #700 fix).
 #[tokio::test]
 async fn gate_report_core_needs_no_runtime() {
     let (database_url, _container) = setup_db_env_or_container().await;

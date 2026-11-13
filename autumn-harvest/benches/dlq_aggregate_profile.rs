@@ -70,7 +70,7 @@ use uuid::Uuid;
 /// is producing a specific, documented, reproducible number must not
 /// silently profile a *different* configuration than the one actually
 /// requested and report success as if nothing were wrong (its own
-/// cardinality self-check would still pass, since it's computed from the
+/// cardinality self-check would still pass, since it is computed from the
 /// same substituted value).
 fn env_usize(key: &str, default: usize) -> usize {
     match std::env::var(key) {
@@ -224,7 +224,7 @@ fn main() {
 
     // `group_count.min(n)` -- with fewer rows than requested groups, only
     // `n` distinct group indices (0..n) ever get produced regardless of
-    // `group_count`; that isn't a fidelity bug, just arithmetic.
+    // `group_count`. That is not a fidelity bug, just arithmetic.
     let expected_groups = group_count.min(n);
 
     // Self-check (once, outside the measured loop -- constant O(1) cost

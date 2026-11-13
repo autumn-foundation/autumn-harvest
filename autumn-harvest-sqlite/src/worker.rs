@@ -219,7 +219,7 @@ pub async fn drain_ready(
 
         // Body runs OUTSIDE any transaction — at-least-once (see module docs).
         //
-        // Contain a PANICKING body (issue #782 analog; Codex round 8). A body
+        // Contain a PANICKING body (issue #782 analog). A body
         // that `panic!()`s (rather than returning `Err`) would otherwise unwind
         // past the finalize/requeue branch AFTER the row is already `RUNNING`, so
         // no failure/requeue ever commits and the run wedges permanently (the

@@ -268,8 +268,8 @@ pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             let workflow_id = workflow_id.into();
             let update_args = #serialize_payload;
             // Issue #499: a debounced workflow cannot be started through the
-            // typed client (it can't route to the debounce-key shard or admit
-            // through the gate); debounce admission is HTTP-only. Same
+            // typed client. It cannot route to the debounce-key shard or admit
+            // through the gate, so debounce admission is HTTP-only. Same
             // rationale covers the sibling throttle and batch checks
             // `reject_if_admission_may_defer` also runs. Reject early.
             Self::info().reject_if_admission_may_defer(&start_input)?;

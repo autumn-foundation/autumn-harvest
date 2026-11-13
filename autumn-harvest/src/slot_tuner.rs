@@ -26,7 +26,7 @@
 //! `max_slots - initial_target` of them as owned permits it holds itself.
 //! **Grow** releases withheld permits (making them available for dispatch).
 //! **Shrink** first tries an opportunistic, non-blocking re-acquire on every
-//! tick; if that can't land (e.g. a busy worker's dispatch queue keeps
+//! tick; if that cannot land (e.g. a busy worker's dispatch queue keeps
 //! winning every released permit), it falls back to a background task that
 //! joins the semaphore's own fair FIFO wait queue, guaranteeing the shrink
 //! eventually lands on its turn rather than needing to win a race against
@@ -172,7 +172,7 @@ pub trait SlotTuner: Send + Sync {
 /// 2. **Saturated and waiting** — every current slot is in use *and* the
 ///    longest recent permit wait has reached [`Self::permit_wait_grow_threshold`]
 ///    — grow. Mere full occupancy with no observed wait is not, by itself, a
-///    signal to grow (a burst that drains within a tick shouldn't ratchet
+///    signal to grow (a burst that drains within a tick should not ratchet
 ///    capacity up).
 /// 3. Otherwise — hold.
 #[derive(Debug, Clone, Copy)]
@@ -285,7 +285,7 @@ impl SlotTunerConfig {
 /// producing an invalid `(lo, hi)` pair with `lo > hi` — capacity is never
 /// widened past the operator's stated ceiling just because the floor was
 /// misconfigured above it. This makes `[min_slots, max_slots]` a true
-/// mathematical interval (`lo <= hi`) everywhere it's consumed, so callers
+/// mathematical interval (`lo <= hi`) everywhere it is consumed, so callers
 /// (notably `.clamp()`, which panics on `min > max`) never see an invalid
 /// range.
 #[must_use]
@@ -428,7 +428,7 @@ pub struct TunedSlotRuntime {
     /// correctly releases only part of an entry when needed.
     withheld: Vec<OwnedSemaphorePermit>,
     /// The most recently requested target, independent of how much of it
-    /// has actually been achieved (issue #548 review). A shrink that can't
+    /// has actually been achieved (issue #548 review). A shrink that cannot
     /// fully land in one call — every slot at the current target is
     /// occupied by in-flight work, so no permit is free to withhold — must
     /// not be silently forgotten just because a *later* tick's fresh
@@ -441,8 +441,8 @@ pub struct TunedSlotRuntime {
     min_slots: usize,
     max_slots: usize,
     /// A background task joining the semaphore's real (fair, FIFO) wait
-    /// queue for one permit, when a shrink can't land via `try_acquire`
-    /// (issue #548 review, round 4). `try_acquire` can be starved
+    /// queue for one permit, when a shrink cannot land via `try_acquire`
+    /// (issue #548). `try_acquire` can be starved
     /// indefinitely under a sustained dispatch backlog: `tokio::sync::Semaphore`
     /// always assigns a released permit to the oldest queued
     /// `.acquire()` waiter before a concurrent `try_acquire` can ever see
@@ -479,7 +479,7 @@ impl TunedSlotRuntime {
         // (a caller bug) is the only way the acquire below can fail — stop
         // withholding rather than panicking, but fall the live target back
         // to the semaphore's true available count so `slot_occupancy`
-        // accounting (which trusts `live_target`) can't silently diverge
+        // accounting (which trusts `live_target`) cannot silently diverge
         // from the semaphore's actual, unconstrained capacity.
         let (withheld, actual_target) = match u32::try_from(to_withhold) {
             Ok(0) => (Vec::new(), target),
@@ -589,7 +589,7 @@ impl TunedSlotRuntime {
     /// as permits are returned, since `desired` is remembered in
     /// [`Self::desired_target`] independent of what this call achieves.
     ///
-    /// Async (issue #548 review, round 4) only to reap an already-finished
+    /// Async (issue #548) only to reap an already-finished
     /// background shrink-acquire (see [`Self::pending_shrink`]) — that
     /// `.await` never actually suspends, since it is only reached after
     /// confirming the task [`JoinHandle::is_finished`]. This does not make
@@ -646,7 +646,7 @@ impl TunedSlotRuntime {
                     }
                     // No free permit right now — every remaining slot at
                     // the current target is occupied by in-flight work, or
-                    // (issue #548 review, round 4) the semaphore has a
+                    // (issue #548) the semaphore has a
                     // queued dispatch backlog and `try_acquire_owned` loses
                     // to it every time. Stop the opportunistic loop either
                     // way; the fallback below picks up the slack by
@@ -665,7 +665,7 @@ impl TunedSlotRuntime {
         // Still short of `desired` and no background acquire already in
         // flight: join the semaphore's real (fair, FIFO) wait queue for
         // one permit instead of only ever retrying `try_acquire` (issue
-        // #548 review, round 4). Once queued here, nothing can "cut in
+        // #548). Once queued here, nothing can "cut in
         // front" of this request — unlike `try_acquire`, which loses to
         // any already-queued dispatch waiter every time a permit is
         // released — so this guarantees eventual forward progress under a
@@ -694,8 +694,8 @@ impl TunedSlotRuntime {
     /// shrunk target during shutdown. See "Known limitation" in
     /// `docs/operations/adaptive-slot-tuner.md`.
     pub fn release_all_withheld(&mut self) {
-        // Abort any in-flight background shrink-acquire first (issue #548
-        // review, round 4): if it's still queued in the semaphore's FIFO
+        // Abort any in-flight background shrink-acquire first (issue #548):
+        // if it is still queued in the semaphore's FIFO
         // wait list, it must be removed before the permits below are
         // released, or it could win one of them ahead of
         // `drain_in_flight`'s later request (which joins the same fair
@@ -761,10 +761,9 @@ async fn tick_one(
 
     let action = tuner.decide(&observations);
     // Base the next target on the *desired* target for Shrink/Hold, but
-    // always on the achieved `current_target` for Grow (issue #548 review,
-    // round 2). An unmet shrink (every slot occupied when it was requested)
-    // must keep being retried by a later Hold/Shrink rather than silently
-    // dropped — that's what `desired_target` is for. But a *Grow* means the
+    // always on the achieved `current_target` for Grow (issue #548). An unmet
+    // shrink (every slot occupied when it was requested) must keep being
+    // retried by a later Hold/Shrink rather than silently dropped. That is what `desired_target` is for. But a *Grow* means the
     // controller has just observed the live semaphore itself saturated and
     // backlogged (occupancy is computed from `current_target`, i.e.
     // `live_target`, not `desired_target`); basing that grow on a stale,
@@ -811,7 +810,7 @@ async fn tick_one(
 /// Runs regardless of whether a metrics recorder is configured — unlike a
 /// pure sampler, the tuner is a controller with a real effect on dispatch
 /// capacity, so it must not be silently disabled by `is_enabled() == false`.
-/// Telemetry emission (not the control decision) is what's gated.
+/// Telemetry emission (not the control decision) is what is gated.
 ///
 /// On cancellation, every withheld permit (for both slot types) is released
 /// before the task returns so a subsequent `drain_in_flight` can observe
@@ -1323,7 +1322,7 @@ mod tests {
 
     #[tokio::test]
     async fn tick_one_retries_an_unmet_shrink_after_a_later_hold_decision() {
-        // Regression test (issue #548 review): a shrink that can't fully
+        // Regression test (issue #548 review): a shrink that cannot fully
         // land in one tick (every slot at the current target is occupied)
         // must not be forgotten just because a later tick's fresh
         // observation no longer looks saturated and reports Hold.
@@ -1355,7 +1354,7 @@ mod tests {
         let mut slot = TunedSlot::new_for_test(runtime, SlotType::Workflow);
 
         // Tick 1: tuner requests Shrink(4), but no permit is free — the
-        // shrink can't land this tick.
+        // shrink cannot land this tick.
         let decision1 = tick_one(&mut slot, &tuner, None).await;
         assert_eq!(decision1, TunerDecision::Shrink);
         assert_eq!(slot.runtime.live_target(), 10);
@@ -1389,7 +1388,7 @@ mod tests {
 
     #[tokio::test]
     async fn tick_one_grow_after_unmet_shrink_rebases_on_live_not_stale_desired() {
-        // Regression test (issue #548 review, round 2): once a shrink is
+        // Regression test (issue #548): once a shrink is
         // stuck unmet (desired_target below live_target), a later Grow
         // decision must expand from the achieved live_target, not resume
         // from the stale, lower desired_target — otherwise a controller
@@ -1423,7 +1422,7 @@ mod tests {
         };
         let mut slot = TunedSlot::new_for_test(runtime, SlotType::Workflow);
 
-        // Tick 1: Shrink(10) requested, but no permit is free — it can't
+        // Tick 1: Shrink(10) requested, but no permit is free — it cannot
         // land. desired_target drops to 10 while live_target stays at 20.
         let decision1 = tick_one(&mut slot, &tuner, None).await;
         assert_eq!(decision1, TunerDecision::Shrink);
@@ -1513,8 +1512,8 @@ mod tests {
         for _ in 0..8 {
             in_flight.pop();
         }
-        // Let the background shrink-acquire spawned above (issue #548
-        // review, round 4) actually complete before it's reaped: dropping
+        // Let the background shrink-acquire spawned above (issue #548)
+        // actually complete before it is reaped: dropping
         // the permits above wakes it but does not run it inline.
         for _ in 0..50 {
             tokio::task::yield_now().await;
@@ -1525,7 +1524,7 @@ mod tests {
 
     #[tokio::test]
     async fn resize_toward_shrink_eventually_succeeds_despite_losing_to_a_queued_waiter() {
-        // Regression test (issue #548 review, round 4): a plain
+        // Regression test (issue #548): a plain
         // `try_acquire`-only shrink can be starved indefinitely by a real
         // dispatch-style queued waiter, since `tokio::sync::Semaphore`
         // always hands a released permit to the oldest queued

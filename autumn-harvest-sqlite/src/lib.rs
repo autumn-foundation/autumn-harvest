@@ -652,7 +652,7 @@
 //! cross-backend guarantee (a history written here replays on the core engine) is
 //! export-shaped and needs none. A future edge → hub sync path that ingests an
 //! in-flight history would have to rebuild the derived task/timer rows from any
-//! open scheduled work (or reject such histories) so a run isn't wedged — that is
+//! open scheduled work, or reject such histories, so that no run wedges. That is
 //! a follow-up.
 //!
 //! # Updates (issue #2025)
@@ -676,7 +676,7 @@
 //! a durable command, such as an activity or a timer. Such a handler returns
 //! [`SqliteError::UpdateTimedOut`] and writes no event.
 //!
-//! # Robustness — healthy-run-killer containment (Codex #1069 / round 8)
+//! # Robustness — healthy-run-killer containment (Codex #1069)
 //!
 //! Failure modes that would otherwise WEDGE (or wrongly seal) a healthy run are
 //! contained:

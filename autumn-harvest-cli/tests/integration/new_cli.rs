@@ -436,7 +436,7 @@ fn default_path_none_resolves_to_name_under_cwd() {
     let name = "scaffold_cwd_demo";
     let result = run_new(name, None, false, ScaffoldTemplate::Minimal);
 
-    // Restore cwd before asserting so a panic can't leave the process adrift.
+    // Restore cwd before asserting so a panic cannot leave the process adrift.
     std::env::set_current_dir(&original).expect("restore cwd");
 
     result.expect("scaffold ok");

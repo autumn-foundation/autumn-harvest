@@ -522,7 +522,7 @@ fn a_refused_update_does_not_modify_the_baseline() {
     );
 }
 
-// ── review round: an empty `--current` is a broken producer, not a deletion ──
+// ── An empty `--current` is a broken producer, not a deletion ──────────────
 
 const EMPTY_CONTRACT: &str = r#"{
   "version": "0.0.0-test",

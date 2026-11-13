@@ -203,10 +203,10 @@ pub fn age_secs(observed_at: DateTime<Utc>, started_at: DateTime<Utc>) -> i64 {
 /// accepts an arbitrary `default_shard`, not just `0` -- see
 /// `ShardRouter::single()` vs. the general constructor). Hardcoding
 /// `shard_id == 0` here would falsely report a healthy legacy worker as
-/// uncovered on any deployment whose single shard isn't literally numbered
-/// `0`. Without this normalization at all, a perfectly healthy legacy
-/// single-shard worker would be reported as covering no shard whatsoever,
-/// falsely flagging every queue it actually polls.
+/// uncovered on any deployment whose single shard is not literally numbered
+/// `0`. Without this normalization, a healthy legacy single-shard worker
+/// is reported as covering no shard. Every queue it polls is then falsely
+/// flagged.
 ///
 /// Shared by `queue_coverage.rs::worker_covers_queue` (issue #774) and
 /// `shard_health.rs::worker_assigned_to_shard`/`worker_can_cover` (issue

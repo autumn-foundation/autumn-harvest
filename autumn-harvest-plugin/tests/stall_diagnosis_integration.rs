@@ -1496,7 +1496,7 @@ async fn diagnose_requires_admin() {
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
 
-// ── AC2 wire coverage for the remaining variants (review round) ────────────
+// ── AC2 wire coverage for the remaining variants ───────────────────────────
 
 /// A drained rate-limit bucket on a NON-breaker activity resolves to
 /// `activity_rate_limited`. Exercises `saturated_rate_limit_keys` end to end —
@@ -2391,7 +2391,7 @@ async fn overdue_timer_does_not_correlate_via_coincidental_proximity_alone() {
 /// A durable timer fires only when a worker claims the owning workflow task, so
 /// a run "sleeping" on a timer whose workflow queue nobody polls is not
 /// sleeping — it can never wake. The queue is the actionable cause, not the
-/// future deadline (PR #1188 review round 5).
+/// future deadline (PR #1188).
 #[tokio::test]
 async fn sleeping_timer_on_a_dead_workflow_queue_reports_no_worker() {
     let (url, _guard) = setup_database().await;
@@ -2606,7 +2606,7 @@ async fn ac2_replay_failure_degrades_to_history_only_and_still_serves_200() {
     );
 }
 
-// ── PR #1188 review round 2: the run's own workflow task row ───────────────
+// ── PR #1188: the run's own workflow task row ──────────────────────────────
 
 /// A workflow task held by a worker means the handler is executing RIGHT NOW.
 /// Canonically a long local activity (issue #98), which schedules no queue row
@@ -2635,7 +2635,7 @@ async fn claimed_workflow_task_reports_healthy_not_a_lost_task() {
     assert_eq!(body["health"], "healthy", "body: {body}");
 }
 
-// ── PR #1188 review round 3: hard impediments outrank a stored claim ───────
+// ── PR #1188: hard impediments outrank a stored claim ──────────────────────
 
 /// A crashed worker leaves its workflow task RUNNING with a non-null `worker_id`
 /// until the poison-pill reclaimer processes it (issue #367). With nothing
@@ -2812,7 +2812,7 @@ async fn workflow_task_fallback_never_masks_a_wedged_activity() {
     );
 }
 
-// ── issue #809 / PR #1188 round 6: nd-blocked runs are not healthy ─────────
+// ── issue #809 / PR #1188: nd-blocked runs are not healthy ─────────────────
 
 /// Stamp the issue #603 non-determinism block columns on a RUNNING execution.
 async fn mark_nd_blocked(pool: &DbPool, exec_id: ExecutionId, reason: &str, count: i32) {
@@ -3423,7 +3423,7 @@ async fn split_fleet_satisfying_each_dimension_separately_is_not_coverage() {
     );
 }
 
-// ── Codex round 9: held rows follow the CLAIMANT, not claim eligibility ─────
+// ── Held rows follow the CLAIMANT, not claim eligibility ────────────────────
 
 /// Seed a HELD (`RUNNING`) activity row whose claim is owned by `claimant`.
 async fn seed_held_activity_task(
@@ -3457,8 +3457,8 @@ async fn seed_held_activity_task(
 /// awaiting `drain_in_flight`, so held work runs to completion.
 ///
 /// Pre-fix this reported `activity_no_worker`/`stalled` for the entire drain
-/// window, because round 8's Active-only claim eligibility was applied to held
-/// rows too.
+/// window. The cause was that the Active-only claim eligibility rule also
+/// applied to held rows.
 #[tokio::test]
 async fn held_activity_on_a_draining_claimant_is_still_progressing() {
     let (url, _guard) = setup_database().await;
@@ -3782,9 +3782,9 @@ async fn rolling_deploy_old_build_worker_is_not_rejected_on_the_new_builds_requi
     );
 }
 
-/// The control -- round 11 preserved. When every live worker runs the SAME build
-/// as this replica, our registry genuinely describes their handlers, so the
-/// fallback still gates them and an unsatisfied label is a real stall.
+/// The control: the registry gate still holds. When every live worker runs the
+/// SAME build as this replica, our registry genuinely describes their handlers.
+/// So the fallback still gates them, and an unsatisfied label is a real stall.
 #[tokio::test]
 async fn same_build_workers_are_still_gated_by_the_registry_fallback() {
     let (url, _guard) = setup_database().await;
@@ -4037,7 +4037,7 @@ async fn ac2_mixed_build_eligible_workers_still_suppress_the_verdict() {
     assert_eq!(kind(&body), "healthy_in_progress", "body: {body}");
 }
 
-/// Review round 2: a row with NO eligible worker at all is a DIFFERENT
+/// A row with NO eligible worker at all is a DIFFERENT
 /// question from a row whose eligible worker is off-build. With no candidate
 /// worker there is no peer to disagree with, so the untracked activity's
 /// rate-limit fact is exactly as reliable as it always was -- and

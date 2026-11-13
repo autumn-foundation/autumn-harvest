@@ -5,7 +5,7 @@
 //! at the boundary where workflow/activity results leave the engine.
 //!
 //! Note: `AutumnError` (from autumn-web) is intentionally NOT `std::error::Error`
-//! — it's an HTTP response wrapper. `HarvestError` converts to `AutumnError` via
+//! — it is an HTTP response wrapper. `HarvestError` converts to `AutumnError` via
 //! the blanket `From<E: Error> for AutumnError` impl automatically.
 
 use uuid::Uuid;
@@ -76,7 +76,7 @@ impl std::fmt::Display for PayloadKind {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "fuzzing", derive(arbitrary::Arbitrary))]
 pub enum TimeoutType {
-    /// Worker claimed the task but didn't finish in time.
+    /// Worker claimed the task but did not finish in time.
     StartToClose,
     /// Task was enqueued but no worker claimed it in time.
     ScheduleToStart,
@@ -349,7 +349,7 @@ pub enum HarvestError {
     /// Raised from inside the start transaction's `FOR UPDATE` lock, only
     /// when the call actually creates a new execution -- a call that merely
     /// attaches to an already-running execution never validates `start_input`
-    /// (it's never written), closing the TOCTOU window a caller-side,
+    /// (it is never written), closing the TOCTOU window a caller-side,
     /// pre-lock check would otherwise need to work around. Carries the same
     /// structured violations `POST /workflows/{name}/start` returns.
     #[error("input validation failed: {} violation(s)", violations.len())]
@@ -1072,7 +1072,7 @@ pub enum HarvestError {
 
     /// A live dispatch cycle suspended making no replay-significant progress,
     /// and the worker could not confirm it still owns the task's claim
-    /// (issue #1182, Codex review round 2).
+    /// (issue #1182).
     ///
     /// This is a **blameless, not-a-real-failure sentinel**, exactly like
     /// [`Self::HandlerNotRegistered`]: it means "no terminal decision can be
@@ -1216,7 +1216,7 @@ impl CapabilityMissPhase {
     /// Restoring `attempt` there would leave the next capable claim looking
     /// exactly like a first dispatch, and `harvest.workflow.started` would be
     /// emitted a **second** time for one execution, inflating start counts and
-    /// every SLO derived from them (Codex round-17 P2).
+    /// every SLO derived from them.
     ///
     /// Splitting on the phase satisfies both roles at once, because the two
     /// populations do not overlap:
@@ -2372,8 +2372,8 @@ mod tests {
 
     /// Durable inline progress at an *earlier* frontier does not license
     /// clearing any of the three strikes at a *later* mid-body miss (issue
-    /// #804, Codex round-24 P2 — declined, pinned here so the decline is
-    /// enforced rather than only argued).
+    /// #804). A proposal to clear them was declined. This test pins the decline
+    /// so that it is enforced rather than only argued.
     ///
     /// The scenario: a task with a strike already recorded completes local
     /// activity 1, then hits an unregistered local activity 2 and is released.
@@ -2462,7 +2462,7 @@ mod tests {
         // non-terminal (the task is released for a capable peer), so it must not
         // reset a streak it observed nothing about -- otherwise a worker
         // alternating "panic" and "unregistered local activity" resets
-        // `workflow_panic_max_attempts` forever (Codex round-13 P2).
+        // `workflow_panic_max_attempts` forever.
         assert!(
             CapabilityMissPhase::AfterHandler.clears_panic_strike(),
             "the body returned its commands without panicking, so the \
@@ -2497,7 +2497,7 @@ mod tests {
 
     #[test]
     fn capability_miss_phase_restores_the_attempt_only_before_the_handler_ran() {
-        // Issue #804 Codex round-17 P2. `task.attempt` is what
+        // Issue #804. `task.attempt` is what
         // `record_workflow_started` reads to decide whether a workflow dispatch
         // is the FIRST one. Restoring it after the handler already ran makes the
         // next capable claim look like a first dispatch and double-counts the
@@ -2523,7 +2523,7 @@ mod tests {
         // `DuringHandler` is the single phase that separates the two facts --
         // it began but did not finish, so BOTH answers are `false` there. Pin
         // that, or a later refactor could "simplify" this to
-        // `!clears_panic_strike()` and silently re-introduce the round-17
+        // `!clears_panic_strike()` and silently re-introduce the start-metric
         // double-count for every mid-body local-activity miss.
         assert!(
             !CapabilityMissPhase::DuringHandler.restores_dispatch_attempt()

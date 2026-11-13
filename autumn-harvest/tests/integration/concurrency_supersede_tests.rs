@@ -298,7 +298,7 @@ async fn start_run_full(
 }
 
 /// Same as [`start_run`] but with an explicit reuse policy, so the
-/// `replace_execution` admission arms can be driven (issue #811, Codex round 2).
+/// `replace_execution` admission arms can be driven (issue #811).
 async fn start_run_with_reuse(
     conn: &mut AsyncPgConnection,
     metrics: &CapturingMetrics,
@@ -1127,7 +1127,7 @@ async fn scan_limit_clamps_shed_per_admission_and_still_converges() {
     assert_eq!(state_of(&mut conn, last).await, "RUNNING");
 }
 
-// ── Scheduler-tick supersede metrics (issue #811, Codex round 1, P2) ───────
+// ── Scheduler-tick supersede metrics (issue #811) ─────────────────────────
 
 /// A scheduled fire that supersedes must emit the counters too.
 ///
@@ -1282,7 +1282,7 @@ async fn scheduled_tick_supersede_emits_the_counters() {
     );
 }
 
-// ── Replacement admissions supersede too (issue #811, Codex round 2, P2) ──
+// ── Replacement admissions supersede too (issue #811) ────────────────────
 
 /// A `replace_execution` admission is a fresh admission — it must shed too.
 ///
@@ -1483,7 +1483,7 @@ async fn defer_replacement_admission_sheds_nothing() {
     assert!(metrics.superseded.lock().unwrap().is_empty());
 }
 
-// ── Completion-trigger supersede metrics (issue #811, Codex round 2, P2) ──
+// ── Completion-trigger supersede metrics (issue #811) ────────────────────
 
 /// A completion-trigger target that supersedes must emit the counters too —
 /// but ONLY once the caller's enclosing transaction has actually committed
@@ -1491,12 +1491,12 @@ async fn defer_replacement_admission_sheds_nothing() {
 ///
 /// `evaluate_triggers_for_execution` propagates the target's declared
 /// `on_conflict`, so a same-shard inline trigger start genuinely *does*
-/// supersede an incumbent. Originally (issue #811, Codex round 2) that
-/// supersede's counters were dropped entirely by a metrics-discarding
-/// wrapper; Codex round 3 fixed emission but left it EAGER — fired at
-/// return, inside the source execution's still-open terminal transaction, so
-/// a later rollback of that transaction would leave a phantom count for a
-/// cancellation that never became durable. Issue #1197 closes that residual:
+/// supersede an incumbent. Originally (issue #811) a metrics-discarding
+/// wrapper dropped that supersede's counters entirely. A later fix restored
+/// emission but left it EAGER. It fired at return, inside the source
+/// execution's still-open terminal transaction. A later rollback of that
+/// transaction then left a phantom count for a cancellation that never became
+/// durable. Issue #1197 closes that residual:
 /// `evaluate_triggers_for_execution_collecting` COLLECTS the samples into
 /// `pending` instead of emitting them, and the caller is responsible for
 /// calling `emit_start_cancel_metrics` only after its own transaction
@@ -1963,7 +1963,7 @@ async fn nested_self_referential_admission_emits_residual_over_limit_counter() {
     )
     .await;
 
-    // Codex round 3 (P2, issue #1197 item 2): `cancel_workflow_execution_collect`
+    // Issue #1197 item 2: `cancel_workflow_execution_collect`
     // used to hardcode `metrics: None` for its own completion-trigger
     // evaluation, so a nested admission recursing off of it could only ever
     // reach a recorder through the process-global fallback, dropping the

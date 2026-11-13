@@ -1408,7 +1408,7 @@ mod tests {
             "precondition: the gate blocks via check() before the lift"
         );
 
-        // Handler's post-lift, refresh-failed path: apply the delta, DON'T fail-closed.
+        // Handler's post-lift, refresh-failed path: apply the delta, do NOT fail-closed.
         cache.apply_lifted(gid);
 
         assert!(
@@ -1561,7 +1561,7 @@ mod tests {
     }
 
     // Serialises the two tests that mutate the process-global gate cache so they
-    // don't race under the default parallel test runner (issue #618 review).
+    // do not race under the default parallel test runner (issue #618 review).
     static GLOBAL_CACHE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]

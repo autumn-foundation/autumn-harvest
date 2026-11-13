@@ -347,7 +347,7 @@ fn the_real_example_workflow_body_is_reachable_by_path() {
     );
 }
 
-// ── Review round 2: shadowed statics and shadowed impl methods ──────────────
+// ── Shadowed statics and shadowed impl methods ─────────────────────────────
 
 #[test]
 fn statics_are_indexed_by_their_full_printed_path() {

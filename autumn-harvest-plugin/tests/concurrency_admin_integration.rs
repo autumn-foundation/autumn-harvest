@@ -327,7 +327,7 @@ async fn admin_concurrency_dedups_repeated_workflow_names_on_one_key() {
 }
 
 /// An **activity** concurrency group always reports `defer`, even when its
-/// owning workflow declares `cancel_running` (issue #811, Codex round 1).
+/// owning workflow declares `cancel_running` (issue #811).
 ///
 /// Latest-wins is a workflow-*start* admission control: the supersede runs
 /// inside the start primitive and sheds workflow *executions*. An activity task

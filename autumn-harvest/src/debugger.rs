@@ -2636,15 +2636,15 @@ mod tests {
     /// `normalized_event_facts` strips per-run identity by **field name**, and
     /// that list is hand-written — so an engine-minted field added to
     /// `WorkflowEvent` later would silently start being compared verbatim,
-    /// making two independent recordings of one scenario diff as different
-    /// (noise that buries the signal — the `worker_id` case Codex found in
-    /// round 3). Re-derive the set from `event.rs` itself so the omission
-    /// fails here instead.
+    /// making two independent recordings of one scenario diff as different.
+    /// That noise buries the signal, as a missed `worker_id` once did.
+    /// Re-derive the set from `event.rs` itself so the omission fails here
+    /// instead.
     ///
     /// The inverse direction matters just as much: a field the engine does
     /// *not* mint must never be in the list, because normalizing a semantic
-    /// field is a false clean — the `idempotency_key` (#521) case Codex found
-    /// in round 2.
+    /// field is a false clean. The `idempotency_key` (#521) field is the case
+    /// that showed this.
     #[test]
     fn engine_minted_id_fields_match_the_event_enum() {
         // Normalized to LF: a Windows checkout terminates the enum with

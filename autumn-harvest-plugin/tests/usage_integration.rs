@@ -572,7 +572,7 @@ async fn reset_terminated_cancelled_execution_still_counted_as_cancelled() {
 async fn external_activity_timeout_without_a_start_is_not_counted_as_failed() {
     // PR #895 review (chatgpt-codex-connector): enforce_external_task_timeouts
     // appends ActivityTimedOut for external activities that never emit
-    // ActivityStarted (they're dispatched via ActivityAwaitingExternal, never
+    // ActivityStarted (they are dispatched via ActivityAwaitingExternal, never
     // claimed by a worker). activity_executions_failed must require a
     // matching start, same as activity_compute_seconds already does.
     let (url, _c) = setup_single_shard().await;

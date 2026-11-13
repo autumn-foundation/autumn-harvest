@@ -260,7 +260,7 @@ async fn sse_stream_route_exists_in_router() {
         .unwrap();
 
     let res = app.oneshot(req).await.unwrap();
-    // The route must be registered — 404 means it's not
+    // The route must be registered. A 404 means that it is not.
     assert_ne!(
         res.status(),
         StatusCode::NOT_FOUND,

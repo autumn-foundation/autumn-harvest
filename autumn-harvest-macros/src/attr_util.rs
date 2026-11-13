@@ -84,11 +84,10 @@ pub fn parse_bool_flag(meta: &syn::meta::ParseNestedMeta<'_>) -> syn::Result<boo
 /// whatever context-type name `expected_ident` names (e.g. `"WorkflowContext"`,
 /// `"WebhookCtx"`).
 ///
-/// `query.rs`/`update.rs`/`signal.rs` each hard-code their own copy of this
-/// check against a fixed `"WorkflowContext"` ident; this generalized version
-/// exists so newer macros (`webhook.rs`) don't add yet another near-identical
-/// copy. The three pre-existing hard-coded copies are left as-is to keep this
-/// change scoped.
+/// `query.rs`, `update.rs` and `signal.rs` each hard-code their own copy of
+/// this check against a fixed `"WorkflowContext"` ident. This generalized
+/// version exists so that newer macros (`webhook.rs`) do not add another
+/// near-identical copy. The three older copies stay as they are.
 pub fn first_param_is_ctx_type(
     inputs: &syn::punctuated::Punctuated<syn::FnArg, syn::token::Comma>,
     expected_ident: &str,

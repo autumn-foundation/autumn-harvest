@@ -14,7 +14,7 @@
 //! callgrind runs each of the pre-fix and post-fix binaries (see #1372's
 //! commits) varied by ~0.1-0.2% run-to-run, over two orders of magnitude
 //! below the delta this harness was built to detect. dhat's allocation
-//! counts/bytes are unaffected (allocation *count* doesn't depend on hash
+//! counts/bytes are unaffected (allocation *count* does not depend on hash
 //! values) and were confirmed byte-identical across repeated runs.
 //!
 //! # Workload
@@ -61,7 +61,7 @@ fn now() -> DateTime<Utc> {
 }
 
 /// A representative per-activity input/output record — small enough to be
-/// typical, large enough that a `Value` clone isn't free.
+/// typical, large enough that a `Value` clone is not free.
 fn payload(i: usize) -> Value {
     json!({
         "order_id": format!("order-{i:08}"),
@@ -110,7 +110,7 @@ fn build_workload(n: usize, start: DateTime<Utc>) -> (Vec<TimelineEventRow>, Dat
     // retries once first); the rest stay open (scheduled, never started).
     // The retry selector counts CLOSED activities, not `i` -- picking on `i
     // % 5` directly would make every retry candidate (i % 5 == 4) land on an
-    // index that's ALSO open (i % 10 == 9, since 9 % 5 == 4 and the period-10
+    // index that is ALSO open (i % 10 == 9, since 9 % 5 == 4 and the period-10
     // open cycle never shifts that residue), so retries would fire on 1 in 10
     // regular activities instead of the documented 1 in 5 of the CLOSED ones
     // (Codex review on #1372).
@@ -285,7 +285,7 @@ fn validate_workload_params(n: usize, reps: usize) {
     // section above), so the one-time, unmeasured-in-INTENT sanity
     // `derive_timeline` call in `main` below IS captured in the collected
     // instruction count -- there is no in-process way to exclude it without
-    // a client-request crate this repo hasn't taken a dependency on. At
+    // a client-request crate this repo has not taken a dependency on. At
     // reps=1 that one call is roughly HALF of the counted work, silently
     // diluting the measured delta (Codex review on #1372). Requiring at
     // least 100 reps keeps the sanity call's fixed one-call cost under ~1%
@@ -373,7 +373,7 @@ fn main() {
     // add MORE run-to-run variance on top of what derive_timeline's own
     // internal hashing already contributes (see this file's header).
     // BTreeMap is Ord-keyed (no hashing at all), so it costs nothing extra
-    // and doesn't make that existing variance any worse.
+    // and does not make that existing variance any worse.
     let mut kind_tally: std::collections::BTreeMap<&'static str, u64> =
         std::collections::BTreeMap::new();
     let mut total_steps: u64 = 0;

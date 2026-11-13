@@ -1771,7 +1771,7 @@ impl ShardedDbPool {
     }
 
     /// The default shard used when an `ExecutionId` carries the unencoded
-    /// sentinel or references a shard that isn't configured locally.
+    /// sentinel or references a shard that is not configured locally.
     #[must_use]
     pub const fn default_shard(&self) -> ShardId {
         self.default_shard
@@ -1939,7 +1939,7 @@ impl ShardedDbPool {
     /// [`Self::exact_pool_for_execution`] and is authoritative. For
     /// [`ExternalTarget::WorkflowId`] the owning shard is resolved via
     /// [`external_target_owning_shard`]; when that returns `None` (the
-    /// process-global shard router isn't initialized), `fallback_shard` is used
+    /// process-global shard router is not initialized), `fallback_shard` is used
     /// instead.
     ///
     /// # Deprecated (issue #1146)

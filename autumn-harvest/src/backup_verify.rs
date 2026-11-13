@@ -1,6 +1,6 @@
 //! Post-restore resumability verification for backup/PITR drills (issue #943).
 //!
-//! "It's just Postgres" is harvest's durability pitch — your DBA's existing
+//! "It is just Postgres" is harvest's durability pitch — your DBA's existing
 //! backup and point-in-time-recovery tooling applies unchanged. That pitch is
 //! only *true* if the restore story is written down and mechanically checkable,
 //! because a database restored to time `T` comes back carrying in-flight
@@ -4304,7 +4304,7 @@ mod tests {
         Finding::new(class, Some(0), 1, vec!["x".into()])
     }
 
-    /// Codex round 4, P1. `ExternalAwaitFailed` is the channel for BOTH a
+    /// `ExternalAwaitFailed` is the channel for BOTH a
     /// transport failure and a resolved non-`COMPLETED` terminal outcome
     /// (`execution::read_external_await_outcome`). Only the transport codes may
     /// be skipped; the outcome codes assert target-shard state.
@@ -4612,10 +4612,10 @@ mod tests {
         );
     }
 
-    /// Codex round 1, P2. `host=alias-a&hostaddr=X` and `host=alias-b&hostaddr=X`
-    /// reach the SAME database; folding hostaddr into the hostname set made
-    /// identity require matching hostname *text*, so the guard waved the run
-    /// through against production.
+    /// `host=alias-a&hostaddr=X` and `host=alias-b&hostaddr=X` reach the SAME
+    /// database. Folding hostaddr into the hostname set made identity require
+    /// matching hostname *text*, so the guard waved the run through against
+    /// production.
     #[test]
     #[cfg(feature = "db")]
     fn dsn_guard_matches_on_a_shared_hostaddr_despite_different_hostnames() {
@@ -4634,11 +4634,11 @@ mod tests {
         ));
     }
 
-    /// Codex round 7, P2. A NUMERIC `host` is an address, not a name: it needs
-    /// no DNS to compare against the other side's `hostaddr`. Keeping it in the
-    /// hostname set meant `host=10.0.0.5` and `host=prod-alias&hostaddr=10.0.0.5`
-    /// -- the same TCP destination -- overlapped in neither set, so the guard
-    /// waved a production target through.
+    /// A NUMERIC `host` is an address, not a name: it needs no DNS to compare
+    /// against the `hostaddr` of the other side. Keeping it in the hostname set
+    /// meant that `host=10.0.0.5` and `host=prod-alias&hostaddr=10.0.0.5` (the
+    /// same TCP destination) overlapped in neither set. The guard then waved a
+    /// production target through.
     ///
     /// This is NOT the documented name-vs-address limit: that one genuinely
     /// requires resolving a name, which the guard deliberately will not do.
@@ -4811,7 +4811,7 @@ mod tests {
     #[test]
     fn every_reclaimable_class_names_the_mechanism_that_heals_it() {
         // A "reclaimable" verdict is an assurance to the operator; the report
-        // must always say WHAT will heal it, never just "don't worry".
+        // must always say WHAT will heal it, never just "do not worry".
         for class in FindingClass::ALL {
             if class.severity() == FindingSeverity::Reclaimable {
                 let text = class.explanation();
@@ -5196,13 +5196,13 @@ mod tests {
         ));
     }
 
-    /// Codex round 3, P2. libpq (and therefore the server, since
-    /// tokio-postgres simply omits `database` from the startup packet when
-    /// `dbname` is unset) defaults the database name to the CONNECTION USER.
-    /// Storing `""` for an omitted `dbname` made `postgres://harvest@prod-host`
-    /// compare unequal to `postgres://ops@prod-host/harvest` even though both
-    /// land on database `harvest` -- so the guard waved a production target
-    /// through without the acknowledgement.
+    /// libpq defaults the database name to the CONNECTION USER. So does the
+    /// server, because tokio-postgres omits `database` from the startup packet
+    /// when `dbname` is unset. Storing `""` for an omitted `dbname` made
+    /// `postgres://harvest@prod-host` compare unequal to
+    /// `postgres://ops@prod-host/harvest`, though both land on database
+    /// `harvest`. The guard then waved a production target through without
+    /// the acknowledgement.
     // `tokio-postgres` (the guard's parser) is a `db`-feature dependency, so
     // the guard itself only exists in a `db` build.
     #[test]

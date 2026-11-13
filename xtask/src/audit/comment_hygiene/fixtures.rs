@@ -839,7 +839,7 @@ pub const RULE_TESTS: &[RuleCase] = &[
     },
     RuleCase {
         source: "/// Parse the `let's` token from the input.\n",
-        expected: &[("CH006", 1)],
+        expected: &[],
         name: "a narrative phrase inside a code span is a literal",
     },
     RuleCase {

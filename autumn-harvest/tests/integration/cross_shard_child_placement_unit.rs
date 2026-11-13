@@ -565,8 +565,8 @@ fn abandon_never_cascades() {
     );
 }
 
-/// **Regression (Codex round 4, P2).** An `Abandon` row must be retired as soon
-/// as the child exists — not held until the child or the parent terminates.
+/// **Regression.** An `Abandon` row must be retired as soon as the child
+/// exists. It is not held until the child or the parent terminates.
 ///
 /// `Abandon` is owed nothing after the start: no terminal to deliver, and by
 /// definition no cascade. Holding the row until the child ends is unbounded in
@@ -659,8 +659,8 @@ fn a_child_row_not_yet_visible_on_the_target_shard_waits() {
     );
 }
 
-/// **Regression (Codex round 1, P1).** A sweep that could not read the parents
-/// must decide nothing destructive.
+/// **Regression.** A sweep that could not read the parents must decide nothing
+/// destructive.
 ///
 /// `Retire` deletes the outbox row outright with no second look at the parent,
 /// so collapsing a transient parent-read failure into "the parent is terminal"

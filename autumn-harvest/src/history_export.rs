@@ -1433,7 +1433,7 @@ mod tests {
         assert_eq!(snapshot.execution_id, exec_id);
     }
 
-    /// Issue #798 (Codex round-12 P1): a history export must carry the execution's
+    /// Issue #798: a history export must carry the execution's
     /// `queue_name` at the TOP LEVEL — sourced from the row's `queue_name` column,
     /// present in no `WorkflowEvent` — in the same wire shape a
     /// `testing::HistorySnapshot` expects.

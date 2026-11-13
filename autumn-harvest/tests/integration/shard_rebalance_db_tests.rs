@@ -2633,7 +2633,7 @@ async fn a_signal_parked_execution_migrates_with_its_parked_task_row() {
     assert_eq!(parked, 1);
 }
 
-// ── Codex round 1: the two copies of a rebalanced run ────────────────────────
+// ── The two copies of a rebalanced run ───────────────────────────────────────
 //
 // A rebalance seals the source rather than deleting it, so for as long as the
 // source shard's retention has not collected the row an execution's bytes exist
@@ -2790,7 +2790,7 @@ async fn payload_bearing_events(conn: &mut AsyncPgConnection, exec_id: Execution
     .await
 }
 
-// ── Codex round 2: verification is a snapshot, and pointers are collapsed ────
+// ── Verification is a snapshot, and pointers are collapsed ───────────────────
 
 #[tokio::test]
 async fn a_cutover_refuses_a_source_whose_history_advanced_since_verification() {
@@ -2980,7 +2980,7 @@ async fn erasing_a_twice_migrated_run_scrubs_the_intermediate_shard_too() {
     );
 }
 
-// ── Codex round 3: the residence history outliving the row it lived on ───────
+// ── The residence history outliving the row it lived on ──────────────────────
 
 #[tokio::test]
 async fn erasure_still_reaches_the_source_after_target_retention_summarised_the_run() {
@@ -3128,7 +3128,7 @@ async fn conn_for_execution_forwarded_with_shard_names_the_connection_it_returns
     );
 }
 
-// ── Codex round 4 ───────────────────────────────────────────────────────────
+// ── A terminate-and-replace start over a rebalanced prior ───────────────────
 
 #[tokio::test]
 async fn a_terminate_existing_start_refuses_a_rebalanced_prior_instead_of_replacing_it() {
@@ -5284,8 +5284,8 @@ async fn a_reverse_migration_keeps_the_live_shard_last_in_the_residence_chain() 
     );
 }
 
-/// A `TerminateExisting` start for `(workflow_name, workflow_id)` — the policy
-/// that, before the round-4 fix, would seal a rebalanced prior
+/// A `TerminateExisting` start for `(workflow_name, workflow_id)`. Without the
+/// active-conflict refusal, this policy would seal a rebalanced prior
 /// `CONTINUED_AS_NEW` and start a second live run for the same business key.
 fn terminate_existing_start<'a>(
     workflow_name: &'a str,
@@ -5338,7 +5338,7 @@ fn terminate_existing_start<'a>(
     }
 }
 
-// ── Codex round 5 ───────────────────────────────────────────────────────────
+// ── Reverse migrations, refused sources and shard fallback ──────────────────
 
 #[tokio::test]
 async fn a_reverse_migration_keeps_the_origin_seal_resolvable_throughout() {

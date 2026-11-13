@@ -691,7 +691,7 @@ async fn schedule_on_down_shard_is_indeterminate_not_404() {
     // issue #762 review: a schedule that genuinely EXISTS but whose owning shard is
     // unreachable must be reported as INDETERMINATE (503), never as a definitive 404
     // (which would lie about existence). Mirrors `one_shard_down_is_partial_not_500`
-    // but seeds the schedule on the DOWN shard so the existence lookup can't resolve
+    // but seeds the schedule on the DOWN shard so the existence lookup cannot resolve
     // it while a shard is unreachable.
     let ((url0, url1), _c) = setup_two_shards().await;
     let sid = Uuid::new_v4();

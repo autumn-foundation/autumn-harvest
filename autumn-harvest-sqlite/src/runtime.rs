@@ -4312,7 +4312,7 @@ impl SqliteRuntime {
         let mut produced = ingest.apply(&tx, exec)?;
         let mut local = None;
         // Timer ids armed within THIS batch, so a (pathological) duplicate
-        // `StartTimer` for the same id in one cycle can't double-append.
+        // `StartTimer` for the same id in one cycle cannot double-append.
         let mut armed_this_batch: std::collections::HashSet<String> =
             std::collections::HashSet::new();
         for cmd in commands {

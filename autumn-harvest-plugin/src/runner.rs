@@ -508,13 +508,12 @@ pub async fn run_startup_orphan_gate(
         // would either page an operator alerting on that string, or teach them to
         // filter away the real detection.
         //
-        // Codex round 1 (P2): key this on the report STATUS, not on whether any
-        // orphan happened to be seen. The mixed case — `fail`, an orphan found on
-        // a reachable shard, another shard unavailable — is exactly the one an
-        // operator most needs explained, and keying on `orphaned_types.is_empty()`
-        // sent it to the message below, which says nothing about the configured
-        // `fail` having been downgraded to a warning or about boot continuing.
-        // Status is also precisely what `startup_orphan_decision` keys on, so the
+        // Key this on the report STATUS, not on whether any orphan was seen.
+        // The mixed case is `fail`, an orphan on a reachable shard, and another
+        // shard unavailable. An operator most needs that case explained. A key on
+        // `orphaned_types.is_empty()` sent it to the message below. That message
+        // says nothing about the downgrade of `fail` to a warning, or about boot
+        // continuing. `startup_orphan_decision` also keys on status, so the
         // branch and the decision cannot disagree. The orphan details ride along,
         // so nothing is lost when some were found.
         StartupOrphanDecision::Warn if report.status != ReachabilityReportStatus::Complete => {
@@ -746,10 +745,10 @@ fn commit_audit_export_config(
 /// (`BuiltHarvest::deferring_audit_export_install`), a failed startup makes no
 /// global change at all and has nothing to undo — and restoring anyway is
 /// worse than doing nothing. Two overlapping `start` calls snapshot the same
-/// old value; if the first succeeds and publishes while the second fails, the
-/// second's restore silently replaces the *running* runtime's sink with a
-/// stale snapshot (round 19 P1). Doing nothing on failure is both simpler and
-/// correct under concurrency.
+/// old value. Suppose the first succeeds and publishes while the second fails.
+/// The second's restore then silently replaces the *running* runtime's sink
+/// with a stale snapshot. Doing nothing on failure is both simpler and correct
+/// under concurrency.
 struct DeferredAuditExportInstall {
     pending: Option<Arc<autumn_harvest::audit_export::AuditExportRuntimeConfig>>,
 }
@@ -889,16 +888,15 @@ impl PreparedHarvestRuntime {
         let partition_archiver = built.partition_archiver().cloned();
         install_completion_callback_config(&built);
         // Resolved here, while `built` is still owned, but NOT published until
-        // every fallible step below has succeeded (issue #953, Codex review
-        // P1). `install_completion_callback_config` above still publishes
-        // eagerly; that is #605's pre-existing behaviour and out of scope here.
+        // every fallible step below has succeeded (issue #953).
+        // `install_completion_callback_config` above still publishes eagerly.
+        // That is the older behaviour of issue #605.
         let audit_export_config = prepare_audit_export_config(&built);
-        // ...and the conversion below must not publish it either (round 5 P1).
-        // Suppressing that write is what keeps the global *untouched* for the
-        // whole build, rather than clobbered and later repaired: a live
-        // runtime's scanner can tick during `compile_dag_catalog`, and a
-        // restore afterwards cannot un-send the records it exported to a sink
-        // that never came into service.
+        // The conversion below must not publish it either. Suppressing that
+        // write keeps the global *untouched* for the whole build. A later
+        // repair is not enough: a live runtime's scanner can tick during
+        // `compile_dag_catalog`. A restore afterwards cannot un-send the records
+        // it exported to a sink that never came into service.
         let built = built.deferring_audit_export_install();
         let registered_dag_names = built
             .dags()
@@ -956,8 +954,8 @@ impl PreparedHarvestRuntime {
         let effective_config =
             capture_effective_config(&built, &storage_pool, &shard_router, resources_sharded_pool);
         // Carried on the returned `PreparedHarvestRuntime` so it stays
-        // unpublished for the whole of `HarvestRunner::start` — not just this
-        // function (issue #953, Codex review round 16 P1). `start` has more
+        // unpublished for the whole of `HarvestRunner::start`, not just this
+        // function (issue #953). `start` has more
         // fallible work after `build` returns (completion-trigger sync, worker
         // construction, shard-pool validation); an early return there drops
         // this without publishing, leaving the global exactly as it was.
@@ -1503,9 +1501,9 @@ impl HarvestRunner {
         // Every fallible step of startup has now succeeded -- `build`, the
         // completion-trigger sync above, worker construction and its shard-pool
         // validation. Only here may this runtime's sink replace whatever a
-        // previously started runtime installed (issue #953, Codex review round
-        // 16 P1). Returning `Err` anywhere above instead drops `prepared`,
-        // whose guard restores the previous config.
+        // previously started runtime installed (issue #953). Returning `Err`
+        // anywhere above instead drops `prepared` and its guard. The guard
+        // leaves the previous config in place.
         if let Some(guard) = prepared.audit_export_guard.take() {
             guard.commit();
         }
@@ -1611,7 +1609,7 @@ impl HarvestRunner {
         let retention_trigger = retention.as_ref().map(RetentionRuntime::trigger_sender);
         // Batch operations executor (issue #102): drive open `harvest_batch_jobs`
         // rows to completion in the background. Only the worker-owning
-        // process spawns it so we don't run multiple competing executors
+        // process spawns it, so that no competing executors run
         // against the same job rows.
         let batch = if plan.batch() {
             Some(BatchRuntime::spawn(

@@ -746,7 +746,7 @@ pub struct ModuleRegistry {
     /// reproducible order for diagnostics and tests.
     bindings: RwLock<BTreeMap<(String, String), Arc<LoadedWorkflowModule>>>,
     /// Guest decisions already taken, shared by every task on this worker
-    /// (issue #967, Codex review round 2). See [`DecisionCache`] for why the
+    /// (issue #967). See [`DecisionCache`] for why the
     /// process is the right lifetime and why sharing is sound.
     decisions: Mutex<DecisionCache>,
     /// Bumped by every [`Self::unload_build`]. Paired with `unloaded_at` below
@@ -968,7 +968,7 @@ impl ModuleRegistry {
         //
         // Two checks, not one. The first compares each entry against what is
         // *already* bound. The second compares the entries against **each
-        // other** (issue #967, Codex review round 1): a batch carrying two
+        // other** (issue #967): a batch carrying two
         // different modules for one `(build_id, workflow_name)` passes the first
         // check trivially when nothing is bound yet — `bindings` does not know
         // about the batch — and the insert loop below would then let the last
@@ -1092,7 +1092,7 @@ impl ModuleRegistry {
     /// Pair with [`load_generation`](Self::load_generation) and
     /// [`commit_prepared`](Self::commit_prepared) to load a whole build
     /// atomically **without holding every module's source bytes at once**
-    /// (issue #967, Codex review round 2): fetch a payload, prepare it, drop the
+    /// (issue #967): fetch a payload, prepare it, drop the
     /// payload, repeat, then commit. [`load_modules`](Self::load_modules) is the
     /// convenience form for callers that already hold the whole batch.
     ///
@@ -1236,7 +1236,7 @@ pub struct ModuleHost {
     /// lateral movement, not configuration.
     pub allow_queue_override: bool,
     /// The binding the dispatch path already resolved, held for the life of the
-    /// invocation (issue #967, Codex review round 1).
+    /// invocation (issue #967).
     ///
     /// The worker seam resolves the module *before* dispatch so a miss is a
     /// typed capability miss rather than a terminal failure. Dropping that `Arc`
@@ -1254,7 +1254,7 @@ pub struct ModuleHost {
 /// Hard ceiling on the NUMBER of entries in a registry's decision cache.
 ///
 /// A count alone is **not** a memory bound, and reading it as one was a real bug
-/// (issue #967, Codex review round 3): the key is a 32-byte digest, but the
+/// (issue #967): the key is a 32-byte digest, but the
 /// *value* is a whole `DecideResponse`, which a guest may return at up to
 /// [`WASM_MAX_OUTPUT_BYTES`](crate::wasm_activities::WASM_MAX_OUTPUT_BYTES)
 /// — 4 MiB. A guest returning a distinct large response per request could
@@ -1280,7 +1280,7 @@ pub const MAX_CACHED_DECISION_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_CACHED_RESPONSE_BYTES: usize = 64 * 1024;
 
 /// A worker-process-lifetime cache of guest decisions, bounded and
-/// insertion-ordered (issue #967, Codex review round 2).
+/// insertion-ordered (issue #967).
 ///
 /// **Why the process and not the task.** The first cut of this cache lived on
 /// `ModuleHost`, installed fresh per workflow task. That is the wrong lifetime:
@@ -1696,7 +1696,7 @@ fn outcome_for_guest(err: &HarvestError) -> Option<DecideOutcome> {
             error: bound_guest_text(&err.to_string()),
         }),
         // An activity-scoped timeout is an activity OUTCOME, not an engine
-        // failure (issue #967, Codex review round 2). `execute_activity_raw`
+        // failure (issue #967). `execute_activity_raw`
         // produces it from `HistoryMatch::TimedOut`, so it is history-backed and
         // replay-deterministic on exactly the same footing as `ActivityFailed` —
         // and the engine itself pairs the two everywhere it classifies a step
@@ -1979,7 +1979,7 @@ pub fn module_workflow_handler(
                 None
             };
             // The budget is charged for a step whether it was recomputed or
-            // served from cache (issue #967, Codex review round 4). A cache hit
+            // served from cache (issue #967). A cache hit
             // used to be free, which made the run's TERMINAL OUTCOME depend on
             // cache residency: the same workflow, with the same history, would
             // complete when its earlier decisions happened to still be resident
@@ -1990,8 +1990,8 @@ pub fn module_workflow_handler(
             // optimisation instead. The cache is allowed to make a run
             // *cheaper*; it is not allowed to change what the run *decides*.
             // ONE order for both paths: charge the cost, check the budget, then
-            // act on the response (issue #967, Codex review round 5, correcting
-            // round 4). The first cut of this charged cache hits — which was the
+            // act on the response (issue #967). The first cut of this charged
+            // cache hits — which was the
             // point — but kept the miss path's check *before* the decision and
             // never re-checked after adding its cost. So a fresh decision that
             // pushed the run over budget was accepted while the same total
@@ -2265,7 +2265,7 @@ mod tests {
 
     #[test]
     fn activity_scoped_timeouts_are_the_guests_business_but_run_scoped_ones_are_not() {
-        // Codex review round 2. `execute_activity_raw` builds this from
+        // `execute_activity_raw` builds this from
         // `HistoryMatch::TimedOut`, so it is history-backed and replay-
         // deterministic on the same footing as `ActivityFailed` — and the engine
         // pairs the two everywhere it classifies a step result. Withholding it

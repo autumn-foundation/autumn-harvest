@@ -181,7 +181,7 @@ impl CriticalPathAnalyzer {
         //
         // The pre-pass itself is one O(tasks) scan of a cheap
         // `Option::is_none()` check -- no hashing, no allocation -- and is
-        // gated cheapest-first so it never runs for a DAG that couldn't
+        // gated cheapest-first so it never runs for a DAG that could not
         // possibly reach the threshold: `tasks.len()` (already known, O(1))
         // upper-bounds `lookups_needed` (a task with `start_to_close` set
         // only ever LOWERS the count), so `tasks.len() <

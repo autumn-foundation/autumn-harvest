@@ -35,9 +35,9 @@
 //! out: a long-running, wide-fan-out workflow near completion — most of its
 //! scheduled work (activities, local activities, external handoffs, timers,
 //! children) already closed out, a handful still genuinely open. That is
-//! exactly the traffic an operator's `/awaitables` request is for: a
-//! workflow that has been running long enough to accumulate a large history
-//! is also the one worth asking "what's it still waiting on?" about. Both
+//! exactly the traffic an operator's `/awaitables` request is for. A
+//! workflow that has run long enough to accumulate a large history is also
+//! the one worth asking "what is it still waiting on?" about. Both
 //! `WaitSetInput` modes are exercised every rep, mirroring how the same
 //! fixed history is diagnosed from both angles in production (a `/diagnose`
 //! call folds in an awaitables-shaped sub-check; the plugin degrades to
@@ -97,7 +97,7 @@ fn now() -> DateTime<Utc> {
 }
 
 /// A representative per-activity input/output record — small enough to be
-/// typical, large enough that a `Value` clone isn't free.
+/// typical, large enough that a `Value` clone is not free.
 fn payload(i: usize) -> Value {
     json!({
         "order_id": format!("order-{i:08}"),

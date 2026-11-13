@@ -97,11 +97,10 @@ pub use crate::builder::DEFAULT_MAX_CONCURRENT_CLAIMS;
 /// wasteful for no benefit — the sampler stays at this 30s ceiling. When a
 /// fast (sub-30s) schedule is present the sampler instead adapts down toward its
 /// cadence (never below the `poll_interval` floor) so `schedule_overdue` is
-/// detected within its grace window (Codex round 4). See
-/// [`next_overdue_sample_interval`].
+/// detected within its grace window. See [`next_overdue_sample_interval`].
 pub const SCHEDULE_OVERDUE_SAMPLE_MAX: Duration = Duration::from_secs(30);
 
-/// Compute the overdue sampler's next sleep interval (issue #696, Codex round 4).
+/// Compute the overdue sampler's next sleep interval (issue #696).
 ///
 /// Adapts to the fleet's fastest active cadence so the `harvest.schedule.overdue`
 /// gauge is refreshed within the detection grace window even for sub-30s
@@ -128,8 +127,7 @@ pub fn next_overdue_sample_interval(
 /// A `harvest.schedule.overdue` gauge series label: `(kind, name)`.
 type ScheduleGaugeKey = (String, String);
 
-/// Gauge labels to reset to `0` after an overdue sampling pass (issue #696,
-/// Codex round 5).
+/// Gauge labels to reset to `0` after an overdue sampling pass (issue #696).
 ///
 /// When a schedule is deleted or renamed, a later pass stops emitting its
 /// `(kind, name)` gauge series, but both the built-in scrape recorder and
@@ -303,7 +301,7 @@ impl WorkerRuntimeConfig {
     /// instead of silently stranding every workflow routed there. With **no**
     /// sharded pool the list is left **empty**: there is no shard identity to
     /// resolve, and fabricating `[ShardId::new(0)]` would assert a shard number
-    /// this process never established (issue #961 review, Codex round 2). Empty
+    /// this process never established (issue #961). Empty
     /// is also the shape every read-side consumer already normalises as
     /// "covers whatever shard the row was read from" — see
     /// `shard_fanout::worker_covers_shard` and issue #1150.
@@ -733,10 +731,10 @@ pub struct HandlerRegistry {
     /// registry, because the host carries the guest's *policy* — the activity
     /// allowlist, the queue-override switch, the capability grant and the
     /// decide budget — and dispatch has to apply the operator's policy, not a
-    /// default one. Storing only the registry meant the dispatch seam built a
-    /// fresh `ModuleHost::new` per task, silently discarding every restriction
-    /// configured through `allowing_activities` and leaving production guests
-    /// able to schedule any activity the worker knows (Codex review round 1).
+    /// default one. With only the registry, the dispatch seam built a fresh
+    /// `ModuleHost::new` per task. That discarded every restriction configured
+    /// through `allowing_activities`. Production guests could then schedule
+    /// any activity the worker knows.
     /// Dispatch clones this prototype and stamps the execution's build id and
     /// resolved module onto the clone.
     #[cfg(feature = "hot-code-swap")]
@@ -3005,8 +3003,8 @@ pub(crate) fn terminal_command_policy(cmd: &WorkflowCommand) -> TerminalCommandP
 pub(crate) struct AbandonedDispatchPlan {
     /// Child ids that already have an execution row: skip them.
     started_child_ids: HashSet<uuid::Uuid>,
-    /// Dispatch ids this execution's history ALREADY records (issue #952,
-    /// review round 1). The row check above answers "did a child row get
+    /// Dispatch ids this execution's history ALREADY records (issue #952).
+    /// The row check above answers "did a child row get
     /// created"; this answers the question the matcher actually asked — "is this
     /// dispatch already in history" — so the two disagreeing (a retention sweep
     /// or a partial restore removed the row while the `ChildWorkflowStarted`
@@ -3288,7 +3286,7 @@ fn abandoned_dispatch_event_count(commands: &[WorkflowCommand]) -> u64 {
 }
 
 /// Exactly the events a FAILING cycle's [`abandoned_dispatch_events`] will
-/// append, for the history hard-cap preflight (Codex P2 round 3).
+/// append, for the history hard-cap preflight.
 ///
 /// Resolves the same dedup persistence will — a child already backed by an
 /// execution row, or a dispatch this execution's history already records, is
@@ -3370,7 +3368,7 @@ fn extract_single_command<T>(
 
     let first_cmd = iter.next()?;
 
-    // Original behavior: return None if there's more than one non-marker command.
+    // Original behavior: return None if there is more than one non-marker command.
     if iter.next().is_some() {
         return None;
     }
@@ -3488,7 +3486,7 @@ fn extract_started_timer_for_suspension(
 
     let first_timer = timers.next()?;
 
-    // If there is more than one StartTimer command, we don't support parallel timers in this branch.
+    // This branch does not support parallel timers, so more than one StartTimer returns None.
     if timers.next().is_some() {
         return None;
     }
@@ -3962,7 +3960,7 @@ fn local_activity_batch_conflict(commands: &[WorkflowCommand]) -> Option<String>
                     // (a fresh `start_timer`/`reset`) records `TimerStarted`,
                     // inserts no row and never suspends, so it composes legally
                     // beside a local activity and is deliberately NOT listed
-                    // (Codex round 4 P2, issue #950).
+                    // (issue #950).
                     | WorkflowCommand::ArmTimer {
                         for_await: true, ..
                     }
@@ -4457,7 +4455,7 @@ fn existing_external_await_terminal(
 ///
 /// `new_events` contains ONLY the `External{Signal,Cancel}Requested` events plus
 /// any inline terminal (`Delivered`/`Failed`) appended for this batch, so the
-/// resolved-id set is fully derivable from it alone — the batch items aren't
+/// resolved-id set is fully derivable from it alone — the batch items are not
 /// needed. A `Requested` event with no matching terminal (still pending → outbox
 /// route) contributes no id.
 fn resolved_external_ids(new_events: &[WorkflowEvent]) -> ResolvedExternalIds {
@@ -5239,8 +5237,7 @@ fn local_attempt_deadline(
 }
 
 /// The claimed workflow-task row whose capability-miss accounting describes the
-/// frontier a local activity is about to resolve (issue #804, Codex round-21
-/// P1).
+/// frontier a local activity is about to resolve (issue #804).
 ///
 /// Carried into [`run_local_activity_inline`] so the reset can commit in the
 /// SAME transaction as the events that make the progress durable — see
@@ -5253,7 +5250,7 @@ struct FrontierAccounting<'a> {
     /// accounting on a row this dispatch still owns.
     worker_id: &'a str,
     /// Set once a frontier reset has **committed** in this dispatch (issue
-    /// #804, Codex round-22 P2).
+    /// #804).
     ///
     /// This is how `handle_capability_miss` knows the persisted counters
     /// without re-reading them. Because the reset commits in the same
@@ -5268,7 +5265,7 @@ struct FrontierAccounting<'a> {
 }
 
 /// Append a local activity's **frontier-resolving** events and clear the
-/// capability-miss accounting atomically (issue #804, Codex round-21 P1).
+/// capability-miss accounting atomically (issue #804).
 ///
 /// The reset is bookkeeping *about* the appended events: it says "the misses
 /// recorded so far were recorded against a handler this run has now moved past".
@@ -5292,7 +5289,7 @@ struct FrontierAccounting<'a> {
 /// deliberately **not** cleared here, and a later mid-body capability miss
 /// deliberately preserves them (see [`CapabilityMissPhase::clears_crash_strikes`]
 /// and its two siblings). Retiring a frontier is not evidence about any of
-/// them, because the thing they measure happens *after* it (Codex round-24 P2).
+/// them, because the thing they measure happens *after* it.
 ///
 /// Clearing them here would be self-defeating rather than merely lax. Every
 /// dispatch of a task that completes one local activity and then kills its
@@ -5348,7 +5345,7 @@ async fn append_frontier_resolution(
     .await?;
     // Only after the commit: a rolled-back transaction reset nothing, so the
     // claim-time snapshot is still the truth and must stay the basis for the
-    // release-vs-escalate decision (issue #804, Codex round-22 P2).
+    // release-vs-escalate decision (issue #804).
     frontier
         .reset_committed
         .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -5382,7 +5379,7 @@ async fn run_local_activity_inline(
     // off at (issue #494), or `None` when that timeout is disabled. Clamps the
     // reported per-attempt deadline so it can never out-live the cycle.
     workflow_task_deadline: Option<chrono::DateTime<chrono::Utc>>,
-    // Issue #804 (Codex round-21 P1): the claimed row whose capability-miss
+    // Issue #804: the claimed row whose capability-miss
     // accounting is retired atomically with this activity's frontier-resolving
     // append. See `append_frontier_resolution`.
     frontier: FrontierAccounting<'_>,
@@ -5414,9 +5411,9 @@ async fn run_local_activity_inline(
     // `fail_execution_on_error` and sealed it terminally).
     //
     // In practice `missing_local_activity_handler` has already raised this a few
-    // frames up (Codex round-19 P2), before the caller commits the batch's
-    // sibling side effects — this lookup is still the one that yields the
-    // `&ActivityInfo`, so it stays as the backstop that keeps the two honest.
+    // frames up, before the caller commits the batch's sibling side effects.
+    // This lookup still yields the `&ActivityInfo`, so it stays as the backstop
+    // that keeps the two honest.
     // Both consult `registry.activities`, so they cannot disagree about
     // *whether* a handler exists; only about how much work happened first.
     let activity =
@@ -5731,8 +5728,7 @@ async fn run_local_activity_inline(
                     output,
                 };
                 // The success append retires this frontier, so it carries the
-                // capability-miss reset in its own transaction (issue #804,
-                // Codex round-21 P1).
+                // capability-miss reset in its own transaction (issue #804).
                 append_frontier_resolution(
                     conn,
                     exec_id,
@@ -5777,7 +5773,7 @@ async fn run_local_activity_inline(
                 // surface see "amount must be positive" rather than the
                 // internal `{"harvest_activity_failure_v1":{...}}` envelope.
                 // Mirrors what `finalize_activity_failure` does for regular
-                // activities. (Local-activity events don't yet carry the
+                // activities. (Local-activity events do not yet carry the
                 // typed fields — see #227 follow-up for symmetry parity.)
                 let stored_error = typed
                     .as_ref()
@@ -5822,7 +5818,7 @@ async fn run_local_activity_inline(
                     let terminal_pair = [failed_event, exhausted_event];
                     // Retry exhaustion retires this frontier just as decisively
                     // as success, so it too carries the capability-miss reset in
-                    // its own transaction (issue #804, Codex round-21 P1).
+                    // its own transaction (issue #804).
                     append_frontier_resolution(
                         conn,
                         exec_id,
@@ -6360,9 +6356,9 @@ async fn lock_workflow_execution_row_and_load_history(
 /// Take the execution row's `FOR UPDATE` lock **without** loading history.
 ///
 /// [`lock_workflow_execution_row_and_load_history`] pays a `load_history` the
-/// capability-miss escalation has already preloaded (issue #804, Codex round-29
-/// P1), so re-using it there would put the awaited read back inside the very
-/// window that round closed. This takes the lock alone.
+/// capability-miss escalation has already preloaded (issue #804). Re-using it
+/// there would put the awaited read back inside the locked commit window, which
+/// the preload keeps it out of. This takes the lock alone.
 ///
 /// The lock is taken for its **ordering**, not its row: `harvest_task_queue`'s
 /// documented lock order is **execution row → task row** (see `timeout.rs`), so
@@ -7038,7 +7034,7 @@ async fn update_workflow_execution_completed(
     // would silently delete pre-existing user search_attrs of the same name
     // on rows created before these keys became reserved.
     // `nd_search_attrs_clear_patch`/`store::update_search_attrs` are defined
-    // further below in this file; Rust item order doesn't matter here.
+    // further below in this file; Rust item order does not matter here.
     if was_nd_blocked {
         crate::store::update_search_attrs(conn, exec_id, &nd_search_attrs_clear_patch()).await?;
     }
@@ -7258,7 +7254,7 @@ pub fn worker_stale_secs(heartbeat_interval: Duration) -> i64 {
 
 /// The slowest `worker_heartbeat_interval` a peer may be configured with and
 /// still be seen as alive by another worker's capability-miss fleet lookup
-/// (issue #804, Codex round-19 P1).
+/// (issue #804).
 ///
 /// This is a *fleet-wide* contract, not a per-worker one, and it exists because
 /// nothing in `harvest_workers` records a worker's own cadence — a reader has
@@ -7269,7 +7265,7 @@ pub fn worker_stale_secs(heartbeat_interval: Duration) -> i64 {
 pub const MAX_SUPPORTED_HEARTBEAT_INTERVAL_FOR_FLEET_LIVENESS: Duration = Duration::from_secs(60);
 
 /// Floor on the liveness window used by the capability-miss fleet lookup
-/// (issue #804, Codex round-19 P1).
+/// (issue #804).
 ///
 /// [`worker_stale_secs`] answers "is a worker alive?" from *this* worker's
 /// configured cadence, which is correct for the two subsystems that ask it
@@ -7282,9 +7278,9 @@ pub const MAX_SUPPORTED_HEARTBEAT_INTERVAL_FOR_FLEET_LIVENESS: Duration = Durati
 /// live peer running the **default** five-second cadence — a default-config
 /// hazard, not an exotic one. With that peer gone the narrowed fleet holds only
 /// the incapable claimant, [`fleet_capability_evidence`] reports
-/// [`FleetCapabilityEvidence::AllLiveWorkersMissed`], and round 15's
-/// configured-total bound terminally fails the execution while a capable peer
-/// is polling the queue.
+/// [`FleetCapabilityEvidence::AllLiveWorkersMissed`]. The configured-total
+/// bound then terminally fails the execution while a capable peer is polling
+/// the queue.
 ///
 /// The floor is `2 ×` [`MAX_SUPPORTED_HEARTBEAT_INTERVAL_FOR_FLEET_LIVENESS`],
 /// so it covers any peer at or under the supported cadence whatever the
@@ -7303,8 +7299,8 @@ pub const MAX_SUPPORTED_HEARTBEAT_INTERVAL_FOR_FLEET_LIVENESS: Duration = Durati
 /// fail-fast, and the session-pinned carve-out. AC3 therefore still holds, but
 /// via the ceiling alone, so the delay this floor can impose is bounded by that
 /// ceiling rather than by `max_redeliveries`. The cost is a delayed escalation;
-/// the cost of the opposite error is the execution. That is the same trade every
-/// prior round took for unprovable coverage: release for longer, never fail
+/// the cost of the opposite error is the execution. Issue #804 makes the same
+/// trade everywhere for unprovable coverage: release for longer, never fail
 /// sooner.
 pub const CAPABILITY_MISS_MIN_FLEET_STALE_SECS: i64 = 120;
 
@@ -7573,7 +7569,7 @@ async fn register_static_rate_limit_buckets(
                 // `persist_scheduled_activities`).
                 // The EFFECTIVE key, since `rate_limit_key` falls back to
                 // the activity name below and that is what gets registered
-                // (issue #1127, Codex review round 1 P2).
+                // (issue #1127).
                 let static_key = activity.rate_limit_key.unwrap_or(activity.name);
                 if let Some(prefix) = crate::builder::RESERVED_RATE_LIMIT_KEY_PREFIXES
                     .into_iter()
@@ -7594,8 +7590,8 @@ async fn register_static_rate_limit_buckets(
                 let burst = activity.rate_limit_burst.unwrap_or(refill_rate);
                 let key = activity.rate_limit_key.unwrap_or(activity.name);
 
-                // Insert rate limit bucket if it doesn't already exist.
-                // This preserves operator overrides.
+                // Insert the bucket only when it is absent, which preserves
+                // operator overrides.
                 if let Err(error) =
                     queue::ensure_rate_limit_bucket(&mut conn, key, refill_rate, burst).await
                 {
@@ -8044,7 +8040,7 @@ fn capture_shard_dispatch(
 }
 
 /// Whether a shard's poll loop may claim tasks, given that shard's pending
-/// fleet-registration state (issue #804, Codex round-54 P1).
+/// fleet-registration state (issue #804).
 ///
 /// A worker whose atomic register+invalidate pair has not committed is **not a
 /// fleet member**, and claiming while unregistered is actively harmful in two
@@ -8054,9 +8050,9 @@ fn capture_shard_dispatch(
 ///    reads `harvest_workers`, so a worker with no row is absent from the live
 ///    fleet. An incapable peer can then see only itself, derive
 ///    `AllLiveWorkersMissed`, and terminally fail a task *this* worker could
-///    have run. Round 51 stopped an unverified row from being read as
-///    affirmative *false* evidence; it could not make an absent row count as a
-///    live claimant, because nothing records that the worker exists.
+///    have run. The lookup does not read an unverified row as affirmative
+///    *false* evidence. That rule cannot make an absent row count as a live
+///    claimant, because nothing records that the worker exists.
 ///
 /// 2. **Its claims cannot be durably held.** With no `harvest_workers` row,
 ///    every task it claims matches
@@ -8068,9 +8064,9 @@ fn capture_shard_dispatch(
 ///    fail to help: repeatedly claiming work it cannot hold manufactures the
 ///    very terminal failures issue #804 exists to prevent.
 ///
-/// Together those retire the round-51 argument for letting it keep polling
-/// ("it might be capable and rescue the task"): it cannot reliably rescue
-/// anything, and each attempt burns a strike toward a terminal quarantine.
+/// Together those refute the argument for letting it keep polling ("it might
+/// be capable and rescue the task"). It cannot reliably rescue anything, and
+/// each attempt burns a strike toward a terminal quarantine.
 ///
 /// Only the **claim** is gated, never the worker. The heartbeat task keeps
 /// running — it is what retries the registration — so the gate lifts by itself
@@ -8117,12 +8113,11 @@ pub const fn capability_miss_decision(
     //
     // A repeat miss by a worker already known to be incapable does not move
     // this number, so no single worker can consume the budget by winning the
-    // claim race repeatedly (issue #804, Codex round-6 P1). But the count alone
-    // still has no relationship to the live fleet: a rollout with `budget + 1`
-    // old pods and one new capable pod can hand `budget + 1` distinct old
-    // worker ids to this check while the capable pod is live and polling, and
-    // the terminal failure would then assert the exact opposite of the truth
-    // (Codex round-8 P1).
+    // claim race repeatedly (issue #804). But the count alone still has no
+    // relationship to the live fleet. A rollout with `budget + 1` old pods and
+    // one new capable pod can hand `budget + 1` distinct old worker ids to this
+    // check while the capable pod is live and polling. The terminal failure
+    // would then assert the exact opposite of the truth.
     //
     // So the budget may only terminate the task once the registry agrees that
     // no live worker on the queue is still unaccounted for. While a live worker
@@ -8140,22 +8135,22 @@ pub const fn capability_miss_decision(
     // any fleet SMALLER than the budget -- with one incapable worker and the
     // default budget of 5, `distinct_after` is pinned at 1 forever. Left to the
     // absolute ceiling alone that permits 50 releases and escalates on the 51st
-    // claim, roughly 23 minutes at the backoff cap, so
-    // `capability_miss_max_redeliveries` stopped being a *maximum* for the
-    // common small deployment and the issue's own bound ("with zero capable
-    // workers, escalate within <= N") was violated (Codex round-15 P1).
+    // claim, roughly 23 minutes at the backoff cap. Then
+    // `capability_miss_max_redeliveries` is not a *maximum* for the common
+    // small deployment, and the issue's own bound ("with zero capable workers,
+    // escalate within <= N") fails.
     //
     // Gated on `AllLiveWorkersMissed` SPECIFICALLY, not merely
     // `!CapablePeerMayExist`. On `Unavailable` this bound would fire after
-    // `budget` releases that may all have been won by the SAME worker, which is
-    // exactly the round-6 P1 the distinct bound exists to prevent -- one
-    // incapable worker exhausting the budget by winning the claim race over and
-    // over. The distinct bound may fire on `Unavailable` because `budget + 1`
-    // distinct workers is strong evidence on its own; this one may not, because
+    // `budget` releases that may all have been won by the SAME worker. That is
+    // exactly the hazard the distinct bound exists to prevent: one incapable
+    // worker exhausting the budget by winning the claim race over and over.
+    // The distinct bound may fire on `Unavailable` because `budget + 1`
+    // distinct workers is strong evidence on its own. This one may not, because
     // its evidence comes entirely from the registry. A fleet the registry cannot
-    // describe therefore keeps the absolute ceiling as its only bound, which is
-    // the "release for longer, never fail sooner" direction every prior round
-    // has chosen for unprovable coverage.
+    // describe therefore keeps the absolute ceiling as its only bound. That is
+    // the "release for longer, never fail sooner" direction that issue #804
+    // chooses for unprovable coverage.
     if matches!(evidence, FleetCapabilityEvidence::AllLiveWorkersMissed)
         && misses_after_increment > budget
     {
@@ -8237,7 +8232,7 @@ pub enum FleetCapabilityEvidence {
 }
 
 /// Narrow a queue's live workers to those that could actually **claim this
-/// task** (issue #804, Codex round-10 P2).
+/// task** (issue #804).
 ///
 /// Advertising the queue is only `claim_task`'s first gate. It also rejects a
 /// worker whose build is not compatible with the task's `required_build_id`
@@ -8304,8 +8299,7 @@ pub fn claim_eligible_workers(
 /// [`FleetCapabilityEvidence::AllLiveWorkersMissed`], and
 /// [`capability_miss_decision`]'s configured-total bound escalates at
 /// `budget + 1` — turning one transient `SELECT` failure into a terminally
-/// failed execution while a live, eligible, capable peer was polling the queue
-/// (Codex round-18 P1).
+/// failed execution while a live, eligible, capable peer was polling the queue.
 ///
 /// So an unreadable table suppresses the **build** axis only, by asking
 /// [`claim_eligible_workers`] to evaluate no build requirement at all
@@ -8315,8 +8309,8 @@ pub fn claim_eligible_workers(
 ///
 /// This is the same doctrine the unparseable-`required_capabilities` case
 /// already follows inside [`claim_eligible_workers`] ("an unreadable
-/// requirement falls back to keeping the worker"), and the same direction every
-/// prior round chose for unprovable coverage: release for longer, never fail
+/// requirement falls back to keeping the worker"). It is also the direction
+/// issue #804 chooses for unprovable coverage: release for longer, never fail
 /// sooner. Retaining a worker that turns out to be genuinely ineligible costs
 /// at most a delay to the absolute ceiling; dropping a capable one costs the
 /// execution.
@@ -8358,28 +8352,28 @@ pub fn fleet_capability_evidence(
         .iter()
         .all(|live| miss_workers.iter().any(|missed| missed == live));
     if !every_live_worker_missed {
-        // An untried live peer wins over the claimant-absent check below
-        // (Codex round-38 P1). `Unavailable` is detected self-referentially,
+        // An untried live peer wins over the claimant-absent check below.
+        // `Unavailable` is detected self-referentially,
         // so it says nothing about whether the REST of the set is readable: a
         // claimant whose registration failed, or whose heartbeats went stale
         // while it kept polling, yields `Unavailable` from a registry that is
         // otherwise perfectly readable and may be naming a live peer that has
         // never missed this task.
         //
-        // Round 15 lets the distinct bound fire on `Unavailable` because
-        // `budget + 1` distinct missers is strong evidence *on its own*,
-        // independent of the registry. That holds when the registry tells us
-        // nothing, and breaks here, where it is actively naming an untried
-        // peer — escalating would terminally fail a task while a worker that
-        // may hold the handler is live and polling, which is the round-8 P1
-        // failure mode reached through the `Unavailable` door.
+        // The distinct bound may fire on `Unavailable` because `budget + 1`
+        // distinct missers is strong evidence *on its own*, independent of the
+        // registry. That holds when the registry says nothing. It breaks here,
+        // where the registry names an untried peer. Escalation would then
+        // terminally fail a task while a worker that may hold the handler is
+        // live and polling. That is the rollout failure mode of the distinct
+        // bound, reached through the `Unavailable` door.
         return FleetCapabilityEvidence::CapablePeerMayExist;
     }
     if !live_workers.iter().any(|w| w == claiming_worker) {
         // Includes the empty-set case: a registry that cannot see the worker
         // currently holding the claim cannot be used to reason about peers.
-        // Reached only when nobody live is untried, so round 15's bound still
-        // has nothing to yield to.
+        // Reached only when nobody live is untried, so the distinct bound on
+        // `Unavailable` still has nothing to yield to.
         return FleetCapabilityEvidence::Unavailable;
     }
     FleetCapabilityEvidence::AllLiveWorkersMissed
@@ -8393,7 +8387,7 @@ pub fn fleet_capability_evidence(
 /// silently inherit another branch's wording (which is exactly how the
 /// session-pinned and zero-budget cases came to claim a budget they never
 /// spent, and how the release-ceiling case briefly claimed the fleet-wide
-/// conclusion after it was added in review round 6).
+/// conclusion after it was added).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EscalationCause {
     /// The configured `max_redeliveries` budget was exhausted, and the registry
@@ -8411,8 +8405,8 @@ enum EscalationCause {
         /// on the same basis as [`ReleaseCeilingExhausted::completed_releases`].
         ///
         /// Carried rather than derived from `max_redeliveries` because the two
-        /// coincide only in the canonical shape where each worker misses once
-        /// (Codex round-23 P1). Under
+        /// coincide only in the canonical shape where each worker misses once.
+        /// Under
         /// [`FleetCapabilityEvidence::Unavailable`] a repeat miss grows this
         /// counter without moving `distinct_after`, and the configured TOTAL
         /// bound is gated off, so releases can run far past the budget before a
@@ -8498,7 +8492,7 @@ impl EscalationCause {
                     ),
                 }
             }
-            // The configured TOTAL bound (Codex round-15 P1). Mirrors
+            // The configured TOTAL bound. Mirrors
             // `capability_miss_decision`'s third branch exactly, on the same
             // clamped budget and the same `AllLiveWorkersMissed` gate, so a
             // small fleet that exhausts the budget by total releases reports the
@@ -8536,14 +8530,13 @@ impl EscalationCause {
     ///
     /// `ReleaseCeilingExhausted` pages despite its weaker evidence because the
     /// executions are being failed either way, and under-paging is the worse
-    /// error for the outage #804 exists to surface. Since round 15 it is
-    /// reachable only on the two evidence states the configured total bound
-    /// withholds itself from — a live worker that never missed the task
-    /// (`CapablePeerMayExist`), or a registry that could not be read
-    /// (`Unavailable`) with no more distinct incapable workers than the budget
-    /// (under `Unavailable` the fleet's actual size is exactly what is not
-    /// knowable, so the distinct set is all this can be said about) — so it now
-    /// means
+    /// error for the outage #804 exists to surface. With the configured total
+    /// bound in place, it is reachable only on the two evidence states that
+    /// bound withholds itself from. One is a live worker that never missed the
+    /// task (`CapablePeerMayExist`). The other is a registry that could not be
+    /// read (`Unavailable`) with no more distinct incapable workers than the
+    /// budget. Under `Unavailable` the fleet's actual size is not knowable, so
+    /// the distinct set is all this can say. So it means
     /// *"bounded by the ceiling because the fleet could not be concluded about"*
     /// rather than *"small fleet"*. Its alternative reading (a capable peer kept
     /// losing the claim race) requires losing `10 × budget` consecutive races
@@ -8606,7 +8599,7 @@ pub struct CapabilityMissEscalation {
 /// release UPDATE, so `resolution.total_after` (and a freshly-appended distinct
 /// worker) describe a release that **did not happen**. Reporting them would
 /// overstate the durable record by one in the exact string an operator uses to
-/// reconstruct the incident (Codex round-8 P2). The decision input
+/// reconstruct the incident. The decision input
 /// (`distinct_after`) is carried through unchanged, because the decision
 /// genuinely was made on it.
 #[must_use]
@@ -8688,8 +8681,8 @@ pub fn no_capable_worker_reason(
                  names workers advertise), so the configured budget alone bounded the release and \
                  a capable worker may still exist"
             };
-            // The REAL release count, not `max_redeliveries` (Codex round-23
-            // P1). The two coincide only in the canonical shape where each
+            // The REAL release count, not `max_redeliveries`. The two
+            // coincide only in the canonical shape where each
             // worker misses exactly once; under `Unavailable` evidence a repeat
             // miss grows the release count without moving `distinct_after`, and
             // the configured TOTAL bound is gated off, so five workers can spend
@@ -8723,8 +8716,8 @@ pub fn no_capable_worker_reason(
             };
             // The ceiling that actually tripped, computed with the SAME clamped,
             // saturating expression `capability_miss_decision` compares against,
-            // so the printed bound cannot drift from the enforced one (Codex
-            // round-23 P2). Previously this rendered
+            // so the printed bound cannot drift from the enforced one.
+            // Previously this rendered
             // `10x capability_miss_max_redeliveries = 5` -- an equation that is
             // false as one, and off by the whole multiplier: an operator sizing
             // the knob off it concludes the fleet gave up after 5 releases when
@@ -8836,8 +8829,7 @@ fn first_persist_capability_miss(
 }
 
 /// The cross-type continue-as-new target this worker cannot dispatch, if the
-/// cycle's outcome is a continuation into an unregistered type (issue #804,
-/// Codex round-45 P1).
+/// cycle's outcome is a continuation into an unregistered type (issue #804).
 ///
 /// Companion to [`first_persist_capability_miss`], and separate from it for a
 /// mechanical reason: `drive_workflow` `swap_remove`s the `ContinueAsNew`
@@ -8888,7 +8880,7 @@ fn continue_as_new_target_capability_miss(
 }
 
 /// The first local activity in this cycle's commands whose handler this worker
-/// does not register (issue #804, Codex round-19 P2).
+/// does not register (issue #804).
 ///
 /// The inline local-activity arm of `process_workflow_task` commits five things
 /// before it ever reaches `run_local_activity_inline`'s registry lookup:
@@ -8960,12 +8952,13 @@ pub struct CapabilityMissResolution {
     /// Completed releases recorded against the current frontier **before** this
     /// claim — the number an escalation must report.
     ///
-    /// Carried here rather than re-read off the task row (issue #804, Codex
-    /// round 27): after round 26 a peer's re-registration can invalidate its own
-    /// stale entry on this row mid-dispatch, so the claim-time snapshot may name
-    /// a worker the decision no longer counted. Reporting from the same values
-    /// the decision consumed is what keeps round 23's contract — every number in
-    /// an escalation reason is the one that actually acted — true.
+    /// Carried here rather than re-read off the task row (issue #804). A peer's
+    /// re-registration can invalidate its own stale entry on this row
+    /// mid-dispatch (`queue::invalidate_capability_miss_evidence_for_worker`).
+    /// The claim-time snapshot may then name a worker the decision no longer
+    /// counted. Reporting from the same values the decision consumed keeps the
+    /// reporting contract true: every number in an escalation reason is the one
+    /// that actually acted.
     pub misses_before: i32,
     /// Distinct workers recorded against the current frontier **before** this
     /// claim. Same provenance as [`Self::misses_before`].
@@ -8977,7 +8970,7 @@ pub struct CapabilityMissResolution {
 }
 
 /// The capability-miss counters the release-vs-escalate decision must be made
-/// on (issue #804, Codex rounds 20 and 22).
+/// on (issue #804).
 ///
 /// The claim-time snapshot is **not** unconditionally current: one dispatch can
 /// resolve several local-activity frontiers inline, and each resolution resets
@@ -8997,8 +8990,8 @@ pub struct CapabilityMissResolution {
 /// * otherwise — nothing in this dispatch touched those columns, so the
 ///   snapshot is still exactly what the row holds.
 ///
-/// The `reset_committed` branch is exact and infallible, and deliberately so:
-/// it deliberately replaces a *fabricated* clean frontier that round 21 P2 had
+/// The `reset_committed` branch is exact and infallible, and deliberately so.
+/// It replaces a *fabricated* clean frontier that an earlier version
 /// substituted when a DB re-read failed. That fabrication bypassed the
 /// storage-ceiling guard, so a row already at `i32::MAX` would be released and
 /// the `capability_misses + 1` in the release statement would raise
@@ -9009,17 +9002,17 @@ pub struct CapabilityMissResolution {
 /// # The snapshot is not authoritative on its own
 ///
 /// This function is the *fallback* half of the decision input, not the whole of
-/// it: see [`current_frontier_miss_state`], which re-reads the row first. Until
-/// round 26 nothing could write these columns between the claim and the miss —
-/// every writer was ownership-guarded, so a concurrent poison-pill reclaim
-/// changed `worker_id` and turned the release into a `0 rows affected` no-op.
-/// `queue::invalidate_capability_miss_evidence_for_worker` broke that invariant
-/// on purpose: it must reach a row under an active claim, because that is the
+/// it: see [`current_frontier_miss_state`], which re-reads the row first.
+/// Ownership-guarded writers cannot write these columns between the claim and
+/// the miss. A concurrent poison-pill reclaim changes `worker_id` and turns the
+/// release into a `0 rows affected` no-op.
+/// `queue::invalidate_capability_miss_evidence_for_worker` breaks that invariant
+/// on purpose. It must reach a row under an active claim, because that is the
 /// row whose decision stale evidence poisons.
 ///
 /// # AC3 (bounded) still holds per task, not just per frontier
 ///
-/// Keying by frontier (round 46) means the absolute ceiling
+/// Keying by frontier means the absolute ceiling
 /// (`CAPABILITY_MISS_TOTAL_BUDGET_MULTIPLIER`) counts per frontier rather than
 /// per task, so it is worth stating why the release loop is still bounded.
 ///
@@ -9044,8 +9037,8 @@ fn frontier_miss_state(
         return (0, Vec::new());
     }
     // The snapshot's counters are evidence about the frontier the row RECORDS,
-    // which is not necessarily the one this dispatch is missing (issue #804,
-    // Codex round-46 P1) -- `prepare_workflow_task_with_cache` can ingest a
+    // which is not necessarily the one this dispatch is missing (issue #804).
+    // `prepare_workflow_task_with_cache` can ingest a
     // timer fire or a pending signal ahead of the capability gate and move the
     // replay onto a branch needing a different handler, with no park and no
     // inline progress to reset anything. Charging the old frontier's spend to a
@@ -9061,31 +9054,30 @@ fn frontier_miss_state(
 }
 
 /// The capability-miss counters to decide on, refreshed from the row
-/// (issue #804, Codex round-27 P1).
+/// (issue #804).
 ///
 /// A worker's claim-time snapshot can be stale by the time it decides.
-/// `queue::invalidate_capability_miss_evidence_for_worker` (round 26) runs when
+/// `queue::invalidate_capability_miss_evidence_for_worker` runs when
 /// a worker registers and is deliberately **not** ownership-guarded, so a pod
 /// restarting onto a capable build clears its stale entry from rows other
 /// workers are mid-dispatch on. Deciding on the snapshot then reads that pod as
-/// still incapable *and* the registry reports it live — which is
-/// `AllLiveWorkersMissed`, the terminal failure round 26 exists to prevent,
-/// reintroduced through the back door.
+/// still incapable *and* the registry reports it live. That is
+/// `AllLiveWorkersMissed`, the terminal failure the invalidation exists to
+/// prevent, reintroduced through the back door.
 ///
 /// So the row is re-read, and the three outcomes are kept **distinct** rather
-/// than collapsed onto one pair of counters (issue #804, Codex round-28 P1) —
-/// see [`CurrentMissState`] for why each one decides differently.
+/// than collapsed onto one pair of counters (issue #804). See
+/// [`CurrentMissState`] for why each one decides differently.
 ///
 /// The read is unconditional, including when this dispatch committed a frontier
-/// reset. Round 22 short-circuited that case on the grounds that the counters
-/// are an exact in-memory fact no read can improve on, and that is still true:
-/// the reset is a durable `capability_misses = 0, capability_miss_workers = '{}'`
-/// write, so a successful read returns exactly those values. But the read now
-/// answers a *second* question the in-memory fact cannot — whether this worker
-/// still owns the claim — and that question has no cheap local answer. The
-/// reset's counters survive as the read-failure fallback, so nothing about
-/// round 22 is lost; only an ownership probe is gained, on a path that is rare
-/// by construction.
+/// reset. The counters are then an exact in-memory fact no read can improve
+/// on. The reset is a durable `capability_misses = 0, capability_miss_workers = '{}'`
+/// write, so a successful read returns exactly those values. But the read also
+/// answers a *second* question the in-memory fact cannot: whether this worker
+/// still owns the claim. That question has no cheap local answer. The reset's
+/// counters survive as the read-failure fallback, so the exact in-memory fact
+/// is not lost. Only an ownership probe is gained, on a path that is rare by
+/// construction.
 async fn current_frontier_miss_state(
     conn: &mut AsyncPgConnection,
     task: &TaskQueueItem,
@@ -9109,8 +9101,8 @@ async fn current_frontier_miss_state(
     }
 }
 
-/// What re-reading the capability-miss counters found (issue #804, Codex
-/// round-28 P1). The three cases decide differently, and collapsing any two of
+/// What re-reading the capability-miss counters found (issue #804).
+/// The three cases decide differently, and collapsing any two of
 /// them reintroduces a terminal failure this issue exists to prevent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CurrentMissState {
@@ -9134,15 +9126,15 @@ enum CurrentMissState {
     /// therefore return without making a terminal decision at all.
     ClaimLost,
     /// The row could not be read. The counters fall back to the claim-time
-    /// snapshot — deliberately **not** a fabricated clean frontier, which is
-    /// the round-21 P2 hazard (a row already at `i32::MAX` would be released
-    /// and the release statement's `capability_misses + 1` would raise
+    /// snapshot, deliberately **not** a fabricated clean frontier. With a
+    /// fabricated frontier, a row already at `i32::MAX` would be released. The
+    /// release statement's `capability_misses + 1` would then raise
     /// `integer out of range`, stranding a `RUNNING` row under a live worker
-    /// that orphan reclamation skips).
+    /// that orphan reclamation skips.
     ///
-    /// But those counters may no longer match storage, because round 26's
-    /// invalidation is an unguarded concurrent writer, so the evidence they
-    /// carry is only good enough for the **ungated** bounds. See
+    /// But those counters may no longer match storage, because the
+    /// re-registration invalidation is an unguarded concurrent writer. So the
+    /// evidence they carry is only good enough for the **ungated** bounds. See
     /// [`MissEvidenceConfidence`].
     Unreadable { misses: i32, workers: Vec<String> },
 }
@@ -9161,7 +9153,7 @@ impl CurrentMissState {
 }
 
 /// Whether the miss evidence the decision is about to weigh is known to be
-/// current (issue #804, Codex round-28 P1).
+/// current (issue #804).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MissEvidenceConfidence {
     /// Read fresh from the owned row, and unchanged across the fleet read.
@@ -9173,8 +9165,7 @@ pub enum MissEvidenceConfidence {
     PossiblyStale,
 }
 
-/// Compare the two miss-state reads that bracket the fleet read (issue #804,
-/// Codex round-28 P1).
+/// Compare the two miss-state reads that bracket the fleet read (issue #804).
 ///
 /// The fleet read and the miss read are separate statements, so under `READ
 /// COMMITTED` each gets its own snapshot and a registration can commit between
@@ -9242,7 +9233,7 @@ pub fn resolve_capability_miss(
 }
 
 /// [`resolve_capability_miss`], told whether the miss evidence it is weighing
-/// is known to be current (issue #804, Codex round-28 P1).
+/// is known to be current (issue #804).
 ///
 /// `PossiblyStale` forces the fleet answer to
 /// [`FleetCapabilityEvidence::CapablePeerMayExist`], which is not a fudge but
@@ -9494,8 +9485,8 @@ fn clear_panic_strike(
 /// *non-terminal* — `fail_execution_on_error` passes it through un-failed so the
 /// dispatch path can release the task for a capable peer. Clearing there would
 /// let a worker that alternates between panicking on the body and missing an
-/// unregistered local activity reset `workflow_panic_max_attempts` forever
-/// (Codex round-13 P2). The phase rule is owned by
+/// unregistered local activity reset `workflow_panic_max_attempts` forever.
+/// The phase rule is owned by
 /// [`CapabilityMissPhase::clears_panic_strike`], so this predicate never
 /// re-derives it.
 const fn failure_clears_panic_strike(error: &HarvestError) -> bool {
@@ -9523,11 +9514,11 @@ fn apply_panic_strike_clear_for_failure<T>(
 }
 
 /// Clear the issue #782 panic strike when a capability miss **escalated**
-/// (issue #804, Codex round-16 P2).
+/// (issue #804).
 ///
 /// [`failure_clears_panic_strike`] deliberately preserves the strike for a
 /// pre-/mid-handler miss, because that miss normally *releases* the task and the
-/// execution keeps running (round 13). Escalation is the other outcome: it
+/// execution keeps running. Escalation is the other outcome: it
 /// routes through `fail_task_and_execution`, so the execution is terminally
 /// failed and no later cycle for it exists. Preserving the entry there leaks one
 /// map slot per such execution for the worker's lifetime — the same leak the
@@ -9539,9 +9530,9 @@ fn apply_panic_strike_clear_for_failure<T>(
 /// `fail_task_and_execution` returned `Ok`, and the release arm never returns
 /// that variant at all — so this shape means "escalated **and** the terminal
 /// write landed", and nothing else. A failed terminal write propagates as its
-/// own error variant, leaves the row stranded `RUNNING`, and keeps the strike:
-/// that row is re-claimed and re-driven later, which is exactly the case round
-/// 13's protection is for.
+/// own error variant, leaves the row stranded `RUNNING`, and keeps the strike.
+/// That row is re-claimed and re-driven later, which is exactly the case the
+/// release-time strike preservation is for.
 ///
 /// `workflow_exec_id` is `None` only for a task with no owning execution, which
 /// has no key in this map.
@@ -10032,16 +10023,15 @@ pub async fn persist_workflow_completion(
     // Issue #1243: the configured payload-codec registry, so this write
     // encodes under the same codecs replay decodes with.
     codecs: &crate::payload_codec::PayloadCodecs,
-    // issue #1197, item 1 (Codex round 2, P1): this function's own
-    // `conn.transaction()` below is demoted to a SAVEPOINT when called (as it
-    // always is in production, via `persist_workflow_outcome`) from inside
-    // `process_workflow_task`'s outer persist transaction -- so emitting
-    // right after that inner savepoint releases is NOT actually post-commit;
-    // the outer transaction can still roll it back (e.g. the
-    // `WORKER_PERSIST_BEFORE_COMMIT` chaos point, or any later failure in
-    // that same closure). Collected samples are appended to the CALLER's
-    // vector instead of emitted here; the caller must emit them only after
-    // its own outermost transaction commits.
+    // Issue #1197, item 1: this function's own `conn.transaction()` below is
+    // demoted to a SAVEPOINT when called from inside `process_workflow_task`'s
+    // outer persist transaction. Production always calls it that way, via
+    // `persist_workflow_outcome`. So emitting right after that inner savepoint
+    // releases is NOT actually post-commit. The outer transaction can still
+    // roll it back (e.g. the `WORKER_PERSIST_BEFORE_COMMIT` chaos point, or
+    // any later failure in that same closure). Collected samples are appended
+    // to the CALLER's vector instead of emitted here. The caller must emit
+    // them only after its own outermost transaction commits.
     pending_cancel_metrics: &mut Vec<crate::execution::StartCancelledRun>,
 ) -> HarvestResult<(ExecutionId, Option<String>)> {
     let event = WorkflowEvent::WorkflowCompleted {
@@ -10185,7 +10175,7 @@ pub async fn persist_workflow_failure(
     // Issue #1243: the configured payload-codec registry, so this write
     // encodes under the same codecs replay decodes with.
     codecs: &crate::payload_codec::PayloadCodecs,
-    // issue #1197, item 1 (Codex round 2, P1): see `persist_workflow_completion`'s
+    // issue #1197, item 1: see `persist_workflow_completion`'s
     // identical parameter doc — this function's own transaction is a SAVEPOINT,
     // not a real commit, when reached via `persist_workflow_outcome`.
     pending_cancel_metrics: &mut Vec<crate::execution::StartCancelledRun>,
@@ -10505,7 +10495,7 @@ pub async fn persist_workflow_failure(
         }))
         .await?;
 
-    // issue #1197, item 1 (Codex round 2, P1): NOT necessarily post-commit —
+    // issue #1197, item 1: NOT necessarily post-commit —
     // see this function's `pending_cancel_metrics` parameter doc. Append to
     // the caller's vector instead of emitting; the caller emits only after
     // its own outermost transaction commits.
@@ -13104,7 +13094,7 @@ async fn persist_all_started_child_workflows(
                 ));
             }
             // Resolve + bound the CHILD's own quota key from ITS OWN declared
-            // policy (issue #946, Codex round-3 review) -- a spawned child
+            // policy (issue #946) -- a spawned child
             // accumulates its own history/DLQ/active-execution footprint
             // against its own key, so it must be visible to quota
             // accounting exactly like any other registry-aware start. This
@@ -13150,7 +13140,7 @@ async fn persist_all_started_child_workflows(
         for plan in &sequential_children {
             let child = plan.child;
             // A spawned child is enforced against its OWN declared quota
-            // policy (issue #946, Codex round-3 review) -- resolved and
+            // policy (issue #946) -- resolved and
             // bound-checked above via `child_quota_key`. Stamping it here
             // (rather than `None`) keeps the row correctly tagged for
             // future usage accounting even on a re-park path where this
@@ -13208,14 +13198,14 @@ async fn persist_all_started_child_workflows(
             // event first would let the child's own start event count
             // toward the very cap deciding whether to admit it -- an
             // off-by-one that could wrongly reject a spawn that should have
-            // succeeded (Codex round-4 review). A violation rolls back the
+            // succeeded. A violation rolls back the
             // WHOLE transaction (this child, any siblings already inserted
             // in this loop, and any parent-side event appends recorded
             // above) -- caught at this function's outer
             // `conn.transaction(...)` call site below, which parks and wakes
             // the parent task rather than letting it reach
             // `fail_execution_on_error` and terminally fail the parent over
-            // an unrelated tenant's quota (Codex round-3 review).
+            // an unrelated tenant's quota.
             crate::execution::enforce_quota_admission(
                 conn,
                 plan.defaults.quota,
@@ -13401,7 +13391,7 @@ async fn persist_all_started_child_workflows(
         // pre-#946 behavior, where a spawned child was simply invisible to
         // quota accounting. Instead: the whole transaction above already
         // rolled back (no child rows, no parent event appends, nothing
-        // committed), and we park + immediately wake the parent task so a
+        // committed), and this arm parks + immediately wakes the parent task so a
         // LATER poll re-drives the identical decision cycle -- mirroring
         // `requeue_parent_on_transient_ingest_conflict`'s "no event
         // appended, no state changed, no retry attempt consumed" contract
@@ -13410,7 +13400,7 @@ async fn persist_all_started_child_workflows(
         // correct here: this catch is reached only AFTER the transaction's
         // capability-miss pre-check and handler resolution already
         // succeeded, so capability is proven -- only the quota-governed
-        // key's admission is blocked (Codex round-3 review).
+        // key's admission is blocked.
         // Issue #1227 (follow-up to #946/#1221): a park immediately
         // followed by an unconditional wake degenerates into a zero-delay
         // retry loop against a durably exhausted quota. An example is
@@ -14022,7 +14012,7 @@ async fn insert_awaited_child_execution(
     // A child-timeout-race child (issue #779) accumulates its own
     // history/DLQ/active-execution footprint exactly like any other
     // registry-aware start, so it is resolved against and enforced under
-    // its OWN declared quota (issue #946, Codex round-3 review) -- it is
+    // its OWN declared quota (issue #946) -- it is
     // not exempt as "in-flight continuation" the way #946 AC3 exempts
     // continue-as-new/reset/workflow-level-retry.
     let child_quota_key: Option<String> = defaults
@@ -14112,7 +14102,7 @@ async fn insert_awaited_child_execution(
         .await
         .map_err(crate::error::database_error)?;
     // Enforce quota BEFORE the child's own `WorkflowStarted` event is
-    // appended (issue #946, Codex round-4 review). `enforce_quota_admission`
+    // appended (issue #946). `enforce_quota_admission`
     // subtracts 1 from `active_executions` to exclude the row it is itself
     // being called about, but its `history_bytes` check has NO such
     // compensation -- it relies entirely on being called before any event
@@ -14285,8 +14275,7 @@ async fn persist_child_timeout_race(
             // batch append would then collide on
             // UNIQUE(workflow_exec_id, event_id) and — routed through
             // `fail_execution_on_error` — terminally FAIL a healthy parent. The
-            // FOR UPDATE re-read serialises the two appends instead (issue #779,
-            // Codex round-12 P2).
+            // FOR UPDATE re-read serialises the two appends instead (issue #779).
             let mut timer_event = timer_is_new.then(|| WorkflowEvent::TimerStarted {
                 timer_id: timer.timer_id.clone(),
                 duration_secs: timer.duration_secs,
@@ -15352,7 +15341,7 @@ async fn fail_task_and_execution(
 }
 
 /// The history read [`fail_task_and_execution`] needs, resolved ahead of the
-/// terminal write (issue #804, Codex round-29 P1).
+/// terminal write (issue #804).
 ///
 /// Loading a workflow's history is an *awaited database read* whose cost grows
 /// with the history, and it used to sit between a capability-miss escalation's
@@ -15381,7 +15370,7 @@ impl PreloadedFailureHistory {
     ///
     /// Used by the escalation commit to take the execution row's lock **before**
     /// the task row's, preserving the documented `harvest_task_queue` lock order
-    /// (issue #804, Codex round-31 P1).
+    /// (issue #804).
     #[must_use]
     pub const fn exec_id(&self) -> Option<ExecutionId> {
         match self {
@@ -15679,7 +15668,7 @@ async fn finalize_activity_completion_write(
                     .require_applied(task.id)?;
                 // Worker sessions (issue #606): a session member activity's
                 // completion pushes the session's lease forward, so a
-                // long-running but still-legitimate pipeline isn't reclaimed by
+                // long-running but still-legitimate pipeline is not reclaimed by
                 // the broken-session scanner's `expires_at < NOW()` check just
                 // because its steps individually outlast one sticky-timeout
                 // window. `task.session_id` is `None` for both ordinary
@@ -15866,7 +15855,7 @@ pub async fn materialize_due_child_timeout_deadlines(
     use crate::schema::harvest_timers::dsl;
     use diesel::TextExpressionMethods;
 
-    // ── Per-table lock-ordering convention (issue #779, Codex round-11 review) ──
+    // ── Per-table lock-ordering convention (issue #779) ──
     //
     //   harvest_workflow_executions (parent row) → harvest_timers (FOR UPDATE)
     //
@@ -16157,7 +16146,7 @@ pub async fn persist_child_workflow_completion(
     // Issue #1243: the configured payload-codec registry, so this write
     // encodes under the same codecs replay decodes with.
     codecs: &crate::payload_codec::PayloadCodecs,
-    // issue #1197, item 1 (Codex round 2, P1): see `persist_workflow_completion`'s
+    // issue #1197, item 1: see `persist_workflow_completion`'s
     // identical parameter doc.
     pending_cancel_metrics: &mut Vec<crate::execution::StartCancelledRun>,
 ) -> HarvestResult<(ExecutionId, Option<String>)> {
@@ -16219,7 +16208,7 @@ pub async fn persist_child_workflow_completion(
         start.spawn();
     }
 
-    // issue #1197, item 1 (Codex round 2, P1): NOT necessarily post-commit —
+    // issue #1197, item 1: NOT necessarily post-commit —
     // see this function's `pending_cancel_metrics` parameter doc.
     pending_cancel_metrics.extend(tx_cancel_metrics);
 
@@ -16245,7 +16234,7 @@ pub async fn persist_child_workflow_failure(
     // Issue #1243: the configured payload-codec registry, so this write
     // encodes under the same codecs replay decodes with.
     codecs: &crate::payload_codec::PayloadCodecs,
-    // issue #1197, item 1 (Codex round 2, P1): see `persist_workflow_completion`'s
+    // issue #1197, item 1: see `persist_workflow_completion`'s
     // identical parameter doc.
     pending_cancel_metrics: &mut Vec<crate::execution::StartCancelledRun>,
 ) -> HarvestResult<(ExecutionId, Option<String>)> {
@@ -16305,7 +16294,7 @@ pub async fn persist_child_workflow_failure(
         start.spawn();
     }
 
-    // issue #1197, item 1 (Codex round 2, P1): NOT necessarily post-commit —
+    // issue #1197, item 1: NOT necessarily post-commit —
     // see this function's `pending_cancel_metrics` parameter doc.
     pending_cancel_metrics.extend(tx_cancel_metrics);
 
@@ -16576,7 +16565,7 @@ async fn create_detached_child_executions(
         // A detached child accumulates its own history/DLQ/active-execution
         // footprint exactly like any other registry-aware start, so it is
         // resolved against and enforced under its OWN declared quota (issue
-        // #946, Codex round-3 review) -- it is not exempt as "in-flight
+        // #946) -- it is not exempt as "in-flight
         // continuation" the way #946 AC3 exempts
         // continue-as-new/reset/workflow-level-retry. `ParentClosePolicy`
         // (#347) governs the detached child's *lifecycle*, not its *tenant
@@ -16648,8 +16637,8 @@ async fn create_detached_child_executions(
             .map_err(crate::error::database_error)?;
 
         // Enforced right after the row INSERT but BEFORE the child's own
-        // `WorkflowStarted` event is appended (issue #946, Codex round-4
-        // review). `enforce_quota_admission` subtracts 1 from
+        // `WorkflowStarted` event is appended (issue #946).
+        // `enforce_quota_admission` subtracts 1 from
         // `active_executions` to exclude the row it is itself being called
         // about, so it must run once that row genuinely exists -- but its
         // `history_bytes` check has NO such compensation, so it must ALSO run
@@ -16846,7 +16835,7 @@ enum ScheduleToCloseTimeoutOutcome {
     /// normal retry requeue instead of failing the task terminally.
     DeadlineShifted,
     /// The owning execution is `PAUSED` as observed under the execution row
-    /// lock (issue #609 post-review hardening, round 2): a pause committed
+    /// lock (issue #609): a pause committed
     /// after the caller's non-locking [`owning_execution_is_paused`] fast
     /// path read. Pause suspends the `schedule_to_close` clock, so the
     /// caller must fall through to a normal retry requeue — the requeued
@@ -16913,7 +16902,7 @@ async fn task_state_and_deadline_for_update(
 /// (`schedule_to_close_at`) of the **claim-time snapshot** would be exceeded
 /// before the next attempt starts.
 ///
-/// The snapshot can be stale (issue #609 post-review hardening): the pause
+/// The snapshot can be stale (issue #609): the pause
 /// primitive introduced the first post-enqueue mutator of
 /// `schedule_to_close_at` — `resume_workflow_execution` shifts it forward by
 /// the pause span. An attempt claimed before (or during) a pause that fails
@@ -16928,8 +16917,8 @@ async fn task_state_and_deadline_for_update(
 /// mutating anything when the fresh deadline is no longer exceeded.
 ///
 /// The caller's `owning_execution_is_paused` gate is likewise a non-locking
-/// read taken *before* this transaction opens (issue #609 post-review
-/// hardening, round 2): a pause committing in the gap would be observed here
+/// read taken *before* this transaction opens (issue #609): a pause
+/// committing in the gap would be observed here
 /// as a now-`PAUSED` execution whose deadline is genuinely exceeded, and
 /// deadline-failing it mid-pause would violate the pause-suspends-the-clock
 /// contract. The locked execution row (free — the lock helper loads it
@@ -18698,7 +18687,7 @@ fn circuit_defer_delay(
 /// configured `rate_limit_rps` to derive a one-token refill interval from.
 const RATE_LIMIT_DEFER_FALLBACK: Duration = Duration::from_millis(250);
 /// Lower clamp on the dispatch-time rate-limit defer delay, so a very high RPS
-/// can't spin the reschedule loop hot.
+/// cannot spin the reschedule loop hot.
 const RATE_LIMIT_DEFER_MIN: Duration = Duration::from_millis(50);
 /// Upper clamp on the dispatch-time rate-limit defer delay, so a very low RPS
 /// still re-evaluates `on_dispatch` (the breaker may have changed) reasonably soon.
@@ -18883,7 +18872,7 @@ async fn handle_session_acquire(
     // `queue::claim_task` never filters out schedule-to-start-expired rows,
     // so a worker with a free slot that claims this task after the deadline
     // already elapsed (e.g. no session-capable worker was polling for a
-    // while, or the timeout scanner hasn't caught up yet) must still reject
+    // while, or the timeout scanner has not caught up yet) must still reject
     // it rather than silently succeeding (issue #929 review). Comparing
     // directly against the task's original eligibility anchor (`created_at`,
     // falling back to `scheduled_at` for pre-#501 rows) also keeps the
@@ -19173,7 +19162,7 @@ async fn handle_session_release(
     }
 
     // Frees the in-process slot for a future acquire. Idempotent -- removing
-    // an id that isn't present (e.g. a defensive double-release from a
+    // an id that is not present (e.g. a defensive double-release from a
     // manually-crafted or corrupted history) is a no-op.
     crate::sessions::release_session_slot(session_slots_in_use, session_id);
 
@@ -20082,11 +20071,11 @@ async fn process_activity_task(
             // The activity will not run: it already has a terminal event, or the
             // task row stopped being RUNNING (cancelled / timed out concurrently).
             // Undo the side effects of the dispatch decision for this no-op so the
-            // breaker and bucket aren't left skewed:
+            // breaker and bucket are not left skewed:
             //   - release any half-open probe `on_dispatch` admitted, or the
             //     breaker would stay HalfOpen with probe_in_flight forever and
             //     short-circuit every later attempt (no-op for non-probe tokens);
-            //   - refund the token reserved above for the call that won't happen
+            //   - refund the token reserved above for the call that will not happen
             //     (only reached when the reservation succeeded — see the guard).
             if let Some(token) = circuit_token {
                 circuit_breakers.on_cancelled(activity_name, token, std::time::Instant::now());
@@ -20397,10 +20386,9 @@ async fn process_activity_task(
                         // whole pre-guest interval — resolution (this checkout +
                         // active-hash lookup + cold-cache byte fetch) plus compile
                         // — against the guest deadline, not just compile (issue
-                        // #965 review round 7). `attempt_clock_start` was captured
-                        // above, just before this dispatch resolution began, so it
-                        // APPROXIMATES the start-to-close anchor (issue #965
-                        // review round 10 — it does not equal it). The
+                        // #965). `attempt_clock_start` was captured above, just
+                        // before this dispatch resolution began. So it only
+                        // APPROXIMATES the start-to-close anchor. The
                         // authoritative anchor is `task.started_at`, set at claim,
                         // and `ActivityStarted` is appended earlier still, so the
                         // setup between them is not charged to the guest. Under
@@ -21729,8 +21717,8 @@ pub async fn apply_race_loser_cancellations(
                 Err(HarvestError::NotFound(_) | HarvestError::Config(_)) => {
                     // Benign no-op: the child is already gone, or already reached
                     // some other terminal state on its own (it also finished,
-                    // just wasn't the winner) -- nothing to durably cancel, and no
-                    // event was appended to our history.
+                    // just was not the winner) -- nothing to durably cancel, and no
+                    // event was appended to this workflow's history.
                 }
                 Err(err) => {
                     // A real persistence failure must not be swallowed here:
@@ -21846,7 +21834,7 @@ fn emit_race_loser_metrics(
 }
 
 /// Pure event-emission plan for the **fresh-arm** timer commands
-/// (`ArmTimer { for_await: false }`) in a batch (issue #768, Codex P2 round 4).
+/// (`ArmTimer { for_await: false }`) in a batch (issue #768).
 /// DB-independent, so it is unit-testable without a database and runs identically
 /// on every suspension path.
 ///
@@ -21870,7 +21858,7 @@ fn emit_race_loser_metrics(
 /// (`TimerCancelled`) and `for_await: true` row inserts stay with the DB loop in
 /// [`plan_timer_lifecycle`].
 /// Detect a same-batch collision between a LIVE cancellable arm and a classic
-/// `StartTimer` for the same id (issue #768, Codex P2 round 15).
+/// `StartTimer` for the same id (issue #768).
 ///
 /// Returns the colliding `timer_id` when the batch holds an `ArmTimer(X)` whose
 /// fresh `TimerStarted` would be dropped by `arm_timer_events`' `StartTimer`-owned
@@ -21885,7 +21873,7 @@ fn same_batch_uncancelled_arm_start_collision(commands: &[WorkflowCommand]) -> O
             continue;
         };
         let id = timer_id.as_str();
-        // Order-independent detection (issue #768, Codex P2 round 16). The ONLY
+        // Order-independent detection (issue #768). The ONLY
         // legit same-id `StartTimer` + `ArmTimer` combo is the cancel-then-classic
         // pattern `[ArmTimer(X,false), CancelTimer(X), StartTimer(X)]` — the arm is
         // dead before the classic start. Any other interleaving is a collision:
@@ -21976,7 +21964,7 @@ fn arm_timer_events(commands: &[WorkflowCommand]) -> Vec<Option<WorkflowEvent>> 
 /// so it is unit-testable without a database.
 ///
 /// A same-batch `CancelTimer(X)` supersedes an `ArmTimer(X)` re-arm in
-/// **batch order** (round 7 fix, refined in rounds 9 and 11): a `for_await: true`
+/// **batch order**: a `for_await: true`
 /// (await) arm for X contributes its deadline iff **no `CancelTimer(X)` appears
 /// after it in the batch**. A `for_await: false` (fresh start/reset) arm never
 /// contributes a firing row on its own. Without this exclusion, an `await_fire`
@@ -21987,9 +21975,9 @@ fn arm_timer_events(commands: &[WorkflowCommand]) -> Vec<Option<WorkflowEvent>> 
 /// ArmTimer(X, true)]`, whose await arm is *last* — still arm the durable row in
 /// the transaction that recorded the reset, while an await-then-reset
 /// `[ArmTimer(X, true), CancelTimer(X), ArmTimer(X, false)]` — whose await arm has
-/// a same-id cancel after it — does NOT arm a stale firing row (round 11 fix): the
-/// live run would otherwise fire off the old await duration while replay, seeing
-/// the recorded `TimerCancelled` first, resolves `Cancelled` — a divergence.
+/// a same-id cancel after it — does NOT arm a stale firing row. Otherwise the
+/// live run would fire off the old await duration. Replay sees the recorded
+/// `TimerCancelled` first and resolves `Cancelled`, which is a divergence.
 fn plan_timer_lifecycle_pure(
     commands: &[WorkflowCommand],
 ) -> (Vec<Option<WorkflowEvent>>, Vec<usize>) {
@@ -22008,16 +21996,16 @@ fn plan_timer_lifecycle_pure(
         .collect();
 
     // Per-await-arm liveness against same-batch cancels, resolved in **batch
-    // order** (rounds 9 + 11). A `for_await: true` (await) arm for id X
+    // order**. A `for_await: true` (await) arm for id X
     // contributes its firing-row deadline IFF, evaluated at its own position:
-    //   (forward, round 11) no `CancelTimer(X)` appears AFTER it in the batch —
+    //   (forward) no `CancelTimer(X)` appears AFTER it in the batch —
     //     a later cancel supersedes the await regardless of any later
     //     `for_await: false` fresh arm re-establishing X. On replay such an await
     //     resolves against the recorded `TimerCancelled` that precedes the fresh
     //     arm's `TimerStarted`, so the live run must not arm a firing row off the
     //     stale await duration (that would fire live while replay resolves
-    //     `Cancelled` — a divergence). This is the round-11 FINDING fix.
-    //   (backward, round 9) X is not sitting cancelled at the arm — if a
+    //     `Cancelled` — a divergence).
+    //   (backward) X is not sitting cancelled at the arm — if a
     //     `CancelTimer(X)` precedes the await with no `ArmTimer(X, for_await:
     //     false)` fresh arm between that cancel and the await, X is dead and the
     //     await wakes now (cancel-then-await with no reset). A fresh arm between
@@ -22033,11 +22021,11 @@ fn plan_timer_lifecycle_pure(
     //     backward re-established → arms in this transaction (deadline starts
     //     when the reset was recorded, not one claim later).
     //   - await-then-reset `[Arm(true, old), Cancel, Arm(false, new)]` → a cancel
-    //     follows the await → does NOT arm (round 11); wake now, so live and
+    //     follows the await → does NOT arm; wake now, so live and
     //     replay both resolve `Cancelled`.
     //   - await-then-cancel `[Arm(true), Cancel]` and cancel-then-await
     //     `[Cancel, Arm(true)]` → forward cancel / backward-dead respectively →
-    //     wake now (round 7 behavior preserved).
+    //     wake now.
     let await_arm_contributes = |id: &str, at: usize| -> bool {
         // (forward) a later same-id cancel supersedes the await.
         let cancelled_after = commands[at + 1..].iter().any(|cmd| {
@@ -22118,8 +22106,8 @@ fn plan_timer_lifecycle_pure(
 ///   but inserts **no** `harvest_timers` row. A cancellable timer becomes
 ///   fire-eligible only when it is awaited, so an armed-but-unawaited timer can
 ///   never fire spuriously while the workflow is parked on some other wait
-///   (an activity, a signal, a child workflow) — this is the round-4 fix for the
-///   spurious-fire-breaks-reset/replay bug.
+///   (an activity, a signal, a child workflow). A spurious fire there would
+///   break reset and replay.
 /// - `ArmTimer { for_await: true }` (a **re-arm for firing**, from
 ///   `await_timer_fire`): upserts the `harvest_timers` row (`fires_at =
 ///   db_clock_now + duration`, dedup by `timer_id` — idempotent on re-park),
@@ -22127,8 +22115,8 @@ fn plan_timer_lifecycle_pure(
 ///   arm's `TimerStarted` was already recorded by the fresh arm). An id that also
 ///   has a `StartTimer` command in the batch is skipped (owned by
 ///   `persist_started_timer`), and an await arm followed by a same-id
-///   `CancelTimer` later in the batch is skipped too (round 7 fix, per-await-arm
-///   order-sensitive in rounds 9/11 — see [`plan_timer_lifecycle_pure`]): it
+///   `CancelTimer` later in the batch is skipped too (per await arm, in batch
+///   order — see [`plan_timer_lifecycle_pure`]): it
 ///   neither arms a row nor contributes to `min_fires_at`, so an `await_fire`
 ///   raced (or reset) by a sibling branch's later `cancel` wakes immediately
 ///   instead of rescheduling to the deleted row's deadline — while a
@@ -22175,7 +22163,7 @@ async fn plan_timer_lifecycle(
         return Ok((vec![None; commands.len()], None));
     }
 
-    // Defensive guard (issue #768, Codex P2 round 15): a batch must never carry a
+    // Defensive guard (issue #768): a batch must never carry a
     // LIVE, un-cancelled cancellable arm (`ArmTimer(X)`) alongside a classic
     // `StartTimer(X)` for the same id. `ctx.timer`/`sleep_until` already reject
     // that collision at the source (see `WorkflowContext::timer`), so this should
@@ -22206,7 +22194,7 @@ async fn plan_timer_lifecycle(
     // both excluded from `armed_indices` (the later same-id cancel supersedes the
     // await arm), so only their delete runs and the row ends absent.
     //
-    // Invariant (issue #768, Codex P2 round 16): a `CancelTimer` here can only name
+    // Invariant (issue #768): a `CancelTimer` here can only name
     // a CANCELLABLE timer's id. `WorkflowContext::cancel_timer`/`reset_timer` no-op
     // (emit no `CancelTimer`) unless the id is a live cancellable arm / not a
     // classic timer id, so `delete_pending_timer` can never delete a classic
@@ -22596,7 +22584,7 @@ async fn handle_suspended_workflow(
         .await
     };
 
-    // Issue #946, Codex round-3/round-4 review: a `QuotaExceeded` reaching
+    // Issue #946: a `QuotaExceeded` reaching
     // here can originate from `persist_all_started_child_workflows`/
     // `persist_child_timeout_race` (both already caught locally at their own
     // transaction boundary and never surface it this far) or from
@@ -22705,7 +22693,7 @@ pub async fn fail_execution_on_error<T>(
     if error.ownership_lost().is_some() {
         return Err(error);
     }
-    // Issue #1182 (Codex review round 2): an ambiguous suspended-dispatch
+    // Issue #1182: an ambiguous suspended-dispatch
     // claim is the identical "blameless, no decision made" shape as a
     // capability miss -- pass it through un-failed so the caller can roll
     // back the enclosing transaction and perform the standalone claim
@@ -22713,7 +22701,7 @@ pub async fn fail_execution_on_error<T>(
     if error.suspended_claim_ambiguous().is_some() {
         return Err(error);
     }
-    // Issue #1184 (Codex review round 1, P1): the identical blameless,
+    // Issue #1184: the identical blameless,
     // no-decision-made shape as the #1182 case just above -- a guard inside
     // `persist_workflow_continue_as_new`'s seal transaction (or any other
     // #1184-guarded write reachable from here) can raise this instead. It
@@ -22738,8 +22726,8 @@ pub async fn fail_execution_on_error<T>(
 }
 
 /// Lower/upper bounds for the randomized reschedule delay after a child
-/// spawn is deferred by a full target-tenant quota (issue #946, Codex
-/// round-4 review). A worker-capacity-style congestion signal, not a
+/// spawn is deferred by a full target-tenant quota (issue #946).
+/// A worker-capacity-style congestion signal, not a
 /// worker-crash or divergent-build signal, so this uses a fixed (non-growing)
 /// jittered window rather than [`nd_block_backoff`]'s unbounded exponential
 /// ramp -- quota capacity is expected to free up on an ordinary timescale (a
@@ -22767,7 +22755,7 @@ const QUOTA_RETRY_BACKOFF_MAX: Duration = Duration::from_secs(3);
 /// the CALLER's fault: it is a capacity signal on the TARGET workflow type's
 /// tenant key. `enforce_quota_admission` is called only after the child row
 /// has been inserted (and BEFORE its `WorkflowStarted`/`ChildWorkflowStarted`
-/// event is appended -- issue #946, Codex round-4 review) inside the
+/// event is appended -- issue #946) inside the
 /// enclosing transaction, so a `QuotaExceeded` here rolls that whole
 /// transaction back -- nothing durable was created. Terminally failing the
 /// CALLING execution over another tenant's quota would be wrong
@@ -22922,7 +22910,7 @@ async fn recover_from_child_quota_exceeded(
 /// concurrent, *unrelated* lock holder (e.g. [`queue::wake_workflow_task`]'s
 /// `wake_requested` fallback, momentarily locking this exact row for a
 /// sibling event) merely contending for it at that instant; both read back
-/// as "not ours right now" (Codex review of #1182). If this dispatch simply
+/// as "not ours right now". If this dispatch simply
 /// returned `Ok(())` in that second case, the row would strand `RUNNING`
 /// under a worker who has already given up on it, with nothing left to ever
 /// re-claim it -- so a lost claim (or a changed evidence snapshot) must
@@ -22941,7 +22929,7 @@ async fn recover_from_child_quota_exceeded(
 /// contend for the task row *while still holding the execution row* -- the
 /// exact ABBA cycle against `poison_pill::quarantine_orphan`'s reversed
 /// (task-row-first) lock order that `SKIP LOCKED` exists to avoid in the
-/// first place (Codex review round 2 of #1182).
+/// first place.
 ///
 /// So an ambiguous claim is surfaced as [`HarvestError::SuspendedClaimAmbiguous`]
 /// instead, and propagated with `?`. This forces the *entire* enclosing
@@ -24949,7 +24937,7 @@ async fn persist_workflow_continue_as_new_with_verdict(
         context_headers: execution.context_headers.clone(),
         schedule_id: execution.schedule_id, // preserve schedule lineage through continue-as-new
         // Same logical slot as the predecessor: keep carryover ordering stable so the
-        // continuation isn't treated as a brand-new fire (issue #488).
+        // continuation is not treated as a brand-new fire (issue #488).
         scheduled_for: execution.scheduled_for,
         // Continue-as-new starts a fresh run: attempt counter resets to 1,
         // but the retry policy is carried forward so the chain can still retry
@@ -25211,7 +25199,7 @@ async fn persist_workflow_outcome(
     // inline), and also threads it into the `SuspendedWorkflowContext`. Empty for
     // every non-suspension outcome and for a pure suspension.
     resolved_inline_external: ResolvedExternalIds,
-    // issue #1197, item 1 (Codex round 2, P1): threaded straight through to
+    // issue #1197, item 1: threaded straight through to
     // whichever leaf persist function below actually runs, for the CALLER to
     // emit only after its own outermost transaction commits — see
     // `persist_workflow_completion`'s identical parameter doc for why this
@@ -25467,7 +25455,7 @@ async fn persist_workflow_outcome(
 /// This cycle's terminal-metrics facts, captured in
 /// [`process_workflow_task`] before its outcome moves into the persist
 /// transaction, and actually emitted only from that transaction's
-/// `Persisted` arm (issue #1184, Codex review round 2, P2) -- see
+/// `Persisted` arm (issue #1184) -- see
 /// `emit_pending_workflow_metrics`'s doc comment for why.
 struct PendingWorkflowMetrics {
     status: WorkflowStatus,
@@ -25479,7 +25467,7 @@ struct PendingWorkflowMetrics {
     is_continued_as_new: bool,
     terminal: TerminalMetricsKind,
     /// `harvest.workflow.duration`'s value, measured here rather than at
-    /// emission time (Codex review round 4, P2): `record_workflow_completed`
+    /// emission time: `record_workflow_completed`
     /// documents this as HANDLER runtime, so it must stop the clock the
     /// moment the decision cycle itself finished, not after the emitter's
     /// post-commit housekeeping (deferred schedule counters, unfinished-
@@ -25508,7 +25496,7 @@ enum TerminalMetricsKind {
 /// Emit the `harvest.workflow.*`/`harvest.canary.*` terminal metrics
 /// [`process_workflow_task`] computed for this cycle, from `pending`.
 ///
-/// Issue #1184 (Codex review round 2, P2): these calls used to run BEFORE
+/// Issue #1184: these calls used to run BEFORE
 /// the persist transaction, so a claim-ambiguity rollback (this issue's own
 /// guards, or #1182's `SuspendedClaimAmbiguous`) or an operator pause caught
 /// by `check_paused_and_park` inside that transaction still counted a
@@ -25654,7 +25642,7 @@ enum WorkflowPersistFlow {
         deferred_checks: Vec<(ExecutionId, Option<String>)>,
         /// `ctx.race()` loser-cancellation completion-trigger starts (issue
         /// #600), gathered from `persist_terminal_outcome_commands` — empty
-        /// when the outcome path didn't run `apply_race_loser_cancellations`.
+        /// when the outcome path did not run `apply_race_loser_cancellations`.
         /// Must only be spawned **after** this transaction commits (see
         /// `apply_race_loser_cancellations`'s doc comment): a start spawned
         /// before commit could run against a cancellation that later rolls
@@ -25780,7 +25768,7 @@ async fn persist_terminal_outcome_commands(
     // abandoned-dispatch record can never duplicate one.
     recorded_dispatches: &RecordedDispatchIds,
     execute_span: &tracing::Span,
-    // issue #1197, item 1 (Codex round 2, P1): threaded straight through to
+    // issue #1197, item 1: threaded straight through to
     // `persist_workflow_outcome` — see its identical parameter doc.
     pending_cancel_metrics: &mut Vec<crate::execution::StartCancelledRun>,
     // Issue #1161: threaded straight through to `persist_workflow_outcome` —
@@ -29709,7 +29697,7 @@ async fn process_workflow_task(
                 start.spawn();
             }
 
-            // issue #1197, item 1 (Codex round 2, P1): emitted only now that
+            // issue #1197, item 1: emitted only now that
             // the OUTER `persist_flow` transaction above has actually
             // committed — reaching this match arm at all proves it did.
             // Emitting inside `persist_workflow_completion`/`_failure` (etc.)

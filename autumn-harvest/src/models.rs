@@ -734,7 +734,7 @@ pub struct TaskQueueItem {
     pub capability_miss_workers: Vec<String>,
 
     /// Which handler the two counters above are evidence about, as
-    /// `{kind}:{name}` (issue #804, Codex round-46 P1).
+    /// `{kind}:{name}` (issue #804).
     ///
     /// The counters describe **one frontier** — the position the workflow is
     /// stuck at, and so the single handler a claiming worker must register to
@@ -2049,7 +2049,7 @@ pub struct NewHarvestSession<'a> {
 /// Changeset for refreshing a session's lease (issue #606).
 ///
 /// Applied after each member-activity completion so a long-running,
-/// legitimate session isn't reaped by the broken-session scanner's
+/// legitimate session is not reaped by the broken-session scanner's
 /// lease-expiry check.
 #[derive(Debug, AsChangeset)]
 #[diesel(table_name = harvest_sessions)]

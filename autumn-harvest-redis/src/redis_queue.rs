@@ -96,7 +96,7 @@ pub struct RedisTaskQueue {
 
 impl std::fmt::Debug for RedisTaskQueue {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // ConnectionManager and Script don't impl Debug, so we elide them.
+        // ConnectionManager and Script do not impl Debug, so the output elides them.
         f.debug_struct("RedisTaskQueue")
             .field("config", &self.config)
             .finish_non_exhaustive()
@@ -201,8 +201,8 @@ impl RedisTaskQueue {
     ///
     /// Idempotent: a `BUSYGROUP` reply (the group already exists) is treated
     /// as success. The `MKSTREAM` flag creates the underlying stream if it
-    /// doesn't yet exist so the first XGROUP CREATE on a brand-new queue
-    /// doesn't fail with `ERR no such key`.
+    /// does not exist yet. So the first XGROUP CREATE on a brand-new queue
+    /// does not fail with `ERR no such key`.
     async fn ensure_group(&self, queue_name: &str) -> RedisAdapterResult<()> {
         let key = self.stream_key(queue_name);
         let mut conn = self.conn.clone();
@@ -685,5 +685,5 @@ mod tests {
     // The exact `is_busygroup` path is exercised end-to-end against a real
     // Redis instance in the integration tests under `tests/`. It is hard to
     // construct a `RedisError` with a `BUSYGROUP` code outside of an actual
-    // server reply, so we don't try to fake one here.
+    // server reply, so this module does not try to fake one.
 }

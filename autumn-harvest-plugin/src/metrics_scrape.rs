@@ -120,7 +120,7 @@ struct Histogram(RwLock<HashMap<LabelValues, (u64, f64)>>);
 impl Histogram {
     // The write guard is held only for the two-statement bump below (bounded,
     // uncontended in-process work); the lint's general "hold locks briefly"
-    // advice doesn't apply cleanly to `HashMap::entry`'s borrow shape here.
+    // advice does not apply cleanly to `HashMap::entry`'s borrow shape here.
     #[allow(clippy::significant_drop_tightening)]
     fn observe(&self, labels: LabelValues, value: f64) {
         let mut map = self
@@ -849,7 +849,7 @@ fn push_catalogue_metrics(families: &mut Vec<MetricFamily>, inner: &Inner) {
 
 /// Metrics the engine's own `is_enabled()`-gated background samplers already
 /// compute alongside the nine catalogue metrics above -- implemented so that
-/// sampler work isn't silently discarded (see the module docs).
+/// sampler work is not silently discarded (see the module docs).
 fn push_sampler_adjacent_metrics(families: &mut Vec<MetricFamily>, inner: &Inner) {
     push_gauge(
         families,
@@ -1408,7 +1408,7 @@ mod tests {
 
     #[test]
     fn shard_dispatched_is_a_counter_labeled_by_shard() {
-        // Issue #961 (Codex round 3): the shipped undrained-shard alert reads
+        // Issue #961: the shipped undrained-shard alert reads
         // `harvest_shard_stranded_pending` (already rendered above) and uses
         // `harvest_shard_dispatched_total` to tell "no poller at all" from
         // "poller present but backlogged". The built-in scrape recorder is
@@ -1429,7 +1429,7 @@ mod tests {
 
     #[test]
     fn schedule_overdue_is_a_gauge_labeled_by_kind_and_name() {
-        // Issue #696 (Codex round 3): the built-in scrape recorder must render
+        // Issue #696: the built-in scrape recorder must render
         // `harvest_schedule_overdue` (1 = overdue, 0 = healthy) so the recommended
         // `with_metrics_scrape()` path exposes the primary overdue gauge the alert
         // consumes — not only the metrics-rs adapter.
@@ -1558,7 +1558,7 @@ mod tests {
 
     #[test]
     fn connector_metrics_reach_the_built_in_scrape_endpoint() {
-        // Issue #944 (Codex round E): this recorder is per-metric
+        // Issue #944: this recorder is per-metric
         // hand-maintained, so a new family that is not overridden here falls
         // through to the trait no-op and `.with_metrics_scrape()` DISCARDS every
         // sample. The connector work shipped dashboard panels, which makes that

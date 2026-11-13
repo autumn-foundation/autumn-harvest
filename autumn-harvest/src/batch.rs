@@ -456,7 +456,7 @@ mod db {
         };
 
         // Single UPDATE = single transaction = atomic. Appending an empty
-        // JSON array via `||` is a no-op, so it's safe to always include the
+        // JSON array via `||` is a no-op, so it is safe to always include the
         // errors and processed_ids set clauses regardless of input length.
         diesel::update(harvest_batch_jobs::table.find(id))
             .set((
@@ -596,7 +596,7 @@ mod db {
     /// drops the per-call limit so a 10k batch can drain over multiple ticks.
     ///
     /// `action` is consulted only to pick the default state filter when the
-    /// caller didn't supply one: Cancel/Signal default to the active states
+    /// caller did not supply one: Cancel/Signal default to the active states
     /// `RUNNING`/`PAUSED` (terminal rows are no-ops, and a paused execution is
     /// still active — cancel accepts it and a signal queues for delivery on
     /// resume); Terminate defaults to "every non-terminal-sealed state"
@@ -924,9 +924,9 @@ mod db {
 
         // Walk every shard, collect targets, dispatch with bounded fan-out.
         // Bolt: Pre-calculate total shards to hint the initial capacity of `all_targets`.
-        // While we don't know exactly how many executions exist on each shard,
-        // pre-allocating an estimated batch size prevents continuous reallocations
-        // when concatenating results from 256 default shards.
+        // The exact count of executions on each shard is not known. An estimated
+        // batch size still prevents continuous reallocations when the loop
+        // concatenates results from 256 default shards.
         let mut all_targets: Vec<ExecutionId> = Vec::with_capacity(pool.iter_shards().count() * 10);
         for (_, shard_pool) in pool.iter_shards() {
             let mut conn = executor_conn(shard_pool).await?;

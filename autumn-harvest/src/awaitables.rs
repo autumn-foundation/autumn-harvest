@@ -790,7 +790,7 @@ fn project_replayed(index: &HistoryIndex, commands: &[WorkflowCommand]) -> Vec<A
                 awaitables.push(awaitable);
             }
             // Known approximation: a cancellable timer's real deadline is
-            // anchored at `await_fire` time (issue #768 round 4), but the
+            // anchored at `await_fire` time (issue #768), but the
             // recorded `TimerStarted` is at ARM time — so an
             // `ArmTimer { for_await: true }` deadline computed from the arm's
             // recorded `since` can UNDERSTATE the true fire time by the

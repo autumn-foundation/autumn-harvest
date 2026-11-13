@@ -168,7 +168,7 @@ pub struct DebounceStartOptions {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub severity: Option<String>,
     /// Effective server-side execution-timeout ceiling (seconds), captured at
-    /// admission so a debounced start can't bypass the cap the normal path
+    /// admission so a debounced start cannot bypass the cap the normal path
     /// enforces.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_execution_timeout_ceiling_secs: Option<i64>,
@@ -185,7 +185,7 @@ pub struct DebounceStartOptions {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_workflow_chain_timeout_ceiling_secs: Option<i64>,
     /// Effective workflow-input byte cap, captured at admission so a debounced
-    /// start can't bypass the size limit the normal path enforces.
+    /// start cannot bypass the size limit the normal path enforces.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_workflow_input_bytes: Option<u64>,
     /// W3C trace context captured at admission time, restored at fire time so
@@ -749,7 +749,7 @@ async fn fire_due_on_conn(
     use diesel_async::{AsyncConnection, RunQueryDsl};
 
     // Tolerate a missing `harvest_debounce` table (mixed-schema test fixtures
-    // that exercise unrelated timeout behaviour, or a deployment that hasn't run
+    // that exercise unrelated timeout behaviour, or a deployment that has not run
     // the migration yet). `to_regclass` returns NULL instead of erroring, so a
     // cheap catalog lookup lets the rest of the timeout sweep proceed rather
     // than aborting the whole pass. In production the table always exists.
@@ -770,7 +770,7 @@ async fn fire_due_on_conn(
     // Claim + fire + delete the whole due batch in one transaction so the
     // `FOR UPDATE SKIP LOCKED` locks are held until each row is deleted.
     // Deferred trigger-starts are collected and spawned *after* the transaction
-    // commits so a rollback can't leave orphaned completion-trigger workflows.
+    // commits so a rollback cannot leave orphaned completion-trigger workflows.
     //
     // Issue #1822: a deadlock or serialization abort runs the batch again.
     // The rollback releases every claimed row, so the next run claims afresh.
@@ -1145,7 +1145,7 @@ async fn fire_claimed_debounce_row(
     // `in_outer_transaction = true`: this runs inside the scanner's fire
     // transaction, so a TerminateIfRunning pre-check cancellation is a savepoint
     // that rolls back with this transaction on error — the collect fn must not
-    // spawn its follow-ups (they'd be orphaned). Deferred starts returned on
+    // spawn its follow-ups (they would be orphaned). Deferred starts returned on
     // success are spawned by the caller only after the fire transaction commits.
     match crate::execution::start_or_load_workflow_execution_collect_with_codecs(
         conn, params, true, false, None, None, codecs,
@@ -1170,8 +1170,8 @@ async fn fire_claimed_debounce_row(
             )))
         }
         // The target workflow_id is already taken under the reuse policy, so the
-        // debounce intent can't produce a new run. Drop the record so the
-        // scanner doesn't retry the doomed start on every tick (and block the
+        // debounce intent cannot produce a new run. Drop the record so the
+        // scanner does not retry the doomed start on every tick (and block the
         // rest of the batch).
         Err(crate::error::HarvestError::AlreadyExists { .. }) => {
             delete_debounce_row(conn, row_id).await?;

@@ -48,7 +48,7 @@
 //! | Property | Behaviour |
 //! |---|---|
 //! | **Token bucket / GCRA** | Admitted starts for a key never exceed `rate` (+ `burst`) over any window. |
-//! | **Defer, don't drop** | An excess start is durably persisted and admitted later — nothing is dropped (contrast debounce) or rejected. |
+//! | **Defer, do not drop** | An excess start is durably persisted and admitted later — nothing is dropped (contrast debounce) or rejected. |
 //! | **Preserve every start** | Every start eventually runs — many pending rows per key, drained FIFO (contrast debounce's collapse-to-one). |
 //! | **Durable** | Deferred starts survive a plugin/worker restart — no in-memory pending queue. |
 //! | **Key scoping** | Shard-local — consistent with per-key concurrency (#247) and the activity limiter. |

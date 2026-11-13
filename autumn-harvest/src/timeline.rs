@@ -198,7 +198,7 @@ pub struct TimelineStep {
     /// The unit's outcome.
     pub outcome: StepOutcome,
     /// Final attempt number for kinds that retry (activity, `local_activity`);
-    /// `None` for kinds that don't (timers, child workflows, external
+    /// `None` for kinds that do not (timers, child workflows, external
     /// activities, side effects, signal waits).
     ///
     /// **Caveat (lower bound):** derived as the max `attempt` field on the id's

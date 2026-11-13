@@ -1042,7 +1042,7 @@ async fn load_queue_depth(
         }
     };
 
-    // Back-fill effective requirements for activity rows that didn't snapshot
+    // Back-fill effective requirements for activity rows that did not snapshot
     // required_capabilities (legacy/manual enqueues), mirroring claim_task's
     // ineligible-activities gate so the constraint check below catches them.
     autumn_harvest::queue::apply_activity_requirements(&mut demands, activity_requirements);

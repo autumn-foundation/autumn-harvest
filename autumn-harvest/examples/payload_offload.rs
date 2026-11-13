@@ -11,7 +11,7 @@
 //! A legitimately large payload — a scraped HTML document, an ML feature vector,
 //! a generated PDF — cannot durably flow through a workflow: the #252 size cap
 //! *rejects* anything over the limit (to keep `harvest_events` small and replay
-//! fast), and `PayloadCodec` is a synchronous in-place transform that can't do
+//! fast). `PayloadCodec` is a synchronous in-place transform that cannot do
 //! async I/O against external storage.
 //!
 //! ## The solution

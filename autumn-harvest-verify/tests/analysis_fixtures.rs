@@ -850,7 +850,7 @@ fn a_body_less_std_callee_is_not_a_boundary() {
     );
 }
 
-// ── Review round 2: three false-`proven` shadowing / trust holes ────────────
+// ── Three false-`proven` shadowing / trust holes ────────────────────────────
 
 /// Finding 1: `a::COUNTER: u64` must not decide the verdict for `b::COUNTER:
 /// AtomicU64`. Both print with their FULL path in the `static` header and in
@@ -1137,9 +1137,9 @@ fn drop_glue_with_no_readable_impl_header_is_unknown_never_proven() {
     }
 }
 
-/// Round 5: a body-less impl from a dependency, reached through a std trait
-/// that rustc prints fully qualified. `std::` in the TRAIT says nothing about
-/// whose body runs — this one is `Clock`'s, and it reads the wall clock.
+/// A body-less impl from a dependency, reached through a std trait that rustc
+/// prints fully qualified. `std::` in the TRAIT says nothing about whose body
+/// runs. This one is the body of `Clock`, and it reads the wall clock.
 #[test]
 fn a_std_trait_does_not_trust_a_dependencys_impl() {
     let verdicts = run(

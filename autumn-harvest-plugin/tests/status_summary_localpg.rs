@@ -2,11 +2,11 @@
 //!
 //! The primary coverage for this route lives in `status_summary_integration.rs`,
 //! which spins a real Postgres via testcontainers. In sandboxes that have a
-//! running Postgres but **no Docker daemon**, testcontainers can't start a
-//! container — so this file drives the identical app router (built with
+//! running Postgres but **no Docker daemon**, testcontainers cannot start a
+//! container. So this file drives the identical app router (built with
 //! `harvest_api_router` over `HarvestApiState`) against an operator-supplied
-//! `DATABASE_URL` instead, exercising the real HTTP route through the axum stack
-//! (not just the pure classifiers). It mirrors the #597 M9 precedent of
+//! `DATABASE_URL` instead. It exercises the real HTTP route through the axum
+//! stack, not just the pure classifiers. It mirrors the #597 M9 precedent of
 //! verifying routes end-to-end against a local Postgres by applying migrations
 //! directly.
 //!

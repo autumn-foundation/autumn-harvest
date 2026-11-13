@@ -737,7 +737,7 @@ async fn batch_does_not_block_unrelated_workflow_reads() {
 
 // Two executor ticks running in parallel must not both claim the same job.
 // The lease-based claim guarantees exactly-once dispatch per target across
-// concurrent worker processes (issue #102, P1 review feedback).
+// concurrent worker processes (issue #102).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn batch_executor_lease_prevents_double_dispatch() {
     let (url, _container) = setup_database().await;

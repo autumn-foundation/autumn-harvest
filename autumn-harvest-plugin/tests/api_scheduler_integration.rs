@@ -8620,7 +8620,7 @@ async fn insert_running_execution_for(database_url: &str, wf_name: &str) {
         .expect("insert running execution");
 }
 
-/// AC (issue #696, Codex round 2): the create/upsert HTTP **response** must
+/// AC (issue #696): the create/upsert HTTP **response** must
 /// report the same tick-exact, shard-local `at_capacity` as the list/get reads
 /// and the `harvest.schedule.overdue` gauge. A same-cadence re-register preserves
 /// the existing `next_run_at` (`apply_workflow_schedule_update` recomputes it only
@@ -8841,7 +8841,7 @@ async fn seed_calendar_deferred_read_schedules(database_url: &str) -> (uuid::Uui
     (deferred_id, control_id)
 }
 
-/// Codex round 3: `GET /admin/schedules/{id}` must honor the tick's calendar
+/// `GET /admin/schedules/{id}` must honor the tick's calendar
 /// deferral. A `run_next_business_day` schedule whose slot fell inside an
 /// exclusion block, rebased to a FUTURE business day, reports `overdue: false`;
 /// the same past slot WITHOUT a calendar reports `overdue: true` (control),

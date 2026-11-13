@@ -1525,7 +1525,7 @@ mod tests {
     fn check_quota_negative_usage_clamps_to_zero_defensively() {
         let policy = QuotaPolicy::new("tenant_id").with_max_active_executions(0);
         // A cap of exactly zero with clamped-to-zero usage still violates
-        // (0 >= 0), proving the clamp doesn't silently disable enforcement.
+        // (0 >= 0), proving the clamp does not silently disable enforcement.
         let usage = QuotaUsage {
             active_executions: -5,
             ..Default::default()

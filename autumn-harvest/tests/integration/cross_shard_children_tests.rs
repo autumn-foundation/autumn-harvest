@@ -2639,8 +2639,8 @@ async fn an_unreachable_target_shard_never_falls_back_to_the_parents_shard() {
 /// **AC3, issue #767 parity.** A cross-shard child that fails with a typed
 /// `WorkflowFailure` reaches its parent as a *typed* `ChildWorkflowFailed`.
 ///
-/// This is the regression test for a defect that survived a whole review round
-/// because only the field was added and never populated: the relay sees the
+/// This is the regression test for a defect that went unnoticed because only
+/// the field was added and never populated: the relay sees the
 /// child solely through what the child durably wrote, and the execution row's
 /// `error` column holds `decoded.message` alone. Reading it back therefore
 /// yields an untyped failure, silently dropping `error_type` / `details` /

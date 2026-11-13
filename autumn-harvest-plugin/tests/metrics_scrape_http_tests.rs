@@ -69,7 +69,7 @@ async fn scrape_endpoint_renders_all_catalogue_metrics_after_recording() {
     // These four back the engine's own is_enabled()-gated background
     // samplers (queue depth/DLQ depth samplers' oldest-age query, the
     // stranded-work scanner, the worker-slot sampler) -- implemented so
-    // that already-paid-for sampler work isn't silently discarded once
+    // that already-paid-for sampler work is not silently discarded once
     // .with_metrics_scrape() flips is_enabled() to true.
     recorder.record_queue_oldest_pending_age("default", 12.5);
     recorder.record_worker_slots(SlotType::Workflow, 3, 7);
@@ -142,7 +142,7 @@ async fn scrape_endpoint_renders_all_catalogue_metrics_after_recording() {
 async fn scrape_endpoint_omits_harvest_families_when_metrics_source_not_registered() {
     // No plugin, no `metrics_source` registration -- mirrors an app that
     // never calls `HarvestPlugin::with_metrics_scrape()`. `/actuator/prometheus`
-    // still exists (it's the app's own endpoint, always mounted by
+    // still exists (it is the app's own endpoint, always mounted by
     // default) but carries no `harvest_*` family, and there is zero runtime
     // cost paid for the unused aggregator (issue #355 AC3/AC8).
     let client = TestApp::new().build();
@@ -156,7 +156,7 @@ async fn scrape_endpoint_omits_harvest_families_when_metrics_source_not_register
 
 #[tokio::test]
 async fn no_family_emitted_for_a_metric_that_was_never_recorded() {
-    // A cold aggregator contributes zero families -- there's no way to
+    // A cold aggregator contributes zero families. There is no way to
     // synthesize a meaningful zero-value default for a labeled series
     // before its label values are known (see `metrics_scrape.rs` module
     // docs).

@@ -990,11 +990,10 @@ async fn raise_fleet_gate(conn: &mut AsyncPgConnection, api_state: &HarvestApiSt
     set_global_admission_gate_cache(Some(api_state.gate_cache()));
 }
 
-/// Round 20 (issue #618): the HTTP start route's gate-skip pre-check must be
-/// reuse-policy aware. `TerminateIfRunning` over a *live* prior ALWAYS creates a
-/// replacement, so it is a genuine admission and MUST be blocked by an active
-/// gate — the old policy-blind "non-sealed row exists → skip gate" wrongly let
-/// it slip.
+/// Issue #618: the HTTP start route's gate-skip pre-check must be reuse-policy
+/// aware. `TerminateIfRunning` over a *live* prior ALWAYS creates a
+/// replacement. So it is a genuine admission and an active gate MUST block it.
+/// The old policy-blind rule "non-sealed row exists → skip gate" let it slip.
 #[tokio::test]
 async fn gate_blocks_terminate_if_running_start_over_a_live_prior() {
     let Some(url) = db_url() else {
@@ -1043,7 +1042,7 @@ async fn gate_blocks_terminate_if_running_start_over_a_live_prior() {
     );
 }
 
-/// Round 20 (issue #618): `AllowDuplicateFailedOnly` over a prior that is
+/// Issue #618: `AllowDuplicateFailedOnly` over a prior that is
 /// FAILED/CANCELLED at read time creates a replacement, so it is a genuine
 /// admission and MUST be blocked by an active gate.
 #[tokio::test]
@@ -1094,10 +1093,10 @@ async fn gate_blocks_allow_duplicate_failed_only_start_over_a_failed_prior() {
     );
 }
 
-/// Round 20 (issue #618): the fix must NOT regress the idempotent-attach bypass
-/// (#808). `AllowDuplicate` attaches to the prior (live OR terminal) instead of
-/// creating anything, so an active gate must be SKIPPED — the retry returns the
-/// existing execution (200) and counts no block, with no new execution.
+/// Issue #618: the fix must NOT regress the idempotent-attach bypass (#808).
+/// `AllowDuplicate` attaches to the prior (live OR terminal) and creates
+/// nothing. So an active gate must be SKIPPED. The retry returns the existing
+/// execution (200) and counts no block, with no new execution.
 #[tokio::test]
 async fn gate_skips_allow_duplicate_attach_regardless_of_prior_state() {
     let Some(url) = db_url() else {
@@ -1145,18 +1144,22 @@ async fn gate_skips_allow_duplicate_attach_regardless_of_prior_state() {
     }
 }
 
-/// Round 21 (issue #618): the HTTP start route's pure-plain explicit-`workflow_id`
-/// gate decision is now made under the SAME `FOR UPDATE` lock as the
-/// create-vs-attach decision (via `gate_checked_start_or_load`), closing the
-/// round-20 residual TOCTOU. Deterministic race repro with the lock-holding
-/// harness: a holder locks the RUNNING prior and seals it to FAILED (uncommitted),
-/// then we spawn the HTTP start (`AllowDuplicateFailedOnly`). Under the fix the
-/// start queues on the prior's `FOR UPDATE` lock inside the locked primitive and,
-/// after the holder commits, observes FAILED — so the ADFO replacement is a fresh
-/// admission and is BLOCKED + counted, with no replacement created. Pre-fix
-/// (round 20) the unlocked pre-read (a plain SELECT) observed the *committed*
-/// RUNNING state and skipped the gate, letting `start_or_load` replace the
-/// freshly-sealed prior past the active gate uncounted (201, no block, 2 rows).
+/// Issue #618: the HTTP start route makes its pure-plain explicit-`workflow_id`
+/// gate decision under the SAME `FOR UPDATE` lock as the create-vs-attach
+/// decision (via `gate_checked_start_or_load`). That closes a TOCTOU between
+/// an unlocked gate pre-read and the start.
+///
+/// This is a deterministic race repro with the lock-holding harness. A holder
+/// locks the RUNNING prior and seals it to FAILED (uncommitted). The test then
+/// spawns the HTTP start (`AllowDuplicateFailedOnly`). Under the fix the start
+/// queues on the prior's `FOR UPDATE` lock inside the locked primitive. After
+/// the holder commits, it observes FAILED. So the ADFO replacement is a fresh
+/// admission and is BLOCKED + counted, with no replacement created.
+///
+/// Before the fix, the unlocked pre-read (a plain SELECT) observed the
+/// *committed* RUNNING state and skipped the gate. `start_or_load` then
+/// replaced the freshly-sealed prior past the active gate, uncounted (201, no
+/// block, 2 rows).
 #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
 async fn http_start_blocks_a_prior_that_seals_between_read_and_start() {
     let Some(url) = db_url() else {

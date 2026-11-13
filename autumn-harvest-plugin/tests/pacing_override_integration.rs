@@ -670,22 +670,22 @@ async fn rate_limit_override_delete_reverts_immediately_before_ttl() {
     }
 }
 
-// ── P1 review: piecewise accrual across an override that expired          ──
-// ── mid-interval with no intervening write (issue #945 review)            ──
+// ── Piecewise accrual across an override that expired                     ──
+// ── mid-interval with no intervening write (issue #945)                   ──
 //
 // A naive `elapsed * effective_refill_rate` applies "whichever rate is
-// effective RIGHT NOW" to the WHOLE elapsed interval. Once an override has
-// expired with no intervening debit/refund to settle the bucket, that
-// retroactively refills at the (now-reverted) baseline rate for the portion
-// of the interval the override was still supposed to be throttling -- a
-// phantom instant refill the moment the TTL lapses. Both tests below fix the
-// bucket's `last_refilled_at`/`override_expires_at` far enough in the past,
-// with the override's own accrual rate pinned to EXACTLY `0.0`, that segment
-// 1 (the override-active portion) provably contributes ZERO tokens
-// regardless of how much real wall-clock overhead the test itself adds --
-// only segment 2 (the short post-expiry tail, at the fast baseline rate)
-// can accrue anything, so the assertions are robust to CI timing jitter by
-// construction, not by a narrow numeric tolerance.
+// effective RIGHT NOW" to the WHOLE elapsed interval. Suppose an override
+// expired with no intervening debit/refund to settle the bucket. That formula
+// then refills at the reverted baseline rate for the part of the interval that
+// the override still throttled. The result is a phantom instant refill the
+// moment the TTL lapses.
+//
+// Both tests below set the bucket's `last_refilled_at`/`override_expires_at`
+// far in the past. They pin the override's own accrual rate to EXACTLY `0.0`.
+// So segment 1 (the override-active part) contributes ZERO tokens, whatever
+// wall-clock overhead the test adds. Only segment 2 (the short post-expiry
+// tail, at the fast baseline rate) can accrue anything. The assertions are
+// robust to CI timing jitter by construction, not by a narrow tolerance.
 
 #[tokio::test]
 async fn rate_limit_override_expiring_mid_interval_accrues_piecewise_not_the_reverted_baseline_across_the_whole_interval()
@@ -786,28 +786,27 @@ async fn rate_limit_override_expiring_mid_interval_does_not_phantom_refill_the_d
     );
 }
 
-// ── Round-4 review: the eligibility explainer must reuse the SAME piecewise ──
-// ── accrual formula the claim gate enforces, not re-derive it in Rust        ──
+// ── The eligibility explainer must reuse the SAME piecewise accrual      ──
+// ── formula the claim gate enforces, not re-derive it in Rust            ──
 //
-// `evaluate_eligibility_for_shard` (the `GET /admin/queues/{queue}/
-// eligibility` handler behind issue #611's operator triage endpoint)
-// independently re-computed "tokens available right now" in Rust via a flat
-// `elapsed_total * effective_refill_rate`, applying whichever rate is
-// effective AT THE MOMENT OF THE READ to the WHOLE elapsed interval -- the
-// exact class of bug `queue::token_accrual_expr` was written to fix at the
-// SQL layer for `claim_task` itself (issue #945 review, round 1, P1; see the
-// two tests immediately above this one). Because the diagnostic and the real
-// gate used two different formulas, an operator polling this endpoint during
-// an incident could be told a task is dispatchable ("no impediment") when
-// `claim_task` is, in fact, still refusing to claim it -- the worst possible
-// answer from a triage tool.
+// `evaluate_eligibility_for_shard` is the `GET /admin/queues/{queue}/
+// eligibility` handler behind issue #611's operator triage endpoint. It
+// re-computed "tokens available right now" in Rust with a flat
+// `elapsed_total * effective_refill_rate`. That applies the rate effective AT
+// THE MOMENT OF THE READ to the WHOLE elapsed interval. It is the same class
+// of bug that `queue::token_accrual_expr` fixes at the SQL layer for
+// `claim_task` itself (issue #945; see the two tests immediately above).
+// The diagnostic and the real gate used two different formulas. So an
+// operator who polls this endpoint during an incident could see a task as
+// dispatchable ("no impediment") while `claim_task` still refuses to claim
+// it. That is the worst possible answer from a triage tool.
 //
-// Reuses the identical accrual shape as the two P1 tests above (an override
-// that was paused for essentially the WHOLE ~10-day span and expired only 1
-// second ago) so the assertion is robust to CI timing jitter by
-// construction: the buggy flat-rate shape clamps straight to the
-// burst (1000.0) ceiling regardless of exact overhead, while the correct
-// piecewise shape can only ever accrue the short post-expiry tail.
+// This test reuses the accrual shape of the two piecewise tests above. The
+// override paused the bucket for nearly the WHOLE ~10-day span and expired
+// only 1 second ago. So the assertion is robust to CI timing jitter by
+// construction. The buggy flat-rate shape clamps straight to the burst
+// (1000.0) ceiling, whatever the overhead. The correct piecewise shape can
+// accrue only the short post-expiry tail.
 #[tokio::test]
 async fn eligibility_endpoint_reports_the_saturation_claim_task_actually_enforces() {
     let (url, _container) = setup_database().await;
@@ -952,8 +951,9 @@ async fn throttle_override_activates_immediately_and_reverts_at_ttl_via_real_sta
 
     // Simulate a scanner tick clearing job-2's backlog: `reserve_or_defer`'s
     // FIFO fast-path guard defers any NEW start for a key with a still-
-    // pending backlog entry (so a burst can't jump the queue), which would
-    // otherwise mask the override's effect on a *fresh* admission below.
+    // pending backlog entry, so that a burst cannot jump the queue. That
+    // guard would otherwise mask the override's effect on a *fresh*
+    // admission below.
     let bucket_key = autumn_harvest::throttle::bucket_key(name, "");
     {
         let mut conn = pool.get().await.expect("conn");
@@ -1001,18 +1001,17 @@ async fn throttle_override_activates_immediately_and_reverts_at_ttl_via_real_sta
     assert_eq!(entry["override_active"], json!(false));
 }
 
-// ── P1 review round 3: the SCANNER's candidate gate must honor an active   ──
-// ── override, not just the claim/dispatch gate (issue #945 review)         ──
+// ── The SCANNER's candidate gate must honor an active override, not      ──
+// ── just the claim/dispatch gate (issue #945)                            ──
 //
 // `throttle_override_activates_immediately_and_reverts_at_ttl_via_real_start_
-// route` above proves the override is honored on the *admission* path
-// (`reserve_or_defer`) and manually simulates a scanner tick by deleting the
-// backlog row directly -- it never actually drives `fire_due_throttled_
-// starts`. This test closes that gap: it drives the REAL scanner against a
-// backlog row that the BASELINE-only candidate gate would leave stranded
-// for the lifetime of any realistic test window (an effectively-frozen
-// 1/hour rate), and proves the scanner's own pre-filter honors the override
-// rate instead.
+// route` above proves that the *admission* path (`reserve_or_defer`) honors
+// the override. It simulates a scanner tick by deleting the backlog row
+// directly. It never drives `fire_due_throttled_starts`. This test closes
+// that gap. It drives the REAL scanner against a backlog row that a
+// BASELINE-only candidate gate leaves stranded for any realistic test window
+// (an effectively-frozen 1/hour rate). It proves that the scanner's own
+// pre-filter honors the override rate instead.
 
 #[tokio::test]
 async fn throttle_scanner_honors_active_override_in_its_candidate_gate() {
@@ -1063,11 +1062,11 @@ async fn throttle_scanner_honors_active_override_in_its_candidate_gate() {
     // math).
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    // Drive the REAL scanner directly -- not a manual row deletion. Money
-    // assertion: at the frozen 1/hour baseline this row can NEVER become a
-    // scanner candidate within any realistic test window, so a scanner that
-    // fires it here can only be honoring the ACTIVE OVERRIDE in its own
-    // candidate pre-filter (the exact site the P1 finding names).
+    // Drive the REAL scanner directly, not a manual row deletion. At the
+    // frozen 1/hour baseline this row can NEVER become a scanner candidate
+    // within any realistic test window. So a scanner that fires it here
+    // honors the ACTIVE OVERRIDE in its own candidate pre-filter. That
+    // pre-filter is the site under test.
     let fired_count = {
         let mut conn = pool.get().await.expect("conn");
         autumn_harvest::throttle::fire_due_throttled_starts(
@@ -1716,21 +1715,21 @@ async fn throttle_override_set_and_clear_record_audit_rows() {
     );
 }
 
-// ── issue #945 review, round 2 ──────────────────────────────────────────────
+// ── issue #945: persisted baseline and shard outages ───────────────────────
 //
-// Two independent P2 findings on the round-1 fix commit:
+// Two independent requirements:
 //
 // 1. `declared_*`/`effective_*` in every SET/CLEAR/GET response must reflect
-//    the bucket's PERSISTED baseline, not the live registry declaration —
-//    the separate, pre-existing, PERMANENT `POST /admin/rate-limits/{key}`
-//    route (issue #332) can change a bucket's `refill_rate`/`burst` columns
-//    independently of the registry, and the dispatch/claim path
+//    the bucket's PERSISTED baseline, not the live registry declaration.
+//    The separate, PERMANENT `POST /admin/rate-limits/{key}` route (issue
+//    #332) can change a bucket's `refill_rate`/`burst` columns independently
+//    of the registry. The dispatch/claim path
 //    (`effective_refill_rate_expr`/`effective_burst_expr`) reads those
 //    columns, not the registry.
 // 2. `GET /admin/start-throttle/{workflow_name}/override` must not silently
-//    misreport a shard outage as "no override configured" — a total outage
-//    must fail closed (`503`), and a partial outage must surface `207` with
-//    the unreachable shard(s) named, never a bare `200`.
+//    misreport a shard outage as "no override configured". A total outage
+//    must fail closed (`503`). A partial outage must surface `207` with the
+//    unreachable shard(s) named, never a bare `200`.
 
 #[tokio::test]
 async fn rate_limit_override_reports_persisted_baseline_not_registry_after_legacy_permanent_change()
@@ -1981,18 +1980,17 @@ async fn get_start_throttle_pacing_override_returns_207_on_partial_shard_outage_
 }
 
 /// Two GENUINELY LIVE, fully reachable shards that DISAGREE on override
-/// state (issue #945 review, round 4, P2): shard 0 carries a live ACTIVE
-/// override; shard 1 has no override at all (a cleared/never-set row).
+/// state (issue #945). Shard 0 carries a live ACTIVE override. Shard 1 has no
+/// override at all (a cleared/never-set row).
 ///
-/// This is deliberately NOT an outage scenario -- both shards answer their
-/// query successfully, so `shard_errors` must be empty. The pre-fix merge
-/// picked a single "representative" row across shards by raw `tokens` count
-/// alone (`existing.tokens <= b.tokens => existing`), which has nothing to
-/// do with whether an override is active. Seeding the ACTIVE shard with
-/// MORE tokens than the INACTIVE shard reproduces the exact failure Codex's
-/// review named: a fully-reachable GET silently returning `200
-/// {"override_active": false}` while a live override still governs dispatch
-/// on shard 0.
+/// This is deliberately NOT an outage scenario. Both shards answer their
+/// query, so `shard_errors` must be empty. The pre-fix merge picked one
+/// "representative" row across shards by raw `tokens` count alone
+/// (`existing.tokens <= b.tokens => existing`). That count has nothing to do
+/// with whether an override is active. The test seeds the ACTIVE shard with
+/// MORE tokens than the INACTIVE shard. That reproduces the failure: a
+/// fully-reachable GET silently returns `200 {"override_active": false}`
+/// while a live override still governs dispatch on shard 0.
 #[tokio::test]
 async fn get_start_throttle_pacing_override_reports_disagreement_across_live_shards() {
     let (url_0, _container_0) = setup_one_shard().await;
@@ -2107,17 +2105,15 @@ async fn get_start_throttle_pacing_override_reports_disagreement_across_live_sha
     );
 }
 
-// ── Round 5: cross-shard disagreement holes in the round-4 fix ─────────────
+// ── Cross-shard disagreement beyond the single-key override read ──────────
 
-/// Issue #945 review, round 5, finding 1: `GET /admin/rate-limits` (the
-/// LIST endpoint) still merged every key down to whichever shard had the
-/// fewest raw `tokens`, converting ONLY that single row -- so a fully
-/// reachable, genuinely disagreeing fleet (one shard actively overridden,
-/// one not) could report `override_active: false` for a key that is, in
-/// fact, still overridden on another live shard. This is the same class of
-/// bug round 4 fixed for the single-key `get_start_throttle_pacing_override`
-/// read; this test proves the fix now also covers the plain rate-limit
-/// list.
+/// Issue #945: `GET /admin/rate-limits` (the LIST endpoint) merged every key
+/// down to the shard with the fewest raw `tokens`, and converted ONLY that
+/// row. So a fully reachable, genuinely disagreeing fleet (one shard actively
+/// overridden, one not) could report `override_active: false` for a key that
+/// is still overridden on another live shard. The single-key
+/// `get_start_throttle_pacing_override` read had the same class of bug. This
+/// test proves that the fix also covers the plain rate-limit list.
 #[tokio::test]
 async fn list_rate_limits_reports_disagreement_across_live_shards() {
     let (url_0, _container_0) = setup_one_shard().await;
@@ -2290,15 +2286,15 @@ async fn list_rate_limits_reports_disagreement_when_a_shard_has_no_row() {
     );
 }
 
-/// Issue #945 review, round 5, finding 2: the round-4 disagreement check
-/// compared only the RAW `override_refill_rate`/`override_burst` columns.
+/// Issue #945: the cross-shard disagreement check of the single-key override
+/// read compared only the RAW `override_refill_rate`/`override_burst` columns.
 /// A partial legacy `POST /admin/rate-limits/{key}` fan-out (issue #332)
-/// can leave shards with divergent persisted BASELINES; a subsequent
-/// one-field override (only `refill_rate` set, `burst` omitted) then
-/// writes byte-IDENTICAL override columns to every shard -- so the raw
-/// comparison reports "no disagreement" even though the *resolved
-/// effective* burst genuinely differs per shard (each omitted-override
-/// field falls back to that shard's own, diverged, baseline burst).
+/// can leave shards with divergent persisted BASELINES. A later one-field
+/// override (only `refill_rate` set, `burst` omitted) then writes
+/// byte-IDENTICAL override columns to every shard. So the raw comparison
+/// reports "no disagreement", but the *resolved effective* burst differs per
+/// shard. Each omitted override field falls back to the diverged baseline
+/// burst of its own shard.
 #[tokio::test]
 async fn get_start_throttle_pacing_override_detects_diverged_baseline_disagreement() {
     let (url_0, _container_0) = setup_one_shard().await;

@@ -2294,7 +2294,7 @@ pub async fn fleet_health(
 /// The predicate — a fresh `last_heartbeat_at` inside a caller-supplied window
 /// — is the same *shape* the poison-pill orphan reclaimer uses
 /// ([`crate::poison_pill::orphaned_running_tasks_query`]), but the **window is
-/// not the same value**, and that divergence is deliberate (Codex round-19 P1).
+/// not the same value**, and that divergence is deliberate.
 ///
 /// The reclaimer judges a row it is entitled to judge, with a window derived
 /// from its own configured cadence. This query judges *peers*, whose cadence the
@@ -2870,8 +2870,7 @@ pub async fn drain_preview(
 // Background heartbeat task
 // ---------------------------------------------------------------------------
 
-/// Remove a worker row whose registration could not be verified (issue #804,
-/// Codex round-51 P1).
+/// Remove a worker row whose registration could not be verified (issue #804).
 ///
 /// A row that survives a rolled-back registration is not merely out of date —
 /// it is *affirmative false evidence*. The capability-miss fleet read counts a
@@ -2902,15 +2901,15 @@ async fn withdraw_unverified_worker_row(
 ///
 /// Registration is atomic with the capability-miss invalidation, exactly as
 /// startup is: republishing this id without clearing the evidence it may still
-/// carry would make it affirmative fleet evidence against itself (issue #804,
-/// Codex round-28 P1). This is also the retry that heals a startup registration
-/// whose invalidation failed and rolled the pair back.
+/// carry would make it affirmative fleet evidence against itself (issue #804).
+/// This is also the retry that heals a startup registration whose invalidation
+/// failed and rolled the pair back.
 ///
-/// The gate (issue #804, Codex round-55 P1) is why the failure arm is not just
-/// a log line. Round 54 seeded `registration_pending` only from the *startup*
-/// registration result, so this runtime path — the fleet row vanishing later
-/// and the heal failing — left a worker claiming while absent from
-/// `harvest_workers`, which is the exact state that gate exists to prevent.
+/// The claim gate (issue #804) is why the failure arm is not just a log line.
+/// `registration_pending` was first seeded only from the *startup*
+/// registration result. So this runtime path left a worker claiming while
+/// absent from `harvest_workers`: the fleet row vanished later and the heal
+/// failed. That is the exact state that the gate exists to prevent.
 ///
 /// Absent is harmful twice over. The worker is invisible to a peer's fleet
 /// evidence, so an incapable claimant can derive
@@ -2999,12 +2998,12 @@ async fn retry_pending_startup_registration(
             true
         }
         Err(error) => {
-            // Do NOT fall through to the heartbeat (issue #804, Codex
-            // round-50 P1). A reused `worker_id` leaves the previous row
-            // alive, so `heartbeat_worker` would succeed and refresh a row
-            // we know is wrong — republishing the old build's `build_id`
-            // and queues as live while this id's stale capability-miss
-            // evidence is still uncleared. That is affirmative false fleet
+            // Do NOT fall through to the heartbeat (issue #804). A reused
+            // `worker_id` leaves the previous row alive, so `heartbeat_worker`
+            // would succeed and refresh a row that is known to be wrong. It
+            // would republish the old build's `build_id` and queues as live
+            // while this id's stale capability-miss evidence is still
+            // uncleared. That is affirmative false fleet
             // evidence, and it is exactly what can produce
             // `AllLiveWorkersMissed` and a terminal failure of a task this
             // worker can run. Publishing nothing is strictly more honest
@@ -3023,8 +3022,8 @@ async fn retry_pending_startup_registration(
             // likewise skipped for this tick; a worker that cannot register
             // is already invisible to the fleet.
             //
-            // Ageing out is not fast enough on its own (issue #804, Codex
-            // round-51 P1): the capability-miss fleet window is floored at
+            // Ageing out is not fast enough on its own (issue #804): the
+            // capability-miss fleet window is floored at
             // 120 s, and for that whole window the surviving row is still
             // read as a LIVE worker carrying this id's stale miss evidence
             // — i.e. as a worker that has already missed — which is what
@@ -3052,7 +3051,7 @@ async fn retry_pending_startup_registration(
 /// Execute one heartbeat DB tick: update `last_heartbeat_at`, handle
 /// re-registration / drain transitions, and refresh the drain deadline.
 ///
-/// `#[doc(hidden)] pub` so the round-49 regression test can drive the real tick
+/// `#[doc(hidden)] pub` so the reused-`worker_id` regression test can drive the real tick
 /// against a live database rather than a reimplementation of it — the defect it
 /// guards lives in this function's arm selection, so a test that recreated the
 /// arms would prove nothing.
@@ -3120,7 +3119,7 @@ pub async fn do_heartbeat_tick(
                 // issued).  Guarded to Active rows only so it never reverts a row
                 // that already reached Draining or Stopped.
                 // Also write the current monotonic drain deadline so the
-                // dedup-by-freshest layer doesn't mask the effective drain
+                // dedup-by-freshest layer does not mask the effective drain
                 // window when this row's heartbeat is the most recent one
                 // (issue #522 review).
                 let current_deadline = drain_deadline_max.lock().ok().and_then(|g| *g);
@@ -3427,7 +3426,7 @@ async fn sync_drain_deadline(
             .unwrap_or(Duration::ZERO);
         let candidate = std::time::Instant::now() + remaining;
         // Update the cell while still holding `max_guard`, so two shards observing
-        // distinct new deadlines concurrently can't reorder their writes (lock
+        // distinct new deadlines concurrently cannot reorder their writes (lock
         // order max_applied→cell is the only place both are held).
         if let Ok(mut guard) = cell.lock() {
             *guard = Some(candidate);
@@ -5483,7 +5482,7 @@ mod tests {
 
     #[test]
     fn apply_filters_shard_keeps_a_worker_on_the_empty_auto_assignment() {
-        // Issue #961 (Codex round 3): a default worker built without a
+        // Issue #961: a default worker built without a
         // ShardedDbPool registers `shard_assignments: []`. Shard health, queue
         // coverage and preflight all report it as covering the shard it polls,
         // so `GET /workers?shard_id=N` must not silently omit it.
@@ -5706,8 +5705,8 @@ mod tests {
     #[test]
     fn drain_preview_defaults_status_to_active_when_unset() {
         // Verify the documented default: callers that omit status see only Active.
-        // We can't run a DB query in a unit test, but we can verify the filter
-        // construction by inspecting the effective filters value.
+        // A unit test cannot run a DB query, so this test checks the filter
+        // construction through the effective filters value.
         let filters = WorkerFilters::new();
         assert!(
             filters.status.is_none(),

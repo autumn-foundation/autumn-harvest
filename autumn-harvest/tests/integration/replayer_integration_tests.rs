@@ -261,7 +261,7 @@ async fn replay_from_db_detects_non_determinism() {
     );
 }
 
-/// (c) `replay_from_db` fails gracefully when the execution ID doesn't exist.
+/// (c) `replay_from_db` fails gracefully when the execution ID does not exist.
 #[tokio::test]
 async fn replay_from_db_unknown_exec_id_returns_error() {
     let (mut conn, _container) = setup_test_db().await;

@@ -942,10 +942,10 @@ async fn an_unmigrated_restore_is_undetermined_never_a_pass() {
 }
 
 // ---------------------------------------------------------------------------
-// Codex round 1 regressions
+// Cross-shard effect and replay-verdict regressions
 // ---------------------------------------------------------------------------
 
-/// Codex round 1, P1. A caller that recorded `ExternalCancelDelivered` asserts
+/// A caller that recorded `ExternalCancelDelivered` asserts
 /// the target is terminal. If the target's shard was restored to a point where
 /// it is still RUNNING, resuming silently loses an effect the caller believes
 /// already happened — the external-request analogue of a rolled-back child
@@ -1139,7 +1139,7 @@ async fn detects_delivered_external_signal_rolled_back_on_the_target_shard() {
     assert_eq!(report.status, VerifyStatus::Incoherent);
 }
 
-/// Codex round 3, P1. The reference scan filtered owning executions to
+/// The reference scan once filtered owning executions to
 /// non-terminal states -- a rule that belongs to the CHILD checks (a terminal
 /// parent's awaited child may legitimately have been collected by retention)
 /// but was wrongly applied to external effects too.
@@ -1461,7 +1461,7 @@ async fn an_absent_external_effect_target_without_a_summary_is_undetermined() {
     assert_eq!(report.status, VerifyStatus::Unavailable, "{report:#?}");
 }
 
-/// Codex round 1, P2. An undecodable child/external `event_data` row may be the
+/// An undecodable child/external `event_data` row may be the
 /// very reference that would have exposed a missing target, so dropping it can
 /// turn an incoherent restore into a resumable verdict. Fail closed: the whole
 /// cross-shard check becomes Undetermined.
@@ -1501,7 +1501,7 @@ async fn an_undecodable_reference_event_is_undetermined_not_silently_dropped() {
     assert_eq!(report.status, VerifyStatus::Unavailable);
 }
 
-/// Codex round 1, P1 — the *mapping*, driven end to end.
+/// The *mapping* of a replay failure, driven end to end.
 ///
 /// A registered handler that returns `Err` against a NON-terminal recorded
 /// history is not a clean replay: the history carries no terminal failure, so
@@ -1599,9 +1599,9 @@ async fn a_replayed_workflow_that_succeeds_is_still_clean() {
     );
 }
 
-// ─────────────── Codex round 2: signal effect identity + chain ───────────────
+// ────────────────────── Signal effect identity + chain ───────────────────────
 
-/// Codex round 2, P1. Continue-as-new REASSIGNS unconsumed `harvest_signals`
+/// Continue-as-new REASSIGNS unconsumed `harvest_signals`
 /// rows to the successor (`worker.rs`), and an unconsumed signal produces no
 /// `SignalReceived` event — so after the transition the ORIGINAL target row
 /// carries no row and no event. Checking the target alone reports a perfectly
@@ -1748,7 +1748,7 @@ async fn a_signal_forwarded_to_a_retry_attempt_is_found_on_the_successor() {
     assert_ne!(report.status, VerifyStatus::Incoherent);
 }
 
-/// Codex round 2, P1. A repeated channel name made the name-level EXISTS match
+/// A repeated channel name once made the name-level EXISTS match
 /// an OLDER delivery, so a rollback that dropped only the newer one read clean.
 /// With an `idempotency_key` the delivery has a real identity, so the check is
 /// exact: a target carrying only the earlier key is definitively rolled back.
