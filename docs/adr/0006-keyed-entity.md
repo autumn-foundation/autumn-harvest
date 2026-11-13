@@ -15,6 +15,9 @@ first alternative below.
 Amended by issue #2266: an opt-in wake hook runs an op at a deadline. See
 [the amendment](#amendment-wakes-issue-2266).
 
+Amended by issue #2658: an opt-in hook lets the state ask for a checkpoint.
+See [the amendment](#amendment-checkpoint-requests-issue-2658).
+
 ## Context
 
 - Restate virtual objects and Azure durable entities give each key
@@ -335,3 +338,37 @@ send that signal.
   which is now due, and the loop runs it again at once. Make a wake op
   return `Ok`.
 - The timer counts whole seconds, so a wake can run up to one second late.
+
+## Amendment: checkpoint requests (issue #2658)
+
+The design record is `docs/design/DESIGN-2658.md`.
+
+### Context
+
+A durable agent reads its profile at the start of a run. To read a new
+profile, the agent must end its run. Before this change, only the engine
+chose a checkpoint: the history size, a byte estimate or `max_ops_per_run`.
+
+### Decision
+
+- `Entity::run_with_wakes_and_checkpoints(handler, wake, take)` adds an
+  opt-in hook. After each op, the loop calls `take(&mut state)`. A `true`
+  ends the run at a checkpoint after that op.
+- The loop calls `take` before the snapshot of the op. So `take` can clear
+  its request in the state, and no snapshot and no checkpoint input holds
+  it.
+- The request stays until the checkpoint. A waiting op that does not fit
+  the checkpoint input runs in this run first, as at any checkpoint.
+- `Entity::run` and `Entity::run_with_wakes` pass a hook that gives
+  `false`. Their histories replay with no change.
+
+### Consequences
+
+- No new event variant and no migration.
+- A requested checkpoint records no checkpoint side effect for its op.
+  Replay runs the handler again, so `take` gives the same answer at the
+  same op.
+- The answer of `take` must depend only on the state. A request field of
+  the state should skip serialization, so a snapshot never holds it.
+- The hook is a generic closure, not a stored function pointer. A static
+  analysis such as harvest-verify can follow it.

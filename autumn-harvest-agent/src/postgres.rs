@@ -929,33 +929,7 @@ impl AgentDirectory for Directory {
 /// paused.
 pub async fn pause_mesh(pg: &PostgresAgents, mesh: &str, reason: &str) -> HarvestResult<MeshPause> {
     let at_ms = Utc::now().timestamp_millis();
-    let attrs = serde_json::json!({ MESH_ATTR: mesh });
-    let mut targets = Vec::new();
-    for shard in pg.group_shards() {
-        let mut conn = pg.conn(shard).await?;
-        let mut after = None;
-        loop {
-            let page = list_running_with_search_attrs(
-                &mut conn,
-                AGENT_WORKFLOW_NAME,
-                &attrs,
-                after,
-                SCAN_PAGE,
-            )
-            .await?;
-            let full = page.len() >= SCAN_PAGE as usize;
-            after = page.last().map(|(exec, _id)| *exec);
-            targets.extend(
-                page.into_iter()
-                    .filter_map(|(_exec, id)| AgentId::parse(&id).ok()),
-            );
-            if !full {
-                break;
-            }
-        }
-    }
-    targets.sort_by(|a, b| a.as_str().cmp(b.as_str()));
-    targets.dedup();
+    let targets = running_agents(pg, &serde_json::json!({ MESH_ATTR: mesh })).await?;
     let key = format!("pause-mesh:{mesh}:{at_ms}");
     let pause = AgentOp::Control(Control::Pause {
         reason: Some(reason.to_owned()),
@@ -980,6 +954,64 @@ pub async fn pause_mesh(pg: &PostgresAgents, mesh: &str, reason: &str) -> Harves
         "a mesh was paused"
     );
     Ok(record)
+}
+
+/// The running agents whose search attributes hold `attrs`, over every
+/// shard of the group. They are sorted by id, with no repeats.
+async fn running_agents(pg: &PostgresAgents, attrs: &Value) -> HarvestResult<Vec<AgentId>> {
+    let mut targets = Vec::new();
+    for shard in pg.group_shards() {
+        let mut conn = pg.conn(shard).await?;
+        let mut after = None;
+        loop {
+            let page = list_running_with_search_attrs(
+                &mut conn,
+                AGENT_WORKFLOW_NAME,
+                attrs,
+                after,
+                SCAN_PAGE,
+            )
+            .await?;
+            let full = page.len() >= SCAN_PAGE as usize;
+            after = page.last().map(|(exec, _id)| *exec);
+            targets.extend(
+                page.into_iter()
+                    .filter_map(|(_exec, id)| AgentId::parse(&id).ok()),
+            );
+            if !full {
+                break;
+            }
+        }
+    }
+    targets.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+    targets.dedup();
+    Ok(targets)
+}
+
+/// Send `Control::ReloadProfile` to each running agent of `kind`. Returns
+/// the agents, sorted by id.
+///
+/// Deploy the new harness first. The reload reads the profile when a worker
+/// runs the op. The op goes to the live run only, so an agent with no live
+/// run stays ended. Each call uses its own idempotency key.
+///
+/// The filter is the search attribute `agent_kind`. Each op of an agent sets
+/// it, so a new agent that has run no op yet is not listed. Send it the op
+/// with [`send`].
+///
+/// # Errors
+///
+/// Returns a list or a send error. Agents that got the op before it keep
+/// it.
+pub async fn reload_profiles(pg: &PostgresAgents, kind: &str) -> HarvestResult<Vec<AgentId>> {
+    let at_ms = Utc::now().timestamp_millis();
+    let targets = running_agents(pg, &serde_json::json!({ "agent_kind": kind })).await?;
+    let key = format!("{ENTITY_OP_SIGNAL}:reload-profiles:{kind}:{at_ms}");
+    let payload = Agent::payload(&AgentOp::Control(Control::ReloadProfile));
+    for id in &targets {
+        signal_live(pg, id, ENTITY_OP_SIGNAL, payload.clone(), Some(&key)).await?;
+    }
+    Ok(targets)
 }
 
 /// Send an interrupt to the live run of `id`. A run that ended takes none.

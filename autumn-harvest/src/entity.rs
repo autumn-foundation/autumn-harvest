@@ -14,6 +14,7 @@
 //! | State change | A snapshot event, [`ENTITY_STATE_SIDE_EFFECT`](crate::entity::ENTITY_STATE_SIDE_EFFECT) |
 //! | Read state without replay | The projection, [`crate::entity_state`] |
 //! | Run an op at a deadline | A [`Wake`](crate::entity::Wake) from the hook of [`Entity::run_with_wakes`](crate::entity::Entity::run_with_wakes) (issue #2266) |
+//! | End a run after an op | The `take` hook of [`Entity::run_with_wakes_and_checkpoints`](crate::entity::Entity::run_with_wakes_and_checkpoints) |
 //!
 //! # Guarantees
 //!
@@ -453,7 +454,8 @@ where
         Fut: Future<Output = Result<S, String>>,
     {
         // No hook means no clock read and no timer, so old histories replay.
-        self.run_loop(handler, |_: &S| None::<Wake<O>>).await
+        self.run_loop(handler, |_: &S| None::<Wake<O>>, |_: &mut S| false)
+            .await
     }
 
     /// Run the loop like [`run`](Self::run), and also run the op of `wake` at
@@ -493,16 +495,64 @@ where
         Fut: Future<Output = Result<S, String>>,
         W: FnMut(&S) -> Option<Wake<O>>,
     {
-        self.run_loop(handler, wake).await
+        self.run_loop(handler, wake, |_: &mut S| false).await
     }
 
-    /// The loop of [`run`](Self::run) and [`run_with_wakes`](Self::run_with_wakes).
-    async fn run_loop<O, H, Fut, W>(self, mut handler: H, mut wake: W) -> HarvestResult<S>
+    /// Run the loop like [`run_with_wakes`](Self::run_with_wakes), and also
+    /// take a checkpoint when the state asks for one.
+    ///
+    /// After each op, the loop calls `take` with the new state. A `true`
+    /// ends the run at a checkpoint after that op. The ops that wait move to
+    /// the next run, as at any checkpoint. `take` must clear the request in
+    /// the state, so the next run does not ask again.
+    ///
+    /// The loop calls `take` before the snapshot of the op. So no snapshot
+    /// and no checkpoint input holds a request that `take` cleared. The
+    /// answer of `take` must depend only on the state. Replay runs the
+    /// handler again, so `take` then gives the same answer. A history from
+    /// before this hook replays when `take` gives `false` for each state.
+    ///
+    /// A checkpoint that `take` asks for records no checkpoint side effect
+    /// for that op. A waiting op that does not fit the checkpoint input runs
+    /// in this run first. The request stays until the checkpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`run_with_wakes`](Self::run_with_wakes).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `continue_as_new` resolves. The engine never resolves it.
+    pub async fn run_with_wakes_and_checkpoints<O, H, Fut, W, C>(
+        self,
+        handler: H,
+        wake: W,
+        take: C,
+    ) -> HarvestResult<S>
     where
         O: DeserializeOwned,
         H: FnMut(S, O) -> Fut,
         Fut: Future<Output = Result<S, String>>,
         W: FnMut(&S) -> Option<Wake<O>>,
+        C: FnMut(&mut S) -> bool,
+    {
+        self.run_loop(handler, wake, take).await
+    }
+
+    /// The loop of [`run`](Self::run), [`run_with_wakes`](Self::run_with_wakes)
+    /// and [`run_with_wakes_and_checkpoints`](Self::run_with_wakes_and_checkpoints).
+    async fn run_loop<O, H, Fut, W, C>(
+        self,
+        mut handler: H,
+        mut wake: W,
+        mut take: C,
+    ) -> HarvestResult<S>
+    where
+        O: DeserializeOwned,
+        H: FnMut(S, O) -> Fut,
+        Fut: Future<Output = Result<S, String>>,
+        W: FnMut(&S) -> Option<Wake<O>>,
+        C: FnMut(&mut S) -> bool,
     {
         let Self {
             ctx,
@@ -531,6 +581,9 @@ where
         record_snapshot(ctx, &mut checkpoint, ENTITY_STATE_SIDE_EFFECT, &mut run)?;
         let published = Arc::new(Mutex::new(Published::of(&checkpoint)));
         register_queries(ctx, &published);
+        // A request stays until the checkpoint, also when a waiting op does
+        // not fit and runs in this run first.
+        let mut requested = false;
 
         loop {
             let message = match next_step(ctx, &mut waiting, wake(&checkpoint.state)).await? {
@@ -567,11 +620,13 @@ where
                     format!("entity message does not decode: {error}"),
                 ),
             }
+            // Before the snapshot, so replay sees the same request.
+            requested |= take(&mut checkpoint.state);
             run.ops += 1;
             record_snapshot(ctx, &mut checkpoint, ENTITY_STATE_SIDE_EFFECT, &mut run)?;
             *lock(&published) = Published::of(&checkpoint);
 
-            if checkpoint_due(ctx, &mut run, max_ops_per_run)? {
+            if requested || checkpoint_due(ctx, &mut run, max_ops_per_run)? {
                 // Record the budget at each attempt. A cap that changes while a
                 // handler waits then applies to the next attempt.
                 let limit = ctx.side_effect(ENTITY_CHECKPOINT_BUDGET_SIDE_EFFECT, || {

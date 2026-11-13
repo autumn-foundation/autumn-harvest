@@ -426,6 +426,9 @@ The module `sqlite::agent` mirrors the durable agent calls of
 - `decide` sends a decision to the approval wait that its signal names. The
   approval notice of the harness names the signal. For a one-shot
   `agent_loop` run, call `HarvestSqlite::signal` with its execution id.
+- `reload_profiles` sends `Control::ReloadProfile` to each running agent
+  of a kind. Each agent then reads the profile of the harness again. Call
+  it after a restart with a new harness. An ended agent stays ended.
 
 No call drives the run. The driver runs each op, so a long model turn
 delays the next write. An activity runs on the driver task, so make these

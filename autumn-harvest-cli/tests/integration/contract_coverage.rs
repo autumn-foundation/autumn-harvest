@@ -385,6 +385,7 @@ fn agents_pause_and_resume_are_covered() {
     for args in [
         &["agents", "pause", "support/ada", "--reason", "audit"][..],
         &["agents", "resume", "support/ada"][..],
+        &["agents", "reload", "support/ada"][..],
     ] {
         assert_covered(args);
         assert_body_fields_documented(args);
