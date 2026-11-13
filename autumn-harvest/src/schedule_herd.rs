@@ -104,7 +104,9 @@ pub fn forecast(
     bucket: Duration,
     min_herd: usize,
 ) -> HerdForecast {
-    forecast_shifted(schedules, from, until, bucket, min_herd, |_, fire| fire)
+    forecast_shifted(schedules, from, until, bucket, min_herd, |_, fire| {
+        Some(fire)
+    })
 }
 
 /// [`forecast`] with a shift applied to each fire before it goes into a bucket.
@@ -113,6 +115,10 @@ pub fn forecast(
 /// It returns the time at which the run really starts. The scheduler adds a
 /// jitter offset to each slot, so pass that offset here. The window check uses
 /// the slot time, as the scheduler does.
+///
+/// A `None` from `shift` ends the walk of that schedule, and the slot does not
+/// count. A run budget or an end time stops a schedule in this way. The calls
+/// for one schedule come in slot order.
 #[must_use]
 pub fn forecast_shifted(
     schedules: &[(&str, &Schedule)],
@@ -120,7 +126,7 @@ pub fn forecast_shifted(
     until: DateTime<Utc>,
     bucket: Duration,
     min_herd: usize,
-    shift: impl Fn(usize, DateTime<Utc>) -> DateTime<Utc>,
+    mut shift: impl FnMut(usize, DateTime<Utc>) -> Option<DateTime<Utc>>,
 ) -> HerdForecast {
     // The width counts in milliseconds, so a fractional bucket keeps its size.
     let width = i64::try_from(bucket.as_millis())
@@ -154,8 +160,11 @@ pub fn forecast_shifted(
                 truncated.push(name.to_string());
                 break;
             }
+            let Some(start) = shift(index, next) else {
+                break;
+            };
             read += 1;
-            let key = shift(index, next).timestamp_millis().div_euclid(width);
+            let key = start.timestamp_millis().div_euclid(width);
             buckets.entry(key).or_default().push(name.to_string());
         }
         fires += read;
@@ -360,17 +369,29 @@ mod tests {
         let b = cron("0 * * * *");
         let schedules = [("a", &a), ("b", &b)];
         let jitter = |index: usize, t: DateTime<Utc>| {
-            if index == 1 {
+            Some(if index == 1 {
                 t + chrono::Duration::seconds(90)
             } else {
                 t
-            }
+            })
         };
         let apart = forecast_shifted(&schedules, at(0), at(HOUR), MINUTE, 2, jitter);
         assert_eq!(apart.fires, 2);
         assert_eq!(apart.spots, []);
-        let still = forecast_shifted(&schedules, at(0), at(HOUR), MINUTE, 2, |_, t| t);
+        let still = forecast_shifted(&schedules, at(0), at(HOUR), MINUTE, 2, |_, t| Some(t));
         assert_eq!(still, forecast(&schedules, at(0), at(HOUR), MINUTE, 2));
+    }
+
+    #[test]
+    fn a_shift_of_none_ends_the_walk_of_its_schedule() {
+        let a = cron("0 * * * *");
+        let b = cron("0 * * * *");
+        let schedules = [("a", &a), ("b", &b)];
+        let cap = |index: usize, t: DateTime<Utc>| (index == 0 || t < at(HOUR)).then_some(t);
+        let report = forecast_shifted(&schedules, at(0), at(3 * HOUR), MINUTE, 2, cap);
+        assert_eq!(report.fires, 4, "a fires 3 times, b only once");
+        assert_eq!(report.spots.len(), 1);
+        assert_eq!(report.spots[0].at, at(0));
     }
 
     #[test]

@@ -12,7 +12,8 @@ scheduler then starts twenty runs at the top of each hour.
 - The report applies the jitter of each schedule, as the scheduler does. It
   lists paused, auto-paused and exhausted schedules as `inactive`. Interval
   schedules have no fixed phase, so it lists them as `unanchored`.
-- Calendar exclusions and the `end_at` cutoff are not applied yet.
+- Each schedule stops at its `end_at` and at the end of its `max_runs`
+  budget, as in the scheduler. Calendar exclusions are not applied yet.
 - `schedule_herd::forecast` and `forecast_shifted` hold the arithmetic. They
   are pure and send no SQL.
 - The SQLite backend answers `501` for the endpoint. It has no port yet.

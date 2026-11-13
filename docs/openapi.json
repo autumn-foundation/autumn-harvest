@@ -3923,7 +3923,7 @@
     },
     "/admin/schedules/herd": {
       "get": {
-        "description": "Forecast schedule herds: the moments when many active cron schedules start runs together. Walks each active schedule over the window, applies its jitter, and groups the fires into buckets. Paused, auto-paused and exhausted schedules are listed as inactive. Interval schedules are listed as unanchored, because their fire times depend on their last run. Calendar exclusions and end_at are not applied. Does not trigger any executions.",
+        "description": "Forecast schedule herds: the moments when many active cron schedules start runs together. Walks each active schedule over the window, applies its jitter, and groups the fires into buckets. Paused, auto-paused and exhausted schedules are listed as inactive. Interval schedules are listed as unanchored, because their fire times depend on their last run. Each schedule stops at its end_at and at the end of its max_runs budget. Calendar exclusions are not applied. Does not trigger any executions.",
         "operationId": "get_admin_schedules_herd",
         "parameters": [
           {
