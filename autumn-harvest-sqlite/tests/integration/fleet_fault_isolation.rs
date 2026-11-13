@@ -514,3 +514,32 @@ async fn poll_once_reporting_keeps_progress_beside_the_error() {
         ExecutionOutcome::Completed(_)
     ));
 }
+
+/// A run that the error path seals `FAILED` changed state, so its pass
+/// counts as progress. A parent that waits for it can then move. A driver
+/// that settles on an idle pass must not stop before that.
+#[tokio::test]
+async fn a_run_sealed_by_its_error_counts_as_progress() {
+    let mut rt = SqliteRuntime::open_in_memory().unwrap();
+    rt.register_workflow(&broken_wf_info());
+    let broken = rt
+        .start_workflow("broken_wf", json!(ExecutionId::new()))
+        .unwrap();
+
+    let pass = rt.poll_once_reporting().await.expect("the pass runs");
+    assert!(
+        matches!(pass.error, Some(SqliteError::Unsupported(_))),
+        "{:?}",
+        pass.error
+    );
+    assert!(pass.progressed, "the seal moved the run to FAILED");
+    assert!(matches!(
+        rt.outcome(broken).unwrap(),
+        ExecutionOutcome::Failed(_)
+    ));
+
+    // Nothing is left to drive.
+    let pass = rt.poll_once_reporting().await.expect("the pass runs");
+    assert!(!pass.progressed);
+    assert!(pass.error.is_none(), "{:?}", pass.error);
+}

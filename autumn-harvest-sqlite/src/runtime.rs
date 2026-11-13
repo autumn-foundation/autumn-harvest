@@ -3243,6 +3243,12 @@ impl SqliteRuntime {
                 ) => {}
                 Ok(_) => progress = true,
                 Err(err) => {
+                    // The error path can still seal the run, as for an
+                    // unsupported command. A sealed run changed state and
+                    // can wake its parent, so the pass made progress.
+                    if store::execution_state(&self.conn, exec)? != "RUNNING" {
+                        progress = true;
+                    }
                     skip.insert(exec);
                     record_fleet_error(exec, err, &mut first_error);
                 }
