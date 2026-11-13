@@ -3094,6 +3094,27 @@ enum ScheduleCommand {
         #[arg(long)]
         cursor: Option<String>,
     },
+    /// Find the moments when many schedules start runs together.
+    ///
+    /// The forecast walks each active cron schedule over the window. It applies
+    /// the jitter of each schedule, and groups the fires into buckets.
+    Herd {
+        /// Start of the window, RFC 3339 (default: now).
+        #[arg(long)]
+        from: Option<String>,
+        /// Length of the window in hours (default 24, at most 744).
+        #[arg(long)]
+        hours: Option<u32>,
+        /// Bucket width in seconds (default 60, at most 86400).
+        #[arg(long)]
+        bucket_secs: Option<u64>,
+        /// Fewest schedules in one bucket that count as a herd (default 2).
+        #[arg(long)]
+        min_herd: Option<usize>,
+        /// Most herds to list (default 50, at most 500).
+        #[arg(long)]
+        limit: Option<usize>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -8869,6 +8890,9 @@ fn render_response(cli: &Cli, value: &Value) -> Result<String, CliError> {
     if backfill_wants_table(cli) {
         return Ok(format_backfill_table(value));
     }
+    if herd_wants_table(cli) {
+        return Ok(format_herd_table(value));
+    }
     if rate_limit_wants_table(cli) {
         return Ok(format_rate_limit_table(value));
     }
@@ -9345,6 +9369,128 @@ fn format_backfill_table(value: &Value) -> String {
         let _ = writeln!(out, "\nWARNING: {warning}");
     }
 
+    out
+}
+
+fn herd_wants_table(cli: &Cli) -> bool {
+    matches!(
+        &cli.command,
+        Commands::Schedule {
+            command: ScheduleCommand::Herd { .. }
+        }
+    ) && cli.output == OutputFormat::PrettyJson
+}
+
+/// The names of the schedules in `value`, an array of `{id, name}` objects.
+fn herd_names(value: Option<&Value>) -> Vec<String> {
+    value
+        .and_then(Value::as_array)
+        .map(|refs| {
+            refs.iter()
+                .map(|r| {
+                    let name = r.get("name").and_then(Value::as_str).unwrap_or("");
+                    if name.is_empty() {
+                        r.get("id")
+                            .and_then(Value::as_str)
+                            .unwrap_or("-")
+                            .to_string()
+                    } else {
+                        name.to_string()
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Render a `GET /admin/schedules/herd` report as text.
+fn format_herd_table(value: &Value) -> String {
+    let text = |key: &str| value.get(key).and_then(Value::as_str).unwrap_or("-");
+    let number = |key: &str| value.get(key).and_then(Value::as_u64).unwrap_or(0);
+
+    let mut out = String::new();
+    let _ = writeln!(out, "window: {} \u{2192} {}", text("from"), text("until"));
+    let _ = writeln!(
+        out,
+        "bucket: {}s  min herd: {}  fires: {}  herds: {}",
+        number("bucket_secs"),
+        number("min_herd"),
+        number("fires"),
+        number("spot_count"),
+    );
+    if text("status") == "partial" {
+        let _ = writeln!(
+            out,
+            "WARNING: a shard did not answer, so the report is partial."
+        );
+    }
+
+    let spots = value.get("spots").and_then(Value::as_array);
+    match spots {
+        Some(spots) if !spots.is_empty() => {
+            let _ = writeln!(out, "\nHerds, largest first:");
+            let mut rows = vec![vec![
+                "AT".to_string(),
+                "SIZE".to_string(),
+                "SCHEDULES".to_string(),
+            ]];
+            for spot in spots {
+                let size = spot.get("size").and_then(Value::as_u64).unwrap_or(0);
+                rows.push(vec![
+                    cell_str(spot.get("at")),
+                    size.to_string(),
+                    herd_names(spot.get("schedules")).join(", "),
+                ]);
+            }
+            let _ = writeln!(out, "{}", render_table(&rows));
+            let shown = spots.len() as u64;
+            if number("spot_count") > shown {
+                let _ = writeln!(
+                    out,
+                    "({} more not shown; raise --limit)",
+                    number("spot_count") - shown
+                );
+            }
+        }
+        _ => out.push_str("\nNo herds in the window.\n"),
+    }
+
+    if let Some(offenders) = value
+        .get("offenders")
+        .and_then(Value::as_array)
+        .filter(|o| !o.is_empty())
+    {
+        let _ = writeln!(out, "\nMove these schedules first:");
+        let mut rows = vec![vec![
+            "SCHEDULE".to_string(),
+            "HERDS".to_string(),
+            "JITTER".to_string(),
+        ]];
+        for offender in offenders {
+            let herds = offender.get("spots").and_then(Value::as_u64).unwrap_or(0);
+            let jitter = offender
+                .get("jitter_secs")
+                .and_then(Value::as_i64)
+                .unwrap_or(0);
+            rows.push(vec![
+                cell_str(offender.get("name")),
+                herds.to_string(),
+                format!("{jitter}s"),
+            ]);
+        }
+        let _ = writeln!(out, "{}", render_table(&rows));
+    }
+
+    for (key, label) in [
+        ("unanchored", "Not forecast (interval schedules)"),
+        ("inactive", "Not forecast (paused, exhausted or unparsable)"),
+        ("truncated", "Cut short (too many fires to forecast)"),
+    ] {
+        let names = herd_names(value.get(key));
+        if !names.is_empty() {
+            let _ = writeln!(out, "\n{label}: {}", names.join(", "));
+        }
+    }
     out
 }
 
@@ -12553,6 +12699,36 @@ fn schedule_request(command: &ScheduleCommand) -> Result<ApiRequest, CliError> {
                 params.push(("cursor", v.clone()));
             }
             let mut path = format!("/admin/schedules/{}/runs", path_segment(id));
+            if !params.is_empty() {
+                path.push('?');
+                path.push_str(&encode_query_params(&params));
+            }
+            Ok(ApiRequest::get(path))
+        }
+        ScheduleCommand::Herd {
+            from,
+            hours,
+            bucket_secs,
+            min_herd,
+            limit,
+        } => {
+            let mut params: Vec<(&str, String)> = Vec::new();
+            if let Some(v) = from {
+                params.push(("from", v.clone()));
+            }
+            if let Some(v) = hours {
+                params.push(("hours", v.to_string()));
+            }
+            if let Some(v) = bucket_secs {
+                params.push(("bucket_secs", v.to_string()));
+            }
+            if let Some(v) = min_herd {
+                params.push(("min_herd", v.to_string()));
+            }
+            if let Some(v) = limit {
+                params.push(("limit", v.to_string()));
+            }
+            let mut path = "/admin/schedules/herd".to_string();
             if !params.is_empty() {
                 path.push('?');
                 path.push_str(&encode_query_params(&params));
@@ -20540,4 +20716,76 @@ fn http_client_builder() -> reqwest::ClientBuilder {
     // An `Err` means that a provider is already installed, which is sufficient.
     let _ = rustls::crypto::ring::default_provider().install_default();
     reqwest::Client::builder()
+}
+
+#[cfg(test)]
+mod herd_tests {
+    use super::*;
+
+    fn herd_cli(args: &[&str]) -> Cli {
+        let all = ["harvest", "schedule", "herd"]
+            .into_iter()
+            .chain(args.iter().copied());
+        Cli::try_parse_from(all).expect("schedule herd args should parse")
+    }
+
+    #[test]
+    fn herd_renders_a_table_by_default() {
+        assert!(herd_wants_table(&herd_cli(&[])));
+        assert!(!herd_wants_table(&herd_cli(&["--output", "json"])));
+    }
+
+    #[test]
+    fn the_herd_table_lists_herds_and_offenders() {
+        let value = serde_json::json!({
+            "from": "2026-11-13T00:00:00Z",
+            "until": "2026-11-14T00:00:00Z",
+            "bucket_secs": 60,
+            "min_herd": 2,
+            "fires": 48,
+            "spot_count": 3,
+            "spots": [{
+                "at": "2026-11-13T01:00:00Z",
+                "size": 2,
+                "schedules": [
+                    { "id": "00000000-0000-0000-0000-000000000001", "name": "billing" },
+                    { "id": "00000000-0000-0000-0000-000000000002", "name": "etl" }
+                ]
+            }],
+            "offenders": [
+                { "id": "00000000-0000-0000-0000-000000000001", "name": "billing", "spots": 24, "jitter_secs": 0 }
+            ],
+            "unanchored": [{ "id": "00000000-0000-0000-0000-000000000003", "name": "poller" }],
+            "inactive": [],
+            "truncated": [],
+            "status": "partial",
+            "unavailable_shards": []
+        });
+        let out = format_herd_table(&value);
+        assert!(out.contains("fires: 48  herds: 3"), "{out}");
+        assert!(out.contains("billing, etl"), "{out}");
+        assert!(out.contains("(2 more not shown; raise --limit)"), "{out}");
+        assert!(out.contains("Move these schedules first:"), "{out}");
+        let row = out
+            .lines()
+            .find(|line| line.starts_with("billing "))
+            .unwrap_or_default();
+        assert_eq!(
+            row.split_whitespace().collect::<Vec<_>>(),
+            ["billing", "24", "0s"],
+            "{out}"
+        );
+        assert!(
+            out.contains("Not forecast (interval schedules): poller"),
+            "{out}"
+        );
+        assert!(out.contains("WARNING: a shard did not answer"), "{out}");
+        assert!(!out.contains("Cut short"), "{out}");
+    }
+
+    #[test]
+    fn an_empty_herd_report_says_so() {
+        let out = format_herd_table(&serde_json::json!({ "spots": [] }));
+        assert!(out.contains("No herds in the window."), "{out}");
+    }
 }

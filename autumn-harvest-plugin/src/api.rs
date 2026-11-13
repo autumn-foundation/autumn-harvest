@@ -5905,6 +5905,7 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<()> {
             "/admin/schedules/preview",
             post(preview_candidate_schedule_handler),
         )
+        .route("/admin/schedules/herd", get(schedule_herd_handler))
         // Calendar management (issue #337): named exclusion sets for business-day aware scheduling.
         .route("/calendars", get(list_calendars_handler))
         .route(
@@ -7802,6 +7803,7 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         ("GET", "/admin/schedules/{id}/runs"),
         ("GET", "/admin/schedules/{id}/preview"),
         ("POST", "/admin/schedules/preview"),
+        ("GET", "/admin/schedules/herd"),
         ("GET", "/admin/schedules/decisions"),
         ("GET", "/admin/schedules/{id}/decisions"),
         // ── calendars (issue #337) ────────────────────────────────────────────
@@ -9974,6 +9976,25 @@ pub const fn management_api_response_fields()
                 "pause_reason",
                 "from",
                 "count_requested",
+            ]),
+        ),
+        (
+            "GET",
+            "/admin/schedules/herd",
+            Some(&[
+                "from",
+                "until",
+                "bucket_secs",
+                "min_herd",
+                "fires",
+                "spot_count",
+                "spots",
+                "offenders",
+                "unanchored",
+                "inactive",
+                "truncated",
+                "status",
+                "unavailable_shards",
             ]),
         ),
         // ── calendars (issue #337) ────────────────────────────────────────────
@@ -49336,6 +49357,467 @@ async fn preview_schedule_firings_handler(
     Ok((StatusCode::OK, Json(preview)))
 }
 
+// ── Schedule herd forecast ────────────────────────────────────────────────────
+
+/// The longest window of `GET /admin/schedules/herd`, in hours: 31 days.
+const HERD_MAX_HOURS: u32 = 744;
+
+/// The widest bucket of `GET /admin/schedules/herd`, in seconds: one day.
+const HERD_MAX_BUCKET_SECS: u64 = 86_400;
+
+/// The most spots that one `GET /admin/schedules/herd` response lists.
+const HERD_MAX_LIMIT: usize = 500;
+
+/// Query parameters for `GET /admin/schedules/herd`.
+#[derive(Debug, Deserialize)]
+struct ScheduleHerdQuery {
+    /// RFC 3339 UTC start of the window. Defaults to now.
+    #[serde(default)]
+    from: Option<String>,
+    /// The length of the window in hours. Defaults to 24, at most 744.
+    #[serde(default = "default_herd_hours")]
+    hours: u32,
+    /// The bucket width in seconds. Defaults to 60, at most 86400.
+    #[serde(default = "default_herd_bucket_secs")]
+    bucket_secs: u64,
+    /// The fewest schedules that make a herd. Defaults to 2.
+    #[serde(default = "default_min_herd")]
+    min_herd: usize,
+    /// The most spots to list. Defaults to 50, at most 500.
+    #[serde(default = "default_herd_limit")]
+    limit: usize,
+}
+
+const fn default_herd_hours() -> u32 {
+    24
+}
+
+const fn default_herd_bucket_secs() -> u64 {
+    60
+}
+
+const fn default_min_herd() -> usize {
+    2
+}
+
+const fn default_herd_limit() -> usize {
+    50
+}
+
+/// One schedule in a herd report.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct HerdScheduleRef {
+    /// The schedule row id.
+    pub id: uuid::Uuid,
+    /// The DAG name or the workflow name of the schedule.
+    pub name: String,
+}
+
+/// One bucket in which several schedules start runs together.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct HerdSpotEntry {
+    /// The start of the bucket.
+    pub at: chrono::DateTime<chrono::Utc>,
+    /// The number of distinct schedules in the bucket.
+    pub size: usize,
+    /// The schedules in the bucket.
+    pub schedules: Vec<HerdScheduleRef>,
+}
+
+/// A schedule ranked by the number of spots that include it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct HerdOffender {
+    /// The schedule row id.
+    pub id: uuid::Uuid,
+    /// The DAG name or the workflow name of the schedule.
+    pub name: String,
+    /// The number of spots that include the schedule.
+    pub spots: usize,
+    /// The jitter window of the schedule. A larger one spreads its runs.
+    pub jitter_secs: i64,
+}
+
+/// The body of `GET /admin/schedules/herd`.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct ScheduleHerdReport {
+    /// The start of the window.
+    pub from: chrono::DateTime<chrono::Utc>,
+    /// The end of the window. It is not included.
+    pub until: chrono::DateTime<chrono::Utc>,
+    /// The bucket width in seconds.
+    pub bucket_secs: u64,
+    /// The fewest schedules that make a herd.
+    pub min_herd: usize,
+    /// The number of runs that start inside the window, over every active
+    /// schedule. A start is the slot plus its jitter.
+    pub fires: usize,
+    /// The number of spots before `limit` applies.
+    pub spot_count: usize,
+    /// The largest spots first, at most `limit` of them.
+    pub spots: Vec<HerdSpotEntry>,
+    /// Every schedule in a spot, the one in the most spots first.
+    pub offenders: Vec<HerdOffender>,
+    /// Interval schedules. Their fire times depend on their last run.
+    pub unanchored: Vec<HerdScheduleRef>,
+    /// Paused, exhausted and unparsable schedules. The scheduler fires none.
+    pub inactive: Vec<HerdScheduleRef>,
+    /// Schedules that fire so often that the forecast stopped reading them.
+    ///
+    /// It also lists a budgeted schedule with too many slots before the
+    /// window, or with an overdue `next_run_at`. Its budget at the window is
+    /// unknown, so it is not forecast. So is a schedule whose jitter carries a
+    /// run past its next slot.
+    pub truncated: Vec<HerdScheduleRef>,
+    /// `complete`, or `partial` when a shard did not answer.
+    pub status: FanoutStatus,
+    /// The shards that did not answer.
+    pub unavailable_shards: Vec<UnavailableShard>,
+}
+
+/// The name of a schedule row: its DAG name, else its workflow name.
+fn herd_schedule_ref(row: &HarvestSchedule) -> HerdScheduleRef {
+    HerdScheduleRef {
+        id: row.id,
+        name: row
+            .dag_name
+            .as_deref()
+            .or(row.workflow_name.as_deref())
+            .unwrap_or("")
+            .to_string(),
+    }
+}
+
+/// The most slots that one schedule walks before the herd window opens.
+const HERD_MAX_SLOTS_BEFORE: i32 = 100_000;
+
+/// The slots of `schedule` from `next_run_at` up to `from`, at most `cap`.
+///
+/// The scheduler spends a run of the budget on each of these slots before the
+/// window opens. With no `next_run_at`, or one at or after `from`, it is 0.
+///
+/// Returns `None` when the walk reaches [`HERD_MAX_SLOTS_BEFORE`] first. The
+/// budget at the window is then unknown, so the caller does not forecast it.
+fn slots_before(
+    schedule: &Schedule,
+    next_run_at: Option<chrono::DateTime<chrono::Utc>>,
+    from: chrono::DateTime<chrono::Utc>,
+    cap: i32,
+) -> Option<i32> {
+    let Some(first) = next_run_at.filter(|&first| first < from) else {
+        return Some(0);
+    };
+    let walker = autumn_harvest::schedule_plan::SlotWalker::new(schedule);
+    let mut count = 1;
+    let mut cursor = first;
+    while count < cap {
+        if count >= HERD_MAX_SLOTS_BEFORE {
+            return None;
+        }
+        match walker.next_after(cursor).filter(|&slot| slot < from) {
+            Some(slot) => {
+                count += 1;
+                cursor = slot;
+            }
+            None => break,
+        }
+    }
+    Some(count.min(cap))
+}
+
+/// The schedules to forecast, with the run budget each one has at `from`.
+///
+/// Each budget drops by the slots before the window. A `None` budget means no
+/// run limit. Two kinds of budgeted schedule go into the third list and are
+/// not forecast, because their budget at the window is unknown:
+///
+/// - one whose walk before the window is too long to project;
+/// - one whose `next_run_at` is before `now`. Its catch-up policy decides how
+///   many missed slots spend a run, and the scheduler applies it on its next
+///   tick.
+///
+/// A schedule whose jitter can carry a run past its next slot also goes into
+/// the third list, with or without a budget. Its catch-up policy then decides
+/// which later slots run.
+#[allow(clippy::type_complexity)]
+fn project_herd_budgets(
+    candidates: Vec<(&HarvestSchedule, Schedule)>,
+    now: chrono::DateTime<chrono::Utc>,
+    from: chrono::DateTime<chrono::Utc>,
+    until: chrono::DateTime<chrono::Utc>,
+) -> (
+    Vec<(&HarvestSchedule, Schedule)>,
+    Vec<Option<i32>>,
+    Vec<HerdScheduleRef>,
+) {
+    let mut active = Vec::new();
+    let mut budgets = Vec::new();
+    let mut unprojected = Vec::new();
+    for (row, schedule) in candidates {
+        if jitter_crosses_a_slot(row, &schedule, from, until) {
+            unprojected.push(herd_schedule_ref(row));
+            continue;
+        }
+        let budget = schedule_remaining_runs(row.max_runs, row.runs_started);
+        let overdue = row.next_run_at.is_some_and(|next| next < now);
+        let projected = budget.map_or(Some(None), |left| {
+            if overdue {
+                return None;
+            }
+            slots_before(&schedule, row.next_run_at, from, left).map(|spent| Some(left - spent))
+        });
+        if let Some(budget) = projected {
+            budgets.push(budget);
+            active.push((row, schedule));
+        } else {
+            unprojected.push(herd_schedule_ref(row));
+        }
+    }
+    (active, budgets, unprojected)
+}
+
+/// `true` when the jitter of `row` carries one of its runs to or past its next
+/// slot, between `from` and `until`.
+///
+/// The scheduler waits for the jittered start of a slot before it moves on.
+/// Its catch-up policy then decides which of the passed slots run. The walk
+/// stops after [`autumn_harvest::schedule_herd::MAX_FIRES_PER_SCHEDULE`] slots.
+fn jitter_crosses_a_slot(
+    row: &HarvestSchedule,
+    schedule: &Schedule,
+    from: chrono::DateTime<chrono::Utc>,
+    until: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    if row.jitter_secs <= 0 {
+        return false;
+    }
+    let walker = autumn_harvest::schedule_plan::SlotWalker::new(schedule);
+    let mut slot = match walker.next_after(from - chrono::Duration::seconds(1)) {
+        Some(slot) if slot < until => slot,
+        _ => return false,
+    };
+    for _ in 0..autumn_harvest::schedule_herd::MAX_FIRES_PER_SCHEDULE {
+        let Some(next) = walker.next_after(slot) else {
+            return false;
+        };
+        let start = effective_fire_time(row.id, Some(slot), row.jitter_secs).unwrap_or(slot);
+        if start >= next {
+            return true;
+        }
+        if next >= until {
+            return false;
+        }
+        slot = next;
+    }
+    false
+}
+
+/// The lookback of a herd walk and the time at which the walk starts.
+///
+/// A slot up to one jitter window before `from` can still start inside the
+/// window. So the walk looks back by the widest jitter of `candidates`.
+fn herd_lookback(
+    candidates: &[(&HarvestSchedule, Schedule)],
+    from: chrono::DateTime<chrono::Utc>,
+) -> (std::time::Duration, chrono::DateTime<chrono::Utc>) {
+    let widest = candidates
+        .iter()
+        .map(|(row, _)| row.jitter_secs.max(0).cast_unsigned())
+        .max()
+        .unwrap_or(0);
+    let lookback = std::time::Duration::from_secs(widest);
+    let walk_from = chrono::Duration::from_std(lookback)
+        .ok()
+        .and_then(|back| from.checked_sub_signed(back))
+        .unwrap_or(from);
+    (lookback, walk_from)
+}
+
+/// Split `rows` into the schedules that the scheduler fires and the rest.
+///
+/// A paused, an auto-paused, an exhausted, a manual and an unparsable schedule
+/// never fires, so it goes into the second list.
+fn partition_herd_rows(
+    rows: &[HarvestSchedule],
+) -> (Vec<(&HarvestSchedule, Schedule)>, Vec<HerdScheduleRef>) {
+    use autumn_harvest::scheduler::parse_schedule_from_expr_pub;
+
+    let mut active = Vec::new();
+    let mut inactive = Vec::new();
+    for row in rows {
+        let stopped = row.is_paused
+            || row.auto_paused_at.is_some()
+            || row.exhausted_at.is_some()
+            || schedule_remaining_runs(row.max_runs, row.runs_started) == Some(0);
+        let parsed = row
+            .schedule_expr
+            .as_deref()
+            .and_then(parse_schedule_from_expr_pub);
+        match parsed {
+            Some(schedule) if !stopped && !matches!(schedule, Schedule::Manual) => {
+                active.push((row, schedule));
+            }
+            _ => inactive.push(herd_schedule_ref(row)),
+        }
+    }
+    (active, inactive)
+}
+
+/// Build the herd report of `rows`. It reads no database.
+///
+/// The scheduler skips a paused, an auto-paused and an exhausted schedule, so
+/// the report lists them as inactive. Each fire moves by the jitter offset of
+/// its schedule, as in [`effective_fire_time`]. A schedule stops at its
+/// `end_at` and at the end of its run budget. Calendar exclusions are not
+/// applied.
+pub(crate) fn build_herd_report(
+    rows: &[HarvestSchedule],
+    now: chrono::DateTime<chrono::Utc>,
+    from: chrono::DateTime<chrono::Utc>,
+    hours: u32,
+    bucket_secs: u64,
+    min_herd: usize,
+    limit: usize,
+) -> ScheduleHerdReport {
+    use autumn_harvest::schedule_herd::{Fire, forecast_shifted};
+
+    let hours = hours.clamp(1, HERD_MAX_HOURS);
+    let bucket_secs = bucket_secs.clamp(1, HERD_MAX_BUCKET_SECS);
+    let min_herd = min_herd.max(2);
+    let limit = limit.clamp(1, HERD_MAX_LIMIT);
+    let until = from + chrono::Duration::hours(i64::from(hours));
+
+    let (candidates, inactive) = partition_herd_rows(rows);
+    let (lookback, walk_from) = herd_lookback(&candidates, from);
+    let (active, mut budgets, unprojected) =
+        project_herd_budgets(candidates, now, walk_from, until);
+
+    // The forecast keys each schedule by its row id, so two rows with one
+    // name stay two schedules.
+    let keys: Vec<String> = active.iter().map(|(row, _)| row.id.to_string()).collect();
+    let pairs: Vec<(&str, &Schedule)> = keys
+        .iter()
+        .zip(&active)
+        .map(|(key, (_, schedule))| (key.as_str(), schedule))
+        .collect();
+    let forecast = forecast_shifted(
+        &pairs,
+        from,
+        until,
+        std::time::Duration::from_secs(bucket_secs),
+        min_herd,
+        lookback,
+        |index, slot| {
+            let row = active[index].0;
+            // The lookback can reach slots that the scheduler already
+            // processed. It dispatches from `next_run_at` on, so an earlier
+            // slot neither runs nor spends the budget.
+            if row.next_run_at.is_some_and(|next| slot < next) {
+                return Fire::Skip;
+            }
+            // The scheduler exhausts a schedule at its last run, and at the
+            // first slot whose slot time or jittered time reaches `end_at`.
+            let fire = effective_fire_time(row.id, Some(slot), row.jitter_secs).unwrap_or(slot);
+            let ended = row.end_at.is_some_and(|end| slot >= end || fire >= end);
+            if ended || budgets[index] == Some(0) {
+                return Fire::Stop;
+            }
+            if let Some(left) = budgets[index].as_mut() {
+                *left -= 1;
+            }
+            Fire::Start(fire)
+        },
+    );
+
+    let by_key: HashMap<&str, &HarvestSchedule> = keys
+        .iter()
+        .zip(&active)
+        .map(|(key, (row, _))| (key.as_str(), *row))
+        .collect();
+    let refs = |names: &[String]| -> Vec<HerdScheduleRef> {
+        names
+            .iter()
+            .filter_map(|key| by_key.get(key.as_str()).map(|row| herd_schedule_ref(row)))
+            .collect()
+    };
+    let offenders = forecast
+        .offenders()
+        .into_iter()
+        .filter_map(|(key, spots)| {
+            let row = by_key.get(key.as_str())?;
+            let named = herd_schedule_ref(row);
+            Some(HerdOffender {
+                id: named.id,
+                name: named.name,
+                spots,
+                jitter_secs: row.jitter_secs,
+            })
+        })
+        .collect();
+    let spots = forecast
+        .spots
+        .iter()
+        .take(limit)
+        .map(|spot| HerdSpotEntry {
+            at: spot.at,
+            size: spot.size(),
+            schedules: refs(&spot.schedules),
+        })
+        .collect();
+
+    ScheduleHerdReport {
+        from,
+        until,
+        bucket_secs,
+        min_herd,
+        fires: forecast.fires,
+        spot_count: forecast.spots.len(),
+        spots,
+        offenders,
+        unanchored: refs(&forecast.unanchored),
+        inactive,
+        truncated: refs(&forecast.truncated)
+            .into_iter()
+            .chain(unprojected)
+            .collect(),
+        status: FanoutStatus::Complete,
+        unavailable_shards: Vec::new(),
+    }
+}
+
+/// `GET /admin/schedules/herd` — the moments when many schedules fire together.
+///
+/// Read-only. It loads every schedule row and writes nothing. A shard that does
+/// not answer makes the report partial, as on `GET /admin/schedules`.
+async fn schedule_herd_handler(
+    Extension(api_state): Extension<HarvestApiState>,
+    Query(params): Query<ScheduleHerdQuery>,
+) -> Result<Json<ScheduleHerdReport>, AutumnError> {
+    let from = parse_from_param(params.from.as_deref()).map_err(AutumnError::bad_request_msg)?;
+    let FanoutRows {
+        rows,
+        status,
+        unavailable_shards,
+    } = load_schedules_from_shards(&api_state).await?;
+    // The forecast is CPU work with no await point. Run it on the blocking
+    // pool, so a large window does not stall the async worker of other tasks.
+    let mut report = tokio::task::spawn_blocking(move || {
+        build_herd_report(
+            &rows,
+            chrono::Utc::now(),
+            from,
+            params.hours,
+            params.bucket_secs,
+            params.min_herd,
+            params.limit,
+        )
+    })
+    .await
+    .map_err(AutumnError::internal_server_error)?;
+    report.status = status;
+    report.unavailable_shards = unavailable_shards;
+    Ok(Json(report))
+}
+
 /// The body of `GET /admin/schedules/{id}/preview`, factored out so the Vantage
 /// preview drill-down (issue #951) renders the *same* projection the API
 /// returns — including the #478/#543 bounded-run truncation and the
@@ -59548,6 +60030,303 @@ mod tests {
             last_catchup_at: None,
             retry_policy: None,
         }
+    }
+
+    /// A schedule row named `name` on `expr`, with the id `n`.
+    fn herd_row(n: u128, name: &str, expr: &str) -> autumn_harvest::models::HarvestSchedule {
+        autumn_harvest::models::HarvestSchedule {
+            id: uuid::Uuid::from_u128(n),
+            workflow_name: Some(name.to_string()),
+            schedule_expr: Some(expr.to_string()),
+            ..test_harvest_schedule()
+        }
+    }
+
+    fn herd_epoch() -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::from_timestamp(0, 0).unwrap()
+    }
+
+    #[test]
+    fn the_herd_report_names_the_schedules_that_fire_together() {
+        let rows = [
+            herd_row(1, "billing", "cron:0 * * * *"),
+            herd_row(2, "etl", "cron:0 * * * *"),
+            herd_row(3, "digest", "cron:17 * * * *"),
+        ];
+        let report = build_herd_report(&rows, herd_epoch(), herd_epoch(), 3, 60, 2, 50);
+        assert_eq!(report.fires, 9);
+        assert_eq!(report.spot_count, 3);
+        let names: Vec<&str> = report.spots[0]
+            .schedules
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        assert_eq!(names, ["billing", "etl"]);
+        assert_eq!(report.spots[0].size, 2);
+        let offenders: Vec<(&str, usize)> = report
+            .offenders
+            .iter()
+            .map(|o| (o.name.as_str(), o.spots))
+            .collect();
+        assert_eq!(offenders, [("billing", 3), ("etl", 3)]);
+        assert_eq!(report.status, FanoutStatus::Complete);
+    }
+
+    #[test]
+    fn the_herd_report_skips_schedules_the_scheduler_never_fires() {
+        let rows = [
+            herd_row(1, "live", "cron:0 * * * *"),
+            autumn_harvest::models::HarvestSchedule {
+                is_paused: true,
+                ..herd_row(2, "paused", "cron:0 * * * *")
+            },
+            autumn_harvest::models::HarvestSchedule {
+                exhausted_at: Some(herd_epoch()),
+                ..herd_row(3, "exhausted", "cron:0 * * * *")
+            },
+            autumn_harvest::models::HarvestSchedule {
+                max_runs: Some(1),
+                runs_started: 1,
+                ..herd_row(4, "spent", "cron:0 * * * *")
+            },
+            herd_row(5, "broken", "not a schedule"),
+            herd_row(6, "every", "interval:3600"),
+        ];
+        let report = build_herd_report(&rows, herd_epoch(), herd_epoch(), 1, 60, 2, 50);
+        assert_eq!(report.spot_count, 0, "only one schedule is live");
+        let inactive: Vec<&str> = report.inactive.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(inactive, ["paused", "exhausted", "spent", "broken"]);
+        let unanchored: Vec<&str> = report.unanchored.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(unanchored, ["every"]);
+    }
+
+    #[test]
+    fn the_herd_report_stops_a_schedule_at_its_run_budget_and_end() {
+        let budgeted = [
+            autumn_harvest::models::HarvestSchedule {
+                max_runs: Some(1),
+                ..herd_row(1, "once-a", "cron:0 * * * *")
+            },
+            autumn_harvest::models::HarvestSchedule {
+                max_runs: Some(3),
+                runs_started: 2,
+                ..herd_row(2, "once-b", "cron:0 * * * *")
+            },
+        ];
+        let report = build_herd_report(&budgeted, herd_epoch(), herd_epoch(), 24, 60, 2, 50);
+        assert_eq!(report.fires, 2, "each schedule has one run left");
+        assert_eq!(report.spot_count, 1);
+
+        let ending = [
+            herd_row(1, "a", "cron:0 * * * *"),
+            autumn_harvest::models::HarvestSchedule {
+                end_at: Some(herd_epoch() + chrono::Duration::hours(2)),
+                ..herd_row(2, "b", "cron:0 * * * *")
+            },
+        ];
+        let report = build_herd_report(&ending, herd_epoch(), herd_epoch(), 24, 60, 2, 50);
+        assert_eq!(report.fires, 24 + 2, "b fires at 00:00 and 01:00 only");
+        assert_eq!(report.spot_count, 2);
+    }
+
+    #[test]
+    fn the_herd_report_spends_the_budget_on_slots_before_the_window() {
+        let tomorrow = herd_epoch() + chrono::Duration::hours(24);
+        let row = |n: u128, max_runs: i32| autumn_harvest::models::HarvestSchedule {
+            max_runs: Some(max_runs),
+            next_run_at: Some(herd_epoch()),
+            ..herd_row(n, &format!("s{n}"), "cron:0 * * * *")
+        };
+        let spent = build_herd_report(
+            &[row(1, 1), row(2, 1)],
+            herd_epoch(),
+            tomorrow,
+            24,
+            60,
+            2,
+            50,
+        );
+        assert_eq!(spent.fires, 0, "both runs happen before the window");
+        assert_eq!(spent.spot_count, 0);
+
+        let left = build_herd_report(
+            &[row(1, 30), row(2, 30)],
+            herd_epoch(),
+            tomorrow,
+            24,
+            60,
+            2,
+            50,
+        );
+        assert_eq!(
+            left.fires,
+            2 * 6,
+            "24 of the 30 runs come before the window"
+        );
+        assert_eq!(left.spot_count, 6);
+    }
+
+    #[test]
+    fn the_herd_report_does_not_project_a_budget_too_far_ahead() {
+        let far = herd_epoch() + chrono::Duration::days(2);
+        let dense = autumn_harvest::models::HarvestSchedule {
+            max_runs: Some(2_000_000_000),
+            next_run_at: Some(herd_epoch()),
+            ..herd_row(1, "dense", "cron:* * * * * *")
+        };
+        let plain = herd_row(2, "plain", "cron:0 * * * *");
+        let report = build_herd_report(&[dense, plain], herd_epoch(), far, 1, 60, 2, 50);
+        let truncated: Vec<&str> = report.truncated.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(
+            truncated,
+            ["dense"],
+            "two days of seconds pass the walk cap"
+        );
+        assert_eq!(report.fires, 1, "only the plain schedule is forecast");
+    }
+
+    #[test]
+    fn the_herd_report_does_not_guess_the_budget_of_an_overdue_schedule() {
+        let now = herd_epoch() + chrono::Duration::hours(10);
+        let overdue = autumn_harvest::models::HarvestSchedule {
+            max_runs: Some(3),
+            next_run_at: Some(herd_epoch()),
+            ..herd_row(1, "overdue", "cron:0 * * * *")
+        };
+        let unlimited = autumn_harvest::models::HarvestSchedule {
+            next_run_at: Some(herd_epoch()),
+            ..herd_row(2, "unlimited", "cron:0 * * * *")
+        };
+        let report = build_herd_report(&[overdue, unlimited], now, now, 3, 60, 2, 50);
+        let truncated: Vec<&str> = report.truncated.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(
+            truncated,
+            ["overdue"],
+            "its catch-up policy sets its budget"
+        );
+        assert_eq!(report.fires, 3, "the unlimited schedule is still forecast");
+    }
+
+    #[test]
+    fn the_herd_report_counts_a_jittered_start_inside_the_window() {
+        let rows: Vec<_> = (1..=2)
+            .map(|n| autumn_harvest::models::HarvestSchedule {
+                jitter_secs: 3_600,
+                ..herd_row(n, &format!("s{n}"), "cron:0 * * * *")
+            })
+            .collect();
+        // Start the window one second after the 00:00 slot. Each slot starts
+        // somewhere in the hour after it, by its own jitter.
+        let from = herd_epoch() + chrono::Duration::seconds(1);
+        let starts: Vec<_> = rows
+            .iter()
+            .map(|row| effective_fire_time(row.id, Some(herd_epoch()), row.jitter_secs).unwrap())
+            .collect();
+        assert!(
+            starts.iter().all(|&start| start >= from),
+            "the fixture needs a start in the window"
+        );
+        let report = build_herd_report(&rows, herd_epoch(), from, 1, 60, 2, 50);
+        assert_eq!(report.fires, 2, "both 00:00 slots start inside the hour");
+    }
+
+    #[test]
+    fn the_herd_lookback_does_not_spend_a_budget_on_processed_slots() {
+        let now = herd_epoch() + chrono::Duration::minutes(630);
+        let eleven = herd_epoch() + chrono::Duration::hours(11);
+        let once = |n: u128| autumn_harvest::models::HarvestSchedule {
+            max_runs: Some(1),
+            next_run_at: Some(eleven),
+            ..herd_row(n, &format!("once{n}"), "cron:0 * * * *")
+        };
+        // A wide jitter on another schedule makes the walk start at 09:30.
+        let wide = autumn_harvest::models::HarvestSchedule {
+            jitter_secs: 3_600,
+            ..herd_row(3, "wide", "cron:0 0 1 1 *")
+        };
+        let report = build_herd_report(&[once(1), once(2), wide], now, now, 2, 60, 2, 50);
+        assert_eq!(
+            report.fires, 2,
+            "each budget is spent at 11:00, not at 10:00"
+        );
+        assert_eq!(report.spots[0].at, eleven);
+    }
+
+    #[test]
+    fn the_herd_report_does_not_project_jitter_that_crosses_a_slot() {
+        // An every-minute schedule with an hour of jitter starts most runs
+        // after its next slot. The scheduler then skips slots by its policy.
+        let crossing = autumn_harvest::models::HarvestSchedule {
+            jitter_secs: 3_600,
+            ..herd_row(1, "crossing", "cron:* * * * *")
+        };
+        let hourly = herd_row(2, "hourly", "cron:0 * * * *");
+        let report = build_herd_report(
+            &[crossing, hourly],
+            herd_epoch(),
+            herd_epoch(),
+            2,
+            60,
+            2,
+            50,
+        );
+        let truncated: Vec<&str> = report.truncated.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(truncated, ["crossing"]);
+        assert_eq!(report.fires, 2, "only the hourly schedule is forecast");
+
+        // A jitter that stays inside the period is still forecast.
+        let narrow = autumn_harvest::models::HarvestSchedule {
+            jitter_secs: 600,
+            ..herd_row(3, "narrow", "cron:0 * * * *")
+        };
+        let report = build_herd_report(&[narrow], herd_epoch(), herd_epoch(), 2, 60, 2, 50);
+        assert_eq!(report.truncated, []);
+        assert_eq!(report.fires, 2);
+    }
+
+    #[test]
+    fn the_herd_report_drops_a_fire_that_jitter_pushes_past_the_end() {
+        let end_at = herd_epoch() + chrono::Duration::seconds(1);
+        let row = autumn_harvest::models::HarvestSchedule {
+            jitter_secs: 3_600,
+            end_at: Some(end_at),
+            ..herd_row(1, "late", "cron:0 * * * *")
+        };
+        let fire = effective_fire_time(row.id, Some(herd_epoch()), row.jitter_secs).unwrap();
+        assert!(fire >= end_at, "the fixture needs jitter past the end");
+        let report = build_herd_report(&[row], herd_epoch(), herd_epoch(), 24, 60, 2, 50);
+        assert_eq!(report.fires, 0, "the scheduler never dispatches this slot");
+    }
+
+    #[test]
+    fn the_herd_report_applies_the_jitter_of_each_schedule() {
+        let jittered: Vec<_> = (0..8)
+            .map(|n| autumn_harvest::models::HarvestSchedule {
+                jitter_secs: 3_600,
+                ..herd_row(n, &format!("s{n}"), "cron:0 * * * *")
+            })
+            .collect();
+        let plain: Vec<_> = (0..8)
+            .map(|n| herd_row(n, &format!("s{n}"), "cron:0 * * * *"))
+            .collect();
+        let spread = build_herd_report(&jittered, herd_epoch(), herd_epoch(), 1, 60, 8, 50);
+        let herd = build_herd_report(&plain, herd_epoch(), herd_epoch(), 1, 60, 8, 50);
+        assert_eq!(herd.spot_count, 1, "eight schedules on one minute");
+        assert_eq!(spread.spot_count, 0, "an hour of jitter spreads them");
+        assert_eq!(spread.fires, 8);
+    }
+
+    #[test]
+    fn the_herd_report_clamps_its_parameters() {
+        let rows: Vec<_> = (0..3)
+            .map(|n| herd_row(n, &format!("s{n}"), "cron:0 * * * *"))
+            .collect();
+        let report = build_herd_report(&rows, herd_epoch(), herd_epoch(), 10_000, 0, 0, 0);
+        assert_eq!(report.until - report.from, chrono::Duration::hours(744));
+        assert_eq!(report.bucket_secs, 1);
+        assert_eq!(report.min_herd, 2);
+        assert_eq!(report.spot_count, 744);
+        assert_eq!(report.spots.len(), 1, "the limit floor is one spot");
     }
 
     #[test]

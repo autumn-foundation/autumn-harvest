@@ -3914,3 +3914,35 @@ fn agents_sampling_policy_encodes_the_kind() {
     let request = cli.api_request().expect("show request should build");
     assert_eq!(request.path, "/admin/agents/a%2Fb/sampling-policy");
 }
+
+#[test]
+fn schedule_herd_maps_to_a_get_with_its_parameters() {
+    let bare = Cli::try_parse_from(["harvest", "schedule", "herd"])
+        .expect("schedule herd args should parse");
+    let request = bare.api_request().expect("herd request should build");
+    assert_eq!(request.method, ApiMethod::Get);
+    assert_eq!(request.path, "/admin/schedules/herd");
+    assert_eq!(request.body, None);
+
+    let full = Cli::try_parse_from([
+        "harvest",
+        "schedule",
+        "herd",
+        "--from",
+        "2026-11-13T00:00:00Z",
+        "--hours",
+        "48",
+        "--bucket-secs",
+        "300",
+        "--min-herd",
+        "3",
+        "--limit",
+        "10",
+    ])
+    .expect("schedule herd args should parse");
+    let request = full.api_request().expect("herd request should build");
+    assert_eq!(
+        request.path,
+        "/admin/schedules/herd?from=2026-11-13T00:00:00Z&hours=48&bucket_secs=300&min_herd=3&limit=10"
+    );
+}

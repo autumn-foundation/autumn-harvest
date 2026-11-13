@@ -752,6 +752,11 @@ fn schedule_backfill_is_covered() {
     ]);
 }
 
+#[test]
+fn schedule_herd_is_covered() {
+    assert_covered(&["schedule", "herd", "--hours", "48"]);
+}
+
 // ── retention ─────────────────────────────────────────────────────────────────
 
 #[test]

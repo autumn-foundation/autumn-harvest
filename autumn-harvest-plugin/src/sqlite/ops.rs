@@ -64,6 +64,7 @@ pub fn routes(flags: &HarvestApiState) -> Router<ApiState> {
         // Static paths win over `{id}`. These have no SQLite port.
         .route("/admin/schedules/decisions", any(not_ported))
         .route("/admin/schedules/preview", any(not_ported))
+        .route("/admin/schedules/herd", any(not_ported))
         .route(
             "/admin/schedules/{id}",
             get(get_one).patch(patch).delete(delete),

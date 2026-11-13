@@ -941,6 +941,7 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
     // Preview a candidate schedule: POST carries the candidate in the body but
     // only validates + projects fire times; no state is written.
     ("POST /admin/schedules/preview", RouteClass::ReadOnly),
+    ("GET /admin/schedules/herd", RouteClass::ReadOnly),
     ("GET /calendars", RouteClass::ReadOnly),
     ("GET /calendars/{name}", RouteClass::ReadOnly),
     ("GET /workers/{worker_id}/pinned", RouteClass::ReadOnly),
@@ -1264,6 +1265,7 @@ pub const EXCLUDED_ROUTES: &[&str] = &[
     "GET /admin/schedules/{id}/decisions",
     "GET /admin/schedules/{id}/preview",
     "POST /admin/schedules/preview",
+    "GET /admin/schedules/herd",
     "GET /calendars",
     "GET /calendars/{name}",
     "GET /workers/{worker_id}/pinned",
@@ -1663,6 +1665,7 @@ pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
     ("GET /admin/schedules/{id}/decisions", None),
     ("GET /admin/schedules/{id}/preview", None),
     ("POST /admin/schedules/preview", None),
+    ("GET /admin/schedules/herd", None),
     ("GET /calendars", None),
     ("GET /calendars/{name}", None),
     ("GET /workers/{worker_id}/pinned", None),
@@ -3324,6 +3327,7 @@ mod tests {
             "GET /admin/schedules/{id}/decisions",
             "GET /admin/schedules/{id}/preview",
             "POST /admin/schedules/preview",
+            "GET /admin/schedules/herd",
             "GET /calendars",
             "GET /calendars/{name}",
             "GET /workers/{worker_id}/pinned",

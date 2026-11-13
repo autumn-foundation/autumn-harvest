@@ -3921,6 +3921,137 @@
         "x-harvest-route-class": "read_only"
       }
     },
+    "/admin/schedules/herd": {
+      "get": {
+        "description": "Forecast schedule herds: the moments when many active cron schedules start runs together. Walks each active schedule over the window, applies its jitter, and groups the fires into buckets. Paused, auto-paused and exhausted schedules are listed as inactive. Interval schedules are listed as unanchored, because their fire times depend on their last run. Each schedule stops at its end_at and at the end of its max_runs budget. Calendar exclusions are not applied. Does not trigger any executions.",
+        "operationId": "get_admin_schedules_herd",
+        "parameters": [
+          {
+            "description": "RFC 3339 UTC start of the window. Defaults to now.",
+            "in": "query",
+            "name": "from",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Length of the window in hours. Defaults to 24, clamped to [1, 744].",
+            "in": "query",
+            "name": "hours",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Bucket width in seconds. Defaults to 60, clamped to [1, 86400].",
+            "in": "query",
+            "name": "bucket_secs",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Fewest distinct schedules in one bucket that count as a herd. Defaults to 2, at least 2.",
+            "in": "query",
+            "name": "min_herd",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Most herds to list. Defaults to 50, clamped to [1, 500].",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "bucket_secs": {
+                      "description": "Effective bucket width in seconds.",
+                      "type": "integer"
+                    },
+                    "fires": {
+                      "description": "Number of runs that start inside the window over every active schedule. A start is the slot plus its jitter, so a slot just before from can count and a slot just before until can fall outside.",
+                      "type": "integer"
+                    },
+                    "from": {
+                      "description": "RFC 3339 start of the window.",
+                      "type": "string"
+                    },
+                    "inactive": {
+                      "description": "Paused, exhausted and unparsable schedules ({id, name}). Not forecast.",
+                      "type": "array"
+                    },
+                    "min_herd": {
+                      "description": "Effective fewest schedules that make a herd.",
+                      "type": "integer"
+                    },
+                    "offenders": {
+                      "description": "Every schedule in a herd, the one in the most herds first. Each has id, name, spots and jitter_secs.",
+                      "type": "array"
+                    },
+                    "spot_count": {
+                      "description": "Number of herds before limit applies.",
+                      "type": "integer"
+                    },
+                    "spots": {
+                      "description": "Herds, largest first, at most limit of them. Each has at, size and schedules (each {id, name}).",
+                      "type": "array"
+                    },
+                    "status": {
+                      "description": "complete, or partial when a shard did not answer.",
+                      "type": "string"
+                    },
+                    "truncated": {
+                      "description": "Schedules ({id, name}) that fire so often that the forecast stopped reading them, or whose run budget at the window cannot be projected: too many slots before the window, or an overdue next_run_at whose catch-up policy decides the budget. It also lists a schedule whose jitter carries a run to or past its next slot, since its catch-up policy then decides which later slots run. Such a schedule is not forecast.",
+                      "type": "array"
+                    },
+                    "unanchored": {
+                      "description": "Interval schedules ({id, name}). Not forecast.",
+                      "type": "array"
+                    },
+                    "unavailable_shards": {
+                      "description": "Shards that did not answer.",
+                      "type": "array"
+                    },
+                    "until": {
+                      "description": "RFC 3339 end of the window (exclusive).",
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Success."
+          },
+          "400": {
+            "description": "Invalid from timestamp or query parameter."
+          },
+          "500": {
+            "description": "Database error."
+          }
+        },
+        "summary": "Forecast schedule herds: the moments when many active cron schedules start runs together.",
+        "tags": [
+          "schedule"
+        ],
+        "x-harvest-read-only": true,
+        "x-harvest-route-class": "read_only"
+      }
+    },
     "/admin/schedules/preview": {
       "post": {
         "description": "Validate a candidate schedule config and preview the next N firing instants without persisting anything (issue #348). Returns 400 with a parseable field-attributed error for invalid cron, timezone, skip_policy, overlap_policy, jitter_secs, or calendar.",
