@@ -50,10 +50,10 @@ archaeology) and CH006 (contractions) started in Tier B and moved here once
 their legacy population reached zero. A new one fails the build. Fix the
 finding; there is no baseline to absorb it.
 
-**Tier B is a ratchet against the merge base.** CH007 has a legacy
-population too large to fix in one change (~17k sentences), so the rule is
-simply: your change may not *add* one to a file it touches. Existing
-findings stay until someone chooses to fix them.
+**Tier B is a ratchet against the merge base.** The rule is simple: your
+change may not *add* a CH007 finding to a file it touches. The corpus held
+about 17k such sentences when the rule landed. A cleanup cleared all of
+them, so the corpus is at zero and a new finding fails the build.
 
 There is no checked-in baseline, deliberately. CI passes `--base`, and the
 harness re-scans each changed file as it stood at the merge base, read out

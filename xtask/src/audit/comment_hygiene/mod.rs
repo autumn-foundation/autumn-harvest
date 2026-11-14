@@ -52,10 +52,10 @@
 //!
 //! ## Tier B: ratcheted against the merge base
 //!
-//! This is a real style defect with a legacy population far too large to
-//! fix in one change: about 17k sentences. The rule is simple. A change may
-//! not add one to a file that it touches.
-//! Existing findings stay until someone chooses to fix them.
+//! This is a real style defect. The rule is simple. A change may not add
+//! one to a file that it touches. The corpus held about 17k such sentences
+//! when the rule landed. A cleanup cleared all of them, so the corpus is at
+//! zero.
 //!
 //! The comparison reads the merge base out of git. CI passes `--base <ref>`.
 //! The audit scans each changed file again as it was there. There is no

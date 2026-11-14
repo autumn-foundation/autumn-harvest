@@ -63,9 +63,9 @@ a blank `//` line at a block edge, review-round archaeology ("Codex round
 8" — cite the issue instead), and a contraction.
 
 Sentences over 25 words are ratcheted against the merge base. Your change
-may not *add* one to a file it touches; the legacy population stays until
-someone chooses to fix it. There is no baseline file to regenerate, so fix
-the flagged line. See `docs/audits/README.md`.
+may not *add* one to a file it touches. The corpus is at zero. There is no
+baseline file to regenerate, so fix the flagged line. See
+`docs/audits/README.md`.
 
 ## Database Migrations
 

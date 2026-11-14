@@ -710,8 +710,8 @@ jobs:
       # aside, a blank comment line at a block edge, review-round
       # archaeology, a contraction) is at zero and must stay there; Tier B
       # (sentences over ASD-STE100's 25-word ceiling) is ratcheted against
-      # the merge base -- a change may not ADD one to a file it touches, and
-      # the legacy population stays until someone chooses to fix it.
+      # the merge base -- a change may not ADD one to a file it touches. The
+      # corpus is at zero, so in practice every new one fails.
       #
       # This deliberately does NOT cap comment length. The long rationale
       # blocks in this tree are load-bearing — the ABBA lock-ordering argument
