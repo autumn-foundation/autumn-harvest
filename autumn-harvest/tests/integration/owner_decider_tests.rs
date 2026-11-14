@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use autumn_harvest::decision_owner::{self, DecisionPartition, EnableOwnerMode};
+use autumn_harvest::decision_owner::{self, DecisionPartition, EnableOwnerMode, OwnerKey};
 use autumn_harvest::notify::{OwnerWakeListener, OwnerWakeWait};
 use autumn_harvest::prelude::*;
 use autumn_harvest::telemetry::{ClaimKind, MetricsRecorder, TelemetryConfig};
@@ -893,6 +893,13 @@ async fn a_saturated_owner_takes_a_high_priority_run_first() {
         live_partitions(&mut conn).await == 512
     })
     .await;
+    // The wake task listens on a partition only after its lease. It sends
+    // one LISTEN per partition, so it can lag the leases. A wake before the
+    // LISTEN is lost, and the owner then learns of the run from a scan.
+    eventually("the owner listens on every partition", async || {
+        listens_on_every_partition(&node.worker)
+    })
+    .await;
     // A slow run holds the one permit. The backlog and the high-priority run
     // arrive behind it, as wakes. The next take frees the best of them.
     let slow = DeciderSlowStub::start_with_options(
@@ -936,6 +943,18 @@ async fn a_saturated_owner_takes_a_high_priority_run_first() {
     assert_eq!(first, high.as_uuid(), "the high-priority run decides first");
     assert_eq!(node.claims.count(ClaimKind::Workflow), 0, "all by take");
     db.drop_db().await;
+}
+
+/// Whether the owner wake task of `worker` listens on every partition.
+fn listens_on_every_partition(worker: &Worker) -> bool {
+    (0..decision_owner::DECISION_PARTITIONS)
+        .filter_map(DecisionPartition::new)
+        .all(|partition| {
+            worker.owner_wake_listening(OwnerKey {
+                shard: OwnerKey::pool_shard(None),
+                partition,
+            })
+        })
 }
 
 /// Start one instant run on `queue`. `wakes` listens on the channel of its
