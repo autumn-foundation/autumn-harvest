@@ -3797,8 +3797,8 @@ mod db {
     ///
     /// The prune keeps `retain` of trailing history. That window is the ceiling
     /// on the lag this can *measure*. A standby further behind than the oldest
-    /// retained watermark reports `None` (unknown). A floor value would
-    /// understate the loss.
+    /// retained watermark reports [`WatermarkReading::BeyondTrail`]. Its floor
+    /// is the age of the oldest retained watermark, a lower bound on the loss.
     ///
     /// # Errors
     ///

@@ -28,6 +28,8 @@ use crate::types::ExecutionId;
 /// [`HarvestError::Cancelled`](crate::error::HarvestError::Cancelled) or
 /// [`HarvestError::Config`](crate::error::HarvestError::Config) if the
 /// execution is already terminal. Returns
+/// [`HarvestError::ShardUnavailable`](crate::error::HarvestError::ShardUnavailable)
+/// if the execution is `MIGRATED` or `MIGRATING` on this shard. Returns
 /// [`HarvestError::Database`](crate::error::HarvestError::Database) if the
 /// insert or wake fails.
 #[cfg(feature = "db")]
@@ -87,6 +89,8 @@ pub async fn send_signal_with_codecs(
 /// [`HarvestError::Cancelled`](crate::error::HarvestError::Cancelled) or
 /// [`HarvestError::Config`](crate::error::HarvestError::Config) if the
 /// execution is already terminal. Returns
+/// [`HarvestError::ShardUnavailable`](crate::error::HarvestError::ShardUnavailable)
+/// if the execution is `MIGRATED` or `MIGRATING` on this shard. Returns
 /// [`HarvestError::Database`](crate::error::HarvestError::Database) if the
 /// insert or wake fails.
 #[cfg(feature = "db")]
@@ -365,7 +369,9 @@ pub struct RoutedSignalDelivery {
 /// Returns [`HarvestError::NotFound`](crate::error::HarvestError::NotFound) if
 /// the execution does not exist. Returns [`HarvestError::Cancelled`] /
 /// [`HarvestError::Config`] if the resolved live attempt is terminal. Returns
-/// [`HarvestError::Database`] if the insert or wake fails.
+/// [`HarvestError::ShardUnavailable`] if that attempt is `MIGRATED` or
+/// `MIGRATING` on its shard. Returns [`HarvestError::Database`] if the insert
+/// or wake fails.
 #[cfg(feature = "db")]
 pub async fn send_signal_to_live_attempt(
     conn: &mut AsyncPgConnection,

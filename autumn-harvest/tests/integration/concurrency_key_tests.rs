@@ -1,6 +1,7 @@
 //! Unit tests for per-key concurrency limits (issue #247).
 //!
-//! RED-phase tests — all expected to fail until the feature is implemented.
+//! These tests pin the `WorkflowInfo` concurrency fields, the key expression
+//! resolver `resolve_concurrency_key`, and the shape of `ConcurrencyPolicy`.
 
 use autumn_harvest::concurrency::{ConcurrencyPolicy, resolve_concurrency_key};
 use autumn_harvest::info::WorkflowInfo;

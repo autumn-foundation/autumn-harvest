@@ -1,6 +1,9 @@
 //! Tests for within-queue task priority (issue #249).
 //!
-//! RED-phase tests — all expected to fail until the feature is implemented.
+//! These tests pin the `Priority` enum: its variants, ordering, `i32` and
+//! string conversions, and serde form. They also pin the priority API of
+//! `EnqueueParams`, `WorkerConfig` priority aging, and the
+//! `StartWorkflowParams` priority field.
 
 use autumn_harvest::builder::WorkerConfig;
 use autumn_harvest::types::Priority;

@@ -1693,10 +1693,11 @@ mod tests {
         // This test PINS that documented v1 behavior, NOT the ideal `succeeded`
         // classification. It matches node_outcome's NotAttempted for the same
         // history (AC5). A precise fix is deferred to a coordinated #366
-        // change, for the same reason as the instance-collapse case. Modelled
-        // as a two-node DAG: the mapped node `a` fans out over nothing, and the
-        // downstream node `b` runs and succeeds. The mapped node still reports
-        // `pending`, not `succeeded`, even on a COMPLETED run.
+        // change, for the same reason as the instance-collapse case. The test
+        // uses the four-node `linear_dag`. Its node `a` stands in for a mapped
+        // node that fans out over nothing, so the history holds no events for
+        // `a`. The downstream node `b` runs and succeeds. The mapped node still
+        // reports `pending`, not `succeeded`, even on a COMPLETED run.
         let def = linear_dag(); // a -> b -> c -> d
         let ib = ActivityExecId::new();
         // `a` (the empty mapped fan-out) appends NO events; `b` runs & succeeds.

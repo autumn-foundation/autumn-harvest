@@ -1332,37 +1332,32 @@ pub async fn admit_update_event_with_codecs(
     Ok(())
 }
 
-/// Load the full event history for a workflow execution, ordered by `event_id`.
-///
-/// Lock the workflow execution row `FOR UPDATE` and then load its full event
-/// history.
+/// Take the execution row's `FOR UPDATE` lock, then load history **undecoded**.
 ///
 /// Acquiring the row lock first serialises concurrent event appends (e.g.
 /// from a second worker racing on the same task). The transaction that holds
 /// the lock owns the right to append the next event batch.
 ///
-/// This is an internal helper called by the transactional activity commit
-/// path in [`crate::context::ActivityContext::run_transactional`] and by
-/// several private functions in `worker.rs`.
+/// This is an internal helper. Its one caller is the transactional activity
+/// commit path in [`crate::context::ActivityContext::run_transactional`].
+///
+/// That caller reads only `next_event_id`, to append the inline
+/// `ActivityCompleted` at the right position. It never looks at a payload
+/// field, so decoding buys it nothing. Decoding would also cost it
+/// correctness. It would need the identity registry, which raises
+/// `UnknownCodecKey` on the first keyed envelope. That would roll back
+/// **every** transactional activity commit on a deployment with a codec
+/// configured.
+///
+/// The name says `undecoded` so a future caller that does want decoded events
+/// has to notice it is asking the wrong function. See
+/// [`load_history_undecoded`] for the general rule.
 ///
 /// # Errors
 ///
 /// Returns [`crate::error::HarvestError::NotFound`] when the execution row
 /// does not exist, and [`crate::error::HarvestError::Database`] on any other
 /// query failure.
-/// Take the execution row's `FOR UPDATE` lock, then load history **undecoded**.
-///
-/// Its one caller -- `ActivityContext::run_transactional` -- reads only
-/// `next_event_id`, to append the inline `ActivityCompleted` at the right
-/// position. It never looks at a payload field, so decoding buys it nothing.
-/// Decoding would also cost it correctness. It would need the identity
-/// registry, which raises `UnknownCodecKey` on the first keyed envelope. That
-/// would roll back **every** transactional activity commit on a deployment
-/// with a codec configured.
-///
-/// The name says `undecoded` so a future caller that does want decoded events
-/// has to notice it is asking the wrong function. See
-/// [`load_history_undecoded`] for the general rule.
 pub(crate) async fn lock_and_load_history_undecoded(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
@@ -1385,6 +1380,8 @@ pub(crate) async fn lock_and_load_history_undecoded(
     load_history_undecoded(conn, exec_id).await
 }
 
+/// Load the full event history for a workflow execution, ordered by `event_id`.
+///
 /// Deserializes each row's `event_data` JSON back into [`WorkflowEvent`].
 ///
 /// The returned [`EventHistory::next_event_id`] is set to one past the last

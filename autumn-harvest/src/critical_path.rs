@@ -20,14 +20,14 @@ pub struct CriticalPathResult {
 
 /// Cardinality bound for the linear duration scan in [`CriticalPathAnalyzer::analyze`].
 ///
-/// Below this many distinct `activity_durations` entries, each task's
+/// At or below this many distinct `activity_durations` entries, each task's
 /// duration comes from a linear scan of a flat slice, not a `HashMap` probe.
-/// At or above it, scanning is worse, up to `O(tasks * names)`. The scan's
-/// call site records the measured crossover. **The miss (`default_duration`
-/// fallback) case binds, not the hit case.** A miss scans every entry, and a
-/// hit exits early on average. So the miss crossover is lower. This limit
-/// respects it, so the scan is never worse than the `HashMap` baseline for
-/// any caller, whatever its hit rate.
+/// Above it, the analyzer uses the `HashMap`, because a scan costs up to
+/// `O(tasks * names)`. The scan's call site records the measured crossover.
+/// **The miss (`default_duration` fallback) case binds, not the hit case.** A
+/// miss scans every entry, and a hit exits early on average. So the miss
+/// crossover is lower. This limit respects it, so the scan is never worse than
+/// the `HashMap` baseline for any caller, whatever its hit rate.
 const LINEAR_SCAN_CARDINALITY_LIMIT: usize = 5;
 
 /// Minimum count of name-based duration lookups before

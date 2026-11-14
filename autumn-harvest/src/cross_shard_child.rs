@@ -1328,10 +1328,10 @@ async fn claim_row_by_delete(
 /// Record a failed relay step on the row, so an operator can see *why* a
 /// cross-shard child is not progressing without reading logs.
 ///
-/// Also drives the retry backoff. `attempts` is the exponent in
-/// `DUE_PREDICATE`. So a row that keeps failing backs off and stops taking a
-/// slot in every sweep. Best effort: a failure to record a failure does not
-/// fail the sweep.
+/// Also drives the retry backoff. `DUE_PREDICATE` waits `attempts` times 5s,
+/// capped at 6 steps, so the backoff is linear. A row that keeps failing
+/// backs off and stops taking a slot in every sweep. Best effort: a failure
+/// to record a failure does not fail the sweep.
 async fn record_attempt_failure(
     conn: &mut AsyncPgConnection,
     child_exec_id: uuid::Uuid,

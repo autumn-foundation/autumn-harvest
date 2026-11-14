@@ -3772,46 +3772,6 @@ enum DeliveryRoute {
     AlreadyDelivered,
 }
 
-/// Resolve which database an outbox delivery to `target` must run against
-/// (issue #1146).
-///
-/// Shared by the signal and cancel outbox sweeps, which previously each
-/// carried their own copy of this decision.
-///
-/// * An [`ExternalTarget::ExecutionId`] is O(1) and authoritative: the shard is
-///   encoded in the id itself. Unchanged from issue #751.
-/// * An [`ExternalTarget::WorkflowId`] is resolved by **observation**, not by
-///   the rendezvous hash that a fresh start would use.
-///   [`crate::external_target_location::resolve_location_by_workflow_id`]
-///   fans out across every expected shard and merges the answers. The hash
-///   predicts where *new* work goes. It is wrong for a workflow pinned by an
-///   explicit [`crate::shard::ShardPlacement`] (issue #697). It is also wrong
-///   for one left behind by a change to `writable_shards`. Both cases once
-///   resolved to a shard the target does not live on. They failed the
-///   request `target_unknown` while the target was running.
-///
-/// # Connection budget
-///
-/// `conn` is the connection the sweep already holds, from the caller's own
-/// shard pool. It has an open transaction and a `FOR UPDATE` lock on the
-/// outbox row. A pool may have no deadpool `Timeouts`. Then a bare
-/// `pool.get()` from that same pool is an unbounded wait. It can park the
-/// whole timeout checker. That is the hazard `codec_rotation.rs` and
-/// `audit_export.rs` were both fixed for. Three things prevent it:
-///
-/// * A deployment expecting **one** shard short-circuits here with no fan-out
-///   at all, so the single-shard default is exactly what it was pre-#1146.
-/// * The caller's own shard is probed on `conn` itself, never re-acquired.
-/// * Every other acquisition is bounded. A shard that fails becomes
-///   `Indeterminate` (retry), memoized in `uninspectable`. So a backlog pays
-///   the bound once per shard per sweep, not once per row.
-///
-/// The delivery attempt then re-resolves under the connection it delivers
-/// on. A run that moves between resolution and delivery, such as a
-/// continue-as-new, is caught there, not here.
-///
-/// With no sharded pool configured at all there is one database by definition,
-/// so the route is always the caller's own connection.
 /// Where the run behind an `ExecutionId` currently lives.
 ///
 /// An id names the shard a run ORIGINATED on. Once a rebalance could move a
@@ -3858,6 +3818,47 @@ async fn execution_id_residence(
     }
 }
 
+/// Resolve which database an outbox delivery to `target` must run against
+/// (issue #1146).
+///
+/// Shared by the signal and cancel outbox sweeps, which previously each
+/// carried their own copy of this decision.
+///
+/// * An [`ExternalTarget::ExecutionId`] is authoritative. The id encodes the
+///   shard the run started on. [`execution_id_residence`] follows the durable
+///   forwarding pointer that a rebalance leaves there (issue #964).
+/// * An [`ExternalTarget::WorkflowId`] is resolved by **observation**, not by
+///   the rendezvous hash that a fresh start would use.
+///   [`crate::external_target_location::resolve_location_by_workflow_id`]
+///   fans out across every expected shard and merges the answers. The hash
+///   predicts where *new* work goes. It is wrong for a workflow pinned by an
+///   explicit [`crate::shard::ShardPlacement`] (issue #697). It is also wrong
+///   for one left behind by a change to `writable_shards`. Both cases once
+///   resolved to a shard the target does not live on. They failed the
+///   request `target_unknown` while the target was running.
+///
+/// # Connection budget
+///
+/// `conn` is the connection the sweep already holds, from the caller's own
+/// shard pool. It has an open transaction and a `FOR UPDATE` lock on the
+/// outbox row. A pool may have no deadpool `Timeouts`. Then a bare
+/// `pool.get()` from that same pool is an unbounded wait. It can park the
+/// whole timeout checker. That is the hazard `codec_rotation.rs` and
+/// `audit_export.rs` were both fixed for. Three things prevent it:
+///
+/// * A deployment expecting **one** shard short-circuits here with no fan-out
+///   at all, so the single-shard default is exactly what it was pre-#1146.
+/// * The caller's own shard is probed on `conn` itself, never re-acquired.
+/// * Every other acquisition is bounded. A shard that fails becomes
+///   `Indeterminate` (retry), memoized in `uninspectable`. So a backlog pays
+///   the bound once per shard per sweep, not once per row.
+///
+/// The delivery attempt then re-resolves under the connection it delivers
+/// on. A run that moves between resolution and delivery, such as a
+/// continue-as-new, is caught there, not here.
+///
+/// With no sharded pool configured at all there is one database by definition,
+/// so the route is always the caller's own connection.
 #[allow(clippy::too_many_lines)]
 async fn resolve_delivery_route(
     conn: &mut AsyncPgConnection,
@@ -4159,14 +4160,6 @@ const fn should_record_other_live_observed(
     !other_live_is_empty && uninspected_is_empty
 }
 
-/// Attempt one signal delivery to `target` on `conn` (issue #751).
-///
-/// Shared by the same-pool and cross-pool branches of
-/// `enforce_external_signals_outbox`, so the `ExecutionId`-vs-`WorkflowId`
-/// dispatch logic exists in exactly one place. A database error is logged and
-/// reported as `Ok(None)` ("leave pending, retry on the next sweep"). It is
-/// not propagated. A transient failure on ONE row must not abort the scan of
-/// every other pending row.
 /// One pending outbox signal, bundled so [`attempt_signal_delivery`] stays under
 /// clippy's argument-count ceiling — the same shape
 /// [`CancelDeliveryAccumulators`] took for the cancel side (issue #751).
@@ -4185,6 +4178,14 @@ struct SignalDeliveryRequest<'a> {
     codecs: &'a crate::payload_codec::PayloadCodecs,
 }
 
+/// Attempt one signal delivery to `target` on `conn` (issue #751).
+///
+/// Shared by the same-pool and cross-pool branches of
+/// `enforce_external_signals_outbox`, so the `ExecutionId`-vs-`WorkflowId`
+/// dispatch logic exists in exactly one place. A database error is logged and
+/// reported as `None` ("leave pending, retry on the next sweep"). It is
+/// not propagated. A transient failure on ONE row must not abort the scan of
+/// every other pending row.
 async fn attempt_signal_delivery(
     conn: &mut AsyncPgConnection,
     request: SignalDeliveryRequest<'_>,
@@ -4348,18 +4349,14 @@ impl OldestPendingIndeterminateAge {
     }
 }
 
-/// Enforce all currently expired task timeouts against the database state.
-///
-/// This mutates queue rows and workflow history so timed-out tasks are not
-/// retried indefinitely in the logs while the rest of the runtime remains
-/// oblivious.
-///
-/// # Errors
-///
 /// Background outbox scanner that polls pending external signal requests. It
 /// attempts same-shard and cross-shard delivery via `GLOBAL_SHARDED_POOL`. It
 /// fails with `"target_unknown"` after `unknown_target_grace_window` has
 /// elapsed, and wakes up the caller workflow.
+///
+/// # Errors
+///
+/// Returns the first database or persistence error encountered.
 #[allow(clippy::too_many_lines)]
 pub async fn enforce_external_signals_outbox(
     conn: &mut AsyncPgConnection,
@@ -5955,6 +5952,11 @@ fn scan_metric_shards(
 }
 
 /// The body of one [`enforce_timeouts_once_on_conn_shard`] pass.
+///
+/// It enforces all currently expired task timeouts against the database state.
+/// This mutates queue rows and workflow history so timed-out tasks are not
+/// retried indefinitely in the logs while the rest of the runtime remains
+/// oblivious.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines, clippy::ref_option)]
 async fn enforce_timeouts_pass(
     conn: &mut AsyncPgConnection,

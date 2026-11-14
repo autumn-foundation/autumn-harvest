@@ -644,7 +644,7 @@ async fn context_execute_activity_external_detects_non_determinism() {
 #[tokio::test]
 async fn context_double_complete_is_idempotent_replay() {
     // The "double-complete" scenario at the replay layer. With
-    // `ActivityCompletedExternally` in history, a second call to
+    // `ActivityCompletedExternally` in history, a replayed call to
     // `execute_activity_external` returns the recorded output. It neither
     // suspends nor emits new commands.
     let activity_id = ActivityExecId::new();
@@ -676,7 +676,7 @@ async fn context_double_complete_is_idempotent_replay() {
 
     let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
 
-    // First call — replays from history.
+    // The call replays from history.
     let result1 = ctx
         .execute_activity_external("approve_expense", Value::Null, "approvals", 86400)
         .await;

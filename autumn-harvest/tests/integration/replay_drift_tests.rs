@@ -2396,10 +2396,11 @@ async fn replay_verifier_carries_the_candidate_build_id() {
 // Candidate payload caps
 // ---------------------------------------------------------------------------
 
+/// The activity-input cap that the candidate worker in the tests below sets.
+const CANDIDATE_CAP_BYTES: u64 = 512 * 1024;
 /// Comfortably under the library default activity-input cap (2 MiB) and over
 /// the candidate cap the tests below configure. So the two configurations
 /// genuinely disagree about this one workflow.
-const CANDIDATE_CAP_BYTES: u64 = 512 * 1024;
 const PAYLOAD_BYTES: usize = 700 * 1024;
 
 /// Schedules one activity whose input sits between the candidate worker's cap

@@ -674,10 +674,10 @@ pub struct HandlerRegistry {
     /// fleet-wide chain default to scheduled runs. `None` = no chain cap
     /// applied fleet-wide.
     ///
-    /// This differs on purpose from the per-run `execution_timeout` ceiling,
-    /// which is NOT threaded into the scheduler. The chain ceiling is a
-    /// fleet-wide DEFAULT that must reach every start (AC4). The per-run
-    /// ceiling only caps a specified value.
+    /// This differs on purpose from the per-run `execution_timeout` ceiling.
+    /// The chain ceiling is a fleet-wide DEFAULT that must reach every start
+    /// (AC4). The per-run ceiling also reaches the scheduler (issue #743),
+    /// but it only caps a specified value.
     pub max_workflow_chain_timeout: Option<std::time::Duration>,
     /// Server-side ceiling on the per-run `execution_timeout` (issue #243).
     /// The HTTP start paths resolve it per request from `api_state`. The
@@ -7175,52 +7175,6 @@ pub enum CapabilityMissAction {
 /// cap, and does not bounce forever.
 pub const CAPABILITY_MISS_TOTAL_BUDGET_MULTIPLIER: i32 = 10;
 
-/// Decide whether a capability miss releases the task for a peer or escalates
-/// to the terminal-failure path (issue #804).
-///
-/// Two bounds, both must hold to release:
-///
-/// * `distinct_workers_after` — how many **distinct** workers will have missed
-///   this task after recording this one. This is the primary budget. A repeat
-///   miss by a worker already in the set does not move it. So no single
-///   incapable worker can exhaust the budget by winning the claim race again
-///   and again. The released task is eligible to every worker again, and the
-///   claim query has no capability filter.
-/// * `misses_after_increment` — the total-release value the UPDATE would
-///   persist to `harvest_task_queue.capability_misses`, so the **first** miss on
-///   a task arrives here as `1`. Bounded by
-///   [`CAPABILITY_MISS_TOTAL_BUDGET_MULTIPLIER`] × the budget, which is what
-///   terminates a fleet too small to ever grow the distinct set to the budget.
-///
-/// The budget is a **count of permitted redeliveries**, not a threshold to
-/// reach. `max_redeliveries = N` allows exactly `N` distinct-worker releases
-/// and escalates on the `N + 1`th. So escalation fires at `>`, not `>=`. This
-/// differs on purpose from the `>=` shape of
-/// [`crate::poison_pill::quarantine_decision`]. That knob is named
-/// `poison_pill_threshold` ("reach it and act"). This one is named for the
-/// number of redeliveries it grants. Under `>=`, a budget of 5 would permit
-/// only four releases. [`no_capable_worker_reason`] would then misreport the
-/// count that it names in the terminal error.
-///
-/// `max_redeliveries == 0` escalates on the first miss — the documented
-/// rollback switch that restores the pre-#804 "fail terminally on first claim
-/// by an incapable worker" behaviour. Note this is the *opposite* sentinel to
-/// `poison_pill_threshold`'s `0` (which disables quarantine): "max
-/// redeliveries = 0" literally means no redeliveries are allowed.
-///
-/// **Storage ceiling.** A value of `i32::MAX` always escalates, whatever the
-/// budget. `capability_misses` is a Postgres `INT`. Rust saturating arithmetic
-/// differs from Postgres here. `i32::saturating_add` clamps, but
-/// `capability_misses + 1` at `2147483647` raises `integer out of range` and
-/// aborts the statement. So a release at the ceiling would issue an UPDATE that
-/// can only fail. The task would stay `RUNNING` and owned by a *live* worker.
-/// The poison-pill orphan reclaimer skips such a row on purpose, because it
-/// only reclaims rows whose worker has no live heartbeat. The invariant is
-/// stated on the value about to be persisted, not on the budget: **never let
-/// the column reach `i32::MAX`**. Then `+ 1` is always representable, however
-/// the counter got there. Organically it never does: 2^31 releases at the
-/// 30 s backoff cap take roughly two thousand years. But an operator, a
-/// backfill or a test seed can write the column.
 /// How long a worker may go without a heartbeat before the fleet treats it as
 /// dead.
 ///
@@ -8078,6 +8032,52 @@ const fn capability_miss_budget(max_redeliveries: u32) -> i32 {
     }
 }
 
+/// Decide whether a capability miss releases the task for a peer or escalates
+/// to the terminal-failure path (issue #804).
+///
+/// Two bounds, both must hold to release:
+///
+/// * `distinct_workers_after` — how many **distinct** workers will have missed
+///   this task after recording this one. This is the primary budget. A repeat
+///   miss by a worker already in the set does not move it. So no single
+///   incapable worker can exhaust the budget by winning the claim race again
+///   and again. The released task is eligible to every worker again, and the
+///   claim query has no capability filter.
+/// * `misses_after_increment` — the total-release value the UPDATE would
+///   persist to `harvest_task_queue.capability_misses`, so the **first** miss on
+///   a task arrives here as `1`. Bounded by
+///   [`CAPABILITY_MISS_TOTAL_BUDGET_MULTIPLIER`] × the budget, which is what
+///   terminates a fleet too small to ever grow the distinct set to the budget.
+///
+/// The budget is a **count of permitted redeliveries**, not a threshold to
+/// reach. `max_redeliveries = N` allows exactly `N` distinct-worker releases
+/// and escalates on the `N + 1`th. So escalation fires at `>`, not `>=`. This
+/// differs on purpose from the `>=` shape of
+/// [`crate::poison_pill::quarantine_decision`]. That knob is named
+/// `poison_pill_threshold` ("reach it and act"). This one is named for the
+/// number of redeliveries it grants. Under `>=`, a budget of 5 would permit
+/// only four releases. [`no_capable_worker_reason`] would then misreport the
+/// count that it names in the terminal error.
+///
+/// `max_redeliveries == 0` escalates on the first miss — the documented
+/// rollback switch that restores the pre-#804 "fail terminally on first claim
+/// by an incapable worker" behaviour. Note this is the *opposite* sentinel to
+/// `poison_pill_threshold`'s `0` (which disables quarantine): "max
+/// redeliveries = 0" literally means no redeliveries are allowed.
+///
+/// **Storage ceiling.** A value of `i32::MAX` always escalates, whatever the
+/// budget. `capability_misses` is a Postgres `INT`. Rust saturating arithmetic
+/// differs from Postgres here. `i32::saturating_add` clamps, but
+/// `capability_misses + 1` at `2147483647` raises `integer out of range` and
+/// aborts the statement. So a release at the ceiling would issue an UPDATE that
+/// can only fail. The task would stay `RUNNING` and owned by a *live* worker.
+/// The poison-pill orphan reclaimer skips such a row on purpose, because it
+/// only reclaims rows whose worker has no live heartbeat. The invariant is
+/// stated on the value about to be persisted, not on the budget: **never let
+/// the column reach `i32::MAX`**. Then `+ 1` is always representable, however
+/// the counter got there. Organically it never does: 2^31 releases at the
+/// 30 s backoff cap take roughly two thousand years. But an operator, a
+/// backfill or a test seed can write the column.
 #[must_use]
 pub const fn capability_miss_decision(
     distinct_workers_after: i32,
@@ -8606,7 +8606,7 @@ pub fn escalation_from_persisted(
 /// distinct from an ordinary application failure. Every variant keeps that
 /// prefix. The runbook's recovery sweep matches it over
 /// `GET /workflows?state=FAILED`. The recovery action (re-start or reset the
-/// run) is the same for all three.
+/// run) is the same for all four.
 ///
 /// Four variants, because the branches have different causes and therefore
 /// different operator fixes. The distinction is load-bearing rather than
@@ -9681,30 +9681,6 @@ async fn update_workflow_execution_failed(
     Ok(())
 }
 
-/// Block an execution non-terminally on an engine-detected replay divergence
-/// (issue #603).
-///
-/// Runs one row-locked transaction (mirroring the pause-guarded persistence
-/// transaction in [`process_workflow_task`]) that:
-/// 1. stamps `nd_blocked_at` / `nd_block_reason` and increments
-///    `nd_block_count` on the execution row — `state` stays `RUNNING`;
-/// 2. stamps the divergence diagnostic into `search_attrs`
-///    ([`nd_search_attrs_patch`]);
-/// 3. re-pends the workflow task with `scheduled_at = NOW() + backoff`
-///    ([`queue::requeue_workflow_task_nd_blocked`]), unpinning sticky
-///    affinity so a rolled-back worker can claim it.
-///
-/// It deliberately appends **zero** events, because the caller already
-/// discarded the divergent cycle's pending commands. It never calls
-/// `queue::fail_task`, and never runs the parent-close cascade, completion
-/// triggers, or a parent wake. So root and child executions block uniformly.
-/// A blocked child's parent stays suspended until the child completes after
-/// the offending build is rolled back.
-///
-/// If an operator pause committed first (observed `PAUSED` under the row
-/// lock), the task is re-parked instead, because pause supersedes the block.
-/// The next resume re-derives the same divergence (or replays cleanly under a
-/// fixed build) on a fresh cycle.
 #[allow(clippy::too_many_arguments)]
 /// Check whether `exec_uuid` is currently `PAUSED` under a `FOR UPDATE` row
 /// lock (serialising with `pause_workflow_execution`'s own lock), and if so,
@@ -9813,6 +9789,30 @@ async fn repend_for_late_signals(
     Ok(true)
 }
 
+/// Block an execution non-terminally on an engine-detected replay divergence
+/// (issue #603).
+///
+/// Runs one row-locked transaction (mirroring the pause-guarded persistence
+/// transaction in [`process_workflow_task`]) that:
+/// 1. stamps `nd_blocked_at` / `nd_block_reason` and increments
+///    `nd_block_count` on the execution row — `state` stays `RUNNING`;
+/// 2. stamps the divergence diagnostic into `search_attrs`
+///    ([`nd_search_attrs_patch`]);
+/// 3. re-pends the workflow task with `scheduled_at = NOW() + backoff`
+///    ([`queue::requeue_workflow_task_nd_blocked`]), unpinning sticky
+///    affinity so a rolled-back worker can claim it.
+///
+/// It deliberately appends **zero** events, because the caller already
+/// discarded the divergent cycle's pending commands. It never calls
+/// `queue::fail_task`, and never runs the parent-close cascade, completion
+/// triggers, or a parent wake. So root and child executions block uniformly.
+/// A blocked child's parent stays suspended until the child completes after
+/// the offending build is rolled back.
+///
+/// If an operator pause committed first (observed `PAUSED` under the row
+/// lock), the task is re-parked instead, because pause supersedes the block.
+/// The next resume re-derives the same divergence (or replays cleanly under a
+/// fixed build) on a fresh cycle.
 #[allow(clippy::too_many_arguments)]
 async fn block_workflow_for_non_determinism(
     conn: &mut AsyncPgConnection,
@@ -13378,16 +13378,16 @@ async fn persist_all_started_child_workflows(
         // here would be strictly worse than the pre-#946 behavior, where a
         // spawned child was simply invisible to quota accounting. Instead, the
         // whole transaction above already rolled back (no child rows, no parent
-        // event appends, nothing committed). This arm parks + immediately wakes
-        // the parent task so a LATER poll re-drives the identical decision
+        // event appends, nothing committed). This arm requeues the parent task
+        // with a backoff, so a LATER poll re-drives the identical decision
         // cycle. That mirrors `requeue_parent_on_transient_ingest_conflict`'s
         // "no event appended, no state changed, no retry attempt consumed"
         // contract (issue #779) for the closely analogous transient-conflict
-        // case. `park_workflow_task` (not `_preserving_capability_misses`) is
-        // correct here. This catch is reached only AFTER the transaction's
-        // capability-miss pre-check and handler resolution succeeded. So
-        // capability is proven; only the quota-governed key's admission is
-        // blocked.
+        // case. The backoff requeue resets the capability-miss counters, and
+        // that is correct here. This catch is reached only AFTER the
+        // transaction's capability-miss pre-check and handler resolution
+        // succeeded. So capability is proven; only the quota-governed key's
+        // admission is blocked.
         // Issue #1227 (follow-up to #946/#1221): a park immediately followed by
         // an unconditional wake degenerates into a zero-delay retry loop
         // against a durably exhausted quota. An example is `max_dead_letters`,
@@ -13409,14 +13409,14 @@ async fn persist_all_started_child_workflows(
         // appends). So the cycle is retried rather than the parent failed, and
         // the child is never quietly placed on the parent's shard.
         //
-        // This is deliberately a *backoff* requeue, not the quota arm's
+        // This is deliberately a *backoff* requeue, like the quota arm, not a
         // park-and-wake. An unreachable shard is a property of THIS process's
         // topology, not of other work draining on this shard. So an immediate
         // re-wake would re-claim, replay the whole history, fail identically,
         // and spin at full poll cadence forever.
-        // `requeue_child_spawn_admission_error` also preserves the
-        // capability-miss bookkeeping, so a peer that *does* hold the shard's
-        // pool can pick the task up.
+        // `requeue_child_spawn_admission_error` also clears the claim, so a
+        // peer that *does* hold the shard's pool can pick the task up after
+        // the backoff.
         Err(e @ HarvestError::ShardUnavailable { .. }) => {
             requeue_child_spawn_admission_error(conn, task_id, parent_exec_id, &e).await?;
             return Ok(());
@@ -22765,8 +22765,8 @@ const QUOTA_RETRY_BACKOFF_MAX: Duration = Duration::from_secs(3);
 /// static property of the pool map of this process. So an immediate re-wake
 /// would re-claim, replay the whole history and fail identically. It would
 /// hot-spin at poll cadence forever, burning a workflow slot and a connection
-/// per iteration. `requeue_for_retry` is durably scheduled and survives a
-/// worker restart.
+/// per iteration. `requeue_workflow_task_for_quota_retry` is durably
+/// scheduled and survives a worker restart.
 async fn requeue_child_spawn_admission_error(
     conn: &mut AsyncPgConnection,
     task_id: uuid::Uuid,
@@ -22810,9 +22810,10 @@ async fn requeue_child_spawn_admission_error(
 /// tenant's quota has capacity again.
 ///
 /// This is a `RUNNING` -> `PENDING`-at-`scheduled_at` requeue (via
-/// [`queue::requeue_for_retry`]), not a park-then-immediate-wake. Nothing
-/// external ever calls [`queue::wake_workflow_task`] for THIS execution when
-/// the quota of the target frees up. Quota capacity is a property of OTHER
+/// [`queue::requeue_workflow_task_for_quota_retry`]), not a
+/// park-then-immediate-wake. Nothing external ever calls
+/// [`queue::wake_workflow_task`] for THIS execution when the quota of the
+/// target frees up. Quota capacity is a property of OTHER
 /// executions of the target type, never an event tied to the `exec_id` of
 /// this caller. So parking, which waits for an explicit wake, is the wrong
 /// primitive here. A park followed at once by an unconditional wake
@@ -23662,11 +23663,7 @@ async fn prepare_workflow_task_with_cache(
     }
 }
 
-/// Atomically seal the current execution as `CONTINUED_AS_NEW` and start a
-/// fresh execution with the same logical `WorkflowId`, a new `ExecutionId`,
-/// and an empty event history. Pending unconsumed signals on the old
-/// execution are reassigned to the new one so that signals delivered during
-/// the transition window are not lost.
+/// Fail a child execution that asks to continue as new.
 ///
 /// Continue-as-new is intentionally restricted to root workflows. Allowing it
 /// from a child workflow would need one of two moves. One reparents the new
@@ -24425,9 +24422,9 @@ fn classify_successor_deadline_representable(
 /// the queried shard are necessarily the same one.
 ///
 /// `Ok(Err(msg))` is a *rejection* (an operator-facing message), not a
-/// database error. A **live** run of the target type already owns the
-/// identity. The `(workflow_name, workflow_id)` uniqueness of harvest admits
-/// exactly one.
+/// database error. A **live** or terminal run of the target type already owns
+/// the identity. The `(workflow_name, workflow_id)` uniqueness of harvest
+/// admits exactly one.
 async fn resolve_successor_slot(
     conn: &mut AsyncPgConnection,
     target: &str,
@@ -24746,6 +24743,12 @@ fn resolve_cross_type_max_input_bytes(
 /// correct the metrics and schedule-failure-counter accounting it already
 /// pre-computed for a plain `ContinuedAsNew` outcome. That accounting is
 /// wrong once this redirect fires (PR #1399).
+///
+/// A `Continue` verdict atomically seals the current execution as
+/// `CONTINUED_AS_NEW`. It then starts a fresh execution with the same logical
+/// `WorkflowId`, a new `ExecutionId`, and an empty event history. Pending
+/// unconsumed signals on the old execution are reassigned to the new one so
+/// that signals delivered during the transition window are not lost.
 #[allow(clippy::too_many_lines)]
 async fn persist_workflow_continue_as_new_with_verdict(
     conn: &mut AsyncPgConnection,
@@ -25076,12 +25079,11 @@ async fn persist_workflow_continue_as_new_with_verdict(
 
         // Issue #803: a cross-type successor takes the `(target, workflow_id)`
         // uniqueness slot, which sealing the predecessor above does NOT free.
-        // Release a *terminal* prior run of that phase the same way the seal of
-        // the predecessor releases its slot. Such a run comes from a win-back
-        // loop, or an external caller started it by naming the old type. A LIVE
-        // occupant was already rejected before this transaction opened. The
-        // `FOR UPDATE` taken there holds until commit, so nothing can claim the
-        // slot in between.
+        // `resolve_successor_slot` already rejected any other occupant before
+        // this transaction opened. That covers a LIVE run and a *terminal*
+        // prior run of that phase. A terminal run comes from a win-back loop
+        // or an external start under the old type. The `FOR UPDATE` taken
+        // there holds until commit, so nothing can claim the slot in between.
         diesel::insert_into(harvest_workflow_executions::table)
             .values(&new_row)
             .execute(conn)
@@ -37755,20 +37757,6 @@ impl Worker {
             "worker starting (multi-shard)"
         );
 
-        // Register + rate-limit buckets on every shard pool. Each shard keeps
-        // its OWN pending flag: a shard whose registration failed must retry
-        // even when a sibling shard succeeded (issue #804).
-        // Each flag is SHARED (not copied) between that shard's heartbeat task
-        // and that shard's slot in the poll loop. The heartbeat retries and
-        // eventually clears it. The poll loop must observe the clearing to
-        // resume claiming on that shard. See `may_claim_tasks`.
-        //
-        // Every per-shard acquisition here is bounded (issue #961). This loop
-        // is sequential. An unreachable or exhausted pool on ONE shard would
-        // otherwise park it forever, and the poll loop below would never start
-        // at all. That would strand every healthy shard. A
-        // bounded failure instead arms that shard's pending flag, which its own
-        // heartbeat task retries. See `shard_acquire_bound`.
         // Cross-shard reads need a connection this process does not already
         // hold. One timeout checker runs per assigned shard. It holds its own
         // shard pool's connection for the whole `enforce_timeouts_once` pass.
@@ -37821,6 +37809,21 @@ impl Worker {
         crate::replication::FenceRegistry::register_worker_shutdown(&self.shutdown);
         let _held_resolver = self.spawn_held_resolver(held);
 
+        // Register + rate-limit buckets on every shard pool. Each shard keeps
+        // its OWN pending flag: a shard whose registration failed must retry
+        // even when a sibling shard succeeded (issue #804).
+        // Each flag is SHARED (not copied) between that shard's heartbeat task
+        // and that shard's slot in the poll loop. The heartbeat retries and
+        // eventually clears it. The poll loop must observe the clearing to
+        // resume claiming on that shard. See `may_claim_tasks`.
+        //
+        // Every per-shard acquisition here is bounded (issue #961).
+        // `register_shards` is sequential. An unreachable or exhausted pool on
+        // ONE shard would otherwise park it forever, and the poll loop below
+        // would never start at all. That would strand every healthy shard. A
+        // bounded failure instead arms that shard's pending flag, which its own
+        // heartbeat task retries. See `shard_acquire_bound`.
+        //
         // The retry guards live as long as this run (issue #1788).
         let (registration_pending_per_shard, _bucket_retries) =
             self.register_shards(&shard_targets).await;
@@ -38440,13 +38443,6 @@ impl Worker {
             return;
         }
 
-        // Register this worker in the fleet table. The returned flag arms this
-        // pool's heartbeat retry when the atomic pair did not commit.
-        //
-        // The flag is shared (not copied) between this pool's heartbeat task and
-        // its poll loop. The heartbeat retries and eventually clears it. The
-        // poll loop must observe that clearing to resume claiming. See
-        // `may_claim_tasks` for why an unregistered worker must not claim.
         // Fence FIRST: pinning must precede fleet registration and the first
         // poll, so a DR-enabled worker is never briefly unfenced (issue #954).
         let Ok((dr_targets, held)) = self.pin_dr_generations(pool).await else {
@@ -38462,6 +38458,13 @@ impl Worker {
         let held_gate = self
             .dr_fence_targets(pool)
             .map_or(crate::types::ShardId::UNENCODED, |(_, shard)| shard);
+        // Register this worker in the fleet table. The returned flag arms this
+        // pool's heartbeat retry when the atomic pair did not commit.
+        //
+        // The flag is shared (not copied) between this pool's heartbeat task and
+        // its poll loop. The heartbeat retries and eventually clears it. The
+        // poll loop must observe that clearing to resume claiming. See
+        // `may_claim_tasks` for why an unregistered worker must not claim.
         let registration_pending = Arc::new(AtomicBool::new(
             fenced_startup_write(pool, held_gate, self.register_in_fleet(pool, None))
                 .await
@@ -57079,14 +57082,15 @@ mod tests {
     /// `deadline_at = NULL` (PR #1159).
     ///
     /// Load-bearing because the scanner is authoritative on `deadline_at`.
-    /// `enforce_workflow_execution_timeouts` selects
-    /// `deadline_at IS NOT NULL AND deadline_at < now` (`timeout.rs:1838-1847`),
-    /// so a NULL deadline is NEVER enforced. Storing the duration anyway would
-    /// leave a row that CLAIMS a hard runaway cap it does not have.
+    /// `timeout::enforce_workflow_execution_timeouts` selects
+    /// `deadline_at IS NOT NULL AND deadline_at < now`, so a NULL deadline is
+    /// NEVER enforced. Storing the duration anyway would leave a row that
+    /// CLAIMS a hard runaway cap it does not have.
     ///
     /// This is the first path that resolves the TARGET type's declaration. The
-    /// normal start path computes `target_start_time + d` with a plain `+`
-    /// (`execution.rs:592`), which panics rather than persisting such a run.
+    /// normal start path computes `target_start_time + d` with a plain `+` (in
+    /// `start_or_load_workflow_execution_collect_with_codecs_and_quota_override`).
+    /// That `+` panics rather than persisting such a run.
     /// So a type whose declaration overflows could never have been started
     /// directly. A refusal here matches that "no run is created with a lying
     /// field" outcome, as a diagnosable terminal failure instead of a panic.

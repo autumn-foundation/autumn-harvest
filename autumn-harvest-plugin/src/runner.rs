@@ -2707,12 +2707,14 @@ mod tests {
             .expect("build tagged pool")
     }
 
-    /// The single source of truth for the runtime pool-resolution precedence
-    /// (issue #700 P2). A `WorkerConfig::with_sharded_pool` MUST win over
-    /// `harvest_pool`. Otherwise the boot-gate, which calls this exact
-    /// function, would validate `harvest_pool`. The workers would poll the
-    /// sharded pool's database. The `max_size` tag identifies which pool was
-    /// resolved without opening a connection.
+    /// Pins the runtime pool-resolution precedence of
+    /// `resolve_runtime_storage_pool` (issue #700 P2). A
+    /// `WorkerConfig::with_sharded_pool` MUST win over `harvest_pool`. The boot
+    /// gate calls `select_runtime_gate_shards`, which shares this precedence
+    /// through `pick_runtime_pool_source`. A wrong order would make the gate
+    /// validate `harvest_pool` while the workers poll the sharded pool's
+    /// database. The `max_size` tag identifies which pool was resolved without
+    /// opening a connection.
     #[test]
     fn resolve_runtime_storage_pool_precedence() {
         let harvest = tagged_pool(3);

@@ -304,7 +304,7 @@ const UNRESOLVED_RESOLVED_MARKER: &str = "U";
 #[must_use]
 pub fn dynamic_rate_bucket_key(key_expr: &str, resolved: Option<&str>) -> String {
     let expr = key_expr.strip_prefix("input.").unwrap_or(key_expr);
-    // The expr component is self-delimiting (`L{len}:{bytes}` or `H{16hex}`);
+    // The expr component is self-delimiting (`L{len}:{bytes}` or `H{64hex}`);
     // the resolved component is either the same (`Some`) or the disjoint
     // single-byte `U` marker (`None`, unresolved). `None` (missing/null/
     // non-object input) is kept DISTINCT from `Some("")`. That is a
@@ -9248,8 +9248,8 @@ pub async fn wake_workflow_task(
 /// Runs the primary re-pend `UPDATE` of [`wake_workflow_task`].
 ///
 /// It resets a parked (or elapsed mixed-signal-suspension) workflow task row
-/// for `exec_id` back to `PENDING`. It returns the queue names of any rows it
-/// touched. It is a separate function so the dropped-wake fallback can retry
+/// for `exec_id` back to `PENDING`. It returns a `PendingHintRow` for each row
+/// it touched. It is a separate function so the dropped-wake fallback can retry
 /// it after it loses the `park_workflow_task` row-lock race.
 ///
 /// `created_at` becomes `clock_timestamp()`, the wake instant. This re-pends

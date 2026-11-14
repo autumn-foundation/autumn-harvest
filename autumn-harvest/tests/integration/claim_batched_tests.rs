@@ -442,9 +442,9 @@ async fn batched_claim_gives_up_after_max_batches_without_claiming_poisoned_rows
 
 /// `N` concurrent claimers racing a backlog of rows sharing one
 /// `concurrency_cap`-capped key must never push RUNNING rows for that key
-/// past the cap. The count of successful claims must also exactly equal
-/// the cap -- not more, and, since every row is otherwise identical,
-/// not fewer either.
+/// past the cap. The count of successful claims must fall in `1..=CAP`.
+/// A claimer that loses the non-blocking lock race claims nothing, so a
+/// round can land below the cap. The RUNNING count must equal the claim count.
 ///
 /// This is the exact property `pg_try_advisory_xact_lock` plus the fresh
 /// per-candidate `COUNT` exists to guarantee, now checked under REAL

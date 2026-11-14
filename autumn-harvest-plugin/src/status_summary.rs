@@ -1349,7 +1349,7 @@ mod tests {
     #[test]
     fn classify_workers_stopped_only_with_backlog_is_critical() {
         // Same all-Stopped fleet, but work is queued with nothing live to run
-        // it ⇒ critical via supposed_running==0 && backlog>0.
+        // it ⇒ critical via active == 0 && backlog > 0.
         let (status, codes) = classify_workers(0, 0, 0, 7, 42, &thresholds());
         assert_eq!(status, SubsystemStatus::Critical);
         assert!(codes.contains(&"worker_no_active".to_string()));

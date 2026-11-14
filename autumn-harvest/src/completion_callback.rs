@@ -523,19 +523,20 @@ mod ssrf_tests {
         }
     }
 
-    // `is_ipv6_non_routable` only unwraps the IPv4-*mapped* form
-    // (`::ffff:a.b.c.d`, RFC 4291 `::ffff:0:0/96`) via `to_ipv4_mapped()` before
-    // checking `is_ipv4_non_routable`. The older IPv4-*compatible* form
-    // (`::a.b.c.d`, the bare `::/96` prefix) encodes the exact same embedded
-    // IPv4 address. But `to_ipv4_mapped()` returns `None` for it. So a
-    // loopback or private IPv4 written this way skips the embedded-IPv4 check
-    // entirely and is classified routable. That bypasses the very guarantee
-    // in `validate_target_url`'s doc comment, which says such a target "even
-    // then is rejected if it is loopback/private/link-local/etc." as its rule.
-    // `Ipv6Addr::to_ipv4()` (unlike `to_ipv4_mapped()`) unwraps both
-    // forms. It still returns `None` for a genuine global-unicast IPv6 address
-    // (verified against `2001:db8::1` and a real public IPv6 literal). So
-    // swapping it in is a same-length, non-widening fix.
+    // `is_ipv6_non_routable` unwraps an embedded IPv4 address with
+    // `Ipv6Addr::to_ipv4()` before it checks `is_ipv4_non_routable`. It
+    // unwraps the IPv4-*mapped* form (`::ffff:a.b.c.d`, RFC 4291
+    // `::ffff:0:0/96`). It also unwraps the older IPv4-*compatible* form
+    // (`::a.b.c.d`, the bare `::/96` prefix), which encodes the same address.
+    // `to_ipv4_mapped()` returns `None` for the compatible form. With
+    // `to_ipv4_mapped()`, a loopback or private IPv4 written this way skips
+    // the embedded-IPv4 check entirely and is classified routable. That
+    // bypasses the very guarantee in `validate_target_url`'s doc comment,
+    // which says such a target "even then is rejected if it is
+    // loopback/private/link-local/etc." as its rule. `to_ipv4()` still
+    // returns `None` for a genuine global-unicast IPv6 address (verified
+    // against `2001:db8::1` and a real public IPv6 literal). So a public IPv6
+    // target is not rejected by mistake. This test pins the compatible form.
     #[test]
     fn rejects_ipv4_compatible_ipv6_embedding_a_loopback_or_private_address() {
         let policy = SsrfPolicy::default().with_allow_ip_literals(true);
@@ -796,7 +797,7 @@ mod ssrf_tests {
     #[test]
     fn ipv4_mapped_ipv6_inherits_ipv4_special_range_rejection() {
         // v4-mapped forms canonicalize to their IPv4 address via
-        // `to_ipv4_mapped()` and must hit the same classifier — including the
+        // `to_ipv4()` and must hit the same classifier — including the
         // two newly closed ranges.
         for addr in [
             "::ffff:0.0.0.1",    // 0.0.0.0/8

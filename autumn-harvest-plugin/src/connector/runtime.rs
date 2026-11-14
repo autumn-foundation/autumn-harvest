@@ -3384,15 +3384,6 @@ mod tests {
         }
     }
 
-    /// A sample that outlasts its own cadence must not re-arm immediately.
-    ///
-    /// The throttle stamps the sample instant. A stamp on the way IN measures
-    /// the gap from when the sample STARTED. A sample that takes longer than
-    /// `lag_sample_interval` is then due again the instant it finishes, on the
-    /// very next pass. So the runtime spends every pass sampling and only a
-    /// sliver of each consuming. A gap measured from COMPLETION guarantees a
-    /// full interval of message polling between samples, however expensive
-    /// one turns out to be.
     /// A short cadence must not shorten the budget below what an adapter can
     /// actually abort within, or abandoned samples pile up.
     ///
@@ -3446,6 +3437,15 @@ mod tests {
         assert_eq!(long.lag_sample_budget(), std::time::Duration::from_secs(60));
     }
 
+    /// A sample that outlasts its own cadence must not re-arm immediately.
+    ///
+    /// The throttle stamps the sample instant. A stamp on the way IN measures
+    /// the gap from when the sample STARTED. A sample that takes longer than
+    /// `lag_sample_interval` is then due again the instant it finishes, on the
+    /// very next pass. So the runtime spends every pass sampling and only a
+    /// sliver of each consuming. A gap measured from COMPLETION guarantees a
+    /// full interval of message polling between samples, however expensive
+    /// one turns out to be.
     #[tokio::test]
     async fn a_slow_lag_sample_does_not_immediately_re_arm_the_throttle() {
         let config = ConnectorRuntimeConfig {
@@ -4153,14 +4153,15 @@ mod tests {
 
     /// A rebuild that never returns must not hang the whole application.
     ///
-    /// The stall arm awaits `recover_from_stall` inside the *body* of a
-    /// `select!` arm that has already resolved, so the cancellation branch is
-    /// no longer racing it. So a rebuild blocked on its broker parks `run`
-    /// before it ever reaches `drain_in_flight`, and bypasses the bounded
-    /// drain entirely. `stop_harvest_runtime` awaits the connector handle with
-    /// no deadline of its own. That is a permanently hung shutdown. The outage
-    /// that wedged the prefix usually also wedges the rebuild. So the two
-    /// coincide by default, not by coincidence.
+    /// The stall arm runs inside the *body* of a `select!` arm that has already
+    /// resolved, so the outer cancellation branch no longer races it. A bare
+    /// await of a rebuild blocked on its broker would park `run` before it
+    /// reaches `drain_in_flight`, and bypass the bounded drain entirely.
+    /// `stop_harvest_runtime` awaits the connector handle with no deadline of
+    /// its own, so shutdown would hang forever. So `run` races
+    /// `recover_from_stall` against cancellation in its own `select!`. This
+    /// test pins that race. The outage that wedged the prefix usually also
+    /// wedges the rebuild. So the two coincide by default, not by coincidence.
     #[tokio::test]
     async fn a_wedged_rebuild_cannot_hang_shutdown() {
         let source = Arc::new(RebuildHangsSource::new("orders"));

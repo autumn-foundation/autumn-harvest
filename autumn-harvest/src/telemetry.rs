@@ -4340,7 +4340,7 @@ pub trait MetricsRecorder: Send + Sync {
     /// #804).
     ///
     /// The worker either released the claim for a capable peer, or escalated
-    /// it after it exhausted the redelivery budget.
+    /// it and failed the execution.
     ///
     /// Maps to the counter
     /// `harvest.task.capability_miss{queue, task_type, outcome}`.
@@ -4348,8 +4348,8 @@ pub trait MetricsRecorder: Send + Sync {
     /// `task_type` is `"workflow"` / `"activity"`. `outcome` is one of:
     ///
     /// - [`CAPABILITY_MISS_OUTCOME_RELEASED`].
-    /// - [`CAPABILITY_MISS_OUTCOME_ESCALATED`]: budget exhausted, the
-    ///   fleet-exhaustion signal that pages.
+    /// - [`CAPABILITY_MISS_OUTCOME_ESCALATED`]: escalated after releases, on an
+    ///   exhausted budget or on the release ceiling. It is the signal that pages.
     /// - [`CAPABILITY_MISS_OUTCOME_ESCALATED_NEVER_OFFERED`]: failed on the
     ///   first claim without ever being offered to a peer.
     ///
@@ -6393,7 +6393,8 @@ mod tests {
         let telemetry = TelemetryConfig::default();
         assert_eq!(&*telemetry.service_name, "autumn-harvest");
         assert!(telemetry.capture_trace_context().is_none());
-        // Calls should not panic; drop the guard immediately.
+        // Calls should not panic; `_guard` keeps the guard alive to the end of
+        // the test.
         let _guard = telemetry.install_trace_context(&TraceContextCarrier::default());
         // Metric calls are no-ops.
         telemetry.metrics.record_workflow_started("demo", "default");

@@ -1073,8 +1073,8 @@ impl SqliteRuntime {
     ///
     /// Every call starts a new, independent execution. The default `workflow_id`
     /// comes from a fresh [`ExecutionId`], so id reuse cannot arise here. The
-    /// v0.1 non-idempotent start contract (no `(workflow_name, workflow_id)`
-    /// uniqueness, no reuse-policy matrix) is documented in full on
+    /// start contract for a caller-supplied id is idempotent by default (issue
+    /// #1068). It is documented in full on
     /// [`start_workflow_with_id`](Self::start_workflow_with_id).
     ///
     /// # Errors
@@ -4652,13 +4652,15 @@ impl SqliteRuntime {
 
     /// Classify why a no-progress cycle is blocked.
     ///
-    /// A no-progress `Suspended` cycle is a legitimate *wait* for one of three
-    /// reasons. They are a `RUNNING` child or await target (issue #2026), an
-    /// undelivered signal, and a not-yet-due durable timer. Each is
+    /// A no-progress `Suspended` cycle is a legitimate *wait* for one of these
+    /// reasons. The first is a `RUNNING` child or await target (issue #2026).
+    /// Next come an undelivered signal, an unacquired mutex (issue #2029) and a
+    /// pending external activity. Last come a not-yet-due durable timer and a
+    /// backing-off activity retry (issue #1069). Each is
     /// checked against ground truth. A `WaitForSignal` command names the awaited
     /// signal. An armed-but-unfired row in `harvest_timers` proves a pending
     /// timer. `drain_ready` already fired every *due* timer this cycle, so any
-    /// survivor is genuinely not yet due. If neither holds, the run made no
+    /// survivor is genuinely not yet due. If none holds, the run made no
     /// progress and cannot be classified. The cause is an unsupported primitive,
     /// or a task stranded `RUNNING` by a crash that reclaim did not clear. That
     /// is exactly [`SqliteError::Stuck`], surfaced honestly instead of

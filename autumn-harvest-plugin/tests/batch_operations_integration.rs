@@ -882,10 +882,10 @@ async fn batch_signal_resume_excludes_processed_ids_not_offset() {
 // ---------------------------------------------------------------------------
 // #769 — dry-run preview for batch operations.
 //
-// These are RED (issue #769 is unimplemented). `SubmitBatchOperationRequest`
-// has no `deny_unknown_fields`, so it silently ignores a `dry_run` field. The
-// request runs as a REAL submit -> 202 + a job row. The assertions below pin the
-// desired 200 + preview body + zero-writes behavior and therefore fail on trunk.
+// `POST /batch-operations` with `dry_run: true` returns a 200 preview, not a
+// 202 submit. The tests below pin the preview body, its sample cap, its parity
+// with a real submit and its zero writes. An empty filter is a 400, as on a
+// real submit. A real submit still returns a 202 and writes a job row.
 // (Testcontainers-based; compile-checked only in sandboxes without Docker, run
 // Docker-backed in CI — per the #543/#544/#601 precedent.)
 // ---------------------------------------------------------------------------

@@ -460,7 +460,7 @@ async fn zz_capture_quota_history_bytes_evidence() {
         // connection and database. So the current-dbid scope alone makes the
         // match exact. The exact `calls` check below asserts it.
         //
-        // A fourth way this can fail is distinct from the three below. PG12
+        // A fourth way this can fail is distinct from the other three. PG12
         // (this crate's stated minimum, see README's "Postgres 12+") names
         // this column `mean_time`. Only PG13 renames it to `mean_exec_time`.
         // Queried as `Result` rather than a version probe, so it folds into

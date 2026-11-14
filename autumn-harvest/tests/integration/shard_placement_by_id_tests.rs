@@ -386,7 +386,7 @@ async fn history_event_types(conn: &mut AsyncPgConnection, exec_id: ExecutionId)
         .collect()
 }
 
-/// A business key whose rendezvous hash under `router` lands on `away_from`.
+/// A business key whose rendezvous hash under `router` lands on `to`.
 ///
 /// Pinning its execution anywhere else is then a genuine
 /// hash-vs-placement divergence, not a coincidence.

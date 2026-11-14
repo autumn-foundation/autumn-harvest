@@ -568,7 +568,7 @@ pub async fn lock_queue_for_pause(
 /// workflow sibling holds the lock across `append_events`, the parent-close
 /// cascade and trigger evaluation. So a backlog of expired tasks can halt
 /// unrelated work again and again. Claims fail their `try` silently and yield
-/// no task. The class-id separation on [`lock_queue_for_pause`] exists to
+/// no task. The keyspace separation on [`lock_queue_for_pause`] exists to
 /// prevent that same "silently stops dispatching" failure. This reaches it
 /// from a different side.
 ///
@@ -989,9 +989,10 @@ pub const fn held_task_count_query() -> &'static str {
 /// `LIMIT 1` because the notification is a *doorbell*, not a work assignment.
 /// [`crate::notify::QueueListener`] hands the payload back to the poll loop,
 /// which ignores it and re-polls the queue normally. So one indexed row is
-/// enough. It deliberately does **not** use `RETURNING id` on the shift
-/// statements. That materialises an id array as large as the whole released
-/// backlog, only to carry a single value.
+/// enough. It deliberately does **not** take its id from the `RETURNING id`
+/// output of the shift statements. That output feeds the pass 2 exclusion and
+/// the dispatch hints. A resume with no dispatch channel loads no late ids.
+/// So this query reads the one doorbell id by itself.
 ///
 /// The predicate mirrors the due-row filter of the shift passes. So the id is
 /// a row this resume just made claimable, not a retry that is still not due.
@@ -1106,8 +1107,8 @@ pub struct ResumeOutcome {
     /// Tasks whose `scheduled_at` was credited back the held time.
     ///
     /// The sum of both resume passes — the backlog that existed when the resume
-    /// began plus anything enqueued while it ran. The two partition on
-    /// `created_at`, so this is an exact row count, never a double count.
+    /// began plus anything enqueued while it ran. Pass 2 excludes the ids that
+    /// pass 1 shifted, so this is an exact row count, never a double count.
     pub released_task_count: i64,
     /// How long the queue was held, in seconds (`0` on a no-op).
     pub paused_duration_secs: i64,

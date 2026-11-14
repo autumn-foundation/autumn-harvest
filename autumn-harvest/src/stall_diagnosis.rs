@@ -2207,8 +2207,10 @@ mod tests {
     /// Issue #1193: an OPEN breaker's two shapes diverge. A FORCED open
     /// (`forced_open: true`) genuinely needs a human -- `stalled`. An
     /// ORGANICALLY-TRIPPED open (`forced_open: false`) admits a recovery
-    /// probe on a timer with no human involved. But every dispatch until then
-    /// fast-fails non-retryably (issue #369's `ActivityFailure::circuit_open`).
+    /// probe on a timer with no human involved. But no dispatch runs until then.
+    /// In defer mode, the default since issue #1809, each one waits in `PENDING`.
+    /// In fail-fast mode each one fails non-retryably (issue #369's
+    /// `ActivityFailure::circuit_open`).
     /// So it is neither a clean `healthy` nor a human-needed `stalled`: it is
     /// `degraded`. The split is keyed on `forced_open`, NOT `cooldown_until`
     /// (PR #1365). An organic trip with an unrepresentable cooldown also has
@@ -2237,8 +2239,8 @@ mod tests {
         };
         assert_eq!(forced_open.health(), ExecutionHealth::Stalled);
 
-        // Organically tripped: self-heals on a timer, but fast-fails every
-        // dispatch until then -- neither `healthy` nor `stalled`.
+        // Organically tripped: self-heals on a timer, but runs no dispatch
+        // until then -- neither `healthy` nor `stalled`.
         let organic_open = BlockedOn::ActivityCircuitOpen {
             activity_name: "charge_card".to_string(),
             phase: BlockingCircuitPhase::Open,

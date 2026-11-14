@@ -1855,7 +1855,7 @@ pub(crate) struct PendingActivity {
     pub(crate) start_to_close_deadline: Option<chrono::DateTime<chrono::Utc>>,
     pub(crate) heartbeat_deadline: Option<chrono::DateTime<chrono::Utc>>,
     /// The most recent recorded failure for this activity (issue #773),
-    /// derived from the latest `ActivityFailed` event. Omitted when the
+    /// derived from the task-row `error` column. Omitted when the
     /// activity has never failed (AC3). `None` for external-handoff rows.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) last_failure: Option<LastFailure>,
@@ -4114,7 +4114,6 @@ async fn list_gates_handler(
     }
 }
 
-/// `POST /admin/gates` — create an admission gate.
 #[allow(clippy::too_many_lines)]
 /// Reconcile the admission-gate cache after a persisted create or lift.
 ///
@@ -4171,6 +4170,7 @@ fn reconcile_gate_cache_after_mutation<E: std::fmt::Display>(
     }
 }
 
+/// `POST /admin/gates` — create an admission gate.
 async fn create_gate_handler(
     Extension(api_state): Extension<HarvestApiState>,
     headers: axum::http::HeaderMap,
@@ -36073,8 +36073,9 @@ async fn run_replay_canary_handler(
 ///     are refused, mirroring the #612 terminal-query path.
 ///
 /// Read-only (AC3): the DB connection is dropped before user code runs. The
-/// replay is pure and in memory. It appends no events and performs no writes.
-/// No audit row is written.
+/// replay is pure and in memory. It appends no events and changes no workflow
+/// state. The one write is the audit row of [`audit_decoded_read`] (issue #608).
+/// That row is written only when read-path decoding decodes a codec envelope.
 #[allow(clippy::too_many_lines)]
 async fn replay_diagnosis(
     Extension(api_state): Extension<HarvestApiState>,
@@ -36611,12 +36612,14 @@ async fn start_throttle_status(
 /// (`throttle::bucket_key(workflow_name, "")`). It reads
 /// `harvest_rate_limit_buckets` directly, with no dependency on backlog state.
 ///
-/// Aggregates across shards with the same "worst-case" (fewest remaining
-/// tokens) merge as [`list_rate_limits`]. Buckets are shard-local (issue
+/// Aggregates across shards without the "worst-case" (fewest remaining
+/// tokens) merge of [`list_rate_limits`]. Buckets are shard-local (issue
 /// #607/#247, see `docs/sharding.md`). A partial multi-shard write (a `207`
 /// from the SET/DELETE routes) can leave shards disagreeing about the
-/// override. This route reports one representative view, not one row per
-/// shard.
+/// override. So this route reads the row of each reachable shard. The
+/// top-level view prefers a shard with an active override, so a live override
+/// never reads as inactive. When the effective pacing of the shards differs,
+/// the route returns `207` with one entry per shard.
 ///
 /// **A total shard outage returns `503`. A partial outage returns `207` and
 /// names the unreachable shard(s) in `shard_errors`.** This is an
@@ -49024,12 +49027,6 @@ fn parse_from_param(from: Option<&str>) -> Result<chrono::DateTime<chrono::Utc>,
     )
 }
 
-/// Build the zero-entry preview response shared by the paused, exhausted, and
-/// unparsable-schedule short-circuits in [`preview_schedule_firings_handler`].
-///
-/// `pause_reason` shows only when `is_paused` is true. Some legacy pause paths,
-/// such as `PATCH /dags/{dag_name}`, clear `is_paused` but keep `pause_reason`.
-/// An unconditional read of the column could leak a stale reason.
 /// The `GET /admin/schedules/{id}/preview` payload (issue #348).
 ///
 /// Typed, so the Vantage schedules page (issue #951) renders exactly what the
@@ -49046,7 +49043,8 @@ pub(crate) struct SchedulePreview {
     /// Whether the schedule is paused (a paused schedule previews zero entries).
     pub is_paused: bool,
     /// The recorded pause reason — surfaced **only** while `is_paused`, so a
-    /// stale reason left on an active row is never leaked.
+    /// stale reason left on an active row is never leaked. An auto-paused row
+    /// gets a generated reason instead (#360).
     pub pause_reason: Option<String>,
     /// The instant the preview was projected from.
     pub from: chrono::DateTime<chrono::Utc>,
@@ -49061,6 +49059,13 @@ pub(crate) struct SchedulePreview {
     pub exhausted_reason: Option<String>,
 }
 
+/// Build the zero-entry preview response shared by the paused, exhausted, and
+/// unparsable-schedule short-circuits in [`compute_schedule_preview_for`].
+///
+/// The stored `pause_reason` shows only when `is_paused` is true. Some legacy
+/// pause paths, such as `PATCH /dags/{dag_name}`, clear `is_paused` but keep
+/// `pause_reason`. An unconditional read of the column could leak a stale
+/// reason. An auto-paused row gets a generated reason instead.
 fn empty_preview_response(
     schedule: &HarvestSchedule,
     remaining_runs: Option<i32>,

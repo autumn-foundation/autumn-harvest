@@ -13,6 +13,7 @@
 //!   (d) A bad weight, a bad key or a bad body is a 400 with a failed audit row.
 //!   (e) The read shows the claim state of each key.
 //!   (f) Without the admin boundary, all three routes are a 401.
+//!   (g) A new key at the override cap is a 409. An existing key still updates.
 
 #![allow(clippy::too_many_lines)]
 #![allow(clippy::doc_markdown)]
@@ -476,7 +477,7 @@ async fn all_three_routes_require_admin() {
     }
 }
 
-// ── (e) the override cap is a 409 ────────────────────────────────────────────
+// ── (g) the override cap is a 409 ────────────────────────────────────────────
 
 /// A queue that holds 1,000 overrides on every shard refuses a new key. The
 /// caller must clear an override first, so the refusal is a 409, as on a

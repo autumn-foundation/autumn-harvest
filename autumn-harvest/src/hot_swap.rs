@@ -1945,10 +1945,10 @@ pub fn module_workflow_handler(
 
         // Under DD-1 the workflow restarts at step 0 on every decision cycle, so
         // the decisions for steps `0..n` are re-derived on every one of them.
-        // The cache that removes that quadratic lives on the *host* (task-local,
-        // one execution's drive), not in this future. A map created here is
+        // The cache that removes that quadratic lives on the *registry*, for
+        // the whole worker process, not in this future. A map created here is
         // written and read in the same monotonically increasing pass, so it
-        // can never hit. See `ModuleHost::decisions`.
+        // can never hit. See `ModuleRegistry::decisions` and `DecisionCache`.
         //
         // The cache is skipped entirely when `host.capabilities` is not
         // deny-all (issue #1345). Its soundness rests on the guest

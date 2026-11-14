@@ -354,7 +354,7 @@ fn metric_payload_rejected_constant_exists() {
 
 #[tokio::test]
 async fn context_rejects_oversized_activity_input_at_schedule_time() {
-    // A 3 MiB input should be rejected when cap is 1 MiB
+    // A 2 MiB input should be rejected when cap is 1 MiB
     let ctx = WorkflowContext::new_test().with_payload_caps(
         1024 * 1024,
         2 * 1024 * 1024,

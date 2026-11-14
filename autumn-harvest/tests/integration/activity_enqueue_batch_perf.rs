@@ -483,12 +483,13 @@ async fn enqueue_batch_returns_ids_in_input_order() {
 
 /// A batch past Postgres's bind-parameter ceiling must still succeed.
 ///
-/// `NewTaskQueueItem` carries 28 columns, so one unchunked multi-row
-/// `INSERT` hits Postgres's 65,535-bind-parameter ceiling at 2,341 rows
-/// (`65_535 / 28 = 2340`, floor). 3,000 rows spans that boundary: two
-/// chunks, not one. `execute_activity_fan_out_raw` accepts an uncapped
-/// `Vec`. Before `enqueue_batch` chunked its insert, a large fan-out got a
-/// database error. The test also checks order across the chunk boundary.
+/// `NewTaskQueueItem` carries 30 columns (`NEW_TASK_QUEUE_ITEM_COLUMNS` in
+/// `queue.rs`). So one unchunked multi-row `INSERT` hits Postgres's
+/// 65,535-bind-parameter ceiling at 2,185 rows (`65_535 / 30 = 2184`, floor).
+/// 3,000 rows spans that boundary: two chunks, not one.
+/// `execute_activity_fan_out_raw` accepts an uncapped `Vec`. Before
+/// `enqueue_batch` chunked its insert, a large fan-out got a database error.
+/// The test also checks order in both chunks.
 #[tokio::test]
 async fn enqueue_batch_handles_a_batch_past_the_parameter_ceiling() {
     use autumn_harvest::models::TaskQueueItem;
@@ -531,9 +532,10 @@ async fn enqueue_batch_handles_a_batch_past_the_parameter_ceiling() {
         "every chunk's INSERT must commit"
     );
 
-    // Check order at both ends and across the chunk boundary (row 2,427,
-    // zero-indexed). This is the contract that
-    // `enqueue_batch_returns_ids_in_input_order` pins for one chunk.
+    // Check order at both ends and at rows 2,426 to 2,428 (zero-indexed).
+    // Those rows sit in the second chunk, which starts at row 2,184. This is
+    // the contract that `enqueue_batch_returns_ids_in_input_order` pins for
+    // one chunk.
     for i in [0_usize, 1, 2_426, 2_427, 2_428, N - 1] {
         let row: TaskQueueItem = harvest_task_queue::table
             .filter(harvest_task_queue::id.eq(ids[i]))
@@ -549,7 +551,7 @@ async fn enqueue_batch_handles_a_batch_past_the_parameter_ceiling() {
     }
 }
 
-// ── End-to-end: a real workflow's fan-out, driven through Worker::run ──────
+// ── End-to-end: a real workflow's fan-out, run through `run_workflow` ──────
 
 fn fan_out_handler<'a>(
     ctx: &'a WorkflowContext,

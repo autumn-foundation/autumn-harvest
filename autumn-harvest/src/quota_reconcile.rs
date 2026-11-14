@@ -264,10 +264,11 @@ struct CandidateRow {
 ///
 /// Only types with a registered `QuotaPolicy` are candidates (see
 /// [`registered_quota_workflow_names`]). A `NoPolicy` row never gets a
-/// `quota_key`. Without the name filter, a mixed deployment would re-fetch every no-policy row on every tick. Each
-/// call re-reads `$1` from the live registry, so a policy declared or
-/// removed mid-uptime takes effect on the next tick. The module doc says
-/// when a given row becomes visible.
+/// `quota_key`. Without the name filter, a mixed deployment would
+/// re-fetch every no-policy row on every tick. Each call re-reads `$1`
+/// from the live registry, so a policy declared or removed mid-uptime
+/// takes effect on the next tick. The module doc says when a given row
+/// becomes visible.
 ///
 /// `AND id >= COALESCE($2, <nil uuid>) AND ($2 IS NULL OR id > $2) ORDER BY
 /// id LIMIT $3` is a keyset cursor, not a bare `LIMIT`. The `>=` bound keeps
@@ -333,10 +334,12 @@ const fn reconciles_key(quota: Option<crate::quota::QuotaPolicy>) -> bool {
     }
 }
 
-/// Names of every registered workflow type that declares a [`QuotaPolicy`].
+/// Names of every registered workflow type that declares a [`QuotaPolicy`]
+/// that uses the quota key.
 ///
 /// [`reconcile_quota_keys_from`] binds this as the `$1` name list of
 /// `CANDIDATE_SQL`, so a type with no declared policy is never a candidate.
+/// Neither is a type whose policy does not use the key (see `reconciles_key`).
 /// `NoPolicy` never sets `quota_key`, so a no-policy row never leaves the
 /// candidate index. Without this filter, a mixed deployment would re-fetch
 /// every no-policy row forever.
@@ -465,8 +468,9 @@ pub async fn reconcile_quota_keys_from_with_codecs(
                 // `enforce_quota_admission` takes the same lock around its
                 // check-then-admit (`quota::lock_quota_key`). A concurrent
                 // admission for this key reads a stale, pre-backfill count
-                // only if it takes this lock first. See this function's doc
-                // comment for why only a synchronous design closes that window.
+                // only if it takes this lock first. See "Residual window" in
+                // the module doc for why only a synchronous design closes that
+                // window.
                 let rows_affected = Box::pin(conn.transaction::<usize, HarvestError, _>(
                     async move |conn| {
                         // Cross-region DR fence (issue #954), before the

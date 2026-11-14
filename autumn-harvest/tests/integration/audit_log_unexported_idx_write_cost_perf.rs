@@ -25,11 +25,12 @@
 //! unconfigured deployment.
 //!
 //! `CREATE DATABASE ... TEMPLATE` then clones that database into two
-//! byte-identical scenario databases. One keeps the shipped schema, index
-//! present. The other drops the index: the "lazily created, only on opt-in"
-//! counterfactual. The clone makes the two scenarios comparable. Independent
-//! seeding would build two physically different B-trees, for reasons
-//! unrelated to the index under test.
+//! byte-identical scenario databases. The shipped schema has no such index.
+//! The harness builds it in one database, as the exporter does on opt-in. The
+//! other stays without it, as an unconfigured deployment does. The clone makes
+//! the two scenarios comparable. Independent seeding would build two
+//! physically different B-trees, for reasons unrelated to the index under
+//! test.
 //!
 //! The harness then calls `audit::insert_audit`, the entry point of every
 //! mutating management-API handler, for a batch of new rows in both
@@ -553,8 +554,9 @@ async fn measure(
         .await
         .expect("seed connection");
 
-    // Issue #1667: no migration creates the index. The shipped-schema arm
-    // builds it, as the exporter does on its first tick.
+    // Issue #1667: a later migration drops the index, so the shipped schema
+    // has none. The with-index arm builds it, as the exporter does on its first
+    // tick.
     if !drop_unexported_idx {
         diesel::sql_query(
             "CREATE INDEX IF NOT EXISTS harvest_audit_log_unexported_idx \

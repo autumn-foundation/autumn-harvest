@@ -76,7 +76,7 @@ async fn get_json(app: &HarvestApiApp, uri: &str) -> (StatusCode, Value) {
     (status, json)
 }
 
-/// `(route with an arbitrary path segment, human-readable name)`. The segment
+/// `(human-readable name, route with an arbitrary path segment)`. The segment
 /// value never matters, because the malformed-query 400 fires before path
 /// validation. Each route still needs *a* value to form a routable URI.
 const MALFORMED_QUERY_ROUTES: &[(&str, &str)] = &[

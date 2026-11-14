@@ -1501,9 +1501,8 @@ pub const MAX_REQUEST_BYTES: usize = 64 * 1024;
 /// Parse an HTTP/1.1 request out of `buf`.
 ///
 /// Deliberately minimal. This endpoint serves exactly one route with a fixed
-/// request shape. The module docs say why the harness pulls in no HTTP stack.
-/// So it understands `Content-Length` bodies only: no chunked encoding, no
-/// keep-alive pipelining.
+/// request shape. So it understands `Content-Length` bodies only: no chunked
+/// encoding, no keep-alive pipelining.
 #[must_use]
 pub fn parse_http_request(buf: &[u8]) -> HttpParse {
     if buf.len() > MAX_REQUEST_BYTES {
@@ -4556,8 +4555,9 @@ pub mod db {
     /// idle connections. This impl and `Fleet`'s `Drop` make per-cell
     /// containment real.
     ///
-    /// `stop` consumes `self`, so on the ordinary path this runs immediately
-    /// after and aborts an already-aborted task, which is a no-op.
+    /// `stop` takes `&self`, so it does not drop the `SignalServer` value. On
+    /// the ordinary path, this impl runs later, when that value leaves scope.
+    /// It then aborts an already-aborted task, which is a no-op.
     impl Drop for SignalServer {
         fn drop(&mut self) {
             self.handle.abort();

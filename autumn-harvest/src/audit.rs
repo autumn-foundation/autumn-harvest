@@ -260,7 +260,6 @@ pub const OP_WEBHOOK_TRIGGER: &str = "webhook.trigger";
 /// `CLASSIFIED_ROUTES`/`ALL_MUTATION_ROUTES` change: no route mutates and no
 /// new route exists.
 pub const OP_PAYLOAD_DECODE_READ: &str = "payload.decode_read";
-/// Audit operation: minted a scoped API token (issue #942).
 /// Operation: an operator paused dispatch on a task queue (issue #619).
 pub const OP_QUEUE_PAUSE: &str = "queue.pause";
 /// Operation: an operator resumed dispatch on a task queue (issue #619).
@@ -272,6 +271,7 @@ pub const OP_FAIRNESS_WEIGHT_SET: &str = "fairness.weight.set";
 /// (issue #1976).
 pub const OP_FAIRNESS_WEIGHT_CLEAR: &str = "fairness.weight.clear";
 
+/// Audit operation: minted a scoped API token (issue #942).
 pub const OP_TOKEN_CREATE: &str = "token.create";
 /// Audit operation: revoked a scoped API token (issue #942).
 pub const OP_TOKEN_REVOKE: &str = "token.revoke";

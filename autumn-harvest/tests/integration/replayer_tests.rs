@@ -9515,19 +9515,19 @@ async fn execution_id_diverges_on_raw_events_path_without_the_builder() {
 }
 
 // ===========================================================================
-// Issue #1071 — interleaved-sibling terminal tolerance (RED phase).
+// Issue #1071 — interleaved-sibling terminal tolerance.
 //
-// Four forward-scan matchers (`match_timer_strict`, `scan_activity_terminal`,
-// `match_signal`) falsely report `NonDeterminismDetected` when a *sibling*
-// terminal/command is interleaved at its recorded history position. That
-// holds even for an IDEAL (correctly-ordered) history. Each scan `break`s at
+// Three forward-scan matchers (`match_timer_strict`, `scan_activity_terminal`,
+// `match_signal`) falsely reported `NonDeterminismDetected` when a *sibling*
+// terminal/command was interleaved at its recorded history position. That
+// held even for an IDEAL (correctly-ordered) history. Each scan broke at
 // the sibling event instead of tolerating it the way
-// `match_signal_or_timer` (issue #476) already does.
+// `match_signal_or_timer` (issue #476) already did.
 //
 // Each test below feeds the replayer a correct, producible history and asserts
-// `ReplaySucceeded`. They are RED against current code: each currently fails
-// (the run wedges → `NonDeterminismDetected` / `EarlyCompletion`). The later
-// GREEN phase makes each scan tolerate the interleaved sibling.
+// `ReplaySucceeded`. The tests pin that each scan tolerates the interleaved
+// sibling. Before the fix, each run wedged (`NonDeterminismDetected` /
+// `EarlyCompletion`).
 // ===========================================================================
 
 /// Manifestation #1 — a mixed suspension batch that emits the **timer command

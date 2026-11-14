@@ -998,7 +998,6 @@ pub enum WorkflowCommand {
     },
 }
 
-// Manual Debug because oneshot::Sender is not Debug.
 impl WorkflowCommand {
     /// Returns `true` when a parked Harvest future still waits on this
     /// command's result channel (issue #1797).
@@ -1039,6 +1038,7 @@ impl WorkflowCommand {
     }
 }
 
+// Manual Debug because oneshot::Sender is not Debug.
 impl std::fmt::Debug for WorkflowCommand {
     #[allow(clippy::too_many_lines)]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -7325,11 +7325,11 @@ impl WorkflowContext {
         // same suspension batch as the arm's `ArmTimer(id)`. The persist plan
         // then silently drops the arm's `TimerStarted`. The live history records
         // only one event for two logically distinct timer calls, and replay
-        // corrupts. Fail fast with a clear, deterministic error instead. A cancellable timer that was already
-        // `cancel()`ed (state `Cancelled`, not `Armed`) is dead, so classically
-        // reusing its id is allowed (the cancel-then-classic pattern). Reusing one
-        // id across the two timer APIs in the same task is API misuse — use
-        // distinct ids.
+        // corrupts. Fail fast with a clear, deterministic error instead. A
+        // cancellable timer that was already `cancel()`ed (state `Cancelled`,
+        // not `Armed`) is dead, so classically reusing its id is allowed (the
+        // cancel-then-classic pattern). Reusing one id across the two timer APIs
+        // in the same task is API misuse — use distinct ids.
         if self.timer_logically_armed(timer_id).is_some() {
             return Err(HarvestError::Config(format!(
                 "timer id '{timer_id}' is used for both a cancellable start_timer/reset_timer \
@@ -12227,9 +12227,11 @@ impl WorkflowContext {
         // (pushes only `WaitForActivity`), never `ScheduleActivity`. So a
         // mid-flight window CHANGE cannot regroup an in-flight slot with fresh
         // slots into a mixed `[WaitForActivity + ScheduleActivity]` suspension
-        // batch the worker cannot persist (issue #750). If any prefix slot is
-        // still in flight, the `try_join_all` below stays pending. Phase 2 is
-        // then not reached this cycle, and no fresh dispatch mixes with the resume.
+        // batch (issue #750). Issue #950 made that batch persistable. The split
+        // keeps the recorded command order independent of the window. If any
+        // prefix slot is still in flight, the `try_join_all` below stays pending.
+        // Phase 2 is then not reached this cycle, and no fresh dispatch mixes
+        // with the resume.
         if scheduled_prefix > 0 {
             self.check_cancellation()?;
             let prefix_futs = activities

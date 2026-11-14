@@ -278,10 +278,10 @@ pub fn parse_rate(s: &str) -> Result<RateSpec, String> {
         .parse()
         .map_err(|_| format!("throttle rate count '{}' is not a number", count_str.trim()))?;
     // `parse::<f64>()` accepts "nan", "inf" and "infinity", so reject both
-    // through `!is_finite()`, not `!(count > 0.0)`. Every NaN comparison is
-    // false, so that negation would silently pass NaN as valid. Infinity
-    // passes `> 0.0` and gives an unbounded refill rate and burst. That
-    // defeats the throttle.
+    // through `!is_finite()`. A bare `count <= 0.0` test is false for NaN,
+    // because every NaN comparison is false. So it alone would silently pass
+    // NaN as valid. Infinity passes `> 0.0` and gives an unbounded refill rate
+    // and burst. That defeats the throttle.
     if !count.is_finite() || count <= 0.0 {
         return Err(format!(
             "throttle rate count must be a finite number > 0, got {count}"
@@ -767,10 +767,11 @@ pub async fn skip_size_check(
 ///    start, possibly under a *different* throttle key. Return the outcome of
 ///    *that* row. Do not reserve a fresh token under the new key and leave the
 ///    old row orphaned.
-/// 2. **FIFO fast-path guard:** if a pending backlog already exists for this
+/// 2. **Bucket ensure:** ensure the bucket exists before either outcome below.
+///    Every later path persists a dependent on it (issue #1127).
+/// 3. **FIFO fast-path guard:** if a pending backlog already exists for this
 ///    key, defer (append). A new start then cannot jump ahead of older
-///    waiters or starve them.
-/// 3. Otherwise ensure the bucket exists and attempt a single-token debit
+///    waiters or starve them. Otherwise attempt a single-token debit
 ///    ([`crate::queue::try_consume_rate_limit_token`]):
 ///    - success → [`ThrottleAdmission::Reserved`] (caller proceeds to start;
 ///      refunds on an id-reuse short-circuit);
@@ -2262,10 +2263,11 @@ mod tests {
         );
     }
 
-    /// Issue #607: an infinite (or NaN) explicit burst passes `b >= 1.0`
-    /// (IEEE 754 comparison). It is inserted verbatim as the initial `tokens`
+    /// Issue #607: an infinite explicit burst passes `b >= 1.0` (IEEE 754
+    /// comparison). Unchecked, it is inserted verbatim as the initial `tokens`
     /// of the bucket. Then `LEAST(burst, tokens + refill)` degrades to an unbounded,
-    /// ever-growing allowance, which disables the throttle for that key.
+    /// ever-growing allowance, which disables the throttle for that key. The
+    /// `is_finite` check rejects it with a "finite" error.
     #[test]
     fn from_rate_str_rejects_infinite_explicit_burst() {
         let err =

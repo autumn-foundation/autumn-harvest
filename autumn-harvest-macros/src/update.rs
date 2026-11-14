@@ -431,14 +431,14 @@ fn build_update_dispatch(fn_name: &syn::Ident, param_names: &[&syn::Ident]) -> T
 //
 // `update_macro` generates the same three typed-stub methods twice: once for
 // the same-module case (`path_tokens.is_empty()`) and once wrapped in a
-// private `mod` for the nested-module case. The two copies are hand-kept in
-// sync. Commit 896978eb (issue #617) updated the first copy's
-// `UpdateWithStartParams` literal and initially missed the second. Only
-// `cargo clippy --all-features --tests` caught it, as a struct-literal
-// missing-field error. No test caught it. These tests pin the two branches
-// to token-identical method bodies, apart from the module wrapper and doc
-// comments. So a one-sided edit fails a fast `cargo test -p
-// autumn-harvest-macros`, not a full clippy run.
+// private `mod` for the nested-module case. Both copies splice one shared
+// `method_defs` block. When the copies were hand-kept, commit 896978eb (issue
+// #617) updated the first copy's `UpdateWithStartParams` literal and initially
+// missed the second. Only `cargo clippy --all-features --tests` caught it, as a
+// struct-literal missing-field error. No test caught it. These tests pin the
+// two branches to token-identical method bodies, apart from the module wrapper
+// and doc comments. So a return to one-sided copies fails a fast `cargo test
+// -p autumn-harvest-macros`, not a full clippy run.
 #[cfg(test)]
 mod same_module_vs_nested_module_parity_tests {
     use super::update_macro;
@@ -446,13 +446,12 @@ mod same_module_vs_nested_module_parity_tests {
 
     /// Removes `# [doc = r"..."]` attribute tokens.
     ///
-    /// The `///` doc comments on `#method_name_uws` are deliberately fuller in
-    /// the same-module branch. Everything else must match. `quote!`'s
-    /// fallback (non-bridged, i.e. `cargo test`) `Display` renders doc
-    /// comments as *raw* string literals (`r"..."`). The doc text can itself
-    /// contain `]`, as in markdown links like `[UpdateWithStartOutcome]`. So
-    /// this scans the string content for the closing quote, not for the next
-    /// `]`.
+    /// The parity check ignores `///` doc comments. Everything else must
+    /// match. `quote!`'s fallback (non-bridged, i.e. `cargo test`) `Display`
+    /// renders doc comments as *raw* string literals (`r"..."`). The doc text
+    /// can itself contain `]`, as in markdown links like
+    /// `[UpdateWithStartOutcome]`. So this scans the string content for the
+    /// closing quote, not for the next `]`.
     fn strip_docs(s: &str) -> String {
         const PREFIX: &str = "# [doc = r\"";
         let mut out = String::new();
@@ -486,12 +485,14 @@ mod same_module_vs_nested_module_parity_tests {
     /// `quote!`'s fallback `Display` reproduces string-literal *source
     /// spelling* verbatim, not the resolved value. A `"a \<newline>   b"`
     /// continuation literal round-trips with the original newline and
-    /// indentation still embedded (verified empirically). The two branches
-    /// write a debounce/batch rejection message at different nesting depths.
-    /// Without collapsing, the leading spaces in `update.rs`'s own source look
-    /// like a content difference. Real `rustc` resolves the `\`-continuation
-    /// the same way for both. Real content differences (an added or removed
-    /// field, a different call) still show up as different words.
+    /// indentation still embedded (verified empirically). Both branches splice
+    /// one `method_defs` block, so today their literals match. Two hand-kept
+    /// copies would write a rejection message at different nesting depths.
+    /// Without collapsing, the leading spaces in `update.rs`'s own source would
+    /// then look like a content difference. Real `rustc` resolves the
+    /// `\`-continuation the same way for both. Real content differences (an
+    /// added or removed field, a different call) still show up as different
+    /// words.
     fn normalize_whitespace(s: &str) -> String {
         s.split_whitespace().collect::<Vec<_>>().join(" ")
     }

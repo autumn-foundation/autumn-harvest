@@ -212,10 +212,10 @@ impl AuditExportRecord {
     ///
     /// Returns `None` for a row with no `export_seq`. A fabricated sequence
     /// would corrupt the receiver's gap accounting.
-    #[must_use]
     ///
     /// The chain fields come along only when `shard` made the links. Another
     /// shard on the same database ships the row without them.
+    #[must_use]
     pub fn from_row(shard: i32, row: crate::models::AuditExportRow) -> Option<Self> {
         let own = row.chain_shard == Some(shard);
         Some(Self {
@@ -677,13 +677,6 @@ impl AuditExportBuilderConfig {
         }
     }
 
-    /// Validate the configured webhook URL against this config's own SSRF
-    /// policy. Called at `HarvestBuilder::try_build()` time so a bad sink URL
-    /// fails startup rather than silently never delivering.
-    ///
-    /// An embedder-supplied [`AuditSink`] is not validated here — it is not a
-    /// URL, and where it ships is the embedder's decision.
-    ///
     /// `true` when a signed webhook is configured but no HMAC key is.
     ///
     /// Fails the build rather than warning (issue #953). The signature *is*
@@ -714,7 +707,12 @@ impl AuditExportBuilderConfig {
             .is_none_or(|secret| secret.as_bytes().is_empty())
     }
 
-    /// Validate the webhook URL against the SSRF policy.
+    /// Validate the configured webhook URL against this config's own SSRF
+    /// policy. Called at `HarvestBuilder::try_build()` time so a bad sink URL
+    /// fails startup rather than silently never delivering.
+    ///
+    /// An embedder-supplied [`AuditSink`] is not validated here — it is not a
+    /// URL, and where it ships is the embedder's decision.
     ///
     /// Skipped entirely when an embedder-supplied `sink` is set. This matches
     /// [`Self::webhook_is_missing_a_secret`] and the documented precedence.
@@ -3274,11 +3272,6 @@ async fn deliver_within_lease(
         })
 }
 
-/// Export one batch for one shard on one connection.
-///
-/// Three phases, deliberately separated: claim (transaction 1), deliver (no
-/// transaction, no locks), apply (transaction 2). Returns the number of
-/// records delivered.
 /// Discard a delivery whose sink was replaced while it was in flight.
 ///
 /// `read_global_audit_export_config` clones the `Arc` at the top of a tick. A
@@ -3319,6 +3312,11 @@ fn fence_against_sink_swap(
     )
 }
 
+/// Export one batch for one shard on one connection.
+///
+/// Three phases, deliberately separated: claim (transaction 1), deliver (no
+/// transaction, no locks), apply (transaction 2). Returns the number of
+/// records delivered.
 #[cfg(feature = "db")]
 async fn export_once_on_conn(
     conn: &mut diesel_async::AsyncPgConnection,

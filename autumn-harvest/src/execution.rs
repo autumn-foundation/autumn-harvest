@@ -4468,10 +4468,10 @@ pub async fn cancel_workflow_execution(
 /// accepts an arbitrary `u32` `max_attempts`, and the builder's
 /// `max_workflow_attempts` ceiling is optional. So a chain deeper than this is
 /// expressible. Exhausting the walk is therefore treated as a pathological
-/// chain and **fails closed** with [`HarvestError::Config`]. It does not
-/// return the deepest row reached. That row may itself be `FAILED` with a live
-/// successor beyond the bound. Returning it would silently route every routed
-/// operation to a stale attempt: the exact bug issue #843 fixes.
+/// chain and **fails closed** with [`HarvestError::RetryChainMaxDepthExceeded`].
+/// It does not return the deepest row reached. That row may itself be `FAILED`
+/// with a live successor beyond the bound. Returning it would silently route
+/// every routed operation to a stale attempt: the exact bug issue #843 fixes.
 pub const RETRY_CHAIN_MAX_DEPTH: usize = 256;
 
 /// Bound on how many times a mutating operation is re-driven when the retry
@@ -7750,6 +7750,46 @@ pub struct SignalWithStartOutcome {
     pub signal_delivered: bool,
 }
 
+/// Check a payload value against a byte cap, returning `PayloadTooLarge` when exceeded.
+/// Zero cap means uncapped (no check performed).
+fn check_sws_payload_cap(
+    value: &serde_json::Value,
+    kind: crate::error::PayloadKind,
+    cap: u64,
+    workflow_type: &str,
+) -> HarvestResult<()> {
+    if cap == 0 {
+        return Ok(());
+    }
+    let observed = serde_json::to_string(value).map_or(0, |s| s.len() as u64);
+    if observed > cap {
+        return Err(crate::error::HarvestError::PayloadTooLarge {
+            kind,
+            observed_bytes: observed,
+            cap_bytes: cap,
+            workflow_type: workflow_type.to_string(),
+            activity_name: None,
+        });
+    }
+    Ok(())
+}
+
+/// Validate `input` against `workflow_info`'s published JSON Schema
+/// (issue #373), when one is registered. Called only on a genuine fresh
+/// start (see the two call sites in
+/// [`signal_with_start_workflow_execution_with_metrics`]). An attach never
+/// writes `start_input`. Validation there would reject a call that never
+/// uses the value it rejects (issue #918 review).
+fn check_sws_input_schema(
+    input: &serde_json::Value,
+    workflow_info: Option<&WorkflowInfo>,
+) -> HarvestResult<()> {
+    let Some(info) = workflow_info else {
+        return Ok(());
+    };
+    info.validate_input(input)
+        .map_err(|violations| HarvestError::InputValidationFailed { violations })
+}
 /// Atomically start a workflow if no live run for `(workflow_name, workflow_id)`
 /// exists (subject to `reuse_policy`), or signal the existing run otherwise.
 ///
@@ -7806,46 +7846,6 @@ pub struct SignalWithStartOutcome {
 /// `start_or_load_workflow_execution`. That shape can leave a CANCELLED
 /// orphan on a crash. The wrapping transaction here makes it all-or-nothing.
 ///
-/// Check a payload value against a byte cap, returning `PayloadTooLarge` when exceeded.
-/// Zero cap means uncapped (no check performed).
-fn check_sws_payload_cap(
-    value: &serde_json::Value,
-    kind: crate::error::PayloadKind,
-    cap: u64,
-    workflow_type: &str,
-) -> HarvestResult<()> {
-    if cap == 0 {
-        return Ok(());
-    }
-    let observed = serde_json::to_string(value).map_or(0, |s| s.len() as u64);
-    if observed > cap {
-        return Err(crate::error::HarvestError::PayloadTooLarge {
-            kind,
-            observed_bytes: observed,
-            cap_bytes: cap,
-            workflow_type: workflow_type.to_string(),
-            activity_name: None,
-        });
-    }
-    Ok(())
-}
-
-/// Validate `input` against `workflow_info`'s published JSON Schema
-/// (issue #373), when one is registered. Called only on a genuine fresh
-/// start (see the two call sites in
-/// [`signal_with_start_workflow_execution_with_metrics`]). An attach never
-/// writes `start_input`. Validation there would reject a call that never
-/// uses the value it rejects (issue #918 review).
-fn check_sws_input_schema(
-    input: &serde_json::Value,
-    workflow_info: Option<&WorkflowInfo>,
-) -> HarvestResult<()> {
-    let Some(info) = workflow_info else {
-        return Ok(());
-    };
-    info.validate_input(input)
-        .map_err(|violations| HarvestError::InputValidationFailed { violations })
-}
 /// # Errors
 ///
 /// - [`HarvestError::AlreadyExists`] when `RejectDuplicate` rejects.
@@ -7858,6 +7858,9 @@ pub async fn signal_with_start_workflow_execution(
     signal_with_start_workflow_execution_with_metrics(conn, request, None, None).await
 }
 
+/// Runs [`signal_with_start_workflow_execution`] with an optional metrics
+/// recorder and an optional admission-gate mode.
+///
 /// # Errors
 ///
 /// - [`HarvestError::AlreadyExists`] when `RejectDuplicate` rejects.
@@ -9670,9 +9673,10 @@ impl ScheduleRunRow {
 
 /// Filters + keyset cursor for [`list_schedule_runs`] (issue #534).
 ///
-/// Mirrors the #514 execution-list conventions. It has a `state` filter and
-/// optional time bounds on `started_at`. A `(started_at, id)` keyset cursor gives
-/// stable newest-first pagination that merges cleanly across shards.
+/// Mirrors the #514 execution-list conventions. It has `state` and `origin`
+/// filters and optional time bounds on `started_at`. A `(sort_key, id)` keyset cursor on the
+/// logical-slot key `COALESCE(scheduled_for, started_at)` gives stable
+/// newest-first pagination that merges cleanly across shards.
 #[derive(Debug, Clone, Default)]
 pub struct ScheduleRunQuery {
     /// Restrict to these terminal/active states. Empty = all states.
@@ -9874,15 +9878,6 @@ pub async fn schedule_run_state_summary(
         .collect())
 }
 
-/// One workflow-type row from the per-shard non-terminal execution count
-/// (issue #520, workflow-type reachability).
-///
-/// Each row groups the **non-terminal** executions on a single shard by
-/// `workflow_name`. A non-terminal execution has a state outside the terminal
-/// set of [`crate::erase::is_terminal_state`]
-/// (`COMPLETED`/`FAILED`/`CANCELLED`/`TIMED_OUT`/`CONTINUED_AS_NEW`/`TERMINATED`).
-/// That is a `RUNNING`, `SUSPENDED`, or `PAUSED` run. Its next replay still
-/// requires the `#[workflow]` handler that `workflow_name` names.
 /// Maximum number of representative non-terminal execution ids returned per
 /// workflow type by [`non_terminal_counts_by_workflow_name`] (issue #700 AC2).
 ///
@@ -9894,6 +9889,15 @@ pub async fn schedule_run_state_summary(
 /// plugin caps the cross-shard union to the same value.
 pub const REACHABILITY_SAMPLE_CAP: usize = 5;
 
+/// One workflow-type row from the per-shard non-terminal execution count
+/// (issue #520, workflow-type reachability).
+///
+/// Each row groups the **non-terminal** executions on a single shard by
+/// `workflow_name`. A non-terminal execution has a state outside the terminal
+/// set of [`crate::erase::is_terminal_state`]
+/// (`COMPLETED`/`FAILED`/`CANCELLED`/`TIMED_OUT`/`CONTINUED_AS_NEW`/`TERMINATED`).
+/// That is a `RUNNING`, `SUSPENDED`, or `PAUSED` run. Its next replay still
+/// requires the `#[workflow]` handler that `workflow_name` names.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkflowTypeNonTerminalCount {
     /// Workflow type name — the handler its non-terminal executions replay against.

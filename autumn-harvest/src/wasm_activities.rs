@@ -699,22 +699,15 @@ pub(crate) type ExtraLink<'a> = dyn Fn(&mut Linker<HostState>) -> Result<(), Act
 ///
 /// # Cooperative cancellation
 ///
-/// When `cancel` is `Some`, the store installs a per-invocation epoch-deadline
-/// callback that polls the token roughly every [`EPOCH_TICK_INTERVAL`]. A
-/// cancel while the guest runs traps the guest at the next safe point (within
-/// ~1 tick). The call then returns a retryable
-/// [`ActivityFailure::resource_exhausted`] and does not run to the ceiling.
-/// The callback is per-`Store`, so a cancellation affects one invocation only.
-/// It still enforces the mandatory `limits.max_wall_clock` ceiling as the hard
-/// backstop.
+/// This is the non-cancellable convenience form. It passes no cancellation
+/// token, so the guest runs until it returns, fails, or reaches the effective
+/// deadline above. The worker dispatch seam uses
+/// [`invoke_wasm_activity_cancellable`] to pass a cancellation token.
 ///
 /// # Errors
 ///
 /// Returns an [`ActivityFailure`] classifying any sandbox denial, resource
 /// exhaustion, guest trap, ABI violation, or contained host-glue panic.
-///
-/// This is the non-cancellable convenience form. The worker dispatch seam uses
-/// [`invoke_wasm_activity_cancellable`] to pass a cancellation token.
 pub fn invoke_wasm_activity(
     store: &WasmModuleStore,
     module: &Module,
@@ -1919,11 +1912,10 @@ mod tests {
         // because there one tick ~= one trivial iteration. This guest makes the
         // two definitions diverge by more than an order of magnitude.
         let store = WasmModuleStore::new();
-        // ~256 fills x 16 MiB = ~4 GiB of memset per back-edge: tens of ms of
-        // real work for ~256 units of fuel.
-        // ~1024 fills x 16 MiB per back-edge. Each bulk fill is itself an epoch
-        // check point, so this maximises work-per-check-point: measured ~2.3x
-        // overrun before the fix, ~1.03x after.
+        // ~1024 fills x 16 MiB of memset per back-edge: real work for ~1024
+        // units of fuel. Each bulk fill is itself an epoch check point, so
+        // this maximises work-per-check-point: measured ~2.3x overrun before
+        // the fix, ~1.03x after.
         let module = compile(&store, &expensive_body_loop_wat(1024));
         let ceiling = Duration::from_millis(100);
         let start = Instant::now();

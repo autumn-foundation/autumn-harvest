@@ -193,9 +193,11 @@ pub enum DispatchDecision {
 /// Only [`RetryableFailure`](Self::RetryableFailure) — a transient,
 /// downstream-style error — contributes to tripping the breaker. A
 /// [`NonRetryableFailure`](Self::NonRetryableFailure) is a permanent per-request
-/// error (bad input, validation). It proves the downstream is reachable enough
-/// to give a definitive answer. So it never trips the breaker, and it counts as
-/// a healthy outcome for a half-open probe.
+/// error (bad input, validation). It can come from before the downstream was
+/// touched, so it is neither sickness nor proof of health. It never trips a
+/// closed breaker, and it leaves the failure window as it is. A half-open probe
+/// that ends with it is inconclusive: the breaker re-opens, re-arms its
+/// cooldown and reports no transition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AttemptOutcome {
     /// The attempt succeeded.
@@ -479,8 +481,9 @@ impl CircuitBreakerRegistry {
     ///
     /// Only [`AttemptOutcome::RetryableFailure`] contributes to tripping the
     /// breaker. A [`AttemptOutcome::NonRetryableFailure`] is a permanent
-    /// per-request error (bad input) that proves the downstream is reachable.
-    /// So it never trips the breaker and counts as a healthy probe result.
+    /// per-request error (bad input) that does not prove the downstream is
+    /// healthy. So it never trips a closed breaker. A half-open probe that ends
+    /// with it is inconclusive: the breaker re-opens and returns `None`.
     ///
     /// Returns `Some(transition)` when the breaker changed open/closed state so
     /// the caller can emit the corresponding metric. Activities without a
@@ -971,10 +974,6 @@ impl Default for CircuitBreakerRegistry {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Tests (red phase: written before the implementation above existed)
-// ---------------------------------------------------------------------------
-
 /// Apply one attempt outcome to an activity's breaker state.
 fn apply_result(
     st: &mut BreakerState,
@@ -1108,6 +1107,10 @@ fn apply_cancelled(st: &mut BreakerState, token: DispatchToken, now: Instant) ->
     }
     false
 }
+
+// ---------------------------------------------------------------------------
+// Tests (red phase: written before the implementation above existed)
+// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {

@@ -2413,8 +2413,10 @@ impl WorkflowHandle {
         // places on the row's true residence, not the origin bits `target`
         // encodes.
         //
-        // `execution.shard_id` above and `history` below resolve residence
-        // separately (line 2246). A migration landing between the two reads
+        // `execution.shard_id` and `history` above resolve residence
+        // separately. `load_effective_execution` reads the row, and
+        // `conn_for_execution_forwarded` picks the connection that loads
+        // `history`. A migration landing between the two reads
         // could make this value stale by the time `history` is read.
         // Currently inert: a query replay emits no commands and appends no
         // events, so no fresh child mint is ever reachable from here. It

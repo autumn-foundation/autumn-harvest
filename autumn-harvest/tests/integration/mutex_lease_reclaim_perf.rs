@@ -414,8 +414,8 @@ async fn measure_one_pass(admin: &str, label: &str, n: i64) -> SizePoint {
 /// Sweeps three fixture sizes so the artifact demonstrates the call-count
 /// shape directly, not just one point on the curve. Run once against the
 /// pre-fix code (`PERF_LABEL=before`), once against the post-fix code
-/// (`PERF_LABEL=after`) -- see
-/// `autumn-harvest/scripts/mutex_lease_reclaim_perf_repro.sh`.
+/// (`PERF_LABEL=after`) -- see the "Reproduce" section of
+/// `docs/performance-mutex-lease-reclaim.md`.
 #[tokio::test]
 #[ignore = "evidence generator, not a CI assertion -- see \
             docs/performance-mutex-lease-reclaim.md"]

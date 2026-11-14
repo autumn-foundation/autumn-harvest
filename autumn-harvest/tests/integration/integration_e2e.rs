@@ -4935,8 +4935,8 @@ async fn wait_for_completion_with_diagnostics(
     }
 }
 
-/// Success-metric test (issue #601): 10 children fanned out in parallel
-/// must all complete.
+/// Success-metric test (issue #601): [`SLOW_FAN_CHILD_COUNT`] children fanned
+/// out in parallel must all complete.
 ///
 /// This proves that the fan-out dispatches all N children concurrently, in
 /// one suspension batch and one worker wave, not one at a time.
@@ -4944,12 +4944,12 @@ async fn wait_for_completion_with_diagnostics(
 /// This is deliberately **not** a tight latency assertion. Two rounds of
 /// `ubuntu-latest` CI failures showed the limits: a 5s bound against a shared
 /// 10s timeout, then a 20s bound against a 30s timeout. GitHub-hosted runners
-/// have 2 vCPUs, and this suite runs with `--test-threads=1`. They give 11
-/// concurrent, DB-heavy workflow tasks far less throughput than a typical dev
-/// sandbox. So the outer bounds below are wide. The claim under test does not
+/// have 2 vCPUs, and this suite runs with `--test-threads=1`. They give the
+/// parent and its children, all concurrent and DB-heavy workflow tasks, far
+/// less throughput than a typical dev sandbox. So the outer bounds below are wide. The claim under test does not
 /// depend on the exact numbers: N fanned-out children complete together, not
-/// one full round trip at a time. Only the "all 10 completed" assertion is
-/// load-bearing on constrained hardware.
+/// one full round trip at a time. Only the "all children completed" assertion
+/// is load-bearing on constrained hardware.
 ///
 /// **Root cause of five later CI failures (PR #901):** the diagnostic dump in
 /// [`wait_for_completion_with_diagnostics`] found it. The original
@@ -5036,12 +5036,12 @@ async fn worker_completes_ten_child_fan_out_within_wall_clock_bound() {
 
     let start = std::time::Instant::now();
     // Bound widened 90s -> 180s. On busy ubuntu-latest runners this test can
-    // leave one of 11 concurrent decision cycles claimed for 2+ minutes with
+    // leave one of the concurrent decision cycles claimed for 2+ minutes with
     // zero progress. It then completes. That is scheduling contention on a
-    // 2-vCPU shared runner, not a hang. The other 9-10 children finish within
-    // ~1-2s of dispatch. Only the "all 10 completed" assertion is load-bearing
-    // on constrained hardware. This outer bound only catches a genuine stall.
-    // It does not assert throughput.
+    // 2-vCPU shared runner, not a hang. The other children finish within
+    // ~1-2s of dispatch. Only the "all children completed" assertion is
+    // load-bearing on constrained hardware. This outer bound only catches a
+    // genuine stall. It does not assert throughput.
     let parent_execution = wait_for_completion_with_diagnostics(
         &database_url,
         parent_exec_id,

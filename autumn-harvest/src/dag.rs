@@ -717,8 +717,8 @@ impl DagTaskRef {
 
     /// Declare the compensator by **name** (issue #780).
     ///
-    /// Use it when the compensator fn item is not in scope. Examples are a
-    /// remote/polyglot worker's activity, or a name computed by a macro.
+    /// Use it when the compensator fn item is not in scope. Examples are an
+    /// activity routed to a different queue, or a name computed by a macro.
     ///
     /// Prefer [`compensate`](Self::compensate), which derives the name from the
     /// fn item and is therefore typo-proof. Semantics are otherwise identical;

@@ -1,8 +1,9 @@
 //! `harvest-replay` — offline replay-safety validator for `#[workflow]` functions.
 //!
-//! Loads a recorded event history from a JSON file, or from Postgres with the
-//! `db` feature. It replays the history against registered workflow handlers to
-//! detect non-determinism before a code change deploys.
+//! Loads a recorded event history from a JSON file. It replays the history
+//! against registered workflow handlers to detect non-determinism before a code
+//! change deploys. This binary does not load history from Postgres:
+//! `--history-source db` prints an error and exits with code 2.
 //!
 //! # Usage
 //!
@@ -70,7 +71,7 @@ struct Args {
 enum HistorySource {
     /// Load history from a JSON `HistorySnapshot` file.
     Json,
-    /// Load history directly from the Postgres event store (requires db feature).
+    /// The Postgres event store. This binary rejects it and exits with code 2.
     Db,
 }
 

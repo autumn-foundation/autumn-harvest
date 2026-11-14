@@ -594,8 +594,8 @@ pub const BUDGET_ENV_VAR: &str = "HARVEST_CLAIM_BUDGET_MS";
 /// `default_ms`.
 ///
 /// A missing, unparseable, non-finite, or non-positive override falls back
-/// rather than silently disabling the gate. A `0` budget would make the gate
-/// unsatisfiable, and a negative one would make it vacuous.
+/// rather than silently disabling the gate. A `0` or negative budget would make
+/// the gate unsatisfiable, because every positive measurement exceeds it.
 #[must_use]
 pub fn budget_from_str(raw: Option<&str>, default_ms: f64) -> f64 {
     raw.and_then(|s| s.trim().parse::<f64>().ok())
@@ -1776,9 +1776,9 @@ mod pure_tests {
 
     #[test]
     fn wall_clock_budget_admits_a_run_at_the_latency_budget() {
-        // The gate asserts both "p99 within budget" AND "the run was not
+        // The gate asserts both "p50 within budget" AND "the run was not
         // truncated". Those two assertions are only coherent if a run sitting
-        // exactly at the p99 budget can finish inside the wall-clock ceiling.
+        // exactly at the p50 budget can finish inside the wall-clock ceiling.
         // If it cannot, the wall clock silently becomes the real budget. A
         // slow-but-passing run trips the truncation assertion first. The gate
         // then reports "measurement unsound" instead of a latency verdict.
@@ -3125,10 +3125,10 @@ pub mod db {
             )
             .await?;
             let n = DB_SEQ.fetch_add(1, Ordering::SeqCst);
-            // Shape: harvest_claim_bench_{pid}_{run_token}_{seq}. The pid is a
-            // cheap same-host liveness handle for the sweep. The run token makes
-            // the name unique when the admin URL is shared across hosts (see
-            // `run_token`).
+            // Shape: harvest_claim_bench_{pid}_{run_token}_{seq}. The sweep
+            // does not read the pid as a liveness signal. The server-visible
+            // lease decides that. The run token makes the name unique when the
+            // admin URL is shared across hosts (see `run_token`).
             let db = format!(
                 "{BENCH_DB_PREFIX}{}_{}_{}",
                 std::process::id(),

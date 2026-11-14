@@ -592,15 +592,14 @@ async fn last_error_reflects_prior_failure_and_clears_after_recovery() {
     worker.shutdown();
 }
 
-/// A schedule that fires two slots but only one runs (the other is not yet past
-/// carryover semantics for Skip). Skipped fires do not advance last_completion_result.
-/// We verify this by checking that the second run sees the first run's output, not
-/// any stale or reset value.
+/// A schedule with `OverlapPolicy::Skip` fires two slots in sequence. Run 1 finishes
+/// before the second tick, so no fire is skipped. The test checks that the second
+/// run sees the first run's output, not any stale or reset value.
 #[tokio::test]
 async fn skip_policy_does_not_advance_carryover() {
-    // OverlapPolicy::Skip dropping a fire must not corrupt carryover. A slot
-    // skipped while run 1 still runs (max_active_runs=1) does not advance the
-    // cursor. Run 2 sees run 1's cursor, not None and not a reset value.
+    // OverlapPolicy::Skip must not corrupt carryover. The test waits for run 1
+    // to complete before the second tick, so no slot is skipped here. Run 2
+    // sees run 1's cursor, not None and not a reset value.
     //
     // The carryover integration test above covers the full scheduler-side path.
     let (mut conn, url, _c) = setup_db().await;

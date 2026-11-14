@@ -1,6 +1,6 @@
 //! The corpus contract for issue #962.
 //!
-//! Five claims, one per test, in the order they have to hold:
+//! Six claims, one per test, in the order they have to hold:
 //!
 //! 1. [`seeded_corpus_is_clean_under_the_syntactic_layer`] — the *premise*. The
 //!    whole corpus compiles under `RUSTFLAGS="-D warnings"`. That is the only

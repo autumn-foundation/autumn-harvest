@@ -280,8 +280,8 @@ impl ActivityInterceptor for OkToErrInterceptor {
 // Handlers (benign — interceptors carry the behaviour under test).
 // ---------------------------------------------------------------------------
 
-/// Regular activity: echoes its input. Also records "handler" into an optional
-/// shared log for the ordering test.
+/// Regular activity: echoes its input. It records nothing, so the ordering test
+/// asserts only the markers of the interceptors.
 fn echo_activity(_ctx: &autumn_harvest::ActivityContext, input: serde_json::Value) -> BoxFut<'_> {
     Box::pin(async move { Ok(input) })
 }

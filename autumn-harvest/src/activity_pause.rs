@@ -241,7 +241,7 @@ pub const fn release_claim_if_activity_paused_query() -> &'static str {
 /// debited is not refunded. That is the same safe-side, self-healing leak as a
 /// lost claim in [`crate::queue::claim_task`]: it only under-dispatches.
 ///
-/// # Residual window (deliberate — see the module note on advisory locks)
+/// # Residual window (deliberate)
 ///
 /// This re-check's verdict is authoritative as of *its own snapshot*, not
 /// through commit. A pause can commit between this statement and the claim
@@ -364,19 +364,19 @@ pub async fn release_claim_if_activity_paused(
 /// pins both halves of the contract, so a future coordination cannot land the
 /// unsafe direction unnoticed.
 ///
-/// # Why one statement, where queue pause needs two
+/// # Why one `CASE` covers both sides, and a second pass still runs
 ///
-/// Queue pause splits this into a primary pass and a late-arrivals pass. Its
-/// primary pass runs before it finds rows enqueued during the resume, so it
-/// must then exclude the rows it already shifted by id. A single statement with
-/// the `CASE` has no such ordering problem. It credits every due `PENDING` row
-/// visible to its snapshot exactly once, by the `CASE` arm that its
-/// `created_at` selects. The irreducible residual is the one queue pause
-/// documents. A row that commits *after* this statement's snapshot and before
-/// this transaction commits is still held and gets no credit. Its under-credit
-/// is at most this statement's remaining duration. To close it completely,
-/// **enqueue** must serialize behind a pause-scoped lock. That puts a
-/// serialization point on the hot enqueue path for every task, paused or not.
+/// This statement credits both sides of the `created_at` partition with one
+/// `CASE`. It credits every due `PENDING` row visible to its snapshot exactly
+/// once, by the `CASE` arm that its `created_at` selects. It returns the ids it
+/// shifted (`RETURNING id`). A row that commits *after* this statement's
+/// snapshot is still held, but this statement cannot see it. So the resume
+/// runs [`resume_shift_late_arrivals_query`] as a second pass, as queue pause
+/// does. That pass skips the ids this statement reported, so no row gets the
+/// credit twice. It also documents the irreducible residual. To close that
+/// residual completely, **enqueue** must serialize behind a pause-scoped lock.
+/// That puts a serialization point on the hot enqueue path for every task,
+/// paused or not.
 ///
 /// `RUNNING` rows are untouched (AC4) and `schedule_to_close_at` is untouched
 /// so the absolute deadline keeps ticking.

@@ -552,7 +552,7 @@ fn level_granular_reexecute_set(
 /// dispatch counts as that node's outcome or timing, it reports a node that
 /// never executed.
 ///
-/// `succeeded` comes from [`succeeded_activity_names`] over the same history —
+/// `dispatched` comes from [`dispatched_activity_names`] over the same history —
 /// hoist it out of per-node loops. The check is history-only, so unlike a
 /// definition-derived one it cannot drift across versions in either direction.
 #[must_use]
@@ -636,7 +636,7 @@ pub fn node_outcome(
 /// compensation-dispatch exclusion. No run with such a dispatch reaches it.
 /// [`resolve_retry_plan`] rejects such a run with
 /// [`DagRetryResolveError::CompensatedRun`] before it computes a cut. It uses
-/// the *same* [`compensates_a_succeeded_node`] predicate that the exclusion
+/// the *same* [`compensates_a_dispatched_node`] predicate that the exclusion
 /// would apply. A compensation dispatch that could shift this cut is exactly
 /// one that already 409'd.
 ///

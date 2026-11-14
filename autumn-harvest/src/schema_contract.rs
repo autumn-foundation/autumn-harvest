@@ -999,10 +999,10 @@ impl WorkflowSchemaContract {
                  or a bare `GET /workflows/registered` array): {e}"
             ))
         })?;
-        // Refuse a format version this binary does not implement. A future v2
-        // may change what a verdict MEANS. A diff of it under v1 rules would
-        // return confident answers from the wrong ruleset. A compatibility gate
-        // must never fail that way.
+        // Refuse a format version this binary does not implement. A future
+        // version may change what a verdict MEANS. A diff of it under the
+        // rules of this build would return confident answers from the wrong
+        // ruleset. A compatibility gate must never fail that way.
         if parsed.contract_version != SCHEMA_CONTRACT_VERSION
             && !READABLE_LEGACY_CONTRACT_VERSIONS.contains(&parsed.contract_version.as_str())
         {
@@ -1654,8 +1654,8 @@ fn delta_key(d: &SchemaDelta) -> AckKey {
 /// acknowledgement that is **new in `head`**. An entry already present at
 /// `base` was recorded for an earlier change. Its reuse would let the same
 /// field break twice against a single record. Matching is a multiset
-/// difference over `(workflow, role, field_path, change)`, so N breaks need N
-/// records.
+/// difference over `(subject, workflow, side_effect, role, field_path,
+/// change)`, so N breaks need N records.
 ///
 /// A record whose `reason` is blank buys **no** coverage. Every authoring path
 /// already refuses one. [`WorkflowSchemaContract::acknowledged_update`] returns
@@ -1712,10 +1712,11 @@ pub fn unacknowledged_breaking<'d>(
 /// that a record the previous revision carried has vanished.
 ///
 /// Matching is a multiset difference over the same
-/// `(workflow, role, field_path, change)` identity `unacknowledged_breaking`
-/// uses. So an edit to only a record's `reason` or `recorded_in` is **not**
-/// reported. Those fields cannot make a record cover a different break. A flag
-/// on a typo fix would block legitimate work for no safety gain.
+/// `(subject, workflow, side_effect, role, field_path, change)` identity
+/// that `unacknowledged_breaking` uses. So an edit to only a record's
+/// `reason` or `recorded_in` is **not** reported. Those fields cannot make a
+/// record cover a different break. A flag on a typo fix would block
+/// legitimate work for no safety gain.
 ///
 /// Returns the dropped records — empty means the log grew, or stayed put.
 #[must_use]
@@ -2547,8 +2548,8 @@ fn diff_enum(
         bo.get("enum").and_then(Value::as_array),
         co.get("enum").and_then(Value::as_array),
     ) else {
-        // An `enum` appearing or disappearing is a constraint change handled by
-        // the unanalysed sweep (appearing) or is a pure relaxation (vanishing).
+        // An `enum` that appears tightens the value, so it is breaking. An
+        // `enum` that disappears is a pure relaxation. Both are reported here.
         if bo.contains_key("enum") && !co.contains_key("enum") {
             diff.push(ctx.delta(
                 path,
@@ -4277,7 +4278,7 @@ fn diff_ambiguous_branches(
         return;
     }
     for (i, (b, c)) in base_branches.iter().zip(cur_branches).enumerate() {
-        // Same rule as `rivals_of` in `diff_branch_set`, by index instead of by
+        // Same rule as `rivals_of` in `diff_branches`, by index instead of by
         // key. `anyOf` binds the FIRST match, so only the branches declared
         // after this one can lose data to it. `oneOf` requires EXACTLY one
         // match and is order-independent. So a LAST branch widened until it
@@ -4408,7 +4409,7 @@ fn diff_unanalysed(
 /// straight to [`Value::pointer`]. `out` doubles as the cycle guard, so a
 /// self-referential definition terminates. External (`https://…`) refs are
 /// skipped: the differ cannot read their targets either way, and
-/// [`diff_ref_pair`] already fails closed when such a ref *changes*.
+/// [`diff_unresolved_ref`] already fails closed when such a ref *changes*.
 fn collect_local_refs(root: &Value, value: &Value, out: &mut BTreeSet<String>, depth: usize) {
     if depth >= MAX_DIFF_DEPTH {
         return;

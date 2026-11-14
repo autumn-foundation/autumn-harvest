@@ -106,7 +106,8 @@ impl QueryRegistry {
     /// # Errors
     ///
     /// - Returns [`HarvestError::QueryHandlerNotFound`] if `name` is not registered.
-    /// - Returns [`HarvestError::QueryHandlerPanicked`] if the handler returns `Err`.
+    /// - Returns [`HarvestError::QueryHandlerFailed`] if the handler returns `Err`.
+    /// - Returns [`HarvestError::QueryHandlerPanicked`] if the handler panics.
     ///
     /// # Examples
     ///
@@ -160,6 +161,8 @@ impl QueryRegistry {
     /// # Errors
     ///
     /// Returns [`HarvestError::QueryHandlerNotFound`] if `name` is not registered.
+    /// Returns the other errors of [`Self::execute_with_args`] if the handler
+    /// fails or panics.
     pub fn execute(&self, name: &str) -> HarvestResult<Value> {
         self.execute_with_args(name, Value::Null)
     }

@@ -1,8 +1,9 @@
 #![cfg(feature = "db")]
 //! Sticky routing is on by default (issue #1798).
 //!
-//! These tests use `WorkerConfig::default()` and set no sticky option. They
-//! prove three things:
+//! Most of these tests use `WorkerConfig::default()` and set no sticky
+//! option. The tests for items 8 to 10 below each change one setting. They
+//! prove the following:
 //!
 //! 1. The next decision of a suspended execution runs on the same worker.
 //!    That worker reports a cache hit.

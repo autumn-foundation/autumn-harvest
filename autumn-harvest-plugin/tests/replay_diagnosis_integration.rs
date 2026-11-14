@@ -648,7 +648,7 @@ async fn failed_run_is_diagnosable_retroactively() {
     let app = build_app(&pool);
 
     // With `should_fail = true`, the handler returns `Err` after all items. A
-    // faithful replay reports `workflow_failed` (AC4: retroactive forensics on a
+    // faithful replay reproduces that failure (AC4: retroactive forensics on a
     // terminal FAILED run, still a 200).
     let (input, mut events) = progress_history(&["a"], true);
     // A real FAILED run always seals its history with `WorkflowFailed`. The

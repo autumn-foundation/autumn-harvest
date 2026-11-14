@@ -1594,7 +1594,7 @@ impl DeferredTriggerStart {
 /// discarding any latest-wins supersede cancellation metrics the same-shard
 /// inline start path collects.
 ///
-/// This is the pre-issue-#1197 entry point. It stays byte-for-byte for the 56
+/// This is the pre-issue-#1197 entry point. It stays byte-for-byte for the
 /// test call sites and for any production call site with no post-commit point
 /// of its own. It delegates to [`evaluate_triggers_for_execution_collecting`]
 /// with a throwaway collector. So a same-shard supersede here emits neither

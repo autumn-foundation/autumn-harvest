@@ -251,7 +251,7 @@ async fn measure_one_pass(admin: &str, label: &str, n: i64, num_workers: i64) ->
     reset_stats_for_db(&mut stats_conn, &db_name).await;
 
     let metrics = NoopMetrics;
-    // The threshold is far above any `crash_strikes` value seeded here (1). So
+    // The threshold is far above any `crash_strikes` value seeded here (0). So
     // every orphan takes the `Requeue` path, and the measurement covers one
     // code path.
     let summary = reclaim_orphaned_tasks(

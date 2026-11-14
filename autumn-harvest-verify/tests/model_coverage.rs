@@ -526,9 +526,9 @@ fn every_pub_async_method_on_durable_promise_is_a_sink() {
 /// `chrono` is trusted, so if `Utc::now` were not *also* a source row it would
 /// propagate cleanly. Then every clock read through chrono would vanish.
 ///
-/// The precedence rule ("sources match before the trusted default") lives in the
-/// matcher, which is GREEN-phase code. This guard checks the other half
-/// structurally, today. The source rows that the precedence rule protects must
+/// The precedence rule ("sources match before the trusted default") lives in
+/// `Model::classify`, and its unit tests prove it. This guard checks the other
+/// half structurally. The source rows that the precedence rule protects must
 /// be present for every trusted crate that ships a non-deterministic entry point.
 #[test]
 fn sources_never_shadowed_by_trusted_crates() {
@@ -801,18 +801,16 @@ reason = "Overridden reason: the later row for the same key replaces the earlier
 }
 
 mod api_gap {
-    //! Documented API gap, kept as a module note rather than a floating comment.
+    //! Where precedence is tested, kept as a module note rather than a floating comment.
     //!
     //! Rule *matching* — path-suffix matching, receiver narrowing, `dest_type`
-    //! pinning and the source-beats-trusted precedence order — lives in the
-    //! analyzer, which is GREEN-phase code. Until it exists there is no API to
-    //! assert precedence against. So
-    //! [`super::sources_never_shadowed_by_trusted_crates`] asserts the
+    //! pinning and the source-beats-trusted precedence order — lives in
+    //! `Model::classify` in `src/model/matcher.rs`. The matcher unit test
+    //! `a_source_is_never_shadowed_by_a_trusted_crate` holds the behavioural half.
+    //! It classifies `autumn_harvest::chrono::Utc::now` against the builtin model.
+    //! It asserts that the `[[source]]` row comes before the `[[trusted]]` row.
+    //!
+    //! So [`super::sources_never_shadowed_by_trusted_crates`] asserts only the
     //! structural precondition (the carve-out rows exist), not the behaviour
     //! (they win).
-    //!
-    //! When the matcher lands, that test should grow a behavioural half. It
-    //! should resolve `autumn_harvest::chrono::Utc::now` against the full model.
-    //! It should assert the answer is the `[[source]]` row, not the `[[trusted]]`
-    //! default.
 }

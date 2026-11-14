@@ -68,9 +68,9 @@ pub fn effective_queue_weights<'a, S: std::hash::BuildHasher>(
 ///
 /// The algorithm is weighted-random sampling *without replacement*
 /// (Efraimidis-Spirakis key-based reservoir). Each queue with `weight > 0`
-/// gets a key `U^(1/weight)`, where `U` is uniform `(0, 1]`. The queues then
-/// sort descending by key. So the first-position frequency is proportional
-/// to `weight`.
+/// gets a key `U^(1/weight)`, where `U` is uniform on
+/// `[f64::MIN_POSITIVE, 1)`. The queues then sort descending by key. So the
+/// first-position frequency is proportional to `weight`.
 ///
 /// Queues with `weight == 0` never come before positive-weight queues. They
 /// come last, in their original (stable) order. The caller can still drain

@@ -92,7 +92,7 @@ async fn exec_sql(conn: &mut AsyncPgConnection, sql: &str) {
     conn.batch_execute(sql).await.expect("seed sql");
 }
 
-/// Insert a RUNNING workflow execution with the given id on `shard_id`.
+/// Insert a workflow execution with the given id and `state` on `shard_id`.
 async fn seed_execution(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,

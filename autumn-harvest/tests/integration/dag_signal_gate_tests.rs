@@ -1,11 +1,9 @@
 //! Issue #746 — declarative DAG signal/timer gate nodes.
 //!
-//! **Phase 1 = RED.** These tests reference the not-yet-implemented gate API
-//! (`DagBuilder::signal_gate`, `DagBuilder::signal_gate_with_timeout`,
-//! `DagTask::signal`, `DagSignalGate`, `GateTimeoutAction`,
-//! `HarvestBuilderError::DagSignalGateRequiresUnifiedExecution`). Per this
-//! repo's TDD convention a compile error against not-yet-existing API is an
-//! acceptable RED — the GREEN implementation lands these symbols.
+//! These tests pin the gate API: `DagBuilder::signal_gate`,
+//! `DagBuilder::signal_gate_with_timeout`, the `DagTask::signal` field,
+//! `DagSignalGate`, `GateTimeoutAction` and
+//! `HarvestBuilderError::DagSignalGateRequiresUnifiedExecution`.
 //!
 //! Acceptance-criteria coverage:
 //! * AC1/AC2/Gap B — the signal payload lands in `__outputs`, where downstream
