@@ -26,68 +26,17 @@ use crate::telemetry::TraceContextCarrier;
 use crate::types::{ExecutionId, Priority};
 
 mod claim_window {
-    //! The window form of the default claim (issue #2680).
+    //! Postgres initializes every CTE subplan at executor startup, run or not,
+    //! and the deep and full-scan fallbacks almost never run. So a claim first
+    //! sends a window form without them, and sends the full statement only
+    //! when the window form sets `claim_fallback`.
     //!
-    //! The default claim statement holds four candidate scans: `seek_candidate`,
-    //! `seek_held`, `seek_deep_candidate` and `legacy_candidate`. Postgres
-    //! initializes every CTE subplan of a statement at executor startup, also a
-    //! subplan that never runs. On the e2e bench the claim initialized 204 plan
-    //! nodes per call, and 110 of them never ran. Its executor startup cost as
-    //! much as its execution. `pg_stat_statements` does not count startup, so the
-    //! census of issue #2651 did not show it.
-    //!
-    //! So a claim with the seek window sends two statements:
-    //!
-    //! 1. **The window form.** It keeps the window scan, `seek_held` and
-    //!    `seek_contended`. Its `candidate` is `seek_candidate` alone. It drops
-    //!    the deep window, the full scan and the backlog-wide concurrency counts.
-    //!    It returns one row: the claimed task, or no task, and a flag.
-    //! 2. **The full statement, unchanged.** It runs only when the flag is set.
-    //!
-    //! # Why the split claims the same row
-    //!
-    //! In the full statement, `candidate` is the union of the three scans. The
-    //! deep gate and the full-scan gate each start with
-    //! `NOT EXISTS (SELECT 1 FROM seek_candidate)`. So when `seek_candidate`
-    //! holds a row, the two other scans are empty, and `candidate` is
-    //! `seek_candidate`. The window form then claims the same row from the same
-    //! snapshot.
-    //!
-    //! With `seek_candidate` empty, the deep scan runs only when
-    //! `seek_contended` holds a row. The full scan runs only when `seek_bounds`
-    //! holds a row, or when ageing is on. The flag is the disjunction of those
-    //! three tests, after an empty `seek_candidate`. So a clear flag with no task
-    //! proves that the full statement claims no row either.
-    //!
-    //! The flag over-approximates in one case only: a held head that the deep
-    //! window reads to its end. The full statement then finds no row, and the
-    //! claim pays one more statement. It never takes a different row.
-    //!
-    //! # Why the full statement after a set flag is safe
-    //!
-    //! A set flag means that `seek_candidate` was empty. The window form then
-    //! locked no row, debited no token and took no advisory lock. The
-    //! `claimed` update matched nothing. So the transaction holds only its
-    //! `SET LOCAL` settings and, for an owned claim, its holder setting. The full
-    //! statement sets the holder again to the same value. It reads a new
-    //! snapshot under `READ COMMITTED`, so it is a fresh claim attempt. A claim
-    //! attempt that starts later is always allowed to see newer rows.
-    //!
-    //! `formal/verus/src/claim_window.rs` proves the decision for every input.
-    //!
-    //! # How the text is built
-    //!
-    //! [`window_claim_sql`] derives the window form from the final text of a full
-    //! statement, after every splice. So the DR fence, the kind predicate and the
-    //! owned gate are already in it. The function parses the top-level CTE list.
-    //! It asserts that each CTE it drops exists once, and that no kept CTE names
-    //! a dropped one. An edit that breaks either rule panics at first use, and
-    //! `window_claim_sql_holds_for_every_variant` runs it for every variant.
+    //! Both fallback gates start with `NOT EXISTS (SELECT 1 FROM seek_candidate)`,
+    //! so a window row is the row the full statement would take. The flag is
+    //! the rest of those gates, so a clear flag means the full statement takes
+    //! nothing either. A set flag means the window form locked and debited
+    //! nothing, so the full statement is just a fresh attempt.
 
-    /// The CTEs that only the deep window and the full scan read.
-    ///
-    /// `concurrency_pending_keys` and `concurrency_running_counts` serve the full
-    /// scan alone. The window scan counts its keys in `seek_running_counts`.
     pub(super) const WINDOW_DROPPED_CTES: [&str; 9] = [
         "concurrency_pending_keys",
         "concurrency_running_counts",
@@ -100,46 +49,26 @@ mod claim_window {
         "legacy_candidate",
     ];
 
-    /// The body of `candidate` in every full statement that has the window.
     const FULL_CANDIDATE_BODY: &str = "SELECT * FROM seek_candidate \
          UNION ALL SELECT * FROM seek_deep_candidate \
          UNION ALL SELECT * FROM legacy_candidate";
 
-    /// The body of `candidate` in the window form.
     const WINDOW_CANDIDATE_BODY: &str = "SELECT * FROM seek_candidate";
 
-    /// The name of the flag column of the window form.
     pub(super) const WINDOW_FALLBACK_COLUMN: &str = "claim_fallback";
 
-    /// The flag of the window form: true when the full statement could claim a
-    /// row that the window form did not.
-    ///
-    /// The three disjuncts are the gates of the deep scan and the full scan in
-    /// the full statement, without their `seek_candidate` test. See the module
-    /// documentation.
     const WINDOW_FALLBACK_SQL: &str = "NOT EXISTS (SELECT 1 FROM seek_candidate) \
          AND (EXISTS (SELECT 1 FROM seek_contended) \
               OR EXISTS (SELECT 1 FROM seek_bounds) \
               OR ($4::BIGINT IS NOT NULL AND $4::BIGINT > 0))";
 
-    /// What a claim does after its window statement.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub(super) enum WindowStep {
-        /// The window statement claimed a row.
         Claimed,
-        /// No row is free. The full statement would claim no row either.
         Empty,
-        /// Send the full statement.
         Fallback,
     }
 
-    /// The next step of a claim after its window statement (issue #2680).
-    ///
-    /// `claimed` is true when the statement returned a task. `fallback` is the
-    /// flag column. A claimed row wins over the flag. The flag is false whenever
-    /// `seek_candidate` holds a row, so the two are never both true. The order
-    /// only keeps the claim safe if that ever changes.
-    ///
     /// `formal/verus/src/claim_window.rs` holds the proved copy.
     pub(super) const fn window_step(claimed: bool, fallback: bool) -> WindowStep {
         if claimed {
@@ -151,21 +80,15 @@ mod claim_window {
         }
     }
 
-    /// One top-level CTE of a claim statement.
     #[derive(Debug)]
     struct Cte<'a> {
         name: &'a str,
-        /// The whole definition, from the name to the closing parenthesis.
         text: &'a str,
-        /// The text inside the outer parentheses.
         body: &'a str,
     }
 
-    /// Find the parenthesis that closes the one at byte `open` of `sql`.
-    ///
-    /// It skips single-quoted literals, with `''` as an escaped quote. The claim
-    /// text holds no comment and no dollar quote. `window_claim_sql` asserts
-    /// both.
+    /// Skips single-quoted literals. Comments and dollar quotes are not
+    /// handled; `window_claim_sql` asserts the text has neither.
     fn closing_paren(sql: &str, open: usize) -> usize {
         let bytes = sql.as_bytes();
         let mut depth = 0_usize;
@@ -196,7 +119,6 @@ mod claim_window {
         panic!("claim query has an unbalanced parenthesis at byte {open}");
     }
 
-    /// Split a `WITH` statement into its top-level CTEs and its final query.
     fn split_ctes(sql: &str) -> (Vec<Cte<'_>>, &str) {
         let mut rest = sql
             .strip_prefix("WITH ")
@@ -231,7 +153,6 @@ mod claim_window {
         }
     }
 
-    /// True when `text` names `ident` as a whole word.
     fn names(text: &str, ident: &str) -> bool {
         let word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
         text.match_indices(ident).any(|(at, _)| {
@@ -241,24 +162,17 @@ mod claim_window {
         })
     }
 
-    /// Collapse each run of whitespace to one space.
     fn squash(text: &str) -> String {
         text.split_whitespace().collect::<Vec<_>>().join(" ")
     }
 
-    /// The window form of one full claim statement (issue #2680).
-    ///
-    /// `full` is the final text of a default claim with the seek window. It can
-    /// be of any kind, with or without the DR fence and the owned gate. The
-    /// window form binds the same parameters. It returns the columns of the full
-    /// statement, then [`WINDOW_FALLBACK_COLUMN`]. It always returns one row.
-    /// The task columns are `NULL` when it claimed no row.
+    /// Built from the final text, after every splice, so the fence, kind and
+    /// owned gates carry over. Always returns one row; the task columns are
+    /// `NULL` when nothing was claimed.
     ///
     /// # Panics
     ///
-    /// Panics when `full` does not have the shape that the module documentation
-    /// describes. Every caller passes a constant text, so a panic means an edit
-    /// broke the shape. The guard tests run it for every variant.
+    /// When `full` is not a seek-window claim. Every input is a constant.
     #[must_use]
     pub(super) fn window_claim_sql(full: &str) -> String {
         assert!(
@@ -3554,10 +3468,7 @@ async fn claim_task_one_statement(
             by_id: None,
             owned: owned.map(|o| (o.holder.as_str(), o.mask())),
         };
-        // A claim with the seek window sends its window form first (issue
-        // #2680). The full statement runs only when the window form cannot
-        // decide. Ageing and fair claims skip the window, so they send the
-        // full statement alone, as before.
+        // Ageing and fair claims have no seek window.
         let windowed = !ageing && fairness == ClaimFairness::Off;
         let task = if windowed {
             let window = window_claim_query_for(kind, fence.is_some(), owned.is_some());
@@ -3886,11 +3797,7 @@ fn fair_variant(kind: Option<TaskType>, fenced: bool) -> &'static str {
     &FAIR[slot]
 }
 
-/// The window form of each default claim statement (issue #2680).
-///
-/// `owned` picks the owned gate. An activity-only claim never carries it.
-/// See [`claim_window::window_claim_sql`] for the transformation and why the
-/// window form claims the row that the full statement would claim.
+/// The window form of the default claim; see `claim_window`.
 #[must_use]
 pub fn window_claim_query_for(kind: Option<TaskType>, fenced: bool, owned: bool) -> &'static str {
     use std::sync::LazyLock;
@@ -3919,10 +3826,6 @@ pub fn window_claim_query_for(kind: Option<TaskType>, fenced: bool, owned: bool)
     &WINDOW[slot]
 }
 
-/// The one row of a window claim statement (issue #2680).
-///
-/// The task columns are `NULL` when the statement claimed no row. The `id`
-/// column tells the two cases apart: a claimed row always has one.
 struct WindowClaimRow {
     task: Option<TaskQueueItem>,
     fallback: bool,
