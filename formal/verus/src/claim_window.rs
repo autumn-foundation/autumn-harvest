@@ -1,33 +1,19 @@
 //! The split claim takes the row that the one full statement takes.
 //!
-//! A default claim sends its window form first (issue #2680). The window
-//! form keeps only the window scan. It returns the claimed row, or no row
-//! and a flag. The full statement runs only when the flag is set.
-//!
-//! The model reads one snapshot of the claim. Each scan of the full
-//! statement is an input: the row that it would take if it ran, and the
-//! tests of its gate. The full statement takes the window row first, then
-//! the deep row, then the full-scan row, each behind its gate.
-//!
-//! The copy below proves the kernel in `autumn-harvest/src/queue.rs`.
-//! The theorem proves that the split claim ends with the row of the full
-//! statement for every input.
+//! Each scan of the full statement is an input: the row it would take if it
+//! ran, and the tests of its gate. The copy below proves the kernel in
+//! `autumn-harvest/src/queue.rs`.
 
 use vstd::prelude::*;
 
 verus! {
 
-/// What a claim does after its window statement.
 pub enum WindowStep {
-    /// The window statement claimed a row.
     Claimed,
-    /// No row is free. The full statement would claim no row either.
     Empty,
-    /// Send the full statement.
     Fallback,
 }
 
-/// `window_step` as a spec.
 pub open spec fn spec_window_step(claimed: bool, fallback: bool) -> WindowStep {
     if claimed {
         WindowStep::Claimed
@@ -70,7 +56,6 @@ pub struct Snapshot {
     pub bounds: bool,
     /// `seek_deep_bounds` holds a row.
     pub deep_bounds: bool,
-    /// Priority ageing is on.
     pub ageing: bool,
 }
 
@@ -83,7 +68,6 @@ pub open spec fn deep_candidate(s: Snapshot) -> Option<int> {
     }
 }
 
-/// The row that the one full statement takes.
 pub open spec fn full_statement(s: Snapshot) -> Option<int> {
     if s.window is Some {
         s.window
@@ -96,7 +80,6 @@ pub open spec fn full_statement(s: Snapshot) -> Option<int> {
     }
 }
 
-/// The flag of the window form.
 pub open spec fn window_flag(s: Snapshot) -> bool {
     s.window is None && (s.contended || s.bounds || s.ageing)
 }
