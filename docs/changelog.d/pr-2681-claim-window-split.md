@@ -1,4 +1,4 @@
-## Claim window split (issue #2680)
+## Claim window split (issue #2680, PR #2681)
 
 A hot path audit with a system-wide CPU profile found a cost that the
 `pg_stat_statements` census cannot see. The census times `ExecutorRun`
