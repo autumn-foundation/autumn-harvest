@@ -62,6 +62,16 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<DagAttrs> {
             result.jitter = Some(value.value());
             Ok(())
         } else if meta.path.is_ident("owner") {
+            // Clone-class note: this owner/runbook/severity branch trio
+            // repeats verbatim in `workflow::parse_attrs`. Apply a change
+            // in either field, or in the severity levels, to both
+            // modules.
+            //
+            // Two instances only. Commit a0bfbcb touches both files once.
+            // It carries no other shared edit, so neither a co-change nor
+            // a missed-fix exists to cite. The merge bar needs rule of
+            // three or a missed-fix. Neither applies yet, so the
+            // duplication stays.
             let value: LitStr = meta.value()?.parse()?;
             result.owner = Some(value.value());
             Ok(())
